@@ -1,0 +1,429 @@
+from __future__ import annotations
+
+import csv
+import datetime as dt
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+
+SUPPORTED_SUFFIXES = {
+    ".abf",
+    ".cdf",
+    ".ibf",
+    ".mzml",
+    ".mzxml",
+    ".raw",
+    ".wiff",
+}
+
+
+def is_supported(path: Path) -> bool:
+    return path.suffix.lower() in SUPPORTED_SUFFIXES or (
+        path.is_dir() and path.name.lower().endswith((".d", ".raw"))
+    )
+
+
+def expand_paths(paths: Iterable[str]) -> list[dict[str, Any]]:
+    expanded: list[Path] = []
+    for raw in paths:
+        path = Path(raw).expanduser().resolve()
+        if path.is_file() and is_supported(path):
+            expanded.append(path)
+        elif path.is_dir() and is_supported(path):
+            expanded.append(path)
+        elif path.is_dir():
+            expanded.extend(
+                child
+                for child in path.iterdir()
+                if is_supported(child)
+            )
+    unique = sorted(set(expanded), key=lambda item: str(item).lower())
+    result = []
+    for index, path in enumerate(unique):
+        name = path.stem
+        lower = name.lower()
+        is_blank = "blank" in lower
+        class_id = (
+            "Blank"
+            if is_blank
+            else "Feces"
+            if "feces" in lower
+            else "Plasma"
+            if "plasma" in lower
+            else "Sample"
+        )
+        result.append(
+            {
+                "file_path": str(path),
+                "file_name": name,
+                "file_type": "Blank" if is_blank else "Sample",
+                "class_id": class_id,
+                "acquisition_type": "DDA",
+                "batch_order": 1,
+                "analytical_order": index + 1,
+                "factor": 1,
+            }
+        )
+    return result
+
+
+def read_lipid_queries(path: str | Path) -> list[dict[str, Any]]:
+    query_path = Path(path)
+    if not query_path.exists():
+        return []
+    rows = []
+    with query_path.open(encoding="utf-8-sig", errors="replace") as handle:
+        for raw in handle:
+            if not raw.strip() or raw.startswith("#"):
+                continue
+            columns = raw.rstrip("\r\n").split("\t")
+            if len(columns) < 4 or columns[0].lower() == "class":
+                continue
+            rows.append(
+                {
+                    "lipid_class": columns[0].strip(),
+                    "adduct": columns[1].strip(),
+                    "ion_mode": columns[2].strip(),
+                    "selected": columns[3].strip().lower() == "true",
+                }
+            )
+    return rows
+
+
+def parse_method(path: str | Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    method_path = Path(path)
+    if not method_path.exists():
+        return values
+    for line in method_path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        if line.startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        values[key.strip().lower()] = value.strip()
+    return values
+
+
+def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    files = state.get("files", [])
+    required_paths = [
+        ("console_path", "MS-DIAL Console executable"),
+        ("template_path", "parameter template"),
+        ("output_root", "output root"),
+    ]
+    for key, label in required_paths:
+        value = str(state.get(key, "")).strip()
+        if not value:
+            issues.append({"level": "error", "message": f"Missing {label}."})
+        elif key != "output_root" and not Path(value).exists():
+            issues.append({"level": "error", "message": f"Not found: {value}"})
+    if not files:
+        issues.append({"level": "error", "message": "No analysis files were added."})
+    names = set()
+    acquisition_types = set()
+    for item in files:
+        path = Path(item.get("file_path", ""))
+        name = str(item.get("file_name", ""))
+        if not path.exists():
+            issues.append({"level": "error", "message": f"Input not found: {path}"})
+        if path.suffix.lower() == ".wiff" and not Path(str(path) + ".scan").exists():
+            issues.append({"level": "error", "message": f"WIFF sidecar not found: {path}.scan"})
+        if "," in str(path) or "," in name or "," in str(item.get("class_id", "")):
+            issues.append(
+                {
+                    "level": "error",
+                    "message": f"Console CSV cannot quote commas: {name}",
+                }
+            )
+        if name.lower() in names:
+            issues.append({"level": "error", "message": f"Duplicate file_name: {name}"})
+        names.add(name.lower())
+        acquisition_types.add(item.get("acquisition_type", "DDA"))
+    if len(acquisition_types) > 1:
+        issues.append(
+            {
+                "level": "warning",
+                "message": (
+                    "Multiple acquisition types require the per-file acquisition_type fix "
+                    "(fix/console-per-file-acquisition-type) or a release containing it."
+                ),
+            }
+        )
+    for key, label in (
+        ("msp_path", "MSP library"),
+        ("lbm_path", "LBM library"),
+        ("text_db_path", "Text DB"),
+    ):
+        value = str(state.get(key, "")).strip()
+        if value and not Path(value).exists():
+            issues.append({"level": "error", "message": f"{label} not found: {value}"})
+    selected = state.get("selected_lipids", [])
+    if state.get("target_omics") == "Lipidomics" and not selected:
+        issues.append({"level": "error", "message": "No lipid annotation query is selected."})
+    return issues
+
+
+def prepare_run(
+    state: dict[str, Any],
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    issues = validate_workflow(state)
+    errors = [issue["message"] for issue in issues if issue["level"] == "error"]
+    if errors:
+        raise ValueError("\n".join(errors))
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_directory = Path(state["output_root"]).expanduser().resolve() / f"{timestamp}-lcms"
+    run_directory.mkdir(parents=True, exist_ok=False)
+    stage_inputs = bool(state.get("stage_inputs", True))
+    input_directory = run_directory / "input"
+    if stage_inputs:
+        input_directory.mkdir()
+
+    effective_files: list[Path] = []
+    files = state["files"]
+    for index, item in enumerate(files):
+        source = Path(item["file_path"]).resolve()
+        if progress:
+            progress(f"Staging input {index + 1}/{len(files)}: {source.name}")
+        if stage_inputs:
+            target = input_directory / source.name
+            _stage_path(source, target)
+            effective_files.append(target)
+        else:
+            effective_files.append(source)
+
+    csv_path = run_directory / "analysis_files.csv"
+    _write_analysis_csv(csv_path, files, effective_files)
+    method_path = run_directory / "method.txt"
+    _write_method(method_path, state)
+    manifest_path = run_directory / "run-manifest.json"
+    manifest = {
+        "created_at": dt.datetime.now().astimezone().isoformat(),
+        "platform": platform.platform(),
+        "analysis_type": "lcms",
+        "project_file_requested": True,
+        "stage_inputs": stage_inputs,
+        "input_csv": str(csv_path),
+        "method_file": str(method_path),
+        "output_folder": str(run_directory),
+        "source_files": [item["file_path"] for item in files],
+        "effective_files": [str(path) for path in effective_files],
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    command = build_console_command(
+        state["console_path"],
+        csv_path,
+        run_directory,
+        method_path,
+    )
+    return {
+        "run_directory": str(run_directory),
+        "input_csv": str(csv_path),
+        "method_file": str(method_path),
+        "manifest": str(manifest_path),
+        "command": command,
+        "warnings": [issue for issue in issues if issue["level"] == "warning"],
+    }
+
+
+def build_console_command(
+    console_path: str,
+    csv_path: str | Path,
+    output_path: str | Path,
+    method_path: str | Path,
+) -> list[str]:
+    executable = Path(console_path).expanduser().resolve()
+    prefix = ["dotnet", str(executable)] if executable.suffix.lower() == ".dll" else [str(executable)]
+    return prefix + [
+        "lcms",
+        "-i",
+        str(csv_path),
+        "-o",
+        str(output_path),
+        "-m",
+        str(method_path),
+        "-p",
+    ]
+
+
+def run_console(
+    preparation: dict[str, Any],
+    on_line: Callable[[str], None],
+) -> int:
+    process = subprocess.Popen(
+        preparation["command"],
+        cwd=str(Path(preparation["command"][0]).parent)
+        if Path(preparation["command"][0]).is_absolute()
+        else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        on_line(line.rstrip())
+    return process.wait()
+
+
+def _write_analysis_csv(
+    path: Path,
+    rows: list[dict[str, Any]],
+    effective_paths: list[Path],
+) -> None:
+    headers = [
+        "file_path",
+        "file_name",
+        "file_type",
+        "class_id",
+        "acquisition_type",
+        "batch_order",
+        "analytical_order",
+        "factor",
+    ]
+    with path.open("w", encoding="ascii", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=headers, lineterminator="\n")
+        writer.writeheader()
+        for row, effective in zip(rows, effective_paths, strict=True):
+            data = {key: row.get(key, "") for key in headers}
+            data["file_path"] = str(effective)
+            writer.writerow(data)
+
+
+def _write_method(path: Path, state: dict[str, Any]) -> None:
+    template_path = Path(state["template_path"])
+    lines = template_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    replacements = {
+        "msp file path": state.get("msp_path", ""),
+        "lbm file path": state.get("lbm_path", ""),
+        "text db file path": state.get("text_db_path", ""),
+        "ion mode": state.get("ion_mode", "Negative"),
+        "target omics": state.get("target_omics", "Lipidomics"),
+        "ms1 data type": state.get("ms1_data_type", "Centroid"),
+        "ms2 data type": state.get("ms2_data_type", "Centroid"),
+        "number of threads": state.get("number_of_threads", 4),
+        "minimum peak height": state.get("minimum_peak_height", 1000),
+        "minimum peak width": state.get("minimum_peak_width", 5),
+        "retention time begin": state.get("retention_time_begin", 0),
+        "retention time end": state.get("retention_time_end", 100),
+        "ms1 tolerance for centroid": state.get("ms1_tolerance", 0.01),
+        "ms2 tolerance for centroid": state.get("ms2_tolerance", 0.025),
+        "retention time tolerance for alignment": state.get(
+            "alignment_rt_tolerance", 0.1
+        ),
+        "ms1 tolerance for alignment": state.get("alignment_ms1_tolerance", 0.015),
+        "export as mztabm format": "True",
+    }
+    selected = state.get("selected_lipids", [])
+    searched = ";".join(
+        f"{item['lipid_class']} {item['adduct']}"
+        for item in selected
+        if item.get("ion_mode") == state.get("ion_mode")
+    )
+    output: list[str] = []
+    found: set[str] = set()
+    annotation_inserted = False
+    for line in lines:
+        stripped = line.lstrip()
+        lower = stripped.lower()
+        if lower.startswith(("solvent type:", "searched lipid class:")):
+            continue
+        matched = next(
+            (key for key in replacements if lower.startswith(key + ":")),
+            None,
+        )
+        if matched:
+            output.append(f"{_title_for_key(matched)}: {replacements[matched]}")
+            found.add(matched)
+            continue
+        output.append(line)
+        if stripped.lower() == "# annotation parameter":
+            output.append(f"Searched lipid class: {searched}")
+            output.append(f"Solvent type: {state.get('solvent', 'CH3COONH4')}")
+            annotation_inserted = True
+    for key, value in replacements.items():
+        if key not in found:
+            output.insert(0, f"{_title_for_key(key)}: {value}")
+    if not annotation_inserted:
+        output.extend(
+            [
+                "",
+                "# Annotation parameter",
+                f"Searched lipid class: {searched}",
+                f"Solvent type: {state.get('solvent', 'CH3COONH4')}",
+            ]
+        )
+    path.write_text("\n".join(output) + "\n", encoding="utf-8")
+
+
+def _title_for_key(key: str) -> str:
+    names = {
+        "msp file path": "Msp file path",
+        "lbm file path": "Lbm file path",
+        "text db file path": "Text DB file path",
+        "ion mode": "Ion mode",
+        "target omics": "Target omics",
+        "ms1 data type": "MS1 data type",
+        "ms2 data type": "MS2 data type",
+        "number of threads": "Number of threads",
+        "minimum peak height": "Minimum peak height",
+        "minimum peak width": "Minimum peak width",
+        "retention time begin": "Retention time begin",
+        "retention time end": "Retention time end",
+        "ms1 tolerance for centroid": "MS1 tolerance for centroid",
+        "ms2 tolerance for centroid": "MS2 tolerance for centroid",
+        "retention time tolerance for alignment": "Retention time tolerance for alignment",
+        "ms1 tolerance for alignment": "MS1 tolerance for alignment",
+        "export as mztabm format": "Export as mztabM format",
+    }
+    return names[key]
+
+
+def _stage_path(source: Path, target: Path) -> None:
+    if source.is_dir():
+        shutil.copytree(source, target)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+    if source.suffix.lower() == ".wiff":
+        sidecar = Path(str(source) + ".scan")
+        if sidecar.exists():
+            sidecar_target = Path(str(target) + ".scan")
+            try:
+                os.link(sidecar, sidecar_target)
+            except OSError:
+                shutil.copy2(sidecar, sidecar_target)
+
+
+def console_version(console_path: str) -> str:
+    path = Path(console_path)
+    if not path.exists():
+        return ""
+    command = ["dotnet", str(path)] if path.suffix.lower() == ".dll" else [str(path)]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    match = re.search(r"Version\s+([0-9.]+)", result.stdout + result.stderr, re.I)
+    return match.group(1) if match else ""

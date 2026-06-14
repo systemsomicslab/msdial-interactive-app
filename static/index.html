@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MS-DIAL Interactive</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>MS-DIAL Interactive</h1>
+      <p>Cross-platform LC-MS Console workflow assistant</p>
+    </div>
+    <div id="platformPill" class="pill">Loading...</div>
+  </header>
+
+  <nav id="tabs">
+    <button data-tab="data" class="active">1. Data</button>
+    <button data-tab="guide">2. Guided setup</button>
+    <button data-tab="annotation">3. Annotation</button>
+    <button data-tab="run">4. Validate &amp; run</button>
+    <button data-tab="help">Ask MS-DIAL</button>
+  </nav>
+
+  <main>
+    <section id="tab-data" class="tab active">
+      <div id="dropZone" class="drop-zone">
+        <h2>Drop raw data here</h2>
+        <p>Files are streamed to this local app. For large data, native selection or server-side paths are faster.</p>
+        <div class="button-row">
+          <button id="pickFiles">Native file picker</button>
+          <button id="pickFolder" class="secondary">Native folder picker</button>
+        </div>
+        <div class="path-add">
+          <input id="serverPath" placeholder="/data/project or D:\data\project">
+          <button id="addPath" class="secondary">Add path</button>
+        </div>
+      </div>
+      <div class="section-head">
+        <h2>Analysis metadata</h2>
+        <button id="clearFiles" class="quiet">Clear</button>
+      </div>
+      <div class="table-wrap">
+        <table id="filesTable">
+          <thead>
+            <tr>
+              <th>File name</th><th>Path</th><th>Type</th><th>Class</th>
+              <th>Acquisition</th><th>Batch</th><th>Order</th><th>Factor</th><th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="tab-guide" class="tab">
+      <div class="guide-layout">
+        <div class="panel">
+          <h2>Core workflow</h2>
+          <div class="form-grid">
+            <label>Ion mode
+              <select id="ionMode"><option>Negative</option><option>Positive</option></select>
+            </label>
+            <label>Target omics
+              <select id="targetOmics"><option>Lipidomics</option><option>Metabolomics</option></select>
+            </label>
+            <label>MS1 data type
+              <select id="ms1Type"><option>Centroid</option><option>Profile</option></select>
+            </label>
+            <label>MS2 data type
+              <select id="ms2Type"><option>Centroid</option><option>Profile</option></select>
+            </label>
+            <label>Solvent
+              <select id="solvent"><option>CH3COONH4</option><option>HCOONH4</option><option>NH4HCO3</option></select>
+            </label>
+          </div>
+        </div>
+        <aside class="assistant-panel">
+          <h2>Next question</h2>
+          <div id="nextQuestion" class="assistant-answer">Loading...</div>
+          <button id="refreshQuestion" class="secondary">Refresh question</button>
+        </aside>
+      </div>
+      <div class="panel">
+        <h2>Paths</h2>
+        <div class="path-grid">
+          <label>MS-DIAL Console<input id="consolePath" placeholder="/opt/msdial/MSDIALCUI or C:\...\MSDIALCUI.exe"></label>
+          <label>Parameter template<input id="templatePath"></label>
+          <label>Output root<input id="outputRoot" value="./runs"></label>
+        </div>
+        <label class="check"><input id="stageInputs" type="checkbox" checked> Stage inputs in the run folder</label>
+      </div>
+      <div class="panel">
+        <h2>Peak detection and alignment</h2>
+        <div class="form-grid">
+          <label>Number of threads<input id="numberOfThreads" type="number" min="1" value="4"></label>
+          <label>Minimum peak height<input id="minimumPeakHeight" type="number" min="0" value="300"></label>
+          <label>Minimum peak width<input id="minimumPeakWidth" type="number" min="1" value="5"></label>
+          <label>RT begin (min)<input id="rtBegin" type="number" step="any" value="0"></label>
+          <label>RT end (min)<input id="rtEnd" type="number" step="any" value="100"></label>
+          <label>MS1 centroid tolerance<input id="ms1Tolerance" type="number" step="any" value="0.01"></label>
+          <label>MS2 centroid tolerance<input id="ms2Tolerance" type="number" step="any" value="0.025"></label>
+          <label>Alignment RT tolerance<input id="alignmentRtTolerance" type="number" step="any" value="0.1"></label>
+          <label>Alignment MS1 tolerance<input id="alignmentMs1Tolerance" type="number" step="any" value="0.015"></label>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-annotation" class="tab">
+      <div class="panel">
+        <h2>Annotation libraries</h2>
+        <div class="path-grid">
+          <label>MSP library<input id="mspPath"></label>
+          <label>LBM library<input id="lbmPath"></label>
+          <label>Text DB<input id="textDbPath"></label>
+          <label>LbmQueries.txt<input id="queriesPath"></label>
+        </div>
+      </div>
+      <div class="section-head">
+        <div>
+          <h2>Lipid queries</h2>
+          <span id="lipidCount" class="muted"></span>
+        </div>
+        <input id="lipidFilter" placeholder="Filter lipid class or adduct">
+      </div>
+      <div id="lipidList" class="lipid-list"></div>
+    </section>
+
+    <section id="tab-run" class="tab">
+      <div class="run-layout">
+        <div>
+          <div class="panel">
+            <h2>Preflight</h2>
+            <button id="validate">Validate workflow</button>
+            <div id="issues" class="issues"></div>
+          </div>
+          <div class="panel">
+            <h2>Execution</h2>
+            <button id="prepare" class="secondary">Prepare only</button>
+            <button id="run">Run MS-DIAL Console (-p)</button>
+            <div id="runPath" class="muted"></div>
+          </div>
+        </div>
+        <pre id="log">Ready.</pre>
+      </div>
+    </section>
+
+    <section id="tab-help" class="tab">
+      <div class="help-layout">
+        <div class="panel">
+          <h2>Ask about MS-DIAL or a parameter</h2>
+          <textarea id="question" placeholder="例: Negative lipidomicsでminimum peak heightはどう考えればよいですか？"></textarea>
+          <div class="button-row">
+            <select id="language"><option value="ja">日本語</option><option value="en">English</option></select>
+            <button id="ask">Ask</button>
+          </div>
+          <div id="answer" class="assistant-answer">蒸留済みの公開QAカードをローカル検索します。</div>
+        </div>
+        <div>
+          <h2>Grounding cards</h2>
+          <div id="cards" class="cards"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <footer><span id="status">Starting...</span></footer>
+  <script src="/app.js"></script>
+</body>
+</html>
