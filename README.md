@@ -50,7 +50,10 @@ confirmation dialog. When the browser exposes the original local path, the app
 uses it directly and the adjacent `.wiff.scan` remains available implicitly.
 Otherwise, the WIFF is uploaded normally. If WIFF and WIFF.SCAN are dropped
 together, only WIFF appears as an analysis row and WIFF.SCAN is retained as its
-companion.
+companion. Import and processing are separate checks: MS-DIAL processing is
+blocked when the selected WIFF path has no adjacent WIFF.SCAN. A standard web
+browser cannot read an unselected sibling file, so use a direct local path or
+drop both files together for diagnostic and production runs.
 
 The Local folder picker references one server-visible folder directly. The
 Browser folder picker uploads one folder into the app. Both can be used
@@ -63,9 +66,10 @@ parameter modes. LC-MS is the currently executable workflow. Other modes show
 their capability boundary and are blocked at preflight until their
 mode-specific parameter backend is implemented.
 
-GC-MS hides precursor-adduct, LBM, Text DB, and lipid-query controls. Other
-project types provide searched-adduct selection from the MS-DIAL positive and
-negative adduct resource tables.
+GC-MS fixes Target omics to Metabolomics and hides solvent, precursor-adduct,
+LBM, Text DB, and lipid-query controls. Other project types provide
+searched-adduct selection from the MS-DIAL positive and negative adduct
+resource tables.
 
 ## LLM settings
 
@@ -86,7 +90,10 @@ The Tune parameters screen runs one representative file with:
 
 The generated ASCII `.mdpeak` file is parsed locally. The peak-height and MSP
 sliders then recalculate detected-peak and passing-annotation counts without
-rerunning MS-DIAL. Suggested starting values are:
+rerunning MS-DIAL. The summary separates precursor-mass MSP reference
+candidates from candidates with non-negative MS/MS score fields; MS-DIAL
+exports `-1` for matched-peak fields when no usable MS/MS comparison exists.
+Suggested starting values are:
 
 - Thermo RAW or FT-ICR: peak height `10000`, mass slice `0.05`
 - QTOF including Waters, Agilent, and Bruker: peak height `100`, mass slice

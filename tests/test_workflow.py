@@ -148,12 +148,14 @@ class WorkflowTests(unittest.TestCase):
                 )
                 + "\n"
                 + "0\t50\t0.6\t0.7\t0.8\t4\t0.5\n"
-                + "1\t100\tnull\tnull\tnull\tnull\tnull\n",
+                + "1\t75\t0\t0\t0\t-1\t-1\n"
+                + "2\t100\tnull\tnull\tnull\tnull\tnull\n",
                 encoding="utf-8",
             )
             result = parse_mdpeak(path)
-            self.assertEqual([50.0, 100.0], result["heights"])
-            self.assertEqual(1, result["msp_candidate_count"])
+            self.assertEqual([50.0, 75.0, 100.0], result["heights"])
+            self.assertEqual(2, result["msp_candidate_count"])
+            self.assertEqual(1, result["msp_scored_count"])
             self.assertEqual(0.7, result["msp_scores"][0]["weighted"])
 
     def test_sciex_primary_files_and_sidecars(self) -> None:
@@ -171,6 +173,7 @@ class WorkflowTests(unittest.TestCase):
             formats = {item["format"] for item in report["files"]}
             self.assertEqual({"SCIEX WIFF", "SCIEX WIFF2"}, formats)
             self.assertEqual("SCIEX", detect_raw_format(wiff)["vendor"])
+            self.assertTrue(detect_raw_format(wiff)["sidecar_available"])
             self.assertEqual(1, len(report["warnings"]))
             self.assertIn("Both .wiff and .wiff2", report["warnings"][0])
 
@@ -193,6 +196,21 @@ class WorkflowTests(unittest.TestCase):
 
             self.assertEqual(1, len(report["files"]))
             self.assertEqual([], report["warnings"])
+            self.assertFalse(report["files"][0]["sidecar_available"])
+            issues = validate_workflow(
+                {
+                    "files": report["files"],
+                    "project_type": "lcms",
+                    "console_path": str(wiff),
+                    "template_path": str(wiff),
+                    "output_root": str(Path(temporary) / "output"),
+                    "target_omics": "Metabolomics",
+                    "selected_adducts": ["[M-H]-"],
+                }
+            )
+            self.assertTrue(
+                any("WIFF.SCAN is not accessible" in issue["message"] for issue in issues)
+            )
 
     def test_staging_wiff_copies_implicit_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

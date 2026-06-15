@@ -78,7 +78,7 @@
             <label>Ion mode
               <select id="ionMode"><option>Negative</option><option>Positive</option></select>
             </label>
-            <label>Target omics
+            <label id="targetOmicsField">Target omics
               <select id="targetOmics"><option>Lipidomics</option><option>Metabolomics</option></select>
             </label>
             <label>MS1 data type
@@ -87,7 +87,7 @@
             <label>MS2 data type
               <select id="ms2Type"><option>Centroid</option><option>Profile</option></select>
             </label>
-            <label>Solvent
+            <label id="solventField">Solvent
               <select id="solvent"><option>CH3COONH4</option><option>HCOONH4</option><option>NH4HCO3</option></select>
             </label>
           </div>
@@ -101,6 +101,16 @@
       </div>
       <div class="panel">
         <h2>Paths</h2>
+        <p class="muted">
+          Download the stable Console package from the
+          <a href="https://github.com/systemsomicslab/MsdialWorkbench/releases/tag/MSDIAL-v5.5.260323"
+             target="_blank" rel="noreferrer">MS-DIAL v5.5.260323 GitHub release</a>.
+          Parameter templates and demo data are available from the
+          <a href="https://systemsomicslab.github.io/msdial5tutorial/consoleapp.html"
+             target="_blank" rel="noreferrer">Console app tutorial</a>
+          and <a href="https://zenodo.org/records/18336159"
+                 target="_blank" rel="noreferrer">Zenodo record 18336159</a>.
+        </p>
         <div class="path-grid">
           <label>MS-DIAL Console<input id="consolePath" placeholder="/opt/msdial/MSDIALCUI or C:\...\MSDIALCUI.exe"></label>
           <label>Parameter template<input id="templatePath"></label>
@@ -169,7 +179,11 @@
           <h2>Lipid queries</h2>
           <span id="lipidCount" class="muted"></span>
         </div>
-        <input id="lipidFilter" placeholder="Filter lipid class or adduct">
+        <div class="button-row">
+          <input id="lipidFilter" placeholder="Filter lipid class or adduct">
+          <button id="selectAllLipids" class="quiet">Select all</button>
+          <button id="clearLipids" class="quiet">Clear all</button>
+        </div>
       </div>
       <div id="lipidList" class="lipid-list"></div>
       </div>
@@ -180,7 +194,7 @@
         <div class="panel">
           <h2>Single-file diagnostic run</h2>
           <p class="muted">Runs the selected file with Minimum peak height = 0 and all MSP cutoffs = 0. Alignment is disabled. The selected Mass slice width is used.</p>
-          <div id="tuningRequirements" class="format-summary">Required: LC-MS project, one imported analysis file, an existing MS-DIAL Console path, parameter template, and output folder. A WIFF file is valid without a WIFF.SCAN sidecar.</div>
+          <div id="tuningRequirements" class="format-summary">Required: LC-MS project, one imported analysis file, an existing MS-DIAL Console path, parameter template, and output folder. WIFF import accepts the primary file alone, but SCIEX processing requires its adjacent WIFF.SCAN to remain accessible.</div>
           <label>Representative analysis file
             <select id="tuningFile"></select>
           </label>
@@ -195,9 +209,10 @@
           <h2>Diagnostic summary</h2>
           <div id="tuningSummary" class="metric-grid">
             <div class="metric"><strong>-</strong><span>peaks at height 0</span></div>
-            <div class="metric"><strong>-</strong><span>MSP-scored peaks</span></div>
+            <div class="metric"><strong>-</strong><span>MSP reference candidates</span></div>
+            <div class="metric"><strong>-</strong><span>MS/MS-scored candidates</span></div>
           </div>
-          <p class="muted">Move the controls after one diagnostic run. Counts are recalculated from the ASCII mdpeak file without rerunning MS-DIAL.</p>
+          <p class="muted">MSP reference candidates include precursor-mass-only suggestions. MS/MS-scored candidates exclude MS-DIAL's negative sentinel values for peaks without a usable MS/MS match. Move the controls after one diagnostic run; counts are recalculated from the ASCII mdpeak file without rerunning MS-DIAL.</p>
         </div>
       </div>
       <div class="panel">

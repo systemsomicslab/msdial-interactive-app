@@ -46,6 +46,9 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
             "instrument_family": "QTOF",
             "minimum_peak_height": 100,
             "mass_slice_width": 0.1,
+            "sidecar_available": (
+                suffix != ".wiff" or Path(str(target) + ".scan").is_file()
+            ),
         }
     if target.is_dir() and suffix == ".raw":
         return {
@@ -270,6 +273,21 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
         name = str(item.get("file_name", ""))
         if not path.exists():
             issues.append({"level": "error", "message": f"Input not found: {path}"})
+        if (
+            path.is_file()
+            and path.suffix.lower() == ".wiff"
+            and not Path(str(path) + ".scan").is_file()
+        ):
+            issues.append(
+                {
+                    "level": "error",
+                    "message": (
+                        f"WIFF.SCAN is not accessible next to {path}. "
+                        "A browser cannot upload an unselected sibling file; drop both "
+                        "files together or reference the original file/folder directly."
+                    ),
+                }
+            )
         if path.is_dir() and path.suffix.lower() == ".d" and item.get("vendor") == "Unknown":
             issues.append(
                 {
@@ -477,6 +495,7 @@ def parse_mdpeak(path: str | Path) -> dict[str, Any]:
     mdpeak = Path(path)
     heights: list[float] = []
     scores: list[dict[str, float]] = []
+    scored_count = 0
     with mdpeak.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {"Height", "Simple dot product", "Weighted dot product", "Reverse dot product"}
@@ -495,6 +514,17 @@ def parse_mdpeak(path: str | Path) -> dict[str, Any]:
                 value is not None
                 for value in (weighted, simple, reverse, matched_percentage, matched_count)
             ):
+                if all(
+                    value >= 0
+                    for value in (
+                        weighted,
+                        simple,
+                        reverse,
+                        matched_percentage,
+                        matched_count,
+                    )
+                ):
+                    scored_count += 1
                 scores.append(
                     {
                         "weighted": weighted,
@@ -510,6 +540,7 @@ def parse_mdpeak(path: str | Path) -> dict[str, Any]:
         "peak_count": len(heights),
         "heights": heights,
         "msp_candidate_count": len(scores),
+        "msp_scored_count": scored_count,
         "msp_scores": scores,
     }
 

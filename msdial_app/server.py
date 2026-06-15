@@ -90,9 +90,10 @@ def _diagnose_console_failure(logs: list[str], fallback: str) -> str:
         )
     if "required 'scan' file missing" in text or "required 'scan' file is missing" in text:
         return (
-            "The SCIEX reader could not open this WIFF data stream without its matching "
-            ".wiff.scan file. WIFF-only import is allowed by the app, but this particular "
-            "dataset requires the sidecar at processing time."
+            "The SCIEX reader could not find the WIFF.SCAN adjacent to the processed WIFF. "
+            "A browser can upload a selected WIFF, but it cannot read an unselected sibling "
+            "file. Drop both files together, or use Native file picker, Local folder, or "
+            "Add path to retain the original directory."
         )
     return fallback
 

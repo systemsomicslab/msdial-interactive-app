@@ -399,6 +399,8 @@ function updateProjectUI() {
   const isLcms = project === "lcms";
   const isGcms = project === "gcms";
   const hasChromatography = ["lcms", "lcimms", "gcms"].includes(project);
+  if (isGcms) $("#targetOmics").value = "Metabolomics";
+  $("#targetOmics").disabled = isGcms;
   const lipidomics = $("#targetOmics").value === "Lipidomics";
   const labels = {
     lcms: "LC-MS is executable in the current version.",
@@ -416,12 +418,13 @@ function updateProjectUI() {
   $("#queriesField").hidden = isGcms || !lipidomics;
   $("#lipidQuerySection").hidden = isGcms || !lipidomics;
   $("#ionMode").closest("label").hidden = isGcms;
+  $("#solventField").hidden = isGcms;
   ["rtBegin", "rtEnd", "alignmentRtTolerance"].forEach((id) => {
     $(`#${id}`).closest("label").hidden = !hasChromatography;
   });
   $("#runTuning").disabled = !isLcms;
   $("#tuningRequirements").textContent = isLcms
-    ? "Required: LC-MS project, one imported analysis file, an existing MS-DIAL Console path, parameter template, and output folder. A WIFF file is valid without a WIFF.SCAN sidecar."
+    ? "Required: LC-MS project, one imported analysis file, an existing MS-DIAL Console path, parameter template, and output folder. WIFF import accepts the primary file alone, but SCIEX processing requires its adjacent WIFF.SCAN to remain accessible."
     : `${labels[project]} Single-file diagnostic is currently available for LC-MS only.`;
 }
 
@@ -459,10 +462,15 @@ function selectedTuningFile() {
 
 function renderTuningFormat() {
   const file = selectedTuningFile();
+  const sidecarNote = file?.format === "SCIEX WIFF" && !file.sidecar_available
+    ? "<br><strong>WIFF.SCAN is not accessible from this imported path.</strong> "
+      + "Drop WIFF and WIFF.SCAN together, or add the original file/folder as a local path."
+    : "";
   $("#tuningFormat").innerHTML = file
     ? `<strong>${escapeHtml(file.format)}</strong><br>
        Detected as ${escapeHtml(file.vendor)} / ${escapeHtml(file.instrument_family)}.
-       Recommended: Minimum peak height ${file.minimum_peak_height}, Mass slice width ${file.mass_slice_width}.`
+       Recommended: Minimum peak height ${file.minimum_peak_height}, Mass slice width ${file.mass_slice_width}.
+       ${sidecarNote}`
     : "No representative file selected.";
 }
 
@@ -525,7 +533,8 @@ function renderTuningResult(result) {
   $("#tuningHeightNumber").value = recommended;
   $("#tuningSummary").innerHTML = `
     <div class="metric"><strong>${result.peak_count}</strong><span>peaks at height 0</span></div>
-    <div class="metric"><strong>${result.msp_candidate_count}</strong><span>MSP-scored peaks</span></div>`;
+    <div class="metric"><strong>${result.msp_candidate_count}</strong><span>MSP reference candidates</span></div>
+    <div class="metric"><strong>${result.msp_scored_count}</strong><span>MS/MS-scored candidates</span></div>`;
   updateTuningCounts();
 }
 
@@ -662,6 +671,20 @@ $("#clearAdducts").addEventListener("click", () => {
   (state.adducts[$("#ionMode").value] || []).forEach((item) => { item.selected = false; });
   renderAdducts();
 });
+$("#selectAllLipids").addEventListener("click", () => {
+  const ion = $("#ionMode").value;
+  state.lipidQueries.forEach((item) => {
+    if (item.ion_mode === ion) item.selected = true;
+  });
+  renderLipids();
+});
+$("#clearLipids").addEventListener("click", () => {
+  const ion = $("#ionMode").value;
+  state.lipidQueries.forEach((item) => {
+    if (item.ion_mode === ion) item.selected = false;
+  });
+  renderLipids();
+});
 $("#llmProvider").addEventListener("change", updateLlmUI);
 $("#refreshQuestion").addEventListener("click", refreshQuestion);
 $("#tuningFile").addEventListener("change", renderTuningFormat);
@@ -672,6 +695,13 @@ $("#runTuning").addEventListener("click", () => runUiAction(async () => {
   const missing = [];
   if (current.project_type !== "lcms") missing.push("Project type must be LC-MS.");
   if (!file) missing.push("Select a representative analysis file.");
+  if (file?.format === "SCIEX WIFF" && !file.sidecar_available) {
+    missing.push(
+      "The imported WIFF path has no adjacent WIFF.SCAN. "
+      + "Drop both files together, or use Native file picker, Local folder, or Add path "
+      + "so MS-DIAL can read the original sibling file."
+    );
+  }
   if (!current.console_path) missing.push("Set the MS-DIAL Console path in Guided setup.");
   if (!current.template_path) missing.push("Set the parameter template path.");
   if (!current.output_root) missing.push("Set the output root.");
