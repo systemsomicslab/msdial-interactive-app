@@ -194,6 +194,38 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(1, len(report["files"]))
             self.assertEqual([], report["warnings"])
 
+    def test_staging_wiff_copies_implicit_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            wiff = root / "sample.wiff"
+            wiff.write_bytes(b"wiff")
+            sidecar = root / "sample.wiff.scan"
+            sidecar.write_bytes(b"scan")
+            template = root / "method.txt"
+            template.write_text(
+                "Ion mode: Negative\nTarget omics: Metabolomics\n",
+                encoding="utf-8",
+            )
+            console = root / "MSDIALCUI.exe"
+            console.write_bytes(b"")
+            prepared = prepare_run(
+                {
+                    "files": expand_paths([str(wiff)]),
+                    "project_type": "lcms",
+                    "console_path": str(console),
+                    "template_path": str(template),
+                    "output_root": str(root / "output"),
+                    "ion_mode": "Negative",
+                    "target_omics": "Metabolomics",
+                    "selected_adducts": ["[M-H]-"],
+                    "stage_inputs": True,
+                }
+            )
+
+            staged = Path(prepared["run_directory"]) / "input"
+            self.assertTrue((staged / wiff.name).exists())
+            self.assertTrue((staged / sidecar.name).exists())
+
     def test_reads_adduct_resources(self) -> None:
         resource = (
             Path(__file__).parents[1]

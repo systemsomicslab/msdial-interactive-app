@@ -157,6 +157,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(expand_paths_report(body.get("paths", [])))
             elif parsed.path == "/api/dialog/files":
                 self._json(expand_paths_report(_pick_files()))
+            elif parsed.path == "/api/dialog/sciex-files":
+                selected = _pick_sciex_files(body.get("filenames", []))
+                self._json(expand_paths_report(selected))
             elif parsed.path == "/api/dialog/directory":
                 selected = _pick_directory()
                 report = (
@@ -421,6 +424,39 @@ def _pick_files() -> list[str]:
         )
         root.destroy()
         return list(paths)
+    except Exception:
+        return []
+
+
+def _pick_sciex_files(filenames: list[str]) -> list[str]:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+        requested = ", ".join(Path(name).name for name in filenames[:3])
+        if len(filenames) > 3:
+            requested += f" and {len(filenames) - 3} more"
+        title = "Confirm original SCIEX WIFF file(s)"
+        if requested:
+            title += f": {requested}"
+        paths = filedialog.askopenfilenames(
+            title=title,
+            filetypes=[
+                ("SCIEX primary data", "*.wiff *.wiff2"),
+                ("All files", "*.*"),
+            ],
+        )
+        root.destroy()
+        requested_names = {Path(name).name.lower() for name in filenames}
+        return [
+            path
+            for path in paths
+            if not requested_names or Path(path).name.lower() in requested_names
+        ]
     except Exception:
         return []
 
