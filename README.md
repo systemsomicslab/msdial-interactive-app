@@ -45,6 +45,34 @@ never added as a separate analysis row. Other SCIEX sidecars are rejected.
 When both `.wiff` and `.wiff2` exist for the same sample, the app asks the user
 to choose one and does not add the ambiguous pair.
 
+A `.wiff` file is accepted without displaying a missing-sidecar warning.
+Whether a sidecar is needed at processing time depends on the SCIEX data and
+vendor reader. If the reader repeatedly reports a missing scan stream, the
+diagnostic is stopped and reports that dataset-specific requirement.
+
+The Local folder picker references one server-visible folder directly. The
+Browser folder picker uploads one folder into the app. Both can be used
+repeatedly to accumulate multiple folders.
+
+## Project types and adducts
+
+The UI separates LC-MS, GC-MS, DI-MS, LC-IM-MS, IM-MS, and Imaging-MS
+parameter modes. LC-MS is the currently executable workflow. Other modes show
+their capability boundary and are blocked at preflight until their
+mode-specific parameter backend is implemented.
+
+GC-MS hides precursor-adduct, LBM, Text DB, and lipid-query controls. Other
+project types provide searched-adduct selection from the MS-DIAL positive and
+negative adduct resource tables.
+
+## LLM settings
+
+The Ask MS-DIAL screen can use local retrieval, Azure OpenAI, or an
+OpenAI-compatible chat-completions endpoint. API keys entered in the UI remain
+in browser memory and are sent to the localhost Python server only for the
+current request; they are not written to disk or included in the workflow
+context.
+
 ## LC-MS parameter tuning
 
 The Tune parameters screen runs one representative file with:

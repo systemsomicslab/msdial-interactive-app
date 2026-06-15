@@ -104,11 +104,18 @@ class KnowledgeBase:
         query: str,
         language: str,
         workflow: dict[str, Any],
+        llm_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         cards = self.search(query, language, 6)
-        generated = self._azure_answer(query, language, workflow, cards)
+        generated = self._llm_answer(
+            query,
+            language,
+            workflow,
+            cards,
+            llm_config or {},
+        )
         if generated:
-            return {"answer": generated, "cards": cards, "mode": "azure-grounded"}
+            return {"answer": generated, "cards": cards, "mode": "llm-grounded"}
 
         if not cards:
             answer = (
@@ -127,19 +134,31 @@ class KnowledgeBase:
             answer += "\n\n" + question["prompt"]
         return {"answer": answer, "cards": cards, "mode": "local-retrieval"}
 
-    def _azure_answer(
+    def _llm_answer(
         self,
         query: str,
         language: str,
         workflow: dict[str, Any],
         cards: list[dict[str, Any]],
+        config: dict[str, Any],
     ) -> str | None:
         import os
 
-        endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
-        key = os.environ.get("AZURE_OPENAI_API_KEY", "")
-        deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
-        api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
+        provider = str(config.get("provider", "")).lower()
+        endpoint = str(config.get("endpoint", "")).strip().rstrip("/")
+        key = str(config.get("api_key", "")).strip()
+        deployment = str(config.get("deployment", "")).strip()
+        api_version = str(config.get("api_version", "2024-10-21")).strip()
+        if not provider:
+            provider = "azure" if os.environ.get("AZURE_OPENAI_ENDPOINT") else "local"
+        if provider == "azure":
+            endpoint = endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+            key = key or os.environ.get("AZURE_OPENAI_API_KEY", "")
+            deployment = deployment or os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
+            api_version = api_version or os.environ.get(
+                "AZURE_OPENAI_API_VERSION",
+                "2024-10-21",
+            )
         if not endpoint or not key or not deployment or not cards:
             return None
         context = "\n\n".join(
@@ -166,14 +185,29 @@ class KnowledgeBase:
             ],
             "temperature": 0.2,
         }
-        url = (
-            f"{endpoint}/openai/deployments/{deployment}/chat/completions"
-            f"?api-version={api_version}"
-        )
+        if provider == "azure":
+            url = (
+                f"{endpoint}/openai/deployments/{deployment}/chat/completions"
+                f"?api-version={api_version}"
+            )
+            headers = {"Content-Type": "application/json", "api-key": key}
+        elif provider == "openai-compatible":
+            url = (
+                endpoint
+                if endpoint.endswith("/chat/completions")
+                else f"{endpoint}/chat/completions"
+            )
+            payload["model"] = deployment
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {key}",
+            }
+        else:
+            return None
         request = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "api-key": key},
+            headers=headers,
             method="POST",
         )
         try:
@@ -192,8 +226,8 @@ def next_parameter_question(
         (
             not workflow.get("files"),
             "files",
-            "解析する生データを追加してください。WIFFの場合は.wiff.scanも必要です。",
-            "Add the raw data to analyze. WIFF files also require .wiff.scan.",
+            "解析する生データを追加してください。SCIEXは.wiffまたは.wiff2を解析ファイルとして受け付けます。",
+            "Add the raw data to analyze. SCIEX .wiff and .wiff2 are accepted as primary files.",
         ),
         (
             not workflow.get("ion_mode"),

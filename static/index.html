@@ -10,7 +10,7 @@
   <header>
     <div>
       <h1>MS-DIAL Interactive</h1>
-      <p>Cross-platform LC-MS Console workflow assistant</p>
+      <p>Cross-platform MS-DIAL Console workflow assistant</p>
     </div>
     <div id="platformPill" class="pill">Loading...</div>
   </header>
@@ -31,10 +31,11 @@
         <p>Files are streamed to this local app. For large data, native selection or server-side paths are faster.</p>
         <div class="button-row">
           <button id="pickFiles">Native file picker</button>
-          <button id="pickFolder" class="secondary">Native folder picker</button>
-          <button id="browserFolder" class="secondary">Browser folder picker</button>
+          <button id="pickFolder" class="secondary">Local folder (direct, one at a time)</button>
+          <button id="browserFolder" class="secondary">Browser folder upload (one at a time)</button>
           <input id="browserFolderInput" type="file" webkitdirectory multiple hidden>
         </div>
+        <p class="muted folder-help">Local folder directly references a folder visible to this Python process and does not copy it. Browser folder upload copies one selected folder into the app. Neither picker selects multiple folders in one dialog; repeat the action to accumulate folders. A common parent also works when the analysis files or vendor folders are its immediate children.</p>
         <div class="path-add">
           <input id="serverPath" placeholder="/data/project or D:\data\project">
           <button id="addPath" class="secondary">Add path</button>
@@ -64,6 +65,16 @@
         <div class="panel">
           <h2>Core workflow</h2>
           <div class="form-grid">
+            <label>Project type
+              <select id="projectType">
+                <option value="lcms">LC-MS</option>
+                <option value="gcms">GC-MS</option>
+                <option value="dims">DI-MS</option>
+                <option value="lcimms">LC-IM-MS</option>
+                <option value="imms">IM-MS</option>
+                <option value="imaging">Imaging-MS</option>
+              </select>
+            </label>
             <label>Ion mode
               <select id="ionMode"><option>Negative</option><option>Positive</option></select>
             </label>
@@ -80,6 +91,7 @@
               <select id="solvent"><option>CH3COONH4</option><option>HCOONH4</option><option>NH4HCO3</option></select>
             </label>
           </div>
+          <div id="projectSupport" class="format-summary"></div>
         </div>
         <aside class="assistant-panel">
           <h2>Next question</h2>
@@ -114,16 +126,20 @@
     </section>
 
     <section id="tab-annotation" class="tab">
-      <div class="panel">
+      <div id="annotationLibraries" class="panel">
         <h2>Annotation libraries</h2>
         <div class="path-grid">
           <label>MSP library<input id="mspPath"></label>
-          <label>LBM library<input id="lbmPath"></label>
-          <label>Text DB<input id="textDbPath"></label>
-          <label>LbmQueries.txt<input id="queriesPath"></label>
+          <label id="lbmField">LBM library<input id="lbmPath"></label>
+          <label id="textDbField">Text DB<input id="textDbPath"></label>
+          <label id="queriesField">LbmQueries.txt<input id="queriesPath"></label>
         </div>
       </div>
-      <div class="panel">
+      <div id="gcmsAnnotationNote" class="panel notice-panel" hidden>
+        <h2>GC-MS annotation</h2>
+        <p>GC-MS does not use precursor-adduct annotation. LBM and Text DB molecular annotation are disabled for this project type. GC-MS-specific EI/CI spectral matching and retention-index parameters will be implemented with the GC-MS backend.</p>
+      </div>
+      <div id="mspCutoffPanel" class="panel">
         <h2>MSP-based annotation cutoffs</h2>
         <div class="form-grid">
           <label>Weighted dot product<input id="mspWeighted" type="number" min="0" max="1" step="0.01" value="0.6"></label>
@@ -133,6 +149,21 @@
           <label>Minimum spectrum match<input id="mspMinimumSpectrumMatch" type="number" min="0" step="1" value="3"></label>
         </div>
       </div>
+      <div id="adductPanel" class="panel">
+        <div class="section-head compact-head">
+          <div>
+            <h2>Searched adduct ions</h2>
+            <span id="adductCount" class="muted"></span>
+          </div>
+          <div class="button-row">
+            <button id="selectAllAdducts" class="quiet">Select all</button>
+            <button id="clearAdducts" class="quiet">Clear</button>
+          </div>
+        </div>
+        <input id="adductFilter" placeholder="Filter adduct">
+        <div id="adductList" class="adduct-list"></div>
+      </div>
+      <div id="lipidQuerySection">
       <div class="section-head">
         <div>
           <h2>Lipid queries</h2>
@@ -141,6 +172,7 @@
         <input id="lipidFilter" placeholder="Filter lipid class or adduct">
       </div>
       <div id="lipidList" class="lipid-list"></div>
+      </div>
     </section>
 
     <section id="tab-tuning" class="tab">
@@ -148,6 +180,7 @@
         <div class="panel">
           <h2>Single-file diagnostic run</h2>
           <p class="muted">Runs the selected file with Minimum peak height = 0 and all MSP cutoffs = 0. Alignment is disabled. The selected Mass slice width is used.</p>
+          <div id="tuningRequirements" class="format-summary">Required: LC-MS project, one imported analysis file, an existing MS-DIAL Console path, parameter template, and output folder. A WIFF file is valid without a WIFF.SCAN sidecar.</div>
           <label>Representative analysis file
             <select id="tuningFile"></select>
           </label>
@@ -211,6 +244,24 @@
     </section>
 
     <section id="tab-help" class="tab">
+      <div class="panel">
+        <h2>LLM API settings</h2>
+        <p class="muted">Optional. The API key remains in browser memory and is sent only to this localhost app for the current request. It is not written to disk or included in the workflow prompt.</p>
+        <div class="form-grid">
+          <label>Provider
+            <select id="llmProvider">
+              <option value="local">Local retrieval only</option>
+              <option value="azure">Azure OpenAI</option>
+              <option value="openai-compatible">OpenAI-compatible endpoint</option>
+            </select>
+          </label>
+          <label>Endpoint<input id="llmEndpoint" placeholder="https://..."></label>
+          <label>Deployment / model<input id="llmDeployment"></label>
+          <label>API key<input id="llmApiKey" type="password" autocomplete="off"></label>
+          <label id="llmApiVersionField">Azure API version<input id="llmApiVersion" value="2024-10-21"></label>
+        </div>
+        <div id="llmStatus" class="muted">Local retrieval is active.</div>
+      </div>
       <div class="help-layout">
         <div class="panel">
           <h2>Ask about MS-DIAL or a parameter</h2>

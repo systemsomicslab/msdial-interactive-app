@@ -1,6 +1,7 @@
 const state = {
   files: [],
   lipidQueries: [],
+  adducts: { Positive: [], Negative: [] },
   jobId: null,
   tuningJobId: null,
   tuningResult: null,
@@ -29,6 +30,7 @@ async function api(path, options = {}) {
 function workflow() {
   return {
     files: state.files,
+    project_type: $("#projectType").value,
     ion_mode: $("#ionMode").value,
     target_omics: $("#targetOmics").value,
     ms1_data_type: $("#ms1Type").value,
@@ -58,6 +60,19 @@ function workflow() {
     together_with_alignment: true,
     stage_inputs: $("#stageInputs").checked,
     selected_lipids: state.lipidQueries.filter((item) => item.selected),
+    selected_adducts: (state.adducts[$("#ionMode").value] || [])
+      .filter((item) => item.selected)
+      .map((item) => item.adduct),
+  };
+}
+
+function llmConfig() {
+  return {
+    provider: $("#llmProvider").value,
+    endpoint: $("#llmEndpoint").value.trim(),
+    deployment: $("#llmDeployment").value.trim(),
+    api_key: $("#llmApiKey").value,
+    api_version: $("#llmApiVersion").value.trim(),
   };
 }
 
@@ -335,6 +350,78 @@ function renderLipids() {
   });
 }
 
+function renderAdducts() {
+  const ionMode = $("#ionMode").value;
+  const filter = $("#adductFilter").value.toLowerCase();
+  const adducts = state.adducts[ionMode] || [];
+  const visible = adducts.filter((item) =>
+    item.adduct.toLowerCase().includes(filter)
+  );
+  $("#adductCount").textContent =
+    `${adducts.filter((item) => item.selected).length} selected / ${visible.length} shown`;
+  $("#adductList").innerHTML = visible.map((item) => {
+    const index = adducts.indexOf(item);
+    return `<label class="adduct-item">
+      <input type="checkbox" data-index="${index}" ${item.selected ? "checked" : ""}>
+      <span>${escapeHtml(item.adduct)} (z=${item.charge})</span>
+    </label>`;
+  }).join("");
+  $$("#adductList input").forEach((input) => {
+    input.addEventListener("change", () => {
+      adducts[Number(input.dataset.index)].selected = input.checked;
+      renderAdducts();
+    });
+  });
+}
+
+function updateProjectUI() {
+  const project = $("#projectType").value;
+  const isLcms = project === "lcms";
+  const isGcms = project === "gcms";
+  const hasChromatography = ["lcms", "lcimms", "gcms"].includes(project);
+  const lipidomics = $("#targetOmics").value === "Lipidomics";
+  const labels = {
+    lcms: "LC-MS is executable in the current version.",
+    gcms: "GC-MS UI is separated from LC-MS, but its RI-specific backend is not implemented yet.",
+    dims: "DI-MS parameter mode is scaffolded; Console execution is not enabled yet.",
+    lcimms: "LC-IM-MS parameter mode is scaffolded; mobility settings are not implemented yet.",
+    imms: "IM-MS parameter mode is scaffolded; mobility settings are not implemented yet.",
+    imaging: "Imaging-MS parameter mode is scaffolded; imaging import and ROI settings are not implemented yet.",
+  };
+  $("#projectSupport").textContent = labels[project];
+  $("#gcmsAnnotationNote").hidden = !isGcms;
+  $("#adductPanel").hidden = isGcms;
+  $("#lbmField").hidden = isGcms || !lipidomics;
+  $("#textDbField").hidden = isGcms;
+  $("#queriesField").hidden = isGcms || !lipidomics;
+  $("#lipidQuerySection").hidden = isGcms || !lipidomics;
+  $("#ionMode").closest("label").hidden = isGcms;
+  ["rtBegin", "rtEnd", "alignmentRtTolerance"].forEach((id) => {
+    $(`#${id}`).closest("label").hidden = !hasChromatography;
+  });
+  $("#runTuning").disabled = !isLcms;
+  $("#tuningRequirements").textContent = isLcms
+    ? "Required: LC-MS project, one imported analysis file, an existing MS-DIAL Console path, parameter template, and output folder. A WIFF file is valid without a WIFF.SCAN sidecar."
+    : `${labels[project]} Single-file diagnostic is currently available for LC-MS only.`;
+}
+
+function updateLlmUI() {
+  const provider = $("#llmProvider").value;
+  const isLocal = provider === "local";
+  ["llmEndpoint", "llmDeployment", "llmApiKey"].forEach((id) => {
+    $(`#${id}`).disabled = isLocal;
+  });
+  $("#llmApiVersionField").hidden = provider !== "azure";
+  if (isLocal) {
+    $("#llmStatus").textContent = state.config?.llm_environment?.azure_configured
+      ? "Local retrieval is active. Azure OpenAI environment variables are available if Azure is selected."
+      : "Local retrieval is active.";
+  } else {
+    $("#llmStatus").textContent =
+      "The key is kept in browser memory only and sent to localhost for each Ask request.";
+  }
+}
+
 function renderTuningFiles() {
   const selected = $("#tuningFile").value;
   $("#tuningFile").innerHTML = state.files.length
@@ -424,17 +511,22 @@ function renderTuningResult(result) {
 
 async function pollTuningJob() {
   if (!state.tuningJobId) return;
-  const job = await api(`/api/jobs/${state.tuningJobId}`);
-  $("#tuningLog").textContent = job.logs.join("\n") || job.status;
-  $("#tuningLog").scrollTop = $("#tuningLog").scrollHeight;
-  setStatus(`Tuning job ${job.status}`);
-  if (["queued", "running"].includes(job.status)) {
-    setTimeout(pollTuningJob, 1000);
-  } else if (job.status === "completed" && job.result) {
-    renderTuningResult(job.result);
-    $("#tuningLog").textContent += `\nLoaded ${job.result.mdpeak}`;
-  } else if (job.error) {
-    $("#tuningLog").textContent += `\n${job.error}`;
+  try {
+    const job = await api(`/api/jobs/${state.tuningJobId}`);
+    $("#tuningLog").textContent = job.logs.join("\n") || job.status;
+    $("#tuningLog").scrollTop = $("#tuningLog").scrollHeight;
+    setStatus(`Tuning job ${job.status}`);
+    if (["queued", "running"].includes(job.status)) {
+      setTimeout(pollTuningJob, 1000);
+    } else if (job.status === "completed" && job.result) {
+      renderTuningResult(job.result);
+      $("#tuningLog").textContent += `\nLoaded ${job.result.mdpeak}`;
+    } else if (job.error) {
+      $("#tuningLog").textContent += `\n${job.error}`;
+    }
+  } catch (error) {
+    $("#tuningLog").textContent += `\nDiagnostic status error: ${error.message}`;
+    setStatus("Tuning job status failed");
   }
 }
 
@@ -470,9 +562,14 @@ async function initialize() {
     `${navigator.platform} | ${state.config.knowledge_cards.ja} JA / ${state.config.knowledge_cards.en} EN cards`;
   $("#templatePath").value = state.config.default_template;
   $("#queriesPath").value = state.config.default_queries;
+  $("#consolePath").value = state.config.default_console || "";
   state.lipidQueries = state.config.lipid_queries;
+  state.adducts = state.config.adducts;
   renderLipids();
+  renderAdducts();
   renderFiles();
+  updateProjectUI();
+  updateLlmUI();
   refreshQuestion();
 }
 
@@ -499,7 +596,8 @@ $("#pickFolder").addEventListener("click", () => runUiAction(async () => {
 $("#browserFolder").addEventListener("click", () => $("#browserFolderInput").click());
 $("#browserFolderInput").addEventListener("change", (event) =>
   uploadBrowserFolder(event.target.files)
-    .catch((error) => showImportMessages([error.message || String(error)], "error")));
+    .catch((error) => showImportMessages([error.message || String(error)], "error"))
+    .finally(() => { event.target.value = ""; }));
 $("#addPath").addEventListener("click", () => runUiAction(async () => {
   if ($("#serverPath").value.trim()) await addServerPaths([$("#serverPath").value.trim()]);
 }));
@@ -521,23 +619,60 @@ dropZone.addEventListener("drop", (event) =>
   uploadDropped(event.dataTransfer)
     .catch((error) => showImportMessages([error.message || String(error)], "error")));
 
-$("#ionMode").addEventListener("change", () => { renderLipids(); refreshQuestion(); });
-$("#targetOmics").addEventListener("change", refreshQuestion);
+$("#projectType").addEventListener("change", () => {
+  updateProjectUI();
+  refreshQuestion();
+});
+$("#ionMode").addEventListener("change", () => {
+  renderLipids();
+  renderAdducts();
+  refreshQuestion();
+});
+$("#targetOmics").addEventListener("change", () => {
+  updateProjectUI();
+  refreshQuestion();
+});
 $("#lipidFilter").addEventListener("input", renderLipids);
+$("#adductFilter").addEventListener("input", renderAdducts);
+$("#selectAllAdducts").addEventListener("click", () => {
+  (state.adducts[$("#ionMode").value] || []).forEach((item) => { item.selected = true; });
+  renderAdducts();
+});
+$("#clearAdducts").addEventListener("click", () => {
+  (state.adducts[$("#ionMode").value] || []).forEach((item) => { item.selected = false; });
+  renderAdducts();
+});
+$("#llmProvider").addEventListener("change", updateLlmUI);
 $("#refreshQuestion").addEventListener("click", refreshQuestion);
 $("#tuningFile").addEventListener("change", renderTuningFormat);
 $("#applyRecommended").addEventListener("click", applyRecommendedParameters);
-$("#runTuning").addEventListener("click", async () => {
+$("#runTuning").addEventListener("click", () => runUiAction(async () => {
+  const current = workflow();
   const file = selectedTuningFile();
-  if (!file) throw new Error("Select a representative file.");
+  const missing = [];
+  if (current.project_type !== "lcms") missing.push("Project type must be LC-MS.");
+  if (!file) missing.push("Select a representative analysis file.");
+  if (!current.console_path) missing.push("Set the MS-DIAL Console path in Guided setup.");
+  if (!current.template_path) missing.push("Set the parameter template path.");
+  if (!current.output_root) missing.push("Set the output root.");
+  if (missing.length) {
+    throw new Error(`Diagnostic cannot start:\n${missing.join("\n")}`);
+  }
   $("#tuningLog").textContent = "Preparing diagnostic run...";
-  const result = await api("/api/tuning/run", {
-    method: "POST",
-    body: JSON.stringify({ workflow: workflow(), file_path: file.file_path }),
-  });
-  state.tuningJobId = result.job_id;
-  pollTuningJob();
-});
+  try {
+    const result = await api("/api/tuning/run", {
+      method: "POST",
+      body: JSON.stringify({ workflow: current, file_path: file.file_path }),
+    });
+    state.tuningJobId = result.job_id;
+    $("#tuningLog").textContent =
+      `Diagnostic queued.\nRun folder: ${result.preparation.run_directory}`;
+    pollTuningJob();
+  } catch (error) {
+    $("#tuningLog").textContent = `Diagnostic could not start:\n${error.message}`;
+    throw error;
+  }
+}));
 $("#tuningHeight").addEventListener("input", () => {
   $("#tuningHeightNumber").value = $("#tuningHeight").value;
   updateTuningCounts();
@@ -561,33 +696,44 @@ $("#applyTuning").addEventListener("click", () => {
   setStatus("Tuning thresholds applied to the workflow.");
 });
 
-$("#validate").addEventListener("click", async () => {
+$("#validate").addEventListener("click", () => runUiAction(async () => {
   const result = await api("/api/validate", { method: "POST", body: JSON.stringify({ workflow: workflow() }) });
   renderIssues(result.issues, result.console_version);
-});
-$("#prepare").addEventListener("click", async () => {
+}));
+$("#prepare").addEventListener("click", () => runUiAction(async () => {
   const result = await api("/api/prepare", { method: "POST", body: JSON.stringify({ workflow: workflow() }) });
   $("#runPath").textContent = result.preparation.run_directory;
   $("#log").textContent = [...result.messages, JSON.stringify(result.preparation.command)].join("\n");
-});
-$("#run").addEventListener("click", async () => {
+}));
+$("#run").addEventListener("click", () => runUiAction(async () => {
   const result = await api("/api/run", { method: "POST", body: JSON.stringify({ workflow: workflow() }) });
   state.jobId = result.job_id;
   $("#runPath").textContent = result.preparation.run_directory;
   pollJob();
-});
-$("#ask").addEventListener("click", async () => {
+}));
+$("#ask").addEventListener("click", () => runUiAction(async () => {
   $("#answer").textContent = "Searching...";
-  const result = await api("/api/assistant", {
-    method: "POST",
-    body: JSON.stringify({ query: $("#question").value, language: $("#language").value, workflow: workflow() }),
-  });
-  $("#answer").textContent = result.answer;
-  $("#cards").innerHTML = result.cards.map((card) =>
-    `<article class="card"><strong>${escapeHtml(card.question)}</strong>
-      <div>${escapeHtml(card.answer)}</div>
-      <div class="muted">${escapeHtml(card.feature || "")} | score ${card.score}</div></article>`
-  ).join("");
-});
+  try {
+    const result = await api("/api/assistant", {
+      method: "POST",
+      body: JSON.stringify({
+        query: $("#question").value,
+        language: $("#language").value,
+        workflow: workflow(),
+        llm: llmConfig(),
+      }),
+    });
+    $("#answer").textContent = result.answer;
+    $("#llmStatus").textContent = `Answer mode: ${result.mode}`;
+    $("#cards").innerHTML = result.cards.map((card) =>
+      `<article class="card"><strong>${escapeHtml(card.question)}</strong>
+        <div>${escapeHtml(card.answer)}</div>
+        <div class="muted">${escapeHtml(card.feature || "")} | score ${card.score}</div></article>`
+    ).join("");
+  } catch (error) {
+    $("#answer").textContent = `LLM request failed: ${error.message}`;
+    throw error;
+  }
+}));
 
 initialize().catch((error) => { setStatus(error.message); console.error(error); });

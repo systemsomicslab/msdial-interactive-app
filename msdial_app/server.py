@@ -24,6 +24,7 @@ from .workflow import (
     parse_mdpeak,
     prepare_run,
     prepare_tuning_run,
+    read_adducts,
     read_lipid_queries,
     run_console,
     validate_workflow,
@@ -39,6 +40,34 @@ TUNING_RUNS = ROOT / "work" / "tuning-runs"
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 KB = KnowledgeBase(KNOWLEDGE)
+
+
+def _default_console_path() -> str:
+    configured = os.environ.get("MSDIAL_CONSOLE_PATH", "")
+    candidates = [
+        Path(configured) if configured else None,
+        ROOT / "MSDIALCUI.exe",
+        ROOT / "MSDIALCUI.dll",
+        ROOT.parent
+        / "MsdialWorkbench"
+        / "tests"
+        / "MSDIAL5"
+        / "MsdialCoreTestApp"
+        / "bin"
+        / "Release"
+        / "net48"
+        / "MSDIALCUI.exe",
+        ROOT.parent
+        / "MsdialWorkbench"
+        / "tests"
+        / "MSDIAL5"
+        / "MsdialCoreTestApp"
+        / "bin"
+        / "Release"
+        / "net8"
+        / "MSDIALCUI.dll",
+    ]
+    return next((str(path.resolve()) for path in candidates if path and path.is_file()), "")
 
 
 def _diagnose_console_failure(logs: list[str], fallback: str) -> str:
@@ -59,6 +88,12 @@ def _diagnose_console_failure(logs: list[str], fallback: str) -> str:
             "MS-DIAL could not find an input path. Folder-type .raw/.d data require a "
             "Console build containing the vendor-directory CSV parser fix."
         )
+    if "required 'scan' file missing" in text or "required 'scan' file is missing" in text:
+        return (
+            "The SCIEX reader could not open this WIFF data stream without its matching "
+            ".wiff.scan file. WIFF-only import is allowed by the app, but this particular "
+            "dataset requires the sidecar at processing time."
+        )
     return fallback
 
 
@@ -73,10 +108,28 @@ class Handler(BaseHTTPRequestHandler):
                     "platform": os.name,
                     "python": os.sys.version.split()[0],
                     "root": str(ROOT),
+                    "default_console": _default_console_path(),
                     "default_queries": str(RESOURCES / "LbmQueries.txt"),
                     "default_template": str(RESOURCES / "msdial_console_param4lipidomics.txt"),
                     "knowledge_cards": {"ja": KB.count("ja"), "en": KB.count("en")},
                     "lipid_queries": read_lipid_queries(RESOURCES / "LbmQueries.txt"),
+                    "adducts": {
+                        "Positive": read_adducts(
+                            RESOURCES / "AdductIonResource_Positive.txt",
+                            "Positive",
+                        ),
+                        "Negative": read_adducts(
+                            RESOURCES / "AdductIonResource_Negative.txt",
+                            "Negative",
+                        ),
+                    },
+                    "llm_environment": {
+                        "azure_configured": bool(
+                            os.environ.get("AZURE_OPENAI_ENDPOINT")
+                            and os.environ.get("AZURE_OPENAI_API_KEY")
+                            and os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+                        ),
+                    },
                 }
             )
             return
@@ -133,6 +186,7 @@ class Handler(BaseHTTPRequestHandler):
                         body.get("query", ""),
                         body.get("language", "ja"),
                         body.get("workflow", {}),
+                        body.get("llm", {}),
                     )
                 )
             elif parsed.path == "/api/next-question":
@@ -274,6 +328,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 
@@ -287,6 +342,9 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
     with JOBS_LOCK:
         JOBS[job_id]["status"] = "running"
     try:
+        log("Starting MS-DIAL single-file diagnostic run.")
+        log("Command: " + " ".join(preparation["command"]))
+        log("Large vendor raw files can take several minutes before the first Console message.")
         exit_code = run_console(preparation, log)
         generated_mdpeaks = list(Path(preparation["run_directory"]).glob("*.mdpeak"))
         with JOBS_LOCK:
@@ -331,6 +389,11 @@ def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
             JOBS[job_id]["exit_code"] = exit_code
             JOBS[job_id]["result"] = result
             JOBS[job_id]["status"] = "completed" if exit_code == 0 else "failed"
+            if exit_code != 0:
+                JOBS[job_id]["error"] = _diagnose_console_failure(
+                    JOBS[job_id]["logs"],
+                    f"MS-DIAL Console exited with code {exit_code}.",
+                )
     except Exception as error:
         with JOBS_LOCK:
             message = _diagnose_console_failure(JOBS[job_id]["logs"], str(error))

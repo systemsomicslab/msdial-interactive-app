@@ -9,6 +9,7 @@ from msdial_app.workflow import (
     expand_paths_report,
     parse_mdpeak,
     prepare_run,
+    read_adducts,
     read_lipid_queries,
     recommended_peak_parameters,
     validate_workflow,
@@ -183,7 +184,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual([], report["files"])
             self.assertEqual([str(sidecar.resolve())], report["rejected"])
 
-    def test_sciex_wiff_without_sidecar_warns_immediately(self) -> None:
+    def test_sciex_wiff_without_sidecar_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             wiff = Path(temporary) / "sample.wiff"
             wiff.write_bytes(b"")
@@ -191,7 +192,59 @@ class WorkflowTests(unittest.TestCase):
             report = expand_paths_report([str(wiff)])
 
             self.assertEqual(1, len(report["files"]))
-            self.assertIn("sidecar was not found", report["warnings"][0])
+            self.assertEqual([], report["warnings"])
+
+    def test_reads_adduct_resources(self) -> None:
+        resource = (
+            Path(__file__).parents[1]
+            / "resources"
+            / "AdductIonResource_Negative.txt"
+        )
+        adducts = read_adducts(resource, "Negative")
+
+        self.assertEqual("[M-H]-", adducts[0]["adduct"])
+        self.assertTrue(adducts[0]["selected"])
+
+    def test_method_writes_selected_adducts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "sample.mzML"
+            raw.write_bytes(b"")
+            template = root / "method.txt"
+            template.write_text(
+                "Adduct list: [M+H]+\nIon mode: Positive\nTarget omics: Metabolomics\n",
+                encoding="utf-8",
+            )
+            console = root / "MSDIALCUI.exe"
+            console.write_bytes(b"")
+            state = {
+                "files": expand_paths([str(raw)]),
+                "project_type": "lcms",
+                "console_path": str(console),
+                "template_path": str(template),
+                "output_root": str(root / "output"),
+                "ion_mode": "Positive",
+                "target_omics": "Metabolomics",
+                "selected_adducts": ["[M+H]+", "[M+Na]+"],
+            }
+
+            prepared = prepare_run(state)
+            method = Path(prepared["method_file"]).read_text(encoding="utf-8")
+
+            self.assertIn("Searched adduct ions: [M+H]+,[M+Na]+", method)
+
+    def test_non_lcms_project_is_not_executable_yet(self) -> None:
+        issues = validate_workflow(
+            {
+                "project_type": "gcms",
+                "files": [],
+                "console_path": "",
+                "template_path": "",
+                "output_root": "",
+                "target_omics": "Metabolomics",
+            }
+        )
+        self.assertTrue(any("executes LC-MS workflows only" in issue["message"] for issue in issues))
 
     def test_agilent_validation_explains_reader_prerequisites(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -156,11 +156,6 @@ def expand_paths_report(paths: Iterable[str]) -> dict[str, Any]:
             }
         )
     warnings = _sciex_pair_warnings(unique)
-    warnings.extend(
-        f"SCIEX WIFF sidecar was not found: {path}.scan"
-        for path in unique
-        if path.suffix.lower() == ".wiff" and not Path(str(path) + ".scan").exists()
-    )
     return {"files": result, "warnings": warnings, "rejected": rejected}
 
 
@@ -205,6 +200,27 @@ def read_lipid_queries(path: str | Path) -> list[dict[str, Any]]:
     return rows
 
 
+def read_adducts(path: str | Path, ion_mode: str) -> list[dict[str, Any]]:
+    resource = Path(path)
+    rows: list[dict[str, Any]] = []
+    with resource.open(encoding="utf-8-sig", errors="replace") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            adduct = str(row.get("Adduct", "")).strip()
+            if not adduct:
+                continue
+            rows.append(
+                {
+                    "adduct": adduct,
+                    "charge": int(row.get("Charge", 0)),
+                    "accurate_mass": float(row.get("Accurate mass", 0)),
+                    "ion_mode": ion_mode,
+                    "selected": True,
+                }
+            )
+    return rows
+
+
 def parse_method(path: str | Path) -> dict[str, str]:
     values: dict[str, str] = {}
     method_path = Path(path)
@@ -221,6 +237,18 @@ def parse_method(path: str | Path) -> dict[str, str]:
 def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
     issues: list[dict[str, str]] = []
     files = state.get("files", [])
+    project_type = str(state.get("project_type", "lcms")).lower()
+    if project_type != "lcms":
+        issues.append(
+            {
+                "level": "error",
+                "message": (
+                    f"{project_type.upper()} parameter UI is scaffolded, but this version "
+                    "executes LC-MS workflows only. A mode-specific parameter template "
+                    "and backend are required before this project type is runnable."
+                ),
+            }
+        )
     required_paths = [
         ("console_path", "MS-DIAL Console executable"),
         ("template_path", "parameter template"),
@@ -242,8 +270,6 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
         name = str(item.get("file_name", ""))
         if not path.exists():
             issues.append({"level": "error", "message": f"Input not found: {path}"})
-        if path.suffix.lower() == ".wiff" and not Path(str(path) + ".scan").exists():
-            issues.append({"level": "error", "message": f"WIFF sidecar not found: {path}.scan"})
         if path.is_dir() and path.suffix.lower() == ".d" and item.get("vendor") == "Unknown":
             issues.append(
                 {
@@ -344,8 +370,14 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
         if value and not Path(value).exists():
             issues.append({"level": "error", "message": f"{label} not found: {value}"})
     selected = state.get("selected_lipids", [])
-    if state.get("target_omics") == "Lipidomics" and not selected:
+    if project_type != "gcms" and state.get("target_omics") == "Lipidomics" and not selected:
         issues.append({"level": "error", "message": "No lipid annotation query is selected."})
+    if (
+        project_type != "gcms"
+        and "selected_adducts" in state
+        and not state.get("selected_adducts")
+    ):
+        issues.append({"level": "error", "message": "No adduct ion is selected."})
     return issues
 
 
@@ -357,8 +389,9 @@ def prepare_run(
     errors = [issue["message"] for issue in issues if issue["level"] == "error"]
     if errors:
         raise ValueError("\n".join(errors))
-    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_directory = Path(state["output_root"]).expanduser().resolve() / f"{timestamp}-lcms"
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    project_type = str(state.get("project_type", "lcms")).lower()
+    run_directory = Path(state["output_root"]).expanduser().resolve() / f"{timestamp}-{project_type}"
     run_directory.mkdir(parents=True, exist_ok=False)
     stage_inputs = bool(state.get("stage_inputs", True))
     input_directory = run_directory / "input"
@@ -386,7 +419,7 @@ def prepare_run(
     manifest = {
         "created_at": dt.datetime.now().astimezone().isoformat(),
         "platform": platform.platform(),
-        "analysis_type": "lcms",
+        "analysis_type": project_type,
         "project_file_requested": True,
         "stage_inputs": stage_inputs,
         "input_csv": str(csv_path),
@@ -525,8 +558,20 @@ def run_console(
         bufsize=1,
     )
     assert process.stdout is not None
+    scan_file_errors = 0
     for line in process.stdout:
-        on_line(line.rstrip())
+        message = line.rstrip()
+        on_line(message)
+        lower = message.lower()
+        if "required 'scan' file missing" in lower or "required 'scan' file is missing" in lower:
+            scan_file_errors += 1
+            if scan_file_errors >= 3:
+                on_line(
+                    "Stopping diagnostic after repeated SCIEX scan-sidecar read failures."
+                )
+                process.terminate()
+                process.wait(timeout=10)
+                return -2
     return process.wait()
 
 
@@ -561,6 +606,7 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         "msp file path": state.get("msp_path", ""),
         "lbm file path": state.get("lbm_path", ""),
         "text db file path": state.get("text_db_path", ""),
+        "searched adduct ions": ",".join(state.get("selected_adducts", [])),
         "ion mode": state.get("ion_mode", "Negative"),
         "target omics": state.get("target_omics", "Lipidomics"),
         "ms1 data type": state.get("ms1_data_type", "Centroid"),
@@ -609,6 +655,12 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         lower = stripped.lower()
         if lower.startswith(("solvent type:", "searched lipid class:")):
             continue
+        if lower.startswith("adduct list:"):
+            output.append(
+                f"Searched adduct ions: {replacements['searched adduct ions']}"
+            )
+            found.add("searched adduct ions")
+            continue
         matched = next(
             (key for key in replacements if lower.startswith(key + ":")),
             None,
@@ -642,6 +694,7 @@ def _title_for_key(key: str) -> str:
         "msp file path": "Msp file path",
         "lbm file path": "Lbm file path",
         "text db file path": "Text DB file path",
+        "searched adduct ions": "Searched adduct ions",
         "ion mode": "Ion mode",
         "target omics": "Target omics",
         "ms1 data type": "MS1 data type",
