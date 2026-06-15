@@ -10,11 +10,49 @@ LC-MS workflows.
 - Large raw files stay local. Nothing is sent to an external service.
 - The browser UI supports drag-and-drop uploads, native file dialogs, and
   server-side paths.
+- Folder-type vendor data are kept as one analysis unit: Waters `.raw`,
+  Agilent `.d`, and Bruker `.d`.
 - The app has no mandatory third-party Python dependencies.
 
 Proprietary vendor formats may still depend on vendor readers supported by the
 selected MS-DIAL Console build. For Linux/macOS workflows, mzML is generally the
 most portable input format.
+
+Agilent `.d` requires the Agilent reader assemblies, including
+`BaseDataAccess.dll`, to be resolvable from the selected Console package. On
+Windows, the vendor reader may also require Microsoft Visual C++ 2013
+Redistributable Package x64. The app shows both checks separately so that a
+missing managed assembly is not mistaken for a missing native runtime.
+
+## Folder-type vendor data
+
+The app detects vendor folders using the same signatures as MS-DIAL:
+
+- Waters: a directory ending in `.raw`
+- Agilent: a `.d` directory containing `AcqData`
+- Bruker: a `.d` directory containing `analysis.tdf`, `analysis.tsf`, or
+  `analysis.baf`
+
+Use drag-and-drop, Browser folder picker, Native folder picker, or a server-side
+path. Browser folder uploads preserve the directory tree instead of flattening
+the vendor package.
+
+## LC-MS parameter tuning
+
+The Tune parameters screen runs one representative file with:
+
+- `Minimum peak height: 0`
+- the selected `Mass slice width`
+- all five MSP cutoffs set to zero
+- alignment disabled
+
+The generated ASCII `.mdpeak` file is parsed locally. The peak-height and MSP
+sliders then recalculate detected-peak and passing-annotation counts without
+rerunning MS-DIAL. Suggested starting values are:
+
+- Thermo RAW or FT-ICR: peak height `10000`, mass slice `0.05`
+- QTOF including Waters, Agilent, and Bruker: peak height `100`, mass slice
+  `0.1`
 
 ## Run
 
@@ -66,4 +104,3 @@ type. The preflight screen warns when multiple acquisition types are present.
 ```bash
 python -m unittest discover -s tests -v
 ```
-

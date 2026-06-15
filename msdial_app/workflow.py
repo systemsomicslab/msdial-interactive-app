@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import datetime as dt
 import json
 import os
@@ -21,12 +22,76 @@ SUPPORTED_SUFFIXES = {
     ".raw",
     ".wiff",
 }
+VC2013_DOWNLOAD_URL = (
+    "https://support.microsoft.com/en-us/topic/"
+    "update-for-visual-c-2013-and-visual-c-redistributable-package-"
+    "5b2ac5ab-4139-8acc-08e2-9578ec9b2cf1"
+)
 
 
 def is_supported(path: Path) -> bool:
     return path.suffix.lower() in SUPPORTED_SUFFIXES or (
         path.is_dir() and path.name.lower().endswith((".d", ".raw"))
     )
+
+
+def detect_raw_format(path: str | Path) -> dict[str, Any]:
+    target = Path(path)
+    suffix = target.suffix.lower()
+    if target.is_dir() and suffix == ".raw":
+        return {
+            "vendor": "Waters",
+            "format": "Waters .raw folder",
+            "instrument_family": "QTOF",
+            "minimum_peak_height": 100,
+            "mass_slice_width": 0.1,
+        }
+    if target.is_file() and suffix == ".raw":
+        return {
+            "vendor": "Thermo",
+            "format": "Thermo .raw file",
+            "instrument_family": "Fourier-transform MS",
+            "minimum_peak_height": 10000,
+            "mass_slice_width": 0.05,
+        }
+    if target.is_dir() and suffix == ".d":
+        if (target / "AcqData").is_dir():
+            vendor, label = "Agilent", "Agilent .d folder"
+        elif any((target / name).is_file() for name in ("analysis.tdf", "analysis.tsf")):
+            vendor, label = "Bruker", "Bruker TDF/TSF .d folder"
+        elif (target / "analysis.baf").is_file():
+            vendor, label = "Bruker", "Bruker BAF .d folder"
+        else:
+            vendor, label = "Unknown", "Unrecognized .d folder"
+        return {
+            "vendor": vendor,
+            "format": label,
+            "instrument_family": "QTOF",
+            "minimum_peak_height": 100,
+            "mass_slice_width": 0.1,
+        }
+    return {
+        "vendor": "Open format" if suffix in {".mzml", ".mzxml", ".cdf"} else "Other",
+        "format": suffix.lstrip(".").upper() or "Unknown",
+        "instrument_family": "QTOF",
+        "minimum_peak_height": 100,
+        "mass_slice_width": 0.1,
+    }
+
+
+def recommended_peak_parameters(files: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    rows = list(files)
+    if not rows:
+        return {"minimum_peak_height": 100, "mass_slice_width": 0.1}
+    high_resolution = any(
+        item.get("instrument_family") in {"Fourier-transform MS", "FT-ICR"}
+        or item.get("vendor") == "Thermo"
+        for item in rows
+    )
+    return {
+        "minimum_peak_height": 10000 if high_resolution else 100,
+        "mass_slice_width": 0.05 if high_resolution else 0.1,
+    }
 
 
 def expand_paths(paths: Iterable[str]) -> list[dict[str, Any]]:
@@ -46,6 +111,7 @@ def expand_paths(paths: Iterable[str]) -> list[dict[str, Any]]:
     unique = sorted(set(expanded), key=lambda item: str(item).lower())
     result = []
     for index, path in enumerate(unique):
+        format_info = detect_raw_format(path)
         name = path.stem
         lower = name.lower()
         is_blank = "blank" in lower
@@ -68,6 +134,7 @@ def expand_paths(paths: Iterable[str]) -> list[dict[str, Any]]:
                 "batch_order": 1,
                 "analytical_order": index + 1,
                 "factor": 1,
+                **format_info,
             }
         )
     return result
@@ -134,6 +201,13 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
             issues.append({"level": "error", "message": f"Input not found: {path}"})
         if path.suffix.lower() == ".wiff" and not Path(str(path) + ".scan").exists():
             issues.append({"level": "error", "message": f"WIFF sidecar not found: {path}.scan"})
+        if path.is_dir() and path.suffix.lower() == ".d" and item.get("vendor") == "Unknown":
+            issues.append(
+                {
+                    "level": "error",
+                    "message": f"Unrecognized .d folder (no AcqData/analysis.tdf/analysis.tsf/analysis.baf): {path}",
+                }
+            )
         if "," in str(path) or "," in name or "," in str(item.get("class_id", "")):
             issues.append(
                 {
@@ -155,6 +229,55 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                 ),
             }
         )
+    if any(item.get("vendor") == "Agilent" for item in files):
+        issues.append(
+            {
+                "level": "warning",
+                "message": (
+                    "Agilent .d reading on Windows may require Microsoft Visual C++ "
+                    f"2013 Redistributable Package x64: {VC2013_DOWNLOAD_URL}"
+                ),
+            }
+        )
+        if platform.system() != "Windows":
+            issues.append(
+                {
+                    "level": "warning",
+                    "message": (
+                        "Agilent .d uses a vendor reader whose OS support depends on the "
+                        "selected MS-DIAL Console package. Convert to mzML when the reader "
+                        "is unavailable on this OS."
+                    ),
+                }
+            )
+        console_value = str(state.get("console_path", "")).strip()
+        console_path = Path(console_value) if console_value else None
+        if console_path and console_path.exists():
+            console_directory = console_path.parent
+            root_reader = console_directory / "BaseDataAccess.dll"
+            packaged_reader = console_directory / "lib" / "Agilent" / "BaseDataAccess.dll"
+            if not root_reader.exists() and not packaged_reader.exists():
+                issues.append(
+                    {
+                        "level": "warning",
+                        "message": (
+                            "Agilent reader dependency BaseDataAccess.dll was not found "
+                            f"beside the Console or under lib/Agilent: {console_directory}"
+                        ),
+                    }
+                )
+            elif not root_reader.exists() and packaged_reader.exists():
+                issues.append(
+                    {
+                        "level": "warning",
+                        "message": (
+                            "BaseDataAccess.dll exists only under lib/Agilent. If the run "
+                            "reports a BaseDataAccess load error, use an official packaged "
+                            "Console build or deploy the Agilent reader so the runtime can "
+                            "resolve it."
+                        ),
+                    }
+                )
     for key, label in (
         ("msp_path", "MSP library"),
         ("lbm_path", "LBM library"),
@@ -233,6 +356,79 @@ def prepare_run(
         "command": command,
         "warnings": [issue for issue in issues if issue["level"] == "warning"],
     }
+
+
+def prepare_tuning_run(
+    state: dict[str, Any],
+    file_path: str,
+    output_root: str | Path,
+) -> dict[str, Any]:
+    tuning = copy.deepcopy(state)
+    selected = next(
+        (item for item in tuning.get("files", []) if item.get("file_path") == file_path),
+        None,
+    )
+    if selected is None:
+        raise ValueError("Select one analysis file for parameter tuning.")
+    tuning["files"] = [selected]
+    tuning["output_root"] = str(output_root)
+    tuning["stage_inputs"] = False
+    tuning["minimum_peak_height"] = 0
+    tuning["together_with_alignment"] = False
+    tuning["msp_weighted_dot_product"] = 0
+    tuning["msp_simple_dot_product"] = 0
+    tuning["msp_reverse_dot_product"] = 0
+    tuning["msp_matched_peaks_percentage"] = 0
+    tuning["msp_minimum_spectrum_match"] = 0
+    return prepare_run(tuning)
+
+
+def parse_mdpeak(path: str | Path) -> dict[str, Any]:
+    mdpeak = Path(path)
+    heights: list[float] = []
+    scores: list[dict[str, float]] = []
+    with mdpeak.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        required = {"Height", "Simple dot product", "Weighted dot product", "Reverse dot product"}
+        if not reader.fieldnames or not required.issubset(reader.fieldnames):
+            raise ValueError(f"Unsupported mdpeak header: {mdpeak}")
+        for row in reader:
+            height = _nullable_float(row.get("Height"))
+            if height is not None:
+                heights.append(height)
+            weighted = _nullable_float(row.get("Weighted dot product"))
+            simple = _nullable_float(row.get("Simple dot product"))
+            reverse = _nullable_float(row.get("Reverse dot product"))
+            matched_percentage = _nullable_float(row.get("Matched peaks percentage"))
+            matched_count = _nullable_float(row.get("Matched peaks count"))
+            if all(
+                value is not None
+                for value in (weighted, simple, reverse, matched_percentage, matched_count)
+            ):
+                scores.append(
+                    {
+                        "weighted": weighted,
+                        "simple": simple,
+                        "reverse": reverse,
+                        "matched_percentage": matched_percentage,
+                        "matched_count": matched_count,
+                    }
+                )
+    heights.sort()
+    return {
+        "mdpeak": str(mdpeak),
+        "peak_count": len(heights),
+        "heights": heights,
+        "msp_candidate_count": len(scores),
+        "msp_scores": scores,
+    }
+
+
+def find_mdpeak(run_directory: str | Path) -> Path:
+    files = sorted(Path(run_directory).glob("*.mdpeak"))
+    if not files:
+        raise FileNotFoundError(f"No mdpeak was generated in {run_directory}")
+    return files[0]
 
 
 def build_console_command(
@@ -314,6 +510,7 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         "ms2 data type": state.get("ms2_data_type", "Centroid"),
         "number of threads": state.get("number_of_threads", 4),
         "minimum peak height": state.get("minimum_peak_height", 1000),
+        "mass slice width": state.get("mass_slice_width", 0.1),
         "minimum peak width": state.get("minimum_peak_width", 5),
         "retention time begin": state.get("retention_time_begin", 0),
         "retention time end": state.get("retention_time_end", 100),
@@ -323,6 +520,22 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
             "alignment_rt_tolerance", 0.1
         ),
         "ms1 tolerance for alignment": state.get("alignment_ms1_tolerance", 0.015),
+        "weighted dot product cutoff for msp-based annotation": state.get(
+            "msp_weighted_dot_product", 0.6
+        ),
+        "simple dot product cutoff for msp-based annotation": state.get(
+            "msp_simple_dot_product", 0.6
+        ),
+        "reverse dot product cutoff for msp-based annotation": state.get(
+            "msp_reverse_dot_product", 0.8
+        ),
+        "matched peaks percentage cutoff for msp-based annotation": state.get(
+            "msp_matched_peaks_percentage", 0.1
+        ),
+        "minimum spectrum match for msp-based annotation": state.get(
+            "msp_minimum_spectrum_match", 3
+        ),
+        "together with alignment": state.get("together_with_alignment", True),
         "export as mztabm format": "True",
     }
     selected = state.get("selected_lipids", [])
@@ -378,6 +591,7 @@ def _title_for_key(key: str) -> str:
         "ms2 data type": "MS2 data type",
         "number of threads": "Number of threads",
         "minimum peak height": "Minimum peak height",
+        "mass slice width": "Mass slice width",
         "minimum peak width": "Minimum peak width",
         "retention time begin": "Retention time begin",
         "retention time end": "Retention time end",
@@ -385,6 +599,12 @@ def _title_for_key(key: str) -> str:
         "ms2 tolerance for centroid": "MS2 tolerance for centroid",
         "retention time tolerance for alignment": "Retention time tolerance for alignment",
         "ms1 tolerance for alignment": "MS1 tolerance for alignment",
+        "weighted dot product cutoff for msp-based annotation": "Weighted dot product cutoff for MSP-based annotation",
+        "simple dot product cutoff for msp-based annotation": "Simple dot product cutoff for MSP-based annotation",
+        "reverse dot product cutoff for msp-based annotation": "Reverse dot product cutoff for MSP-based annotation",
+        "matched peaks percentage cutoff for msp-based annotation": "Matched peaks percentage cutoff for MSP-based annotation",
+        "minimum spectrum match for msp-based annotation": "Minimum spectrum match for MSP-based annotation",
+        "together with alignment": "Together with alignment",
         "export as mztabm format": "Export as mztabM format",
     }
     return names[key]
@@ -407,6 +627,16 @@ def _stage_path(source: Path, target: Path) -> None:
                 os.link(sidecar, sidecar_target)
             except OSError:
                 shutil.copy2(sidecar, sidecar_target)
+
+
+def _nullable_float(value: Any) -> float | None:
+    text = str(value or "").strip()
+    if not text or text.lower() == "null":
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
 
 
 def console_version(console_path: str) -> str:

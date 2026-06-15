@@ -19,7 +19,8 @@
     <button data-tab="data" class="active">1. Data</button>
     <button data-tab="guide">2. Guided setup</button>
     <button data-tab="annotation">3. Annotation</button>
-    <button data-tab="run">4. Validate &amp; run</button>
+    <button data-tab="tuning">4. Tune parameters</button>
+    <button data-tab="run">5. Validate &amp; run</button>
     <button data-tab="help">Ask MS-DIAL</button>
   </nav>
 
@@ -31,12 +32,15 @@
         <div class="button-row">
           <button id="pickFiles">Native file picker</button>
           <button id="pickFolder" class="secondary">Native folder picker</button>
+          <button id="browserFolder" class="secondary">Browser folder picker</button>
+          <input id="browserFolderInput" type="file" webkitdirectory multiple hidden>
         </div>
         <div class="path-add">
           <input id="serverPath" placeholder="/data/project or D:\data\project">
           <button id="addPath" class="secondary">Add path</button>
         </div>
       </div>
+      <div id="vendorTips" class="vendor-tips" hidden></div>
       <div class="section-head">
         <h2>Analysis metadata</h2>
         <button id="clearFiles" class="quiet">Clear</button>
@@ -46,7 +50,7 @@
           <thead>
             <tr>
               <th>File name</th><th>Path</th><th>Type</th><th>Class</th>
-              <th>Acquisition</th><th>Batch</th><th>Order</th><th>Factor</th><th></th>
+              <th>Raw format</th><th>Acquisition</th><th>Batch</th><th>Order</th><th>Factor</th><th></th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -96,6 +100,7 @@
         <div class="form-grid">
           <label>Number of threads<input id="numberOfThreads" type="number" min="1" value="4"></label>
           <label>Minimum peak height<input id="minimumPeakHeight" type="number" min="0" value="300"></label>
+          <label>Mass slice width<input id="massSliceWidth" type="number" min="0.001" step="0.001" value="0.1"></label>
           <label>Minimum peak width<input id="minimumPeakWidth" type="number" min="1" value="5"></label>
           <label>RT begin (min)<input id="rtBegin" type="number" step="any" value="0"></label>
           <label>RT end (min)<input id="rtEnd" type="number" step="any" value="100"></label>
@@ -117,6 +122,16 @@
           <label>LbmQueries.txt<input id="queriesPath"></label>
         </div>
       </div>
+      <div class="panel">
+        <h2>MSP-based annotation cutoffs</h2>
+        <div class="form-grid">
+          <label>Weighted dot product<input id="mspWeighted" type="number" min="0" max="1" step="0.01" value="0.6"></label>
+          <label>Simple dot product<input id="mspSimple" type="number" min="0" max="1" step="0.01" value="0.6"></label>
+          <label>Reverse dot product<input id="mspReverse" type="number" min="0" max="1" step="0.01" value="0.8"></label>
+          <label>Matched peaks percentage<input id="mspMatchedPercentage" type="number" min="0" max="1" step="0.01" value="0.1"></label>
+          <label>Minimum spectrum match<input id="mspMinimumSpectrumMatch" type="number" min="0" step="1" value="3"></label>
+        </div>
+      </div>
       <div class="section-head">
         <div>
           <h2>Lipid queries</h2>
@@ -125,6 +140,54 @@
         <input id="lipidFilter" placeholder="Filter lipid class or adduct">
       </div>
       <div id="lipidList" class="lipid-list"></div>
+    </section>
+
+    <section id="tab-tuning" class="tab">
+      <div class="guide-layout">
+        <div class="panel">
+          <h2>Single-file diagnostic run</h2>
+          <p class="muted">Runs the selected file with Minimum peak height = 0 and all MSP cutoffs = 0. Alignment is disabled. The selected Mass slice width is used.</p>
+          <label>Representative analysis file
+            <select id="tuningFile"></select>
+          </label>
+          <div class="button-row tuning-actions">
+            <button id="applyRecommended" class="secondary">Apply format recommendation</button>
+            <button id="runTuning">Run diagnostic</button>
+          </div>
+          <div id="tuningFormat" class="format-summary"></div>
+          <pre id="tuningLog">Choose one representative file.</pre>
+        </div>
+        <div class="panel">
+          <h2>Diagnostic summary</h2>
+          <div id="tuningSummary" class="metric-grid">
+            <div class="metric"><strong>-</strong><span>peaks at height 0</span></div>
+            <div class="metric"><strong>-</strong><span>MSP-scored peaks</span></div>
+          </div>
+          <p class="muted">Move the controls after one diagnostic run. Counts are recalculated from the ASCII mdpeak file without rerunning MS-DIAL.</p>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Peak-picking threshold</h2>
+        <div class="slider-row">
+          <label>Minimum peak height<input id="tuningHeightNumber" type="number" min="0" value="100"></label>
+          <input id="tuningHeight" type="range" min="0" max="10000" step="1" value="100">
+          <div class="metric compact"><strong id="peakPassCount">-</strong><span>detected peaks</span></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>MSP annotation thresholds</h2>
+        <div class="slider-grid">
+          <label>Weighted dot product <output id="tuneWeightedValue">0.60</output><input id="tuneWeighted" type="range" min="0" max="1" step="0.01" value="0.6"></label>
+          <label>Simple dot product <output id="tuneSimpleValue">0.60</output><input id="tuneSimple" type="range" min="0" max="1" step="0.01" value="0.6"></label>
+          <label>Reverse dot product <output id="tuneReverseValue">0.80</output><input id="tuneReverse" type="range" min="0" max="1" step="0.01" value="0.8"></label>
+          <label>Matched peaks percentage <output id="tuneMatchedPercentageValue">0.10</output><input id="tuneMatchedPercentage" type="range" min="0" max="1" step="0.01" value="0.1"></label>
+          <label>Minimum spectrum match <output id="tuneMinimumMatchValue">3</output><input id="tuneMinimumMatch" type="range" min="0" max="20" step="1" value="3"></label>
+        </div>
+        <div class="button-row">
+          <div class="metric compact"><strong id="annotationPassCount">-</strong><span>passing MSP annotations</span></div>
+          <button id="applyTuning" class="secondary">Apply thresholds to workflow</button>
+        </div>
+      </div>
     </section>
 
     <section id="tab-run" class="tab">

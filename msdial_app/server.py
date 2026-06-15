@@ -18,8 +18,11 @@ from .knowledge import KnowledgeBase, next_parameter_question
 from .workflow import (
     console_version,
     expand_paths,
+    find_mdpeak,
     parse_method,
+    parse_mdpeak,
     prepare_run,
+    prepare_tuning_run,
     read_lipid_queries,
     run_console,
     validate_workflow,
@@ -31,9 +34,31 @@ STATIC = ROOT / "static"
 RESOURCES = ROOT / "resources"
 KNOWLEDGE = ROOT / "knowledge"
 UPLOADS = ROOT / "work" / "uploads"
+TUNING_RUNS = ROOT / "work" / "tuning-runs"
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 KB = KnowledgeBase(KNOWLEDGE)
+
+
+def _diagnose_console_failure(logs: list[str], fallback: str) -> str:
+    text = "\n".join(logs).lower()
+    if "basedataaccess" in text:
+        return (
+            "Agilent reader could not load BaseDataAccess.dll. Check the MS-DIAL Console "
+            "package and its lib/Agilent deployment before checking the VC++ runtime."
+        )
+    vc_runtime_markers = ("msvcp120", "msvcr120", "vcruntime", "0xc000007b")
+    if any(marker in text for marker in vc_runtime_markers):
+        return (
+            "Agilent vendor reader could not load its native runtime. Install Microsoft "
+            "Visual C++ 2013 Redistributable Package x64, then retry."
+        )
+    if "file not found:" in text:
+        return (
+            "MS-DIAL could not find an input path. Folder-type .raw/.d data require a "
+            "Console build containing the vendor-directory CSV parser fix."
+        )
+    return fallback
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -83,8 +108,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"path": selected, "files": expand_paths([selected]) if selected else []})
             elif parsed.path == "/api/upload-session":
                 session = uuid.uuid4().hex
-                (UPLOADS / session).mkdir(parents=True, exist_ok=False)
-                self._json({"session": session})
+                directory = UPLOADS / session
+                directory.mkdir(parents=True, exist_ok=False)
+                self._json({"session": session, "root": str(directory.resolve())})
             elif parsed.path == "/api/knowledge/search":
                 self._json(
                     {
@@ -142,6 +168,30 @@ class Handler(BaseHTTPRequestHandler):
                     daemon=True,
                 ).start()
                 self._json({"job_id": job_id, "preparation": preparation})
+            elif parsed.path == "/api/tuning/run":
+                state = body.get("workflow", body)
+                preparation = prepare_tuning_run(
+                    state,
+                    body.get("file_path", ""),
+                    TUNING_RUNS,
+                )
+                job_id = uuid.uuid4().hex
+                with JOBS_LOCK:
+                    JOBS[job_id] = {
+                        "id": job_id,
+                        "status": "queued",
+                        "kind": "tuning",
+                        "logs": [],
+                        "preparation": preparation,
+                        "exit_code": None,
+                        "result": None,
+                    }
+                threading.Thread(
+                    target=_run_tuning_job,
+                    args=(job_id, preparation),
+                    daemon=True,
+                ).start()
+                self._json({"job_id": job_id, "preparation": preparation})
             else:
                 self._json({"error": "Unknown endpoint."}, HTTPStatus.NOT_FOUND)
         except Exception as error:
@@ -156,16 +206,29 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "Unknown endpoint."}, HTTPStatus.NOT_FOUND)
             return
         parts = parsed.path.split("/")
-        if len(parts) != 5:
+        if len(parts) not in (4, 5):
             self._json({"error": "Invalid upload path."}, HTTPStatus.BAD_REQUEST)
             return
         session = Path(parts[3]).name
-        filename = Path(urllib.parse.unquote(parts[4])).name
         directory = (UPLOADS / session).resolve()
         if directory.parent != UPLOADS.resolve() or not directory.exists():
             self._json({"error": "Upload session not found."}, HTTPStatus.NOT_FOUND)
             return
-        target = directory / filename
+        if len(parts) == 5:
+            relative = Path(urllib.parse.unquote(parts[4])).name
+        else:
+            query = urllib.parse.parse_qs(parsed.query)
+            relative = query.get("path", [""])[0].replace("\\", "/").lstrip("/")
+        if not relative:
+            self._json({"error": "Missing upload path."}, HTTPStatus.BAD_REQUEST)
+            return
+        target = (directory / Path(relative)).resolve()
+        try:
+            target.relative_to(directory)
+        except ValueError:
+            self._json({"error": "Invalid upload path."}, HTTPStatus.BAD_REQUEST)
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
         remaining = int(self.headers.get("Content-Length", "0"))
         with target.open("wb") as handle:
             while remaining > 0:
@@ -219,14 +282,56 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
         JOBS[job_id]["status"] = "running"
     try:
         exit_code = run_console(preparation, log)
+        generated_mdpeaks = list(Path(preparation["run_directory"]).glob("*.mdpeak"))
         with JOBS_LOCK:
             JOBS[job_id]["exit_code"] = exit_code
-            JOBS[job_id]["status"] = "completed" if exit_code == 0 else "failed"
+            if exit_code == 0 and generated_mdpeaks:
+                JOBS[job_id]["status"] = "completed"
+            else:
+                JOBS[job_id]["status"] = "failed"
+                fallback = (
+                    "MS-DIAL returned exit code 0 but generated no mdpeak file. "
+                    "Check the Console log for an import or parser error."
+                    if exit_code == 0
+                    else f"MS-DIAL Console exited with code {exit_code}."
+                )
+                JOBS[job_id]["error"] = _diagnose_console_failure(
+                    JOBS[job_id]["logs"],
+                    fallback,
+                )
     except Exception as error:
+        with JOBS_LOCK:
+            message = _diagnose_console_failure(JOBS[job_id]["logs"], str(error))
         log(traceback.format_exc())
         with JOBS_LOCK:
             JOBS[job_id]["status"] = "failed"
-            JOBS[job_id]["error"] = str(error)
+            JOBS[job_id]["error"] = message
+
+
+def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
+    def log(line: str) -> None:
+        with JOBS_LOCK:
+            JOBS[job_id]["logs"].append(line)
+            JOBS[job_id]["logs"] = JOBS[job_id]["logs"][-2000:]
+
+    with JOBS_LOCK:
+        JOBS[job_id]["status"] = "running"
+    try:
+        exit_code = run_console(preparation, log)
+        result = None
+        if exit_code == 0:
+            result = parse_mdpeak(find_mdpeak(preparation["run_directory"]))
+        with JOBS_LOCK:
+            JOBS[job_id]["exit_code"] = exit_code
+            JOBS[job_id]["result"] = result
+            JOBS[job_id]["status"] = "completed" if exit_code == 0 else "failed"
+    except Exception as error:
+        with JOBS_LOCK:
+            message = _diagnose_console_failure(JOBS[job_id]["logs"], str(error))
+        log(traceback.format_exc())
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "failed"
+            JOBS[job_id]["error"] = message
 
 
 def _pick_files() -> list[str]:
@@ -274,4 +379,3 @@ def main() -> None:
         pass
     finally:
         server.server_close()
-
