@@ -241,7 +241,7 @@ async function uploadDropped(dataTransfer) {
     const records = [...dataTransfer.files].map((file) => ({ file, relativePath: file.name }));
     const prepared = prepareTopLevelFileDrop(records);
     showImportMessages(prepared.messages, prepared.hasConflict ? "error" : "warning", prepared.hasConflict);
-    await resolveLocalSciexFiles(prepared);
+    if (await addDirectLocalFiles(prepared)) return;
     if (!prepared.analysisRoots.length) return;
     return uploadRecords(prepared.records, prepared.analysisRoots);
   }
@@ -250,7 +250,7 @@ async function uploadDropped(dataTransfer) {
     for (const entry of entries) await collectEntryFiles(entry, entry.name, records);
     const prepared = prepareTopLevelFileDrop(records);
     showImportMessages(prepared.messages, prepared.hasConflict ? "error" : "warning", prepared.hasConflict);
-    await resolveLocalSciexFiles(prepared);
+    if (await addDirectLocalFiles(prepared)) return;
     if (!prepared.analysisRoots.length) return;
     return uploadRecords(prepared.records, prepared.analysisRoots);
   }
@@ -259,64 +259,22 @@ async function uploadDropped(dataTransfer) {
   await uploadRecords(records, entries.map((entry) => entry.name));
 }
 
-async function resolveLocalSciexFiles(prepared) {
-  const recordNames = new Set(
-    prepared.records.map((record) => record.relativePath.toLowerCase()),
+async function addDirectLocalFiles(prepared) {
+  const primaryNames = new Set(
+    prepared.analysisRoots.map((name) => name.toLowerCase()),
   );
-  const unresolved = prepared.analysisRoots.filter((relativePath) => {
-    const lower = relativePath.toLowerCase();
-    return lower.endsWith(".wiff") && !recordNames.has(`${lower}.scan`);
-  });
-  if (!unresolved.length) return;
-
-  setStatus("Confirm the original SCIEX WIFF path; its adjacent WIFF.SCAN is used automatically.");
-  const result = await api("/api/dialog/sciex-files", {
-    method: "POST",
-    body: JSON.stringify({ filenames: unresolved }),
-  });
-  const selected = result.files || [];
-  if (!selected.length) {
-    showImportMessages(
-      [
-        "The browser cannot read an unselected sibling WIFF.SCAN file. "
-        + "The WIFF was not uploaded. Use Native file picker, Local folder, "
-        + "or confirm the original WIFF in the dialog.",
-      ],
-      "warning",
-    );
-    const unresolvedSet = new Set(unresolved.map((name) => name.toLowerCase()));
-    prepared.records = prepared.records.filter(
-      (record) => !unresolvedSet.has(record.relativePath.toLowerCase()),
-    );
-    prepared.analysisRoots = prepared.analysisRoots.filter(
-      (name) => !unresolvedSet.has(name.toLowerCase()),
-    );
-    return;
+  const primaryRecords = prepared.records.filter(
+    (record) => primaryNames.has(record.relativePath.toLowerCase()),
+  );
+  const localPaths = primaryRecords.map((record) => String(record.file.path || ""));
+  if (
+    !localPaths.length
+    || localPaths.some((path) => !/^(?:[a-zA-Z]:[\\/]|\/)/.test(path))
+  ) {
+    return false;
   }
-
-  const selectedNames = new Set(
-    selected.map((file) => file.file_path.split(/[\\/]/).pop().toLowerCase()),
-  );
-  const resolvedNames = new Set(
-    unresolved
-      .filter((name) => selectedNames.has(name.split("/").pop().toLowerCase()))
-      .map((name) => name.toLowerCase()),
-  );
-  mergeFiles(selected, result.warnings || []);
-  const unresolvedSet = new Set(unresolved.map((name) => name.toLowerCase()));
-  prepared.records = prepared.records.filter(
-    (record) => !unresolvedSet.has(record.relativePath.toLowerCase()),
-  );
-  prepared.analysisRoots = prepared.analysisRoots.filter(
-    (name) => !unresolvedSet.has(name.toLowerCase()),
-  );
-  const skipped = unresolved.filter((name) => !resolvedNames.has(name.toLowerCase()));
-  if (skipped.length) {
-    showImportMessages(
-      skipped.map((name) => `Skipped unconfirmed SCIEX WIFF: ${name}`),
-      "warning",
-    );
-  }
+  await addServerPaths(localPaths);
+  return true;
 }
 
 function prepareTopLevelFileDrop(records) {

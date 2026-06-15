@@ -45,13 +45,12 @@ never added as a separate analysis row. Other SCIEX sidecars are rejected.
 When both `.wiff` and `.wiff2` exist for the same sample, the app asks the user
 to choose one and does not add the ambiguous pair.
 
-A `.wiff` file is accepted without displaying a missing-sidecar warning. Native
-file selection and local paths retain the original path, so an adjacent
-`.wiff.scan` is used implicitly. A web browser does not reveal the original
-absolute path or unselected sibling files during a single-file drop. In that
-case, the app asks the user to confirm the original WIFF path once instead of
-uploading an incomplete copy. Folder drops/uploads already include the sibling
-and need no confirmation.
+A `.wiff` file is accepted without displaying a missing-sidecar warning or
+confirmation dialog. When the browser exposes the original local path, the app
+uses it directly and the adjacent `.wiff.scan` remains available implicitly.
+Otherwise, the WIFF is uploaded normally. If WIFF and WIFF.SCAN are dropped
+together, only WIFF appears as an analysis row and WIFF.SCAN is retained as its
+companion.
 
 The Local folder picker references one server-visible folder directly. The
 Browser folder picker uploads one folder into the app. Both can be used
