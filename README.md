@@ -9,8 +9,7 @@ LC-MS workflows.
 - MS-DIAL Console executables can be selected per operating system.
 - Raw files are always read from their original filesystem paths and are never
   copied into the app.
-- The browser UI supports direct-path drag and drop, native file dialogs, and
-  manually entered local paths.
+- The browser UI supports native file dialogs and manually entered local paths.
 - Folder-type vendor data are kept as one analysis unit: Waters `.raw`,
   Agilent `.d`, and Bruker `.d`.
 - The app has no mandatory third-party Python dependencies.
@@ -34,9 +33,9 @@ The app detects vendor folders using the same signatures as MS-DIAL:
 - Bruker: a `.d` directory containing `analysis.tdf`, `analysis.tsf`, or
   `analysis.baf`
 
-Use direct-path drag and drop, Add original folder, or Add path. Standard web
-browsers may hide absolute paths during drag and drop; in that case the app
-refuses to create a copy and asks for a native picker or explicit path.
+Use Add original files, Add original folder, or Add path. Drag and drop is not
+offered because standard web browsers do not reliably expose absolute paths,
+and this app intentionally never creates fallback copies.
 
 ## SCIEX data
 

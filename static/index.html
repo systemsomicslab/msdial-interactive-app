@@ -26,14 +26,14 @@
 
   <main>
     <section id="tab-data" class="tab active">
-      <div id="dropZone" class="drop-zone">
-        <h2>Drop raw data here</h2>
+      <div class="drop-zone">
+        <h2>Add analysis data</h2>
         <p>Raw data are referenced at their original paths and are never copied into this app.</p>
         <div class="button-row">
           <button id="pickFiles">Add original files</button>
           <button id="pickFolder" class="secondary">Add original folder</button>
         </div>
-        <p class="muted folder-help">The native pickers and Add path always retain original filesystem paths. Drag and Drop also works when the browser exposes absolute local paths; otherwise use a native picker because the app will not upload a fallback copy. A common parent folder works when analysis files or vendor folders are its immediate children.</p>
+        <p class="muted folder-help">Choose original files, choose an original folder, or enter a local path. A common parent folder works when analysis files or vendor folders are its immediate children.</p>
         <div class="path-add">
           <input id="serverPath" placeholder="/data/project or D:\data\project">
           <button id="addPath" class="secondary">Add path</button>
