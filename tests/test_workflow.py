@@ -9,6 +9,7 @@ from msdial_app.workflow import (
     expand_paths_report,
     parse_mdpeak,
     prepare_run,
+    prepare_tuning_run,
     read_adducts,
     read_lipid_queries,
     recommended_peak_parameters,
@@ -212,7 +213,7 @@ class WorkflowTests(unittest.TestCase):
                 any("WIFF.SCAN is not accessible" in issue["message"] for issue in issues)
             )
 
-    def test_staging_wiff_copies_implicit_sidecar(self) -> None:
+    def test_prepare_run_uses_original_wiff_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             wiff = root / "sample.wiff"
@@ -240,9 +241,31 @@ class WorkflowTests(unittest.TestCase):
                 }
             )
 
-            staged = Path(prepared["run_directory"]) / "input"
-            self.assertTrue((staged / wiff.name).exists())
-            self.assertTrue((staged / sidecar.name).exists())
+            run_directory = Path(prepared["run_directory"])
+            self.assertFalse((run_directory / "input").exists())
+            csv_text = Path(prepared["input_csv"]).read_text(encoding="ascii")
+            self.assertIn(str(wiff.resolve()), csv_text)
+            manifest = Path(prepared["manifest"]).read_text(encoding="utf-8")
+            self.assertIn('"stage_inputs": false', manifest)
+
+            tuning = prepare_tuning_run(
+                {
+                    "files": expand_paths([str(wiff)]),
+                    "project_type": "lcms",
+                    "console_path": str(console),
+                    "template_path": str(template),
+                    "output_root": str(root / "ignored"),
+                    "ion_mode": "Negative",
+                    "target_omics": "Metabolomics",
+                    "selected_adducts": ["[M-H]-"],
+                },
+                str(wiff.resolve()),
+                root / "diagnostic-output",
+            )
+            self.assertEqual(
+                (root / "diagnostic-output").resolve(),
+                Path(tuning["run_directory"]).parent,
+            )
 
     def test_reads_adduct_resources(self) -> None:
         resource = (

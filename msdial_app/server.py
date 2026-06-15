@@ -35,8 +35,6 @@ ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "static"
 RESOURCES = ROOT / "resources"
 KNOWLEDGE = ROOT / "knowledge"
-UPLOADS = ROOT / "work" / "uploads"
-TUNING_RUNS = ROOT / "work" / "tuning-runs"
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 KB = KnowledgeBase(KNOWLEDGE)
@@ -91,9 +89,8 @@ def _diagnose_console_failure(logs: list[str], fallback: str) -> str:
     if "required 'scan' file missing" in text or "required 'scan' file is missing" in text:
         return (
             "The SCIEX reader could not find the WIFF.SCAN adjacent to the processed WIFF. "
-            "A browser can upload a selected WIFF, but it cannot read an unselected sibling "
-            "file. Drop both files together, or use Native file picker, Local folder, or "
-            "Add path to retain the original directory."
+            "Use Add original files, Add original folder, or Add path so MS-DIAL reads "
+            "the WIFF from its original directory."
         )
     return fallback
 
@@ -166,11 +163,6 @@ class Handler(BaseHTTPRequestHandler):
                     else {"files": [], "warnings": [], "rejected": []}
                 )
                 self._json({"path": selected, **report})
-            elif parsed.path == "/api/upload-session":
-                session = uuid.uuid4().hex
-                directory = UPLOADS / session
-                directory.mkdir(parents=True, exist_ok=False)
-                self._json({"session": session, "root": str(directory.resolve())})
             elif parsed.path == "/api/knowledge/search":
                 self._json(
                     {
@@ -234,7 +226,7 @@ class Handler(BaseHTTPRequestHandler):
                 preparation = prepare_tuning_run(
                     state,
                     body.get("file_path", ""),
-                    TUNING_RUNS,
+                    state.get("output_root", ""),
                 )
                 job_id = uuid.uuid4().hex
                 with JOBS_LOCK:
@@ -260,45 +252,6 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": str(error), "trace": traceback.format_exc()},
                 HTTPStatus.BAD_REQUEST,
             )
-
-    def do_PUT(self) -> None:
-        parsed = urllib.parse.urlparse(self.path)
-        if not parsed.path.startswith("/api/uploads/"):
-            self._json({"error": "Unknown endpoint."}, HTTPStatus.NOT_FOUND)
-            return
-        parts = parsed.path.split("/")
-        if len(parts) not in (4, 5):
-            self._json({"error": "Invalid upload path."}, HTTPStatus.BAD_REQUEST)
-            return
-        session = Path(parts[3]).name
-        directory = (UPLOADS / session).resolve()
-        if directory.parent != UPLOADS.resolve() or not directory.exists():
-            self._json({"error": "Upload session not found."}, HTTPStatus.NOT_FOUND)
-            return
-        if len(parts) == 5:
-            relative = Path(urllib.parse.unquote(parts[4])).name
-        else:
-            query = urllib.parse.parse_qs(parsed.query)
-            relative = query.get("path", [""])[0].replace("\\", "/").lstrip("/")
-        if not relative:
-            self._json({"error": "Missing upload path."}, HTTPStatus.BAD_REQUEST)
-            return
-        target = (directory / Path(relative)).resolve()
-        try:
-            target.relative_to(directory)
-        except ValueError:
-            self._json({"error": "Invalid upload path."}, HTTPStatus.BAD_REQUEST)
-            return
-        target.parent.mkdir(parents=True, exist_ok=True)
-        remaining = int(self.headers.get("Content-Length", "0"))
-        with target.open("wb") as handle:
-            while remaining > 0:
-                chunk = self.rfile.read(min(1024 * 1024, remaining))
-                if not chunk:
-                    break
-                handle.write(chunk)
-                remaining -= len(chunk)
-        self._json({"path": str(target), "size": target.stat().st_size})
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"[http] {self.address_string()} {format % args}")

@@ -7,9 +7,10 @@ LC-MS workflows.
 
 - The same application code runs on Windows, macOS, and Linux.
 - MS-DIAL Console executables can be selected per operating system.
-- Large raw files stay local. Nothing is sent to an external service.
-- The browser UI supports drag-and-drop uploads, native file dialogs, and
-  server-side paths.
+- Raw files are always read from their original filesystem paths and are never
+  copied into the app.
+- The browser UI supports direct-path drag and drop, native file dialogs, and
+  manually entered local paths.
 - Folder-type vendor data are kept as one analysis unit: Waters `.raw`,
   Agilent `.d`, and Bruker `.d`.
 - The app has no mandatory third-party Python dependencies.
@@ -33,31 +34,26 @@ The app detects vendor folders using the same signatures as MS-DIAL:
 - Bruker: a `.d` directory containing `analysis.tdf`, `analysis.tsf`, or
   `analysis.baf`
 
-Use drag-and-drop, Browser folder picker, Native folder picker, or a server-side
-path. Browser folder uploads preserve the directory tree instead of flattening
-the vendor package.
+Use direct-path drag and drop, Add original folder, or Add path. Standard web
+browsers may hide absolute paths during drag and drop; in that case the app
+refuses to create a copy and asks for a native picker or explicit path.
 
 ## SCIEX data
 
 Only `.wiff` and `.wiff2` are added as SCIEX analysis files. A `.wiff.scan`
-file is transported as the required companion of its matching `.wiff`, but is
-never added as a separate analysis row. Other SCIEX sidecars are rejected.
+file is never added as a separate analysis row. It remains beside its matching
+`.wiff` in the original directory where the SCIEX reader expects it. Other
+SCIEX sidecars are rejected.
 When both `.wiff` and `.wiff2` exist for the same sample, the app asks the user
 to choose one and does not add the ambiguous pair.
 
-A `.wiff` file is accepted without displaying a missing-sidecar warning or
-confirmation dialog. When the browser exposes the original local path, the app
-uses it directly and the adjacent `.wiff.scan` remains available implicitly.
-Otherwise, the WIFF is uploaded normally. If WIFF and WIFF.SCAN are dropped
-together, only WIFF appears as an analysis row and WIFF.SCAN is retained as its
-companion. Import and processing are separate checks: MS-DIAL processing is
-blocked when the selected WIFF path has no adjacent WIFF.SCAN. A standard web
-browser cannot read an unselected sibling file, so use a direct local path or
-drop both files together for diagnostic and production runs.
+A `.wiff` file is accepted when its original path is available. The app checks
+for the adjacent `.wiff.scan` before processing. It never falls back to
+`work/uploads`.
 
-The Local folder picker references one server-visible folder directly. The
-Browser folder picker uploads one folder into the app. Both can be used
-repeatedly to accumulate multiple folders.
+Output root defaults to the directory containing the first analysis data item.
+It remains editable, and both diagnostic and production result folders are
+created below that selected location.
 
 ## Project types and adducts
 

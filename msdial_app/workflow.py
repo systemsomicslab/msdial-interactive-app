@@ -4,10 +4,8 @@ import csv
 import copy
 import datetime as dt
 import json
-import os
 import platform
 import re
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -283,8 +281,8 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                     "level": "error",
                     "message": (
                         f"WIFF.SCAN is not accessible next to {path}. "
-                        "A browser cannot upload an unselected sibling file; drop both "
-                        "files together or reference the original file/folder directly."
+                        "Use Add original files, Add original folder, or Add path so the "
+                        "original WIFF directory remains directly accessible."
                     ),
                 }
             )
@@ -411,23 +409,13 @@ def prepare_run(
     project_type = str(state.get("project_type", "lcms")).lower()
     run_directory = Path(state["output_root"]).expanduser().resolve() / f"{timestamp}-{project_type}"
     run_directory.mkdir(parents=True, exist_ok=False)
-    stage_inputs = bool(state.get("stage_inputs", True))
-    input_directory = run_directory / "input"
-    if stage_inputs:
-        input_directory.mkdir()
-
     effective_files: list[Path] = []
     files = state["files"]
     for index, item in enumerate(files):
         source = Path(item["file_path"]).resolve()
         if progress:
-            progress(f"Staging input {index + 1}/{len(files)}: {source.name}")
-        if stage_inputs:
-            target = input_directory / source.name
-            _stage_path(source, target)
-            effective_files.append(target)
-        else:
-            effective_files.append(source)
+            progress(f"Using original input {index + 1}/{len(files)}: {source}")
+        effective_files.append(source)
 
     csv_path = run_directory / "analysis_files.csv"
     _write_analysis_csv(csv_path, files, effective_files)
@@ -439,7 +427,7 @@ def prepare_run(
         "platform": platform.platform(),
         "analysis_type": project_type,
         "project_file_requested": True,
-        "stage_inputs": stage_inputs,
+        "stage_inputs": False,
         "input_csv": str(csv_path),
         "method_file": str(method_path),
         "output_folder": str(run_directory),
@@ -749,25 +737,6 @@ def _title_for_key(key: str) -> str:
         "export as mztabm format": "Export as mztabM format",
     }
     return names[key]
-
-
-def _stage_path(source: Path, target: Path) -> None:
-    if source.is_dir():
-        shutil.copytree(source, target)
-        return
-    target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.link(source, target)
-    except OSError:
-        shutil.copy2(source, target)
-    if source.suffix.lower() == ".wiff":
-        sidecar = Path(str(source) + ".scan")
-        if sidecar.exists():
-            sidecar_target = Path(str(target) + ".scan")
-            try:
-                os.link(sidecar, sidecar_target)
-            except OSError:
-                shutil.copy2(sidecar, sidecar_target)
 
 
 def _nullable_float(value: Any) -> float | None:

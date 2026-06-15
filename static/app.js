@@ -6,6 +6,7 @@ const state = {
   tuningJobId: null,
   tuningResult: null,
   config: null,
+  outputRootAutomatic: true,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -58,7 +59,7 @@ function workflow() {
     msp_matched_peaks_percentage: Number($("#mspMatchedPercentage").value),
     msp_minimum_spectrum_match: Number($("#mspMinimumSpectrumMatch").value),
     together_with_alignment: true,
-    stage_inputs: $("#stageInputs").checked,
+    stage_inputs: false,
     selected_lipids: state.lipidQueries.filter((item) => item.selected),
     selected_adducts: (state.adducts[$("#ionMode").value] || [])
       .filter((item) => item.selected)
@@ -147,6 +148,7 @@ function renderFiles() {
     row.querySelector(".remove").addEventListener("click", () => {
       state.files.splice(index, 1);
       state.files.forEach((item, order) => item.analytical_order = order + 1);
+      if (state.outputRootAutomatic) setOutputRootFromFirstFile();
       renderFiles();
       refreshQuestion();
     });
@@ -199,7 +201,10 @@ function mergeFiles(files, messages = []) {
   }
   state.files.forEach((item, index) => item.analytical_order = index + 1);
   renderFiles();
-  if (wasEmpty && state.files.length) applyRecommendedParameters();
+  if (wasEmpty && state.files.length) {
+    applyRecommendedParameters();
+    if (state.outputRootAutomatic) setOutputRootFromFirstFile();
+  }
   refreshQuestion().catch((error) => showImportMessages([error.message || String(error)], "error"));
   const allMessages = [...messages, ...conflictMessages];
   showImportMessages(allMessages, conflictMessages.length ? "error" : "warning", conflictMessages.length > 0);
@@ -215,25 +220,7 @@ async function addServerPaths(paths) {
   mergeFiles(result.files || [], [...(result.warnings || []), ...rejected]);
 }
 
-async function uploadRecords(records, roots) {
-  setStatus(`Uploading ${records.length} file(s)...`);
-  const { session, root } = await api("/api/upload-session", { method: "POST", body: "{}" });
-  for (let index = 0; index < records.length; index++) {
-    const { file, relativePath } = records[index];
-    setStatus(`Uploading ${index + 1}/${records.length}: ${relativePath}`);
-    const response = await fetch(`/api/uploads/${session}?path=${encodeURIComponent(relativePath)}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/octet-stream" },
-      body: file,
-    });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error || "Upload failed");
-  }
-  const separator = root.includes("\\") ? "\\" : "/";
-  await addServerPaths(roots.map((relative) => `${root}${separator}${relative.replaceAll("/", separator)}`));
-}
-
-async function uploadDropped(dataTransfer) {
+async function importDropped(dataTransfer) {
   const entries = [...dataTransfer.items]
     .map((item) => item.webkitGetAsEntry?.())
     .filter(Boolean);
@@ -243,7 +230,7 @@ async function uploadDropped(dataTransfer) {
     showImportMessages(prepared.messages, prepared.hasConflict ? "error" : "warning", prepared.hasConflict);
     if (await addDirectLocalFiles(prepared)) return;
     if (!prepared.analysisRoots.length) return;
-    return uploadRecords(prepared.records, prepared.analysisRoots);
+    throw new Error(originalPathRequiredMessage());
   }
   if (entries.every((entry) => entry.isFile)) {
     const records = [];
@@ -252,11 +239,20 @@ async function uploadDropped(dataTransfer) {
     showImportMessages(prepared.messages, prepared.hasConflict ? "error" : "warning", prepared.hasConflict);
     if (await addDirectLocalFiles(prepared)) return;
     if (!prepared.analysisRoots.length) return;
-    return uploadRecords(prepared.records, prepared.analysisRoots);
+    throw new Error(originalPathRequiredMessage());
   }
   const records = [];
   for (const entry of entries) await collectEntryFiles(entry, entry.name, records);
-  await uploadRecords(records, entries.map((entry) => entry.name));
+  const roots = originalFolderPaths(records, entries.map((entry) => entry.name));
+  if (!roots.length || roots.length !== entries.length) {
+    throw new Error(originalPathRequiredMessage());
+  }
+  await addServerPaths(roots);
+}
+
+function originalPathRequiredMessage() {
+  return "This browser did not expose the original local path. "
+    + "No copy was created. Use Add original files, Add original folder, or Add path.";
 }
 
 async function addDirectLocalFiles(prepared) {
@@ -275,6 +271,21 @@ async function addDirectLocalFiles(prepared) {
   }
   await addServerPaths(localPaths);
   return true;
+}
+
+function originalFolderPaths(records, rootNames) {
+  return rootNames.map((rootName) => {
+    const normalizedRoot = rootName.replaceAll("\\", "/");
+    const record = records.find((item) => {
+      const relative = item.relativePath.replaceAll("\\", "/");
+      return relative === normalizedRoot || relative.startsWith(`${normalizedRoot}/`);
+    });
+    const absolute = String(record?.file?.path || "").replaceAll("\\", "/");
+    const relative = String(record?.relativePath || "").replaceAll("\\", "/");
+    if (!/^(?:[a-zA-Z]:\/|\/)/.test(absolute)) return "";
+    if (!absolute.toLowerCase().endsWith(relative.toLowerCase())) return "";
+    return absolute.slice(0, absolute.length - relative.length + normalizedRoot.length);
+  }).filter(Boolean);
 }
 
 function prepareTopLevelFileDrop(records) {
@@ -339,13 +350,20 @@ async function collectEntryFiles(entry, relativePath, records) {
   }
 }
 
-async function uploadBrowserFolder(files) {
-  const records = [...files].map((file) => ({
-    file,
-    relativePath: file.webkitRelativePath || file.name,
-  }));
-  const roots = [...new Set(records.map((item) => item.relativePath.split("/")[0]))];
-  await uploadRecords(records, roots);
+function parentDirectory(path) {
+  const normalized = String(path || "").replace(/[\\/]+$/, "");
+  const separatorIndex = Math.max(normalized.lastIndexOf("/"), normalized.lastIndexOf("\\"));
+  if (separatorIndex < 0) return "";
+  if (separatorIndex === 2 && /^[a-zA-Z]:/.test(normalized)) {
+    return normalized.slice(0, 3);
+  }
+  return separatorIndex === 0 ? normalized[0] : normalized.slice(0, separatorIndex);
+}
+
+function setOutputRootFromFirstFile() {
+  $("#outputRoot").value = state.files.length
+    ? parentDirectory(state.files[0].file_path)
+    : "";
 }
 
 function renderLipids() {
@@ -464,7 +482,7 @@ function renderTuningFormat() {
   const file = selectedTuningFile();
   const sidecarNote = file?.format === "SCIEX WIFF" && !file.sidecar_available
     ? "<br><strong>WIFF.SCAN is not accessible from this imported path.</strong> "
-      + "Drop WIFF and WIFF.SCAN together, or add the original file/folder as a local path."
+      + "Add the original WIFF file or its containing folder so the sibling remains accessible."
     : "";
   $("#tuningFormat").innerHTML = file
     ? `<strong>${escapeHtml(file.format)}</strong><br>
@@ -622,19 +640,22 @@ $("#pickFolder").addEventListener("click", () => runUiAction(async () => {
     ...(result.rejected || []).map((path) => `Rejected unsupported analysis input: ${path}`),
   ]);
 }));
-$("#browserFolder").addEventListener("click", () => $("#browserFolderInput").click());
-$("#browserFolderInput").addEventListener("change", (event) =>
-  uploadBrowserFolder(event.target.files)
-    .catch((error) => showImportMessages([error.message || String(error)], "error"))
-    .finally(() => { event.target.value = ""; }));
 $("#addPath").addEventListener("click", () => runUiAction(async () => {
   if ($("#serverPath").value.trim()) await addServerPaths([$("#serverPath").value.trim()]);
 }));
 $("#clearFiles").addEventListener("click", () => {
   state.files = [];
+  if (state.outputRootAutomatic) setOutputRootFromFirstFile();
   renderFiles();
   showImportMessages([]);
   refreshQuestion().catch((error) => showImportMessages([error.message || String(error)], "error"));
+});
+$("#outputRoot").addEventListener("input", () => {
+  state.outputRootAutomatic = false;
+});
+$("#useDataDirectory").addEventListener("click", () => {
+  state.outputRootAutomatic = true;
+  setOutputRootFromFirstFile();
 });
 
 const dropZone = $("#dropZone");
@@ -645,7 +666,7 @@ const dropZone = $("#dropZone");
   event.preventDefault(); dropZone.classList.remove("drag");
 }));
 dropZone.addEventListener("drop", (event) =>
-  uploadDropped(event.dataTransfer)
+  importDropped(event.dataTransfer)
     .catch((error) => showImportMessages([error.message || String(error)], "error")));
 
 $("#projectType").addEventListener("change", () => {
@@ -698,8 +719,8 @@ $("#runTuning").addEventListener("click", () => runUiAction(async () => {
   if (file?.format === "SCIEX WIFF" && !file.sidecar_available) {
     missing.push(
       "The imported WIFF path has no adjacent WIFF.SCAN. "
-      + "Drop both files together, or use Native file picker, Local folder, or Add path "
-      + "so MS-DIAL can read the original sibling file."
+      + "Use Add original files, Add original folder, or Add path "
+      + "so MS-DIAL reads the WIFF from its original directory."
     );
   }
   if (!current.console_path) missing.push("Set the MS-DIAL Console path in Guided setup.");
