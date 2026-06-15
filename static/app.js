@@ -15,7 +15,13 @@ async function api(path, options = {}) {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
   });
-  const result = await response.json();
+  const text = await response.text();
+  let result;
+  try {
+    result = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(`The local app returned an invalid response (HTTP ${response.status}).`);
+  }
   if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
   return result;
 }
@@ -56,6 +62,30 @@ function workflow() {
 }
 
 function setStatus(text) { $("#status").textContent = text; }
+
+function showImportMessages(messages, level = "warning", useAlert = false) {
+  const panel = $("#importMessages");
+  const unique = [...new Set((messages || []).filter(Boolean))];
+  if (!unique.length) {
+    panel.hidden = true;
+    panel.textContent = "";
+    panel.classList.remove("error");
+    return;
+  }
+  panel.hidden = false;
+  panel.classList.toggle("error", level === "error");
+  panel.textContent = unique.join("\n");
+  setStatus(unique[0]);
+  if (useAlert) window.alert(unique.join("\n"));
+}
+
+async function runUiAction(action) {
+  try {
+    await action();
+  } catch (error) {
+    showImportMessages([error.message || String(error)], "error");
+  }
+}
 
 function renderVendorTips() {
   const panel = $("#vendorTips");
@@ -122,9 +152,32 @@ function escapeHtml(value) {
   })[char]);
 }
 
-function mergeFiles(files) {
+function sciexDescriptor(file) {
+  const match = String(file.file_path || "").match(/^(.*)\.(wiff2|wiff)$/i);
+  return match ? { sample: match[1].toLowerCase(), extension: match[2].toLowerCase() } : null;
+}
+
+function mergeFiles(files, messages = []) {
   const wasEmpty = state.files.length === 0;
+  const combined = [...state.files, ...files];
+  const sciexBySample = new Map();
+  combined.forEach((file) => {
+    const descriptor = sciexDescriptor(file);
+    if (!descriptor) return;
+    if (!sciexBySample.has(descriptor.sample)) sciexBySample.set(descriptor.sample, new Set());
+    sciexBySample.get(descriptor.sample).add(descriptor.extension);
+  });
+  const conflicts = new Set(
+    [...sciexBySample.entries()]
+      .filter(([, extensions]) => extensions.has("wiff") && extensions.has("wiff2"))
+      .map(([sample]) => sample),
+  );
+  const conflictMessages = [...conflicts].map((sample) =>
+    `Both .wiff and .wiff2 were supplied for '${sample}'. Choose exactly one; neither new file was added.`
+  );
   for (const file of files) {
+    const descriptor = sciexDescriptor(file);
+    if (descriptor && conflicts.has(descriptor.sample)) continue;
     if (!state.files.some((item) => item.file_path.toLowerCase() === file.file_path.toLowerCase())) {
       state.files.push(file);
     }
@@ -132,14 +185,19 @@ function mergeFiles(files) {
   state.files.forEach((item, index) => item.analytical_order = index + 1);
   renderFiles();
   if (wasEmpty && state.files.length) applyRecommendedParameters();
-  refreshQuestion();
+  refreshQuestion().catch((error) => showImportMessages([error.message || String(error)], "error"));
+  const allMessages = [...messages, ...conflictMessages];
+  showImportMessages(allMessages, conflictMessages.length ? "error" : "warning", conflictMessages.length > 0);
 }
 
 async function addServerPaths(paths) {
   const result = await api("/api/files/expand", {
     method: "POST", body: JSON.stringify({ paths })
   });
-  mergeFiles(result.files);
+  const rejected = (result.rejected || []).map((path) =>
+    `Rejected unsupported analysis input: ${path}. Use .wiff or .wiff2 for SCIEX data.`
+  );
+  mergeFiles(result.files || [], [...(result.warnings || []), ...rejected]);
 }
 
 async function uploadRecords(records, roots) {
@@ -166,11 +224,68 @@ async function uploadDropped(dataTransfer) {
     .filter(Boolean);
   if (!entries.length) {
     const records = [...dataTransfer.files].map((file) => ({ file, relativePath: file.name }));
-    return uploadRecords(records, records.map((item) => item.relativePath));
+    const prepared = prepareTopLevelFileDrop(records);
+    showImportMessages(prepared.messages, prepared.hasConflict ? "error" : "warning", prepared.hasConflict);
+    if (!prepared.analysisRoots.length) return;
+    return uploadRecords(prepared.records, prepared.analysisRoots);
+  }
+  if (entries.every((entry) => entry.isFile)) {
+    const records = [];
+    for (const entry of entries) await collectEntryFiles(entry, entry.name, records);
+    const prepared = prepareTopLevelFileDrop(records);
+    showImportMessages(prepared.messages, prepared.hasConflict ? "error" : "warning", prepared.hasConflict);
+    if (!prepared.analysisRoots.length) return;
+    return uploadRecords(prepared.records, prepared.analysisRoots);
   }
   const records = [];
   for (const entry of entries) await collectEntryFiles(entry, entry.name, records);
   await uploadRecords(records, entries.map((entry) => entry.name));
+}
+
+function prepareTopLevelFileDrop(records) {
+  const supported = [".wiff2", ".wiff", ".raw", ".mzml", ".mzxml", ".cdf", ".abf", ".ibf"];
+  const byLowerName = new Map(records.map((record) => [record.relativePath.toLowerCase(), record]));
+  const primary = records.filter((record) =>
+    supported.some((extension) => record.relativePath.toLowerCase().endsWith(extension))
+  );
+  const sampleKinds = new Map();
+  primary.forEach((record) => {
+    const match = record.relativePath.match(/^(.*)\.(wiff2|wiff)$/i);
+    if (!match) return;
+    const sample = match[1].toLowerCase();
+    if (!sampleKinds.has(sample)) sampleKinds.set(sample, new Set());
+    sampleKinds.get(sample).add(match[2].toLowerCase());
+  });
+  const conflicts = new Set(
+    [...sampleKinds.entries()]
+      .filter(([, kinds]) => kinds.has("wiff") && kinds.has("wiff2"))
+      .map(([sample]) => sample),
+  );
+  const acceptedPrimary = primary.filter((record) => {
+    const match = record.relativePath.match(/^(.*)\.(wiff2|wiff)$/i);
+    return !match || !conflicts.has(match[1].toLowerCase());
+  });
+  const acceptedRecords = [...acceptedPrimary];
+  acceptedPrimary
+    .filter((record) => record.relativePath.toLowerCase().endsWith(".wiff"))
+    .forEach((record) => {
+      const sidecar = byLowerName.get(`${record.relativePath.toLowerCase()}.scan`);
+      if (sidecar) acceptedRecords.push(sidecar);
+    });
+  const acceptedNames = new Set(acceptedRecords.map((record) => record.relativePath.toLowerCase()));
+  const rejected = records.filter((record) => !acceptedNames.has(record.relativePath.toLowerCase()));
+  const messages = [
+    ...[...conflicts].map((sample) =>
+      `Both ${sample}.wiff and ${sample}.wiff2 were dropped. Choose exactly one SCIEX primary file.`
+    ),
+    ...rejected.map((record) => `Rejected unsupported analysis input: ${record.relativePath}`),
+  ];
+  return {
+    records: acceptedRecords,
+    analysisRoots: acceptedPrimary.map((record) => record.relativePath),
+    messages,
+    hasConflict: conflicts.size > 0,
+  };
 }
 
 async function collectEntryFiles(entry, relativePath, records) {
@@ -367,15 +482,33 @@ $("#tabs").addEventListener("click", (event) => {
   $$(".tab").forEach((tab) => tab.classList.toggle("active", tab.id === `tab-${event.target.dataset.tab}`));
 });
 
-$("#pickFiles").addEventListener("click", async () => mergeFiles((await api("/api/dialog/files", { method: "POST", body: "{}" })).files));
-$("#pickFolder").addEventListener("click", async () => mergeFiles((await api("/api/dialog/directory", { method: "POST", body: "{}" })).files));
+$("#pickFiles").addEventListener("click", () => runUiAction(async () => {
+  const result = await api("/api/dialog/files", { method: "POST", body: "{}" });
+  mergeFiles(result.files || [], [
+    ...(result.warnings || []),
+    ...(result.rejected || []).map((path) => `Rejected unsupported analysis input: ${path}`),
+  ]);
+}));
+$("#pickFolder").addEventListener("click", () => runUiAction(async () => {
+  const result = await api("/api/dialog/directory", { method: "POST", body: "{}" });
+  mergeFiles(result.files || [], [
+    ...(result.warnings || []),
+    ...(result.rejected || []).map((path) => `Rejected unsupported analysis input: ${path}`),
+  ]);
+}));
 $("#browserFolder").addEventListener("click", () => $("#browserFolderInput").click());
 $("#browserFolderInput").addEventListener("change", (event) =>
-  uploadBrowserFolder(event.target.files).catch((error) => setStatus(error.message)));
-$("#addPath").addEventListener("click", async () => {
+  uploadBrowserFolder(event.target.files)
+    .catch((error) => showImportMessages([error.message || String(error)], "error")));
+$("#addPath").addEventListener("click", () => runUiAction(async () => {
   if ($("#serverPath").value.trim()) await addServerPaths([$("#serverPath").value.trim()]);
+}));
+$("#clearFiles").addEventListener("click", () => {
+  state.files = [];
+  renderFiles();
+  showImportMessages([]);
+  refreshQuestion().catch((error) => showImportMessages([error.message || String(error)], "error"));
 });
-$("#clearFiles").addEventListener("click", () => { state.files = []; renderFiles(); refreshQuestion(); });
 
 const dropZone = $("#dropZone");
 ["dragenter", "dragover"].forEach((name) => dropZone.addEventListener(name, (event) => {
@@ -384,7 +517,9 @@ const dropZone = $("#dropZone");
 ["dragleave", "drop"].forEach((name) => dropZone.addEventListener(name, (event) => {
   event.preventDefault(); dropZone.classList.remove("drag");
 }));
-dropZone.addEventListener("drop", (event) => uploadDropped(event.dataTransfer).catch((error) => setStatus(error.message)));
+dropZone.addEventListener("drop", (event) =>
+  uploadDropped(event.dataTransfer)
+    .catch((error) => showImportMessages([error.message || String(error)], "error")));
 
 $("#ionMode").addEventListener("change", () => { renderLipids(); refreshQuestion(); });
 $("#targetOmics").addEventListener("change", refreshQuestion);

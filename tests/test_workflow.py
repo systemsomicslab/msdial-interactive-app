@@ -6,6 +6,7 @@ from msdial_app.workflow import (
     build_console_command,
     detect_raw_format,
     expand_paths,
+    expand_paths_report,
     parse_mdpeak,
     prepare_run,
     read_lipid_queries,
@@ -153,6 +154,44 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual([50.0, 100.0], result["heights"])
             self.assertEqual(1, result["msp_candidate_count"])
             self.assertEqual(0.7, result["msp_scores"][0]["weighted"])
+
+    def test_sciex_primary_files_and_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            wiff = root / "sample.wiff"
+            wiff.write_bytes(b"")
+            (root / "sample.wiff.scan").write_bytes(b"")
+            wiff2 = root / "sample.wiff2"
+            wiff2.write_bytes(b"")
+
+            report = expand_paths_report([str(root)])
+
+            self.assertEqual(2, len(report["files"]))
+            formats = {item["format"] for item in report["files"]}
+            self.assertEqual({"SCIEX WIFF", "SCIEX WIFF2"}, formats)
+            self.assertEqual("SCIEX", detect_raw_format(wiff)["vendor"])
+            self.assertEqual(1, len(report["warnings"]))
+            self.assertIn("Both .wiff and .wiff2", report["warnings"][0])
+
+    def test_sciex_sidecar_is_not_an_analysis_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sidecar = Path(temporary) / "sample.wiff.scan"
+            sidecar.write_bytes(b"")
+
+            report = expand_paths_report([str(sidecar)])
+
+            self.assertEqual([], report["files"])
+            self.assertEqual([str(sidecar.resolve())], report["rejected"])
+
+    def test_sciex_wiff_without_sidecar_warns_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            wiff = Path(temporary) / "sample.wiff"
+            wiff.write_bytes(b"")
+
+            report = expand_paths_report([str(wiff)])
+
+            self.assertEqual(1, len(report["files"]))
+            self.assertIn("sidecar was not found", report["warnings"][0])
 
     def test_agilent_validation_explains_reader_prerequisites(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

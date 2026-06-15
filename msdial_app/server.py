@@ -18,6 +18,7 @@ from .knowledge import KnowledgeBase, next_parameter_question
 from .workflow import (
     console_version,
     expand_paths,
+    expand_paths_report,
     find_mdpeak,
     parse_method,
     parse_mdpeak,
@@ -100,12 +101,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self._read_json()
             if parsed.path == "/api/files/expand":
-                self._json({"files": expand_paths(body.get("paths", []))})
+                self._json(expand_paths_report(body.get("paths", [])))
             elif parsed.path == "/api/dialog/files":
-                self._json({"files": expand_paths(_pick_files())})
+                self._json(expand_paths_report(_pick_files()))
             elif parsed.path == "/api/dialog/directory":
                 selected = _pick_directory()
-                self._json({"path": selected, "files": expand_paths([selected]) if selected else []})
+                report = (
+                    expand_paths_report([selected])
+                    if selected
+                    else {"files": [], "warnings": [], "rejected": []}
+                )
+                self._json({"path": selected, **report})
             elif parsed.path == "/api/upload-session":
                 session = uuid.uuid4().hex
                 directory = UPLOADS / session
@@ -341,7 +347,15 @@ def _pick_files() -> list[str]:
 
         root = tk.Tk()
         root.withdraw()
-        paths = filedialog.askopenfilenames(title="Select MS-DIAL analysis files")
+        root.attributes("-topmost", True)
+        root.update()
+        paths = filedialog.askopenfilenames(
+            title="Select MS-DIAL analysis files",
+            filetypes=[
+                ("MS-DIAL raw data", "*.wiff *.wiff2 *.raw *.mzML *.mzXML *.cdf *.abf *.ibf"),
+                ("All files", "*.*"),
+            ],
+        )
         root.destroy()
         return list(paths)
     except Exception:
@@ -355,6 +369,8 @@ def _pick_directory() -> str:
 
         root = tk.Tk()
         root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
         path = filedialog.askdirectory(title="Select directory")
         root.destroy()
         return path

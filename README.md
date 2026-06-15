@@ -37,6 +37,14 @@ Use drag-and-drop, Browser folder picker, Native folder picker, or a server-side
 path. Browser folder uploads preserve the directory tree instead of flattening
 the vendor package.
 
+## SCIEX data
+
+Only `.wiff` and `.wiff2` are added as SCIEX analysis files. A `.wiff.scan`
+file is transported as the required companion of its matching `.wiff`, but is
+never added as a separate analysis row. Other SCIEX sidecars are rejected.
+When both `.wiff` and `.wiff2` exist for the same sample, the app asks the user
+to choose one and does not add the ambiguous pair.
+
 ## LC-MS parameter tuning
 
 The Tune parameters screen runs one representative file with:

@@ -21,6 +21,7 @@ SUPPORTED_SUFFIXES = {
     ".mzxml",
     ".raw",
     ".wiff",
+    ".wiff2",
 }
 VC2013_DOWNLOAD_URL = (
     "https://support.microsoft.com/en-us/topic/"
@@ -38,6 +39,14 @@ def is_supported(path: Path) -> bool:
 def detect_raw_format(path: str | Path) -> dict[str, Any]:
     target = Path(path)
     suffix = target.suffix.lower()
+    if target.is_file() and suffix in {".wiff", ".wiff2"}:
+        return {
+            "vendor": "SCIEX",
+            "format": "SCIEX WIFF" if suffix == ".wiff" else "SCIEX WIFF2",
+            "instrument_family": "QTOF",
+            "minimum_peak_height": 100,
+            "mass_slice_width": 0.1,
+        }
     if target.is_dir() and suffix == ".raw":
         return {
             "vendor": "Waters",
@@ -95,7 +104,12 @@ def recommended_peak_parameters(files: Iterable[dict[str, Any]]) -> dict[str, An
 
 
 def expand_paths(paths: Iterable[str]) -> list[dict[str, Any]]:
+    return expand_paths_report(paths)["files"]
+
+
+def expand_paths_report(paths: Iterable[str]) -> dict[str, Any]:
     expanded: list[Path] = []
+    rejected: list[str] = []
     for raw in paths:
         path = Path(raw).expanduser().resolve()
         if path.is_file() and is_supported(path):
@@ -108,6 +122,10 @@ def expand_paths(paths: Iterable[str]) -> list[dict[str, Any]]:
                 for child in path.iterdir()
                 if is_supported(child)
             )
+        elif path.exists():
+            rejected.append(str(path))
+        else:
+            rejected.append(f"{path} (not found)")
     unique = sorted(set(expanded), key=lambda item: str(item).lower())
     result = []
     for index, path in enumerate(unique):
@@ -137,7 +155,31 @@ def expand_paths(paths: Iterable[str]) -> list[dict[str, Any]]:
                 **format_info,
             }
         )
-    return result
+    warnings = _sciex_pair_warnings(unique)
+    warnings.extend(
+        f"SCIEX WIFF sidecar was not found: {path}.scan"
+        for path in unique
+        if path.suffix.lower() == ".wiff" and not Path(str(path) + ".scan").exists()
+    )
+    return {"files": result, "warnings": warnings, "rejected": rejected}
+
+
+def _sciex_pair_warnings(paths: Iterable[Path]) -> list[str]:
+    samples: dict[tuple[str, str], set[str]] = {}
+    for path in paths:
+        suffix = path.suffix.lower()
+        if suffix not in {".wiff", ".wiff2"}:
+            continue
+        key = (str(path.parent).lower(), path.stem.lower())
+        samples.setdefault(key, set()).add(suffix)
+    return [
+        (
+            f"Both .wiff and .wiff2 were found for sample '{sample}'. "
+            "Choose exactly one SCIEX primary data file."
+        )
+        for (_, sample), suffixes in samples.items()
+        if suffixes == {".wiff", ".wiff2"}
+    ]
 
 
 def read_lipid_queries(path: str | Path) -> list[dict[str, Any]]:
@@ -194,6 +236,7 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
         issues.append({"level": "error", "message": "No analysis files were added."})
     names = set()
     acquisition_types = set()
+    sciex_samples: dict[tuple[str, str], set[str]] = {}
     for item in files:
         path = Path(item.get("file_path", ""))
         name = str(item.get("file_name", ""))
@@ -219,6 +262,20 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
             issues.append({"level": "error", "message": f"Duplicate file_name: {name}"})
         names.add(name.lower())
         acquisition_types.add(item.get("acquisition_type", "DDA"))
+        if path.suffix.lower() in {".wiff", ".wiff2"}:
+            key = (str(path.parent).lower(), path.stem.lower())
+            sciex_samples.setdefault(key, set()).add(path.suffix.lower())
+    for (_, sample), suffixes in sciex_samples.items():
+        if suffixes == {".wiff", ".wiff2"}:
+            issues.append(
+                {
+                    "level": "error",
+                    "message": (
+                        f"Both .wiff and .wiff2 are selected for sample '{sample}'. "
+                        "Keep exactly one SCIEX primary data file."
+                    ),
+                }
+            )
     if len(acquisition_types) > 1:
         issues.append(
             {

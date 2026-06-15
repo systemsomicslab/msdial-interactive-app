@@ -46,6 +46,8 @@ td:nth-child(2) { min-width: 360px; color: var(--muted); font-size: 12px; }
 .vendor-tips { border: 1px solid #e1bd62; border-left: 5px solid #c28a00; border-radius: 7px; padding: 14px 16px; margin: 16px 0; background: #fff8e5; }
 .vendor-tips h2 { margin: 0 0 8px; font-size: 18px; }
 .vendor-tips p { margin: 6px 0; line-height: 1.5; }
+.import-messages { border: 1px solid #e1bd62; border-radius: 7px; padding: 12px 14px; margin: 16px 0; background: #fff8e5; color: var(--warn); white-space: pre-wrap; }
+.import-messages.error { border-color: #d98d98; background: #fff0f1; color: var(--danger); }
 .panel { border: 1px solid var(--line); border-radius: 7px; padding: 16px; margin-bottom: 16px; }
 .guide-layout, .help-layout, .run-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 .assistant-panel { border: 1px solid #b9dde3; background: #eaf5f7; border-radius: 7px; padding: 16px; }
