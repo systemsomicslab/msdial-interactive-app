@@ -278,6 +278,11 @@ See the Japanese distribution memo:
 docs/distribution_ja.md
 ```
 
+## License
+
+This project is released under the GNU Lesser General Public License version
+3.0. See `LICENSE`, `COPYING`, and `COPYING.LESSER`.
+
 ## Optional lab-server mode
 
 Lab-server mode is still available for advanced cases:
