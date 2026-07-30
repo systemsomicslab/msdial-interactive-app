@@ -25,19 +25,32 @@
   </nav>
 
   <main>
+    <div id="serverNotice" class="server-notice" hidden></div>
     <section id="tab-data" class="tab active">
       <div class="drop-zone">
         <h2>Add analysis data</h2>
         <p>Raw data are referenced at their original paths and are never copied into this app.</p>
         <div class="button-row">
           <button id="pickFiles">Add original files</button>
-          <button id="pickFolder" class="secondary">Add original folder</button>
+          <button id="pickVendorFolder" class="secondary">Add vendor folders (.d/.raw)</button>
+          <button id="pickFolder" class="secondary">Add parent folder</button>
         </div>
-        <p class="muted folder-help">Choose original files, choose an original folder, or enter a local path. A common parent folder works when analysis files or vendor folders are its immediate children.</p>
+        <p class="muted folder-help">Use Add original files for file-type data such as WIFF, mzML, ABF, or Thermo RAW. Use Add vendor folders for folder-type data such as Agilent .d, Bruker .d, or Waters .raw; multiple vendor folders can be selected in the local path browser. Browser drag-and-drop cannot reliably expose original absolute paths, so this app references local paths through the path browser or Add path.</p>
         <div class="path-add">
           <input id="serverPath" placeholder="/data/project or D:\data\project">
           <button id="addPath" class="secondary">Add path</button>
         </div>
+        <p class="muted">
+          Parameter templates and demo data are available from the
+          <a href="https://systemsomicslab.github.io/msdial5tutorial/consoleapp.html"
+             target="_blank" rel="noreferrer">Console app tutorial</a>.
+          Demo packages:
+          <a href="https://zenodo.org/records/18336159"
+             target="_blank" rel="noreferrer">LC-MS/MS lipidomics</a>
+          and
+          <a href="https://zenodo.org/records/10604540"
+             target="_blank" rel="noreferrer">GC-MS</a>.
+        </p>
       </div>
       <div id="vendorTips" class="vendor-tips" hidden></div>
       <div id="importMessages" class="import-messages" hidden></div>
@@ -103,11 +116,6 @@
           Download the stable Console package from the
           <a href="https://github.com/systemsomicslab/MsdialWorkbench/releases/tag/MSDIAL-v5.5.260323"
              target="_blank" rel="noreferrer">MS-DIAL v5.5.260323 GitHub release</a>.
-          Parameter templates and demo data are available from the
-          <a href="https://systemsomicslab.github.io/msdial5tutorial/consoleapp.html"
-             target="_blank" rel="noreferrer">Console app tutorial</a>
-          and <a href="https://zenodo.org/records/18336159"
-                 target="_blank" rel="noreferrer">Zenodo record 18336159</a>.
         </p>
         <div class="path-grid">
           <label>MS-DIAL Console<input id="consolePath" placeholder="/opt/msdial/MSDIALCUI or C:\...\MSDIALCUI.exe"></label>
@@ -125,6 +133,17 @@
         <h2>Peak detection and alignment</h2>
         <div class="form-grid">
           <label>Number of threads<input id="numberOfThreads" type="number" min="1" value="4"></label>
+          <label>Smoothing method
+            <select id="smoothingMethod">
+              <option>SimpleMovingAverage</option>
+              <option selected>LinearWeightedMovingAverage</option>
+              <option>SavitzkyGolayFilter</option>
+              <option>BinomialFilter</option>
+              <option>LowessFilter</option>
+              <option>LoessFilter</option>
+              <option>TimeBasedLinearWeightedMovingAverage</option>
+            </select>
+          </label>
           <label>Minimum peak height<input id="minimumPeakHeight" type="number" min="0" value="300"></label>
           <label>Mass slice width<input id="massSliceWidth" type="number" min="0.001" step="0.001" value="0.1"></label>
           <label>Minimum peak width<input id="minimumPeakWidth" type="number" min="1" value="5"></label>
@@ -136,31 +155,154 @@
           <label>Alignment MS1 tolerance<input id="alignmentMs1Tolerance" type="number" step="any" value="0.015"></label>
         </div>
       </div>
+      <div id="gcmsSettings" class="panel" hidden>
+        <h2>GC-MS retention index settings</h2>
+        <p class="muted">Use RT-only when retention index is not calculated. If Annotation or Alignment uses RI, provide either one alkane/FAME carbon-RT file for all samples or an existing per-file RI dictionary.</p>
+        <div class="form-grid">
+          <label>Accuracy type
+            <select id="gcmsAccuracyType">
+              <option>IsNominal</option>
+              <option>IsAccurate</option>
+            </select>
+          </label>
+          <label>RI compound type
+            <select id="gcmsRiCompoundType">
+              <option>Alkanes</option>
+              <option>Fames</option>
+            </select>
+          </label>
+          <label>Annotation retention type
+            <select id="gcmsRetentionType">
+              <option>RT</option>
+              <option selected>RI</option>
+            </select>
+          </label>
+          <label>Alignment index type
+            <select id="gcmsAlignmentIndexType">
+              <option>RT</option>
+              <option selected>RI</option>
+            </select>
+          </label>
+          <label>RI alignment tolerance
+            <input id="gcmsRiAlignmentTolerance" type="number" step="any" value="10">
+          </label>
+          <label>RI dictionary source
+            <select id="gcmsRiSource">
+              <option value="single">Use one carbon-RT file for all samples</option>
+              <option value="perFile">Build per-file dictionary in this UI</option>
+              <option value="dictionary">Use existing per-file dictionary</option>
+            </select>
+          </label>
+          <label id="gcmsRiStandardField">Alkane/FAME carbon-RT file
+            <input id="gcmsRiStandardPath" placeholder="D:\...\alkaneinfo.txt or /data/alkaneinfo.txt">
+          </label>
+          <label id="gcmsRiDictionaryField">Existing RI dictionary path
+            <input id="gcmsRiDictionaryPath" placeholder="D:\...\alkane_dictionary_pathes.txt">
+          </label>
+        </div>
+        <div id="gcmsRiHelp" class="format-summary"></div>
+        <div id="gcmsRiMapPanel" hidden>
+          <div class="section-head">
+            <div>
+              <h2>Per-file RI dictionary builder</h2>
+              <span class="muted">First column is the analysis file path; second column is its alkane/FAME carbon-RT file.</span>
+            </div>
+            <button id="fillRiMapFromSingle" type="button" class="secondary">Fill all from carbon-RT file</button>
+          </div>
+          <div class="table-wrap compact-table">
+            <table id="gcmsRiMapTable">
+              <thead>
+                <tr><th>Analysis file</th><th>RI carbon-RT file</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section id="tab-annotation" class="tab">
       <div id="annotationLibraries" class="panel">
         <h2>Annotation libraries</h2>
-        <div class="path-grid">
-          <label>MSP library<input id="mspPath"></label>
-          <label id="lbmField">LBM library<input id="lbmPath"></label>
-          <label id="textDbField">Text DB<input id="textDbPath"></label>
-          <label id="queriesField">LbmQueries.txt<input id="queriesPath"></label>
+        <div id="lbmAnnotatorPanel" class="nested-panel">
+          <div class="section-head compact-head">
+            <div>
+              <h2>LBM annotator in MS-DIAL CUI</h2>
+              <span class="muted">Lipidomics only. MS-DIAL CUI currently supports one LBM file with one LBM annotation setting.</span>
+            </div>
+          </div>
+          <div class="table-wrap compact-table">
+            <table id="lbmAnnotatorTable">
+              <thead>
+                <tr>
+                  <th>LBM library path</th><th>RT tol.</th><th>m/z tol.</th><th>MS/MS tol.</th>
+                  <th>Use RT score</th><th>Use RT filter</th>
+                  <th>Weighted</th><th>Simple</th><th>Reverse</th><th>Matched %</th><th>Min match</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <div id="lbmQueriesPanel" class="nested-panel">
+          <h2>Lipid query resource</h2>
+          <p class="muted">This path is used by the interactive app to show selectable lipid class/adduct pairs. The Console receives the selected pairs as <code>Searched lipid class</code>.</p>
+          <label>LbmQueries.txt<input id="queriesPath"></label>
+        </div>
+        <div id="multiMspPanel" class="nested-panel">
+          <div class="section-head compact-head">
+            <div>
+              <h2>MSP annotators in MS-DIAL CUI</h2>
+              <span class="muted">Use one row for a single MSP library. LC-MS writes <code>msp_annotator_settings.tsv</code>; GC-MS currently uses the first row as the conventional <code>Msp file path</code>.</span>
+            </div>
+            <div class="button-row">
+              <button id="addMspAnnotator" type="button" class="secondary">Add MSP row</button>
+              <button id="clearMspAnnotators" type="button" class="quiet">Clear</button>
+            </div>
+          </div>
+          <div class="table-wrap compact-table">
+            <table id="mspAnnotatorTable">
+              <thead>
+                <tr>
+                  <th>Annotator ID</th><th>MSP path</th><th>Priority</th><th>RT tol.</th>
+                  <th>Use RT score</th><th>Use RT filter</th>
+                  <th>Weighted</th><th>Simple</th><th>Reverse</th><th>Matched %</th><th>Min match</th><th></th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p class="muted">Example: realRT library can use RT filtering with a strict RT tolerance, predRT can use a wider tolerance, and notpred can leave RT scoring/filtering off.</p>
+        </div>
+        <div id="textAnnotatorPanel" class="nested-panel">
+          <div class="section-head compact-head">
+            <div>
+              <h2>Text library annotators in MS-DIAL CUI</h2>
+              <span class="muted">LC-MS currently writes <code>text_annotator_settings.tsv</code>. Use one row for a single text library, or multiple rows for different libraries/parameters.</span>
+            </div>
+            <div class="button-row">
+              <button id="addTextAnnotator" type="button" class="secondary">Add Text row</button>
+              <button id="clearTextAnnotators" type="button" class="quiet">Clear</button>
+            </div>
+          </div>
+          <div class="table-wrap compact-table">
+            <table id="textAnnotatorTable">
+              <thead>
+                <tr>
+                  <th>Annotator ID</th><th>Text library path</th><th>Priority</th>
+                  <th>RT tol.</th><th>m/z tol.</th><th>Total score</th>
+                  <th>Use RT score</th><th>Use RT filter</th><th></th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p class="muted">For LC-MS, set RT tolerance and m/z tolerance per text library. Future DI-MS/IM-MS/LC-IM-MS/Imaging modes can expose their own tolerance columns here.</p>
         </div>
       </div>
       <div id="gcmsAnnotationNote" class="panel notice-panel" hidden>
         <h2>GC-MS annotation</h2>
-        <p>GC-MS does not use precursor-adduct annotation. LBM and Text DB molecular annotation are disabled for this project type. GC-MS-specific EI/CI spectral matching and retention-index parameters will be implemented with the GC-MS backend.</p>
-      </div>
-      <div id="mspCutoffPanel" class="panel">
-        <h2>MSP-based annotation cutoffs</h2>
-        <div class="form-grid">
-          <label>Weighted dot product<input id="mspWeighted" type="number" min="0" max="1" step="0.01" value="0.6"></label>
-          <label>Simple dot product<input id="mspSimple" type="number" min="0" max="1" step="0.01" value="0.6"></label>
-          <label>Reverse dot product<input id="mspReverse" type="number" min="0" max="1" step="0.01" value="0.8"></label>
-          <label>Matched peaks percentage<input id="mspMatchedPercentage" type="number" min="0" max="1" step="0.01" value="0.1"></label>
-          <label>Minimum spectrum match<input id="mspMinimumSpectrumMatch" type="number" min="0" step="1" value="3"></label>
-        </div>
+        <p>GC-MS does not use precursor-adduct annotation. LBM and Text DB molecular annotation are disabled for this project type. EI MSP matching and RT/RI retention settings are controlled by the GC-MS panel in Guided setup.</p>
       </div>
       <div id="adductPanel" class="panel">
         <div class="section-head compact-head">
@@ -229,11 +371,11 @@
       <div class="panel">
         <h2>MSP annotation thresholds</h2>
         <div class="slider-grid">
-          <label>Weighted dot product <output id="tuneWeightedValue">0.60</output><input id="tuneWeighted" type="range" min="0" max="1" step="0.01" value="0.6"></label>
-          <label>Simple dot product <output id="tuneSimpleValue">0.60</output><input id="tuneSimple" type="range" min="0" max="1" step="0.01" value="0.6"></label>
-          <label>Reverse dot product <output id="tuneReverseValue">0.80</output><input id="tuneReverse" type="range" min="0" max="1" step="0.01" value="0.8"></label>
-          <label>Matched peaks percentage <output id="tuneMatchedPercentageValue">0.10</output><input id="tuneMatchedPercentage" type="range" min="0" max="1" step="0.01" value="0.1"></label>
-          <label>Minimum spectrum match <output id="tuneMinimumMatchValue">3</output><input id="tuneMinimumMatch" type="range" min="0" max="20" step="1" value="3"></label>
+          <label><span>Weighted dot product</span><input id="tuneWeightedNumber" class="threshold-number" type="number" min="0" max="1" step="0.01" value="0.60"><input id="tuneWeighted" type="range" min="0" max="1" step="0.01" value="0.6"></label>
+          <label><span>Simple dot product</span><input id="tuneSimpleNumber" class="threshold-number" type="number" min="0" max="1" step="0.01" value="0.60"><input id="tuneSimple" type="range" min="0" max="1" step="0.01" value="0.6"></label>
+          <label><span>Reverse dot product</span><input id="tuneReverseNumber" class="threshold-number" type="number" min="0" max="1" step="0.01" value="0.80"><input id="tuneReverse" type="range" min="0" max="1" step="0.01" value="0.8"></label>
+          <label><span>Matched peaks percentage</span><input id="tuneMatchedPercentageNumber" class="threshold-number" type="number" min="0" max="1" step="0.01" value="0.10"><input id="tuneMatchedPercentage" type="range" min="0" max="1" step="0.01" value="0.1"></label>
+          <label><span>Minimum spectrum match</span><input id="tuneMinimumMatchNumber" class="threshold-number" type="number" min="0" max="20" step="1" value="3"><input id="tuneMinimumMatch" type="range" min="0" max="20" step="1" value="3"></label>
         </div>
         <div class="button-row">
           <div class="metric compact"><strong id="annotationPassCount">-</strong><span>passing MSP annotations</span></div>
@@ -254,7 +396,28 @@
             <h2>Execution</h2>
             <button id="prepare" class="secondary">Prepare only</button>
             <button id="run">Run MS-DIAL Console (-p)</button>
+            <button id="exportWorkflow" class="secondary">Export reusable workflow</button>
             <div id="runPath" class="muted"></div>
+            <div id="workflowExport" class="format-summary" hidden></div>
+          </div>
+          <div class="panel">
+            <h2>mzTab-M bridge check</h2>
+            <p class="muted">After an alignment run, the app checks whether the exported mzTab-M file is present and structurally ready for downstream tools. This built-in check does not require extra Python packages.</p>
+            <label>mzTab-M file
+              <select id="mztabFileSelect">
+                <option value="">Latest mzTab-M in output folder</option>
+              </select>
+            </label>
+            <div class="button-row mztab-file-actions">
+              <button id="refreshMzTabFiles" class="secondary" type="button">Refresh mzTab-M list</button>
+              <button id="browseMzTabFile" class="secondary" type="button">Native file picker</button>
+              <button id="pickMzTabPath" class="secondary" type="button">Local path browser</button>
+            </div>
+            <div id="mztabFileHint" class="muted">Default is the newest mzTab-M file in the output folder.</div>
+            <button id="validateMzTab" class="secondary">Validate mzTab-M output</button>
+            <button id="previewMzTab" class="secondary">Preview mzTab-M output</button>
+            <div id="mztabValidation" class="format-summary" hidden></div>
+            <div id="mztabPreview" class="format-summary" hidden></div>
           </div>
         </div>
         <pre id="log">Ready.</pre>
@@ -280,6 +443,14 @@
         </div>
         <div id="llmStatus" class="muted">Local retrieval is active.</div>
       </div>
+      <div class="panel">
+        <h2>Literature-based starting parameters</h2>
+        <p class="muted">Available only with an LLM API configuration. Searches explicitly licensed open-access Crossref records for similar MS-DIAL workflows. Citation count and direct parameter evidence are reported separately; suggestions are not applied automatically.</p>
+        <button id="searchLiterature" class="secondary" disabled>Search open-access studies</button>
+        <div id="literatureStatus" class="muted">Configure an API provider and key to enable this search.</div>
+        <div id="literatureSummary" class="assistant-answer" hidden></div>
+        <div id="literatureWorks" class="cards"></div>
+      </div>
       <div class="help-layout">
         <div class="panel">
           <h2>Ask about MS-DIAL or a parameter</h2>
@@ -288,7 +459,7 @@
             <select id="language"><option value="ja">日本語</option><option value="en">English</option></select>
             <button id="ask">Ask</button>
           </div>
-          <div id="answer" class="assistant-answer">蒸留済みの公開QAカードをローカル検索します。</div>
+          <div id="answer" class="assistant-answer">定義されたQAカードをローカル検索します。</div>
         </div>
         <div>
           <h2>Grounding cards</h2>
@@ -297,6 +468,30 @@
       </div>
     </section>
   </main>
+  <div id="pathPickerModal" class="modal-backdrop" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <div>
+          <h2 id="pathPickerTitle">Local path browser</h2>
+          <div id="pathPickerCurrent" class="muted"></div>
+        </div>
+        <button id="pathPickerClose" class="quiet" type="button">Close</button>
+      </div>
+      <p id="pathPickerHelp" class="muted"></p>
+      <div class="path-picker-nav">
+        <select id="pathPickerRoot"></select>
+        <input id="pathPickerPath" placeholder="D:\data or /data">
+        <button id="pathPickerGo" class="secondary" type="button">Go</button>
+        <button id="pathPickerUp" class="secondary" type="button">Up</button>
+      </div>
+      <div class="path-picker-actions">
+        <button id="pathPickerSelectAll" class="secondary" type="button">Select all supported here</button>
+        <button id="pathPickerAddCurrent" class="secondary" type="button">Add current folder</button>
+        <button id="pathPickerAddSelected" type="button">Add selected</button>
+      </div>
+      <div id="pathPickerEntries" class="path-picker-list"></div>
+    </div>
+  </div>
   <footer><span id="status">Starting...</span></footer>
   <script src="/app.js"></script>
 </body>

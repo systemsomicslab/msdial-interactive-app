@@ -1,0 +1,90 @@
+# Project information
+MS1 data type: Centroid
+MS2 data type: Centroid
+Ion mode: Positive
+Target omics: Metabolomics
+Ionization: EI
+Machine category: GCMS
+Instrument type: 
+Instrument: 
+Authors: 
+License: 
+Comment: 
+Msp file path: 
+Compounds library file path for target detection: 
+Compounds library file path for RT correction: 
+
+# Feature detection parameters
+Smoothing method: LinearWeightedMovingAverage
+Smoothing level: 3
+Minimum peak height: 1000
+Minimum peak width: 5
+Average peak width: 30
+Mass slice width: 0.1
+Retention time begin: 0
+Retention time end: 100
+MS1 mass range begin: 85
+MS1 mass range end: 600
+MS1 tolerance for centroid: 0.5
+Accuracy type: IsNominal
+Max charge number: 2
+Considering Br and Cl for isotopes: False
+Exclude mass list: 
+
+# Deconvolution
+Sigma window value: 0.5
+Amplitude cut off: 0
+Keep isotope range: 5
+Exclude after precursor: True
+Keep original precursor isotopes: False
+Target CE: 0
+
+# MSP-based annotation
+RT tolerance for MSP-based annotation: 100
+RI tolerance for MSP-based annotation: 20
+Mass range begin for MSP-based annotation: 85
+Mass range end for MSP-based annotation: 600
+Relative amplitude cutoff for MSP-based annotation: 0.1
+Absolute amplitude cutoff for MSP-based annotation: 5
+Weighted dot product cutoff for MSP-based annotation: 0.5
+Simple dot product cutoff for MSP-based annotation: 0.5
+Reverse dot product cutoff for MSP-based annotation: 0.5
+Matched peaks percentage cutoff for MSP-based annotation: 0.5
+Minimum spectrum match for MSP-based annotation: 3
+Total score cutoff for MSP-based annotation: 0.8
+MS1 tolerance for MSP-based annotation: 0.5
+MS2 tolerance for MSP-based annotation: 0.5
+Use retention information for MSP-based annotation scoring: False
+Use retention information for MSP-based annotation filtering: False
+Only report top hit for MSP-based annotation: False
+Execute annotation process only for alignment file: False
+
+# Alignment parameters
+Alignment reference file ID: 0
+Retention time tolerance for alignment: 0.05
+Retention time factor for alignment: 0.5
+Spectrum similarity tolerance for alignment: 0.8
+Spectrum similarity factor for alignment: 0.5
+MS1 tolerance for alignment: 0.015
+MS1 factor for alignment: 0.5
+Force insert peaks in gap filling: True
+
+# Filtering
+Peak count filter: 0
+N percent detected in one group: 0
+Remove feature based on peak height fold-change: False
+Blank filtering: SampleMaxOverBlankAve
+Sample max / blank average: 5
+Sample average / blank average: 5
+Keep reference matched metabolites: True
+Keep suggested metabolites: False
+Keep removable features and assigned tag for checking: True
+Replace true zero values with 1/2 of minimum peak height over all samples: False
+
+# GCMS specific parameters
+RI index file pathes: 
+RI compound type: Alkanes
+RI compound: Alkanes
+Retention type: RT
+Alignment index type: RT
+Retention index alignment tolerance: 10

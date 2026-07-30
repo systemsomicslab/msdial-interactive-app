@@ -4,11 +4,11 @@ import json
 import math
 import re
 import unicodedata
-import urllib.error
-import urllib.request
 from collections import Counter
 from pathlib import Path
 from typing import Any
+
+from .llm import chat_completion
 
 
 def _normalize(value: str) -> str:
@@ -142,31 +142,14 @@ class KnowledgeBase:
         cards: list[dict[str, Any]],
         config: dict[str, Any],
     ) -> str | None:
-        import os
-
-        provider = str(config.get("provider", "")).lower()
-        endpoint = str(config.get("endpoint", "")).strip().rstrip("/")
-        key = str(config.get("api_key", "")).strip()
-        deployment = str(config.get("deployment", "")).strip()
-        api_version = str(config.get("api_version", "2024-10-21")).strip()
-        if not provider:
-            provider = "azure" if os.environ.get("AZURE_OPENAI_ENDPOINT") else "local"
-        if provider == "azure":
-            endpoint = endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
-            key = key or os.environ.get("AZURE_OPENAI_API_KEY", "")
-            deployment = deployment or os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
-            api_version = api_version or os.environ.get(
-                "AZURE_OPENAI_API_VERSION",
-                "2024-10-21",
-            )
-        if not endpoint or not key or not deployment or not cards:
+        if not cards:
             return None
         context = "\n\n".join(
             f"Q: {card.get('question', '')}\nA: {card.get('answer', '')}"
             for card in cards
         )
-        payload = {
-            "messages": [
+        return chat_completion(
+            [
                 {
                     "role": "system",
                     "content": (
@@ -183,39 +166,8 @@ class KnowledgeBase:
                     ),
                 },
             ],
-            "temperature": 0.2,
-        }
-        if provider == "azure":
-            url = (
-                f"{endpoint}/openai/deployments/{deployment}/chat/completions"
-                f"?api-version={api_version}"
-            )
-            headers = {"Content-Type": "application/json", "api-key": key}
-        elif provider == "openai-compatible":
-            url = (
-                endpoint
-                if endpoint.endswith("/chat/completions")
-                else f"{endpoint}/chat/completions"
-            )
-            payload["model"] = deployment
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {key}",
-            }
-        else:
-            return None
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
+            config,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                result = json.load(response)
-            return result["choices"][0]["message"]["content"]
-        except (urllib.error.URLError, KeyError, IndexError, TimeoutError):
-            return None
 
 
 def next_parameter_question(

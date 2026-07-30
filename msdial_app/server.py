@@ -4,6 +4,7 @@ import argparse
 import json
 import mimetypes
 import os
+import socket
 import threading
 import traceback
 import urllib.parse
@@ -14,19 +15,27 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from .agent_bridge import create_datamining_handoff, summarize_jobs
 from .knowledge import KnowledgeBase, next_parameter_question
+from .literature import recommend_from_literature
+from .mztab_validation import list_mztab_outputs, validate_mztab_outputs
+from .mztab_preview import preview_mztab_outputs
 from .workflow import (
     console_version,
     expand_paths,
     expand_paths_report,
     find_mdpeak,
+    find_mdscan,
+    detect_raw_format,
     parse_method,
     parse_mdpeak,
+    parse_mdscan,
     prepare_run,
     prepare_tuning_run,
     read_adducts,
     read_lipid_queries,
     run_console,
+    is_supported,
     validate_workflow,
 )
 
@@ -37,15 +46,36 @@ RESOURCES = ROOT / "resources"
 KNOWLEDGE = ROOT / "knowledge"
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+DOWNLOADS: dict[str, Path] = {}
 KB = KnowledgeBase(KNOWLEDGE)
+
+
+def _local_ipv4_addresses() -> list[str]:
+    addresses: set[str] = set()
+    try:
+        host_name = socket.gethostname()
+        for info in socket.getaddrinfo(host_name, None, socket.AF_INET):
+            address = info[4][0]
+            if not address.startswith("127."):
+                addresses.add(address)
+    except OSError:
+        pass
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))
+        address = probe.getsockname()[0]
+        if not address.startswith("127."):
+            addresses.add(address)
+        probe.close()
+    except OSError:
+        pass
+    return sorted(addresses)
 
 
 def _default_console_path() -> str:
     configured = os.environ.get("MSDIAL_CONSOLE_PATH", "")
     candidates = [
         Path(configured) if configured else None,
-        ROOT / "MSDIALCUI.exe",
-        ROOT / "MSDIALCUI.dll",
         ROOT.parent
         / "MsdialWorkbench"
         / "tests"
@@ -64,6 +94,11 @@ def _default_console_path() -> str:
         / "Release"
         / "net8"
         / "MSDIALCUI.dll",
+        ROOT.parent
+        / "MSDIAL.console.v5.5.260323-windows-net48"
+        / "MSDIALCUI.exe",
+        ROOT / "MSDIALCUI.exe",
+        ROOT / "MSDIALCUI.dll",
     ]
     return next((str(path.resolve()) for path in candidates if path and path.is_file()), "")
 
@@ -74,6 +109,12 @@ def _diagnose_console_failure(logs: list[str], fallback: str) -> str:
         return (
             "Agilent reader could not load BaseDataAccess.dll. Check the MS-DIAL Console "
             "package and its lib/Agilent deployment before checking the VC++ runtime."
+        )
+    if "rdam_dll" in text or "loading spectral information" in text and "fileloadexception" in text:
+        return (
+            "The ABF/Reifycs reader dependency could not be loaded. Use the official "
+            "MS-DIAL Console package with its lib/Reifycs folder intact, or select a "
+            "Console path whose vendor-reader dependencies match this data type."
         )
     vc_runtime_markers = ("msvcp120", "msvcr120", "vcruntime", "0xc000007b")
     if any(marker in text for marker in vc_runtime_markers):
@@ -95,20 +136,110 @@ def _diagnose_console_failure(logs: list[str], fallback: str) -> str:
     return fallback
 
 
+def _register_download(path: str | Path) -> str:
+    token = uuid.uuid4().hex
+    DOWNLOADS[token] = Path(path).resolve()
+    return f"/api/downloads/{token}"
+
+
+def _filesystem_roots() -> list[dict[str, str]]:
+    if os.name == "nt":
+        roots = []
+        for code in range(ord("A"), ord("Z") + 1):
+            root = f"{chr(code)}:\\"
+            if Path(root).exists():
+                roots.append({"label": root, "path": root})
+        return roots
+    return [
+        {"label": "Home", "path": str(Path.home())},
+        {"label": "/", "path": "/"},
+    ]
+
+
+def _browse_filesystem(path_text: str = "") -> dict[str, Any]:
+    roots = _filesystem_roots()
+    if path_text:
+        current = Path(path_text).expanduser()
+    elif os.name == "nt" and roots:
+        current = Path(roots[0]["path"])
+    else:
+        current = Path.home()
+    if current.is_file():
+        current = current.parent
+    current = current.resolve()
+    if not current.exists() or not current.is_dir():
+        raise FileNotFoundError(f"Directory not found: {current}")
+
+    entries = []
+    try:
+        children = list(current.iterdir())
+    except PermissionError:
+        children = []
+    for child in sorted(children, key=lambda item: (not item.is_dir(), item.name.lower())):
+        try:
+            child_is_dir = child.is_dir()
+            child_is_file = child.is_file()
+        except OSError:
+            continue
+        suffix = child.suffix.lower()
+        is_vendor_folder = child_is_dir and child.name.lower().endswith((".d", ".raw"))
+        selectable = is_supported(child)
+        entries.append(
+            {
+                "name": child.name,
+                "path": str(child),
+                "is_dir": child_is_dir,
+                "is_file": child_is_file,
+                "is_vendor_folder": is_vendor_folder,
+                "is_supported": selectable,
+                "suffix": suffix,
+                "format": detect_raw_format(child)["format"] if selectable else "",
+            }
+        )
+    parent = current.parent if current.parent != current else None
+    return {
+        "path": str(current),
+        "parent": str(parent) if parent else "",
+        "roots": roots,
+        "entries": entries,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "MSDIALInteractive/0.1"
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/config":
+            bind_host, bind_port = self.server.server_address[:2]
+            shared_server = bind_host in ("0.0.0.0", "::") or not str(bind_host).startswith(
+                "127."
+            )
+            lan_urls = [f"http://{address}:{bind_port}" for address in _local_ipv4_addresses()]
             self._json(
                 {
                     "platform": os.name,
                     "python": os.sys.version.split()[0],
                     "root": str(ROOT),
+                    "server": {
+                        "bind_host": bind_host,
+                        "port": bind_port,
+                        "shared_server": shared_server,
+                        "lan_urls": lan_urls,
+                    },
                     "default_console": _default_console_path(),
                     "default_queries": str(RESOURCES / "LbmQueries.txt"),
                     "default_template": str(RESOURCES / "msdial_console_param4lipidomics.txt"),
+                    "default_gcms_template": str(RESOURCES / "gcms_console_param_kovats.txt"),
+                    "smoothing_methods": [
+                        "SimpleMovingAverage",
+                        "LinearWeightedMovingAverage",
+                        "SavitzkyGolayFilter",
+                        "BinomialFilter",
+                        "LowessFilter",
+                        "LoessFilter",
+                        "TimeBasedLinearWeightedMovingAverage",
+                    ],
                     "knowledge_cards": {"ja": KB.count("ja"), "en": KB.count("en")},
                     "lipid_queries": read_lipid_queries(RESOURCES / "LbmQueries.txt"),
                     "adducts": {
@@ -141,6 +272,39 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(response)
             return
+        if parsed.path == "/api/agent/status":
+            with JOBS_LOCK:
+                response = summarize_jobs(dict(JOBS))
+            self._json(response)
+            return
+        if parsed.path == "/api/agent/handoff":
+            query = urllib.parse.parse_qs(parsed.query)
+            with JOBS_LOCK:
+                job = JOBS.get(query.get("job_id", [""])[0])
+            run_directory = query.get("run_directory", [""])[0]
+            if job is None and not run_directory:
+                self._json(
+                    {"error": "Set job_id or run_directory."},
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            self._json(
+                {
+                    "handoff": create_datamining_handoff(
+                        job=job,
+                        run_directory=run_directory or None,
+                    )
+                }
+            )
+            return
+        if parsed.path.startswith("/api/downloads/"):
+            token = parsed.path.rsplit("/", 1)[-1]
+            target = DOWNLOADS.get(token)
+            if target is None or not target.is_file():
+                self._json({"error": "Download not found."}, HTTPStatus.NOT_FOUND)
+            else:
+                self._download(target)
+            return
         if parsed.path == "/api/method":
             query = urllib.parse.parse_qs(parsed.query)
             self._json(parse_method(query.get("path", [""])[0]))
@@ -153,8 +317,23 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_json()
             if parsed.path == "/api/files/expand":
                 self._json(expand_paths_report(body.get("paths", [])))
+            elif parsed.path == "/api/files/browse":
+                self._json(_browse_filesystem(body.get("path", "")))
             elif parsed.path == "/api/dialog/files":
                 self._json(expand_paths_report(_pick_files()))
+            elif parsed.path == "/api/dialog/vendor-directory":
+                if body.get("dry_run"):
+                    self._json({"ok": True, "endpoint": parsed.path})
+                    return
+                selected = _pick_directory(
+                    "Select a vendor folder (.d/.raw) or a parent folder containing vendor folders"
+                )
+                report = (
+                    expand_paths_report([selected])
+                    if selected
+                    else {"files": [], "warnings": [], "rejected": []}
+                )
+                self._json({"path": selected, **report})
             elif parsed.path == "/api/dialog/directory":
                 selected = _pick_directory()
                 report = (
@@ -163,6 +342,9 @@ class Handler(BaseHTTPRequestHandler):
                     else {"files": [], "warnings": [], "rejected": []}
                 )
                 self._json({"path": selected, **report})
+            elif parsed.path == "/api/dialog/mztab-file":
+                selected = _pick_mztab_file()
+                self._json({"path": selected})
             elif parsed.path == "/api/knowledge/search":
                 self._json(
                     {
@@ -180,6 +362,14 @@ class Handler(BaseHTTPRequestHandler):
                         body.get("language", "ja"),
                         body.get("workflow", {}),
                         body.get("llm", {}),
+                    )
+                )
+            elif parsed.path == "/api/literature/recommend":
+                self._json(
+                    recommend_from_literature(
+                        body.get("workflow", {}),
+                        body.get("llm", {}),
+                        body.get("language", "ja"),
                     )
                 )
             elif parsed.path == "/api/next-question":
@@ -202,7 +392,65 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/prepare":
                 messages: list[str] = []
                 result = prepare_run(body.get("workflow", body), messages.append)
-                self._json({"preparation": result, "messages": messages})
+                self._json(
+                    {
+                        "preparation": result,
+                        "messages": messages,
+                        "download_url": _register_download(result["bundle"]),
+                    }
+                )
+            elif parsed.path == "/api/mztab/validate":
+                self._json(
+                    {
+                        "validation": validate_mztab_outputs(
+                            body.get("file_path", "") or body.get("run_directory", "")
+                        )
+                    }
+                )
+            elif parsed.path == "/api/mztab/list":
+                self._json(
+                    {
+                        "mztab": list_mztab_outputs(
+                            body.get("run_directory", "")
+                        )
+                    }
+                )
+            elif parsed.path == "/api/mztab/preview":
+                self._json(
+                    {
+                        "preview": preview_mztab_outputs(
+                            body.get("run_directory", ""),
+                            body.get("file_path", "") or None,
+                        )
+                    }
+                )
+            elif parsed.path == "/api/agent/handoff":
+                job_id = body.get("job_id", "")
+                with JOBS_LOCK:
+                    job = JOBS.get(job_id)
+                run_directory = body.get("run_directory", "")
+                if job is None and not run_directory:
+                    self._json(
+                        {"error": "Set job_id or run_directory."},
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                self._json(
+                    {
+                        "handoff": create_datamining_handoff(
+                            job=job,
+                            run_directory=run_directory or None,
+                        )
+                    }
+                )
+            elif parsed.path == "/api/export-workflow":
+                result = prepare_run(body.get("workflow", body))
+                self._json(
+                    {
+                        "preparation": result,
+                        "download_url": _register_download(result["bundle"]),
+                    }
+                )
             elif parsed.path == "/api/run":
                 state = body.get("workflow", body)
                 preparation = prepare_run(state)
@@ -220,7 +468,13 @@ class Handler(BaseHTTPRequestHandler):
                     args=(job_id, preparation),
                     daemon=True,
                 ).start()
-                self._json({"job_id": job_id, "preparation": preparation})
+                self._json(
+                    {
+                        "job_id": job_id,
+                        "preparation": preparation,
+                        "download_url": _register_download(preparation["bundle"]),
+                    }
+                )
             elif parsed.path == "/api/tuning/run":
                 state = body.get("workflow", body)
                 preparation = prepare_tuning_run(
@@ -271,6 +525,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _download(self, target: Path) -> None:
+        data = target.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header(
+            "Content-Disposition",
+            f'attachment; filename="{target.name}"',
+        )
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _static(self, request_path: str) -> None:
         relative = "index.html" if request_path in ("", "/") else request_path.lstrip("/")
         target = (STATIC / relative).resolve()
@@ -296,26 +563,47 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
     with JOBS_LOCK:
         JOBS[job_id]["status"] = "running"
     try:
-        log("Starting MS-DIAL single-file diagnostic run.")
+        log("Starting MS-DIAL Console run.")
         log("Command: " + " ".join(preparation["command"]))
         log("Large vendor raw files can take several minutes before the first Console message.")
         exit_code = run_console(preparation, log)
-        generated_mdpeaks = list(Path(preparation["run_directory"]).glob("*.mdpeak"))
+        validation = None
+        handoff = None
+        if exit_code == 0:
+            validation = validate_mztab_outputs(preparation["run_directory"])
+            summary = validation["summary"]
+            log(
+                "mzTab-M validation: "
+                f"{summary['status']} "
+                f"({summary['passed']} passed, "
+                f"{summary['warnings']} warning, "
+                f"{summary['failed']} failed)."
+            )
+            handoff = create_datamining_handoff(
+                preparation=preparation,
+                job={
+                    "id": job_id,
+                    "kind": "run",
+                    "status": "completed",
+                    "exit_code": exit_code,
+                    "preparation": preparation,
+                    "mztab_validation": validation,
+                    "logs": [],
+                },
+            )
+            if handoff.get("handoff_file"):
+                log("Data-mining handoff: " + handoff["handoff_file"])
         with JOBS_LOCK:
             JOBS[job_id]["exit_code"] = exit_code
-            if exit_code == 0 and generated_mdpeaks:
+            JOBS[job_id]["mztab_validation"] = validation
+            JOBS[job_id]["datamining_handoff"] = handoff
+            if exit_code == 0:
                 JOBS[job_id]["status"] = "completed"
             else:
                 JOBS[job_id]["status"] = "failed"
-                fallback = (
-                    "MS-DIAL returned exit code 0 but generated no mdpeak file. "
-                    "Check the Console log for an import or parser error."
-                    if exit_code == 0
-                    else f"MS-DIAL Console exited with code {exit_code}."
-                )
                 JOBS[job_id]["error"] = _diagnose_console_failure(
                     JOBS[job_id]["logs"],
-                    fallback,
+                    f"MS-DIAL Console exited with code {exit_code}.",
                 )
     except Exception as error:
         with JOBS_LOCK:
@@ -324,6 +612,16 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
         with JOBS_LOCK:
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = message
+    finally:
+        if preparation.get("preserve_temporary_input_folder"):
+            folder = preparation.get("temporary_input_folder")
+            if folder:
+                log(
+                    "Keeping folder-type input links for the saved MS-DIAL project: "
+                    + str(folder)
+                )
+        else:
+            _cleanup_temporary_input_folder(preparation.get("temporary_input_folder"), log)
 
 
 def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
@@ -338,7 +636,19 @@ def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
         exit_code = run_console(preparation, log)
         result = None
         if exit_code == 0:
-            result = parse_mdpeak(find_mdpeak(preparation["run_directory"]))
+            analysis_type = str(preparation.get("analysis_type", "lcms")).lower()
+            diagnostic_result = preparation.get("diagnostic_result_file")
+            try:
+                if analysis_type == "gcms":
+                    result = parse_mdscan(diagnostic_result or find_mdscan(preparation["run_directory"]))
+                else:
+                    result = parse_mdpeak(diagnostic_result or find_mdpeak(preparation["run_directory"]))
+            except FileNotFoundError as missing:
+                raise RuntimeError(
+                    "MS-DIAL finished without generating the expected diagnostic result file. "
+                    "Check whether the selected Console build can read this raw-data format and "
+                    f"whether vendor dependencies are installed. Missing: {missing}"
+                ) from missing
         with JOBS_LOCK:
             JOBS[job_id]["exit_code"] = exit_code
             JOBS[job_id]["result"] = result
@@ -355,6 +665,27 @@ def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
         with JOBS_LOCK:
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = message
+    finally:
+        _cleanup_temporary_input_folder(
+            preparation.get("diagnostic_input_folder") or preparation.get("temporary_input_folder"),
+            log,
+        )
+
+
+def _cleanup_temporary_input_folder(path: str | None, log: Any) -> None:
+    if not path:
+        return
+    staging = Path(path).resolve()
+    base = (ROOT / "work" / "console_inputs").resolve()
+    if staging.parent != base or not staging.name.startswith(".msdial_interactive_input_"):
+        log(f"Skipped cleanup for unexpected temporary input folder: {staging}")
+        return
+    try:
+        for child in staging.iterdir():
+            child.rmdir()
+        staging.rmdir()
+    except OSError as error:
+        log(f"Could not clean up temporary input folder {staging}: {error}")
 
 
 def _pick_files() -> list[str]:
@@ -379,7 +710,7 @@ def _pick_files() -> list[str]:
         return []
 
 
-def _pick_directory() -> str:
+def _pick_directory(title: str = "Select directory") -> str:
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -388,7 +719,29 @@ def _pick_directory() -> str:
         root.withdraw()
         root.attributes("-topmost", True)
         root.update()
-        path = filedialog.askdirectory(title="Select directory")
+        path = filedialog.askdirectory(title=title)
+        root.destroy()
+        return path
+    except Exception:
+        return ""
+
+
+def _pick_mztab_file() -> str:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+        path = filedialog.askopenfilename(
+            title="Select mzTab-M output",
+            filetypes=[
+                ("mzTab-M files", "*.mzTab *.mztab *.mzTabM *.mztabm *.txt"),
+                ("All files", "*.*"),
+            ],
+        )
         root.destroy()
         return path
     except Exception:
@@ -400,10 +753,26 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8765, type=int)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--lab",
+        action="store_true",
+        help="Serve on all network interfaces for lab-internal use.",
+    )
     args = parser.parse_args()
+    if args.lab:
+        args.host = "0.0.0.0"
+        args.no_browser = True
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}"
     print(f"MS-DIAL Interactive: {url}")
+    if args.host in ("0.0.0.0", "::"):
+        print("Lab server mode: use only on a trusted lab network.")
+        print("Raw-data paths must be visible from this server, not only from a client PC.")
+        lan_urls = _local_ipv4_addresses()
+        if lan_urls:
+            print("Candidate lab URLs:")
+            for address in lan_urls:
+                print(f"  http://{address}:{args.port}")
     if not args.no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:

@@ -5,9 +5,12 @@ description = "Cross-platform interactive workflow assistant for MS-DIAL Console
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+mcp = ["mcp[cli]>=1.28,<3"]
+
 [project.scripts]
 msdial-interactive = "msdial_app.server:main"
+msdial-interactive-mcp = "msdial_app.mcp_server:main"
 
 [tool.setuptools]
 packages = ["msdial_app"]
-
