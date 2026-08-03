@@ -74,6 +74,7 @@ class WorkflowTests(unittest.TestCase):
                 "smoothing_method": "SavitzkyGolayFilter",
                 "minimum_peak_height": 4321,
                 "mass_slice_width": 0.05,
+                "alignment_light_mode": True,
                 "msp_weighted_dot_product": 0.55,
                 "lbm_path": str(lbm),
                 "lbm_rt_tolerance": 0.25,
@@ -99,6 +100,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn("Smoothing method: SavitzkyGolayFilter", method_text)
             self.assertIn("Minimum peak height: 4321", method_text)
             self.assertIn("Mass slice width: 0.05", method_text)
+            self.assertIn("Alignment light mode: True", method_text)
             self.assertIn(
                 "Weighted dot product cutoff for MSP-based annotation: 0.55",
                 method_text,

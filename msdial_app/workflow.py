@@ -262,6 +262,20 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                 ),
             }
         )
+    if state.get("alignment_light_mode") and project_type != "lcms":
+        issues.append(
+            {
+                "level": "error",
+                "message": "Alignment light mode is currently available for LC-MS Console runs only.",
+            }
+        )
+    if state.get("alignment_light_mode") and not state.get("together_with_alignment", True):
+        issues.append(
+            {
+                "level": "error",
+                "message": "Alignment light mode requires Together with alignment to be enabled.",
+            }
+        )
     required_paths = [
         ("console_path", "MS-DIAL Console executable"),
         ("template_path", "parameter template"),
@@ -1157,6 +1171,8 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         "together with alignment": state.get("together_with_alignment", True),
         "export as mztabm format": "True",
     }
+    if project_type == "lcms":
+        replacements["alignment light mode"] = bool(state.get("alignment_light_mode", False))
     if msp_annotator_settings_path is not None:
         replacements["msp annotator settings file path"] = str(msp_annotator_settings_path)
     if text_annotator_settings_path is not None:
@@ -1403,6 +1419,7 @@ def _title_for_key(key: str) -> str:
         "use retention information for lbm-based annotation scoring": "Use retention information for LBM-based annotation scoring",
         "use retention information for lbm-based annotation filtering": "Use retention information for LBM-based annotation filtering",
         "together with alignment": "Together with alignment",
+        "alignment light mode": "Alignment light mode",
         "export as mztabm format": "Export as mztabM format",
         "ionization": "Ionization",
         "machine category": "Machine category",

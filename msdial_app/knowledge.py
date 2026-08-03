@@ -43,7 +43,7 @@ class KnowledgeBase:
             path = self.directory / f"qa_cards_{language}.jsonl"
             if not path.exists():
                 continue
-            for raw in path.read_text(encoding="utf-8").splitlines():
+            for raw in path.read_text(encoding="utf-8-sig").splitlines():
                 if not raw.strip():
                     continue
                 card = json.loads(raw)

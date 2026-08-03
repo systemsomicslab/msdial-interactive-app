@@ -153,6 +153,10 @@
           <label>MS2 centroid tolerance<input id="ms2Tolerance" type="number" step="any" value="0.025"></label>
           <label>Alignment RT tolerance<input id="alignmentRtTolerance" type="number" step="any" value="0.1"></label>
           <label>Alignment MS1 tolerance<input id="alignmentMs1Tolerance" type="number" step="any" value="0.015"></label>
+          <label id="alignmentLightModeField">Alignment light mode
+            <span class="inline-check"><input id="alignmentLightMode" type="checkbox"> Use LC-MS text-export light mode</span>
+            <span class="muted">For large LC-MS Console runs. This keeps mdalign/mdmsp/mzTab text outputs and alignment dcl while skipping GUI project serialization.</span>
+          </label>
         </div>
       </div>
       <div id="gcmsSettings" class="panel" hidden>

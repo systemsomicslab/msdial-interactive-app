@@ -128,6 +128,11 @@ Suggested starting values are:
 - QTOF including Waters, Agilent, and Bruker: peak height `100`, mass slice
   `0.1`
 
+For large LC-MS Console jobs, the Peak detection and alignment panel can write
+`Alignment light mode: True` to `method.txt`. This uses the experimental
+MS-DIAL Console light alignment path for text-export workflows and skips GUI
+project serialization.
+
 ## Reusable Console workflow
 
 Prepare, Run, and Export reusable workflow generate a ZIP containing:

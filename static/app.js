@@ -84,6 +84,7 @@ function workflow() {
     ms2_tolerance: Number($("#ms2Tolerance").value),
     alignment_rt_tolerance: Number($("#alignmentRtTolerance").value),
     alignment_ms1_tolerance: Number($("#alignmentMs1Tolerance").value),
+    alignment_light_mode: Boolean($("#alignmentLightMode")?.checked),
     solvent: $("#solvent").value,
     console_path: $("#consolePath").value.trim(),
     template_path: $("#templatePath").value.trim(),
@@ -732,6 +733,8 @@ function updateProjectUI() {
   $("#multiMspPanel").hidden = !(isLcms || isGcms);
   $("#textAnnotatorPanel").hidden = !isLcms;
   $("#lipidQuerySection").hidden = isGcms || !lipidomics;
+  $("#alignmentLightModeField").hidden = !isLcms;
+  if (!isLcms) $("#alignmentLightMode").checked = false;
   $("#ionMode").closest("label").hidden = isGcms;
   $("#solventField").hidden = isGcms;
   ["rtBegin", "rtEnd", "alignmentRtTolerance"].forEach((id) => {
