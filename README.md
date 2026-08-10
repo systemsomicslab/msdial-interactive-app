@@ -51,8 +51,17 @@ for the adjacent `.wiff.scan` before processing. It never falls back to
 `work/uploads`.
 
 Output root defaults to the directory containing the first analysis data item.
-It remains editable, and both diagnostic and production result folders are
+It remains editable, and both diagnostic and full-analysis result folders are
 created below that selected location.
+
+## Analysis metadata CSV import
+
+**Import analysis CSV** loads an existing MS-DIAL Console metadata CSV and
+populates the Data table in one step. It reads `file_path`, `file_name`,
+`file_type`, `class_id`, `acquisition_type`, `batch_order`,
+`analytical_order`, and `factor`. Relative `file_path` values are resolved
+from the CSV directory. The legacy `Included` column is accepted but ignored,
+matching the current app behavior in which every displayed row is processed.
 
 ## Project types and adducts
 
@@ -66,6 +75,8 @@ LBM, Text DB, and lipid-query controls. It provides EI MSP annotation settings,
 nominal/accurate mass selection, and RT/RI retention-index settings. Other
 project types provide searched-adduct selection from the MS-DIAL positive and
 negative adduct resource tables.
+For non-lipidomics workflows, Solvent is shown disabled because it does not
+affect Metabolomics processing.
 
 ## Common peak picking
 
@@ -133,6 +144,57 @@ For large LC-MS Console jobs, the Peak detection and alignment panel can write
 MS-DIAL Console light alignment path for text-export workflows and skips GUI
 project serialization.
 
+## LC-MS retention-time correction
+
+The main app and the dedicated review workspace have separate roles. The main
+app (`/`) configures and runs the complete MS-DIAL analysis. Its Guided setup
+contains a launcher and the production-run enable switch. The dedicated
+workspace (`/rt-correction`) performs anchor detection and review:
+
+1. Select an anchor library in the MS-DIAL text-library format.
+2. Browse reads the original anchor library into the editor without copying or
+   renaming it. Edit the anchor name, target RT, RT tolerance, target m/z, m/z
+   tolerance, minimum height, and inclusion flag when needed. Only **Save edited
+   anchor library** creates a timestamped file such as
+   `MTcorrection_anion_20260810-154230.txt`; the source remains unchanged.
+3. Run **Extract EICs and detect anchors**. The app calls `eic rtcorrection`
+   in the selected MS-DIAL Console build.
+   Choose automatic peak selection by highest intensity, closest reference RT,
+   or a weighted combination. The RT weight ranges from `0` (intensity only) to
+   `1` (RT proximity only).
+4. Review the overlaid Original and Corrected EICs. Each chart is limited to
+   `Target RT +/- RT tolerance`. EIC intensity is smoothed with MS-DIAL's
+   `LinearWeightedMovingAverage` setting (default level 3, +/-3 points).
+5. Edit `Selected RT` or clear `Use` for an incorrect anchor, then use **Save
+   approved peak selections**. This TSV is the explicit file-by-anchor decision
+   table consumed by the Console. The optional existing-selection input is only
+   for reopening a previous review and rechecking its corrected EICs.
+6. Return to the main analysis. The app carries the data paths, Console paths,
+   anchor library, and approved selection TSV back to `/`. The production-run
+   RT-correction switch becomes available only after both files are present.
+
+The Console detects anchors with the same Core process used by the GUI, writes
+one `.rtc` warping file per analysis file, and applies corrected RT values before
+normal peak detection. This requires a Console build containing the
+`eic rtcorrection` and LC-MS RT-correction changes; older stable binaries do not
+provide this command.
+
+For a focused, cross-platform review tool, start the same backend directly in
+RT correction mode:
+
+```powershell
+.\scripts\start-rt-correction-windows.ps1
+```
+
+```bash
+./scripts/start-rt-correction-linux.sh
+```
+
+On macOS, open `scripts/start-rt-correction-macos.command`. These commands open
+`http://127.0.0.1:8765/rt-correction`, which presents only Data, paths, and the
+RT correction review workflow. It shares the same backend and file formats as
+the main app, while keeping review and production-run responsibilities distinct.
+
 ## Reusable Console workflow
 
 Prepare, Run, and Export reusable workflow generate a ZIP containing:
@@ -143,6 +205,7 @@ Prepare, Run, and Export reusable workflow generate a ZIP containing:
 - `command.txt`
 - `run-msdial.ps1` and `run-msdial.sh`
 - `REPRODUCE.txt`, including `vim method.txt` and launch examples
+- the RT-correction anchor library and reviewed selection TSV when enabled
 
 The bundle contains no raw data.
 

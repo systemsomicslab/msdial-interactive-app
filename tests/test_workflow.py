@@ -15,16 +15,199 @@ from msdial_app.workflow import (
     expand_paths_report,
     parse_mdpeak,
     parse_mdscan,
+    parse_rt_correction_result,
     prepare_run,
+    prepare_rt_correction_run,
     prepare_tuning_run,
+    read_analysis_csv,
     read_adducts,
     read_lipid_queries,
+    read_rt_correction_anchors,
     recommended_peak_parameters,
+    save_rt_correction_anchors,
+    save_rt_correction_selections,
     validate_workflow,
 )
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_analysis_metadata_csv_import_preserves_per_file_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "sample1.mzML"
+            second = root / "sample2.mzML"
+            first.write_bytes(b"")
+            second.write_bytes(b"")
+            source = root / "analysis.csv"
+            source.write_text(
+                "file_path,file_name,file_type,class_id,acquisition_type,batch_order,analytical_order,factor,Included\n"
+                "sample1.mzML,First,Sample,Control,DDA,2,7,1.5,TRUE\n"
+                f"{second},Second,QC,QC,SWATH,3,8,2,FALSE\n",
+                encoding="utf-8",
+            )
+
+            result = read_analysis_csv(source)
+
+            self.assertEqual(2, len(result["files"]))
+            self.assertEqual(str(first.resolve()), result["files"][0]["file_path"])
+            self.assertEqual("Control", result["files"][0]["class_id"])
+            self.assertEqual(2, result["files"][0]["batch_order"])
+            self.assertEqual(7, result["files"][0]["analytical_order"])
+            self.assertEqual(1.5, result["files"][0]["factor"])
+            self.assertEqual("SWATH", result["files"][1]["acquisition_type"])
+            self.assertEqual("QC", result["files"][1]["file_type"])
+
+    def test_rt_correction_anchor_library_edit_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "anchors.txt"
+            source.write_text(
+                "Name\tRT(min)\tRT tol.(min)\tm/z\tm/z tol.\tMinimum height\tT/F\n"
+                "STD1\t7.5\t3\t231.1\t0.01\t10000\tTRUE\n",
+                encoding="ascii",
+            )
+            rows = read_rt_correction_anchors(source)
+            rows[0]["rt"] = 7.6
+            rows[0]["minimum_height"] = 15000
+            saved = Path(
+                save_rt_correction_anchors(
+                    {
+                        "output_root": str(root),
+                        "rt_correction_anchor_source_path": str(source),
+                    },
+                    rows,
+                )
+            )
+            reloaded = read_rt_correction_anchors(saved)
+
+            self.assertRegex(saved.name, r"^anchors_\d{8}-\d{6}\.txt$")
+            self.assertTrue(source.is_file())
+            self.assertEqual(7.6, reloaded[0]["rt"])
+            self.assertEqual(3, reloaded[0]["rt_tolerance"])
+            self.assertEqual(15000, reloaded[0]["minimum_height"])
+            self.assertTrue(reloaded[0]["include"])
+
+    def test_rt_correction_preview_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "sample.mzML"
+            raw.write_text("raw", encoding="ascii")
+            anchor = root / "anchors.txt"
+            anchor.write_text("Name\tRT\nSTD1\t7.5\n", encoding="ascii")
+            template = root / "method.txt"
+            template.write_text("Ion mode: Negative\n", encoding="ascii")
+            console = root / "MSDIALCUI.dll"
+            console.write_text("", encoding="ascii")
+            state = {
+                "project_type": "lcms",
+                "files": [
+                    {
+                        "file_path": str(raw),
+                        "file_name": "sample",
+                        "acquisition_type": "SWATH",
+                    }
+                ],
+                "console_path": str(console),
+                "template_path": str(template),
+                "output_root": str(root / "output"),
+                "ion_mode": "Negative",
+                "rt_correction_anchor_path": str(anchor),
+            }
+            prepared = prepare_rt_correction_run(state)
+            self.assertEqual("dotnet", prepared["command"][0])
+            self.assertEqual(["eic", "rtcorrection"], prepared["command"][2:4])
+            self.assertIn("SWATH", prepared["command"])
+
+            selection = Path(prepared["selection_file"])
+            selection.write_text(
+                "File path\tFile name\tStandard ID\tStandard name\tReference RT (min)\tDetected RT (min)\tSelected RT (min)\tUse\tPeak height\n"
+                f"{raw}\tsample\t0\tSTD1\t7.5\t7.45\t7.45\tTrue\t12345\n",
+                encoding="utf-8",
+            )
+            Path(prepared["eic_file"]).write_text(
+                "FileName,FilePath,StandardId,StandardName,ReferenceRT,RTTolerance,TargetMz,MzTolerance,MinimumHeight,ScanId,RT,CorrectedRT,Intensity,SmoothedIntensity\n"
+                f"sample,{raw},0,STD1,7.5,0.5,231.1,0.01,10000,1,7.45,7.50,12345,12000\n",
+                encoding="utf-8",
+            )
+            result = parse_rt_correction_result(prepared)
+            self.assertEqual(1, len(result["rows"]))
+            self.assertEqual(7.5, result["series"][0]["corrected_rt"][0])
+            self.assertEqual(231.1, result["series"][0]["target_mz"])
+            self.assertEqual(0.5, result["series"][0]["rt_tolerance"])
+            result["rows"][0]["use"] = False
+            saved = Path(save_rt_correction_selections(state, result["rows"]))
+            self.assertIn("\t0\tFalse\t", saved.read_text(encoding="utf-8"))
+
+    def test_rt_correction_preview_rejects_legacy_eic_format(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selection = root / "selections.tsv"
+            selection.write_text(
+                "File path\tFile name\tStandard ID\tStandard name\tReference RT (min)\tDetected RT (min)\tSelected RT (min)\tUse\tPeak height\n",
+                encoding="utf-8",
+            )
+            eic = root / "eics.csv"
+            eic.write_text(
+                "FileName,FilePath,StandardId,StandardName,ReferenceRT,TargetMz,RT,Intensity\n",
+                encoding="utf-8",
+            )
+            preparation = {
+                "selection_file": str(selection),
+                "eic_file": str(eic),
+                "command": ["old-MSDIALCUI.exe"],
+            }
+            with self.assertRaisesRegex(RuntimeError, "legacy RT correction EIC format"):
+                parse_rt_correction_result(preparation)
+
+    def test_prepare_run_writes_rt_correction_parameters(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "sample.mzML"
+            raw.write_text("raw", encoding="ascii")
+            console = root / "MSDIALCUI"
+            console.write_text("", encoding="ascii")
+            anchor = root / "anchors.txt"
+            anchor.write_text("anchors", encoding="ascii")
+            selection = root / "selection.tsv"
+            selection.write_text("selection", encoding="ascii")
+            template = root / "method.txt"
+            template.write_text("Ion mode: Positive\nExecute RT correction: False\n", encoding="ascii")
+            files = expand_paths([str(raw)])
+            state = {
+                "project_type": "lcms",
+                "files": files,
+                "console_path": str(console),
+                "template_path": str(template),
+                "output_root": str(root / "output"),
+                "ion_mode": "Negative",
+                "target_omics": "Metabolomics",
+                "execute_rt_correction": True,
+                "rt_correction_anchor_path": str(anchor),
+                "rt_correction_selection_path": str(selection),
+                "rt_correction_diff_method": "SampleMinusReference",
+                "rt_correction_smooth_rt_diff": True,
+                "rt_correction_intercept": 0.25,
+                "rt_correction_extrapolation_begin": "FirstPoint",
+                "rt_correction_extrapolation_end": "LinearExtrapolation",
+                "rt_correction_peak_selection_mode": "Weighted",
+                "rt_correction_peak_selection_rt_weight": 0.7,
+            }
+            prepared = prepare_run(state)
+            method = Path(prepared["method_file"]).read_text(encoding="utf-8")
+            self.assertIn("Execute RT correction: True", method)
+            self.assertIn(f"Compounds library file path for RT correction: {anchor}", method)
+            self.assertIn(f"RT correction peak selection file path: {selection}", method)
+            self.assertIn("RT diff calc method: SampleMinusReference", method)
+            self.assertIn("RT correction with smoothing for RT diff: True", method)
+            self.assertIn("User setting intercept: 0.25", method)
+            self.assertIn("Extrapolation method (begin): FirstPoint", method)
+            self.assertIn("Extrapolation method (end): LinearExtrapolation", method)
+            self.assertIn("RT correction peak selection mode: Weighted", method)
+            self.assertIn("RT correction peak selection RT weight: 0.7", method)
+            with zipfile.ZipFile(prepared["bundle"]) as archive:
+                self.assertIn(anchor.name, archive.namelist())
+                self.assertIn(selection.name, archive.namelist())
+
     def test_expand_paths_and_prepare_run(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

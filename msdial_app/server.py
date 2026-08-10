@@ -6,6 +6,7 @@ import mimetypes
 import os
 import socket
 import threading
+import time
 import traceback
 import urllib.parse
 import uuid
@@ -30,11 +31,17 @@ from .workflow import (
     parse_method,
     parse_mdpeak,
     parse_mdscan,
+    parse_rt_correction_result,
     prepare_run,
+    prepare_rt_correction_run,
     prepare_tuning_run,
+    read_analysis_csv,
     read_adducts,
     read_lipid_queries,
+    read_rt_correction_anchors,
     run_console,
+    save_rt_correction_anchors,
+    save_rt_correction_selections,
     is_supported,
     validate_workflow,
 )
@@ -317,6 +324,8 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_json()
             if parsed.path == "/api/files/expand":
                 self._json(expand_paths_report(body.get("paths", [])))
+            elif parsed.path == "/api/files/import-csv":
+                self._json(read_analysis_csv(body.get("path", "")))
             elif parsed.path == "/api/files/browse":
                 self._json(_browse_filesystem(body.get("path", "")))
             elif parsed.path == "/api/dialog/files":
@@ -345,6 +354,17 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/dialog/mztab-file":
                 selected = _pick_mztab_file()
                 self._json({"path": selected})
+            elif parsed.path == "/api/dialog/reference-file":
+                selected = _pick_reference_file(body.get("kind", "reference"))
+                self._json({"path": selected})
+            elif parsed.path == "/api/rt-correction/anchors/load":
+                path = body.get("path", "")
+                self._json({"path": str(Path(path).expanduser().resolve()), "rows": read_rt_correction_anchors(path)})
+            elif parsed.path == "/api/rt-correction/anchors/save":
+                saved = save_rt_correction_anchors(
+                    body.get("workflow", {}), body.get("rows", [])
+                )
+                self._json({"anchor_file": saved})
             elif parsed.path == "/api/knowledge/search":
                 self._json(
                     {
@@ -499,6 +519,30 @@ class Handler(BaseHTTPRequestHandler):
                     daemon=True,
                 ).start()
                 self._json({"job_id": job_id, "preparation": preparation})
+            elif parsed.path == "/api/rt-correction/run":
+                state = body.get("workflow", body)
+                preparation = prepare_rt_correction_run(state)
+                job_id = uuid.uuid4().hex
+                with JOBS_LOCK:
+                    JOBS[job_id] = {
+                        "id": job_id,
+                        "status": "queued",
+                        "kind": "rt_correction",
+                        "logs": [],
+                        "preparation": preparation,
+                        "exit_code": None,
+                        "result": None,
+                    }
+                threading.Thread(
+                    target=_run_rt_correction_job,
+                    args=(job_id, preparation),
+                    daemon=True,
+                ).start()
+                self._json({"job_id": job_id, "preparation": preparation})
+            elif parsed.path == "/api/rt-correction/save":
+                state = body.get("workflow", {})
+                path = save_rt_correction_selections(state, body.get("rows", []))
+                self._json({"selection_file": path})
             else:
                 self._json({"error": "Unknown endpoint."}, HTTPStatus.NOT_FOUND)
         except Exception as error:
@@ -539,7 +583,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _static(self, request_path: str) -> None:
-        relative = "index.html" if request_path in ("", "/") else request_path.lstrip("/")
+        relative = (
+            "index.html"
+            if request_path in ("", "/", "/rt-correction", "/rt-correction/")
+            else request_path.lstrip("/")
+        )
         target = (STATIC / relative).resolve()
         if target.parent != STATIC.resolve() or not target.is_file():
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -672,6 +720,38 @@ def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
         )
 
 
+def _run_rt_correction_job(job_id: str, preparation: dict[str, Any]) -> None:
+    def log(line: str) -> None:
+        with JOBS_LOCK:
+            JOBS[job_id]["logs"].append(line)
+            JOBS[job_id]["logs"] = JOBS[job_id]["logs"][-2000:]
+
+    with JOBS_LOCK:
+        JOBS[job_id]["status"] = "running"
+    try:
+        log("Starting RT correction EIC audit.")
+        log("Command: " + " ".join(preparation["command"]))
+        preparation["run_started_ns"] = time.time_ns()
+        exit_code = run_console(preparation, log)
+        result = parse_rt_correction_result(preparation) if exit_code == 0 else None
+        with JOBS_LOCK:
+            JOBS[job_id]["exit_code"] = exit_code
+            JOBS[job_id]["result"] = result
+            JOBS[job_id]["status"] = "completed" if exit_code == 0 else "failed"
+            if exit_code != 0:
+                JOBS[job_id]["error"] = _diagnose_console_failure(
+                    JOBS[job_id]["logs"],
+                    f"MS-DIAL Console exited with code {exit_code}.",
+                )
+    except Exception as error:
+        with JOBS_LOCK:
+            message = _diagnose_console_failure(JOBS[job_id]["logs"], str(error))
+        log(traceback.format_exc())
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "failed"
+            JOBS[job_id]["error"] = message
+
+
 def _cleanup_temporary_input_folder(path: str | None, log: Any) -> None:
     if not path:
         return
@@ -748,11 +828,41 @@ def _pick_mztab_file() -> str:
         return ""
 
 
+def _pick_reference_file(kind: str) -> str:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+        if kind == "rt-selection":
+            title = "Select RT correction peak selections"
+            filetypes = [("RT correction selection", "*.tsv *.txt"), ("All files", "*.*")]
+        elif kind == "analysis-csv":
+            title = "Select MS-DIAL analysis metadata CSV"
+            filetypes = [("Analysis metadata CSV", "*.csv"), ("All files", "*.*")]
+        else:
+            title = "Select RT correction anchor library"
+            filetypes = [("MS-DIAL text library", "*.txt *.tsv"), ("All files", "*.*")]
+        path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        root.destroy()
+        return path
+    except Exception:
+        return ""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="MS-DIAL Interactive local web app")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8765, type=int)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--rt-correction",
+        action="store_true",
+        help="Open the focused RT correction review workspace.",
+    )
     parser.add_argument(
         "--lab",
         action="store_true",
@@ -763,7 +873,8 @@ def main() -> None:
         args.host = "0.0.0.0"
         args.no_browser = True
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    url = f"http://{args.host}:{args.port}"
+    start_path = "/rt-correction" if args.rt_correction else "/"
+    url = f"http://{args.host}:{args.port}{start_path}"
     print(f"MS-DIAL Interactive: {url}")
     if args.host in ("0.0.0.0", "::"):
         print("Lab server mode: use only on a trusted lab network.")

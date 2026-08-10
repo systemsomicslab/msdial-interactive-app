@@ -12,7 +12,10 @@
       <h1>MS-DIAL Interactive</h1>
       <p>Cross-platform MS-DIAL Console workflow assistant</p>
     </div>
-    <div id="platformPill" class="pill">Loading...</div>
+    <div class="header-actions">
+      <button id="returnToMainAppHeader" type="button" class="header-return" hidden>Save state and return to MS-DIAL Interactive</button>
+      <div id="platformPill" class="pill">Loading...</div>
+    </div>
   </header>
 
   <nav id="tabs">
@@ -34,8 +37,9 @@
           <button id="pickFiles">Add original files</button>
           <button id="pickVendorFolder" class="secondary">Add vendor folders (.d/.raw)</button>
           <button id="pickFolder" class="secondary">Add parent folder</button>
+          <button id="importAnalysisCsv" class="secondary">Import analysis CSV</button>
         </div>
-        <p class="muted folder-help">Use Add original files for file-type data such as WIFF, mzML, ABF, or Thermo RAW. Use Add vendor folders for folder-type data such as Agilent .d, Bruker .d, or Waters .raw; multiple vendor folders can be selected in the local path browser. Browser drag-and-drop cannot reliably expose original absolute paths, so this app references local paths through the path browser or Add path.</p>
+        <p class="muted folder-help">Use Add original files for file-type data such as WIFF, mzML, ABF, or Thermo RAW. Use Add vendor folders for folder-type data such as Agilent .d, Bruker .d, or Waters .raw; multiple vendor folders can be selected in the local path browser. Import analysis CSV reads the MS-DIAL columns <code>file_path</code>, <code>file_name</code>, <code>file_type</code>, <code>class_id</code>, <code>acquisition_type</code>, <code>batch_order</code>, <code>analytical_order</code>, and <code>factor</code> in one step.</p>
         <div class="path-add">
           <input id="serverPath" placeholder="/data/project or D:\data\project">
           <button id="addPath" class="secondary">Add path</button>
@@ -73,7 +77,7 @@
 
     <section id="tab-guide" class="tab">
       <div class="guide-layout">
-        <div class="panel">
+        <div id="coreWorkflowPanel" class="panel">
           <h2>Core workflow</h2>
           <div class="form-grid">
             <label>Project type
@@ -110,7 +114,7 @@
           <button id="refreshQuestion" class="secondary">Refresh question</button>
         </aside>
       </div>
-      <div class="panel">
+      <div id="pathsPanel" class="panel">
         <h2>Paths</h2>
         <p class="muted">
           Download the stable Console package from the
@@ -129,7 +133,7 @@
         </div>
         <p class="muted">MS-DIAL reads raw data from their original paths. Only result and project files are written below Output root.</p>
       </div>
-      <div class="panel">
+      <div id="peakDetectionPanel" class="panel">
         <h2>Peak detection and alignment</h2>
         <div class="form-grid">
           <label>Number of threads<input id="numberOfThreads" type="number" min="1" value="4"></label>
@@ -157,6 +161,125 @@
             <span class="inline-check"><input id="alignmentLightMode" type="checkbox"> Use LC-MS text-export light mode</span>
             <span class="muted">For large LC-MS Console runs. This keeps mdalign/mdmsp/mzTab text outputs and alignment dcl while skipping GUI project serialization.</span>
           </label>
+        </div>
+      </div>
+      <div id="rtCorrectionLauncher" class="panel" hidden>
+        <div class="section-head compact-head">
+          <div>
+            <h2>LC-MS retention time correction</h2>
+            <p class="muted">Anchor detection and chromatogram review are handled in a dedicated workspace. When its approved selection file is returned here, this analysis can use RT correction during the production run.</p>
+          </div>
+          <button id="openRtCorrectionWorkspace" type="button">Open RT correction workspace</button>
+        </div>
+        <div id="rtCorrectionLauncherStatus" class="format-summary">No approved RT correction setup has been returned yet.</div>
+        <label class="check"><input id="executeRtCorrection" type="checkbox" disabled> Use the approved RT correction setup in this MS-DIAL analysis</label>
+      </div>
+      <div id="rtCorrectionSettings" class="panel">
+        <div class="section-head compact-head">
+          <div>
+            <h2>RT correction review workspace</h2>
+            <span class="muted">Detect anchor peaks, inspect and correct the selected RTs, then save an approved selection TSV for the main MS-DIAL analysis.</span>
+          </div>
+          <button id="returnToMainApp" type="button" class="secondary">Save state and return to MS-DIAL Interactive</button>
+        </div>
+        <div class="workspace-goal">
+          <strong>Goal of this workspace</strong>
+          <span>Produce an approved peak-selection TSV. The main app combines that file with the selected anchor library and enables RT correction in the production MS-DIAL run.</span>
+        </div>
+        <div class="path-grid">
+          <label>Anchor library (MS-DIAL text format)
+            <div class="output-path-row rt-anchor-path-row">
+              <input id="rtCorrectionAnchorPath" placeholder="D:\...\MTcorrection_anion.txt">
+              <button id="browseRtCorrectionAnchor" type="button" class="secondary">Browse</button>
+              <button id="loadRtCorrectionAnchors" type="button" class="secondary" title="Discard unsaved editor changes and reread the file currently shown in this path.">Reload file</button>
+            </div>
+            <span class="muted">Browse selects and reads a file immediately. Reload file rereads the displayed path and discards unsaved editor changes.</span>
+          </label>
+          <label>Existing approved peak-selection TSV (optional)
+            <div class="output-path-row">
+              <input id="rtCorrectionSelectionPath" placeholder="Use only when reopening a previous review">
+              <button id="browseRtCorrectionSelection" type="button" class="secondary">Browse</button>
+            </div>
+            <span class="muted">Leave blank for a new review. Select a previously saved TSV to reapply those peak choices and inspect the corrected EICs again.</span>
+          </label>
+        </div>
+        <div class="form-grid rt-correction-options">
+          <label>RT difference calculation
+            <select id="rtCorrectionDiffMethod">
+              <option value="SampleMinusSampleAverage">Sample - sample average</option>
+              <option value="SampleMinusReference">Sample - reference RT</option>
+            </select>
+          </label>
+          <label>Beginning extrapolation
+            <select id="rtCorrectionExtrapolationBegin">
+              <option value="UserSetting">Fixed value</option>
+              <option value="FirstPoint">First anchor difference</option>
+              <option value="LinearExtrapolation">Linear extrapolation</option>
+            </select>
+          </label>
+          <label>End extrapolation
+            <select id="rtCorrectionExtrapolationEnd">
+              <option value="LastPoint">Last anchor difference</option>
+              <option value="LinearExtrapolation">Linear extrapolation</option>
+            </select>
+          </label>
+          <label>Automatic peak selection
+            <select id="rtCorrectionPeakSelectionMode">
+              <option value="HighestIntensity">Highest intensity</option>
+              <option value="ClosestToReferenceRt">Closest to reference RT</option>
+              <option value="Weighted">Weighted intensity + RT</option>
+            </select>
+          </label>
+          <label id="rtCorrectionPeakSelectionRtWeightField">RT weight (0 = intensity, 1 = RT)
+            <input id="rtCorrectionPeakSelectionRtWeight" type="number" min="0" max="1" step="0.05" value="0.5">
+          </label>
+          <label>Intercept at 0 min (sample - reference)
+            <input id="rtCorrectionIntercept" type="number" step="any" value="0">
+          </label>
+          <label class="check"><input id="rtCorrectionSmoothDiff" type="checkbox"> Smooth the RT-difference curve</label>
+        </div>
+        <p class="muted">Anchor EICs use MS-DIAL's configured <code>LinearWeightedMovingAverage</code> smoothing (default level 3, ±3 points). Automatic peak detection is the same Core process used by the GUI. Weighted selection uses <code>(1 - RT weight) × relative height + RT weight × proximity to reference RT</code>; both terms range from 0 to 1.</p>
+        <details class="format-summary">
+          <summary><strong>Anchor library format</strong> (tab-delimited text)</summary>
+          <pre>Name	RT(min)	RT tol.(min)	m/z	m/z tol.	Minimum height	T/F
+Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
+        </details>
+        <div id="rtCorrectionAnchorEditor" class="nested-panel" hidden>
+          <div class="section-head compact-head">
+            <div>
+              <h2>Anchor library editor</h2>
+              <span id="rtCorrectionAnchorCount" class="muted"></span>
+            </div>
+            <button id="saveRtCorrectionAnchors" type="button" class="secondary">Save edited anchor library</button>
+          </div>
+          <div class="table-wrap compact-table rt-anchor-table">
+            <table>
+              <thead><tr><th>Use</th><th>Name</th><th>Target RT (min)</th><th>RT tolerance (min)</th><th>m/z</th><th>m/z tolerance</th><th>Minimum height</th></tr></thead>
+              <tbody id="rtCorrectionAnchorRows"></tbody>
+            </table>
+          </div>
+          <p class="muted">Loading does not copy or rename the source. Saving creates a new timestamped file such as <code>MTcorrection_anion_20260810-154230.txt</code> under Output root; the original file remains unchanged.</p>
+        </div>
+        <div class="button-row">
+          <button id="runRtCorrectionAudit" type="button">Extract EICs and detect anchors</button>
+          <button id="saveRtCorrectionSelections" type="button" class="secondary" disabled>Save approved peak selections</button>
+        </div>
+        <div id="rtCorrectionCompletion" class="completion-panel" hidden></div>
+        <pre id="rtCorrectionLog" class="rt-correction-log">Set an anchor library and run the EIC audit.</pre>
+        <div id="rtCorrectionReview" hidden>
+          <div class="section-head">
+            <div>
+              <h2>Anchor peak review</h2>
+              <span id="rtCorrectionCount" class="muted"></span>
+            </div>
+          </div>
+          <div class="table-wrap compact-table rt-selection-table">
+            <table>
+              <thead><tr><th>Use</th><th>File</th><th>Standard</th><th>Reference RT</th><th>Detected RT</th><th>Selected RT</th><th>Peak height</th></tr></thead>
+              <tbody id="rtCorrectionSelectionRows"></tbody>
+            </table>
+          </div>
+          <div id="rtCorrectionCharts" class="rt-correction-charts"></div>
         </div>
       </div>
       <div id="gcmsSettings" class="panel" hidden>

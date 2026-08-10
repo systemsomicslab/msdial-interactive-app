@@ -120,6 +120,83 @@ def expand_paths(paths: Iterable[str]) -> list[dict[str, Any]]:
     return expand_paths_report(paths)["files"]
 
 
+def read_analysis_csv(path: str | Path) -> dict[str, Any]:
+    csv_path = Path(path).expanduser().resolve()
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Analysis metadata CSV was not found: {csv_path}")
+
+    files: list[dict[str, Any]] = []
+    rejected: list[str] = []
+    warnings: list[str] = []
+    with csv_path.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            raise ValueError("Analysis metadata CSV has no header row.")
+        header_map = {str(name).strip().casefold(): name for name in reader.fieldnames}
+        if "file_path" not in header_map:
+            raise ValueError("Analysis metadata CSV requires a file_path column.")
+
+        for line_number, source in enumerate(reader, start=2):
+            row = {
+                key: source.get(original, "")
+                for key, original in header_map.items()
+            }
+            raw_path = str(row.get("file_path", "")).strip()
+            if not raw_path:
+                rejected.append(f"line {line_number}: empty file_path")
+                continue
+            analysis_path = Path(raw_path).expanduser()
+            if not analysis_path.is_absolute():
+                analysis_path = csv_path.parent / analysis_path
+            analysis_path = analysis_path.resolve()
+            if not analysis_path.exists():
+                rejected.append(f"{analysis_path} (not found; line {line_number})")
+                continue
+            if not is_supported(analysis_path):
+                rejected.append(f"{analysis_path} (unsupported; line {line_number})")
+                continue
+
+            format_info = detect_raw_format(analysis_path)
+            files.append(
+                {
+                    "file_path": str(analysis_path),
+                    "file_name": str(row.get("file_name", "")).strip() or analysis_path.stem,
+                    "file_type": str(row.get("file_type", "")).strip() or "Sample",
+                    "class_id": str(row.get("class_id", "")).strip() or "Sample",
+                    "acquisition_type": str(row.get("acquisition_type", "")).strip() or "DDA",
+                    "batch_order": _csv_number(row.get("batch_order"), 1, int),
+                    "analytical_order": _csv_number(
+                        row.get("analytical_order"), len(files) + 1, int
+                    ),
+                    "factor": _csv_number(row.get("factor"), 1, float),
+                    **format_info,
+                }
+            )
+
+    if not files:
+        detail = f" Rejected rows: {'; '.join(rejected[:5])}" if rejected else ""
+        raise ValueError(f"Analysis metadata CSV contained no usable analysis files.{detail}")
+    duplicate_paths = len(files) - len({item["file_path"].casefold() for item in files})
+    if duplicate_paths:
+        warnings.append(f"The CSV contains {duplicate_paths} duplicate file path(s).")
+    return {
+        "files": files,
+        "warnings": warnings,
+        "rejected": rejected,
+        "source_csv": str(csv_path),
+    }
+
+
+def _csv_number(value: Any, default: int | float, converter: Any) -> int | float:
+    text = str(value or "").strip()
+    if not text:
+        return default
+    try:
+        return converter(float(text)) if converter is int else converter(text)
+    except (TypeError, ValueError):
+        return default
+
+
 def expand_paths_report(paths: Iterable[str]) -> dict[str, Any]:
     expanded: list[Path] = []
     rejected: list[str] = []
@@ -234,6 +311,91 @@ def read_adducts(path: str | Path, ion_mode: str) -> list[dict[str, Any]]:
     return rows
 
 
+def read_rt_correction_anchors(path: str | Path) -> list[dict[str, Any]]:
+    anchor_path = Path(path).expanduser().resolve()
+    if not anchor_path.is_file():
+        raise FileNotFoundError(f"RT correction anchor library was not found: {anchor_path}")
+    rows: list[dict[str, Any]] = []
+    with anchor_path.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
+        reader = csv.reader(handle, delimiter="\t")
+        next(reader, None)
+        for line_number, columns in enumerate(reader, start=2):
+            if not columns or not any(str(value).strip() for value in columns):
+                continue
+            if len(columns) < 7:
+                raise ValueError(
+                    f"RT correction anchor line {line_number} requires 7 tab-delimited columns."
+                )
+            try:
+                rows.append(
+                    {
+                        "name": columns[0].strip(),
+                        "rt": float(columns[1]),
+                        "rt_tolerance": float(columns[2]),
+                        "mz": float(columns[3]),
+                        "mz_tolerance": float(columns[4]),
+                        "minimum_height": float(columns[5]),
+                        "include": columns[6].strip().casefold() == "true",
+                    }
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"RT correction anchor line {line_number} contains a non-numeric value."
+                ) from error
+    if not rows:
+        raise ValueError("RT correction anchor library contains no entries.")
+    return rows
+
+
+def save_rt_correction_anchors(
+    state: dict[str, Any], rows: list[dict[str, Any]]
+) -> str:
+    output_root = Path(str(state.get("output_root", ""))).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    source_value = str(
+        state.get("rt_correction_anchor_source_path")
+        or state.get("rt_correction_anchor_path")
+        or "rt_correction_anchors"
+    ).strip()
+    source_stem = Path(source_value).stem or "rt_correction_anchors"
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = output_root / f"{source_stem}_{timestamp}.txt"
+    suffix = 2
+    while path.exists():
+        path = output_root / f"{source_stem}_{timestamp}_{suffix}.txt"
+        suffix += 1
+    with path.open("w", encoding="ascii", errors="replace", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
+        writer.writerow(
+            ["Name", "RT(min)", "RT tol.(min)", "m/z", "m/z tol.", "Minimum height", "T/F"]
+        )
+        for index, row in enumerate(rows, start=1):
+            name = str(row.get("name", "")).strip()
+            if not name:
+                raise ValueError(f"RT correction anchor row {index} requires a name.")
+            rt = float(row.get("rt", 0))
+            rt_tolerance = float(row.get("rt_tolerance", 0))
+            mz = float(row.get("mz", 0))
+            mz_tolerance = float(row.get("mz_tolerance", 0))
+            minimum_height = float(row.get("minimum_height", 0))
+            if rt < 0 or rt_tolerance <= 0 or mz <= 0 or mz_tolerance <= 0 or minimum_height < 0:
+                raise ValueError(
+                    f"RT correction anchor row {index} has an invalid RT, tolerance, m/z, or height."
+                )
+            writer.writerow(
+                [
+                    name,
+                    format(rt, ".15g"),
+                    format(rt_tolerance, ".15g"),
+                    format(mz, ".15g"),
+                    format(mz_tolerance, ".15g"),
+                    format(minimum_height, ".15g"),
+                    "TRUE" if bool(row.get("include", False)) else "FALSE",
+                ]
+            )
+    return str(path)
+
+
 def parse_method(path: str | Path) -> dict[str, str]:
     values: dict[str, str] = {}
     method_path = Path(path)
@@ -269,6 +431,59 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                 "message": "Alignment light mode is currently available for LC-MS Console runs only.",
             }
         )
+    if state.get("execute_rt_correction"):
+        if project_type != "lcms":
+            issues.append(
+                {
+                    "level": "error",
+                    "message": "Retention-time correction is currently available only for LC-MS.",
+                }
+            )
+        anchor_path = str(state.get("rt_correction_anchor_path", "")).strip()
+        if not anchor_path:
+            issues.append(
+                {
+                    "level": "error",
+                    "message": "Set the RT correction anchor library path.",
+                }
+            )
+        elif not Path(anchor_path).exists():
+            issues.append(
+                {
+                    "level": "error",
+                    "message": f"RT correction anchor library not found: {anchor_path}",
+                }
+            )
+        selection_path = str(state.get("rt_correction_selection_path", "")).strip()
+        if selection_path and not Path(selection_path).exists():
+            issues.append(
+                {
+                    "level": "error",
+                    "message": f"RT correction peak selection file not found: {selection_path}",
+                }
+            )
+        selection_mode = str(
+            state.get("rt_correction_peak_selection_mode", "HighestIntensity")
+        )
+        if selection_mode not in {
+            "HighestIntensity",
+            "ClosestToReferenceRt",
+            "Weighted",
+        }:
+            issues.append(
+                {
+                    "level": "error",
+                    "message": f"Unknown RT correction peak selection mode: {selection_mode}",
+                }
+            )
+        rt_weight = float(state.get("rt_correction_peak_selection_rt_weight", 0.5))
+        if not 0 <= rt_weight <= 1:
+            issues.append(
+                {
+                    "level": "error",
+                    "message": "RT correction peak selection RT weight must be between 0 and 1.",
+                }
+            )
     if state.get("alignment_light_mode") and not state.get("together_with_alignment", True):
         issues.append(
             {
@@ -562,6 +777,8 @@ def prepare_run(
         "ri_dictionary_file": str(ri_dictionary) if ri_dictionary is not None else "",
         "msp_annotator_settings_file": str(method_state.get("msp_annotator_settings_file_path", "")),
         "text_annotator_settings_file": str(method_state.get("text_annotator_settings_file_path", "")),
+        "rt_correction_anchor_file": str(method_state.get("rt_correction_anchor_path", "")),
+        "rt_correction_selection_file": str(method_state.get("rt_correction_selection_path", "")),
         "command": command,
         "expected_analysis_exports": expected_analysis_exports,
     }
@@ -609,6 +826,7 @@ def prepare_tuning_run(
     tuning["stage_inputs"] = False
     tuning["project_store"] = False
     tuning["together_with_alignment"] = False
+    tuning["execute_rt_correction"] = False
     if str(tuning.get("project_type", "lcms")).lower() == "gcms":
         tuning["minimum_peak_height"] = state.get("minimum_peak_height", 1000)
     else:
@@ -868,6 +1086,193 @@ def build_console_command(
     return command
 
 
+def prepare_rt_correction_run(state: dict[str, Any]) -> dict[str, Any]:
+    if str(state.get("project_type", "lcms")).lower() != "lcms":
+        raise ValueError("Retention-time correction preview is currently available only for LC-MS.")
+    files = state.get("files", [])
+    if not files:
+        raise ValueError("Add at least one LC-MS analysis file.")
+    console_path = str(state.get("console_path", "")).strip()
+    if not console_path:
+        raise ValueError("Set the MS-DIAL Console path.")
+    executable = Path(console_path).expanduser().resolve()
+    if not executable.is_file():
+        raise ValueError(f"MS-DIAL Console not found: {executable}")
+    anchor_path = Path(str(state.get("rt_correction_anchor_path", ""))).expanduser().resolve()
+    if not anchor_path.is_file():
+        raise ValueError(f"RT correction anchor library not found: {anchor_path}")
+    output_root = Path(str(state.get("output_root", ""))).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    template_path = Path(str(state.get("template_path", ""))).expanduser().resolve()
+    if not template_path.is_file():
+        raise ValueError(f"Parameter template not found: {template_path}")
+
+    acquisition_types = {
+        str(item.get("acquisition_type", "DDA") or "DDA")
+        for item in files
+    }
+    if len(acquisition_types) != 1:
+        raise ValueError("RT correction preview currently requires one common acquisition type.")
+    acquisition_type = next(iter(acquisition_types))
+    prefix = ["dotnet", str(executable)] if executable.suffix.lower() == ".dll" else [str(executable)]
+    eic_path = output_root / "rt_correction_eics.csv"
+    command = prefix + ["eic", "rtcorrection"]
+    for item in files:
+        command.extend(["-i", str(Path(str(item["file_path"])).expanduser().resolve())])
+    command.extend(
+        [
+            "-library",
+            str(anchor_path),
+            "-o",
+            str(eic_path),
+            "-m",
+            str(template_path),
+            "-ionmode",
+            str(state.get("ion_mode", "Negative")),
+            "-acquisitiontype",
+            acquisition_type,
+        ]
+    )
+    selection_input = str(state.get("rt_correction_selection_path", "")).strip()
+    if selection_input:
+        selection_path = Path(selection_input).expanduser().resolve()
+        if not selection_path.is_file():
+            raise ValueError(f"RT correction peak selection file not found: {selection_path}")
+        command.extend(["-selection", str(selection_path)])
+        result_selection = output_root / "rt_correction_peak_selections_applied.tsv"
+    else:
+        result_selection = output_root / "rt_correction_peak_selections.tsv"
+    return {
+        "run_directory": str(output_root),
+        "analysis_type": "lcms",
+        "kind": "rt_correction",
+        "command": command,
+        "eic_file": str(eic_path),
+        "selection_file": str(result_selection),
+    }
+
+
+def parse_rt_correction_result(preparation: dict[str, Any]) -> dict[str, Any]:
+    selection_path = Path(preparation["selection_file"])
+    eic_path = Path(preparation["eic_file"])
+    if not selection_path.is_file():
+        raise FileNotFoundError(f"RT correction peak selection file was not generated: {selection_path}")
+    if not eic_path.is_file():
+        raise FileNotFoundError(f"RT correction EIC file was not generated: {eic_path}")
+    run_started_ns = int(preparation.get("run_started_ns", 0))
+    if run_started_ns and (
+        selection_path.stat().st_mtime_ns < run_started_ns
+        or eic_path.stat().st_mtime_ns < run_started_ns
+    ):
+        raise RuntimeError(
+            "The selected MS-DIAL Console did not generate fresh RT correction outputs. "
+            "Use a CUI build containing the current eic rtcorrection implementation: "
+            f"{preparation['command'][0]}"
+        )
+
+    rows: list[dict[str, Any]] = []
+    with selection_path.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            rows.append(
+                {
+                    "file_path": row.get("File path", ""),
+                    "file_name": row.get("File name", ""),
+                    "standard_id": int(row.get("Standard ID", "0")),
+                    "standard_name": row.get("Standard name", ""),
+                    "reference_rt": float(row.get("Reference RT (min)", "0")),
+                    "detected_rt": float(row.get("Detected RT (min)", "0")),
+                    "selected_rt": float(row.get("Selected RT (min)", "0")),
+                    "use": str(row.get("Use", "False")).lower() == "true",
+                    "peak_height": float(row.get("Peak height", "0")),
+                }
+            )
+
+    series_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    with eic_path.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required_columns = {"CorrectedRT", "SmoothedIntensity", "RTTolerance"}
+        missing_columns = required_columns.difference(reader.fieldnames or [])
+        if missing_columns:
+            raise RuntimeError(
+                "The selected MS-DIAL Console returned the legacy RT correction EIC format "
+                f"(missing: {', '.join(sorted(missing_columns))}). "
+                "This output cannot display corrected chromatograms. Rebuild or select the "
+                f"current CUI: {preparation['command'][0]}"
+            )
+        for row in reader:
+            key = (row.get("FilePath", ""), int(row.get("StandardId", "0")))
+            series = series_by_key.setdefault(
+                key,
+                {
+                    "file_path": row.get("FilePath", ""),
+                    "file_name": row.get("FileName", ""),
+                    "standard_id": key[1],
+                    "standard_name": row.get("StandardName", ""),
+                    "target_mz": float(row.get("TargetMz", "0")),
+                    "reference_rt": float(row.get("ReferenceRT", "0")),
+                    "rt_tolerance": float(row.get("RTTolerance", "0")),
+                    "rt": [],
+                    "corrected_rt": [],
+                    "intensity": [],
+                    "smoothed_intensity": [],
+                },
+            )
+            series["rt"].append(float(row.get("RT", "0")))
+            series["corrected_rt"].append(float(row.get("CorrectedRT", "0")))
+            series["intensity"].append(float(row.get("Intensity", "0")))
+            series["smoothed_intensity"].append(float(row.get("SmoothedIntensity", "0")))
+    return {
+        "selection_file": str(selection_path),
+        "eic_file": str(eic_path),
+        "rows": rows,
+        "series": list(series_by_key.values()),
+    }
+
+
+def save_rt_correction_selections(state: dict[str, Any], rows: list[dict[str, Any]]) -> str:
+    output_root = Path(str(state.get("output_root", ""))).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    allowed_files = {
+        str(Path(str(item["file_path"])).expanduser().resolve()).casefold()
+        for item in state.get("files", [])
+    }
+    path = output_root / "rt_correction_peak_selections_edited.tsv"
+    fields = [
+        "File path",
+        "File name",
+        "Standard ID",
+        "Standard name",
+        "Reference RT (min)",
+        "Detected RT (min)",
+        "Selected RT (min)",
+        "Use",
+        "Peak height",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        for row in rows:
+            file_path = str(Path(str(row.get("file_path", ""))).expanduser().resolve())
+            if file_path.casefold() not in allowed_files:
+                raise ValueError(f"Unexpected analysis file in RT correction selections: {file_path}")
+            selected_rt = float(row.get("selected_rt", 0))
+            use = bool(row.get("use", False))
+            writer.writerow(
+                {
+                    "File path": file_path,
+                    "File name": row.get("file_name", ""),
+                    "Standard ID": int(row.get("standard_id", 0)),
+                    "Standard name": row.get("standard_name", ""),
+                    "Reference RT (min)": float(row.get("reference_rt", 0)),
+                    "Detected RT (min)": float(row.get("detected_rt", 0)),
+                    "Selected RT (min)": selected_rt if use else 0,
+                    "Use": str(use),
+                    "Peak height": float(row.get("peak_height", 0)),
+                }
+            )
+    return str(path)
+
+
 def _write_reproduction_files(
     run_directory: Path,
     state: dict[str, Any],
@@ -927,6 +1332,7 @@ def _write_reproduction_files(
             "- method.txt: final parameter file, including Tune parameters values\n"
             "- msp_annotator_settings.tsv: optional per-MSP LC-MS annotation settings\n"
             "- text_annotator_settings.tsv: optional per-Text-library LC-MS annotation settings\n"
+            "- RT correction anchor/selection files: included when RT correction is enabled\n"
             "- workflow-settings.json: UI settings used to generate the workflow\n"
             "- command.txt: exact command generated on the original machine\n"
             "- run-msdial.ps1 / run-msdial.sh: portable launch scripts\n\n"
@@ -939,6 +1345,7 @@ def _write_reproduction_files(
             "  bash run-msdial.sh\n"
             "  bash run-msdial.sh /path/to/MSDIALCUI.dll\n\n"
             "The CSV contains absolute raw-data paths. Update them if the data move.\n"
+            "RT correction paths in method.txt are also absolute; update them after moving the bundle.\n"
         ),
         encoding="utf-8",
     )
@@ -962,6 +1369,11 @@ def _write_reproduction_files(
     text_annotator_settings = state.get("text_annotator_settings_file_path")
     if text_annotator_settings and Path(text_annotator_settings).is_file():
         members.append(Path(text_annotator_settings))
+    if state.get("execute_rt_correction"):
+        for key in ("rt_correction_anchor_path", "rt_correction_selection_path"):
+            value = str(state.get(key, "")).strip()
+            if value and Path(value).is_file():
+                members.append(Path(value))
     with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for member in members:
             archive.write(member, member.name)
@@ -1170,6 +1582,21 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         "use retention information for lbm-based annotation filtering": state.get("lbm_use_rt_filtering", False),
         "together with alignment": state.get("together_with_alignment", True),
         "export as mztabm format": "True",
+        "compounds library file path for rt correction": state.get("rt_correction_anchor_path", ""),
+        "rt correction peak selection file path": state.get("rt_correction_selection_path", ""),
+        "execute rt correction": bool(state.get("execute_rt_correction", False)),
+        "rt correction with smoothing for rt diff": bool(state.get("rt_correction_smooth_rt_diff", False)),
+        "user setting intercept": state.get("rt_correction_intercept", 0),
+        "rt diff calc method": state.get("rt_correction_diff_method", "SampleMinusSampleAverage"),
+        "interpolation method": "Linear",
+        "extrapolation method (begin)": state.get("rt_correction_extrapolation_begin", "UserSetting"),
+        "extrapolation method (end)": state.get("rt_correction_extrapolation_end", "LastPoint"),
+        "rt correction peak selection mode": state.get(
+            "rt_correction_peak_selection_mode", "HighestIntensity"
+        ),
+        "rt correction peak selection rt weight": state.get(
+            "rt_correction_peak_selection_rt_weight", 0.5
+        ),
     }
     if project_type == "lcms":
         replacements["alignment light mode"] = bool(state.get("alignment_light_mode", False))
@@ -1261,6 +1688,15 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         "minimum spectrum match for lbm-based annotation",
         "use retention information for lbm-based annotation scoring",
         "use retention information for lbm-based annotation filtering",
+        "compounds library file path for rt correction",
+        "rt correction peak selection file path",
+        "execute rt correction",
+        "rt correction with smoothing for rt diff",
+        "user setting intercept",
+        "rt diff calc method",
+        "interpolation method",
+        "extrapolation method (begin)",
+        "extrapolation method (end)",
     }
     for key, value in replacements.items():
         if key not in found:
@@ -1421,6 +1857,17 @@ def _title_for_key(key: str) -> str:
         "together with alignment": "Together with alignment",
         "alignment light mode": "Alignment light mode",
         "export as mztabm format": "Export as mztabM format",
+        "compounds library file path for rt correction": "Compounds library file path for RT correction",
+        "rt correction peak selection file path": "RT correction peak selection file path",
+        "execute rt correction": "Execute RT correction",
+        "rt correction with smoothing for rt diff": "RT correction with smoothing for RT diff",
+        "user setting intercept": "User setting intercept",
+        "rt diff calc method": "RT diff calc method",
+        "interpolation method": "Interpolation method",
+        "extrapolation method (begin)": "Extrapolation method (begin)",
+        "extrapolation method (end)": "Extrapolation method (end)",
+        "rt correction peak selection mode": "RT correction peak selection mode",
+        "rt correction peak selection rt weight": "RT correction peak selection RT weight",
         "ionization": "Ionization",
         "machine category": "Machine category",
         "accuracy type": "Accuracy type",

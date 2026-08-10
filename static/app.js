@@ -5,6 +5,12 @@ const state = {
   jobId: null,
   tuningJobId: null,
   tuningResult: null,
+  rtCorrectionJobId: null,
+  rtCorrectionResult: null,
+  rtCorrectionAnchors: [],
+  rtCorrectionAnchorsDirty: false,
+  rtCorrectionAnchorSourcePath: "",
+  analysisCsvSource: "",
   config: null,
   outputRootAutomatic: true,
   gcmsRiMap: {},
@@ -48,6 +54,7 @@ const DEFAULT_LBM_SETTINGS = {
   use_rt_scoring: false,
   use_rt_filtering: false,
 };
+const RT_WORKSPACE_STORAGE_KEY = "msdialInteractive.rtCorrectionWorkspace.v1";
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -85,6 +92,17 @@ function workflow() {
     alignment_rt_tolerance: Number($("#alignmentRtTolerance").value),
     alignment_ms1_tolerance: Number($("#alignmentMs1Tolerance").value),
     alignment_light_mode: Boolean($("#alignmentLightMode")?.checked),
+    execute_rt_correction: Boolean($("#executeRtCorrection")?.checked),
+    rt_correction_anchor_path: $("#rtCorrectionAnchorPath")?.value.trim() || "",
+    rt_correction_anchor_source_path: state.rtCorrectionAnchorSourcePath || "",
+    rt_correction_selection_path: $("#rtCorrectionSelectionPath")?.value.trim() || "",
+    rt_correction_diff_method: $("#rtCorrectionDiffMethod")?.value || "SampleMinusSampleAverage",
+    rt_correction_smooth_rt_diff: Boolean($("#rtCorrectionSmoothDiff")?.checked),
+    rt_correction_intercept: Number($("#rtCorrectionIntercept")?.value || 0),
+    rt_correction_extrapolation_begin: $("#rtCorrectionExtrapolationBegin")?.value || "UserSetting",
+    rt_correction_extrapolation_end: $("#rtCorrectionExtrapolationEnd")?.value || "LastPoint",
+    rt_correction_peak_selection_mode: $("#rtCorrectionPeakSelectionMode")?.value || "HighestIntensity",
+    rt_correction_peak_selection_rt_weight: Number($("#rtCorrectionPeakSelectionRtWeight")?.value || 0.5),
     solvent: $("#solvent").value,
     console_path: $("#consolePath").value.trim(),
     template_path: $("#templatePath").value.trim(),
@@ -247,6 +265,81 @@ function renderFiles() {
   renderVendorTips();
   renderTuningFiles();
   renderGcmsRiMap();
+}
+
+function renderRtCorrectionAnchors() {
+  const rows = state.rtCorrectionAnchors || [];
+  $("#rtCorrectionAnchorEditor").hidden = !rows.length;
+  updateRtCorrectionAnchorCount();
+  $("#rtCorrectionAnchorRows").innerHTML = rows.map((row, index) => `
+    <tr data-index="${index}">
+      <td><input data-key="include" type="checkbox" ${row.include ? "checked" : ""}></td>
+      <td><input data-key="name" value="${escapeHtml(row.name)}"></td>
+      <td><input data-key="rt" type="number" step="any" min="0" value="${Number(row.rt)}"></td>
+      <td><input data-key="rt_tolerance" type="number" step="any" min="0" value="${Number(row.rt_tolerance)}"></td>
+      <td><input data-key="mz" type="number" step="any" min="0" value="${Number(row.mz)}"></td>
+      <td><input data-key="mz_tolerance" type="number" step="any" min="0" value="${Number(row.mz_tolerance)}"></td>
+      <td><input data-key="minimum_height" type="number" step="any" min="0" value="${Number(row.minimum_height)}"></td>
+    </tr>`).join("");
+  $$("#rtCorrectionAnchorRows tr").forEach((tableRow) => {
+    const row = rows[Number(tableRow.dataset.index)];
+    tableRow.querySelectorAll("[data-key]").forEach((element) => {
+      element.addEventListener("input", () => {
+        const key = element.dataset.key;
+        row[key] = element.type === "checkbox"
+          ? element.checked
+          : element.type === "number"
+            ? Number(element.value)
+            : element.value;
+        state.rtCorrectionAnchorsDirty = true;
+        updateRtCorrectionAnchorCount();
+      });
+    });
+  });
+}
+
+function updateRtCorrectionAnchorCount() {
+  const rows = state.rtCorrectionAnchors || [];
+  const dirty = state.rtCorrectionAnchorsDirty ? " | Unsaved changes" : "";
+  $("#rtCorrectionAnchorCount").textContent =
+    `${rows.filter((row) => row.include).length} / ${rows.length} anchors enabled${dirty}`;
+}
+
+async function loadRtCorrectionAnchors(path = $("#rtCorrectionAnchorPath").value.trim()) {
+  if (!path) throw new Error("Select an RT correction anchor library.");
+  const result = await api("/api/rt-correction/anchors/load", {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
+  $("#rtCorrectionAnchorPath").value = result.path;
+  state.rtCorrectionAnchorSourcePath = result.path;
+  state.rtCorrectionAnchors = result.rows || [];
+  state.rtCorrectionAnchorsDirty = false;
+  state.rtCorrectionResult = null;
+  $("#rtCorrectionReview").hidden = true;
+  renderRtCorrectionAnchors();
+  saveRtWorkspaceState();
+  setStatus(`Loaded ${state.rtCorrectionAnchors.length} RT correction anchors.`);
+}
+
+async function saveEditedRtCorrectionAnchors() {
+  if (!state.rtCorrectionAnchors.length) {
+    throw new Error("Load an RT correction anchor library before saving.");
+  }
+  if (!$("#outputRoot").value.trim()) setOutputRootFromFirstFile();
+  if (!$("#outputRoot").value.trim()) {
+    throw new Error("Set Output root before saving the edited anchor library.");
+  }
+  const result = await api("/api/rt-correction/anchors/save", {
+    method: "POST",
+    body: JSON.stringify({ workflow: workflow(), rows: state.rtCorrectionAnchors }),
+  });
+  $("#rtCorrectionAnchorPath").value = result.anchor_file;
+  state.rtCorrectionAnchorsDirty = false;
+  updateRtCorrectionAnchorCount();
+  saveRtWorkspaceState();
+  setStatus(`Saved edited RT correction anchors: ${result.anchor_file}`);
+  return result.anchor_file;
 }
 
 function options(values, selected) {
@@ -716,6 +809,10 @@ function updateProjectUI() {
   if (isGcms) $("#ionMode").value = "Positive";
   $("#targetOmics").disabled = isGcms;
   const lipidomics = $("#targetOmics").value === "Lipidomics";
+  $("#solvent").disabled = isGcms || !lipidomics;
+  $("#solventField").title = lipidomics
+    ? "Solvent type is used by lipidomics annotation."
+    : "Solvent type is not used for Metabolomics.";
   const labels = {
     lcms: "LC-MS is executable in the current version.",
     gcms: "GC-MS is executable with EI MSP annotation and optional RT/RI retention-index settings.",
@@ -734,7 +831,11 @@ function updateProjectUI() {
   $("#textAnnotatorPanel").hidden = !isLcms;
   $("#lipidQuerySection").hidden = isGcms || !lipidomics;
   $("#alignmentLightModeField").hidden = !isLcms;
+  const isRtWorkspace = location.pathname.startsWith("/rt-correction");
+  $("#rtCorrectionSettings").hidden = !isLcms || !isRtWorkspace;
+  $("#rtCorrectionLauncher").hidden = !isLcms || isRtWorkspace;
   if (!isLcms) $("#alignmentLightMode").checked = false;
+  if (!isLcms) $("#executeRtCorrection").checked = false;
   $("#ionMode").closest("label").hidden = isGcms;
   $("#solventField").hidden = isGcms;
   ["rtBegin", "rtEnd", "alignmentRtTolerance"].forEach((id) => {
@@ -750,6 +851,100 @@ function updateProjectUI() {
     $("#tuningLog").textContent = "Diagnostic tuning is currently enabled for LC-MS mdpeak and GC-MS mdscan outputs.";
   }
   updateGcmsRiUI();
+  updateRtCorrectionSelectionUI();
+  updateRtCorrectionLauncher();
+}
+
+function updateRtCorrectionSelectionUI() {
+  const weighted = $("#rtCorrectionPeakSelectionMode")?.value === "Weighted";
+  if ($("#rtCorrectionPeakSelectionRtWeight")) {
+    $("#rtCorrectionPeakSelectionRtWeight").disabled = !weighted;
+  }
+  if ($("#rtCorrectionPeakSelectionRtWeightField")) {
+    $("#rtCorrectionPeakSelectionRtWeightField").title = weighted
+      ? "Blend normalized peak height and proximity to the reference RT."
+      : "RT weight is used only by Weighted selection.";
+  }
+}
+
+function updateRtCorrectionLauncher() {
+  const anchorPath = $("#rtCorrectionAnchorPath")?.value.trim() || "";
+  const selectionPath = $("#rtCorrectionSelectionPath")?.value.trim() || "";
+  const ready = Boolean(anchorPath && selectionPath);
+  const checkbox = $("#executeRtCorrection");
+  checkbox.disabled = !ready;
+  if (!ready) checkbox.checked = false;
+  $("#rtCorrectionLauncherStatus").innerHTML = ready
+    ? `<strong>Approved setup is ready.</strong><br>Anchor: ${escapeHtml(anchorPath)}<br>Peak selections: ${escapeHtml(selectionPath)}`
+    : "Open the review workspace, inspect the anchor peaks, and save an approved peak-selection TSV.";
+}
+
+function saveRtWorkspaceState() {
+  const current = workflow();
+  const payload = {
+    files: state.files,
+    analysis_csv_source: state.analysisCsvSource,
+    output_root_automatic: state.outputRootAutomatic,
+    project_type: current.project_type,
+    ion_mode: current.ion_mode,
+    target_omics: current.target_omics,
+    ms1_data_type: current.ms1_data_type,
+    ms2_data_type: current.ms2_data_type,
+    console_path: current.console_path,
+    template_path: current.template_path,
+    output_root: current.output_root,
+    execute_rt_correction: current.execute_rt_correction,
+    rt_correction_anchor_path: current.rt_correction_anchor_path,
+    rt_correction_anchor_source_path: current.rt_correction_anchor_source_path,
+    rt_correction_selection_path: current.rt_correction_selection_path,
+    rt_correction_diff_method: current.rt_correction_diff_method,
+    rt_correction_smooth_rt_diff: current.rt_correction_smooth_rt_diff,
+    rt_correction_intercept: current.rt_correction_intercept,
+    rt_correction_extrapolation_begin: current.rt_correction_extrapolation_begin,
+    rt_correction_extrapolation_end: current.rt_correction_extrapolation_end,
+    rt_correction_peak_selection_mode: current.rt_correction_peak_selection_mode,
+    rt_correction_peak_selection_rt_weight: current.rt_correction_peak_selection_rt_weight,
+  };
+  localStorage.setItem(RT_WORKSPACE_STORAGE_KEY, JSON.stringify(payload));
+}
+
+function restoreRtWorkspaceState() {
+  let saved;
+  try {
+    saved = JSON.parse(localStorage.getItem(RT_WORKSPACE_STORAGE_KEY) || "null");
+  } catch {
+    saved = null;
+  }
+  if (!saved) return;
+  if (Array.isArray(saved.files)) state.files = saved.files;
+  state.analysisCsvSource = saved.analysis_csv_source || "";
+  state.outputRootAutomatic = Boolean(saved.output_root_automatic);
+  const values = {
+    projectType: saved.project_type,
+    ionMode: saved.ion_mode,
+    targetOmics: saved.target_omics,
+    ms1Type: saved.ms1_data_type,
+    ms2Type: saved.ms2_data_type,
+    consolePath: saved.console_path,
+    templatePath: saved.template_path,
+    outputRoot: saved.output_root,
+    rtCorrectionAnchorPath: saved.rt_correction_anchor_path,
+    rtCorrectionSelectionPath: saved.rt_correction_selection_path,
+    rtCorrectionDiffMethod: saved.rt_correction_diff_method,
+    rtCorrectionIntercept: saved.rt_correction_intercept,
+    rtCorrectionExtrapolationBegin: saved.rt_correction_extrapolation_begin,
+    rtCorrectionExtrapolationEnd: saved.rt_correction_extrapolation_end,
+    rtCorrectionPeakSelectionMode: saved.rt_correction_peak_selection_mode,
+    rtCorrectionPeakSelectionRtWeight: saved.rt_correction_peak_selection_rt_weight,
+  };
+  Object.entries(values).forEach(([id, value]) => {
+    if (value !== undefined && value !== null && $(`#${id}`)) $(`#${id}`).value = value;
+  });
+  $("#executeRtCorrection").checked = Boolean(saved.execute_rt_correction);
+  $("#rtCorrectionSmoothDiff").checked = Boolean(saved.rt_correction_smooth_rt_diff);
+  state.rtCorrectionAnchorSourcePath = saved.rt_correction_anchor_source_path
+    || saved.rt_correction_anchor_path
+    || "";
 }
 
 function updateLlmUI() {
@@ -1159,6 +1354,142 @@ async function pollTuningJob() {
   }
 }
 
+function renderRtCorrectionResult(result) {
+  state.rtCorrectionResult = result;
+  const rows = result?.rows || [];
+  $("#rtCorrectionReview").hidden = !rows.length;
+  $("#saveRtCorrectionSelections").disabled = !rows.length;
+  $("#rtCorrectionCount").textContent = `${rows.filter((row) => row.use).length} / ${rows.length} anchors enabled`;
+  $("#rtCorrectionSelectionRows").innerHTML = rows.map((row, index) => `
+    <tr data-index="${index}">
+      <td><input data-key="use" type="checkbox" ${row.use ? "checked" : ""}></td>
+      <td title="${escapeHtml(row.file_path)}">${escapeHtml(row.file_name)}</td>
+      <td>${escapeHtml(row.standard_name)}</td>
+      <td>${Number(row.reference_rt).toFixed(4)}</td>
+      <td>${Number(row.detected_rt).toFixed(4)}</td>
+      <td><input data-key="selected_rt" type="number" step="any" value="${Number(row.selected_rt)}"></td>
+      <td>${Number(row.peak_height).toLocaleString()}</td>
+    </tr>`).join("");
+  $$("#rtCorrectionSelectionRows tr").forEach((tableRow) => {
+    const index = Number(tableRow.dataset.index);
+    tableRow.querySelector('[data-key="use"]').addEventListener("change", (event) => {
+      rows[index].use = event.target.checked;
+      $("#rtCorrectionCount").textContent = `${rows.filter((row) => row.use).length} / ${rows.length} anchors enabled`;
+    });
+    tableRow.querySelector('[data-key="selected_rt"]').addEventListener("input", (event) => {
+      rows[index].selected_rt = Number(event.target.value);
+    });
+  });
+
+  const groups = new Map();
+  (result?.series || []).forEach((series) => {
+    const key = `${series.standard_id}|${series.standard_name}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(series);
+  });
+  $("#rtCorrectionCharts").innerHTML = [...groups.entries()].map(([key, series], index) => `
+    <article class="rt-chart-card">
+      <h3>${escapeHtml(series[0]?.standard_name || key)} | m/z ${Number(series[0]?.target_mz || 0).toFixed(5)}</h3>
+      <div class="rt-chart-pair">
+        <div><strong>Original EIC</strong><canvas data-chart-index="${index}" data-x-key="rt"></canvas></div>
+        <div><strong>Corrected EIC</strong><canvas data-chart-index="${index}" data-x-key="corrected_rt"></canvas></div>
+      </div>
+      <div class="muted">${series.map((item, itemIndex) => `${itemIndex + 1}: ${escapeHtml(item.file_name)}`).join(" | ")}</div>
+    </article>`).join("");
+  const groupedSeries = [...groups.values()];
+  requestAnimationFrame(() => {
+    $$("#rtCorrectionCharts canvas").forEach((canvas) => {
+      drawRtCorrectionChart(
+        canvas,
+        groupedSeries[Number(canvas.dataset.chartIndex)] || [],
+        canvas.dataset.xKey,
+      );
+    });
+  });
+}
+
+function drawRtCorrectionChart(canvas, seriesList, xKey) {
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(360, canvas.clientWidth || 520);
+  const height = 235;
+  canvas.width = width * ratio;
+  canvas.height = height * ratio;
+  const context = canvas.getContext("2d");
+  context.scale(ratio, ratio);
+  context.clearRect(0, 0, width, height);
+  const padding = { left: 52, right: 14, top: 15, bottom: 34 };
+  const xs = seriesList.flatMap((series) => series[xKey] || []);
+  const ys = seriesList.flatMap((series) => series.smoothed_intensity || []);
+  if (!xs.length || !ys.length) return;
+  const referenceRt = Number(seriesList[0]?.reference_rt);
+  const rtTolerance = Number(seriesList[0]?.rt_tolerance);
+  const hasAnchorRange = Number.isFinite(referenceRt)
+    && Number.isFinite(rtTolerance)
+    && rtTolerance > 0;
+  const xMin = hasAnchorRange ? Math.max(0, referenceRt - rtTolerance) : Math.min(...xs);
+  const xMax = hasAnchorRange ? referenceRt + rtTolerance : Math.max(...xs);
+  const yMax = Math.max(...ys, 1);
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const scaleX = (value) => padding.left + ((value - xMin) / Math.max(xMax - xMin, 1e-9)) * plotWidth;
+  const scaleY = (value) => padding.top + plotHeight - (value / yMax) * plotHeight;
+  context.strokeStyle = "#93a7b1";
+  context.lineWidth = 1;
+  context.beginPath();
+  context.moveTo(padding.left, padding.top);
+  context.lineTo(padding.left, padding.top + plotHeight);
+  context.lineTo(padding.left + plotWidth, padding.top + plotHeight);
+  context.stroke();
+  context.fillStyle = "#526975";
+  context.font = "11px system-ui";
+  context.fillText(xMin.toFixed(2), padding.left, height - 12);
+  context.fillText(xMax.toFixed(2), padding.left + plotWidth - 28, height - 12);
+  context.fillText(yMax.toExponential(1), 3, padding.top + 5);
+  context.fillText("RT (min)", padding.left + plotWidth / 2 - 20, height - 3);
+  const colors = ["#007f86", "#d85f2a", "#6e55a5", "#b68a00", "#2879b9", "#c44771"];
+  seriesList.forEach((series, index) => {
+    const xValues = series[xKey] || [];
+    const yValues = series.smoothed_intensity || [];
+    context.strokeStyle = colors[index % colors.length];
+    context.lineWidth = 1.6;
+    context.beginPath();
+    let started = false;
+    xValues.forEach((x, pointIndex) => {
+      if (x < xMin || x > xMax) return;
+      const px = scaleX(x);
+      const py = scaleY(yValues[pointIndex] || 0);
+      if (!started) {
+        context.moveTo(px, py);
+        started = true;
+      }
+      else context.lineTo(px, py);
+    });
+    context.stroke();
+  });
+}
+
+async function pollRtCorrectionJob() {
+  if (!state.rtCorrectionJobId) return;
+  try {
+    const job = await api(`/api/jobs/${state.rtCorrectionJobId}`);
+    $("#rtCorrectionLog").textContent = job.logs.join("\n") || job.status;
+    $("#rtCorrectionLog").scrollTop = $("#rtCorrectionLog").scrollHeight;
+    setStatus(`RT correction audit ${job.status}`);
+    if (["queued", "running"].includes(job.status)) {
+      setTimeout(pollRtCorrectionJob, 1000);
+    } else if (job.status === "completed" && job.result) {
+      renderRtCorrectionResult(job.result);
+      $("#rtCorrectionLog").textContent +=
+        `\nLoaded ${job.result.rows.length} automatic anchor selections. Review the table, then save the approved peak selections.`;
+    } else if (job.error) {
+      $("#rtCorrectionLog").textContent += `\n${job.error}`;
+    }
+  } catch (error) {
+    $("#rtCorrectionLog").textContent += `\nRT correction status error: ${error.message}`;
+    setStatus("RT correction job status failed");
+  }
+}
+
 async function refreshQuestion() {
   const result = await api("/api/next-question", {
     method: "POST",
@@ -1216,6 +1547,7 @@ async function initialize() {
       .map((method) => `<option ${method === "LinearWeightedMovingAverage" ? "selected" : ""}>${escapeHtml(method)}</option>`)
       .join("");
   }
+  restoreRtWorkspaceState();
   state.lipidQueries = state.config.lipid_queries;
   state.adducts = state.config.adducts;
   if (!state.mspAnnotators.length) state.mspAnnotators.push(defaultMspAnnotatorRow());
@@ -1228,8 +1560,26 @@ async function initialize() {
   renderTextAnnotators();
   renderFiles();
   updateProjectUI();
+  applyWorkspaceMode();
+  if (location.pathname.startsWith("/rt-correction") && $("#rtCorrectionAnchorPath").value.trim()) {
+    await loadRtCorrectionAnchors($("#rtCorrectionAnchorPath").value.trim());
+  }
   updateLlmUI();
   refreshQuestion();
+}
+
+function applyWorkspaceMode() {
+  if (!location.pathname.startsWith("/rt-correction")) return;
+  document.body.classList.add("rt-correction-workspace");
+  $("#returnToMainAppHeader").hidden = false;
+  document.querySelector("header h1").textContent = "MS-DIAL RT Correction Review";
+  document.querySelector("header p").textContent =
+    "Cross-platform anchor EIC review and retention-time correction";
+  $("#projectType").value = "lcms";
+  updateProjectUI();
+  $$("#tabs button").forEach((button) => {
+    button.hidden = !["data", "guide"].includes(button.dataset.tab);
+  });
 }
 
 $("#tabs").addEventListener("click", (event) => {
@@ -1250,6 +1600,31 @@ $("#pickVendorFolder").addEventListener("click", () => runUiAction(async () => {
 }));
 $("#pickFolder").addEventListener("click", () => runUiAction(async () => {
   await openPathPicker("all");
+}));
+$("#importAnalysisCsv").addEventListener("click", () => runUiAction(async () => {
+  const picked = await api("/api/dialog/reference-file", {
+    method: "POST",
+    body: JSON.stringify({ kind: "analysis-csv" }),
+  });
+  if (!picked.path) return;
+  const result = await api("/api/files/import-csv", {
+    method: "POST",
+    body: JSON.stringify({ path: picked.path }),
+  });
+  if (state.files.length && !window.confirm(
+    `Replace the current ${state.files.length} analysis file(s) with ${result.files.length} row(s) from the CSV?`
+  )) return;
+  state.files = result.files || [];
+  state.analysisCsvSource = result.source_csv || picked.path;
+  if (state.outputRootAutomatic) setOutputRootFromFirstFile();
+  renderFiles();
+  applyRecommendedParameters();
+  showImportMessages([
+    `Imported ${state.files.length} analysis rows from ${state.analysisCsvSource}.`,
+    ...(result.warnings || []),
+    ...(result.rejected || []).map((path) => `Skipped CSV row: ${path}`),
+  ], result.rejected?.length ? "warning" : "info");
+  refreshQuestion();
 }));
 $("#addPath").addEventListener("click", () => runUiAction(async () => {
   if ($("#serverPath").value.trim()) await addServerPaths([$("#serverPath").value.trim()]);
@@ -1319,6 +1694,91 @@ $("#targetOmics").addEventListener("change", () => {
   updateProjectUI();
   refreshQuestion();
 });
+$("#openRtCorrectionWorkspace").addEventListener("click", () => {
+  saveRtWorkspaceState();
+  location.assign("/rt-correction");
+});
+function returnToMainApp() {
+  saveRtWorkspaceState();
+  location.assign("/");
+}
+$("#returnToMainApp").addEventListener("click", returnToMainApp);
+$("#returnToMainAppHeader").addEventListener("click", returnToMainApp);
+$("#rtCorrectionPeakSelectionMode").addEventListener("change", () => {
+  updateRtCorrectionSelectionUI();
+  refreshQuestion();
+});
+$("#browseRtCorrectionAnchor").addEventListener("click", () => runUiAction(async () => {
+  if (state.rtCorrectionAnchorsDirty && !window.confirm(
+    "Discard unsaved anchor-library edits and choose another file?"
+  )) return;
+  const result = await api("/api/dialog/reference-file", {
+    method: "POST",
+    body: JSON.stringify({ kind: "rt-anchor" }),
+  });
+  if (result.path) await loadRtCorrectionAnchors(result.path);
+}));
+$("#loadRtCorrectionAnchors").addEventListener("click", () => runUiAction(async () => {
+  if (state.rtCorrectionAnchorsDirty && !window.confirm(
+    "Discard unsaved edits and reload the anchor library from disk?"
+  )) return;
+  await loadRtCorrectionAnchors();
+}));
+$("#saveRtCorrectionAnchors").addEventListener("click", () =>
+  runUiAction(() => saveEditedRtCorrectionAnchors()));
+$("#browseRtCorrectionSelection").addEventListener("click", () => runUiAction(async () => {
+  const result = await api("/api/dialog/reference-file", {
+    method: "POST",
+    body: JSON.stringify({ kind: "rt-selection" }),
+  });
+  if (result.path) {
+    $("#rtCorrectionSelectionPath").value = result.path;
+    saveRtWorkspaceState();
+  }
+}));
+$("#runRtCorrectionAudit").addEventListener("click", () => runUiAction(async () => {
+  if (state.rtCorrectionAnchorsDirty) {
+    throw new Error(
+      "The anchor editor has unsaved changes. Save the edited anchor library, or reload the source file before extracting EICs."
+    );
+  }
+  const current = workflow();
+  const missing = [];
+  if (current.project_type !== "lcms") missing.push("Select LC-MS as the project type.");
+  if (!current.files.length) missing.push("Add at least one analysis file.");
+  if (!current.console_path) missing.push("Set the MS-DIAL Console path.");
+  if (!current.template_path) missing.push("Set the parameter template path.");
+  if (!current.output_root) missing.push("Set the output root.");
+  if (!current.rt_correction_anchor_path) missing.push("Set the RT correction anchor library.");
+  if (missing.length) throw new Error(`RT correction audit cannot start:\n${missing.join("\n")}`);
+  $("#rtCorrectionLog").textContent = "Preparing RT correction EIC audit...";
+  const result = await api("/api/rt-correction/run", {
+    method: "POST",
+    body: JSON.stringify({ workflow: current }),
+  });
+  state.rtCorrectionJobId = result.job_id;
+  $("#rtCorrectionLog").textContent = `RT correction audit queued.\nOutput folder: ${result.preparation.run_directory}`;
+  pollRtCorrectionJob();
+}));
+$("#saveRtCorrectionSelections").addEventListener("click", () => runUiAction(async () => {
+  if (!state.rtCorrectionResult?.rows?.length) throw new Error("Run the RT correction EIC audit first.");
+  const result = await api("/api/rt-correction/save", {
+    method: "POST",
+    body: JSON.stringify({
+      workflow: workflow(),
+      rows: state.rtCorrectionResult.rows,
+    }),
+  });
+  $("#rtCorrectionSelectionPath").value = result.selection_file;
+  $("#executeRtCorrection").checked = true;
+  updateRtCorrectionLauncher();
+  saveRtWorkspaceState();
+  $("#rtCorrectionCompletion").hidden = false;
+  $("#rtCorrectionCompletion").innerHTML =
+    `<strong>Review completed.</strong><br>Approved peak selections: ${escapeHtml(result.selection_file)}<br>`
+    + "Return to the main analysis to apply this RT correction setup in the production run.";
+  setStatus(`Saved approved RT correction peak selections: ${result.selection_file}`);
+}));
 [
   "gcmsRetentionType",
   "gcmsAlignmentIndexType",
