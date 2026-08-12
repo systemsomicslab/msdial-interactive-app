@@ -1375,6 +1375,8 @@ function renderQaReport(report) {
     [qaValue(summary.qc_pca_relative_dispersion, 3), "QC PCA dispersion / all samples"],
     [qaPercent(summary.median_blank_carryover_ratio), "median blank / previous injection"],
     [qaValue(summary.run_order_intensity_correlation, 3), "order vs median intensity r"],
+    [qaPercent(summary.median_msms_acquisition_rate), "median MS/MS acquisition rate"],
+    [qaValue(summary.median_sample_sn, 1), "median sample S/N"],
   ].map(([value, label]) => `<div class="metric"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`).join("");
   const warnings = (report.warnings || []).map((message) => `<div class="issue warning">${escapeHtml(message)}</div>`).join("");
   const standardCards = (report.internal_standards || []).map((standard, index) => {
@@ -1401,14 +1403,18 @@ function renderQaReport(report) {
       <article class="qa-chart-card"><h3>PCA topology</h3><canvas id="qaPca"></canvas><div class="muted">PC1 ${qaPercent(report.pca?.explained_variance?.[0])}; PC2 ${qaPercent(report.pca?.explained_variance?.[1])}</div></article>
       <article class="qa-chart-card"><h3>Median detected intensity by analytical order</h3><canvas id="qaIntensityOrder"></canvas></article>
       <article class="qa-chart-card"><h3>Reference-matched count by analytical order</h3><canvas id="qaReferenceOrder"></canvas></article>
+      <article class="qa-chart-card"><h3>MS/MS acquisition rate by analytical order</h3><canvas id="qaMsmsOrder"></canvas></article>
+      <article class="qa-chart-card"><h3>S/N distribution by analytical order</h3><canvas id="qaSnOrder"></canvas></article>
       ${standardCards}
     </div>
     <div class="muted qa-method">${escapeHtml(Object.values(report.method || {}).join(" | "))}</div>`;
   requestAnimationFrame(() => {
     drawQaHistogram($("#qaIntensityDistribution"), report.intensity_distributions || []);
     drawQaPca($("#qaPca"), report.pca || {});
-    drawQaOrderSeries($("#qaIntensityOrder"), report.samples || [], "median_log_intensity", "log10 intensity");
+    drawQaOrderDistribution($("#qaIntensityOrder"), report.samples || [], "median_log_intensity", "q25_log_intensity", "q75_log_intensity", "log10 intensity");
     drawQaOrderSeries($("#qaReferenceOrder"), report.samples || [], "reference_matched_count", "matched features");
+    drawQaOrderSeries($("#qaMsmsOrder"), report.samples || [], "msms_acquisition_rate", "MS/MS acquisition rate");
+    drawQaOrderDistribution($("#qaSnOrder"), report.samples || [], "median_sn", "q25_sn", "q75_sn", "S/N");
     $$("[data-qa-standard]").forEach((canvas) => {
       const standard = (report.internal_standards || [])[Number(canvas.dataset.qaStandard)];
       drawQaOrderSeries(canvas, standard?.values || [], canvas.dataset.qaValue, canvas.dataset.qaValue);
@@ -1416,7 +1422,7 @@ function renderQaReport(report) {
   });
 }
 
-function qaCanvas(canvas, height = 250) {
+function qaCanvas(canvas, height = 280) {
   if (!canvas) return null;
   const ratio = window.devicePixelRatio || 1;
   const width = Math.max(340, canvas.clientWidth || 520);
@@ -1425,7 +1431,7 @@ function qaCanvas(canvas, height = 250) {
   const context = canvas.getContext("2d");
   context.scale(ratio, ratio);
   context.clearRect(0, 0, width, height);
-  return { context, width, height, padding: { left: 52, right: 16, top: 16, bottom: 36 } };
+  return { context, width, height, padding: { left: 72, right: 18, top: 18, bottom: 52 } };
 }
 
 function qaAxes(frame, xMin, xMax, yMin, yMax, xLabel, yLabel) {
@@ -1434,24 +1440,51 @@ function qaAxes(frame, xMin, xMax, yMin, yMax, xLabel, yLabel) {
   const plotHeight = height - padding.top - padding.bottom;
   const sx = (value) => padding.left + ((value - xMin) / Math.max(xMax - xMin, 1e-12)) * plotWidth;
   const sy = (value) => padding.top + plotHeight - ((value - yMin) / Math.max(yMax - yMin, 1e-12)) * plotHeight;
-  context.strokeStyle = "#93a7b1";
+  context.font = "14px Arial, sans-serif";
+  context.fillStyle = "#526975";
+  context.textBaseline = "middle";
+  const tickLabel = (value) => {
+    const absolute = Math.abs(value);
+    if ((absolute > 0 && absolute < 0.01) || absolute >= 10000) return value.toExponential(1);
+    if (absolute >= 100) return value.toFixed(0);
+    if (absolute >= 10) return value.toFixed(1);
+    return value.toFixed(2);
+  };
+  context.strokeStyle = "#e3eaed";
   context.lineWidth = 1;
+  for (let index = 0; index <= 4; index += 1) {
+    const fraction = index / 4;
+    const x = padding.left + fraction * plotWidth;
+    const y = padding.top + plotHeight - fraction * plotHeight;
+    context.beginPath();
+    context.moveTo(x, padding.top);
+    context.lineTo(x, padding.top + plotHeight);
+    context.moveTo(padding.left, y);
+    context.lineTo(padding.left + plotWidth, y);
+    context.stroke();
+    const xValue = xMin + fraction * (xMax - xMin);
+    const yValue = yMin + fraction * (yMax - yMin);
+    context.textAlign = "center";
+    context.fillText(tickLabel(xValue), x, padding.top + plotHeight + 18);
+    context.textAlign = "right";
+    context.fillText(tickLabel(yValue), padding.left - 8, y);
+  }
+  context.strokeStyle = "#718994";
   context.beginPath();
   context.moveTo(padding.left, padding.top);
   context.lineTo(padding.left, padding.top + plotHeight);
   context.lineTo(padding.left + plotWidth, padding.top + plotHeight);
   context.stroke();
-  context.fillStyle = "#526975";
-  context.font = "11px system-ui";
-  context.fillText(Number(xMin).toFixed(2), padding.left, height - 14);
-  context.fillText(Number(xMax).toFixed(2), padding.left + plotWidth - 30, height - 14);
-  context.fillText(Number(yMax).toPrecision(3), 2, padding.top + 5);
-  context.fillText(xLabel, padding.left + plotWidth / 2 - 28, height - 3);
+  context.font = "bold 14px Arial, sans-serif";
+  context.textAlign = "center";
+  context.fillText(xLabel, padding.left + plotWidth / 2, height - 10);
   context.save();
-  context.translate(11, padding.top + plotHeight / 2 + 20);
+  context.translate(15, padding.top + plotHeight / 2);
   context.rotate(-Math.PI / 2);
   context.fillText(yLabel, 0, 0);
   context.restore();
+  context.font = "14px Arial, sans-serif";
+  context.textBaseline = "alphabetic";
   return { sx, sy };
 }
 
@@ -1500,7 +1533,11 @@ function drawQaPca(canvas, pca) {
 function drawQaOrderSeries(canvas, values, key, yLabel) {
   const frame = qaCanvas(canvas);
   const points = values
-    .map((item) => ({ ...item, x: Number(item.order), y: Number(item[key]) }))
+    .map((item) => ({
+      ...item,
+      x: Number(item.order),
+      y: item[key] === null || item[key] === undefined ? Number.NaN : Number(item[key]),
+    }))
     .filter((item) => Number.isFinite(item.x) && Number.isFinite(item.y));
   if (!frame || !points.length) return;
   points.sort((left, right) => left.batch - right.batch || left.x - right.x);
@@ -1520,6 +1557,51 @@ function drawQaOrderSeries(canvas, values, key, yLabel) {
     frame.context.fillStyle = QA_COLORS[point.category] || "#6e55a5";
     frame.context.beginPath();
     frame.context.arc(axes.sx(point.x), axes.sy(point.y), point.category === "QC" ? 4.5 : 3, 0, Math.PI * 2);
+    frame.context.fill();
+  });
+}
+
+function drawQaOrderDistribution(canvas, values, medianKey, lowKey, highKey, yLabel) {
+  const frame = qaCanvas(canvas);
+  const points = values
+    .map((item) => ({
+      ...item,
+      x: Number(item.order),
+      y: item[medianKey] === null || item[medianKey] === undefined ? Number.NaN : Number(item[medianKey]),
+      low: item[lowKey] === null || item[lowKey] === undefined ? Number.NaN : Number(item[lowKey]),
+      high: item[highKey] === null || item[highKey] === undefined ? Number.NaN : Number(item[highKey]),
+    }))
+    .filter((item) => [item.x, item.y, item.low, item.high].every(Number.isFinite));
+  if (!frame || !points.length) return;
+  points.sort((left, right) => left.batch - right.batch || left.x - right.x);
+  const xs = points.map((item) => item.x);
+  const ranges = points.flatMap((item) => [item.low, item.high]);
+  const yPad = Math.max((Math.max(...ranges) - Math.min(...ranges)) * 0.08, 1e-6);
+  const axes = qaAxes(frame, Math.min(...xs), Math.max(...xs), Math.min(...ranges) - yPad, Math.max(...ranges) + yPad, "analytical order", yLabel);
+  frame.context.strokeStyle = "#b5c2c8";
+  frame.context.lineWidth = 1;
+  frame.context.beginPath();
+  points.forEach((point, index) => {
+    if (index === 0) frame.context.moveTo(axes.sx(point.x), axes.sy(point.y));
+    else frame.context.lineTo(axes.sx(point.x), axes.sy(point.y));
+  });
+  frame.context.stroke();
+  points.forEach((point) => {
+    const x = axes.sx(point.x);
+    const color = QA_COLORS[point.category] || "#6e55a5";
+    frame.context.strokeStyle = color;
+    frame.context.lineWidth = 2;
+    frame.context.beginPath();
+    frame.context.moveTo(x, axes.sy(point.low));
+    frame.context.lineTo(x, axes.sy(point.high));
+    frame.context.moveTo(x - 4, axes.sy(point.low));
+    frame.context.lineTo(x + 4, axes.sy(point.low));
+    frame.context.moveTo(x - 4, axes.sy(point.high));
+    frame.context.lineTo(x + 4, axes.sy(point.high));
+    frame.context.stroke();
+    frame.context.fillStyle = color;
+    frame.context.beginPath();
+    frame.context.arc(x, axes.sy(point.y), point.category === "QC" ? 5 : 3.5, 0, Math.PI * 2);
     frame.context.fill();
   });
 }
@@ -1716,7 +1798,7 @@ function drawRtCorrectionChart(canvas, seriesList, xKey) {
   const context = canvas.getContext("2d");
   context.scale(ratio, ratio);
   context.clearRect(0, 0, width, height);
-  const padding = { left: 52, right: 14, top: 15, bottom: 34 };
+  const padding = { left: 72, right: 16, top: 18, bottom: 48 };
   const xs = seriesList.flatMap((series) => series[xKey] || []);
   const ys = seriesList.flatMap((series) => series.smoothed_intensity || []);
   if (!xs.length || !ys.length) return;
@@ -1740,11 +1822,21 @@ function drawRtCorrectionChart(canvas, seriesList, xKey) {
   context.lineTo(padding.left + plotWidth, padding.top + plotHeight);
   context.stroke();
   context.fillStyle = "#526975";
-  context.font = "11px system-ui";
-  context.fillText(xMin.toFixed(2), padding.left, height - 12);
-  context.fillText(xMax.toFixed(2), padding.left + plotWidth - 28, height - 12);
-  context.fillText(yMax.toExponential(1), 3, padding.top + 5);
-  context.fillText("RT (min)", padding.left + plotWidth / 2 - 20, height - 3);
+  context.font = "14px Arial, sans-serif";
+  context.textAlign = "center";
+  context.fillText(xMin.toFixed(2), padding.left, padding.top + plotHeight + 18);
+  context.fillText(xMax.toFixed(2), padding.left + plotWidth, padding.top + plotHeight + 18);
+  context.textAlign = "right";
+  context.fillText(yMax.toExponential(1), padding.left - 8, padding.top + 5);
+  context.fillText("0", padding.left - 8, padding.top + plotHeight);
+  context.font = "bold 14px Arial, sans-serif";
+  context.textAlign = "center";
+  context.fillText("RT (min)", padding.left + plotWidth / 2, height - 8);
+  context.save();
+  context.translate(15, padding.top + plotHeight / 2);
+  context.rotate(-Math.PI / 2);
+  context.fillText("Intensity", 0, 0);
+  context.restore();
   const colors = ["#007f86", "#d85f2a", "#6e55a5", "#b68a00", "#2879b9", "#c44771"];
   seriesList.forEach((series, index) => {
     const xValues = series[xKey] || [];

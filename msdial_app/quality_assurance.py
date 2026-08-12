@@ -40,6 +40,7 @@ def build_lcms_qa_report(
     samples: dict[str, dict[str, Any]] = {}
     sample_order: list[str] = []
     sample_reservoirs: dict[str, _Reservoir] = {}
+    sn_reservoirs: dict[str, _Reservoir] = {}
     type_reservoirs: dict[str, _Reservoir] = {}
     qc_rsds = _Reservoir()
     qc_detection_rates = _Reservoir()
@@ -53,6 +54,7 @@ def build_lcms_qa_report(
     with target.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         _validate_headers(reader.fieldnames or [])
+        msms_available = "MSMS" in (reader.fieldnames or [])
         current_id: str | None = None
         spot_rows: list[dict[str, Any]] = []
         for raw in reader:
@@ -69,6 +71,7 @@ def build_lcms_qa_report(
                     pca_indices,
                     samples,
                     sample_reservoirs,
+                    sn_reservoirs,
                     type_reservoirs,
                     qc_rsds,
                     qc_detection_rates,
@@ -81,7 +84,7 @@ def build_lcms_qa_report(
                 spot_count += 1
                 spot_rows = []
             row = _parse_row(raw)
-            _register_sample(row, samples, sample_reservoirs, type_reservoirs)
+            _register_sample(row, samples, sample_reservoirs, sn_reservoirs, type_reservoirs)
             spot_rows.append(row)
             current_id = spot_id
         if spot_rows:
@@ -96,6 +99,7 @@ def build_lcms_qa_report(
                 pca_indices,
                 samples,
                 sample_reservoirs,
+                sn_reservoirs,
                 type_reservoirs,
                 qc_rsds,
                 qc_detection_rates,
@@ -107,7 +111,7 @@ def build_lcms_qa_report(
             )
             spot_count += 1
 
-    sample_summaries = _summarize_samples(samples, sample_reservoirs)
+    sample_summaries = _summarize_samples(samples, sample_reservoirs, sn_reservoirs, msms_available)
     pca_files = [sample_order[index] for index in pca_indices]
     pca = _compute_pca([item[2] for item in pca_heap], pca_files, samples)
     summary = _summarize_report(
@@ -135,6 +139,8 @@ def build_lcms_qa_report(
             "blank_separation": "sample median height / blank median height for each feature",
             "carryover": "blank total height / immediately preceding injection total height",
             "qc_topology": "median pairwise PCA distance among QCs / median pairwise distance among all displayed samples",
+            "msms_acquisition": "features with an assigned MS/MS spectrum / detected features in each sample",
+            "sn_distribution": "median and interquartile range of positive feature S/N values in each sample",
         },
     }
 
@@ -177,6 +183,7 @@ def _parse_row(raw: dict[str, str]) -> dict[str, Any]:
         "rt": _number(raw.get("RT")),
         "mz": _number(raw.get("MZ")),
         "sn": _number(raw.get("SN")),
+        "msms": str(raw.get("MSMS", "")).strip().lower() == "true",
         "reference_matched": str(raw.get("Reference matched", "")).strip().lower() == "true",
     }
 
@@ -185,6 +192,7 @@ def _register_sample(
     row: dict[str, Any],
     samples: dict[str, dict[str, Any]],
     sample_reservoirs: dict[str, _Reservoir],
+    sn_reservoirs: dict[str, _Reservoir],
     type_reservoirs: dict[str, _Reservoir],
 ) -> None:
     name = row["file"]
@@ -199,10 +207,12 @@ def _register_sample(
         "order": row["order"],
         "batch": row["batch"],
         "detected_features": 0,
+        "msms_acquired_count": 0,
         "reference_matched_count": 0,
         "total_height": 0.0,
     }
     sample_reservoirs[name] = _Reservoir(seed=23 + len(samples))
+    sn_reservoirs[name] = _Reservoir(seed=29 + len(samples))
     type_reservoirs.setdefault(category, _Reservoir(seed=31 + len(type_reservoirs)))
 
 
@@ -213,6 +223,7 @@ def _consume_spot(
     pca_indices: list[int],
     samples: dict[str, dict[str, Any]],
     sample_reservoirs: dict[str, _Reservoir],
+    sn_reservoirs: dict[str, _Reservoir],
     type_reservoirs: dict[str, _Reservoir],
     qc_rsds: _Reservoir,
     qc_detection_rates: _Reservoir,
@@ -230,8 +241,12 @@ def _consume_spot(
         sample = samples[row["file"]]
         sample["detected_features"] += 1
         sample["total_height"] += height
+        if row["msms"]:
+            sample["msms_acquired_count"] += 1
         if row["reference_matched"]:
             sample["reference_matched_count"] += 1
+        if row["sn"] > 0:
+            sn_reservoirs[row["file"]].add(row["sn"])
         transformed = math.log10(height + 1.0)
         sample_reservoirs[row["file"]].add(transformed)
         type_reservoirs[sample["category"]].add(transformed)
@@ -375,16 +390,30 @@ def _normalize(values: list[float]) -> list[float]:
     return [value / length for value in values]
 
 
-def _summarize_samples(samples: dict[str, dict[str, Any]], reservoirs: dict[str, _Reservoir]) -> list[dict[str, Any]]:
+def _summarize_samples(
+    samples: dict[str, dict[str, Any]],
+    reservoirs: dict[str, _Reservoir],
+    sn_reservoirs: dict[str, _Reservoir],
+    msms_available: bool,
+) -> list[dict[str, Any]]:
     result = []
     for name, item in samples.items():
         values = sorted(reservoirs[name].values)
+        sn_values = sorted(sn_reservoirs[name].values)
         result.append({
             **item,
             "median_log_intensity": _quantile(values, 0.5),
             "q25_log_intensity": _quantile(values, 0.25),
             "q75_log_intensity": _quantile(values, 0.75),
             "log_total_height": math.log10(item["total_height"] + 1.0),
+            "msms_acquisition_rate": (
+                item["msms_acquired_count"] / item["detected_features"]
+                if msms_available and item["detected_features"] > 0
+                else None
+            ),
+            "median_sn": _quantile(sn_values, 0.5),
+            "q25_sn": _quantile(sn_values, 0.25),
+            "q75_sn": _quantile(sn_values, 0.75),
         })
     result.sort(key=lambda item: (item["batch"], item["order"], item["file"]))
     for index, item in enumerate(result):
@@ -413,6 +442,8 @@ def _summarize_report(
         [float(item["order"]) for item in samples],
         [float(item["reference_matched_count"]) for item in samples],
     )
+    msms_rates = [float(item["msms_acquisition_rate"]) for item in samples if item["msms_acquisition_rate"] is not None]
+    median_sns = [float(item["median_sn"]) for item in samples if item["median_sn"] is not None]
     return {
         "sample_count": len(samples),
         "alignment_spot_count": spot_count,
@@ -423,6 +454,8 @@ def _summarize_report(
         "sample_blank_ratio_ge_3": _fraction(blank_ratios, lambda value: value >= 3.0),
         "run_order_intensity_correlation": intensity_corr,
         "run_order_reference_match_correlation": ref_corr,
+        "median_msms_acquisition_rate": _safe_median(msms_rates),
+        "median_sample_sn": _safe_median(median_sns),
         "median_blank_carryover_ratio": _safe_median([
             float(item["carryover_ratio_to_previous_injection"])
             for item in samples
