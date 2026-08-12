@@ -1121,15 +1121,15 @@ def prepare_rt_correction_run(state: dict[str, Any]) -> dict[str, Any]:
         command.extend(["-i", str(Path(str(item["file_path"])).expanduser().resolve())])
     command.extend(
         [
-            "-library",
+            "--library",
             str(anchor_path),
             "-o",
             str(eic_path),
             "-m",
             str(template_path),
-            "-ionmode",
+            "--ionmode",
             str(state.get("ion_mode", "Negative")),
-            "-acquisitiontype",
+            "--acquisitiontype",
             acquisition_type,
         ]
     )
@@ -1138,7 +1138,7 @@ def prepare_rt_correction_run(state: dict[str, Any]) -> dict[str, Any]:
         selection_path = Path(selection_input).expanduser().resolve()
         if not selection_path.is_file():
             raise ValueError(f"RT correction peak selection file not found: {selection_path}")
-        command.extend(["-selection", str(selection_path)])
+        command.extend(["--selection", str(selection_path)])
         result_selection = output_root / "rt_correction_peak_selections_applied.tsv"
     else:
         result_selection = output_root / "rt_correction_peak_selections.tsv"

@@ -116,6 +116,12 @@ class WorkflowTests(unittest.TestCase):
             prepared = prepare_rt_correction_run(state)
             self.assertEqual("dotnet", prepared["command"][0])
             self.assertEqual(["eic", "rtcorrection"], prepared["command"][2:4])
+            self.assertIn("--library", prepared["command"])
+            self.assertIn("--ionmode", prepared["command"])
+            self.assertIn("--acquisitiontype", prepared["command"])
+            self.assertNotIn("-library", prepared["command"])
+            self.assertNotIn("-ionmode", prepared["command"])
+            self.assertNotIn("-acquisitiontype", prepared["command"])
             self.assertIn("SWATH", prepared["command"])
 
             selection = Path(prepared["selection_file"])
