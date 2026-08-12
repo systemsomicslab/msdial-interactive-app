@@ -140,7 +140,7 @@ def build_lcms_qa_report(
             "carryover": "blank total height / immediately preceding injection total height",
             "qc_topology": "median pairwise PCA distance among QCs / median pairwise distance among all displayed samples",
             "msms_acquisition": "features with an assigned MS/MS spectrum / detected features in each sample",
-            "sn_distribution": "median and interquartile range of positive feature S/N values in each sample",
+            "sn_distribution": "median and interquartile range of positive raw (not log-transformed) feature S/N values in each sample",
         },
     }
 

@@ -1376,7 +1376,7 @@ function renderQaReport(report) {
     [qaPercent(summary.median_blank_carryover_ratio), "median blank / previous injection"],
     [qaValue(summary.run_order_intensity_correlation, 3), "order vs median intensity r"],
     [qaPercent(summary.median_msms_acquisition_rate), "median MS/MS acquisition rate"],
-    [qaValue(summary.median_sample_sn, 1), "median sample S/N"],
+    [qaValue(summary.median_sample_sn, 1), "median sample raw S/N"],
   ].map(([value, label]) => `<div class="metric"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`).join("");
   const warnings = (report.warnings || []).map((message) => `<div class="issue warning">${escapeHtml(message)}</div>`).join("");
   const standardCards = (report.internal_standards || []).map((standard, index) => {
@@ -1404,7 +1404,7 @@ function renderQaReport(report) {
       <article class="qa-chart-card"><h3>Median detected intensity by analytical order</h3><canvas id="qaIntensityOrder"></canvas></article>
       <article class="qa-chart-card"><h3>Reference-matched count by analytical order</h3><canvas id="qaReferenceOrder"></canvas></article>
       <article class="qa-chart-card"><h3>MS/MS acquisition rate by analytical order</h3><canvas id="qaMsmsOrder"></canvas></article>
-      <article class="qa-chart-card"><h3>S/N distribution by analytical order</h3><canvas id="qaSnOrder"></canvas></article>
+      <article class="qa-chart-card"><h3>Raw S/N distribution by analytical order</h3><canvas id="qaSnOrder"></canvas></article>
       ${standardCards}
     </div>
     <div class="muted qa-method">${escapeHtml(Object.values(report.method || {}).join(" | "))}</div>`;
@@ -1414,7 +1414,7 @@ function renderQaReport(report) {
     drawQaOrderDistribution($("#qaIntensityOrder"), report.samples || [], "median_log_intensity", "q25_log_intensity", "q75_log_intensity", "log10 intensity");
     drawQaOrderSeries($("#qaReferenceOrder"), report.samples || [], "reference_matched_count", "matched features");
     drawQaOrderSeries($("#qaMsmsOrder"), report.samples || [], "msms_acquisition_rate", "MS/MS acquisition rate");
-    drawQaOrderDistribution($("#qaSnOrder"), report.samples || [], "median_sn", "q25_sn", "q75_sn", "S/N");
+    drawQaOrderDistribution($("#qaSnOrder"), report.samples || [], "median_sn", "q25_sn", "q75_sn", "raw S/N");
     $$("[data-qa-standard]").forEach((canvas) => {
       const standard = (report.internal_standards || [])[Number(canvas.dataset.qaStandard)];
       drawQaOrderSeries(canvas, standard?.values || [], canvas.dataset.qaValue, canvas.dataset.qaValue);
@@ -1434,7 +1434,21 @@ function qaCanvas(canvas, height = 280) {
   return { context, width, height, padding: { left: 72, right: 18, top: 18, bottom: 52 } };
 }
 
-function qaAxes(frame, xMin, xMax, yMin, yMax, xLabel, yLabel) {
+function qaAxisTicks(minimum, maximum, integerOnly = false) {
+  if (!integerOnly) {
+    return Array.from({ length: 5 }, (_, index) => minimum + (index / 4) * (maximum - minimum));
+  }
+  const lower = Math.ceil(minimum);
+  const upper = Math.floor(maximum);
+  if (upper <= lower) return [lower];
+  const step = Math.max(1, Math.ceil((upper - lower) / 6));
+  const ticks = [];
+  for (let value = lower; value <= upper; value += step) ticks.push(value);
+  if (ticks[ticks.length - 1] !== upper) ticks.push(upper);
+  return ticks;
+}
+
+function qaAxes(frame, xMin, xMax, yMin, yMax, xLabel, yLabel, options = {}) {
   const { context, width, height, padding } = frame;
   const plotWidth = width - padding.left - padding.right;
   const plotHeight = height - padding.top - padding.bottom;
@@ -1452,23 +1466,27 @@ function qaAxes(frame, xMin, xMax, yMin, yMax, xLabel, yLabel) {
   };
   context.strokeStyle = "#e3eaed";
   context.lineWidth = 1;
-  for (let index = 0; index <= 4; index += 1) {
-    const fraction = index / 4;
-    const x = padding.left + fraction * plotWidth;
-    const y = padding.top + plotHeight - fraction * plotHeight;
+  const xTicks = qaAxisTicks(xMin, xMax, Boolean(options.integerX));
+  const yTicks = qaAxisTicks(yMin, yMax);
+  xTicks.forEach((xValue) => {
+    const x = sx(xValue);
     context.beginPath();
     context.moveTo(x, padding.top);
     context.lineTo(x, padding.top + plotHeight);
+    context.stroke();
+    context.textAlign = "center";
+    context.fillText(options.integerX ? String(Math.round(xValue)) : tickLabel(xValue), x, padding.top + plotHeight + 18);
+  });
+  yTicks.forEach((yValue) => {
+    const fraction = (yValue - yMin) / Math.max(yMax - yMin, 1e-12);
+    const y = padding.top + plotHeight - fraction * plotHeight;
+    context.beginPath();
     context.moveTo(padding.left, y);
     context.lineTo(padding.left + plotWidth, y);
     context.stroke();
-    const xValue = xMin + fraction * (xMax - xMin);
-    const yValue = yMin + fraction * (yMax - yMin);
-    context.textAlign = "center";
-    context.fillText(tickLabel(xValue), x, padding.top + plotHeight + 18);
     context.textAlign = "right";
     context.fillText(tickLabel(yValue), padding.left - 8, y);
-  }
+  });
   context.strokeStyle = "#718994";
   context.beginPath();
   context.moveTo(padding.left, padding.top);
@@ -1544,7 +1562,7 @@ function drawQaOrderSeries(canvas, values, key, yLabel) {
   const xs = points.map((item) => item.x);
   const ys = points.map((item) => item.y);
   const yPad = Math.max((Math.max(...ys) - Math.min(...ys)) * 0.08, 1e-6);
-  const axes = qaAxes(frame, Math.min(...xs), Math.max(...xs), Math.min(...ys) - yPad, Math.max(...ys) + yPad, "analytical order", yLabel);
+  const axes = qaAxes(frame, Math.min(...xs), Math.max(...xs), Math.min(...ys) - yPad, Math.max(...ys) + yPad, "analytical order", yLabel, { integerX: true });
   frame.context.strokeStyle = "#b5c2c8";
   frame.context.lineWidth = 1;
   frame.context.beginPath();
@@ -1577,7 +1595,7 @@ function drawQaOrderDistribution(canvas, values, medianKey, lowKey, highKey, yLa
   const xs = points.map((item) => item.x);
   const ranges = points.flatMap((item) => [item.low, item.high]);
   const yPad = Math.max((Math.max(...ranges) - Math.min(...ranges)) * 0.08, 1e-6);
-  const axes = qaAxes(frame, Math.min(...xs), Math.max(...xs), Math.min(...ranges) - yPad, Math.max(...ranges) + yPad, "analytical order", yLabel);
+  const axes = qaAxes(frame, Math.min(...xs), Math.max(...xs), Math.min(...ranges) - yPad, Math.max(...ranges) + yPad, "analytical order", yLabel, { integerX: true });
   frame.context.strokeStyle = "#b5c2c8";
   frame.context.lineWidth = 1;
   frame.context.beginPath();
