@@ -19,6 +19,7 @@ const state = {
   lbmAnnotator: {},
   mztabFiles: [],
   selectedMzTabPath: "",
+  qaReport: null,
   pathPicker: {
     mode: "vendor",
     currentPath: "",
@@ -1317,6 +1318,205 @@ function renderMzTabPreviewSection(name, section) {
     </details>`;
 }
 
+function parseQaInternalStandards() {
+  return $("#qaInternalStandards").value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line, index) => {
+      const fields = line.split(/[\t,]/).map((item) => item.trim());
+      if (index === 0 && fields.some((item) => item.toLowerCase() === "m/z" || item.toLowerCase() === "mz")) return null;
+      return {
+        name: fields[0] || `Internal standard ${index + 1}`,
+        mz: Number(fields[1]),
+        rt: Number(fields[2]),
+        mz_tolerance: Number(fields[3] || 0.01),
+        rt_tolerance: Number(fields[4] || 0.5),
+      };
+    })
+    .filter((item) => item && Number.isFinite(item.mz) && item.mz > 0 && Number.isFinite(item.rt) && item.rt >= 0);
+}
+
+function qaValue(value, digits = 2) {
+  if (value === null || value === undefined || value === "") return "N/A";
+  return Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : "N/A";
+}
+
+function qaPercent(value, digits = 1) {
+  if (value === null || value === undefined || value === "") return "N/A";
+  return Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(digits)}%` : "N/A";
+}
+
+function qaRawPercent(value, digits = 2) {
+  const formatted = qaValue(value, digits);
+  return formatted === "N/A" ? formatted : `${formatted}%`;
+}
+
+function renderQaReport(report) {
+  state.qaReport = report;
+  const panel = $("#qaReport");
+  panel.hidden = false;
+  const summary = report.summary || {};
+  const counts = summary.category_counts || {};
+  const metrics = [
+    [summary.sample_count ?? 0, "files"],
+    [summary.alignment_spot_count ?? 0, "alignment spots"],
+    [`${counts.Sample || 0} / ${counts.QC || 0} / ${counts.Blank || 0}`, "Sample / QC / Blank"],
+    [qaRawPercent(summary.median_qc_rsd_percent), "median QC feature RSD"],
+    [qaPercent(summary.qc_features_rsd_le_30_percent), "QC features with RSD ≤30%"],
+    [qaPercent(summary.median_qc_detection_rate), "median QC detection rate"],
+    [qaPercent(summary.sample_blank_ratio_ge_3), "features with Sample/Blank ≥3"],
+    [qaValue(summary.qc_pca_relative_dispersion, 3), "QC PCA dispersion / all samples"],
+    [qaPercent(summary.median_blank_carryover_ratio), "median blank / previous injection"],
+    [qaValue(summary.run_order_intensity_correlation, 3), "order vs median intensity r"],
+  ].map(([value, label]) => `<div class="metric"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`).join("");
+  const warnings = (report.warnings || []).map((message) => `<div class="issue warning">${escapeHtml(message)}</div>`).join("");
+  const standardCards = (report.internal_standards || []).map((standard, index) => {
+    if (standard.status !== "matched") {
+      return `<article class="qa-chart-card wide"><h3>${escapeHtml(standard.name)}: not found within the supplied tolerances</h3></article>`;
+    }
+    return `<article class="qa-chart-card wide">
+      <h3>${escapeHtml(standard.name)} | Alignment ID ${escapeHtml(standard.alignment_id)} | median m/z ${qaValue(standard.median_mz, 5)} | median RT ${qaValue(standard.median_rt, 3)}</h3>
+      <div class="qa-chart-grid">
+        <div><strong>Intensity</strong><canvas data-qa-standard="${index}" data-qa-value="log_height"></canvas></div>
+        <div><strong>Mass error (ppm)</strong><canvas data-qa-standard="${index}" data-qa-value="ppm_error"></canvas></div>
+        <div><strong>RT error (min)</strong><canvas data-qa-standard="${index}" data-qa-value="rt_delta"></canvas></div>
+      </div>
+    </article>`;
+  }).join("");
+  panel.innerHTML = `
+    <strong>LC-MS QA report: ${escapeHtml(report.file_name || report.file)}</strong>
+    <div class="muted">${escapeHtml(report.file)}</div>
+    <div class="metric-grid mztab-counts">${metrics}</div>
+    ${warnings}
+    <div class="qa-chart-grid">
+      <article class="qa-chart-card"><h3>Blank / QC / Sample intensity distributions</h3><canvas id="qaIntensityDistribution"></canvas></article>
+      <article class="qa-chart-card"><h3>PCA topology</h3><canvas id="qaPca"></canvas><div class="muted">PC1 ${qaPercent(report.pca?.explained_variance?.[0])}; PC2 ${qaPercent(report.pca?.explained_variance?.[1])}</div></article>
+      <article class="qa-chart-card"><h3>Median detected intensity by analytical order</h3><canvas id="qaIntensityOrder"></canvas></article>
+      <article class="qa-chart-card"><h3>Reference-matched count by analytical order</h3><canvas id="qaReferenceOrder"></canvas></article>
+      ${standardCards}
+    </div>
+    <div class="muted qa-method">${escapeHtml(Object.values(report.method || {}).join(" | "))}</div>`;
+  requestAnimationFrame(() => {
+    drawQaHistogram($("#qaIntensityDistribution"), report.intensity_distributions || []);
+    drawQaPca($("#qaPca"), report.pca || {});
+    drawQaOrderSeries($("#qaIntensityOrder"), report.samples || [], "median_log_intensity", "log10 intensity");
+    drawQaOrderSeries($("#qaReferenceOrder"), report.samples || [], "reference_matched_count", "matched features");
+    $$("[data-qa-standard]").forEach((canvas) => {
+      const standard = (report.internal_standards || [])[Number(canvas.dataset.qaStandard)];
+      drawQaOrderSeries(canvas, standard?.values || [], canvas.dataset.qaValue, canvas.dataset.qaValue);
+    });
+  });
+}
+
+function qaCanvas(canvas, height = 250) {
+  if (!canvas) return null;
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(340, canvas.clientWidth || 520);
+  canvas.width = width * ratio;
+  canvas.height = height * ratio;
+  const context = canvas.getContext("2d");
+  context.scale(ratio, ratio);
+  context.clearRect(0, 0, width, height);
+  return { context, width, height, padding: { left: 52, right: 16, top: 16, bottom: 36 } };
+}
+
+function qaAxes(frame, xMin, xMax, yMin, yMax, xLabel, yLabel) {
+  const { context, width, height, padding } = frame;
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const sx = (value) => padding.left + ((value - xMin) / Math.max(xMax - xMin, 1e-12)) * plotWidth;
+  const sy = (value) => padding.top + plotHeight - ((value - yMin) / Math.max(yMax - yMin, 1e-12)) * plotHeight;
+  context.strokeStyle = "#93a7b1";
+  context.lineWidth = 1;
+  context.beginPath();
+  context.moveTo(padding.left, padding.top);
+  context.lineTo(padding.left, padding.top + plotHeight);
+  context.lineTo(padding.left + plotWidth, padding.top + plotHeight);
+  context.stroke();
+  context.fillStyle = "#526975";
+  context.font = "11px system-ui";
+  context.fillText(Number(xMin).toFixed(2), padding.left, height - 14);
+  context.fillText(Number(xMax).toFixed(2), padding.left + plotWidth - 30, height - 14);
+  context.fillText(Number(yMax).toPrecision(3), 2, padding.top + 5);
+  context.fillText(xLabel, padding.left + plotWidth / 2 - 28, height - 3);
+  context.save();
+  context.translate(11, padding.top + plotHeight / 2 + 20);
+  context.rotate(-Math.PI / 2);
+  context.fillText(yLabel, 0, 0);
+  context.restore();
+  return { sx, sy };
+}
+
+const QA_COLORS = { Sample: "#2879b9", QC: "#007f86", Blank: "#d85f2a" };
+
+function drawQaHistogram(canvas, distributions) {
+  const frame = qaCanvas(canvas);
+  if (!frame || !distributions.length) return;
+  const xs = distributions.flatMap((item) => item.bin_centers || []);
+  const ys = distributions.flatMap((item) => item.density || []);
+  const axes = qaAxes(frame, Math.min(...xs), Math.max(...xs), 0, Math.max(...ys, 1e-4), "log10(height + 1)", "density");
+  distributions.forEach((item) => {
+    frame.context.strokeStyle = QA_COLORS[item.category] || "#6e55a5";
+    frame.context.lineWidth = 2;
+    frame.context.beginPath();
+    (item.bin_centers || []).forEach((value, index) => {
+      const x = axes.sx(value);
+      const y = axes.sy(item.density[index] || 0);
+      if (index === 0) frame.context.moveTo(x, y); else frame.context.lineTo(x, y);
+    });
+    frame.context.stroke();
+  });
+  distributions.forEach((item, index) => {
+    frame.context.fillStyle = QA_COLORS[item.category] || "#6e55a5";
+    frame.context.fillText(item.category, frame.padding.left + 8 + index * 65, frame.padding.top + 12);
+  });
+}
+
+function drawQaPca(canvas, pca) {
+  const frame = qaCanvas(canvas);
+  const points = pca?.points || [];
+  if (!frame || !points.length) return;
+  const xs = points.map((item) => Number(item.pc1));
+  const ys = points.map((item) => Number(item.pc2));
+  const xPad = Math.max((Math.max(...xs) - Math.min(...xs)) * 0.08, 1e-6);
+  const yPad = Math.max((Math.max(...ys) - Math.min(...ys)) * 0.08, 1e-6);
+  const axes = qaAxes(frame, Math.min(...xs) - xPad, Math.max(...xs) + xPad, Math.min(...ys) - yPad, Math.max(...ys) + yPad, "PC1", "PC2");
+  points.forEach((point) => {
+    frame.context.fillStyle = QA_COLORS[point.category] || "#6e55a5";
+    frame.context.beginPath();
+    frame.context.arc(axes.sx(point.pc1), axes.sy(point.pc2), point.category === "QC" ? 5 : 3.5, 0, Math.PI * 2);
+    frame.context.fill();
+  });
+}
+
+function drawQaOrderSeries(canvas, values, key, yLabel) {
+  const frame = qaCanvas(canvas);
+  const points = values
+    .map((item) => ({ ...item, x: Number(item.order), y: Number(item[key]) }))
+    .filter((item) => Number.isFinite(item.x) && Number.isFinite(item.y));
+  if (!frame || !points.length) return;
+  points.sort((left, right) => left.batch - right.batch || left.x - right.x);
+  const xs = points.map((item) => item.x);
+  const ys = points.map((item) => item.y);
+  const yPad = Math.max((Math.max(...ys) - Math.min(...ys)) * 0.08, 1e-6);
+  const axes = qaAxes(frame, Math.min(...xs), Math.max(...xs), Math.min(...ys) - yPad, Math.max(...ys) + yPad, "analytical order", yLabel);
+  frame.context.strokeStyle = "#b5c2c8";
+  frame.context.lineWidth = 1;
+  frame.context.beginPath();
+  points.forEach((point, index) => {
+    if (index === 0) frame.context.moveTo(axes.sx(point.x), axes.sy(point.y));
+    else frame.context.lineTo(axes.sx(point.x), axes.sy(point.y));
+  });
+  frame.context.stroke();
+  points.forEach((point) => {
+    frame.context.fillStyle = QA_COLORS[point.category] || "#6e55a5";
+    frame.context.beginPath();
+    frame.context.arc(axes.sx(point.x), axes.sy(point.y), point.category === "QC" ? 4.5 : 3, 0, Math.PI * 2);
+    frame.context.fill();
+  });
+}
+
 function renderLiterature(result) {
   $("#literatureSummary").hidden = false;
   $("#literatureSummary").textContent = result.summary;
@@ -1368,7 +1568,7 @@ function renderRtCorrectionResult(result) {
       <td>${Number(row.reference_rt).toFixed(4)}</td>
       <td>${Number(row.detected_rt).toFixed(4)}</td>
       <td><input data-key="selected_rt" type="number" step="any" value="${Number(row.selected_rt)}"></td>
-      <td>${Number(row.peak_height).toLocaleString()}</td>
+      <td data-value="peak_height">${Number(row.peak_height).toLocaleString()}</td>
     </tr>`).join("");
   $$("#rtCorrectionSelectionRows tr").forEach((tableRow) => {
     const index = Number(tableRow.dataset.index);
@@ -1394,18 +1594,110 @@ function renderRtCorrectionResult(result) {
         <div><strong>Original EIC</strong><canvas data-chart-index="${index}" data-x-key="rt"></canvas></div>
         <div><strong>Corrected EIC</strong><canvas data-chart-index="${index}" data-x-key="corrected_rt"></canvas></div>
       </div>
+      <div class="rt-manual-picker">
+        <label>Manual sample
+          <select data-rt-manual-group="${index}">
+            ${series.map((item, itemIndex) => `<option value="${itemIndex}">${escapeHtml(item.file_name)}</option>`).join("")}
+          </select>
+        </label>
+        <strong>Click the intended peak in the single-sample EIC</strong>
+        <canvas data-rt-manual-canvas="${index}"></canvas>
+        <div class="muted">The click snaps to the strongest smoothed point in a ±7-point neighborhood and updates Selected RT in the review table.</div>
+      </div>
       <div class="muted">${series.map((item, itemIndex) => `${itemIndex + 1}: ${escapeHtml(item.file_name)}`).join(" | ")}</div>
     </article>`).join("");
   const groupedSeries = [...groups.values()];
   requestAnimationFrame(() => {
     $$("#rtCorrectionCharts canvas").forEach((canvas) => {
+      if (canvas.dataset.rtManualCanvas !== undefined) return;
       drawRtCorrectionChart(
         canvas,
         groupedSeries[Number(canvas.dataset.chartIndex)] || [],
         canvas.dataset.xKey,
       );
     });
+    $$('[data-rt-manual-group]').forEach((select) => {
+      const groupIndex = Number(select.dataset.rtManualGroup);
+      const draw = () => drawManualRtSelection(groupedSeries, groupIndex, Number(select.value));
+      select.addEventListener("change", draw);
+      const canvas = $(`[data-rt-manual-canvas="${groupIndex}"]`);
+      canvas.addEventListener("click", (event) => selectManualRtFromChart(event, groupedSeries[groupIndex]?.[Number(select.value)]));
+      draw();
+    });
   });
+}
+
+function rtSelectionRowIndex(series) {
+  if (!series) return -1;
+  const path = String(series.file_path || "").toLowerCase();
+  return (state.rtCorrectionResult?.rows || []).findIndex((row) =>
+    Number(row.standard_id) === Number(series.standard_id)
+    && String(row.file_path || "").toLowerCase() === path
+  );
+}
+
+function drawManualRtSelection(groupedSeries, groupIndex, seriesIndex) {
+  const series = groupedSeries[groupIndex]?.[seriesIndex];
+  const canvas = $(`[data-rt-manual-canvas="${groupIndex}"]`);
+  if (!series || !canvas) return;
+  drawRtCorrectionChart(canvas, [series], "rt");
+  const rowIndex = rtSelectionRowIndex(series);
+  const row = state.rtCorrectionResult?.rows?.[rowIndex];
+  drawSelectedRtMarker(canvas, row);
+}
+
+function drawSelectedRtMarker(canvas, row) {
+  const geometry = canvas._rtChartGeometry;
+  if (!row || !geometry || !Number.isFinite(Number(row.selected_rt))) return;
+  const x = geometry.scaleX(Number(row.selected_rt));
+  geometry.context.save();
+  geometry.context.strokeStyle = "#c44771";
+  geometry.context.setLineDash([5, 4]);
+  geometry.context.lineWidth = 2;
+  geometry.context.beginPath();
+  geometry.context.moveTo(x, geometry.padding.top);
+  geometry.context.lineTo(x, geometry.padding.top + geometry.plotHeight);
+  geometry.context.stroke();
+  geometry.context.restore();
+}
+
+function selectManualRtFromChart(event, series) {
+  const canvas = event.currentTarget;
+  const geometry = canvas._rtChartGeometry;
+  if (!series || !geometry) return;
+  const bounds = canvas.getBoundingClientRect();
+  const chartX = event.clientX - bounds.left;
+  const clickedRt = geometry.xMin
+    + ((chartX - geometry.padding.left) / Math.max(geometry.plotWidth, 1)) * (geometry.xMax - geometry.xMin);
+  const rtValues = series.rt || [];
+  const intensities = series.smoothed_intensity || [];
+  if (!rtValues.length) return;
+  let nearest = 0;
+  for (let index = 1; index < rtValues.length; index += 1) {
+    if (Math.abs(rtValues[index] - clickedRt) < Math.abs(rtValues[nearest] - clickedRt)) nearest = index;
+  }
+  let selected = nearest;
+  const begin = Math.max(0, nearest - 7);
+  const end = Math.min(rtValues.length - 1, nearest + 7);
+  for (let index = begin; index <= end; index += 1) {
+    if (Number(intensities[index] || 0) > Number(intensities[selected] || 0)) selected = index;
+  }
+  const rowIndex = rtSelectionRowIndex(series);
+  if (rowIndex < 0) return;
+  const row = state.rtCorrectionResult.rows[rowIndex];
+  row.selected_rt = Number(rtValues[selected]);
+  row.peak_height = Number(intensities[selected] || 0);
+  row.use = true;
+  const tableRow = $(`#rtCorrectionSelectionRows tr[data-index="${rowIndex}"]`);
+  if (tableRow) {
+    tableRow.querySelector('[data-key="use"]').checked = true;
+    tableRow.querySelector('[data-key="selected_rt"]').value = row.selected_rt;
+    tableRow.querySelector('[data-value="peak_height"]').textContent = row.peak_height.toLocaleString();
+  }
+  $("#rtCorrectionCount").textContent = `${state.rtCorrectionResult.rows.filter((item) => item.use).length} / ${state.rtCorrectionResult.rows.length} anchors enabled`;
+  drawRtCorrectionChart(canvas, [series], "rt");
+  drawSelectedRtMarker(canvas, row);
+  setStatus(`Manual RT selected: ${series.file_name} / ${series.standard_name} = ${row.selected_rt.toFixed(4)} min`);
 }
 
 function drawRtCorrectionChart(canvas, seriesList, xKey) {
@@ -1466,6 +1758,9 @@ function drawRtCorrectionChart(canvas, seriesList, xKey) {
     });
     context.stroke();
   });
+  canvas._rtChartGeometry = {
+    context, width, height, padding, plotWidth, plotHeight, xMin, xMax, scaleX, scaleY,
+  };
 }
 
 async function pollRtCorrectionJob() {
@@ -1971,6 +2266,41 @@ $("#previewMzTab").addEventListener("click", () => runUiAction(async () => {
     body: JSON.stringify(payload),
   });
   renderMzTabPreview(result.preview);
+}));
+$("#refreshQaFile").addEventListener("click", () => runUiAction(async () => {
+  const outputRoot = $("#outputRoot").value.trim();
+  if (!outputRoot) throw new Error("Set Output root before searching for the latest QA matrix.");
+  const result = await api("/api/qa/list", {
+    method: "POST",
+    body: JSON.stringify({ path: outputRoot }),
+  });
+  $("#qaFilePath").value = result.default_file || "";
+  setStatus(result.default_file ? `Selected latest QA matrix: ${result.default_file}` : "No *.qa.tsv was found in Output root.");
+}));
+$("#browseQaFile").addEventListener("click", () => runUiAction(async () => {
+  const result = await api("/api/dialog/qa-file", { method: "POST", body: "{}" });
+  if (result.path) {
+    $("#qaFilePath").value = result.path;
+    setStatus(`Selected LC-MS QA matrix: ${result.path}`);
+  }
+}));
+$("#generateQaReport").addEventListener("click", () => runUiAction(async () => {
+  const filePath = $("#qaFilePath").value.trim();
+  const runDirectory = $("#outputRoot").value.trim();
+  if (!filePath && !runDirectory) throw new Error("Choose an LC-MS QA matrix or set Output root.");
+  $("#qaReport").hidden = false;
+  $("#qaReport").textContent = "Building LC-MS QA report...";
+  const result = await api("/api/qa/report", {
+    method: "POST",
+    body: JSON.stringify({
+      file_path: filePath,
+      run_directory: runDirectory,
+      internal_standards: parseQaInternalStandards(),
+    }),
+  });
+  $("#qaFilePath").value = result.report.file;
+  renderQaReport(result.report);
+  setStatus("LC-MS QA report generated.");
 }));
 $("#exportWorkflow").addEventListener("click", () => runUiAction(async () => {
   const result = await api("/api/export-workflow", {

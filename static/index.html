@@ -546,6 +546,23 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
             <div id="mztabValidation" class="format-summary" hidden></div>
             <div id="mztabPreview" class="format-summary" hidden></div>
           </div>
+          <div class="panel" id="lcmsQaPanel">
+            <h2>LC-MS quality assurance</h2>
+            <p class="muted">Inspect analytical quality from the alignment-level <code>*.qa.tsv</code> written by the current MS-DIAL Console. The report combines visual checks with numeric metrics recommended for transparent QA/QC reporting.</p>
+            <label>LC-MS QA matrix
+              <input id="qaFilePath" placeholder="Latest *.qa.tsv in Output root">
+            </label>
+            <div class="button-row">
+              <button id="refreshQaFile" class="secondary" type="button">Use latest QA matrix</button>
+              <button id="browseQaFile" class="secondary" type="button">Native file picker</button>
+            </div>
+            <label>Internal standards (optional)
+              <textarea id="qaInternalStandards" rows="4" placeholder="Name,m/z,RT (min),m/z tolerance (Da),RT tolerance (min)&#10;IS 1,231.06953,7.61,0.01,0.5"></textarea>
+            </label>
+            <p class="muted">One standard per line. The nearest alignment spot within both tolerances is followed across analytical order for intensity, mass error (ppm), and RT error.</p>
+            <button id="generateQaReport" type="button">Generate LC-MS QA report</button>
+            <div id="qaReport" class="format-summary qa-report" hidden></div>
+          </div>
         </div>
         <pre id="log">Ready.</pre>
       </div>

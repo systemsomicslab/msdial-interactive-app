@@ -21,6 +21,7 @@ from .knowledge import KnowledgeBase, next_parameter_question
 from .literature import recommend_from_literature
 from .mztab_validation import list_mztab_outputs, validate_mztab_outputs
 from .mztab_preview import preview_mztab_outputs
+from .quality_assurance import build_lcms_qa_report, find_qa_files
 from .workflow import (
     console_version,
     expand_paths,
@@ -354,6 +355,9 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/dialog/mztab-file":
                 selected = _pick_mztab_file()
                 self._json({"path": selected})
+            elif parsed.path == "/api/dialog/qa-file":
+                selected = _pick_qa_file()
+                self._json({"path": selected})
             elif parsed.path == "/api/dialog/reference-file":
                 selected = _pick_reference_file(body.get("kind", "reference"))
                 self._json({"path": selected})
@@ -441,6 +445,23 @@ class Handler(BaseHTTPRequestHandler):
                         "preview": preview_mztab_outputs(
                             body.get("run_directory", ""),
                             body.get("file_path", "") or None,
+                        )
+                    }
+                )
+            elif parsed.path == "/api/qa/list":
+                files = find_qa_files(body.get("path", ""))
+                self._json(
+                    {
+                        "files": [str(path) for path in files],
+                        "default_file": str(files[0]) if files else "",
+                    }
+                )
+            elif parsed.path == "/api/qa/report":
+                self._json(
+                    {
+                        "report": build_lcms_qa_report(
+                            body.get("file_path", "") or body.get("run_directory", ""),
+                            body.get("internal_standards", []),
                         )
                     }
                 )
@@ -819,6 +840,29 @@ def _pick_mztab_file() -> str:
             title="Select mzTab-M output",
             filetypes=[
                 ("mzTab-M files", "*.mzTab *.mztab *.mzTabM *.mztabm *.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+        root.destroy()
+        return path
+    except Exception:
+        return ""
+
+
+def _pick_qa_file() -> str:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+        path = filedialog.askopenfilename(
+            title="Select MS-DIAL LC-MS quality-assurance matrix",
+            filetypes=[
+                ("MS-DIAL QA matrix", "*.qa.tsv"),
+                ("Tab-separated files", "*.tsv"),
                 ("All files", "*.*"),
             ],
         )
