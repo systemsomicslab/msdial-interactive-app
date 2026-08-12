@@ -1326,12 +1326,15 @@ function parseQaInternalStandards() {
     .map((line, index) => {
       const fields = line.split(/[\t,]/).map((item) => item.trim());
       if (index === 0 && fields.some((item) => item.toLowerCase() === "m/z" || item.toLowerCase() === "mz")) return null;
+      const hasAdduct = fields.length >= 6;
+      const offset = hasAdduct ? 1 : 0;
       return {
         name: fields[0] || `Internal standard ${index + 1}`,
-        mz: Number(fields[1]),
-        rt: Number(fields[2]),
-        mz_tolerance: Number(fields[3] || 0.01),
-        rt_tolerance: Number(fields[4] || 0.5),
+        adduct: hasAdduct ? fields[1] : "",
+        mz: Number(fields[1 + offset]),
+        rt: Number(fields[2 + offset]),
+        mz_tolerance: Number(fields[3 + offset] || 0.01),
+        rt_tolerance: Number(fields[4 + offset] || 0.5),
       };
     })
     .filter((item) => item && Number.isFinite(item.mz) && item.mz > 0 && Number.isFinite(item.rt) && item.rt >= 0);
@@ -1372,11 +1375,12 @@ function renderQaReport(report) {
   ].map(([value, label]) => `<div class="metric"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`).join("");
   const warnings = (report.warnings || []).map((message) => `<div class="issue warning">${escapeHtml(message)}</div>`).join("");
   const standardCards = (report.internal_standards || []).map((standard, index) => {
+    const label = standard.adduct ? `${standard.name} ${standard.adduct}` : standard.name;
     if (standard.status !== "matched") {
-      return `<article class="qa-chart-card wide"><h3>${escapeHtml(standard.name)}: not found within the supplied tolerances</h3></article>`;
+      return `<article class="qa-chart-card wide"><h3>${escapeHtml(label)}: not found within the supplied tolerances</h3></article>`;
     }
     return `<article class="qa-chart-card wide">
-      <h3>${escapeHtml(standard.name)} | Alignment ID ${escapeHtml(standard.alignment_id)} | median m/z ${qaValue(standard.median_mz, 5)} | median RT ${qaValue(standard.median_rt, 3)}</h3>
+      <h3>${escapeHtml(label)} | Alignment ID ${escapeHtml(standard.alignment_id)} | median m/z ${qaValue(standard.median_mz, 5)} | median RT ${qaValue(standard.median_rt, 3)}</h3>
       <div class="qa-chart-grid">
         <div><strong>Intensity</strong><canvas data-qa-standard="${index}" data-qa-value="log_height"></canvas></div>
         <div><strong>Mass error (ppm)</strong><canvas data-qa-standard="${index}" data-qa-value="ppm_error"></canvas></div>
@@ -2284,6 +2288,13 @@ $("#browseQaFile").addEventListener("click", () => runUiAction(async () => {
     setStatus(`Selected LC-MS QA matrix: ${result.path}`);
   }
 }));
+$("#loadQaInternalStandardExample").addEventListener("click", () => {
+  $("#qaInternalStandards").value = [
+    "FA 16:0,[M-H]-,255.2330,2.107,0.01,0.05",
+    "FA 18:0,[M-H]-,283.2643,2.431,0.01,0.05",
+  ].join("\n");
+  setStatus("Loaded the FA 16:0 / FA 18:0 pseudo internal-standard example.");
+});
 $("#generateQaReport").addEventListener("click", () => runUiAction(async () => {
   const filePath = $("#qaFilePath").value.trim();
   const runDirectory = $("#outputRoot").value.trim();

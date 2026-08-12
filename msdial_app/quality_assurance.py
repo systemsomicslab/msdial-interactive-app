@@ -488,6 +488,7 @@ def _normalize_standard(item: dict[str, Any], index: int) -> dict[str, Any] | No
         return None
     return {
         "name": str(item.get("name", "")).strip() or f"Internal standard {index + 1}",
+        "adduct": str(item.get("adduct", "")).strip(),
         "mz": mz,
         "rt": rt,
         "mz_tolerance": max(_number(item.get("mz_tolerance"), 0.01), 1e-9),

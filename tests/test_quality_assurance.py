@@ -42,7 +42,7 @@ class QualityAssuranceTests(unittest.TestCase):
 
             report = build_lcms_qa_report(
                 root,
-                [{"name": "IS", "mz": 102.0, "rt": 7.0, "mz_tolerance": 0.01, "rt_tolerance": 0.1}],
+                [{"name": "IS", "adduct": "[M-H]-", "mz": 102.0, "rt": 7.0, "mz_tolerance": 0.01, "rt_tolerance": 0.1}],
             )
 
             self.assertEqual(str(qa.resolve()), report["file"])
@@ -53,6 +53,7 @@ class QualityAssuranceTests(unittest.TestCase):
             self.assertEqual(4, len(report["pca"]["points"]))
             self.assertEqual("matched", report["internal_standards"][0]["status"])
             self.assertEqual("2", report["internal_standards"][0]["alignment_id"])
+            self.assertEqual("[M-H]-", report["internal_standards"][0]["adduct"])
             self.assertTrue(find_qa_files(root))
 
     def test_lcms_qa_report_rejects_old_alignment_matrix(self) -> None:

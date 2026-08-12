@@ -557,9 +557,12 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
               <button id="browseQaFile" class="secondary" type="button">Native file picker</button>
             </div>
             <label>Internal standards (optional)
-              <textarea id="qaInternalStandards" rows="4" placeholder="Name,m/z,RT (min),m/z tolerance (Da),RT tolerance (min)&#10;IS 1,231.06953,7.61,0.01,0.5"></textarea>
+              <textarea id="qaInternalStandards" rows="4" placeholder="Name,Adduct,m/z,RT (min),m/z tolerance (Da),RT tolerance (min)&#10;IS 1,[M-H]-,231.06953,7.61,0.01,0.5"></textarea>
             </label>
-            <p class="muted">One standard per line. The nearest alignment spot within both tolerances is followed across analytical order for intensity, mass error (ppm), and RT error.</p>
+            <div class="button-row">
+              <button id="loadQaInternalStandardExample" class="secondary" type="button">Example: FA 16:0 / FA 18:0</button>
+            </div>
+            <p class="muted">One standard per line. Adduct is optional, so the previous five-column format remains valid. The nearest alignment spot within both tolerances is followed across analytical order for intensity, mass error (ppm), and RT error.</p>
             <button id="generateQaReport" type="button">Generate LC-MS QA report</button>
             <div id="qaReport" class="format-summary qa-report" hidden></div>
           </div>
