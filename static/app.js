@@ -906,13 +906,16 @@ function saveRtWorkspaceState() {
     rt_correction_peak_selection_mode: current.rt_correction_peak_selection_mode,
     rt_correction_peak_selection_rt_weight: current.rt_correction_peak_selection_rt_weight,
   };
-  localStorage.setItem(RT_WORKSPACE_STORAGE_KEY, JSON.stringify(payload));
+  sessionStorage.setItem(RT_WORKSPACE_STORAGE_KEY, JSON.stringify(payload));
 }
 
 function restoreRtWorkspaceState() {
   let saved;
   try {
-    saved = JSON.parse(localStorage.getItem(RT_WORKSPACE_STORAGE_KEY) || "null");
+    // Earlier versions persisted analysis paths across app restarts. Remove that
+    // legacy cache while retaining same-tab handoff to the RT review workspace.
+    localStorage.removeItem(RT_WORKSPACE_STORAGE_KEY);
+    saved = JSON.parse(sessionStorage.getItem(RT_WORKSPACE_STORAGE_KEY) || "null");
   } catch {
     saved = null;
   }
@@ -1966,8 +1969,10 @@ $("#pathPickerAddCurrent").addEventListener("click", () => runUiAction(async () 
 $("#pathPickerAddSelected").addEventListener("click", () => runUiAction(addSelectedPathPickerEntries));
 $("#clearFiles").addEventListener("click", () => {
   state.files = [];
+  state.analysisCsvSource = "";
   if (state.outputRootAutomatic) setOutputRootFromFirstFile();
   renderFiles();
+  saveRtWorkspaceState();
   showImportMessages([]);
   refreshQuestion().catch((error) => showImportMessages([error.message || String(error)], "error"));
 });
