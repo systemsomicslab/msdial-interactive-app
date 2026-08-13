@@ -25,7 +25,7 @@ from msdial_app.workflow import (
     read_adducts,
     read_lipid_queries,
     read_rt_correction_anchors,
-    recommended_peak_parameters,
+    format_based_peak_parameters,
     save_rt_correction_anchors,
     save_rt_correction_selections,
     validate_workflow,
@@ -438,9 +438,9 @@ class WorkflowTests(unittest.TestCase):
             manifest = json.loads(
                 Path(result["manifest"]).read_text(encoding="utf-8")
             )
-            self.assertEqual("0.2.0", settings["msdial_interactive_version"])
+            self.assertEqual("0.3.0", settings["msdial_interactive_version"])
             self.assertEqual("not recorded", settings["msdial_console_version"])
-            self.assertEqual("0.2.0", manifest["msdial_interactive_version"])
+            self.assertEqual("0.3.0", manifest["msdial_interactive_version"])
             self.assertEqual("21904324", settings["library_provenance"][0]["record_id"])
             self.assertEqual("CC BY 4.0", settings["library_provenance"][0]["license"])
 
@@ -823,7 +823,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual("PC", rows[0]["lipid_class"])
             self.assertTrue(rows[0]["selected"])
 
-    def test_folder_type_vendor_detection_and_recommendations(self) -> None:
+    def test_folder_type_vendor_detection_and_starting_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             waters = root / "sample.raw"
@@ -845,7 +845,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual("Thermo", vendors["thermo"])
             self.assertEqual(
                 {"minimum_peak_height": 10000, "mass_slice_width": 0.05},
-                recommended_peak_parameters(expanded),
+                format_based_peak_parameters(expanded),
             )
             self.assertEqual("Agilent", detect_raw_format(agilent)["vendor"])
 

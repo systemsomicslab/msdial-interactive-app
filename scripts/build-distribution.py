@@ -19,6 +19,7 @@ INCLUDE_PATHS = [
     "msdial_app",
     "resources",
     "scripts",
+    "skills",
     "static",
     "tests",
 ]

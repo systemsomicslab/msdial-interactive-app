@@ -18,16 +18,24 @@ def summarize_jobs(jobs: dict[str, dict[str, Any]], limit: int = 10) -> dict[str
     latest_completed = next((item for item in items if item.get("status") == "completed"), None)
     return {
         "service": "MS-DIAL Interactive",
-        "agent_api_version": "0.1",
+        "agent_api_version": "0.2",
         "capabilities": [
+            "guided_analysis_planning",
+            "reusable_worksets",
+            "single_file_peak_count_tuning",
+            "restart_incompatible_local_service",
             "start_msdial_console_run",
             "observe_job_status",
+            "generate_lcms_quality_assurance",
+            "generate_publication_report",
+            "complete_guided_pipeline_without_ui",
             "validate_mztab_m_outputs",
             "preview_mztab_m_outputs",
             "create_datamining_handoff",
         ],
-        "recommended_flow": [
-            "Open the local UI and help the user configure a workflow.",
+        "workflow_outline": [
+            "Inspect the input path and collect the guided scientific choices.",
+            "Review the generated plan and obtain explicit confirmation before execution.",
             "Wait until /api/agent/status reports a completed analysis job.",
             "Call /api/agent/handoff with the completed job_id.",
             "Pass primary_mztab_file or mztab_files to the downstream data-mining MCP server.",

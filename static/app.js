@@ -390,7 +390,7 @@ function mergeFiles(files, messages = []) {
   state.files.forEach((item, index) => item.analytical_order = index + 1);
   renderFiles();
   if (wasEmpty && state.files.length) {
-    applyRecommendedParameters();
+    applyFormatStartingValues();
     if (state.outputRootAutomatic) setOutputRootFromFirstFile();
   }
   refreshQuestion().catch((error) => showImportMessages([error.message || String(error)], "error"));
@@ -1171,12 +1171,12 @@ function renderTuningFormat() {
   $("#tuningFormat").innerHTML = file
     ? `<strong>${escapeHtml(file.format)}</strong><br>
        Detected as ${escapeHtml(file.vendor)} / ${escapeHtml(file.instrument_family)}.
-       Recommended: Minimum peak height ${file.minimum_peak_height}, Mass slice width ${file.mass_slice_width}.
+       Format-based starting values: Minimum peak height ${file.minimum_peak_height}, Mass slice width ${file.mass_slice_width}.
        ${sidecarNote}`
     : "No representative file selected.";
 }
 
-function applyRecommendedParameters() {
+function applyFormatStartingValues() {
   const file = selectedTuningFile() || state.files[0];
   if (!file) return;
   $("#minimumPeakHeight").value = file.minimum_peak_height;
@@ -1248,9 +1248,9 @@ function renderTuningResult(result) {
   const percentileIndex = Math.max(0, Math.ceil(result.heights.length * 0.99) - 1);
   const sliderMax = Math.max(100, Math.ceil(result.heights[percentileIndex] || maxHeight));
   $("#tuningHeight").max = sliderMax;
-  const recommended = Number(selectedTuningFile()?.minimum_peak_height || 100);
-  $("#tuningHeight").value = Math.min(recommended, sliderMax);
-  $("#tuningHeightNumber").value = recommended;
+  const startingValue = Number(selectedTuningFile()?.minimum_peak_height || 100);
+  $("#tuningHeight").value = Math.min(startingValue, sliderMax);
+  $("#tuningHeightNumber").value = startingValue;
   $("#tuningSummary").innerHTML = `
     <div class="metric"><strong>${result.peak_count}</strong><span>peaks at height 0</span></div>
     <div class="metric"><strong>${result.msp_candidate_count}</strong><span>MSP reference candidates</span></div>
@@ -2291,7 +2291,7 @@ $("#importAnalysisCsv").addEventListener("click", () => runUiAction(async () => 
   state.analysisCsvSource = result.source_csv || picked.path;
   if (state.outputRootAutomatic) setOutputRootFromFirstFile();
   renderFiles();
-  applyRecommendedParameters();
+  applyFormatStartingValues();
   showImportMessages([
     `Imported ${state.files.length} analysis rows from ${state.analysisCsvSource}.`,
     ...(result.warnings || []),
@@ -2548,7 +2548,7 @@ $("#llmProvider").addEventListener("change", updateLlmUI);
   $(`#${id}`).addEventListener("input", updateLlmUI));
 $("#refreshQuestion").addEventListener("click", refreshQuestion);
 $("#tuningFile").addEventListener("change", renderTuningFormat);
-$("#applyRecommended").addEventListener("click", applyRecommendedParameters);
+$("#applyFormatStartingValues").addEventListener("click", applyFormatStartingValues);
 $("#runTuning").addEventListener("click", () => runUiAction(async () => {
   const current = workflow();
   const file = selectedTuningFile();
@@ -2791,7 +2791,7 @@ $("#searchLiterature").addEventListener("click", () => runUiAction(async () => {
   $("#literatureStatus").textContent = "Searching open-access Crossref records...";
   $("#literatureSummary").hidden = true;
   $("#literatureWorks").innerHTML = "";
-  const result = await api("/api/literature/recommend", {
+  const result = await api("/api/literature/evidence", {
     method: "POST",
     body: JSON.stringify({
       language: $("#language").value,

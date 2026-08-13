@@ -1,0 +1,12 @@
+interface:
+  display_name: "MS-DIAL Guided Analysis"
+  short_description: "Guide and run reproducible LC-MS and GC-MS workflows"
+  default_prompt: "Use $msdial-guided-analysis to analyze a local mass-spectrometry dataset with MS-DIAL."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "msdial-interactive"
+      description: "Local MS-DIAL Interactive planning, execution, QA, and publication tools"
+      transport: "stdio"
+policy:
+  allow_implicit_invocation: true

@@ -19,9 +19,10 @@ from typing import Any
 
 from . import __version__
 from .agent_bridge import create_datamining_handoff, summarize_jobs
+from .agent_workflow import build_guided_plan, estimate_peak_height
 from .knowledge import KnowledgeBase, next_parameter_question
 from .library_catalog import catalog_status, download_library, library_directory
-from .literature import recommend_from_literature
+from .literature import evaluate_literature_evidence
 from .mztab_validation import list_mztab_outputs, validate_mztab_outputs
 from .mztab_preview import preview_mztab_outputs
 from .materials_methods import generate_publication_report
@@ -52,6 +53,7 @@ from .workflow import (
     validate_workflow,
 )
 from .user_settings import load_user_settings, save_path_settings, settings_path
+from .worksets import list_worksets, save_workset
 
 
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
@@ -320,6 +322,9 @@ class Handler(BaseHTTPRequestHandler):
                 response = summarize_jobs(dict(JOBS))
             self._json(response)
             return
+        if parsed.path == "/api/agent/worksets":
+            self._json({"worksets": list_worksets()})
+            return
         if parsed.path == "/api/agent/handoff":
             query = urllib.parse.parse_qs(parsed.query)
             with JOBS_LOCK:
@@ -461,9 +466,9 @@ class Handler(BaseHTTPRequestHandler):
                         body.get("llm", {}),
                     )
                 )
-            elif parsed.path == "/api/literature/recommend":
+            elif parsed.path == "/api/literature/evidence":
                 self._json(
-                    recommend_from_literature(
+                    evaluate_literature_evidence(
                         body.get("workflow", {}),
                         body.get("llm", {}),
                         body.get("language", "ja"),
@@ -478,6 +483,160 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     }
                 )
+            elif parsed.path == "/api/agent/plan":
+                self._json(
+                    build_guided_plan(
+                        body.get("input_path", ""),
+                        body.get("answers", {}),
+                        body.get("workset_id", ""),
+                    )
+                )
+            elif parsed.path == "/api/agent/worksets/save":
+                self._json(
+                    {
+                        "workset": save_workset(
+                            body.get("name", ""),
+                            body.get("answers", {}),
+                            description=body.get("description", ""),
+                            workflow_overrides=body.get("workflow_overrides", {}),
+                        )
+                    }
+                )
+            elif parsed.path == "/api/agent/prepare":
+                plan = build_guided_plan(
+                    body.get("input_path", ""),
+                    body.get("answers", {}),
+                    body.get("workset_id", ""),
+                )
+                if not plan["ready_to_prepare"]:
+                    self._json(
+                        {"plan": plan, "error": "The guided analysis plan is not ready."},
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                messages: list[str] = []
+                preparation = prepare_run(plan["workflow"], messages.append)
+                self._json(
+                    {
+                        "plan": plan,
+                        "preparation": preparation,
+                        "messages": messages,
+                        "download_url": _register_download(preparation["bundle"]),
+                    }
+                )
+            elif parsed.path == "/api/agent/run":
+                plan = build_guided_plan(
+                    body.get("input_path", ""),
+                    body.get("answers", {}),
+                    body.get("workset_id", ""),
+                )
+                if not plan["ready_to_prepare"]:
+                    self._json(
+                        {"plan": plan, "error": "The guided analysis plan is not ready."},
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                if body.get("confirmed") is not True:
+                    self._json(
+                        {
+                            "started": False,
+                            "confirmation_required": True,
+                            "plan": plan,
+                            "message": "Review the plan, then call again with confirmed=true.",
+                        }
+                    )
+                    return
+                preparation = prepare_run(plan["workflow"])
+                job_id = uuid.uuid4().hex
+                with JOBS_LOCK:
+                    JOBS[job_id] = {
+                        "id": job_id,
+                        "status": "queued",
+                        "kind": "run",
+                        "logs": [],
+                        "preparation": preparation,
+                        "exit_code": None,
+                    }
+                threading.Thread(
+                    target=_run_job,
+                    args=(job_id, preparation),
+                    daemon=True,
+                ).start()
+                self._json(
+                    {
+                        "started": True,
+                        "job_id": job_id,
+                        "plan": plan,
+                        "preparation": preparation,
+                        "download_url": _register_download(preparation["bundle"]),
+                    }
+                )
+            elif parsed.path == "/api/agent/tuning/run":
+                plan = build_guided_plan(
+                    body.get("input_path", ""),
+                    body.get("answers", {}),
+                    body.get("workset_id", ""),
+                )
+                workflow = plan.get("workflow")
+                if not workflow or not plan.get("requires_diagnostic"):
+                    raise ValueError(
+                        "Complete the guided questions and choose target_peak_count before diagnostic tuning."
+                    )
+                if body.get("confirmed") is not True:
+                    self._json(
+                        {
+                            "started": False,
+                            "confirmation_required": True,
+                            "plan": plan,
+                            "message": "The diagnostic runs MS-DIAL on one file. Call again with confirmed=true.",
+                        }
+                    )
+                    return
+                representative = str(body.get("representative_file", "")).strip()
+                if not representative:
+                    representative = workflow["files"][0]["file_path"]
+                preparation = prepare_tuning_run(
+                    workflow,
+                    representative,
+                    workflow["output_root"],
+                )
+                job_id = uuid.uuid4().hex
+                with JOBS_LOCK:
+                    JOBS[job_id] = {
+                        "id": job_id,
+                        "status": "queued",
+                        "kind": "tuning",
+                        "logs": [],
+                        "preparation": preparation,
+                        "exit_code": None,
+                        "result": None,
+                    }
+                threading.Thread(
+                    target=_run_tuning_job,
+                    args=(job_id, preparation),
+                    daemon=True,
+                ).start()
+                self._json({"started": True, "job_id": job_id, "preparation": preparation})
+            elif parsed.path == "/api/agent/tuning/estimate":
+                job_id = str(body.get("job_id", "")).strip()
+                with JOBS_LOCK:
+                    job = dict(JOBS.get(job_id) or {})
+                if not job:
+                    raise ValueError(f"Diagnostic job not found: {job_id}")
+                if job.get("status") != "completed" or not job.get("result"):
+                    self._json(
+                        {
+                            "ready": False,
+                            "job_id": job_id,
+                            "status": job.get("status", "unknown"),
+                        }
+                    )
+                    return
+                estimate = estimate_peak_height(
+                    job["result"].get("heights", []),
+                    int(body.get("target_peak_count", 0)),
+                )
+                self._json({"ready": True, "job_id": job_id, "estimate": estimate})
             elif parsed.path == "/api/validate":
                 state = body.get("workflow", body)
                 self._json(
@@ -710,7 +869,7 @@ class Handler(BaseHTTPRequestHandler):
             )
 
     def log_message(self, format: str, *args: object) -> None:
-        print(f"[http] {self.address_string()} {format % args}")
+        print(f"[http] {self.address_string()} {format % args}", file=sys.stderr)
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
