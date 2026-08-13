@@ -35,6 +35,7 @@ class UserResourceTests(unittest.TestCase):
             self.assertEqual(5, len(LIBRARY_CATALOG))
             self.assertEqual(5, len(status))
             self.assertTrue(all(item["record_url"].startswith("https://zenodo.org/records/") for item in status))
+            self.assertTrue(all(item["doi"].startswith("10.5281/zenodo.") for item in status))
             self.assertTrue(all(len(item["md5"]) == 32 for item in status))
             self.assertTrue(all(item["license"] == "CC BY 4.0" for item in status))
 

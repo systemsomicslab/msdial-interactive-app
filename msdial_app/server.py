@@ -17,12 +17,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .agent_bridge import create_datamining_handoff, summarize_jobs
 from .knowledge import KnowledgeBase, next_parameter_question
 from .library_catalog import catalog_status, download_library, library_directory
 from .literature import recommend_from_literature
 from .mztab_validation import list_mztab_outputs, validate_mztab_outputs
 from .mztab_preview import preview_mztab_outputs
+from .materials_methods import generate_publication_report
 from .quality_assurance import build_lcms_qa_report, find_qa_files
 from .workflow import (
     console_version,
@@ -264,6 +266,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "platform": os.name,
                     "python": os.sys.version.split()[0],
+                    "app_version": __version__,
                     "root": str(ROOT),
                     "server": {
                         "bind_host": bind_host,
@@ -535,6 +538,69 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     }
                 )
+            elif parsed.path == "/api/publication/report":
+                state = body.get("workflow", {})
+                run_directory = str(body.get("run_directory", "")).strip()
+                settings_file = Path(run_directory).expanduser() / "workflow-settings.json"
+                used_saved_settings = body.get("use_saved_run", True) and settings_file.is_file()
+                if used_saved_settings:
+                    state = json.loads(settings_file.read_text(encoding="utf-8-sig"))
+                additional_provenance = body.get("additional_library_provenance", [])
+                if additional_provenance:
+                    state["library_provenance"] = [
+                        *state.get("library_provenance", []),
+                        *additional_provenance,
+                    ]
+                qa_report = body.get("qa_report")
+                qa_path = str(body.get("qa_file_path", "")).strip()
+                output_root = run_directory or str(state.get("output_root", "")).strip()
+                if not output_root:
+                    raise ValueError("Set a run/output directory for the publication report.")
+                if (
+                    not qa_report
+                    and not qa_path
+                    and str(state.get("project_type", "lcms")).lower() == "lcms"
+                ):
+                    qa_files = find_qa_files(output_root, recursive=True)
+                    if qa_files:
+                        qa_path = str(qa_files[0])
+                if not qa_report and qa_path:
+                    qa_report = build_lcms_qa_report(
+                        qa_path, body.get("internal_standards", [])
+                    )
+                result = generate_publication_report(
+                    state,
+                    qa_report,
+                    output_root,
+                    app_version=str(
+                        state.get("msdial_interactive_version")
+                        or ("not recorded" if used_saved_settings else __version__)
+                    ),
+                    console_version=str(
+                        state.get("msdial_console_version")
+                        or (
+                            "not recorded"
+                            if used_saved_settings
+                            else console_version(state.get("console_path", ""))
+                        )
+                    ),
+                    qa_criteria=body.get("qa_criteria"),
+                )
+                self._json(
+                    {
+                        "report": result,
+                        "downloads": {
+                            "methods": _register_download(result["methods_file"]),
+                            "qa_results": _register_download(result["qa_results_file"]),
+                            "supplementary_table": _register_download(result["supplementary_table"]),
+                            "audit": _register_download(result["audit_file"]),
+                            "bundle": _register_download(result["bundle"]),
+                        },
+                        "used_saved_settings": used_saved_settings,
+                        "settings_file": str(settings_file) if settings_file.is_file() else "",
+                        "qa_file": qa_path,
+                    }
+                )
             elif parsed.path == "/api/agent/handoff":
                 job_id = body.get("job_id", "")
                 with JOBS_LOCK:
@@ -663,7 +729,10 @@ class Handler(BaseHTTPRequestHandler):
     def _download(self, target: Path) -> None:
         data = target.read_bytes()
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "application/zip")
+        content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        if target.suffix.lower() in {".txt", ".tsv", ".csv", ".json"}:
+            content_type += "; charset=utf-8"
+        self.send_header("Content-Type", content_type)
         self.send_header(
             "Content-Disposition",
             f'attachment; filename="{target.name}"',

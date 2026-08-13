@@ -22,6 +22,22 @@ Windows artifact内のZIP、またはmacOS/Linux artifact内のtar.gzを展開�
 あります。今回の想定では、各ユーザーのPCにあるデータを直接扱いたいので、
 個人PCローカル起動を推奨します。
 
+## 論文記載用ファイル
+
+`7. Publication report` では、解析runの `workflow-settings.json` とQA結果から、
+英語のMaterials and Methods案、QA Results案、Supplementary Table TSV、監査用JSONを
+生成できます。文章は画面上で編集後、コピーまたはダウンロードできます。
+
+新規runではMS-DIAL ConsoleとMS-DIAL Interactiveのバージョンを保存します。
+旧runにバージョンが保存されていない場合、現在版を過去の解析版として推測せず、
+`not recorded` と表示します。Zenodo catalogから取得したライブラリーはDOI、URL、
+MD5、licenseを自動記録します。個別に用意したライブラリーは、VersionとDOIまたは
+repository URLをPublication report画面で追記してください。
+
+現在のセッションでQA matrixが未選択の場合は、解析run直下またはその直下のQA出力
+サブフォルダーにある最新の `*.qa.tsv` を自動使用します。採用したファイルはPublication
+report画面に表示します。vendor RAWフォルダーの内部までは再帰検索しません。
+
 ## 配布ZIPの作成
 
 開発者PCで以下を実行します。

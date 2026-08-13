@@ -93,6 +93,7 @@ def catalog_status() -> list[dict[str, Any]]:
         item.update(
             {
                 "record_url": f"https://zenodo.org/records/{item['record_id']}",
+                "doi": f"10.5281/zenodo.{item['record_id']}",
                 "local_path": str(path) if path.is_file() else "",
                 "downloaded": downloaded,
                 "size_mb": round(item["size"] / 1_000_000, 1),
@@ -135,7 +136,7 @@ def download_library(
     temporary = target.with_suffix(target.suffix + ".part")
     digest = hashlib.md5()
     received = 0
-    request = urllib.request.Request(url, headers={"User-Agent": "MS-DIAL-Interactive/0.1"})
+    request = urllib.request.Request(url, headers={"User-Agent": "MS-DIAL-Interactive/0.2"})
     try:
         with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as handle:
             total = int(response.headers.get("Content-Length") or item["size"])
@@ -170,6 +171,7 @@ def _write_metadata(item: dict[str, Any], target: Path) -> None:
             {
                 "record_id": item["record_id"],
                 "record_url": f"https://zenodo.org/records/{item['record_id']}",
+                "doi": f"10.5281/zenodo.{item['record_id']}",
                 "filename": item["filename"],
                 "size": item["size"],
                 "md5": item["md5"],
@@ -200,6 +202,7 @@ def _download_result(item: dict[str, Any], path: Path, reused: bool) -> dict[str
         "ri_compound_type": item.get("ri_compound_type", ""),
         "local_path": str(path),
         "record_url": f"https://zenodo.org/records/{item['record_id']}",
+        "doi": f"10.5281/zenodo.{item['record_id']}",
         "filename": item["filename"],
         "md5": item["md5"],
         "license": "CC BY 4.0",

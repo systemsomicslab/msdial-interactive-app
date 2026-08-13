@@ -175,6 +175,7 @@ function workflow() {
     selected_adducts: (state.adducts[$("#ionMode").value] || [])
       .filter((item) => item.selected)
       .map((item) => item.adduct),
+    msdial_interactive_version: state.config?.app_version || "not recorded",
   };
 }
 
@@ -741,6 +742,7 @@ function applyCatalogLibrary(item) {
       catalog_id: item.id,
       label: item.label,
       record_url: item.record_url,
+      doi: item.doi,
       local_path: path,
       filename: item.filename,
       md5: item.md5,
@@ -1507,6 +1509,96 @@ function parseQaInternalStandards() {
     .filter((item) => item && Number.isFinite(item.mz) && item.mz > 0 && Number.isFinite(item.rt) && item.rt >= 0);
 }
 
+function parsePublicationLibraryProvenance() {
+  return $("#publicationLibraryProvenance").value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line, index) => {
+      const fields = line.split("|").map((item) => item.trim());
+      if (index === 0 && fields[0].toLowerCase().includes("library path")) return null;
+      const persistentId = fields[2] || "";
+      return {
+        label: fields[0] ? fields[0].split(/[\\/]/).pop() : `User library ${index + 1}`,
+        local_path: fields[0] || "",
+        version: fields[1] || "not recorded",
+        doi: persistentId.toLowerCase().includes("doi.org/") ? persistentId.replace(/^https?:\/\/doi\.org\//i, "") : "",
+        record_url: persistentId,
+        license: fields[3] || "not recorded",
+        source: "user supplied",
+      };
+    })
+    .filter(Boolean);
+}
+
+function publicationQaCriteria() {
+  return {
+    median_qc_rsd_percent_max: Number($("#qaCriterionMedianRsd").value),
+    qc_features_rsd_le_30_fraction_min: Number($("#qaCriterionRsdFraction").value),
+    median_qc_detection_rate_min: Number($("#qaCriterionDetection").value),
+    sample_blank_ratio_ge_3_fraction_min: Number($("#qaCriterionBlankSeparation").value),
+    qc_pca_relative_dispersion_max: Number($("#qaCriterionPca").value),
+    median_blank_carryover_ratio_max: Number($("#qaCriterionCarryover").value),
+    run_order_intensity_abs_correlation_max: Number($("#qaCriterionOrderCorrelation").value),
+  };
+}
+
+async function copyPublicationText(selector, label) {
+  const text = $(selector).value;
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+  } else {
+    $(selector).focus();
+    $(selector).select();
+    document.execCommand("copy");
+  }
+  setStatus(`${label} copied to the clipboard.`);
+}
+
+function renderPublicationReport(result) {
+  const report = result.report || {};
+  const downloads = result.downloads || {};
+  $("#publicationOutput").hidden = false;
+  $("#materialsMethodsText").value = report.methods_text || "";
+  $("#qaResultsText").value = report.qa_results_text || "";
+  updatePublicationTextDownloads();
+  $("#downloadSupplementaryTable").href = downloads.supplementary_table || "#";
+  $("#downloadPublicationAudit").href = downloads.audit || "#";
+  $("#downloadPublicationBundle").href = downloads.bundle || "#";
+  const assessment = report.qa_assessment || {};
+  $("#publicationSource").textContent = result.used_saved_settings
+    ? `Run settings loaded from ${result.settings_file}. QA criteria passed: ${assessment.passed || 0}/${assessment.evaluated || 0}.`
+    : `Current UI settings were used. QA criteria passed: ${assessment.passed || 0}/${assessment.evaluated || 0}.`;
+  if (result.qa_file) {
+    $("#publicationSource").textContent += ` QA matrix: ${result.qa_file}.`;
+  }
+  $("#publicationWarnings").innerHTML = (report.warnings || [])
+    .map((message) => `<div class="issue warning">${escapeHtml(message)}</div>`)
+    .join("");
+}
+
+function setPublicationTextDownload(linkSelector, text, filename) {
+  const link = $(linkSelector);
+  if (link.dataset.objectUrl) URL.revokeObjectURL(link.dataset.objectUrl);
+  const objectUrl = URL.createObjectURL(new Blob([`${text}\n`], { type: "text/plain;charset=utf-8" }));
+  link.href = objectUrl;
+  link.download = filename;
+  link.dataset.objectUrl = objectUrl;
+}
+
+function updatePublicationTextDownloads() {
+  setPublicationTextDownload(
+    "#downloadMaterialsMethods",
+    $("#materialsMethodsText").value,
+    "MS_DIAL_Materials_and_Methods.txt",
+  );
+  setPublicationTextDownload(
+    "#downloadQaResults",
+    $("#qaResultsText").value,
+    "MS_DIAL_QA_Results.txt",
+  );
+}
+
 function qaValue(value, digits = 2) {
   if (value === null || value === undefined || value === "") return "N/A";
   return Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : "N/A";
@@ -2113,7 +2205,7 @@ async function pollJob() {
 async function initialize() {
   state.config = await api("/api/config");
   $("#platformPill").textContent =
-    `${navigator.platform} | ${state.config.knowledge_cards.ja} JA / ${state.config.knowledge_cards.en} EN cards`;
+    `v${state.config.app_version} | ${navigator.platform} | ${state.config.knowledge_cards.ja} JA / ${state.config.knowledge_cards.en} EN cards`;
   renderServerNotice();
   $("#templatePath").value = state.config.default_template;
   $("#queriesPath").value = state.config.default_queries;
@@ -2623,6 +2715,40 @@ $("#generateQaReport").addEventListener("click", () => runUiAction(async () => {
   renderQaReport(result.report);
   setStatus("LC-MS QA report generated.");
 }));
+$("#usePublicationOutputRoot").addEventListener("click", () => {
+  $("#publicationRunDirectory").value = $("#outputRoot").value.trim();
+  setStatus("Publication report directory set from Output root.");
+});
+$("#generatePublicationReport").addEventListener("click", () => runUiAction(async () => {
+  const runDirectory = $("#publicationRunDirectory").value.trim() || $("#outputRoot").value.trim();
+  if (!runDirectory) throw new Error("Set an analysis run/output directory.");
+  $("#publicationRunDirectory").value = runDirectory;
+  $("#publicationOutput").hidden = true;
+  $("#publicationSource").textContent = "Generating publication files...";
+  const result = await api("/api/publication/report", {
+    method: "POST",
+    body: JSON.stringify({
+      workflow: workflow(),
+      run_directory: runDirectory,
+      use_saved_run: $("#publicationUseSavedRun").checked,
+      qa_report: state.qaReport,
+      qa_file_path: $("#qaFilePath").value.trim(),
+      internal_standards: parseQaInternalStandards(),
+      qa_criteria: publicationQaCriteria(),
+      additional_library_provenance: parsePublicationLibraryProvenance(),
+    }),
+  });
+  renderPublicationReport(result);
+  setStatus("Publication report generated.");
+}));
+$("#copyMaterialsMethods").addEventListener("click", () => runUiAction(
+  () => copyPublicationText("#materialsMethodsText", "Materials and Methods text")
+));
+$("#copyQaResults").addEventListener("click", () => runUiAction(
+  () => copyPublicationText("#qaResultsText", "QA Results text")
+));
+$("#materialsMethodsText").addEventListener("input", updatePublicationTextDownloads);
+$("#qaResultsText").addEventListener("input", updatePublicationTextDownloads);
 $("#exportWorkflow").addEventListener("click", () => runUiAction(async () => {
   const result = await api("/api/export-workflow", {
     method: "POST",
