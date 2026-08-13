@@ -136,7 +136,7 @@ def download_library(
     temporary = target.with_suffix(target.suffix + ".part")
     digest = hashlib.md5()
     received = 0
-    request = urllib.request.Request(url, headers={"User-Agent": "MS-DIAL-Interactive/0.2"})
+    request = urllib.request.Request(url, headers={"User-Agent": "MS-DIAL-Interactive/0.3"})
     try:
         with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as handle:
             total = int(response.headers.get("Content-Length") or item["size"])

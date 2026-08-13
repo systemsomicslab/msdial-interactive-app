@@ -294,11 +294,18 @@ Prepare, Run, and Export reusable workflow generate a ZIP containing:
 
 The bundle contains no raw data.
 
-## Agent and MCP integration
+## Agent Skill and MCP integration
 
-MS-DIAL Interactive exposes local agent endpoints and an optional MCP server so
-Codex, Claude Desktop, or another MCP host can observe an analysis without
-guessing what this app is.
+MS-DIAL Interactive combines two complementary layers:
+
+- the Agent Skill defines the scientific interview, confirmation boundaries,
+  QA interpretation, and publication workflow;
+- the local MCP server inspects data paths, runs MS-DIAL, reports job state,
+  validates mzTab-M, generates QA, and creates publication artifacts.
+
+Raw data stay on the user's PC. Guided execution currently supports LC-MS and
+GC-MS. Five built-in worksets cover GC-MS metabolomics and positive/negative
+LC-MS metabolomics/lipidomics; accepted choices can be saved as user worksets.
 
 Install the optional MCP dependency:
 
@@ -312,15 +319,20 @@ Run the MCP server:
 python scripts/msdial-interactive-mcp.py
 ```
 
-Typical MCP tools:
+Core MCP tools:
 
 - `msdial_interactive_launch`: start the local web app if needed
+- `msdial_guided_analysis_plan`: inspect input and return the next question
+- `msdial_list_worksets` / `msdial_save_workset`: reuse scientific choices
+- `msdial_start_peak_count_diagnostic`: tune from one representative file
+- `msdial_prepare_guided_analysis`: write and validate reproducible inputs
+- `msdial_start_guided_analysis`: execute only after explicit confirmation
 - `msdial_interactive_status`: check queued/running/completed jobs
 - `msdial_interactive_wait_for_completion`: wait for a run to finish
-- `msdial_interactive_create_handoff`: create `datamining-handoff.json`
 - `msdial_interactive_validate_mztab`: validate mzTab-M outputs
-- `msdial_interactive_preview_mztab`: inspect mzTab-M sections, first rows, and
-  numeric columns
+- `msdial_generate_lcms_qa`: build the LC-MS QA report
+- `msdial_generate_publication_report`: create text, Excel, audit, and ZIP files
+- `msdial_interactive_create_handoff`: create `datamining-handoff.json`
 
 Claude Desktop example:
 
@@ -328,7 +340,7 @@ Claude Desktop example:
 {
   "mcpServers": {
     "msdial-interactive": {
-      "command": "python",
+      "command": "C:\\Users\\<user>\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
       "args": [
         "D:\\0_SourceCode\\msdial_interactive_app\\scripts\\msdial-interactive-mcp.py"
       ]
@@ -337,9 +349,28 @@ Claude Desktop example:
 }
 ```
 
-The MCP server is intentionally a local adapter. Raw data remain on the user PC,
-the web UI remains user-in-the-loop, and downstream MCP servers should consume
-the generated `primary_mztab_file` or `datamining-handoff.json`.
+Use the actual Python path on that PC. Restart Claude Desktop after editing its
+configuration.
+
+Package the cross-platform Agent Skill:
+
+```bash
+python scripts/package-agent-skill.py
+```
+
+Upload `dist/msdial-guided-analysis.skill.zip` from Claude's
+`Customize > Skills` screen, or install the folder
+`skills/msdial-guided-analysis` in another Agent Skills-compatible host. The
+format follows the open Agent Skills standard. See
+[`docs/agent_integration.md`](docs/agent_integration.md) for setup, tool flow,
+and test prompts.
+
+Example prompt:
+
+```text
+D:\0_SourceCode\MsdialWorkbenchDemo\console_fastlc_demo の質量分析データを
+MS-DIALで解析し、mzTab-M検証、QA、Materials and Methods生成まで案内して。
+```
 
 ## Literature-based starting parameters
 

@@ -1,0 +1,89 @@
+---
+name: msdial-guided-analysis
+description: Guide and execute reproducible local MS-DIAL analyses from raw LC-MS or GC-MS data through mzTab-M validation, LC-MS quality assurance, Materials and Methods generation, and reusable workset registration. Use when a user asks to analyze a local mass-spectrometry folder or CSV, run MS-DIAL Interactive, tune peak counts, apply RT correction, choose annotation libraries, inspect QA, or prepare publication artifacts.
+---
+
+# MS-DIAL Guided Analysis
+
+Use the `msdial-interactive` MCP tools as the execution layer. Keep raw data on the user's computer and treat the conversation as the scientific decision layer.
+
+## Start
+
+1. Call `msdial_interactive_status`.
+2. Call `msdial_interactive_launch` when the local app is not running.
+3. Call `msdial_guided_analysis_plan` with the user's local input path and an empty `answers` object, or with a named `workset_id`.
+4. Report the recognized file count, formats, rejected paths, and warnings before discussing parameters.
+
+Do not infer GC-MS versus LC-MS, ion mode, or target omics from a filename alone. Ask when the user has not explicitly supplied the value. Explain that guided execution currently supports LC-MS and GC-MS; direct other project types to the web UI without pretending they are supported.
+
+## Collect Decisions
+
+Follow `next_question` from `msdial_guided_analysis_plan`. Retain all accepted values in one `answers` object and call the planner again after each answer. Ask one scientific decision at a time unless the user explicitly requests a compact questionnaire.
+
+Use these branches:
+
+1. Select `lcms` or `gcms`.
+2. For LC-MS, collect `ion_mode` and `target_omics`.
+3. Select template defaults or `target_peak_count` tuning.
+4. For LC-MS, decide whether to apply retention-time correction. If enabled, collect an anchor library and peak-selection rule.
+5. Select official, existing, or no annotation libraries.
+6. For LC-MS, decide whether to generate QA and collect internal-standard definitions when available. QA without internal standards still evaluates distributions and sample topology, but must not claim internal-standard stability.
+7. Decide whether to generate Materials and Methods and supplementary tables.
+
+Load [tool-reference.md](references/tool-reference.md) when constructing nested `answers`, internal standards, library settings, or worksets.
+
+## Tune Peak Count
+
+When `parameter_strategy` is `target_peak_count`:
+
+1. Call `msdial_start_peak_count_diagnostic` with `confirmed=false` and explain that one representative file will be processed.
+2. Obtain explicit user confirmation.
+3. Call it again with `confirmed=true`.
+4. Poll the returned job with `msdial_interactive_job` until completed or failed.
+5. Call `msdial_recommend_peak_height` using the requested target count.
+6. Present the proposed `minimum_peak_height`, diagnostic peak count, and estimated retained count.
+7. Add the threshold to `answers` only after the user accepts it or supplies a replacement.
+
+Treat the recommendation as an order-statistic starting point, not a biological quality guarantee.
+
+## Resolve Libraries
+
+For `official`, use the catalog ID returned by the planner or choose the matching versioned catalog entry:
+
+- `metabolomics-positive`
+- `metabolomics-negative`
+- `lipidomics`
+- `gcms-kovats`
+- `gcms-fiehn`
+
+Call `msdial_download_official_library` with `confirmed=false` first. State the record, DOI, download size, and local destination. Download only after explicit confirmation. For user libraries, preserve paths and provenance supplied by the user; prompt for a version, DOI/repository URL, or checksum before publication when none is recorded.
+
+## Review And Run
+
+Do not start a production analysis while `remaining_questions` or `blockers` are present.
+
+1. Call `msdial_prepare_guided_analysis` to validate and write the reproducible CSV, method, manifest, scripts, and workflow bundle.
+2. Summarize project type, ion mode, target omics, file count, output directory, peak-picking strategy, RT correction, libraries, alignment-light mode, QA, and publication actions.
+3. Call `msdial_start_guided_analysis` with `confirmed=false`.
+4. Ask the user to approve the displayed plan and command.
+5. Call it with `confirmed=true` only after approval.
+6. Poll with `msdial_interactive_job` or `msdial_interactive_wait_for_completion`.
+
+Never silently overwrite the scientific meaning of an existing output folder. If generated files already exist, describe the collision and ask the user to choose another output directory or explicitly accept reuse.
+
+## Complete The Workflow
+
+After a successful run:
+
+1. Call `msdial_interactive_validate_mztab` and report pass, warning, and failure counts.
+2. Call `msdial_interactive_preview_mztab` for a compact content sanity check.
+3. For requested LC-MS QA, call `msdial_generate_lcms_qa`. Distinguish passed, failed, and not-evaluable checks. Do not describe missing checks as passed.
+4. When requested, call `msdial_generate_publication_report`. Return the Materials and Methods file, QA Results file, supplementary Excel workbook, audit JSON, and bundle paths.
+5. Call `msdial_interactive_create_handoff` when downstream PCA, UMAP, HCA, chromatogram visualization, or other data-mining tools will consume the mzTab-M output.
+6. Ask whether to save the accepted scientific choices as a workset. Call `msdial_save_workset` only when the user agrees and provides a name.
+
+Do not store raw-data paths or output directories in reusable worksets. Preserve accepted peak-picking thresholds and other scientific choices; each run supplies its own input and output locations.
+
+## Recover
+
+On failure, read the job log tail before changing parameters. Preserve the failed workflow files for audit. Explain vendor sidecar/runtime errors, missing libraries, invalid paths, and mzTab-M validation failures separately. Do not retry a production run with changed scientific parameters without telling the user exactly what changed.
