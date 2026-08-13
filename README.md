@@ -116,10 +116,21 @@ Catalog records:
 ## Publication reporting
 
 The **7. Publication report** workspace generates an English Materials and
-Methods draft, a separate QA Results draft, a long-format supplementary TSV,
-and a machine-readable JSON audit file. The complete reporting bundle contains
-all four files. The two manuscript drafts remain editable in the browser and
-can be copied or downloaded after editing.
+Methods draft, a separate QA Results draft, an Excel supplementary workbook, a
+long-format supplementary TSV, and a machine-readable JSON audit file. The
+complete reporting bundle contains all five files. The two manuscript drafts
+remain editable in the browser and can be copied or downloaded after editing.
+
+The Excel workbook is the primary human-readable supplementary output:
+
+- **Data** reproduces the MS-DIAL analysis-file CSV as a sample-by-field matrix.
+- **Guided setup** lists processing settings as sectioned Field/Value rows.
+- **Annotation** groups MSP, text, and LBM annotators and presents selected
+  adducts, lipid queries, and library provenance as compact tables.
+- **Quality assurance** records observed metrics and prespecified criteria.
+
+The long-format TSV remains available as an audit-friendly machine-readable
+companion.
 
 When `workflow-settings.json` exists in the selected run/output directory, the
 report uses those saved run settings instead of the current UI. New runs record

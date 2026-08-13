@@ -8,6 +8,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+from .supplementary_excel import write_supplementary_workbook
+
 
 DEFAULT_QA_CRITERIA: dict[str, float] = {
     "median_qc_rsd_percent_max": 30.0,
@@ -49,6 +51,7 @@ def generate_publication_report(
     methods_path = root / "MS_DIAL_Materials_and_Methods.txt"
     results_path = root / "MS_DIAL_QA_Results.txt"
     table_path = root / "Supplementary_Table_MS_DIAL.tsv"
+    workbook_path = root / "Supplementary_Table_MS_DIAL.xlsx"
     audit_path = root / "MS_DIAL_publication_report.json"
     bundle_path = root / "MS_DIAL_publication_reporting_bundle.zip"
 
@@ -63,6 +66,14 @@ def generate_publication_report(
         )
         writer.writeheader()
         writer.writerows(rows)
+    write_supplementary_workbook(
+        workbook_path,
+        workflow,
+        qa_report,
+        qa_assessment,
+        app_version=app_version,
+        console_version=console_version,
+    )
     audit = {
         "generated_at": dt.datetime.now().astimezone().isoformat(),
         "software": {
@@ -78,7 +89,7 @@ def generate_publication_report(
         json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for path in (methods_path, results_path, table_path, audit_path):
+        for path in (methods_path, results_path, workbook_path, table_path, audit_path):
             archive.write(path, path.name)
     return {
         "methods_text": methods,
@@ -87,6 +98,7 @@ def generate_publication_report(
         "warnings": provenance_warnings,
         "methods_file": str(methods_path),
         "qa_results_file": str(results_path),
+        "supplementary_workbook": str(workbook_path),
         "supplementary_table": str(table_path),
         "audit_file": str(audit_path),
         "bundle": str(bundle_path),

@@ -1562,6 +1562,7 @@ function renderPublicationReport(result) {
   $("#materialsMethodsText").value = report.methods_text || "";
   $("#qaResultsText").value = report.qa_results_text || "";
   updatePublicationTextDownloads();
+  $("#downloadSupplementaryWorkbook").href = downloads.supplementary_workbook || "#";
   $("#downloadSupplementaryTable").href = downloads.supplementary_table || "#";
   $("#downloadPublicationAudit").href = downloads.audit || "#";
   $("#downloadPublicationBundle").href = downloads.bundle || "#";

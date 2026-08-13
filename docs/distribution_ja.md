@@ -28,6 +28,11 @@ Windows artifact内のZIP、またはmacOS/Linux artifact内のtar.gzを展開�
 英語のMaterials and Methods案、QA Results案、Supplementary Table TSV、監査用JSONを
 生成できます。文章は画面上で編集後、コピーまたはダウンロードできます。
 
+Supplementary TableはExcel (`.xlsx`) が主出力です。`Data`にはMS-DIAL入力CSVと同じ
+マトリックス、`Guided setup`にはセクション別のField/Value、`Annotation`にはannotator、
+adduct、lipid query、library provenance、`Quality assurance`にはQA結果と基準を記録します。
+従来のlong-format TSVも機械処理・監査用として同時に出力します。
+
 新規runではMS-DIAL ConsoleとMS-DIAL Interactiveのバージョンを保存します。
 旧runにバージョンが保存されていない場合、現在版を過去の解析版として推測せず、
 `not recorded` と表示します。Zenodo catalogから取得したライブラリーはDOI、URL、

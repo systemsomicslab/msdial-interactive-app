@@ -8,6 +8,7 @@ import zipfile
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
+from xml.etree import ElementTree as ET
 
 from msdial_app.materials_methods import assess_qa, generate_publication_report
 from msdial_app.workflow import console_version
@@ -94,6 +95,26 @@ class MaterialsMethodsTests(unittest.TestCase):
                 rows = list(csv.DictReader(handle, delimiter="\t"))
             self.assertTrue({"Software", "Data", "Guided setup", "Annotation", "Library provenance", "Quality assurance"}.issubset({row["Section"] for row in rows}))
             self.assertTrue(any(row["Value"] == "10.5281/zenodo.21904103" for row in rows))
+            workbook_path = Path(result["supplementary_workbook"])
+            self.assertTrue(workbook_path.is_file())
+            with zipfile.ZipFile(workbook_path) as workbook:
+                workbook_xml = ET.fromstring(workbook.read("xl/workbook.xml"))
+                namespace = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+                self.assertEqual(
+                    ["Data", "Guided setup", "Annotation", "Quality assurance"],
+                    [item.attrib["name"] for item in workbook_xml.findall("x:sheets/x:sheet", namespace)],
+                )
+                data_text = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+                guided_text = workbook.read("xl/worksheets/sheet2.xml").decode("utf-8")
+                annotation_text = workbook.read("xl/worksheets/sheet3.xml").decode("utf-8")
+            self.assertIn("file_path", data_text)
+            self.assertIn("analytical_order", data_text)
+            self.assertIn("D:/data/sample.raw", data_text)
+            self.assertIn("Core workflow", guided_text)
+            self.assertIn("Project type", guided_text)
+            self.assertIn("MSP annotator: msp_annotator_1", annotation_text)
+            self.assertIn("Selected lipid queries", annotation_text)
+            self.assertIn("10.5281/zenodo.21904103", annotation_text)
             audit = json.loads(Path(result["audit_file"]).read_text(encoding="utf-8"))
             self.assertEqual("pass", audit["qa_assessment"]["status"])
             with zipfile.ZipFile(result["bundle"]) as archive:
@@ -101,6 +122,7 @@ class MaterialsMethodsTests(unittest.TestCase):
                     {
                         "MS_DIAL_Materials_and_Methods.txt",
                         "MS_DIAL_QA_Results.txt",
+                        "Supplementary_Table_MS_DIAL.xlsx",
                         "Supplementary_Table_MS_DIAL.tsv",
                         "MS_DIAL_publication_report.json",
                     },

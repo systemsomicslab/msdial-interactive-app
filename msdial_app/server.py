@@ -592,6 +592,7 @@ class Handler(BaseHTTPRequestHandler):
                         "downloads": {
                             "methods": _register_download(result["methods_file"]),
                             "qa_results": _register_download(result["qa_results_file"]),
+                            "supplementary_workbook": _register_download(result["supplementary_workbook"]),
                             "supplementary_table": _register_download(result["supplementary_table"]),
                             "audit": _register_download(result["audit_file"]),
                             "bundle": _register_download(result["bundle"]),
