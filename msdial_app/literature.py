@@ -41,7 +41,7 @@ def build_search_query(workflow: dict[str, Any]) -> str:
     return " ".join(term for term in terms if term).strip()
 
 
-def recommend_from_literature(
+def evaluate_literature_evidence(
     workflow: dict[str, Any],
     llm_config: dict[str, Any],
     language: str = "ja",
@@ -77,10 +77,10 @@ def recommend_from_literature(
             "content": (
                 "You are an evidence-constrained MS-DIAL parameter assistant. "
                 "Use only the supplied open-access Crossref metadata. Never invent a numeric "
-                "parameter. Recommend a numeric value only when it is explicitly present in "
+                "parameter. Report a numeric value only when it is explicitly present in "
                 "the supplied title or abstract. Citation count measures influence, not "
-                "parameter validity. If no explicit parameters are present, recommend using "
-                "the application's format-based defaults and say that evidence was insufficient. "
+                "parameter validity. If no explicit parameters are present, state that no "
+                "literature-derived setting was found and leave the choice to the user. "
                 "Cite sources as [1], [2], etc."
             ),
         },

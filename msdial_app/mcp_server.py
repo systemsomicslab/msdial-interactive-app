@@ -388,16 +388,16 @@ def msdial_start_peak_count_diagnostic(
 
 
 @mcp.tool()
-def msdial_recommend_peak_height(
+def msdial_estimate_peak_height(
     job_id: str,
     target_peak_count: int,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
-    """Recommend Minimum peak height from a completed diagnostic height distribution."""
+    """Estimate Minimum peak height from a completed diagnostic height distribution."""
     return _request_json(
         "POST",
-        "/api/agent/tuning/recommend",
+        "/api/agent/tuning/estimate",
         host=host,
         port=port,
         body={"job_id": job_id, "target_peak_count": target_peak_count},

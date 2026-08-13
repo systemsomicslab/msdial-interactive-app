@@ -125,7 +125,7 @@ def build_guided_plan(
     }
 
 
-def recommend_peak_height(heights: list[float], target_peak_count: int) -> dict[str, Any]:
+def estimate_peak_height(heights: list[float], target_peak_count: int) -> dict[str, Any]:
     values = sorted(float(value) for value in heights if float(value) >= 0)
     target = max(1, int(target_peak_count))
     if not values:
@@ -148,7 +148,13 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
 
     def ask(identifier: str, prompt: str, choices: list[str] | None = None) -> None:
         result.append(
-            {"id": identifier, "prompt": prompt, "choices": choices or [], "required": True}
+            {
+                "id": identifier,
+                "prompt": prompt,
+                "choices": choices or [],
+                "required": True,
+                "presentation": "neutral",
+            }
         )
 
     project_type = str(answers.get("project_type", "")).casefold()

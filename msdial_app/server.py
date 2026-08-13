@@ -19,10 +19,10 @@ from typing import Any
 
 from . import __version__
 from .agent_bridge import create_datamining_handoff, summarize_jobs
-from .agent_workflow import build_guided_plan, recommend_peak_height
+from .agent_workflow import build_guided_plan, estimate_peak_height
 from .knowledge import KnowledgeBase, next_parameter_question
 from .library_catalog import catalog_status, download_library, library_directory
-from .literature import recommend_from_literature
+from .literature import evaluate_literature_evidence
 from .mztab_validation import list_mztab_outputs, validate_mztab_outputs
 from .mztab_preview import preview_mztab_outputs
 from .materials_methods import generate_publication_report
@@ -466,9 +466,9 @@ class Handler(BaseHTTPRequestHandler):
                         body.get("llm", {}),
                     )
                 )
-            elif parsed.path == "/api/literature/recommend":
+            elif parsed.path == "/api/literature/evidence":
                 self._json(
-                    recommend_from_literature(
+                    evaluate_literature_evidence(
                         body.get("workflow", {}),
                         body.get("llm", {}),
                         body.get("language", "ja"),
@@ -617,7 +617,7 @@ class Handler(BaseHTTPRequestHandler):
                     daemon=True,
                 ).start()
                 self._json({"started": True, "job_id": job_id, "preparation": preparation})
-            elif parsed.path == "/api/agent/tuning/recommend":
+            elif parsed.path == "/api/agent/tuning/estimate":
                 job_id = str(body.get("job_id", "")).strip()
                 with JOBS_LOCK:
                     job = dict(JOBS.get(job_id) or {})
@@ -632,11 +632,11 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     )
                     return
-                recommendation = recommend_peak_height(
+                estimate = estimate_peak_height(
                     job["result"].get("heights", []),
                     int(body.get("target_peak_count", 0)),
                 )
-                self._json({"ready": True, "job_id": job_id, "recommendation": recommendation})
+                self._json({"ready": True, "job_id": job_id, "estimate": estimate})
             elif parsed.path == "/api/validate":
                 state = body.get("workflow", body)
                 self._json(

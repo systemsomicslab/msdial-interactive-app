@@ -7,7 +7,7 @@ from unittest.mock import patch
 from msdial_app.agent_workflow import (
     build_guided_plan,
     inspect_analysis_input,
-    recommend_peak_height,
+    estimate_peak_height,
 )
 from msdial_app.worksets import get_workset, list_worksets, save_workset
 
@@ -54,6 +54,7 @@ class AgentWorkflowTests(unittest.TestCase):
         plan = build_guided_plan("", {})
 
         self.assertEqual("project_type", plan["next_question"]["id"])
+        self.assertEqual("neutral", plan["next_question"]["presentation"])
         self.assertFalse(plan["ready_to_prepare"])
 
     def test_target_peak_count_requires_diagnostic_threshold(self) -> None:
@@ -96,8 +97,8 @@ class AgentWorkflowTests(unittest.TestCase):
         self.assertFalse(plan["post_run_actions"]["quality_assurance"])
         self.assertFalse(plan["post_run_actions"]["materials_and_methods"])
 
-    def test_peak_height_recommendation_uses_target_order_statistic(self) -> None:
-        result = recommend_peak_height([1, 2, 3, 4, 5], 2)
+    def test_peak_height_estimate_uses_target_order_statistic(self) -> None:
+        result = estimate_peak_height([1, 2, 3, 4, 5], 2)
 
         self.assertEqual(4, result["minimum_peak_height"])
         self.assertEqual(2, result["estimated_peak_count"])

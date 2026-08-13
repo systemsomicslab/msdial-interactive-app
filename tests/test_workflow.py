@@ -25,7 +25,7 @@ from msdial_app.workflow import (
     read_adducts,
     read_lipid_queries,
     read_rt_correction_anchors,
-    recommended_peak_parameters,
+    format_based_peak_parameters,
     save_rt_correction_anchors,
     save_rt_correction_selections,
     validate_workflow,
@@ -823,7 +823,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual("PC", rows[0]["lipid_class"])
             self.assertTrue(rows[0]["selected"])
 
-    def test_folder_type_vendor_detection_and_recommendations(self) -> None:
+    def test_folder_type_vendor_detection_and_starting_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             waters = root / "sample.raw"
@@ -845,7 +845,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual("Thermo", vendors["thermo"])
             self.assertEqual(
                 {"minimum_peak_height": 10000, "mass_slice_width": 0.05},
-                recommended_peak_parameters(expanded),
+                format_based_peak_parameters(expanded),
             )
             self.assertEqual("Agilent", detect_raw_format(agilent)["vendor"])
 

@@ -58,8 +58,11 @@ async def smoke_test(
                 "restarted": restarted,
                 "has_guided_plan": "msdial_guided_analysis_plan" in names,
                 "has_publication": "msdial_generate_publication_report" in names,
+                "has_peak_height_estimate": "msdial_estimate_peak_height" in names,
+                "has_legacy_peak_height_tool": any("recommend" in name.casefold() for name in names),
                 "file_count": payload["input"]["file_count"],
                 "next_question": payload["next_question"]["id"],
+                "question_presentation": payload["next_question"].get("presentation"),
             }
 
 

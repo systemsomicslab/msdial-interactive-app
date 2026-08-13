@@ -103,7 +103,7 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
     }
 
 
-def recommended_peak_parameters(files: Iterable[dict[str, Any]]) -> dict[str, Any]:
+def format_based_peak_parameters(files: Iterable[dict[str, Any]]) -> dict[str, Any]:
     rows = list(files)
     if not rows:
         return {"minimum_peak_height": 100, "mass_slice_width": 0.1}

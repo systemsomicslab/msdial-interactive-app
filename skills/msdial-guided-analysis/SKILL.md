@@ -23,6 +23,8 @@ Do not infer GC-MS versus LC-MS, ion mode, or target omics from a filename alone
 
 Follow `next_question` from `msdial_guided_analysis_plan`. Retain all accepted values in one `answers` object and call the planner again after each answer. Ask one scientific decision at a time unless the user explicitly requests a compact questionnaire.
 
+Present every choice neutrally and in the order returned by the planner. Do not append evaluative labels or imply that the first choice is scientifically superior. Explain tradeoffs only when evidence or the user's stated goal supports them.
+
 Use these branches:
 
 1. Select `lcms` or `gcms`.
@@ -43,11 +45,11 @@ When `parameter_strategy` is `target_peak_count`:
 2. Obtain explicit user confirmation.
 3. Call it again with `confirmed=true`.
 4. Poll the returned job with `msdial_interactive_job` until completed or failed.
-5. Call `msdial_recommend_peak_height` using the requested target count.
+5. Call `msdial_estimate_peak_height` using the requested target count.
 6. Present the proposed `minimum_peak_height`, diagnostic peak count, and estimated retained count.
 7. Add the threshold to `answers` only after the user accepts it or supplies a replacement.
 
-Treat the recommendation as an order-statistic starting point, not a biological quality guarantee.
+Treat the estimate as an order-statistic starting point, not a biological quality guarantee.
 
 ## Resolve Libraries
 

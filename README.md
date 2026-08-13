@@ -385,9 +385,9 @@ title/abstract metadata, and a confidence label. Citation counts are Crossref
 invent numeric parameters; when detailed settings are absent, the app retains
 its instrument-format defaults. Suggestions are never applied automatically.
 
-## Recommended distribution model
+## Local distribution model
 
-The recommended lab trial model is **one local instance per user PC**.
+The lab trial model described here is **one local instance per user PC**.
 Each user downloads or receives the app ZIP, launches it on their own Windows,
 macOS, or Linux machine, and opens `http://127.0.0.1:8765`.
 
@@ -503,7 +503,7 @@ python app.py --lab --port 8765
 ```
 
 Use this only when raw data, libraries, and output folders are visible from
-the server filesystem. It is not the recommended mode for users who want to
+the server filesystem. It does not fit users who want to
 process data stored on their own PCs. Do not expose it directly to the public
 internet.
 
@@ -513,9 +513,9 @@ Optional environment variables:
 MSDIAL_CONSOLE_PATH       Default Console path shown in the UI
 MSDIAL_INTERACTIVE_PORT   Linux helper script port, default 8765
 PYTHON_BIN                Linux/macOS helper script Python executable
-AZURE_OPENAI_ENDPOINT     Optional Ask MS-DIAL / literature recommendation
-AZURE_OPENAI_API_KEY      Optional Ask MS-DIAL / literature recommendation
-AZURE_OPENAI_DEPLOYMENT   Optional Ask MS-DIAL / literature recommendation
+AZURE_OPENAI_ENDPOINT     Optional Ask MS-DIAL / literature evidence search
+AZURE_OPENAI_API_KEY      Optional Ask MS-DIAL / literature evidence search
+AZURE_OPENAI_DEPLOYMENT   Optional Ask MS-DIAL / literature evidence search
 ```
 
 ## Knowledge cards

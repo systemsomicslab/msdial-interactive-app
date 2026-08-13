@@ -584,7 +584,7 @@ def _warnings(samples: list[dict[str, Any]], pca: dict[str, Any]) -> list[str]:
     if not any(item["category"] == "Blank" for item in samples):
         warnings.append("No Blank files were identified; blank separation and carryover cannot be assessed.")
     if sum(item["category"] == "QC" for item in samples) < 3:
-        warnings.append("At least three QC injections are recommended for QC precision and topology assessment.")
+        warnings.append("At least three QC injections are needed to evaluate QC precision and topology.")
     if pca.get("sample_limited"):
         warnings.append(f"PCA was limited to {pca.get('sample_count', PCA_SAMPLE_LIMIT)} representative samples.")
     return warnings

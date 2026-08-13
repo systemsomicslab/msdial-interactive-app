@@ -33,7 +33,7 @@ def summarize_jobs(jobs: dict[str, dict[str, Any]], limit: int = 10) -> dict[str
             "preview_mztab_m_outputs",
             "create_datamining_handoff",
         ],
-        "recommended_flow": [
+        "workflow_outline": [
             "Inspect the input path and collect the guided scientific choices.",
             "Review the generated plan and obtain explicit confirmation before execution.",
             "Wait until /api/agent/status reports a completed analysis job.",

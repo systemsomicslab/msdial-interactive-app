@@ -92,7 +92,7 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 - `msdial_list_worksets`
 - `msdial_download_official_library`
 - `msdial_start_peak_count_diagnostic`
-- `msdial_recommend_peak_height`
+- `msdial_estimate_peak_height`
 - `msdial_prepare_guided_analysis`
 - `msdial_start_guided_analysis`
 - `msdial_interactive_job`
@@ -113,7 +113,7 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 - `POST /api/agent/prepare`
 - `POST /api/agent/run`
 - `POST /api/agent/tuning/run`
-- `POST /api/agent/tuning/recommend`
+- `POST /api/agent/tuning/estimate`
 - `GET|POST /api/agent/handoff`
 
 ## Test prompts
