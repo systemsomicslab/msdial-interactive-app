@@ -2732,6 +2732,7 @@ $("#generatePublicationReport").addEventListener("click", () => runUiAction(asyn
       workflow: workflow(),
       run_directory: runDirectory,
       use_saved_run: $("#publicationUseSavedRun").checked,
+      run_qa: Boolean(state.qaReport || $("#qaFilePath").value.trim()),
       qa_report: state.qaReport,
       qa_file_path: $("#qaFilePath").value.trim(),
       internal_standards: parseQaInternalStandards(),

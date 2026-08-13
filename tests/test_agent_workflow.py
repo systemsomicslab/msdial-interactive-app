@@ -57,6 +57,12 @@ class AgentWorkflowTests(unittest.TestCase):
         self.assertEqual("neutral", plan["next_question"]["presentation"])
         self.assertFalse(plan["ready_to_prepare"])
 
+    def test_unknown_answer_key_is_reported(self) -> None:
+        plan = build_guided_plan("", {"export_folder_path_typo": "D:/ignored"})
+
+        self.assertEqual(["export_folder_path_typo"], plan["unknown_answer_keys"])
+        self.assertTrue(any("export_folder_path_typo" in item for item in plan["warnings"]))
+
     def test_target_peak_count_requires_diagnostic_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -78,6 +84,31 @@ class AgentWorkflowTests(unittest.TestCase):
 
             self.assertTrue(plan["requires_diagnostic"])
             self.assertTrue(any("diagnostic" in item for item in plan["blockers"]))
+
+    def test_lcms_qa_sets_height_matrix_export_to_output_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "sample.mzML").write_text("", encoding="ascii")
+            console = root / "MSDIALCUI.exe"
+            console.write_text("", encoding="ascii")
+            plan = build_guided_plan(
+                str(root),
+                {
+                    "project_type": "lcms",
+                    "ion_mode": "Negative",
+                    "target_omics": "Metabolomics",
+                    "parameter_strategy": "default",
+                    "execute_rt_correction": False,
+                    "library_strategy": "none",
+                    "run_qa": True,
+                    "generate_materials_methods": True,
+                    "console_path": str(console),
+                    "template_path": str(ROOT / "resources" / "msdial_console_param4lipidomics.txt"),
+                },
+            )
+
+            self.assertTrue(plan["workflow"]["height_matrix_export"])
+            self.assertEqual(root.resolve(), Path(plan["workflow"]["export_folder_path"]).resolve())
 
     def test_string_false_answers_remain_false(self) -> None:
         plan = build_guided_plan(

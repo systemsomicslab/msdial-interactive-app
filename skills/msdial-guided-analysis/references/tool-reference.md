@@ -21,11 +21,22 @@ Common keys:
   "internal_standards": [],
   "generate_materials_methods": true,
   "alignment_light_mode": false,
+  "console_path": "D:/path/to/MSDIALCUI.exe",
+  "export_folder_path": "D:/analysis-output",
   "output_root": "D:/analysis-output"
 }
 ```
 
+`console_path` accepts an absolute path to `MSDIALCUI.exe` or `MSDIALCUI.dll`.
+Use `msdial_check_console_path` before asking the user to locate it manually, and
+`msdial_set_console_path` to persist an accepted path. Unknown answer keys are
+reported in `warnings` and `unknown_answer_keys`; they are never silently applied.
+
 Use `parameter_strategy: "target_peak_count"` only with `target_peak_count`. Add `minimum_peak_height` after diagnostic review.
+
+When `run_qa` is true, the planner enables `Height matrix export` and sets
+`Export folder path` to `output_root` unless `export_folder_path` is supplied.
+The production job records only files created or updated during that run.
 
 For existing libraries:
 
@@ -67,6 +78,22 @@ LC-MS internal standards use objects such as:
 ```
 
 If no true internal standard is present, label any endogenous substitute as a pseudo internal standard in the report.
+
+## Job-scoped post-processing
+
+Pass the production `job_id` to:
+
+- `msdial_interactive_wait_for_completion`
+- `msdial_interactive_validate_mztab`
+- `msdial_interactive_preview_mztab`
+- `msdial_generate_lcms_qa`
+- `msdial_generate_publication_report`
+- `msdial_complete_guided_analysis`
+
+Do not substitute `run_directory` for `job_id` in an automated workflow. A
+directory can contain outputs from unrelated runs. Set `run_qa: false` on
+`msdial_generate_publication_report` when Materials and Methods and supplementary
+tables are needed without a QA matrix.
 
 ## Worksets
 

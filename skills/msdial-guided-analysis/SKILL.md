@@ -12,8 +12,9 @@ Use the `msdial-interactive` MCP tools as the execution layer. Keep raw data on 
 1. Call `msdial_interactive_status`.
 2. Call `msdial_interactive_launch` when the local app is not running.
 3. When `compatible` is false, call `msdial_interactive_restart` with `confirmed=false`, explain the detected and required API versions and recognized process, obtain confirmation, then call it with `confirmed=true`.
-4. Call `msdial_guided_analysis_plan` with the user's local input path and an empty `answers` object, or with a named `workset_id`.
-5. Report the recognized file count, formats, rejected paths, and warnings before discussing parameters.
+4. Call `msdial_check_console_path`. Use a discovered path or the persisted setting. If none is found, ask for a search root or explicit `MSDIALCUI.exe`/`MSDIALCUI.dll`, then call `msdial_set_console_path`.
+5. Call `msdial_guided_analysis_plan` with the user's local input path and an empty `answers` object, or with a named `workset_id`.
+6. Report the recognized file count, formats, rejected paths, warnings, and unknown answer keys before discussing parameters.
 
 Keep `open_browser=false` unless the user asks to inspect or edit the web UI. The normal guided path is conversation plus MCP only; do not tell the user to click through the UI.
 
@@ -72,7 +73,7 @@ Do not start a production analysis while `remaining_questions` or `blockers` are
 3. Call `msdial_start_guided_analysis` with `confirmed=false`.
 4. Ask the user to approve the displayed plan and command.
 5. Call it with `confirmed=true` only after approval.
-6. Poll with `msdial_interactive_job` or `msdial_interactive_wait_for_completion`.
+6. Poll the returned `job_id` with `msdial_interactive_job` or pass that exact ID to `msdial_interactive_wait_for_completion`. Never wait for an unspecified latest job.
 
 Never silently overwrite the scientific meaning of an existing output folder. If generated files already exist, describe the collision and ask the user to choose another output directory or explicitly accept reuse.
 
@@ -82,10 +83,10 @@ After starting a production run, normally call `msdial_complete_guided_analysis`
 
 If individual control is needed after a successful run:
 
-1. Call `msdial_interactive_validate_mztab` and report pass, warning, and failure counts.
-2. Call `msdial_interactive_preview_mztab` for a compact content sanity check.
-3. For requested LC-MS QA, call `msdial_generate_lcms_qa`. Distinguish passed, failed, and not-evaluable checks. Do not describe missing checks as passed.
-4. When requested, call `msdial_generate_publication_report`. Return the Materials and Methods file, QA Results file, supplementary Excel workbook, audit JSON, and bundle paths.
+1. Call `msdial_interactive_validate_mztab` with the completed `job_id` and report pass, warning, and failure counts.
+2. Call `msdial_interactive_preview_mztab` with the same `job_id` for a compact content sanity check.
+3. For requested LC-MS QA, call `msdial_generate_lcms_qa` with the same `job_id`. A missing job-owned QA matrix is an error; never search for an older matrix. Distinguish passed, failed, and not-evaluable checks.
+4. When requested, call `msdial_generate_publication_report` with the same `job_id`. Set `run_qa=false` when publication files should be generated without QA. Return the Materials and Methods file, QA Results file, supplementary Excel workbook, audit JSON, and bundle paths.
 5. Call `msdial_interactive_create_handoff` when downstream PCA, UMAP, HCA, chromatogram visualization, or other data-mining tools will consume the mzTab-M output.
 6. Ask whether to save the accepted scientific choices as a workset. Call `msdial_save_workset` only when the user agrees and provides a name.
 

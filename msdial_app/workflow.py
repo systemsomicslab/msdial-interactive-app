@@ -8,12 +8,15 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import __version__
+from .user_settings import load_user_settings
 
 
 SUPPORTED_SUFFIXES = {
@@ -40,6 +43,64 @@ SMOOTHING_METHODS = [
     "LoessFilter",
     "TimeBasedLinearWeightedMovingAverage",
 ]
+
+
+def discover_console_paths(search_roots: Iterable[str | Path] | None = None) -> dict[str, Any]:
+    saved = str(load_user_settings().get("console_path", "")).strip()
+    environment = str(os.environ.get("MSDIAL_CONSOLE_PATH", "")).strip()
+    path_match = shutil.which("MSDIALCUI.exe") or shutil.which("MSDIALCUI")
+    candidates: list[tuple[str, Path | None]] = [
+        ("saved setting", Path(saved) if saved else None),
+        ("MSDIAL_CONSOLE_PATH", Path(environment) if environment else None),
+        ("PATH", Path(path_match) if path_match else None),
+    ]
+    bases = [Path.cwd(), Path(sys.executable).resolve().parent, Path(__file__).resolve().parent.parent]
+    for base in list(bases):
+        bases.extend(list(base.parents)[:2])
+    for base in dict.fromkeys(bases):
+        candidates.extend(
+            [
+                ("near application", base / "MSDIALCUI.exe"),
+                ("near application", base / "MSDIALCUI.dll"),
+                ("source build", base / "MsdialWorkbench" / "tests" / "MSDIAL5" / "MsdialCoreTestApp" / "bin" / "Release" / "net48" / "MSDIALCUI.exe"),
+                ("source build", base / "MsdialWorkbench" / "tests" / "MSDIAL5" / "MsdialCoreTestApp" / "bin" / "Release" / "net8" / "MSDIALCUI.dll"),
+            ]
+        )
+        if base.is_dir():
+            candidates.extend(
+                ("console distribution", path)
+                for pattern in ("MSDIAL.console*/MSDIALCUI.exe", "MSDIAL.console*/MSDIALCUI.dll")
+                for path in base.glob(pattern)
+            )
+    for raw_root in search_roots or []:
+        root = Path(raw_root).expanduser()
+        if root.is_file():
+            candidates.append(("requested path", root))
+        elif root.is_dir():
+            candidates.extend(
+                ("requested search root", path)
+                for name in ("MSDIALCUI.exe", "MSDIALCUI.dll")
+                for path in root.rglob(name)
+            )
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source, candidate in candidates:
+        if not candidate or not candidate.is_file():
+            continue
+        resolved = str(candidate.resolve())
+        if resolved.casefold() in seen:
+            continue
+        seen.add(resolved.casefold())
+        found.append(
+            {"path": resolved, "source": source, "version": console_version(resolved)}
+        )
+    return {
+        "configured_path": saved,
+        "environment_path": environment,
+        "candidates": found,
+        "selected_path": found[0]["path"] if found else "",
+        "expected_names": ["MSDIALCUI.exe", "MSDIALCUI.dll"],
+    }
 
 
 def is_supported(path: Path) -> bool:
@@ -510,6 +571,8 @@ def load_parameter_template(
         "alignment_rt_tolerance": number("retention time tolerance for alignment", default=0.1),
         "alignment_ms1_tolerance": number("ms1 tolerance for alignment", default=0.015),
         "alignment_light_mode": boolean("alignment light mode"),
+        "export_folder_path": library_path("export folder path"),
+        "height_matrix_export": boolean("height matrix export"),
         "solvent": value("solvent type", default="CH3COONH4"),
         "gcms_accuracy_type": value("accuracy type", default="IsNominal"),
         "gcms_ri_compound_type": value("ri compound type", "ri compound", default="Alkanes"),
@@ -599,6 +662,24 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
     issues: list[dict[str, str]] = []
     files = state.get("files", [])
     project_type = str(state.get("project_type", "lcms")).lower()
+    if state.get("run_qa") and project_type == "lcms":
+        if not state.get("height_matrix_export"):
+            issues.append(
+                {
+                    "level": "error",
+                    "message": "LC-MS QA requires Height matrix export to be enabled.",
+                }
+            )
+        if not str(state.get("export_folder_path", "")).strip():
+            issues.append(
+                {
+                    "level": "warning",
+                    "message": (
+                        "LC-MS QA Export folder path is blank; Output root will be "
+                        "written into the generated method before execution."
+                    ),
+                }
+            )
     if project_type not in {"lcms", "gcms"}:
         issues.append(
             {
@@ -924,6 +1005,10 @@ def prepare_run(
     csv_path = run_directory / "analysis_files.csv"
     _write_analysis_csv(csv_path, files, effective_files)
     method_state = dict(state)
+    if method_state.get("height_matrix_export") and not str(
+        method_state.get("export_folder_path", "")
+    ).strip():
+        method_state["export_folder_path"] = str(run_directory)
     method_state["msdial_console_version"] = console_version(state["console_path"]) or "not recorded"
     method_state["msdial_interactive_version"] = __version__
     ri_dictionary = _prepare_gcms_ri_dictionary(
@@ -971,6 +1056,7 @@ def prepare_run(
         "rt_correction_selection_file": str(method_state.get("rt_correction_selection_path", "")),
         "command": command,
         "expected_analysis_exports": expected_analysis_exports,
+        "export_folder_path": str(method_state.get("export_folder_path", "")),
     }
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -985,6 +1071,7 @@ def prepare_run(
         "run_directory": str(run_directory),
         "analysis_type": project_type,
         "expected_analysis_exports": expected_analysis_exports,
+        "export_folder_path": str(method_state.get("export_folder_path", "")),
         "diagnostic_result_file": expected_analysis_exports[0] if len(files) == 1 else "",
         "input_csv": str(csv_path),
         "console_input": str(csv_path),
@@ -1772,6 +1859,8 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         "use retention information for lbm-based annotation filtering": state.get("lbm_use_rt_filtering", False),
         "together with alignment": state.get("together_with_alignment", True),
         "export as mztabm format": "True",
+        "export folder path": state.get("export_folder_path", ""),
+        "height matrix export": bool(state.get("height_matrix_export", False)),
         "compounds library file path for rt correction": state.get("rt_correction_anchor_path", ""),
         "rt correction peak selection file path": state.get("rt_correction_selection_path", ""),
         "execute rt correction": bool(state.get("execute_rt_correction", False)),
@@ -2047,6 +2136,8 @@ def _title_for_key(key: str) -> str:
         "together with alignment": "Together with alignment",
         "alignment light mode": "Alignment light mode",
         "export as mztabm format": "Export as mztabM format",
+        "export folder path": "Export folder path",
+        "height matrix export": "Height matrix export",
         "compounds library file path for rt correction": "Compounds library file path for RT correction",
         "rt correction peak selection file path": "RT correction peak selection file path",
         "execute rt correction": "Execute RT correction",

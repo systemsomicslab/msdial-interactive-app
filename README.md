@@ -323,19 +323,24 @@ Core MCP tools:
 
 - `msdial_interactive_launch`: start the local web app if needed
 - `msdial_interactive_restart`: replace a recognized incompatible local app
+- `msdial_check_console_path` / `msdial_set_console_path`: discover and persist the Console path
 - `msdial_guided_analysis_plan`: inspect input and return the next question
 - `msdial_list_worksets` / `msdial_save_workset`: reuse scientific choices
 - `msdial_start_peak_count_diagnostic`: tune from one representative file
 - `msdial_prepare_guided_analysis`: write and validate reproducible inputs
 - `msdial_start_guided_analysis`: execute only after explicit confirmation
 - `msdial_interactive_status`: check queued/running/completed jobs
-- `msdial_interactive_wait_for_completion`: wait for a run to finish
+- `msdial_interactive_wait_for_completion`: wait for one specified job to finish
 - `msdial_interactive_validate_mztab`: validate mzTab-M outputs
 - `msdial_generate_lcms_qa`: build the LC-MS QA report
 - `msdial_generate_publication_report`: create text, Excel, audit, and ZIP files
 - `msdial_complete_guided_analysis`: wait for one job and complete validation,
   QA, publication, and handoff without browser interaction
 - `msdial_interactive_create_handoff`: create `datamining-handoff.json`
+
+Agent API 0.3 binds mzTab-M, QA, publication, and handoff operations to the
+production `job_id`. Files left by earlier runs in the same output directory are
+excluded. Job summaries are compact by default; full details are opt-in.
 
 Claude Desktop example:
 
