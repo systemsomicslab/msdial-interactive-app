@@ -8,6 +8,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_NAME = "msdial-interactive-app-local"
 INCLUDE_PATHS = [
+    "Start MS-DIAL Interactive.cmd",
+    "Start MS-DIAL Interactive.command",
+    "start-msdial-interactive.sh",
     "app.py",
     "pyproject.toml",
     "README.md",

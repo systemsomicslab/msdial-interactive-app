@@ -1,12 +1,13 @@
 [project]
 name = "msdial-interactive-app"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cross-platform interactive workflow assistant for MS-DIAL Console"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
 mcp = ["mcp[cli]>=1.28,<3"]
+desktop = ["pyinstaller>=6.10,<7"]
 
 [project.scripts]
 msdial-interactive = "msdial_app.server:main"

@@ -78,6 +78,91 @@ negative adduct resource tables.
 For non-lipidomics workflows, Solvent is shown disabled because it does not
 affect Metabolomics processing.
 
+## Saved paths and parameter-template loading
+
+The Paths panel can persist the MS-DIAL Console, parameter template, and
+`LbmQueries.txt` paths for the next launch. This is a JSON file rather than an
+INI file. The exact path is shown in the UI and follows the operating system:
+
+- Windows: `%LOCALAPPDATA%\MSDIALInteractive\settings.json`
+- macOS: `~/Library/Application Support/MSDIALInteractive/settings.json`
+- Linux: `${XDG_CONFIG_HOME:-~/.config}/msdial-interactive/settings.json`
+
+**Load template** parses the selected MS-DIAL `Key: Value` parameter file and
+applies supported Guided setup and Annotation values. For Lipidomics,
+`Searched lipid class` controls the checked lipid queries. When a Lipidomics
+template has no explicit list, all currently available `LbmQueries.txt` rows
+are selected.
+
+## Official library downloads
+
+The Annotation screen provides an on-demand catalog for the official
+MS-DIAL libraries. Downloads are not started automatically because the LBM
+library alone is about 785 MB. The app downloads only the selected library,
+checks its Zenodo MD5 digest, and keeps it in a per-user data directory outside
+the replaceable app package. A downloaded library can then be applied directly
+to the MSP or LBM annotation row. Zenodo record URL, filename, checksum,
+license, and local path are retained in `workflow-settings.json` as library
+provenance for future Materials and Methods generation.
+
+Catalog records:
+
+- [Metabolomics positive MSP](https://zenodo.org/records/21901200)
+- [Metabolomics negative MSP](https://zenodo.org/records/21904103)
+- [Lipidomics LBM](https://zenodo.org/records/21904324)
+- [GC-MS Kovats RI MSP](https://zenodo.org/records/21910638)
+- [GC-MS Fiehn RI MSP](https://zenodo.org/records/21910646)
+
+## Publication reporting
+
+The **7. Publication report** workspace generates an English Materials and
+Methods draft, a separate QA Results draft, an Excel supplementary workbook, a
+long-format supplementary TSV, and a machine-readable JSON audit file. The
+complete reporting bundle contains all five files. The two manuscript drafts
+remain editable in the browser and can be copied or downloaded after editing.
+
+The Excel workbook is the primary human-readable supplementary output:
+
+- **Data** reproduces the MS-DIAL analysis-file CSV as a sample-by-field matrix.
+- **Guided setup** lists processing settings as sectioned Field/Value rows.
+- **Annotation** groups MSP, text, and LBM annotators and presents selected
+  adducts, lipid queries, and library provenance as compact tables.
+- **Quality assurance** records observed metrics and prespecified criteria.
+
+The long-format TSV remains available as an audit-friendly machine-readable
+companion.
+
+When `workflow-settings.json` exists in the selected run/output directory, the
+report uses those saved run settings instead of the current UI. New runs record
+both the MS-DIAL Console version and MS-DIAL Interactive version in
+`workflow-settings.json` and `run-manifest.json`. A version missing from an old
+run is reported as `not recorded`; the current application version is not
+silently assigned to historical processing.
+
+If no QA matrix is selected in the current session, the report automatically
+uses the newest `*.qa.tsv` in the run directory or one of its immediate QA
+output subdirectories. The selected matrix is shown in the Publication
+workspace; vendor RAW directory contents are not recursively searched.
+
+Supplementary Table S1 includes:
+
+- analysis-file metadata from **1. Data**
+- workflow and processing settings from **2. Guided setup**
+- annotation rows, selected adducts/lipid queries, and library provenance from **3. Annotation**
+- software versions and LC-MS QA metrics, criteria, and pass/review outcomes
+
+The default QA reporting criteria are visible and editable before generation.
+They are transparent report defaults, not universal acceptance criteria. The
+Methods draft describes how QA was assessed and how many evaluable criteria
+were met; the separate Results draft reports observed values and identifies
+criteria requiring review.
+
+Catalog libraries carry a Zenodo DOI, record URL, checksum, and license. For a
+user-supplied library, the Publication workspace requests a version and DOI or
+repository URL. Missing persistent identifiers produce a warning. Local
+absolute paths remain in the supplementary TSV for auditability and must be
+reviewed before public release.
+
 ## Common peak picking
 
 Peak detection includes the MS-DIAL smoothing method used by all executable
@@ -316,6 +401,30 @@ Advanced direct launch:
 ```bash
 python app.py --host 127.0.0.1 --port 8765
 ```
+
+The source ZIP also places launchers at its top level. On Windows, double-click
+`Start MS-DIAL Interactive.cmd`; on macOS open
+`Start MS-DIAL Interactive.command`; on Linux run or open
+`start-msdial-interactive.sh` after granting execute permission once.
+
+## Native packages for users without Python
+
+The GitHub Actions workflow `Build native desktop packages` creates separate
+artifacts for Windows, macOS, and Linux using PyInstaller. These are native
+per-OS packages, not one universal binary:
+
+- Windows: open `MS-DIAL-Interactive.exe`
+- macOS: open `MS-DIAL-Interactive.app`
+- Linux: run/open the executable `MS-DIAL-Interactive`
+
+The user does not need to install Python for these artifacts. MS-DIAL Console
+itself remains a separate OS-specific dependency selected from the Paths panel.
+Build locally with `python -m pip install ".[desktop]"` followed by
+`python scripts/build-native.py`.
+
+The Windows artifact contains a ZIP. The macOS and Linux artifacts contain a
+`tar.gz` archive so executable permissions survive GitHub artifact download.
+Extract the inner archive once, then open the launcher listed above.
 
 See the Japanese user tutorial:
 

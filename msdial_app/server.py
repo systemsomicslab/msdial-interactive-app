@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -16,17 +17,22 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .agent_bridge import create_datamining_handoff, summarize_jobs
 from .knowledge import KnowledgeBase, next_parameter_question
+from .library_catalog import catalog_status, download_library, library_directory
 from .literature import recommend_from_literature
 from .mztab_validation import list_mztab_outputs, validate_mztab_outputs
 from .mztab_preview import preview_mztab_outputs
+from .materials_methods import generate_publication_report
+from .quality_assurance import build_lcms_qa_report, find_qa_files
 from .workflow import (
     console_version,
     expand_paths,
     expand_paths_report,
     find_mdpeak,
     find_mdscan,
+    load_parameter_template,
     detect_raw_format,
     parse_method,
     parse_mdpeak,
@@ -45,9 +51,10 @@ from .workflow import (
     is_supported,
     validate_workflow,
 )
+from .user_settings import load_user_settings, save_path_settings, settings_path
 
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 STATIC = ROOT / "static"
 RESOURCES = ROOT / "resources"
 KNOWLEDGE = ROOT / "knowledge"
@@ -108,6 +115,37 @@ def _default_console_path() -> str:
         ROOT / "MSDIALCUI.dll",
     ]
     return next((str(path.resolve()) for path in candidates if path and path.is_file()), "")
+
+
+def _application_config() -> dict[str, Any]:
+    saved = load_user_settings()
+    default_queries = str(saved.get("queries_path", "")).strip() or str(
+        RESOURCES / "LbmQueries.txt"
+    )
+    default_template = str(saved.get("template_path", "")).strip() or str(
+        RESOURCES / "msdial_console_param4lipidomics.txt"
+    )
+    default_console = str(saved.get("console_path", "")).strip() or _default_console_path()
+    lipid_queries = read_lipid_queries(default_queries)
+    try:
+        loaded = load_parameter_template(default_template, default_queries)
+        if loaded["workflow"].get("target_omics", "").casefold() == "lipidomics":
+            for item in lipid_queries:
+                item["selected"] = True
+    except (OSError, ValueError):
+        for item in lipid_queries:
+            item["selected"] = True
+    return {
+        "default_console": default_console,
+        "default_queries": default_queries,
+        "default_template": default_template,
+        "default_gcms_template": str(RESOURCES / "gcms_console_param_kovats.txt"),
+        "settings_file": str(settings_path()),
+        "settings_loaded": bool(saved),
+        "library_directory": str(library_directory()),
+        "library_catalog": catalog_status(),
+        "lipid_queries": lipid_queries,
+    }
 
 
 def _diagnose_console_failure(logs: list[str], fallback: str) -> str:
@@ -223,10 +261,12 @@ class Handler(BaseHTTPRequestHandler):
                 "127."
             )
             lan_urls = [f"http://{address}:{bind_port}" for address in _local_ipv4_addresses()]
+            app_config = _application_config()
             self._json(
                 {
                     "platform": os.name,
                     "python": os.sys.version.split()[0],
+                    "app_version": __version__,
                     "root": str(ROOT),
                     "server": {
                         "bind_host": bind_host,
@@ -234,10 +274,7 @@ class Handler(BaseHTTPRequestHandler):
                         "shared_server": shared_server,
                         "lan_urls": lan_urls,
                     },
-                    "default_console": _default_console_path(),
-                    "default_queries": str(RESOURCES / "LbmQueries.txt"),
-                    "default_template": str(RESOURCES / "msdial_console_param4lipidomics.txt"),
-                    "default_gcms_template": str(RESOURCES / "gcms_console_param_kovats.txt"),
+                    **app_config,
                     "smoothing_methods": [
                         "SimpleMovingAverage",
                         "LinearWeightedMovingAverage",
@@ -248,7 +285,6 @@ class Handler(BaseHTTPRequestHandler):
                         "TimeBasedLinearWeightedMovingAverage",
                     ],
                     "knowledge_cards": {"ja": KB.count("ja"), "en": KB.count("en")},
-                    "lipid_queries": read_lipid_queries(RESOURCES / "LbmQueries.txt"),
                     "adducts": {
                         "Positive": read_adducts(
                             RESOURCES / "AdductIonResource_Positive.txt",
@@ -324,6 +360,44 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_json()
             if parsed.path == "/api/files/expand":
                 self._json(expand_paths_report(body.get("paths", [])))
+            elif parsed.path == "/api/settings/paths":
+                saved = save_path_settings(body)
+                self._json(
+                    {
+                        "settings": saved,
+                        "settings_file": str(settings_path()),
+                    }
+                )
+            elif parsed.path == "/api/templates/load":
+                self._json(
+                    load_parameter_template(
+                        body.get("path", ""),
+                        body.get("queries_path", "") or None,
+                    )
+                )
+            elif parsed.path == "/api/libraries/download":
+                catalog_id = str(body.get("catalog_id", "")).strip()
+                if not catalog_id:
+                    raise ValueError("Select a library to download.")
+                job_id = uuid.uuid4().hex
+                with JOBS_LOCK:
+                    JOBS[job_id] = {
+                        "id": job_id,
+                        "status": "queued",
+                        "kind": "library_download",
+                        "catalog_id": catalog_id,
+                        "progress": 0,
+                        "received": 0,
+                        "total": 0,
+                        "logs": [],
+                        "result": None,
+                    }
+                threading.Thread(
+                    target=_run_library_download_job,
+                    args=(job_id, catalog_id),
+                    daemon=True,
+                ).start()
+                self._json({"job_id": job_id})
             elif parsed.path == "/api/files/import-csv":
                 self._json(read_analysis_csv(body.get("path", "")))
             elif parsed.path == "/api/files/browse":
@@ -353,6 +427,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"path": selected, **report})
             elif parsed.path == "/api/dialog/mztab-file":
                 selected = _pick_mztab_file()
+                self._json({"path": selected})
+            elif parsed.path == "/api/dialog/qa-file":
+                selected = _pick_qa_file()
                 self._json({"path": selected})
             elif parsed.path == "/api/dialog/reference-file":
                 selected = _pick_reference_file(body.get("kind", "reference"))
@@ -442,6 +519,87 @@ class Handler(BaseHTTPRequestHandler):
                             body.get("run_directory", ""),
                             body.get("file_path", "") or None,
                         )
+                    }
+                )
+            elif parsed.path == "/api/qa/list":
+                files = find_qa_files(body.get("path", ""))
+                self._json(
+                    {
+                        "files": [str(path) for path in files],
+                        "default_file": str(files[0]) if files else "",
+                    }
+                )
+            elif parsed.path == "/api/qa/report":
+                self._json(
+                    {
+                        "report": build_lcms_qa_report(
+                            body.get("file_path", "") or body.get("run_directory", ""),
+                            body.get("internal_standards", []),
+                        )
+                    }
+                )
+            elif parsed.path == "/api/publication/report":
+                state = body.get("workflow", {})
+                run_directory = str(body.get("run_directory", "")).strip()
+                settings_file = Path(run_directory).expanduser() / "workflow-settings.json"
+                used_saved_settings = body.get("use_saved_run", True) and settings_file.is_file()
+                if used_saved_settings:
+                    state = json.loads(settings_file.read_text(encoding="utf-8-sig"))
+                additional_provenance = body.get("additional_library_provenance", [])
+                if additional_provenance:
+                    state["library_provenance"] = [
+                        *state.get("library_provenance", []),
+                        *additional_provenance,
+                    ]
+                qa_report = body.get("qa_report")
+                qa_path = str(body.get("qa_file_path", "")).strip()
+                output_root = run_directory or str(state.get("output_root", "")).strip()
+                if not output_root:
+                    raise ValueError("Set a run/output directory for the publication report.")
+                if (
+                    not qa_report
+                    and not qa_path
+                    and str(state.get("project_type", "lcms")).lower() == "lcms"
+                ):
+                    qa_files = find_qa_files(output_root, recursive=True)
+                    if qa_files:
+                        qa_path = str(qa_files[0])
+                if not qa_report and qa_path:
+                    qa_report = build_lcms_qa_report(
+                        qa_path, body.get("internal_standards", [])
+                    )
+                result = generate_publication_report(
+                    state,
+                    qa_report,
+                    output_root,
+                    app_version=str(
+                        state.get("msdial_interactive_version")
+                        or ("not recorded" if used_saved_settings else __version__)
+                    ),
+                    console_version=str(
+                        state.get("msdial_console_version")
+                        or (
+                            "not recorded"
+                            if used_saved_settings
+                            else console_version(state.get("console_path", ""))
+                        )
+                    ),
+                    qa_criteria=body.get("qa_criteria"),
+                )
+                self._json(
+                    {
+                        "report": result,
+                        "downloads": {
+                            "methods": _register_download(result["methods_file"]),
+                            "qa_results": _register_download(result["qa_results_file"]),
+                            "supplementary_workbook": _register_download(result["supplementary_workbook"]),
+                            "supplementary_table": _register_download(result["supplementary_table"]),
+                            "audit": _register_download(result["audit_file"]),
+                            "bundle": _register_download(result["bundle"]),
+                        },
+                        "used_saved_settings": used_saved_settings,
+                        "settings_file": str(settings_file) if settings_file.is_file() else "",
+                        "qa_file": qa_path,
                     }
                 )
             elif parsed.path == "/api/agent/handoff":
@@ -572,7 +730,10 @@ class Handler(BaseHTTPRequestHandler):
     def _download(self, target: Path) -> None:
         data = target.read_bytes()
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "application/zip")
+        content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        if target.suffix.lower() in {".txt", ".tsv", ".csv", ".json"}:
+            content_type += "; charset=utf-8"
+        self.send_header("Content-Type", content_type)
         self.send_header(
             "Content-Disposition",
             f'attachment; filename="{target.name}"',
@@ -600,6 +761,33 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
+
+
+def _run_library_download_job(job_id: str, catalog_id: str) -> None:
+    with JOBS_LOCK:
+        JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["logs"].append("Downloading the selected Zenodo library.")
+
+    def progress(received: int, total: int) -> None:
+        with JOBS_LOCK:
+            JOBS[job_id]["received"] = received
+            JOBS[job_id]["total"] = total
+            JOBS[job_id]["progress"] = round(received / total * 100, 1) if total else 0
+
+    try:
+        result = download_library(catalog_id, progress)
+        with JOBS_LOCK:
+            JOBS[job_id]["result"] = result
+            JOBS[job_id]["progress"] = 100
+            JOBS[job_id]["status"] = "completed"
+            JOBS[job_id]["logs"].append(
+                "Library ready: " + str(result["local_path"])
+            )
+    except Exception as error:
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "failed"
+            JOBS[job_id]["error"] = str(error)
+            JOBS[job_id]["logs"].append(traceback.format_exc())
 
 
 def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
@@ -819,6 +1007,29 @@ def _pick_mztab_file() -> str:
             title="Select mzTab-M output",
             filetypes=[
                 ("mzTab-M files", "*.mzTab *.mztab *.mzTabM *.mztabm *.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+        root.destroy()
+        return path
+    except Exception:
+        return ""
+
+
+def _pick_qa_file() -> str:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+        path = filedialog.askopenfilename(
+            title="Select MS-DIAL LC-MS quality-assurance matrix",
+            filetypes=[
+                ("MS-DIAL QA matrix", "*.qa.tsv"),
+                ("Tab-separated files", "*.tsv"),
                 ("All files", "*.*"),
             ],
         )

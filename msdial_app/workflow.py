@@ -13,6 +13,8 @@ import zipfile
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from . import __version__
+
 
 SUPPORTED_SUFFIXES = {
     ".abf",
@@ -409,6 +411,190 @@ def parse_method(path: str | Path) -> dict[str, str]:
     return values
 
 
+def load_parameter_template(
+    path: str | Path,
+    lipid_queries_path: str | Path | None = None,
+) -> dict[str, Any]:
+    template_path = Path(path).expanduser().resolve()
+    if not template_path.is_file():
+        raise FileNotFoundError(f"Parameter template not found: {template_path}")
+    values = parse_method(template_path)
+
+    def value(*keys: str, default: str = "") -> str:
+        return next((values[key] for key in keys if key in values), default)
+
+    def number(*keys: str, default: float = 0.0) -> float:
+        try:
+            return float(value(*keys, default=str(default)))
+        except ValueError:
+            return default
+
+    def boolean(*keys: str, default: bool = False) -> bool:
+        text = value(*keys, default=str(default)).strip().casefold()
+        return text in {"true", "1", "yes", "on"}
+
+    def library_path(*keys: str) -> str:
+        text = value(*keys).strip()
+        if not text:
+            return ""
+        candidate = Path(text).expanduser()
+        if not candidate.is_absolute():
+            candidate = template_path.parent / candidate
+        return str(candidate.resolve())
+
+    def annotator_rows(setting_key: str, path_key: str, defaults: dict[str, Any]) -> list[dict[str, Any]]:
+        settings_file = library_path(setting_key)
+        if not settings_file:
+            return []
+        settings_path = Path(settings_file)
+        if not settings_path.is_file():
+            raise FileNotFoundError(f"Annotator settings file not found: {settings_path}")
+        rows: list[dict[str, Any]] = []
+        with settings_path.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
+            for index, source in enumerate(csv.DictReader(handle, delimiter="\t"), start=1):
+                library_text = str(source.get(path_key, "")).strip()
+                library = Path(library_text).expanduser()
+                if library_text and not library.is_absolute():
+                    library = settings_path.parent / library
+                row = dict(defaults)
+                row.update(
+                    {
+                        "annotator_id": str(source.get("annotator_id", "")).strip()
+                        or f"{defaults['annotator_id'].rsplit('_', 1)[0]}_{index}",
+                        path_key: str(library.resolve()) if library_text else "",
+                        "priority": int(float(source.get("priority") or index)),
+                    }
+                )
+                for key in (
+                    "rt_tolerance",
+                    "ms1_tolerance",
+                    "ms2_tolerance",
+                    "weighted_dot_product_cutoff",
+                    "simple_dot_product_cutoff",
+                    "reverse_dot_product_cutoff",
+                    "matched_peaks_percentage_cutoff",
+                    "minimum_spectrum_match",
+                    "total_score_cutoff",
+                ):
+                    if source.get(key, "").strip():
+                        row[key] = float(source[key])
+                if "minimum_spectrum_match" in row:
+                    row["minimum_spectrum_match"] = int(row["minimum_spectrum_match"])
+                row["use_rt_scoring"] = str(
+                    source.get("use_retention_information_for_scoring", row.get("use_rt_scoring", False))
+                ).casefold() in {"true", "1", "yes", "on"}
+                row["use_rt_filtering"] = str(
+                    source.get("use_retention_information_for_filtering", row.get("use_rt_filtering", False))
+                ).casefold() in {"true", "1", "yes", "on"}
+                rows.append(row)
+        return rows
+
+    machine = value("machine category", "ionization").casefold()
+    project_type = "gcms" if "gc" in machine or value("ionization").casefold() == "ei" else "lcms"
+    target_omics = value("target omics", default="Metabolomics")
+    workflow_values: dict[str, Any] = {
+        "project_type": project_type,
+        "ion_mode": value("ion mode", default="Positive"),
+        "target_omics": target_omics,
+        "ms1_data_type": value("ms1 data type", default="Centroid"),
+        "ms2_data_type": value("ms2 data type", default="Centroid"),
+        "number_of_threads": int(number("number of threads", default=4)),
+        "smoothing_method": value("smoothing method", default="LinearWeightedMovingAverage"),
+        "minimum_peak_height": number("minimum peak height", default=300),
+        "mass_slice_width": number("mass slice width", default=0.1),
+        "minimum_peak_width": int(number("minimum peak width", default=5)),
+        "retention_time_begin": number("retention time begin", default=0),
+        "retention_time_end": number("retention time end", default=100),
+        "ms1_tolerance": number("ms1 tolerance for centroid", default=0.01),
+        "ms2_tolerance": number("ms2 tolerance for centroid", default=0.025),
+        "alignment_rt_tolerance": number("retention time tolerance for alignment", default=0.1),
+        "alignment_ms1_tolerance": number("ms1 tolerance for alignment", default=0.015),
+        "alignment_light_mode": boolean("alignment light mode"),
+        "solvent": value("solvent type", default="CH3COONH4"),
+        "gcms_accuracy_type": value("accuracy type", default="IsNominal"),
+        "gcms_ri_compound_type": value("ri compound type", "ri compound", default="Alkanes"),
+        "gcms_retention_type": value("retention type", default="RT"),
+        "gcms_alignment_index_type": value("alignment index type", default="RT"),
+        "gcms_ri_alignment_tolerance": number("retention index alignment tolerance", default=10),
+        "gcms_ri_dictionary_path": library_path("ri index file pathes"),
+    }
+
+    msp_path = library_path("msp file path")
+    msp = {
+        "annotator_id": "msp_annotator_1",
+        "msp_file_path": msp_path,
+        "priority": 1,
+        "rt_tolerance": number("rt tolerance for msp-based annotation", default=0.5),
+        "use_rt_scoring": boolean("use retention information for msp-based annotation scoring"),
+        "use_rt_filtering": boolean("use retention information for msp-based annotation filtering"),
+        "weighted_dot_product_cutoff": number("weighted dot product cutoff for msp-based annotation", default=0.6),
+        "simple_dot_product_cutoff": number("simple dot product cutoff for msp-based annotation", default=0.6),
+        "reverse_dot_product_cutoff": number("reverse dot product cutoff for msp-based annotation", default=0.8),
+        "matched_peaks_percentage_cutoff": number("matched peaks percentage cutoff for msp-based annotation", default=0.1),
+        "minimum_spectrum_match": int(number("minimum spectrum match for msp-based annotation", default=3)),
+    }
+    text_path = library_path("text db file path")
+    text = {
+        "annotator_id": "text_annotator_1",
+        "text_db_file_path": text_path,
+        "priority": 1,
+        "rt_tolerance": number("rt tolerance for text-based annotation", default=0.5),
+        "ms1_tolerance": number("accurate ms1 tolerance for text-based annotation", default=0.01),
+        "total_score_cutoff": number("total score cutoff for text-based annotation", default=0.8),
+        "use_rt_scoring": boolean("use retention information for text-based annotation scoring"),
+        "use_rt_filtering": boolean("use retention information for text-based annotation filtering"),
+    }
+    lbm = {
+        "lbm_file_path": library_path("lbm file path"),
+        "rt_tolerance": number("rt tolerance for lbm-based annotation", default=100),
+        "ms1_tolerance": number("ms1 tolerance for lbm-based annotation", default=0.01),
+        "ms2_tolerance": number("ms2 tolerance for lbm-based annotation", default=0.025),
+        "weighted_dot_product_cutoff": number("weighted dot product cutoff for lbm-based annotation", default=0.15),
+        "simple_dot_product_cutoff": number("simple dot product cutoff for lbm-based annotation", default=0.15),
+        "reverse_dot_product_cutoff": number("reverse dot product cutoff for lbm-based annotation", default=0.3),
+        "matched_peaks_percentage_cutoff": number("matched peaks percentage cutoff for lbm-based annotation", default=0),
+        "minimum_spectrum_match": int(number("minimum spectrum match for lbm-based annotation", default=1)),
+        "use_rt_scoring": boolean("use retention information for lbm-based annotation scoring"),
+        "use_rt_filtering": boolean("use retention information for lbm-based annotation filtering"),
+    }
+    msp_rows = annotator_rows(
+        "msp annotator settings file path", "msp_file_path", msp
+    )
+    text_rows = annotator_rows(
+        "text annotator settings file path", "text_db_file_path", text
+    )
+
+    searched_lipids = [
+        item.strip()
+        for item in value("searched lipid class").split(";")
+        if item.strip()
+    ]
+    searched_adducts = [
+        item.strip()
+        for item in value("searched adduct ions", "adduct list").split(",")
+        if item.strip()
+    ]
+    lipid_queries = read_lipid_queries(lipid_queries_path) if lipid_queries_path else []
+    selected_set = set(searched_lipids)
+    if target_omics.casefold() == "lipidomics" and not selected_set:
+        selected_set = {
+            f"{item['lipid_class']} {item['adduct']}" for item in lipid_queries
+        }
+    for item in lipid_queries:
+        item["selected"] = f"{item['lipid_class']} {item['adduct']}" in selected_set
+
+    return {
+        "path": str(template_path),
+        "workflow": workflow_values,
+        "msp_annotators": msp_rows or [msp],
+        "text_annotators": text_rows or [text],
+        "lbm_annotator": lbm,
+        "selected_lipids": searched_lipids,
+        "selected_adducts": searched_adducts,
+        "lipid_queries": lipid_queries,
+    }
+
+
 def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
     issues: list[dict[str, str]] = []
     files = state.get("files", [])
@@ -738,6 +924,8 @@ def prepare_run(
     csv_path = run_directory / "analysis_files.csv"
     _write_analysis_csv(csv_path, files, effective_files)
     method_state = dict(state)
+    method_state["msdial_console_version"] = console_version(state["console_path"]) or "not recorded"
+    method_state["msdial_interactive_version"] = __version__
     ri_dictionary = _prepare_gcms_ri_dictionary(
         run_directory,
         method_state,
@@ -765,6 +953,8 @@ def prepare_run(
         "created_at": dt.datetime.now().astimezone().isoformat(),
         "platform": platform.platform(),
         "analysis_type": project_type,
+        "msdial_console_version": method_state["msdial_console_version"],
+        "msdial_interactive_version": method_state["msdial_interactive_version"],
         "project_file_requested": project_file_requested,
         "stage_inputs": False,
         "input_csv": str(csv_path),
@@ -1121,15 +1311,15 @@ def prepare_rt_correction_run(state: dict[str, Any]) -> dict[str, Any]:
         command.extend(["-i", str(Path(str(item["file_path"])).expanduser().resolve())])
     command.extend(
         [
-            "-library",
+            "--library",
             str(anchor_path),
             "-o",
             str(eic_path),
             "-m",
             str(template_path),
-            "-ionmode",
+            "--ionmode",
             str(state.get("ion_mode", "Negative")),
-            "-acquisitiontype",
+            "--acquisitiontype",
             acquisition_type,
         ]
     )
@@ -1138,7 +1328,7 @@ def prepare_rt_correction_run(state: dict[str, Any]) -> dict[str, Any]:
         selection_path = Path(selection_input).expanduser().resolve()
         if not selection_path.is_file():
             raise ValueError(f"RT correction peak selection file not found: {selection_path}")
-        command.extend(["-selection", str(selection_path)])
+        command.extend(["--selection", str(selection_path)])
         result_selection = output_root / "rt_correction_peak_selections_applied.tsv"
     else:
         result_selection = output_root / "rt_correction_peak_selections.tsv"
@@ -1903,6 +2093,21 @@ def console_version(console_path: str) -> str:
     command = ["dotnet", str(path)] if path.suffix.lower() == ".dll" else [str(path)]
     try:
         result = subprocess.run(
+            command + ["--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    text = (result.stdout + result.stderr).strip()
+    match = re.search(r"(?:^|\s)(\d+\.\d+(?:\.\d+)+)(?:\s|$)", text)
+    if match:
+        return match.group(1)
+    try:
+        fallback = subprocess.run(
             command,
             capture_output=True,
             text=True,
@@ -1912,5 +2117,9 @@ def console_version(console_path: str) -> str:
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
-    match = re.search(r"Version\s+([0-9.]+)", result.stdout + result.stderr, re.I)
+    match = re.search(
+        r"(?:Version|Application)\s+([0-9.]+)",
+        fallback.stdout + fallback.stderr,
+        re.I,
+    )
     return match.group(1) if match else ""

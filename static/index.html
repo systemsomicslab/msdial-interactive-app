@@ -24,6 +24,8 @@
     <button data-tab="annotation">3. Annotation</button>
     <button data-tab="tuning">4. Tune parameters</button>
     <button data-tab="run">5. Validate &amp; run</button>
+    <button data-tab="qa">6. Quality assurance</button>
+    <button data-tab="publication">7. Publication report</button>
     <button data-tab="help">Ask MS-DIAL</button>
   </nav>
 
@@ -123,13 +125,22 @@
         </p>
         <div class="path-grid">
           <label>MS-DIAL Console<input id="consolePath" placeholder="/opt/msdial/MSDIALCUI or C:\...\MSDIALCUI.exe"></label>
-          <label>Parameter template<input id="templatePath"></label>
+          <label>Parameter template
+            <div class="output-path-row">
+              <input id="templatePath">
+              <button id="loadParameterTemplate" type="button" class="secondary">Load template</button>
+            </div>
+          </label>
           <label>Output root
             <div class="output-path-row">
               <input id="outputRoot" placeholder="Defaults to the first data file directory">
               <button id="useDataDirectory" type="button" class="secondary">Use first data directory</button>
             </div>
           </label>
+        </div>
+        <div class="button-row path-actions">
+          <button id="savePathSettings" type="button" class="secondary">Save paths for next launch</button>
+          <span id="pathSettingsInfo" class="muted"></span>
         </div>
         <p class="muted">MS-DIAL reads raw data from their original paths. Only result and project files are written below Output root.</p>
       </div>
@@ -349,6 +360,12 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
     </section>
 
     <section id="tab-annotation" class="tab">
+      <div id="libraryCatalogPanel" class="panel">
+        <h2>Official MS-DIAL library downloads</h2>
+        <p class="muted">Download only the library needed for this workflow. Files are verified with the Zenodo MD5 checksum and retained in the per-user library directory, outside the replaceable application package.</p>
+        <div id="libraryCatalogDirectory" class="format-summary"></div>
+        <div id="libraryCatalogList" class="library-catalog"></div>
+      </div>
       <div id="annotationLibraries" class="panel">
         <h2>Annotation libraries</h2>
         <div id="lbmAnnotatorPanel" class="nested-panel">
@@ -548,6 +565,91 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
           </div>
         </div>
         <pre id="log">Ready.</pre>
+      </div>
+    </section>
+
+    <section id="tab-qa" class="tab">
+      <div class="panel" id="lcmsQaPanel">
+        <h2>LC-MS quality assurance</h2>
+        <p class="muted">Inspect analytical quality from the alignment-level <code>*.qa.tsv</code> written by the current MS-DIAL Console. The report combines visual checks with numeric metrics recommended for transparent QA/QC reporting.</p>
+        <label>LC-MS QA matrix
+          <input id="qaFilePath" placeholder="Latest *.qa.tsv in Output root">
+        </label>
+        <div class="button-row">
+          <button id="refreshQaFile" class="secondary" type="button">Use latest QA matrix</button>
+          <button id="browseQaFile" class="secondary" type="button">Native file picker</button>
+        </div>
+        <label>Internal standards (optional)
+          <textarea id="qaInternalStandards" rows="4" placeholder="Name,Adduct,m/z,RT (min),m/z tolerance (Da),RT tolerance (min)&#10;IS 1,[M-H]-,231.06953,7.61,0.01,0.5"></textarea>
+        </label>
+        <div class="button-row">
+          <button id="loadQaInternalStandardExample" class="secondary" type="button">Example: FA 16:0 / FA 18:0</button>
+        </div>
+        <p class="muted">One standard per line. Adduct is optional, so the previous five-column format remains valid. The nearest alignment spot within both tolerances is followed across analytical order for intensity, mass error (ppm), and RT error.</p>
+        <button id="generateQaReport" type="button">Generate LC-MS QA report</button>
+        <div id="qaReport" class="format-summary qa-report" hidden></div>
+      </div>
+    </section>
+
+    <section id="tab-publication" class="tab">
+      <div class="panel">
+        <h2>Materials and Methods and supplementary reporting</h2>
+        <p class="muted">Generate an English manuscript draft from the settings used for one analysis run. When <code>workflow-settings.json</code> exists in the selected run directory, it is used in preference to the current UI so the report describes the executed workflow.</p>
+        <label>Analysis run / output directory
+          <div class="output-path-row">
+            <input id="publicationRunDirectory" placeholder="Defaults to Output root">
+            <button id="usePublicationOutputRoot" type="button" class="secondary">Use Output root</button>
+          </div>
+        </label>
+        <label class="checkbox-line"><input id="publicationUseSavedRun" type="checkbox" checked> Use saved <code>workflow-settings.json</code> when available</label>
+        <label>Additional provenance for user-supplied libraries (optional)
+          <textarea id="publicationLibraryProvenance" rows="4" placeholder="Library path | Version | DOI or repository URL | License&#10;D:\libraries\inhouse.msp | 2026-08-01 | https://doi.org/... | institutional"></textarea>
+        </label>
+        <p class="muted">Downloaded catalog libraries already carry a Zenodo DOI, checksum, and license. For an in-house or manually supplied library, record a version plus a persistent identifier or repository URL whenever possible.</p>
+        <details class="publication-criteria">
+          <summary><strong>Prespecified LC-MS QA reporting criteria</strong></summary>
+          <p class="muted">These transparent defaults are reporting rules, not universal biological acceptance criteria. Adjust them before generating the manuscript text when the study protocol specifies different limits.</p>
+          <div class="form-grid">
+            <label>Median QC RSD max (%)<input id="qaCriterionMedianRsd" type="number" step="any" value="30"></label>
+            <label>QC features with RSD ≤30% min (fraction)<input id="qaCriterionRsdFraction" type="number" step="any" min="0" max="1" value="0.7"></label>
+            <label>Median QC detection rate min<input id="qaCriterionDetection" type="number" step="any" min="0" max="1" value="0.8"></label>
+            <label>Features with Sample/Blank ≥3 min<input id="qaCriterionBlankSeparation" type="number" step="any" min="0" max="1" value="0.7"></label>
+            <label>QC PCA relative dispersion max<input id="qaCriterionPca" type="number" step="any" value="0.5"></label>
+            <label>Median blank carryover max<input id="qaCriterionCarryover" type="number" step="any" min="0" max="1" value="0.1"></label>
+            <label>|Order-intensity correlation| max<input id="qaCriterionOrderCorrelation" type="number" step="any" min="0" max="1" value="0.3"></label>
+          </div>
+        </details>
+        <button id="generatePublicationReport" type="button">Generate publication report</button>
+        <div id="publicationSource" class="muted"></div>
+        <div id="publicationWarnings" class="issues"></div>
+      </div>
+      <div id="publicationOutput" hidden>
+        <div class="panel">
+          <h2>Materials and Methods draft</h2>
+          <textarea id="materialsMethodsText" class="publication-text" rows="16"></textarea>
+          <div class="button-row">
+            <button id="copyMaterialsMethods" type="button" class="secondary">Copy Methods text</button>
+            <a id="downloadMaterialsMethods" class="download-link" href="#">Download Methods text</a>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Quality assurance Results draft</h2>
+          <textarea id="qaResultsText" class="publication-text" rows="9"></textarea>
+          <div class="button-row">
+            <button id="copyQaResults" type="button" class="secondary">Copy QA Results text</button>
+            <a id="downloadQaResults" class="download-link" href="#">Download QA Results text</a>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Supplementary files</h2>
+          <p class="muted">The Excel workbook contains matrix-formatted Data, sectioned Guided setup and Annotation sheets, and a Quality assurance sheet. The long-format TSV remains available for machine-readable audit. Local absolute paths are retained for auditability and should be reviewed before publication.</p>
+          <div class="button-row">
+            <a id="downloadSupplementaryWorkbook" class="download-link" href="#">Download Supplementary Table Excel (.xlsx)</a>
+            <a id="downloadSupplementaryTable" class="download-link" href="#">Download audit TSV (long format)</a>
+            <a id="downloadPublicationAudit" class="download-link" href="#">Download machine-readable JSON</a>
+            <a id="downloadPublicationBundle" class="download-link" href="#">Download complete reporting bundle</a>
+          </div>
+        </div>
       </div>
     </section>
 

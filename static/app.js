@@ -17,8 +17,11 @@ const state = {
   mspAnnotators: [],
   textAnnotators: [],
   lbmAnnotator: {},
+  libraryJobs: {},
+  libraryProvenance: [],
   mztabFiles: [],
   selectedMzTabPath: "",
+  qaReport: null,
   pathPicker: {
     mode: "vendor",
     currentPath: "",
@@ -152,6 +155,7 @@ function workflow() {
         use_rt_scoring: Boolean(item.use_rt_scoring),
         use_rt_filtering: Boolean(item.use_rt_filtering),
       })),
+    library_provenance: state.libraryProvenance,
     gcms_accuracy_type: $("#gcmsAccuracyType").value,
     gcms_ri_compound_type: $("#gcmsRiCompoundType").value,
     gcms_retention_type: $("#gcmsRetentionType").value,
@@ -171,6 +175,7 @@ function workflow() {
     selected_adducts: (state.adducts[$("#ionMode").value] || [])
       .filter((item) => item.selected)
       .map((item) => item.adduct),
+    msdial_interactive_version: state.config?.app_version || "not recorded",
   };
 }
 
@@ -665,6 +670,168 @@ function defaultLbmAnnotator(overrides = {}) {
   };
 }
 
+function setTemplateControl(id, value, checkbox = false) {
+  const control = $(`#${id}`);
+  if (!control || value === undefined || value === null) return;
+  if (checkbox) {
+    control.checked = Boolean(value);
+    return;
+  }
+  const text = String(value);
+  if (control.tagName === "SELECT" && ![...control.options].some((item) => item.value === text)) return;
+  control.value = text;
+}
+
+function applyLoadedParameterTemplate(result) {
+  const values = result.workflow || {};
+  const controls = {
+    project_type: "projectType",
+    ion_mode: "ionMode",
+    target_omics: "targetOmics",
+    ms1_data_type: "ms1Type",
+    ms2_data_type: "ms2Type",
+    number_of_threads: "numberOfThreads",
+    smoothing_method: "smoothingMethod",
+    minimum_peak_height: "minimumPeakHeight",
+    mass_slice_width: "massSliceWidth",
+    minimum_peak_width: "minimumPeakWidth",
+    retention_time_begin: "rtBegin",
+    retention_time_end: "rtEnd",
+    ms1_tolerance: "ms1Tolerance",
+    ms2_tolerance: "ms2Tolerance",
+    alignment_rt_tolerance: "alignmentRtTolerance",
+    alignment_ms1_tolerance: "alignmentMs1Tolerance",
+    solvent: "solvent",
+    gcms_accuracy_type: "gcmsAccuracyType",
+    gcms_ri_compound_type: "gcmsRiCompoundType",
+    gcms_retention_type: "gcmsRetentionType",
+    gcms_alignment_index_type: "gcmsAlignmentIndexType",
+    gcms_ri_alignment_tolerance: "gcmsRiAlignmentTolerance",
+    gcms_ri_dictionary_path: "gcmsRiDictionaryPath",
+  };
+  Object.entries(controls).forEach(([key, id]) => setTemplateControl(id, values[key]));
+  setTemplateControl("alignmentLightMode", values.alignment_light_mode, true);
+  if (result.path) $("#templatePath").value = result.path;
+  if (Array.isArray(result.msp_annotators)) state.mspAnnotators = result.msp_annotators;
+  if (Array.isArray(result.text_annotators)) state.textAnnotators = result.text_annotators;
+  if (result.lbm_annotator) state.lbmAnnotator = result.lbm_annotator;
+  if (Array.isArray(result.lipid_queries) && result.lipid_queries.length) {
+    state.lipidQueries = result.lipid_queries;
+  }
+  if (Array.isArray(result.selected_adducts) && result.selected_adducts.length) {
+    Object.values(state.adducts).flat().forEach((item) => {
+      item.selected = result.selected_adducts.includes(item.adduct);
+    });
+  }
+  if (values.gcms_ri_dictionary_path) $("#gcmsRiSource").value = "dictionary";
+  renderLipids();
+  renderAdducts();
+  renderLbmAnnotator();
+  renderMspAnnotators();
+  renderTextAnnotators();
+  updateProjectUI();
+  refreshQuestion();
+}
+
+function applyCatalogLibrary(item) {
+  const path = item.local_path || "";
+  if (!path) return;
+  state.libraryProvenance = [
+    ...state.libraryProvenance.filter((entry) => entry.catalog_id !== item.id),
+    {
+      catalog_id: item.id,
+      label: item.label,
+      record_url: item.record_url,
+      doi: item.doi,
+      local_path: path,
+      filename: item.filename,
+      md5: item.md5,
+      license: item.license,
+    },
+  ];
+  if (item.kind === "lbm") {
+    $("#projectType").value = "lcms";
+    $("#targetOmics").value = "Lipidomics";
+    state.lbmAnnotator = { ...defaultLbmAnnotator(), ...state.lbmAnnotator, lbm_file_path: path };
+    renderLbmAnnotator();
+  } else {
+    if (item.kind === "gcms_msp") {
+      $("#projectType").value = "gcms";
+      $("#targetOmics").value = "Metabolomics";
+      if (item.ri_compound_type) $("#gcmsRiCompoundType").value = item.ri_compound_type;
+    } else if (item.ion_mode) {
+      $("#ionMode").value = item.ion_mode;
+    }
+    const existing = state.mspAnnotators[0] || defaultMspAnnotatorRow();
+    state.mspAnnotators = [{ ...existing, annotator_id: existing.annotator_id || "msp_annotator_1", msp_file_path: path }, ...state.mspAnnotators.slice(1)];
+    renderMspAnnotators();
+  }
+  updateProjectUI();
+  renderLipids();
+  renderAdducts();
+  setStatus(`Using downloaded library: ${path}`);
+}
+
+function renderLibraryCatalog() {
+  const catalog = state.config?.library_catalog || [];
+  $("#libraryCatalogDirectory").innerHTML = `Library directory: <code>${escapeHtml(state.config?.library_directory || "")}</code>`;
+  $("#libraryCatalogList").innerHTML = catalog.map((item) => {
+    const job = state.libraryJobs[item.id];
+    const status = job
+      ? job.status === "failed" ? `Failed: ${escapeHtml(job.error || "download error")}` : `${escapeHtml(job.status)} ${escapeHtml(job.progress || 0)}%`
+      : item.downloaded ? "Downloaded and checksum verified" : `${item.size_mb} MB download`;
+    return `<article class="library-card" data-library-id="${escapeHtml(item.id)}">
+      <div class="library-card-head">
+        <div><strong>${escapeHtml(item.label)}</strong><span class="muted">${escapeHtml(item.scope)} | ${escapeHtml(item.license)}</span></div>
+        <span class="library-progress">${status}</span>
+      </div>
+      ${item.local_path ? `<div class="muted"><code>${escapeHtml(item.local_path)}</code></div>` : ""}
+      <div class="button-row">
+        <button type="button" class="secondary library-action" ${job && !["completed", "failed"].includes(job.status) ? "disabled" : ""}>${item.downloaded ? "Use in workflow" : "Download and use"}</button>
+        <a href="${escapeHtml(item.record_url)}" target="_blank" rel="noreferrer">Open Zenodo record</a>
+      </div>
+    </article>`;
+  }).join("");
+  $$(".library-card").forEach((card) => {
+    card.querySelector(".library-action").addEventListener("click", () => runUiAction(async () => {
+      const item = catalog.find((entry) => entry.id === card.dataset.libraryId);
+      if (item.downloaded) {
+        applyCatalogLibrary(item);
+        return;
+      }
+      const result = await api("/api/libraries/download", {
+        method: "POST",
+        body: JSON.stringify({ catalog_id: item.id }),
+      });
+      state.libraryJobs[item.id] = { id: result.job_id, status: "queued", progress: 0 };
+      renderLibraryCatalog();
+      pollLibraryDownload(item.id, result.job_id).catch((error) => {
+        state.libraryJobs[item.id] = { status: "failed", error: error.message };
+        renderLibraryCatalog();
+      });
+    }));
+  });
+}
+
+async function pollLibraryDownload(catalogId, jobId) {
+  const job = await api(`/api/jobs/${jobId}`);
+  state.libraryJobs[catalogId] = job;
+  renderLibraryCatalog();
+  if (["queued", "running"].includes(job.status)) {
+    window.setTimeout(() => pollLibraryDownload(catalogId, jobId).catch((error) => {
+      state.libraryJobs[catalogId] = { status: "failed", error: error.message };
+      renderLibraryCatalog();
+    }), 750);
+    return;
+  }
+  if (job.status === "failed") throw new Error(job.error || "Library download failed.");
+  const item = state.config.library_catalog.find((entry) => entry.id === catalogId);
+  Object.assign(item, job.result, { downloaded: true });
+  delete state.libraryJobs[catalogId];
+  renderLibraryCatalog();
+  applyCatalogLibrary(item);
+}
+
 function updateLbmAnnotator(key, value) {
   state.lbmAnnotator = { ...state.lbmAnnotator, [key]: value };
 }
@@ -905,13 +1072,16 @@ function saveRtWorkspaceState() {
     rt_correction_peak_selection_mode: current.rt_correction_peak_selection_mode,
     rt_correction_peak_selection_rt_weight: current.rt_correction_peak_selection_rt_weight,
   };
-  localStorage.setItem(RT_WORKSPACE_STORAGE_KEY, JSON.stringify(payload));
+  sessionStorage.setItem(RT_WORKSPACE_STORAGE_KEY, JSON.stringify(payload));
 }
 
 function restoreRtWorkspaceState() {
   let saved;
   try {
-    saved = JSON.parse(localStorage.getItem(RT_WORKSPACE_STORAGE_KEY) || "null");
+    // Earlier versions persisted analysis paths across app restarts. Remove that
+    // legacy cache while retaining same-tab handoff to the RT review workspace.
+    localStorage.removeItem(RT_WORKSPACE_STORAGE_KEY);
+    saved = JSON.parse(sessionStorage.getItem(RT_WORKSPACE_STORAGE_KEY) || "null");
   } catch {
     saved = null;
   }
@@ -1317,6 +1487,400 @@ function renderMzTabPreviewSection(name, section) {
     </details>`;
 }
 
+function parseQaInternalStandards() {
+  return $("#qaInternalStandards").value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line, index) => {
+      const fields = line.split(/[\t,]/).map((item) => item.trim());
+      if (index === 0 && fields.some((item) => item.toLowerCase() === "m/z" || item.toLowerCase() === "mz")) return null;
+      const hasAdduct = fields.length >= 6;
+      const offset = hasAdduct ? 1 : 0;
+      return {
+        name: fields[0] || `Internal standard ${index + 1}`,
+        adduct: hasAdduct ? fields[1] : "",
+        mz: Number(fields[1 + offset]),
+        rt: Number(fields[2 + offset]),
+        mz_tolerance: Number(fields[3 + offset] || 0.01),
+        rt_tolerance: Number(fields[4 + offset] || 0.5),
+      };
+    })
+    .filter((item) => item && Number.isFinite(item.mz) && item.mz > 0 && Number.isFinite(item.rt) && item.rt >= 0);
+}
+
+function parsePublicationLibraryProvenance() {
+  return $("#publicationLibraryProvenance").value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line, index) => {
+      const fields = line.split("|").map((item) => item.trim());
+      if (index === 0 && fields[0].toLowerCase().includes("library path")) return null;
+      const persistentId = fields[2] || "";
+      return {
+        label: fields[0] ? fields[0].split(/[\\/]/).pop() : `User library ${index + 1}`,
+        local_path: fields[0] || "",
+        version: fields[1] || "not recorded",
+        doi: persistentId.toLowerCase().includes("doi.org/") ? persistentId.replace(/^https?:\/\/doi\.org\//i, "") : "",
+        record_url: persistentId,
+        license: fields[3] || "not recorded",
+        source: "user supplied",
+      };
+    })
+    .filter(Boolean);
+}
+
+function publicationQaCriteria() {
+  return {
+    median_qc_rsd_percent_max: Number($("#qaCriterionMedianRsd").value),
+    qc_features_rsd_le_30_fraction_min: Number($("#qaCriterionRsdFraction").value),
+    median_qc_detection_rate_min: Number($("#qaCriterionDetection").value),
+    sample_blank_ratio_ge_3_fraction_min: Number($("#qaCriterionBlankSeparation").value),
+    qc_pca_relative_dispersion_max: Number($("#qaCriterionPca").value),
+    median_blank_carryover_ratio_max: Number($("#qaCriterionCarryover").value),
+    run_order_intensity_abs_correlation_max: Number($("#qaCriterionOrderCorrelation").value),
+  };
+}
+
+async function copyPublicationText(selector, label) {
+  const text = $(selector).value;
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+  } else {
+    $(selector).focus();
+    $(selector).select();
+    document.execCommand("copy");
+  }
+  setStatus(`${label} copied to the clipboard.`);
+}
+
+function renderPublicationReport(result) {
+  const report = result.report || {};
+  const downloads = result.downloads || {};
+  $("#publicationOutput").hidden = false;
+  $("#materialsMethodsText").value = report.methods_text || "";
+  $("#qaResultsText").value = report.qa_results_text || "";
+  updatePublicationTextDownloads();
+  $("#downloadSupplementaryWorkbook").href = downloads.supplementary_workbook || "#";
+  $("#downloadSupplementaryTable").href = downloads.supplementary_table || "#";
+  $("#downloadPublicationAudit").href = downloads.audit || "#";
+  $("#downloadPublicationBundle").href = downloads.bundle || "#";
+  const assessment = report.qa_assessment || {};
+  $("#publicationSource").textContent = result.used_saved_settings
+    ? `Run settings loaded from ${result.settings_file}. QA criteria passed: ${assessment.passed || 0}/${assessment.evaluated || 0}.`
+    : `Current UI settings were used. QA criteria passed: ${assessment.passed || 0}/${assessment.evaluated || 0}.`;
+  if (result.qa_file) {
+    $("#publicationSource").textContent += ` QA matrix: ${result.qa_file}.`;
+  }
+  $("#publicationWarnings").innerHTML = (report.warnings || [])
+    .map((message) => `<div class="issue warning">${escapeHtml(message)}</div>`)
+    .join("");
+}
+
+function setPublicationTextDownload(linkSelector, text, filename) {
+  const link = $(linkSelector);
+  if (link.dataset.objectUrl) URL.revokeObjectURL(link.dataset.objectUrl);
+  const objectUrl = URL.createObjectURL(new Blob([`${text}\n`], { type: "text/plain;charset=utf-8" }));
+  link.href = objectUrl;
+  link.download = filename;
+  link.dataset.objectUrl = objectUrl;
+}
+
+function updatePublicationTextDownloads() {
+  setPublicationTextDownload(
+    "#downloadMaterialsMethods",
+    $("#materialsMethodsText").value,
+    "MS_DIAL_Materials_and_Methods.txt",
+  );
+  setPublicationTextDownload(
+    "#downloadQaResults",
+    $("#qaResultsText").value,
+    "MS_DIAL_QA_Results.txt",
+  );
+}
+
+function qaValue(value, digits = 2) {
+  if (value === null || value === undefined || value === "") return "N/A";
+  return Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : "N/A";
+}
+
+function qaPercent(value, digits = 1) {
+  if (value === null || value === undefined || value === "") return "N/A";
+  return Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(digits)}%` : "N/A";
+}
+
+function qaRawPercent(value, digits = 2) {
+  const formatted = qaValue(value, digits);
+  return formatted === "N/A" ? formatted : `${formatted}%`;
+}
+
+function renderQaReport(report) {
+  state.qaReport = report;
+  const panel = $("#qaReport");
+  panel.hidden = false;
+  const summary = report.summary || {};
+  const counts = summary.category_counts || {};
+  const metrics = [
+    [summary.sample_count ?? 0, "files"],
+    [summary.alignment_spot_count ?? 0, "alignment spots"],
+    [`${counts.Sample || 0} / ${counts.QC || 0} / ${counts.Blank || 0}`, "Sample / QC / Blank"],
+    [qaRawPercent(summary.median_qc_rsd_percent), "median QC feature RSD"],
+    [qaPercent(summary.qc_features_rsd_le_30_percent), "QC features with RSD ≤30%"],
+    [qaPercent(summary.median_qc_detection_rate), "median QC detection rate"],
+    [qaPercent(summary.sample_blank_ratio_ge_3), "features with Sample/Blank ≥3"],
+    [qaValue(summary.qc_pca_relative_dispersion, 3), "QC PCA dispersion / all samples"],
+    [qaPercent(summary.median_blank_carryover_ratio), "median blank / previous injection"],
+    [qaValue(summary.run_order_intensity_correlation, 3), "order vs median intensity r"],
+    [qaPercent(summary.median_msms_acquisition_rate), "median MS/MS acquisition rate"],
+    [qaValue(summary.median_sample_sn, 1), "median sample raw S/N"],
+  ].map(([value, label]) => `<div class="metric"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`).join("");
+  const warnings = (report.warnings || []).map((message) => `<div class="issue warning">${escapeHtml(message)}</div>`).join("");
+  const standardCards = (report.internal_standards || []).map((standard, index) => {
+    const label = standard.adduct ? `${standard.name} ${standard.adduct}` : standard.name;
+    if (standard.status !== "matched") {
+      return `<article class="qa-chart-card wide"><h3>${escapeHtml(label)}: not found within the supplied tolerances</h3></article>`;
+    }
+    return `<article class="qa-chart-card wide">
+      <h3>${escapeHtml(label)} | Alignment ID ${escapeHtml(standard.alignment_id)} | median m/z ${qaValue(standard.median_mz, 5)} | median RT ${qaValue(standard.median_rt, 3)}</h3>
+      <div class="qa-chart-grid">
+        <div><strong>Intensity</strong><canvas data-qa-standard="${index}" data-qa-value="log_height"></canvas></div>
+        <div><strong>Mass error (ppm)</strong><canvas data-qa-standard="${index}" data-qa-value="ppm_error"></canvas></div>
+        <div><strong>RT error (min)</strong><canvas data-qa-standard="${index}" data-qa-value="rt_delta"></canvas></div>
+      </div>
+    </article>`;
+  }).join("");
+  panel.innerHTML = `
+    <strong>LC-MS QA report: ${escapeHtml(report.file_name || report.file)}</strong>
+    <div class="muted">${escapeHtml(report.file)}</div>
+    <div class="metric-grid mztab-counts">${metrics}</div>
+    ${warnings}
+    <div class="qa-chart-grid">
+      <article class="qa-chart-card"><h3>Blank / QC / Sample intensity distributions</h3><canvas id="qaIntensityDistribution"></canvas></article>
+      <article class="qa-chart-card"><h3>PCA topology</h3><canvas id="qaPca"></canvas><div class="muted">PC1 ${qaPercent(report.pca?.explained_variance?.[0])}; PC2 ${qaPercent(report.pca?.explained_variance?.[1])}</div></article>
+      <article class="qa-chart-card"><h3>Median detected intensity by analytical order</h3><canvas id="qaIntensityOrder"></canvas></article>
+      <article class="qa-chart-card"><h3>Reference-matched count by analytical order</h3><canvas id="qaReferenceOrder"></canvas></article>
+      <article class="qa-chart-card"><h3>MS/MS acquisition rate by analytical order</h3><canvas id="qaMsmsOrder"></canvas></article>
+      <article class="qa-chart-card"><h3>Raw S/N distribution by analytical order</h3><canvas id="qaSnOrder"></canvas></article>
+      ${standardCards}
+    </div>
+    <div class="muted qa-method">${escapeHtml(Object.values(report.method || {}).join(" | "))}</div>`;
+  requestAnimationFrame(() => {
+    drawQaHistogram($("#qaIntensityDistribution"), report.intensity_distributions || []);
+    drawQaPca($("#qaPca"), report.pca || {});
+    drawQaOrderDistribution($("#qaIntensityOrder"), report.samples || [], "median_log_intensity", "q25_log_intensity", "q75_log_intensity", "log10 intensity");
+    drawQaOrderSeries($("#qaReferenceOrder"), report.samples || [], "reference_matched_count", "matched features");
+    drawQaOrderSeries($("#qaMsmsOrder"), report.samples || [], "msms_acquisition_rate", "MS/MS acquisition rate");
+    drawQaOrderDistribution($("#qaSnOrder"), report.samples || [], "median_sn", "q25_sn", "q75_sn", "raw S/N");
+    $$("[data-qa-standard]").forEach((canvas) => {
+      const standard = (report.internal_standards || [])[Number(canvas.dataset.qaStandard)];
+      drawQaOrderSeries(canvas, standard?.values || [], canvas.dataset.qaValue, canvas.dataset.qaValue);
+    });
+  });
+}
+
+function qaCanvas(canvas, height = 280) {
+  if (!canvas) return null;
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(340, canvas.clientWidth || 520);
+  canvas.width = width * ratio;
+  canvas.height = height * ratio;
+  const context = canvas.getContext("2d");
+  context.scale(ratio, ratio);
+  context.clearRect(0, 0, width, height);
+  return { context, width, height, padding: { left: 72, right: 18, top: 18, bottom: 52 } };
+}
+
+function qaAxisTicks(minimum, maximum, integerOnly = false) {
+  if (!integerOnly) {
+    return Array.from({ length: 5 }, (_, index) => minimum + (index / 4) * (maximum - minimum));
+  }
+  const lower = Math.ceil(minimum);
+  const upper = Math.floor(maximum);
+  if (upper <= lower) return [lower];
+  const step = Math.max(1, Math.ceil((upper - lower) / 6));
+  const ticks = [];
+  for (let value = lower; value <= upper; value += step) ticks.push(value);
+  if (ticks[ticks.length - 1] !== upper) ticks.push(upper);
+  return ticks;
+}
+
+function qaAxes(frame, xMin, xMax, yMin, yMax, xLabel, yLabel, options = {}) {
+  const { context, width, height, padding } = frame;
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const sx = (value) => padding.left + ((value - xMin) / Math.max(xMax - xMin, 1e-12)) * plotWidth;
+  const sy = (value) => padding.top + plotHeight - ((value - yMin) / Math.max(yMax - yMin, 1e-12)) * plotHeight;
+  context.font = "14px Arial, sans-serif";
+  context.fillStyle = "#526975";
+  context.textBaseline = "middle";
+  const tickLabel = (value) => {
+    const absolute = Math.abs(value);
+    if ((absolute > 0 && absolute < 0.01) || absolute >= 10000) return value.toExponential(1);
+    if (absolute >= 100) return value.toFixed(0);
+    if (absolute >= 10) return value.toFixed(1);
+    return value.toFixed(2);
+  };
+  context.strokeStyle = "#e3eaed";
+  context.lineWidth = 1;
+  const xTicks = qaAxisTicks(xMin, xMax, Boolean(options.integerX));
+  const yTicks = qaAxisTicks(yMin, yMax);
+  xTicks.forEach((xValue) => {
+    const x = sx(xValue);
+    context.beginPath();
+    context.moveTo(x, padding.top);
+    context.lineTo(x, padding.top + plotHeight);
+    context.stroke();
+    context.textAlign = "center";
+    context.fillText(options.integerX ? String(Math.round(xValue)) : tickLabel(xValue), x, padding.top + plotHeight + 18);
+  });
+  yTicks.forEach((yValue) => {
+    const fraction = (yValue - yMin) / Math.max(yMax - yMin, 1e-12);
+    const y = padding.top + plotHeight - fraction * plotHeight;
+    context.beginPath();
+    context.moveTo(padding.left, y);
+    context.lineTo(padding.left + plotWidth, y);
+    context.stroke();
+    context.textAlign = "right";
+    context.fillText(tickLabel(yValue), padding.left - 8, y);
+  });
+  context.strokeStyle = "#718994";
+  context.beginPath();
+  context.moveTo(padding.left, padding.top);
+  context.lineTo(padding.left, padding.top + plotHeight);
+  context.lineTo(padding.left + plotWidth, padding.top + plotHeight);
+  context.stroke();
+  context.font = "bold 14px Arial, sans-serif";
+  context.textAlign = "center";
+  context.fillText(xLabel, padding.left + plotWidth / 2, height - 10);
+  context.save();
+  context.translate(15, padding.top + plotHeight / 2);
+  context.rotate(-Math.PI / 2);
+  context.fillText(yLabel, 0, 0);
+  context.restore();
+  context.font = "14px Arial, sans-serif";
+  context.textBaseline = "alphabetic";
+  return { sx, sy };
+}
+
+const QA_COLORS = { Sample: "#2879b9", QC: "#007f86", Blank: "#d85f2a" };
+
+function drawQaHistogram(canvas, distributions) {
+  const frame = qaCanvas(canvas);
+  if (!frame || !distributions.length) return;
+  const xs = distributions.flatMap((item) => item.bin_centers || []);
+  const ys = distributions.flatMap((item) => item.density || []);
+  const axes = qaAxes(frame, Math.min(...xs), Math.max(...xs), 0, Math.max(...ys, 1e-4), "log10(height + 1)", "density");
+  distributions.forEach((item) => {
+    frame.context.strokeStyle = QA_COLORS[item.category] || "#6e55a5";
+    frame.context.lineWidth = 2;
+    frame.context.beginPath();
+    (item.bin_centers || []).forEach((value, index) => {
+      const x = axes.sx(value);
+      const y = axes.sy(item.density[index] || 0);
+      if (index === 0) frame.context.moveTo(x, y); else frame.context.lineTo(x, y);
+    });
+    frame.context.stroke();
+  });
+  distributions.forEach((item, index) => {
+    frame.context.fillStyle = QA_COLORS[item.category] || "#6e55a5";
+    frame.context.fillText(item.category, frame.padding.left + 8 + index * 65, frame.padding.top + 12);
+  });
+}
+
+function drawQaPca(canvas, pca) {
+  const frame = qaCanvas(canvas);
+  const points = pca?.points || [];
+  if (!frame || !points.length) return;
+  const xs = points.map((item) => Number(item.pc1));
+  const ys = points.map((item) => Number(item.pc2));
+  const xPad = Math.max((Math.max(...xs) - Math.min(...xs)) * 0.08, 1e-6);
+  const yPad = Math.max((Math.max(...ys) - Math.min(...ys)) * 0.08, 1e-6);
+  const axes = qaAxes(frame, Math.min(...xs) - xPad, Math.max(...xs) + xPad, Math.min(...ys) - yPad, Math.max(...ys) + yPad, "PC1", "PC2");
+  points.forEach((point) => {
+    frame.context.fillStyle = QA_COLORS[point.category] || "#6e55a5";
+    frame.context.beginPath();
+    frame.context.arc(axes.sx(point.pc1), axes.sy(point.pc2), point.category === "QC" ? 5 : 3.5, 0, Math.PI * 2);
+    frame.context.fill();
+  });
+}
+
+function drawQaOrderSeries(canvas, values, key, yLabel) {
+  const frame = qaCanvas(canvas);
+  const points = values
+    .map((item) => ({
+      ...item,
+      x: Number(item.order),
+      y: item[key] === null || item[key] === undefined ? Number.NaN : Number(item[key]),
+    }))
+    .filter((item) => Number.isFinite(item.x) && Number.isFinite(item.y));
+  if (!frame || !points.length) return;
+  points.sort((left, right) => left.batch - right.batch || left.x - right.x);
+  const xs = points.map((item) => item.x);
+  const ys = points.map((item) => item.y);
+  const yPad = Math.max((Math.max(...ys) - Math.min(...ys)) * 0.08, 1e-6);
+  const axes = qaAxes(frame, Math.min(...xs), Math.max(...xs), Math.min(...ys) - yPad, Math.max(...ys) + yPad, "analytical order", yLabel, { integerX: true });
+  frame.context.strokeStyle = "#b5c2c8";
+  frame.context.lineWidth = 1;
+  frame.context.beginPath();
+  points.forEach((point, index) => {
+    if (index === 0) frame.context.moveTo(axes.sx(point.x), axes.sy(point.y));
+    else frame.context.lineTo(axes.sx(point.x), axes.sy(point.y));
+  });
+  frame.context.stroke();
+  points.forEach((point) => {
+    frame.context.fillStyle = QA_COLORS[point.category] || "#6e55a5";
+    frame.context.beginPath();
+    frame.context.arc(axes.sx(point.x), axes.sy(point.y), point.category === "QC" ? 4.5 : 3, 0, Math.PI * 2);
+    frame.context.fill();
+  });
+}
+
+function drawQaOrderDistribution(canvas, values, medianKey, lowKey, highKey, yLabel) {
+  const frame = qaCanvas(canvas);
+  const points = values
+    .map((item) => ({
+      ...item,
+      x: Number(item.order),
+      y: item[medianKey] === null || item[medianKey] === undefined ? Number.NaN : Number(item[medianKey]),
+      low: item[lowKey] === null || item[lowKey] === undefined ? Number.NaN : Number(item[lowKey]),
+      high: item[highKey] === null || item[highKey] === undefined ? Number.NaN : Number(item[highKey]),
+    }))
+    .filter((item) => [item.x, item.y, item.low, item.high].every(Number.isFinite));
+  if (!frame || !points.length) return;
+  points.sort((left, right) => left.batch - right.batch || left.x - right.x);
+  const xs = points.map((item) => item.x);
+  const ranges = points.flatMap((item) => [item.low, item.high]);
+  const yPad = Math.max((Math.max(...ranges) - Math.min(...ranges)) * 0.08, 1e-6);
+  const axes = qaAxes(frame, Math.min(...xs), Math.max(...xs), Math.min(...ranges) - yPad, Math.max(...ranges) + yPad, "analytical order", yLabel, { integerX: true });
+  frame.context.strokeStyle = "#b5c2c8";
+  frame.context.lineWidth = 1;
+  frame.context.beginPath();
+  points.forEach((point, index) => {
+    if (index === 0) frame.context.moveTo(axes.sx(point.x), axes.sy(point.y));
+    else frame.context.lineTo(axes.sx(point.x), axes.sy(point.y));
+  });
+  frame.context.stroke();
+  points.forEach((point) => {
+    const x = axes.sx(point.x);
+    const color = QA_COLORS[point.category] || "#6e55a5";
+    frame.context.strokeStyle = color;
+    frame.context.lineWidth = 2;
+    frame.context.beginPath();
+    frame.context.moveTo(x, axes.sy(point.low));
+    frame.context.lineTo(x, axes.sy(point.high));
+    frame.context.moveTo(x - 4, axes.sy(point.low));
+    frame.context.lineTo(x + 4, axes.sy(point.low));
+    frame.context.moveTo(x - 4, axes.sy(point.high));
+    frame.context.lineTo(x + 4, axes.sy(point.high));
+    frame.context.stroke();
+    frame.context.fillStyle = color;
+    frame.context.beginPath();
+    frame.context.arc(x, axes.sy(point.y), point.category === "QC" ? 5 : 3.5, 0, Math.PI * 2);
+    frame.context.fill();
+  });
+}
+
 function renderLiterature(result) {
   $("#literatureSummary").hidden = false;
   $("#literatureSummary").textContent = result.summary;
@@ -1368,7 +1932,7 @@ function renderRtCorrectionResult(result) {
       <td>${Number(row.reference_rt).toFixed(4)}</td>
       <td>${Number(row.detected_rt).toFixed(4)}</td>
       <td><input data-key="selected_rt" type="number" step="any" value="${Number(row.selected_rt)}"></td>
-      <td>${Number(row.peak_height).toLocaleString()}</td>
+      <td data-value="peak_height">${Number(row.peak_height).toLocaleString()}</td>
     </tr>`).join("");
   $$("#rtCorrectionSelectionRows tr").forEach((tableRow) => {
     const index = Number(tableRow.dataset.index);
@@ -1394,18 +1958,110 @@ function renderRtCorrectionResult(result) {
         <div><strong>Original EIC</strong><canvas data-chart-index="${index}" data-x-key="rt"></canvas></div>
         <div><strong>Corrected EIC</strong><canvas data-chart-index="${index}" data-x-key="corrected_rt"></canvas></div>
       </div>
+      <div class="rt-manual-picker">
+        <label>Manual sample
+          <select data-rt-manual-group="${index}">
+            ${series.map((item, itemIndex) => `<option value="${itemIndex}">${escapeHtml(item.file_name)}</option>`).join("")}
+          </select>
+        </label>
+        <strong>Click the intended peak in the single-sample EIC</strong>
+        <canvas data-rt-manual-canvas="${index}"></canvas>
+        <div class="muted">The click snaps to the strongest smoothed point in a ±7-point neighborhood and updates Selected RT in the review table.</div>
+      </div>
       <div class="muted">${series.map((item, itemIndex) => `${itemIndex + 1}: ${escapeHtml(item.file_name)}`).join(" | ")}</div>
     </article>`).join("");
   const groupedSeries = [...groups.values()];
   requestAnimationFrame(() => {
     $$("#rtCorrectionCharts canvas").forEach((canvas) => {
+      if (canvas.dataset.rtManualCanvas !== undefined) return;
       drawRtCorrectionChart(
         canvas,
         groupedSeries[Number(canvas.dataset.chartIndex)] || [],
         canvas.dataset.xKey,
       );
     });
+    $$('[data-rt-manual-group]').forEach((select) => {
+      const groupIndex = Number(select.dataset.rtManualGroup);
+      const draw = () => drawManualRtSelection(groupedSeries, groupIndex, Number(select.value));
+      select.addEventListener("change", draw);
+      const canvas = $(`[data-rt-manual-canvas="${groupIndex}"]`);
+      canvas.addEventListener("click", (event) => selectManualRtFromChart(event, groupedSeries[groupIndex]?.[Number(select.value)]));
+      draw();
+    });
   });
+}
+
+function rtSelectionRowIndex(series) {
+  if (!series) return -1;
+  const path = String(series.file_path || "").toLowerCase();
+  return (state.rtCorrectionResult?.rows || []).findIndex((row) =>
+    Number(row.standard_id) === Number(series.standard_id)
+    && String(row.file_path || "").toLowerCase() === path
+  );
+}
+
+function drawManualRtSelection(groupedSeries, groupIndex, seriesIndex) {
+  const series = groupedSeries[groupIndex]?.[seriesIndex];
+  const canvas = $(`[data-rt-manual-canvas="${groupIndex}"]`);
+  if (!series || !canvas) return;
+  drawRtCorrectionChart(canvas, [series], "rt");
+  const rowIndex = rtSelectionRowIndex(series);
+  const row = state.rtCorrectionResult?.rows?.[rowIndex];
+  drawSelectedRtMarker(canvas, row);
+}
+
+function drawSelectedRtMarker(canvas, row) {
+  const geometry = canvas._rtChartGeometry;
+  if (!row || !geometry || !Number.isFinite(Number(row.selected_rt))) return;
+  const x = geometry.scaleX(Number(row.selected_rt));
+  geometry.context.save();
+  geometry.context.strokeStyle = "#c44771";
+  geometry.context.setLineDash([5, 4]);
+  geometry.context.lineWidth = 2;
+  geometry.context.beginPath();
+  geometry.context.moveTo(x, geometry.padding.top);
+  geometry.context.lineTo(x, geometry.padding.top + geometry.plotHeight);
+  geometry.context.stroke();
+  geometry.context.restore();
+}
+
+function selectManualRtFromChart(event, series) {
+  const canvas = event.currentTarget;
+  const geometry = canvas._rtChartGeometry;
+  if (!series || !geometry) return;
+  const bounds = canvas.getBoundingClientRect();
+  const chartX = event.clientX - bounds.left;
+  const clickedRt = geometry.xMin
+    + ((chartX - geometry.padding.left) / Math.max(geometry.plotWidth, 1)) * (geometry.xMax - geometry.xMin);
+  const rtValues = series.rt || [];
+  const intensities = series.smoothed_intensity || [];
+  if (!rtValues.length) return;
+  let nearest = 0;
+  for (let index = 1; index < rtValues.length; index += 1) {
+    if (Math.abs(rtValues[index] - clickedRt) < Math.abs(rtValues[nearest] - clickedRt)) nearest = index;
+  }
+  let selected = nearest;
+  const begin = Math.max(0, nearest - 7);
+  const end = Math.min(rtValues.length - 1, nearest + 7);
+  for (let index = begin; index <= end; index += 1) {
+    if (Number(intensities[index] || 0) > Number(intensities[selected] || 0)) selected = index;
+  }
+  const rowIndex = rtSelectionRowIndex(series);
+  if (rowIndex < 0) return;
+  const row = state.rtCorrectionResult.rows[rowIndex];
+  row.selected_rt = Number(rtValues[selected]);
+  row.peak_height = Number(intensities[selected] || 0);
+  row.use = true;
+  const tableRow = $(`#rtCorrectionSelectionRows tr[data-index="${rowIndex}"]`);
+  if (tableRow) {
+    tableRow.querySelector('[data-key="use"]').checked = true;
+    tableRow.querySelector('[data-key="selected_rt"]').value = row.selected_rt;
+    tableRow.querySelector('[data-value="peak_height"]').textContent = row.peak_height.toLocaleString();
+  }
+  $("#rtCorrectionCount").textContent = `${state.rtCorrectionResult.rows.filter((item) => item.use).length} / ${state.rtCorrectionResult.rows.length} anchors enabled`;
+  drawRtCorrectionChart(canvas, [series], "rt");
+  drawSelectedRtMarker(canvas, row);
+  setStatus(`Manual RT selected: ${series.file_name} / ${series.standard_name} = ${row.selected_rt.toFixed(4)} min`);
 }
 
 function drawRtCorrectionChart(canvas, seriesList, xKey) {
@@ -1417,7 +2073,7 @@ function drawRtCorrectionChart(canvas, seriesList, xKey) {
   const context = canvas.getContext("2d");
   context.scale(ratio, ratio);
   context.clearRect(0, 0, width, height);
-  const padding = { left: 52, right: 14, top: 15, bottom: 34 };
+  const padding = { left: 72, right: 16, top: 18, bottom: 48 };
   const xs = seriesList.flatMap((series) => series[xKey] || []);
   const ys = seriesList.flatMap((series) => series.smoothed_intensity || []);
   if (!xs.length || !ys.length) return;
@@ -1441,11 +2097,21 @@ function drawRtCorrectionChart(canvas, seriesList, xKey) {
   context.lineTo(padding.left + plotWidth, padding.top + plotHeight);
   context.stroke();
   context.fillStyle = "#526975";
-  context.font = "11px system-ui";
-  context.fillText(xMin.toFixed(2), padding.left, height - 12);
-  context.fillText(xMax.toFixed(2), padding.left + plotWidth - 28, height - 12);
-  context.fillText(yMax.toExponential(1), 3, padding.top + 5);
-  context.fillText("RT (min)", padding.left + plotWidth / 2 - 20, height - 3);
+  context.font = "14px Arial, sans-serif";
+  context.textAlign = "center";
+  context.fillText(xMin.toFixed(2), padding.left, padding.top + plotHeight + 18);
+  context.fillText(xMax.toFixed(2), padding.left + plotWidth, padding.top + plotHeight + 18);
+  context.textAlign = "right";
+  context.fillText(yMax.toExponential(1), padding.left - 8, padding.top + 5);
+  context.fillText("0", padding.left - 8, padding.top + plotHeight);
+  context.font = "bold 14px Arial, sans-serif";
+  context.textAlign = "center";
+  context.fillText("RT (min)", padding.left + plotWidth / 2, height - 8);
+  context.save();
+  context.translate(15, padding.top + plotHeight / 2);
+  context.rotate(-Math.PI / 2);
+  context.fillText("Intensity", 0, 0);
+  context.restore();
   const colors = ["#007f86", "#d85f2a", "#6e55a5", "#b68a00", "#2879b9", "#c44771"];
   seriesList.forEach((series, index) => {
     const xValues = series[xKey] || [];
@@ -1466,6 +2132,9 @@ function drawRtCorrectionChart(canvas, seriesList, xKey) {
     });
     context.stroke();
   });
+  canvas._rtChartGeometry = {
+    context, width, height, padding, plotWidth, plotHeight, xMin, xMax, scaleX, scaleY,
+  };
 }
 
 async function pollRtCorrectionJob() {
@@ -1537,11 +2206,14 @@ async function pollJob() {
 async function initialize() {
   state.config = await api("/api/config");
   $("#platformPill").textContent =
-    `${navigator.platform} | ${state.config.knowledge_cards.ja} JA / ${state.config.knowledge_cards.en} EN cards`;
+    `v${state.config.app_version} | ${navigator.platform} | ${state.config.knowledge_cards.ja} JA / ${state.config.knowledge_cards.en} EN cards`;
   renderServerNotice();
   $("#templatePath").value = state.config.default_template;
   $("#queriesPath").value = state.config.default_queries;
   $("#consolePath").value = state.config.default_console || "";
+  $("#pathSettingsInfo").textContent = state.config.settings_loaded
+    ? `Loaded saved paths from ${state.config.settings_file}`
+    : `Paths can be saved locally to ${state.config.settings_file}`;
   if (state.config.smoothing_methods?.length) {
     $("#smoothingMethod").innerHTML = state.config.smoothing_methods
       .map((method) => `<option ${method === "LinearWeightedMovingAverage" ? "selected" : ""}>${escapeHtml(method)}</option>`)
@@ -1558,6 +2230,7 @@ async function initialize() {
   renderLbmAnnotator();
   renderMspAnnotators();
   renderTextAnnotators();
+  renderLibraryCatalog();
   renderFiles();
   updateProjectUI();
   applyWorkspaceMode();
@@ -1667,8 +2340,10 @@ $("#pathPickerAddCurrent").addEventListener("click", () => runUiAction(async () 
 $("#pathPickerAddSelected").addEventListener("click", () => runUiAction(addSelectedPathPickerEntries));
 $("#clearFiles").addEventListener("click", () => {
   state.files = [];
+  state.analysisCsvSource = "";
   if (state.outputRootAutomatic) setOutputRootFromFirstFile();
   renderFiles();
+  saveRtWorkspaceState();
   showImportMessages([]);
   refreshQuestion().catch((error) => showImportMessages([error.message || String(error)], "error"));
 });
@@ -1679,6 +2354,33 @@ $("#useDataDirectory").addEventListener("click", () => {
   state.outputRootAutomatic = true;
   setOutputRootFromFirstFile();
 });
+
+$("#savePathSettings").addEventListener("click", () => runUiAction(async () => {
+  const result = await api("/api/settings/paths", {
+    method: "POST",
+    body: JSON.stringify({
+      console_path: $("#consolePath").value.trim(),
+      template_path: $("#templatePath").value.trim(),
+      queries_path: $("#queriesPath").value.trim(),
+    }),
+  });
+  state.config.settings_loaded = true;
+  state.config.settings_file = result.settings_file;
+  $("#pathSettingsInfo").textContent = `Saved paths to ${result.settings_file}`;
+  setStatus("Paths saved for the next launch.");
+}));
+
+$("#loadParameterTemplate").addEventListener("click", () => runUiAction(async () => {
+  const path = $("#templatePath").value.trim();
+  if (!path) throw new Error("Set the Parameter template path before loading it.");
+  const result = await api("/api/templates/load", {
+    method: "POST",
+    body: JSON.stringify({ path, queries_path: $("#queriesPath").value.trim() }),
+  });
+  applyLoadedParameterTemplate(result);
+  const lipidCount = (result.lipid_queries || []).filter((item) => item.selected).length;
+  setStatus(`Loaded parameter template. ${lipidCount} lipid queries selected.`);
+}));
 
 $("#projectType").addEventListener("change", () => {
   maybeSwitchTemplateForProject($("#projectType").value);
@@ -1972,6 +2674,82 @@ $("#previewMzTab").addEventListener("click", () => runUiAction(async () => {
   });
   renderMzTabPreview(result.preview);
 }));
+$("#refreshQaFile").addEventListener("click", () => runUiAction(async () => {
+  const outputRoot = $("#outputRoot").value.trim();
+  if (!outputRoot) throw new Error("Set Output root before searching for the latest QA matrix.");
+  const result = await api("/api/qa/list", {
+    method: "POST",
+    body: JSON.stringify({ path: outputRoot }),
+  });
+  $("#qaFilePath").value = result.default_file || "";
+  setStatus(result.default_file ? `Selected latest QA matrix: ${result.default_file}` : "No *.qa.tsv was found in Output root.");
+}));
+$("#browseQaFile").addEventListener("click", () => runUiAction(async () => {
+  const result = await api("/api/dialog/qa-file", { method: "POST", body: "{}" });
+  if (result.path) {
+    $("#qaFilePath").value = result.path;
+    setStatus(`Selected LC-MS QA matrix: ${result.path}`);
+  }
+}));
+$("#loadQaInternalStandardExample").addEventListener("click", () => {
+  $("#qaInternalStandards").value = [
+    "FA 16:0,[M-H]-,255.2330,2.107,0.01,0.05",
+    "FA 18:0,[M-H]-,283.2643,2.431,0.01,0.05",
+  ].join("\n");
+  setStatus("Loaded the FA 16:0 / FA 18:0 pseudo internal-standard example.");
+});
+$("#generateQaReport").addEventListener("click", () => runUiAction(async () => {
+  const filePath = $("#qaFilePath").value.trim();
+  const runDirectory = $("#outputRoot").value.trim();
+  if (!filePath && !runDirectory) throw new Error("Choose an LC-MS QA matrix or set Output root.");
+  $("#qaReport").hidden = false;
+  $("#qaReport").textContent = "Building LC-MS QA report...";
+  const result = await api("/api/qa/report", {
+    method: "POST",
+    body: JSON.stringify({
+      file_path: filePath,
+      run_directory: runDirectory,
+      internal_standards: parseQaInternalStandards(),
+    }),
+  });
+  $("#qaFilePath").value = result.report.file;
+  renderQaReport(result.report);
+  setStatus("LC-MS QA report generated.");
+}));
+$("#usePublicationOutputRoot").addEventListener("click", () => {
+  $("#publicationRunDirectory").value = $("#outputRoot").value.trim();
+  setStatus("Publication report directory set from Output root.");
+});
+$("#generatePublicationReport").addEventListener("click", () => runUiAction(async () => {
+  const runDirectory = $("#publicationRunDirectory").value.trim() || $("#outputRoot").value.trim();
+  if (!runDirectory) throw new Error("Set an analysis run/output directory.");
+  $("#publicationRunDirectory").value = runDirectory;
+  $("#publicationOutput").hidden = true;
+  $("#publicationSource").textContent = "Generating publication files...";
+  const result = await api("/api/publication/report", {
+    method: "POST",
+    body: JSON.stringify({
+      workflow: workflow(),
+      run_directory: runDirectory,
+      use_saved_run: $("#publicationUseSavedRun").checked,
+      qa_report: state.qaReport,
+      qa_file_path: $("#qaFilePath").value.trim(),
+      internal_standards: parseQaInternalStandards(),
+      qa_criteria: publicationQaCriteria(),
+      additional_library_provenance: parsePublicationLibraryProvenance(),
+    }),
+  });
+  renderPublicationReport(result);
+  setStatus("Publication report generated.");
+}));
+$("#copyMaterialsMethods").addEventListener("click", () => runUiAction(
+  () => copyPublicationText("#materialsMethodsText", "Materials and Methods text")
+));
+$("#copyQaResults").addEventListener("click", () => runUiAction(
+  () => copyPublicationText("#qaResultsText", "QA Results text")
+));
+$("#materialsMethodsText").addEventListener("input", updatePublicationTextDownloads);
+$("#qaResultsText").addEventListener("input", updatePublicationTextDownloads);
 $("#exportWorkflow").addEventListener("click", () => runUiAction(async () => {
   const result = await api("/api/export-workflow", {
     method: "POST",
