@@ -322,6 +322,7 @@ python scripts/msdial-interactive-mcp.py
 Core MCP tools:
 
 - `msdial_interactive_launch`: start the local web app if needed
+- `msdial_interactive_restart`: replace a recognized incompatible local app
 - `msdial_guided_analysis_plan`: inspect input and return the next question
 - `msdial_list_worksets` / `msdial_save_workset`: reuse scientific choices
 - `msdial_start_peak_count_diagnostic`: tune from one representative file
@@ -332,6 +333,8 @@ Core MCP tools:
 - `msdial_interactive_validate_mztab`: validate mzTab-M outputs
 - `msdial_generate_lcms_qa`: build the LC-MS QA report
 - `msdial_generate_publication_report`: create text, Excel, audit, and ZIP files
+- `msdial_complete_guided_analysis`: wait for one job and complete validation,
+  QA, publication, and handoff without browser interaction
 - `msdial_interactive_create_handoff`: create `datamining-handoff.json`
 
 Claude Desktop example:

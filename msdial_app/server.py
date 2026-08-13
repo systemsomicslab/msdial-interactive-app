@@ -869,7 +869,7 @@ class Handler(BaseHTTPRequestHandler):
             )
 
     def log_message(self, format: str, *args: object) -> None:
-        print(f"[http] {self.address_string()} {format % args}")
+        print(f"[http] {self.address_string()} {format % args}", file=sys.stderr)
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))

@@ -31,7 +31,11 @@ Use the full Python path in Claude Desktop's `claude_desktop_config.json`:
 ```
 
 Replace the Python path as needed and restart Claude Desktop. The MCP process
-uses stdio and can launch the web app on `http://127.0.0.1:8765`.
+uses stdio and can launch the app backend on `http://127.0.0.1:8765` without
+opening a browser. If an older app occupies the port,
+`msdial_interactive_status` reports `compatible: false` and
+`msdial_interactive_restart` can replace only a recognized local MS-DIAL
+Interactive process after explicit confirmation.
 
 ## Install the Agent Skill
 
@@ -61,7 +65,9 @@ the same Agent Skills package.
 6. Use official versioned, existing, or no annotation libraries.
 7. Optionally configure LC-MS QA and internal standards.
 8. Prepare the reproducible workflow, show the command, and request confirmation.
-9. Run MS-DIAL, validate and preview mzTab-M, then generate QA and publication files.
+9. Run MS-DIAL and call `msdial_complete_guided_analysis` to wait for the exact
+   job, validate and preview mzTab-M, generate requested QA/publication files,
+   and create the data-mining handoff.
 10. Optionally save the accepted scientific choices as a reusable workset.
 
 Downloads and production runs require a separate explicit confirmation. A
@@ -81,6 +87,7 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 ## Main MCP tools
 
 - `msdial_interactive_launch`
+- `msdial_interactive_restart`
 - `msdial_guided_analysis_plan`
 - `msdial_list_worksets`
 - `msdial_download_official_library`
@@ -93,6 +100,7 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 - `msdial_interactive_preview_mztab`
 - `msdial_generate_lcms_qa`
 - `msdial_generate_publication_report`
+- `msdial_complete_guided_analysis`
 - `msdial_save_workset`
 - `msdial_interactive_create_handoff`
 

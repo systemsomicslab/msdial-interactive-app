@@ -84,6 +84,7 @@ User worksets retain scientific `answers`, including an accepted diagnostic thre
 
 These tools return a preview when `confirmed=false`:
 
+- `msdial_interactive_restart`
 - `msdial_download_official_library`
 - `msdial_start_peak_count_diagnostic`
 - `msdial_start_guided_analysis`

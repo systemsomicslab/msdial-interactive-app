@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
-import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+REQUIRED_AGENT_API_VERSION = "0.2"
+_EMBEDDED_SERVERS: dict[tuple[str, int], tuple[ThreadingHTTPServer, threading.Thread]] = {}
 
 
 try:
@@ -62,9 +64,90 @@ def _request_json(
 def _status_or_error(host: str, port: int) -> dict[str, Any]:
     try:
         status = _request_json("GET", "/api/agent/status", host=host, port=port, timeout=2)
-        return {"running": True, "url": _base_url(host, port), "status": status}
+        detected = str(status.get("agent_api_version", "0"))
+        return {
+            "running": True,
+            "compatible": _version_tuple(detected) >= _version_tuple(REQUIRED_AGENT_API_VERSION),
+            "required_agent_api_version": REQUIRED_AGENT_API_VERSION,
+            "detected_agent_api_version": detected,
+            "url": _base_url(host, port),
+            "status": status,
+        }
     except RuntimeError as error:
-        return {"running": False, "url": _base_url(host, port), "error": str(error)}
+        return {
+            "running": False,
+            "compatible": False,
+            "required_agent_api_version": REQUIRED_AGENT_API_VERSION,
+            "url": _base_url(host, port),
+            "error": str(error),
+        }
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    result = []
+    for part in str(value).split("."):
+        digits = "".join(character for character in part if character.isdigit())
+        result.append(int(digits or 0))
+    return tuple((result + [0, 0])[:3])
+
+
+def _launch_local_app(host: str, port: int, open_browser: bool) -> dict[str, Any]:
+    from .server import Handler
+
+    key = (host, int(port))
+    existing = _EMBEDDED_SERVERS.get(key)
+    if not existing or not existing[1].is_alive():
+        server = ThreadingHTTPServer(key, Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        _EMBEDDED_SERVERS[key] = (server, thread)
+    if open_browser:
+        webbrowser.open(_base_url(host, port))
+    deadline = time.time() + 15
+    last = _status_or_error(host, port)
+    while time.time() < deadline:
+        time.sleep(0.5)
+        last = _status_or_error(host, port)
+        if last["running"]:
+            break
+    return last
+
+
+def _local_listener(host: str, port: int) -> dict[str, Any]:
+    try:
+        import psutil
+    except ImportError as error:
+        raise RuntimeError(
+            "Restart support requires psutil. Reinstall with: python -m pip install -e \".[mcp]\""
+        ) from error
+    listeners = []
+    for connection in psutil.net_connections(kind="inet"):
+        if connection.status != psutil.CONN_LISTEN or not connection.laddr:
+            continue
+        if int(connection.laddr.port) != int(port) or not connection.pid:
+            continue
+        address = str(connection.laddr.ip)
+        if host in {"127.0.0.1", "localhost"} and address not in {"127.0.0.1", "::1"}:
+            continue
+        listeners.append(connection.pid)
+    pids = sorted(set(listeners))
+    if len(pids) != 1:
+        raise RuntimeError(f"Expected one local listener on port {port}; found {len(pids)}.")
+    process = psutil.Process(pids[0])
+    command = process.cmdline()
+    description = " ".join([process.name(), process.exe(), *command]).casefold()
+    markers = ("ms-dial-interactive", "msdial-interactive", "msdial_interactive", "app.py")
+    if not any(marker in description for marker in markers):
+        raise RuntimeError(
+            f"Port {port} is owned by an unrelated process; restart was refused: {process.name()}"
+        )
+    return {
+        "pid": process.pid,
+        "name": process.name(),
+        "executable": process.exe(),
+        "command": command,
+        "process": process,
+    }
 
 
 @mcp.tool()
@@ -77,34 +160,62 @@ def msdial_interactive_status(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT
 def msdial_interactive_launch(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
-    open_browser: bool = True,
+    open_browser: bool = False,
 ) -> dict[str, Any]:
-    """Launch the local MS-DIAL Interactive web app if it is not already running."""
+    """Launch the local backend without opening the browser unless explicitly requested."""
     current = _status_or_error(host, port)
     if current["running"]:
         if open_browser:
             webbrowser.open(current["url"])
         return {"launched": False, **current}
+    return {"launched": True, **_launch_local_app(host, port, open_browser)}
 
-    command = [sys.executable, str(ROOT / "app.py"), "--host", host, "--port", str(port)]
-    if not open_browser:
-        command.append("--no-browser")
-    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    subprocess.Popen(
-        command,
-        cwd=str(ROOT),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=creationflags,
-    )
-    deadline = time.time() + 10
-    last = current
-    while time.time() < deadline:
-        time.sleep(0.5)
-        last = _status_or_error(host, port)
-        if last["running"]:
-            return {"launched": True, **last}
-    return {"launched": True, **last}
+
+@mcp.tool()
+def msdial_interactive_restart(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    confirmed: bool = False,
+    open_browser: bool = False,
+) -> dict[str, Any]:
+    """Replace a recognized local MS-DIAL Interactive process with the current source version."""
+    current = _status_or_error(host, port)
+    if not current["running"]:
+        return {"restarted": False, "launched": True, **_launch_local_app(host, port, open_browser)}
+    listener = _local_listener(host, port)
+    process_info = {key: value for key, value in listener.items() if key != "process"}
+    if not confirmed:
+        return {
+            "restarted": False,
+            "confirmation_required": True,
+            "current": current,
+            "process": process_info,
+            "message": "Ask the user before stopping this recognized local MS-DIAL Interactive process.",
+        }
+    process = listener["process"]
+    if process.pid == os.getpid():
+        embedded = _EMBEDDED_SERVERS.pop((host, int(port)), None)
+        if embedded:
+            embedded[0].shutdown()
+            embedded[0].server_close()
+            embedded[1].join(timeout=5)
+        else:
+            return {"restarted": False, "already_current": True, **current}
+    else:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except Exception as error:
+            raise RuntimeError(
+                f"MS-DIAL Interactive process {process.pid} did not stop cleanly."
+            ) from error
+    launched = _launch_local_app(host, port, open_browser)
+    if not launched.get("compatible"):
+        raise RuntimeError(
+            "The restarted app is still incompatible with this MCP server: "
+            + str(launched)
+        )
+    return {"restarted": True, "previous_process": process_info, **launched}
 
 
 @mcp.tool()
@@ -425,6 +536,103 @@ def msdial_generate_publication_report(
         },
         timeout=180,
     )
+
+
+@mcp.tool()
+def msdial_complete_guided_analysis(
+    job_id: str,
+    run_qa: bool = True,
+    internal_standards: list[dict[str, Any]] | None = None,
+    generate_materials_methods: bool = True,
+    qa_criteria: dict[str, Any] | None = None,
+    timeout_seconds: int = 86400,
+    poll_seconds: int = 10,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Wait for one run, then validate/preview mzTab-M and generate requested QA/publication artifacts."""
+    deadline = time.time() + max(1, timeout_seconds)
+    while True:
+        job = _request_json("GET", f"/api/jobs/{job_id}", host=host, port=port, timeout=10)
+        if job.get("status") in {"completed", "failed"}:
+            break
+        if time.time() >= deadline:
+            return {"finished": False, "job": job}
+        time.sleep(max(1, poll_seconds))
+    if job.get("status") != "completed":
+        return {"finished": True, "success": False, "job": job}
+
+    preparation = job.get("preparation") or {}
+    run_directory = str(preparation.get("run_directory", ""))
+    result: dict[str, Any] = {
+        "finished": True,
+        "success": True,
+        "job": job,
+        "run_directory": run_directory,
+    }
+    result["mztab_validation"] = _request_json(
+        "POST",
+        "/api/mztab/validate",
+        host=host,
+        port=port,
+        body={"run_directory": run_directory},
+        timeout=120,
+    ).get("validation")
+    result["mztab_preview"] = _request_json(
+        "POST",
+        "/api/mztab/preview",
+        host=host,
+        port=port,
+        body={"run_directory": run_directory},
+        timeout=120,
+    ).get("preview")
+
+    qa_report = None
+    if run_qa and str(preparation.get("analysis_type", "lcms")).casefold() == "lcms":
+        try:
+            qa_report = _request_json(
+                "POST",
+                "/api/qa/report",
+                host=host,
+                port=port,
+                body={
+                    "run_directory": run_directory,
+                    "internal_standards": internal_standards or [],
+                },
+                timeout=180,
+            ).get("report")
+            result["quality_assurance"] = qa_report
+        except RuntimeError as error:
+            result["quality_assurance_error"] = str(error)
+
+    if generate_materials_methods:
+        try:
+            result["publication"] = _request_json(
+                "POST",
+                "/api/publication/report",
+                host=host,
+                port=port,
+                body={
+                    "run_directory": run_directory,
+                    "use_saved_run": True,
+                    "qa_report": qa_report,
+                    "internal_standards": internal_standards or [],
+                    "qa_criteria": qa_criteria or {},
+                },
+                timeout=300,
+            )
+        except RuntimeError as error:
+            result["publication_error"] = str(error)
+
+    result["handoff"] = _request_json(
+        "POST",
+        "/api/agent/handoff",
+        host=host,
+        port=port,
+        body={"job_id": job_id, "run_directory": run_directory},
+        timeout=120,
+    ).get("handoff")
+    return result
 
 
 def main() -> None:

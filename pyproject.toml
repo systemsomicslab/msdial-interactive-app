@@ -6,7 +6,7 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-mcp = ["mcp[cli]>=1.28,<3"]
+mcp = ["mcp[cli]>=1.28,<3", "psutil>=6,<8"]
 desktop = ["pyinstaller>=6.10,<7"]
 
 [project.scripts]

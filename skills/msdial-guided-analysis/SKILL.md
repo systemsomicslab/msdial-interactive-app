@@ -11,8 +11,11 @@ Use the `msdial-interactive` MCP tools as the execution layer. Keep raw data on 
 
 1. Call `msdial_interactive_status`.
 2. Call `msdial_interactive_launch` when the local app is not running.
-3. Call `msdial_guided_analysis_plan` with the user's local input path and an empty `answers` object, or with a named `workset_id`.
-4. Report the recognized file count, formats, rejected paths, and warnings before discussing parameters.
+3. When `compatible` is false, call `msdial_interactive_restart` with `confirmed=false`, explain the detected and required API versions and recognized process, obtain confirmation, then call it with `confirmed=true`.
+4. Call `msdial_guided_analysis_plan` with the user's local input path and an empty `answers` object, or with a named `workset_id`.
+5. Report the recognized file count, formats, rejected paths, and warnings before discussing parameters.
+
+Keep `open_browser=false` unless the user asks to inspect or edit the web UI. The normal guided path is conversation plus MCP only; do not tell the user to click through the UI.
 
 Do not infer GC-MS versus LC-MS, ion mode, or target omics from a filename alone. Ask when the user has not explicitly supplied the value. Explain that guided execution currently supports LC-MS and GC-MS; direct other project types to the web UI without pretending they are supported.
 
@@ -73,7 +76,9 @@ Never silently overwrite the scientific meaning of an existing output folder. If
 
 ## Complete The Workflow
 
-After a successful run:
+After starting a production run, normally call `msdial_complete_guided_analysis` with the accepted QA and publication choices. It waits for that exact job and performs mzTab-M validation/preview, requested LC-MS QA, publication generation, and handoff without browser interaction.
+
+If individual control is needed after a successful run:
 
 1. Call `msdial_interactive_validate_mztab` and report pass, warning, and failure counts.
 2. Call `msdial_interactive_preview_mztab` for a compact content sanity check.
