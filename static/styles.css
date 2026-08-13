@@ -127,6 +127,8 @@ label .inline-check input { width: auto; }
 .slider-grid input[type="range"] { grid-column: 1 / -1; width: 100%; }
 .slider-grid .threshold-number { width: 90px; color: var(--teal-dark); font-weight: 700; }
 .download-link { display: inline-block; margin-top: 8px; font-weight: 700; }
+.publication-text { width: 100%; min-height: 180px; font-family: Arial, sans-serif; font-size: 15px; line-height: 1.55; }
+.publication-criteria { margin: 16px 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
 .mztab-file-actions { margin: 8px 0; flex-wrap: wrap; }
 .mztab-counts { margin: 10px 0 14px; }
 .mztab-preview-section { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }

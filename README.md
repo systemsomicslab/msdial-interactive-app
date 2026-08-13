@@ -113,6 +113,56 @@ Catalog records:
 - [GC-MS Kovats RI MSP](https://zenodo.org/records/21910638)
 - [GC-MS Fiehn RI MSP](https://zenodo.org/records/21910646)
 
+## Publication reporting
+
+The **7. Publication report** workspace generates an English Materials and
+Methods draft, a separate QA Results draft, an Excel supplementary workbook, a
+long-format supplementary TSV, and a machine-readable JSON audit file. The
+complete reporting bundle contains all five files. The two manuscript drafts
+remain editable in the browser and can be copied or downloaded after editing.
+
+The Excel workbook is the primary human-readable supplementary output:
+
+- **Data** reproduces the MS-DIAL analysis-file CSV as a sample-by-field matrix.
+- **Guided setup** lists processing settings as sectioned Field/Value rows.
+- **Annotation** groups MSP, text, and LBM annotators and presents selected
+  adducts, lipid queries, and library provenance as compact tables.
+- **Quality assurance** records observed metrics and prespecified criteria.
+
+The long-format TSV remains available as an audit-friendly machine-readable
+companion.
+
+When `workflow-settings.json` exists in the selected run/output directory, the
+report uses those saved run settings instead of the current UI. New runs record
+both the MS-DIAL Console version and MS-DIAL Interactive version in
+`workflow-settings.json` and `run-manifest.json`. A version missing from an old
+run is reported as `not recorded`; the current application version is not
+silently assigned to historical processing.
+
+If no QA matrix is selected in the current session, the report automatically
+uses the newest `*.qa.tsv` in the run directory or one of its immediate QA
+output subdirectories. The selected matrix is shown in the Publication
+workspace; vendor RAW directory contents are not recursively searched.
+
+Supplementary Table S1 includes:
+
+- analysis-file metadata from **1. Data**
+- workflow and processing settings from **2. Guided setup**
+- annotation rows, selected adducts/lipid queries, and library provenance from **3. Annotation**
+- software versions and LC-MS QA metrics, criteria, and pass/review outcomes
+
+The default QA reporting criteria are visible and editable before generation.
+They are transparent report defaults, not universal acceptance criteria. The
+Methods draft describes how QA was assessed and how many evaluable criteria
+were met; the separate Results draft reports observed values and identifies
+criteria requiring review.
+
+Catalog libraries carry a Zenodo DOI, record URL, checksum, and license. For a
+user-supplied library, the Publication workspace requests a version and DOI or
+repository URL. Missing persistent identifiers produce a warning. Local
+absolute paths remain in the supplementary TSV for auditability and must be
+reviewed before public release.
+
 ## Common peak picking
 
 Peak detection includes the MS-DIAL smoothing method used by all executable

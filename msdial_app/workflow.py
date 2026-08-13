@@ -13,6 +13,8 @@ import zipfile
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from . import __version__
+
 
 SUPPORTED_SUFFIXES = {
     ".abf",
@@ -922,6 +924,8 @@ def prepare_run(
     csv_path = run_directory / "analysis_files.csv"
     _write_analysis_csv(csv_path, files, effective_files)
     method_state = dict(state)
+    method_state["msdial_console_version"] = console_version(state["console_path"]) or "not recorded"
+    method_state["msdial_interactive_version"] = __version__
     ri_dictionary = _prepare_gcms_ri_dictionary(
         run_directory,
         method_state,
@@ -949,6 +953,8 @@ def prepare_run(
         "created_at": dt.datetime.now().astimezone().isoformat(),
         "platform": platform.platform(),
         "analysis_type": project_type,
+        "msdial_console_version": method_state["msdial_console_version"],
+        "msdial_interactive_version": method_state["msdial_interactive_version"],
         "project_file_requested": project_file_requested,
         "stage_inputs": False,
         "input_csv": str(csv_path),
@@ -2087,6 +2093,21 @@ def console_version(console_path: str) -> str:
     command = ["dotnet", str(path)] if path.suffix.lower() == ".dll" else [str(path)]
     try:
         result = subprocess.run(
+            command + ["--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    text = (result.stdout + result.stderr).strip()
+    match = re.search(r"(?:^|\s)(\d+\.\d+(?:\.\d+)+)(?:\s|$)", text)
+    if match:
+        return match.group(1)
+    try:
+        fallback = subprocess.run(
             command,
             capture_output=True,
             text=True,
@@ -2096,5 +2117,9 @@ def console_version(console_path: str) -> str:
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
-    match = re.search(r"Version\s+([0-9.]+)", result.stdout + result.stderr, re.I)
+    match = re.search(
+        r"(?:Version|Application)\s+([0-9.]+)",
+        fallback.stdout + fallback.stderr,
+        re.I,
+    )
     return match.group(1) if match else ""

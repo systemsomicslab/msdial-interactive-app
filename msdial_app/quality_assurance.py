@@ -15,13 +15,26 @@ PCA_SAMPLE_LIMIT = 500
 RESERVOIR_LIMIT = 5000
 
 
-def find_qa_files(path: str | Path, limit: int = 200) -> list[Path]:
+def find_qa_files(
+    path: str | Path, limit: int = 200, *, recursive: bool = False
+) -> list[Path]:
     root = Path(path).expanduser()
     if root.is_file():
         return [root.resolve()] if root.name.lower().endswith(QA_SUFFIX) else []
     if not root.is_dir():
         return []
-    files = [item.resolve() for item in root.glob(f"*{QA_SUFFIX}") if item.is_file()]
+    patterns = [f"*{QA_SUFFIX}"]
+    if recursive:
+        # QA exports are written either in the run root or one generated QA
+        # directory below it. Avoid traversing vendor RAW directory contents.
+        patterns.append(f"*/*{QA_SUFFIX}")
+    files = {
+        item.resolve()
+        for pattern in patterns
+        for item in root.glob(pattern)
+        if item.is_file()
+    }
+    files = list(files)
     files.sort(key=lambda item: item.stat().st_mtime, reverse=True)
     return files[:limit]
 

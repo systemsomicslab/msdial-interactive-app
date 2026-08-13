@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,24 @@ from msdial_app.quality_assurance import build_lcms_qa_report, find_qa_files
 
 
 class QualityAssuranceTests(unittest.TestCase):
+    def test_find_qa_files_can_find_latest_nested_run_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            older = root / "qa_older" / "alignment.qa.tsv"
+            newer = root / "qa_newer" / "alignment.qa.tsv"
+            older.parent.mkdir()
+            newer.parent.mkdir()
+            older.write_text("ID\n", encoding="utf-8")
+            newer.write_text("ID\n", encoding="utf-8")
+            os.utime(older, (1, 1))
+            os.utime(newer, (2, 2))
+
+            self.assertEqual([], find_qa_files(root))
+            self.assertEqual(
+                [newer.resolve(), older.resolve()],
+                find_qa_files(root, recursive=True),
+            )
+
     def test_lcms_qa_report_summarizes_metadata_pca_and_internal_standard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
