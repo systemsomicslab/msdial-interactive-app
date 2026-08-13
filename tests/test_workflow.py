@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import zipfile
 import importlib.util
+import json
 import os
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from msdial_app.workflow import (
     detect_raw_format,
     expand_paths,
     expand_paths_report,
+    load_parameter_template,
     parse_mdpeak,
     parse_mdscan,
     parse_rt_correction_result,
@@ -31,6 +33,103 @@ from msdial_app.workflow import (
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_parameter_template_loads_guided_annotation_and_lipid_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queries = root / "LbmQueries.txt"
+            queries.write_text(
+                "Class\tAdduct\tIon mode\tDefault\n"
+                "PC\t[M+H]+\tPositive\tFALSE\n"
+                "PE\t[M-H]-\tNegative\tFALSE\n",
+                encoding="ascii",
+            )
+            msp = root / "library.msp"
+            lbm = root / "library.lbm2"
+            template = root / "method.txt"
+            template.write_text(
+                "Ion mode: Positive\n"
+                "Target omics: Lipidomics\n"
+                "Machine category: LCMS\n"
+                "Msp file path: library.msp\n"
+                "Lbm file path: library.lbm2\n"
+                "Minimum peak height: 1234\n"
+                "Smoothing method: SavitzkyGolayFilter\n"
+                "Weighted dot product cutoff for MSP-based annotation: 0.72\n"
+                "adduct list: [M+H]+,[M+Na]+\n"
+                "Searched lipid class: PC [M+H]+\n",
+                encoding="ascii",
+            )
+
+            result = load_parameter_template(template, queries)
+
+            self.assertEqual("lcms", result["workflow"]["project_type"])
+            self.assertEqual(1234, result["workflow"]["minimum_peak_height"])
+            self.assertEqual("SavitzkyGolayFilter", result["workflow"]["smoothing_method"])
+            self.assertEqual(str(msp.resolve()), result["msp_annotators"][0]["msp_file_path"])
+            self.assertEqual(str(lbm.resolve()), result["lbm_annotator"]["lbm_file_path"])
+            self.assertEqual(0.72, result["msp_annotators"][0]["weighted_dot_product_cutoff"])
+            self.assertEqual(["[M+H]+", "[M+Na]+"], result["selected_adducts"])
+            selected = [
+                f"{item['lipid_class']} {item['adduct']}"
+                for item in result["lipid_queries"]
+                if item["selected"]
+            ]
+            self.assertEqual(["PC [M+H]+"], selected)
+
+    def test_lipidomics_template_without_query_list_selects_all_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queries = root / "LbmQueries.txt"
+            queries.write_text(
+                "Class\tAdduct\tIon mode\tDefault\n"
+                "PC\t[M+H]+\tPositive\tFALSE\n"
+                "PE\t[M-H]-\tNegative\tFALSE\n",
+                encoding="ascii",
+            )
+            template = root / "method.txt"
+            template.write_text("Target omics: Lipidomics\n", encoding="ascii")
+
+            result = load_parameter_template(template, queries)
+
+            self.assertTrue(all(item["selected"] for item in result["lipid_queries"]))
+
+    def test_parameter_template_loads_multiple_annotator_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first.msp"
+            second = root / "second.msp"
+            text_db = root / "standards.txt"
+            for path in (first, second, text_db):
+                path.write_text("", encoding="ascii")
+            msp_settings = root / "msp_annotator_settings.tsv"
+            msp_settings.write_text(
+                "annotator_id\tmsp_file_path\tpriority\trt_tolerance\tminimum_spectrum_match\tuse_retention_information_for_scoring\tuse_retention_information_for_filtering\n"
+                f"confirmed\t{first.name}\t2\t0.05\t5\tTrue\tTrue\n"
+                f"predicted\t{second.name}\t1\t1.0\t3\tTrue\tFalse\n",
+                encoding="ascii",
+            )
+            text_settings = root / "text_annotator_settings.tsv"
+            text_settings.write_text(
+                "annotator_id\ttext_db_file_path\tpriority\trt_tolerance\tms1_tolerance\ttotal_score_cutoff\tuse_retention_information_for_scoring\tuse_retention_information_for_filtering\n"
+                f"istd\t{text_db.name}\t3\t0.1\t0.005\t0.7\tTrue\tTrue\n",
+                encoding="ascii",
+            )
+            template = root / "method.txt"
+            template.write_text(
+                f"MSP annotator settings file path: {msp_settings.name}\n"
+                f"Text annotator settings file path: {text_settings.name}\n",
+                encoding="ascii",
+            )
+
+            result = load_parameter_template(template)
+
+            self.assertEqual(["confirmed", "predicted"], [row["annotator_id"] for row in result["msp_annotators"]])
+            self.assertEqual(str(first.resolve()), result["msp_annotators"][0]["msp_file_path"])
+            self.assertEqual(5, result["msp_annotators"][0]["minimum_spectrum_match"])
+            self.assertTrue(result["msp_annotators"][0]["use_rt_filtering"])
+            self.assertEqual("istd", result["text_annotators"][0]["annotator_id"])
+            self.assertEqual(str(text_db.resolve()), result["text_annotators"][0]["text_db_file_path"])
+
     def test_analysis_metadata_csv_import_preserves_per_file_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -277,6 +376,16 @@ class WorkflowTests(unittest.TestCase):
                         "ion_mode": "Negative",
                     }
                 ],
+                "library_provenance": [
+                    {
+                        "record_id": "21904324",
+                        "record_url": "https://zenodo.org/records/21904324",
+                        "filename": "MSDIAL-LipidDB-VS72-FiehnOad.lbm2",
+                        "md5": "c54c577ec40d2e8fd6d4365daf4a8157",
+                        "license": "CC BY 4.0",
+                        "local_path": str(lbm),
+                    }
+                ],
                 "stage_inputs": True,
             }
             result = prepare_run(state)
@@ -323,6 +432,11 @@ class WorkflowTests(unittest.TestCase):
                 "vim method.txt",
                 Path(result["reproduce_readme"]).read_text(encoding="utf-8"),
             )
+            settings = json.loads(
+                Path(result["settings_file"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual("21904324", settings["library_provenance"][0]["record_id"])
+            self.assertEqual("CC BY 4.0", settings["library_provenance"][0]["license"])
 
     def test_prepare_run_writes_multi_msp_annotator_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

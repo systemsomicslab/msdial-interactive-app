@@ -1,0 +1,35 @@
+name: Build native desktop packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: msdial-interactive-windows
+          - os: macos-latest
+            artifact: msdial-interactive-macos
+          - os: ubuntu-latest
+            artifact: msdial-interactive-linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install desktop build dependency
+        run: python -m pip install ".[desktop]"
+      - name: Build native package
+        run: python scripts/build-native.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release-artifacts/*
+          if-no-files-found: error

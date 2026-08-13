@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -18,6 +19,7 @@ from typing import Any
 
 from .agent_bridge import create_datamining_handoff, summarize_jobs
 from .knowledge import KnowledgeBase, next_parameter_question
+from .library_catalog import catalog_status, download_library, library_directory
 from .literature import recommend_from_literature
 from .mztab_validation import list_mztab_outputs, validate_mztab_outputs
 from .mztab_preview import preview_mztab_outputs
@@ -28,6 +30,7 @@ from .workflow import (
     expand_paths_report,
     find_mdpeak,
     find_mdscan,
+    load_parameter_template,
     detect_raw_format,
     parse_method,
     parse_mdpeak,
@@ -46,9 +49,10 @@ from .workflow import (
     is_supported,
     validate_workflow,
 )
+from .user_settings import load_user_settings, save_path_settings, settings_path
 
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 STATIC = ROOT / "static"
 RESOURCES = ROOT / "resources"
 KNOWLEDGE = ROOT / "knowledge"
@@ -109,6 +113,37 @@ def _default_console_path() -> str:
         ROOT / "MSDIALCUI.dll",
     ]
     return next((str(path.resolve()) for path in candidates if path and path.is_file()), "")
+
+
+def _application_config() -> dict[str, Any]:
+    saved = load_user_settings()
+    default_queries = str(saved.get("queries_path", "")).strip() or str(
+        RESOURCES / "LbmQueries.txt"
+    )
+    default_template = str(saved.get("template_path", "")).strip() or str(
+        RESOURCES / "msdial_console_param4lipidomics.txt"
+    )
+    default_console = str(saved.get("console_path", "")).strip() or _default_console_path()
+    lipid_queries = read_lipid_queries(default_queries)
+    try:
+        loaded = load_parameter_template(default_template, default_queries)
+        if loaded["workflow"].get("target_omics", "").casefold() == "lipidomics":
+            for item in lipid_queries:
+                item["selected"] = True
+    except (OSError, ValueError):
+        for item in lipid_queries:
+            item["selected"] = True
+    return {
+        "default_console": default_console,
+        "default_queries": default_queries,
+        "default_template": default_template,
+        "default_gcms_template": str(RESOURCES / "gcms_console_param_kovats.txt"),
+        "settings_file": str(settings_path()),
+        "settings_loaded": bool(saved),
+        "library_directory": str(library_directory()),
+        "library_catalog": catalog_status(),
+        "lipid_queries": lipid_queries,
+    }
 
 
 def _diagnose_console_failure(logs: list[str], fallback: str) -> str:
@@ -224,6 +259,7 @@ class Handler(BaseHTTPRequestHandler):
                 "127."
             )
             lan_urls = [f"http://{address}:{bind_port}" for address in _local_ipv4_addresses()]
+            app_config = _application_config()
             self._json(
                 {
                     "platform": os.name,
@@ -235,10 +271,7 @@ class Handler(BaseHTTPRequestHandler):
                         "shared_server": shared_server,
                         "lan_urls": lan_urls,
                     },
-                    "default_console": _default_console_path(),
-                    "default_queries": str(RESOURCES / "LbmQueries.txt"),
-                    "default_template": str(RESOURCES / "msdial_console_param4lipidomics.txt"),
-                    "default_gcms_template": str(RESOURCES / "gcms_console_param_kovats.txt"),
+                    **app_config,
                     "smoothing_methods": [
                         "SimpleMovingAverage",
                         "LinearWeightedMovingAverage",
@@ -249,7 +282,6 @@ class Handler(BaseHTTPRequestHandler):
                         "TimeBasedLinearWeightedMovingAverage",
                     ],
                     "knowledge_cards": {"ja": KB.count("ja"), "en": KB.count("en")},
-                    "lipid_queries": read_lipid_queries(RESOURCES / "LbmQueries.txt"),
                     "adducts": {
                         "Positive": read_adducts(
                             RESOURCES / "AdductIonResource_Positive.txt",
@@ -325,6 +357,44 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_json()
             if parsed.path == "/api/files/expand":
                 self._json(expand_paths_report(body.get("paths", [])))
+            elif parsed.path == "/api/settings/paths":
+                saved = save_path_settings(body)
+                self._json(
+                    {
+                        "settings": saved,
+                        "settings_file": str(settings_path()),
+                    }
+                )
+            elif parsed.path == "/api/templates/load":
+                self._json(
+                    load_parameter_template(
+                        body.get("path", ""),
+                        body.get("queries_path", "") or None,
+                    )
+                )
+            elif parsed.path == "/api/libraries/download":
+                catalog_id = str(body.get("catalog_id", "")).strip()
+                if not catalog_id:
+                    raise ValueError("Select a library to download.")
+                job_id = uuid.uuid4().hex
+                with JOBS_LOCK:
+                    JOBS[job_id] = {
+                        "id": job_id,
+                        "status": "queued",
+                        "kind": "library_download",
+                        "catalog_id": catalog_id,
+                        "progress": 0,
+                        "received": 0,
+                        "total": 0,
+                        "logs": [],
+                        "result": None,
+                    }
+                threading.Thread(
+                    target=_run_library_download_job,
+                    args=(job_id, catalog_id),
+                    daemon=True,
+                ).start()
+                self._json({"job_id": job_id})
             elif parsed.path == "/api/files/import-csv":
                 self._json(read_analysis_csv(body.get("path", "")))
             elif parsed.path == "/api/files/browse":
@@ -621,6 +691,33 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
+
+
+def _run_library_download_job(job_id: str, catalog_id: str) -> None:
+    with JOBS_LOCK:
+        JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["logs"].append("Downloading the selected Zenodo library.")
+
+    def progress(received: int, total: int) -> None:
+        with JOBS_LOCK:
+            JOBS[job_id]["received"] = received
+            JOBS[job_id]["total"] = total
+            JOBS[job_id]["progress"] = round(received / total * 100, 1) if total else 0
+
+    try:
+        result = download_library(catalog_id, progress)
+        with JOBS_LOCK:
+            JOBS[job_id]["result"] = result
+            JOBS[job_id]["progress"] = 100
+            JOBS[job_id]["status"] = "completed"
+            JOBS[job_id]["logs"].append(
+                "Library ready: " + str(result["local_path"])
+            )
+    except Exception as error:
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "failed"
+            JOBS[job_id]["error"] = str(error)
+            JOBS[job_id]["logs"].append(traceback.format_exc())
 
 
 def _run_job(job_id: str, preparation: dict[str, Any]) -> None:

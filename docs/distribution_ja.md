@@ -1,5 +1,19 @@
 # MS-DIAL Interactive 配布メモ
 
+## 初心者向けの推奨配布物
+
+GitHub Actionsの `Build native desktop packages` を実行し、利用OSに対応する
+artifactを配布します。Windowsは `MS-DIAL-Interactive.exe`、macOSは
+`MS-DIAL-Interactive.app`、Linuxは `MS-DIAL-Interactive` 実行ファイルを
+開くだけで起動でき、Pythonの事前インストールは不要です。MS-DIAL Consoleは
+OSごとに別途用意し、初回のみPaths画面で指定します。
+
+Windows artifact内のZIP、またはmacOS/Linux artifact内のtar.gzを展開して
+使用します。macOS/Linuxをtar.gzにしているのは、実行権限を保持するためです。
+
+ソースZIPを配布する場合も、ルート直下の `Start MS-DIAL Interactive.cmd`
+（Windows）または `Start MS-DIAL Interactive.command`（macOS）から起動できます。
+
 このアプリの標準配布形態は、各ユーザーが自分のPCで起動する
 ローカルWebアプリです。
 

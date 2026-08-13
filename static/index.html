@@ -124,13 +124,22 @@
         </p>
         <div class="path-grid">
           <label>MS-DIAL Console<input id="consolePath" placeholder="/opt/msdial/MSDIALCUI or C:\...\MSDIALCUI.exe"></label>
-          <label>Parameter template<input id="templatePath"></label>
+          <label>Parameter template
+            <div class="output-path-row">
+              <input id="templatePath">
+              <button id="loadParameterTemplate" type="button" class="secondary">Load template</button>
+            </div>
+          </label>
           <label>Output root
             <div class="output-path-row">
               <input id="outputRoot" placeholder="Defaults to the first data file directory">
               <button id="useDataDirectory" type="button" class="secondary">Use first data directory</button>
             </div>
           </label>
+        </div>
+        <div class="button-row path-actions">
+          <button id="savePathSettings" type="button" class="secondary">Save paths for next launch</button>
+          <span id="pathSettingsInfo" class="muted"></span>
         </div>
         <p class="muted">MS-DIAL reads raw data from their original paths. Only result and project files are written below Output root.</p>
       </div>
@@ -350,6 +359,12 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
     </section>
 
     <section id="tab-annotation" class="tab">
+      <div id="libraryCatalogPanel" class="panel">
+        <h2>Official MS-DIAL library downloads</h2>
+        <p class="muted">Download only the library needed for this workflow. Files are verified with the Zenodo MD5 checksum and retained in the per-user library directory, outside the replaceable application package.</p>
+        <div id="libraryCatalogDirectory" class="format-summary"></div>
+        <div id="libraryCatalogList" class="library-catalog"></div>
+      </div>
       <div id="annotationLibraries" class="panel">
         <h2>Annotation libraries</h2>
         <div id="lbmAnnotatorPanel" class="nested-panel">

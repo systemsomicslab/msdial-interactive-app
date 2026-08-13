@@ -78,6 +78,41 @@ negative adduct resource tables.
 For non-lipidomics workflows, Solvent is shown disabled because it does not
 affect Metabolomics processing.
 
+## Saved paths and parameter-template loading
+
+The Paths panel can persist the MS-DIAL Console, parameter template, and
+`LbmQueries.txt` paths for the next launch. This is a JSON file rather than an
+INI file. The exact path is shown in the UI and follows the operating system:
+
+- Windows: `%LOCALAPPDATA%\MSDIALInteractive\settings.json`
+- macOS: `~/Library/Application Support/MSDIALInteractive/settings.json`
+- Linux: `${XDG_CONFIG_HOME:-~/.config}/msdial-interactive/settings.json`
+
+**Load template** parses the selected MS-DIAL `Key: Value` parameter file and
+applies supported Guided setup and Annotation values. For Lipidomics,
+`Searched lipid class` controls the checked lipid queries. When a Lipidomics
+template has no explicit list, all currently available `LbmQueries.txt` rows
+are selected.
+
+## Official library downloads
+
+The Annotation screen provides an on-demand catalog for the official
+MS-DIAL libraries. Downloads are not started automatically because the LBM
+library alone is about 785 MB. The app downloads only the selected library,
+checks its Zenodo MD5 digest, and keeps it in a per-user data directory outside
+the replaceable app package. A downloaded library can then be applied directly
+to the MSP or LBM annotation row. Zenodo record URL, filename, checksum,
+license, and local path are retained in `workflow-settings.json` as library
+provenance for future Materials and Methods generation.
+
+Catalog records:
+
+- [Metabolomics positive MSP](https://zenodo.org/records/21901200)
+- [Metabolomics negative MSP](https://zenodo.org/records/21904103)
+- [Lipidomics LBM](https://zenodo.org/records/21904324)
+- [GC-MS Kovats RI MSP](https://zenodo.org/records/21910638)
+- [GC-MS Fiehn RI MSP](https://zenodo.org/records/21910646)
+
 ## Common peak picking
 
 Peak detection includes the MS-DIAL smoothing method used by all executable
@@ -316,6 +351,30 @@ Advanced direct launch:
 ```bash
 python app.py --host 127.0.0.1 --port 8765
 ```
+
+The source ZIP also places launchers at its top level. On Windows, double-click
+`Start MS-DIAL Interactive.cmd`; on macOS open
+`Start MS-DIAL Interactive.command`; on Linux run or open
+`start-msdial-interactive.sh` after granting execute permission once.
+
+## Native packages for users without Python
+
+The GitHub Actions workflow `Build native desktop packages` creates separate
+artifacts for Windows, macOS, and Linux using PyInstaller. These are native
+per-OS packages, not one universal binary:
+
+- Windows: open `MS-DIAL-Interactive.exe`
+- macOS: open `MS-DIAL-Interactive.app`
+- Linux: run/open the executable `MS-DIAL-Interactive`
+
+The user does not need to install Python for these artifacts. MS-DIAL Console
+itself remains a separate OS-specific dependency selected from the Paths panel.
+Build locally with `python -m pip install ".[desktop]"` followed by
+`python scripts/build-native.py`.
+
+The Windows artifact contains a ZIP. The macOS and Linux artifacts contain a
+`tar.gz` archive so executable permissions survive GitHub artifact download.
+Extract the inner archive once, then open the launcher listed above.
 
 See the Japanese user tutorial:
 

@@ -65,6 +65,14 @@ td:nth-child(2) { min-width: 360px; color: var(--muted); font-size: 14px; }
 .assistant-answer { white-space: pre-wrap; line-height: 1.6; background: white; border: 1px solid var(--line); border-radius: 6px; padding: 14px; min-height: 100px; margin-bottom: 10px; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(180px, 1fr)); gap: 12px; }
 .path-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.path-actions { margin-top: 12px; }
+.output-path-row > button { white-space: nowrap; }
+.library-catalog { display: grid; gap: 10px; }
+.library-card { border: 1px solid var(--line); border-radius: 7px; padding: 12px; background: #fbfdfe; }
+.library-card-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+.library-card strong { display: block; margin-bottom: 4px; }
+.library-card .button-row { margin-top: 9px; }
+.library-progress { min-width: 110px; color: var(--teal-dark); font-weight: 650; }
 .output-path-row { display: grid; grid-template-columns: minmax(220px, 1fr) auto; gap: 8px; }
 .rt-anchor-path-row { grid-template-columns: minmax(220px, 1fr) auto auto; }
 .output-path-row input { min-width: 0; }

@@ -17,6 +17,8 @@ const state = {
   mspAnnotators: [],
   textAnnotators: [],
   lbmAnnotator: {},
+  libraryJobs: {},
+  libraryProvenance: [],
   mztabFiles: [],
   selectedMzTabPath: "",
   qaReport: null,
@@ -153,6 +155,7 @@ function workflow() {
         use_rt_scoring: Boolean(item.use_rt_scoring),
         use_rt_filtering: Boolean(item.use_rt_filtering),
       })),
+    library_provenance: state.libraryProvenance,
     gcms_accuracy_type: $("#gcmsAccuracyType").value,
     gcms_ri_compound_type: $("#gcmsRiCompoundType").value,
     gcms_retention_type: $("#gcmsRetentionType").value,
@@ -664,6 +667,167 @@ function defaultLbmAnnotator(overrides = {}) {
     ...DEFAULT_LBM_SETTINGS,
     ...overrides,
   };
+}
+
+function setTemplateControl(id, value, checkbox = false) {
+  const control = $(`#${id}`);
+  if (!control || value === undefined || value === null) return;
+  if (checkbox) {
+    control.checked = Boolean(value);
+    return;
+  }
+  const text = String(value);
+  if (control.tagName === "SELECT" && ![...control.options].some((item) => item.value === text)) return;
+  control.value = text;
+}
+
+function applyLoadedParameterTemplate(result) {
+  const values = result.workflow || {};
+  const controls = {
+    project_type: "projectType",
+    ion_mode: "ionMode",
+    target_omics: "targetOmics",
+    ms1_data_type: "ms1Type",
+    ms2_data_type: "ms2Type",
+    number_of_threads: "numberOfThreads",
+    smoothing_method: "smoothingMethod",
+    minimum_peak_height: "minimumPeakHeight",
+    mass_slice_width: "massSliceWidth",
+    minimum_peak_width: "minimumPeakWidth",
+    retention_time_begin: "rtBegin",
+    retention_time_end: "rtEnd",
+    ms1_tolerance: "ms1Tolerance",
+    ms2_tolerance: "ms2Tolerance",
+    alignment_rt_tolerance: "alignmentRtTolerance",
+    alignment_ms1_tolerance: "alignmentMs1Tolerance",
+    solvent: "solvent",
+    gcms_accuracy_type: "gcmsAccuracyType",
+    gcms_ri_compound_type: "gcmsRiCompoundType",
+    gcms_retention_type: "gcmsRetentionType",
+    gcms_alignment_index_type: "gcmsAlignmentIndexType",
+    gcms_ri_alignment_tolerance: "gcmsRiAlignmentTolerance",
+    gcms_ri_dictionary_path: "gcmsRiDictionaryPath",
+  };
+  Object.entries(controls).forEach(([key, id]) => setTemplateControl(id, values[key]));
+  setTemplateControl("alignmentLightMode", values.alignment_light_mode, true);
+  if (result.path) $("#templatePath").value = result.path;
+  if (Array.isArray(result.msp_annotators)) state.mspAnnotators = result.msp_annotators;
+  if (Array.isArray(result.text_annotators)) state.textAnnotators = result.text_annotators;
+  if (result.lbm_annotator) state.lbmAnnotator = result.lbm_annotator;
+  if (Array.isArray(result.lipid_queries) && result.lipid_queries.length) {
+    state.lipidQueries = result.lipid_queries;
+  }
+  if (Array.isArray(result.selected_adducts) && result.selected_adducts.length) {
+    Object.values(state.adducts).flat().forEach((item) => {
+      item.selected = result.selected_adducts.includes(item.adduct);
+    });
+  }
+  if (values.gcms_ri_dictionary_path) $("#gcmsRiSource").value = "dictionary";
+  renderLipids();
+  renderAdducts();
+  renderLbmAnnotator();
+  renderMspAnnotators();
+  renderTextAnnotators();
+  updateProjectUI();
+  refreshQuestion();
+}
+
+function applyCatalogLibrary(item) {
+  const path = item.local_path || "";
+  if (!path) return;
+  state.libraryProvenance = [
+    ...state.libraryProvenance.filter((entry) => entry.catalog_id !== item.id),
+    {
+      catalog_id: item.id,
+      label: item.label,
+      record_url: item.record_url,
+      local_path: path,
+      filename: item.filename,
+      md5: item.md5,
+      license: item.license,
+    },
+  ];
+  if (item.kind === "lbm") {
+    $("#projectType").value = "lcms";
+    $("#targetOmics").value = "Lipidomics";
+    state.lbmAnnotator = { ...defaultLbmAnnotator(), ...state.lbmAnnotator, lbm_file_path: path };
+    renderLbmAnnotator();
+  } else {
+    if (item.kind === "gcms_msp") {
+      $("#projectType").value = "gcms";
+      $("#targetOmics").value = "Metabolomics";
+      if (item.ri_compound_type) $("#gcmsRiCompoundType").value = item.ri_compound_type;
+    } else if (item.ion_mode) {
+      $("#ionMode").value = item.ion_mode;
+    }
+    const existing = state.mspAnnotators[0] || defaultMspAnnotatorRow();
+    state.mspAnnotators = [{ ...existing, annotator_id: existing.annotator_id || "msp_annotator_1", msp_file_path: path }, ...state.mspAnnotators.slice(1)];
+    renderMspAnnotators();
+  }
+  updateProjectUI();
+  renderLipids();
+  renderAdducts();
+  setStatus(`Using downloaded library: ${path}`);
+}
+
+function renderLibraryCatalog() {
+  const catalog = state.config?.library_catalog || [];
+  $("#libraryCatalogDirectory").innerHTML = `Library directory: <code>${escapeHtml(state.config?.library_directory || "")}</code>`;
+  $("#libraryCatalogList").innerHTML = catalog.map((item) => {
+    const job = state.libraryJobs[item.id];
+    const status = job
+      ? job.status === "failed" ? `Failed: ${escapeHtml(job.error || "download error")}` : `${escapeHtml(job.status)} ${escapeHtml(job.progress || 0)}%`
+      : item.downloaded ? "Downloaded and checksum verified" : `${item.size_mb} MB download`;
+    return `<article class="library-card" data-library-id="${escapeHtml(item.id)}">
+      <div class="library-card-head">
+        <div><strong>${escapeHtml(item.label)}</strong><span class="muted">${escapeHtml(item.scope)} | ${escapeHtml(item.license)}</span></div>
+        <span class="library-progress">${status}</span>
+      </div>
+      ${item.local_path ? `<div class="muted"><code>${escapeHtml(item.local_path)}</code></div>` : ""}
+      <div class="button-row">
+        <button type="button" class="secondary library-action" ${job && !["completed", "failed"].includes(job.status) ? "disabled" : ""}>${item.downloaded ? "Use in workflow" : "Download and use"}</button>
+        <a href="${escapeHtml(item.record_url)}" target="_blank" rel="noreferrer">Open Zenodo record</a>
+      </div>
+    </article>`;
+  }).join("");
+  $$(".library-card").forEach((card) => {
+    card.querySelector(".library-action").addEventListener("click", () => runUiAction(async () => {
+      const item = catalog.find((entry) => entry.id === card.dataset.libraryId);
+      if (item.downloaded) {
+        applyCatalogLibrary(item);
+        return;
+      }
+      const result = await api("/api/libraries/download", {
+        method: "POST",
+        body: JSON.stringify({ catalog_id: item.id }),
+      });
+      state.libraryJobs[item.id] = { id: result.job_id, status: "queued", progress: 0 };
+      renderLibraryCatalog();
+      pollLibraryDownload(item.id, result.job_id).catch((error) => {
+        state.libraryJobs[item.id] = { status: "failed", error: error.message };
+        renderLibraryCatalog();
+      });
+    }));
+  });
+}
+
+async function pollLibraryDownload(catalogId, jobId) {
+  const job = await api(`/api/jobs/${jobId}`);
+  state.libraryJobs[catalogId] = job;
+  renderLibraryCatalog();
+  if (["queued", "running"].includes(job.status)) {
+    window.setTimeout(() => pollLibraryDownload(catalogId, jobId).catch((error) => {
+      state.libraryJobs[catalogId] = { status: "failed", error: error.message };
+      renderLibraryCatalog();
+    }), 750);
+    return;
+  }
+  if (job.status === "failed") throw new Error(job.error || "Library download failed.");
+  const item = state.config.library_catalog.find((entry) => entry.id === catalogId);
+  Object.assign(item, job.result, { downloaded: true });
+  delete state.libraryJobs[catalogId];
+  renderLibraryCatalog();
+  applyCatalogLibrary(item);
 }
 
 function updateLbmAnnotator(key, value) {
@@ -1954,6 +2118,9 @@ async function initialize() {
   $("#templatePath").value = state.config.default_template;
   $("#queriesPath").value = state.config.default_queries;
   $("#consolePath").value = state.config.default_console || "";
+  $("#pathSettingsInfo").textContent = state.config.settings_loaded
+    ? `Loaded saved paths from ${state.config.settings_file}`
+    : `Paths can be saved locally to ${state.config.settings_file}`;
   if (state.config.smoothing_methods?.length) {
     $("#smoothingMethod").innerHTML = state.config.smoothing_methods
       .map((method) => `<option ${method === "LinearWeightedMovingAverage" ? "selected" : ""}>${escapeHtml(method)}</option>`)
@@ -1970,6 +2137,7 @@ async function initialize() {
   renderLbmAnnotator();
   renderMspAnnotators();
   renderTextAnnotators();
+  renderLibraryCatalog();
   renderFiles();
   updateProjectUI();
   applyWorkspaceMode();
@@ -2093,6 +2261,33 @@ $("#useDataDirectory").addEventListener("click", () => {
   state.outputRootAutomatic = true;
   setOutputRootFromFirstFile();
 });
+
+$("#savePathSettings").addEventListener("click", () => runUiAction(async () => {
+  const result = await api("/api/settings/paths", {
+    method: "POST",
+    body: JSON.stringify({
+      console_path: $("#consolePath").value.trim(),
+      template_path: $("#templatePath").value.trim(),
+      queries_path: $("#queriesPath").value.trim(),
+    }),
+  });
+  state.config.settings_loaded = true;
+  state.config.settings_file = result.settings_file;
+  $("#pathSettingsInfo").textContent = `Saved paths to ${result.settings_file}`;
+  setStatus("Paths saved for the next launch.");
+}));
+
+$("#loadParameterTemplate").addEventListener("click", () => runUiAction(async () => {
+  const path = $("#templatePath").value.trim();
+  if (!path) throw new Error("Set the Parameter template path before loading it.");
+  const result = await api("/api/templates/load", {
+    method: "POST",
+    body: JSON.stringify({ path, queries_path: $("#queriesPath").value.trim() }),
+  });
+  applyLoadedParameterTemplate(result);
+  const lipidCount = (result.lipid_queries || []).filter((item) => item.selected).length;
+  setStatus(`Loaded parameter template. ${lipidCount} lipid queries selected.`);
+}));
 
 $("#projectType").addEventListener("change", () => {
   maybeSwitchTemplateForProject($("#projectType").value);
