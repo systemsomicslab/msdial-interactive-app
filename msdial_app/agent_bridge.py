@@ -12,17 +12,20 @@ HANDOFF_FILENAME = "datamining-handoff.json"
 
 
 def summarize_jobs(jobs: dict[str, dict[str, Any]], limit: int = 10) -> dict[str, Any]:
-    items = [_summarize_job(job) for job in jobs.values()]
+    items = [summarize_job(job) for job in jobs.values()]
     items.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "", reverse=True)
     latest = items[0] if items else None
     latest_completed = next((item for item in items if item.get("status") == "completed"), None)
     return {
         "service": "MS-DIAL Interactive",
-        "agent_api_version": "0.2",
+        "agent_api_version": "0.3",
         "capabilities": [
             "guided_analysis_planning",
             "reusable_worksets",
             "single_file_peak_count_tuning",
+            "console_path_discovery_and_persistence",
+            "job_scoped_output_provenance",
+            "persistent_job_history",
             "restart_incompatible_local_service",
             "start_msdial_console_run",
             "observe_job_status",
@@ -68,12 +71,16 @@ def create_datamining_handoff(
         for item in validation.get("files", [])
     ]
     primary_mztab_file = _select_primary_mztab_file(mztab_files)
-    output_files = _collect_output_files(run_dir)
+    output_files = (
+        _collect_output_files_from_artifacts((job or {}).get("artifacts") or {})
+        if job and job.get("artifacts")
+        else _collect_output_files(run_dir)
+    )
     handoff = {
         "schema": "msdial-interactive.datamining-handoff.v1",
         "created_at": dt.datetime.now().astimezone().isoformat(),
         "source_application": "MS-DIAL Interactive",
-        "job": _summarize_job(job) if job else None,
+        "job": summarize_job(job) if job else None,
         "analysis_type": prep.get("analysis_type", ""),
         "run_directory": str(run_dir),
         "input_csv": prep.get("input_csv", ""),
@@ -110,7 +117,9 @@ def create_datamining_handoff(
     return handoff
 
 
-def _summarize_job(job: dict[str, Any] | None) -> dict[str, Any] | None:
+def summarize_job(
+    job: dict[str, Any] | None, *, log_lines: int = 10
+) -> dict[str, Any] | None:
     if not job:
         return None
     preparation = job.get("preparation", {})
@@ -125,7 +134,15 @@ def _summarize_job(job: dict[str, Any] | None) -> dict[str, Any] | None:
         "mztab_status": validation.get("summary", {}).get("status", ""),
         "mztab_file_count": validation.get("summary", {}).get("file_count", 0),
         "handoff_file": job.get("datamining_handoff", {}).get("handoff_file", ""),
-        "log_tail": (job.get("logs") or [])[-10:],
+        "artifacts": {
+            key: list((job.get("artifacts") or {}).get(key, []))
+            for key in ("mztab", "qa", "msdial")
+        },
+        "created_at": job.get("created_at", ""),
+        "updated_at": job.get("updated_at", ""),
+        "error": job.get("error", ""),
+        "progress": job.get("progress"),
+        "log_tail": (job.get("logs") or [])[-max(0, log_lines):],
     }
 
 
@@ -154,6 +171,32 @@ def _collect_output_files(run_directory: Path) -> dict[str, list[str]]:
             paths.extend(run_directory.glob(pattern))
         collected[key] = [str(path) for path in sorted(set(paths))]
     return collected
+
+
+def _collect_output_files_from_artifacts(
+    artifacts: dict[str, Any]
+) -> dict[str, list[str]]:
+    result = {
+        "mztab": list(artifacts.get("mztab", [])),
+        "alignment": [],
+        "peak": [],
+        "spectra": [],
+        "project": [],
+        "workflow": [],
+        "qa": list(artifacts.get("qa", [])),
+    }
+    for raw in artifacts.get("msdial", []):
+        path = Path(raw)
+        suffix = path.suffix.casefold()
+        if suffix == ".mdalign":
+            result["alignment"].append(str(path))
+        elif suffix in {".mdpeak", ".mdscan"}:
+            result["peak"].append(str(path))
+        elif suffix == ".mdmsp":
+            result["spectra"].append(str(path))
+        elif suffix in {".mdproject", ".arf2", ".dcl"}:
+            result["project"].append(str(path))
+    return result
 
 
 def _select_primary_mztab_file(mztab_files: list[dict[str, Any]]) -> str:

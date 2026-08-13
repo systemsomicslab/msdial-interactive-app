@@ -61,7 +61,13 @@ def list_mztab_outputs(run_directory: str | Path) -> dict[str, Any]:
 
 
 def validate_mztab_outputs(run_directory: str | Path) -> dict[str, Any]:
-    files = [validate_mztab_file(path) for path in find_mztab_files(run_directory)]
+    return validate_mztab_files(find_mztab_files(run_directory), run_directory)
+
+
+def validate_mztab_files(
+    paths: list[str | Path], run_directory: str | Path = ""
+) -> dict[str, Any]:
+    files = [validate_mztab_file(path) for path in paths]
     summary = {
         "status": "passed",
         "passed": sum(1 for item in files if item["status"] == "passed"),
@@ -78,7 +84,7 @@ def validate_mztab_outputs(run_directory: str | Path) -> dict[str, Any]:
 
     external = _external_validator_status()
     return {
-        "run_directory": str(Path(run_directory).expanduser()),
+        "run_directory": str(Path(run_directory).expanduser()) if str(run_directory) else "",
         "summary": summary,
         "status": summary["status"],
         "files": files,

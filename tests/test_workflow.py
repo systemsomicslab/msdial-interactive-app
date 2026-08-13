@@ -8,7 +8,7 @@ from pathlib import Path
 
 from msdial_app.agent_bridge import create_datamining_handoff, summarize_jobs
 from msdial_app.mztab_preview import preview_mztab_file, preview_mztab_outputs
-from msdial_app.mztab_validation import validate_mztab_file, validate_mztab_outputs
+from msdial_app.mztab_validation import validate_mztab_file, validate_mztab_files, validate_mztab_outputs
 from msdial_app.workflow import (
     build_console_command,
     detect_raw_format,
@@ -363,6 +363,9 @@ class WorkflowTests(unittest.TestCase):
                 "minimum_peak_height": 4321,
                 "mass_slice_width": 0.05,
                 "alignment_light_mode": True,
+                "run_qa": True,
+                "height_matrix_export": True,
+                "export_folder_path": "",
                 "msp_weighted_dot_product": 0.55,
                 "lbm_path": str(lbm),
                 "lbm_rt_tolerance": 0.25,
@@ -399,6 +402,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn("Minimum peak height: 4321", method_text)
             self.assertIn("Mass slice width: 0.05", method_text)
             self.assertIn("Alignment light mode: True", method_text)
+            self.assertIn(f"Export folder path: {(root / 'runs').resolve()}", method_text)
+            self.assertIn("Height matrix export: True", method_text)
             self.assertIn(
                 "Weighted dot product cutoff for MSP-based annotation: 0.55",
                 method_text,
@@ -438,9 +443,9 @@ class WorkflowTests(unittest.TestCase):
             manifest = json.loads(
                 Path(result["manifest"]).read_text(encoding="utf-8")
             )
-            self.assertEqual("0.3.0", settings["msdial_interactive_version"])
+            self.assertEqual("0.3.1", settings["msdial_interactive_version"])
             self.assertEqual("not recorded", settings["msdial_console_version"])
-            self.assertEqual("0.3.0", manifest["msdial_interactive_version"])
+            self.assertEqual("0.3.1", manifest["msdial_interactive_version"])
             self.assertEqual("21904324", settings["library_provenance"][0]["record_id"])
             self.assertEqual("CC BY 4.0", settings["library_provenance"][0]["license"])
 
@@ -583,6 +588,24 @@ class WorkflowTests(unittest.TestCase):
             result = validate_mztab_file(mztab)
             self.assertEqual("failed", result["status"])
             self.assertTrue(any("mzTab-version" in message for message in result["errors"]))
+
+    def test_mztab_validation_can_be_limited_to_job_owned_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old = root / "old.mzTab"
+            current = root / "current.mzTab"
+            content = (
+                "MTD\tmzTab-version\t2.0.0-M\n"
+                "SMH\tidentifier\n"
+                "SML\tfeature\n"
+            )
+            old.write_text(content, encoding="ascii")
+            current.write_text(content, encoding="ascii")
+
+            result = validate_mztab_files([current], root)
+
+            self.assertEqual(1, result["summary"]["file_count"])
+            self.assertEqual(str(current.resolve()), result["files"][0]["file"])
 
     def test_mztab_preview_reads_metadata_sections_and_numeric_columns(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

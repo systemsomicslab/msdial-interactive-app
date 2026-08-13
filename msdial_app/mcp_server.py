@@ -16,7 +16,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-REQUIRED_AGENT_API_VERSION = "0.2"
+REQUIRED_AGENT_API_VERSION = "0.3"
 _EMBEDDED_SERVERS: dict[tuple[str, int], tuple[ThreadingHTTPServer, threading.Thread]] = {}
 
 
@@ -154,6 +154,40 @@ def _local_listener(host: str, port: int) -> dict[str, Any]:
 def msdial_interactive_status(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> dict[str, Any]:
     """Return current MS-DIAL Interactive status and recent analysis jobs."""
     return _status_or_error(host, port)
+
+
+@mcp.tool()
+def msdial_check_console_path(
+    search_roots: list[str] | None = None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Find configured and discoverable MSDIALCUI.exe/MSDIALCUI.dll paths."""
+    return _request_json(
+        "POST",
+        "/api/agent/console/check",
+        host=host,
+        port=port,
+        body={"search_roots": search_roots or []},
+        timeout=120,
+    )
+
+
+@mcp.tool()
+def msdial_set_console_path(
+    console_path: str,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Validate and persist the MS-DIAL Console path for later local analyses."""
+    return _request_json(
+        "POST",
+        "/api/agent/console/set",
+        host=host,
+        port=port,
+        body={"console_path": console_path},
+        timeout=30,
+    )
 
 
 @mcp.tool()
@@ -408,29 +442,34 @@ def msdial_estimate_peak_height(
 @mcp.tool()
 def msdial_interactive_job(
     job_id: str,
+    detail: bool = False,
+    log_lines: int = 50,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
-    """Return one analysis, tuning, or library-download job including its recent logs."""
-    return _request_json("GET", f"/api/jobs/{job_id}", host=host, port=port, timeout=10)
+    """Return a compact job summary; request detail only for diagnostics."""
+    query = urllib.parse.urlencode(
+        {"detail": "full" if detail else "summary", "log_lines": max(0, log_lines)}
+    )
+    return _request_json("GET", f"/api/jobs/{job_id}?{query}", host=host, port=port, timeout=10)
 
 
 @mcp.tool()
 def msdial_interactive_wait_for_completion(
+    job_id: str,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     timeout_seconds: int = 3600,
     poll_seconds: int = 10,
 ) -> dict[str, Any]:
-    """Poll until the latest MS-DIAL Console job completes or fails."""
+    """Poll until the specified MS-DIAL job completes or fails."""
     deadline = time.time() + max(1, timeout_seconds)
     while True:
-        status = _request_json("GET", "/api/agent/status", host=host, port=port, timeout=5)
-        latest = status.get("latest_job") or {}
-        if latest.get("status") in {"completed", "failed"}:
-            return {"finished": True, "status": status}
+        job = _request_json("GET", f"/api/jobs/{job_id}", host=host, port=port, timeout=5)
+        if job.get("status") in {"completed", "failed", "interrupted"}:
+            return {"finished": True, "job": job}
         if time.time() >= deadline:
-            return {"finished": False, "status": status}
+            return {"finished": False, "job": job}
         time.sleep(max(1, poll_seconds))
 
 
@@ -455,6 +494,7 @@ def msdial_interactive_create_handoff(
 
 @mcp.tool()
 def msdial_interactive_validate_mztab(
+    job_id: str = "",
     run_directory: str = "",
     file_path: str = "",
     host: str = DEFAULT_HOST,
@@ -466,14 +506,15 @@ def msdial_interactive_validate_mztab(
         "/api/mztab/validate",
         host=host,
         port=port,
-        body={"run_directory": run_directory, "file_path": file_path},
+        body={"job_id": job_id, "run_directory": run_directory, "file_path": file_path},
         timeout=30,
     )
 
 
 @mcp.tool()
 def msdial_interactive_preview_mztab(
-    run_directory: str,
+    job_id: str = "",
+    run_directory: str = "",
     file_path: str = "",
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
@@ -484,27 +525,27 @@ def msdial_interactive_preview_mztab(
         "/api/mztab/preview",
         host=host,
         port=port,
-        body={"run_directory": run_directory, "file_path": file_path},
+        body={"job_id": job_id, "run_directory": run_directory, "file_path": file_path},
         timeout=30,
     )
 
 
 @mcp.tool()
 def msdial_generate_lcms_qa(
-    run_directory: str,
+    job_id: str,
     internal_standards: list[dict[str, Any]] | None = None,
     file_path: str = "",
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
-    """Generate the LC-MS QA summary and chart data from the newest QA matrix."""
+    """Generate LC-MS QA only from the matrix created or updated by one job."""
     return _request_json(
         "POST",
         "/api/qa/report",
         host=host,
         port=port,
         body={
-            "run_directory": run_directory,
+            "job_id": job_id,
             "file_path": file_path,
             "internal_standards": internal_standards or [],
         },
@@ -514,7 +555,8 @@ def msdial_generate_lcms_qa(
 
 @mcp.tool()
 def msdial_generate_publication_report(
-    run_directory: str,
+    job_id: str,
+    run_qa: bool = True,
     internal_standards: list[dict[str, Any]] | None = None,
     qa_file_path: str = "",
     qa_criteria: dict[str, Any] | None = None,
@@ -528,8 +570,9 @@ def msdial_generate_publication_report(
         host=host,
         port=port,
         body={
-            "run_directory": run_directory,
+            "job_id": job_id,
             "use_saved_run": True,
+            "run_qa": run_qa,
             "qa_file_path": qa_file_path,
             "internal_standards": internal_standards or [],
             "qa_criteria": qa_criteria or {},
@@ -554,7 +597,7 @@ def msdial_complete_guided_analysis(
     deadline = time.time() + max(1, timeout_seconds)
     while True:
         job = _request_json("GET", f"/api/jobs/{job_id}", host=host, port=port, timeout=10)
-        if job.get("status") in {"completed", "failed"}:
+        if job.get("status") in {"completed", "failed", "interrupted"}:
             break
         if time.time() >= deadline:
             return {"finished": False, "job": job}
@@ -562,12 +605,21 @@ def msdial_complete_guided_analysis(
     if job.get("status") != "completed":
         return {"finished": True, "success": False, "job": job}
 
+    job = _request_json(
+        "GET", f"/api/jobs/{job_id}?detail=full", host=host, port=port, timeout=30
+    )
+
     preparation = job.get("preparation") or {}
     run_directory = str(preparation.get("run_directory", ""))
     result: dict[str, Any] = {
         "finished": True,
         "success": True,
-        "job": job,
+        "job": {
+            "id": job.get("id"),
+            "status": job.get("status"),
+            "exit_code": job.get("exit_code"),
+            "artifacts": job.get("artifacts", {}),
+        },
         "run_directory": run_directory,
     }
     result["mztab_validation"] = _request_json(
@@ -575,7 +627,7 @@ def msdial_complete_guided_analysis(
         "/api/mztab/validate",
         host=host,
         port=port,
-        body={"run_directory": run_directory},
+        body={"job_id": job_id},
         timeout=120,
     ).get("validation")
     result["mztab_preview"] = _request_json(
@@ -583,7 +635,7 @@ def msdial_complete_guided_analysis(
         "/api/mztab/preview",
         host=host,
         port=port,
-        body={"run_directory": run_directory},
+        body={"job_id": job_id},
         timeout=120,
     ).get("preview")
 
@@ -596,7 +648,7 @@ def msdial_complete_guided_analysis(
                 host=host,
                 port=port,
                 body={
-                    "run_directory": run_directory,
+                    "job_id": job_id,
                     "internal_standards": internal_standards or [],
                 },
                 timeout=180,
@@ -613,8 +665,9 @@ def msdial_complete_guided_analysis(
                 host=host,
                 port=port,
                 body={
-                    "run_directory": run_directory,
+                    "job_id": job_id,
                     "use_saved_run": True,
+                    "run_qa": bool(qa_report),
                     "qa_report": qa_report,
                     "internal_standards": internal_standards or [],
                     "qa_criteria": qa_criteria or {},
@@ -629,7 +682,7 @@ def msdial_complete_guided_analysis(
         "/api/agent/handoff",
         host=host,
         port=port,
-        body={"job_id": job_id, "run_directory": run_directory},
+        body={"job_id": job_id},
         timeout=120,
     ).get("handoff")
     return result

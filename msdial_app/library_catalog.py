@@ -134,30 +134,45 @@ def download_library(
     encoded_name = urllib.parse.quote(str(item["filename"]))
     url = f"https://zenodo.org/records/{item['record_id']}/files/{encoded_name}?download=1"
     temporary = target.with_suffix(target.suffix + ".part")
-    digest = hashlib.md5()
-    received = 0
-    request = urllib.request.Request(url, headers={"User-Agent": "MS-DIAL-Interactive/0.3"})
+    received = temporary.stat().st_size if temporary.is_file() else 0
+    if received == item["size"] and _md5(temporary) == item["md5"]:
+        os.replace(temporary, target)
+        _write_metadata(item, target)
+        return _download_result(item, target, reused=False)
+    if received >= item["size"]:
+        temporary.unlink(missing_ok=True)
+        received = 0
+    headers = {"User-Agent": "MS-DIAL-Interactive/0.3"}
+    if received:
+        headers["Range"] = f"bytes={received}-"
+    request = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as handle:
-            total = int(response.headers.get("Content-Length") or item["size"])
-            while True:
-                block = response.read(1024 * 1024)
-                if not block:
-                    break
-                handle.write(block)
-                digest.update(block)
-                received += len(block)
+        with urllib.request.urlopen(request, timeout=60) as response:
+            resumed = received > 0 and getattr(response, "status", 200) == 206
+            if received and not resumed:
+                received = 0
+            mode = "ab" if resumed else "wb"
+            total = item["size"]
+            with temporary.open(mode) as handle:
                 if progress:
                     progress(received, total)
+                while True:
+                    block = response.read(1024 * 1024)
+                    if not block:
+                        break
+                    handle.write(block)
+                    received += len(block)
+                    if progress:
+                        progress(received, total)
         if received != item["size"]:
             raise RuntimeError(
                 f"Downloaded size mismatch for {item['filename']}: {received} != {item['size']} bytes."
             )
-        if digest.hexdigest().lower() != item["md5"]:
+        if _md5(temporary) != item["md5"]:
             raise RuntimeError(f"MD5 verification failed for {item['filename']}.")
         os.replace(temporary, target)
     except Exception:
-        temporary.unlink(missing_ok=True)
+        # Keep the partial file so a later request can resume with HTTP Range.
         raise
 
     _write_metadata(item, target)

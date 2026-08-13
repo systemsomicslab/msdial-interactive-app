@@ -88,6 +88,7 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 
 - `msdial_interactive_launch`
 - `msdial_interactive_restart`
+- `msdial_check_console_path` / `msdial_set_console_path`
 - `msdial_guided_analysis_plan`
 - `msdial_list_worksets`
 - `msdial_download_official_library`
@@ -103,6 +104,12 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 - `msdial_complete_guided_analysis`
 - `msdial_save_workset`
 - `msdial_interactive_create_handoff`
+
+Run completion, mzTab-M validation/preview, LC-MS QA, publication generation,
+and handoff should receive the exact `job_id` returned by the production run.
+Agent API 0.3 tracks files created or updated by that job and does not silently
+reuse older mzTab-M or `*.qa.tsv` files from the same directory. Publication can
+be generated without QA by setting `run_qa=false`.
 
 ## Agent endpoints
 

@@ -158,6 +158,16 @@ def build_lcms_qa_report(
     }
 
 
+def build_lcms_qa_report_from_file(
+    path: str | Path,
+    internal_standards: Iterable[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    target = Path(path).expanduser().resolve()
+    if not target.is_file() or not target.name.lower().endswith(QA_SUFFIX):
+        raise FileNotFoundError(f"LC-MS QA matrix not found: {target}")
+    return build_lcms_qa_report(target, internal_standards)
+
+
 class _Reservoir:
     def __init__(self, limit: int = RESERVOIR_LIMIT, seed: int = 17) -> None:
         self.limit = limit

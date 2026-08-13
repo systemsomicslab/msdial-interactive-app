@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import mimetypes
 import os
@@ -18,17 +19,18 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .agent_bridge import create_datamining_handoff, summarize_jobs
+from .agent_bridge import create_datamining_handoff, summarize_job, summarize_jobs
 from .agent_workflow import build_guided_plan, estimate_peak_height
 from .knowledge import KnowledgeBase, next_parameter_question
 from .library_catalog import catalog_status, download_library, library_directory
 from .literature import evaluate_literature_evidence
-from .mztab_validation import list_mztab_outputs, validate_mztab_outputs
+from .mztab_validation import list_mztab_outputs, validate_mztab_files, validate_mztab_outputs
 from .mztab_preview import preview_mztab_outputs
 from .materials_methods import generate_publication_report
-from .quality_assurance import build_lcms_qa_report, find_qa_files
+from .quality_assurance import build_lcms_qa_report_from_file, find_qa_files
 from .workflow import (
     console_version,
+    discover_console_paths,
     expand_paths,
     expand_paths_report,
     find_mdpeak,
@@ -52,7 +54,7 @@ from .workflow import (
     is_supported,
     validate_workflow,
 )
-from .user_settings import load_user_settings, save_path_settings, settings_path
+from .user_settings import load_user_settings, save_path_settings, settings_path, user_data_directory
 from .worksets import list_worksets, save_workset
 
 
@@ -62,8 +64,140 @@ RESOURCES = ROOT / "resources"
 KNOWLEDGE = ROOT / "knowledge"
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+JOBS_FILE = user_data_directory() / "agent-jobs.json"
 DOWNLOADS: dict[str, Path] = {}
 KB = KnowledgeBase(KNOWLEDGE)
+
+
+def _artifact_roots(preparation: dict[str, Any]) -> list[Path]:
+    values = [preparation.get("run_directory"), preparation.get("export_folder_path")]
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for value in values:
+        if not str(value or "").strip():
+            continue
+        root = Path(str(value)).expanduser().resolve()
+        key = str(root).casefold()
+        if key not in seen:
+            seen.add(key)
+            roots.append(root)
+    return roots
+
+
+def _snapshot_run_artifacts(preparation: dict[str, Any]) -> dict[str, list[int]]:
+    snapshot: dict[str, list[int]] = {}
+    for root in _artifact_roots(preparation):
+        if not root.is_dir():
+            continue
+        for path in _artifact_files(root):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            snapshot[str(path.resolve())] = [stat.st_mtime_ns, stat.st_size]
+    return snapshot
+
+
+def _classify_artifact(path: Path) -> str:
+    name = path.name.casefold()
+    if name.endswith(".qa.tsv"):
+        return "qa"
+    if path.suffix.casefold() in {".mztab", ".mztabm"} or "mztab" in name:
+        return "mztab"
+    if path.suffix.casefold() in {".mdalign", ".mdpeak", ".mdscan", ".mdmsp", ".mdproject", ".arf2", ".dcl"}:
+        return "msdial"
+    return "other"
+
+
+def _artifact_files(root: Path) -> list[Path]:
+    files = [path for path in root.glob("*") if path.is_file()]
+    for child in root.iterdir():
+        if not child.is_dir() or child.suffix.casefold() in {".d", ".raw"}:
+            continue
+        files.extend(path for path in child.glob("*") if path.is_file())
+    return files
+
+
+def _changed_run_artifacts(
+    preparation: dict[str, Any], baseline: dict[str, list[int]]
+) -> dict[str, Any]:
+    grouped: dict[str, list[str]] = {"mztab": [], "qa": [], "msdial": [], "other": []}
+    records: list[dict[str, Any]] = []
+    for root in _artifact_roots(preparation):
+        if not root.is_dir():
+            continue
+        for path in _artifact_files(root):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            resolved = str(path.resolve())
+            signature = [stat.st_mtime_ns, stat.st_size]
+            if baseline.get(resolved) == signature:
+                continue
+            kind = _classify_artifact(path)
+            grouped[kind].append(resolved)
+            records.append(
+                {
+                    "path": resolved,
+                    "kind": kind,
+                    "size_bytes": stat.st_size,
+                    "modified_time_ns": stat.st_mtime_ns,
+                    "change": "created" if resolved not in baseline else "updated",
+                }
+            )
+    for values in grouped.values():
+        values.sort()
+    records.sort(key=lambda item: item["path"])
+    return {**grouped, "records": records}
+
+
+def _job_artifact_paths(job: dict[str, Any], kind: str) -> list[str]:
+    return [str(path) for path in (job.get("artifacts") or {}).get(kind, [])]
+
+
+def _load_persisted_jobs() -> dict[str, dict[str, Any]]:
+    if not JOBS_FILE.is_file():
+        return {}
+    try:
+        raw = json.loads(JOBS_FILE.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    jobs = raw.get("jobs", {}) if isinstance(raw, dict) else {}
+    if not isinstance(jobs, dict):
+        return {}
+    now = dt.datetime.now().astimezone().isoformat()
+    for job in jobs.values():
+        if job.get("status") in {"queued", "running"}:
+            job["status"] = "interrupted"
+            job["updated_at"] = now
+            job["error"] = (
+                "The local backend stopped before this job completed. "
+                "A library download can be started again and will resume from its .part file."
+            )
+            job.setdefault("logs", []).append(job["error"])
+    return jobs
+
+
+def _persist_jobs_locked() -> None:
+    JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ordered = sorted(
+        JOBS.items(),
+        key=lambda item: str(item[1].get("updated_at") or item[1].get("created_at") or ""),
+        reverse=True,
+    )[:100]
+    temporary = JOBS_FILE.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps({"jobs": dict(ordered)}, ensure_ascii=False, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(JOBS_FILE)
+
+
+JOBS.update(_load_persisted_jobs())
+if JOBS:
+    with JOBS_LOCK:
+        _persist_jobs_locked()
 
 
 def _local_ipv4_addresses() -> list[str]:
@@ -89,34 +223,7 @@ def _local_ipv4_addresses() -> list[str]:
 
 
 def _default_console_path() -> str:
-    configured = os.environ.get("MSDIAL_CONSOLE_PATH", "")
-    candidates = [
-        Path(configured) if configured else None,
-        ROOT.parent
-        / "MsdialWorkbench"
-        / "tests"
-        / "MSDIAL5"
-        / "MsdialCoreTestApp"
-        / "bin"
-        / "Release"
-        / "net48"
-        / "MSDIALCUI.exe",
-        ROOT.parent
-        / "MsdialWorkbench"
-        / "tests"
-        / "MSDIAL5"
-        / "MsdialCoreTestApp"
-        / "bin"
-        / "Release"
-        / "net8"
-        / "MSDIALCUI.dll",
-        ROOT.parent
-        / "MSDIAL.console.v5.5.260323-windows-net48"
-        / "MSDIALCUI.exe",
-        ROOT / "MSDIALCUI.exe",
-        ROOT / "MSDIALCUI.dll",
-    ]
-    return next((str(path.resolve()) for path in candidates if path and path.is_file()), "")
+    return str(discover_console_paths().get("selected_path", ""))
 
 
 def _application_config() -> dict[str, Any]:
@@ -309,9 +416,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/jobs/"):
             job_id = parsed.path.rsplit("/", 1)[-1]
+            query = urllib.parse.parse_qs(parsed.query)
             with JOBS_LOCK:
                 job = JOBS.get(job_id)
-                response = dict(job) if job else None
+                if job and query.get("detail", ["summary"])[0] == "full":
+                    response = dict(job)
+                else:
+                    response = summarize_job(
+                        job,
+                        log_lines=int(query.get("log_lines", ["50"])[0]),
+                    )
             if response is None:
                 self._json({"error": "Job not found."}, HTTPStatus.NOT_FOUND)
             else:
@@ -324,6 +438,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/agent/worksets":
             self._json({"worksets": list_worksets()})
+            return
+        if parsed.path == "/api/agent/console":
+            self._json(discover_console_paths())
             return
         if parsed.path == "/api/agent/handoff":
             query = urllib.parse.parse_qs(parsed.query)
@@ -373,6 +490,24 @@ class Handler(BaseHTTPRequestHandler):
                         "settings_file": str(settings_path()),
                     }
                 )
+            elif parsed.path == "/api/agent/console/check":
+                self._json(discover_console_paths(body.get("search_roots", [])))
+            elif parsed.path == "/api/agent/console/set":
+                path = Path(str(body.get("console_path", ""))).expanduser().resolve()
+                if not path.is_file() or path.name.casefold() not in {
+                    "msdialcui.exe", "msdialcui.dll"
+                }:
+                    raise ValueError(
+                        "console_path must identify an existing MSDIALCUI.exe or MSDIALCUI.dll."
+                    )
+                saved = save_path_settings({"console_path": str(path)})
+                self._json(
+                    {
+                        "console_path": saved["console_path"],
+                        "version": console_version(saved["console_path"]),
+                        "settings_file": str(settings_path()),
+                    }
+                )
             elif parsed.path == "/api/templates/load":
                 self._json(
                     load_parameter_template(
@@ -396,7 +531,9 @@ class Handler(BaseHTTPRequestHandler):
                         "total": 0,
                         "logs": [],
                         "result": None,
+                        "created_at": dt.datetime.now().astimezone().isoformat(),
                     }
+                    _persist_jobs_locked()
                 threading.Thread(
                     target=_run_library_download_job,
                     args=(job_id, catalog_id),
@@ -548,6 +685,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 preparation = prepare_run(plan["workflow"])
                 job_id = uuid.uuid4().hex
+                artifact_baseline = _snapshot_run_artifacts(preparation)
                 with JOBS_LOCK:
                     JOBS[job_id] = {
                         "id": job_id,
@@ -556,7 +694,11 @@ class Handler(BaseHTTPRequestHandler):
                         "logs": [],
                         "preparation": preparation,
                         "exit_code": None,
+                        "created_at": dt.datetime.now().astimezone().isoformat(),
+                        "artifact_baseline": artifact_baseline,
+                        "artifacts": {},
                     }
+                    _persist_jobs_locked()
                 threading.Thread(
                     target=_run_job,
                     args=(job_id, preparation),
@@ -610,7 +752,9 @@ class Handler(BaseHTTPRequestHandler):
                         "preparation": preparation,
                         "exit_code": None,
                         "result": None,
+                        "created_at": dt.datetime.now().astimezone().isoformat(),
                     }
+                    _persist_jobs_locked()
                 threading.Thread(
                     target=_run_tuning_job,
                     args=(job_id, preparation),
@@ -656,11 +800,25 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 )
             elif parsed.path == "/api/mztab/validate":
+                job_id = str(body.get("job_id", "")).strip()
+                job = None
+                if job_id:
+                    with JOBS_LOCK:
+                        job = JOBS.get(job_id)
+                    if job is None:
+                        raise ValueError(f"Job not found: {job_id}")
+                target = body.get("file_path", "") or body.get("run_directory", "")
                 self._json(
                     {
-                        "validation": validate_mztab_outputs(
-                            body.get("file_path", "") or body.get("run_directory", "")
-                        )
+                        "validation": (
+                            validate_mztab_files(
+                                _job_artifact_paths(job, "mztab"),
+                                (job.get("preparation") or {}).get("run_directory", ""),
+                            )
+                            if job is not None
+                            else validate_mztab_outputs(target)
+                        ),
+                        "job_id": job_id,
                     }
                 )
             elif parsed.path == "/api/mztab/list":
@@ -672,12 +830,27 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 )
             elif parsed.path == "/api/mztab/preview":
+                job_id = str(body.get("job_id", "")).strip()
+                file_path = body.get("file_path", "") or None
+                run_directory = body.get("run_directory", "")
+                if job_id:
+                    with JOBS_LOCK:
+                        job = JOBS.get(job_id)
+                    if job is None:
+                        raise ValueError(f"Job not found: {job_id}")
+                    files = _job_artifact_paths(job, "mztab")
+                    if not files:
+                        raise FileNotFoundError(
+                            f"Job {job_id} did not create or update an mzTab-M file."
+                        )
+                    file_path = files[0]
+                    run_directory = (job.get("preparation") or {}).get("run_directory", "")
                 self._json(
                     {
                         "preview": preview_mztab_outputs(
-                            body.get("run_directory", ""),
-                            body.get("file_path", "") or None,
-                        )
+                            run_directory, file_path
+                        ),
+                        "job_id": job_id,
                     }
                 )
             elif parsed.path == "/api/qa/list":
@@ -689,17 +862,45 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 )
             elif parsed.path == "/api/qa/report":
+                job_id = str(body.get("job_id", "")).strip()
+                qa_path = str(body.get("file_path", "")).strip()
+                if job_id:
+                    with JOBS_LOCK:
+                        job = JOBS.get(job_id)
+                    if job is None:
+                        raise ValueError(f"Job not found: {job_id}")
+                    qa_files = _job_artifact_paths(job, "qa")
+                    if not qa_files:
+                        raise FileNotFoundError(
+                            f"Job {job_id} did not create or update an LC-MS QA matrix. "
+                            "Enable Height matrix export and set Export folder path before running."
+                        )
+                    qa_path = qa_files[0]
+                elif not qa_path:
+                    raise ValueError("Set job_id or an explicit QA file_path.")
                 self._json(
                     {
-                        "report": build_lcms_qa_report(
-                            body.get("file_path", "") or body.get("run_directory", ""),
+                        "report": build_lcms_qa_report_from_file(
+                            qa_path,
                             body.get("internal_standards", []),
-                        )
+                        ),
+                        "job_id": job_id,
+                        "qa_file": qa_path,
                     }
                 )
             elif parsed.path == "/api/publication/report":
                 state = body.get("workflow", {})
-                run_directory = str(body.get("run_directory", "")).strip()
+                job_id = str(body.get("job_id", "")).strip()
+                job = None
+                if job_id:
+                    with JOBS_LOCK:
+                        job = JOBS.get(job_id)
+                    if job is None:
+                        raise ValueError(f"Job not found: {job_id}")
+                run_directory = str(
+                    body.get("run_directory", "")
+                    or ((job or {}).get("preparation") or {}).get("run_directory", "")
+                ).strip()
                 settings_file = Path(run_directory).expanduser() / "workflow-settings.json"
                 used_saved_settings = body.get("use_saved_run", True) and settings_file.is_file()
                 if used_saved_settings:
@@ -712,19 +913,28 @@ class Handler(BaseHTTPRequestHandler):
                     ]
                 qa_report = body.get("qa_report")
                 qa_path = str(body.get("qa_file_path", "")).strip()
+                run_qa = bool(body.get("run_qa", True))
                 output_root = run_directory or str(state.get("output_root", "")).strip()
                 if not output_root:
                     raise ValueError("Set a run/output directory for the publication report.")
-                if (
-                    not qa_report
-                    and not qa_path
-                    and str(state.get("project_type", "lcms")).lower() == "lcms"
-                ):
-                    qa_files = find_qa_files(output_root, recursive=True)
-                    if qa_files:
-                        qa_path = str(qa_files[0])
-                if not qa_report and qa_path:
-                    qa_report = build_lcms_qa_report(
+                if run_qa and not qa_report and job is not None:
+                    qa_files = _job_artifact_paths(job, "qa")
+                    if qa_path:
+                        requested = str(Path(qa_path).expanduser().resolve()).casefold()
+                        owned = {str(Path(path).resolve()).casefold() for path in qa_files}
+                        if requested not in owned:
+                            raise ValueError(
+                                f"The requested QA matrix was not created or updated by job {job_id}."
+                            )
+                    elif qa_files:
+                        qa_path = qa_files[0]
+                if run_qa and not qa_report and not qa_path:
+                    raise FileNotFoundError(
+                        "No QA matrix is associated with this publication request. "
+                        "Set run_qa=false to generate Materials and Methods without QA."
+                    )
+                if run_qa and not qa_report and qa_path:
+                    qa_report = build_lcms_qa_report_from_file(
                         qa_path, body.get("internal_standards", [])
                     )
                 result = generate_publication_report(
@@ -759,6 +969,8 @@ class Handler(BaseHTTPRequestHandler):
                         "used_saved_settings": used_saved_settings,
                         "settings_file": str(settings_file) if settings_file.is_file() else "",
                         "qa_file": qa_path,
+                        "job_id": job_id,
+                        "qa_included": bool(qa_report),
                     }
                 )
             elif parsed.path == "/api/agent/handoff":
@@ -792,14 +1004,20 @@ class Handler(BaseHTTPRequestHandler):
                 state = body.get("workflow", body)
                 preparation = prepare_run(state)
                 job_id = uuid.uuid4().hex
+                artifact_baseline = _snapshot_run_artifacts(preparation)
                 with JOBS_LOCK:
                     JOBS[job_id] = {
                         "id": job_id,
                         "status": "queued",
+                        "kind": "run",
                         "logs": [],
                         "preparation": preparation,
                         "exit_code": None,
+                        "created_at": dt.datetime.now().astimezone().isoformat(),
+                        "artifact_baseline": artifact_baseline,
+                        "artifacts": {},
                     }
+                    _persist_jobs_locked()
                 threading.Thread(
                     target=_run_job,
                     args=(job_id, preparation),
@@ -829,7 +1047,9 @@ class Handler(BaseHTTPRequestHandler):
                         "preparation": preparation,
                         "exit_code": None,
                         "result": None,
+                        "created_at": dt.datetime.now().astimezone().isoformat(),
                     }
+                    _persist_jobs_locked()
                 threading.Thread(
                     target=_run_tuning_job,
                     args=(job_id, preparation),
@@ -849,7 +1069,9 @@ class Handler(BaseHTTPRequestHandler):
                         "preparation": preparation,
                         "exit_code": None,
                         "result": None,
+                        "created_at": dt.datetime.now().astimezone().isoformat(),
                     }
+                    _persist_jobs_locked()
                 threading.Thread(
                     target=_run_rt_correction_job,
                     args=(job_id, preparation),
@@ -925,13 +1147,20 @@ class Handler(BaseHTTPRequestHandler):
 def _run_library_download_job(job_id: str, catalog_id: str) -> None:
     with JOBS_LOCK:
         JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
         JOBS[job_id]["logs"].append("Downloading the selected Zenodo library.")
+        _persist_jobs_locked()
 
     def progress(received: int, total: int) -> None:
         with JOBS_LOCK:
             JOBS[job_id]["received"] = received
             JOBS[job_id]["total"] = total
             JOBS[job_id]["progress"] = round(received / total * 100, 1) if total else 0
+            progress_value = float(JOBS[job_id]["progress"] or 0)
+            if progress_value - float(JOBS[job_id].get("persisted_progress", -5)) >= 5:
+                JOBS[job_id]["persisted_progress"] = progress_value
+                JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+                _persist_jobs_locked()
 
     try:
         result = download_library(catalog_id, progress)
@@ -942,11 +1171,15 @@ def _run_library_download_job(job_id: str, catalog_id: str) -> None:
             JOBS[job_id]["logs"].append(
                 "Library ready: " + str(result["local_path"])
             )
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
     except Exception as error:
         with JOBS_LOCK:
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = str(error)
             JOBS[job_id]["logs"].append(traceback.format_exc())
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
 
 
 def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
@@ -957,6 +1190,8 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
 
     with JOBS_LOCK:
         JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+        _persist_jobs_locked()
     try:
         log("Starting MS-DIAL Console run.")
         log("Command: " + " ".join(preparation["command"]))
@@ -964,8 +1199,13 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
         exit_code = run_console(preparation, log)
         validation = None
         handoff = None
+        with JOBS_LOCK:
+            baseline = dict(JOBS[job_id].get("artifact_baseline") or {})
+        artifacts = _changed_run_artifacts(preparation, baseline)
         if exit_code == 0:
-            validation = validate_mztab_outputs(preparation["run_directory"])
+            validation = validate_mztab_files(
+                artifacts["mztab"], preparation["run_directory"]
+            )
             summary = validation["summary"]
             log(
                 "mzTab-M validation: "
@@ -983,6 +1223,7 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
                     "exit_code": exit_code,
                     "preparation": preparation,
                     "mztab_validation": validation,
+                    "artifacts": artifacts,
                     "logs": [],
                 },
             )
@@ -992,6 +1233,8 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
             JOBS[job_id]["exit_code"] = exit_code
             JOBS[job_id]["mztab_validation"] = validation
             JOBS[job_id]["datamining_handoff"] = handoff
+            JOBS[job_id]["artifacts"] = artifacts
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             if exit_code == 0:
                 JOBS[job_id]["status"] = "completed"
             else:
@@ -1000,6 +1243,8 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
                     JOBS[job_id]["logs"],
                     f"MS-DIAL Console exited with code {exit_code}.",
                 )
+            JOBS[job_id].pop("artifact_baseline", None)
+            _persist_jobs_locked()
     except Exception as error:
         with JOBS_LOCK:
             message = _diagnose_console_failure(JOBS[job_id]["logs"], str(error))
@@ -1007,6 +1252,9 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
         with JOBS_LOCK:
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = message
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            JOBS[job_id].pop("artifact_baseline", None)
+            _persist_jobs_locked()
     finally:
         if preparation.get("preserve_temporary_input_folder"):
             folder = preparation.get("temporary_input_folder")
@@ -1027,6 +1275,8 @@ def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
 
     with JOBS_LOCK:
         JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+        _persist_jobs_locked()
     try:
         exit_code = run_console(preparation, log)
         result = None
@@ -1053,6 +1303,8 @@ def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
                     JOBS[job_id]["logs"],
                     f"MS-DIAL Console exited with code {exit_code}.",
                 )
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
     except Exception as error:
         with JOBS_LOCK:
             message = _diagnose_console_failure(JOBS[job_id]["logs"], str(error))
@@ -1060,6 +1312,8 @@ def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
         with JOBS_LOCK:
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = message
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
     finally:
         _cleanup_temporary_input_folder(
             preparation.get("diagnostic_input_folder") or preparation.get("temporary_input_folder"),
@@ -1075,6 +1329,8 @@ def _run_rt_correction_job(job_id: str, preparation: dict[str, Any]) -> None:
 
     with JOBS_LOCK:
         JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+        _persist_jobs_locked()
     try:
         log("Starting RT correction EIC audit.")
         log("Command: " + " ".join(preparation["command"]))
@@ -1090,6 +1346,8 @@ def _run_rt_correction_job(job_id: str, preparation: dict[str, Any]) -> None:
                     JOBS[job_id]["logs"],
                     f"MS-DIAL Console exited with code {exit_code}.",
                 )
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
     except Exception as error:
         with JOBS_LOCK:
             message = _diagnose_console_failure(JOBS[job_id]["logs"], str(error))
@@ -1097,6 +1355,8 @@ def _run_rt_correction_job(job_id: str, preparation: dict[str, Any]) -> None:
         with JOBS_LOCK:
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = message
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
 
 
 def _cleanup_temporary_input_folder(path: str | None, log: Any) -> None:

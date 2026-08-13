@@ -52,6 +52,10 @@ async def smoke_test(
                 {"input_path": input_path, "answers": {}, "port": port},
             )
             payload = json.loads(result.content[0].text)
+            console_result = await session.call_tool(
+                "msdial_check_console_path", {"port": port}
+            )
+            console = json.loads(console_result.content[0].text)
             return {
                 "tool_count": len(names),
                 "compatible": True,
@@ -60,6 +64,9 @@ async def smoke_test(
                 "has_publication": "msdial_generate_publication_report" in names,
                 "has_peak_height_estimate": "msdial_estimate_peak_height" in names,
                 "has_legacy_peak_height_tool": any("recommend" in name.casefold() for name in names),
+                "has_console_discovery": "msdial_check_console_path" in names,
+                "has_job_scoped_completion": "msdial_complete_guided_analysis" in names,
+                "console_candidate_count": len(console.get("candidates", [])),
                 "file_count": payload["input"]["file_count"],
                 "next_question": payload["next_question"]["id"],
                 "question_presentation": payload["next_question"].get("presentation"),

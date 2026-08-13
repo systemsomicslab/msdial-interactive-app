@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import os
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +8,7 @@ from .library_catalog import catalog_status
 from .user_settings import load_user_settings
 from .workflow import (
     expand_paths_report,
+    discover_console_paths,
     load_parameter_template,
     read_adducts,
     read_analysis_csv,
@@ -21,6 +21,19 @@ from .worksets import get_workset
 ROOT = Path(__file__).resolve().parent.parent
 RESOURCES = ROOT / "resources"
 SUPPORTED_PROJECT_TYPES = {"lcms", "gcms"}
+SUPPORTED_ANSWER_KEYS = {
+    "project_type", "ion_mode", "target_omics", "parameter_strategy",
+    "target_peak_count", "minimum_peak_height", "acquisition_type",
+    "execute_rt_correction", "rt_correction_anchor_path",
+    "rt_correction_selection_path", "rt_correction_peak_selection_mode",
+    "rt_correction_peak_selection_rt_weight", "library_strategy", "libraries",
+    "library_provenance", "run_qa", "internal_standards",
+    "generate_materials_methods", "alignment_light_mode", "output_root",
+    "export_folder_path", "height_matrix_export", "console_path", "template_path",
+    "queries_path", "project_store", "workflow_overrides", "gcms_retention_type",
+    "gcms_alignment_index_type", "gcms_ri_compound_type", "gcms_ri_source",
+    "gcms_ri_standard_path", "gcms_ri_dictionary_path",
+}
 
 
 def inspect_analysis_input(input_path: str) -> dict[str, Any]:
@@ -68,6 +81,7 @@ def build_guided_plan(
     workset = get_workset(workset_id)
     merged = dict((workset or {}).get("answers", {}))
     merged.update(supplied)
+    unknown_answer_keys = sorted(set(merged) - SUPPORTED_ANSWER_KEYS)
     inspection = inspect_analysis_input(input_path)
     questions = _questions(merged)
     blockers: list[str] = []
@@ -110,6 +124,11 @@ def build_guided_plan(
         "remaining_questions": questions,
         "workflow": workflow,
         "validation": validation,
+        "warnings": [
+            *inspection.get("warnings", []),
+            *[f"Unknown answers key was not applied: {key}" for key in unknown_answer_keys],
+        ],
+        "unknown_answer_keys": unknown_answer_keys,
         "blockers": list(dict.fromkeys(blockers)),
         "official_library": official_library,
         "ready_to_prepare": not questions and not blockers,
@@ -235,6 +254,8 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
         )
     loaded = load_parameter_template(template, queries_path)
     state = dict(loaded["workflow"])
+    output_root = str(answers.get("output_root") or inspection["default_output_root"])
+    run_qa = _as_bool(answers.get("run_qa"))
     state.update(
         {
             "files": copy.deepcopy(inspection["files"]),
@@ -247,7 +268,15 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
                 or _default_console_path()
             ),
             "template_path": str(template.resolve()),
-            "output_root": str(answers.get("output_root") or inspection["default_output_root"]),
+            "output_root": output_root,
+            "run_qa": run_qa,
+            "generate_materials_methods": _as_bool(answers.get("generate_materials_methods")),
+            "height_matrix_export": _as_bool(
+                answers.get("height_matrix_export", run_qa)
+            ),
+            "export_folder_path": str(
+                answers.get("export_folder_path") or (output_root if run_qa else "")
+            ),
             "project_store": _as_bool(answers.get("project_store", True)),
             "together_with_alignment": True,
             "stage_inputs": False,
@@ -423,22 +452,4 @@ def _as_bool(value: Any) -> bool:
 
 
 def _default_console_path() -> str:
-    configured = str(os.environ.get("MSDIAL_CONSOLE_PATH", "")).strip()
-    candidates = [
-        Path(configured) if configured else None,
-        ROOT.parent
-        / "MsdialWorkbench"
-        / "tests"
-        / "MSDIAL5"
-        / "MsdialCoreTestApp"
-        / "bin"
-        / "Release"
-        / "net48"
-        / "MSDIALCUI.exe",
-        ROOT.parent
-        / "MSDIAL.console.v5.5.260323-windows-net48"
-        / "MSDIALCUI.exe",
-        ROOT / "MSDIALCUI.exe",
-        ROOT / "MSDIALCUI.dll",
-    ]
-    return next((str(path.resolve()) for path in candidates if path and path.is_file()), "")
+    return str(discover_console_paths().get("selected_path", ""))
