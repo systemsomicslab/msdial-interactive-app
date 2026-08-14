@@ -66,6 +66,13 @@ td:nth-child(2) { min-width: 360px; color: var(--muted); font-size: 14px; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(180px, 1fr)); gap: 12px; }
 .path-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .path-actions { margin-top: 12px; }
+.job-history { display: grid; gap: 8px; }
+.job-card { border: 1px solid var(--line); border-radius: 7px; padding: 10px 12px; background: #fbfdfe; }
+.job-card.active { border-color: var(--teal); box-shadow: inset 4px 0 0 var(--teal); }
+.job-card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+.job-card-meta { color: var(--muted); font-size: 14px; overflow-wrap: anywhere; line-height: 1.45; }
+.job-status { font-weight: 700; color: var(--teal-dark); }
+.job-status.failed, .job-status.interrupted { color: var(--danger); }
 .output-path-row > button { white-space: nowrap; }
 .library-catalog { display: grid; gap: 10px; }
 .library-card { border: 1px solid var(--line); border-radius: 7px; padding: 12px; background: #fbfdfe; }

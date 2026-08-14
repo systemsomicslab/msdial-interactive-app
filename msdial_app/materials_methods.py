@@ -282,10 +282,13 @@ def _annotation_sentence(workflow: dict[str, Any]) -> str:
         types.append("one LBM annotator")
     description = ", ".join(types) if types else "the annotation resources listed in Supplementary Table S1"
     cited = []
-    for item in workflow.get("library_provenance", []):
+    for _, item in _matched_library_provenance(workflow):
+        if not item:
+            continue
         identifier = item.get("doi") or item.get("record_url")
         if identifier:
             cited.append(f"{item.get('label') or item.get('filename') or 'library'} ({identifier})")
+    cited = list(dict.fromkeys(cited))
     citation = f" Downloaded libraries were {', '.join(cited)}." if cited else ""
     return f"Molecular annotation used {description} with the database-specific settings reported in Supplementary Table S1.{citation}"
 
@@ -327,20 +330,56 @@ def _results_text(qa_report: dict[str, Any] | None, assessment: dict[str, Any]) 
 
 
 def _library_warnings(workflow: dict[str, Any]) -> list[str]:
-    provenance = workflow.get("library_provenance", [])
-    by_path = {str(item.get("local_path", "")).casefold(): item for item in provenance}
     warnings = []
-    paths = [str(item.get("msp_file_path", "")) for item in workflow.get("msp_annotators", [])]
-    paths += [str(item.get("text_db_file_path", "")) for item in workflow.get("text_annotators", [])]
-    if workflow.get("lbm_path"):
-        paths.append(str(workflow["lbm_path"]))
-    for path in filter(None, paths):
-        item = by_path.get(path.casefold())
+    for path, item in _matched_library_provenance(workflow):
         if not item or not (item.get("doi") or item.get("record_url")):
             warnings.append(
                 f"No persistent identifier was recorded for {Path(path).name}. Add a database version, DOI, repository URL, or checksum before publication."
             )
     return warnings
+
+
+def _matched_library_provenance(
+    workflow: dict[str, Any]
+) -> list[tuple[str, dict[str, Any] | None]]:
+    provenance = [item for item in workflow.get("library_provenance", []) if isinstance(item, dict)]
+    by_path = {
+        _library_path_key(item.get("local_path", "")): item
+        for item in provenance
+        if str(item.get("local_path", "")).strip()
+    }
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for item in provenance:
+        name = str(item.get("filename") or Path(str(item.get("local_path", ""))).name).casefold()
+        if name:
+            by_name.setdefault(name, []).append(item)
+
+    matches: list[tuple[str, dict[str, Any] | None]] = []
+    for path in _used_library_paths(workflow):
+        item = by_path.get(_library_path_key(path))
+        if item is None:
+            same_name = by_name.get(Path(path).name.casefold(), [])
+            if len(same_name) == 1:
+                item = same_name[0]
+        matches.append((path, item))
+    return matches
+
+
+def _used_library_paths(workflow: dict[str, Any]) -> list[str]:
+    paths = [str(item.get("msp_file_path", "")).strip() for item in workflow.get("msp_annotators", [])]
+    paths += [str(item.get("text_db_file_path", "")).strip() for item in workflow.get("text_annotators", [])]
+    paths.append(str(workflow.get("lbm_path", "")).strip())
+    return list(dict.fromkeys(path for path in paths if path))
+
+
+def _library_path_key(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).expanduser().resolve()).casefold()
+    except OSError:
+        return text.replace("/", "\\").casefold()
 
 
 def _criteria(values: dict[str, Any] | None) -> dict[str, float]:

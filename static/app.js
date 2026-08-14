@@ -19,9 +19,13 @@ const state = {
   lbmAnnotator: {},
   libraryJobs: {},
   libraryProvenance: [],
+  consoleDiscovery: null,
+  jobs: [],
   mztabFiles: [],
   selectedMzTabPath: "",
+  selectedMzTabScope: "",
   qaReport: null,
+  qaSourceJobId: "",
   pathPicker: {
     mode: "vendor",
     currentPath: "",
@@ -95,6 +99,11 @@ function workflow() {
     alignment_rt_tolerance: Number($("#alignmentRtTolerance").value),
     alignment_ms1_tolerance: Number($("#alignmentMs1Tolerance").value),
     alignment_light_mode: Boolean($("#alignmentLightMode")?.checked),
+    run_qa: $("#projectType").value === "lcms" && Boolean($("#heightMatrixExport")?.checked),
+    height_matrix_export: $("#projectType").value === "lcms" && Boolean($("#heightMatrixExport")?.checked),
+    export_folder_path: $("#projectType").value === "lcms" && $("#heightMatrixExport")?.checked
+      ? $("#outputRoot").value.trim()
+      : "",
     execute_rt_correction: Boolean($("#executeRtCorrection")?.checked),
     rt_correction_anchor_path: $("#rtCorrectionAnchorPath")?.value.trim() || "",
     rt_correction_anchor_source_path: state.rtCorrectionAnchorSourcePath || "",
@@ -711,6 +720,7 @@ function applyLoadedParameterTemplate(result) {
   };
   Object.entries(controls).forEach(([key, id]) => setTemplateControl(id, values[key]));
   setTemplateControl("alignmentLightMode", values.alignment_light_mode, true);
+  setTemplateControl("heightMatrixExport", values.height_matrix_export, true);
   if (result.path) $("#templatePath").value = result.path;
   if (Array.isArray(result.msp_annotators)) state.mspAnnotators = result.msp_annotators;
   if (Array.isArray(result.text_annotators)) state.textAnnotators = result.text_annotators;
@@ -730,6 +740,7 @@ function applyLoadedParameterTemplate(result) {
   renderMspAnnotators();
   renderTextAnnotators();
   updateProjectUI();
+  renderConsoleDiscovery(state.consoleDiscovery);
   refreshQuestion();
 }
 
@@ -998,6 +1009,7 @@ function updateProjectUI() {
   $("#textAnnotatorPanel").hidden = !isLcms;
   $("#lipidQuerySection").hidden = isGcms || !lipidomics;
   $("#alignmentLightModeField").hidden = !isLcms;
+  $("#lcmsQaExportField").hidden = !isLcms;
   const isRtWorkspace = location.pathname.startsWith("/rt-correction");
   $("#rtCorrectionSettings").hidden = !isLcms || !isRtWorkspace;
   $("#rtCorrectionLauncher").hidden = !isLcms || isRtWorkspace;
@@ -1336,7 +1348,8 @@ function renderMzTabFileChoices() {
   }
   select.innerHTML = files.length
     ? files.map((file, index) => {
-        const label = `${index === 0 && file.is_default ? "Latest: " : ""}${file.file_name} (${file.modified_time_iso || "mtime unknown"})`;
+        const prefix = state.selectedMzTabScope === "job" ? "Job output: " : index === 0 && file.is_default ? "Latest: " : "";
+        const label = `${prefix}${file.file_name} (${file.modified_time_iso || "mtime unknown"})`;
         return `<option value="${escapeHtml(file.file)}">${escapeHtml(label)}</option>`;
       }).join("")
     : `<option value="">Latest mzTab-M in output folder</option>`;
@@ -1350,12 +1363,15 @@ function renderMzTabFileChoices() {
   if (hint) {
     hint.textContent = files.length
       ? `Selected: ${select.value || "none"}`
-      : "Default is the newest mzTab-M file in the output folder. Refresh after a run, or choose a file manually.";
+      : state.jobId
+        ? `Selected job ${state.jobId} did not create or update an mzTab-M file.`
+        : "Run or select an analysis job, or choose an archived mzTab-M file manually.";
   }
 }
 
-function setSelectedMzTabPath(path) {
+function setSelectedMzTabPath(path, scope = "manual") {
   state.selectedMzTabPath = path || "";
+  state.selectedMzTabScope = path ? scope : "";
   if (path && !state.mztabFiles.some((file) => file.file === path)) {
     state.mztabFiles.unshift({
       file: path,
@@ -1368,6 +1384,16 @@ function setSelectedMzTabPath(path) {
 }
 
 async function refreshMzTabFiles(keepSelection = true) {
+  if (state.jobId) {
+    const job = await api(`/api/jobs/${state.jobId}`);
+    state.mztabFiles = jobArtifactFiles(job, "mztab");
+    state.selectedMzTabPath = keepSelection && state.mztabFiles.some((file) => file.file === state.selectedMzTabPath)
+      ? state.selectedMzTabPath
+      : state.mztabFiles[0]?.file || "";
+    state.selectedMzTabScope = state.selectedMzTabPath ? "job" : "";
+    renderMzTabFileChoices();
+    return;
+  }
   const runDirectory = mztabRunDirectory();
   if (!runDirectory) {
     state.mztabFiles = [];
@@ -1381,6 +1407,7 @@ async function refreshMzTabFiles(keepSelection = true) {
     body: JSON.stringify({ run_directory: runDirectory }),
   });
   state.mztabFiles = result.mztab?.files || [];
+  state.selectedMzTabScope = "manual";
   if (previous && state.mztabFiles.some((file) => file.file === previous)) {
     state.selectedMzTabPath = previous;
   } else {
@@ -1397,6 +1424,9 @@ async function selectedMzTabPayload() {
   const filePath = currentMzTabFilePath();
   if (!runDirectory && !filePath) {
     throw new Error("Run MS-DIAL first, set an output folder, or choose an mzTab-M file.");
+  }
+  if (state.jobId && state.selectedMzTabScope === "job") {
+    return { job_id: state.jobId, file_path: filePath };
   }
   return { run_directory: runDirectory, file_path: filePath };
 }
@@ -2189,17 +2219,171 @@ function renderServerNotice() {
   notice.hidden = false;
 }
 
+function renderConsoleDiscovery(discovery = state.consoleDiscovery) {
+  state.consoleDiscovery = discovery || { candidates: [] };
+  const select = $("#consoleCandidateSelect");
+  const candidates = state.consoleDiscovery.candidates || [];
+  const current = $("#consolePath").value.trim();
+  select.innerHTML = candidates.length
+    ? candidates.map((candidate) => {
+        const qa = (candidate.capabilities || []).includes("lcms_alignment_qa_matrix")
+          ? "QA matrix supported"
+          : "QA matrix unavailable";
+        const label = `${candidate.version || "version unknown"} | ${qa} | ${candidate.source} | ${candidate.path}`;
+        return `<option value="${escapeHtml(candidate.path)}">${escapeHtml(label)}</option>`;
+      }).join("")
+    : `<option value="">No MS-DIAL Console candidate was found</option>`;
+  const matched = candidates.find((candidate) => candidate.path.toLowerCase() === current.toLowerCase());
+  if (matched) select.value = matched.path;
+  renderConsoleCapability(matched || null);
+}
+
+function renderConsoleCapability(candidate) {
+  const panel = $("#consoleCapabilityStatus");
+  const qaControl = $("#heightMatrixExport");
+  const path = $("#consolePath").value.trim();
+  if (!path) {
+    panel.innerHTML = `<div class="issue error">No MS-DIAL Console is selected.</div>`;
+    return;
+  }
+  if (!candidate) {
+    panel.innerHTML = `Selected path: <code>${escapeHtml(path)}</code><br><span class="muted">Run Detect / check Consoles to verify version and capabilities.</span>`;
+    return;
+  }
+  const capabilities = candidate.capabilities || [];
+  const qa = capabilities.includes("lcms_alignment_qa_matrix");
+  const wasUnsupported = qaControl.disabled;
+  qaControl.disabled = !qa;
+  if (!qa) qaControl.checked = false;
+  else if (wasUnsupported) qaControl.checked = true;
+  panel.innerHTML = `<strong>MS-DIAL Console ${escapeHtml(candidate.version || "version unknown")}</strong><br>`
+    + `<code>${escapeHtml(candidate.path)}</code><br>`
+    + `<span class="${qa ? "" : "issue warning"}">${qa
+      ? "LC-MS QA matrix export is available."
+      : "LC-MS QA matrix export is not available in this Console build. Analysis can run, but *.qa.tsv cannot be requested."}</span>`;
+}
+
+async function refreshConsoleDiscovery() {
+  const current = $("#consolePath").value.trim();
+  const result = await api("/api/agent/console/check", {
+    method: "POST",
+    body: JSON.stringify({ search_roots: current ? [current] : [] }),
+  });
+  renderConsoleDiscovery(result);
+  return result;
+}
+
+function jobArtifactFiles(job, kind) {
+  return ((job?.artifacts || {})[kind] || []).map((path) => ({
+    file: path,
+    file_name: path.split(/[\\/]/).pop(),
+    modified_time_iso: "created or updated by this job",
+    is_default: true,
+  }));
+}
+
+function renderJobHistory() {
+  const panel = $("#jobHistory");
+  const jobs = state.jobs || [];
+  panel.innerHTML = jobs.length ? jobs.map((job) => {
+    const artifacts = job.artifacts || {};
+    const warning = (job.warnings || []).map((message) => `<div class="issue warning">${escapeHtml(message)}</div>`).join("");
+    return `<article class="job-card ${job.id === state.jobId ? "active" : ""}" data-job-id="${escapeHtml(job.id)}">
+      <div class="job-card-head">
+        <div><span class="job-status ${escapeHtml(job.status)}">${escapeHtml(job.status || "unknown")}</span> <strong>${escapeHtml(job.analysis_type || job.kind || "job")}</strong></div>
+        <button type="button" class="secondary select-job">Use this job</button>
+      </div>
+      <div class="job-card-meta">${escapeHtml(job.updated_at || job.created_at || "time unknown")}<br>${escapeHtml(job.run_directory || "No run directory")}<br>
+      mzTab-M ${(artifacts.mztab || []).length} | QA ${(artifacts.qa || []).length} | MS-DIAL ${(artifacts.msdial || []).length}</div>${warning}
+    </article>`;
+  }).join("") : `<div class="muted">No persisted analysis jobs were found.</div>`;
+  panel.querySelectorAll(".select-job").forEach((button) => {
+    button.addEventListener("click", () => runUiAction(async () => {
+      await selectAnalysisJob(button.closest(".job-card").dataset.jobId);
+    }));
+  });
+}
+
+async function refreshJobHistory() {
+  const status = await api("/api/agent/status");
+  state.jobs = (status.jobs || []).filter((job) => job.kind === "run");
+  renderJobHistory();
+}
+
+async function selectAnalysisJob(jobId, job = null) {
+  const selected = job || await api(`/api/jobs/${jobId}`);
+  state.jobId = selected.id;
+  if (selected.run_directory) {
+    $("#runPath").textContent = selected.run_directory;
+    $("#publicationRunDirectory").value = selected.run_directory;
+  }
+  state.mztabFiles = jobArtifactFiles(selected, "mztab");
+  state.selectedMzTabPath = state.mztabFiles[0]?.file || "";
+  state.selectedMzTabScope = state.selectedMzTabPath ? "job" : "";
+  renderMzTabFileChoices();
+  const qaFiles = jobArtifactFiles(selected, "qa");
+  $("#qaFilePath").value = qaFiles[0]?.file || "";
+  state.qaSourceJobId = qaFiles.length ? selected.id : "";
+  state.qaReport = null;
+  renderQaFileProvenance(selected);
+  renderPublicationJobSource(selected);
+  $("#log").textContent = (selected.log_tail || []).join("\n") || selected.status;
+  renderJobHistory();
+  setStatus(`Selected analysis job ${selected.id}.`);
+}
+
+function clearAnalysisJobSelection() {
+  state.jobId = null;
+  state.qaSourceJobId = "";
+  state.selectedMzTabScope = "manual";
+  state.qaReport = null;
+  renderJobHistory();
+  renderQaFileProvenance();
+  renderPublicationJobSource();
+  setStatus("Job scoping cleared. Explicitly selected files and directories will be used.");
+}
+
+function renderQaFileProvenance(job = null) {
+  const panel = $("#qaFileProvenance");
+  const qaPath = $("#qaFilePath").value.trim();
+  if (job && state.qaSourceJobId === job.id && qaPath) {
+    panel.innerHTML = `<strong>Job-owned QA matrix</strong><br>Job: <code>${escapeHtml(job.id)}</code><br>File: <code>${escapeHtml(qaPath)}</code><br>Updated: ${escapeHtml(job.updated_at || "unknown")}`;
+  } else if (qaPath) {
+    panel.innerHTML = `<strong>Manually selected QA matrix</strong><br><code>${escapeHtml(qaPath)}</code><br><span class="muted">This file is not attributed to the selected analysis job.</span>`;
+  } else {
+    panel.textContent = "No QA matrix is associated with the selected job.";
+  }
+}
+
+function renderPublicationJobSource(job = null) {
+  const panel = $("#publicationJobSource");
+  if (!job) {
+    panel.textContent = "No analysis job selected. The report will use the explicitly selected directory and files.";
+    return;
+  }
+  const qaCount = ((job.artifacts || {}).qa || []).length;
+  panel.innerHTML = `<strong>Selected job:</strong> <code>${escapeHtml(job.id)}</code><br>${escapeHtml(job.run_directory || "")}`
+    + `<br>QA matrices created or updated by this job: ${qaCount}`;
+}
+
 async function pollJob() {
   if (!state.jobId) return;
   const job = await api(`/api/jobs/${state.jobId}`);
-  $("#log").textContent = job.logs.join("\n") || job.status;
+  $("#log").textContent = (job.log_tail || []).join("\n") || job.status;
   $("#log").scrollTop = $("#log").scrollHeight;
-  renderMzTabValidation(job.mztab_validation);
   setStatus(`Job ${job.status}`);
   if (["queued", "running"].includes(job.status)) {
     setTimeout(pollJob, 1000);
   } else {
-    refreshMzTabFiles(false).catch((error) => setStatus(`mzTab-M list refresh failed: ${error.message}`));
+    await selectAnalysisJob(job.id, job);
+    if ((job.artifacts?.mztab || []).length) {
+      const result = await api("/api/mztab/validate", {
+        method: "POST",
+        body: JSON.stringify({ job_id: job.id }),
+      });
+      renderMzTabValidation(result.validation);
+    }
+    await refreshJobHistory();
   }
 }
 
@@ -2211,6 +2395,7 @@ async function initialize() {
   $("#templatePath").value = state.config.default_template;
   $("#queriesPath").value = state.config.default_queries;
   $("#consolePath").value = state.config.default_console || "";
+  renderConsoleDiscovery(state.config.console_discovery);
   $("#pathSettingsInfo").textContent = state.config.settings_loaded
     ? `Loaded saved paths from ${state.config.settings_file}`
     : `Paths can be saved locally to ${state.config.settings_file}`;
@@ -2231,6 +2416,7 @@ async function initialize() {
   renderMspAnnotators();
   renderTextAnnotators();
   renderLibraryCatalog();
+  await refreshJobHistory();
   renderFiles();
   updateProjectUI();
   applyWorkspaceMode();
@@ -2369,6 +2555,37 @@ $("#savePathSettings").addEventListener("click", () => runUiAction(async () => {
   $("#pathSettingsInfo").textContent = `Saved paths to ${result.settings_file}`;
   setStatus("Paths saved for the next launch.");
 }));
+$("#refreshConsoleCandidates").addEventListener("click", () => runUiAction(async () => {
+  const discovery = await refreshConsoleDiscovery();
+  setStatus(`Detected ${discovery.candidates?.length || 0} MS-DIAL Console candidate(s).`);
+}));
+$("#useConsoleCandidate").addEventListener("click", () => runUiAction(async () => {
+  const path = $("#consoleCandidateSelect").value;
+  if (!path) throw new Error("Select an MS-DIAL Console candidate first.");
+  const result = await api("/api/agent/console/set", {
+    method: "POST",
+    body: JSON.stringify({ console_path: path }),
+  });
+  $("#consolePath").value = result.console_path;
+  state.config.default_console = result.console_path;
+  state.config.settings_loaded = true;
+  const candidate = {
+    path: result.console_path,
+    version: result.version,
+    capabilities: result.capabilities || [],
+    capability_probe: result.capability_probe,
+    source: "saved setting",
+  };
+  renderConsoleCapability(candidate);
+  $("#pathSettingsInfo").textContent = `Saved Console path to ${result.settings_file}`;
+  setStatus("Selected and saved the MS-DIAL Console path.");
+}));
+$("#consoleCandidateSelect").addEventListener("change", () => {
+  const path = $("#consoleCandidateSelect").value;
+  const candidate = (state.consoleDiscovery?.candidates || []).find((item) => item.path === path);
+  if (candidate) renderConsoleCapability(candidate);
+});
+$("#consolePath").addEventListener("input", () => renderConsoleCapability(null));
 
 $("#loadParameterTemplate").addEventListener("click", () => runUiAction(async () => {
   const path = $("#templatePath").value.trim();
@@ -2625,6 +2842,7 @@ $("#prepare").addEventListener("click", () => runUiAction(async () => {
   renderMzTabPreview(null);
   state.mztabFiles = [];
   state.selectedMzTabPath = "";
+  state.selectedMzTabScope = "";
   renderMzTabFileChoices();
   renderWorkflowExport(result);
 }));
@@ -2636,10 +2854,20 @@ $("#run").addEventListener("click", () => runUiAction(async () => {
   renderMzTabPreview(null);
   state.mztabFiles = [];
   state.selectedMzTabPath = "";
+  state.selectedMzTabScope = "";
+  state.qaSourceJobId = "";
+  state.qaReport = null;
+  $("#qaFilePath").value = "";
+  renderQaFileProvenance();
   renderMzTabFileChoices();
   renderWorkflowExport(result);
   pollJob();
 }));
+$("#refreshJobHistory").addEventListener("click", () => runUiAction(async () => {
+  await refreshJobHistory();
+  setStatus(`Loaded ${state.jobs.length} analysis job(s).`);
+}));
+$("#clearJobSelection").addEventListener("click", clearAnalysisJobSelection);
 $("#refreshMzTabFiles").addEventListener("click", () => runUiAction(async () => {
   await refreshMzTabFiles(false);
   setStatus(state.selectedMzTabPath ? "mzTab-M list refreshed." : "No mzTab-M file was found.");
@@ -2647,7 +2875,7 @@ $("#refreshMzTabFiles").addEventListener("click", () => runUiAction(async () => 
 $("#browseMzTabFile").addEventListener("click", () => runUiAction(async () => {
   const result = await api("/api/dialog/mztab-file", { method: "POST", body: "{}" });
   if (result.path) {
-    setSelectedMzTabPath(result.path);
+    setSelectedMzTabPath(result.path, "manual");
     setStatus(`Selected mzTab-M: ${result.path}`);
   }
 }));
@@ -2674,6 +2902,17 @@ $("#previewMzTab").addEventListener("click", () => runUiAction(async () => {
   });
   renderMzTabPreview(result.preview);
 }));
+$("#useJobQaFile").addEventListener("click", () => runUiAction(async () => {
+  if (!state.jobId) throw new Error("Run or select an analysis job first.");
+  const job = await api(`/api/jobs/${state.jobId}`);
+  const qaFiles = jobArtifactFiles(job, "qa");
+  if (!qaFiles.length) throw new Error(`Job ${state.jobId} did not create or update an LC-MS QA matrix.`);
+  $("#qaFilePath").value = qaFiles[0].file;
+  state.qaSourceJobId = job.id;
+  state.qaReport = null;
+  renderQaFileProvenance(job);
+  setStatus(`Selected the QA matrix created by job ${job.id}.`);
+}));
 $("#refreshQaFile").addEventListener("click", () => runUiAction(async () => {
   const outputRoot = $("#outputRoot").value.trim();
   if (!outputRoot) throw new Error("Set Output root before searching for the latest QA matrix.");
@@ -2682,15 +2921,26 @@ $("#refreshQaFile").addEventListener("click", () => runUiAction(async () => {
     body: JSON.stringify({ path: outputRoot }),
   });
   $("#qaFilePath").value = result.default_file || "";
+  state.qaSourceJobId = "";
+  state.qaReport = null;
+  renderQaFileProvenance();
   setStatus(result.default_file ? `Selected latest QA matrix: ${result.default_file}` : "No *.qa.tsv was found in Output root.");
 }));
 $("#browseQaFile").addEventListener("click", () => runUiAction(async () => {
   const result = await api("/api/dialog/qa-file", { method: "POST", body: "{}" });
   if (result.path) {
     $("#qaFilePath").value = result.path;
+    state.qaSourceJobId = "";
+    state.qaReport = null;
+    renderQaFileProvenance();
     setStatus(`Selected LC-MS QA matrix: ${result.path}`);
   }
 }));
+$("#qaFilePath").addEventListener("input", () => {
+  state.qaSourceJobId = "";
+  state.qaReport = null;
+  renderQaFileProvenance();
+});
 $("#loadQaInternalStandardExample").addEventListener("click", () => {
   $("#qaInternalStandards").value = [
     "FA 16:0,[M-H]-,255.2330,2.107,0.01,0.05",
@@ -2707,12 +2957,14 @@ $("#generateQaReport").addEventListener("click", () => runUiAction(async () => {
   const result = await api("/api/qa/report", {
     method: "POST",
     body: JSON.stringify({
+      job_id: state.qaSourceJobId || "",
       file_path: filePath,
       run_directory: runDirectory,
       internal_standards: parseQaInternalStandards(),
     }),
   });
   $("#qaFilePath").value = result.report.file;
+  state.qaSourceJobId = result.job_id || state.qaSourceJobId;
   renderQaReport(result.report);
   setStatus("LC-MS QA report generated.");
 }));
@@ -2726,15 +2978,18 @@ $("#generatePublicationReport").addEventListener("click", () => runUiAction(asyn
   $("#publicationRunDirectory").value = runDirectory;
   $("#publicationOutput").hidden = true;
   $("#publicationSource").textContent = "Generating publication files...";
+  const jobScopedQa = Boolean(state.jobId && state.qaSourceJobId === state.jobId);
+  const manualQa = Boolean(!state.jobId && $("#qaFilePath").value.trim());
   const result = await api("/api/publication/report", {
     method: "POST",
     body: JSON.stringify({
       workflow: workflow(),
+      job_id: state.jobId || "",
       run_directory: runDirectory,
       use_saved_run: $("#publicationUseSavedRun").checked,
-      run_qa: Boolean(state.qaReport || $("#qaFilePath").value.trim()),
-      qa_report: state.qaReport,
-      qa_file_path: $("#qaFilePath").value.trim(),
+      run_qa: $("#publicationIncludeQa").checked,
+      qa_report: jobScopedQa || manualQa ? state.qaReport : null,
+      qa_file_path: jobScopedQa || manualQa ? $("#qaFilePath").value.trim() : "",
       internal_standards: parseQaInternalStandards(),
       qa_criteria: publicationQaCriteria(),
       additional_library_provenance: parsePublicationLibraryProvenance(),
@@ -2761,6 +3016,7 @@ $("#exportWorkflow").addEventListener("click", () => runUiAction(async () => {
   renderMzTabPreview(null);
   state.mztabFiles = [];
   state.selectedMzTabPath = "";
+  state.selectedMzTabScope = "";
   renderMzTabFileChoices();
   renderWorkflowExport(result);
 }));

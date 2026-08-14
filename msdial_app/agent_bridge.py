@@ -141,6 +141,7 @@ def summarize_job(
         "created_at": job.get("created_at", ""),
         "updated_at": job.get("updated_at", ""),
         "error": job.get("error", ""),
+        "warnings": list(job.get("warnings") or []),
         "progress": job.get("progress"),
         "log_tail": (job.get("logs") or [])[-max(0, log_lines):],
     }

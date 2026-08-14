@@ -1,7 +1,9 @@
 import hashlib
 import os
+import io
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from msdial_app.library_catalog import LIBRARY_CATALOG, catalog_status, download_library, library_path
@@ -9,6 +11,45 @@ from msdial_app.user_settings import load_user_settings, save_path_settings, set
 
 
 class UserResourceTests(unittest.TestCase):
+    def test_library_download_resumes_a_partial_file(self) -> None:
+        content = b"0123456789abcdef"
+        item = {
+            "id": "test-library",
+            "record_id": "1",
+            "filename": "library.bin",
+            "size": len(content),
+            "md5": hashlib.md5(content).hexdigest(),
+            "kind": "msp",
+        }
+
+        class Response(io.BytesIO):
+            status = 206
+            headers = {"Content-Length": str(len(content) - 6)}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                self.close()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / item["filename"]
+            target.with_suffix(".bin.part").write_bytes(content[:6])
+            with (
+                patch("msdial_app.library_catalog._entry", return_value=item),
+                patch("msdial_app.library_catalog.library_path", return_value=target),
+                patch(
+                    "msdial_app.library_catalog.urllib.request.urlopen",
+                    return_value=Response(content[6:]),
+                ) as urlopen,
+            ):
+                result = download_library(item["id"])
+
+            self.assertEqual(content, target.read_bytes())
+            self.assertFalse(target.with_suffix(".bin.part").exists())
+            self.assertEqual(f"bytes=6-", urlopen.call_args.args[0].headers["Range"])
+            self.assertEqual(str(target), result["local_path"])
+
     def test_path_settings_round_trip_in_user_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.dict(
             os.environ, {"LOCALAPPDATA": temporary}

@@ -108,6 +108,12 @@ class JobArtifactTests(unittest.TestCase):
                 self.assertEqual(1, validation["summary"]["file_count"])
                 self.assertEqual(str(current_mztab.resolve()), validation["files"][0]["file"])
 
+                preview = self._post(
+                    server.server_port, "/api/mztab/preview", {"job_id": job_id}
+                )["preview"]
+                self.assertEqual(1, len(preview["files"]))
+                self.assertTrue(Path(preview["files"][0]).samefile(current_mztab))
+
                 with self.assertRaises(urllib.error.HTTPError) as error:
                     self._post(server.server_port, "/api/qa/report", {"job_id": job_id})
                 payload = json.loads(error.exception.read().decode("utf-8"))
