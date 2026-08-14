@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 async def smoke_test(
-    input_path: str, port: int, restart_incompatible: bool, restart: bool
+    input_path: str, port: int, restart_incompatible: bool, restart: bool, job_id: str
 ) -> dict[str, object]:
     parameters = StdioServerParameters(
         command=sys.executable,
@@ -56,6 +56,18 @@ async def smoke_test(
                 "msdial_check_console_path", {"port": port}
             )
             console = json.loads(console_result.content[0].text)
+            waited_job = None
+            if job_id:
+                wait_result = await session.call_tool(
+                    "msdial_interactive_wait_for_completion",
+                    {
+                        "job_id": job_id,
+                        "port": port,
+                        "timeout_seconds": 5,
+                        "poll_seconds": 1,
+                    },
+                )
+                waited_job = json.loads(wait_result.content[0].text)
             return {
                 "tool_count": len(names),
                 "compatible": True,
@@ -70,6 +82,8 @@ async def smoke_test(
                 "file_count": payload["input"]["file_count"],
                 "next_question": payload["next_question"]["id"],
                 "question_presentation": payload["next_question"].get("presentation"),
+                "waited_job_id": (waited_job or {}).get("job", {}).get("id", ""),
+                "waited_job_finished": (waited_job or {}).get("finished"),
             }
 
 
@@ -79,6 +93,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--restart-incompatible", action="store_true")
     parser.add_argument("--restart", action="store_true")
+    parser.add_argument("--job-id", default="")
     args = parser.parse_args()
     print(
         json.dumps(
@@ -88,6 +103,7 @@ def main() -> None:
                     args.port,
                     args.restart_incompatible,
                     args.restart,
+                    args.job_id,
                 )
             ),
             indent=2,

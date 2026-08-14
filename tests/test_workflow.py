@@ -11,6 +11,7 @@ from msdial_app.mztab_preview import preview_mztab_file, preview_mztab_outputs
 from msdial_app.mztab_validation import validate_mztab_file, validate_mztab_files, validate_mztab_outputs
 from msdial_app.workflow import (
     build_console_command,
+    console_capabilities,
     detect_raw_format,
     expand_paths,
     expand_paths_report,
@@ -33,6 +34,16 @@ from msdial_app.workflow import (
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_console_capability_falls_back_to_qa_assembly_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            console = Path(temporary) / "MSDIALCUI.exe"
+            console.write_bytes("LC-MS quality-assurance matrix:".encode("utf-16-le"))
+
+            result = console_capabilities(str(console))
+
+            self.assertEqual("assembly marker", result["capability_probe"])
+            self.assertIn("lcms_alignment_qa_matrix", result["capabilities"])
+
     def test_parameter_template_loads_guided_annotation_and_lipid_queries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -347,7 +358,7 @@ class WorkflowTests(unittest.TestCase):
                 encoding="utf-8",
             )
             console = root / "MSDIALCUI"
-            console.write_text("")
+            console.write_bytes("LC-MS quality-assurance matrix:".encode("utf-16-le"))
             files = expand_paths([str(raw)])
             files[0]["acquisition_type"] = "SWATH"
             state = {
@@ -443,9 +454,9 @@ class WorkflowTests(unittest.TestCase):
             manifest = json.loads(
                 Path(result["manifest"]).read_text(encoding="utf-8")
             )
-            self.assertEqual("0.3.1", settings["msdial_interactive_version"])
+            self.assertEqual("0.3.2", settings["msdial_interactive_version"])
             self.assertEqual("not recorded", settings["msdial_console_version"])
-            self.assertEqual("0.3.1", manifest["msdial_interactive_version"])
+            self.assertEqual("0.3.2", manifest["msdial_interactive_version"])
             self.assertEqual("21904324", settings["library_provenance"][0]["record_id"])
             self.assertEqual("CC BY 4.0", settings["library_provenance"][0]["license"])
 

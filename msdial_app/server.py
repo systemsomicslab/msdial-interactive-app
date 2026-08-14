@@ -30,6 +30,7 @@ from .materials_methods import generate_publication_report
 from .quality_assurance import build_lcms_qa_report_from_file, find_qa_files
 from .workflow import (
     console_version,
+    console_capabilities,
     discover_console_paths,
     expand_paths,
     expand_paths_report,
@@ -244,6 +245,7 @@ def _application_config() -> dict[str, Any]:
     except (OSError, ValueError):
         for item in lipid_queries:
             item["selected"] = True
+    console_discovery = discover_console_paths()
     return {
         "default_console": default_console,
         "default_queries": default_queries,
@@ -253,6 +255,7 @@ def _application_config() -> dict[str, Any]:
         "settings_loaded": bool(saved),
         "library_directory": str(library_directory()),
         "library_catalog": catalog_status(),
+        "console_discovery": console_discovery,
         "lipid_queries": lipid_queries,
     }
 
@@ -505,6 +508,7 @@ class Handler(BaseHTTPRequestHandler):
                     {
                         "console_path": saved["console_path"],
                         "version": console_version(saved["console_path"]),
+                        **console_capabilities(saved["console_path"]),
                         "settings_file": str(settings_path()),
                     }
                 )
@@ -843,16 +847,21 @@ class Handler(BaseHTTPRequestHandler):
                         raise FileNotFoundError(
                             f"Job {job_id} did not create or update an mzTab-M file."
                         )
-                    file_path = files[0]
+                    if file_path:
+                        requested = str(Path(file_path).expanduser().resolve()).casefold()
+                        owned = {str(Path(path).resolve()).casefold(): path for path in files}
+                        if requested not in owned:
+                            raise ValueError(
+                                f"The requested mzTab-M file was not created or updated by job {job_id}."
+                            )
+                        file_path = owned[requested]
+                    else:
+                        file_path = files[0]
                     run_directory = (job.get("preparation") or {}).get("run_directory", "")
-                self._json(
-                    {
-                        "preview": preview_mztab_outputs(
-                            run_directory, file_path
-                        ),
-                        "job_id": job_id,
-                    }
-                )
+                preview = preview_mztab_outputs(run_directory, file_path)
+                if job_id:
+                    preview["files"] = files
+                self._json({"preview": preview, "job_id": job_id})
             elif parsed.path == "/api/qa/list":
                 files = find_qa_files(body.get("path", ""))
                 self._json(
@@ -917,7 +926,10 @@ class Handler(BaseHTTPRequestHandler):
                 output_root = run_directory or str(state.get("output_root", "")).strip()
                 if not output_root:
                     raise ValueError("Set a run/output directory for the publication report.")
-                if run_qa and not qa_report and job is not None:
+                if run_qa and job is not None:
+                    # A job-scoped publication must derive QA from that job's own
+                    # matrix, never from a client-supplied report object.
+                    qa_report = None
                     qa_files = _job_artifact_paths(job, "qa")
                     if qa_path:
                         requested = str(Path(qa_path).expanduser().resolve()).casefold()
@@ -1202,6 +1214,15 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
         with JOBS_LOCK:
             baseline = dict(JOBS[job_id].get("artifact_baseline") or {})
         artifacts = _changed_run_artifacts(preparation, baseline)
+        artifact_warnings: list[str] = []
+        if exit_code == 0 and preparation.get("qa_matrix_expected") and not artifacts["qa"]:
+            warning = (
+                "LC-MS QA matrix export was requested, but this job did not create or update "
+                "a *.qa.tsv file. Verify that the selected Console advertises the "
+                "lcms_alignment_qa_matrix capability and that Export folder path is writable."
+            )
+            artifact_warnings.append(warning)
+            log("WARNING: " + warning)
         if exit_code == 0:
             validation = validate_mztab_files(
                 artifacts["mztab"], preparation["run_directory"]
@@ -1234,6 +1255,7 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
             JOBS[job_id]["mztab_validation"] = validation
             JOBS[job_id]["datamining_handoff"] = handoff
             JOBS[job_id]["artifacts"] = artifacts
+            JOBS[job_id]["warnings"] = artifact_warnings
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             if exit_code == 0:
                 JOBS[job_id]["status"] = "completed"

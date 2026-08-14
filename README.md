@@ -139,10 +139,16 @@ both the MS-DIAL Console version and MS-DIAL Interactive version in
 run is reported as `not recorded`; the current application version is not
 silently assigned to historical processing.
 
-If no QA matrix is selected in the current session, the report automatically
-uses the newest `*.qa.tsv` in the run directory or one of its immediate QA
-output subdirectories. The selected matrix is shown in the Publication
-workspace; vendor RAW directory contents are not recursively searched.
+For a selected analysis job, mzTab-M validation, QA, and publication reporting
+use only files created or updated by that job. The GUI displays the job ID,
+timestamp, output directory, and artifact counts. Archived results can still be
+selected manually, but they are visibly identified as manual inputs.
+
+LC-MS QA matrix export requires a Console build that advertises the
+`lcms_alignment_qa_matrix` capability. Guided setup lists detected Console
+candidates and shows whether each candidate supports this export. If export was
+requested but no `*.qa.tsv` was produced, the completed job carries an explicit
+warning even when the Console exit code is zero.
 
 Supplementary Table S1 includes:
 

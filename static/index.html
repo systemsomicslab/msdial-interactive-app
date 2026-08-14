@@ -125,6 +125,9 @@
         </p>
         <div class="path-grid">
           <label>MS-DIAL Console<input id="consolePath" placeholder="/opt/msdial/MSDIALCUI or C:\...\MSDIALCUI.exe"></label>
+          <label>Detected Console candidates
+            <select id="consoleCandidateSelect"><option value="">No candidates checked</option></select>
+          </label>
           <label>Parameter template
             <div class="output-path-row">
               <input id="templatePath">
@@ -139,9 +142,12 @@
           </label>
         </div>
         <div class="button-row path-actions">
+          <button id="refreshConsoleCandidates" type="button" class="secondary">Detect / check Consoles</button>
+          <button id="useConsoleCandidate" type="button" class="secondary">Use selected Console</button>
           <button id="savePathSettings" type="button" class="secondary">Save paths for next launch</button>
           <span id="pathSettingsInfo" class="muted"></span>
         </div>
+        <div id="consoleCapabilityStatus" class="format-summary">Console capability has not been checked.</div>
         <p class="muted">MS-DIAL reads raw data from their original paths. Only result and project files are written below Output root.</p>
       </div>
       <div id="peakDetectionPanel" class="panel">
@@ -171,6 +177,10 @@
           <label id="alignmentLightModeField">Alignment light mode
             <span class="inline-check"><input id="alignmentLightMode" type="checkbox"> Use LC-MS text-export light mode</span>
             <span class="muted">For large LC-MS Console runs. This keeps mdalign/mdmsp/mzTab text outputs and alignment dcl while skipping GUI project serialization.</span>
+          </label>
+          <label id="lcmsQaExportField">LC-MS quality-assurance matrix
+            <span class="inline-check"><input id="heightMatrixExport" type="checkbox" checked> Export <code>*.qa.tsv</code> after alignment</span>
+            <span class="muted">The QA matrix is written to Output root. This requires a Console build advertising <code>lcms_alignment_qa_matrix</code>.</span>
           </label>
         </div>
       </div>
@@ -545,6 +555,19 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
             <div id="workflowExport" class="format-summary" hidden></div>
           </div>
           <div class="panel">
+            <div class="section-head compact-head">
+              <div>
+                <h2>Analysis job history</h2>
+                <p class="muted">Select a job to use only the mzTab-M and QA files created or updated by that run.</p>
+              </div>
+              <div class="button-row">
+                <button id="clearJobSelection" type="button" class="secondary">Use manual files</button>
+                <button id="refreshJobHistory" type="button" class="secondary">Refresh jobs</button>
+              </div>
+            </div>
+            <div id="jobHistory" class="job-history"><div class="muted">No job history loaded.</div></div>
+          </div>
+          <div class="panel">
             <h2>mzTab-M bridge check</h2>
             <p class="muted">After an alignment run, the app checks whether the exported mzTab-M file is present and structurally ready for downstream tools. This built-in check does not require extra Python packages.</p>
             <label>mzTab-M file
@@ -557,7 +580,7 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
               <button id="browseMzTabFile" class="secondary" type="button">Native file picker</button>
               <button id="pickMzTabPath" class="secondary" type="button">Local path browser</button>
             </div>
-            <div id="mztabFileHint" class="muted">Default is the newest mzTab-M file in the output folder.</div>
+            <div id="mztabFileHint" class="muted">Run or select an analysis job. Manual file selection remains available for archived results.</div>
             <button id="validateMzTab" class="secondary">Validate mzTab-M output</button>
             <button id="previewMzTab" class="secondary">Preview mzTab-M output</button>
             <div id="mztabValidation" class="format-summary" hidden></div>
@@ -576,9 +599,11 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
           <input id="qaFilePath" placeholder="Latest *.qa.tsv in Output root">
         </label>
         <div class="button-row">
-          <button id="refreshQaFile" class="secondary" type="button">Use latest QA matrix</button>
+          <button id="useJobQaFile" class="secondary" type="button">Use QA from selected job</button>
+          <button id="refreshQaFile" class="secondary" type="button">Find latest manually</button>
           <button id="browseQaFile" class="secondary" type="button">Native file picker</button>
         </div>
+        <div id="qaFileProvenance" class="format-summary">No QA matrix is associated with the selected job.</div>
         <label>Internal standards (optional)
           <textarea id="qaInternalStandards" rows="4" placeholder="Name,Adduct,m/z,RT (min),m/z tolerance (Da),RT tolerance (min)&#10;IS 1,[M-H]-,231.06953,7.61,0.01,0.5"></textarea>
         </label>
@@ -602,6 +627,8 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
           </div>
         </label>
         <label class="checkbox-line"><input id="publicationUseSavedRun" type="checkbox" checked> Use saved <code>workflow-settings.json</code> when available</label>
+        <label class="checkbox-line"><input id="publicationIncludeQa" type="checkbox" checked> Include QA from the selected analysis job</label>
+        <div id="publicationJobSource" class="format-summary">No analysis job selected. The report will use the explicitly selected directory and files.</div>
         <label>Additional provenance for user-supplied libraries (optional)
           <textarea id="publicationLibraryProvenance" rows="4" placeholder="Library path | Version | DOI or repository URL | License&#10;D:\libraries\inhouse.msp | 2026-08-01 | https://doi.org/... | institutional"></textarea>
         </label>

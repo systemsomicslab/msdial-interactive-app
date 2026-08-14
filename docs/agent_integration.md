@@ -111,6 +111,11 @@ Agent API 0.3 tracks files created or updated by that job and does not silently
 reuse older mzTab-M or `*.qa.tsv` files from the same directory. Publication can
 be generated without QA by setting `run_qa=false`.
 
+The browser UI uses the same provenance model. Its job history can select a
+completed run, after which mzTab-M preview, LC-MS QA, and publication generation
+are scoped to that exact job. Guided setup also probes `MSDIALCUI capabilities`;
+LC-MS QA requires `lcms_alignment_qa_matrix`.
+
 ## Agent endpoints
 
 - `GET /api/agent/status`

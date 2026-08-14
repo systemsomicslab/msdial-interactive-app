@@ -161,6 +161,28 @@ class MaterialsMethodsTests(unittest.TestCase):
         self.assertIn("No persistent identifier", result["warnings"][0])
         self.assertIn("[VERSION NOT RECORDED]", result["methods_text"])
 
+    def test_official_library_doi_matches_an_identical_filename_at_another_path(self) -> None:
+        workflow = {
+            "project_type": "lcms",
+            "files": [],
+            "lbm_path": "D:/demo/Msp2025_dev.lbm2",
+            "library_provenance": [
+                {
+                    "label": "Official lipid library",
+                    "filename": "Msp2025_dev.lbm2",
+                    "local_path": "C:/cache/21904324/Msp2025_dev.lbm2",
+                    "doi": "10.5281/zenodo.21904324",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result = generate_publication_report(
+                workflow, None, temporary, app_version="0.3.1", console_version="5.5"
+            )
+
+        self.assertEqual([], result["warnings"])
+        self.assertIn("10.5281/zenodo.21904324", result["methods_text"])
+
     def test_gcms_methods_use_retention_index_settings_without_lcms_tolerances(self) -> None:
         workflow = {
             "project_type": "gcms",

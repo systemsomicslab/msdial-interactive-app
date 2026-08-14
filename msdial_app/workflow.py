@@ -43,6 +43,7 @@ SMOOTHING_METHODS = [
     "LoessFilter",
     "TimeBasedLinearWeightedMovingAverage",
 ]
+LCMS_QA_CAPABILITY = "lcms_alignment_qa_matrix"
 
 
 def discover_console_paths(search_roots: Iterable[str | Path] | None = None) -> dict[str, Any]:
@@ -91,8 +92,14 @@ def discover_console_paths(search_roots: Iterable[str | Path] | None = None) -> 
         if resolved.casefold() in seen:
             continue
         seen.add(resolved.casefold())
+        capability_info = console_capabilities(resolved)
         found.append(
-            {"path": resolved, "source": source, "version": console_version(resolved)}
+            {
+                "path": resolved,
+                "source": source,
+                "version": console_version(resolved),
+                **capability_info,
+            }
         )
     return {
         "configured_path": saved,
@@ -680,6 +687,18 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                     ),
                 }
             )
+        console_path = str(state.get("console_path", "")).strip()
+        if console_path and LCMS_QA_CAPABILITY not in console_capabilities(console_path)["capabilities"]:
+            issues.append(
+                {
+                    "level": "error",
+                    "message": (
+                        "The selected MS-DIAL Console does not advertise LC-MS QA matrix export. "
+                        "Choose a Console build containing the lcms_alignment_qa_matrix capability, "
+                        "or disable QA matrix export for this run."
+                    ),
+                }
+            )
     if project_type not in {"lcms", "gcms"}:
         issues.append(
             {
@@ -1057,6 +1076,9 @@ def prepare_run(
         "command": command,
         "expected_analysis_exports": expected_analysis_exports,
         "export_folder_path": str(method_state.get("export_folder_path", "")),
+        "qa_matrix_expected": bool(
+            project_type == "lcms" and method_state.get("height_matrix_export")
+        ),
     }
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -1072,6 +1094,9 @@ def prepare_run(
         "analysis_type": project_type,
         "expected_analysis_exports": expected_analysis_exports,
         "export_folder_path": str(method_state.get("export_folder_path", "")),
+        "qa_matrix_expected": bool(
+            project_type == "lcms" and method_state.get("height_matrix_export")
+        ),
         "diagnostic_result_file": expected_analysis_exports[0] if len(files) == 1 else "",
         "input_csv": str(csv_path),
         "console_input": str(csv_path),
@@ -2214,3 +2239,44 @@ def console_version(console_path: str) -> str:
         re.I,
     )
     return match.group(1) if match else ""
+
+
+def console_capabilities(console_path: str) -> dict[str, Any]:
+    path = Path(console_path)
+    if not path.is_file():
+        return {"capability_probe": "missing", "capabilities": []}
+    command = ["dotnet", str(path)] if path.suffix.lower() == ".dll" else [str(path)]
+    try:
+        result = subprocess.run(
+            command + ["capabilities"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+    if result is not None and result.returncode == 0:
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if "msdial.console.capabilities.v1" in lines:
+            return {
+                "capability_probe": "command",
+                "capabilities": sorted(
+                    line for line in lines if line != "msdial.console.capabilities.v1"
+                ),
+            }
+
+    # Builds from the QA feature branch made before the capabilities command
+    # still contain this exact Console output marker.
+    try:
+        binary = path.read_bytes()
+    except OSError:
+        binary = b""
+    marker = "LC-MS quality-assurance matrix:"
+    if marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary:
+        return {
+            "capability_probe": "assembly marker",
+            "capabilities": [LCMS_QA_CAPABILITY],
+        }
+    return {"capability_probe": "unsupported", "capabilities": []}
