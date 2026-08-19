@@ -694,8 +694,8 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                 {
                     "level": "error",
                     "message": (
-                        "The selected MS-DIAL Console does not report support for LC-MS QA matrix export. "
-                        "Choose a Console build containing the lcms_alignment_qa_matrix feature, "
+                        "The selected MS-DIAL Console does not support LC-MS QA matrix export. "
+                        "Choose a Console build containing the LC-MS QA matrix exporter, "
                         "or disable QA matrix export for this run."
                     ),
                 }
@@ -2253,9 +2253,14 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
     if not path.is_file():
         return {"capability_probe": "missing", "capabilities": []}
     command = ["dotnet", str(path)] if path.suffix.lower() == ".dll" else [str(path)]
+    capabilities: set[str] = set()
+    probes: list[str] = []
+
+    # Command availability is already represented by System.CommandLine help;
+    # do not require MS-DIAL Console to maintain a separate partial inventory.
     try:
         result = subprocess.run(
-            command + ["info", "--format", "json"],
+            command + ["rtcorrection", "--help"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -2265,54 +2270,22 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
     except (OSError, subprocess.TimeoutExpired):
         result = None
     if result is not None and result.returncode == 0:
-        try:
-            payload = json.loads(result.stdout)
-        except (json.JSONDecodeError, TypeError):
-            payload = {}
-        if payload.get("schema") == "msdial.console.info.v1":
-            features = payload.get("features", [])
-            return {
-                "capability_probe": "info command",
-                "capabilities": sorted(
-                    str(item.get("id", "")).strip()
-                    for item in features
-                    if isinstance(item, dict) and str(item.get("id", "")).strip()
-                ),
-            }
+        help_text = result.stdout + result.stderr
+        if "--library" in help_text and "--selection" in help_text:
+            capabilities.add(RT_CORRECTION_REVIEW_CAPABILITY)
+            probes.append("rtcorrection help")
 
-    # Retain compatibility with Console builds made before the clearer info
-    # command and top-level rtcorrection command were introduced.
-    try:
-        result = subprocess.run(
-            command + ["capabilities"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        result = None
-    if result is not None and result.returncode == 0:
-        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        if "msdial.console.capabilities.v1" in lines:
-            return {
-                "capability_probe": "legacy capabilities command",
-                "capabilities": sorted(
-                    line for line in lines if line != "msdial.console.capabilities.v1"
-                ),
-            }
-
-    # Builds from the QA feature branch made before the legacy discovery command
-    # still contain this exact Console output marker.
+    # QA export is not a standalone command, so recognize the exact exporter
+    # message embedded in compatible builds and verify the artifact after a run.
     try:
         binary = path.read_bytes()
     except OSError:
         binary = b""
     marker = "LC-MS quality-assurance matrix:"
     if marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary:
-        return {
-            "capability_probe": "assembly marker",
-            "capabilities": [LCMS_QA_CAPABILITY],
-        }
-    return {"capability_probe": "unsupported", "capabilities": []}
+        capabilities.add(LCMS_QA_CAPABILITY)
+        probes.append("QA exporter marker")
+    return {
+        "capability_probe": " + ".join(probes) if probes else "unsupported",
+        "capabilities": sorted(capabilities),
+    }

@@ -1218,8 +1218,8 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
         if exit_code == 0 and preparation.get("qa_matrix_expected") and not artifacts["qa"]:
             warning = (
                 "LC-MS QA matrix export was requested, but this job did not create or update "
-                "a *.qa.tsv file. Verify that the selected Console reports the "
-                "lcms_alignment_qa_matrix feature and that Export folder path is writable."
+                "a *.qa.tsv file. Verify that the selected Console contains the "
+                "LC-MS QA matrix exporter and that Export folder path is writable."
             )
             artifact_warnings.append(warning)
             log("WARNING: " + warning)

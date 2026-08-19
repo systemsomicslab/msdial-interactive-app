@@ -36,42 +36,35 @@ from msdial_app.workflow import (
 
 class WorkflowTests(unittest.TestCase):
     @patch("msdial_app.workflow.subprocess.run")
-    def test_console_capability_reads_info_json(self, run: Mock) -> None:
+    def test_console_capability_probes_command_help_and_qa_exporter(self, run: Mock) -> None:
         run.return_value = Mock(
             returncode=0,
-            stdout=json.dumps(
-                {
-                    "schema": "msdial.console.info.v1",
-                    "version": "5.5.test",
-                    "features": [
-                        {"id": "lcms_alignment_qa_matrix"},
-                        {"id": "rt_correction_review", "command": "rtcorrection"},
-                    ],
-                }
-            ),
+            stdout="Usage: MSDIALCUI rtcorrection --library <library> --selection <selection>",
             stderr="",
         )
-        with tempfile.TemporaryDirectory() as temporary:
-            console = Path(temporary) / "MSDIALCUI.exe"
-            console.write_bytes(b"console")
-
-            result = console_capabilities(str(console))
-
-        self.assertEqual("info command", result["capability_probe"])
-        self.assertEqual(
-            ["lcms_alignment_qa_matrix", "rt_correction_review"],
-            result["capabilities"],
-        )
-        self.assertEqual([str(console), "info", "--format", "json"], run.call_args.args[0])
-
-    def test_console_capability_falls_back_to_qa_assembly_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             console = Path(temporary) / "MSDIALCUI.exe"
             console.write_bytes("LC-MS quality-assurance matrix:".encode("utf-16-le"))
 
             result = console_capabilities(str(console))
 
-            self.assertEqual("assembly marker", result["capability_probe"])
+        self.assertEqual("rtcorrection help + QA exporter marker", result["capability_probe"])
+        self.assertEqual(
+            ["lcms_alignment_qa_matrix", "rt_correction_review"],
+            result["capabilities"],
+        )
+        self.assertEqual([str(console), "rtcorrection", "--help"], run.call_args.args[0])
+
+    @patch("msdial_app.workflow.subprocess.run")
+    def test_console_capability_falls_back_to_qa_assembly_marker(self, run: Mock) -> None:
+        run.return_value = Mock(returncode=1, stdout="", stderr="Unknown command")
+        with tempfile.TemporaryDirectory() as temporary:
+            console = Path(temporary) / "MSDIALCUI.exe"
+            console.write_bytes("LC-MS quality-assurance matrix:".encode("utf-16-le"))
+
+            result = console_capabilities(str(console))
+
+            self.assertEqual("QA exporter marker", result["capability_probe"])
             self.assertIn("lcms_alignment_qa_matrix", result["capabilities"])
 
     def test_parameter_template_loads_guided_annotation_and_lipid_queries(self) -> None:
@@ -267,7 +260,7 @@ class WorkflowTests(unittest.TestCase):
             with patch(
                 "msdial_app.workflow.console_capabilities",
                 return_value={
-                    "capability_probe": "info command",
+                    "capability_probe": "rtcorrection help",
                     "capabilities": ["rt_correction_review"],
                 },
             ):
@@ -495,9 +488,9 @@ class WorkflowTests(unittest.TestCase):
             manifest = json.loads(
                 Path(result["manifest"]).read_text(encoding="utf-8")
             )
-            self.assertEqual("0.3.3", settings["msdial_interactive_version"])
+            self.assertEqual("0.3.4", settings["msdial_interactive_version"])
             self.assertEqual("not recorded", settings["msdial_console_version"])
-            self.assertEqual("0.3.3", manifest["msdial_interactive_version"])
+            self.assertEqual("0.3.4", manifest["msdial_interactive_version"])
             self.assertEqual("21904324", settings["library_provenance"][0]["record_id"])
             self.assertEqual("CC BY 4.0", settings["library_provenance"][0]["license"])
 

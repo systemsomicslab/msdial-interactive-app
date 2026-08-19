@@ -144,9 +144,10 @@ use only files created or updated by that job. The GUI displays the job ID,
 timestamp, output directory, and artifact counts. Archived results can still be
 selected manually, but they are visibly identified as manual inputs.
 
-LC-MS QA matrix export requires a Console build that reports the
-`lcms_alignment_qa_matrix` feature. Guided setup lists detected Console
-candidates and shows whether each candidate supports this export. If export was
+LC-MS QA matrix export requires a Console build containing the QA exporter.
+Guided setup checks detected Console candidates for this support and probes
+top-level RT correction through the command's standard `--help` interface. It
+does not depend on a separate, partial Console feature inventory. If export was
 requested but no `*.qa.tsv` was produced, the completed job carries an explicit
 warning even when the Console exit code is zero.
 
