@@ -113,7 +113,8 @@ be generated without QA by setting `run_qa=false`.
 
 The browser UI uses the same provenance model. Its job history can select a
 completed run, after which mzTab-M preview, LC-MS QA, and publication generation
-are scoped to that exact job. Guided setup also probes `MSDIALCUI capabilities`;
+are scoped to that exact job. Guided setup also probes
+`MSDIALCUI info --format json`;
 LC-MS QA requires `lcms_alignment_qa_matrix`.
 
 ## Agent endpoints

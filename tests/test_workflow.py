@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from msdial_app.agent_bridge import create_datamining_handoff, summarize_jobs
 from msdial_app.mztab_preview import preview_mztab_file, preview_mztab_outputs
@@ -34,6 +35,35 @@ from msdial_app.workflow import (
 
 
 class WorkflowTests(unittest.TestCase):
+    @patch("msdial_app.workflow.subprocess.run")
+    def test_console_capability_reads_info_json(self, run: Mock) -> None:
+        run.return_value = Mock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "schema": "msdial.console.info.v1",
+                    "version": "5.5.test",
+                    "features": [
+                        {"id": "lcms_alignment_qa_matrix"},
+                        {"id": "rt_correction_review", "command": "rtcorrection"},
+                    ],
+                }
+            ),
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            console = Path(temporary) / "MSDIALCUI.exe"
+            console.write_bytes(b"console")
+
+            result = console_capabilities(str(console))
+
+        self.assertEqual("info command", result["capability_probe"])
+        self.assertEqual(
+            ["lcms_alignment_qa_matrix", "rt_correction_review"],
+            result["capabilities"],
+        )
+        self.assertEqual([str(console), "info", "--format", "json"], run.call_args.args[0])
+
     def test_console_capability_falls_back_to_qa_assembly_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             console = Path(temporary) / "MSDIALCUI.exe"
@@ -233,6 +263,17 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("-ionmode", prepared["command"])
             self.assertNotIn("-acquisitiontype", prepared["command"])
             self.assertIn("SWATH", prepared["command"])
+
+            with patch(
+                "msdial_app.workflow.console_capabilities",
+                return_value={
+                    "capability_probe": "info command",
+                    "capabilities": ["rt_correction_review"],
+                },
+            ):
+                current = prepare_rt_correction_run(state)
+            self.assertEqual("rtcorrection", current["command"][2])
+            self.assertNotEqual("eic", current["command"][2])
 
             selection = Path(prepared["selection_file"])
             selection.write_text(
@@ -454,9 +495,9 @@ class WorkflowTests(unittest.TestCase):
             manifest = json.loads(
                 Path(result["manifest"]).read_text(encoding="utf-8")
             )
-            self.assertEqual("0.3.2", settings["msdial_interactive_version"])
+            self.assertEqual("0.3.3", settings["msdial_interactive_version"])
             self.assertEqual("not recorded", settings["msdial_console_version"])
-            self.assertEqual("0.3.2", manifest["msdial_interactive_version"])
+            self.assertEqual("0.3.3", manifest["msdial_interactive_version"])
             self.assertEqual("21904324", settings["library_provenance"][0]["record_id"])
             self.assertEqual("CC BY 4.0", settings["library_provenance"][0]["license"])
 

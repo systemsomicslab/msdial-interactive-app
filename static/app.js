@@ -2247,11 +2247,12 @@ function renderConsoleCapability(candidate) {
     return;
   }
   if (!candidate) {
-    panel.innerHTML = `Selected path: <code>${escapeHtml(path)}</code><br><span class="muted">Run Detect / check Consoles to verify version and capabilities.</span>`;
+    panel.innerHTML = `Selected path: <code>${escapeHtml(path)}</code><br><span class="muted">Run Detect / check Consoles to verify the version and supported workflow features.</span>`;
     return;
   }
   const capabilities = candidate.capabilities || [];
   const qa = capabilities.includes("lcms_alignment_qa_matrix");
+  const rtCorrection = capabilities.includes("rt_correction_review");
   const wasUnsupported = qaControl.disabled;
   qaControl.disabled = !qa;
   if (!qa) qaControl.checked = false;
@@ -2260,7 +2261,8 @@ function renderConsoleCapability(candidate) {
     + `<code>${escapeHtml(candidate.path)}</code><br>`
     + `<span class="${qa ? "" : "issue warning"}">${qa
       ? "LC-MS QA matrix export is available."
-      : "LC-MS QA matrix export is not available in this Console build. Analysis can run, but *.qa.tsv cannot be requested."}</span>`;
+      : "LC-MS QA matrix export is not available in this Console build. Analysis can run, but *.qa.tsv cannot be requested."}</span>`
+    + (rtCorrection ? `<br><span>Top-level RT correction review is available.</span>` : "");
 }
 
 async function refreshConsoleDiscovery() {

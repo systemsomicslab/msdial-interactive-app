@@ -44,6 +44,7 @@ SMOOTHING_METHODS = [
     "TimeBasedLinearWeightedMovingAverage",
 ]
 LCMS_QA_CAPABILITY = "lcms_alignment_qa_matrix"
+RT_CORRECTION_REVIEW_CAPABILITY = "rt_correction_review"
 
 
 def discover_console_paths(search_roots: Iterable[str | Path] | None = None) -> dict[str, Any]:
@@ -693,8 +694,8 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                 {
                     "level": "error",
                     "message": (
-                        "The selected MS-DIAL Console does not advertise LC-MS QA matrix export. "
-                        "Choose a Console build containing the lcms_alignment_qa_matrix capability, "
+                        "The selected MS-DIAL Console does not report support for LC-MS QA matrix export. "
+                        "Choose a Console build containing the lcms_alignment_qa_matrix feature, "
                         "or disable QA matrix export for this run."
                     ),
                 }
@@ -1418,7 +1419,13 @@ def prepare_rt_correction_run(state: dict[str, Any]) -> dict[str, Any]:
     acquisition_type = next(iter(acquisition_types))
     prefix = ["dotnet", str(executable)] if executable.suffix.lower() == ".dll" else [str(executable)]
     eic_path = output_root / "rt_correction_eics.csv"
-    command = prefix + ["eic", "rtcorrection"]
+    features = console_capabilities(str(executable))["capabilities"]
+    rt_command = (
+        ["rtcorrection"]
+        if RT_CORRECTION_REVIEW_CAPABILITY in features
+        else ["eic", "rtcorrection"]
+    )
+    command = prefix + rt_command
     for item in files:
         command.extend(["-i", str(Path(str(item["file_path"])).expanduser().resolve())])
     command.extend(
@@ -1468,7 +1475,7 @@ def parse_rt_correction_result(preparation: dict[str, Any]) -> dict[str, Any]:
     ):
         raise RuntimeError(
             "The selected MS-DIAL Console did not generate fresh RT correction outputs. "
-            "Use a CUI build containing the current eic rtcorrection implementation: "
+            "Use a CUI build containing the current rtcorrection implementation: "
             f"{preparation['command'][0]}"
         )
 
@@ -2248,6 +2255,35 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
     command = ["dotnet", str(path)] if path.suffix.lower() == ".dll" else [str(path)]
     try:
         result = subprocess.run(
+            command + ["info", "--format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+    if result is not None and result.returncode == 0:
+        try:
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        if payload.get("schema") == "msdial.console.info.v1":
+            features = payload.get("features", [])
+            return {
+                "capability_probe": "info command",
+                "capabilities": sorted(
+                    str(item.get("id", "")).strip()
+                    for item in features
+                    if isinstance(item, dict) and str(item.get("id", "")).strip()
+                ),
+            }
+
+    # Retain compatibility with Console builds made before the clearer info
+    # command and top-level rtcorrection command were introduced.
+    try:
+        result = subprocess.run(
             command + ["capabilities"],
             capture_output=True,
             text=True,
@@ -2261,13 +2297,13 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if "msdial.console.capabilities.v1" in lines:
             return {
-                "capability_probe": "command",
+                "capability_probe": "legacy capabilities command",
                 "capabilities": sorted(
                     line for line in lines if line != "msdial.console.capabilities.v1"
                 ),
             }
 
-    # Builds from the QA feature branch made before the capabilities command
+    # Builds from the QA feature branch made before the legacy discovery command
     # still contain this exact Console output marker.
     try:
         binary = path.read_bytes()
