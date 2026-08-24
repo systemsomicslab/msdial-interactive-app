@@ -146,6 +146,13 @@ workflow settings, QA, publication-report artifacts, and checksums are kept
 after raw-data cleanup. See [Public repository reanalysis](docs/public_repository_reanalysis.md)
 for commands, eligibility rules, and the pilot validation record.
 
+The Data tab also includes a repository metadata handler. It normalizes
+Metabolomics Workbench, MetaboLights, and MB-POST sample metadata, previews an
+ordered multi-field grouping hierarchy, and writes the resulting underscore-
+separated value into MS-DIAL's single `Class` column. Reviewed source metadata
+remain available as JSON/TSV, and the same workflow is callable from the CLI or
+local agent API.
+
 When `workflow-settings.json` exists in the selected run/output directory, the
 report uses those saved run settings instead of the current UI. New runs record
 both the MS-DIAL Console version and MS-DIAL Interactive version in

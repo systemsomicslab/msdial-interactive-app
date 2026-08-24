@@ -95,6 +95,34 @@ directory can contain outputs from unrelated runs. Set `run_qa: false` on
 `msdial_generate_publication_report` when Materials and Methods and supplementary
 tables are needed without a QA matrix.
 
+## Repository metadata
+
+Repository identifiers accepted by `msdial_inspect_repository_metadata`:
+
+- `metabolomics_workbench` with `ST...`
+- `metabolights` with `MTBLS...`
+- `mb_post` with `MPST...`
+
+Its `workspace.fields` entries contain `name`, `non_missing`, `missing`,
+`unique_count`, and `examples`. Its `workspace.rows` entries preserve
+`sample_id`, `source_name`, `raw_file`, and the original `values` object.
+
+Pass the complete workspace and an ordered field-name list to
+`msdial_project_repository_classes`. Example:
+
+```json
+{
+  "hierarchy": ["Genotype", "Region", "Sex"],
+  "missing_value": "NA",
+  "separator": "_"
+}
+```
+
+The returned `application` reports `matched_count`, `unmatched`, and
+`ambiguous`, and contains analysis-file rows with projected `class_id` values.
+Use `msdial_save_repository_metadata` to persist the projected workspace and
+those rows before preparing the production analysis.
+
 ## Worksets
 
 Built-in IDs:

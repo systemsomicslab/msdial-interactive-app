@@ -75,6 +75,60 @@
           <tbody></tbody>
         </table>
       </div>
+      <div class="panel repository-metadata-panel">
+        <div class="section-head compact-head">
+          <div>
+            <h2>Repository metadata handler</h2>
+            <p class="muted">Inspect repository metadata, choose an ordered metadata hierarchy, and project it into MS-DIAL's single <code>Class</code> field. Original values remain in the reviewed metadata files.</p>
+          </div>
+        </div>
+        <div class="repository-source-grid">
+          <label>Repository
+            <select id="repositoryName">
+              <option value="metabolomics_workbench">Metabolomics Workbench</option>
+              <option value="metabolights">MetaboLights</option>
+              <option value="mb_post">MB-POST / MetaboBank</option>
+            </select>
+          </label>
+          <label>Accession
+            <input id="repositoryAccession" placeholder="ST002419, MTBLS341, or MPST000007">
+          </label>
+          <div class="repository-source-actions">
+            <button id="inspectRepositoryMetadata" type="button">Inspect metadata</button>
+            <button id="loadRepositoryMetadata" type="button" class="secondary">Load manifest / metadata JSON</button>
+          </div>
+        </div>
+        <div id="repositoryMetadataSummary" class="format-summary" hidden></div>
+        <div id="repositoryMetadataEditor" hidden>
+          <h3>Class hierarchy</h3>
+          <p class="muted">Check grouping fields and set their order. Values are joined with <code>_</code>; spaces and underscores inside each value are normalized to <code>-</code> so the result can be split later without ambiguity.</p>
+          <div class="repository-metadata-layout">
+            <div class="table-wrap metadata-field-table">
+              <table>
+                <thead><tr><th>Use</th><th>Order</th><th>Metadata field</th><th>Present</th><th>Distinct</th><th>Examples</th></tr></thead>
+                <tbody id="repositoryMetadataFields"></tbody>
+              </table>
+            </div>
+            <div>
+              <div class="form-grid compact-form-grid">
+                <label>Missing value token<input id="repositoryMissingValue" value="NA"></label>
+                <label>Class separator<input id="repositoryClassSeparator" value="_" maxlength="3"></label>
+              </div>
+              <div class="button-row metadata-actions">
+                <button id="previewRepositoryClasses" type="button">Preview Class</button>
+                <button id="applyRepositoryClasses" type="button" class="secondary">Apply to analysis metadata</button>
+                <button id="saveRepositoryMetadata" type="button" class="secondary">Save reviewed metadata</button>
+              </div>
+              <div id="repositoryMetadataApplication" class="muted"></div>
+            </div>
+          </div>
+          <h3>Sample metadata preview and editor</h3>
+          <p class="muted">Edits below affect the reviewed metadata and the next Class preview. The first 100 rows are shown.</p>
+          <div class="table-wrap metadata-preview-table">
+            <table><thead id="repositoryMetadataPreviewHead"></thead><tbody id="repositoryMetadataPreviewBody"></tbody></table>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section id="tab-guide" class="tab">

@@ -1041,6 +1041,14 @@ def prepare_run(
         method_state["export_folder_path"] = str(run_directory)
     method_state["msdial_console_version"] = console_version(state["console_path"]) or "not recorded"
     method_state["msdial_interactive_version"] = __version__
+    repository_metadata_files: dict[str, str] = {}
+    if isinstance(state.get("repository_metadata"), dict):
+        from .repository_metadata import save_metadata_review
+
+        repository_metadata_files = save_metadata_review(
+            state["repository_metadata"], run_directory
+        )
+        method_state["repository_metadata_files"] = repository_metadata_files
     ri_dictionary = _prepare_gcms_ri_dictionary(
         run_directory,
         method_state,
@@ -1084,6 +1092,7 @@ def prepare_run(
         "text_annotator_settings_file": str(method_state.get("text_annotator_settings_file_path", "")),
         "rt_correction_anchor_file": str(method_state.get("rt_correction_anchor_path", "")),
         "rt_correction_selection_file": str(method_state.get("rt_correction_selection_path", "")),
+        "repository_metadata_files": repository_metadata_files,
         "command": command,
         "expected_analysis_exports": expected_analysis_exports,
         "export_folder_path": str(method_state.get("export_folder_path", "")),
@@ -1601,7 +1610,7 @@ def _write_reproduction_files(
     settings = {
         key: value
         for key, value in state.items()
-        if key not in {"files"}
+        if key not in {"files", "repository_metadata"}
     }
     settings["files"] = [
         {
@@ -1653,6 +1662,7 @@ def _write_reproduction_files(
             "- text_annotator_settings.tsv: optional per-Text-library LC-MS annotation settings\n"
             "- RT correction anchor/selection files: included when RT correction is enabled\n"
             "- workflow-settings.json: UI settings used to generate the workflow\n"
+            "- *_repository_metadata_reviewed.json / *_sample_metadata_reviewed.tsv: reviewed repository metadata and Class hierarchy\n"
             "- command.txt: exact command generated on the original machine\n"
             "- run-msdial.ps1 / run-msdial.sh: portable launch scripts\n\n"
             "Edit parameters:\n"
@@ -1693,6 +1703,10 @@ def _write_reproduction_files(
             value = str(state.get(key, "")).strip()
             if value and Path(value).is_file():
                 members.append(Path(value))
+    for value in (state.get("repository_metadata_files") or {}).values():
+        path = Path(str(value))
+        if path.is_file():
+            members.append(path)
     with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for member in members:
             archive.write(member, member.name)

@@ -11,6 +11,7 @@ const state = {
   rtCorrectionAnchorsDirty: false,
   rtCorrectionAnchorSourcePath: "",
   analysisCsvSource: "",
+  repositoryMetadata: null,
   config: null,
   outputRootAutomatic: true,
   gcmsRiMap: {},
@@ -82,6 +83,7 @@ async function api(path, options = {}) {
 function workflow() {
   return {
     files: state.files,
+    repository_metadata: state.repositoryMetadata,
     project_type: $("#projectType").value,
     ion_mode: $("#ionMode").value,
     target_omics: $("#targetOmics").value,
@@ -279,6 +281,114 @@ function renderFiles() {
   renderVendorTips();
   renderTuningFiles();
   renderGcmsRiMap();
+}
+
+function repositoryHierarchy() {
+  return $$("#repositoryMetadataFields tr")
+    .map((row) => ({
+      name: row.dataset.field,
+      use: row.querySelector("[data-role='use']")?.checked,
+      order: Number(row.querySelector("[data-role='order']")?.value || 999),
+    }))
+    .filter((item) => item.use)
+    .sort((left, right) => left.order - right.order || left.name.localeCompare(right.name))
+    .map((item) => item.name);
+}
+
+function renderRepositoryMetadata() {
+  const workspace = state.repositoryMetadata;
+  const summary = $("#repositoryMetadataSummary");
+  const editor = $("#repositoryMetadataEditor");
+  if (!workspace) {
+    summary.hidden = true;
+    editor.hidden = true;
+    return;
+  }
+  const publications = workspace.publications || [];
+  const publicationText = publications.length
+    ? publications.map((item) => item.doi || item.pubmed_id || item.title).filter(Boolean).join("; ")
+    : "not provided by the repository response";
+  summary.hidden = false;
+  summary.innerHTML = `<strong>${escapeHtml(workspace.accession || "Repository metadata")}</strong> | ` +
+    `${escapeHtml(workspace.title || "Untitled project")}<br>` +
+    `${(workspace.rows || []).length} sample row(s), ${(workspace.fields || []).length} metadata field(s). ` +
+    `Publication: ${escapeHtml(publicationText)}`;
+  editor.hidden = false;
+  const hierarchy = workspace.hierarchy || [];
+  $("#repositoryMissingValue").value = workspace.missing_value || "NA";
+  $("#repositoryClassSeparator").value = workspace.separator || "_";
+  $("#repositoryMetadataFields").innerHTML = (workspace.fields || []).map((field) => {
+    const selectedIndex = hierarchy.indexOf(field.name);
+    return `<tr data-field="${escapeHtml(field.name)}">
+      <td><input data-role="use" type="checkbox" ${selectedIndex >= 0 ? "checked" : ""}></td>
+      <td><input data-role="order" type="number" min="1" value="${selectedIndex >= 0 ? selectedIndex + 1 : ""}" placeholder="-"></td>
+      <td>${escapeHtml(field.name)}</td>
+      <td>${Number(field.non_missing || 0)} / ${(workspace.rows || []).length}</td>
+      <td>${Number(field.unique_count || 0)}</td>
+      <td>${escapeHtml((field.examples || []).join("; "))}</td>
+    </tr>`;
+  }).join("");
+  $$("#repositoryMetadataFields tr").forEach((row) => {
+    const use = row.querySelector("[data-role='use']");
+    const order = row.querySelector("[data-role='order']");
+    use.addEventListener("change", () => {
+      if (use.checked && !order.value) {
+        order.value = String(repositoryHierarchy().length);
+      }
+    });
+  });
+  renderRepositoryMetadataPreview();
+}
+
+function renderRepositoryMetadataPreview() {
+  const workspace = state.repositoryMetadata;
+  if (!workspace) return;
+  const hierarchy = workspace.hierarchy || [];
+  const fields = hierarchy.length ? hierarchy : (workspace.fields || []).slice(0, 6).map((item) => item.name);
+  $("#repositoryMetadataPreviewHead").innerHTML = `<tr>
+    <th>Sample ID</th><th>Raw file</th><th>Class preview</th>
+    ${fields.map((name) => `<th>${escapeHtml(name)}</th>`).join("")}
+  </tr>`;
+  $("#repositoryMetadataPreviewBody").innerHTML = (workspace.rows || []).slice(0, 100).map((row, rowIndex) => `<tr data-row="${rowIndex}">
+    <td><input data-identity="sample_id" value="${escapeHtml(row.sample_id)}"></td>
+    <td><input data-identity="raw_file" value="${escapeHtml(row.raw_file)}"></td>
+    <td><strong>${escapeHtml(row.class_id || "")}</strong></td>
+    ${fields.map((name, fieldIndex) => `<td><input data-field-index="${fieldIndex}" value="${escapeHtml(row.values?.[name] || "")}"></td>`).join("")}
+  </tr>`).join("");
+  $$("#repositoryMetadataPreviewBody tr").forEach((tableRow) => {
+    const row = workspace.rows[Number(tableRow.dataset.row)];
+    tableRow.querySelectorAll("[data-identity]").forEach((input) => {
+      input.addEventListener("input", () => { row[input.dataset.identity] = input.value; });
+    });
+    tableRow.querySelectorAll("[data-field-index]").forEach((input) => {
+      input.addEventListener("input", () => { row.values[fields[Number(input.dataset.fieldIndex)]] = input.value; });
+    });
+  });
+}
+
+async function projectRepositoryMetadata(applyToFiles = false) {
+  if (!state.repositoryMetadata) throw new Error("Inspect or load repository metadata first.");
+  const result = await api("/api/repository/metadata/project", {
+    method: "POST",
+    body: JSON.stringify({
+      workspace: state.repositoryMetadata,
+      hierarchy: repositoryHierarchy(),
+      separator: $("#repositoryClassSeparator").value || "_",
+      missing_value: $("#repositoryMissingValue").value || "NA",
+      files: state.files,
+    }),
+  });
+  state.repositoryMetadata = result.workspace;
+  const application = result.application || {};
+  if (applyToFiles) {
+    state.files = application.files || state.files;
+    renderFiles();
+  }
+  renderRepositoryMetadata();
+  $("#repositoryMetadataApplication").textContent =
+    `${application.matched_count || 0} analysis file(s) matched; ` +
+    `${(application.unmatched || []).length} unmatched; ${(application.ambiguous || []).length} ambiguous.`;
+  return result;
 }
 
 function renderRtCorrectionAnchors() {
@@ -2486,6 +2596,57 @@ $("#importAnalysisCsv").addEventListener("click", () => runUiAction(async () => 
     ...(result.rejected || []).map((path) => `Skipped CSV row: ${path}`),
   ], result.rejected?.length ? "warning" : "info");
   refreshQuestion();
+}));
+$("#inspectRepositoryMetadata").addEventListener("click", () => runUiAction(async () => {
+  const result = await api("/api/repository/metadata/inspect", {
+    method: "POST",
+    body: JSON.stringify({
+      repository: $("#repositoryName").value,
+      accession: $("#repositoryAccession").value.trim(),
+    }),
+  });
+  state.repositoryMetadata = result.workspace;
+  renderRepositoryMetadata();
+  setStatus(`Inspected repository metadata for ${result.workspace.accession}.`);
+}));
+$("#loadRepositoryMetadata").addEventListener("click", () => runUiAction(async () => {
+  const picked = await api("/api/dialog/reference-file", {
+    method: "POST",
+    body: JSON.stringify({ kind: "repository-metadata" }),
+  });
+  if (!picked.path) return;
+  const result = await api("/api/repository/metadata/load", {
+    method: "POST",
+    body: JSON.stringify({ path: picked.path }),
+  });
+  state.repositoryMetadata = result.workspace;
+  $("#repositoryAccession").value = result.workspace.accession || "";
+  renderRepositoryMetadata();
+  setStatus(`Loaded repository metadata: ${picked.path}`);
+}));
+$("#previewRepositoryClasses").addEventListener("click", () => runUiAction(async () => {
+  await projectRepositoryMetadata(false);
+  setStatus("Updated the repository Class preview.");
+}));
+$("#applyRepositoryClasses").addEventListener("click", () => runUiAction(async () => {
+  const result = await projectRepositoryMetadata(true);
+  setStatus(`Applied repository metadata to ${result.application?.matched_count || 0} analysis file(s).`);
+}));
+$("#saveRepositoryMetadata").addEventListener("click", () => runUiAction(async () => {
+  await projectRepositoryMetadata(false);
+  if (!$("#outputRoot").value.trim()) setOutputRootFromFirstFile();
+  const destination = $("#outputRoot").value.trim();
+  if (!destination) throw new Error("Set Output root before saving reviewed repository metadata.");
+  const result = await api("/api/repository/metadata/save", {
+    method: "POST",
+    body: JSON.stringify({
+      workspace: state.repositoryMetadata,
+      destination,
+      analysis_files: state.files,
+    }),
+  });
+  const paths = Object.values(result.files || {});
+  setStatus(`Saved reviewed repository metadata: ${paths.join(" | ")}`);
 }));
 $("#addPath").addEventListener("click", () => runUiAction(async () => {
   if ($("#serverPath").value.trim()) await addServerPaths([$("#serverPath").value.trim()]);

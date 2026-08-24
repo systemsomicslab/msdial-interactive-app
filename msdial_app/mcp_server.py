@@ -16,7 +16,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-REQUIRED_AGENT_API_VERSION = "0.3"
+REQUIRED_AGENT_API_VERSION = "0.4"
 _EMBEDDED_SERVERS: dict[tuple[str, int], tuple[ThreadingHTTPServer, threading.Thread]] = {}
 
 
@@ -278,6 +278,74 @@ def msdial_guided_analysis_plan(
             "input_path": input_path,
             "answers": answers or {},
             "workset_id": workset_id,
+        },
+        timeout=30,
+    )
+
+
+@mcp.tool()
+def msdial_inspect_repository_metadata(
+    repository: str,
+    accession: str,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Extract per-sample metadata and publications from a public metabolomics accession."""
+    return _request_json(
+        "POST",
+        "/api/repository/metadata/inspect",
+        host=host,
+        port=port,
+        body={"repository": repository, "accession": accession},
+        timeout=180,
+    )
+
+
+@mcp.tool()
+def msdial_project_repository_classes(
+    workspace: dict[str, Any],
+    hierarchy: list[str],
+    analysis_files: list[dict[str, Any]] | None = None,
+    missing_value: str = "NA",
+    separator: str = "_",
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Join an ordered metadata hierarchy into MS-DIAL Class and match it to analysis files."""
+    return _request_json(
+        "POST",
+        "/api/repository/metadata/project",
+        host=host,
+        port=port,
+        body={
+            "workspace": workspace,
+            "hierarchy": hierarchy,
+            "files": analysis_files or [],
+            "missing_value": missing_value,
+            "separator": separator,
+        },
+        timeout=30,
+    )
+
+
+@mcp.tool()
+def msdial_save_repository_metadata(
+    workspace: dict[str, Any],
+    destination: str,
+    analysis_files: list[dict[str, Any]] | None = None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Save reviewed repository metadata as JSON/TSV and an optional MS-DIAL analysis CSV."""
+    return _request_json(
+        "POST",
+        "/api/repository/metadata/save",
+        host=host,
+        port=port,
+        body={
+            "workspace": workspace,
+            "destination": destination,
+            "analysis_files": analysis_files or [],
         },
         timeout=30,
     )

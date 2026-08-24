@@ -18,7 +18,7 @@ def summarize_jobs(jobs: dict[str, dict[str, Any]], limit: int = 10) -> dict[str
     latest_completed = next((item for item in items if item.get("status") == "completed"), None)
     return {
         "service": "MS-DIAL Interactive",
-        "agent_api_version": "0.3",
+        "agent_api_version": "0.4",
         "capabilities": [
             "guided_analysis_planning",
             "reusable_worksets",
@@ -35,6 +35,9 @@ def summarize_jobs(jobs: dict[str, dict[str, Any]], limit: int = 10) -> dict[str
             "validate_mztab_m_outputs",
             "preview_mztab_m_outputs",
             "create_datamining_handoff",
+            "inspect_repository_sample_metadata",
+            "project_repository_metadata_to_msdial_class",
+            "save_reviewed_repository_metadata",
         ],
         "workflow_outline": [
             "Inspect the input path and collect the guided scientific choices.",

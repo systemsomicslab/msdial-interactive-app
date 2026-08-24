@@ -78,6 +78,8 @@ async def smoke_test(
                 "has_legacy_peak_height_tool": any("recommend" in name.casefold() for name in names),
                 "has_console_discovery": "msdial_check_console_path" in names,
                 "has_job_scoped_completion": "msdial_complete_guided_analysis" in names,
+                "has_repository_metadata": "msdial_inspect_repository_metadata" in names,
+                "has_repository_class_projection": "msdial_project_repository_classes" in names,
                 "console_candidate_count": len(console.get("candidates", [])),
                 "file_count": payload["input"]["file_count"],
                 "next_question": payload["next_question"]["id"],

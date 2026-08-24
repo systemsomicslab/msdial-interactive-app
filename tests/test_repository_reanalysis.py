@@ -236,6 +236,10 @@ class RepositoryReanalysisTests(unittest.TestCase):
                 "MTD\tmzTab-version\t2.0.0-M\nSMH\tSML_ID\nSML\t1\n",
                 encoding="ascii",
             )
+            mdpeak = output / "sample.mdpeak"
+            mdpeak.write_text("Peak ID\n", encoding="ascii")
+            arf = output / "result.arf2"
+            arf.write_bytes(b"project")
             manifest = provenance / "run-manifest.json"
             manifest.write_text(
                 json.dumps(
@@ -253,6 +257,12 @@ class RepositoryReanalysisTests(unittest.TestCase):
             self.assertEqual("mztab_validated", result["status"])
             self.assertTrue(result["cleanup_allowed"])
             self.assertIn(str(mztab.resolve()), result["retained_artifacts"])
+            self.assertIn(str(mdpeak.resolve()), result["retained_artifacts"])
+            archive = Path(result["project_archive"])
+            self.assertTrue(archive.is_file())
+            with zipfile.ZipFile(archive) as handle:
+                self.assertIn("result.arf2", handle.namelist())
+            self.assertTrue(result["retained_artifact_inventory"])
 
     def test_raw_metadata_summary_maps_normalized_contract(self) -> None:
         records = [

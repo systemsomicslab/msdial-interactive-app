@@ -50,6 +50,23 @@ th { position: sticky; top: 0; background: #f5f8f9; }
 td input, td select { width: 100%; min-width: 78px; padding: 5px; }
 td:nth-child(2) { min-width: 360px; color: var(--muted); font-size: 14px; }
 .format-badge { display: inline-block; min-width: 130px; padding: 4px 7px; border-radius: 12px; background: #eaf5f7; color: var(--teal-dark); font-size: 14px; font-weight: 650; }
+.repository-metadata-panel { margin-top: 18px; background: #fbfdfe; }
+.repository-metadata-panel h3 { margin: 18px 0 8px; font-size: 16px; }
+.repository-source-grid { display: grid; grid-template-columns: minmax(190px, 0.7fr) minmax(240px, 1fr) auto; gap: 12px; align-items: end; }
+.repository-source-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.repository-metadata-layout { display: grid; grid-template-columns: minmax(560px, 1.4fr) minmax(320px, 0.8fr); gap: 14px; align-items: start; }
+.metadata-field-table { max-height: 340px; }
+.metadata-field-table table { min-width: 760px; }
+.metadata-field-table td:nth-child(2) { min-width: 70px; color: inherit; font-size: inherit; }
+.metadata-field-table td:nth-child(3) { min-width: 180px; }
+.metadata-field-table td:nth-child(6) { min-width: 220px; color: var(--muted); }
+.metadata-field-table input[type="checkbox"] { width: auto; min-width: 0; }
+.metadata-field-table input[type="number"] { width: 70px; min-width: 0; }
+.compact-form-grid { grid-template-columns: 1fr 1fr; }
+.metadata-actions { margin: 12px 0; }
+.metadata-preview-table { max-height: 430px; }
+.metadata-preview-table table { min-width: 920px; }
+.metadata-preview-table td:nth-child(2) { min-width: 260px; color: inherit; font-size: inherit; }
 .vendor-tips { border: 1px solid #e1bd62; border-left: 5px solid #c28a00; border-radius: 7px; padding: 14px 16px; margin: 16px 0; background: #fff8e5; }
 .vendor-tips h2 { margin: 0 0 8px; font-size: 18px; }
 .vendor-tips p { margin: 6px 0; line-height: 1.5; }
@@ -187,5 +204,6 @@ footer { height: 40px; padding: 10px 18px; background: #e9eff1; border-top: 1px 
   .rt-chart-pair { grid-template-columns: 1fr; }
   .qa-chart-grid { grid-template-columns: 1fr; }
   .qa-chart-card.wide { grid-column: auto; }
+  .repository-source-grid, .repository-metadata-layout { grid-template-columns: 1fr; }
   nav { overflow-x: auto; }
 }

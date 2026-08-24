@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import csv
 import json
 import random
 import re
@@ -24,6 +25,10 @@ RAW_SUFFIXES = {
     ".abf", ".cdf", ".d", ".lcd", ".mzml", ".mzxml", ".qgd", ".raw", ".wiff", ".wiff2",
 }
 ARCHIVE_SUFFIXES = {".zip", ".tar", ".tgz", ".gz"}
+TEXT_RESULT_SUFFIXES = {
+    ".mdalign", ".mdmsp", ".mdpeak", ".mdscan", ".mztab", ".mztabm",
+}
+PROJECT_RESULT_SUFFIXES = {".arf", ".arf2", ".dcl", ".mdproject"}
 
 
 @dataclass
@@ -51,6 +56,10 @@ class RepositoryProject:
     untargeted: bool | None = None
     sample_count: int | None = None
     files: list[RepositoryFile] = field(default_factory=list)
+    publications: list[dict[str, str]] = field(default_factory=list)
+    metadata_sources: list[str] = field(default_factory=list)
+    sample_metadata: list[dict[str, Any]] = field(default_factory=list)
+    repository_metadata: dict[str, Any] = field(default_factory=dict)
     total_download_bytes: int = 0
     evidence: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -177,6 +186,8 @@ class MetabolomicsWorkbenchAdapter:
             untargeted=untargeted,
             sample_count=_parse_int(summary_row.get("number_of_samples", "")),
             files=files,
+            publications=_extract_publications(summary_row, detail_text),
+            metadata_sources=[summary_url, analysis_url, public_url],
             total_download_bytes=total,
             evidence=[
                 f"analysis_type={summary_row.get('analysis_type', '')}",
@@ -185,6 +196,28 @@ class MetabolomicsWorkbenchAdapter:
         )
         if not files:
             project.warnings.append("No public raw-data archive was found on the study download page.")
+        return project
+
+    def inspect_metadata(self, accession: str) -> RepositoryProject:
+        project = self.inspect(accession)
+        summary_url = f"{self.base}/rest/study/study_id/{accession}/summary/json"
+        analysis_url = f"{self.base}/rest/study/study_id/{accession}/analysis/json"
+        factors_url = f"{self.base}/rest/study/study_id/{accession}/factors/json"
+        summary = _parse_tab_blocks(self.client.get_text(summary_url))
+        analysis = _parse_tab_blocks(self.client.get_text(analysis_url))
+        try:
+            factor_rows = _parse_workbench_records(self.client.get_text(factors_url))
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            factor_rows = []
+        project.metadata_sources = list(
+            dict.fromkeys([*project.metadata_sources, factors_url])
+        )
+        project.sample_metadata = _workbench_sample_metadata(factor_rows)
+        project.repository_metadata = {
+            "summary": summary,
+            "analysis": analysis,
+            "factors": factor_rows,
+        }
         return project
 
 
@@ -264,6 +297,8 @@ class MetaboLightsAdapter:
             untargeted=_infer_untargeted(combined),
             sample_count=sample_count,
             files=files,
+            publications=_extract_publications(study.get("publications", [])),
+            metadata_sources=[study_url, f"{self.api}/studies/{accession}/assays"],
             total_download_bytes=total,
             evidence=[
                 f"available assay files={len(assay_names)}",
@@ -279,6 +314,37 @@ class MetaboLightsAdapter:
             project.warnings.append(
                 f"Size was unavailable for {len(unknown_sizes)} raw references; nested FILES paths may require review."
             )
+        return project
+
+    def inspect_metadata(self, accession: str) -> RepositoryProject:
+        project = self.inspect(accession)
+        study_url = f"{self.api}/studies/{accession}"
+        payload = self.client.get_json(study_url)
+        investigation = payload.get("isaInvestigation", {})
+        studies = investigation.get("studies") or []
+        study = studies[0] if studies else {}
+        assay_text = ""
+        if project.assay_name:
+            assay_text = self.client.get_text(
+                f"{self.api}/studies/{accession}/{urllib.parse.quote(project.assay_name)}"
+            )
+        study_table_url = f"{self.public}/{accession}/s_{accession}.txt"
+        try:
+            study_table_text = self.client.get_text(study_table_url)
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            study_table_text = ""
+        project.metadata_sources = list(
+            dict.fromkeys([*project.metadata_sources, study_table_url])
+        )
+        project.sample_metadata = _metabolights_sample_metadata(
+            assay_text, study, study_table_text
+        )
+        project.repository_metadata = {
+            "study_api": payload,
+            "selected_assay_name": project.assay_name,
+            "selected_assay_rows": _assay_rows(assay_text),
+            "study_table": study_table_text,
+        }
         return project
 
 
@@ -339,6 +405,25 @@ class MbPostAdapter:
             untargeted=_infer_untargeted(combined),
             sample_count=len(primary_items) or None,
             files=files,
+            publications=_extract_publications(
+                project_data.get("publications")
+                or project_data.get("publication")
+                or {
+                    "title": "",
+                    "pubmedId": project_data.get("pubmedId", ""),
+                    "doi": project_data.get("doi", ""),
+                }
+            ),
+            metadata_sources=[
+                f"{self.base}/api/projects/{accession}",
+                listing_url,
+            ],
+            sample_metadata=_mbpost_sample_metadata(project_data, primary_items),
+            repository_metadata={
+                "project": project_data,
+                "file_listing": listing,
+                "first_raw_file_detail": json.loads(profile_text) if profile_text else {},
+            },
             total_download_bytes=archive_size,
             evidence=[
                 f"primary raw files={len(primary_items)}",
@@ -346,6 +431,46 @@ class MbPostAdapter:
                 "MB-POST analytical-condition preset",
             ],
         )
+
+    def inspect_metadata(self, accession: str) -> RepositoryProject:
+        project = self.inspect(accession)
+        location = next(
+            (
+                urllib.parse.urlparse(item.url).path.rsplit("/", 1)[-1]
+                for item in project.files
+                if item.url
+            ),
+            f"{accession}.0",
+        )
+        listing_url = f"{self.base}/api/projects/{location}/files?limit=10000&offset=0"
+        listing = self.client.get_json(listing_url)
+        raw_items = [item for item in listing.get("list", []) if item.get("type") == "raw"]
+
+        def read_detail(item: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
+            try:
+                detail = self.client.get_json(
+                    f"{self.base}/api/projects/{location}/files/{item['id']}"
+                )
+                return str(item.get("name") or ""), detail, ""
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
+                return str(item.get("name") or ""), {}, str(error)
+
+        details: dict[str, dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=min(6, max(1, len(raw_items)))) as executor:
+            for name, detail, error in executor.map(read_detail, raw_items):
+                details[name.casefold()] = detail
+                if error:
+                    project.warnings.append(
+                        f"Sample metadata detail was unavailable for {name}: {error}"
+                    )
+        project.sample_metadata = _mbpost_sample_metadata(
+            {"keywords": ""}, raw_items, details
+        )
+        project.repository_metadata["raw_file_details"] = details
+        project.metadata_sources.extend(
+            f"{self.base}/api/projects/{location}/files/{item['id']}" for item in raw_items
+        )
+        return project
 
 
 ADAPTERS = {
@@ -469,6 +594,15 @@ def create_download_lease(
     if project.total_download_bytes > maximum_bytes:
         raise ValueError("Project exceeds the download lease size limit.")
     client = client or RepositoryHttpClient()
+    adapter_type = ADAPTERS.get(project.repository)
+    if adapter_type and hasattr(adapter_type, "inspect_metadata"):
+        try:
+            detailed = adapter_type(client).inspect_metadata(project.accession)
+            project.publications = detailed.publications
+            project.metadata_sources = detailed.metadata_sources
+            project.sample_metadata = detailed.sample_metadata
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as error:
+            project.warnings.append(f"Detailed repository sample metadata was unavailable: {error}")
     root = workspace_root.resolve() / project.repository / project.accession
     raw_root = root / "raw"
     download_root = raw_root / "downloads"
@@ -520,6 +654,14 @@ def create_download_lease(
         "cleanup_allowed": False,
     }
     manifest_path = provenance / "run-manifest.json"
+    repository_metadata_path = provenance / "repository-metadata.json"
+    sample_metadata_path = provenance / "sample-metadata-extracted.json"
+    from .repository_metadata import metadata_workspace
+
+    _write_json(repository_metadata_path, project.as_dict())
+    _write_json(sample_metadata_path, metadata_workspace(project.as_dict()))
+    manifest["repository_metadata_file"] = str(repository_metadata_path)
+    manifest["sample_metadata_file"] = str(sample_metadata_path)
     _write_json(manifest_path, manifest)
     return {**manifest, "manifest_path": str(manifest_path)}
 
@@ -541,13 +683,30 @@ def finalize_download_lease(manifest_path: Path) -> dict[str, Any]:
         manifest["cleanup_allowed"] = True
     retained = list(mztab_files)
     for path in output.rglob("*") if output.is_dir() else []:
-        if path.is_file() and any(
-            token in path.name.casefold()
-            for token in ("quality", "qa", "publication", "method", "parameter", "analysis_files")
+        if path.is_file() and (
+            path.suffix.casefold() in TEXT_RESULT_SUFFIXES
+            or path.suffix.casefold() in {".csv", ".tsv", ".txt", ".json", ".xlsx"}
+            or any(
+                token in path.name.casefold()
+                for token in ("quality", "qa", "publication", "method", "parameter", "analysis_files")
+            )
         ):
             retained.append(path.resolve())
+    project_archive = _archive_project_results(output)
+    if project_archive:
+        retained.append(project_archive)
+    provenance = manifest_path.parent
+    retained.extend(
+        path.resolve()
+        for path in provenance.rglob("*")
+        if path.is_file() and path.resolve() != manifest_path
+    )
     manifest["mztab_validation"] = validation
     manifest["retained_artifacts"] = list(dict.fromkeys(str(path) for path in retained))
+    manifest["retained_artifact_inventory"] = [
+        _artifact_inventory(Path(path)) for path in manifest["retained_artifacts"]
+    ]
+    manifest["project_archive"] = str(project_archive) if project_archive else ""
     manifest["finalized_at"] = datetime.now(timezone.utc).isoformat()
     _write_json(manifest_path, manifest)
     return {**manifest, "manifest_path": str(manifest_path)}
@@ -692,6 +851,38 @@ def _is_archive(path: Path) -> bool:
     return lower.endswith((".zip", ".tar", ".tar.gz", ".tgz"))
 
 
+def _archive_project_results(output: Path) -> Path | None:
+    if not output.is_dir():
+        return None
+    project_files = [
+        path for path in output.rglob("*")
+        if path.is_file() and path.suffix.casefold() in PROJECT_RESULT_SUFFIXES
+    ]
+    if not project_files:
+        return None
+    archive = output / "msdial-project-artifacts.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as handle:
+        for path in sorted(project_files):
+            handle.write(path, path.relative_to(output).as_posix())
+    with zipfile.ZipFile(archive) as handle:
+        if handle.testzip() is not None:
+            archive.unlink(missing_ok=True)
+            raise ValueError("The MS-DIAL project artifact ZIP failed its integrity check.")
+    return archive.resolve()
+
+
+def _artifact_inventory(path: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "path": str(path.resolve()),
+        "size_bytes": path.stat().st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
 def _extract_archive(archive: Path, destination: Path, maximum_bytes: int) -> list[str]:
     destination = destination.resolve()
     extracted = []
@@ -823,6 +1014,20 @@ def _parse_tab_blocks(text: str) -> list[dict[str, str]]:
     return blocks
 
 
+def _parse_workbench_records(text: str) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return _parse_tab_blocks(text)
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        if all(not isinstance(value, dict) for value in payload.values()):
+            return [payload]
+        return [item for item in payload.values() if isinstance(item, dict)]
+    return []
+
+
 def _parse_workbench_downloads(text: str, base: str) -> list[RepositoryFile]:
     pattern = re.compile(
         r'<a\s+href=["\'](?P<href>[^"\']+)["\'][^>]*>(?P<name>[^<]+)</a>\s*'
@@ -866,6 +1071,265 @@ def _raw_names_from_assay(text: str) -> set[str]:
         if raw or derived:
             result.add(raw or derived)
     return result
+
+
+def _workbench_sample_metadata(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    result = []
+    for index, row in enumerate(rows, start=1):
+        sample_id = str(
+            row.get("local_sample_id")
+            or row.get("sample_id")
+            or row.get("sample")
+            or f"sample_{index}"
+        ).strip()
+        values = {}
+        values.update(_parse_name_value_pairs(str(row.get("factors") or "")))
+        values.update(
+            _parse_name_value_pairs(
+                str(row.get("additional_sample_data") or row.get("additional sample data") or "")
+            )
+        )
+        for key, value in row.items():
+            if key not in {"study_id", "local_sample_id", "sample_id", "sample", "factors"}:
+                values.setdefault(_display_field_name(key), str(value or "").strip())
+        result.append(
+            {
+                "sample_id": sample_id,
+                "source_name": str(row.get("subject_id") or row.get("subject") or sample_id),
+                "raw_file": str(
+                    row.get("raw_data")
+                    or row.get("raw data")
+                    or row.get("raw_file")
+                    or row.get("filename")
+                    or sample_id
+                ),
+                "values": values,
+            }
+        )
+    return result
+
+
+def _metabolights_sample_metadata(
+    text: str, study: dict[str, Any], study_table_text: str = ""
+) -> list[dict[str, Any]]:
+    assay_rows = _assay_rows(text)
+    material_values = _metabolights_material_values(study)
+    for key, values in _metabolights_study_table_values(study_table_text).items():
+        material_values.setdefault(key, {}).update(values)
+    result = []
+    for index, row in enumerate(assay_rows, start=1):
+        raw_file = _first_matching_value(
+            row,
+            ("raw spectral data file", "derived spectral data file", "raw data file"),
+        )
+        sample_id = _first_matching_value(
+            row,
+            ("sample name", "source name", "sample identifier"),
+        ) or Path(raw_file.replace("\\", "/")).stem or f"sample_{index}"
+        source_name = _first_matching_value(row, ("source name",)) or sample_id
+        values = dict(material_values.get(sample_id.casefold(), {}))
+        values.update(material_values.get(source_name.casefold(), {}))
+        for key, value in row.items():
+            name = _display_field_name(key)
+            if name.casefold() in {
+                "raw spectral data file",
+                "derived spectral data file",
+                "raw data file",
+                "sample name",
+                "source name",
+            }:
+                continue
+            text_value = _metadata_scalar(value)
+            if text_value:
+                values[name] = text_value
+        result.append(
+            {
+                "sample_id": sample_id,
+                "source_name": source_name,
+                "raw_file": raw_file,
+                "values": values,
+            }
+        )
+    return result
+
+
+def _metabolights_study_table_values(text: str) -> dict[str, dict[str, str]]:
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    for row in csv.DictReader(lines, delimiter="\t"):
+        sample_name = _first_matching_value(row, ("sample name",))
+        if not sample_name:
+            continue
+        values = result.setdefault(sample_name.casefold(), {})
+        for key, value in row.items():
+            text_value = _metadata_scalar(value)
+            match = re.match(r"(?i)(?:characteristics|factor value)\[(.+)]$", str(key).strip())
+            if match and text_value:
+                values[_display_field_name(match.group(1))] = text_value
+    return result
+
+
+def _mbpost_sample_metadata(
+    project: dict[str, Any],
+    raw_items: Iterable[dict[str, Any]],
+    details: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    shared = {}
+    for key in ("organism", "species", "tissue", "sampleType", "keywords"):
+        value = _metadata_scalar(project.get(key))
+        if value:
+            shared[_display_field_name(key)] = value
+    described_samples = project.get("samples") or project.get("sampleList") or []
+    by_name = {}
+    if isinstance(described_samples, list):
+        for sample in described_samples:
+            if not isinstance(sample, dict):
+                continue
+            name = _metadata_scalar(
+                sample.get("name") or sample.get("sampleName") or sample.get("id")
+            )
+            if name:
+                by_name[name.casefold()] = {
+                    _display_field_name(key): _metadata_scalar(value)
+                    for key, value in sample.items()
+                    if key not in {"name", "sampleName", "id"} and _metadata_scalar(value)
+                }
+    result = []
+    for index, item in enumerate(raw_items, start=1):
+        raw_file = str(item.get("name") or "").strip()
+        sample_id = Path(raw_file.replace("\\", "/")).stem or f"sample_{index}"
+        values = dict(shared)
+        values.update(by_name.get(sample_id.casefold(), {}))
+        detail = (details or {}).get(raw_file.casefold(), {})
+        for preset_group in detail.get("presets", []) or []:
+            category = _display_field_name(preset_group.get("category") or "metadata")
+            for preset in preset_group.get("presets", []) or []:
+                value = _metadata_scalar(preset.get("value"))
+                if not value:
+                    continue
+                label = _display_field_name(preset.get("label") or preset.get("key"))
+                values[f"{category} / {label}"] = value
+        result.append(
+            {
+                "sample_id": sample_id,
+                "source_name": sample_id,
+                "raw_file": raw_file,
+                "values": values,
+            }
+        )
+    return result
+
+
+def _assay_rows(text: str) -> list[dict[str, Any]]:
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+        rows = payload.get("data", {}).get("rows", [])
+        return [row for row in rows if isinstance(row, dict)]
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return []
+    return [dict(row) for row in csv.DictReader(lines, delimiter="\t")]
+
+
+def _metabolights_material_values(study: dict[str, Any]) -> dict[str, dict[str, str]]:
+    result: dict[str, dict[str, str]] = {}
+    materials = study.get("materials", {})
+    for group_name in ("sources", "samples"):
+        for item in materials.get(group_name, []) or []:
+            if not isinstance(item, dict):
+                continue
+            name = _metadata_scalar(item.get("name"))
+            if not name:
+                continue
+            values = result.setdefault(name.casefold(), {})
+            for collection in ("characteristics", "factorValues"):
+                for entry in item.get(collection, []) or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    field_name = _annotation_text(
+                        entry.get("category") or entry.get("factorName") or entry.get("name")
+                    )
+                    field_value = _annotation_text(
+                        entry.get("value") or entry.get("annotationValue")
+                    )
+                    if field_name and field_value:
+                        values[field_name] = field_value
+    return result
+
+
+def _parse_name_value_pairs(value: str) -> dict[str, str]:
+    result = {}
+    for part in re.split(r"\s*\|\s*|\s*;\s*", value.strip()):
+        key, separator, item = part.partition(":")
+        if not separator:
+            key, separator, item = part.partition("=")
+        if separator and key.strip():
+            result[_display_field_name(key)] = item.strip()
+    return result
+
+
+def _extract_publications(*values: Any) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for value in values:
+        candidates = value if isinstance(value, list) else [value]
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            lowered = {str(key).casefold(): item for key, item in candidate.items()}
+            doi = _metadata_scalar(
+                lowered.get("doi") or lowered.get("publication doi") or lowered.get("pubdoi")
+            )
+            pubmed = _metadata_scalar(
+                lowered.get("pubmedid") or lowered.get("pubmed id") or lowered.get("pmid")
+            )
+            title = _metadata_scalar(
+                lowered.get("title") or lowered.get("publication title") or lowered.get("citation")
+            )
+            if doi or pubmed or title:
+                records.append({"title": title, "doi": doi, "pubmed_id": pubmed})
+    joined = json.dumps(values, ensure_ascii=False) if values else ""
+    for doi in re.findall(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", joined, re.IGNORECASE):
+        cleaned = doi.rstrip(".,;)]}")
+        if not any(item.get("doi", "").casefold() == cleaned.casefold() for item in records):
+            records.append({"title": "", "doi": cleaned, "pubmed_id": ""})
+    return records
+
+
+def _first_matching_value(row: dict[str, Any], names: Iterable[str]) -> str:
+    normalized = {str(key).strip().casefold(): value for key, value in row.items()}
+    return next(
+        (_metadata_scalar(normalized.get(name)) for name in names if _metadata_scalar(normalized.get(name))),
+        "",
+    )
+
+
+def _annotation_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return _metadata_scalar(
+            value.get("annotationValue") or value.get("value") or value.get("name")
+        )
+    return _metadata_scalar(value)
+
+
+def _metadata_scalar(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return _annotation_text(value)
+    if isinstance(value, list):
+        return "; ".join(filter(None, (_metadata_scalar(item) for item in value)))
+    return str(value).strip()
+
+
+def _display_field_name(value: Any) -> str:
+    text = re.sub(r"[_-]+", " ", str(value or "")).strip()
+    return re.sub(r"\s+", " ", text)
 
 
 def _metabolights_files(

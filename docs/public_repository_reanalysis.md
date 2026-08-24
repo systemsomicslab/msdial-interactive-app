@@ -28,6 +28,14 @@ Downloaded raw data are a temporary lease:
    validation.
 7. Raw data can then be deleted while provenance and analysis artifacts remain.
 
+The retained set includes repository and publication metadata, reviewed
+sample metadata, `analysis_files.csv`, parameter/method files, mzTab-M,
+`mdpeak`, `mdscan`, `mdmsp`, and `mdalign`. GUI project artifacts such as
+`dcl`, `arf`, and `arf2` are also collected into
+`msdial-project-artifacts.zip`. The manifest stores SHA-256 and byte size for
+each retained artifact. Original project files are not removed by this archive
+step.
+
 This order makes disk cleanup routine without allowing an incomplete or failed
 analysis to erase its only input copy.
 
@@ -77,6 +85,40 @@ Inspect one accession without downloading raw data:
 ```powershell
 python scripts/repository-reanalysis.py inspect mb_post MPST000007
 ```
+
+## Repository metadata and MS-DIAL Class
+
+The Data tab contains a **Repository metadata handler**. It can inspect an
+accession directly or reopen `run-manifest.json`, `repository-metadata.json`,
+or a reviewed metadata JSON. Each repository is normalized to one row per
+analysis file while all source values remain available for audit and editing.
+
+Select metadata fields in the intended hierarchy, for example `Genotype`,
+`Region`, then `Sex`. MS-DIAL Interactive projects these fields into its single
+Class value as `KO_North_F`. Spaces and underscores inside values become
+hyphens, and missing values use `NA`, so downstream R code can split the Class
+on `_` without silently changing the number of levels. Blank, pooled QC, and
+standard labels are also used to populate MS-DIAL's File type when the
+repository metadata states them.
+
+The same operation is available without the browser:
+
+```powershell
+python scripts/repository-reanalysis.py metadata inspect `
+  metabolomics_workbench ST002419 `
+  --output D:\MSDIAL_Public_Reanalysis\ST002419-metadata.json
+
+python scripts/repository-reanalysis.py metadata project `
+  D:\MSDIAL_Public_Reanalysis\ST002419-metadata.json `
+  --field treatment --field "sample source" `
+  --analysis-csv D:\MSDIAL_Public_Reanalysis\analysis_files.csv `
+  --destination D:\MSDIAL_Public_Reanalysis\ST002419\provenance
+```
+
+`metadata project` writes reviewed JSON and TSV files plus an updated
+`analysis_files.csv`. Field order on the command line is the Class hierarchy
+order. These APIs are also exposed by the local service for agent workflows:
+`/api/repository/metadata/inspect`, `/load`, `/project`, and `/save`.
 
 ## Download and preflight
 

@@ -28,6 +28,14 @@ from .mztab_validation import list_mztab_outputs, validate_mztab_files, validate
 from .mztab_preview import preview_mztab_outputs
 from .materials_methods import generate_publication_report
 from .quality_assurance import build_lcms_qa_report_from_file, find_qa_files
+from .repository_metadata import (
+    apply_classes_to_analysis_files,
+    metadata_workspace,
+    metadata_workspace_from_file,
+    project_class_hierarchy,
+    save_metadata_review,
+)
+from .repository_reanalysis import ADAPTERS
 from .workflow import (
     console_version,
     console_capabilities,
@@ -546,6 +554,48 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"job_id": job_id})
             elif parsed.path == "/api/files/import-csv":
                 self._json(read_analysis_csv(body.get("path", "")))
+            elif parsed.path == "/api/repository/metadata/inspect":
+                repository = str(body.get("repository", "")).strip().casefold()
+                accession = str(body.get("accession", "")).strip().upper()
+                aliases = {
+                    "workbench": "metabolomics_workbench",
+                    "metabolomicsworkbench": "metabolomics_workbench",
+                    "metabolomics_workbench": "metabolomics_workbench",
+                    "metabolights": "metabolights",
+                    "mb-post": "mb_post",
+                    "mbpost": "mb_post",
+                    "mb_post": "mb_post",
+                }
+                adapter_name = aliases.get(repository, repository)
+                if adapter_name not in ADAPTERS:
+                    raise ValueError("Select Metabolomics Workbench, MetaboLights, or MB-POST.")
+                if not accession:
+                    raise ValueError("Enter a repository accession.")
+                adapter = ADAPTERS[adapter_name]()
+                inspector = getattr(adapter, "inspect_metadata", adapter.inspect)
+                project = inspector(accession)
+                self._json({"project": project.as_dict(), "workspace": metadata_workspace(project.as_dict())})
+            elif parsed.path == "/api/repository/metadata/load":
+                self._json({"workspace": metadata_workspace_from_file(body.get("path", ""))})
+            elif parsed.path == "/api/repository/metadata/project":
+                projected = project_class_hierarchy(
+                    body.get("workspace", {}),
+                    body.get("hierarchy", []),
+                    str(body.get("separator", "_")),
+                    str(body.get("missing_value", "NA")),
+                )
+                applied = apply_classes_to_analysis_files(projected, body.get("files", []))
+                self._json({"workspace": projected, "application": applied})
+            elif parsed.path == "/api/repository/metadata/save":
+                self._json(
+                    {
+                        "files": save_metadata_review(
+                            body.get("workspace", {}),
+                            body.get("destination", ""),
+                            body.get("analysis_files", []),
+                        )
+                    }
+                )
             elif parsed.path == "/api/files/browse":
                 self._json(_browse_filesystem(body.get("path", "")))
             elif parsed.path == "/api/dialog/files":
@@ -1495,6 +1545,9 @@ def _pick_reference_file(kind: str) -> str:
         elif kind == "analysis-csv":
             title = "Select MS-DIAL analysis metadata CSV"
             filetypes = [("Analysis metadata CSV", "*.csv"), ("All files", "*.*")]
+        elif kind == "repository-metadata":
+            title = "Select repository metadata or run manifest"
+            filetypes = [("Repository metadata JSON", "*.json"), ("All files", "*.*")]
         else:
             title = "Select RT correction anchor library"
             filetypes = [("MS-DIAL text library", "*.txt *.tsv"), ("All files", "*.*")]

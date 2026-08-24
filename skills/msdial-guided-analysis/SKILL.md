@@ -20,6 +20,34 @@ Keep `open_browser=false` unless the user asks to inspect or edit the web UI. Th
 
 Do not infer GC-MS versus LC-MS, ion mode, or target omics from a filename alone. Ask when the user has not explicitly supplied the value. Explain that guided execution currently supports LC-MS and GC-MS; direct other project types to the web UI without pretending they are supported.
 
+## Public Repository Metadata
+
+When the user supplies a Metabolomics Workbench (`ST...`), MetaboLights
+(`MTBLS...`), or MB-POST (`MPST...`) accession, call
+`msdial_inspect_repository_metadata` before building the analysis plan. Report
+the repository title, publication identifiers, sample count, metadata fields,
+missing counts, distinct counts, and representative values.
+
+Ask the user which fields define the ordered analysis hierarchy. Do not treat a
+field as a grouping variable merely because it exists: per-subject continuous
+values such as age or BMI can create one Class per sample. Call
+`msdial_project_repository_classes` with the accepted field order. Preserve
+the original values and use the projected underscore-separated value only for
+MS-DIAL's single `Class` field. Report unmatched and ambiguous raw-file names;
+do not silently apply a partial mapping.
+
+Call `msdial_save_repository_metadata` before analysis so the reviewed JSON,
+sample metadata TSV, and updated `analysis_files.csv` become run provenance.
+The browser metadata editor is optional; use it when the user wants visual or
+manual ground-truth review. Agent-only execution should use the same MCP tools
+without requiring UI interaction.
+
+After a public-data run, retain repository/publication metadata,
+`analysis_files.csv`, parameter files, mzTab-M, `mdpeak`/`mdscan`, `mdmsp`, and
+`mdalign`. Retain the ZIP containing `dcl`/`arf` project artifacts. Delete raw
+data only after mzTab-M validation succeeds and the retained-artifact inventory
+is complete.
+
 ## Collect Decisions
 
 Follow `next_question` from `msdial_guided_analysis_plan`. Retain all accepted values in one `answers` object and call the planner again after each answer. Ask one scientific decision at a time unless the user explicitly requests a compact questionnaire.

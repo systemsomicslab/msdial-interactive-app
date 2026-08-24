@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -21,6 +22,12 @@ from msdial_app.repository_reanalysis import (
     finalize_download_lease,
     project_from_dict,
     run_raw_metadata_preflight,
+)
+from msdial_app.repository_metadata import (
+    metadata_workspace,
+    metadata_workspace_from_file,
+    project_class_hierarchy,
+    save_metadata_review,
 )
 
 
@@ -67,6 +74,26 @@ def main() -> int:
     discard_parser = subparsers.add_parser("discard", help="Delete a rejected preflight download while retaining provenance.")
     discard_parser.add_argument("manifest", type=Path)
     discard_parser.add_argument("--confirmed", action="store_true")
+
+    metadata_parser = subparsers.add_parser(
+        "metadata", help="Inspect, project, and save repository sample metadata."
+    )
+    metadata_subparsers = metadata_parser.add_subparsers(dest="metadata_command", required=True)
+    metadata_inspect = metadata_subparsers.add_parser(
+        "inspect", help="Extract normalized sample metadata without downloading raw data."
+    )
+    metadata_inspect.add_argument("repository", choices=sorted(ADAPTERS))
+    metadata_inspect.add_argument("accession")
+    metadata_inspect.add_argument("--output", type=Path, required=True)
+    metadata_project = metadata_subparsers.add_parser(
+        "project", help="Project an ordered metadata hierarchy into MS-DIAL Class."
+    )
+    metadata_project.add_argument("metadata", type=Path)
+    metadata_project.add_argument("--field", action="append", default=[], required=True)
+    metadata_project.add_argument("--destination", type=Path, required=True)
+    metadata_project.add_argument("--analysis-csv", type=Path)
+    metadata_project.add_argument("--missing-value", default="NA")
+    metadata_project.add_argument("--separator", default="_")
 
     args = parser.parse_args()
     display_result = None
@@ -124,6 +151,28 @@ def main() -> int:
         )
     elif args.command == "discard":
         result = discard_download_lease(args.manifest, args.confirmed)
+    elif args.command == "metadata" and args.metadata_command == "inspect":
+        adapter = ADAPTERS[args.repository]()
+        inspector = getattr(adapter, "inspect_metadata", adapter.inspect)
+        workspace = metadata_workspace(inspector(args.accession).as_dict())
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(workspace, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        result = {
+            "metadata_file": str(args.output.resolve()),
+            "sample_count": len(workspace.get("rows", [])),
+            "field_count": len(workspace.get("fields", [])),
+        }
+    elif args.command == "metadata" and args.metadata_command == "project":
+        workspace = project_class_hierarchy(
+            metadata_workspace_from_file(args.metadata),
+            args.field,
+            args.separator,
+            args.missing_value,
+        )
+        analysis_files = _read_analysis_rows(args.analysis_csv) if args.analysis_csv else []
+        result = save_metadata_review(workspace, args.destination, analysis_files)
     else:
         result = cleanup_download_lease(args.manifest, args.confirmed)
     print(json.dumps(display_result or result, indent=2, ensure_ascii=False))
@@ -150,6 +199,11 @@ def _default_workspace() -> Path:
     if os.name == "nt" and Path("D:/").exists():
         return Path("D:/MSDIAL_Public_Reanalysis")
     return Path.home() / "MSDIAL_Public_Reanalysis"
+
+
+def _read_analysis_rows(path: Path) -> list[dict[str, str]]:
+    with path.expanduser().resolve().open(encoding="utf-8-sig", newline="") as handle:
+        return [dict(row) for row in csv.DictReader(handle)]
 
 
 if __name__ == "__main__":
