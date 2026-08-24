@@ -35,6 +35,19 @@ from msdial_app.workflow import (
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_shimadzu_lcd_and_qgd_are_supported_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lcd = root / "sample.lcd"
+            qgd = root / "sample.qgd"
+            lcd.write_text("", encoding="ascii")
+            qgd.write_text("", encoding="ascii")
+            report = expand_paths_report([str(root)])
+            self.assertEqual(2, len(report["files"]))
+            self.assertEqual("Shimadzu", detect_raw_format(lcd)["vendor"])
+            self.assertEqual("Shimadzu LCD", detect_raw_format(lcd)["format"])
+            self.assertEqual("Shimadzu QGD", detect_raw_format(qgd)["format"])
+
     @patch("msdial_app.workflow.subprocess.run")
     def test_console_capability_probes_command_help_and_qa_exporter(self, run: Mock) -> None:
         run.return_value = Mock(

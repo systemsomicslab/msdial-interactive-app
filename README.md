@@ -132,6 +132,20 @@ The Excel workbook is the primary human-readable supplementary output:
 The long-format TSV remains available as an audit-friendly machine-readable
 companion.
 
+## Public repository reanalysis
+
+An experimental command-line workflow can discover and stage lightweight,
+untargeted GC-MS or LC-MS projects from Metabolomics Workbench, MetaboLights,
+and MB-POST. Candidate selection is reproducible with a recorded random seed.
+Downloads are size-bounded, checksummed when the repository supplies a digest,
+and extracted with archive traversal and expansion limits.
+
+Raw data are managed as a temporary download lease. The cleanup command remains
+locked until the retained mzTab-M output passes validation. Provenance,
+workflow settings, QA, publication-report artifacts, and checksums are kept
+after raw-data cleanup. See [Public repository reanalysis](docs/public_repository_reanalysis.md)
+for commands, eligibility rules, and the pilot validation record.
+
 When `workflow-settings.json` exists in the selected run/output directory, the
 report uses those saved run settings instead of the current UI. New runs record
 both the MS-DIAL Console version and MS-DIAL Interactive version in

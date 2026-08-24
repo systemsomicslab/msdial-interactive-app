@@ -57,6 +57,40 @@ class AgentWorkflowTests(unittest.TestCase):
         self.assertEqual("neutral", plan["next_question"]["presentation"])
         self.assertFalse(plan["ready_to_prepare"])
 
+    def test_missing_persisted_resource_paths_fall_back_to_bundled_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "sample.cdf").write_text("", encoding="ascii")
+            console = root / "MSDIALCUI.exe"
+            console.write_text("", encoding="ascii")
+            with patch(
+                "msdial_app.agent_workflow.load_user_settings",
+                return_value={
+                    "template_path": str(root / "missing-template.txt"),
+                    "queries_path": str(root / "missing-queries.txt"),
+                },
+            ):
+                plan = build_guided_plan(
+                    str(root),
+                    {
+                        "project_type": "gcms",
+                        "parameter_strategy": "default",
+                        "gcms_retention_type": "RT",
+                        "library_strategy": "none",
+                        "generate_materials_methods": False,
+                        "console_path": str(console),
+                    },
+                )
+            self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+            self.assertEqual(
+                (ROOT / "resources" / "gcms_console_param_kovats.txt").resolve(),
+                Path(plan["workflow"]["template_path"]),
+            )
+            self.assertEqual(
+                {"None"},
+                {item["acquisition_type"] for item in plan["workflow"]["files"]},
+            )
+
     def test_unknown_answer_key_is_reported(self) -> None:
         plan = build_guided_plan("", {"export_folder_path_typo": "D:/ignored"})
 

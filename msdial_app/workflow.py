@@ -23,8 +23,10 @@ SUPPORTED_SUFFIXES = {
     ".abf",
     ".cdf",
     ".ibf",
+    ".lcd",
     ".mzml",
     ".mzxml",
+    ".qgd",
     ".raw",
     ".wiff",
     ".wiff2",
@@ -146,6 +148,14 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
             "instrument_family": "Fourier-transform MS",
             "minimum_peak_height": 10000,
             "mass_slice_width": 0.05,
+        }
+    if target.is_file() and suffix in {".lcd", ".qgd"}:
+        return {
+            "vendor": "Shimadzu",
+            "format": "Shimadzu LCD" if suffix == ".lcd" else "Shimadzu QGD",
+            "instrument_family": "QTOF" if suffix == ".lcd" else "GC-MS",
+            "minimum_peak_height": 100,
+            "mass_slice_width": 0.1,
         }
     if target.is_dir() and suffix == ".d":
         if (target / "AcqData").is_dir():
