@@ -573,7 +573,19 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Enter a repository accession.")
                 adapter = ADAPTERS[adapter_name]()
                 inspector = getattr(adapter, "inspect_metadata", adapter.inspect)
-                project = inspector(accession)
+                repository_label = {
+                    "metabolomics_workbench": "Metabolomics Workbench",
+                    "metabolights": "MetaboLights",
+                    "mb_post": "MB-POST / MetaboBank",
+                }[adapter_name]
+                try:
+                    project = inspector(accession)
+                except Exception as error:
+                    raise RuntimeError(
+                        f"Could not retrieve {accession} metadata from {repository_label}. "
+                        "This operation reads the public repository API directly; an LLM/API key "
+                        f"is not required. Details: {error}"
+                    ) from error
                 self._json({"project": project.as_dict(), "workspace": metadata_workspace(project.as_dict())})
             elif parsed.path == "/api/repository/metadata/load":
                 self._json({"workspace": metadata_workspace_from_file(body.get("path", ""))})
@@ -1145,7 +1157,20 @@ class Handler(BaseHTTPRequestHandler):
                 path = save_rt_correction_selections(state, body.get("rows", []))
                 self._json({"selection_file": path})
             else:
-                self._json({"error": "Unknown endpoint."}, HTTPStatus.NOT_FOUND)
+                self._json(
+                    {
+                        "error": f"Unknown endpoint: {parsed.path}",
+                        "code": "unknown_endpoint",
+                        "requested_path": parsed.path,
+                        "app_version": __version__,
+                        "hint": (
+                            "Refresh the browser. If the control exists in the page, an older "
+                            "MS-DIAL Interactive process may still be using this port; stop old "
+                            "instances and restart the current app."
+                        ),
+                    },
+                    HTTPStatus.NOT_FOUND,
+                )
         except Exception as error:
             self._json(
                 {"error": str(error), "trace": traceback.format_exc()},
@@ -1558,6 +1583,18 @@ def _pick_reference_file(kind: str) -> str:
         return ""
 
 
+class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """Prevent stale and current local app versions from sharing one port on Windows."""
+
+    allow_reuse_address = False
+    allow_reuse_port = False
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="MS-DIAL Interactive local web app")
     parser.add_argument("--host", default="127.0.0.1")
@@ -1577,7 +1614,14 @@ def main() -> None:
     if args.lab:
         args.host = "0.0.0.0"
         args.no_browser = True
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        server = ExclusiveThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as error:
+        raise SystemExit(
+            f"Could not start MS-DIAL Interactive on {args.host}:{args.port}. "
+            "Another process is already using this port. Close the old MS-DIAL Interactive "
+            f"instance or choose another --port. Details: {error}"
+        ) from error
     start_path = "/rt-correction" if args.rt_correction else "/"
     url = f"http://{args.host}:{args.port}{start_path}"
     print(f"MS-DIAL Interactive: {url}")

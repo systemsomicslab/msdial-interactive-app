@@ -15,6 +15,7 @@ _CONFIG = tempfile.TemporaryDirectory()
 with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
     from msdial_app.server import (
         Handler,
+        ExclusiveThreadingHTTPServer,
         JOBS,
         JOBS_LOCK,
         _changed_run_artifacts,
@@ -32,6 +33,14 @@ class JobArtifactTests(unittest.TestCase):
         )
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    def test_local_server_rejects_duplicate_port(self) -> None:
+        first = ExclusiveThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        try:
+            with self.assertRaises(OSError):
+                ExclusiveThreadingHTTPServer(("127.0.0.1", first.server_port), Handler)
+        finally:
+            first.server_close()
 
     def test_old_qa_and_mztab_are_not_attributed_to_new_job(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

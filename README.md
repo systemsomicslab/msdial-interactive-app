@@ -231,6 +231,13 @@ in browser memory and are sent to the localhost Python server only for the
 current request; they are not written to disk or included in the workflow
 context.
 
+An API key is not used for repository metadata inspection, local QA-card
+retrieval, MS-DIAL execution, QA, or mzTab-M processing. Repository metadata are
+read directly from the public Metabolomics Workbench, MetaboLights, or MB-POST
+API. When a GPT/Claude desktop app uses the local MCP server, model
+authentication remains the responsibility of that desktop app rather than this
+web form.
+
 ## LC-MS parameter tuning
 
 The Tune parameters screen runs one representative file with:
@@ -366,8 +373,11 @@ Core MCP tools:
 - `msdial_complete_guided_analysis`: wait for one job and complete validation,
   QA, publication, and handoff without browser interaction
 - `msdial_interactive_create_handoff`: create `datamining-handoff.json`
+- `msdial_inspect_repository_metadata`: inspect public sample metadata and publication provenance
+- `msdial_project_repository_classes`: project a user-selected metadata hierarchy into MS-DIAL `Class`
+- `msdial_save_repository_metadata`: save reviewed JSON/TSV and optional analysis metadata CSV
 
-Agent API 0.3 binds mzTab-M, QA, publication, and handoff operations to the
+Agent API 0.4 binds mzTab-M, QA, publication, and handoff operations to the
 production `job_id`. Files left by earlier runs in the same output directory are
 excluded. Job summaries are compact by default; full details are opt-in.
 
@@ -388,6 +398,12 @@ Claude Desktop example:
 
 Use the actual Python path on that PC. Restart Claude Desktop after editing its
 configuration.
+
+If a newly added control reports `Unknown endpoint`, first refresh the browser
+and confirm `/api/config` reports the current app version. An older local app
+may still be using port 8765. Current builds use an exclusive port binding and
+exit with a clear message instead of allowing old and new servers to share the
+same port.
 
 Package the cross-platform Agent Skill:
 

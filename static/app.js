@@ -76,7 +76,18 @@ async function api(path, options = {}) {
   } catch {
     throw new Error(`The local app returned an invalid response (HTTP ${response.status}).`);
   }
-  if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+  if (!response.ok) {
+    if (response.status === 404 && String(result.error || "").toLowerCase().includes("unknown endpoint")) {
+      const version = result.app_version || state.config?.app_version || "unknown";
+      throw new Error(
+        `The local server does not support ${path} (HTTP 404; app version ${version}). `
+        + "An older MS-DIAL Interactive process may still be using port 8765. "
+        + "Close old instances and restart the current app. Repository metadata inspection does not use an LLM or API key."
+      );
+    }
+    const detail = result.hint ? `${result.error || `HTTP ${response.status}`} ${result.hint}` : result.error;
+    throw new Error(detail || `HTTP ${response.status}`);
+  }
   return result;
 }
 
@@ -2598,16 +2609,31 @@ $("#importAnalysisCsv").addEventListener("click", () => runUiAction(async () => 
   refreshQuestion();
 }));
 $("#inspectRepositoryMetadata").addEventListener("click", () => runUiAction(async () => {
-  const result = await api("/api/repository/metadata/inspect", {
-    method: "POST",
-    body: JSON.stringify({
-      repository: $("#repositoryName").value,
-      accession: $("#repositoryAccession").value.trim(),
-    }),
-  });
-  state.repositoryMetadata = result.workspace;
-  renderRepositoryMetadata();
-  setStatus(`Inspected repository metadata for ${result.workspace.accession}.`);
+  const button = $("#inspectRepositoryMetadata");
+  const originalLabel = button.textContent;
+  const accession = $("#repositoryAccession").value.trim();
+  if (!accession) throw new Error("Enter a repository accession before inspecting metadata.");
+  button.disabled = true;
+  button.textContent = "Inspecting metadata...";
+  $("#repositoryMetadataSummary").hidden = false;
+  $("#repositoryMetadataSummary").textContent =
+    "Reading the public repository API directly. No LLM or API key is used.";
+  setStatus(`Inspecting public repository metadata for ${accession}...`);
+  try {
+    const result = await api("/api/repository/metadata/inspect", {
+      method: "POST",
+      body: JSON.stringify({
+        repository: $("#repositoryName").value,
+        accession,
+      }),
+    });
+    state.repositoryMetadata = result.workspace;
+    renderRepositoryMetadata();
+    setStatus(`Inspected repository metadata for ${result.workspace.accession}.`);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }
 }));
 $("#loadRepositoryMetadata").addEventListener("click", () => runUiAction(async () => {
   const picked = await api("/api/dialog/reference-file", {

@@ -80,6 +80,7 @@
           <div>
             <h2>Repository metadata handler</h2>
             <p class="muted">Inspect repository metadata, choose an ordered metadata hierarchy, and project it into MS-DIAL's single <code>Class</code> field. Original values remain in the reviewed metadata files.</p>
+            <p class="muted"><strong>No LLM or API key is used here.</strong> Inspect metadata reads the selected repository's public API directly. A compatible GPT/Claude desktop agent can operate the same workflow through the bundled MS-DIAL Interactive MCP server.</p>
           </div>
         </div>
         <div class="repository-source-grid">
@@ -737,7 +738,8 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
     <section id="tab-help" class="tab">
       <div class="panel">
         <h2>LLM API settings</h2>
-        <p class="muted">Optional. The API key remains in browser memory and is sent only to this localhost app for the current request. It is not written to disk or included in the workflow prompt.</p>
+        <p class="muted"><strong>Optional and unrelated to Repository metadata.</strong> No key is required for local QA cards, repository metadata inspection, MS-DIAL execution, or mzTab-M processing. Configure a key only for an LLM-generated Ask response or literature-based parameter search. The key remains in browser memory, is sent only to this localhost app for the current request, and is not written to disk or included in workflow files.</p>
+        <p class="muted">When a compatible GPT/Claude desktop app controls MS-DIAL Interactive through its MCP server, model authentication is handled by that desktop app. You do not enter the desktop agent's credentials in this web form.</p>
         <div class="form-grid">
           <label>Provider
             <select id="llmProvider">
