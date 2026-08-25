@@ -1377,13 +1377,12 @@ def _run_repository_download_job(
             else "Raw data will be deleted only after a successful run and validated mzTab-M output."
         )
         started = time.monotonic()
-        last_reported_percent = -5.0
         last_persisted = 0.0
 
         def progress(
             index: int, total_objects: int, name: str, received: int, total_bytes: int
         ) -> None:
-            nonlocal last_reported_percent, last_persisted
+            nonlocal last_persisted
             elapsed = max(time.monotonic() - started, 1e-6)
             speed = received / elapsed
             percent = received / total_bytes * 100 if total_bytes else 0.0
@@ -1399,13 +1398,6 @@ def _run_repository_download_job(
                 job["current_file"] = name
                 job["download_object"] = index
                 job["download_objects"] = total_objects
-                if percent - last_reported_percent >= 5 or received == total_bytes:
-                    last_reported_percent = percent
-                    job["logs"].append(
-                        f"Downloaded {received / 1024**2:.1f} MiB "
-                        f"({percent:.1f}%, {index}/{total_objects} object(s)): {name}"
-                    )
-                    job["logs"] = job["logs"][-2000:]
                 if now - last_persisted >= 2 or received == total_bytes:
                     last_persisted = now
                     job["updated_at"] = dt.datetime.now().astimezone().isoformat()

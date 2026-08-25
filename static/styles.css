@@ -57,8 +57,9 @@ td:nth-child(2) { min-width: 360px; color: var(--muted); font-size: 14px; }
 .repository-metadata-layout { display: grid; grid-template-columns: minmax(560px, 1.4fr) minmax(320px, 0.8fr); gap: 14px; align-items: start; }
 .repository-raw-workspace { margin-top: 14px; padding: 14px; border: 1px solid #cbdce5; border-radius: 8px; background: #f6fafc; }
 .repository-raw-workspace h3 { margin-top: 0; }
-.compact-log { min-height: 64px; max-height: 180px; margin-top: 10px; }
+.compact-log { min-height: 64px; max-height: 180px; margin-top: 10px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 .repository-raw-workspace progress { width: 100%; height: 18px; margin-top: 10px; accent-color: var(--teal); }
+.repository-progress-text { line-height: 1.45; overflow-wrap: anywhere; }
 .metadata-field-table { max-height: 340px; }
 .metadata-field-table table { min-width: 760px; }
 .metadata-field-table td:nth-child(2) { min-width: 70px; color: inherit; font-size: inherit; }
@@ -85,6 +86,8 @@ td:nth-child(2) { min-width: 360px; color: var(--muted); font-size: 14px; }
 .assistant-panel { border: 1px solid #b9dde3; background: #eaf5f7; border-radius: 7px; padding: 16px; }
 .assistant-answer { white-space: pre-wrap; line-height: 1.6; background: white; border: 1px solid var(--line); border-radius: 6px; padding: 14px; min-height: 100px; margin-bottom: 10px; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(180px, 1fr)); gap: 12px; }
+.form-grid > label { min-width: 0; }
+.form-grid input:not([type="checkbox"]):not([type="radio"]), .form-grid select { width: 100%; min-width: 0; }
 .path-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .path-actions { margin-top: 12px; }
 .job-history { display: grid; gap: 8px; }
