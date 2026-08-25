@@ -5,8 +5,9 @@ execution. This matches the intended division: Skills teach a repeatable
 workflow, while MCP connects the model to tools and local data. See the official
 [Claude Skills overview](https://support.claude.com/en/articles/12512176-what-are-skills)
 and [Anthropic MCP documentation](https://docs.anthropic.com/en/docs/mcp). For
-ChatGPT, see OpenAI's
-[developer mode and MCP apps](https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt).
+ChatGPT and Codex, see OpenAI's
+[MCP server documentation](https://developers.openai.com/plugins/concepts/mcp-server)
+and [Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
 
 This connection does not expose Claude or ChatGPT as an API to the browser.
 Instead, the authenticated desktop agent calls MS-DIAL Interactive. Therefore a
