@@ -725,8 +725,16 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
             <button id="usePublicationOutputRoot" type="button" class="secondary">Use Output root</button>
           </div>
         </label>
-        <label class="checkbox-line"><input id="publicationUseSavedRun" type="checkbox" checked> Use saved <code>workflow-settings.json</code> when available</label>
-        <label class="checkbox-line"><input id="publicationIncludeQa" type="checkbox" checked> Include QA from the selected analysis job</label>
+        <div class="publication-options">
+          <div class="publication-option">
+            <label class="check"><input id="publicationUseSavedRun" type="checkbox" checked> Use saved <code>workflow-settings.json</code> when available</label>
+            <p class="muted">When selected, the report uses the settings snapshot saved with this analysis run, so later changes in the current UI do not alter its description. If the file is absent, the app falls back to the current UI. Clear this option to always describe the settings currently shown in the app.</p>
+          </div>
+          <div class="publication-option">
+            <label class="check"><input id="publicationIncludeQa" type="checkbox" checked> Include QA in the publication report</label>
+            <p class="muted">When selected, QA criteria and conclusions are generated from the selected job's <code>*.qa.tsv</code>. With no selected job, the QA matrix chosen in Quality assurance is used. Clear this option to generate Materials and Methods and supplementary tables without a QA assessment. Report generation stops if this option is selected but no QA matrix is available.</p>
+          </div>
+        </div>
         <div id="publicationJobSource" class="format-summary">No analysis job selected. The report will use the explicitly selected directory and files.</div>
         <label>Additional provenance for user-supplied libraries (optional)
           <textarea id="publicationLibraryProvenance" rows="4" placeholder="Library path | Version | DOI or repository URL | License&#10;D:\libraries\inhouse.msp | 2026-08-01 | https://doi.org/... | institutional"></textarea>
