@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -23,9 +24,13 @@ def resolve_llm_config(config: dict[str, Any]) -> dict[str, str] | None:
             "AZURE_OPENAI_API_VERSION",
             "2024-10-21",
         )
-    if provider not in {"azure", "openai-compatible"}:
+    if provider not in {"azure", "openai-compatible", "local-openai-compatible"}:
         return None
-    if not endpoint or not key or not deployment:
+    if not endpoint or not deployment:
+        return None
+    if provider != "local-openai-compatible" and not key:
+        return None
+    if provider == "local-openai-compatible" and not _is_loopback_endpoint(endpoint):
         return None
     return {
         "provider": provider,
@@ -34,6 +39,14 @@ def resolve_llm_config(config: dict[str, Any]) -> dict[str, str] | None:
         "deployment": deployment,
         "api_version": api_version,
     }
+
+
+def _is_loopback_endpoint(endpoint: str) -> bool:
+    try:
+        hostname = urllib.parse.urlparse(endpoint).hostname
+    except ValueError:
+        return False
+    return hostname in {"127.0.0.1", "localhost", "::1"}
 
 
 def chat_completion(
@@ -64,10 +77,9 @@ def chat_completion(
             else f"{resolved['endpoint']}/chat/completions"
         )
         payload["model"] = resolved["deployment"]
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {resolved['api_key']}",
-        }
+        headers = {"Content-Type": "application/json"}
+        if resolved["api_key"]:
+            headers["Authorization"] = f"Bearer {resolved['api_key']}"
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),

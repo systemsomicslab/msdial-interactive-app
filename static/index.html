@@ -26,7 +26,7 @@
     <button data-tab="run">5. Validate &amp; run</button>
     <button data-tab="qa">6. Quality assurance</button>
     <button data-tab="publication">7. Publication report</button>
-    <button data-tab="help">Ask MS-DIAL</button>
+    <button data-tab="help">LLM &amp; agent settings</button>
   </nav>
 
   <main>
@@ -701,7 +701,7 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
           <div class="button-row">
             <button id="draftRepositoryQaTargets" class="secondary" type="button">Draft QA targets with configured LLM</button>
           </div>
-          <p class="muted">The repository statement is extracted locally. Exact m/z/adduct candidates are drafted only when an API is configured in Ask MS-DIAL. Drafts require review; RT remains blank unless explicitly supported by repository metadata.</p>
+          <p class="muted">The repository statement is extracted locally. Exact m/z/adduct candidates are drafted only when an LLM connection is configured in LLM &amp; agent settings. Drafts require review; RT remains blank unless explicitly supported by repository metadata.</p>
         </div>
         <label>Internal standards (optional)
           <textarea id="qaInternalStandards" rows="4" placeholder="Name,Adduct,m/z,RT (min),m/z tolerance (Da),RT tolerance (min)&#10;IS 1,[M-H]-,231.06953,7.61,0.01,0.5"></textarea>
@@ -781,29 +781,46 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
 
     <section id="tab-help" class="tab">
       <div class="panel">
-        <h2>LLM API settings</h2>
-        <p class="muted"><strong>Optional and unrelated to Repository metadata.</strong> No key is required for local QA cards, repository metadata inspection, MS-DIAL execution, or mzTab-M processing. Configure a key only for an LLM-generated Ask response or literature-based parameter search. The key remains in browser memory, is sent only to this localhost app for the current request, and is not written to disk or included in workflow files.</p>
-        <p class="muted">When a compatible GPT/Claude desktop app controls MS-DIAL Interactive through its MCP server, model authentication is handled by that desktop app. You do not enter the desktop agent's credentials in this web form.</p>
+        <h2>LLM and agent integration</h2>
+        <p class="muted"><strong>These are two separate connection directions.</strong> An in-app LLM connection lets buttons on this web page ask a model. A desktop agent connection lets Claude, ChatGPT, Codex, or another compatible host operate MS-DIAL Interactive through MCP.</p>
+        <div class="integration-mode-grid">
+          <article class="integration-mode-card">
+            <h3>Desktop agent via MCP</h3>
+            <p>No separate model API key is entered here. The desktop agent uses its own account and calls the bundled MS-DIAL Interactive MCP tools. The browser app cannot reuse or call a desktop chat session directly.</p>
+            <p class="muted">Claude Desktop can run a local MCP server or desktop extension. ChatGPT custom MCP availability and local connectivity depend on the plan and may require a remote endpoint or secure tunnel.</p>
+            <a href="https://github.com/systemsomicslab/msdial-interactive-app/blob/main/docs/agent_integration.md" target="_blank" rel="noreferrer">MS-DIAL agent setup guide</a>
+          </article>
+          <article class="integration-mode-card">
+            <h3>In-app LLM connection</h3>
+            <p>Used only for model-generated answers, literature assessment, and QA-target drafts initiated from this web page. Choose a cloud API or a local OpenAI-compatible model server.</p>
+            <p class="muted">Local retrieval, repository inspection, MS-DIAL execution, QA calculation, and mzTab-M processing do not require an LLM.</p>
+          </article>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>In-app LLM connection</h2>
+        <p class="muted">Cloud API keys remain in browser memory, are sent only to this localhost app for the current request, and are not written to disk or included in workflow files. A local model server accepts only a loopback endpoint and does not require a key.</p>
         <div class="form-grid">
           <label>Provider
             <select id="llmProvider">
               <option value="local">Local retrieval only</option>
+              <option value="local-openai-compatible">Local model server (Ollama / LM Studio)</option>
               <option value="azure">Azure OpenAI</option>
               <option value="openai-compatible">OpenAI-compatible endpoint</option>
             </select>
           </label>
-          <label>Endpoint<input id="llmEndpoint" placeholder="https://..."></label>
+          <label>Endpoint<input id="llmEndpoint" placeholder="https://... or http://127.0.0.1:11434/v1"></label>
           <label>Deployment / model<input id="llmDeployment"></label>
-          <label>API key<input id="llmApiKey" type="password" autocomplete="off"></label>
+          <label>API key <span id="llmApiKeyOptional" class="muted"></span><input id="llmApiKey" type="password" autocomplete="off"></label>
           <label id="llmApiVersionField">Azure API version<input id="llmApiVersion" value="2024-10-21"></label>
         </div>
         <div id="llmStatus" class="muted">Local retrieval is active.</div>
       </div>
       <div class="panel">
         <h2>Literature-based starting parameters</h2>
-        <p class="muted">Available only with an LLM API configuration. Searches explicitly licensed open-access Crossref records for similar MS-DIAL workflows. Citation count and direct parameter evidence are reported separately; suggestions are not applied automatically.</p>
+        <p class="muted">Available with a cloud API or local model connection. Searches explicitly licensed open-access Crossref records for similar MS-DIAL workflows. Citation count and direct parameter evidence are reported separately; suggestions are not applied automatically.</p>
         <button id="searchLiterature" class="secondary" disabled>Search open-access studies</button>
-        <div id="literatureStatus" class="muted">Configure an API provider and key to enable this search.</div>
+        <div id="literatureStatus" class="muted">Configure a cloud API or local model server to enable this search.</div>
         <div id="literatureSummary" class="assistant-answer" hidden></div>
         <div id="literatureWorks" class="cards"></div>
       </div>

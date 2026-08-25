@@ -4,7 +4,17 @@ MS-DIAL Interactive uses an Agent Skill for procedure and a local MCP server for
 execution. This matches the intended division: Skills teach a repeatable
 workflow, while MCP connects the model to tools and local data. See the official
 [Claude Skills overview](https://support.claude.com/en/articles/12512176-what-are-skills)
-and [Anthropic MCP documentation](https://docs.anthropic.com/en/docs/mcp).
+and [Anthropic MCP documentation](https://docs.anthropic.com/en/docs/mcp). For
+ChatGPT, see OpenAI's
+[developer mode and MCP apps](https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt).
+
+This connection does not expose Claude or ChatGPT as an API to the browser.
+Instead, the authenticated desktop agent calls MS-DIAL Interactive. Therefore a
+separate model API key is not needed for agent-driven execution. In-app model
+generation remains a separate optional connection under `LLM & agent settings`.
+Claude Desktop supports local MCP servers and desktop extensions. ChatGPT custom
+MCP support is plan-dependent and may require a remote MCP endpoint or secure
+tunnel rather than a direct localhost connection.
 
 ## Install the local MCP server
 

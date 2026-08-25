@@ -208,11 +208,12 @@ function workflow() {
 }
 
 function llmConfig() {
+  const provider = $("#llmProvider").value;
   return {
-    provider: $("#llmProvider").value,
+    provider,
     endpoint: $("#llmEndpoint").value.trim(),
     deployment: $("#llmDeployment").value.trim(),
-    api_key: $("#llmApiKey").value,
+    api_key: provider === "local-openai-compatible" ? "" : $("#llmApiKey").value,
     api_version: $("#llmApiVersion").value.trim(),
   };
 }
@@ -220,6 +221,12 @@ function llmConfig() {
 function llmConfigured() {
   const provider = $("#llmProvider").value;
   if (provider === "local") return false;
+  if (provider === "local-openai-compatible") {
+    return Boolean(
+      $("#llmEndpoint").value.trim()
+      && $("#llmDeployment").value.trim()
+    );
+  }
   const uiConfigured = Boolean(
     $("#llmApiKey").value.trim()
     && $("#llmEndpoint").value.trim()
@@ -1336,14 +1343,20 @@ function restoreRtWorkspaceState() {
 function updateLlmUI() {
   const provider = $("#llmProvider").value;
   const isLocal = provider === "local";
+  const isLocalModel = provider === "local-openai-compatible";
   ["llmEndpoint", "llmDeployment", "llmApiKey"].forEach((id) => {
     $(`#${id}`).disabled = isLocal;
   });
+  $("#llmApiKey").disabled = isLocal || isLocalModel;
+  $("#llmApiKeyOptional").textContent = isLocalModel ? "(not required)" : "";
   $("#llmApiVersionField").hidden = provider !== "azure";
   if (isLocal) {
     $("#llmStatus").textContent = state.config?.llm_environment?.azure_configured
       ? "Local retrieval is active. Azure OpenAI environment variables are available if Azure is selected."
       : "Local retrieval is active.";
+  } else if (isLocalModel) {
+    $("#llmStatus").textContent =
+      "Use a loopback OpenAI-compatible endpoint, for example Ollama at http://127.0.0.1:11434/v1 or LM Studio at http://127.0.0.1:1234/v1.";
   } else {
     $("#llmStatus").textContent =
       "The key is kept in browser memory only and sent to localhost for each Ask request.";
@@ -1352,7 +1365,7 @@ function updateLlmUI() {
   $("#searchLiterature").disabled = !configured;
   $("#literatureStatus").textContent = configured
     ? "Ready to search explicitly licensed open-access Crossref records."
-    : "Configure an API provider and key to enable this search.";
+    : "Configure a cloud API or local model server to enable this search.";
 }
 
 function renderTuningFiles() {
@@ -2860,7 +2873,7 @@ async function pollRepositoryDownload() {
 async function draftRepositoryQaTargets(automatic = false) {
   if (!state.repositoryMetadata) throw new Error("Inspect repository metadata first.");
   if (!llmConfigured()) {
-    throw new Error("Configure Azure OpenAI or an OpenAI-compatible API in Ask MS-DIAL first.");
+    throw new Error("Configure a cloud API or local model server in LLM & agent settings first.");
   }
   renderRepositoryQaMetadata("Drafting m/z candidates with the configured LLM...");
   const result = await api("/api/repository/qa-targets", {

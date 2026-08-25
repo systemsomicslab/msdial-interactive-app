@@ -52,7 +52,7 @@ def propose_repository_qa_targets(
     if resolve_llm_config(llm_config) is None:
         raise ValueError(
             "Internal-standard metadata was found, but exact QA targets require an Azure OpenAI "
-            "or OpenAI-compatible API configuration in Ask MS-DIAL."
+            "API or local model connection in LLM & agent settings."
         )
     messages = [
         {

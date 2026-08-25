@@ -232,13 +232,24 @@ or generate one in the run folder from a single alkane/FAME carbon-number to
 RT table. The generated file is named `ri_dictionary_paths.txt` and is included
 in the reusable workflow ZIP.
 
-## LLM settings
+## LLM and agent settings
 
-The Ask MS-DIAL screen can use local retrieval, Azure OpenAI, or an
-OpenAI-compatible chat-completions endpoint. API keys entered in the UI remain
-in browser memory and are sent to the localhost Python server only for the
-current request; they are not written to disk or included in the workflow
-context.
+The `LLM & agent settings` screen separates two connection directions:
+
+- an in-app LLM connection lets web-page actions call Azure OpenAI, an
+  OpenAI-compatible cloud endpoint, or a loopback OpenAI-compatible local model
+  server such as Ollama or LM Studio;
+- a desktop agent connection lets Claude Desktop, ChatGPT/Codex, or another MCP
+  host operate MS-DIAL Interactive. Authentication is handled by the desktop
+  host, so no model API key is entered in this web page.
+
+A desktop subscription cannot be reused as an inference API by the browser
+app, and the browser cannot call an existing desktop chat session. MCP solves
+the inverse problem: the desktop agent calls MS-DIAL Interactive. API keys
+entered in the UI remain in browser memory and are sent to the localhost Python
+server only for the current request; they are not written to disk or included
+in the workflow context. Keyless local-model connections are restricted to
+`localhost`, `127.0.0.1`, or `::1`.
 
 An API key is not used for repository metadata inspection, local QA-card
 retrieval, MS-DIAL execution, QA, or mzTab-M processing. Repository metadata are
@@ -572,20 +583,20 @@ Optional environment variables:
 MSDIAL_CONSOLE_PATH       Default Console path shown in the UI
 MSDIAL_INTERACTIVE_PORT   Linux helper script port, default 8765
 PYTHON_BIN                Linux/macOS helper script Python executable
-AZURE_OPENAI_ENDPOINT     Optional Ask MS-DIAL / literature evidence search
-AZURE_OPENAI_API_KEY      Optional Ask MS-DIAL / literature evidence search
-AZURE_OPENAI_DEPLOYMENT   Optional Ask MS-DIAL / literature evidence search
+AZURE_OPENAI_ENDPOINT     Optional in-app LLM / literature evidence search
+AZURE_OPENAI_API_KEY      Optional in-app LLM / literature evidence search
+AZURE_OPENAI_DEPLOYMENT   Optional in-app LLM / literature evidence search
 ```
 
 ## Knowledge cards
 
 `knowledge/qa_cards_ja.jsonl` and `knowledge/qa_cards_en.jsonl` contain only
 small public-safe sample cards in this repository. They are included so that
-Ask MS-DIAL works immediately after checkout. Labs can replace these files with
+Local MS-DIAL question retrieval works immediately after checkout. Labs can replace these files with
 their own local Q&A cards; private or email-derived cards should not be
 committed to a public repository.
 
-The Ask MS-DIAL screen works in local retrieval mode without an API key.
+The LLM and agent screen works in local retrieval mode without an API key.
 Grounded Azure OpenAI answers are enabled when these variables are set:
 
 ```text
