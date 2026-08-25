@@ -24,6 +24,7 @@ from msdial_app.repository_reanalysis import (
     _extract_archive,
     _common_input_path,
     cleanup_download_lease,
+    create_download_lease,
     discard_download_lease,
     evaluate_eligibility,
     finalize_download_lease,
@@ -314,6 +315,42 @@ class RepositoryReanalysisTests(unittest.TestCase):
             first.write_text("", encoding="ascii")
             second.write_text("", encoding="ascii")
             self.assertEqual(str(nested.resolve()), _common_input_path([str(first), str(second)], root))
+
+    def test_download_lease_reports_byte_progress_for_one_large_object(self) -> None:
+        class FakeClient:
+            def download(self, _url, destination, _maximum_bytes, progress_callback=None):
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"12345678")
+                if progress_callback:
+                    progress_callback(4, 8)
+                    progress_callback(8, 8)
+                return {
+                    "path": str(destination),
+                    "size_bytes": 8,
+                    "sha256": "",
+                    "md5": "",
+                }
+
+        project = RepositoryProject(
+            repository="test",
+            accession="X6",
+            eligible=True,
+            selection_status="eligible",
+            files=[RepositoryFile("sample.mzML", 8, "https://example.org/sample.mzML")],
+            total_download_bytes=8,
+        )
+        updates = []
+        with tempfile.TemporaryDirectory() as temporary:
+            result = create_download_lease(
+                project,
+                Path(temporary),
+                100,
+                client=FakeClient(),
+                progress_callback=lambda *args: updates.append(args),
+            )
+            self.assertEqual(8, updates[-1][3])
+            self.assertEqual(8, updates[-1][4])
+            self.assertEqual(1, len(result["input_candidates"]))
 
 
 if __name__ == "__main__":

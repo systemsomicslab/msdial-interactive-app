@@ -25,7 +25,9 @@ ANALYSIS_FIELDS = [
 
 def metadata_workspace(project: dict[str, Any]) -> dict[str, Any]:
     rows = normalize_sample_rows(project.get("sample_metadata", []))
-    return {
+    fields = describe_fields(rows)
+    hierarchy = default_class_hierarchy(fields, len(rows))
+    workspace = {
         "schema": SCHEMA,
         "repository": str(project.get("repository", "")),
         "accession": str(project.get("accession", "")),
@@ -35,13 +37,18 @@ def metadata_workspace(project: dict[str, Any]) -> dict[str, Any]:
         "publications": list(project.get("publications", [])),
         "metadata_sources": list(project.get("metadata_sources", [])),
         "repository_record": dict(project.get("repository_metadata", {})),
-        "fields": describe_fields(rows),
+        "separation": str(project.get("separation", "Unknown")),
+        "acquisition_mode": str(project.get("acquisition_mode", "Unknown")),
+        "ion_mode": str(project.get("ion_mode", "Unknown")),
+        "target_omics": _infer_target_omics(project, rows),
+        "fields": fields,
         "rows": rows,
-        "hierarchy": [],
+        "hierarchy": hierarchy,
         "separator": "_",
         "missing_value": "NA",
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+    return project_class_hierarchy(workspace, hierarchy) if hierarchy else workspace
 
 
 def metadata_workspace_from_file(path: str | Path) -> dict[str, Any]:
@@ -181,8 +188,9 @@ def apply_classes_to_analysis_files(
                     seen.add(marker)
                     candidates.append(row)
         if len(candidates) == 1:
-            item["class_id"] = candidates[0].get("class_id") or "Sample"
-            inferred_type = infer_analysis_file_type(candidates[0])
+            candidate = candidates[0]
+            item["class_id"] = candidate.get("class_id") or "Sample"
+            inferred_type = infer_analysis_file_type(candidate)
             if inferred_type != "Sample" or not str(item.get("file_type", "")).strip():
                 item["file_type"] = inferred_type
             analytical_order = metadata_integer(
@@ -196,6 +204,11 @@ def apply_classes_to_analysis_files(
                 item["analytical_order"] = analytical_order
             if batch_order is not None:
                 item["batch_order"] = batch_order
+            acquisition = infer_acquisition_type(
+                candidate, str(workspace.get("acquisition_mode", ""))
+            )
+            if acquisition:
+                item["acquisition_type"] = acquisition
             matches.append(
                 {
                     "file_path": str(item.get("file_path", "")),
@@ -214,6 +227,66 @@ def apply_classes_to_analysis_files(
         "unmatched": unmatched,
         "ambiguous": ambiguous,
     }
+
+
+def default_class_hierarchy(
+    fields: Iterable[dict[str, Any]], row_count: int
+) -> list[str]:
+    priorities = (
+        ("group", "class", "factor value", "treatment", "condition", "genotype", "phenotype"),
+        ("cell line", "strain", "region", "tissue", "organ", "sex", "age"),
+        ("sample type", "sample source", "species"),
+    )
+    candidates = []
+    for field in fields:
+        unique_count = int(field.get("unique_count") or 0)
+        if unique_count <= 1 or (row_count > 1 and unique_count >= row_count):
+            continue
+        normalized = re.sub(r"[_/-]+", " ", str(field.get("name", ""))).casefold()
+        rank = next(
+            (
+                group_index
+                for group_index, tokens in enumerate(priorities)
+                if any(token in normalized for token in tokens)
+            ),
+            None,
+        )
+        if rank is not None:
+            candidates.append((rank, unique_count, str(field["name"])))
+    candidates.sort(key=lambda item: (item[0], item[1], item[2].casefold()))
+    return [item[2] for item in candidates[:3]]
+
+
+def infer_acquisition_type(row: dict[str, Any], fallback: str = "") -> str:
+    values = row.get("values", {})
+    focused = " ".join(
+        scalar_text(value)
+        for key, value in values.items()
+        if any(token in key.casefold() for token in ("instrument mode", "acquisition", "scan mode"))
+    )
+    text = f"{focused} {fallback}".casefold()
+    if re.search(r"\b(aif|all[- ]?ions?)\b", text):
+        return "AIF"
+    if re.search(r"\b(dia|swath|data[- ]independent)\b", text):
+        return "SWATH"
+    if re.search(r"\b(dda|data[- ]dependent|auto\s*ms/?ms)\b", text):
+        return "DDA"
+    return ""
+
+
+def _infer_target_omics(project: dict[str, Any], rows: list[dict[str, Any]]) -> str:
+    text = " ".join(
+        [
+            scalar_text(project.get("title")),
+            scalar_text(project.get("description")),
+            *(
+                scalar_text(value)
+                for row in rows[:10]
+                for value in row.get("values", {}).values()
+            ),
+        ]
+    ).casefold()
+    return "Lipidomics" if re.search(r"\b(lipidome|lipidomics|lipidomic)\b", text) else "Metabolomics"
 
 
 def infer_analysis_file_type(row: dict[str, Any]) -> str:

@@ -35,6 +35,7 @@ from .repository_metadata import (
     project_class_hierarchy,
     save_metadata_review,
 )
+from .repository_qa import propose_repository_qa_targets
 from .repository_reanalysis import (
     ADAPTERS,
     EligibilityPolicy,
@@ -636,6 +637,11 @@ class Handler(BaseHTTPRequestHandler):
                         "kind": "repository_download",
                         "logs": [],
                         "result": None,
+                        "received": 0,
+                        "total": evaluated.total_download_bytes,
+                        "progress": 0,
+                        "speed_bps": 0,
+                        "eta_seconds": None,
                         "repository": evaluated.repository,
                         "accession": evaluated.accession,
                         "raw_retention_policy": retention,
@@ -668,6 +674,14 @@ class Handler(BaseHTTPRequestHandler):
                             body.get("analysis_files", []),
                         )
                     }
+                )
+            elif parsed.path == "/api/repository/qa-targets":
+                self._json(
+                    propose_repository_qa_targets(
+                        body.get("workspace", {}),
+                        body.get("workflow", {}),
+                        body.get("llm", {}),
+                    )
                 )
             elif parsed.path == "/api/files/browse":
                 self._json(_browse_filesystem(body.get("path", "")))
@@ -1362,16 +1376,40 @@ def _run_repository_download_job(
             if retention == "keep"
             else "Raw data will be deleted only after a successful run and validated mzTab-M output."
         )
-        last_reported = 0
+        started = time.monotonic()
+        last_reported_percent = -5.0
+        last_persisted = 0.0
 
-        def progress(index: int, total: int, name: str, received: int) -> None:
-            nonlocal last_reported
-            interval = max(1, total // 20)
-            if index == total or index - last_reported >= interval:
-                last_reported = index
-                log(
-                    f"Downloaded {index}/{total} object(s), {received / 1024**2:.1f} MiB: {name}"
-                )
+        def progress(
+            index: int, total_objects: int, name: str, received: int, total_bytes: int
+        ) -> None:
+            nonlocal last_reported_percent, last_persisted
+            elapsed = max(time.monotonic() - started, 1e-6)
+            speed = received / elapsed
+            percent = received / total_bytes * 100 if total_bytes else 0.0
+            eta = (total_bytes - received) / speed if total_bytes and speed > 0 else None
+            now = time.monotonic()
+            with JOBS_LOCK:
+                job = JOBS[job_id]
+                job["received"] = received
+                job["total"] = total_bytes
+                job["progress"] = round(min(100.0, percent), 1)
+                job["speed_bps"] = round(speed)
+                job["eta_seconds"] = round(eta) if eta is not None else None
+                job["current_file"] = name
+                job["download_object"] = index
+                job["download_objects"] = total_objects
+                if percent - last_reported_percent >= 5 or received == total_bytes:
+                    last_reported_percent = percent
+                    job["logs"].append(
+                        f"Downloaded {received / 1024**2:.1f} MiB "
+                        f"({percent:.1f}%, {index}/{total_objects} object(s)): {name}"
+                    )
+                    job["logs"] = job["logs"][-2000:]
+                if now - last_persisted >= 2 or received == total_bytes:
+                    last_persisted = now
+                    job["updated_at"] = dt.datetime.now().astimezone().isoformat()
+                    _persist_jobs_locked()
 
         lease = create_download_lease(
             project,
@@ -1395,6 +1433,7 @@ def _run_repository_download_job(
         log(f"Recognized {len(recognized.get('files', []))} MS-DIAL analysis file(s).")
         with JOBS_LOCK:
             JOBS[job_id]["result"] = result
+            JOBS[job_id]["progress"] = 100
             JOBS[job_id]["status"] = "completed"
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             _persist_jobs_locked()

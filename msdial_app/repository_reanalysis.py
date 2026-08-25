@@ -103,7 +103,13 @@ class RepositoryHttpClient:
         except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
             return 0
 
-    def download(self, url: str, destination: Path, maximum_bytes: int) -> dict[str, Any]:
+    def download(
+        self,
+        url: str,
+        destination: Path,
+        maximum_bytes: int,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
         destination.parent.mkdir(parents=True, exist_ok=True)
         partial = destination.with_name(destination.name + ".part")
         digest = hashlib.sha256()
@@ -125,6 +131,8 @@ class RepositoryHttpClient:
                     output.write(chunk)
                     digest.update(chunk)
                     md5.update(chunk)
+                    if progress_callback:
+                        progress_callback(downloaded, declared)
             partial.replace(destination)
         except Exception:
             partial.unlink(missing_ok=True)
@@ -721,7 +729,25 @@ def create_download_lease(
             filename = f"{project.accession}.tar"
         archive = Path(filename).suffix.casefold() in ARCHIVE_SUFFIXES
         destination = download_root / filename if archive else data_root / _safe_relative_name(item.name)
-        result = client.download(url, destination, maximum_bytes - downloaded_bytes)
+        def item_progress(received: int, declared: int) -> None:
+            if progress_callback:
+                known_total = project.total_download_bytes or (
+                    downloaded_bytes + declared if declared else 0
+                )
+                progress_callback(
+                    index,
+                    total_objects,
+                    item.name,
+                    downloaded_bytes + received,
+                    known_total,
+                )
+
+        result = client.download(
+            url,
+            destination,
+            maximum_bytes - downloaded_bytes,
+            progress_callback=item_progress,
+        )
         downloaded_bytes += result["size_bytes"]
         result["source_url"] = url
         result["declared_checksum"] = item.checksum
@@ -730,7 +756,13 @@ def create_download_lease(
                 raise ValueError(f"MD5 checksum mismatch for {filename}.")
         downloads.append(result)
         if progress_callback:
-            progress_callback(index, total_objects, item.name, downloaded_bytes)
+            progress_callback(
+                index,
+                total_objects,
+                item.name,
+                downloaded_bytes,
+                project.total_download_bytes or downloaded_bytes,
+            )
     extracted = []
     for item in downloads:
         archive_path = Path(item["path"])

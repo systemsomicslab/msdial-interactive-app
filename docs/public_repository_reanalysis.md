@@ -134,6 +134,16 @@ tab then exposes **Download and recognize raw data**. This creates a bounded
 workspace, reconstructs folder-type vendor data, and fills the analysis-file
 table. Raw-data retention is selected per repository run: keep the raw data,
 or delete it only after MS-DIAL succeeds and mzTab-M validation passes.
+The transfer view reports declared bytes, measured throughput, percentage, and
+ETA, including repositories that expose one large archive. Repository metadata
+can then populate Class, file type, DDA/SWATH/AIF acquisition, batch, and
+analytical order automatically or through **Apply metadata now**.
+
+Internal-standard declarations such as a named commercial mixture are extracted
+locally and shown in Quality assurance. If an Azure OpenAI or OpenAI-compatible
+endpoint is configured, the user may draft m/z/adduct QA targets from that public
+metadata. These remain reviewable drafts; RT is left blank unless the repository
+explicitly supports it, and m/z-only QA matching does not report RT error.
 
 ## Download and preflight
 

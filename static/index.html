@@ -118,11 +118,22 @@
                 <option value="delete_after_validated_output">Delete after mzTab-M validation</option>
               </select>
             </label>
+            <label>Download eligibility
+              <select id="repositoryDownloadEligibility">
+                <option value="allow_preflight">Allow download when raw-header review is required</option>
+                <option value="eligible_only">Only download fully classified projects</option>
+              </select>
+            </label>
           </div>
-          <label class="checkline"><input id="repositoryAllowPreflight" type="checkbox" checked> Allow download when raw-header preflight is still required</label>
+          <p class="muted">Raw-header review means repository metadata could not yet determine items such as DDA/DIA or polarity. It permits download for local inspection; it does not silently mark the project as validated.</p>
+          <label class="checkline"><input id="repositoryAutoApplyMetadata" type="checkbox" checked> Automatically apply Class, file type, acquisition type, batch, and analytical order after download</label>
           <div class="button-row">
             <button id="downloadRepositoryRaw" type="button">Download and recognize raw data</button>
+            <button id="applyDownloadedRepositoryMetadata" type="button" class="secondary">Apply metadata now</button>
           </div>
+          <div id="repositoryDownloadEstimate" class="muted"></div>
+          <progress id="repositoryDownloadProgress" max="100" value="0"></progress>
+          <div id="repositoryDownloadProgressText" class="muted">0%</div>
           <pre id="repositoryDownloadLog" class="log compact-log">Waiting for download.</pre>
         </div>
         <div id="repositoryMetadataEditor" hidden>
@@ -684,13 +695,21 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
           <button id="browseQaFile" class="secondary" type="button">Native file picker</button>
         </div>
         <div id="qaFileProvenance" class="format-summary">No QA matrix is associated with the selected job.</div>
+        <div id="repositoryQaMetadata" class="format-summary" hidden>
+          <strong>Repository internal-standard metadata</strong>
+          <div id="repositoryQaEvidence"></div>
+          <div class="button-row">
+            <button id="draftRepositoryQaTargets" class="secondary" type="button">Draft QA targets with configured LLM</button>
+          </div>
+          <p class="muted">The repository statement is extracted locally. Exact m/z/adduct candidates are drafted only when an API is configured in Ask MS-DIAL. Drafts require review; RT remains blank unless explicitly supported by repository metadata.</p>
+        </div>
         <label>Internal standards (optional)
           <textarea id="qaInternalStandards" rows="4" placeholder="Name,Adduct,m/z,RT (min),m/z tolerance (Da),RT tolerance (min)&#10;IS 1,[M-H]-,231.06953,7.61,0.01,0.5"></textarea>
         </label>
         <div class="button-row">
           <button id="loadQaInternalStandardExample" class="secondary" type="button">Example: FA 16:0 / FA 18:0</button>
         </div>
-        <p class="muted">One standard per line. Adduct is optional, so the previous five-column format remains valid. The nearest alignment spot within both tolerances is followed across analytical order for intensity, mass error (ppm), and RT error.</p>
+        <p class="muted">One standard per line. Adduct and RT are optional. With blank RT, matching uses m/z only and RT error is not calculated. Review LLM-drafted entries before generating QA.</p>
         <button id="generateQaReport" type="button">Generate LC-MS QA report</button>
         <div id="qaReport" class="format-summary qa-report" hidden></div>
       </div>

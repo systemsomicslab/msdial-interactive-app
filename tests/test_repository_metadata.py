@@ -158,6 +158,26 @@ class RepositoryMetadataTests(unittest.TestCase):
         self.assertEqual("Human", mbpost[0]["values"]["organism"])
         self.assertEqual("KO", mbpost[0]["values"]["sample / Genotype"])
 
+    def test_default_hierarchy_and_acquisition_are_applied(self) -> None:
+        workspace = metadata_workspace(
+            {
+                "repository": "test",
+                "acquisition_mode": "DIA",
+                "sample_metadata": [
+                    {"sample_id": "S1", "raw_file": "S1.raw", "values": {"Group": "Control"}},
+                    {"sample_id": "S2", "raw_file": "S2.raw", "values": {"Group": "Case"}},
+                    {"sample_id": "S3", "raw_file": "S3.raw", "values": {"Group": "Control"}},
+                ],
+            }
+        )
+        self.assertEqual(["Group"], workspace["hierarchy"])
+        applied = apply_classes_to_analysis_files(
+            workspace,
+            [{"file_path": r"D:\data\S1.raw", "file_name": "S1", "acquisition_type": "DDA"}],
+        )
+        self.assertEqual("Control", applied["files"][0]["class_id"])
+        self.assertEqual("SWATH", applied["files"][0]["acquisition_type"])
+
     def test_class_token_is_split_safe(self) -> None:
         self.assertEqual("Control-North", class_token("Control_North"))
         self.assertEqual("対照群-東京", class_token("対照群_東京"))

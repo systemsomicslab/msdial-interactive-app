@@ -217,6 +217,33 @@ function llmConfig() {
   };
 }
 
+function llmConfigured() {
+  const provider = $("#llmProvider").value;
+  if (provider === "local") return false;
+  const uiConfigured = Boolean(
+    $("#llmApiKey").value.trim()
+    && $("#llmEndpoint").value.trim()
+    && $("#llmDeployment").value.trim()
+  );
+  return uiConfigured
+    || (provider === "azure" && Boolean(state.config?.llm_environment?.azure_configured));
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!bytes) return "unknown size";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+  return `${(bytes / (1024 ** index)).toFixed(index >= 3 ? 2 : 1)} ${units[index]}`;
+}
+
+function formatDuration(value) {
+  const seconds = Math.max(0, Math.round(Number(value || 0)));
+  if (seconds < 60) return `${seconds} sec`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ${seconds % 60} sec`;
+  return `${Math.floor(seconds / 3600)} hr ${Math.floor((seconds % 3600) / 60)} min`;
+}
+
 function setStatus(text) { $("#status").textContent = text; }
 
 function showImportMessages(messages, level = "warning", useAlert = false) {
@@ -334,6 +361,13 @@ function renderRepositoryMetadata() {
     `Publication: ${escapeHtml(publicationText)}`;
   editor.hidden = false;
   rawWorkspace.hidden = !state.repositoryProject;
+  if (state.repositoryProject) {
+    const total = Number(state.repositoryProject.total_download_bytes || 0);
+    const estimatedSeconds = total ? total / (100 * 1000 * 1000 / 8) : 0;
+    $("#repositoryDownloadEstimate").textContent = total
+      ? `Declared download: ${formatBytes(total)}. Approx. ${formatDuration(estimatedSeconds)} at 100 Mbps; actual speed and ETA appear after transfer starts.`
+      : "The repository did not declare a complete download size; the configured safety limit still applies.";
+  }
   const hierarchy = workspace.hierarchy || [];
   $("#repositoryMissingValue").value = workspace.missing_value || "NA";
   $("#repositoryClassSeparator").value = workspace.separator || "_";
@@ -358,6 +392,46 @@ function renderRepositoryMetadata() {
     });
   });
   renderRepositoryMetadataPreview();
+  renderRepositoryQaMetadata();
+}
+
+function repositoryInternalStandardEvidence() {
+  const grouped = new Map();
+  (state.repositoryMetadata?.rows || []).forEach((row) => {
+    Object.entries(row.values || {}).forEach(([field, rawValue]) => {
+      if (!/\b(internal standard|internal standards|is mixture|spiked? standard|reference standard)\b/i.test(field)) return;
+      const value = String(rawValue || "").trim();
+      if (!value) return;
+      const key = `${field.toLowerCase()}\u0000${value.toLowerCase()}`;
+      if (!grouped.has(key)) grouped.set(key, { field, value, count: 0 });
+      grouped.get(key).count += 1;
+    });
+  });
+  return [...grouped.values()];
+}
+
+function renderRepositoryQaMetadata(extraMessage = "") {
+  const panel = $("#repositoryQaMetadata");
+  const evidence = repositoryInternalStandardEvidence();
+  panel.hidden = !evidence.length;
+  if (!evidence.length) return;
+  $("#repositoryQaEvidence").innerHTML = evidence.map((item) =>
+    `<div><code>${escapeHtml(item.field)}</code>: ${escapeHtml(item.value)} <span class="muted">(${item.count} sample row(s))</span></div>`
+  ).join("") + (extraMessage ? `<div class="muted">${escapeHtml(extraMessage)}</div>` : "");
+}
+
+function applyRepositoryProjectDefaults() {
+  const project = state.repositoryProject || {};
+  if (project.separation === "LC-MS") $("#projectType").value = "lcms";
+  if (project.separation === "GC-MS") $("#projectType").value = "gcms";
+  if (["Positive", "Negative"].includes(project.ion_mode)) {
+    $("#ionMode").value = project.ion_mode;
+  }
+  const target = state.repositoryMetadata?.target_omics;
+  if (["Lipidomics", "Metabolomics"].includes(target)) $("#targetOmics").value = target;
+  updateProjectUI();
+  renderLipids();
+  renderAdducts();
 }
 
 function renderRepositoryMetadataPreview() {
@@ -1274,15 +1348,7 @@ function updateLlmUI() {
     $("#llmStatus").textContent =
       "The key is kept in browser memory only and sent to localhost for each Ask request.";
   }
-  const uiConfigured = Boolean(
-    $("#llmApiKey").value.trim()
-    && $("#llmEndpoint").value.trim()
-    && $("#llmDeployment").value.trim()
-  );
-  const configured = !isLocal && (
-    uiConfigured
-    || (provider === "azure" && Boolean(state.config?.llm_environment?.azure_configured))
-  );
+  const configured = llmConfigured();
   $("#searchLiterature").disabled = !configured;
   $("#literatureStatus").textContent = configured
     ? "Ready to search explicitly licensed open-access Crossref records."
@@ -1657,16 +1723,18 @@ function parseQaInternalStandards() {
       if (index === 0 && fields.some((item) => item.toLowerCase() === "m/z" || item.toLowerCase() === "mz")) return null;
       const hasAdduct = fields.length >= 6;
       const offset = hasAdduct ? 1 : 0;
+      const rtText = fields[2 + offset] || "";
       return {
         name: fields[0] || `Internal standard ${index + 1}`,
         adduct: hasAdduct ? fields[1] : "",
         mz: Number(fields[1 + offset]),
-        rt: Number(fields[2 + offset]),
+        rt: rtText === "" ? null : Number(rtText),
         mz_tolerance: Number(fields[3 + offset] || 0.01),
         rt_tolerance: Number(fields[4 + offset] || 0.5),
       };
     })
-    .filter((item) => item && Number.isFinite(item.mz) && item.mz > 0 && Number.isFinite(item.rt) && item.rt >= 0);
+    .filter((item) => item && Number.isFinite(item.mz) && item.mz > 0
+      && (item.rt === null || (Number.isFinite(item.rt) && item.rt >= 0)));
 }
 
 function parsePublicationLibraryProvenance() {
@@ -2640,6 +2708,7 @@ $("#inspectRepositoryMetadata").addEventListener("click", () => runUiAction(asyn
     state.repositoryRunManifest = "";
     state.repositoryMetadata = result.workspace;
     renderRepositoryMetadata();
+    applyRepositoryProjectDefaults();
     setStatus(`Inspected repository metadata for ${result.workspace.accession}.`);
   } finally {
     button.disabled = false;
@@ -2669,6 +2738,10 @@ $("#previewRepositoryClasses").addEventListener("click", () => runUiAction(async
 $("#applyRepositoryClasses").addEventListener("click", () => runUiAction(async () => {
   const result = await projectRepositoryMetadata(true);
   setStatus(`Applied repository metadata to ${result.application?.matched_count || 0} analysis file(s).`);
+}));
+$("#applyDownloadedRepositoryMetadata").addEventListener("click", () => runUiAction(async () => {
+  const result = await projectRepositoryMetadata(true);
+  setStatus(`Applied repository metadata to ${result.application?.matched_count || 0} downloaded analysis file(s).`);
 }));
 $("#saveRepositoryMetadata").addEventListener("click", () => runUiAction(async () => {
   await projectRepositoryMetadata(false);
@@ -2707,12 +2780,14 @@ $("#downloadRepositoryRaw").addEventListener("click", () => runUiAction(async ()
       project: state.repositoryProject,
       workspace_root: workspaceRoot,
       maximum_gb: Number($("#repositoryMaximumGb").value || 20),
-      allow_preflight: $("#repositoryAllowPreflight").checked,
+      allow_preflight: $("#repositoryDownloadEligibility").value === "allow_preflight",
       raw_retention_policy: state.repositoryRawRetentionPolicy,
     }),
   });
   state.repositoryDownloadJobId = response.job_id;
   $("#repositoryDownloadLog").textContent = "Repository download queued.";
+  $("#repositoryDownloadProgress").value = 0;
+  $("#repositoryDownloadProgressText").textContent = "0%";
   $("#downloadRepositoryRaw").disabled = true;
   setStatus("Downloading and recognizing repository raw data...");
   pollRepositoryDownload();
@@ -2723,6 +2798,17 @@ async function pollRepositoryDownload() {
   try {
     const job = await api(`/api/jobs/${state.repositoryDownloadJobId}?detail=full`);
     $("#repositoryDownloadLog").textContent = (job.logs || []).join("\n") || job.status;
+    const progress = Number(job.progress || 0);
+    $("#repositoryDownloadProgress").value = progress;
+    const transfer = job.total
+      ? `${formatBytes(job.received)} / ${formatBytes(job.total)}`
+      : formatBytes(job.received);
+    const speed = job.speed_bps ? `${formatBytes(job.speed_bps)}/s` : "measuring speed";
+    const eta = job.eta_seconds !== null && job.eta_seconds !== undefined
+      ? `ETA ${formatDuration(job.eta_seconds)}`
+      : "ETA unavailable";
+    $("#repositoryDownloadProgressText").textContent =
+      `${progress.toFixed(1)}% | ${transfer} | ${speed} | ${eta}`;
     if (["queued", "running"].includes(job.status)) {
       setTimeout(pollRepositoryDownload, 1500);
       return;
@@ -2739,20 +2825,61 @@ async function pollRepositoryDownload() {
     $("#outputRoot").value = result.output_directory || "";
     state.outputRootAutomatic = false;
     renderFiles();
+    let metadataApplyWarning = "";
+    if ($("#repositoryAutoApplyMetadata").checked) {
+      try {
+        await projectRepositoryMetadata(true);
+      } catch (metadataError) {
+        metadataApplyWarning = `Automatic metadata application was unavailable: ${metadataError.message || metadataError}`;
+      }
+    }
     applyFormatStartingValues();
     showImportMessages([
       `Recognized ${state.files.length} repository analysis file(s).`,
       `Run manifest: ${state.repositoryRunManifest}`,
+      metadataApplyWarning,
       ...(recognized.warnings || []),
       ...(recognized.rejected || []).map((path) => `Skipped: ${path}`),
     ], recognized.rejected?.length ? "warning" : "info");
     setStatus(`Repository raw data ready: ${state.files.length} analysis file(s).`);
+    if (llmConfigured() && repositoryInternalStandardEvidence().length) {
+      try {
+        await draftRepositoryQaTargets(true);
+      } catch (llmError) {
+        renderRepositoryQaMetadata(`Automatic QA target drafting was unavailable: ${llmError.message || llmError}`);
+      }
+    }
     refreshQuestion();
   } catch (error) {
     $("#downloadRepositoryRaw").disabled = false;
     $("#repositoryDownloadLog").textContent += `\n${error.message || error}`;
     setStatus(error.message || String(error));
   }
+}
+
+async function draftRepositoryQaTargets(automatic = false) {
+  if (!state.repositoryMetadata) throw new Error("Inspect repository metadata first.");
+  if (!llmConfigured()) {
+    throw new Error("Configure Azure OpenAI or an OpenAI-compatible API in Ask MS-DIAL first.");
+  }
+  renderRepositoryQaMetadata("Drafting m/z candidates with the configured LLM...");
+  const result = await api("/api/repository/qa-targets", {
+    method: "POST",
+    body: JSON.stringify({
+      workspace: state.repositoryMetadata,
+      workflow: workflow(),
+      llm: llmConfig(),
+    }),
+  });
+  const existing = $("#qaInternalStandards").value.split(/\r?\n/).filter(Boolean);
+  const merged = [...new Set([...existing, ...(result.lines || [])])];
+  $("#qaInternalStandards").value = merged.join("\n");
+  const warning = (result.warnings || []).join(" ");
+  renderRepositoryQaMetadata(
+    `${result.candidates?.length || 0} reviewable QA target(s) added${automatic ? " automatically" : ""}. ${warning}`.trim()
+  );
+  setStatus(`Added ${result.candidates?.length || 0} repository-derived QA target draft(s); review before QA.`);
+  return result;
 }
 $("#addPath").addEventListener("click", () => runUiAction(async () => {
   if ($("#serverPath").value.trim()) await addServerPaths([$("#serverPath").value.trim()]);
@@ -3217,6 +3344,9 @@ $("#loadQaInternalStandardExample").addEventListener("click", () => {
   ].join("\n");
   setStatus("Loaded the FA 16:0 / FA 18:0 pseudo internal-standard example.");
 });
+$("#draftRepositoryQaTargets").addEventListener("click", () =>
+  runUiAction(async () => draftRepositoryQaTargets(false))
+);
 $("#generateQaReport").addEventListener("click", () => runUiAction(async () => {
   const filePath = $("#qaFilePath").value.trim();
   const runDirectory = $("#outputRoot").value.trim();

@@ -501,9 +501,9 @@ class WorkflowTests(unittest.TestCase):
             manifest = json.loads(
                 Path(result["manifest"]).read_text(encoding="utf-8")
             )
-            self.assertEqual("0.4.1", settings["msdial_interactive_version"])
+            self.assertEqual("0.4.2", settings["msdial_interactive_version"])
             self.assertEqual("not recorded", settings["msdial_console_version"])
-            self.assertEqual("0.4.1", manifest["msdial_interactive_version"])
+            self.assertEqual("0.4.2", manifest["msdial_interactive_version"])
             self.assertEqual("21904324", settings["library_provenance"][0]["record_id"])
             self.assertEqual("CC BY 4.0", settings["library_provenance"][0]["license"])
 

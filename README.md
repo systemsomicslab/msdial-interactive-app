@@ -154,6 +154,14 @@ separated value into MS-DIAL's single `Class` column. Reviewed source metadata
 remain available as JSON/TSV, and the same workflow is callable from the CLI or
 local agent API.
 
+Repository downloads show declared size, a 100-Mbps planning estimate, measured
+transfer speed, byte progress, and ETA. After recognition, repository Class,
+file type, DDA/SWATH/AIF acquisition, batch, and analytical order can be applied
+automatically or manually. Internal-standard statements are surfaced in the QA
+tab. When an LLM endpoint is explicitly configured, the app can draft reviewable
+m/z/adduct targets; unsupported retention times remain blank instead of being
+invented.
+
 When `workflow-settings.json` exists in the selected run/output directory, the
 report uses those saved run settings instead of the current UI. New runs record
 both the MS-DIAL Console version and MS-DIAL Interactive version in
