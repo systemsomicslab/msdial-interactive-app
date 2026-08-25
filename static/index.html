@@ -88,11 +88,12 @@
             <select id="repositoryName">
               <option value="metabolomics_workbench">Metabolomics Workbench</option>
               <option value="metabolights">MetaboLights</option>
-              <option value="mb_post">MB-POST / MetaboBank</option>
+              <option value="mb_post">MB-POST</option>
+              <option value="metabobank">MetaboBank</option>
             </select>
           </label>
           <label>Accession
-            <input id="repositoryAccession" placeholder="ST002419, MTBLS341, or MPST000007">
+            <input id="repositoryAccession" placeholder="ST002419, MTBLS341, MPST000007, or MTBKS47">
           </label>
           <div class="repository-source-actions">
             <button id="inspectRepositoryMetadata" type="button">Inspect metadata</button>
@@ -100,6 +101,30 @@
           </div>
         </div>
         <div id="repositoryMetadataSummary" class="format-summary" hidden></div>
+        <div id="repositoryRawWorkspace" class="repository-raw-workspace" hidden>
+          <h3>Raw data download and recognition</h3>
+          <p class="muted"><strong>Inspect metadata does not download raw data.</strong> Use the button below to create a bounded local workspace, download the repository files, and add recognized MS-DIAL inputs to the Data table.</p>
+          <div class="form-grid">
+            <label>Repository workspace root
+              <div class="output-path-row">
+                <input id="repositoryWorkspaceRoot" placeholder="D:\MSDIAL_Public_Reanalysis or /data/msdial-reanalysis">
+                <button id="chooseRepositoryWorkspace" type="button" class="secondary">Choose</button>
+              </div>
+            </label>
+            <label>Maximum download size (GB)<input id="repositoryMaximumGb" type="number" min="0.1" step="0.1" value="20"></label>
+            <label>Raw data after validated analysis
+              <select id="repositoryRawRetention">
+                <option value="keep">Keep downloaded raw data</option>
+                <option value="delete_after_validated_output">Delete after mzTab-M validation</option>
+              </select>
+            </label>
+          </div>
+          <label class="checkline"><input id="repositoryAllowPreflight" type="checkbox" checked> Allow download when raw-header preflight is still required</label>
+          <div class="button-row">
+            <button id="downloadRepositoryRaw" type="button">Download and recognize raw data</button>
+          </div>
+          <pre id="repositoryDownloadLog" class="log compact-log">Waiting for download.</pre>
+        </div>
         <div id="repositoryMetadataEditor" hidden>
           <h3>Class hierarchy</h3>
           <p class="muted">Check grouping fields and set their order. Values are joined with <code>_</code>; spaces and underscores inside each value are normalized to <code>-</code> so the result can be split later without ambiguity.</p>
@@ -174,9 +199,9 @@
       <div id="pathsPanel" class="panel">
         <h2>Paths</h2>
         <p class="muted">
-          Download the stable Console package from the
-          <a href="https://github.com/systemsomicslab/MsdialWorkbench/releases/tag/MSDIAL-v5.5.260323"
-             target="_blank" rel="noreferrer">MS-DIAL v5.5.260323 GitHub release</a>.
+          Download the latest stable Console package from the
+          <a href="https://github.com/systemsomicslab/MsdialWorkbench/releases"
+             target="_blank" rel="noreferrer">latest MS-DIAL GitHub release</a>.
         </p>
         <div class="path-grid">
           <label>MS-DIAL Console<input id="consolePath" placeholder="/opt/msdial/MSDIALCUI or C:\...\MSDIALCUI.exe"></label>

@@ -12,6 +12,10 @@ const state = {
   rtCorrectionAnchorSourcePath: "",
   analysisCsvSource: "",
   repositoryMetadata: null,
+  repositoryProject: null,
+  repositoryDownloadJobId: null,
+  repositoryRunManifest: "",
+  repositoryRawRetentionPolicy: "keep",
   config: null,
   outputRootAutomatic: true,
   gcmsRiMap: {},
@@ -95,6 +99,8 @@ function workflow() {
   return {
     files: state.files,
     repository_metadata: state.repositoryMetadata,
+    repository_run_manifest: state.repositoryRunManifest,
+    repository_raw_retention_policy: state.repositoryRawRetentionPolicy,
     project_type: $("#projectType").value,
     ion_mode: $("#ionMode").value,
     target_omics: $("#targetOmics").value,
@@ -310,9 +316,11 @@ function renderRepositoryMetadata() {
   const workspace = state.repositoryMetadata;
   const summary = $("#repositoryMetadataSummary");
   const editor = $("#repositoryMetadataEditor");
+  const rawWorkspace = $("#repositoryRawWorkspace");
   if (!workspace) {
     summary.hidden = true;
     editor.hidden = true;
+    rawWorkspace.hidden = true;
     return;
   }
   const publications = workspace.publications || [];
@@ -325,6 +333,7 @@ function renderRepositoryMetadata() {
     `${(workspace.rows || []).length} sample row(s), ${(workspace.fields || []).length} metadata field(s). ` +
     `Publication: ${escapeHtml(publicationText)}`;
   editor.hidden = false;
+  rawWorkspace.hidden = !state.repositoryProject;
   const hierarchy = workspace.hierarchy || [];
   $("#repositoryMissingValue").value = workspace.missing_value || "NA";
   $("#repositoryClassSeparator").value = workspace.separator || "_";
@@ -2627,6 +2636,8 @@ $("#inspectRepositoryMetadata").addEventListener("click", () => runUiAction(asyn
         accession,
       }),
     });
+    state.repositoryProject = result.project;
+    state.repositoryRunManifest = "";
     state.repositoryMetadata = result.workspace;
     renderRepositoryMetadata();
     setStatus(`Inspected repository metadata for ${result.workspace.accession}.`);
@@ -2646,6 +2657,7 @@ $("#loadRepositoryMetadata").addEventListener("click", () => runUiAction(async (
     body: JSON.stringify({ path: picked.path }),
   });
   state.repositoryMetadata = result.workspace;
+  state.repositoryProject = null;
   $("#repositoryAccession").value = result.workspace.accession || "";
   renderRepositoryMetadata();
   setStatus(`Loaded repository metadata: ${picked.path}`);
@@ -2674,6 +2686,74 @@ $("#saveRepositoryMetadata").addEventListener("click", () => runUiAction(async (
   const paths = Object.values(result.files || {});
   setStatus(`Saved reviewed repository metadata: ${paths.join(" | ")}`);
 }));
+$("#chooseRepositoryWorkspace").addEventListener("click", () => runUiAction(async () => {
+  const picked = await api("/api/dialog/directory", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  if (picked.path) $("#repositoryWorkspaceRoot").value = picked.path;
+}));
+$("#downloadRepositoryRaw").addEventListener("click", () => runUiAction(async () => {
+  if (!state.repositoryProject) throw new Error("Inspect repository metadata before downloading raw data.");
+  const workspaceRoot = $("#repositoryWorkspaceRoot").value.trim();
+  if (!workspaceRoot) throw new Error("Set a repository workspace root.");
+  if (state.files.length && !window.confirm(
+    `The recognized repository data will replace the current ${state.files.length} analysis file(s). Continue?`
+  )) return;
+  state.repositoryRawRetentionPolicy = $("#repositoryRawRetention").value;
+  const response = await api("/api/repository/download", {
+    method: "POST",
+    body: JSON.stringify({
+      project: state.repositoryProject,
+      workspace_root: workspaceRoot,
+      maximum_gb: Number($("#repositoryMaximumGb").value || 20),
+      allow_preflight: $("#repositoryAllowPreflight").checked,
+      raw_retention_policy: state.repositoryRawRetentionPolicy,
+    }),
+  });
+  state.repositoryDownloadJobId = response.job_id;
+  $("#repositoryDownloadLog").textContent = "Repository download queued.";
+  $("#downloadRepositoryRaw").disabled = true;
+  setStatus("Downloading and recognizing repository raw data...");
+  pollRepositoryDownload();
+}));
+
+async function pollRepositoryDownload() {
+  if (!state.repositoryDownloadJobId) return;
+  try {
+    const job = await api(`/api/jobs/${state.repositoryDownloadJobId}?detail=full`);
+    $("#repositoryDownloadLog").textContent = (job.logs || []).join("\n") || job.status;
+    if (["queued", "running"].includes(job.status)) {
+      setTimeout(pollRepositoryDownload, 1500);
+      return;
+    }
+    $("#downloadRepositoryRaw").disabled = false;
+    if (job.status !== "completed") throw new Error(job.error || "Repository download failed.");
+    const result = job.result || {};
+    const recognized = result.recognized || {};
+    state.files = recognized.files || [];
+    state.analysisCsvSource = "";
+    state.repositoryRunManifest = result.manifest_path || "";
+    state.repositoryRawRetentionPolicy = result.raw_retention_policy || "keep";
+    $("#repositoryRawRetention").value = state.repositoryRawRetentionPolicy;
+    $("#outputRoot").value = result.output_directory || "";
+    state.outputRootAutomatic = false;
+    renderFiles();
+    applyFormatStartingValues();
+    showImportMessages([
+      `Recognized ${state.files.length} repository analysis file(s).`,
+      `Run manifest: ${state.repositoryRunManifest}`,
+      ...(recognized.warnings || []),
+      ...(recognized.rejected || []).map((path) => `Skipped: ${path}`),
+    ], recognized.rejected?.length ? "warning" : "info");
+    setStatus(`Repository raw data ready: ${state.files.length} analysis file(s).`);
+    refreshQuestion();
+  } catch (error) {
+    $("#downloadRepositoryRaw").disabled = false;
+    $("#repositoryDownloadLog").textContent += `\n${error.message || error}`;
+    setStatus(error.message || String(error));
+  }
+}
 $("#addPath").addEventListener("click", () => runUiAction(async () => {
   if ($("#serverPath").value.trim()) await addServerPaths([$("#serverPath").value.trim()]);
 }));

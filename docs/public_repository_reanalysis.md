@@ -5,7 +5,11 @@ projects for reproducible MS-DIAL reanalysis. It currently supports:
 
 - Metabolomics Workbench (`metabolomics_workbench`)
 - MetaboLights (`metabolights`)
-- MB-POST / MetaboBank (`mb_post`)
+- MB-POST (`mb_post`, `MPST...` accessions)
+- MetaboBank (`metabobank`, `MTBKS...` accessions)
+
+These are distinct repositories. MetaboBank metadata and original raw-data
+references are read from the DDBJ Search API and its MAGE-TAB SDRF/file list.
 
 The initial scope excludes targeted SIM/MRM experiments, proteomics projects,
 and LC-MS experiments whose acquisition cannot be resolved as DDA or DIA.
@@ -60,6 +64,11 @@ python scripts/repository-reanalysis.py select mb_post `
   --count 10 --seed 20260824 --inspection-limit 200 `
   --max-download-gb 5 --max-samples 40 `
   --output D:\MSDIAL_Public_Reanalysis\selection-mb_post.json
+
+python scripts/repository-reanalysis.py select metabobank `
+  --count 10 --seed 20260824 --inspection-limit 200 `
+  --max-download-gb 5 --max-samples 40 `
+  --output D:\MSDIAL_Public_Reanalysis\selection-metabobank.json
 ```
 
 The selection JSON records inspected projects, selected projects, projects that
@@ -84,6 +93,8 @@ Inspect one accession without downloading raw data:
 
 ```powershell
 python scripts/repository-reanalysis.py inspect mb_post MPST000007
+
+python scripts/repository-reanalysis.py inspect metabobank MTBKS47
 ```
 
 ## Repository metadata and MS-DIAL Class
@@ -118,7 +129,11 @@ python scripts/repository-reanalysis.py metadata project `
 `metadata project` writes reviewed JSON and TSV files plus an updated
 `analysis_files.csv`. Field order on the command line is the Class hierarchy
 order. These APIs are also exposed by the local service for agent workflows:
-`/api/repository/metadata/inspect`, `/load`, `/project`, and `/save`.
+`/api/repository/metadata/inspect`, `/load`, `/project`, and `/save`. The Data
+tab then exposes **Download and recognize raw data**. This creates a bounded
+workspace, reconstructs folder-type vendor data, and fills the analysis-file
+table. Raw-data retention is selected per repository run: keep the raw data,
+or delete it only after MS-DIAL succeeds and mzTab-M validation passes.
 
 ## Download and preflight
 
@@ -196,3 +211,4 @@ Repository APIs and file documentation used by the adapters:
 - [Metabolomics Workbench REST API](https://www.metabolomicsworkbench.org/tools/MWRestAPIv1.0.pdf)
 - [MetaboLights file guide](https://ebi-metabolights.github.io/guides/Files/)
 - [MB-POST repository](https://repository.massbank.jp/)
+- [MetaboBank](https://www.ddbj.nig.ac.jp/metabobank/)

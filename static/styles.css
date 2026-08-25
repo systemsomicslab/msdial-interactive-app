@@ -55,6 +55,9 @@ td:nth-child(2) { min-width: 360px; color: var(--muted); font-size: 14px; }
 .repository-source-grid { display: grid; grid-template-columns: minmax(190px, 0.7fr) minmax(240px, 1fr) auto; gap: 12px; align-items: end; }
 .repository-source-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .repository-metadata-layout { display: grid; grid-template-columns: minmax(560px, 1.4fr) minmax(320px, 0.8fr); gap: 14px; align-items: start; }
+.repository-raw-workspace { margin-top: 14px; padding: 14px; border: 1px solid #cbdce5; border-radius: 8px; background: #f6fafc; }
+.repository-raw-workspace h3 { margin-top: 0; }
+.compact-log { min-height: 64px; max-height: 180px; margin-top: 10px; }
 .metadata-field-table { max-height: 340px; }
 .metadata-field-table table { min-width: 760px; }
 .metadata-field-table td:nth-child(2) { min-width: 70px; color: inherit; font-size: inherit; }

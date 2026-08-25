@@ -15,6 +15,10 @@ from msdial_app.repository_reanalysis import (
     _parse_apache_index,
     _parse_tab_blocks,
     _parse_workbench_downloads,
+    _parse_metabobank_filelist,
+    _parse_metabobank_sdrf,
+    _metabobank_raw_files,
+    _metabobank_raw_references,
     _raw_names_from_assay,
     _summarize_raw_metadata,
     _extract_archive,
@@ -76,6 +80,27 @@ class RepositoryReanalysisTests(unittest.TestCase):
             '<td align="right">2026-01-01</td><td align="right"> 36M</td></tr>'
         )
         self.assertEqual(_parse_apache_index(listing)["sample.mzML"], 36 * 1024**2)
+
+    def test_metabobank_prefers_original_vendor_folder_over_abf(self) -> None:
+        sdrf = (
+            "Sample Name\tRaw Data File\tRaw Data File\tFactor Value[Group]\n"
+            "S1\traw/rawdata/S1.raw/\traw/abf/S1.abf\tControl\n"
+        )
+        filelist = (
+            "Type\tName\tTime\tSize\tMD5\n"
+            "raw\traw/rawdata/S1.raw/_HEADER.TXT\t2026-01-01T00:00:00Z\t12\t0123456789abcdef0123456789abcdef\n"
+            "raw\traw/rawdata/S1.raw/_FUNC001.DAT\t2026-01-01T00:00:00Z\t34\tfedcba9876543210fedcba9876543210\n"
+            "raw\traw/abf/S1.abf\t2026-01-01T00:00:00Z\t56\t11111111111111111111111111111111\n"
+        )
+        rows = _parse_metabobank_sdrf(sdrf)
+        references = _metabobank_raw_references(rows)
+        files, fallback = _metabobank_raw_files(
+            _parse_metabobank_filelist(filelist), references, "https://example.org/MTBKS1/"
+        )
+        self.assertEqual(["raw/rawdata/S1.raw/"], references)
+        self.assertFalse(fallback)
+        self.assertEqual(2, len(files))
+        self.assertTrue(all("raw/rawdata/S1.raw/" in item.name for item in files))
 
     def test_metabolights_assay_json_falls_back_to_derived_spectra(self) -> None:
         payload = {

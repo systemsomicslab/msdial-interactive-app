@@ -136,7 +136,8 @@ companion.
 
 An experimental command-line workflow can discover and stage lightweight,
 untargeted GC-MS or LC-MS projects from Metabolomics Workbench, MetaboLights,
-and MB-POST. Candidate selection is reproducible with a recorded random seed.
+MB-POST, and MetaboBank. MB-POST (`MPST...`) and MetaboBank (`MTBKS...`) use
+separate repository adapters. Candidate selection is reproducible with a recorded random seed.
 Downloads are size-bounded, checksummed when the repository supplies a digest,
 and extracted with archive traversal and expansion limits.
 
@@ -147,7 +148,7 @@ after raw-data cleanup. See [Public repository reanalysis](docs/public_repositor
 for commands, eligibility rules, and the pilot validation record.
 
 The Data tab also includes a repository metadata handler. It normalizes
-Metabolomics Workbench, MetaboLights, and MB-POST sample metadata, previews an
+Metabolomics Workbench, MetaboLights, MB-POST, and MetaboBank sample metadata, previews an
 ordered multi-field grouping hierarchy, and writes the resulting underscore-
 separated value into MS-DIAL's single `Class` column. Reviewed source metadata
 remain available as JSON/TSV, and the same workflow is callable from the CLI or
@@ -233,7 +234,7 @@ context.
 
 An API key is not used for repository metadata inspection, local QA-card
 retrieval, MS-DIAL execution, QA, or mzTab-M processing. Repository metadata are
-read directly from the public Metabolomics Workbench, MetaboLights, or MB-POST
+read directly from the public Metabolomics Workbench, MetaboLights, MB-POST, or MetaboBank
 API. When a GPT/Claude desktop app uses the local MCP server, model
 authentication remains the responsibility of that desktop app rather than this
 web form.

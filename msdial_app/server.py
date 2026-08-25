@@ -35,7 +35,15 @@ from .repository_metadata import (
     project_class_hierarchy,
     save_metadata_review,
 )
-from .repository_reanalysis import ADAPTERS
+from .repository_reanalysis import (
+    ADAPTERS,
+    EligibilityPolicy,
+    cleanup_download_lease,
+    create_download_lease,
+    evaluate_eligibility,
+    finalize_download_lease,
+    project_from_dict,
+)
 from .workflow import (
     console_version,
     console_capabilities,
@@ -565,10 +573,12 @@ class Handler(BaseHTTPRequestHandler):
                     "mb-post": "mb_post",
                     "mbpost": "mb_post",
                     "mb_post": "mb_post",
+                    "metabobank": "metabobank",
+                    "mtbks": "metabobank",
                 }
                 adapter_name = aliases.get(repository, repository)
                 if adapter_name not in ADAPTERS:
-                    raise ValueError("Select Metabolomics Workbench, MetaboLights, or MB-POST.")
+                    raise ValueError("Select Metabolomics Workbench, MetaboLights, MB-POST, or MetaboBank.")
                 if not accession:
                     raise ValueError("Enter a repository accession.")
                 adapter = ADAPTERS[adapter_name]()
@@ -576,7 +586,8 @@ class Handler(BaseHTTPRequestHandler):
                 repository_label = {
                     "metabolomics_workbench": "Metabolomics Workbench",
                     "metabolights": "MetaboLights",
-                    "mb_post": "MB-POST / MetaboBank",
+                    "mb_post": "MB-POST",
+                    "metabobank": "MetaboBank",
                 }[adapter_name]
                 try:
                     project = inspector(accession)
@@ -587,6 +598,56 @@ class Handler(BaseHTTPRequestHandler):
                         f"is not required. Details: {error}"
                     ) from error
                 self._json({"project": project.as_dict(), "workspace": metadata_workspace(project.as_dict())})
+            elif parsed.path == "/api/repository/download":
+                project = project_from_dict(body.get("project", {}))
+                workspace_root = Path(str(body.get("workspace_root", "")).strip()).expanduser()
+                if not str(body.get("workspace_root", "")).strip():
+                    raise ValueError("Set a repository workspace root before downloading raw data.")
+                maximum_gb = float(body.get("maximum_gb", 20) or 20)
+                if maximum_gb <= 0:
+                    raise ValueError("Maximum download size must be greater than zero.")
+                maximum_bytes = int(maximum_gb * 1024**3)
+                evaluated = evaluate_eligibility(
+                    project,
+                    EligibilityPolicy(
+                        max_download_bytes=maximum_bytes,
+                        max_samples=max(project.sample_count or 1, 1),
+                        require_known_size=False,
+                        require_untargeted=True,
+                    ),
+                )
+                allow_preflight = bool(body.get("allow_preflight"))
+                if not evaluated.eligible and not (
+                    allow_preflight and evaluated.selection_status == "raw_metadata_required"
+                ):
+                    reasons = evaluated.exclusion_reasons or evaluated.review_reasons
+                    raise ValueError(
+                        "This repository project is not ready for an untargeted GC-MS/LC-MS download: "
+                        + "; ".join(reasons or ["review repository metadata first"])
+                    )
+                retention = str(body.get("raw_retention_policy") or "keep")
+                if retention not in {"keep", "delete_after_validated_output"}:
+                    raise ValueError("Unknown repository raw-data retention policy.")
+                job_id = uuid.uuid4().hex
+                with JOBS_LOCK:
+                    JOBS[job_id] = {
+                        "id": job_id,
+                        "status": "queued",
+                        "kind": "repository_download",
+                        "logs": [],
+                        "result": None,
+                        "repository": evaluated.repository,
+                        "accession": evaluated.accession,
+                        "raw_retention_policy": retention,
+                        "created_at": dt.datetime.now().astimezone().isoformat(),
+                    }
+                    _persist_jobs_locked()
+                threading.Thread(
+                    target=_run_repository_download_job,
+                    args=(job_id, evaluated, workspace_root, maximum_bytes, allow_preflight, retention),
+                    daemon=True,
+                ).start()
+                self._json({"job_id": job_id})
             elif parsed.path == "/api/repository/metadata/load":
                 self._json({"workspace": metadata_workspace_from_file(body.get("path", ""))})
             elif parsed.path == "/api/repository/metadata/project":
@@ -1077,6 +1138,12 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/run":
                 state = body.get("workflow", body)
                 preparation = prepare_run(state)
+                preparation["repository_run_manifest"] = str(
+                    state.get("repository_run_manifest") or ""
+                )
+                preparation["repository_raw_retention_policy"] = str(
+                    state.get("repository_raw_retention_policy") or "keep"
+                )
                 job_id = uuid.uuid4().hex
                 artifact_baseline = _snapshot_run_artifacts(preparation)
                 with JOBS_LOCK:
@@ -1269,6 +1336,77 @@ def _run_library_download_job(job_id: str, catalog_id: str) -> None:
             _persist_jobs_locked()
 
 
+def _run_repository_download_job(
+    job_id: str,
+    project: Any,
+    workspace_root: Path,
+    maximum_bytes: int,
+    allow_preflight: bool,
+    retention: str,
+) -> None:
+    def log(message: str) -> None:
+        with JOBS_LOCK:
+            JOBS[job_id]["logs"].append(message)
+            JOBS[job_id]["logs"] = JOBS[job_id]["logs"][-2000:]
+
+    with JOBS_LOCK:
+        JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+        _persist_jobs_locked()
+    try:
+        log(
+            f"Downloading {project.repository} {project.accession} into {workspace_root}."
+        )
+        log(
+            "Raw data will be kept."
+            if retention == "keep"
+            else "Raw data will be deleted only after a successful run and validated mzTab-M output."
+        )
+        last_reported = 0
+
+        def progress(index: int, total: int, name: str, received: int) -> None:
+            nonlocal last_reported
+            interval = max(1, total // 20)
+            if index == total or index - last_reported >= interval:
+                last_reported = index
+                log(
+                    f"Downloaded {index}/{total} object(s), {received / 1024**2:.1f} MiB: {name}"
+                )
+
+        lease = create_download_lease(
+            project,
+            workspace_root,
+            maximum_bytes,
+            allow_preflight=allow_preflight,
+            progress_callback=progress,
+        )
+        recognized = expand_paths_report(lease.get("input_candidates", []))
+        result = {
+            "manifest_path": lease["manifest_path"],
+            "workspace": lease["workspace"],
+            "raw_directory": lease["raw_directory"],
+            "input_directory": lease["input_directory"],
+            "output_directory": lease["output_directory"],
+            "analysis_input_path": lease["analysis_input_path"],
+            "input_candidates": lease["input_candidates"],
+            "recognized": recognized,
+            "raw_retention_policy": retention,
+        }
+        log(f"Recognized {len(recognized.get('files', []))} MS-DIAL analysis file(s).")
+        with JOBS_LOCK:
+            JOBS[job_id]["result"] = result
+            JOBS[job_id]["status"] = "completed"
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
+    except Exception as error:
+        log(traceback.format_exc())
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "failed"
+            JOBS[job_id]["error"] = str(error)
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
+
+
 def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
     def log(line: str) -> None:
         with JOBS_LOCK:
@@ -1286,6 +1424,7 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
         exit_code = run_console(preparation, log)
         validation = None
         handoff = None
+        repository_retention = None
         with JOBS_LOCK:
             baseline = dict(JOBS[job_id].get("artifact_baseline") or {})
         artifacts = _changed_run_artifacts(preparation, baseline)
@@ -1325,12 +1464,49 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
             )
             if handoff.get("handoff_file"):
                 log("Data-mining handoff: " + handoff["handoff_file"])
+            manifest_text = str(preparation.get("repository_run_manifest") or "").strip()
+            retention = str(
+                preparation.get("repository_raw_retention_policy") or "keep"
+            )
+            if manifest_text:
+                try:
+                    if artifacts["mztab"] and summary.get("failed", 0) == 0:
+                        finalized = finalize_download_lease(Path(manifest_text))
+                        repository_retention = {
+                            "policy": retention,
+                            "finalization": finalized,
+                            "cleanup": None,
+                        }
+                        if retention == "delete_after_validated_output":
+                            cleanup = cleanup_download_lease(
+                                Path(manifest_text), confirmed=True
+                            )
+                            repository_retention["cleanup"] = cleanup
+                            log("Validated output retained; downloaded repository raw data were deleted.")
+                        else:
+                            log("Validated output retained; downloaded repository raw data were kept.")
+                    else:
+                        repository_retention = {
+                            "policy": retention,
+                            "cleanup": None,
+                            "reason": "Raw data were kept because this run did not produce a validated mzTab-M output.",
+                        }
+                        log(repository_retention["reason"])
+                except Exception as retention_error:
+                    repository_retention = {
+                        "policy": retention,
+                        "cleanup": None,
+                        "reason": f"Raw data were kept because retention finalization failed: {retention_error}",
+                    }
+                    artifact_warnings.append(repository_retention["reason"])
+                    log("WARNING: " + repository_retention["reason"])
         with JOBS_LOCK:
             JOBS[job_id]["exit_code"] = exit_code
             JOBS[job_id]["mztab_validation"] = validation
             JOBS[job_id]["datamining_handoff"] = handoff
             JOBS[job_id]["artifacts"] = artifacts
             JOBS[job_id]["warnings"] = artifact_warnings
+            JOBS[job_id]["repository_retention"] = repository_retention
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             if exit_code == 0:
                 JOBS[job_id]["status"] = "completed"

@@ -473,10 +473,107 @@ class MbPostAdapter:
         return project
 
 
+class MetaboBankAdapter:
+    name = "metabobank"
+    search_api = "https://ddbj.nig.ac.jp/search/api"
+
+    def __init__(self, client: RepositoryHttpClient | None = None) -> None:
+        self.client = client or RepositoryHttpClient()
+
+    def list_accessions(self) -> list[str]:
+        result = []
+        page = 1
+        while True:
+            payload = self.client.get_json(
+                f"{self.search_api}/entries/metabobank/?page={page}&perPage=100"
+            )
+            result.extend(
+                str(item.get("identifier") or "")
+                for item in payload.get("items", [])
+                if item.get("identifier")
+            )
+            if not payload.get("pagination", {}).get("hasNext"):
+                break
+            page += 1
+        return sorted(set(result))
+
+    def inspect(self, accession: str) -> RepositoryProject:
+        accession = accession.upper()
+        metadata_url = f"{self.search_api}/entries/metabobank/{accession}"
+        entry = self.client.get_json(metadata_url)
+        data_root = _metabobank_data_root(entry)
+        if not data_root:
+            raise ValueError("MetaboBank did not publish a DATA distribution URL.")
+        filelist_url = urllib.parse.urljoin(data_root, f"{accession}.filelist.txt")
+        sdrf_url = urllib.parse.urljoin(data_root, f"{accession}.sdrf.txt")
+        idf_url = urllib.parse.urljoin(data_root, f"{accession}.idf.txt")
+        filelist_text = self.client.get_text(filelist_url)
+        sdrf_text = self.client.get_text(sdrf_url)
+        file_rows = _parse_metabobank_filelist(filelist_text)
+        sdrf_rows = _parse_metabobank_sdrf(sdrf_text)
+        raw_references = _metabobank_raw_references(sdrf_rows)
+        files, fallback_to_abf = _metabobank_raw_files(
+            file_rows, raw_references, data_root
+        )
+        combined = " ".join(
+            [
+                str(entry.get("title") or ""),
+                str(entry.get("description") or ""),
+                " ".join(_string_list(entry.get("studyType"))),
+                " ".join(_string_list(entry.get("experimentType"))),
+                " ".join(_string_list(entry.get("submissionType"))),
+                sdrf_text,
+            ]
+        )
+        project = RepositoryProject(
+            repository=self.name,
+            accession=accession,
+            title=str(entry.get("title") or ""),
+            description=str(entry.get("description") or ""),
+            public_url=str(entry.get("url") or f"https://ddbj.nig.ac.jp/search/entry/metabobank/{accession}"),
+            metadata_url=metadata_url,
+            license=str(entry.get("license") or ""),
+            separation=_infer_separation(combined),
+            acquisition_mode=_infer_acquisition(combined),
+            ion_mode=_infer_ion_mode(combined),
+            untargeted=_infer_untargeted(combined),
+            sample_count=len(sdrf_rows) or None,
+            files=files,
+            publications=_metabobank_publications(entry.get("publication")),
+            metadata_sources=[metadata_url, idf_url, sdrf_url, filelist_url],
+            sample_metadata=_metabobank_sample_metadata(sdrf_rows),
+            repository_metadata={
+                "search_entry": entry,
+                "data_root": data_root,
+                "sdrf_rows": sdrf_rows,
+                "filelist": file_rows,
+            },
+            total_download_bytes=sum(item.size_bytes for item in files),
+            evidence=[
+                f"MAGE-TAB SDRF rows={len(sdrf_rows)}",
+                f"original raw references={len(raw_references)}",
+                f"download objects={len(files)}",
+            ],
+        )
+        if fallback_to_abf:
+            project.warnings.append(
+                "Original vendor raw references were unavailable; MetaboBank ABF files were selected as a fallback."
+            )
+        if not files:
+            project.warnings.append(
+                "MAGE-TAB raw-data references did not match downloadable file-list entries."
+            )
+        return project
+
+    def inspect_metadata(self, accession: str) -> RepositoryProject:
+        return self.inspect(accession)
+
+
 ADAPTERS = {
     "metabolomics_workbench": MetabolomicsWorkbenchAdapter,
     "metabolights": MetaboLightsAdapter,
     "mb_post": MbPostAdapter,
+    "metabobank": MetaboBankAdapter,
 }
 
 
@@ -585,6 +682,7 @@ def create_download_lease(
     maximum_bytes: int,
     client: RepositoryHttpClient | None = None,
     allow_preflight: bool = False,
+    progress_callback: Any = None,
 ) -> dict[str, Any]:
     downloadable = project.eligible or (
         allow_preflight and project.selection_status == "raw_metadata_required"
@@ -616,6 +714,7 @@ def create_download_lease(
     for item in project.files:
         unique_urls.setdefault(item.url, item)
     downloaded_bytes = 0
+    total_objects = len(unique_urls)
     for index, (url, item) in enumerate(unique_urls.items(), start=1):
         filename = Path(urllib.parse.urlparse(url).path).name or f"{project.accession}_{index}.zip"
         if project.repository == "mb_post":
@@ -630,6 +729,8 @@ def create_download_lease(
             if result["md5"].casefold() != item.checksum.casefold():
                 raise ValueError(f"MD5 checksum mismatch for {filename}.")
         downloads.append(result)
+        if progress_callback:
+            progress_callback(index, total_objects, item.name, downloaded_bytes)
     extracted = []
     for item in downloads:
         archive_path = Path(item["path"])
@@ -1374,6 +1475,154 @@ def _parse_apache_index(text: str) -> dict[str, int]:
             continue
         result[href] = _parse_size(sizes[-1])
         result.setdefault(Path(href).name, result[href])
+    return result
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item or "").strip()]
+    return [str(value)] if str(value or "").strip() else []
+
+
+def _metabobank_data_root(entry: dict[str, Any]) -> str:
+    for item in entry.get("distribution", []) or []:
+        if str(item.get("encodingFormat") or "").upper() == "DATA":
+            return str(item.get("contentUrl") or "").rstrip("/") + "/"
+    return ""
+
+
+def _parse_metabobank_filelist(text: str) -> list[dict[str, Any]]:
+    rows = []
+    reader = csv.DictReader(text.splitlines(), delimiter="\t")
+    for row in reader:
+        name = str(row.get("Name") or "").replace("\\", "/").lstrip("/")
+        if not name:
+            continue
+        rows.append(
+            {
+                "type": str(row.get("Type") or ""),
+                "name": name,
+                "time": str(row.get("Time") or ""),
+                "size": _parse_int(row.get("Size")) or 0,
+                "md5": str(row.get("MD5") or "").strip(),
+            }
+        )
+    return rows
+
+
+def _parse_metabobank_sdrf(text: str) -> list[dict[str, str]]:
+    reader = csv.reader(text.splitlines(), delimiter="\t")
+    try:
+        headers = next(reader)
+    except StopIteration:
+        return []
+    counts: dict[str, int] = {}
+    unique_headers = []
+    for header in headers:
+        base = header.strip() or "Unnamed"
+        counts[base] = counts.get(base, 0) + 1
+        unique_headers.append(base if counts[base] == 1 else f"{base} [{counts[base]}]")
+    return [
+        {header: values[index].strip() if index < len(values) else "" for index, header in enumerate(unique_headers)}
+        for values in reader
+        if any(value.strip() for value in values)
+    ]
+
+
+def _metabobank_raw_references(rows: list[dict[str, str]]) -> list[str]:
+    references = []
+    for row in rows:
+        for key, value in row.items():
+            if key.startswith("Raw Data File") and value.strip():
+                normalized = value.replace("\\", "/").lstrip("/")
+                if normalized not in references:
+                    references.append(normalized)
+    original = [
+        value for value in references
+        if not value.casefold().endswith(".abf") and "/abf/" not in value.casefold()
+    ]
+    return original or references
+
+
+def _metabobank_raw_files(
+    file_rows: list[dict[str, Any]], references: list[str], data_root: str
+) -> tuple[list[RepositoryFile], bool]:
+    selected: dict[str, dict[str, Any]] = {}
+    fallback_to_abf = bool(references) and all(
+        value.casefold().endswith(".abf") or "/abf/" in value.casefold()
+        for value in references
+    )
+    for reference in references:
+        prefix = reference.rstrip("/")
+        lower = prefix.casefold()
+        for row in file_rows:
+            name = str(row.get("name") or "")
+            name_lower = name.casefold()
+            matches_folder = name_lower.startswith(lower + "/")
+            matches_file = name_lower == lower
+            matches_sidecar = lower.endswith((".wiff", ".wiff2")) and name_lower.startswith(lower + ".")
+            if matches_folder or matches_file or matches_sidecar:
+                selected.setdefault(name_lower, row)
+    files = []
+    for row in selected.values():
+        name = str(row["name"])
+        files.append(
+            RepositoryFile(
+                name=name,
+                size_bytes=int(row.get("size") or 0),
+                url=urllib.parse.urljoin(data_root, urllib.parse.quote(name, safe="/")),
+                role="sidecar" if _is_sidecar_name(name) else "raw",
+                checksum=str(row.get("md5") or ""),
+            )
+        )
+    return sorted(files, key=lambda item: item.name.casefold()), fallback_to_abf
+
+
+def _metabobank_sample_metadata(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
+    result = []
+    for index, row in enumerate(rows, start=1):
+        raw_values = [
+            value for key, value in row.items()
+            if key.startswith("Raw Data File") and value
+        ]
+        original = next(
+            (
+                value for value in raw_values
+                if not value.casefold().endswith(".abf") and "/abf/" not in value.casefold()
+            ),
+            raw_values[0] if raw_values else "",
+        )
+        sample_id = str(row.get("Sample Name") or row.get("Assay Name") or f"sample_{index}")
+        values = {
+            key: value for key, value in row.items()
+            if value and key not in {"Source Name", "Sample Name"} and not key.startswith("Raw Data File")
+        }
+        result.append(
+            {
+                "sample_id": sample_id,
+                "source_name": str(row.get("Source Name") or sample_id),
+                "raw_file": original,
+                "values": values,
+            }
+        )
+    return result
+
+
+def _metabobank_publications(value: Any) -> list[dict[str, str]]:
+    result = []
+    for item in value if isinstance(value, list) else []:
+        if not isinstance(item, dict):
+            continue
+        identifier = str(item.get("id") or "")
+        db_type = str(item.get("dbType") or "").casefold()
+        result.append(
+            {
+                "title": str(item.get("title") or ""),
+                "doi": identifier if db_type == "doi" else "",
+                "pubmed_id": identifier if db_type in {"pubmed", "pmid"} else "",
+                "url": str(item.get("url") or ""),
+            }
+        )
     return result
 
 
