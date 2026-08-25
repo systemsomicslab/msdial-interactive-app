@@ -30,7 +30,8 @@ SUPPORTED_ANSWER_KEYS = {
     "library_provenance", "run_qa", "internal_standards",
     "generate_materials_methods", "alignment_light_mode", "output_root",
     "export_folder_path", "height_matrix_export", "console_path", "template_path",
-    "queries_path", "project_store", "workflow_overrides", "gcms_retention_type",
+    "queries_path", "project_store", "workflow_overrides", "repository_metadata_path",
+    "gcms_retention_type",
     "gcms_alignment_index_type", "gcms_ri_compound_type", "gcms_ri_source",
     "gcms_ri_standard_path", "gcms_ri_dictionary_path",
 }
@@ -337,6 +338,14 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             }
         )
     state.update(dict(answers.get("workflow_overrides") or {}))
+    repository_metadata_path = str(answers.get("repository_metadata_path") or "").strip()
+    if repository_metadata_path:
+        from .repository_metadata import metadata_workspace_from_file
+
+        state["repository_metadata"] = metadata_workspace_from_file(repository_metadata_path)
+        state["repository_metadata_source_path"] = str(
+            Path(repository_metadata_path).expanduser().resolve()
+        )
     return state
 
 

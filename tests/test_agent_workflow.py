@@ -57,6 +57,46 @@ class AgentWorkflowTests(unittest.TestCase):
         self.assertEqual("neutral", plan["next_question"]["presentation"])
         self.assertFalse(plan["ready_to_prepare"])
 
+    def test_guided_plan_loads_repository_metadata_from_local_review_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "sample.mzML"
+            raw.write_text("", encoding="ascii")
+            console = root / "MSDIALCUI.exe"
+            console.write_text("", encoding="ascii")
+            metadata = root / "MPST000007_repository_metadata_reviewed.json"
+            metadata.write_text(
+                """{
+  "schema": "msdial-repository-metadata.v1",
+  "repository": "mb_post",
+  "accession": "MPST000007",
+  "fields": [],
+  "rows": [],
+  "hierarchy": []
+}""",
+                encoding="utf-8",
+            )
+
+            plan = build_guided_plan(
+                str(root),
+                {
+                    "project_type": "lcms",
+                    "ion_mode": "Negative",
+                    "target_omics": "Lipidomics",
+                    "parameter_strategy": "default",
+                    "execute_rt_correction": False,
+                    "library_strategy": "none",
+                    "run_qa": False,
+                    "generate_materials_methods": True,
+                    "console_path": str(console),
+                    "repository_metadata_path": str(metadata),
+                },
+            )
+
+            self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+            self.assertEqual("MPST000007", plan["workflow"]["repository_metadata"]["accession"])
+            self.assertEqual(str(metadata.resolve()), plan["workflow"]["repository_metadata_source_path"])
+
     def test_missing_persisted_resource_paths_fall_back_to_bundled_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

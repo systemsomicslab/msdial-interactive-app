@@ -501,9 +501,9 @@ class WorkflowTests(unittest.TestCase):
             manifest = json.loads(
                 Path(result["manifest"]).read_text(encoding="utf-8")
             )
-            self.assertEqual("0.4.5", settings["msdial_interactive_version"])
+            self.assertEqual("0.4.6", settings["msdial_interactive_version"])
             self.assertEqual("not recorded", settings["msdial_console_version"])
-            self.assertEqual("0.4.5", manifest["msdial_interactive_version"])
+            self.assertEqual("0.4.6", manifest["msdial_interactive_version"])
             self.assertEqual("21904324", settings["library_provenance"][0]["record_id"])
             self.assertEqual("CC BY 4.0", settings["library_provenance"][0]["license"])
 
@@ -738,6 +738,24 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual("0.4", status["agent_api_version"])
             self.assertIn("create_datamining_handoff", status["capabilities"])
             self.assertIn("inspect_repository_sample_metadata", status["capabilities"])
+            self.assertIn("prepare_repository_reanalysis_without_ui", status["capabilities"])
+
+    def test_agent_status_accepts_jobs_with_null_optional_objects(self) -> None:
+        status = summarize_jobs(
+            {
+                "download": {
+                    "id": "download",
+                    "kind": "repository_download",
+                    "status": "completed",
+                    "preparation": None,
+                    "datamining_handoff": None,
+                    "mztab_validation": None,
+                    "artifacts": None,
+                }
+            }
+        )
+        self.assertEqual("download", status["latest_completed_job"]["id"])
+        self.assertEqual("", status["latest_completed_job"]["handoff_file"])
 
     def test_console_dll_uses_dotnet(self) -> None:
         command = build_console_command("MSDIALCUI.dll", "a.csv", "out", "method.txt")

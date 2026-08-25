@@ -91,6 +91,143 @@ def _version_tuple(value: str) -> tuple[int, ...]:
     return tuple((result + [0, 0])[:3])
 
 
+def _repository_download_job(
+    job_id: str, host: str, port: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    job = _request_json(
+        "GET",
+        f"/api/jobs/{job_id}?detail=full",
+        host=host,
+        port=port,
+        timeout=30,
+    )
+    if job.get("kind") != "repository_download":
+        raise RuntimeError(f"Job {job_id} is not a repository download job.")
+    if job.get("status") != "completed":
+        raise RuntimeError(
+            f"Repository download job {job_id} is {job.get('status', 'unknown')}; "
+            "wait for completion before preparing the analysis."
+        )
+    result = job.get("result") or {}
+    manifest_path = Path(str(result.get("manifest_path") or "")).expanduser()
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Repository run manifest was not found for job {job_id}: {manifest_path}"
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    manifest["manifest_path"] = str(manifest_path.resolve())
+    return job, manifest
+
+
+def _repository_project_summary(
+    project: dict[str, Any], workspace: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "repository": project.get("repository"),
+        "accession": project.get("accession"),
+        "title": project.get("title"),
+        "public_url": project.get("public_url"),
+        "publications": project.get("publications", []),
+        "sample_count": project.get("sample_count") or len(workspace.get("rows", [])),
+        "file_count": len(project.get("files", [])),
+        "total_download_bytes": project.get("total_download_bytes", 0),
+        "separation": workspace.get("separation"),
+        "acquisition_mode": workspace.get("acquisition_mode"),
+        "ion_mode": workspace.get("ion_mode"),
+        "target_omics": workspace.get("target_omics"),
+        "selection_status": project.get("selection_status"),
+        "eligible": bool(project.get("eligible")),
+        "exclusion_reasons": project.get("exclusion_reasons", []),
+        "review_reasons": project.get("review_reasons", []),
+        "warnings": project.get("warnings", []),
+    }
+
+
+def _repository_answer_seed(
+    workspace: dict[str, Any],
+    manifest: dict[str, Any],
+    output_root: str,
+    raw_retention_policy: str,
+) -> dict[str, Any]:
+    separation = str(workspace.get("separation") or "").strip().casefold()
+    project_type = ""
+    if "gas" in separation or separation in {"gc", "gc-ms", "gcms"}:
+        project_type = "gcms"
+    elif "liquid" in separation or separation in {"lc", "lc-ms", "lcms"}:
+        project_type = "lcms"
+
+    raw_ion_mode = str(workspace.get("ion_mode") or "").strip().casefold()
+    ion_mode = ""
+    if "negative" in raw_ion_mode or raw_ion_mode == "neg":
+        ion_mode = "Negative"
+    elif "positive" in raw_ion_mode or raw_ion_mode == "pos":
+        ion_mode = "Positive"
+
+    raw_acquisition = str(workspace.get("acquisition_mode") or "").strip().casefold()
+    acquisition_type = ""
+    if "all-ion" in raw_acquisition or "all ion" in raw_acquisition or "aif" in raw_acquisition:
+        acquisition_type = "AIF"
+    elif "swath" in raw_acquisition or "dia" in raw_acquisition:
+        acquisition_type = "SWATH"
+    elif "dda" in raw_acquisition or "data-dependent" in raw_acquisition:
+        acquisition_type = "DDA"
+
+    answers: dict[str, Any] = {
+        "parameter_strategy": "default",
+        "output_root": output_root,
+        "export_folder_path": output_root,
+        "generate_materials_methods": True,
+        "workflow_overrides": {
+            "repository_run_manifest": manifest["manifest_path"],
+            "repository_raw_retention_policy": raw_retention_policy,
+        },
+    }
+    if project_type:
+        answers["project_type"] = project_type
+        answers["run_qa"] = project_type == "lcms"
+    if ion_mode and project_type == "lcms":
+        answers["ion_mode"] = ion_mode
+    target_omics = str(workspace.get("target_omics") or "").strip()
+    if target_omics in {"Metabolomics", "Lipidomics"}:
+        answers["target_omics"] = target_omics
+    if acquisition_type:
+        answers["acquisition_type"] = acquisition_type
+    return answers
+
+
+def _raw_metadata_extractor_candidates(configured: str = "") -> list[str]:
+    candidates = [
+        configured,
+        os.environ.get("MSDIAL_RAW_METADATA_EXTRACTOR", ""),
+        str(
+            ROOT.parent
+            / "msrawdataworkbench"
+            / "RawMetadataConsoleApp"
+            / "bin"
+            / "Release"
+            / "net8.0-windows"
+            / "RawMetadataConsoleApp.exe"
+        ),
+        str(
+            ROOT.parent
+            / "msrawdataworkbench"
+            / "RawMetadataConsoleApp"
+            / "bin"
+            / "Release"
+            / "net48"
+            / "RawMetadataConsoleApp.exe"
+        ),
+    ]
+    result = []
+    for value in candidates:
+        path = Path(str(value or "")).expanduser()
+        if str(value or "").strip() and path.is_file():
+            resolved = str(path.resolve())
+            if resolved not in result:
+                result.append(resolved)
+    return result
+
+
 def _launch_local_app(host: str, port: int, open_browser: bool) -> dict[str, Any]:
     from .server import Handler
 
@@ -349,6 +486,260 @@ def msdial_save_repository_metadata(
         },
         timeout=30,
     )
+
+
+@mcp.tool()
+def msdial_repository_reanalysis_plan(
+    repository: str,
+    accession: str,
+    workspace_root: str = "",
+    maximum_gb: float = 20,
+    raw_retention_policy: str = "keep",
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Inspect one public accession and return metadata, QA evidence, and download decisions."""
+    response = _request_json(
+        "POST",
+        "/api/repository/metadata/inspect",
+        host=host,
+        port=port,
+        body={"repository": repository, "accession": accession},
+        timeout=180,
+    )
+    project = response.get("project") or {}
+    workspace = response.get("workspace") or {}
+    from .repository_qa import repository_internal_standard_evidence
+
+    return {
+        "project": _repository_project_summary(project, workspace),
+        "metadata": {
+            "default_class_hierarchy": workspace.get("hierarchy", []),
+            "fields": workspace.get("fields", []),
+            "field_count": len(workspace.get("fields", [])),
+            "row_count": len(workspace.get("rows", [])),
+        },
+        "qa_internal_standard_evidence": repository_internal_standard_evidence(workspace),
+        "download": {
+            "workspace_root": workspace_root,
+            "maximum_gb": maximum_gb,
+            "raw_retention_policy": raw_retention_policy,
+            "confirmation_required": True,
+        },
+        "next_decisions": [
+            "Review the inferred LC-MS/GC-MS, polarity, acquisition mode, and target omics.",
+            "Review and confirm the ordered metadata fields used to build MS-DIAL Class.",
+            "Choose whether downloaded raw data are kept or deleted only after validated output.",
+            "Confirm the bounded raw-data download before starting it.",
+        ],
+    }
+
+
+@mcp.tool()
+def msdial_download_repository_raw(
+    repository: str,
+    accession: str,
+    workspace_root: str,
+    maximum_gb: float = 20,
+    raw_retention_policy: str = "keep",
+    allow_preflight: bool = False,
+    confirmed: bool = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Download and recognize repository raw data only after explicit user confirmation."""
+    response = _request_json(
+        "POST",
+        "/api/repository/metadata/inspect",
+        host=host,
+        port=port,
+        body={"repository": repository, "accession": accession},
+        timeout=180,
+    )
+    project = response.get("project") or {}
+    workspace = response.get("workspace") or {}
+    preview = {
+        "project": _repository_project_summary(project, workspace),
+        "workspace_root": workspace_root,
+        "maximum_gb": maximum_gb,
+        "raw_retention_policy": raw_retention_policy,
+        "allow_preflight": allow_preflight,
+    }
+    if not confirmed:
+        return {
+            "started": False,
+            "confirmation_required": True,
+            "preview": preview,
+            "message": (
+                "This downloads repository raw data to the stated local workspace. "
+                "Ask the user to approve the accession, size limit, destination, and retention "
+                "policy, then call again with confirmed=true."
+            ),
+        }
+    started = _request_json(
+        "POST",
+        "/api/repository/download",
+        host=host,
+        port=port,
+        body={
+            "project": project,
+            "workspace_root": workspace_root,
+            "maximum_gb": maximum_gb,
+            "raw_retention_policy": raw_retention_policy,
+            "allow_preflight": allow_preflight,
+        },
+        timeout=30,
+    )
+    return {"started": True, **started, "preview": preview}
+
+
+@mcp.tool()
+def msdial_repository_raw_metadata_preflight(
+    download_job_id: str,
+    extractor_path: str = "",
+    max_inputs: int = 3,
+    confirm_untargeted: bool = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Cross-check representative downloaded files with the local raw-metadata parser."""
+    _, manifest = _repository_download_job(download_job_id, host, port)
+    candidates = _raw_metadata_extractor_candidates(extractor_path)
+    if not candidates:
+        return {
+            "completed": False,
+            "extractor_found": False,
+            "manifest_path": manifest["manifest_path"],
+            "message": (
+                "Set extractor_path or MSDIAL_RAW_METADATA_EXTRACTOR to a built "
+                "RawMetadataConsoleApp executable. Repository metadata remains available."
+            ),
+        }
+    from .repository_reanalysis import run_raw_metadata_preflight
+
+    result = run_raw_metadata_preflight(
+        Path(manifest["manifest_path"]),
+        Path(candidates[0]),
+        max_inputs=max(1, max_inputs),
+        confirm_untargeted=confirm_untargeted,
+    )
+    raw = result.get("raw_metadata_preflight") or {}
+    return {
+        "completed": True,
+        "extractor_found": True,
+        "extractor_path": candidates[0],
+        "manifest_path": result.get("manifest_path"),
+        "status": result.get("status"),
+        "execution_allowed": result.get("execution_allowed"),
+        "summary": raw.get("summary"),
+        "advisory": raw.get("advisory"),
+        "confirm_untargeted_applied": confirm_untargeted,
+    }
+
+
+@mcp.tool()
+def msdial_prepare_repository_reanalysis(
+    download_job_id: str,
+    hierarchy: list[str] | None = None,
+    confirmed: bool = False,
+    allow_partial_mapping: bool = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Project repository metadata into Class and prepare an analysis CSV after review."""
+    job, manifest = _repository_download_job(download_job_id, host, port)
+    from .repository_metadata import (
+        apply_classes_to_analysis_files,
+        metadata_workspace,
+        project_class_hierarchy,
+        save_metadata_review,
+    )
+
+    workspace = metadata_workspace(manifest.get("project") or {})
+    selected_hierarchy = list(hierarchy if hierarchy is not None else workspace.get("hierarchy", []))
+    projected = project_class_hierarchy(workspace, selected_hierarchy)
+    recognized = ((job.get("result") or {}).get("recognized") or {}).get("files", [])
+    application = apply_classes_to_analysis_files(projected, recognized)
+    output_root = str(manifest.get("output_directory") or "")
+    raw_retention_policy = str(job.get("raw_retention_policy") or "keep")
+    answer_seed = _repository_answer_seed(
+        projected, manifest, output_root, raw_retention_policy
+    )
+    from .repository_qa import repository_internal_standard_evidence
+
+    preview = {
+        "download_job_id": download_job_id,
+        "manifest_path": manifest["manifest_path"],
+        "analysis_input_path": manifest.get("analysis_input_path"),
+        "output_root": output_root,
+        "class_hierarchy": selected_hierarchy,
+        "matched_count": application["matched_count"],
+        "recognized_count": len(recognized),
+        "unmatched": application["unmatched"],
+        "ambiguous": application["ambiguous"],
+        "answer_seed": answer_seed,
+        "qa_internal_standard_evidence": repository_internal_standard_evidence(projected),
+    }
+    if not confirmed:
+        return {
+            "prepared": False,
+            "confirmation_required": True,
+            "preview": preview,
+            "message": (
+                "Review the Class hierarchy and file matching. Call again with confirmed=true "
+                "to write reviewed metadata and analysis_files.csv."
+            ),
+        }
+    if (application["unmatched"] or application["ambiguous"]) and not allow_partial_mapping:
+        raise RuntimeError(
+            "Repository metadata did not map uniquely to every recognized raw file. "
+            "Review unmatched/ambiguous paths, or explicitly set allow_partial_mapping=true."
+        )
+    saved = save_metadata_review(projected, output_root, application["files"])
+    input_path = saved.get("analysis_files_csv")
+    if not input_path:
+        raise RuntimeError("No analysis_files.csv was generated from the repository download.")
+    answer_seed["repository_metadata_path"] = saved["metadata_json"]
+    return {
+        "prepared": True,
+        "input_path": input_path,
+        "output_root": output_root,
+        "files": saved,
+        "preview": preview,
+        "next_step": (
+            "Pass input_path and preview.answer_seed to msdial_guided_analysis_plan, then "
+            "collect any remaining scientific decisions before execution."
+        ),
+    }
+
+
+@mcp.tool()
+def msdial_repository_qa_evidence(
+    download_job_id: str,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Return repository declarations that may identify LC-MS internal-standard QA targets."""
+    _, manifest = _repository_download_job(download_job_id, host, port)
+    from .repository_metadata import metadata_workspace
+    from .repository_qa import repository_internal_standard_evidence
+
+    workspace = metadata_workspace(manifest.get("project") or {})
+    evidence = repository_internal_standard_evidence(workspace)
+    return {
+        "repository": workspace.get("repository"),
+        "accession": workspace.get("accession"),
+        "ion_mode": workspace.get("ion_mode"),
+        "target_omics": workspace.get("target_omics"),
+        "evidence": evidence,
+        "review_required": bool(evidence),
+        "message": (
+            "Use the repository evidence to draft name/adduct/mz/tolerances, but present them "
+            "as reviewable candidates. Do not invent RT; leave it null unless recorded."
+            if evidence
+            else "No internal-standard declaration was found in the repository metadata."
+        ),
+    }
 
 
 @mcp.tool()

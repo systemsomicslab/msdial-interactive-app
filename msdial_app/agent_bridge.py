@@ -38,6 +38,11 @@ def summarize_jobs(jobs: dict[str, dict[str, Any]], limit: int = 10) -> dict[str
             "inspect_repository_sample_metadata",
             "project_repository_metadata_to_msdial_class",
             "save_reviewed_repository_metadata",
+            "plan_repository_reanalysis",
+            "download_and_recognize_repository_raw_data",
+            "cross_check_repository_raw_metadata",
+            "prepare_repository_reanalysis_without_ui",
+            "inspect_repository_internal_standard_evidence",
         ],
         "workflow_outline": [
             "Inspect the input path and collect the guided scientific choices.",
@@ -125,8 +130,9 @@ def summarize_job(
 ) -> dict[str, Any] | None:
     if not job:
         return None
-    preparation = job.get("preparation", {})
+    preparation = job.get("preparation") or {}
     validation = job.get("mztab_validation") or {}
+    handoff = job.get("datamining_handoff") or {}
     return {
         "id": job.get("id", ""),
         "kind": job.get("kind", "run"),
@@ -136,7 +142,7 @@ def summarize_job(
         "analysis_type": preparation.get("analysis_type", ""),
         "mztab_status": validation.get("summary", {}).get("status", ""),
         "mztab_file_count": validation.get("summary", {}).get("file_count", 0),
-        "handoff_file": job.get("datamining_handoff", {}).get("handoff_file", ""),
+        "handoff_file": handoff.get("handoff_file", ""),
         "artifacts": {
             key: list((job.get("artifacts") or {}).get(key, []))
             for key in ("mztab", "qa", "msdial")

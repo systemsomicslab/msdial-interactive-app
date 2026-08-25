@@ -123,6 +123,28 @@ The returned `application` reports `matched_count`, `unmatched`, and
 Use `msdial_save_repository_metadata` to persist the projected workspace and
 those rows before preparing the production analysis.
 
+For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
+
+- `msdial_repository_reanalysis_plan`: inspect metadata, eligibility, the
+  default Class hierarchy, and internal-standard declarations without
+  downloading raw data.
+- `msdial_download_repository_raw`: preview with `confirmed=false`, then start a
+  bounded download with `confirmed=true` after the user approves destination,
+  accession, size limit, and retention policy.
+- `msdial_repository_raw_metadata_preflight`: run the local RawMetadataConsoleApp
+  against representative downloaded files when raw-header evidence is needed.
+- `msdial_prepare_repository_reanalysis`: preview Class matching first, then
+  write reviewed metadata and `analysis_files.csv` after confirmation. Its
+  `preview.answer_seed` is passed unchanged to `msdial_guided_analysis_plan`.
+  The seed points to the complete reviewed metadata JSON locally rather than
+  carrying every sample row through the model context.
+- `msdial_repository_qa_evidence`: return internal-standard declarations for a
+  desktop-agent draft. It does not claim that a name, adduct, m/z, or RT has
+  been experimentally confirmed.
+
+`allow_partial_mapping=true` and raw-data cleanup are explicit user decisions;
+do not infer either from the absence of an error.
+
 ## Worksets
 
 Built-in IDs:
@@ -143,5 +165,7 @@ These tools return a preview when `confirmed=false`:
 - `msdial_download_official_library`
 - `msdial_start_peak_count_diagnostic`
 - `msdial_start_guided_analysis`
+- `msdial_download_repository_raw`
+- `msdial_prepare_repository_reanalysis`
 
 Do not set `confirmed=true` until the user approves the corresponding action in the current conversation.

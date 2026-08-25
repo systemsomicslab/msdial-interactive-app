@@ -14,7 +14,13 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 async def smoke_test(
-    input_path: str, port: int, restart_incompatible: bool, restart: bool, job_id: str
+    input_path: str,
+    port: int,
+    restart_incompatible: bool,
+    restart: bool,
+    job_id: str,
+    repository: str = "",
+    accession: str = "",
 ) -> dict[str, object]:
     parameters = StdioServerParameters(
         command=sys.executable,
@@ -57,6 +63,18 @@ async def smoke_test(
             )
             console = json.loads(console_result.content[0].text)
             waited_job = None
+            repository_plan = None
+            if repository and accession:
+                repository_result = await session.call_tool(
+                    "msdial_repository_reanalysis_plan",
+                    {
+                        "repository": repository,
+                        "accession": accession,
+                        "workspace_root": str(ROOT / "work" / "repository-smoke"),
+                        "port": port,
+                    },
+                )
+                repository_plan = json.loads(repository_result.content[0].text)
             if job_id:
                 wait_result = await session.call_tool(
                     "msdial_interactive_wait_for_completion",
@@ -80,12 +98,23 @@ async def smoke_test(
                 "has_job_scoped_completion": "msdial_complete_guided_analysis" in names,
                 "has_repository_metadata": "msdial_inspect_repository_metadata" in names,
                 "has_repository_class_projection": "msdial_project_repository_classes" in names,
+                "has_repository_reanalysis_plan": "msdial_repository_reanalysis_plan" in names,
+                "has_repository_download": "msdial_download_repository_raw" in names,
+                "has_repository_preparation": "msdial_prepare_repository_reanalysis" in names,
+                "has_repository_qa_evidence": "msdial_repository_qa_evidence" in names,
                 "console_candidate_count": len(console.get("candidates", [])),
                 "file_count": payload["input"]["file_count"],
                 "next_question": payload["next_question"]["id"],
                 "question_presentation": payload["next_question"].get("presentation"),
                 "waited_job_id": (waited_job or {}).get("job", {}).get("id", ""),
                 "waited_job_finished": (waited_job or {}).get("finished"),
+                "repository_accession": (repository_plan or {}).get("project", {}).get("accession", ""),
+                "repository_default_hierarchy": (repository_plan or {}).get("metadata", {}).get(
+                    "default_class_hierarchy", []
+                ),
+                "repository_qa_evidence_count": len(
+                    (repository_plan or {}).get("qa_internal_standard_evidence", [])
+                ),
             }
 
 
@@ -96,6 +125,8 @@ def main() -> None:
     parser.add_argument("--restart-incompatible", action="store_true")
     parser.add_argument("--restart", action="store_true")
     parser.add_argument("--job-id", default="")
+    parser.add_argument("--repository", default="")
+    parser.add_argument("--accession", default="")
     args = parser.parse_args()
     print(
         json.dumps(
@@ -106,6 +137,8 @@ def main() -> None:
                     args.restart_incompatible,
                     args.restart,
                     args.job_id,
+                    args.repository,
+                    args.accession,
                 )
             ),
             indent=2,

@@ -396,6 +396,11 @@ Core MCP tools:
 - `msdial_inspect_repository_metadata`: inspect public sample metadata and publication provenance
 - `msdial_project_repository_classes`: project a user-selected metadata hierarchy into MS-DIAL `Class`
 - `msdial_save_repository_metadata`: save reviewed JSON/TSV and optional analysis metadata CSV
+- `msdial_repository_reanalysis_plan`: plan an accession-to-mzTab-M workflow without downloading data
+- `msdial_download_repository_raw`: start a bounded repository download after explicit confirmation
+- `msdial_repository_raw_metadata_preflight`: cross-check representative raw headers with the local parser
+- `msdial_prepare_repository_reanalysis`: review Class matching and prepare `analysis_files.csv`
+- `msdial_repository_qa_evidence`: expose internal-standard declarations for agent-reviewed QA targets
 
 Agent API 0.4 binds mzTab-M, QA, publication, and handoff operations to the
 production `job_id`. Files left by earlier runs in the same output directory are
