@@ -44,6 +44,7 @@ SMOOTHING_METHODS = [
     "TimeBasedLinearWeightedMovingAverage",
 ]
 LCMS_QA_CAPABILITY = "lcms_alignment_qa_matrix"
+RT_CORRECTION_REVIEW_CAPABILITY = "rt_correction_review"
 
 
 def discover_console_paths(search_roots: Iterable[str | Path] | None = None) -> dict[str, Any]:
@@ -693,8 +694,8 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                 {
                     "level": "error",
                     "message": (
-                        "The selected MS-DIAL Console does not advertise LC-MS QA matrix export. "
-                        "Choose a Console build containing the lcms_alignment_qa_matrix capability, "
+                        "The selected MS-DIAL Console does not support LC-MS QA matrix export. "
+                        "Choose a Console build containing the LC-MS QA matrix exporter, "
                         "or disable QA matrix export for this run."
                     ),
                 }
@@ -1418,7 +1419,13 @@ def prepare_rt_correction_run(state: dict[str, Any]) -> dict[str, Any]:
     acquisition_type = next(iter(acquisition_types))
     prefix = ["dotnet", str(executable)] if executable.suffix.lower() == ".dll" else [str(executable)]
     eic_path = output_root / "rt_correction_eics.csv"
-    command = prefix + ["eic", "rtcorrection"]
+    features = console_capabilities(str(executable))["capabilities"]
+    rt_command = (
+        ["rtcorrection"]
+        if RT_CORRECTION_REVIEW_CAPABILITY in features
+        else ["eic", "rtcorrection"]
+    )
+    command = prefix + rt_command
     for item in files:
         command.extend(["-i", str(Path(str(item["file_path"])).expanduser().resolve())])
     command.extend(
@@ -1468,7 +1475,7 @@ def parse_rt_correction_result(preparation: dict[str, Any]) -> dict[str, Any]:
     ):
         raise RuntimeError(
             "The selected MS-DIAL Console did not generate fresh RT correction outputs. "
-            "Use a CUI build containing the current eic rtcorrection implementation: "
+            "Use a CUI build containing the current rtcorrection implementation: "
             f"{preparation['command'][0]}"
         )
 
@@ -2246,9 +2253,14 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
     if not path.is_file():
         return {"capability_probe": "missing", "capabilities": []}
     command = ["dotnet", str(path)] if path.suffix.lower() == ".dll" else [str(path)]
+    capabilities: set[str] = set()
+    probes: list[str] = []
+
+    # Command availability is already represented by System.CommandLine help;
+    # do not require MS-DIAL Console to maintain a separate partial inventory.
     try:
         result = subprocess.run(
-            command + ["capabilities"],
+            command + ["rtcorrection", "--help"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -2258,25 +2270,22 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
     except (OSError, subprocess.TimeoutExpired):
         result = None
     if result is not None and result.returncode == 0:
-        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        if "msdial.console.capabilities.v1" in lines:
-            return {
-                "capability_probe": "command",
-                "capabilities": sorted(
-                    line for line in lines if line != "msdial.console.capabilities.v1"
-                ),
-            }
+        help_text = result.stdout + result.stderr
+        if "--library" in help_text and "--selection" in help_text:
+            capabilities.add(RT_CORRECTION_REVIEW_CAPABILITY)
+            probes.append("rtcorrection help")
 
-    # Builds from the QA feature branch made before the capabilities command
-    # still contain this exact Console output marker.
+    # QA export is not a standalone command, so recognize the exact exporter
+    # message embedded in compatible builds and verify the artifact after a run.
     try:
         binary = path.read_bytes()
     except OSError:
         binary = b""
     marker = "LC-MS quality-assurance matrix:"
     if marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary:
-        return {
-            "capability_probe": "assembly marker",
-            "capabilities": [LCMS_QA_CAPABILITY],
-        }
-    return {"capability_probe": "unsupported", "capabilities": []}
+        capabilities.add(LCMS_QA_CAPABILITY)
+        probes.append("QA exporter marker")
+    return {
+        "capability_probe": " + ".join(probes) if probes else "unsupported",
+        "capabilities": sorted(capabilities),
+    }

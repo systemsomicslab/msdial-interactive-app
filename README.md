@@ -144,9 +144,10 @@ use only files created or updated by that job. The GUI displays the job ID,
 timestamp, output directory, and artifact counts. Archived results can still be
 selected manually, but they are visibly identified as manual inputs.
 
-LC-MS QA matrix export requires a Console build that advertises the
-`lcms_alignment_qa_matrix` capability. Guided setup lists detected Console
-candidates and shows whether each candidate supports this export. If export was
+LC-MS QA matrix export requires a Console build containing the QA exporter.
+Guided setup checks detected Console candidates for this support and probes
+top-level RT correction through the command's standard `--help` interface. It
+does not depend on a separate, partial Console feature inventory. If export was
 requested but no `*.qa.tsv` was produced, the completed job carries an explicit
 warning even when the Console exit code is zero.
 
@@ -248,8 +249,9 @@ workspace (`/rt-correction`) performs anchor detection and review:
    tolerance, minimum height, and inclusion flag when needed. Only **Save edited
    anchor library** creates a timestamped file such as
    `MTcorrection_anion_20260810-154230.txt`; the source remains unchanged.
-3. Run **Extract EICs and detect anchors**. The app calls `eic rtcorrection`
-   in the selected MS-DIAL Console build.
+3. Run **Extract EICs and detect anchors**. The app calls the top-level
+   `rtcorrection` command in current MS-DIAL Console builds. For compatibility,
+   it falls back to the earlier `eic rtcorrection` command when needed.
    Choose automatic peak selection by highest intensity, closest reference RT,
    or a weighted combination. The RT weight ranges from `0` (intensity only) to
    `1` (RT proximity only).
@@ -267,7 +269,7 @@ workspace (`/rt-correction`) performs anchor detection and review:
 The Console detects anchors with the same Core process used by the GUI, writes
 one `.rtc` warping file per analysis file, and applies corrected RT values before
 normal peak detection. This requires a Console build containing the
-`eic rtcorrection` and LC-MS RT-correction changes; older stable binaries do not
+`rtcorrection` and LC-MS RT-correction changes; older stable binaries do not
 provide this command.
 
 For a focused, cross-platform review tool, start the same backend directly in

@@ -147,7 +147,7 @@
           <button id="savePathSettings" type="button" class="secondary">Save paths for next launch</button>
           <span id="pathSettingsInfo" class="muted"></span>
         </div>
-        <div id="consoleCapabilityStatus" class="format-summary">Console capability has not been checked.</div>
+        <div id="consoleCapabilityStatus" class="format-summary">Console feature support has not been checked.</div>
         <p class="muted">MS-DIAL reads raw data from their original paths. Only result and project files are written below Output root.</p>
       </div>
       <div id="peakDetectionPanel" class="panel">
@@ -180,7 +180,7 @@
           </label>
           <label id="lcmsQaExportField">LC-MS quality-assurance matrix
             <span class="inline-check"><input id="heightMatrixExport" type="checkbox" checked> Export <code>*.qa.tsv</code> after alignment</span>
-            <span class="muted">The QA matrix is written to Output root. This requires a Console build advertising <code>lcms_alignment_qa_matrix</code>.</span>
+            <span class="muted">The QA matrix is written to Output root. This requires a Console build containing the LC-MS QA matrix exporter.</span>
           </label>
         </div>
       </div>
