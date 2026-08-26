@@ -48,7 +48,7 @@ def evaluate_literature_evidence(
 ) -> dict[str, Any]:
     if resolve_llm_config(llm_config) is None:
         raise ValueError(
-            "Configure an Azure OpenAI or OpenAI-compatible API key before literature search."
+            "Configure an Azure OpenAI, OpenAI-compatible, or local model connection before literature search."
         )
     query = build_search_query(workflow)
     works = search_crossref_open_access(query)

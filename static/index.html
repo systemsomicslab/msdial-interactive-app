@@ -26,7 +26,7 @@
     <button data-tab="run">5. Validate &amp; run</button>
     <button data-tab="qa">6. Quality assurance</button>
     <button data-tab="publication">7. Publication report</button>
-    <button data-tab="help">Ask MS-DIAL</button>
+    <button data-tab="help">LLM &amp; agent settings</button>
   </nav>
 
   <main>
@@ -75,6 +75,97 @@
           <tbody></tbody>
         </table>
       </div>
+      <div class="panel repository-metadata-panel">
+        <div class="section-head compact-head">
+          <div>
+            <h2>Repository metadata handler</h2>
+            <p class="muted">Inspect repository metadata, choose an ordered metadata hierarchy, and project it into MS-DIAL's single <code>Class</code> field. Original values remain in the reviewed metadata files.</p>
+            <p class="muted"><strong>No LLM or API key is used here.</strong> Inspect metadata reads the selected repository's public API directly. A compatible GPT/Claude desktop agent can operate the same workflow through the bundled MS-DIAL Interactive MCP server.</p>
+          </div>
+        </div>
+        <div class="repository-source-grid">
+          <label>Repository
+            <select id="repositoryName">
+              <option value="metabolomics_workbench">Metabolomics Workbench</option>
+              <option value="metabolights">MetaboLights</option>
+              <option value="mb_post">MB-POST</option>
+              <option value="metabobank">MetaboBank</option>
+            </select>
+          </label>
+          <label>Accession
+            <input id="repositoryAccession" placeholder="ST002419, MTBLS341, MPST000007, or MTBKS47">
+          </label>
+          <div class="repository-source-actions">
+            <button id="inspectRepositoryMetadata" type="button">Inspect metadata</button>
+            <button id="loadRepositoryMetadata" type="button" class="secondary">Load manifest / metadata JSON</button>
+          </div>
+        </div>
+        <div id="repositoryMetadataSummary" class="format-summary" hidden></div>
+        <div id="repositoryRawWorkspace" class="repository-raw-workspace" hidden>
+          <h3>Raw data download and recognition</h3>
+          <p class="muted"><strong>Inspect metadata does not download raw data.</strong> Use the button below to create a bounded local workspace, download the repository files, and add recognized MS-DIAL inputs to the Data table.</p>
+          <div class="form-grid">
+            <label>Repository workspace root
+              <div class="output-path-row">
+                <input id="repositoryWorkspaceRoot" placeholder="D:\MSDIAL_Public_Reanalysis or /data/msdial-reanalysis">
+                <button id="chooseRepositoryWorkspace" type="button" class="secondary">Choose</button>
+              </div>
+            </label>
+            <label>Maximum download size (GB)<input id="repositoryMaximumGb" type="number" min="0.1" step="0.1" value="20"></label>
+            <label>Raw data after validated analysis
+              <select id="repositoryRawRetention">
+                <option value="keep">Keep downloaded raw data</option>
+                <option value="delete_after_validated_output">Delete after mzTab-M validation</option>
+              </select>
+            </label>
+            <label>Download eligibility
+              <select id="repositoryDownloadEligibility">
+                <option value="allow_preflight">Allow download when raw-header review is required</option>
+                <option value="eligible_only">Only download fully classified projects</option>
+              </select>
+            </label>
+          </div>
+          <p class="muted">Raw-header review means repository metadata could not yet determine items such as DDA/DIA or polarity. It permits download for local inspection; it does not silently mark the project as validated.</p>
+          <label class="checkline"><input id="repositoryAutoApplyMetadata" type="checkbox" checked> Automatically apply Class, file type, acquisition type, batch, and analytical order after download</label>
+          <div class="button-row">
+            <button id="downloadRepositoryRaw" type="button">Download and recognize raw data</button>
+            <button id="applyDownloadedRepositoryMetadata" type="button" class="secondary">Apply metadata now</button>
+          </div>
+          <div id="repositoryDownloadEstimate" class="muted"></div>
+          <progress id="repositoryDownloadProgress" max="100" value="0"></progress>
+          <div id="repositoryDownloadProgressText" class="muted repository-progress-text">0%</div>
+          <pre id="repositoryDownloadLog" class="log compact-log">Waiting for download.</pre>
+        </div>
+        <div id="repositoryMetadataEditor" hidden>
+          <h3>Class hierarchy</h3>
+          <p class="muted">Check grouping fields and set their order. Values are joined with <code>_</code>; spaces and underscores inside each value are normalized to <code>-</code> so the result can be split later without ambiguity.</p>
+          <div class="repository-metadata-layout">
+            <div class="table-wrap metadata-field-table">
+              <table>
+                <thead><tr><th>Use</th><th>Order</th><th>Metadata field</th><th>Present</th><th>Distinct</th><th>Examples</th></tr></thead>
+                <tbody id="repositoryMetadataFields"></tbody>
+              </table>
+            </div>
+            <div>
+              <div class="form-grid compact-form-grid">
+                <label>Missing value token<input id="repositoryMissingValue" value="NA"></label>
+                <label>Class separator<input id="repositoryClassSeparator" value="_" maxlength="3"></label>
+              </div>
+              <div class="button-row metadata-actions">
+                <button id="previewRepositoryClasses" type="button">Preview Class</button>
+                <button id="applyRepositoryClasses" type="button" class="secondary">Apply to analysis metadata</button>
+                <button id="saveRepositoryMetadata" type="button" class="secondary">Save reviewed metadata</button>
+              </div>
+              <div id="repositoryMetadataApplication" class="muted"></div>
+            </div>
+          </div>
+          <h3>Sample metadata preview and editor</h3>
+          <p class="muted">Edits below affect the reviewed metadata and the next Class preview. The first 100 rows are shown.</p>
+          <div class="table-wrap metadata-preview-table">
+            <table><thead id="repositoryMetadataPreviewHead"></thead><tbody id="repositoryMetadataPreviewBody"></tbody></table>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section id="tab-guide" class="tab">
@@ -119,9 +210,9 @@
       <div id="pathsPanel" class="panel">
         <h2>Paths</h2>
         <p class="muted">
-          Download the stable Console package from the
-          <a href="https://github.com/systemsomicslab/MsdialWorkbench/releases/tag/MSDIAL-v5.5.260323"
-             target="_blank" rel="noreferrer">MS-DIAL v5.5.260323 GitHub release</a>.
+          Download the latest stable Console package from the
+          <a href="https://github.com/systemsomicslab/MsdialWorkbench/releases"
+             target="_blank" rel="noreferrer">latest MS-DIAL GitHub release</a>.
         </p>
         <div class="path-grid">
           <label>MS-DIAL Console<input id="consolePath" placeholder="/opt/msdial/MSDIALCUI or C:\...\MSDIALCUI.exe"></label>
@@ -604,13 +695,21 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
           <button id="browseQaFile" class="secondary" type="button">Native file picker</button>
         </div>
         <div id="qaFileProvenance" class="format-summary">No QA matrix is associated with the selected job.</div>
+        <div id="repositoryQaMetadata" class="format-summary" hidden>
+          <strong>Repository internal-standard metadata</strong>
+          <div id="repositoryQaEvidence"></div>
+          <div class="button-row">
+            <button id="draftRepositoryQaTargets" class="secondary" type="button">Draft QA targets with configured LLM</button>
+          </div>
+          <p class="muted">The repository statement is extracted locally. Exact m/z/adduct candidates are drafted only when an LLM connection is configured in LLM &amp; agent settings. Drafts require review; RT remains blank unless explicitly supported by repository metadata.</p>
+        </div>
         <label>Internal standards (optional)
           <textarea id="qaInternalStandards" rows="4" placeholder="Name,Adduct,m/z,RT (min),m/z tolerance (Da),RT tolerance (min)&#10;IS 1,[M-H]-,231.06953,7.61,0.01,0.5"></textarea>
         </label>
         <div class="button-row">
           <button id="loadQaInternalStandardExample" class="secondary" type="button">Example: FA 16:0 / FA 18:0</button>
         </div>
-        <p class="muted">One standard per line. Adduct is optional, so the previous five-column format remains valid. The nearest alignment spot within both tolerances is followed across analytical order for intensity, mass error (ppm), and RT error.</p>
+        <p class="muted">One standard per line. Adduct and RT are optional. With blank RT, matching uses m/z only and RT error is not calculated. Review LLM-drafted entries before generating QA.</p>
         <button id="generateQaReport" type="button">Generate LC-MS QA report</button>
         <div id="qaReport" class="format-summary qa-report" hidden></div>
       </div>
@@ -626,8 +725,16 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
             <button id="usePublicationOutputRoot" type="button" class="secondary">Use Output root</button>
           </div>
         </label>
-        <label class="checkbox-line"><input id="publicationUseSavedRun" type="checkbox" checked> Use saved <code>workflow-settings.json</code> when available</label>
-        <label class="checkbox-line"><input id="publicationIncludeQa" type="checkbox" checked> Include QA from the selected analysis job</label>
+        <div class="publication-options">
+          <div class="publication-option">
+            <label class="check"><input id="publicationUseSavedRun" type="checkbox" checked> Use saved <code>workflow-settings.json</code> when available</label>
+            <p class="muted">When selected, the report uses the settings snapshot saved with this analysis run, so later changes in the current UI do not alter its description. If the file is absent, the app falls back to the current UI. Clear this option to always describe the settings currently shown in the app.</p>
+          </div>
+          <div class="publication-option">
+            <label class="check"><input id="publicationIncludeQa" type="checkbox" checked> Include QA in the publication report</label>
+            <p class="muted">When selected, QA criteria and conclusions are generated from the selected job's <code>*.qa.tsv</code>. With no selected job, the QA matrix chosen in Quality assurance is used. Clear this option to generate Materials and Methods and supplementary tables without a QA assessment. Report generation stops if this option is selected but no QA matrix is available.</p>
+          </div>
+        </div>
         <div id="publicationJobSource" class="format-summary">No analysis job selected. The report will use the explicitly selected directory and files.</div>
         <label>Additional provenance for user-supplied libraries (optional)
           <textarea id="publicationLibraryProvenance" rows="4" placeholder="Library path | Version | DOI or repository URL | License&#10;D:\libraries\inhouse.msp | 2026-08-01 | https://doi.org/... | institutional"></textarea>
@@ -682,28 +789,46 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
 
     <section id="tab-help" class="tab">
       <div class="panel">
-        <h2>LLM API settings</h2>
-        <p class="muted">Optional. The API key remains in browser memory and is sent only to this localhost app for the current request. It is not written to disk or included in the workflow prompt.</p>
+        <h2>LLM and agent integration</h2>
+        <p class="muted"><strong>These are two separate connection directions.</strong> An in-app LLM connection lets buttons on this web page ask a model. A desktop agent connection lets Claude, ChatGPT, Codex, or another compatible host operate MS-DIAL Interactive through MCP.</p>
+        <div class="integration-mode-grid">
+          <article class="integration-mode-card">
+            <h3>Desktop agent via MCP</h3>
+            <p>No separate model API key is entered here. The desktop agent uses its own account and calls the bundled MS-DIAL Interactive MCP tools. The browser app cannot reuse or call a desktop chat session directly.</p>
+            <p class="muted">Claude Desktop can run a local MCP server or desktop extension. ChatGPT custom MCP availability and local connectivity depend on the plan and may require a remote endpoint or secure tunnel.</p>
+            <a href="https://github.com/systemsomicslab/msdial-interactive-app/blob/main/docs/agent_integration.md" target="_blank" rel="noreferrer">MS-DIAL agent setup guide</a>
+          </article>
+          <article class="integration-mode-card">
+            <h3>In-app LLM connection</h3>
+            <p>Used only for model-generated answers, literature assessment, and QA-target drafts initiated from this web page. Choose a cloud API or a local OpenAI-compatible model server.</p>
+            <p class="muted">Local retrieval, repository inspection, MS-DIAL execution, QA calculation, and mzTab-M processing do not require an LLM.</p>
+          </article>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>In-app LLM connection</h2>
+        <p class="muted">Cloud API keys remain in browser memory, are sent only to this localhost app for the current request, and are not written to disk or included in workflow files. A local model server accepts only a loopback endpoint and does not require a key.</p>
         <div class="form-grid">
           <label>Provider
             <select id="llmProvider">
               <option value="local">Local retrieval only</option>
+              <option value="local-openai-compatible">Local model server (Ollama / LM Studio)</option>
               <option value="azure">Azure OpenAI</option>
               <option value="openai-compatible">OpenAI-compatible endpoint</option>
             </select>
           </label>
-          <label>Endpoint<input id="llmEndpoint" placeholder="https://..."></label>
+          <label>Endpoint<input id="llmEndpoint" placeholder="https://... or http://127.0.0.1:11434/v1"></label>
           <label>Deployment / model<input id="llmDeployment"></label>
-          <label>API key<input id="llmApiKey" type="password" autocomplete="off"></label>
+          <label>API key <span id="llmApiKeyOptional" class="muted"></span><input id="llmApiKey" type="password" autocomplete="off"></label>
           <label id="llmApiVersionField">Azure API version<input id="llmApiVersion" value="2024-10-21"></label>
         </div>
         <div id="llmStatus" class="muted">Local retrieval is active.</div>
       </div>
       <div class="panel">
         <h2>Literature-based starting parameters</h2>
-        <p class="muted">Available only with an LLM API configuration. Searches explicitly licensed open-access Crossref records for similar MS-DIAL workflows. Citation count and direct parameter evidence are reported separately; suggestions are not applied automatically.</p>
+        <p class="muted">Available with a cloud API or local model connection. Searches explicitly licensed open-access Crossref records for similar MS-DIAL workflows. Citation count and direct parameter evidence are reported separately; suggestions are not applied automatically.</p>
         <button id="searchLiterature" class="secondary" disabled>Search open-access studies</button>
-        <div id="literatureStatus" class="muted">Configure an API provider and key to enable this search.</div>
+        <div id="literatureStatus" class="muted">Configure a cloud API or local model server to enable this search.</div>
         <div id="literatureSummary" class="assistant-answer" hidden></div>
         <div id="literatureWorks" class="cards"></div>
       </div>

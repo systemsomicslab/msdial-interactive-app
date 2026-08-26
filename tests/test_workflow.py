@@ -35,6 +35,19 @@ from msdial_app.workflow import (
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_shimadzu_lcd_and_qgd_are_supported_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lcd = root / "sample.lcd"
+            qgd = root / "sample.qgd"
+            lcd.write_text("", encoding="ascii")
+            qgd.write_text("", encoding="ascii")
+            report = expand_paths_report([str(root)])
+            self.assertEqual(2, len(report["files"]))
+            self.assertEqual("Shimadzu", detect_raw_format(lcd)["vendor"])
+            self.assertEqual("Shimadzu LCD", detect_raw_format(lcd)["format"])
+            self.assertEqual("Shimadzu QGD", detect_raw_format(qgd)["format"])
+
     @patch("msdial_app.workflow.subprocess.run")
     def test_console_capability_probes_command_help_and_qa_exporter(self, run: Mock) -> None:
         run.return_value = Mock(
@@ -488,9 +501,9 @@ class WorkflowTests(unittest.TestCase):
             manifest = json.loads(
                 Path(result["manifest"]).read_text(encoding="utf-8")
             )
-            self.assertEqual("0.3.4", settings["msdial_interactive_version"])
+            self.assertEqual("0.4.6", settings["msdial_interactive_version"])
             self.assertEqual("not recorded", settings["msdial_console_version"])
-            self.assertEqual("0.3.4", manifest["msdial_interactive_version"])
+            self.assertEqual("0.4.6", manifest["msdial_interactive_version"])
             self.assertEqual("21904324", settings["library_provenance"][0]["record_id"])
             self.assertEqual("CC BY 4.0", settings["library_provenance"][0]["license"])
 
@@ -722,7 +735,27 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(Path(handoff["handoff_file"]).is_file())
             status = summarize_jobs({"job1": {**job, "datamining_handoff": handoff}})
             self.assertEqual("job1", status["latest_completed_job"]["id"])
+            self.assertEqual("0.4", status["agent_api_version"])
             self.assertIn("create_datamining_handoff", status["capabilities"])
+            self.assertIn("inspect_repository_sample_metadata", status["capabilities"])
+            self.assertIn("prepare_repository_reanalysis_without_ui", status["capabilities"])
+
+    def test_agent_status_accepts_jobs_with_null_optional_objects(self) -> None:
+        status = summarize_jobs(
+            {
+                "download": {
+                    "id": "download",
+                    "kind": "repository_download",
+                    "status": "completed",
+                    "preparation": None,
+                    "datamining_handoff": None,
+                    "mztab_validation": None,
+                    "artifacts": None,
+                }
+            }
+        )
+        self.assertEqual("download", status["latest_completed_job"]["id"])
+        self.assertEqual("", status["latest_completed_job"]["handoff_file"])
 
     def test_console_dll_uses_dotnet(self) -> None:
         command = build_console_command("MSDIALCUI.dll", "a.csv", "out", "method.txt")
@@ -1172,6 +1205,14 @@ class WorkflowTests(unittest.TestCase):
                     "target_omics": "Metabolomics",
                     "selected_adducts": ["[M-H]-"],
                     "stage_inputs": True,
+                    "repository_metadata": {
+                        "schema": "msdial-repository-metadata.v1",
+                        "repository": "test",
+                        "accession": "X1",
+                        "fields": [{"name": "Group", "non_missing": 1, "missing": 0, "unique_count": 1, "examples": ["Control"]}],
+                        "rows": [{"sample_id": "sample", "raw_file": "sample.wiff", "values": {"Group": "Control"}, "class_id": "Control"}],
+                        "hierarchy": ["Group"],
+                    },
                 }
             )
 
@@ -1181,6 +1222,10 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn(str(wiff.resolve()), csv_text)
             manifest = Path(prepared["manifest"]).read_text(encoding="utf-8")
             self.assertIn('"stage_inputs": false', manifest)
+            self.assertIn("X1_repository_metadata_reviewed.json", manifest)
+            with zipfile.ZipFile(prepared["bundle"]) as archive:
+                self.assertIn("X1_repository_metadata_reviewed.json", archive.namelist())
+                self.assertIn("X1_sample_metadata_reviewed.tsv", archive.namelist())
 
             tuning = prepare_tuning_run(
                 {

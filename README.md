@@ -132,6 +132,36 @@ The Excel workbook is the primary human-readable supplementary output:
 The long-format TSV remains available as an audit-friendly machine-readable
 companion.
 
+## Public repository reanalysis
+
+An experimental command-line workflow can discover and stage lightweight,
+untargeted GC-MS or LC-MS projects from Metabolomics Workbench, MetaboLights,
+MB-POST, and MetaboBank. MB-POST (`MPST...`) and MetaboBank (`MTBKS...`) use
+separate repository adapters. Candidate selection is reproducible with a recorded random seed.
+Downloads are size-bounded, checksummed when the repository supplies a digest,
+and extracted with archive traversal and expansion limits.
+
+Raw data are managed as a temporary download lease. The cleanup command remains
+locked until the retained mzTab-M output passes validation. Provenance,
+workflow settings, QA, publication-report artifacts, and checksums are kept
+after raw-data cleanup. See [Public repository reanalysis](docs/public_repository_reanalysis.md)
+for commands, eligibility rules, and the pilot validation record.
+
+The Data tab also includes a repository metadata handler. It normalizes
+Metabolomics Workbench, MetaboLights, MB-POST, and MetaboBank sample metadata, previews an
+ordered multi-field grouping hierarchy, and writes the resulting underscore-
+separated value into MS-DIAL's single `Class` column. Reviewed source metadata
+remain available as JSON/TSV, and the same workflow is callable from the CLI or
+local agent API.
+
+Repository downloads show declared size, a 100-Mbps planning estimate, measured
+transfer speed, byte progress, and ETA. After recognition, repository Class,
+file type, DDA/SWATH/AIF acquisition, batch, and analytical order can be applied
+automatically or manually. Internal-standard statements are surfaced in the QA
+tab. When an LLM endpoint is explicitly configured, the app can draft reviewable
+m/z/adduct targets; unsupported retention times remain blank instead of being
+invented.
+
 When `workflow-settings.json` exists in the selected run/output directory, the
 report uses those saved run settings instead of the current UI. New runs record
 both the MS-DIAL Console version and MS-DIAL Interactive version in
@@ -202,13 +232,31 @@ or generate one in the run folder from a single alkane/FAME carbon-number to
 RT table. The generated file is named `ri_dictionary_paths.txt` and is included
 in the reusable workflow ZIP.
 
-## LLM settings
+## LLM and agent settings
 
-The Ask MS-DIAL screen can use local retrieval, Azure OpenAI, or an
-OpenAI-compatible chat-completions endpoint. API keys entered in the UI remain
-in browser memory and are sent to the localhost Python server only for the
-current request; they are not written to disk or included in the workflow
-context.
+The `LLM & agent settings` screen separates two connection directions:
+
+- an in-app LLM connection lets web-page actions call Azure OpenAI, an
+  OpenAI-compatible cloud endpoint, or a loopback OpenAI-compatible local model
+  server such as Ollama or LM Studio;
+- a desktop agent connection lets Claude Desktop, ChatGPT/Codex, or another MCP
+  host operate MS-DIAL Interactive. Authentication is handled by the desktop
+  host, so no model API key is entered in this web page.
+
+A desktop subscription cannot be reused as an inference API by the browser
+app, and the browser cannot call an existing desktop chat session. MCP solves
+the inverse problem: the desktop agent calls MS-DIAL Interactive. API keys
+entered in the UI remain in browser memory and are sent to the localhost Python
+server only for the current request; they are not written to disk or included
+in the workflow context. Keyless local-model connections are restricted to
+`localhost`, `127.0.0.1`, or `::1`.
+
+An API key is not used for repository metadata inspection, local QA-card
+retrieval, MS-DIAL execution, QA, or mzTab-M processing. Repository metadata are
+read directly from the public Metabolomics Workbench, MetaboLights, MB-POST, or MetaboBank
+API. When a GPT/Claude desktop app uses the local MCP server, model
+authentication remains the responsibility of that desktop app rather than this
+web form.
 
 ## LC-MS parameter tuning
 
@@ -345,8 +393,16 @@ Core MCP tools:
 - `msdial_complete_guided_analysis`: wait for one job and complete validation,
   QA, publication, and handoff without browser interaction
 - `msdial_interactive_create_handoff`: create `datamining-handoff.json`
+- `msdial_inspect_repository_metadata`: inspect public sample metadata and publication provenance
+- `msdial_project_repository_classes`: project a user-selected metadata hierarchy into MS-DIAL `Class`
+- `msdial_save_repository_metadata`: save reviewed JSON/TSV and optional analysis metadata CSV
+- `msdial_repository_reanalysis_plan`: plan an accession-to-mzTab-M workflow without downloading data
+- `msdial_download_repository_raw`: start a bounded repository download after explicit confirmation
+- `msdial_repository_raw_metadata_preflight`: cross-check representative raw headers with the local parser
+- `msdial_prepare_repository_reanalysis`: review Class matching and prepare `analysis_files.csv`
+- `msdial_repository_qa_evidence`: expose internal-standard declarations for agent-reviewed QA targets
 
-Agent API 0.3 binds mzTab-M, QA, publication, and handoff operations to the
+Agent API 0.4 binds mzTab-M, QA, publication, and handoff operations to the
 production `job_id`. Files left by earlier runs in the same output directory are
 excluded. Job summaries are compact by default; full details are opt-in.
 
@@ -367,6 +423,12 @@ Claude Desktop example:
 
 Use the actual Python path on that PC. Restart Claude Desktop after editing its
 configuration.
+
+If a newly added control reports `Unknown endpoint`, first refresh the browser
+and confirm `/api/config` reports the current app version. An older local app
+may still be using port 8765. Current builds use an exclusive port binding and
+exit with a clear message instead of allowing old and new servers to share the
+same port.
 
 Package the cross-platform Agent Skill:
 
@@ -526,20 +588,20 @@ Optional environment variables:
 MSDIAL_CONSOLE_PATH       Default Console path shown in the UI
 MSDIAL_INTERACTIVE_PORT   Linux helper script port, default 8765
 PYTHON_BIN                Linux/macOS helper script Python executable
-AZURE_OPENAI_ENDPOINT     Optional Ask MS-DIAL / literature evidence search
-AZURE_OPENAI_API_KEY      Optional Ask MS-DIAL / literature evidence search
-AZURE_OPENAI_DEPLOYMENT   Optional Ask MS-DIAL / literature evidence search
+AZURE_OPENAI_ENDPOINT     Optional in-app LLM / literature evidence search
+AZURE_OPENAI_API_KEY      Optional in-app LLM / literature evidence search
+AZURE_OPENAI_DEPLOYMENT   Optional in-app LLM / literature evidence search
 ```
 
 ## Knowledge cards
 
 `knowledge/qa_cards_ja.jsonl` and `knowledge/qa_cards_en.jsonl` contain only
 small public-safe sample cards in this repository. They are included so that
-Ask MS-DIAL works immediately after checkout. Labs can replace these files with
+Local MS-DIAL question retrieval works immediately after checkout. Labs can replace these files with
 their own local Q&A cards; private or email-derived cards should not be
 committed to a public repository.
 
-The Ask MS-DIAL screen works in local retrieval mode without an API key.
+The LLM and agent screen works in local retrieval mode without an API key.
 Grounded Azure OpenAI answers are enabled when these variables are set:
 
 ```text

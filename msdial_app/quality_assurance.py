@@ -308,10 +308,20 @@ def _consume_spot(
     spot_rt = median([row["rt"] for row in detected])
     for index, standard in enumerate(standards):
         mz_delta = abs(spot_mz - standard["mz"])
-        rt_delta = abs(spot_rt - standard["rt"])
-        if mz_delta > standard["mz_tolerance"] or rt_delta > standard["rt_tolerance"]:
+        use_rt = standard["rt"] is not None
+        rt_delta = abs(spot_rt - standard["rt"]) if use_rt else 0.0
+        if mz_delta > standard["mz_tolerance"] or (
+            use_rt and rt_delta > standard["rt_tolerance"]
+        ):
             continue
-        score = math.hypot(mz_delta / standard["mz_tolerance"], rt_delta / standard["rt_tolerance"])
+        score = (
+            math.hypot(
+                mz_delta / standard["mz_tolerance"],
+                rt_delta / standard["rt_tolerance"],
+            )
+            if use_rt
+            else mz_delta / standard["mz_tolerance"]
+        )
         if standard_matches[index] is None or score < standard_matches[index]["score"]:
             standard_matches[index] = {
                 "score": score,
@@ -539,8 +549,9 @@ def _histograms(reservoirs: dict[str, _Reservoir], bins: int = 30) -> list[dict[
 
 def _normalize_standard(item: dict[str, Any], index: int) -> dict[str, Any] | None:
     mz = _number(item.get("mz"))
-    rt = _number(item.get("rt"))
-    if mz <= 0 or rt < 0:
+    raw_rt = item.get("rt")
+    rt = None if raw_rt is None or str(raw_rt).strip() == "" else _number(raw_rt)
+    if mz <= 0 or (rt is not None and rt < 0):
         return None
     return {
         "name": str(item.get("name", "")).strip() or f"Internal standard {index + 1}",
@@ -574,7 +585,11 @@ def _summarize_internal_standards(
                 "mz": row["mz"],
                 "ppm_error": (row["mz"] - standard["mz"]) / standard["mz"] * 1e6 if row["mz"] > 0 else None,
                 "rt": row["rt"],
-                "rt_delta": row["rt"] - standard["rt"] if row["rt"] >= 0 else None,
+                "rt_delta": (
+                    row["rt"] - standard["rt"]
+                    if row["rt"] >= 0 and standard["rt"] is not None
+                    else None
+                ),
                 "reference_matched": row["reference_matched"],
             })
         result.append({
