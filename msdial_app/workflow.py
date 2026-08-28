@@ -1979,6 +1979,18 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
     output: list[str] = []
     found: set[str] = set()
     annotation_inserted = False
+    output_aliases = (
+        {
+            "retention index alignment tolerance": "retention index tolerance for alignment",
+            "weighted dot product cutoff": "square root of weighted dot product cutoff for msp-based annotation",
+            "simple dot product cutoff": "square root of simple dot product cutoff for msp-based annotation",
+            "reverse dot product cutoff": "square root of reverse dot product cutoff for msp-based annotation",
+            "matched peaks percentage cutoff": "matched peaks percentage cutoff for msp-based annotation",
+            "minimum spectrum match": "minimum spectrum match for msp-based annotation",
+        }
+        if project_type == "gcms"
+        else {}
+    )
     for line in lines:
         stripped = line.lstrip()
         lower = stripped.lower()
@@ -1995,8 +2007,10 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
             None,
         )
         if matched:
-            output.append(f"{_title_for_key(matched)}: {replacements[matched]}")
+            output_key = output_aliases.get(matched, matched)
+            output.append(f"{_title_for_key(output_key)}: {replacements[matched]}")
             found.add(matched)
+            found.add(output_key)
             continue
         output.append(line)
         if project_type != "gcms" and stripped.lower() == "# annotation parameter":
@@ -2214,11 +2228,17 @@ def _title_for_key(key: str) -> str:
         "retention type": "Retention type",
         "alignment index type": "Alignment index type",
         "retention index alignment tolerance": "Retention index alignment tolerance",
+        "retention index tolerance for alignment": "Retention index tolerance for alignment",
         "weighted dot product cutoff": "Weighted dot product cutoff",
         "simple dot product cutoff": "Simple dot product cutoff",
         "reverse dot product cutoff": "Reverse dot product cutoff",
         "matched peaks percentage cutoff": "Matched peaks percentage cutoff",
         "minimum spectrum match": "Minimum spectrum match",
+        "square root of weighted dot product cutoff for msp-based annotation": "Square root of weighted dot product cutoff for MSP-based annotation",
+        "square root of simple dot product cutoff for msp-based annotation": "Square root of simple dot product cutoff for MSP-based annotation",
+        "square root of reverse dot product cutoff for msp-based annotation": "Square root of reverse dot product cutoff for MSP-based annotation",
+        "matched peaks percentage cutoff for msp-based annotation": "Matched peaks percentage cutoff for MSP-based annotation",
+        "minimum spectrum match for msp-based annotation": "Minimum spectrum match for MSP-based annotation",
     }
     return names[key]
 

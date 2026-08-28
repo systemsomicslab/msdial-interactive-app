@@ -855,9 +855,24 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn("Accuracy type: IsNominal", method)
             self.assertIn("Retention type: RI", method)
             self.assertIn("Alignment index type: RI", method)
-            self.assertIn("Retention index alignment tolerance: 12", method)
-            self.assertIn("Weighted dot product cutoff: 0.55", method)
-            self.assertIn("Minimum spectrum match: 4", method)
+            self.assertIn("Retention index tolerance for alignment: 12", method)
+            self.assertIn(
+                "Square root of weighted dot product cutoff for MSP-based annotation: 0.55",
+                method,
+            )
+            self.assertIn(
+                "Square root of simple dot product cutoff for MSP-based annotation: 0.56",
+                method,
+            )
+            self.assertIn(
+                "Square root of reverse dot product cutoff for MSP-based annotation: 0.57",
+                method,
+            )
+            self.assertIn(
+                "Matched peaks percentage cutoff for MSP-based annotation: 0.58",
+                method,
+            )
+            self.assertIn("Minimum spectrum match for MSP-based annotation: 4", method)
             ri_dictionary = Path(prepared["run_directory"]) / "ri_dictionary_paths.txt"
             self.assertTrue(ri_dictionary.is_file())
             self.assertIn(str(raw.resolve()), ri_dictionary.read_text(encoding="ascii"))
