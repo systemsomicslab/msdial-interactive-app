@@ -501,9 +501,9 @@ class WorkflowTests(unittest.TestCase):
             manifest = json.loads(
                 Path(result["manifest"]).read_text(encoding="utf-8")
             )
-            self.assertEqual("0.4.6", settings["msdial_interactive_version"])
+            self.assertEqual("0.4.7", settings["msdial_interactive_version"])
             self.assertEqual("not recorded", settings["msdial_console_version"])
-            self.assertEqual("0.4.6", manifest["msdial_interactive_version"])
+            self.assertEqual("0.4.7", manifest["msdial_interactive_version"])
             self.assertEqual("21904324", settings["library_provenance"][0]["record_id"])
             self.assertEqual("CC BY 4.0", settings["library_provenance"][0]["license"])
 
@@ -756,6 +756,22 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertEqual("download", status["latest_completed_job"]["id"])
         self.assertEqual("", status["latest_completed_job"]["handoff_file"])
+
+    def test_agent_status_is_bounded_and_omits_artifact_paths_by_default(self) -> None:
+        jobs = {
+            f"job-{index}": {
+                "id": f"job-{index}",
+                "status": "completed",
+                "created_at": f"2026-09-02T00:{index:02d}:00+00:00",
+                "artifacts": {"mztab": [f"D:/large/{index}/{item}.mzTab" for item in range(100)]},
+            }
+            for index in range(20)
+        }
+        status = summarize_jobs(jobs)
+        self.assertEqual(5, len(status["jobs"]))
+        self.assertNotIn("artifacts", status["latest_job"])
+        self.assertEqual(100, status["latest_job"]["artifact_counts"]["mztab"])
+        self.assertLess(len(json.dumps(status)), 8000)
 
     def test_console_dll_uses_dotnet(self) -> None:
         command = build_console_command("MSDIALCUI.dll", "a.csv", "out", "method.txt")

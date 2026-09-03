@@ -22,9 +22,13 @@ const state = {
   mspAnnotators: [],
   textAnnotators: [],
   lbmAnnotator: {},
+  annotationPipelineProfile: "",
   libraryJobs: {},
   libraryProvenance: [],
   consoleDiscovery: null,
+  consoleBuildJobId: null,
+  consoleBuildPlan: null,
+  officialConsoleReleases: null,
   jobs: [],
   mztabFiles: [],
   selectedMzTabPath: "",
@@ -140,6 +144,8 @@ function workflow() {
     output_root: $("#outputRoot").value.trim(),
     msp_path: "",
     lbm_path: (state.lbmAnnotator.lbm_file_path || "").trim(),
+    annotation_pipeline_profile: state.annotationPipelineProfile,
+    lbm_priority: Number(state.lbmAnnotator.priority ?? 1),
     lbm_rt_tolerance: Number(state.lbmAnnotator.rt_tolerance ?? DEFAULT_LBM_SETTINGS.rt_tolerance),
     lbm_ms1_tolerance: Number(state.lbmAnnotator.ms1_tolerance ?? DEFAULT_LBM_SETTINGS.ms1_tolerance),
     lbm_ms2_tolerance: Number(state.lbmAnnotator.ms2_tolerance ?? DEFAULT_LBM_SETTINGS.ms2_tolerance),
@@ -161,8 +167,11 @@ function workflow() {
       .map((item) => ({
         annotator_id: (item.annotator_id || "").trim(),
         msp_file_path: (item.msp_file_path || "").trim(),
+        target_omics: item.target_omics || "",
         priority: Number(item.priority || 1),
         rt_tolerance: Number(item.rt_tolerance || 0),
+        ms1_tolerance: Number(item.ms1_tolerance ?? 0.01),
+        ms2_tolerance: Number(item.ms2_tolerance ?? 0.025),
         use_rt_scoring: Boolean(item.use_rt_scoring),
         use_rt_filtering: Boolean(item.use_rt_filtering),
         weighted_dot_product_cutoff: Number(item.weighted_dot_product_cutoff ?? DEFAULT_MSP_CUTOFFS.weighted_dot_product_cutoff),
@@ -170,6 +179,7 @@ function workflow() {
         reverse_dot_product_cutoff: Number(item.reverse_dot_product_cutoff ?? DEFAULT_MSP_CUTOFFS.reverse_dot_product_cutoff),
         matched_peaks_percentage_cutoff: Number(item.matched_peaks_percentage_cutoff ?? DEFAULT_MSP_CUTOFFS.matched_peaks_percentage_cutoff),
         minimum_spectrum_match: Number(item.minimum_spectrum_match ?? DEFAULT_MSP_CUTOFFS.minimum_spectrum_match),
+        evidence_tier: item.evidence_tier || "",
       })),
     text_annotators: state.textAnnotators
       .filter((item) => (item.text_db_file_path || "").trim())
@@ -861,7 +871,10 @@ function defaultMspAnnotatorRow(overrides = {}) {
     annotator_id: `msp_annotator_${index}`,
     msp_file_path: "",
     priority: index,
+    target_omics: "",
     rt_tolerance: 0.5,
+    ms1_tolerance: 0.01,
+    ms2_tolerance: 0.025,
     use_rt_scoring: false,
     use_rt_filtering: false,
     ...DEFAULT_MSP_CUTOFFS,
@@ -885,6 +898,7 @@ function defaultTextAnnotatorRow(overrides = {}) {
 function defaultLbmAnnotator(overrides = {}) {
   return {
     lbm_file_path: "",
+    priority: 1,
     ...DEFAULT_LBM_SETTINGS,
     ...overrides,
   };
@@ -1067,6 +1081,7 @@ function renderLbmAnnotator() {
   const row = document.createElement("tr");
   row.innerHTML = `
     <td><input data-key="lbm_file_path" value="${escapeHtml(item.lbm_file_path || "")}" placeholder="D:\\...\\lipid_library.lbm2"></td>
+    <td><input data-key="priority" type="number" step="1" value="${escapeHtml(item.priority ?? 1)}"></td>
     <td><input data-key="rt_tolerance" type="number" step="any" value="${escapeHtml(item.rt_tolerance)}"></td>
     <td><input data-key="ms1_tolerance" type="number" step="any" value="${escapeHtml(item.ms1_tolerance)}"></td>
     <td><input data-key="ms2_tolerance" type="number" step="any" value="${escapeHtml(item.ms2_tolerance)}"></td>
@@ -1106,8 +1121,11 @@ function renderMspAnnotators() {
     row.innerHTML = `
       <td><input data-key="annotator_id" value="${escapeHtml(item.annotator_id || "")}" placeholder="msp_annotator_1"></td>
       <td><input data-key="msp_file_path" value="${escapeHtml(item.msp_file_path || "")}" placeholder="D:\\...\\library.msp"></td>
+      <td><select data-key="target_omics"><option value="" ${!item.target_omics ? "selected" : ""}>Project setting</option><option value="Metabolomics" ${item.target_omics === "Metabolomics" ? "selected" : ""}>Metabolomics</option><option value="Lipidomics" ${item.target_omics === "Lipidomics" ? "selected" : ""}>Lipidomics</option></select></td>
       <td><input data-key="priority" type="number" step="1" value="${escapeHtml(item.priority ?? index + 1)}"></td>
       <td><input data-key="rt_tolerance" type="number" step="any" value="${escapeHtml(item.rt_tolerance ?? 0.5)}"></td>
+      <td><input data-key="ms1_tolerance" type="number" step="any" value="${escapeHtml(item.ms1_tolerance ?? 0.01)}"></td>
+      <td><input data-key="ms2_tolerance" type="number" step="any" value="${escapeHtml(item.ms2_tolerance ?? 0.025)}"></td>
       <td><input data-key="use_rt_scoring" type="checkbox" ${item.use_rt_scoring ? "checked" : ""}></td>
       <td><input data-key="use_rt_filtering" type="checkbox" ${item.use_rt_filtering ? "checked" : ""}></td>
       <td><input data-key="weighted_dot_product_cutoff" type="number" min="0" max="1" step="0.01" value="${escapeHtml(item.weighted_dot_product_cutoff ?? 0.6)}"></td>
@@ -1116,7 +1134,7 @@ function renderMspAnnotators() {
       <td><input data-key="matched_peaks_percentage_cutoff" type="number" min="0" max="1" step="0.01" value="${escapeHtml(item.matched_peaks_percentage_cutoff ?? 0.1)}"></td>
       <td><input data-key="minimum_spectrum_match" type="number" min="0" step="1" value="${escapeHtml(item.minimum_spectrum_match ?? 3)}"></td>
       <td><button type="button" class="quiet remove">Remove</button></td>`;
-    row.querySelectorAll("input").forEach((input) => {
+    row.querySelectorAll("input, select").forEach((input) => {
       input.addEventListener("input", () => {
         const key = input.dataset.key;
         const value = input.type === "checkbox"
@@ -1136,6 +1154,72 @@ function renderMspAnnotators() {
     });
     table.appendChild(row);
   });
+}
+
+function applyTieredAnnotationPreset() {
+  if ($("#projectType").value !== "lcms") {
+    throw new Error("The tiered lipid/MSP preset is currently available for LC-MS only.");
+  }
+  const mspPath = $("#tieredMspPath").value.trim()
+    || state.mspAnnotators.find((item) => (item.msp_file_path || "").trim())?.msp_file_path?.trim()
+    || "";
+  const lbmPath = (state.lbmAnnotator.lbm_file_path || "").trim();
+  if (!lbmPath) {
+    throw new Error("Select or download the LBM library before applying the tiered preset.");
+  }
+  if (!mspPath) {
+    throw new Error("Set the MSP library reused by the high- and low-quality tiers.");
+  }
+  state.annotationPipelineProfile = "lipid-rule-msp-high-low-v1";
+  state.lbmAnnotator = {
+    ...defaultLbmAnnotator(),
+    ...state.lbmAnnotator,
+    lbm_file_path: lbmPath,
+    priority: 3,
+  };
+  const common = {
+    msp_file_path: mspPath,
+    target_omics: "Metabolomics",
+    rt_tolerance: 0.5,
+    ms1_tolerance: 0.01,
+    use_rt_scoring: false,
+    use_rt_filtering: false,
+    matched_peaks_percentage_cutoff: 0,
+  };
+  state.mspAnnotators = [
+    {
+      ...common,
+      annotator_id: "msp_high_quality",
+      priority: 2,
+      ms2_tolerance: 0.05,
+      weighted_dot_product_cutoff: 0.6,
+      simple_dot_product_cutoff: 0.6,
+      reverse_dot_product_cutoff: 0.8,
+      minimum_spectrum_match: 3,
+      evidence_tier: "MSP high quality",
+    },
+    {
+      ...common,
+      annotator_id: "msp_low_quality",
+      priority: 1,
+      ms2_tolerance: 0.25,
+      weighted_dot_product_cutoff: 0.5,
+      simple_dot_product_cutoff: 0.5,
+      reverse_dot_product_cutoff: 0.5,
+      minimum_spectrum_match: 1,
+      evidence_tier: "MSP low quality candidate",
+    },
+  ];
+  const ionMode = $("#ionMode").value;
+  state.lipidQueries.forEach((item) => {
+    if (item.ion_mode === ionMode) item.selected = true;
+  });
+  $("#tieredMspPath").value = mspPath;
+  $("#tieredAnnotationStatus").textContent =
+    "Applied lipid-rule-msp-high-low-v1. LBM priority 3; MSP high priority 2; MSP low candidate priority 1.";
+  renderLbmAnnotator();
+  renderMspAnnotators();
+  renderLipids();
 }
 
 function updateTextAnnotator(index, key, value) {
@@ -1214,11 +1298,12 @@ function updateProjectUI() {
   $("#gcmsAnnotationNote").hidden = !isGcms;
   $("#gcmsSettings").hidden = !isGcms;
   $("#adductPanel").hidden = isGcms;
-  $("#lbmAnnotatorPanel").hidden = isGcms || !lipidomics;
-  $("#lbmQueriesPanel").hidden = isGcms || !lipidomics;
+  $("#lbmAnnotatorPanel").hidden = !isLcms;
+  $("#lbmQueriesPanel").hidden = !isLcms;
+  $("#tieredAnnotationPanel").hidden = !isLcms;
   $("#multiMspPanel").hidden = !(isLcms || isGcms);
   $("#textAnnotatorPanel").hidden = !isLcms;
-  $("#lipidQuerySection").hidden = isGcms || !lipidomics;
+  $("#lipidQuerySection").hidden = !isLcms;
   $("#alignmentLightModeField").hidden = !isLcms;
   $("#lcmsQaExportField").hidden = !isLcms;
   const isRtWorkspace = location.pathname.startsWith("/rt-correction");
@@ -2440,11 +2525,16 @@ function renderConsoleDiscovery(discovery = state.consoleDiscovery) {
         const qa = (candidate.capabilities || []).includes("lcms_alignment_qa_matrix")
           ? "QA matrix supported"
           : "QA matrix unavailable";
-        const label = `${candidate.version || "version unknown"} | ${qa} | ${candidate.source} | ${candidate.path}`;
+        const kind = (candidate.source_kind || candidate.source || "custom").replaceAll("_", " ");
+        const git = candidate.git?.short_head ? ` | Git ${candidate.git.short_head}${candidate.git.dirty ? " dirty" : ""}` : "";
+        const label = `${candidate.version || "version unknown"} | ${kind}${git} | ${qa} | ${candidate.path}`;
         return `<option value="${escapeHtml(candidate.path)}">${escapeHtml(label)}</option>`;
       }).join("")
     : `<option value="">No MS-DIAL Console candidate was found</option>`;
   const matched = candidates.find((candidate) => candidate.path.toLowerCase() === current.toLowerCase());
+  if (matched?.git?.source_root && !$("#consoleSourceRoot").value.trim()) {
+    $("#consoleSourceRoot").value = matched.git.source_root;
+  }
   if (matched) select.value = matched.path;
   renderConsoleCapability(matched || null);
 }
@@ -2464,16 +2554,96 @@ function renderConsoleCapability(candidate) {
   const capabilities = candidate.capabilities || [];
   const qa = capabilities.includes("lcms_alignment_qa_matrix");
   const rtCorrection = capabilities.includes("rt_correction_review");
+  const kind = (candidate.source_kind || candidate.source || "custom").replaceAll("_", " ");
+  const git = candidate.git || {};
+  let provenance = "";
+  if (candidate.source_kind === "local_source_build") {
+    if (candidate.provenance_verified && candidate.matches_recorded_git_head) {
+      provenance = `<br><span>Build provenance verified against Git <code>${escapeHtml(git.short_head || "")}</code>${git.dirty ? ` with ${escapeHtml(git.changed_files)} changed file(s)` : ""}.</span>`;
+    } else if (candidate.provenance_verified) {
+      provenance = `<br><span class="issue warning">The binary has a valid build record, but the source tree has changed since it was built.</span>`;
+    } else {
+      provenance = `<br><span class="issue warning">This looks like a local source build, but no matching provenance record exists. Its current Git HEAD cannot be attributed to this binary yet; rebuild it here to record that link.</span>`;
+    }
+    if (Number.isInteger(git.behind_origin_master) && Number.isInteger(git.ahead_of_origin_master)) {
+      provenance += `<br><span class="${git.behind_origin_master ? "issue warning" : ""}">Current checkout is ${escapeHtml(git.ahead_of_origin_master)} commit(s) ahead and ${escapeHtml(git.behind_origin_master)} behind the locally known <code>origin/master</code>. Use Fetch and compare source before relying on this value.</span>`;
+    }
+  } else if (candidate.source_kind === "official_distribution") {
+    provenance = `<br><span>Classified as an installed official distribution by its folder name. Use Check official releases to compare release channels.</span>`;
+  }
   const wasUnsupported = qaControl.disabled;
   qaControl.disabled = !qa;
   if (!qa) qaControl.checked = false;
   else if (wasUnsupported) qaControl.checked = true;
-  panel.innerHTML = `<strong>MS-DIAL Console ${escapeHtml(candidate.version || "version unknown")}</strong><br>`
+  panel.innerHTML = `<strong>MS-DIAL Console ${escapeHtml(candidate.version || "version unknown")}</strong> <span class="muted">(${escapeHtml(kind)})</span><br>`
     + `<code>${escapeHtml(candidate.path)}</code><br>`
-    + `<span class="${qa ? "" : "issue warning"}">${qa
+    + `<span class="muted">Modified ${escapeHtml(candidate.binary_modified_at || "unknown")} | SHA-256 <code>${escapeHtml((candidate.binary_sha256 || "").slice(0, 16) || "unknown")}</code></span>`
+    + provenance
+    + `<br><span class="${qa ? "" : "issue warning"}">${qa
       ? "LC-MS QA matrix export is available."
       : "LC-MS QA matrix export is not available in this Console build. Analysis can run, but *.qa.tsv cannot be requested."}</span>`
     + (rtCorrection ? `<br><span>Top-level RT correction review is available.</span>` : "");
+}
+
+function renderOfficialConsoleReleases(result) {
+  state.officialConsoleReleases = result;
+  const panel = $("#officialConsoleReleaseStatus");
+  const row = (label, release) => release
+    ? `<strong>${label}:</strong> <a href="${escapeHtml(release.html_url)}" target="_blank" rel="noreferrer">${escapeHtml(release.tag || release.name)}</a> `
+      + `(${escapeHtml(release.published_at || "date unknown")}; ${escapeHtml(release.console_assets?.length || 0)} Console package(s))`
+    : `<strong>${label}:</strong> no Console package found`;
+  panel.innerHTML = `${row("Stable channel", result.stable)}<br>${row("Prerelease channel", result.preview)}<br>`
+    + `<span class="muted">Checked ${escapeHtml(result.checked_at || "")}. Prereleases can contain newer Console-only work than the stable GUI release.</span>`;
+}
+
+function renderConsoleBuildPlan(plan) {
+  state.consoleBuildPlan = plan;
+  const git = plan.git || {};
+  const dirty = git.dirty
+    ? `DIRTY (${git.changed_files || 0} changed/untracked file(s)); these local changes are included.`
+    : "clean";
+  const log = $("#consoleBuildLog");
+  log.hidden = false;
+  const remote = Number.isInteger(git.behind_origin_master)
+    ? `\nCompared with known origin/master: ${git.ahead_of_origin_master} ahead / ${git.behind_origin_master} behind`
+    : "";
+  log.textContent = `Source: ${plan.source_root}\nGit: ${git.branch || "detached"} @ ${git.short_head || "unknown"} | ${dirty}${remote}\nTarget: ${plan.framework} / ${plan.configuration}\nOutput: ${plan.output_path}\nCommand: ${plan.command_text}\n\nThis builds the current checkout. It does not switch branches, pull, merge, or discard local changes.`;
+}
+
+async function previewConsoleBuild() {
+  const result = await api("/api/agent/console/build", {
+    method: "POST",
+    body: JSON.stringify({
+      source_root: $("#consoleSourceRoot").value.trim(),
+      framework: $("#consoleBuildFramework").value,
+      configuration: "Release",
+      confirmed: false,
+    }),
+  });
+  renderConsoleBuildPlan(result.plan);
+  setStatus("Local Console build plan is ready for review.");
+  return result.plan;
+}
+
+async function pollConsoleBuild() {
+  if (!state.consoleBuildJobId) return;
+  const job = await api(`/api/jobs/${state.consoleBuildJobId}?detail=full`);
+  const log = $("#consoleBuildLog");
+  log.hidden = false;
+  log.textContent = (job.logs || []).join("\n") || job.status;
+  log.scrollTop = log.scrollHeight;
+  setStatus(`Console build ${job.status}`);
+  if (["queued", "running"].includes(job.status)) {
+    setTimeout(() => pollConsoleBuild().catch((error) => setStatus(error.message)), 1000);
+    return;
+  }
+  state.consoleBuildJobId = null;
+  if (job.status !== "completed") throw new Error(job.error || "Console build failed.");
+  const result = job.result || {};
+  $("#consolePath").value = result.path || $("#consolePath").value;
+  state.config.default_console = $("#consolePath").value;
+  await refreshConsoleDiscovery();
+  setStatus(`Built and selected local MS-DIAL Console from Git ${result.git?.short_head || "HEAD"}.`);
 }
 
 async function refreshConsoleDiscovery() {
@@ -2608,6 +2778,7 @@ async function initialize() {
   $("#templatePath").value = state.config.default_template;
   $("#queriesPath").value = state.config.default_queries;
   $("#consolePath").value = state.config.default_console || "";
+  $("#consoleSourceRoot").value = state.config.console_source_root || "";
   renderConsoleDiscovery(state.config.console_discovery);
   $("#pathSettingsInfo").textContent = state.config.settings_loaded
     ? `Loaded saved paths from ${state.config.settings_file}`
@@ -2955,6 +3126,7 @@ $("#savePathSettings").addEventListener("click", () => runUiAction(async () => {
     method: "POST",
     body: JSON.stringify({
       console_path: $("#consolePath").value.trim(),
+      console_source_root: $("#consoleSourceRoot").value.trim(),
       template_path: $("#templatePath").value.trim(),
       queries_path: $("#queriesPath").value.trim(),
     }),
@@ -2995,6 +3167,52 @@ $("#consoleCandidateSelect").addEventListener("change", () => {
   if (candidate) renderConsoleCapability(candidate);
 });
 $("#consolePath").addEventListener("input", () => renderConsoleCapability(null));
+$("#checkOfficialConsoleReleases").addEventListener("click", () => runUiAction(async () => {
+  setStatus("Checking official MS-DIAL release channels...");
+  const result = await api("/api/agent/console/releases", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  renderOfficialConsoleReleases(result);
+  setStatus("Official MS-DIAL Console release channels checked.");
+}));
+$("#checkConsoleSourceUpdates").addEventListener("click", () => runUiAction(async () => {
+  setStatus("Fetching origin and comparing the local MS-DIAL source...");
+  const result = await api("/api/agent/console/source-status", {
+    method: "POST",
+    body: JSON.stringify({ source_root: $("#consoleSourceRoot").value.trim() }),
+  });
+  const git = result.git || {};
+  $("#consoleBuildLog").hidden = false;
+  $("#consoleBuildLog").textContent = `Fetched: ${result.checked_at || ""}\nLocal: ${git.branch || "detached"} @ ${git.short_head || "unknown"}${git.dirty ? ` | DIRTY (${git.changed_files || 0} files)` : " | clean"}\norigin/master: ${git.origin_master_short_head || "unknown"}\nDifference: ${git.ahead_of_origin_master ?? "?"} ahead / ${git.behind_origin_master ?? "?"} behind`;
+  await refreshConsoleDiscovery();
+  setStatus(`Source compared with origin/master: ${git.ahead_of_origin_master ?? "?"} ahead, ${git.behind_origin_master ?? "?"} behind.`);
+}));
+$("#previewConsoleBuild").addEventListener("click", () => runUiAction(previewConsoleBuild));
+$("#buildConsoleFromSource").addEventListener("click", () => runUiAction(async () => {
+  const plan = await previewConsoleBuild();
+  const git = plan.git || {};
+  const changeNote = git.dirty
+    ? `\n\nThe source tree has ${git.changed_files || 0} changed or untracked file(s). They will be included in this private build.`
+    : "";
+  if (!window.confirm(`Build and select MS-DIAL Console from Git ${git.short_head || "HEAD"}?${changeNote}`)) {
+    setStatus("Local Console build was not started.");
+    return;
+  }
+  const response = await api("/api/agent/console/build", {
+    method: "POST",
+    body: JSON.stringify({
+      source_root: plan.source_root,
+      framework: plan.framework,
+      configuration: plan.configuration,
+      select_after_build: true,
+      confirmed: true,
+    }),
+  });
+  state.consoleBuildJobId = response.job_id;
+  setStatus("Local MS-DIAL Console build started.");
+  await pollConsoleBuild();
+}));
 
 $("#loadParameterTemplate").addEventListener("click", () => runUiAction(async () => {
   const path = $("#templatePath").value.trim();
@@ -3143,6 +3361,9 @@ $("#addMspAnnotator").addEventListener("click", () => {
   state.mspAnnotators.push(defaultMspAnnotatorRow());
   renderMspAnnotators();
 });
+$("#applyTieredAnnotation").addEventListener("click", () => runUiAction(async () => {
+  applyTieredAnnotationPreset();
+}));
 $("#clearMspAnnotators").addEventListener("click", () => {
   state.mspAnnotators = [defaultMspAnnotatorRow({ annotator_id: "msp_annotator_1", priority: 1 })];
   renderMspAnnotators();
@@ -3220,6 +3441,29 @@ $("#tuningHeightNumber").addEventListener("input", () => {
   );
   updateTuningCounts();
 });
+$("#autoTunePeakHeight").addEventListener("click", () => runUiAction(async () => {
+  if (!state.tuningJobId || !state.tuningResult) {
+    throw new Error("Run and complete the zero-threshold diagnostic first.");
+  }
+  $("#autoTunePeakStatus").textContent = "Calculating stepped threshold...";
+  const result = await api("/api/agent/tuning/estimate", {
+    method: "POST",
+    body: JSON.stringify({
+      job_id: state.tuningJobId,
+      target_peak_count_min: 3000,
+      target_peak_count_max: 6000,
+    }),
+  });
+  if (!result.ready) throw new Error(`Diagnostic is ${result.status || "not ready"}.`);
+  const estimate = result.estimate;
+  $("#tuningHeightNumber").value = estimate.minimum_peak_height;
+  $("#tuningHeight").value = Math.min(
+    Number(estimate.minimum_peak_height), Number($("#tuningHeight").max),
+  );
+  updateTuningCounts();
+  $("#autoTunePeakStatus").textContent =
+    `Selected ${estimate.minimum_peak_height} (${estimate.estimated_peak_count} peaks; step ${estimate.threshold_step}).`;
+}));
 connectThresholdInputs("tuneWeighted", "tuneWeightedNumber");
 connectThresholdInputs("tuneSimple", "tuneSimpleNumber");
 connectThresholdInputs("tuneReverse", "tuneReverseNumber");

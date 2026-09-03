@@ -88,6 +88,18 @@ INI file. The exact path is shown in the UI and follows the operating system:
 - macOS: `~/Library/Application Support/MSDIALInteractive/settings.json`
 - Linux: `${XDG_CONFIG_HOME:-~/.config}/msdial-interactive/settings.json`
 
+The panel also distinguishes an installed official distribution, a build from
+a local `MsdialWorkbench` source tree, and a custom executable path. **Check
+official releases** reports stable and prerelease Console channels separately.
+**Build and select local source** runs `dotnet build` and writes
+`msdial-console-build-provenance.json` beside the binary. That record contains
+the Git commit, dirty-tree status, build command, timestamp, and binary SHA-256,
+so private developer builds are not mistaken for published releases.
+**Fetch and compare source** updates only the Git remote-tracking references and
+reports how far the current checkout is ahead of or behind `origin/master`; it
+does not switch branches, merge, or discard local changes. The build action
+always builds the current checkout, including explicitly reported local edits.
+
 **Load template** parses the selected MS-DIAL `Key: Value` parameter file and
 applies supported Guided setup and Annotation values. For Lipidomics,
 `Searched lipid class` controls the checked lipid queries. When a Lipidomics
@@ -112,6 +124,23 @@ Catalog records:
 - [Lipidomics LBM](https://zenodo.org/records/21904324)
 - [GC-MS Kovats RI MSP](https://zenodo.org/records/21910638)
 - [GC-MS Fiehn RI MSP](https://zenodo.org/records/21910646)
+
+### Tiered LC-MS annotation
+
+The Annotation screen can generate an auditable three-tier LC-MS annotation
+profile from one LBM path and one MSP path:
+
+1. LBM rule-based lipid annotation, priority 3
+2. `msp_high_quality`, priority 2, 0.05 Da MS/MS tolerance
+3. `msp_low_quality`, priority 1, 0.25 Da MS/MS tolerance
+
+The same MSP file is referenced by both rows but loaded once by MS-DIAL Console.
+Each row records its own `target_omics`, tolerance, thresholds, annotator ID, and
+evidence tier in `msp_annotator_settings.tsv`. A lower-priority MS/MS match outranks
+a higher-priority precursor-m/z-only suggestion. The broad third tier is retained
+as a tentative candidate source and should not be reported as equivalent to a
+high-quality spectral match. Private MSP files remain at their original local
+paths and are never bundled or redistributed by the app.
 
 ## Publication reporting
 
@@ -273,11 +302,23 @@ rerunning MS-DIAL. The summary separates precursor-mass MSP reference
 candidates from candidates with non-negative MS/MS score fields; MS-DIAL
 exports `-1` for matched-peak fields when no usable MS/MS comparison exists.
 Each MSP slider is paired with a numeric input for exact threshold entry.
+After a diagnostic run, **Auto-select for 3,000-6,000 peaks** chooses a stepped
+threshold from the observed height distribution. It uses 100-unit steps for
+QTOF-type data and 1,000-unit steps for Fourier-transform data; a zero-threshold
+count at or below 6,000 keeps the threshold at zero. Agent-driven repository
+analysis selects a QC nearest the run midpoint, or a mid-run non-blank sample
+when no QC is available.
 Suggested starting values are:
 
 - Thermo RAW or FT-ICR: peak height `10000`, mass slice `0.05`
 - QTOF including Waters, Agilent, and Bruker: peak height `100`, mass slice
   `0.1`
+
+Public repository answer seeds use
+`TimeBasedLinearWeightedMovingAverage`. It is designed to preserve the weighted
+moving-average behavior while accounting for irregular scan intervals, at a
+modest additional computational cost. Other Interactive workflows keep their
+selected template method.
 
 For large LC-MS Console jobs, the Peak detection and alignment panel can write
 `Alignment light mode: True` to `method.txt`. This uses the experimental
@@ -379,7 +420,10 @@ Core MCP tools:
 
 - `msdial_interactive_launch`: start the local web app if needed
 - `msdial_interactive_restart`: replace a recognized incompatible local app
-- `msdial_check_console_path` / `msdial_set_console_path`: discover and persist the Console path
+- `msdial_check_console_path` / `msdial_set_console_path`: discover, inspect, and persist the Console path
+- `msdial_check_official_console_releases`: compare stable and prerelease Console channels
+- `msdial_check_local_console_source`: fetch and compare the checkout with `origin/master`
+- `msdial_build_console_from_local_source`: preview or explicitly confirm a local-source build with provenance
 - `msdial_guided_analysis_plan`: inspect input and return the next question
 - `msdial_list_worksets` / `msdial_save_workset`: reuse scientific choices
 - `msdial_start_peak_count_diagnostic`: tune from one representative file
@@ -396,7 +440,8 @@ Core MCP tools:
 - `msdial_inspect_repository_metadata`: inspect public sample metadata and publication provenance
 - `msdial_project_repository_classes`: project a user-selected metadata hierarchy into MS-DIAL `Class`
 - `msdial_save_repository_metadata`: save reviewed JSON/TSV and optional analysis metadata CSV
-- `msdial_repository_reanalysis_plan`: plan an accession-to-mzTab-M workflow without downloading data
+- `msdial_repository_batch_plan`: split Catalog handoffs into independent analysis-unit runs
+- `msdial_repository_reanalysis_plan`: plan an accession or Catalog analysis unit without downloading data
 - `msdial_download_repository_raw`: start a bounded repository download after explicit confirmation
 - `msdial_repository_raw_metadata_preflight`: cross-check representative raw headers with the local parser
 - `msdial_prepare_repository_reanalysis`: review Class matching and prepare `analysis_files.csv`

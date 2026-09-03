@@ -8,6 +8,8 @@ from msdial_app.agent_workflow import (
     build_guided_plan,
     inspect_analysis_input,
     estimate_peak_height,
+    estimate_peak_height_range,
+    select_peak_tuning_representative,
 )
 from msdial_app.worksets import get_workset, list_worksets, save_workset
 
@@ -32,6 +34,7 @@ class AgentWorkflowTests(unittest.TestCase):
                     "ion_mode": "Negative",
                     "target_omics": "Metabolomics",
                     "parameter_strategy": "default",
+                    "smoothing_method": "TimeBasedLinearWeightedMovingAverage",
                     "execute_rt_correction": False,
                     "library_strategy": "none",
                     "run_qa": False,
@@ -47,6 +50,10 @@ class AgentWorkflowTests(unittest.TestCase):
             self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
             self.assertEqual("lcms", plan["workflow"]["project_type"])
             self.assertEqual("Negative", plan["workflow"]["ion_mode"])
+            self.assertEqual(
+                "TimeBasedLinearWeightedMovingAverage",
+                plan["workflow"]["smoothing_method"],
+            )
             self.assertEqual([], plan["workflow"]["msp_annotators"])
             self.assertTrue(plan["workflow"]["selected_adducts"])
 
@@ -207,6 +214,77 @@ class AgentWorkflowTests(unittest.TestCase):
 
         self.assertEqual(4, result["minimum_peak_height"])
         self.assertEqual(2, result["estimated_peak_count"])
+
+    def test_peak_height_range_estimate_respects_instrument_step(self) -> None:
+        heights = list(range(1, 10001))
+
+        qtof = estimate_peak_height_range(heights, 3000, 6000, 100)
+        ft = estimate_peak_height_range(heights, 3000, 6000, 1000)
+
+        self.assertEqual(0, qtof["minimum_peak_height"] % 100)
+        self.assertEqual(0, ft["minimum_peak_height"] % 1000)
+        self.assertTrue(qtof["within_target_range"])
+        self.assertTrue(ft["within_target_range"])
+
+    def test_peak_height_range_keeps_zero_when_diagnostic_is_below_upper_bound(self) -> None:
+        result = estimate_peak_height_range(list(range(2500)), 3000, 6000, 100)
+
+        self.assertEqual(0, result["minimum_peak_height"])
+        self.assertEqual(2500, result["estimated_peak_count"])
+        self.assertFalse(result["within_target_range"])
+
+    def test_peak_tuning_representative_prefers_midrun_qc_and_ft_step(self) -> None:
+        files = [
+            {
+                "file_path": "D:/sample-1.raw",
+                "file_name": "sample-1",
+                "file_type": "Sample",
+                "analytical_order": 1,
+                "instrument_family": "Fourier-transform MS",
+            },
+            {
+                "file_path": "D:/qc-1.raw",
+                "file_name": "qc-1",
+                "file_type": "QC",
+                "analytical_order": 5,
+                "instrument_family": "Fourier-transform MS",
+            },
+            {
+                "file_path": "D:/qc-2.raw",
+                "file_name": "qc-2",
+                "file_type": "QC",
+                "analytical_order": 9,
+                "instrument_family": "Fourier-transform MS",
+            },
+        ]
+
+        result = select_peak_tuning_representative(files)
+
+        self.assertEqual("D:/qc-1.raw", result["file_path"])
+        self.assertEqual(1000, result["threshold_step"])
+        self.assertEqual("QC-nearest-run-midpoint", result["selection_reason"])
+
+    def test_zero_peak_height_is_an_accepted_auto_tuning_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "sample.mzML").write_text("", encoding="ascii")
+            plan = build_guided_plan(
+                str(root),
+                {
+                    "project_type": "lcms",
+                    "ion_mode": "Negative",
+                    "target_omics": "Metabolomics",
+                    "parameter_strategy": "auto_peak_range",
+                    "minimum_peak_height": 0,
+                    "execute_rt_correction": False,
+                    "library_strategy": "none",
+                    "run_qa": False,
+                    "generate_materials_methods": False,
+                },
+            )
+
+        self.assertFalse(plan["requires_diagnostic"])
+        self.assertFalse(any("Peak-count tuning" in item for item in plan["blockers"]))
 
     def test_builtin_and_user_worksets_are_available(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.dict(

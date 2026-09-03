@@ -9,7 +9,13 @@ from typing import Any
 
 APP_DIRECTORY_NAME = "MSDIALInteractive"
 SETTINGS_FILENAME = "settings.json"
-PATH_SETTING_KEYS = {"console_path", "template_path", "queries_path"}
+PATH_SETTING_KEYS = {
+    "console_path",
+    "console_source_kind",
+    "console_source_root",
+    "template_path",
+    "queries_path",
+}
 
 
 def user_config_directory() -> Path:

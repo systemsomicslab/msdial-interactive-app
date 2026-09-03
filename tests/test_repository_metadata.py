@@ -178,6 +178,50 @@ class RepositoryMetadataTests(unittest.TestCase):
         self.assertEqual("Control", applied["files"][0]["class_id"])
         self.assertEqual("SWATH", applied["files"][0]["acquisition_type"])
 
+    def test_default_hierarchy_excludes_technical_namespaces(self) -> None:
+        technical = metadata_workspace(
+            {
+                "sample_metadata": [
+                    {
+                        "sample_id": "S1",
+                        "raw_file": "S1.wiff",
+                        "values": {
+                            "analyticalCondition / Collision energy": "14 eV",
+                            "softwareSetting / Processing mode": "A",
+                        },
+                    },
+                    {
+                        "sample_id": "S2",
+                        "raw_file": "S2.wiff",
+                        "values": {
+                            "analyticalCondition / Collision energy": "18 eV",
+                            "softwareSetting / Processing mode": "B",
+                        },
+                    },
+                    {
+                        "sample_id": "S3",
+                        "raw_file": "S3.wiff",
+                        "values": {
+                            "analyticalCondition / Collision energy": "14 eV",
+                            "softwareSetting / Processing mode": "A",
+                        },
+                    },
+                ]
+            }
+        )
+        biological = metadata_workspace(
+            {
+                "sample_metadata": [
+                    {"sample_id": "A1", "values": {"sample / Cell line": "A"}},
+                    {"sample_id": "A2", "values": {"sample / Cell line": "A"}},
+                    {"sample_id": "B1", "values": {"sample / Cell line": "B"}},
+                ]
+            }
+        )
+
+        self.assertEqual([], technical["hierarchy"])
+        self.assertEqual(["sample / Cell line"], biological["hierarchy"])
+
     def test_class_token_is_split_safe(self) -> None:
         self.assertEqual("Control-North", class_token("Control_North"))
         self.assertEqual("対照群-東京", class_token("対照群_東京"))

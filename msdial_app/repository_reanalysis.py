@@ -34,8 +34,8 @@ PROJECT_RESULT_SUFFIXES = {".arf", ".arf2", ".dcl", ".mdproject"}
 @dataclass
 class RepositoryFile:
     name: str
-    size_bytes: int
-    url: str
+    size_bytes: int = 0
+    url: str = ""
     role: str = "raw"
     checksum: str = ""
 
@@ -44,6 +44,8 @@ class RepositoryFile:
 class RepositoryProject:
     repository: str
     accession: str
+    analysis_unit_id: str = ""
+    source_subrecord_id: str = ""
     title: str = ""
     description: str = ""
     public_url: str = ""
@@ -57,6 +59,7 @@ class RepositoryProject:
     sample_count: int | None = None
     files: list[RepositoryFile] = field(default_factory=list)
     publications: list[dict[str, str]] = field(default_factory=list)
+    publication_status: str = "none_recorded"
     metadata_sources: list[str] = field(default_factory=list)
     sample_metadata: list[dict[str, Any]] = field(default_factory=list)
     repository_metadata: dict[str, Any] = field(default_factory=dict)
@@ -67,6 +70,14 @@ class RepositoryProject:
     review_reasons: list[str] = field(default_factory=list)
     eligible: bool = False
     exclusion_reasons: list[str] = field(default_factory=list)
+    download_scope: dict[str, Any] = field(default_factory=dict)
+    class_proposal: dict[str, Any] | None = None
+    blocking_reasons: list[str] = field(default_factory=list)
+    pending_decisions: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.publications and self.publication_status == "none_recorded":
+            self.publication_status = "recorded"
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -78,6 +89,8 @@ class EligibilityPolicy:
     max_samples: int = 40
     require_known_size: bool = True
     require_untargeted: bool = True
+    allowed_separations: tuple[str, ...] = ("LC-MS",)
+    allowed_acquisition_modes: tuple[str, ...] = ("DDA", "DIA", "AIF", "SWATH")
 
 
 class RepositoryHttpClient:
@@ -588,21 +601,21 @@ ADAPTERS = {
 def evaluate_eligibility(project: RepositoryProject, policy: EligibilityPolicy) -> RepositoryProject:
     reasons = []
     review_reasons = []
-    if project.separation not in {"GC-MS", "LC-MS"}:
-        reasons.append("Separation is not confidently GC-MS or LC-MS.")
+    if project.separation == "Unknown":
+        review_reasons.append("Confirm LC-MS separation from repository context or raw scan metadata.")
+    elif project.separation not in set(policy.allowed_separations):
+        reasons.append("Repository reanalysis currently accepts LC-MS data only.")
     if project.separation == "LC-MS":
         if project.acquisition_mode == "Unknown":
-            review_reasons.append("Inspect raw scan metadata to distinguish DDA/DIA/AIF from unsupported acquisition modes.")
-        elif project.acquisition_mode not in {"DDA", "DIA", "AIF"}:
-            reasons.append("LC-MS acquisition is not scan-based DDA/DIA/AIF.")
+            review_reasons.append("Inspect raw scan metadata to distinguish DDA from DIA/AIF/SWATH.")
+        elif project.acquisition_mode not in set(policy.allowed_acquisition_modes):
+            reasons.append("Repository reanalysis currently accepts untargeted DDA or DIA/AIF/SWATH LC-MS/MS acquisition only.")
         if project.ion_mode == "Unknown":
             review_reasons.append("Confirm LC-MS ion mode from raw scan metadata.")
         elif project.ion_mode == "Both":
             review_reasons.append(
                 "Distinguish polarity-switching data from separate positive/negative files before analysis."
             )
-    if project.separation == "GC-MS" and project.acquisition_mode in {"MRM", "SRM", "SIM"}:
-        reasons.append("Targeted GC-MS SIM/MRM/SRM is outside this pilot.")
     if policy.require_untargeted:
         if project.untargeted is False:
             reasons.append("Repository metadata identifies the study as targeted.")
@@ -697,11 +710,19 @@ def create_download_lease(
     )
     if not downloadable:
         raise ValueError("Only an eligible or explicitly approved preflight project can receive a download lease.")
-    if project.total_download_bytes > maximum_bytes:
-        raise ValueError("Project exceeds the download lease size limit.")
+    required_download_bytes = int(
+        project.download_scope.get("bundle_bytes")
+        or project.total_download_bytes
+        or 0
+    )
+    if required_download_bytes > maximum_bytes:
+        raise ValueError(
+            f"Required repository bundle is {required_download_bytes} bytes; "
+            f"the download lease limit is {maximum_bytes} bytes."
+        )
     client = client or RepositoryHttpClient()
     adapter_type = ADAPTERS.get(project.repository)
-    if adapter_type and hasattr(adapter_type, "inspect_metadata"):
+    if not project.analysis_unit_id and adapter_type and hasattr(adapter_type, "inspect_metadata"):
         try:
             detailed = adapter_type(client).inspect_metadata(project.accession)
             project.publications = detailed.publications
@@ -710,6 +731,8 @@ def create_download_lease(
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as error:
             project.warnings.append(f"Detailed repository sample metadata was unavailable: {error}")
     root = workspace_root.resolve() / project.repository / project.accession
+    if project.analysis_unit_id:
+        root = root / project.analysis_unit_id
     raw_root = root / "raw"
     download_root = raw_root / "downloads"
     data_root = raw_root / "data"
@@ -731,7 +754,7 @@ def create_download_lease(
         destination = download_root / filename if archive else data_root / _safe_relative_name(item.name)
         def item_progress(received: int, declared: int) -> None:
             if progress_callback:
-                known_total = project.total_download_bytes or (
+                known_total = required_download_bytes or (
                     downloaded_bytes + declared if declared else 0
                 )
                 progress_callback(
@@ -761,14 +784,17 @@ def create_download_lease(
                 total_objects,
                 item.name,
                 downloaded_bytes,
-                project.total_download_bytes or downloaded_bytes,
+                required_download_bytes or downloaded_bytes,
             )
     extracted = []
     for item in downloads:
         archive_path = Path(item["path"])
         if archive_path.parent == download_root and _is_archive(archive_path):
             extracted.extend(_extract_archive(archive_path, data_root, maximum_bytes * 5))
-    inputs = _find_msdial_inputs(data_root)
+    selected_extracted = _filter_project_allowlist_paths(extracted, data_root, project)
+    checksum_validation = _verify_project_allowlist_checksums(data_root, project)
+    all_inputs = _find_msdial_inputs(data_root)
+    inputs = _filter_inputs_by_project_allowlist(all_inputs, data_root, project)
     analysis_input = _common_input_path(inputs, data_root)
     manifest = {
         "schema": "msdial-public-reanalysis-run.v1",
@@ -780,8 +806,11 @@ def create_download_lease(
         "input_directory": str(data_root),
         "output_directory": str(output),
         "downloads": downloads,
-        "extracted_files": extracted,
+        "extracted_files": selected_extracted,
+        "ignored_extracted_file_count": len(extracted) - len(selected_extracted),
+        "allowlist_checksum_validation": checksum_validation,
         "input_candidates": inputs,
+        "ignored_input_candidate_count": len(all_inputs) - len(inputs),
         "analysis_input_path": analysis_input,
         "execution_allowed": project.eligible,
         "cleanup_allowed": False,
@@ -967,6 +996,117 @@ def project_from_dict(value: dict[str, Any]) -> RepositoryProject:
     data = dict(value)
     data["files"] = [RepositoryFile(**item) for item in data.get("files", [])]
     return RepositoryProject(**data)
+
+
+def _filter_inputs_by_project_allowlist(
+    inputs: list[str], data_root: Path, project: RepositoryProject
+) -> list[str]:
+    if not project.analysis_unit_id:
+        return inputs
+    allowed = _project_allowlist(project, analysis_only=True)
+    if not allowed:
+        raise ValueError(f"Analysis unit {project.analysis_unit_id} has an empty file allow-list.")
+
+    selected = [
+        item for item in inputs if _path_matches_allowlist(Path(item), data_root, allowed)
+    ]
+    if not selected:
+        raise ValueError(
+            f"Downloaded content did not contain an MS-DIAL input listed for analysis unit "
+            f"{project.analysis_unit_id}. Refusing to fall back to accession-level inputs."
+        )
+    return selected
+
+
+def _project_allowlist(
+    project: RepositoryProject, *, analysis_only: bool = False
+) -> list[str]:
+    return [
+        _safe_relative_name(item.name).as_posix().casefold()
+        for item in project.files
+        if item.name and (not analysis_only or item.role == "raw")
+    ]
+
+
+def _path_matches_allowlist(
+    path: Path,
+    data_root: Path,
+    allowed: list[str],
+    *,
+    allow_directory_descendants: bool = False,
+) -> bool:
+    try:
+        relative = path.resolve().relative_to(data_root.resolve()).as_posix().casefold()
+    except ValueError:
+        return False
+    candidates = {relative}
+    if relative.startswith("files/"):
+        candidates.add(relative[6:])
+    parts = relative.split("/")
+    if len(parts) > 1:
+        without_archive_root = "/".join(parts[1:])
+        candidates.add(without_archive_root)
+        if without_archive_root.startswith("files/"):
+            candidates.add(without_archive_root[6:])
+    for candidate in candidates:
+        for expected in allowed:
+            if candidate == expected:
+                return True
+            if allow_directory_descendants and candidate.startswith(expected.rstrip("/") + "/"):
+                if Path(expected).suffix.casefold() in {".d", ".raw"}:
+                    return True
+    return False
+
+
+def _filter_project_allowlist_paths(
+    paths: list[str], data_root: Path, project: RepositoryProject
+) -> list[str]:
+    if not project.analysis_unit_id:
+        return paths
+    allowed = _project_allowlist(project)
+    return [
+        item
+        for item in paths
+        if _path_matches_allowlist(
+            Path(item), data_root, allowed, allow_directory_descendants=True
+        )
+    ]
+
+
+def _verify_project_allowlist_checksums(
+    data_root: Path, project: RepositoryProject
+) -> dict[str, Any]:
+    if not project.analysis_unit_id:
+        return {"required": False, "verified": 0, "skipped": 0}
+    files = [path for path in data_root.rglob("*") if path.is_file()]
+    verified = 0
+    skipped = 0
+    for item in project.files:
+        checksum = item.checksum.strip().casefold()
+        if not checksum:
+            skipped += 1
+            continue
+        algorithm = {32: "md5", 40: "sha1", 64: "sha256"}.get(len(checksum))
+        if algorithm is None or not re.fullmatch(r"[0-9a-f]+", checksum):
+            raise ValueError(f"Unsupported checksum for allow-listed file {item.name}.")
+        expected = _safe_relative_name(item.name).as_posix().casefold()
+        matches = [
+            path
+            for path in files
+            if _path_matches_allowlist(path, data_root, [expected])
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Allow-listed file {item.name} resolved to {len(matches)} extracted files."
+            )
+        digest = hashlib.new(algorithm)
+        with matches[0].open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest().casefold() != checksum:
+            raise ValueError(f"{algorithm.upper()} checksum mismatch for {item.name}.")
+        verified += 1
+    return {"required": verified > 0, "verified": verified, "skipped": skipped}
 
 
 def _safe_relative_name(value: str) -> Path:
@@ -1421,11 +1561,20 @@ def _extract_publications(*values: Any) -> list[dict[str, str]]:
             pubmed = _metadata_scalar(
                 lowered.get("pubmedid") or lowered.get("pubmed id") or lowered.get("pmid")
             )
+            if pubmed.casefold().startswith("10.") and "/" in pubmed:
+                doi = doi or pubmed
+                pubmed = ""
             title = _metadata_scalar(
                 lowered.get("title") or lowered.get("publication title") or lowered.get("citation")
             )
             if doi or pubmed or title:
-                records.append({"title": title, "doi": doi, "pubmed_id": pubmed})
+                record = {"title": title, "doi": doi, "pubmed_id": pubmed}
+                if not any(
+                    item.get("doi", "").casefold() == doi.casefold()
+                    and item.get("pubmed_id", "").casefold() == pubmed.casefold()
+                    for item in records
+                ):
+                    records.append(record)
     joined = json.dumps(values, ensure_ascii=False) if values else ""
     for doi in re.findall(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", joined, re.IGNORECASE):
         cleaned = doi.rstrip(".,;)]}")
@@ -1488,7 +1637,7 @@ def _metabolights_files(
 def _metabolights_group_rank(group: dict[str, Any]) -> tuple[int, int, int, int]:
     separation = group.get("separation")
     acquisition = group.get("acquisition")
-    supported = separation == "GC-MS" or (separation == "LC-MS" and acquisition in {"DDA", "DIA", "AIF"})
+    supported = separation == "LC-MS" and acquisition in {"DDA", "DIA", "AIF", "SWATH"}
     known_size = group.get("total", 0) > 0
     has_files = bool(group.get("files"))
     # Prefer a directly actionable assay, then one with downloadable files and a known bounded size.

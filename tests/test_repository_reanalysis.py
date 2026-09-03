@@ -179,6 +179,41 @@ class RepositoryReanalysisTests(unittest.TestCase):
         self.assertEqual("excluded", result.selection_status)
         self.assertTrue(result.exclusion_reasons)
 
+    def test_repository_campaign_accepts_dda_and_dia_but_excludes_gcms(self) -> None:
+        lcms_projects = [
+            RepositoryProject(
+                repository="test",
+                accession=mode,
+                separation="LC-MS",
+                acquisition_mode=mode,
+                ion_mode="Negative",
+                untargeted=True,
+                files=[RepositoryFile("a.raw", 100, "https://example.org/a.raw")],
+                total_download_bytes=100,
+            )
+            for mode in ("DDA", "DIA", "AIF", "SWATH")
+        ]
+        gcms = RepositoryProject(
+            repository="test",
+            accession="GC",
+            separation="GC-MS",
+            acquisition_mode="Scan",
+            ion_mode="Positive",
+            untargeted=True,
+            files=[RepositoryFile("a.cdf", 100, "https://example.org/a.cdf")],
+            total_download_bytes=100,
+        )
+
+        lcms_results = [
+            evaluate_eligibility(project, EligibilityPolicy(max_download_bytes=1000))
+            for project in lcms_projects
+        ]
+        gc_result = evaluate_eligibility(gcms, EligibilityPolicy(max_download_bytes=1000))
+
+        self.assertTrue(all(result.selection_status == "eligible" for result in lcms_results))
+        self.assertEqual("excluded", gc_result.selection_status)
+        self.assertIn("LC-MS data only", " ".join(gc_result.exclusion_reasons))
+
     def test_gc_sim_is_excluded(self) -> None:
         project = RepositoryProject(
             repository="test",
@@ -351,6 +386,20 @@ class RepositoryReanalysisTests(unittest.TestCase):
             self.assertEqual(8, updates[-1][3])
             self.assertEqual(8, updates[-1][4])
             self.assertEqual(1, len(result["input_candidates"]))
+
+    def test_download_lease_uses_bundle_size_for_safety_limit(self) -> None:
+        project = RepositoryProject(
+            repository="mb_post",
+            accession="MPST-BUNDLE",
+            eligible=True,
+            selection_status="eligible",
+            files=[RepositoryFile("sample.mzML", 8, "https://example.org/bundle.tar")],
+            total_download_bytes=8,
+            download_scope={"bundle_bytes": 200},
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "Required repository bundle"):
+                create_download_lease(project, Path(temporary), 100)
 
 
 if __name__ == "__main__":

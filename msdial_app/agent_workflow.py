@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import copy
+import math
+from bisect import bisect_left
 from pathlib import Path
 from typing import Any
 
+from .annotation_pipeline import apply_tiered_lcms_annotation
 from .library_catalog import catalog_status
 from .user_settings import load_user_settings
 from .workflow import (
@@ -23,7 +26,8 @@ RESOURCES = ROOT / "resources"
 SUPPORTED_PROJECT_TYPES = {"lcms", "gcms"}
 SUPPORTED_ANSWER_KEYS = {
     "project_type", "ion_mode", "target_omics", "parameter_strategy",
-    "target_peak_count", "minimum_peak_height", "acquisition_type",
+    "target_peak_count", "target_peak_count_min", "target_peak_count_max",
+    "minimum_peak_height", "smoothing_method", "acquisition_type",
     "execute_rt_correction", "rt_correction_anchor_path",
     "rt_correction_selection_path", "rt_correction_peak_selection_mode",
     "rt_correction_peak_selection_rt_weight", "library_strategy", "libraries",
@@ -102,9 +106,20 @@ def build_guided_plan(
             blockers.append(
                 f"Official library '{catalog_id}' is not downloaded. Ask for confirmation, then download it."
             )
-    if merged.get("parameter_strategy") == "target_peak_count" and not merged.get(
-        "minimum_peak_height"
-    ):
+    if merged.get("library_strategy") == "tiered_lipid_msp":
+        item = next(
+            (entry for entry in catalog_status() if entry["id"] == "lipidomics"),
+            None,
+        )
+        official_library = item
+        if item and not item.get("downloaded"):
+            blockers.append(
+                "The official lipidomics LBM library is not downloaded. Ask for confirmation, then download it."
+            )
+    tuning_strategy = merged.get("parameter_strategy") in {
+        "target_peak_count", "auto_peak_range"
+    }
+    if tuning_strategy and not _has_minimum_peak_height(merged):
         blockers.append(
             "Peak-count tuning requires a diagnostic run and an accepted minimum_peak_height."
         )
@@ -133,8 +148,7 @@ def build_guided_plan(
         "blockers": list(dict.fromkeys(blockers)),
         "official_library": official_library,
         "ready_to_prepare": not questions and not blockers,
-        "requires_diagnostic": merged.get("parameter_strategy") == "target_peak_count"
-        and not merged.get("minimum_peak_height"),
+        "requires_diagnostic": tuning_strategy and not _has_minimum_peak_height(merged),
         "post_run_actions": {
             "quality_assurance": _as_bool(merged.get("run_qa")),
             "internal_standards": merged.get("internal_standards", []),
@@ -161,6 +175,129 @@ def estimate_peak_height(heights: list[float], target_peak_count: int) -> dict[s
         "method": "height order statistic",
         "note": "Review this threshold in the Tune parameters view before production use.",
     }
+
+
+def estimate_peak_height_range(
+    heights: list[float],
+    minimum_peak_count: int = 3000,
+    maximum_peak_count: int = 6000,
+    threshold_step: int = 100,
+) -> dict[str, Any]:
+    values = sorted(float(value) for value in heights if float(value) >= 0)
+    minimum = max(0, int(minimum_peak_count))
+    maximum = max(minimum, int(maximum_peak_count))
+    step = max(1, int(threshold_step))
+    if not values:
+        raise ValueError("The diagnostic result contains no peak heights.")
+
+    if len(values) <= maximum:
+        return {
+            "minimum_peak_height": 0,
+            "target_peak_count_min": minimum,
+            "target_peak_count_max": maximum,
+            "estimated_peak_count": len(values),
+            "diagnostic_peak_count": len(values),
+            "threshold_step": step,
+            "within_target_range": minimum <= len(values) <= maximum,
+            "method": "quantized height-range search",
+            "note": (
+                "The zero-threshold diagnostic did not exceed the upper peak-count bound; "
+                "Minimum peak height remains 0."
+            ),
+        }
+
+    candidates = {0}
+    for value in values:
+        lower = max(0, math.floor(value / step) * step)
+        candidates.add(lower)
+        candidates.add(lower + step)
+    midpoint = (minimum + maximum) / 2
+
+    def candidate_score(threshold: int) -> tuple[float, float, int]:
+        count = len(values) - bisect_left(values, threshold)
+        distance = max(minimum - count, 0, count - maximum)
+        return distance, abs(count - midpoint), threshold
+
+    threshold = min(candidates, key=candidate_score)
+    detected = len(values) - bisect_left(values, threshold)
+    return {
+        "minimum_peak_height": threshold,
+        "target_peak_count_min": minimum,
+        "target_peak_count_max": maximum,
+        "estimated_peak_count": detected,
+        "diagnostic_peak_count": len(values),
+        "threshold_step": step,
+        "within_target_range": minimum <= detected <= maximum,
+        "method": "quantized height-range search",
+        "note": (
+            "The threshold is constrained to the instrument-family step. Review the "
+            "diagnostic count when no stepped threshold can enter the requested range."
+        ),
+    }
+
+
+def select_peak_tuning_representative(
+    files: list[dict[str, Any]], requested_file: str = ""
+) -> dict[str, Any]:
+    if not files:
+        raise ValueError("No analysis file is available for peak-count tuning.")
+    requested = str(requested_file or "").strip().casefold()
+    if requested:
+        selected = next(
+            (item for item in files if str(item.get("file_path") or "").casefold() == requested),
+            None,
+        )
+        if selected is None:
+            raise ValueError("The requested representative file is not part of this analysis unit.")
+        reason = "user-selected"
+    else:
+        qc = [item for item in files if _is_qc_file(item)]
+        candidates = qc or [item for item in files if not _is_blank_file(item)] or list(files)
+        orders = [float(item.get("analytical_order") or 0) for item in files]
+        midpoint = (min(orders) + max(orders)) / 2 if orders else 0
+        selected = min(
+            candidates,
+            key=lambda item: (
+                abs(float(item.get("analytical_order") or 0) - midpoint),
+                str(item.get("file_path") or "").casefold(),
+            ),
+        )
+        reason = "QC-nearest-run-midpoint" if qc else "non-blank-nearest-run-midpoint"
+    instrument_family = str(selected.get("instrument_family") or "Unknown")
+    family = instrument_family.casefold()
+    threshold_step = 1000 if ("fourier" in family or "ft-icr" in family) else 100
+    return {
+        "file": selected,
+        "file_path": str(selected.get("file_path") or ""),
+        "file_name": str(selected.get("file_name") or ""),
+        "selection_reason": reason,
+        "instrument_family": instrument_family,
+        "threshold_step": threshold_step,
+        "target_peak_count_min": 3000,
+        "target_peak_count_max": 6000,
+    }
+
+
+def _has_minimum_peak_height(answers: dict[str, Any]) -> bool:
+    value = answers.get("minimum_peak_height")
+    return value is not None and str(value).strip() != ""
+
+
+def _is_qc_file(item: dict[str, Any]) -> bool:
+    values = (
+        item.get("file_type"), item.get("class_id"), item.get("file_name")
+    )
+    return any(str(value or "").strip().casefold() == "qc" for value in values[:2]) or any(
+        token == "qc"
+        for token in str(values[2] or "").replace("-", "_").casefold().split("_")
+    )
+
+
+def _is_blank_file(item: dict[str, Any]) -> bool:
+    return any(
+        str(item.get(key) or "").strip().casefold() == "blank"
+        for key in ("file_type", "class_id")
+    )
 
 
 def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
@@ -191,8 +328,8 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
     if not answers.get("parameter_strategy"):
         ask(
             "parameter_strategy",
-            "Use template defaults, or tune Minimum peak height toward a target peak count?",
-            ["default", "target_peak_count"],
+            "Use template defaults, automatically tune to 3,000-6,000 peaks, or choose an exact target?",
+            ["default", "auto_peak_range", "target_peak_count"],
         )
     elif answers.get("parameter_strategy") == "target_peak_count" and not answers.get(
         "target_peak_count"
@@ -221,12 +358,17 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
         ask(
             "library_strategy",
             "Which annotation libraries should be used?",
-            ["official", "existing", "none"],
+            ["official", "existing", "tiered_lipid_msp", "none"],
         )
     elif answers.get("library_strategy") == "existing" and not _has_existing_library(answers):
         ask(
             "libraries",
             "Provide msp_paths and optional text_paths/lbm_path for the existing libraries.",
+        )
+    elif answers.get("library_strategy") == "tiered_lipid_msp" and not _has_msp_library(answers):
+        ask(
+            "libraries",
+            "Provide one msp_paths entry for the high- and low-quality MSP tiers. The official LBM library is used as tier 1.",
         )
     if project_type == "lcms" and "run_qa" not in answers:
         ask("run_qa", "Generate the LC-MS quality-assurance report after analysis?", ["true", "false"])
@@ -299,6 +441,8 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             ),
         }
     )
+    if answers.get("smoothing_method"):
+        state["smoothing_method"] = str(answers["smoothing_method"])
     if answers.get("minimum_peak_height") is not None:
         state["minimum_peak_height"] = float(answers["minimum_peak_height"])
     acquisition_type = answers.get("acquisition_type")
@@ -322,7 +466,7 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             item
             for item in queries
             if item.get("ion_mode") == ion_mode
-            and state["target_omics"] == "Lipidomics"
+            and (state["target_omics"] == "Lipidomics" or state.get("lbm_path"))
         ]
     else:
         state.update(
@@ -388,6 +532,27 @@ def _apply_libraries(
     libraries = dict(answers.get("libraries") or {})
     msp_paths = _path_list(libraries.get("msp_paths"))
     text_paths = _path_list(libraries.get("text_paths"))
+    if strategy == "tiered_lipid_msp":
+        lbm_item = next(entry for entry in catalog_status() if entry["id"] == "lipidomics")
+        lbm_path = str(lbm_item.get("local_path", ""))
+        apply_tiered_lcms_annotation(state, lbm_path, msp_paths[0])
+        state["library_provenance"] = [
+            {
+                "path": lbm_path,
+                "version": str(lbm_item["record_id"]),
+                "source": lbm_item["record_url"],
+                "doi": lbm_item["doi"],
+                "license": lbm_item["license"],
+            },
+            {
+                "path": str(msp_paths[0]),
+                "version": str(libraries.get("msp_version", "")),
+                "source": str(libraries.get("msp_source", "")),
+                "doi": str(libraries.get("msp_doi", "")),
+                "license": str(libraries.get("msp_license", "institutional/private")),
+            },
+        ]
+        return
     for index, path in enumerate(msp_paths, start=1):
         state["msp_annotators"].append(_msp_row(path, index))
     for index, path in enumerate(text_paths, start=1):
@@ -460,6 +625,11 @@ def _has_existing_library(answers: dict[str, Any]) -> bool:
         or libraries.get("text_paths")
         or libraries.get("lbm_path")
     )
+
+
+def _has_msp_library(answers: dict[str, Any]) -> bool:
+    libraries = answers.get("libraries") or {}
+    return bool(_path_list(libraries.get("msp_paths")))
 
 
 def _path_list(value: Any) -> list[str]:

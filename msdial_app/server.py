@@ -20,7 +20,19 @@ from typing import Any
 
 from . import __version__
 from .agent_bridge import create_datamining_handoff, summarize_job, summarize_jobs
-from .agent_workflow import build_guided_plan, estimate_peak_height
+from .agent_workflow import (
+    build_guided_plan,
+    estimate_peak_height,
+    estimate_peak_height_range,
+    select_peak_tuning_representative,
+)
+from .console_management import (
+    build_local_console,
+    fetch_and_compare_source,
+    fetch_and_compare_source,
+    fetch_official_console_releases,
+    prepare_local_console_build,
+)
 from .knowledge import KnowledgeBase, next_parameter_question
 from .library_catalog import catalog_status, download_library, library_directory
 from .literature import evaluate_literature_evidence
@@ -49,6 +61,7 @@ from .workflow import (
     console_version,
     console_capabilities,
     discover_console_paths,
+    inspect_console_path,
     expand_paths,
     expand_paths_report,
     find_mdpeak,
@@ -273,6 +286,7 @@ def _application_config() -> dict[str, Any]:
         "library_directory": str(library_directory()),
         "library_catalog": catalog_status(),
         "console_discovery": console_discovery,
+        "console_source_root": str(saved.get("console_source_root", "")),
         "lipid_queries": lipid_queries,
     }
 
@@ -452,8 +466,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(response)
             return
         if parsed.path == "/api/agent/status":
+            query = urllib.parse.parse_qs(parsed.query)
+            limit = max(0, min(100, int(query.get("limit", ["5"])[0])))
+            include_artifacts = query.get("include_artifacts", ["false"])[0].casefold() in {
+                "1", "true", "yes"
+            }
             with JOBS_LOCK:
-                response = summarize_jobs(dict(JOBS))
+                response = summarize_jobs(
+                    dict(JOBS), limit=limit, include_artifacts=include_artifacts
+                )
             self._json(response)
             return
         if parsed.path == "/api/agent/worksets":
@@ -512,6 +533,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/agent/console/check":
                 self._json(discover_console_paths(body.get("search_roots", [])))
+            elif parsed.path == "/api/agent/console/releases":
+                self._json(fetch_official_console_releases())
+            elif parsed.path == "/api/agent/console/source-status":
+                self._json(fetch_and_compare_source(body.get("source_root", "")))
             elif parsed.path == "/api/agent/console/set":
                 path = Path(str(body.get("console_path", ""))).expanduser().resolve()
                 if not path.is_file() or path.name.casefold() not in {
@@ -520,15 +545,44 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError(
                         "console_path must identify an existing MSDIALCUI.exe or MSDIALCUI.dll."
                     )
-                saved = save_path_settings({"console_path": str(path)})
-                self._json(
+                inspected = inspect_console_path(path, "saved setting")
+                source_root = str((inspected.get("git") or {}).get("source_root", ""))
+                saved = save_path_settings(
                     {
-                        "console_path": saved["console_path"],
-                        "version": console_version(saved["console_path"]),
-                        **console_capabilities(saved["console_path"]),
-                        "settings_file": str(settings_path()),
+                        "console_path": str(path),
+                        "console_source_kind": inspected.get("source_kind", "custom"),
+                        "console_source_root": source_root,
                     }
                 )
+                self._json({**inspected, "console_path": saved["console_path"], "settings_file": str(settings_path())})
+            elif parsed.path == "/api/agent/console/build":
+                plan = prepare_local_console_build(
+                    body.get("source_root", ""),
+                    body.get("framework", "net48"),
+                    body.get("configuration", "Release"),
+                )
+                if not bool(body.get("confirmed")):
+                    self._json({"confirmation_required": True, "plan": plan})
+                else:
+                    job_id = uuid.uuid4().hex
+                    with JOBS_LOCK:
+                        JOBS[job_id] = {
+                            "id": job_id,
+                            "status": "queued",
+                            "kind": "console_build",
+                            "logs": [],
+                            "preparation": plan,
+                            "exit_code": None,
+                            "result": None,
+                            "created_at": dt.datetime.now().astimezone().isoformat(),
+                        }
+                        _persist_jobs_locked()
+                    threading.Thread(
+                        target=_run_console_build_job,
+                        args=(job_id, plan, bool(body.get("select_after_build", True))),
+                        daemon=True,
+                    ).start()
+                    self._json({"job_id": job_id, "plan": plan})
             elif parsed.path == "/api/templates/load":
                 self._json(
                     load_parameter_template(
@@ -608,6 +662,16 @@ class Handler(BaseHTTPRequestHandler):
                 if maximum_gb <= 0:
                     raise ValueError("Maximum download size must be greater than zero.")
                 maximum_bytes = int(maximum_gb * 1024**3)
+                required_download_bytes = int(
+                    project.download_scope.get("bundle_bytes")
+                    or project.total_download_bytes
+                    or 0
+                )
+                if required_download_bytes > maximum_bytes:
+                    raise ValueError(
+                        f"Required repository bundle is {required_download_bytes} bytes; "
+                        f"the configured limit is {maximum_bytes} bytes."
+                    )
                 evaluated = evaluate_eligibility(
                     project,
                     EligibilityPolicy(
@@ -623,7 +687,7 @@ class Handler(BaseHTTPRequestHandler):
                 ):
                     reasons = evaluated.exclusion_reasons or evaluated.review_reasons
                     raise ValueError(
-                        "This repository project is not ready for an untargeted GC-MS/LC-MS download: "
+                        "This repository project is not ready for the untargeted LC-MS/MS DDA/DIA campaign: "
                         + "; ".join(reasons or ["review repository metadata first"])
                     )
                 retention = str(body.get("raw_retention_policy") or "keep")
@@ -638,7 +702,7 @@ class Handler(BaseHTTPRequestHandler):
                         "logs": [],
                         "result": None,
                         "received": 0,
-                        "total": evaluated.total_download_bytes,
+                        "total": required_download_bytes,
                         "progress": 0,
                         "speed_bps": 0,
                         "eta_seconds": None,
@@ -875,14 +939,18 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     )
                     return
-                representative = str(body.get("representative_file", "")).strip()
-                if not representative:
-                    representative = workflow["files"][0]["file_path"]
+                profile = select_peak_tuning_representative(
+                    workflow["files"], str(body.get("representative_file", ""))
+                )
+                representative = profile["file_path"]
                 preparation = prepare_tuning_run(
                     workflow,
                     representative,
                     workflow["output_root"],
                 )
+                preparation["peak_tuning_profile"] = {
+                    key: value for key, value in profile.items() if key != "file"
+                }
                 job_id = uuid.uuid4().hex
                 with JOBS_LOCK:
                     JOBS[job_id] = {
@@ -917,11 +985,31 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     )
                     return
-                estimate = estimate_peak_height(
-                    job["result"].get("heights", []),
-                    int(body.get("target_peak_count", 0)),
+                target = int(body.get("target_peak_count", 0) or 0)
+                profile = (job.get("preparation") or {}).get("peak_tuning_profile") or {}
+                if target > 0:
+                    estimate = estimate_peak_height(
+                        job["result"].get("heights", []), target
+                    )
+                else:
+                    requested_step = int(body.get("threshold_step", 0) or 0)
+                    threshold_step = requested_step or int(
+                        profile.get("threshold_step", 100) or 100
+                    )
+                    estimate = estimate_peak_height_range(
+                        job["result"].get("heights", []),
+                        int(body.get("target_peak_count_min", 3000) or 3000),
+                        int(body.get("target_peak_count_max", 6000) or 6000),
+                        threshold_step,
+                    )
+                self._json(
+                    {
+                        "ready": True,
+                        "job_id": job_id,
+                        "representative": profile,
+                        "estimate": estimate,
+                    }
                 )
-                self._json({"ready": True, "job_id": job_id, "estimate": estimate})
             elif parsed.path == "/api/validate":
                 state = body.get("workflow", body)
                 self._json(
@@ -1187,11 +1275,17 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/tuning/run":
                 state = body.get("workflow", body)
+                profile = select_peak_tuning_representative(
+                    state.get("files", []), body.get("file_path", "")
+                )
                 preparation = prepare_tuning_run(
                     state,
-                    body.get("file_path", ""),
+                    profile["file_path"],
                     state.get("output_root", ""),
                 )
+                preparation["peak_tuning_profile"] = {
+                    key: value for key, value in profile.items() if key != "file"
+                }
                 job_id = uuid.uuid4().hex
                 with JOBS_LOCK:
                     JOBS[job_id] = {
@@ -1310,6 +1404,38 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
+
+
+def _run_console_build_job(
+    job_id: str, plan: dict[str, Any], select_after_build: bool
+) -> None:
+    def log(message: str) -> None:
+        with JOBS_LOCK:
+            JOBS[job_id]["logs"].append(message)
+            JOBS[job_id]["logs"] = JOBS[job_id]["logs"][-2000:]
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+
+    with JOBS_LOCK:
+        JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+        _persist_jobs_locked()
+    try:
+        result = build_local_console(plan, log, select_after_build)
+        with JOBS_LOCK:
+            JOBS[job_id]["result"] = result
+            JOBS[job_id]["exit_code"] = 0
+            JOBS[job_id]["progress"] = 100
+            JOBS[job_id]["status"] = "completed"
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
+    except Exception as error:
+        log(traceback.format_exc())
+        with JOBS_LOCK:
+            JOBS[job_id]["exit_code"] = 1
+            JOBS[job_id]["status"] = "failed"
+            JOBS[job_id]["error"] = str(error)
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
 
 
 def _run_library_download_job(job_id: str, catalog_id: str) -> None:

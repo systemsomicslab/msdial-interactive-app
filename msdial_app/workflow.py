@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import copy
 import datetime as dt
+import hashlib
 import json
 import os
 import platform
@@ -47,6 +48,125 @@ SMOOTHING_METHODS = [
 ]
 LCMS_QA_CAPABILITY = "lcms_alignment_qa_matrix"
 RT_CORRECTION_REVIEW_CAPABILITY = "rt_correction_review"
+CONSOLE_BUILD_PROVENANCE = "msdial-console-build-provenance.json"
+
+
+def _git_output(root: Path, *arguments: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def find_console_source_root(console_path: str | Path) -> Path | None:
+    path = Path(console_path).expanduser().resolve()
+    for parent in path.parents:
+        project = parent / "tests" / "MSDIAL5" / "MsdialCoreTestApp" / "MsdialCoreTestApp.csproj"
+        if project.is_file() and (parent / ".git").exists():
+            return parent
+    return None
+
+
+def console_git_state(source_root: str | Path) -> dict[str, Any]:
+    root = Path(source_root).expanduser().resolve()
+    head = _git_output(root, "rev-parse", "HEAD")
+    if not head:
+        return {"source_root": str(root), "available": False}
+    status = _git_output(root, "status", "--porcelain", "--untracked-files=normal")
+    diff = _git_output(root, "diff", "--binary", "HEAD")
+    working_tree_state = status + "\n" + diff
+    origin_master = _git_output(root, "rev-parse", "--verify", "refs/remotes/origin/master")
+    ahead = behind = None
+    if origin_master:
+        counts = _git_output(root, "rev-list", "--left-right", "--count", "HEAD...origin/master")
+        try:
+            ahead_text, behind_text = counts.split()
+            ahead, behind = int(ahead_text), int(behind_text)
+        except (ValueError, TypeError):
+            pass
+    return {
+        "source_root": str(root),
+        "available": True,
+        "branch": _git_output(root, "branch", "--show-current"),
+        "head": head,
+        "short_head": head[:12],
+        "head_time": _git_output(root, "show", "-s", "--format=%cI", "HEAD"),
+        "origin_master_head": origin_master,
+        "origin_master_short_head": origin_master[:12],
+        "ahead_of_origin_master": ahead,
+        "behind_origin_master": behind,
+        "remote_note": "origin/master is a local tracking reference; use Fetch and compare source to refresh it.",
+        "dirty": bool(status),
+        "changed_files": len(status.splitlines()) if status else 0,
+        "working_tree_diff_sha256": hashlib.sha256(diff.encode("utf-8")).hexdigest()
+        if diff
+        else "",
+        "working_tree_state_sha256": hashlib.sha256(
+            working_tree_state.encode("utf-8")
+        ).hexdigest()
+        if working_tree_state.strip()
+        else "",
+    }
+
+
+def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str, Any]:
+    path = Path(console_path).expanduser().resolve()
+    if not path.is_file():
+        return {"path": str(path), "exists": False, "source": source or "custom"}
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    stat = path.stat()
+    source_root = find_console_source_root(path)
+    folder_text = str(path.parent).casefold()
+    if source_root:
+        source_kind = "local_source_build"
+    elif "msdial.console" in folder_text:
+        source_kind = "official_distribution"
+    else:
+        source_kind = "custom"
+    provenance_path = path.parent / CONSOLE_BUILD_PROVENANCE
+    provenance: dict[str, Any] = {}
+    if provenance_path.is_file():
+        try:
+            loaded = json.loads(provenance_path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict) and loaded.get("binary_sha256") == digest.hexdigest():
+                provenance = loaded
+        except (OSError, json.JSONDecodeError):
+            pass
+    result = {
+        "path": str(path),
+        "exists": True,
+        "source": source or source_kind.replace("_", " "),
+        "source_kind": source_kind,
+        "version": console_version(str(path)),
+        "binary_sha256": digest.hexdigest(),
+        "binary_size": stat.st_size,
+        "binary_modified_at": dt.datetime.fromtimestamp(
+            stat.st_mtime, tz=dt.timezone.utc
+        ).astimezone().isoformat(),
+        "provenance_verified": bool(provenance),
+        "provenance": provenance,
+        **console_capabilities(str(path)),
+    }
+    if source_root:
+        result["git"] = console_git_state(source_root)
+        if provenance:
+            result["matches_recorded_git_head"] = (
+                provenance.get("git_head") == result["git"].get("head")
+                and provenance.get("working_tree_state_sha256", "")
+                == result["git"].get("working_tree_state_sha256", "")
+            )
+    return result
 
 
 def discover_console_paths(search_roots: Iterable[str | Path] | None = None) -> dict[str, Any]:
@@ -95,15 +215,7 @@ def discover_console_paths(search_roots: Iterable[str | Path] | None = None) -> 
         if resolved.casefold() in seen:
             continue
         seen.add(resolved.casefold())
-        capability_info = console_capabilities(resolved)
-        found.append(
-            {
-                "path": resolved,
-                "source": source,
-                "version": console_version(resolved),
-                **capability_info,
-            }
-        )
+        found.append(inspect_console_path(resolved, source))
     return {
         "configured_path": saved,
         "environment_path": environment,
@@ -542,6 +654,10 @@ def load_parameter_template(
                         or f"{defaults['annotator_id'].rsplit('_', 1)[0]}_{index}",
                         path_key: str(library.resolve()) if library_text else "",
                         "priority": int(float(source.get("priority") or index)),
+                        "target_omics": str(source.get("target_omics", "")).strip()
+                        or row.get("target_omics", ""),
+                        "evidence_tier": str(source.get("evidence_tier", "")).strip()
+                        or row.get("evidence_tier", ""),
                     }
                 )
                 for key in (
@@ -627,6 +743,7 @@ def load_parameter_template(
     }
     lbm = {
         "lbm_file_path": library_path("lbm file path"),
+        "priority": int(number("lbm annotator priority", "lbm annotation priority", default=1)),
         "rt_tolerance": number("rt tolerance for lbm-based annotation", default=100),
         "ms1_tolerance": number("ms1 tolerance for lbm-based annotation", default=0.01),
         "ms2_tolerance": number("ms2 tolerance for lbm-based annotation", default=0.025),
@@ -1869,6 +1986,7 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
     replacements = {
         "msp file path": "" if msp_annotator_settings_path else (state.get("msp_path", "") or first_msp_path),
         "lbm file path": state.get("lbm_path", ""),
+        "lbm annotator priority": int(state.get("lbm_annotator", {}).get("priority", state.get("lbm_priority", 1))),
         "text db file path": "" if text_annotator_settings_path else state.get("text_db_path", ""),
         "searched adduct ions": ",".join(state.get("selected_adducts", [])),
         "ion mode": state.get("ion_mode", "Negative"),
@@ -1935,6 +2053,8 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
     }
     if project_type == "lcms":
         replacements["alignment light mode"] = bool(state.get("alignment_light_mode", False))
+        if state.get("annotation_pipeline_profile"):
+            replacements["annotation pipeline profile"] = state["annotation_pipeline_profile"]
     if msp_annotator_settings_path is not None:
         replacements["msp annotator settings file path"] = str(msp_annotator_settings_path)
     if text_annotator_settings_path is not None:
@@ -2095,6 +2215,8 @@ def _write_msp_annotator_settings(run_directory: Path, state: dict[str, Any]) ->
         "minimum_spectrum_match",
         "use_retention_information_for_scoring",
         "use_retention_information_for_filtering",
+        "target_omics",
+        "evidence_tier",
     ]
     with settings_path.open("w", encoding="ascii", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=header, delimiter="\t", lineterminator="\n")
@@ -2105,6 +2227,8 @@ def _write_msp_annotator_settings(run_directory: Path, state: dict[str, Any]) ->
                     "annotator_id": str(row.get("annotator_id", "")).strip() or f"msp_annotator_{index}",
                     "msp_file_path": str(Path(str(row["msp_file_path"])).expanduser().resolve()),
                     "priority": int(row.get("priority") or index),
+                    "target_omics": str(row.get("target_omics", "")).strip(),
+                    "evidence_tier": str(row.get("evidence_tier", "")).strip(),
                     "rt_tolerance": row.get("rt_tolerance", state.get("msp_rt_tolerance", 100)),
                     "ms1_tolerance": row.get("ms1_tolerance", state.get("ms1_tolerance", 0.01)),
                     "ms2_tolerance": row.get("ms2_tolerance", state.get("ms2_tolerance", 0.025)),
@@ -2193,6 +2317,8 @@ def _title_for_key(key: str) -> str:
         "reverse dot product cutoff for msp-based annotation": "Reverse dot product cutoff for MSP-based annotation",
         "matched peaks percentage cutoff for msp-based annotation": "Matched peaks percentage cutoff for MSP-based annotation",
         "minimum spectrum match for msp-based annotation": "Minimum spectrum match for MSP-based annotation",
+        "annotation pipeline profile": "Annotation pipeline profile",
+        "lbm annotator priority": "LBM annotator priority",
         "rt tolerance for lbm-based annotation": "RT tolerance for LBM-based annotation",
         "ms1 tolerance for lbm-based annotation": "MS1 tolerance for LBM-based annotation",
         "ms2 tolerance for lbm-based annotation": "MS2 tolerance for LBM-based annotation",

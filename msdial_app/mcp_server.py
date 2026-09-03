@@ -10,6 +10,7 @@ import urllib.request
 import webbrowser
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from functools import wraps
 from typing import Any
 
 
@@ -17,6 +18,13 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 REQUIRED_AGENT_API_VERSION = "0.4"
+REPOSITORY_EXECUTION_SCOPE = {
+    "project_type": "LC-MS/MS",
+    "acquisition_modes": ["DDA", "DIA", "AIF", "SWATH"],
+    "untargeted": True,
+    "requires_ms1_survey": True,
+    "requires_product_ion_spectra": True,
+}
 _EMBEDDED_SERVERS: dict[tuple[str, int], tuple[ThreadingHTTPServer, threading.Thread]] = {}
 
 
@@ -61,9 +69,16 @@ def _request_json(
         raise RuntimeError(f"Could not connect to MS-DIAL Interactive at {url}: {error.reason}") from error
 
 
-def _status_or_error(host: str, port: int) -> dict[str, Any]:
+def _status_or_error(
+    host: str, port: int, *, limit: int = 5, include_artifacts: bool = False
+) -> dict[str, Any]:
     try:
-        status = _request_json("GET", "/api/agent/status", host=host, port=port, timeout=2)
+        query = urllib.parse.urlencode(
+            {"limit": max(0, int(limit)), "include_artifacts": str(include_artifacts).lower()}
+        )
+        status = _request_json(
+            "GET", f"/api/agent/status?{query}", host=host, port=port, timeout=2
+        )
         detected = str(status.get("agent_api_version", "0"))
         return {
             "running": True,
@@ -89,6 +104,115 @@ def _version_tuple(value: str) -> tuple[int, ...]:
         digits = "".join(character for character in part if character.isdigit())
         result.append(int(digits or 0))
     return tuple((result + [0, 0])[:3])
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().casefold()
+    if normalized in {"true", "1", "yes", "y"}:
+        return True
+    if normalized in {"false", "0", "no", "n"}:
+        return False
+    return None
+
+
+def _validated_workspace_root(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("Set a non-empty repository workspace root.")
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        raise ValueError("Repository workspace root must be an absolute path.")
+    resolved = path.resolve()
+    configured = str(os.environ.get("MSDIAL_REPOSITORY_WORKSPACE_ROOT") or "").strip()
+    if configured:
+        boundary = Path(configured).expanduser().resolve()
+        try:
+            resolved.relative_to(boundary)
+        except ValueError as error:
+            raise ValueError(
+                f"Repository workspace root must stay under the configured boundary: {boundary}"
+            ) from error
+    return str(resolved)
+
+
+def _structured_validation_errors(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
+            return {
+                "ok": False,
+                "reason": "validation_error",
+                "detail": str(error),
+                "error_type": type(error).__name__,
+            }
+
+    return wrapped
+
+
+def _analysis_intent(value: str) -> dict[str, Any]:
+    purpose = " ".join(str(value or "").split())
+    return {
+        "purpose": purpose,
+        "confirmed": bool(purpose),
+        "pending_decisions": [] if purpose else ["analysis_purpose"],
+        "prompt": (
+            "State the scientific purpose of this reanalysis, including the biological comparison, "
+            "whether annotation or comparative profiling is central, and the outputs needed."
+            if not purpose
+            else "Use this purpose when proposing Class, contrasts, annotation, QA, and outputs."
+        ),
+    }
+
+
+def _repository_download_blockers(
+    project: dict[str, Any],
+    intent: dict[str, Any],
+    required_bytes: int,
+    maximum_bytes: int,
+    allow_preflight: bool,
+) -> list[str]:
+    blocking = list(project.get("blocking_reasons", []))
+    preflight_exception = (
+        allow_preflight and project.get("selection_status") == "raw_metadata_required"
+    )
+    if preflight_exception:
+        blocking = [
+            item for item in blocking if not str(item).startswith("technical_metadata:")
+        ]
+    elif not project.get("eligible"):
+        blocking.extend(project.get("exclusion_reasons", []))
+        blocking.extend(project.get("review_reasons", []))
+    if not intent["confirmed"]:
+        blocking.append("analysis_purpose:missing")
+    if required_bytes > maximum_bytes:
+        blocking.append("size_limit:exceeded")
+    return list(dict.fromkeys(str(item) for item in blocking if str(item).strip()))
+
+
+def _load_analysis_unit_handoff(
+    handoff: dict[str, Any] | None = None, handoff_path: str = ""
+) -> dict[str, Any] | None:
+    if handoff is not None and handoff_path:
+        raise ValueError("Provide analysis_unit_handoff or analysis_unit_handoff_path, not both.")
+    if handoff is not None:
+        return handoff
+    if not handoff_path:
+        return None
+    path = Path(handoff_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Analysis-unit handoff was not found: {path}")
+    loaded = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(loaded, dict):
+        raise ValueError("Analysis-unit handoff file must contain one JSON object.")
+    return loaded
 
 
 def _repository_download_job(
@@ -125,12 +249,15 @@ def _repository_project_summary(
     return {
         "repository": project.get("repository"),
         "accession": project.get("accession"),
+        "analysis_unit_id": project.get("analysis_unit_id", ""),
         "title": project.get("title"),
         "public_url": project.get("public_url"),
         "publications": project.get("publications", []),
+        "publication_status": project.get("publication_status", "none_recorded"),
         "sample_count": project.get("sample_count") or len(workspace.get("rows", [])),
         "file_count": len(project.get("files", [])),
         "total_download_bytes": project.get("total_download_bytes", 0),
+        "download_scope": project.get("download_scope", {}),
         "separation": workspace.get("separation"),
         "acquisition_mode": workspace.get("acquisition_mode"),
         "ion_mode": workspace.get("ion_mode"),
@@ -140,6 +267,232 @@ def _repository_project_summary(
         "exclusion_reasons": project.get("exclusion_reasons", []),
         "review_reasons": project.get("review_reasons", []),
         "warnings": project.get("warnings", []),
+        "blocking_reasons": project.get("blocking_reasons", []),
+        "pending_decisions": project.get("pending_decisions", []),
+    }
+
+
+def _project_from_analysis_unit_handoff(
+    handoff: dict[str, Any], repository: str = "", accession: str = ""
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if handoff.get("schema") != "msdial-repository-reanalysis-handoff.v1":
+        raise ValueError("Unsupported or missing repository reanalysis handoff schema.")
+    handoff_repository = str(handoff.get("repository") or "").strip()
+    handoff_accession = str(handoff.get("accession") or "").strip()
+    unit_id = str(handoff.get("analysis_unit_id") or "").strip()
+    if not handoff_repository or not handoff_accession or not unit_id:
+        raise ValueError("Handoff repository, accession, and analysis_unit_id are required.")
+    if repository and repository != handoff_repository:
+        raise ValueError("Handoff repository does not match the requested repository.")
+    if accession and accession != handoff_accession:
+        raise ValueError("Handoff accession does not match the requested accession.")
+    settings = dict(handoff.get("technical_settings") or {})
+    file_payload = handoff.get("files") or []
+    if handoff.get("files_omitted"):
+        file_path = Path(str(handoff.get("file_manifest_path") or "")).expanduser().resolve()
+        if not file_path.is_file():
+            raise FileNotFoundError(
+                f"External file manifest for analysis unit {unit_id} was not found: {file_path}"
+            )
+        file_payload = json.loads(file_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(file_payload, list):
+            raise ValueError("External analysis-unit file manifest must contain a JSON array.")
+    files = []
+    for item in file_payload:
+        path = str(item.get("path") or "").strip()
+        url = str(item.get("download_url") or "").strip()
+        if not path or not url:
+            raise ValueError(f"Analysis unit {unit_id} contains a file without path/download_url.")
+        files.append(
+            {
+                "name": path,
+                "size_bytes": int(item.get("size_bytes") or 0),
+                "url": url,
+                "role": str(item.get("role") or "raw"),
+                "checksum": str(item.get("checksum") or ""),
+            }
+        )
+    if not files:
+        raise ValueError(f"Analysis unit {unit_id} contains no downloadable files.")
+    scope = dict(handoff.get("download_scope") or {})
+    declared_file_count = scope.get("file_count")
+    if declared_file_count is not None and int(declared_file_count) != len(files):
+        raise ValueError(
+            f"Analysis unit {unit_id} declares {declared_file_count} files but provides {len(files)}."
+        )
+    common_attributes = dict(handoff.get("unit_attributes") or {})
+    sample_payload = handoff.get("sample_metadata") or []
+    if handoff.get("sample_metadata_omitted"):
+        sample_path = Path(str(handoff.get("sample_table_path") or "")).expanduser().resolve()
+        if not sample_path.is_file():
+            raise FileNotFoundError(
+                f"External sample table for analysis unit {unit_id} was not found: {sample_path}"
+            )
+        sample_payload = json.loads(sample_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(sample_payload, list):
+            raise ValueError("External analysis-unit sample table must contain a JSON array.")
+    samples = [
+        {
+            "sample_id": str(item.get("sample_id") or ""),
+            "raw_file": str(item.get("raw_file") or ""),
+            "values": {
+                **common_attributes,
+                **dict(item.get("attributes") or item.get("values") or {}),
+            },
+        }
+        for item in sample_payload
+    ]
+    declared_sample_count = handoff.get("sample_count")
+    if declared_sample_count is not None and int(declared_sample_count) != len(samples):
+        raise ValueError(
+            f"Analysis unit {unit_id} declares {declared_sample_count} sample rows but provides {len(samples)}."
+        )
+    untargeted = _optional_bool(settings.get("untargeted"))
+    project = {
+        "repository": handoff_repository,
+        "accession": handoff_accession,
+        "analysis_unit_id": unit_id,
+        "source_subrecord_id": str(handoff.get("source_subrecord_id") or ""),
+        "title": str(handoff.get("title") or handoff_accession),
+        "description": str(handoff.get("description") or ""),
+        "public_url": str(handoff.get("repository_url") or ""),
+        "separation": str(settings.get("separation") or "Unknown"),
+        "acquisition_mode": str(settings.get("acquisition_mode") or "Unknown"),
+        "ion_mode": str(settings.get("ion_mode") or "Unknown"),
+        "untargeted": untargeted,
+        "sample_count": int(
+            handoff.get("analytical_sample_count")
+            or scope.get("analysis_file_count")
+            or len({item["sample_id"] for item in samples if item["sample_id"]})
+        ),
+        "files": files,
+        "publications": list(handoff.get("publications") or []),
+        "publication_status": str(handoff.get("publication_status") or "not_retrieved"),
+        "sample_metadata": samples,
+        "total_download_bytes": sum(item["size_bytes"] for item in files),
+        "warnings": list(handoff.get("warnings") or []),
+        "selection_status": "unreviewed",
+        "review_reasons": [],
+        "eligible": False,
+        "exclusion_reasons": [],
+        "download_scope": scope,
+        "class_proposal": handoff.get("class_proposal"),
+        "blocking_reasons": [],
+        "pending_decisions": [],
+        "repository_metadata": {"catalog_handoff": handoff},
+    }
+    from .repository_reanalysis import EligibilityPolicy, evaluate_eligibility, project_from_dict
+
+    typed = evaluate_eligibility(
+        project_from_dict(project),
+        EligibilityPolicy(
+            max_download_bytes=max(int(scope.get("bundle_bytes") or 0), project["total_download_bytes"], 1),
+            max_samples=max(project["sample_count"], 1),
+            require_known_size=False,
+            require_untargeted=True,
+        ),
+    )
+    declared_blocks = [str(item) for item in handoff.get("blocking_reasons") or []]
+    technical_blocks = [item for item in declared_blocks if item.startswith("technical_metadata:")]
+    decision_blocks = [item for item in declared_blocks if not item.startswith("technical_metadata:")]
+    if technical_blocks and not typed.exclusion_reasons:
+        typed.review_reasons = list(dict.fromkeys([*typed.review_reasons, *technical_blocks]))
+        typed.eligible = False
+        typed.selection_status = "raw_metadata_required"
+    typed.blocking_reasons = list(dict.fromkeys(decision_blocks))
+    typed.pending_decisions = [
+        "class_proposal" for item in decision_blocks if item == "class_proposal:missing"
+    ]
+    project = typed.as_dict()
+    from .repository_metadata import metadata_workspace
+
+    workspace = metadata_workspace(project)
+    workspace["target_omics"] = str(settings.get("target_omics") or "Unknown")
+    return project, workspace
+
+
+def _repository_inspection(
+    repository: str,
+    accession: str,
+    analysis_unit_handoff: dict[str, Any] | None,
+    analysis_unit_handoff_path: str,
+    host: str,
+    port: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    analysis_unit_handoff = _load_analysis_unit_handoff(
+        analysis_unit_handoff, analysis_unit_handoff_path
+    )
+    if analysis_unit_handoff:
+        return _project_from_analysis_unit_handoff(
+            analysis_unit_handoff, repository, accession
+        )
+    response = _request_json(
+        "POST",
+        "/api/repository/metadata/inspect",
+        host=host,
+        port=port,
+        body={"repository": repository, "accession": accession},
+        timeout=180,
+    )
+    project = response.get("project") or {}
+    workspace = response.get("workspace") or {}
+    from .repository_reanalysis import (
+        EligibilityPolicy,
+        evaluate_eligibility,
+        project_from_dict,
+    )
+
+    typed = project_from_dict(project)
+    typed = evaluate_eligibility(
+        typed,
+        EligibilityPolicy(
+            max_download_bytes=max(typed.total_download_bytes, 1),
+            max_samples=max(typed.sample_count or 1, 1),
+            require_known_size=False,
+            require_untargeted=True,
+        ),
+    )
+    project = typed.as_dict()
+    conflicts = _repository_technical_conflicts(workspace)
+    for field, values in conflicts.items():
+        project["eligible"] = False
+        reason = f"Mixed {field} values in accession scope: {', '.join(values)}."
+        project["review_reasons"].append(reason)
+        project["warnings"].append(reason + " Select an analysis unit before reanalysis.")
+        if field == "ion mode":
+            workspace["ion_mode"] = None
+        elif field == "separation":
+            workspace["separation"] = None
+        elif field == "acquisition mode":
+            workspace["acquisition_mode"] = None
+    if not project["eligible"] and not (
+        project["exclusion_reasons"] or project["review_reasons"]
+    ):
+        project["review_reasons"] = ["Repository metadata requires review before reanalysis."]
+    return project, workspace
+
+
+def _repository_technical_conflicts(workspace: dict[str, Any]) -> dict[str, list[str]]:
+    groups = {
+        "ion mode": ("polarity", "ion mode"),
+        "separation": ("method type", "separation mode"),
+        "acquisition mode": ("acquisition mode", "acquisition type", "scan mode"),
+    }
+    values: dict[str, set[str]] = {key: set() for key in groups}
+    for row in workspace.get("rows") or []:
+        row_values = dict(row.get("values") or {})
+        for name, value in row_values.items():
+            normalized_name = str(name).strip().casefold()
+            normalized_value = str(value or "").strip()
+            if not normalized_value:
+                continue
+            for group, aliases in groups.items():
+                if any(alias in normalized_name for alias in aliases):
+                    values[group].add(normalized_value)
+    return {
+        key: sorted(items, key=str.casefold)
+        for key, items in values.items()
+        if len(items) > 1
     }
 
 
@@ -173,7 +526,10 @@ def _repository_answer_seed(
         acquisition_type = "DDA"
 
     answers: dict[str, Any] = {
-        "parameter_strategy": "default",
+        "parameter_strategy": "auto_peak_range",
+        "target_peak_count_min": 3000,
+        "target_peak_count_max": 6000,
+        "smoothing_method": "TimeBasedLinearWeightedMovingAverage",
         "output_root": output_root,
         "export_folder_path": output_root,
         "generate_materials_methods": True,
@@ -288,9 +644,16 @@ def _local_listener(host: str, port: int) -> dict[str, Any]:
 
 
 @mcp.tool()
-def msdial_interactive_status(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> dict[str, Any]:
+def msdial_interactive_status(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    limit: int = 5,
+    include_artifacts: bool = False,
+) -> dict[str, Any]:
     """Return current MS-DIAL Interactive status and recent analysis jobs."""
-    return _status_or_error(host, port)
+    return _status_or_error(
+        host, port, limit=max(0, int(limit)), include_artifacts=include_artifacts
+    )
 
 
 @mcp.tool()
@@ -323,6 +686,65 @@ def msdial_set_console_path(
         host=host,
         port=port,
         body={"console_path": console_path},
+        timeout=30,
+    )
+
+
+@mcp.tool()
+def msdial_check_official_console_releases(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Check official stable and prerelease MS-DIAL Console packages on GitHub."""
+    return _request_json(
+        "POST",
+        "/api/agent/console/releases",
+        host=host,
+        port=port,
+        body={},
+        timeout=30,
+    )
+
+
+@mcp.tool()
+def msdial_check_local_console_source(
+    source_root: str,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Fetch origin and compare a local MS-DIAL source checkout with origin/master."""
+    return _request_json(
+        "POST",
+        "/api/agent/console/source-status",
+        host=host,
+        port=port,
+        body={"source_root": source_root},
+        timeout=210,
+    )
+
+
+@mcp.tool()
+def msdial_build_console_from_local_source(
+    source_root: str,
+    framework: str = "net48",
+    confirmed: bool = False,
+    select_after_build: bool = True,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Preview or start a local-source Console build; execution requires confirmed=True."""
+    return _request_json(
+        "POST",
+        "/api/agent/console/build",
+        host=host,
+        port=port,
+        body={
+            "source_root": source_root,
+            "framework": framework,
+            "configuration": "Release",
+            "confirmed": confirmed,
+            "select_after_build": select_after_build,
+        },
         timeout=30,
     )
 
@@ -489,32 +911,50 @@ def msdial_save_repository_metadata(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_repository_reanalysis_plan(
     repository: str,
     accession: str,
     workspace_root: str = "",
     maximum_gb: float = 20,
     raw_retention_policy: str = "keep",
+    analysis_unit_handoff: dict[str, Any] | None = None,
+    analysis_unit_handoff_path: str = "",
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    analysis_purpose: str = "",
 ) -> dict[str, Any]:
     """Inspect one public accession and return metadata, QA evidence, and download decisions."""
-    response = _request_json(
-        "POST",
-        "/api/repository/metadata/inspect",
-        host=host,
-        port=port,
-        body={"repository": repository, "accession": accession},
-        timeout=180,
+    workspace_root = _validated_workspace_root(workspace_root)
+    project, workspace = _repository_inspection(
+        repository, accession, analysis_unit_handoff, analysis_unit_handoff_path, host, port
     )
-    project = response.get("project") or {}
-    workspace = response.get("workspace") or {}
     from .repository_qa import repository_internal_standard_evidence
 
+    if float(maximum_gb) <= 0:
+        raise ValueError("maximum_gb must be greater than zero.")
+    required_bytes = int(
+        (project.get("download_scope") or {}).get("bundle_bytes")
+        or project.get("total_download_bytes")
+        or 0
+    )
+    maximum_bytes = int(float(maximum_gb) * 1024**3)
+    intent = _analysis_intent(analysis_purpose)
+    blocking_reasons = _repository_download_blockers(
+        project, intent, required_bytes, maximum_bytes, allow_preflight=False
+    )
+
     return {
+        "execution_scope": dict(REPOSITORY_EXECUTION_SCOPE),
+        "analysis_intent": intent,
         "project": _repository_project_summary(project, workspace),
         "metadata": {
             "default_class_hierarchy": workspace.get("hierarchy", []),
+            "class_hierarchy_note": (
+                "No biological grouping field was selected automatically; review sample metadata and define Class explicitly."
+                if not workspace.get("hierarchy")
+                else "Review the proposed biological grouping fields before saving Class assignments."
+            ),
             "fields": workspace.get("fields", []),
             "field_count": len(workspace.get("fields", [])),
             "row_count": len(workspace.get("rows", [])),
@@ -523,11 +963,17 @@ def msdial_repository_reanalysis_plan(
         "download": {
             "workspace_root": workspace_root,
             "maximum_gb": maximum_gb,
+            "unit_file_bytes": int(project.get("total_download_bytes") or 0),
+            "required_download_bytes": required_bytes,
+            "within_size_limit": required_bytes <= maximum_bytes,
             "raw_retention_policy": raw_retention_policy,
             "confirmation_required": True,
+            "ready": bool(project.get("eligible")) and not blocking_reasons,
+            "blocking_reasons": blocking_reasons,
         },
         "next_decisions": [
-            "Review the inferred LC-MS/GC-MS, polarity, acquisition mode, and target omics.",
+            intent["prompt"],
+            "Confirm that the unit is untargeted LC-MS/MS and distinguish DDA from DIA/AIF/SWATH, with one ion mode.",
             "Review and confirm the ordered metadata fields used to build MS-DIAL Class.",
             "Choose whether downloaded raw data are kept or deleted only after validated output.",
             "Confirm the bounded raw-data download before starting it.",
@@ -544,27 +990,51 @@ def msdial_download_repository_raw(
     raw_retention_policy: str = "keep",
     allow_preflight: bool = False,
     confirmed: bool = False,
+    analysis_unit_handoff: dict[str, Any] | None = None,
+    analysis_unit_handoff_path: str = "",
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    analysis_purpose: str = "",
 ) -> dict[str, Any]:
     """Download and recognize repository raw data only after explicit user confirmation."""
-    response = _request_json(
-        "POST",
-        "/api/repository/metadata/inspect",
-        host=host,
-        port=port,
-        body={"repository": repository, "accession": accession},
-        timeout=180,
+    workspace_root = _validated_workspace_root(workspace_root)
+    project, workspace = _repository_inspection(
+        repository, accession, analysis_unit_handoff, analysis_unit_handoff_path, host, port
     )
-    project = response.get("project") or {}
-    workspace = response.get("workspace") or {}
+    if float(maximum_gb) <= 0:
+        raise ValueError("maximum_gb must be greater than zero.")
+    required_bytes = int(
+        (project.get("download_scope") or {}).get("bundle_bytes")
+        or project.get("total_download_bytes")
+        or 0
+    )
+    maximum_bytes = int(float(maximum_gb) * 1024**3)
+    intent = _analysis_intent(analysis_purpose)
+    blocking_reasons = _repository_download_blockers(
+        project, intent, required_bytes, maximum_bytes, allow_preflight
+    )
     preview = {
+        "execution_scope": dict(REPOSITORY_EXECUTION_SCOPE),
+        "analysis_intent": intent,
         "project": _repository_project_summary(project, workspace),
         "workspace_root": workspace_root,
         "maximum_gb": maximum_gb,
         "raw_retention_policy": raw_retention_policy,
         "allow_preflight": allow_preflight,
+        "unit_file_bytes": int(project.get("total_download_bytes") or 0),
+        "required_download_bytes": required_bytes,
+        "within_size_limit": required_bytes <= maximum_bytes,
+        "blocking_reasons": blocking_reasons,
     }
+    if blocking_reasons:
+        detail = "; ".join(blocking_reasons)
+        return {
+            "started": False,
+            "blocked": True,
+            "confirmation_required": False,
+            "preview": preview,
+            "message": f"Resolve all download blockers before continuing: {detail}",
+        }
     if not confirmed:
         return {
             "started": False,
@@ -576,6 +1046,14 @@ def msdial_download_repository_raw(
                 "policy, then call again with confirmed=true."
             ),
         }
+    if required_bytes > maximum_bytes:
+        raise ValueError(
+            f"Required repository bundle is {required_bytes} bytes; the approved limit is "
+            f"{maximum_bytes} bytes. Increase maximum_gb only after reviewing the bundle size."
+        )
+    repository_metadata = dict(project.get("repository_metadata") or {})
+    repository_metadata["analysis_purpose"] = intent["purpose"]
+    project["repository_metadata"] = repository_metadata
     started = _request_json(
         "POST",
         "/api/repository/download",
@@ -591,6 +1069,93 @@ def msdial_download_repository_raw(
         timeout=30,
     )
     return {"started": True, **started, "preview": preview}
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_repository_batch_plan(
+    analysis_unit_handoffs: list[dict[str, Any]] | None = None,
+    workspace_root: str = "",
+    analysis_unit_handoff_paths: list[str] | None = None,
+    maximum_gb_per_unit: float = 20,
+    raw_retention_policy: str = "keep",
+    analysis_purpose: str = "",
+) -> dict[str, Any]:
+    """Expand a mixed repository accession into independent analysis-unit run plans."""
+    workspace_root = _validated_workspace_root(workspace_root)
+    if float(maximum_gb_per_unit) <= 0:
+        raise ValueError("maximum_gb_per_unit must be greater than zero.")
+    maximum_bytes = int(float(maximum_gb_per_unit) * 1024**3)
+    handoffs = list(analysis_unit_handoffs or [])
+    for handoff_path in analysis_unit_handoff_paths or []:
+        loaded = _load_analysis_unit_handoff(None, handoff_path)
+        if loaded is not None:
+            handoffs.append(loaded)
+    if not handoffs:
+        raise ValueError("Provide at least one analysis-unit handoff or handoff path.")
+    intent = _analysis_intent(analysis_purpose)
+    seen: set[str] = set()
+    runs = []
+    for handoff in handoffs:
+        project, workspace = _project_from_analysis_unit_handoff(handoff)
+        unit_id = str(project["analysis_unit_id"])
+        if unit_id in seen:
+            raise ValueError(f"Duplicate analysis_unit_id in batch: {unit_id}")
+        seen.add(unit_id)
+        blocking = list(
+            dict.fromkeys(
+                [
+                    *project.get("exclusion_reasons", []),
+                    *project.get("review_reasons", []),
+                    *project.get("blocking_reasons", []),
+                ]
+            )
+        )
+        if not intent["confirmed"]:
+            blocking.append("analysis_purpose:missing")
+        required_bytes = int(
+            (project.get("download_scope") or {}).get("bundle_bytes")
+            or project.get("total_download_bytes")
+            or 0
+        )
+        if required_bytes > maximum_bytes:
+            blocking.append("size_limit:exceeded")
+        pending_decisions = list(project.get("pending_decisions", []))
+        pending_decisions.extend(intent["pending_decisions"])
+        runs.append(
+            {
+                "analysis_unit_id": unit_id,
+                "repository": project["repository"],
+                "accession": project["accession"],
+                "technical_settings": handoff.get("technical_settings") or {},
+                "project": _repository_project_summary(project, workspace),
+                "workspace": str(
+                    Path(workspace_root)
+                    / project["repository"]
+                    / project["accession"]
+                    / unit_id
+                ),
+                "blocking_reasons": list(dict.fromkeys(blocking)),
+                "required_download_bytes": required_bytes,
+                "within_size_limit": required_bytes <= maximum_bytes,
+                "pending_decisions": list(dict.fromkeys(pending_decisions)),
+                "ready": bool(project.get("eligible")) and not blocking,
+                "next_tool": "msdial_download_repository_raw",
+            }
+        )
+    return {
+        "schema": "msdial-repository-batch-plan.v1",
+        "execution_scope": dict(REPOSITORY_EXECUTION_SCOPE),
+        "analysis_intent": intent,
+        "workspace_root": workspace_root,
+        "raw_retention_policy": raw_retention_policy,
+        "maximum_gb_per_unit": maximum_gb_per_unit,
+        "run_count": len(runs),
+        "ready_count": sum(bool(item["ready"]) for item in runs),
+        "blocked_count": sum(not bool(item["ready"]) for item in runs),
+        "execution_model": "sequential-independent-analysis-units",
+        "runs": runs,
+    }
 
 
 @mcp.tool()
@@ -883,17 +1448,26 @@ def msdial_start_peak_count_diagnostic(
 @mcp.tool()
 def msdial_estimate_peak_height(
     job_id: str,
-    target_peak_count: int,
+    target_peak_count: int = 0,
+    target_peak_count_min: int = 3000,
+    target_peak_count_max: int = 6000,
+    threshold_step: int = 0,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
-    """Estimate Minimum peak height from a completed diagnostic height distribution."""
+    """Estimate a stepped Minimum peak height from a completed zero-threshold diagnostic."""
     return _request_json(
         "POST",
         "/api/agent/tuning/estimate",
         host=host,
         port=port,
-        body={"job_id": job_id, "target_peak_count": target_peak_count},
+        body={
+            "job_id": job_id,
+            "target_peak_count": target_peak_count,
+            "target_peak_count_min": target_peak_count_min,
+            "target_peak_count_max": target_peak_count_max,
+            "threshold_step": threshold_step,
+        },
         timeout=30,
     )
 

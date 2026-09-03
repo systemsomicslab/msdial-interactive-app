@@ -1,7 +1,10 @@
 # Public repository reanalysis
 
-This experimental workflow prepares small public GC-MS and untargeted LC-MS
-projects for reproducible MS-DIAL reanalysis. It currently supports:
+This experimental workflow prepares public untargeted LC-MS/MS DDA and
+DIA/AIF/SWATH projects for
+reproducible MS-DIAL reanalysis. The general Interactive application supports
+additional workflows, but the current repository campaign is intentionally
+narrow. It reads metadata from:
 
 - Metabolomics Workbench (`metabolomics_workbench`)
 - MetaboLights (`metabolights`)
@@ -11,10 +14,15 @@ projects for reproducible MS-DIAL reanalysis. It currently supports:
 These are distinct repositories. MetaboBank metadata and original raw-data
 references are read from the DDBJ Search API and its MAGE-TAB SDRF/file list.
 
-The initial scope excludes targeted SIM/MRM experiments, proteomics projects,
-and LC-MS experiments whose acquisition cannot be resolved as DDA or DIA.
+The current scope excludes GC-MS, targeted SIM/MRM experiments, proteomics
+projects, and LC-MS experiments whose acquisition cannot be resolved as DDA or
+DIA/AIF/SWATH with product-ion spectra.
 Ambiguous records are placed in `raw_metadata_required`; they are not silently
 treated as eligible.
+
+Agent-driven reanalysis also requires a user-reviewed `analysis_purpose` before
+download. That purpose anchors Class/contrast selection, annotation strategy,
+QA, and requested outputs; it is retained with repository provenance.
 
 ## Workspace and retention policy
 

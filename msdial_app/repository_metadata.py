@@ -239,10 +239,14 @@ def default_class_hierarchy(
     )
     candidates = []
     for field in fields:
+        field_name = str(field.get("name", ""))
+        namespace = re.sub(r"\s+", "", field_name).casefold()
+        if namespace.startswith(("analyticalcondition/", "softwaresetting/")):
+            continue
         unique_count = int(field.get("unique_count") or 0)
         if unique_count <= 1 or (row_count > 1 and unique_count >= row_count):
             continue
-        normalized = re.sub(r"[_/-]+", " ", str(field.get("name", ""))).casefold()
+        normalized = re.sub(r"[_/-]+", " ", field_name).casefold()
         rank = next(
             (
                 group_index
@@ -252,7 +256,7 @@ def default_class_hierarchy(
             None,
         )
         if rank is not None:
-            candidates.append((rank, unique_count, str(field["name"])))
+            candidates.append((rank, unique_count, field_name))
     candidates.sort(key=lambda item: (item[0], item[1], item[2].casefold()))
     return [item[2] for item in candidates[:3]]
 
