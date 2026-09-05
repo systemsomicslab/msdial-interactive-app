@@ -7,6 +7,7 @@ import random
 from pathlib import Path
 from statistics import median
 from typing import Any, Iterable
+from .diagnostic_paths import is_diagnostic_artifact
 
 
 QA_SUFFIX = ".qa.tsv"
@@ -32,7 +33,7 @@ def find_qa_files(
         item.resolve()
         for pattern in patterns
         for item in root.glob(pattern)
-        if item.is_file()
+        if item.is_file() and not is_diagnostic_artifact(item)
     }
     files = list(files)
     files.sort(key=lambda item: item.stat().st_mtime, reverse=True)
