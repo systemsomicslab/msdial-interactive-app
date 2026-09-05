@@ -1203,6 +1203,43 @@ def msdial_repository_raw_metadata_preflight(
 
 
 @mcp.tool()
+def msdial_cleanup_repository_raw(
+    download_job_id: str = "",
+    manifest_path: str = "",
+    confirmed: bool = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Preview, and only on explicit confirmation perform, deletion of one unit's downloaded raw data.
+
+    With confirmed=false nothing is deleted and the result carries what a deletion would remove and what
+    would survive it: the target path, the file count and bytes that would be freed, the retained
+    artifact inventory, and any blockers. Only a caller that has shown those to the user and received an
+    explicit answer may call again with confirmed=true. A run finishing does not authorise this, whatever
+    retention policy was chosen at download time.
+
+    Either identifier works. manifest_path is accepted because the job registry keeps only the most
+    recently updated jobs and downgrades running jobs on restart, so a unit whose download job has aged
+    out would otherwise have no way back to its own raw data.
+    """
+    from .repository_reanalysis import cleanup_download_lease
+
+    resolved = Path(str(manifest_path or "")).expanduser()
+    if not resolved.is_file():
+        if not download_job_id:
+            raise ValueError("Provide either download_job_id or a manifest_path that exists.")
+        _, manifest = _repository_download_job(download_job_id, host, port)
+        resolved = Path(manifest["manifest_path"])
+    result = cleanup_download_lease(resolved, confirmed=confirmed)
+    if not confirmed:
+        result["message"] = (
+            "Nothing was deleted. Show the deletion target, the size and the retained artifacts to the "
+            "user, and call again with confirmed=true only after an explicit answer."
+        )
+    return result
+
+
+@mcp.tool()
 def msdial_prepare_repository_reanalysis(
     download_job_id: str,
     hierarchy: list[str] | None = None,

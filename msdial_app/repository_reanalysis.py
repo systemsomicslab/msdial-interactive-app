@@ -946,12 +946,96 @@ def run_raw_metadata_preflight(
     return {**manifest, "manifest_path": str(manifest_path)}
 
 
+# The manifest states from which a confirmed deletion may proceed. cleanup_pending_confirmation is the
+# state a run leaves behind when its retention policy asked for deletion: the technical preconditions are
+# met and the decision is now waiting for a person.
+CLEANUP_READY_STATUSES = {"mztab_validated", "completed", "cleanup_pending_confirmation"}
+
+
+def _tree_size(root: Path) -> tuple[int, int]:
+    """Return (file count, total bytes) under root, or (0, 0) when it is gone."""
+    if not root.is_dir():
+        return 0, 0
+    files = [path for path in root.rglob("*") if path.is_file()]
+    return len(files), sum(path.stat().st_size for path in files)
+
+
+def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
+    """Describe exactly what a raw-data deletion would remove and what would survive it.
+
+    Deleting downloaded raw data is the only irreversible operation in this pipeline, and the campaign
+    rules require the person approving it to have seen three things first: the artifacts that will be
+    retained, the paths that will be removed, and how much will be freed. This produces those three so a
+    caller can present them; it changes nothing.
+    """
+    manifest_path = manifest_path.resolve()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw_root = Path(manifest.get("raw_directory", "")).resolve()
+    workspace = Path(manifest.get("workspace", "")).resolve()
+    retained = [Path(value) for value in manifest.get("retained_artifacts", [])]
+    missing = [str(path) for path in retained if not path.exists()]
+    file_count, total_bytes = _tree_size(raw_root)
+    within_workspace = raw_root.parent == workspace and raw_root.name == "raw"
+    blockers: list[str] = []
+    if manifest.get("status") not in CLEANUP_READY_STATUSES:
+        blockers.append(
+            f"Manifest status is {manifest.get('status', 'unknown')!r}; deletion requires a validated run."
+        )
+    if not manifest.get("cleanup_allowed"):
+        blockers.append("cleanup_allowed is not true; the run did not produce a validated mzTab-M output.")
+    if not retained:
+        blockers.append("No retained artifacts are recorded, so nothing would survive the deletion.")
+    if missing:
+        blockers.append(f"{len(missing)} recorded retained artifacts are missing from disk.")
+    if not within_workspace:
+        blockers.append("The raw directory is not the expected 'raw' folder inside the project workspace.")
+    return {
+        "manifest_path": str(manifest_path),
+        "status": manifest.get("status"),
+        "retention_policy": manifest.get("raw_retention_policy"),
+        "cleanup_allowed": bool(manifest.get("cleanup_allowed")),
+        "deletion_target": str(raw_root),
+        "deletion_file_count": file_count,
+        "deletion_bytes": total_bytes,
+        "retained_artifact_count": len(retained),
+        "retained_artifact_inventory": manifest.get("retained_artifact_inventory", []),
+        "missing_retained_artifacts": missing,
+        "blockers": blockers,
+        "ready_for_confirmation": not blockers and file_count > 0,
+    }
+
+
+def request_download_cleanup(manifest_path: Path) -> dict[str, Any]:
+    """Record that the run's retention policy asked for deletion, and stop there.
+
+    The retention policy chosen at download time records a wish. Whether the technical preconditions are
+    met is a second, separate thing, recorded as cleanup_allowed. Whether to actually delete, having seen
+    what goes and what stays, is a third, and it belongs to a person. Running a job is not an occasion to
+    make that third decision on their behalf, so this marks the manifest and returns the plan.
+    """
+    manifest_path = manifest_path.resolve()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("cleanup_allowed") and manifest.get("status") in {"mztab_validated", "completed"}:
+        manifest["status"] = "cleanup_pending_confirmation"
+        manifest["cleanup_requested_at"] = datetime.now(timezone.utc).isoformat()
+        _write_json(manifest_path, manifest)
+    plan = plan_download_cleanup(manifest_path)
+    plan["deleted"] = False
+    plan["confirmation_required"] = True
+    return plan
+
+
 def cleanup_download_lease(manifest_path: Path, confirmed: bool = False) -> dict[str, Any]:
     manifest_path = manifest_path.resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not confirmed:
-        return {"deleted": False, "confirmation_required": True, "manifest_path": str(manifest_path)}
-    if manifest.get("status") not in {"mztab_validated", "completed"} or not manifest.get("cleanup_allowed"):
+        # The preview carries the retained artifacts, the target and the size, because a confirmation
+        # given without them is not an informed one. It used to return only the flag.
+        plan = plan_download_cleanup(manifest_path)
+        plan["deleted"] = False
+        plan["confirmation_required"] = True
+        return plan
+    if manifest.get("status") not in CLEANUP_READY_STATUSES or not manifest.get("cleanup_allowed"):
         raise ValueError("Raw cleanup requires a completed/validated manifest with cleanup_allowed=true.")
     retained = [Path(value) for value in manifest.get("retained_artifacts", [])]
     if not retained or any(not path.exists() for path in retained):
