@@ -51,6 +51,7 @@ from .repository_qa import propose_repository_qa_targets
 from .repository_reanalysis import (
     ADAPTERS,
     EligibilityPolicy,
+    evaluate_repository_execution_gate,
     request_download_cleanup,
     create_download_lease,
     evaluate_eligibility,
@@ -888,6 +889,19 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     )
                     return
+                gate = evaluate_repository_execution_gate(plan["workflow"])
+                if not gate["allowed"]:
+                    self._json(
+                        {
+                            "started": False,
+                            "execution_allowed": False,
+                            "repository_gate": gate,
+                            "plan": plan,
+                            "error": "This repository analysis unit is not cleared to run MS-DIAL.",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 preparation = prepare_run(plan["workflow"])
                 job_id = uuid.uuid4().hex
                 artifact_baseline = _snapshot_run_artifacts(preparation)
@@ -937,6 +951,21 @@ class Handler(BaseHTTPRequestHandler):
                             "plan": plan,
                             "message": "The diagnostic runs MS-DIAL on one file. Call again with confirmed=true.",
                         }
+                    )
+                    return
+                gate = evaluate_repository_execution_gate(workflow)
+                if not gate["allowed"]:
+                    self._json(
+                        {
+                            "started": False,
+                            "execution_allowed": False,
+                            "repository_gate": gate,
+                            "error": (
+                                "This repository analysis unit is not cleared to run MS-DIAL. The "
+                                "diagnostic starts the Console too, so it is held by the same gate."
+                            ),
+                        },
+                        HTTPStatus.BAD_REQUEST,
                     )
                     return
                 profile = select_peak_tuning_representative(
@@ -1239,6 +1268,18 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/run":
                 state = body.get("workflow", body)
+                gate = evaluate_repository_execution_gate(state)
+                if not gate["allowed"]:
+                    self._json(
+                        {
+                            "started": False,
+                            "execution_allowed": False,
+                            "repository_gate": gate,
+                            "error": "This repository analysis unit is not cleared to run MS-DIAL.",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 preparation = prepare_run(state)
                 preparation["repository_run_manifest"] = str(
                     state.get("repository_run_manifest") or ""
