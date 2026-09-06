@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +25,8 @@ def _base_answers(console: Path, lbm: Path) -> dict:
         "generate_materials_methods": False,
         "console_path": str(console),
         "template_path": str(TEMPLATE),
+        # The Class assignment is a required confirmation on the laboratory path.
+        "class_assignment_confirmed": True,
     }
 
 
@@ -221,3 +224,76 @@ class WorksetOverrideTests(unittest.TestCase):
         workflow = self._workflow("override-test-c")
         self.assertEqual(8, workflow["number_of_threads"])
         self.assertEqual(9, workflow["minimum_peak_width"])
+
+
+class SampleTableConfirmationTests(unittest.TestCase):
+    """The grouping is the axis every comparison is drawn along."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        for name in ("run_1_ctrl.mzML", "run_2_ctrl.mzML", "run_3_dosed.mzML", "run_4_dosed.mzML"):
+            (self.root / name).write_text("", encoding="ascii")
+        self.console = self.root / "MSDIALCUI.exe"
+        self.console.write_text("", encoding="ascii")
+        self.lbm = self.root / "lab.lbm2"
+        self.lbm.write_text("", encoding="ascii")
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def _plan(self, **extra) -> dict:
+        answers = _base_answers(self.console, self.lbm)
+        answers.pop("class_assignment_confirmed", None)
+        answers.update(extra)
+        return build_guided_plan(str(self.root), answers)
+
+    def test_the_class_assignment_must_be_confirmed_before_the_plan_is_ready(self) -> None:
+        plan = self._plan()
+        ids = [item["id"] for item in plan["remaining_questions"]]
+        self.assertIn("class_assignment_confirmed", ids)
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertIsNone(plan["workflow"], "nothing is built until the comparison is agreed")
+
+    def test_confirming_it_lets_the_plan_proceed(self) -> None:
+        plan = self._plan(class_assignment_confirmed=True)
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        self.assertIsNotNone(plan["workflow"])
+
+    def test_a_repository_run_is_not_asked_because_it_has_no_analyst(self) -> None:
+        # Repository reanalysis takes its classes from repository metadata and has its
+        # own gate; asking here would stop a systematic batch that nobody is watching.
+        metadata = self.root / "meta.json"
+        metadata.write_text(
+            json.dumps(
+                {
+                    "project": {
+                        "repository": "MetaboLights",
+                        "accession": "MTBLS0000",
+                        "sample_metadata": [
+                            {"values": {"raw_file": name, "group": name.split("_")[-1]}}
+                            for name in ("run_1_ctrl", "run_2_ctrl", "run_3_dosed", "run_4_dosed")
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        plan = self._plan(repository_metadata_path=str(metadata))
+        ids = [item["id"] for item in plan["remaining_questions"]]
+        self.assertNotIn("class_assignment_confirmed", ids)
+
+    def test_the_dilution_factor_is_raised_and_reaches_the_files(self) -> None:
+        plan = self._plan(class_assignment_confirmed=True)
+        self.assertIn("dilution_factor", [item["id"] for item in plan["remaining_questions"]])
+
+        answered = self._plan(class_assignment_confirmed=True, dilution_factor=2.5)
+        self.assertEqual(
+            [2.5] * 4, [item["factor"] for item in answered["workflow"]["files"]]
+        )
+
+    def test_the_plan_says_how_the_injection_order_was_derived(self) -> None:
+        proposal = self._plan(class_assignment_confirmed=True)["input"]["sample_table_proposal"]
+        self.assertIn("acquisition sequence", proposal["analytical_order"]["reason"])
+        self.assertTrue(proposal["dilution_factor"]["assumed"])
+        self.assertIn("default rather than a value", proposal["dilution_factor"]["note"])

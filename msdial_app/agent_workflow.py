@@ -33,7 +33,7 @@ SUPPORTED_ANSWER_KEYS = {
     "rt_correction_peak_selection_rt_weight", "library_strategy", "libraries",
     "library_provenance", "run_qa", "internal_standards",
     "use_retention_time_for_annotation", "retention_time_tolerance", "number_of_threads",
-    "stage_inputs",
+    "stage_inputs", "dilution_factor", "class_assignment_confirmed",
     "generate_materials_methods", "alignment_light_mode", "output_root",
     "export_folder_path", "height_matrix_export", "console_path", "template_path",
     "queries_path", "project_store", "workflow_overrides", "repository_metadata_path",
@@ -80,6 +80,41 @@ def inspect_analysis_input(input_path: str) -> dict[str, Any]:
         # The grouping is a scientific decision; the file names only suggest it, so the
         # reasoning travels with the proposal for a person to accept or replace.
         "class_proposal": _describe_class_proposal(files),
+        "sample_table_proposal": _describe_sample_table(files),
+    }
+
+
+def _describe_sample_table(files: list[dict[str, Any]]) -> dict[str, Any]:
+    """How the injection order was arrived at, and what the dilution factor is set to.
+
+    Both are silently consequential: the order is what every drift plot downstream is
+    drawn against, and the factor scales every concentration. Neither said where it came
+    from, so a value that happened to be right was indistinguishable from one that had
+    never been considered.
+    """
+    from .sample_grouping import propose_injection_order
+
+    names = [str(item.get("file_name", "")) for item in files]
+    order = propose_injection_order(names) if names else {"reason": "no files", "alternatives": []}
+    factors = sorted({float(item.get("factor", 1) or 1) for item in files})
+    return {
+        "analytical_order": {
+            "derived_from": order.get("chosen", "listing"),
+            "reason": order.get("reason", ""),
+            "agrees_with_file_listing": order.get("agrees_with_listing"),
+            "alternatives": [item.get("label", "") for item in order.get("alternatives", [])],
+        },
+        "dilution_factor": {
+            "values": factors,
+            "assumed": factors == [1.0],
+            "note": (
+                "Every file is set to 1, which is the default rather than a value read "
+                "from anywhere. A wrong factor scales every concentration."
+                if factors == [1.0]
+                else "Dilution factors differ between files; confirm they are right."
+            ),
+        },
+        "confirmation_required": True,
     }
 
 
@@ -455,6 +490,13 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
             "Within how many minutes of the library retention time should a match be accepted?",
             required=False,
         )
+    if "dilution_factor" not in answers:
+        ask(
+            "dilution_factor",
+            "What dilution factor applies to these samples? It scales every concentration, "
+            "and 1 is a default rather than a value read from the data.",
+            required=False,
+        )
     if "stage_inputs" not in answers:
         ask(
             "stage_inputs",
@@ -469,6 +511,20 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
             "number_of_threads",
             "How many threads should MS-DIAL use on this machine?",
             required=False,
+        )
+    # The one question worth blocking on. Every downstream comparison is drawn along
+    # this axis, correcting it afterwards means re-running, and answering it costs a
+    # word. A repository reanalysis has its own gate and no analyst to ask, so it is
+    # raised only where the classes came from reading file names.
+    if (
+        not answers.get("repository_metadata_path")
+        and "class_assignment_confirmed" not in answers
+    ):
+        ask(
+            "class_assignment_confirmed",
+            "The Class assignment was read from the file names. Confirm it is the "
+            "comparison this experiment is about, or give the assignment to use.",
+            ["true", "false"],
         )
     if project_type == "lcms" and "run_qa" not in answers:
         ask("run_qa", "Generate the LC-MS quality-assurance report after analysis?", ["true", "false"])
@@ -557,6 +613,11 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
         state["number_of_threads"] = max(1, int(answers["number_of_threads"]))
     if answers.get("stage_inputs") is not None:
         state["stage_inputs"] = _as_bool(answers.get("stage_inputs"))
+    if answers.get("dilution_factor") is not None:
+        factor = float(answers["dilution_factor"])
+        if factor > 0:
+            for item in state["files"]:
+                item["factor"] = factor
     if project_type == "lcms":
         ion_mode = str(state["ion_mode"])
         state["selected_adducts"] = [

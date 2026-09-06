@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import __version__
-from .sample_grouping import file_type_for, propose_grouping
+from .sample_grouping import file_type_for, propose_grouping, propose_injection_order
 from .user_settings import load_user_settings
 
 
@@ -445,6 +445,7 @@ def expand_paths_report(paths: Iterable[str]) -> dict[str, Any]:
     # The grouping is read from how the names vary across the whole set, so it has to be
     # decided once for all of them rather than file by file.
     grouping = propose_grouping([path.stem for path in unique])
+    injection = propose_injection_order([path.stem for path in unique])
     result = []
     for index, path in enumerate(unique):
         format_info = detect_raw_format(path)
@@ -457,7 +458,7 @@ def expand_paths_report(paths: Iterable[str]) -> dict[str, Any]:
                 "class_id": grouping["assignments"].get(name, "Sample"),
                 "acquisition_type": "DDA",
                 "batch_order": 1,
-                "analytical_order": index + 1,
+                "analytical_order": injection["orders"].get(name, index + 1),
                 "factor": 1,
                 **format_info,
             }

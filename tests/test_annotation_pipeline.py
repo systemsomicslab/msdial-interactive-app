@@ -87,6 +87,7 @@ class AnnotationPipelineTests(unittest.TestCase):
                         "generate_materials_methods": False,
                         "console_path": str(console),
                         "template_path": str(ROOT / "resources" / "msdial_console_param4lipidomics.txt"),
+                        "class_assignment_confirmed": True,
                     },
                 )
 

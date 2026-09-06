@@ -99,3 +99,52 @@ class GroupingShapeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InjectionOrderTests(unittest.TestCase):
+    def test_the_sequence_number_in_the_name_is_read_as_the_order(self) -> None:
+        from msdial_app.sample_grouping import propose_injection_order
+
+        result = propose_injection_order(LECTURE_NAMES)
+
+        self.assertEqual("embedded", result["chosen"])
+        self.assertIn("4, 10, 22, 23, 25, 35", result["reason"])
+        self.assertEqual(
+            [1, 2, 3, 4, 5, 6, 7], [result["orders"][name] for name in LECTURE_NAMES]
+        )
+
+    def test_it_says_whether_the_sequence_agrees_with_the_file_listing(self) -> None:
+        # Alphabetical listing and acquisition order coincide often enough that the
+        # difference has to be stated rather than left to be assumed either way.
+        from msdial_app.sample_grouping import propose_injection_order
+
+        self.assertTrue(propose_injection_order(LECTURE_NAMES)["agrees_with_listing"])
+
+        reordered = ["run_030_ctrl", "run_007_ctrl", "run_019_dosed", "run_002_dosed"]
+        result = propose_injection_order(reordered)
+        self.assertFalse(result["agrees_with_listing"])
+        self.assertEqual([4, 2, 3, 1], [result["orders"][name] for name in reordered])
+        self.assertIn("disagrees with the file listing", result["reason"])
+
+    def test_a_blank_keeps_the_place_the_listing_gave_it(self) -> None:
+        # A blank carries no sequence number and would otherwise defeat the detection
+        # for every other file.
+        from msdial_app.sample_grouping import propose_injection_order
+
+        result = propose_injection_order(LECTURE_NAMES)
+        self.assertEqual(7, result["orders"][LECTURE_NAMES[-1]])
+        self.assertIn("blank or quality-control file", result["reason"])
+
+    def test_a_replicate_index_is_not_mistaken_for_a_sequence(self) -> None:
+        from msdial_app.sample_grouping import propose_injection_order
+
+        names = ["s_ctrl_1", "s_ctrl_2", "s_dosed_1", "s_dosed_2"]
+        result = propose_injection_order(names)
+        self.assertEqual("listing", result["chosen"], result["reason"])
+
+    def test_names_without_any_number_fall_back_to_the_listing_and_say_so(self) -> None:
+        from msdial_app.sample_grouping import propose_injection_order
+
+        result = propose_injection_order(["alpha_ctrl", "beta_ctrl", "gamma_dosed"])
+        self.assertEqual("listing", result["chosen"])
+        self.assertIn("no token varies numerically", result["reason"])
