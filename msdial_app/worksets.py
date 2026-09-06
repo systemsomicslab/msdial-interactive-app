@@ -11,6 +11,28 @@ from .user_settings import user_data_directory
 
 WORKSET_SCHEMA = "msdial-interactive.workset.v1"
 
+# Answers that belong to one dataset, or to one person's agreement about one dataset.
+# Reusing them is not merely unhelpful: a confirmation carried forward is a
+# confirmation nobody gave, and a threshold measured on other files is a threshold
+# nobody measured here. Each entry says why, because the reasons are reported to the
+# person rather than applied in silence.
+DATASET_SCOPED_ANSWERS: dict[str, str] = {
+    "input_path": "names this dataset",
+    "output_root": "names where this run wrote",
+    "export_folder_path": "names where this run wrote",
+    "project_store": "names where this run wrote",
+    "confirmed": "approves this run and nothing after it",
+    "class_assignment_confirmed": (
+        "is one person's agreement about these file names; the next dataset has its own"
+    ),
+    "dilution_factor": (
+        "belongs to how this batch was prepared, and a wrong value scales every concentration"
+    ),
+    "repository_metadata_path": "names this accession's metadata",
+    "rt_correction_anchor_path": "names this batch's retention-time anchors",
+    "rt_correction_selection_path": "names this batch's retention-time anchors",
+}
+
 
 _BUILTIN_WORKSETS: tuple[dict[str, Any], ...] = (
     {
@@ -146,7 +168,11 @@ def save_workset(
         "builtin": False,
         "created_at": dt.datetime.now().astimezone().isoformat(),
         "answers": _portable_answers(answers),
-        "workflow_overrides": dict(workflow_overrides or {}),
+        # Overrides travel in their own field. They also arrive inside answers, from a
+        # plan that carried them there, and taking only the argument would drop them.
+        "workflow_overrides": dict(
+            workflow_overrides or answers.get("workflow_overrides") or {}
+        ),
     }
     directory = workset_directory()
     directory.mkdir(parents=True, exist_ok=True)
@@ -161,9 +187,64 @@ def save_workset(
     return item
 
 
+def describe_workset_candidate(
+    answers: dict[str, Any],
+    *,
+    source: dict[str, Any] | None = None,
+    suggested_name: str = "",
+) -> dict[str, Any]:
+    """What a workset made from these answers would carry, and what it would drop.
+
+    The point of a workset is that the second dataset only has to confirm what changed.
+    That is only safe if the things which cannot be inherited are visibly not
+    inherited, so both halves are returned: the method settings that carry, and the
+    dataset-scoped answers that are deliberately left behind with the reason.
+    """
+    reusable = _portable_answers(answers)
+    dropped = {
+        key: DATASET_SCOPED_ANSWERS[key]
+        for key in sorted(answers)
+        if key in DATASET_SCOPED_ANSWERS
+    }
+    # A minimum peak height is a method parameter a laboratory fixes for an instrument,
+    # so it carries. When it came from a diagnostic it was *measured* on these files,
+    # and saving a measurement as a setting is only safe if it says so.
+    caveats: list[str] = []
+    if answers.get("parameter_strategy") in {"target_peak_count", "auto_peak_range"} and (
+        "minimum_peak_height" in reusable
+    ):
+        caveats.append(
+            f"minimum_peak_height {reusable['minimum_peak_height']} was measured by a "
+            "diagnostic run on this dataset, not chosen. Reusing it on data from another "
+            "instrument or preparation carries a threshold nobody measured there."
+        )
+
+    previous = dict((source or {}).get("answers", {}))
+    changed = {
+        key: {"was": previous.get(key), "now": value}
+        for key, value in sorted(reusable.items())
+        if key not in previous or previous[key] != value
+    }
+    return {
+        "suggested_name": str(suggested_name).strip(),
+        "reusable_answers": reusable,
+        "workflow_overrides": dict(answers.get("workflow_overrides") or {}),
+        "not_reusable": dropped,
+        "caveats": caveats,
+        "source_workset": (source or {}).get("id", ""),
+        # A workset already in use and unchanged does not need saving again; one built
+        # from nothing, or changed since, does.
+        "changed_from_source": changed,
+        "worth_saving": bool(reusable) and (source is None or bool(changed)),
+    }
+
+
 def _portable_answers(answers: dict[str, Any]) -> dict[str, Any]:
-    excluded = {"input_path", "output_root", "confirmed"}
-    return {key: value for key, value in answers.items() if key not in excluded}
+    return {
+        key: value
+        for key, value in answers.items()
+        if key not in DATASET_SCOPED_ANSWERS and key != "workflow_overrides"
+    }
 
 
 def _slug(value: str) -> str:

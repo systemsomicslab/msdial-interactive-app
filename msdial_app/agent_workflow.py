@@ -18,7 +18,7 @@ from .workflow import (
     read_lipid_queries,
     validate_workflow,
 )
-from .worksets import get_workset
+from .worksets import describe_workset_candidate, get_workset
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -147,6 +147,21 @@ def _describe_class_proposal(files: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _suggested_workset_name(answers: dict[str, Any], inspection: dict[str, Any]) -> str:
+    """A name a laboratory would recognise, built from what makes this method distinct."""
+    parts = [
+        str(answers.get("project_type", "")).upper().replace("LCMS", "LC-MS").replace("GCMS", "GC-MS"),
+        str(answers.get("ion_mode", "")),
+        str(answers.get("target_omics", "")),
+    ]
+    library = (answers.get("libraries") or {})
+    if isinstance(library, dict) and library.get("lbm_path"):
+        parts.append(Path(str(library["lbm_path"])).stem[:24])
+    elif inspection.get("vendors"):
+        parts.append(str(inspection["vendors"][0]))
+    return " ".join(part for part in parts if part).strip()
+
+
 def build_guided_plan(
     input_path: str,
     answers: dict[str, Any] | None = None,
@@ -225,6 +240,15 @@ def build_guided_plan(
         "remaining_questions": questions,
         "advisory_questions": [item for item in questions if not item.get("required", True)],
         "workflow": workflow,
+        # The second dataset should only have to confirm what changed, which requires
+        # that the first one's settings be saved. Nothing here saves them; it says what
+        # a workset would hold and what it would deliberately not carry, so the offer
+        # can be made with the trade-off visible.
+        "workset_suggestion": describe_workset_candidate(
+            merged,
+            source=workset,
+            suggested_name=_suggested_workset_name(merged, inspection),
+        ),
         "validation": validation,
         "warnings": [
             *inspection.get("warnings", []),

@@ -88,7 +88,7 @@ from .workflow import (
     validate_workflow,
 )
 from .user_settings import load_user_settings, save_path_settings, settings_path, user_data_directory
-from .worksets import list_worksets, save_workset
+from .worksets import describe_workset_candidate, list_worksets, save_workset
 from .diagnostic_paths import diagnostic_run_directory, is_diagnostic_artifact
 
 
@@ -362,6 +362,49 @@ def _diagnose_console_failure(logs: list[str], fallback: str) -> str:
             "the WIFF from its original directory."
         )
     return fallback
+
+
+def _write_guided_answers(preparation: dict, plan: dict) -> str:
+    """Keep the answers that produced this run beside the run.
+
+    workflow-settings.json records the resolved workflow: every parameter, with no
+    trace of which of them a person decided and which fell out of a default. That is
+    what a reproduction needs and not what a workset needs, so the answers are written
+    too, and the next dataset can start from a run that already happened.
+    """
+    run_directory = str(preparation.get("run_directory", "")).strip()
+    if not run_directory:
+        return ""
+    path = Path(run_directory).expanduser() / "guided-answers.json"
+    payload = {
+        "schema": "msdial-interactive.guided-answers.v1",
+        "recorded_at": dt.datetime.now().astimezone().isoformat(),
+        "input_path": plan.get("input", {}).get("input_path", ""),
+        "workset_id": (plan.get("workset") or {}).get("id", ""),
+        "answers": plan.get("answers", {}),
+        "workset_suggestion": plan.get("workset_suggestion", {}),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str) + chr(10),
+            encoding="utf-8",
+        )
+    except OSError:
+        # Losing the record must not lose the run.
+        return ""
+    return str(path)
+
+
+def _read_guided_answers(run_directory: str) -> dict:
+    path = Path(run_directory).expanduser() / "guided-answers.json"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{path} does not exist, so the answers this run used cannot be recovered. "
+            "Pass answers explicitly."
+        )
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    return dict(payload.get("answers") or {})
 
 
 def _register_download(path: str | Path) -> str:
@@ -873,14 +916,24 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 )
             elif parsed.path == "/api/agent/worksets/save":
+                answers = dict(body.get("answers") or {})
+                source_run = str(body.get("run_directory", "")).strip()
+                if source_run and not answers:
+                    answers = _read_guided_answers(source_run)
+                saved = save_workset(
+                    body.get("name", ""),
+                    answers,
+                    description=body.get("description", ""),
+                    workflow_overrides=body.get("workflow_overrides", {}),
+                )
                 self._json(
                     {
-                        "workset": save_workset(
-                            body.get("name", ""),
-                            body.get("answers", {}),
-                            description=body.get("description", ""),
-                            workflow_overrides=body.get("workflow_overrides", {}),
-                        )
+                        "workset": saved,
+                        "from_run_directory": source_run,
+                        # What was deliberately not carried, so the next dataset is not
+                        # told it inherited a confirmation it never gave.
+                        "not_reusable": describe_workset_candidate(answers)["not_reusable"],
+                        "caveats": describe_workset_candidate(answers)["caveats"],
                     }
                 )
             elif parsed.path == "/api/agent/prepare":
@@ -897,6 +950,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 messages: list[str] = []
                 preparation = prepare_run(plan["workflow"], messages.append)
+                _write_guided_answers(preparation, plan)
                 self._json(
                     {
                         "plan": plan,
@@ -941,6 +995,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
                 preparation = prepare_run(plan["workflow"])
+                _write_guided_answers(preparation, plan)
                 job_id = uuid.uuid4().hex
                 artifact_baseline = _snapshot_run_artifacts(preparation)
                 with JOBS_LOCK:
