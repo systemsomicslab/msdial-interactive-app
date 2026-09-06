@@ -599,3 +599,86 @@ class McpRepositoryToolsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DownloadSizeGuardTests(unittest.TestCase):
+    """CLAUDE-C02/C04: the number a human is asked to approve must be checkable."""
+
+    def _handoff(self) -> dict:
+        return McpRepositoryToolsTests._unit_handoff()
+
+    def test_a_handoff_cannot_declare_a_bundle_smaller_than_its_own_files(self) -> None:
+        handoff = self._handoff()
+        handoff["download_scope"]["bundle_bytes"] = 1
+        with self.assertRaisesRegex(
+            ValueError, r"declares a 1-byte bundle but its file manifest totals 1024 bytes"
+        ):
+            mcp_server._project_from_analysis_unit_handoff(handoff)
+
+    def test_a_forged_bundle_figure_no_longer_defeats_the_size_limit(self) -> None:
+        handoff = self._handoff()
+        handoff["download_scope"]["bundle_bytes"] = 1
+        result = mcp_server.msdial_repository_reanalysis_plan(
+            "mb_post",
+            "MPST-MIXED",
+            "D:/repository",
+            analysis_unit_handoff=handoff,
+            analysis_purpose="Compare biological groups and produce mzTab-M.",
+            maximum_gb=0.001,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual("validation_error", result["reason"])
+        self.assertIn("1-byte bundle", result["detail"])
+
+    def test_a_bundle_figure_below_the_manifest_is_never_within_the_size_limit(self) -> None:
+        # Defence in depth: a project that reached the resolver without passing the
+        # handoff guard still may not report a figure smaller than its own files.
+        size = mcp_server._required_download_size(
+            {"download_scope": {"bundle_bytes": 1}, "total_download_bytes": 103_478_458}
+        )
+        self.assertEqual(103_478_458, size["required_download_bytes"])
+        self.assertTrue(size["bundle_bytes_contradicted"])
+        self.assertEqual(1, size["declared_bundle_bytes"])
+
+    def test_a_shared_bundle_larger_than_the_unit_is_not_a_contradiction(self) -> None:
+        size = mcp_server._required_download_size(
+            {"download_scope": {"bundle_bytes": 20_121_195_706}, "total_download_bytes": 103_478_458}
+        )
+        self.assertEqual(20_121_195_706, size["required_download_bytes"])
+        self.assertFalse(size["bundle_bytes_contradicted"])
+
+    def test_an_unknown_bundle_figure_falls_back_to_the_manifest_total(self) -> None:
+        size = mcp_server._required_download_size(
+            {"download_scope": {}, "total_download_bytes": 1024}
+        )
+        self.assertEqual(1024, size["required_download_bytes"])
+        self.assertFalse(size["bundle_bytes_contradicted"])
+
+    def test_the_declared_bundle_figure_is_never_reported_as_verified(self) -> None:
+        handoff = self._handoff()
+        result = mcp_server.msdial_repository_reanalysis_plan(
+            "mb_post",
+            "MPST-MIXED",
+            "D:/repository",
+            analysis_unit_handoff=handoff,
+            analysis_purpose="Compare biological groups and produce mzTab-M.",
+        )
+        self.assertFalse(result["download"]["bundle_bytes_verified"])
+        self.assertFalse(result["download"]["bundle_bytes_contradicted"])
+        self.assertEqual(2048, result["download"]["declared_bundle_bytes"])
+
+    def test_maximum_gb_is_decimal_gb_not_gibibytes(self) -> None:
+        handoff = self._handoff()
+        handoff["files"][0]["size_bytes"] = 103_478_458
+        handoff["download_scope"]["bundle_bytes"] = 20_121_195_706
+        result = mcp_server.msdial_repository_reanalysis_plan(
+            "mb_post",
+            "MPST-MIXED",
+            "D:/repository",
+            analysis_unit_handoff=handoff,
+            analysis_purpose="Compare biological groups and produce mzTab-M.",
+            maximum_gb=19,
+        )
+        # 19 GiB would admit 20,401,094,656 bytes and pass this bundle.
+        self.assertFalse(result["download"]["within_size_limit"])
+        self.assertIn("size_limit:exceeded", result["download"]["blocking_reasons"])

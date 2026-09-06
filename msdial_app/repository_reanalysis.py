@@ -698,6 +698,31 @@ def discover_candidates(
     }
 
 
+def resolve_required_download_bytes(
+    declared_bundle_bytes: Any, unit_file_bytes: Any
+) -> dict[str, Any]:
+    """Bytes that must actually be transferred for one analysis unit.
+
+    ``download_scope.bundle_bytes`` is copied from the catalog handoff and is
+    unverified until a download job has read the bundle's own Content-Length. A
+    bundle may legitimately be far larger than the unit's files, because several
+    units often share one archive, but it can never be smaller than the files it
+    has to supply. When the declared figure falls below the total recomputed from
+    the file manifest, the recomputed total is the safety-limit quantity and the
+    declared figure is reported as contradicted rather than used. A stale handoff
+    left behind by a re-bundled accession fails this way, not silently.
+    """
+    unit_bytes = max(int(unit_file_bytes or 0), 0)
+    declared = max(int(declared_bundle_bytes or 0), 0)
+    return {
+        "required_download_bytes": max(declared, unit_bytes),
+        "declared_bundle_bytes": declared,
+        "unit_file_bytes": unit_bytes,
+        "bundle_bytes_verified": False,
+        "bundle_bytes_contradicted": bool(declared and unit_bytes and declared < unit_bytes),
+    }
+
+
 def create_download_lease(
     project: RepositoryProject,
     workspace_root: Path,
@@ -711,11 +736,10 @@ def create_download_lease(
     )
     if not downloadable:
         raise ValueError("Only an eligible or explicitly approved preflight project can receive a download lease.")
-    required_download_bytes = int(
-        project.download_scope.get("bundle_bytes")
-        or project.total_download_bytes
-        or 0
+    size = resolve_required_download_bytes(
+        project.download_scope.get("bundle_bytes"), project.total_download_bytes
     )
+    required_download_bytes = size["required_download_bytes"]
     if required_download_bytes > maximum_bytes:
         raise ValueError(
             f"Required repository bundle is {required_download_bytes} bytes; "
