@@ -74,6 +74,39 @@ def inspect_analysis_input(input_path: str) -> dict[str, Any]:
         "vendors": sorted({str(item.get("vendor", "Unknown")) for item in files}),
         "default_output_root": str(default_output),
         "analysis_csv_source": str(path) if path.suffix.casefold() == ".csv" else "",
+        # How the proposed grouping was arrived at, and what else it could have been.
+        # The grouping is a scientific decision; the file names only suggest it, so the
+        # reasoning travels with the proposal for a person to accept or replace.
+        "class_proposal": _describe_class_proposal(files),
+    }
+
+
+def _describe_class_proposal(files: list[dict[str, Any]]) -> dict[str, Any]:
+    from .sample_grouping import propose_grouping
+
+    names = [str(item.get("file_name", "")) for item in files]
+    if not names:
+        return {"reason": "no files were recognised", "alternatives": [], "groups": {}}
+    grouping = propose_grouping(names)
+    groups: dict[str, list[str]] = {}
+    for item in files:
+        groups.setdefault(str(item.get("class_id", "Sample")), []).append(
+            str(item.get("file_name", ""))
+        )
+    chosen = grouping.get("chosen")
+    return {
+        "reason": grouping.get("reason", ""),
+        "groups": {label: len(members) for label, members in sorted(groups.items())},
+        "alternatives": [
+            {
+                "label": " / ".join(candidate["values"]),
+                "group_count": candidate["group_count"],
+                "smallest_group": candidate["smallest_group"],
+                "chosen": chosen is not None and candidate["position"] == chosen["position"],
+            }
+            for candidate in grouping.get("candidates", [])[:5]
+        ],
+        "confirmation_required": True,
     }
 
 

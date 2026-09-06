@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import __version__
+from .sample_grouping import file_type_for, propose_grouping
 from .user_settings import load_user_settings
 
 
@@ -441,27 +442,19 @@ def expand_paths_report(paths: Iterable[str]) -> dict[str, Any]:
         else:
             rejected.append(f"{path} (not found)")
     unique = sorted(set(expanded), key=lambda item: str(item).lower())
+    # The grouping is read from how the names vary across the whole set, so it has to be
+    # decided once for all of them rather than file by file.
+    grouping = propose_grouping([path.stem for path in unique])
     result = []
     for index, path in enumerate(unique):
         format_info = detect_raw_format(path)
         name = path.stem
-        lower = name.lower()
-        is_blank = "blank" in lower
-        class_id = (
-            "Blank"
-            if is_blank
-            else "Feces"
-            if "feces" in lower
-            else "Plasma"
-            if "plasma" in lower
-            else "Sample"
-        )
         result.append(
             {
                 "file_path": str(path),
                 "file_name": name,
-                "file_type": "Blank" if is_blank else "Sample",
-                "class_id": class_id,
+                "file_type": file_type_for(name),
+                "class_id": grouping["assignments"].get(name, "Sample"),
                 "acquisition_type": "DDA",
                 "batch_order": 1,
                 "analytical_order": index + 1,
