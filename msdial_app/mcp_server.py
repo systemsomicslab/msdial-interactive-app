@@ -548,6 +548,12 @@ def _repository_answer_seed(
         answers["target_omics"] = target_omics
     if acquisition_type:
         answers["acquisition_type"] = acquisition_type
+    # Carried into the workflow so it reaches workflow-settings.json and, through it, the publication
+    # provenance. A Methods section that names a Class grouping should be able to say which approved
+    # proposal produced it, under what purpose and contrast, and from which prompt.
+    provenance = workspace.get("class_proposal_provenance")
+    if provenance:
+        answers["workflow_overrides"]["class_proposal_provenance"] = provenance
     return answers
 
 
@@ -1257,9 +1263,31 @@ def msdial_prepare_repository_reanalysis(
         save_metadata_review,
     )
 
-    workspace = metadata_workspace(manifest.get("project") or {})
-    selected_hierarchy = list(hierarchy if hierarchy is not None else workspace.get("hierarchy", []))
-    projected = project_class_hierarchy(workspace, selected_hierarchy)
+    from .repository_metadata import apply_class_proposal
+
+    project = manifest.get("project") or {}
+    workspace = metadata_workspace(project)
+    # The Catalog owns the scientific decision and records it as one Class label per sample. Saving
+    # that proposal is the confirmation, so a proposal reaching here has already been approved; the
+    # Catalog does not move its status field afterwards, and gating on a status it never sets would
+    # silently turn this whole path off.
+    proposal = project.get("class_proposal") or {}
+    if proposal.get("assignments"):
+        approved_fields = [str(item) for item in proposal.get("selected_fields") or []]
+        if hierarchy is not None and list(hierarchy) != approved_fields:
+            raise RuntimeError(
+                "This unit has an approved Class proposal, so its per-sample assignments are applied "
+                f"and a hierarchy argument may only restate the fields it selected ({approved_fields}). "
+                f"Requested {list(hierarchy)}. To group the samples differently, create and approve a "
+                "new proposal in the Catalog rather than re-deriving Class here."
+            )
+        projected = apply_class_proposal(workspace, proposal)
+        selected_hierarchy = list(projected.get("hierarchy") or [])
+    else:
+        selected_hierarchy = list(
+            hierarchy if hierarchy is not None else workspace.get("hierarchy", [])
+        )
+        projected = project_class_hierarchy(workspace, selected_hierarchy)
     recognized = ((job.get("result") or {}).get("recognized") or {}).get("files", [])
     application = apply_classes_to_analysis_files(projected, recognized)
     output_root = str(manifest.get("output_directory") or "")
@@ -1287,6 +1315,8 @@ def msdial_prepare_repository_reanalysis(
         "output_root": output_root,
         "execution_allowed": execution_allowed,
         "execution_blockers": execution_blockers,
+        "class_source": projected.get("class_source", "hierarchy"),
+        "class_proposal_provenance": projected.get("class_proposal_provenance"),
         "class_hierarchy": selected_hierarchy,
         "matched_count": application["matched_count"],
         "recognized_count": len(recognized),
