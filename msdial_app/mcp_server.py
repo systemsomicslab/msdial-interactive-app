@@ -336,6 +336,21 @@ def _repository_project_summary(
     }
 
 
+def _required_download_size(project: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the safety-limit byte count for one project.
+
+    ``CLAUDE.md`` designates the actual required bundle bytes as the download
+    approval and safety-limit quantity, so it may never be taken on the handoff's
+    word alone; see ``resolve_required_download_bytes``.
+    """
+    from .repository_reanalysis import resolve_required_download_bytes
+
+    return resolve_required_download_bytes(
+        (project.get("download_scope") or {}).get("bundle_bytes"),
+        project.get("total_download_bytes"),
+    )
+
+
 def _project_from_analysis_unit_handoff(
     handoff: dict[str, Any], repository: str = "", accession: str = ""
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -383,6 +398,17 @@ def _project_from_analysis_unit_handoff(
     if declared_file_count is not None and int(declared_file_count) != len(files):
         raise ValueError(
             f"Analysis unit {unit_id} declares {declared_file_count} files but provides {len(files)}."
+        )
+    manifest_bytes = sum(item["size_bytes"] for item in files)
+    declared_bundle_bytes = scope.get("bundle_bytes")
+    if (
+        declared_bundle_bytes is not None
+        and manifest_bytes > 0
+        and int(declared_bundle_bytes) < manifest_bytes
+    ):
+        raise ValueError(
+            f"Analysis unit {unit_id} declares a {int(declared_bundle_bytes)}-byte bundle "
+            f"but its file manifest totals {manifest_bytes} bytes."
         )
     common_attributes = dict(handoff.get("unit_attributes") or {})
     sample_payload = handoff.get("sample_metadata") or []
@@ -1007,7 +1033,10 @@ def msdial_repository_reanalysis_plan(
     port: int = DEFAULT_PORT,
     analysis_purpose: str = "",
 ) -> dict[str, Any]:
-    """Inspect one public accession and return metadata, QA evidence, and download decisions."""
+    """Inspect one public accession and return metadata, QA evidence, and download decisions.
+
+    ``maximum_gb`` is decimal GB (1e9 bytes), matching how repositories report size.
+    """
     workspace_root = _validated_workspace_root(workspace_root)
     project, workspace = _repository_inspection(
         repository, accession, analysis_unit_handoff, analysis_unit_handoff_path, host, port
@@ -1016,12 +1045,9 @@ def msdial_repository_reanalysis_plan(
 
     if float(maximum_gb) <= 0:
         raise ValueError("maximum_gb must be greater than zero.")
-    required_bytes = int(
-        (project.get("download_scope") or {}).get("bundle_bytes")
-        or project.get("total_download_bytes")
-        or 0
-    )
-    maximum_bytes = int(float(maximum_gb) * 1024**3)
+    size = _required_download_size(project)
+    required_bytes = size["required_download_bytes"]
+    maximum_bytes = int(float(maximum_gb) * 1000**3)
     intent = _analysis_intent(analysis_purpose)
     blocking_reasons = _repository_download_blockers(
         project, intent, required_bytes, maximum_bytes, allow_preflight=False
@@ -1046,8 +1072,11 @@ def msdial_repository_reanalysis_plan(
         "download": {
             "workspace_root": workspace_root,
             "maximum_gb": maximum_gb,
-            "unit_file_bytes": int(project.get("total_download_bytes") or 0),
+            "unit_file_bytes": size["unit_file_bytes"],
             "required_download_bytes": required_bytes,
+            "declared_bundle_bytes": size["declared_bundle_bytes"],
+            "bundle_bytes_verified": size["bundle_bytes_verified"],
+            "bundle_bytes_contradicted": size["bundle_bytes_contradicted"],
             "within_size_limit": required_bytes <= maximum_bytes,
             "raw_retention_policy": raw_retention_policy,
             "confirmation_required": True,
@@ -1080,19 +1109,19 @@ def msdial_download_repository_raw(
     port: int = DEFAULT_PORT,
     analysis_purpose: str = "",
 ) -> dict[str, Any]:
-    """Download and recognize repository raw data only after explicit user confirmation."""
+    """Download and recognize repository raw data only after explicit user confirmation.
+
+    ``maximum_gb`` is decimal GB (1e9 bytes), matching how repositories report size.
+    """
     workspace_root = _validated_workspace_root(workspace_root)
     project, workspace = _repository_inspection(
         repository, accession, analysis_unit_handoff, analysis_unit_handoff_path, host, port
     )
     if float(maximum_gb) <= 0:
         raise ValueError("maximum_gb must be greater than zero.")
-    required_bytes = int(
-        (project.get("download_scope") or {}).get("bundle_bytes")
-        or project.get("total_download_bytes")
-        or 0
-    )
-    maximum_bytes = int(float(maximum_gb) * 1024**3)
+    size = _required_download_size(project)
+    required_bytes = size["required_download_bytes"]
+    maximum_bytes = int(float(maximum_gb) * 1000**3)
     intent = _analysis_intent(analysis_purpose)
     blocking_reasons = _repository_download_blockers(
         project, intent, required_bytes, maximum_bytes, allow_preflight
@@ -1105,8 +1134,11 @@ def msdial_download_repository_raw(
         "maximum_gb": maximum_gb,
         "raw_retention_policy": raw_retention_policy,
         "allow_preflight": allow_preflight,
-        "unit_file_bytes": int(project.get("total_download_bytes") or 0),
+        "unit_file_bytes": size["unit_file_bytes"],
         "required_download_bytes": required_bytes,
+        "declared_bundle_bytes": size["declared_bundle_bytes"],
+        "bundle_bytes_verified": size["bundle_bytes_verified"],
+        "bundle_bytes_contradicted": size["bundle_bytes_contradicted"],
         "within_size_limit": required_bytes <= maximum_bytes,
         "blocking_reasons": blocking_reasons,
     }
@@ -1165,11 +1197,15 @@ def msdial_repository_batch_plan(
     raw_retention_policy: str = "keep",
     analysis_purpose: str = "",
 ) -> dict[str, Any]:
-    """Expand a mixed repository accession into independent analysis-unit run plans."""
+    """Expand a mixed repository accession into independent analysis-unit run plans.
+
+    ``maximum_gb_per_unit`` is decimal GB (1e9 bytes), matching how repositories
+    report size.
+    """
     workspace_root = _validated_workspace_root(workspace_root)
     if float(maximum_gb_per_unit) <= 0:
         raise ValueError("maximum_gb_per_unit must be greater than zero.")
-    maximum_bytes = int(float(maximum_gb_per_unit) * 1024**3)
+    maximum_bytes = int(float(maximum_gb_per_unit) * 1000**3)
     handoffs = list(analysis_unit_handoffs or [])
     for handoff_path in analysis_unit_handoff_paths or []:
         loaded = _load_analysis_unit_handoff(None, handoff_path)
@@ -1197,11 +1233,8 @@ def msdial_repository_batch_plan(
         )
         if not intent["confirmed"]:
             blocking.append("analysis_purpose:missing")
-        required_bytes = int(
-            (project.get("download_scope") or {}).get("bundle_bytes")
-            or project.get("total_download_bytes")
-            or 0
-        )
+        size = _required_download_size(project)
+        required_bytes = size["required_download_bytes"]
         if required_bytes > maximum_bytes:
             blocking.append("size_limit:exceeded")
         pending_decisions = list(project.get("pending_decisions", []))
@@ -1221,6 +1254,8 @@ def msdial_repository_batch_plan(
                 ),
                 "blocking_reasons": list(dict.fromkeys(blocking)),
                 "required_download_bytes": required_bytes,
+                "unit_file_bytes": size["unit_file_bytes"],
+                "bundle_bytes_contradicted": size["bundle_bytes_contradicted"],
                 "within_size_limit": required_bytes <= maximum_bytes,
                 "pending_decisions": list(dict.fromkeys(pending_decisions)),
                 "ready": bool(project.get("eligible")) and not blocking,

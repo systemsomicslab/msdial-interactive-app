@@ -57,6 +57,7 @@ from .repository_reanalysis import (
     evaluate_eligibility,
     finalize_download_lease,
     project_from_dict,
+    resolve_required_download_bytes,
 )
 from .workflow import (
     console_version,
@@ -700,12 +701,11 @@ class Handler(BaseHTTPRequestHandler):
                 maximum_gb = float(body.get("maximum_gb", 20) or 20)
                 if maximum_gb <= 0:
                     raise ValueError("Maximum download size must be greater than zero.")
-                maximum_bytes = int(maximum_gb * 1024**3)
-                required_download_bytes = int(
-                    project.download_scope.get("bundle_bytes")
-                    or project.total_download_bytes
-                    or 0
-                )
+                maximum_bytes = int(maximum_gb * 1000**3)
+                required_download_bytes = resolve_required_download_bytes(
+                    project.download_scope.get("bundle_bytes"),
+                    project.total_download_bytes,
+                )["required_download_bytes"]
                 if required_download_bytes > maximum_bytes:
                     raise ValueError(
                         f"Required repository bundle is {required_download_bytes} bytes; "
