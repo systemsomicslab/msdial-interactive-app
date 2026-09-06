@@ -51,6 +51,7 @@ from .repository_qa import propose_repository_qa_targets
 from .repository_reanalysis import (
     ADAPTERS,
     EligibilityPolicy,
+    evaluate_repository_execution_gate,
     request_download_cleanup,
     create_download_lease,
     evaluate_eligibility,
@@ -87,6 +88,7 @@ from .workflow import (
 )
 from .user_settings import load_user_settings, save_path_settings, settings_path, user_data_directory
 from .worksets import list_worksets, save_workset
+from .diagnostic_paths import diagnostic_run_directory, is_diagnostic_artifact
 
 
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
@@ -140,13 +142,35 @@ def _classify_artifact(path: Path) -> str:
     return "other"
 
 
+def _repository_workspace(state: dict[str, Any]) -> str:
+    """The analysis-unit workspace a repository workflow belongs to, or "" for a local analysis.
+
+    Read from the unit's own manifest rather than derived from the output path, so a workflow cannot
+    steer a diagnostic outside the unit by pointing output_root somewhere else. The manifest is also
+    what states which directory the unit owns.
+    """
+    manifest_text = str(state.get("repository_run_manifest") or "").strip()
+    if not manifest_text:
+        return ""
+    manifest_path = Path(manifest_text).expanduser()
+    if not manifest_path.is_file():
+        return ""
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return ""
+    return str(manifest.get("workspace") or "")
+
+
 def _artifact_files(root: Path) -> list[Path]:
     files = [path for path in root.glob("*") if path.is_file()]
     for child in root.iterdir():
         if not child.is_dir() or child.suffix.casefold() in {".d", ".raw"}:
             continue
+        if is_diagnostic_artifact(child):
+            continue
         files.extend(path for path in child.glob("*") if path.is_file())
-    return files
+    return [path for path in files if not is_diagnostic_artifact(path)]
 
 
 def _changed_run_artifacts(
@@ -888,6 +912,19 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     )
                     return
+                gate = evaluate_repository_execution_gate(plan["workflow"])
+                if not gate["allowed"]:
+                    self._json(
+                        {
+                            "started": False,
+                            "execution_allowed": False,
+                            "repository_gate": gate,
+                            "plan": plan,
+                            "error": "This repository analysis unit is not cleared to run MS-DIAL.",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 preparation = prepare_run(plan["workflow"])
                 job_id = uuid.uuid4().hex
                 artifact_baseline = _snapshot_run_artifacts(preparation)
@@ -939,19 +976,45 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     )
                     return
+                gate = evaluate_repository_execution_gate(workflow)
+                if not gate["allowed"]:
+                    self._json(
+                        {
+                            "started": False,
+                            "execution_allowed": False,
+                            "repository_gate": gate,
+                            "error": (
+                                "This repository analysis unit is not cleared to run MS-DIAL. The "
+                                "diagnostic starts the Console too, so it is held by the same gate."
+                            ),
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 profile = select_peak_tuning_representative(
                     workflow["files"], str(body.get("representative_file", ""))
                 )
                 representative = profile["file_path"]
+                # The job id is minted before the preparation, because the diagnostic's own directory
+                # is named after it. The preparer writes an analysis CSV, a method file and a run
+                # manifest into whatever directory it is given, and it used to be given the production
+                # output directory: a reviewed multi-sample CSV came back holding only this
+                # representative, and every later stage was self-consistent about the wrong study.
+                job_id = uuid.uuid4().hex
+                diagnostic_root = diagnostic_run_directory(
+                    workflow["output_root"],
+                    job_id,
+                    workspace=_repository_workspace(workflow),
+                )
                 preparation = prepare_tuning_run(
                     workflow,
                     representative,
-                    workflow["output_root"],
+                    diagnostic_root,
                 )
                 preparation["peak_tuning_profile"] = {
                     key: value for key, value in profile.items() if key != "file"
                 }
-                job_id = uuid.uuid4().hex
+                preparation["diagnostic_run_directory"] = str(diagnostic_root)
                 with JOBS_LOCK:
                     JOBS[job_id] = {
                         "id": job_id,
@@ -1239,6 +1302,18 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/run":
                 state = body.get("workflow", body)
+                gate = evaluate_repository_execution_gate(state)
+                if not gate["allowed"]:
+                    self._json(
+                        {
+                            "started": False,
+                            "execution_allowed": False,
+                            "repository_gate": gate,
+                            "error": "This repository analysis unit is not cleared to run MS-DIAL.",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 preparation = prepare_run(state)
                 preparation["repository_run_manifest"] = str(
                     state.get("repository_run_manifest") or ""
@@ -1275,18 +1350,39 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/tuning/run":
                 state = body.get("workflow", body)
+                gate = evaluate_repository_execution_gate(state)
+                if not gate["allowed"]:
+                    self._json(
+                        {
+                            "started": False,
+                            "execution_allowed": False,
+                            "repository_gate": gate,
+                            "error": (
+                                "This repository analysis unit is not cleared to run MS-DIAL. The "
+                                "diagnostic starts the Console too, so it is held by the same gate."
+                            ),
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 profile = select_peak_tuning_representative(
                     state.get("files", []), body.get("file_path", "")
+                )
+                job_id = uuid.uuid4().hex
+                diagnostic_root = diagnostic_run_directory(
+                    state.get("output_root", ""),
+                    job_id,
+                    workspace=_repository_workspace(state),
                 )
                 preparation = prepare_tuning_run(
                     state,
                     profile["file_path"],
-                    state.get("output_root", ""),
+                    diagnostic_root,
                 )
                 preparation["peak_tuning_profile"] = {
                     key: value for key, value in profile.items() if key != "file"
                 }
-                job_id = uuid.uuid4().hex
+                preparation["diagnostic_run_directory"] = str(diagnostic_root)
                 with JOBS_LOCK:
                     JOBS[job_id] = {
                         "id": job_id,

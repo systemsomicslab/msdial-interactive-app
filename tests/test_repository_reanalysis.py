@@ -27,6 +27,7 @@ from msdial_app.repository_reanalysis import (
     create_download_lease,
     discard_download_lease,
     evaluate_eligibility,
+    evaluate_repository_execution_gate,
     finalize_download_lease,
     request_download_cleanup,
 )
@@ -437,6 +438,108 @@ class RepositoryReanalysisTests(unittest.TestCase):
                 "an unvalidated run must not be advanced to pending confirmation",
             )
             self.assertTrue(raw.is_dir())
+
+    def _gate_workspace(self, root: Path, **manifest_overrides: object) -> tuple[Path, dict]:
+        """A repository unit's manifest plus a workflow state that matches it."""
+        output = root / "output"
+        data = root / "raw" / "data"
+        provenance = root / "provenance"
+        for directory in (output, data, provenance):
+            directory.mkdir(parents=True)
+        sample = data / "sample.lcd"
+        sample.write_bytes(b"x")
+        manifest = provenance / "run-manifest.json"
+        payload = {
+            "status": "preflight_passed",
+            "workspace": str(root),
+            "output_directory": str(output),
+            "input_candidates": [str(sample)],
+            "execution_allowed": True,
+            "project": {"analysis_unit_id": "unit-1", "ion_mode": "Negative"},
+        }
+        payload.update(manifest_overrides)
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        state = {
+            "repository_run_manifest": str(manifest),
+            "output_root": str(output),
+            "ion_mode": "Negative",
+            "files": [{"file_path": str(sample)}],
+        }
+        return manifest, state
+
+    def test_a_local_analysis_is_not_gated(self) -> None:
+        # An ordinary local run carries no manifest, no eligibility verdict and nothing to gate.
+        gate = evaluate_repository_execution_gate({"output_root": "C:/tmp", "files": []})
+        self.assertFalse(gate["gated"])
+        self.assertTrue(gate["allowed"])
+
+    def test_an_eligible_unit_is_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, state = self._gate_workspace(Path(temporary) / "repo" / "G1")
+            gate = evaluate_repository_execution_gate(state)
+            self.assertTrue(gate["gated"])
+            self.assertTrue(gate["allowed"], gate["blockers"])
+            self.assertEqual("unit-1", gate["analysis_unit_id"])
+
+    def test_an_unresolved_unit_is_refused(self) -> None:
+        # The state a unit sits in when its acquisition mode could not be established from repository
+        # metadata and no raw-header preflight has settled it.
+        with tempfile.TemporaryDirectory() as temporary:
+            _, state = self._gate_workspace(
+                Path(temporary) / "repo" / "G2",
+                execution_allowed=False,
+                status="preflight_review_required",
+            )
+            gate = evaluate_repository_execution_gate(state)
+            self.assertFalse(gate["allowed"])
+            self.assertTrue(any("execution_allowed" in item for item in gate["blockers"]))
+
+    def test_a_missing_manifest_is_refused_rather_than_ignored(self) -> None:
+        gate = evaluate_repository_execution_gate(
+            {"repository_run_manifest": "D:/nowhere/run-manifest.json", "files": []}
+        )
+        self.assertFalse(gate["allowed"])
+        self.assertTrue(any("does not exist" in item for item in gate["blockers"]))
+
+    def test_a_workflow_writing_outside_the_unit_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, state = self._gate_workspace(Path(temporary) / "repo" / "G3")
+            state["output_root"] = str(Path(temporary) / "somewhere-else")
+            gate = evaluate_repository_execution_gate(state)
+            self.assertFalse(gate["allowed"])
+            self.assertTrue(any("owns" in item for item in gate["blockers"]))
+
+    def test_an_input_the_manifest_did_not_admit_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, state = self._gate_workspace(Path(temporary) / "repo" / "G4")
+            intruder = Path(temporary) / "elsewhere.lcd"
+            intruder.write_bytes(b"x")
+            state["files"].append({"file_path": str(intruder)})
+            gate = evaluate_repository_execution_gate(state)
+            self.assertFalse(gate["allowed"])
+            self.assertTrue(
+                any("not among the files" in item for item in gate["blockers"]), gate["blockers"]
+            )
+
+    def test_the_wrong_polarity_is_refused(self) -> None:
+        # A run in the wrong polarity produces a complete, validated, entirely void result, and no other
+        # stage flags it.
+        with tempfile.TemporaryDirectory() as temporary:
+            _, state = self._gate_workspace(Path(temporary) / "repo" / "G5")
+            state["ion_mode"] = "Positive"
+            gate = evaluate_repository_execution_gate(state)
+            self.assertFalse(gate["allowed"])
+            self.assertTrue(any("ion mode" in item for item in gate["blockers"]))
+
+    def test_an_undeclared_polarity_does_not_manufacture_a_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, state = self._gate_workspace(
+                Path(temporary) / "repo" / "G6",
+                project={"analysis_unit_id": "unit-1", "ion_mode": "Unknown"},
+            )
+            state["ion_mode"] = "Positive"
+            gate = evaluate_repository_execution_gate(state)
+            self.assertTrue(gate["allowed"], gate["blockers"])
 
     def test_raw_metadata_summary_maps_normalized_contract(self) -> None:
         records = [

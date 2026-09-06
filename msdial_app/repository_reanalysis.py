@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from .diagnostic_paths import is_diagnostic_artifact
 
 
 USER_AGENT = "MS-DIAL-Interactive/0.3 public-reanalysis"
@@ -845,6 +846,8 @@ def finalize_download_lease(manifest_path: Path) -> dict[str, Any]:
         manifest["cleanup_allowed"] = True
     retained = list(mztab_files)
     for path in output.rglob("*") if output.is_dir() else []:
+        if is_diagnostic_artifact(path):
+            continue
         if path.is_file() and (
             path.suffix.casefold() in TEXT_RESULT_SUFFIXES
             or path.suffix.casefold() in {".csv", ".tsv", ".txt", ".json", ".xlsx"}
@@ -950,6 +953,111 @@ def run_raw_metadata_preflight(
 # state a run leaves behind when its retention policy asked for deletion: the technical preconditions are
 # met and the decision is now waiting for a person.
 CLEANUP_READY_STATUSES = {"mztab_validated", "completed", "cleanup_pending_confirmation"}
+
+
+def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
+    """Decide whether a workflow may start MS-DIAL Console against a repository analysis unit.
+
+    execution_allowed is the gate that holds a downloaded unit back until its technical conditions are
+    settled. A unit whose repository metadata already establishes untargeted LC-MS/MS with a known
+    acquisition mode and polarity gets it at download time; a unit whose metadata is ambiguous may still
+    be downloaded for inspection, but with execution_allowed false, and only a raw-header preflight that
+    re-evaluates eligibility can turn it true.
+
+    The field was written at three points and read for a decision nowhere, so the hold never held. This
+    is that missing read. It applies only to a workflow carrying a repository_run_manifest: an ordinary
+    local analysis has no manifest, no eligibility verdict, and nothing to gate.
+
+    Everything before the Console stays open. Metadata review, applying a Class proposal, the raw-header
+    preflight itself and any dry-run preview are how a unit becomes eligible in the first place, so
+    refusing them would make the gate impossible to pass.
+    """
+    manifest_text = str(state.get("repository_run_manifest") or "").strip()
+    if not manifest_text:
+        return {"gated": False, "allowed": True, "blockers": []}
+
+    blockers: list[str] = []
+    manifest_path = Path(manifest_text).expanduser()
+    if not manifest_path.is_file():
+        return {
+            "gated": True,
+            "allowed": False,
+            "manifest_path": str(manifest_path),
+            "blockers": [
+                "The workflow names a repository run manifest that does not exist: "
+                f"{manifest_path}. A repository unit may not run without the manifest that records "
+                "its eligibility."
+            ],
+        }
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as error:
+        return {
+            "gated": True,
+            "allowed": False,
+            "manifest_path": str(manifest_path),
+            "blockers": [f"The repository run manifest could not be read: {error}"],
+        }
+
+    project = manifest.get("project") or {}
+    if manifest.get("execution_allowed") is not True:
+        blockers.append(
+            "execution_allowed is not true for this analysis unit "
+            f"(status {manifest.get('status', 'unknown')!r}, selection "
+            f"{project.get('selection_status', 'unknown')!r}). Resolve the unit's technical conditions "
+            "with a raw-header preflight before running MS-DIAL."
+        )
+
+    # The manifest and the workflow must be describing the same unit. A workflow that has drifted to
+    # another directory or another file set is no longer covered by this manifest's verdict, whatever
+    # that verdict says.
+    declared_output = str(manifest.get("output_directory") or "").strip()
+    requested_output = str(state.get("output_root") or "").strip()
+    if declared_output and requested_output:
+        if Path(declared_output).resolve() != Path(requested_output).resolve():
+            blockers.append(
+                f"The workflow writes to {requested_output}, but this unit's manifest owns "
+                f"{declared_output}."
+            )
+
+    admitted = {
+        Path(str(item)).resolve()
+        for item in (manifest.get("input_candidates") or [])
+        if str(item).strip()
+    }
+    if admitted:
+        requested = [
+            Path(str(item.get("file_path") or "")).resolve()
+            for item in (state.get("files") or [])
+            if str(item.get("file_path") or "").strip()
+        ]
+        outside = [str(path) for path in requested if path not in admitted]
+        if outside:
+            blockers.append(
+                f"{len(outside)} input files are not among the files this unit's manifest admitted; "
+                f"the first is {outside[0]}."
+            )
+
+    # A run in the wrong polarity produces a complete, validated, entirely void result, and no later
+    # stage flags it. The manifest records what the repository declared for this unit.
+    declared_mode = str(project.get("ion_mode") or "").strip().casefold()
+    requested_mode = str(state.get("ion_mode") or "").strip().casefold()
+    if declared_mode and requested_mode and declared_mode not in {"both", "unknown"}:
+        if declared_mode != requested_mode:
+            blockers.append(
+                f"The workflow is set to {state.get('ion_mode')} ion mode, but this unit is "
+                f"{project.get('ion_mode')}."
+            )
+
+    return {
+        "gated": True,
+        "allowed": not blockers,
+        "manifest_path": str(manifest_path),
+        "analysis_unit_id": project.get("analysis_unit_id"),
+        "execution_allowed": manifest.get("execution_allowed"),
+        "manifest_status": manifest.get("status"),
+        "blockers": blockers,
+    }
 
 
 def _tree_size(root: Path) -> tuple[int, int]:
@@ -1213,7 +1321,9 @@ def _archive_project_results(output: Path) -> Path | None:
         return None
     project_files = [
         path for path in output.rglob("*")
-        if path.is_file() and path.suffix.casefold() in PROJECT_RESULT_SUFFIXES
+        if path.is_file()
+        and path.suffix.casefold() in PROJECT_RESULT_SUFFIXES
+        and not is_diagnostic_artifact(path)
     ]
     if not project_files:
         return None
