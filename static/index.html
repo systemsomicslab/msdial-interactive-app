@@ -115,7 +115,7 @@
             <label>Raw data after validated analysis
               <select id="repositoryRawRetention">
                 <option value="keep">Keep downloaded raw data</option>
-                <option value="delete_after_validated_output">Delete after mzTab-M validation</option>
+                <option value="delete_after_validated_output">Request deletion after validation (separate confirmation required)</option>
               </select>
             </label>
             <label>Download eligibility
@@ -239,6 +239,34 @@
           <span id="pathSettingsInfo" class="muted"></span>
         </div>
         <div id="consoleCapabilityStatus" class="format-summary">Console feature support has not been checked.</div>
+        <div class="nested-panel">
+          <h3>Console release and developer build</h3>
+          <p class="muted">
+            The executable version alone does not prove source recency. Inspect compares the selected binary,
+            feature probes, SHA-256, build provenance, and the local Git HEAD. Official stable and prerelease
+            Console packages are reported separately.
+          </p>
+          <div class="form-grid console-management-grid">
+            <label>Local MS-DIAL source root
+              <input id="consoleSourceRoot" placeholder="D:\0_SourceCode\MsdialWorkbench">
+            </label>
+            <label>Build target
+              <select id="consoleBuildFramework">
+                <option value="net48">Windows .NET Framework 4.8 (net48)</option>
+                <option value="net8">Cross-platform .NET 8 (net8)</option>
+                <option value="net472">Windows .NET Framework 4.7.2 (net472)</option>
+              </select>
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="checkOfficialConsoleReleases" type="button" class="secondary">Check official releases</button>
+            <button id="checkConsoleSourceUpdates" type="button" class="secondary">Fetch and compare source</button>
+            <button id="previewConsoleBuild" type="button" class="secondary">Preview local build</button>
+            <button id="buildConsoleFromSource" type="button">Build and select current checkout</button>
+          </div>
+          <div id="officialConsoleReleaseStatus" class="format-summary">Official release status has not been checked online.</div>
+          <pre id="consoleBuildLog" class="compact-log" hidden></pre>
+        </div>
         <p class="muted">MS-DIAL reads raw data from their original paths. Only result and project files are written below Output root.</p>
       </div>
       <div id="peakDetectionPanel" class="panel">
@@ -469,18 +497,27 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
       </div>
       <div id="annotationLibraries" class="panel">
         <h2>Annotation libraries</h2>
+        <div id="tieredAnnotationPanel" class="nested-panel">
+          <h2>Tiered LC-MS annotation pipeline</h2>
+          <p class="muted">Apply lipid rule-based annotation first, then reuse one MSP library for strict and broad spectral searches. A lower-priority MS/MS match is preferred over a higher-priority precursor-m/z-only suggestion. If no tier produces an MS/MS match, MS-DIAL retains the highest-priority <code>no MS2</code> suggestion. Representative matched results follow the priority order: LBM (3), MSP high quality (2), MSP low quality candidate (1).</p>
+          <div class="path-row">
+            <label>MSP library reused by both tiers<input id="tieredMspPath" placeholder="D:\\...\\MSMS-Private-neg-VS20.msp"></label>
+            <button id="applyTieredAnnotation" type="button" class="secondary">Apply 3-tier preset</button>
+          </div>
+          <div id="tieredAnnotationStatus" class="format-summary">The low-quality tier uses a broad 0.25 Da MS/MS tolerance and should be interpreted as a tentative candidate, not an identification.</div>
+        </div>
         <div id="lbmAnnotatorPanel" class="nested-panel">
           <div class="section-head compact-head">
             <div>
               <h2>LBM annotator in MS-DIAL CUI</h2>
-              <span class="muted">Lipidomics only. MS-DIAL CUI currently supports one LBM file with one LBM annotation setting.</span>
+              <span class="muted">Available for LC-MS Metabolomics and Lipidomics workflows. MS-DIAL CUI supports one LBM file with one lipid-rule annotation setting.</span>
             </div>
           </div>
           <div class="table-wrap compact-table">
             <table id="lbmAnnotatorTable">
               <thead>
                 <tr>
-                  <th>LBM library path</th><th>RT tol.</th><th>m/z tol.</th><th>MS/MS tol.</th>
+                  <th>LBM library path</th><th>Priority</th><th>RT tol.</th><th>m/z tol.</th><th>MS/MS tol.</th>
                   <th>Use RT score</th><th>Use RT filter</th>
                   <th>Weighted</th><th>Simple</th><th>Reverse</th><th>Matched %</th><th>Min match</th>
                 </tr>
@@ -509,7 +546,7 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
             <table id="mspAnnotatorTable">
               <thead>
                 <tr>
-                  <th>Annotator ID</th><th>MSP path</th><th>Priority</th><th>RT tol.</th>
+                  <th>Annotator ID</th><th>MSP path</th><th>Mode</th><th>Priority</th><th>RT tol.</th><th>m/z tol.</th><th>MS/MS tol.</th>
                   <th>Use RT score</th><th>Use RT filter</th>
                   <th>Weighted</th><th>Simple</th><th>Reverse</th><th>Matched %</th><th>Min match</th><th></th>
                 </tr>
@@ -607,10 +644,15 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
       </div>
       <div class="panel">
         <h2>Peak-picking threshold</h2>
+        <p class="muted">After the zero-threshold diagnostic, the automatic selector targets 3,000-6,000 peaks. It uses 100-unit steps for QTOF-type data and 1,000-unit steps for Fourier-transform data. If no more than 6,000 peaks are found at zero, the threshold remains 0.</p>
         <div class="slider-row">
           <label>Minimum peak height<input id="tuningHeightNumber" type="number" min="0" value="100"></label>
           <input id="tuningHeight" type="range" min="0" max="10000" step="1" value="100">
           <div class="metric compact"><strong id="peakPassCount">-</strong><span>detected peaks</span></div>
+        </div>
+        <div class="button-row">
+          <button id="autoTunePeakHeight" class="secondary">Auto-select for 3,000-6,000 peaks</button>
+          <span id="autoTunePeakStatus" class="muted"></span>
         </div>
       </div>
       <div class="panel">

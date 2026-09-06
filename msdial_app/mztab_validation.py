@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 from typing import Any
+from .diagnostic_paths import is_diagnostic_artifact
 
 
 MZTAB_SUFFIXES = {".mztab", ".mztabm"}
@@ -24,6 +25,11 @@ def find_mztab_files(run_directory: str | Path, limit: int = 200) -> list[Path]:
         return []
     files: list[Path] = []
     for path in root.rglob("*"):
+        # A diagnostic writes a real mzTab-M for one file. It is not a result of the study, and
+        # the primary-file choice takes the newest match, so an unfiltered scan would hand a
+        # single-sample diagnostic to validation, publication and the data-mining handoff.
+        if is_diagnostic_artifact(path):
+            continue
         if path.is_file() and _looks_like_mztab(path):
             files.append(path)
             if len(files) >= limit:

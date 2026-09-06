@@ -46,9 +46,9 @@ Use these branches:
 
 1. Select `lcms` or `gcms`.
 2. For LC-MS, collect `ion_mode` and `target_omics`.
-3. Select template defaults or `target_peak_count` tuning.
+3. Select template defaults, `auto_peak_range`, or an exact `target_peak_count`.
 4. For LC-MS, decide whether to apply retention-time correction. If enabled, collect an anchor library and peak-selection rule.
-5. Select official, existing, or no annotation libraries.
+5. Select official, existing, tiered lipid/MSP, or no annotation libraries.
 6. For LC-MS, decide whether to generate QA and collect internal-standard definitions when available. QA without internal standards still evaluates distributions and sample topology, but must not claim internal-standard stability.
 7. Decide whether to generate Materials and Methods and supplementary tables.
 
@@ -56,17 +56,26 @@ Load [tool-reference.md](references/tool-reference.md) when constructing nested 
 
 ## Tune Peak Count
 
-When `parameter_strategy` is `target_peak_count`:
+When `parameter_strategy` is `auto_peak_range` or `target_peak_count`:
 
 1. Call `msdial_start_peak_count_diagnostic` with `confirmed=false` and explain that one representative file will be processed.
 2. Obtain explicit user confirmation.
 3. Call it again with `confirmed=true`.
 4. Poll the returned job with `msdial_interactive_job` until completed or failed.
-5. Call `msdial_estimate_peak_height` using the requested target count.
+5. For `auto_peak_range`, call `msdial_estimate_peak_height` without an exact
+   target. The diagnostic automatically selects a mid-run QC, or a mid-run
+   non-blank sample when no QC exists. It targets 3,000-6,000 retained peaks in
+   100-unit threshold steps for QTOF-type data and 1,000-unit steps for
+   Fourier-transform data. A diagnostic count at or below 6,000 keeps the
+   threshold at 0. For an exact target, pass `target_peak_count`.
 6. Present the proposed `minimum_peak_height`, diagnostic peak count, and estimated retained count.
 7. Add the threshold to `answers` only after the user accepts it or supplies a replacement.
 
-Treat the estimate as an order-statistic starting point, not a biological quality guarantee.
+Treat the estimate as a reproducible starting point, not a biological quality
+guarantee. Public repository reanalysis uses
+`TimeBasedLinearWeightedMovingAverage`; retain that choice in the method and
+provenance. It handles irregular scan intervals at a modest additional compute
+cost.
 
 ## Resolve Libraries
 
@@ -79,6 +88,8 @@ For `official`, use the catalog ID returned by the planner or choose the matchin
 - `gcms-fiehn`
 
 Call `msdial_download_official_library` with `confirmed=false` first. State the record, DOI, download size, and local destination. Download only after explicit confirmation. For user libraries, preserve paths and provenance supplied by the user; prompt for a version, DOI/repository URL, or checksum before publication when none is recorded.
+
+For an untargeted LC-MS repository workflow that should retain broad annotation evidence, `tiered_lipid_msp` applies the official LBM rule-based search and reuses one user-supplied MSP in two parameter tiers. A lower-priority MS/MS reference match outranks a higher-priority precursor-m/z-only suggestion. Among results with the same match status, the priorities are LBM 3, strict MSP 2, and broad MSP candidate 1. If no tier yields an MS/MS match, MS-DIAL may retain the highest-priority `no MS2` suggestion. The broad tier uses 0.25 Da MS/MS tolerance and is a tentative candidate tier; never describe it as equivalent to a high-quality match. Read [tool-reference.md](references/tool-reference.md) for the exact thresholds and nested `libraries` object. Download the official LBM only after the normal confirmation boundary, and never copy or redistribute a private MSP.
 
 ## Review And Run
 
