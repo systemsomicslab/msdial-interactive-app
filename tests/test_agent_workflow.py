@@ -39,6 +39,7 @@ class AgentWorkflowTests(unittest.TestCase):
                     "library_strategy": "none",
                     "run_qa": False,
                     "generate_materials_methods": True,
+                    "class_assignment_confirmed": True,
                     "console_path": str(console),
                     "template_path": str(
                         ROOT / "resources" / "msdial_console_param4lipidomics.txt"
@@ -95,6 +96,7 @@ class AgentWorkflowTests(unittest.TestCase):
                     "library_strategy": "none",
                     "run_qa": False,
                     "generate_materials_methods": True,
+                    "class_assignment_confirmed": True,
                     "console_path": str(console),
                     "repository_metadata_path": str(metadata),
                 },
@@ -125,6 +127,7 @@ class AgentWorkflowTests(unittest.TestCase):
                         "gcms_retention_type": "RT",
                         "library_strategy": "none",
                         "generate_materials_methods": False,
+                    "class_assignment_confirmed": True,
                         "console_path": str(console),
                     },
                 )
@@ -160,6 +163,7 @@ class AgentWorkflowTests(unittest.TestCase):
                     "library_strategy": "none",
                     "run_qa": False,
                     "generate_materials_methods": False,
+                    "class_assignment_confirmed": True,
                 },
             )
 
@@ -183,6 +187,7 @@ class AgentWorkflowTests(unittest.TestCase):
                     "library_strategy": "none",
                     "run_qa": True,
                     "generate_materials_methods": True,
+                    "class_assignment_confirmed": True,
                     "console_path": str(console),
                     "template_path": str(ROOT / "resources" / "msdial_console_param4lipidomics.txt"),
                 },
@@ -280,6 +285,7 @@ class AgentWorkflowTests(unittest.TestCase):
                     "library_strategy": "none",
                     "run_qa": False,
                     "generate_materials_methods": False,
+                    "class_assignment_confirmed": True,
                 },
             )
 

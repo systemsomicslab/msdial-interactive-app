@@ -1509,13 +1509,20 @@ def msdial_list_worksets(
 @_structured_validation_errors
 def msdial_save_workset(
     name: str,
-    answers: dict[str, Any],
+    answers: dict[str, Any] | None = None,
     description: str = "",
     workflow_overrides: dict[str, Any] | None = None,
+    run_directory: str = "",
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
-    """Save reusable scientific choices as a named local workset."""
+    """Save reusable scientific choices as a named local workset.
+
+    Give run_directory to save the answers a finished run actually used, rather than
+    retyping them; the run records them beside its bundle. Dataset-scoped answers --
+    the Class confirmation, the dilution factor, the paths -- are left out on purpose
+    and the result names them under not_reusable.
+    """
     return _request_json(
         "POST",
         "/api/agent/worksets/save",
@@ -1524,8 +1531,9 @@ def msdial_save_workset(
         body={
             "name": name,
             "description": description,
-            "answers": answers,
+            "answers": answers or {},
             "workflow_overrides": workflow_overrides or {},
+            "run_directory": run_directory,
         },
     )
 
