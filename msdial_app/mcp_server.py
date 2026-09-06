@@ -648,27 +648,16 @@ def _repository_answer_seed(
 
 
 def _raw_metadata_extractor_candidates(configured: str = "") -> list[str]:
+    # net48 first: it is the framework RawMetadataConsoleApp targets, so it is the build
+    # that a source fix actually reaches. A net8.0-windows directory can survive a change
+    # of target framework and then sit here for weeks, being preferred while describing a
+    # version of the code that no longer exists.
+    build_root = ROOT.parent / "msrawdataworkbench" / "RawMetadataConsoleApp" / "bin" / "Release"
     candidates = [
         configured,
         os.environ.get("MSDIAL_RAW_METADATA_EXTRACTOR", ""),
-        str(
-            ROOT.parent
-            / "msrawdataworkbench"
-            / "RawMetadataConsoleApp"
-            / "bin"
-            / "Release"
-            / "net8.0-windows"
-            / "RawMetadataConsoleApp.exe"
-        ),
-        str(
-            ROOT.parent
-            / "msrawdataworkbench"
-            / "RawMetadataConsoleApp"
-            / "bin"
-            / "Release"
-            / "net48"
-            / "RawMetadataConsoleApp.exe"
-        ),
+        str(build_root / "net48" / "RawMetadataConsoleApp.exe"),
+        str(build_root / "net8.0-windows" / "RawMetadataConsoleApp.exe"),
     ]
     result = []
     for value in candidates:
@@ -1318,6 +1307,8 @@ def msdial_repository_raw_metadata_preflight(
         "execution_allowed": result.get("execution_allowed"),
         "summary": raw.get("summary"),
         "advisory": raw.get("advisory"),
+        "unsupported_formats": raw.get("unsupported_formats") or [],
+        "retry_can_help": result.get("status") != "preflight_unsupported_format",
         "confirm_untargeted_applied": confirm_untargeted,
     }
 

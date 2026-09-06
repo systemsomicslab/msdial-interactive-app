@@ -901,6 +901,13 @@ def finalize_download_lease(manifest_path: Path) -> dict[str, Any]:
     return {**manifest, "manifest_path": str(manifest_path)}
 
 
+# The extractor selects this when it recognises the format but has no reader for it.
+# It is deliberately distinct from any other non-zero exit: "this vendor format can
+# never be checked here" and "the check did not work this time" call for different
+# decisions, and one failure channel cannot carry both.
+RAW_METADATA_UNSUPPORTED_FORMAT_EXIT_CODE = 82
+
+
 def run_raw_metadata_preflight(
     manifest_path: Path,
     extractor_path: Path,
@@ -925,13 +932,40 @@ def run_raw_metadata_preflight(
         command.extend(["--input", str(path)])
     command.extend(["--output", str(output), "--max-spectrum-headers", "200"])
     completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    extractor_stat = extractor_path.stat()
     manifest["raw_metadata_preflight"] = {
         "command": command,
+        # Which binary produced this verdict, so the verdict can be tied to a build rather
+        # than to whichever executable happened to be first on the search order.
+        "extractor": {
+            "path": str(extractor_path),
+            "size_bytes": extractor_stat.st_size,
+            "modified_at": datetime.fromtimestamp(
+                extractor_stat.st_mtime, tz=timezone.utc
+            ).isoformat(),
+        },
         "exit_code": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
         "output": str(output),
     }
+    if completed.returncode == RAW_METADATA_UNSUPPORTED_FORMAT_EXIT_CODE:
+        # Fails closed exactly as an unavailable preflight does: a unit that was not
+        # already eligible stays ineligible. What changes is that the agent can now tell
+        # that waiting or retrying will never help.
+        manifest["status"] = "preflight_unsupported_format"
+        manifest["execution_allowed"] = previously_allowed
+        manifest["raw_metadata_preflight"]["unsupported_formats"] = sorted(
+            {path.suffix.lower() for path in inputs if path.suffix}
+        )
+        manifest["raw_metadata_preflight"]["detail"] = (completed.stderr or "").strip().splitlines()[:1]
+        manifest["raw_metadata_preflight"]["advisory"] = (
+            "This raw data format has no metadata reader, so a raw-header check cannot "
+            "resolve the unit's technical settings on any retry. Resolve them from "
+            "repository metadata or the publication, or exclude the unit."
+        )
+        _write_json(manifest_path, manifest)
+        return {**manifest, "manifest_path": str(manifest_path)}
     if completed.returncode != 0 or not output.is_file():
         manifest["status"] = "preflight_unavailable"
         manifest["execution_allowed"] = previously_allowed

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from msdial_app.repository_reanalysis import (
     EligibilityPolicy,
@@ -23,6 +24,7 @@ from msdial_app.repository_reanalysis import (
     _summarize_raw_metadata,
     _extract_archive,
     _common_input_path,
+    run_raw_metadata_preflight,
     cleanup_download_lease,
     create_download_lease,
     discard_download_lease,
@@ -620,3 +622,109 @@ class RepositoryReanalysisTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RawMetadataPreflightFormatTests(unittest.TestCase):
+    """CLAUDE-C03: a format that can never be checked is not the same as a check that failed."""
+
+    def _workspace(self, root: Path, *, execution_allowed: bool) -> tuple[Path, Path]:
+        data = root / "raw" / "data"
+        provenance = root / "provenance"
+        for directory in (data, provenance):
+            directory.mkdir(parents=True)
+        sample = data / "0555_1_neg.lcd"
+        sample.write_bytes(b"x")
+        manifest = provenance / "run-manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "status": "downloaded",
+                    "workspace": str(root),
+                    "input_candidates": [str(sample)],
+                    "execution_allowed": execution_allowed,
+                    "project": {"analysis_unit_id": "unit-1", "eligible": execution_allowed},
+                }
+            ),
+            encoding="utf-8",
+        )
+        extractor = root / "RawMetadataConsoleApp.exe"
+        extractor.write_bytes(b"stub")
+        return manifest, extractor
+
+    @staticmethod
+    def _completed(returncode: int, stderr: str = ""):
+        from subprocess import CompletedProcess
+
+        return CompletedProcess(args=["stub"], returncode=returncode, stdout="", stderr=stderr)
+
+    def test_an_unsupported_format_is_reported_as_its_own_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor = self._workspace(Path(temporary) / "u1", execution_allowed=False)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run",
+                return_value=self._completed(
+                    82, "unsupported format: .lcd (Shimadzu) has no raw metadata reader: x"
+                ),
+            ):
+                result = run_raw_metadata_preflight(manifest, extractor)
+
+        self.assertEqual("preflight_unsupported_format", result["status"])
+        self.assertEqual([".lcd"], result["raw_metadata_preflight"]["unsupported_formats"])
+        self.assertIn("no metadata reader", result["raw_metadata_preflight"]["advisory"])
+        self.assertEqual(1, len(result["raw_metadata_preflight"]["detail"]))
+
+    def test_an_unsupported_format_cannot_promote_an_ineligible_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor = self._workspace(Path(temporary) / "u2", execution_allowed=False)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run",
+                return_value=self._completed(82),
+            ):
+                result = run_raw_metadata_preflight(manifest, extractor)
+
+        self.assertFalse(result["execution_allowed"])
+
+    def test_an_unsupported_format_does_not_revoke_an_already_eligible_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor = self._workspace(Path(temporary) / "u3", execution_allowed=True)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run",
+                return_value=self._completed(82),
+            ):
+                result = run_raw_metadata_preflight(manifest, extractor)
+
+        self.assertTrue(result["execution_allowed"])
+        self.assertEqual("preflight_unsupported_format", result["status"])
+
+    def test_any_other_failure_is_still_an_unavailable_preflight(self) -> None:
+        # A crash, a missing dependency or a timeout may work on a retry; an absent reader
+        # never will, and only the second is worth telling an agent to stop trying.
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor = self._workspace(Path(temporary) / "u4", execution_allowed=False)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run",
+                return_value=self._completed(1, "System.NullReferenceException"),
+            ):
+                result = run_raw_metadata_preflight(manifest, extractor)
+
+        self.assertEqual("preflight_unavailable", result["status"])
+        self.assertNotIn("unsupported_formats", result["raw_metadata_preflight"])
+        self.assertFalse(result["execution_allowed"])
+
+    def test_the_manifest_records_which_extractor_produced_the_verdict(self) -> None:
+        # A verdict that does not say which binary produced it cannot be tied to a build,
+        # and a stale executable earlier on the search order looks identical to the fix.
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor = self._workspace(Path(temporary) / "u5", execution_allowed=False)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run",
+                return_value=self._completed(82),
+            ):
+                result = run_raw_metadata_preflight(manifest, extractor)
+            expected_path = str(extractor.resolve())
+            expected_size = extractor.stat().st_size
+
+        recorded = result["raw_metadata_preflight"]["extractor"]
+        self.assertEqual(expected_path, recorded["path"])
+        self.assertEqual(expected_size, recorded["size_bytes"])
+        self.assertTrue(recorded["modified_at"])
