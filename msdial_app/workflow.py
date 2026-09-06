@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterable
 
 from . import __version__
 from .sample_grouping import file_type_for, propose_grouping, propose_injection_order
-from .user_settings import load_user_settings
+from .user_settings import load_user_settings, user_data_directory
 
 
 SUPPORTED_SUFFIXES = {
@@ -65,6 +65,105 @@ def _git_output(root: Path, *arguments: str) -> str:
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return result.stdout.strip() if result.returncode == 0 else ""
+
+
+# Below this, hashing costs less than the round trip to the cache file.
+IDENTITY_CACHE_MIN_BYTES = 64 * 1024 * 1024
+
+
+def file_identity(path: str | Path) -> dict[str, Any]:
+    """Identify one file by content, not by where it happens to sit.
+
+    A manifest that records only a library path says nothing about which library was
+    used: the path can be reused, moved, or point at a rebuilt file. A checksum is the
+    only field that survives all of that, so it is recorded even when no catalogue
+    knows the file -- which is the usual case for a laboratory's own LBM2.
+
+    Hashing a 700 MB library takes seconds, and a run prepares more than once, so the
+    digest is cached against the file's size and modification time.
+    """
+    try:
+        resolved = Path(path).expanduser().resolve()
+        stat = resolved.stat()
+    except (OSError, ValueError):
+        return {"sha256": "", "size": 0, "modified_at": "", "identity_error": "unreadable"}
+
+    # A size-and-timestamp cache cannot tell two same-length rewrites apart when both
+    # land inside one clock tick, and a recorded checksum of content that is not there
+    # is worse than no checksum. So the cache is used only where hashing is genuinely
+    # expensive -- a multi-hundred-megabyte library, which takes seconds to write and
+    # cannot be rewritten inside a tick -- and everything smaller is simply hashed.
+    key = f"{resolved}|{stat.st_size}|{stat.st_mtime_ns}"
+    cacheable = stat.st_size >= IDENTITY_CACHE_MIN_BYTES
+    cache_path = user_data_directory() / "file-identity-cache.json"
+    cache: dict[str, str] = {}
+    if cacheable:
+        try:
+            if cache_path.is_file():
+                loaded = json.loads(cache_path.read_text(encoding="utf-8-sig"))
+                if isinstance(loaded, dict):
+                    cache = {str(k): str(v) for k, v in loaded.items()}
+        except (OSError, json.JSONDecodeError):
+            cache = {}
+
+    digest = cache.get(key, "")
+    if not digest:
+        hasher = hashlib.sha256()
+        try:
+            with resolved.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                    hasher.update(chunk)
+        except OSError:
+            return {
+                "sha256": "",
+                "size": stat.st_size,
+                "modified_at": "",
+                "identity_error": "unreadable",
+            }
+        digest = hasher.hexdigest()
+    if cacheable and cache.get(key) != digest:
+        cache[key] = digest
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            # Keep the cache from growing without bound; the entries are cheap to remake.
+            trimmed = dict(list(cache.items())[-256:])
+            cache_path.write_text(json.dumps(trimmed, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    return {
+        "sha256": digest,
+        "size": stat.st_size,
+        "modified_at": dt.datetime.fromtimestamp(
+            stat.st_mtime, tz=dt.timezone.utc
+        ).astimezone().isoformat(),
+    }
+
+
+def _console_provenance_warning(console: dict[str, Any]) -> str:
+    """What to tell the analyst about a binary whose identity is not established."""
+    status = console.get("provenance_status", "absent")
+    if status == "verified":
+        dirty = (console.get("git") or {}).get("dirty")
+        if dirty:
+            return (
+                "The recorded build matches this binary, but it was built from a working "
+                "tree with uncommitted changes, so the git revision does not fully "
+                "describe the code that ran."
+            )
+        return ""
+    if status == "stale_mismatch":
+        return (
+            "A build record sits beside this binary and describes a different one, so the "
+            "recorded version names code that did not run. Offer a rebuild through "
+            "msdial_build_console_from_local_source before relying on the provenance."
+        )
+    if status == "unreadable":
+        return "The build record beside this binary could not be read."
+    return (
+        "No build record accompanies this binary, so the run is identified by its "
+        "checksum alone and not by a source revision."
+    )
 
 
 def find_console_source_root(console_path: str | Path) -> Path | None:
@@ -1251,12 +1350,43 @@ def prepare_run(
         for item in files
     ]
     manifest_path = run_directory / "run-manifest.json"
+    # A version string and a path cannot identify a binary: the string is whatever the
+    # assembly claims, the path can be rebuilt under. inspect_console_path already
+    # computes the checksum, the build record and the git state of the working tree it
+    # came from; the manifest simply never carried any of it, so a run could not be
+    # traced back to the code that produced it.
+    console = inspect_console_path(state["console_path"])
     manifest = {
         "created_at": dt.datetime.now().astimezone().isoformat(),
         "platform": platform.platform(),
         "analysis_type": project_type,
         "msdial_console_version": method_state["msdial_console_version"],
         "msdial_interactive_version": method_state["msdial_interactive_version"],
+        "console": {
+            "path": console.get("path", ""),
+            "source_kind": console.get("source_kind", ""),
+            "binary_sha256": console.get("binary_sha256", ""),
+            "binary_size": console.get("binary_size", 0),
+            "binary_modified_at": console.get("binary_modified_at", ""),
+            "provenance_status": console.get("provenance_status", "absent"),
+            "provenance": console.get("provenance", {}),
+            "provenance_mismatch": console.get("provenance_mismatch", {}),
+            "git": console.get("git", {}),
+        },
+        # One field a reader sees without digging: whether the software this run used
+        # can be identified at all.
+        "software_provenance_status": console.get("provenance_status", "absent"),
+        "libraries": [
+            {
+                **{
+                    key: entry.get(key, "")
+                    for key in ("path", "version", "source", "doi", "license")
+                },
+                **file_identity(entry.get("path", "")),
+            }
+            for entry in method_state.get("library_provenance", [])
+            if isinstance(entry, dict) and str(entry.get("path", "")).strip()
+        ],
         "project_file_requested": project_file_requested,
         "stage_inputs": stage_inputs,
         "input_csv": str(csv_path),
@@ -1291,6 +1421,14 @@ def prepare_run(
     return {
         "run_directory": str(run_directory),
         "analysis_type": project_type,
+        # Written into the manifest above; repeated here because a status nobody reads
+        # is the same as a status nobody recorded.
+        "software_provenance": {
+            "status": console.get("provenance_status", "absent"),
+            "binary_sha256": console.get("binary_sha256", ""),
+            "version": method_state["msdial_console_version"],
+            "warning": _console_provenance_warning(console),
+        },
         "expected_analysis_exports": expected_analysis_exports,
         "export_folder_path": str(method_state.get("export_folder_path", "")),
         "qa_matrix_expected": bool(
