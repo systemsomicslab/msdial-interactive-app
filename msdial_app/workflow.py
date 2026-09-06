@@ -1250,11 +1250,44 @@ def _link_directory(source: Path, link: Path) -> None:
             ) from symlink_error
 
 
+# MS-DIAL marks an annotation score that it never computed, and the notation changed. A Console
+# that includes the shared AnnotationScoreFormat writes "null" into every score column of such a
+# row; earlier Consoles wrote 0.000 for the three dot products and -1 for the matched-peak
+# columns. Both forms mean the same thing: a precursor-only suggestion had no product-ion spectrum
+# to compare, and a text-database annotation has no reference spectrum to compare against. Neither
+# is a similarity of zero, so neither is counted as a spectral comparison here.
+def _annotation_score_row(
+    weighted: float | None,
+    simple: float | None,
+    reverse: float | None,
+    matched_percentage: float | None,
+    matched_count: float | None,
+) -> dict[str, float] | None:
+    values = (weighted, simple, reverse, matched_percentage, matched_count)
+    if any(value is None or value < 0 for value in values):
+        return None
+    return {
+        "weighted": weighted,
+        "simple": simple,
+        "reverse": reverse,
+        "matched_percentage": matched_percentage,
+        "matched_count": matched_count,
+    }
+
+
+# A reference candidate is any row MS-DIAL gave a name, including the "no MS2: ", "w/o MS2: " and
+# "low score: " prefixes. "Unknown" and an empty name mean there was no candidate. Counting names
+# rather than present score cells keeps this number the same whichever notation the Console used.
+def _names_a_reference_candidate(value: str | None) -> bool:
+    name = str(value or "").strip()
+    return bool(name) and name.lower() != "unknown"
+
+
 def parse_mdpeak(path: str | Path) -> dict[str, Any]:
     mdpeak = Path(path)
     heights: list[float] = []
     scores: list[dict[str, float]] = []
-    scored_count = 0
+    candidate_count = 0
     with mdpeak.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {"Height", "Simple dot product", "Weighted dot product", "Reverse dot product"}
@@ -1264,43 +1297,27 @@ def parse_mdpeak(path: str | Path) -> dict[str, Any]:
             height = _nullable_float(row.get("Height"))
             if height is not None:
                 heights.append(height)
-            weighted = _nullable_float(row.get("Weighted dot product"))
-            simple = _nullable_float(row.get("Simple dot product"))
-            reverse = _nullable_float(row.get("Reverse dot product"))
-            matched_percentage = _nullable_float(row.get("Matched peaks percentage"))
-            matched_count = _nullable_float(row.get("Matched peaks count"))
-            if all(
-                value is not None
-                for value in (weighted, simple, reverse, matched_percentage, matched_count)
-            ):
-                if all(
-                    value >= 0
-                    for value in (
-                        weighted,
-                        simple,
-                        reverse,
-                        matched_percentage,
-                        matched_count,
-                    )
-                ):
-                    scored_count += 1
-                scores.append(
-                    {
-                        "weighted": weighted,
-                        "simple": simple,
-                        "reverse": reverse,
-                        "matched_percentage": matched_percentage,
-                        "matched_count": matched_count,
-                    }
-                )
+            if _names_a_reference_candidate(row.get("Name")):
+                candidate_count += 1
+            score = _annotation_score_row(
+                _nullable_float(row.get("Weighted dot product")),
+                _nullable_float(row.get("Simple dot product")),
+                _nullable_float(row.get("Reverse dot product")),
+                _nullable_float(row.get("Matched peaks percentage")),
+                _nullable_float(row.get("Matched peaks count")),
+            )
+            if score is not None:
+                scores.append(score)
     heights.sort()
     return {
         "mdpeak": str(mdpeak),
         "source_file": str(mdpeak),
         "peak_count": len(heights),
         "heights": heights,
-        "msp_candidate_count": len(scores),
-        "msp_scored_count": scored_count,
+        # Name is always present in a Console .mdpeak. Fall back to the scored rows so a reduced
+        # table supplied by a caller still reports a sane candidate count.
+        "msp_candidate_count": max(candidate_count, len(scores)),
+        "msp_scored_count": len(scores),
         "msp_scores": scores,
     }
 
@@ -1309,7 +1326,7 @@ def parse_mdscan(path: str | Path) -> dict[str, Any]:
     mdscan = Path(path)
     heights: list[float] = []
     scores: list[dict[str, float]] = []
-    scored_count = 0
+    candidate_count = 0
     with mdscan.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {
@@ -1325,41 +1342,30 @@ def parse_mdscan(path: str | Path) -> dict[str, Any]:
             height = _nullable_float(row.get("Integrated height"))
             if height is not None:
                 heights.append(height)
-            weighted = _nullable_float(row.get("Weighted dot product"))
-            simple = _nullable_float(row.get("Simple dot product"))
-            reverse = _nullable_float(row.get("Reverse dot product"))
-            matched_percentage = _nullable_float(row.get("Fragment presence %"))
+            if _names_a_reference_candidate(row.get("Name")):
+                candidate_count += 1
             matched_count = _nullable_float(row.get("Matched peaks count"))
             if matched_count is None:
                 matched_count = _count_spectrum_peaks(row.get("Spectrum"))
-            if all(
-                value is not None
-                for value in (weighted, simple, reverse, matched_percentage)
-            ):
-                if (
-                    weighted >= 0
-                    and simple >= 0
-                    and reverse >= 0
-                    and matched_percentage >= 0
-                ):
-                    scored_count += 1
-                scores.append(
-                    {
-                        "weighted": weighted,
-                        "simple": simple,
-                        "reverse": reverse,
-                        "matched_percentage": matched_percentage,
-                        "matched_count": matched_count,
-                    }
-                )
+            score = _annotation_score_row(
+                _nullable_float(row.get("Weighted dot product")),
+                _nullable_float(row.get("Simple dot product")),
+                _nullable_float(row.get("Reverse dot product")),
+                _nullable_float(row.get("Fragment presence %")),
+                matched_count,
+            )
+            if score is not None:
+                scores.append(score)
     heights.sort()
     return {
         "mdscan": str(mdscan),
         "source_file": str(mdscan),
         "peak_count": len(heights),
         "heights": heights,
-        "msp_candidate_count": len(scores),
-        "msp_scored_count": scored_count,
+        # GcmsAnalysisMetadataAccessor writes the string -1 into these columns when there is no
+        # match result, so an Unknown .mdscan row is excluded above and counted by name here.
+        "msp_candidate_count": max(candidate_count, len(scores)),
+        "msp_scored_count": len(scores),
         "msp_scores": scores,
     }
 

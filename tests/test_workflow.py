@@ -950,32 +950,69 @@ class WorkflowTests(unittest.TestCase):
             )
             self.assertEqual("Agilent", detect_raw_format(agilent)["vendor"])
 
+    MDPEAK_HEADER = [
+        "Peak ID",
+        "Name",
+        "Height",
+        "Simple dot product",
+        "Weighted dot product",
+        "Reverse dot product",
+        "Matched peaks count",
+        "Matched peaks percentage",
+    ]
+
+    def _write_mdpeak(self, directory: Path, *rows: str) -> Path:
+        path = directory / "sample.mdpeak"
+        path.write_text(
+            "\t".join(self.MDPEAK_HEADER) + "\n" + "".join(row + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        return path
+
     def test_parse_ascii_mdpeak(self) -> None:
+        """A Console older than the shared AnnotationScoreFormat: 0.000 dot products with a -1
+        matched-peak sentinel for the precursor-only row."""
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "sample.mdpeak"
-            path.write_text(
-                "\t".join(
-                    [
-                        "Peak ID",
-                        "Height",
-                        "Simple dot product",
-                        "Weighted dot product",
-                        "Reverse dot product",
-                        "Matched peaks count",
-                        "Matched peaks percentage",
-                    ]
-                )
-                + "\n"
-                + "0\t50\t0.6\t0.7\t0.8\t4\t0.5\n"
-                + "1\t75\t0\t0\t0\t-1\t-1\n"
-                + "2\t100\tnull\tnull\tnull\tnull\tnull\n",
-                encoding="utf-8",
+            path = self._write_mdpeak(
+                Path(temporary),
+                "0\tKnown compound\t50\t0.6\t0.7\t0.8\t4\t0.5",
+                "1\tno MS2: FA 5:0\t75\t0\t0\t0\t-1\t-1",
+                "2\tUnknown\t100\tnull\tnull\tnull\tnull\tnull",
             )
             result = parse_mdpeak(path)
             self.assertEqual([50.0, 75.0, 100.0], result["heights"])
             self.assertEqual(2, result["msp_candidate_count"])
             self.assertEqual(1, result["msp_scored_count"])
             self.assertEqual(0.7, result["msp_scores"][0]["weighted"])
+
+    def test_parse_ascii_mdpeak_reports_same_counts_for_null_uncomputed_scores(self) -> None:
+        """A Console that includes the shared AnnotationScoreFormat writes null into every score
+        column of a precursor-only row. The reported counts must not change."""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_mdpeak(
+                Path(temporary),
+                "0\tKnown compound\t50\t0.6\t0.7\t0.8\t4\t0.5",
+                "1\tno MS2: FA 5:0\t75\tnull\tnull\tnull\tnull\tnull",
+                "2\tUnknown\t100\tnull\tnull\tnull\tnull\tnull",
+            )
+            result = parse_mdpeak(path)
+            self.assertEqual(2, result["msp_candidate_count"])
+            self.assertEqual(1, result["msp_scored_count"])
+            self.assertEqual(1, len(result["msp_scores"]))
+
+    def test_parse_ascii_mdpeak_keeps_a_comparison_that_scored_zero(self) -> None:
+        """A product-ion spectrum was compared and nothing overlapped. Those zeros are
+        measurements, so the row is a scored candidate."""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_mdpeak(
+                Path(temporary),
+                "0\tlow score: LPA 13:1\t50\t0\t0\t0\t0\t0",
+                "1\tno MS2: FA 5:0\t75\tnull\tnull\tnull\tnull\tnull",
+            )
+            result = parse_mdpeak(path)
+            self.assertEqual(2, result["msp_candidate_count"])
+            self.assertEqual(1, result["msp_scored_count"])
+            self.assertEqual(0.0, result["msp_scores"][0]["matched_count"])
 
     def test_folder_type_tuning_uses_linked_input_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1122,7 +1159,9 @@ class WorkflowTests(unittest.TestCase):
             )
             result = parse_mdscan(path)
             self.assertEqual([50.0, 75.0], result["heights"])
-            self.assertEqual(2, result["msp_candidate_count"])
+            # GcmsAnalysisMetadataAccessor writes -1 into every score column of an Unknown row,
+            # so only the named row is a reference candidate.
+            self.assertEqual(1, result["msp_candidate_count"])
             self.assertEqual(1, result["msp_scored_count"])
             self.assertEqual(4.0, result["msp_scores"][0]["matched_count"])
 
