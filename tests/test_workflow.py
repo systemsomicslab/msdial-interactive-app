@@ -1235,7 +1235,7 @@ class WorkflowTests(unittest.TestCase):
                     "ion_mode": "Negative",
                     "target_omics": "Metabolomics",
                     "selected_adducts": ["[M-H]-"],
-                    "stage_inputs": True,
+                    "stage_inputs": False,
                     "repository_metadata": {
                         "schema": "msdial-repository-metadata.v1",
                         "repository": "test",
@@ -1257,6 +1257,44 @@ class WorkflowTests(unittest.TestCase):
             with zipfile.ZipFile(prepared["bundle"]) as archive:
                 self.assertIn("X1_repository_metadata_reviewed.json", archive.namelist())
                 self.assertIn("X1_sample_metadata_reviewed.tsv", archive.namelist())
+
+    def test_prepare_run_stages_a_wiff_with_its_sidecar_when_asked(self) -> None:
+        # A .wiff is unreadable without its .wiff.scan, so staging one without the other
+        # would produce an input that fails deep inside the vendor reader.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            wiff = root / "sample.wiff"
+            wiff.write_bytes(b"wiff")
+            (root / "sample.wiff.scan").write_bytes(b"scan")
+            template = root / "method.txt"
+            template.write_text(
+                "Ion mode: Negative" + chr(10) + "Target omics: Metabolomics" + chr(10), encoding="utf-8"
+            )
+            console = root / "MSDIALCUI.exe"
+            console.write_bytes(b"")
+            prepared = prepare_run(
+                {
+                    "files": expand_paths([str(wiff)]),
+                    "project_type": "lcms",
+                    "console_path": str(console),
+                    "template_path": str(template),
+                    "output_root": str(root / "output"),
+                    "ion_mode": "Negative",
+                    "target_omics": "Metabolomics",
+                    "selected_adducts": ["[M-H]-"],
+                    "stage_inputs": True,
+                }
+            )
+
+            staged = Path(prepared["run_directory"]) / "input"
+            self.assertTrue((staged / "sample.wiff").is_file())
+            self.assertTrue((staged / "sample.wiff.scan").is_file())
+            csv_text = Path(prepared["input_csv"]).read_text(encoding="ascii")
+            self.assertIn(str(staged / "sample.wiff"), csv_text)
+            self.assertNotIn(str(wiff.resolve()), csv_text)
+            self.assertEqual(str(staged), prepared["temporary_input_folder"])
+            # The copy was asked for, so it outlives the run rather than being cleaned up.
+            self.assertTrue(prepared["preserve_temporary_input_folder"])
 
             tuning = prepare_tuning_run(
                 {

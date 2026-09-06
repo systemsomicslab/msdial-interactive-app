@@ -1154,6 +1154,34 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
     return issues
 
 
+def _stage_input(source: Path, destination_folder: Path) -> Path:
+    """Copy one input, and whatever travels with it, into a working folder.
+
+    MS-DIAL writes its per-file intermediates beside the file it read, so an analysis
+    run against data in place leaves .dcl, .pai2 and tag files in the original folder.
+    On a shared or archival location that is not acceptable, and no output setting
+    prevents it -- reading from a copy is the only remedy.
+
+    Sidecars travel with their file: a .wiff is unreadable without its .wiff.scan, and
+    copying one without the other produces an input that fails deep inside the vendor
+    reader rather than here.
+    """
+    if source.is_dir():
+        target = destination_folder / source.name
+        if not target.exists():
+            shutil.copytree(source, target)
+        return target
+    for candidate in sorted(source.parent.glob(source.name + "*")):
+        if candidate.is_file():
+            target = destination_folder / candidate.name
+            if not target.exists() or target.stat().st_size != candidate.stat().st_size:
+                shutil.copy2(candidate, target)
+    staged = destination_folder / source.name
+    if not staged.exists():
+        shutil.copy2(source, staged)
+    return staged
+
+
 def prepare_run(
     state: dict[str, Any],
     progress: Callable[[str], None] | None = None,
@@ -1167,11 +1195,20 @@ def prepare_run(
     run_directory.mkdir(parents=True, exist_ok=True)
     effective_files: list[Path] = []
     files = state["files"]
+    stage_inputs = bool(state.get("stage_inputs", False))
+    staging_folder = run_directory / "input" if stage_inputs else None
+    if staging_folder is not None:
+        staging_folder.mkdir(parents=True, exist_ok=True)
     for index, item in enumerate(files):
         source = Path(item["file_path"]).resolve()
+        if staging_folder is None:
+            if progress:
+                progress(f"Using original input {index + 1}/{len(files)}: {source}")
+            effective_files.append(source)
+            continue
         if progress:
-            progress(f"Using original input {index + 1}/{len(files)}: {source}")
-        effective_files.append(source)
+            progress(f"Staging input {index + 1}/{len(files)}: {source}")
+        effective_files.append(_stage_input(source, staging_folder))
 
     csv_path = run_directory / "analysis_files.csv"
     _write_analysis_csv(csv_path, files, effective_files)
@@ -1220,10 +1257,10 @@ def prepare_run(
         "msdial_console_version": method_state["msdial_console_version"],
         "msdial_interactive_version": method_state["msdial_interactive_version"],
         "project_file_requested": project_file_requested,
-        "stage_inputs": False,
+        "stage_inputs": stage_inputs,
         "input_csv": str(csv_path),
         "console_input": str(csv_path),
-        "temporary_input_folder": "",
+        "temporary_input_folder": str(staging_folder) if staging_folder is not None else "",
         "method_file": str(method_path),
         "output_folder": str(run_directory),
         "source_files": [item["file_path"] for item in files],
@@ -1261,8 +1298,11 @@ def prepare_run(
         "diagnostic_result_file": expected_analysis_exports[0] if len(files) == 1 else "",
         "input_csv": str(csv_path),
         "console_input": str(csv_path),
-        "temporary_input_folder": "",
-        "preserve_temporary_input_folder": False,
+        "temporary_input_folder": str(staging_folder) if staging_folder is not None else "",
+        # A staged copy was asked for, so it is the analyst's copy to keep: deleting it
+        # after the run would throw away the very thing that lets the next run avoid
+        # touching the original data again.
+        "preserve_temporary_input_folder": stage_inputs,
         "project_file_requested": project_file_requested,
         "method_file": str(method_path),
         "manifest": str(manifest_path),

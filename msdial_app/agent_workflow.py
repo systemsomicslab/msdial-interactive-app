@@ -33,6 +33,7 @@ SUPPORTED_ANSWER_KEYS = {
     "rt_correction_peak_selection_rt_weight", "library_strategy", "libraries",
     "library_provenance", "run_qa", "internal_standards",
     "use_retention_time_for_annotation", "retention_time_tolerance", "number_of_threads",
+    "stage_inputs",
     "generate_materials_methods", "alignment_light_mode", "output_root",
     "export_folder_path", "height_matrix_export", "console_path", "template_path",
     "queries_path", "project_store", "workflow_overrides", "repository_metadata_path",
@@ -119,7 +120,17 @@ def build_guided_plan(
     supplied = dict(answers or {})
     workset = get_workset(workset_id)
     merged = dict((workset or {}).get("answers", {}))
+    # A workset stores answers and workflow_overrides side by side, and only the answers
+    # were ever read back: overrides saved into a workset were accepted, written to disk,
+    # and then silently ignored by every plan built from it.
+    overrides = {
+        **dict((workset or {}).get("workflow_overrides", {}) or {}),
+        **dict(merged.get("workflow_overrides") or {}),
+        **dict(supplied.get("workflow_overrides") or {}),
+    }
     merged.update(supplied)
+    if overrides:
+        merged["workflow_overrides"] = overrides
     unknown_answer_keys = sorted(set(merged) - SUPPORTED_ANSWER_KEYS)
     inspection = inspect_analysis_input(input_path)
     questions = _questions(merged)
@@ -444,6 +455,15 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
             "Within how many minutes of the library retention time should a match be accepted?",
             required=False,
         )
+    if "stage_inputs" not in answers:
+        ask(
+            "stage_inputs",
+            "MS-DIAL writes its per-file intermediates beside the files it reads, so "
+            "running against the data where it sits will add .dcl, .pai2 and tag files "
+            "to that folder. Copy the raw data into the output folder first?",
+            ["true", "false"],
+            required=False,
+        )
     if "number_of_threads" not in answers:
         ask(
             "number_of_threads",
@@ -535,6 +555,8 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
     _apply_retention_time_use(state, answers)
     if answers.get("number_of_threads") is not None:
         state["number_of_threads"] = max(1, int(answers["number_of_threads"]))
+    if answers.get("stage_inputs") is not None:
+        state["stage_inputs"] = _as_bool(answers.get("stage_inputs"))
     if project_type == "lcms":
         ion_mode = str(state["ion_mode"])
         state["selected_adducts"] = [

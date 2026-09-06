@@ -163,3 +163,61 @@ class RetentionTimeReachesTheParameterFileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorksetOverrideTests(unittest.TestCase):
+    """A workset stores answers and overrides side by side; both must be read back."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        (self.root / "sample.mzML").write_text("", encoding="ascii")
+        self.console = self.root / "MSDIALCUI.exe"
+        self.console.write_text("", encoding="ascii")
+        self.lbm = self.root / "lab.lbm2"
+        self.lbm.write_text("", encoding="ascii")
+        self.saved: list[Path] = []
+
+    def tearDown(self) -> None:
+        for path in self.saved:
+            if path.exists():
+                path.unlink()
+        self.directory.cleanup()
+
+    def _save(self, name: str, answers: dict, overrides: dict) -> None:
+        from msdial_app.worksets import get_workset, save_workset
+
+        save_workset(name, answers, description="test", workflow_overrides=overrides)
+        stored = get_workset(name)
+        if stored and stored.get("file"):
+            self.saved.append(Path(stored["file"]))
+
+    def _workflow(self, workset_id: str, **extra) -> dict:
+        answers = _base_answers(self.console, self.lbm)
+        answers["output_root"] = str(self.root / "out")
+        answers.update(extra)
+        plan = build_guided_plan(str(self.root), answers, workset_id)
+        self.assertIsNotNone(plan["workflow"], plan["blockers"])
+        return plan["workflow"]
+
+    def test_an_override_saved_in_a_workset_reaches_the_workflow(self) -> None:
+        # It used to be written to disk and then ignored by every plan built from it.
+        self._save("override-test-a", {}, {"minimum_peak_width": 9})
+        self.assertEqual(9, self._workflow("override-test-a")["minimum_peak_width"])
+
+    def test_an_override_supplied_now_beats_the_one_the_workset_remembers(self) -> None:
+        self._save("override-test-b", {}, {"minimum_peak_width": 9})
+        workflow = self._workflow(
+            "override-test-b", workflow_overrides={"minimum_peak_width": 3}
+        )
+        self.assertEqual(3, workflow["minimum_peak_width"])
+
+    def test_answers_and_overrides_from_one_workset_both_apply(self) -> None:
+        self._save(
+            "override-test-c",
+            {"number_of_threads": 8},
+            {"minimum_peak_width": 9},
+        )
+        workflow = self._workflow("override-test-c")
+        self.assertEqual(8, workflow["number_of_threads"])
+        self.assertEqual(9, workflow["minimum_peak_width"])
