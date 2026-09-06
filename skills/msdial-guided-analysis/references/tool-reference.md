@@ -9,9 +9,10 @@ Common keys:
   "project_type": "lcms",
   "ion_mode": "Negative",
   "target_omics": "Lipidomics",
-  "parameter_strategy": "default",
-  "target_peak_count": 10000,
-  "minimum_peak_height": 300,
+  "parameter_strategy": "auto_peak_range",
+  "target_peak_count_min": 3000,
+  "target_peak_count_max": 6000,
+  "smoothing_method": "TimeBasedLinearWeightedMovingAverage",
   "acquisition_type": "DDA",
   "execute_rt_correction": false,
   "rt_correction_anchor_path": "D:/anchors.txt",
@@ -32,7 +33,17 @@ Use `msdial_check_console_path` before asking the user to locate it manually, an
 `msdial_set_console_path` to persist an accepted path. Unknown answer keys are
 reported in `warnings` and `unknown_answer_keys`; they are never silently applied.
 
-Use `parameter_strategy: "target_peak_count"` only with `target_peak_count`. Add `minimum_peak_height` after diagnostic review.
+Use `msdial_check_official_console_releases` when release recency matters. For a
+developer source tree, use `msdial_check_local_console_source` to fetch and
+compare the current checkout with `origin/master` without changing the working
+tree. Call `msdial_build_console_from_local_source` first with
+`confirmed=false` to show the Git commit, dirty status, command, and output.
+Call it again with `confirmed=true` only after explicit approval.
+
+Use `parameter_strategy: "auto_peak_range"` for the 3,000-6,000 stepped
+repository workflow, or `"target_peak_count"` with an exact
+`target_peak_count`. Add `minimum_peak_height` after diagnostic review; zero is
+a valid accepted result.
 
 When `run_qa` is true, the planner enables `Height matrix export` and sets
 `Export folder path` to `output_root` unless `export_folder_path` is supplied.
@@ -59,6 +70,35 @@ For existing libraries:
   ]
 }
 ```
+
+For the tiered LC-MS pipeline, provide one MSP path. The official versioned LBM
+catalog entry is used for the lipid-rule tier:
+
+```json
+{
+  "library_strategy": "tiered_lipid_msp",
+  "libraries": {
+    "msp_paths": ["D:/libraries/private-neg-vs20.msp"],
+    "msp_version": "VS20",
+    "msp_source": "institutional library",
+    "msp_license": "institutional/private"
+  }
+}
+```
+
+The generated cascade is:
+
+| Tier | Annotator ID | Priority | Mode | MS/MS tol. | Weighted/simple/reverse | Matched peaks |
+|---|---|---:|---|---:|---|---:|
+| Lipid rules | LBM path | 3 | Lipidomics | LBM setting | LBM setting | LBM setting |
+| MSP high | `msp_high_quality` | 2 | Metabolomics | 0.05 Da | 0.6 / 0.6 / 0.8 | >= 3 |
+| MSP low candidate | `msp_low_quality` | 1 | Metabolomics | 0.25 Da | 0.5 / 0.5 / 0.5 | >= 1 |
+
+A lower-priority MS/MS reference match outranks a higher-priority precursor-m/z-only
+suggestion. If no tier yields an MS/MS match, MS-DIAL retains the highest-priority
+suggestion. Both MSP rows set matched-peak percentage to 0 and disable RT scoring/filtering.
+MS-DIAL loads the shared MSP once and evaluates both settings. The low tier is
+an intentionally broad candidate search and requires downstream evidence review.
 
 For GC-MS RI analysis, add `gcms_retention_type: "RI"`, `gcms_ri_compound_type: "Alkanes"` or `"Fames"`, and an RI standard/dictionary path.
 
@@ -125,12 +165,20 @@ those rows before preparing the production analysis.
 
 For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
 
+- `msdial_repository_batch_plan`: validate Catalog `handoff_path` values and
+  expand mixed accessions into independent analysis-unit workspaces. Prefer
+  `analysis_unit_handoff_paths` over inlining file/sample manifests. It never
+  downloads or executes data. Pass the reviewed `analysis_purpose`; omission is
+  reported as a pending decision.
 - `msdial_repository_reanalysis_plan`: inspect metadata, eligibility, the
   default Class hierarchy, and internal-standard declarations without
-  downloading raw data.
+  downloading raw data. Pass `analysis_unit_handoff_path` for Catalog-driven
+  runs and `analysis_purpose` so later choices share one stated goal.
 - `msdial_download_repository_raw`: preview with `confirmed=false`, then start a
   bounded download with `confirmed=true` after the user approves destination,
-  accession, size limit, and retention policy.
+  accession, analysis unit, actual bundle size, size limit, and retention policy.
+  Reuse the exact handoff path passed to the planner. Download remains blocked
+  until both the Class proposal and `analysis_purpose` are present.
 - `msdial_repository_raw_metadata_preflight`: run the local RawMetadataConsoleApp
   against representative downloaded files when raw-header evidence is needed.
 - `msdial_prepare_repository_reanalysis`: preview Class matching first, then

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import copy
 import datetime as dt
+import hashlib
 import json
 import os
 import platform
@@ -16,7 +17,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import __version__
-from .user_settings import load_user_settings
+from .sample_grouping import file_type_for, propose_grouping, propose_injection_order
+from .user_settings import load_user_settings, user_data_directory
 
 
 SUPPORTED_SUFFIXES = {
@@ -47,6 +49,255 @@ SMOOTHING_METHODS = [
 ]
 LCMS_QA_CAPABILITY = "lcms_alignment_qa_matrix"
 RT_CORRECTION_REVIEW_CAPABILITY = "rt_correction_review"
+CONSOLE_BUILD_PROVENANCE = "msdial-console-build-provenance.json"
+
+
+def _git_output(root: Path, *arguments: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+# Below this, hashing costs less than the round trip to the cache file.
+IDENTITY_CACHE_MIN_BYTES = 64 * 1024 * 1024
+
+
+def file_identity(path: str | Path) -> dict[str, Any]:
+    """Identify one file by content, not by where it happens to sit.
+
+    A manifest that records only a library path says nothing about which library was
+    used: the path can be reused, moved, or point at a rebuilt file. A checksum is the
+    only field that survives all of that, so it is recorded even when no catalogue
+    knows the file -- which is the usual case for a laboratory's own LBM2.
+
+    Hashing a 700 MB library takes seconds, and a run prepares more than once, so the
+    digest is cached against the file's size and modification time.
+    """
+    try:
+        resolved = Path(path).expanduser().resolve()
+        stat = resolved.stat()
+    except (OSError, ValueError):
+        return {"sha256": "", "size": 0, "modified_at": "", "identity_error": "unreadable"}
+
+    # A size-and-timestamp cache cannot tell two same-length rewrites apart when both
+    # land inside one clock tick, and a recorded checksum of content that is not there
+    # is worse than no checksum. So the cache is used only where hashing is genuinely
+    # expensive -- a multi-hundred-megabyte library, which takes seconds to write and
+    # cannot be rewritten inside a tick -- and everything smaller is simply hashed.
+    key = f"{resolved}|{stat.st_size}|{stat.st_mtime_ns}"
+    cacheable = stat.st_size >= IDENTITY_CACHE_MIN_BYTES
+    cache_path = user_data_directory() / "file-identity-cache.json"
+    cache: dict[str, str] = {}
+    if cacheable:
+        try:
+            if cache_path.is_file():
+                loaded = json.loads(cache_path.read_text(encoding="utf-8-sig"))
+                if isinstance(loaded, dict):
+                    cache = {str(k): str(v) for k, v in loaded.items()}
+        except (OSError, json.JSONDecodeError):
+            cache = {}
+
+    digest = cache.get(key, "")
+    if not digest:
+        hasher = hashlib.sha256()
+        try:
+            with resolved.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                    hasher.update(chunk)
+        except OSError:
+            return {
+                "sha256": "",
+                "size": stat.st_size,
+                "modified_at": "",
+                "identity_error": "unreadable",
+            }
+        digest = hasher.hexdigest()
+    if cacheable and cache.get(key) != digest:
+        cache[key] = digest
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            # Keep the cache from growing without bound; the entries are cheap to remake.
+            trimmed = dict(list(cache.items())[-256:])
+            cache_path.write_text(json.dumps(trimmed, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    return {
+        "sha256": digest,
+        "size": stat.st_size,
+        "modified_at": dt.datetime.fromtimestamp(
+            stat.st_mtime, tz=dt.timezone.utc
+        ).astimezone().isoformat(),
+    }
+
+
+def _console_provenance_warning(console: dict[str, Any]) -> str:
+    """What to tell the analyst about a binary whose identity is not established."""
+    status = console.get("provenance_status", "absent")
+    if status == "verified":
+        dirty = (console.get("git") or {}).get("dirty")
+        if dirty:
+            return (
+                "The recorded build matches this binary, but it was built from a working "
+                "tree with uncommitted changes, so the git revision does not fully "
+                "describe the code that ran."
+            )
+        return ""
+    if status == "stale_mismatch":
+        return (
+            "A build record sits beside this binary and describes a different one, so the "
+            "recorded version names code that did not run. Offer a rebuild through "
+            "msdial_build_console_from_local_source before relying on the provenance."
+        )
+    if status == "unreadable":
+        return "The build record beside this binary could not be read."
+    return (
+        "No build record accompanies this binary, so the run is identified by its "
+        "checksum alone and not by a source revision."
+    )
+
+
+def find_console_source_root(console_path: str | Path) -> Path | None:
+    path = Path(console_path).expanduser().resolve()
+    for parent in path.parents:
+        project = parent / "tests" / "MSDIAL5" / "MsdialCoreTestApp" / "MsdialCoreTestApp.csproj"
+        if project.is_file() and (parent / ".git").exists():
+            return parent
+    return None
+
+
+def console_git_state(source_root: str | Path) -> dict[str, Any]:
+    root = Path(source_root).expanduser().resolve()
+    head = _git_output(root, "rev-parse", "HEAD")
+    if not head:
+        return {"source_root": str(root), "available": False}
+    status = _git_output(root, "status", "--porcelain", "--untracked-files=normal")
+    diff = _git_output(root, "diff", "--binary", "HEAD")
+    working_tree_state = status + "\n" + diff
+    origin_master = _git_output(root, "rev-parse", "--verify", "refs/remotes/origin/master")
+    ahead = behind = None
+    if origin_master:
+        counts = _git_output(root, "rev-list", "--left-right", "--count", "HEAD...origin/master")
+        try:
+            ahead_text, behind_text = counts.split()
+            ahead, behind = int(ahead_text), int(behind_text)
+        except (ValueError, TypeError):
+            pass
+    return {
+        "source_root": str(root),
+        "available": True,
+        "branch": _git_output(root, "branch", "--show-current"),
+        "head": head,
+        "short_head": head[:12],
+        "head_time": _git_output(root, "show", "-s", "--format=%cI", "HEAD"),
+        "origin_master_head": origin_master,
+        "origin_master_short_head": origin_master[:12],
+        "ahead_of_origin_master": ahead,
+        "behind_origin_master": behind,
+        "remote_note": "origin/master is a local tracking reference; use Fetch and compare source to refresh it.",
+        "dirty": bool(status),
+        "changed_files": len(status.splitlines()) if status else 0,
+        "working_tree_diff_sha256": hashlib.sha256(diff.encode("utf-8")).hexdigest()
+        if diff
+        else "",
+        "working_tree_state_sha256": hashlib.sha256(
+            working_tree_state.encode("utf-8")
+        ).hexdigest()
+        if working_tree_state.strip()
+        else "",
+    }
+
+
+def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str, Any]:
+    path = Path(console_path).expanduser().resolve()
+    if not path.is_file():
+        return {"path": str(path), "exists": False, "source": source or "custom"}
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    stat = path.stat()
+    source_root = find_console_source_root(path)
+    folder_text = str(path.parent).casefold()
+    if source_root:
+        source_kind = "local_source_build"
+    elif "msdial.console" in folder_text:
+        source_kind = "official_distribution"
+    else:
+        source_kind = "custom"
+    provenance_path = path.parent / CONSOLE_BUILD_PROVENANCE
+    provenance: dict[str, Any] = {}
+    recorded: dict[str, Any] = {}
+    # "No record exists" and "a record exists and describes a different binary"
+    # are opposite situations that a boolean reports identically. CLAUDE.md
+    # requires software versions in every retained artifact, so the caller has to
+    # be able to tell them apart -- and a rebuild outside the build tool leaves a
+    # sidecar that still names the previous binary.
+    provenance_status = "absent"
+    if provenance_path.is_file():
+        try:
+            loaded = json.loads(provenance_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            provenance_status = "unreadable"
+        else:
+            if isinstance(loaded, dict):
+                recorded = loaded
+                if loaded.get("binary_sha256") == digest.hexdigest():
+                    provenance = loaded
+                    provenance_status = "verified"
+                else:
+                    provenance_status = "stale_mismatch"
+            else:
+                provenance_status = "unreadable"
+    result = {
+        "path": str(path),
+        "exists": True,
+        "source": source or source_kind.replace("_", " "),
+        "source_kind": source_kind,
+        "version": console_version(str(path)),
+        "binary_sha256": digest.hexdigest(),
+        "binary_size": stat.st_size,
+        "binary_modified_at": dt.datetime.fromtimestamp(
+            stat.st_mtime, tz=dt.timezone.utc
+        ).astimezone().isoformat(),
+        "provenance_verified": provenance_status == "verified",
+        "provenance_status": provenance_status,
+        "provenance": provenance,
+        **console_capabilities(str(path)),
+    }
+    if provenance_status in {"stale_mismatch", "unreadable"}:
+        result["provenance_mismatch"] = {
+            "record_path": str(provenance_path),
+            "recorded_binary_sha256": str(recorded.get("binary_sha256") or ""),
+            "actual_binary_sha256": digest.hexdigest(),
+            "recorded_git_head": str(recorded.get("git_head") or ""),
+            "recorded_built_at": str(recorded.get("built_at") or ""),
+            "detail": (
+                "A build-provenance record sits beside this binary but does not describe it. "
+                "Rebuild through msdial_build_console_from_local_source, or remove the record, "
+                "before relying on recorded software versions."
+            )
+            if provenance_status == "stale_mismatch"
+            else "The build-provenance record beside this binary could not be read.",
+        }
+    if source_root:
+        result["git"] = console_git_state(source_root)
+        if provenance:
+            result["matches_recorded_git_head"] = (
+                provenance.get("git_head") == result["git"].get("head")
+                and provenance.get("working_tree_state_sha256", "")
+                == result["git"].get("working_tree_state_sha256", "")
+            )
+    return result
 
 
 def discover_console_paths(search_roots: Iterable[str | Path] | None = None) -> dict[str, Any]:
@@ -95,15 +346,7 @@ def discover_console_paths(search_roots: Iterable[str | Path] | None = None) -> 
         if resolved.casefold() in seen:
             continue
         seen.add(resolved.casefold())
-        capability_info = console_capabilities(resolved)
-        found.append(
-            {
-                "path": resolved,
-                "source": source,
-                "version": console_version(resolved),
-                **capability_info,
-            }
-        )
+        found.append(inspect_console_path(resolved, source))
     return {
         "configured_path": saved,
         "environment_path": environment,
@@ -120,6 +363,13 @@ def is_supported(path: Path) -> bool:
 
 
 def detect_raw_format(path: str | Path) -> dict[str, Any]:
+    """What a file's format implies, before anyone has decided anything.
+
+    The peak-height and mass-slice values here are what this vendor and instrument
+    family usually want. They are named as suggestions because the run applies one
+    value chosen elsewhere: reporting a per-file 100 beside an applied 300 states a
+    threshold that governs nothing.
+    """
     target = Path(path)
     suffix = target.suffix.lower()
     if target.is_file() and suffix in {".wiff", ".wiff2"}:
@@ -127,8 +377,8 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
             "vendor": "SCIEX",
             "format": "SCIEX WIFF" if suffix == ".wiff" else "SCIEX WIFF2",
             "instrument_family": "QTOF",
-            "minimum_peak_height": 100,
-            "mass_slice_width": 0.1,
+            "suggested_minimum_peak_height": 100,
+            "suggested_mass_slice_width": 0.1,
             "sidecar_available": (
                 suffix != ".wiff" or Path(str(target) + ".scan").is_file()
             ),
@@ -138,24 +388,24 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
             "vendor": "Waters",
             "format": "Waters .raw folder",
             "instrument_family": "QTOF",
-            "minimum_peak_height": 100,
-            "mass_slice_width": 0.1,
+            "suggested_minimum_peak_height": 100,
+            "suggested_mass_slice_width": 0.1,
         }
     if target.is_file() and suffix == ".raw":
         return {
             "vendor": "Thermo",
             "format": "Thermo .raw file",
             "instrument_family": "Fourier-transform MS",
-            "minimum_peak_height": 10000,
-            "mass_slice_width": 0.05,
+            "suggested_minimum_peak_height": 10000,
+            "suggested_mass_slice_width": 0.05,
         }
     if target.is_file() and suffix in {".lcd", ".qgd"}:
         return {
             "vendor": "Shimadzu",
             "format": "Shimadzu LCD" if suffix == ".lcd" else "Shimadzu QGD",
             "instrument_family": "QTOF" if suffix == ".lcd" else "GC-MS",
-            "minimum_peak_height": 100,
-            "mass_slice_width": 0.1,
+            "suggested_minimum_peak_height": 100,
+            "suggested_mass_slice_width": 0.1,
         }
     if target.is_dir() and suffix == ".d":
         if (target / "AcqData").is_dir():
@@ -170,15 +420,15 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
             "vendor": vendor,
             "format": label,
             "instrument_family": "QTOF",
-            "minimum_peak_height": 100,
-            "mass_slice_width": 0.1,
+            "suggested_minimum_peak_height": 100,
+            "suggested_mass_slice_width": 0.1,
         }
     return {
         "vendor": "Open format" if suffix in {".mzml", ".mzxml", ".cdf"} else "Other",
         "format": suffix.lstrip(".").upper() or "Unknown",
         "instrument_family": "QTOF",
-        "minimum_peak_height": 100,
-        "mass_slice_width": 0.1,
+        "suggested_minimum_peak_height": 100,
+        "suggested_mass_slice_width": 0.1,
     }
 
 
@@ -298,30 +548,23 @@ def expand_paths_report(paths: Iterable[str]) -> dict[str, Any]:
         else:
             rejected.append(f"{path} (not found)")
     unique = sorted(set(expanded), key=lambda item: str(item).lower())
+    # The grouping is read from how the names vary across the whole set, so it has to be
+    # decided once for all of them rather than file by file.
+    grouping = propose_grouping([path.stem for path in unique])
+    injection = propose_injection_order([path.stem for path in unique])
     result = []
     for index, path in enumerate(unique):
         format_info = detect_raw_format(path)
         name = path.stem
-        lower = name.lower()
-        is_blank = "blank" in lower
-        class_id = (
-            "Blank"
-            if is_blank
-            else "Feces"
-            if "feces" in lower
-            else "Plasma"
-            if "plasma" in lower
-            else "Sample"
-        )
         result.append(
             {
                 "file_path": str(path),
                 "file_name": name,
-                "file_type": "Blank" if is_blank else "Sample",
-                "class_id": class_id,
+                "file_type": file_type_for(name),
+                "class_id": grouping["assignments"].get(name, "Sample"),
                 "acquisition_type": "DDA",
                 "batch_order": 1,
-                "analytical_order": index + 1,
+                "analytical_order": injection["orders"].get(name, index + 1),
                 "factor": 1,
                 **format_info,
             }
@@ -542,6 +785,10 @@ def load_parameter_template(
                         or f"{defaults['annotator_id'].rsplit('_', 1)[0]}_{index}",
                         path_key: str(library.resolve()) if library_text else "",
                         "priority": int(float(source.get("priority") or index)),
+                        "target_omics": str(source.get("target_omics", "")).strip()
+                        or row.get("target_omics", ""),
+                        "evidence_tier": str(source.get("evidence_tier", "")).strip()
+                        or row.get("evidence_tier", ""),
                     }
                 )
                 for key in (
@@ -627,6 +874,7 @@ def load_parameter_template(
     }
     lbm = {
         "lbm_file_path": library_path("lbm file path"),
+        "priority": int(number("lbm annotator priority", "lbm annotation priority", default=1)),
         "rt_tolerance": number("rt tolerance for lbm-based annotation", default=100),
         "ms1_tolerance": number("ms1 tolerance for lbm-based annotation", default=0.01),
         "ms2_tolerance": number("ms2 tolerance for lbm-based annotation", default=0.025),
@@ -1013,6 +1261,34 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
     return issues
 
 
+def _stage_input(source: Path, destination_folder: Path) -> Path:
+    """Copy one input, and whatever travels with it, into a working folder.
+
+    MS-DIAL writes its per-file intermediates beside the file it read, so an analysis
+    run against data in place leaves .dcl, .pai2 and tag files in the original folder.
+    On a shared or archival location that is not acceptable, and no output setting
+    prevents it -- reading from a copy is the only remedy.
+
+    Sidecars travel with their file: a .wiff is unreadable without its .wiff.scan, and
+    copying one without the other produces an input that fails deep inside the vendor
+    reader rather than here.
+    """
+    if source.is_dir():
+        target = destination_folder / source.name
+        if not target.exists():
+            shutil.copytree(source, target)
+        return target
+    for candidate in sorted(source.parent.glob(source.name + "*")):
+        if candidate.is_file():
+            target = destination_folder / candidate.name
+            if not target.exists() or target.stat().st_size != candidate.stat().st_size:
+                shutil.copy2(candidate, target)
+    staged = destination_folder / source.name
+    if not staged.exists():
+        shutil.copy2(source, staged)
+    return staged
+
+
 def prepare_run(
     state: dict[str, Any],
     progress: Callable[[str], None] | None = None,
@@ -1026,11 +1302,20 @@ def prepare_run(
     run_directory.mkdir(parents=True, exist_ok=True)
     effective_files: list[Path] = []
     files = state["files"]
+    stage_inputs = bool(state.get("stage_inputs", False))
+    staging_folder = run_directory / "input" if stage_inputs else None
+    if staging_folder is not None:
+        staging_folder.mkdir(parents=True, exist_ok=True)
     for index, item in enumerate(files):
         source = Path(item["file_path"]).resolve()
+        if staging_folder is None:
+            if progress:
+                progress(f"Using original input {index + 1}/{len(files)}: {source}")
+            effective_files.append(source)
+            continue
         if progress:
-            progress(f"Using original input {index + 1}/{len(files)}: {source}")
-        effective_files.append(source)
+            progress(f"Staging input {index + 1}/{len(files)}: {source}")
+        effective_files.append(_stage_input(source, staging_folder))
 
     csv_path = run_directory / "analysis_files.csv"
     _write_analysis_csv(csv_path, files, effective_files)
@@ -1072,17 +1357,48 @@ def prepare_run(
         for item in files
     ]
     manifest_path = run_directory / "run-manifest.json"
+    # A version string and a path cannot identify a binary: the string is whatever the
+    # assembly claims, the path can be rebuilt under. inspect_console_path already
+    # computes the checksum, the build record and the git state of the working tree it
+    # came from; the manifest simply never carried any of it, so a run could not be
+    # traced back to the code that produced it.
+    console = inspect_console_path(state["console_path"])
     manifest = {
         "created_at": dt.datetime.now().astimezone().isoformat(),
         "platform": platform.platform(),
         "analysis_type": project_type,
         "msdial_console_version": method_state["msdial_console_version"],
         "msdial_interactive_version": method_state["msdial_interactive_version"],
+        "console": {
+            "path": console.get("path", ""),
+            "source_kind": console.get("source_kind", ""),
+            "binary_sha256": console.get("binary_sha256", ""),
+            "binary_size": console.get("binary_size", 0),
+            "binary_modified_at": console.get("binary_modified_at", ""),
+            "provenance_status": console.get("provenance_status", "absent"),
+            "provenance": console.get("provenance", {}),
+            "provenance_mismatch": console.get("provenance_mismatch", {}),
+            "git": console.get("git", {}),
+        },
+        # One field a reader sees without digging: whether the software this run used
+        # can be identified at all.
+        "software_provenance_status": console.get("provenance_status", "absent"),
+        "libraries": [
+            {
+                **{
+                    key: entry.get(key, "")
+                    for key in ("path", "version", "source", "doi", "license")
+                },
+                **file_identity(entry.get("path", "")),
+            }
+            for entry in method_state.get("library_provenance", [])
+            if isinstance(entry, dict) and str(entry.get("path", "")).strip()
+        ],
         "project_file_requested": project_file_requested,
-        "stage_inputs": False,
+        "stage_inputs": stage_inputs,
         "input_csv": str(csv_path),
         "console_input": str(csv_path),
-        "temporary_input_folder": "",
+        "temporary_input_folder": str(staging_folder) if staging_folder is not None else "",
         "method_file": str(method_path),
         "output_folder": str(run_directory),
         "source_files": [item["file_path"] for item in files],
@@ -1112,6 +1428,14 @@ def prepare_run(
     return {
         "run_directory": str(run_directory),
         "analysis_type": project_type,
+        # Written into the manifest above; repeated here because a status nobody reads
+        # is the same as a status nobody recorded.
+        "software_provenance": {
+            "status": console.get("provenance_status", "absent"),
+            "binary_sha256": console.get("binary_sha256", ""),
+            "version": method_state["msdial_console_version"],
+            "warning": _console_provenance_warning(console),
+        },
         "expected_analysis_exports": expected_analysis_exports,
         "export_folder_path": str(method_state.get("export_folder_path", "")),
         "qa_matrix_expected": bool(
@@ -1120,8 +1444,11 @@ def prepare_run(
         "diagnostic_result_file": expected_analysis_exports[0] if len(files) == 1 else "",
         "input_csv": str(csv_path),
         "console_input": str(csv_path),
-        "temporary_input_folder": "",
-        "preserve_temporary_input_folder": False,
+        "temporary_input_folder": str(staging_folder) if staging_folder is not None else "",
+        # A staged copy was asked for, so it is the analyst's copy to keep: deleting it
+        # after the run would throw away the very thing that lets the next run avoid
+        # touching the original data again.
+        "preserve_temporary_input_folder": stage_inputs,
         "project_file_requested": project_file_requested,
         "method_file": str(method_path),
         "manifest": str(manifest_path),
@@ -1875,6 +2202,7 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
     replacements = {
         "msp file path": "" if msp_annotator_settings_path else (state.get("msp_path", "") or first_msp_path),
         "lbm file path": state.get("lbm_path", ""),
+        "lbm annotator priority": int(state.get("lbm_annotator", {}).get("priority", state.get("lbm_priority", 1))),
         "text db file path": "" if text_annotator_settings_path else state.get("text_db_path", ""),
         "searched adduct ions": ",".join(state.get("selected_adducts", [])),
         "ion mode": state.get("ion_mode", "Negative"),
@@ -1941,6 +2269,8 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
     }
     if project_type == "lcms":
         replacements["alignment light mode"] = bool(state.get("alignment_light_mode", False))
+        if state.get("annotation_pipeline_profile"):
+            replacements["annotation pipeline profile"] = state["annotation_pipeline_profile"]
     if msp_annotator_settings_path is not None:
         replacements["msp annotator settings file path"] = str(msp_annotator_settings_path)
     if text_annotator_settings_path is not None:
@@ -1985,6 +2315,18 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
     output: list[str] = []
     found: set[str] = set()
     annotation_inserted = False
+    output_aliases = (
+        {
+            "retention index alignment tolerance": "retention index tolerance for alignment",
+            "weighted dot product cutoff": "square root of weighted dot product cutoff for msp-based annotation",
+            "simple dot product cutoff": "square root of simple dot product cutoff for msp-based annotation",
+            "reverse dot product cutoff": "square root of reverse dot product cutoff for msp-based annotation",
+            "matched peaks percentage cutoff": "matched peaks percentage cutoff for msp-based annotation",
+            "minimum spectrum match": "minimum spectrum match for msp-based annotation",
+        }
+        if project_type == "gcms"
+        else {}
+    )
     for line in lines:
         stripped = line.lstrip()
         lower = stripped.lower()
@@ -2001,8 +2343,10 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
             None,
         )
         if matched:
-            output.append(f"{_title_for_key(matched)}: {replacements[matched]}")
+            output_key = output_aliases.get(matched, matched)
+            output.append(f"{_title_for_key(output_key)}: {replacements[matched]}")
             found.add(matched)
+            found.add(output_key)
             continue
         output.append(line)
         if project_type != "gcms" and stripped.lower() == "# annotation parameter":
@@ -2087,6 +2431,8 @@ def _write_msp_annotator_settings(run_directory: Path, state: dict[str, Any]) ->
         "minimum_spectrum_match",
         "use_retention_information_for_scoring",
         "use_retention_information_for_filtering",
+        "target_omics",
+        "evidence_tier",
     ]
     with settings_path.open("w", encoding="ascii", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=header, delimiter="\t", lineterminator="\n")
@@ -2097,6 +2443,8 @@ def _write_msp_annotator_settings(run_directory: Path, state: dict[str, Any]) ->
                     "annotator_id": str(row.get("annotator_id", "")).strip() or f"msp_annotator_{index}",
                     "msp_file_path": str(Path(str(row["msp_file_path"])).expanduser().resolve()),
                     "priority": int(row.get("priority") or index),
+                    "target_omics": str(row.get("target_omics", "")).strip(),
+                    "evidence_tier": str(row.get("evidence_tier", "")).strip(),
                     "rt_tolerance": row.get("rt_tolerance", state.get("msp_rt_tolerance", 100)),
                     "ms1_tolerance": row.get("ms1_tolerance", state.get("ms1_tolerance", 0.01)),
                     "ms2_tolerance": row.get("ms2_tolerance", state.get("ms2_tolerance", 0.025)),
@@ -2185,6 +2533,8 @@ def _title_for_key(key: str) -> str:
         "reverse dot product cutoff for msp-based annotation": "Reverse dot product cutoff for MSP-based annotation",
         "matched peaks percentage cutoff for msp-based annotation": "Matched peaks percentage cutoff for MSP-based annotation",
         "minimum spectrum match for msp-based annotation": "Minimum spectrum match for MSP-based annotation",
+        "annotation pipeline profile": "Annotation pipeline profile",
+        "lbm annotator priority": "LBM annotator priority",
         "rt tolerance for lbm-based annotation": "RT tolerance for LBM-based annotation",
         "ms1 tolerance for lbm-based annotation": "MS1 tolerance for LBM-based annotation",
         "ms2 tolerance for lbm-based annotation": "MS2 tolerance for LBM-based annotation",
@@ -2220,11 +2570,17 @@ def _title_for_key(key: str) -> str:
         "retention type": "Retention type",
         "alignment index type": "Alignment index type",
         "retention index alignment tolerance": "Retention index alignment tolerance",
+        "retention index tolerance for alignment": "Retention index tolerance for alignment",
         "weighted dot product cutoff": "Weighted dot product cutoff",
         "simple dot product cutoff": "Simple dot product cutoff",
         "reverse dot product cutoff": "Reverse dot product cutoff",
         "matched peaks percentage cutoff": "Matched peaks percentage cutoff",
         "minimum spectrum match": "Minimum spectrum match",
+        "square root of weighted dot product cutoff for msp-based annotation": "Square root of weighted dot product cutoff for MSP-based annotation",
+        "square root of simple dot product cutoff for msp-based annotation": "Square root of simple dot product cutoff for MSP-based annotation",
+        "square root of reverse dot product cutoff for msp-based annotation": "Square root of reverse dot product cutoff for MSP-based annotation",
+        "matched peaks percentage cutoff for msp-based annotation": "Matched peaks percentage cutoff for MSP-based annotation",
+        "minimum spectrum match for msp-based annotation": "Minimum spectrum match for MSP-based annotation",
     }
     return names[key]
 

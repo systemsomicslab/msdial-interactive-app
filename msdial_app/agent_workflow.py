@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import copy
+import math
+from bisect import bisect_left
 from pathlib import Path
 from typing import Any
 
+from .annotation_pipeline import apply_tiered_lcms_annotation
 from .library_catalog import catalog_status
 from .user_settings import load_user_settings
 from .workflow import (
@@ -15,7 +18,7 @@ from .workflow import (
     read_lipid_queries,
     validate_workflow,
 )
-from .worksets import get_workset
+from .worksets import describe_workset_candidate, get_workset
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -23,11 +26,14 @@ RESOURCES = ROOT / "resources"
 SUPPORTED_PROJECT_TYPES = {"lcms", "gcms"}
 SUPPORTED_ANSWER_KEYS = {
     "project_type", "ion_mode", "target_omics", "parameter_strategy",
-    "target_peak_count", "minimum_peak_height", "acquisition_type",
+    "target_peak_count", "target_peak_count_min", "target_peak_count_max",
+    "minimum_peak_height", "smoothing_method", "acquisition_type",
     "execute_rt_correction", "rt_correction_anchor_path",
     "rt_correction_selection_path", "rt_correction_peak_selection_mode",
     "rt_correction_peak_selection_rt_weight", "library_strategy", "libraries",
     "library_provenance", "run_qa", "internal_standards",
+    "use_retention_time_for_annotation", "retention_time_tolerance", "number_of_threads",
+    "stage_inputs", "dilution_factor", "class_assignment_confirmed",
     "generate_materials_methods", "alignment_light_mode", "output_root",
     "export_folder_path", "height_matrix_export", "console_path", "template_path",
     "queries_path", "project_store", "workflow_overrides", "repository_metadata_path",
@@ -70,7 +76,90 @@ def inspect_analysis_input(input_path: str) -> dict[str, Any]:
         "vendors": sorted({str(item.get("vendor", "Unknown")) for item in files}),
         "default_output_root": str(default_output),
         "analysis_csv_source": str(path) if path.suffix.casefold() == ".csv" else "",
+        # How the proposed grouping was arrived at, and what else it could have been.
+        # The grouping is a scientific decision; the file names only suggest it, so the
+        # reasoning travels with the proposal for a person to accept or replace.
+        "class_proposal": _describe_class_proposal(files),
+        "sample_table_proposal": _describe_sample_table(files),
     }
+
+
+def _describe_sample_table(files: list[dict[str, Any]]) -> dict[str, Any]:
+    """How the injection order was arrived at, and what the dilution factor is set to.
+
+    Both are silently consequential: the order is what every drift plot downstream is
+    drawn against, and the factor scales every concentration. Neither said where it came
+    from, so a value that happened to be right was indistinguishable from one that had
+    never been considered.
+    """
+    from .sample_grouping import propose_injection_order
+
+    names = [str(item.get("file_name", "")) for item in files]
+    order = propose_injection_order(names) if names else {"reason": "no files", "alternatives": []}
+    factors = sorted({float(item.get("factor", 1) or 1) for item in files})
+    return {
+        "analytical_order": {
+            "derived_from": order.get("chosen", "listing"),
+            "reason": order.get("reason", ""),
+            "agrees_with_file_listing": order.get("agrees_with_listing"),
+            "alternatives": [item.get("label", "") for item in order.get("alternatives", [])],
+        },
+        "dilution_factor": {
+            "values": factors,
+            "assumed": factors == [1.0],
+            "note": (
+                "Every file is set to 1, which is the default rather than a value read "
+                "from anywhere. A wrong factor scales every concentration."
+                if factors == [1.0]
+                else "Dilution factors differ between files; confirm they are right."
+            ),
+        },
+        "confirmation_required": True,
+    }
+
+
+def _describe_class_proposal(files: list[dict[str, Any]]) -> dict[str, Any]:
+    from .sample_grouping import propose_grouping
+
+    names = [str(item.get("file_name", "")) for item in files]
+    if not names:
+        return {"reason": "no files were recognised", "alternatives": [], "groups": {}}
+    grouping = propose_grouping(names)
+    groups: dict[str, list[str]] = {}
+    for item in files:
+        groups.setdefault(str(item.get("class_id", "Sample")), []).append(
+            str(item.get("file_name", ""))
+        )
+    chosen = grouping.get("chosen")
+    return {
+        "reason": grouping.get("reason", ""),
+        "groups": {label: len(members) for label, members in sorted(groups.items())},
+        "alternatives": [
+            {
+                "label": " / ".join(candidate["values"]),
+                "group_count": candidate["group_count"],
+                "smallest_group": candidate["smallest_group"],
+                "chosen": chosen is not None and candidate["position"] == chosen["position"],
+            }
+            for candidate in grouping.get("candidates", [])[:5]
+        ],
+        "confirmation_required": True,
+    }
+
+
+def _suggested_workset_name(answers: dict[str, Any], inspection: dict[str, Any]) -> str:
+    """A name a laboratory would recognise, built from what makes this method distinct."""
+    parts = [
+        str(answers.get("project_type", "")).upper().replace("LCMS", "LC-MS").replace("GCMS", "GC-MS"),
+        str(answers.get("ion_mode", "")),
+        str(answers.get("target_omics", "")),
+    ]
+    library = (answers.get("libraries") or {})
+    if isinstance(library, dict) and library.get("lbm_path"):
+        parts.append(Path(str(library["lbm_path"])).stem[:24])
+    elif inspection.get("vendors"):
+        parts.append(str(inspection["vendors"][0]))
+    return " ".join(part for part in parts if part).strip()
 
 
 def build_guided_plan(
@@ -81,7 +170,17 @@ def build_guided_plan(
     supplied = dict(answers or {})
     workset = get_workset(workset_id)
     merged = dict((workset or {}).get("answers", {}))
+    # A workset stores answers and workflow_overrides side by side, and only the answers
+    # were ever read back: overrides saved into a workset were accepted, written to disk,
+    # and then silently ignored by every plan built from it.
+    overrides = {
+        **dict((workset or {}).get("workflow_overrides", {}) or {}),
+        **dict(merged.get("workflow_overrides") or {}),
+        **dict(supplied.get("workflow_overrides") or {}),
+    }
     merged.update(supplied)
+    if overrides:
+        merged["workflow_overrides"] = overrides
     unknown_answer_keys = sorted(set(merged) - SUPPORTED_ANSWER_KEYS)
     inspection = inspect_analysis_input(input_path)
     questions = _questions(merged)
@@ -102,14 +201,28 @@ def build_guided_plan(
             blockers.append(
                 f"Official library '{catalog_id}' is not downloaded. Ask for confirmation, then download it."
             )
-    if merged.get("parameter_strategy") == "target_peak_count" and not merged.get(
-        "minimum_peak_height"
-    ):
+    if merged.get("library_strategy") == "tiered_lipid_msp":
+        item = next(
+            (entry for entry in catalog_status() if entry["id"] == "lipidomics"),
+            None,
+        )
+        official_library = item
+        if item and not item.get("downloaded"):
+            blockers.append(
+                "The official lipidomics LBM library is not downloaded. Ask for confirmation, then download it."
+            )
+    tuning_strategy = merged.get("parameter_strategy") in {
+        "target_peak_count", "auto_peak_range"
+    }
+    if tuning_strategy and not _has_minimum_peak_height(merged):
         blockers.append(
             "Peak-count tuning requires a diagnostic run and an accepted minimum_peak_height."
         )
 
-    workflow = _workflow(inspection, merged) if not questions else None
+    # An unanswered advisory question leaves a conservative default in place, so the
+    # workflow can still be built and shown; only a required one makes it unknowable.
+    pending_required = [item for item in questions if item.get("required", True)]
+    workflow = _workflow(inspection, merged) if not pending_required else None
     validation: list[dict[str, str]] = []
     if workflow is not None:
         validation = validate_workflow(workflow)
@@ -121,9 +234,21 @@ def build_guided_plan(
         "input": inspection,
         "workset": workset,
         "answers": merged,
+        # The first question still to be answered, required or not, so an agent works
+        # through them all; readiness below turns only on the required ones.
         "next_question": questions[0] if questions else None,
         "remaining_questions": questions,
+        "advisory_questions": [item for item in questions if not item.get("required", True)],
         "workflow": workflow,
+        # The second dataset should only have to confirm what changed, which requires
+        # that the first one's settings be saved. Nothing here saves them; it says what
+        # a workset would hold and what it would deliberately not carry, so the offer
+        # can be made with the trade-off visible.
+        "workset_suggestion": describe_workset_candidate(
+            merged,
+            source=workset,
+            suggested_name=_suggested_workset_name(merged, inspection),
+        ),
         "validation": validation,
         "warnings": [
             *inspection.get("warnings", []),
@@ -132,9 +257,8 @@ def build_guided_plan(
         "unknown_answer_keys": unknown_answer_keys,
         "blockers": list(dict.fromkeys(blockers)),
         "official_library": official_library,
-        "ready_to_prepare": not questions and not blockers,
-        "requires_diagnostic": merged.get("parameter_strategy") == "target_peak_count"
-        and not merged.get("minimum_peak_height"),
+        "ready_to_prepare": not pending_required and not blockers,
+        "requires_diagnostic": tuning_strategy and not _has_minimum_peak_height(merged),
         "post_run_actions": {
             "quality_assurance": _as_bool(merged.get("run_qa")),
             "internal_standards": merged.get("internal_standards", []),
@@ -163,16 +287,147 @@ def estimate_peak_height(heights: list[float], target_peak_count: int) -> dict[s
     }
 
 
+def estimate_peak_height_range(
+    heights: list[float],
+    minimum_peak_count: int = 3000,
+    maximum_peak_count: int = 6000,
+    threshold_step: int = 100,
+) -> dict[str, Any]:
+    values = sorted(float(value) for value in heights if float(value) >= 0)
+    minimum = max(0, int(minimum_peak_count))
+    maximum = max(minimum, int(maximum_peak_count))
+    step = max(1, int(threshold_step))
+    if not values:
+        raise ValueError("The diagnostic result contains no peak heights.")
+
+    if len(values) <= maximum:
+        return {
+            "minimum_peak_height": 0,
+            "target_peak_count_min": minimum,
+            "target_peak_count_max": maximum,
+            "estimated_peak_count": len(values),
+            "diagnostic_peak_count": len(values),
+            "threshold_step": step,
+            "within_target_range": minimum <= len(values) <= maximum,
+            "method": "quantized height-range search",
+            "note": (
+                "The zero-threshold diagnostic did not exceed the upper peak-count bound; "
+                "Minimum peak height remains 0."
+            ),
+        }
+
+    candidates = {0}
+    for value in values:
+        lower = max(0, math.floor(value / step) * step)
+        candidates.add(lower)
+        candidates.add(lower + step)
+    midpoint = (minimum + maximum) / 2
+
+    def candidate_score(threshold: int) -> tuple[float, float, int]:
+        count = len(values) - bisect_left(values, threshold)
+        distance = max(minimum - count, 0, count - maximum)
+        return distance, abs(count - midpoint), threshold
+
+    threshold = min(candidates, key=candidate_score)
+    detected = len(values) - bisect_left(values, threshold)
+    return {
+        "minimum_peak_height": threshold,
+        "target_peak_count_min": minimum,
+        "target_peak_count_max": maximum,
+        "estimated_peak_count": detected,
+        "diagnostic_peak_count": len(values),
+        "threshold_step": step,
+        "within_target_range": minimum <= detected <= maximum,
+        "method": "quantized height-range search",
+        "note": (
+            "The threshold is constrained to the instrument-family step. Review the "
+            "diagnostic count when no stepped threshold can enter the requested range."
+        ),
+    }
+
+
+def select_peak_tuning_representative(
+    files: list[dict[str, Any]], requested_file: str = ""
+) -> dict[str, Any]:
+    if not files:
+        raise ValueError("No analysis file is available for peak-count tuning.")
+    requested = str(requested_file or "").strip().casefold()
+    if requested:
+        selected = next(
+            (item for item in files if str(item.get("file_path") or "").casefold() == requested),
+            None,
+        )
+        if selected is None:
+            raise ValueError("The requested representative file is not part of this analysis unit.")
+        reason = "user-selected"
+    else:
+        qc = [item for item in files if _is_qc_file(item)]
+        candidates = qc or [item for item in files if not _is_blank_file(item)] or list(files)
+        orders = [float(item.get("analytical_order") or 0) for item in files]
+        midpoint = (min(orders) + max(orders)) / 2 if orders else 0
+        selected = min(
+            candidates,
+            key=lambda item: (
+                abs(float(item.get("analytical_order") or 0) - midpoint),
+                str(item.get("file_path") or "").casefold(),
+            ),
+        )
+        reason = "QC-nearest-run-midpoint" if qc else "non-blank-nearest-run-midpoint"
+    instrument_family = str(selected.get("instrument_family") or "Unknown")
+    family = instrument_family.casefold()
+    threshold_step = 1000 if ("fourier" in family or "ft-icr" in family) else 100
+    return {
+        "file": selected,
+        "file_path": str(selected.get("file_path") or ""),
+        "file_name": str(selected.get("file_name") or ""),
+        "selection_reason": reason,
+        "instrument_family": instrument_family,
+        "threshold_step": threshold_step,
+        "target_peak_count_min": 3000,
+        "target_peak_count_max": 6000,
+    }
+
+
+def _has_minimum_peak_height(answers: dict[str, Any]) -> bool:
+    value = answers.get("minimum_peak_height")
+    return value is not None and str(value).strip() != ""
+
+
+def _is_qc_file(item: dict[str, Any]) -> bool:
+    values = (
+        item.get("file_type"), item.get("class_id"), item.get("file_name")
+    )
+    return any(str(value or "").strip().casefold() == "qc" for value in values[:2]) or any(
+        token == "qc"
+        for token in str(values[2] or "").replace("-", "_").casefold().split("_")
+    )
+
+
+def _is_blank_file(item: dict[str, Any]) -> bool:
+    return any(
+        str(item.get(key) or "").strip().casefold() == "blank"
+        for key in ("file_type", "class_id")
+    )
+
+
 def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
 
-    def ask(identifier: str, prompt: str, choices: list[str] | None = None) -> None:
+    def ask(
+        identifier: str,
+        prompt: str,
+        choices: list[str] | None = None,
+        required: bool = True,
+    ) -> None:
+        # A question is required when proceeding without it would mean guessing. Where a
+        # conservative default exists and is the honest one, the question is still put --
+        # it is the analyst's to answer -- but it does not hold the plan hostage.
         result.append(
             {
                 "id": identifier,
                 "prompt": prompt,
                 "choices": choices or [],
-                "required": True,
+                "required": required,
                 "presentation": "neutral",
             }
         )
@@ -191,8 +446,8 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
     if not answers.get("parameter_strategy"):
         ask(
             "parameter_strategy",
-            "Use template defaults, or tune Minimum peak height toward a target peak count?",
-            ["default", "target_peak_count"],
+            "Use template defaults, automatically tune to 3,000-6,000 peaks, or choose an exact target?",
+            ["default", "auto_peak_range", "target_peak_count"],
         )
     elif answers.get("parameter_strategy") == "target_peak_count" and not answers.get(
         "target_peak_count"
@@ -221,12 +476,79 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
         ask(
             "library_strategy",
             "Which annotation libraries should be used?",
-            ["official", "existing", "none"],
+            ["official", "existing", "tiered_lipid_msp", "none"],
         )
     elif answers.get("library_strategy") == "existing" and not _has_existing_library(answers):
         ask(
             "libraries",
             "Provide msp_paths and optional text_paths/lbm_path for the existing libraries.",
+        )
+    elif answers.get("library_strategy") == "tiered_lipid_msp" and not _has_msp_library(answers):
+        ask(
+            "libraries",
+            "Provide one msp_paths entry for the high- and low-quality MSP tiers. The official LBM library is used as tier 1.",
+        )
+    # Once a library is settled, how its retention times should be used is the next
+    # decision, and it belongs to the analyst: a library built for this chromatography
+    # is normally scored and filtered on retention time, one built elsewhere must not be,
+    # and no property of the file says which this is.
+    strategy = str(answers.get("library_strategy") or "")
+    library_chosen = strategy in {"official", "existing", "tiered_lipid_msp"} and (
+        strategy != "existing" or _has_existing_library(answers)
+    )
+    if library_chosen and "use_retention_time_for_annotation" not in answers:
+        ask(
+            "use_retention_time_for_annotation",
+            "Does this library carry retention times for this chromatography, so that "
+            "annotation should be scored and filtered on them?",
+            ["true", "false"],
+            required=False,
+        )
+    if (
+        library_chosen
+        and _as_bool(answers.get("use_retention_time_for_annotation"))
+        and answers.get("retention_time_tolerance") is None
+    ):
+        ask(
+            "retention_time_tolerance",
+            "Within how many minutes of the library retention time should a match be accepted?",
+            required=False,
+        )
+    if "dilution_factor" not in answers:
+        ask(
+            "dilution_factor",
+            "What dilution factor applies to these samples? It scales every concentration, "
+            "and 1 is a default rather than a value read from the data.",
+            required=False,
+        )
+    if "stage_inputs" not in answers:
+        ask(
+            "stage_inputs",
+            "MS-DIAL writes its per-file intermediates beside the files it reads, so "
+            "running against the data where it sits will add .dcl, .pai2 and tag files "
+            "to that folder. Copy the raw data into the output folder first?",
+            ["true", "false"],
+            required=False,
+        )
+    if "number_of_threads" not in answers:
+        ask(
+            "number_of_threads",
+            "How many threads should MS-DIAL use on this machine?",
+            required=False,
+        )
+    # The one question worth blocking on. Every downstream comparison is drawn along
+    # this axis, correcting it afterwards means re-running, and answering it costs a
+    # word. A repository reanalysis has its own gate and no analyst to ask, so it is
+    # raised only where the classes came from reading file names.
+    if (
+        not answers.get("repository_metadata_path")
+        and "class_assignment_confirmed" not in answers
+    ):
+        ask(
+            "class_assignment_confirmed",
+            "The Class assignment was read from the file names. Confirm it is the "
+            "comparison this experiment is about, or give the assignment to use.",
+            ["true", "false"],
         )
     if project_type == "lcms" and "run_qa" not in answers:
         ask("run_qa", "Generate the LC-MS quality-assurance report after analysis?", ["true", "false"])
@@ -299,6 +621,8 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             ),
         }
     )
+    if answers.get("smoothing_method"):
+        state["smoothing_method"] = str(answers["smoothing_method"])
     if answers.get("minimum_peak_height") is not None:
         state["minimum_peak_height"] = float(answers["minimum_peak_height"])
     acquisition_type = answers.get("acquisition_type")
@@ -308,6 +632,16 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
         for item in state["files"]:
             item["acquisition_type"] = acquisition_type
     _apply_libraries(state, loaded, answers)
+    _apply_retention_time_use(state, answers)
+    if answers.get("number_of_threads") is not None:
+        state["number_of_threads"] = max(1, int(answers["number_of_threads"]))
+    if answers.get("stage_inputs") is not None:
+        state["stage_inputs"] = _as_bool(answers.get("stage_inputs"))
+    if answers.get("dilution_factor") is not None:
+        factor = float(answers["dilution_factor"])
+        if factor > 0:
+            for item in state["files"]:
+                item["factor"] = factor
     if project_type == "lcms":
         ion_mode = str(state["ion_mode"])
         state["selected_adducts"] = [
@@ -322,7 +656,7 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             item
             for item in queries
             if item.get("ion_mode") == ion_mode
-            and state["target_omics"] == "Lipidomics"
+            and (state["target_omics"] == "Lipidomics" or state.get("lbm_path"))
         ]
     else:
         state.update(
@@ -358,6 +692,29 @@ def _existing_path(configured: Any, fallback: Path) -> Path:
     return fallback.resolve()
 
 
+def _apply_retention_time_use(state: dict[str, Any], answers: dict[str, Any]) -> None:
+    """Apply the analyst's decision about retention time to every library in use.
+
+    Whether retention time helps or hurts annotation is a property of the library and
+    the chromatography it was built for, not of the file format, so it is asked once
+    and then applies to whichever library kinds this run actually uses.
+    """
+    if answers.get("use_retention_time_for_annotation") is None:
+        return
+    use_rt = _as_bool(answers.get("use_retention_time_for_annotation"))
+    for kind in ("lbm", "msp", "text"):
+        state[f"{kind}_use_rt_scoring"] = use_rt
+        state[f"{kind}_use_rt_filtering"] = use_rt
+    tolerance = answers.get("retention_time_tolerance")
+    if not use_rt or tolerance is None:
+        return
+    value = float(tolerance)
+    if value <= 0:
+        return
+    for kind in ("lbm", "msp", "text"):
+        state[f"{kind}_rt_tolerance"] = value
+
+
 def _apply_libraries(
     state: dict[str, Any], loaded: dict[str, Any], answers: dict[str, Any]
 ) -> None:
@@ -388,6 +745,27 @@ def _apply_libraries(
     libraries = dict(answers.get("libraries") or {})
     msp_paths = _path_list(libraries.get("msp_paths"))
     text_paths = _path_list(libraries.get("text_paths"))
+    if strategy == "tiered_lipid_msp":
+        lbm_item = next(entry for entry in catalog_status() if entry["id"] == "lipidomics")
+        lbm_path = str(lbm_item.get("local_path", ""))
+        apply_tiered_lcms_annotation(state, lbm_path, msp_paths[0])
+        state["library_provenance"] = [
+            {
+                "path": lbm_path,
+                "version": str(lbm_item["record_id"]),
+                "source": lbm_item["record_url"],
+                "doi": lbm_item["doi"],
+                "license": lbm_item["license"],
+            },
+            {
+                "path": str(msp_paths[0]),
+                "version": str(libraries.get("msp_version", "")),
+                "source": str(libraries.get("msp_source", "")),
+                "doi": str(libraries.get("msp_doi", "")),
+                "license": str(libraries.get("msp_license", "institutional/private")),
+            },
+        ]
+        return
     for index, path in enumerate(msp_paths, start=1):
         state["msp_annotators"].append(_msp_row(path, index))
     for index, path in enumerate(text_paths, start=1):
@@ -460,6 +838,11 @@ def _has_existing_library(answers: dict[str, Any]) -> bool:
         or libraries.get("text_paths")
         or libraries.get("lbm_path")
     )
+
+
+def _has_msp_library(answers: dict[str, Any]) -> bool:
+    libraries = answers.get("libraries") or {}
+    return bool(_path_list(libraries.get("msp_paths")))
 
 
 def _path_list(value: Any) -> list[str]:

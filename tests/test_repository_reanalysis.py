@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from msdial_app.repository_reanalysis import (
     EligibilityPolicy,
@@ -23,11 +24,14 @@ from msdial_app.repository_reanalysis import (
     _summarize_raw_metadata,
     _extract_archive,
     _common_input_path,
+    run_raw_metadata_preflight,
     cleanup_download_lease,
     create_download_lease,
     discard_download_lease,
     evaluate_eligibility,
+    evaluate_repository_execution_gate,
     finalize_download_lease,
+    request_download_cleanup,
 )
 
 
@@ -179,6 +183,41 @@ class RepositoryReanalysisTests(unittest.TestCase):
         self.assertEqual("excluded", result.selection_status)
         self.assertTrue(result.exclusion_reasons)
 
+    def test_repository_campaign_accepts_dda_and_dia_but_excludes_gcms(self) -> None:
+        lcms_projects = [
+            RepositoryProject(
+                repository="test",
+                accession=mode,
+                separation="LC-MS",
+                acquisition_mode=mode,
+                ion_mode="Negative",
+                untargeted=True,
+                files=[RepositoryFile("a.raw", 100, "https://example.org/a.raw")],
+                total_download_bytes=100,
+            )
+            for mode in ("DDA", "DIA", "AIF", "SWATH")
+        ]
+        gcms = RepositoryProject(
+            repository="test",
+            accession="GC",
+            separation="GC-MS",
+            acquisition_mode="Scan",
+            ion_mode="Positive",
+            untargeted=True,
+            files=[RepositoryFile("a.cdf", 100, "https://example.org/a.cdf")],
+            total_download_bytes=100,
+        )
+
+        lcms_results = [
+            evaluate_eligibility(project, EligibilityPolicy(max_download_bytes=1000))
+            for project in lcms_projects
+        ]
+        gc_result = evaluate_eligibility(gcms, EligibilityPolicy(max_download_bytes=1000))
+
+        self.assertTrue(all(result.selection_status == "eligible" for result in lcms_results))
+        self.assertEqual("excluded", gc_result.selection_status)
+        self.assertIn("LC-MS data only", " ".join(gc_result.exclusion_reasons))
+
     def test_gc_sim_is_excluded(self) -> None:
         project = RepositoryProject(
             repository="test",
@@ -290,6 +329,220 @@ class RepositoryReanalysisTests(unittest.TestCase):
                 self.assertIn("result.arf2", handle.namelist())
             self.assertTrue(result["retained_artifact_inventory"])
 
+    def _validated_unit(self, root: Path) -> tuple[Path, Path]:
+        """A unit whose run finished and validated, standing at the retention decision."""
+        raw = root / "raw"
+        output = root / "output"
+        provenance = root / "provenance"
+        for directory in (raw, output, provenance):
+            directory.mkdir(parents=True)
+        (raw / "sample.lcd").write_bytes(b"x" * 2048)
+        (output / "result.mzTab").write_text(
+            "MTD\tmzTab-version\t2.0.0-M\nSMH\tSML_ID\nSML\t1\n", encoding="ascii"
+        )
+        (output / "sample.mdpeak").write_text("Peak ID\n", encoding="ascii")
+        manifest = provenance / "run-manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "status": "prepared",
+                    "workspace": str(root),
+                    "raw_directory": str(raw),
+                    "output_directory": str(output),
+                    "raw_retention_policy": "delete_after_validated_output",
+                    "cleanup_allowed": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        finalize_download_lease(manifest)
+        return manifest, raw
+
+    def test_requesting_cleanup_deletes_nothing_and_states_what_it_would_remove(self) -> None:
+        # The retention policy chosen at download time records a wish. It is not an approval to delete,
+        # and a background job holds none of what an informed approval needs.
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, raw = self._validated_unit(Path(temporary) / "repo" / "X5")
+
+            pending = request_download_cleanup(manifest)
+
+            self.assertFalse(pending["deleted"])
+            self.assertTrue(pending["confirmation_required"])
+            self.assertTrue(raw.is_dir(), "the raw tree must survive a mere request")
+            self.assertEqual(
+                "cleanup_pending_confirmation",
+                json.loads(manifest.read_text(encoding="utf-8"))["status"],
+            )
+            # The three things a person needs in front of them before answering.
+            self.assertEqual(str(raw.resolve()), pending["deletion_target"])
+            self.assertEqual(1, pending["deletion_file_count"])
+            self.assertEqual(2048, pending["deletion_bytes"])
+            self.assertGreater(pending["retained_artifact_count"], 0)
+            self.assertTrue(pending["ready_for_confirmation"])
+            self.assertEqual([], pending["blockers"])
+
+    def test_an_unconfirmed_cleanup_carries_the_same_inventory(self) -> None:
+        # The preview used to return only a flag, so a caller had nothing to show. A confirmation given
+        # without the target, the size and the retained artifacts is not an informed one.
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, raw = self._validated_unit(Path(temporary) / "repo" / "X6")
+
+            preview = cleanup_download_lease(manifest, confirmed=False)
+
+            self.assertFalse(preview["deleted"])
+            self.assertTrue(raw.is_dir())
+            self.assertEqual(str(raw.resolve()), preview["deletion_target"])
+            self.assertEqual(2048, preview["deletion_bytes"])
+            self.assertTrue(preview["retained_artifact_inventory"])
+
+    def test_a_confirmed_cleanup_still_proceeds_after_a_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, raw = self._validated_unit(Path(temporary) / "repo" / "X7")
+            request_download_cleanup(manifest)
+
+            result = cleanup_download_lease(manifest, confirmed=True)
+
+            self.assertTrue(result["deleted"])
+            self.assertFalse(raw.exists())
+            self.assertEqual(
+                "raw_cleaned", json.loads(manifest.read_text(encoding="utf-8"))["status"]
+            )
+
+    def test_a_request_on_an_unvalidated_run_reports_blockers_and_stays_put(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo" / "X8"
+            raw = root / "raw"
+            provenance = root / "provenance"
+            raw.mkdir(parents=True)
+            provenance.mkdir()
+            (raw / "sample.lcd").write_bytes(b"x")
+            manifest = provenance / "run-manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "status": "prepared",
+                        "workspace": str(root),
+                        "raw_directory": str(raw),
+                        "output_directory": str(root / "output"),
+                        "cleanup_allowed": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            pending = request_download_cleanup(manifest)
+
+            self.assertFalse(pending["ready_for_confirmation"])
+            self.assertTrue(pending["blockers"])
+            self.assertEqual(
+                "prepared",
+                json.loads(manifest.read_text(encoding="utf-8"))["status"],
+                "an unvalidated run must not be advanced to pending confirmation",
+            )
+            self.assertTrue(raw.is_dir())
+
+    def _gate_workspace(self, root: Path, **manifest_overrides: object) -> tuple[Path, dict]:
+        """A repository unit's manifest plus a workflow state that matches it."""
+        output = root / "output"
+        data = root / "raw" / "data"
+        provenance = root / "provenance"
+        for directory in (output, data, provenance):
+            directory.mkdir(parents=True)
+        sample = data / "sample.lcd"
+        sample.write_bytes(b"x")
+        manifest = provenance / "run-manifest.json"
+        payload = {
+            "status": "preflight_passed",
+            "workspace": str(root),
+            "output_directory": str(output),
+            "input_candidates": [str(sample)],
+            "execution_allowed": True,
+            "project": {"analysis_unit_id": "unit-1", "ion_mode": "Negative"},
+        }
+        payload.update(manifest_overrides)
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        state = {
+            "repository_run_manifest": str(manifest),
+            "output_root": str(output),
+            "ion_mode": "Negative",
+            "files": [{"file_path": str(sample)}],
+        }
+        return manifest, state
+
+    def test_a_local_analysis_is_not_gated(self) -> None:
+        # An ordinary local run carries no manifest, no eligibility verdict and nothing to gate.
+        gate = evaluate_repository_execution_gate({"output_root": "C:/tmp", "files": []})
+        self.assertFalse(gate["gated"])
+        self.assertTrue(gate["allowed"])
+
+    def test_an_eligible_unit_is_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, state = self._gate_workspace(Path(temporary) / "repo" / "G1")
+            gate = evaluate_repository_execution_gate(state)
+            self.assertTrue(gate["gated"])
+            self.assertTrue(gate["allowed"], gate["blockers"])
+            self.assertEqual("unit-1", gate["analysis_unit_id"])
+
+    def test_an_unresolved_unit_is_refused(self) -> None:
+        # The state a unit sits in when its acquisition mode could not be established from repository
+        # metadata and no raw-header preflight has settled it.
+        with tempfile.TemporaryDirectory() as temporary:
+            _, state = self._gate_workspace(
+                Path(temporary) / "repo" / "G2",
+                execution_allowed=False,
+                status="preflight_review_required",
+            )
+            gate = evaluate_repository_execution_gate(state)
+            self.assertFalse(gate["allowed"])
+            self.assertTrue(any("execution_allowed" in item for item in gate["blockers"]))
+
+    def test_a_missing_manifest_is_refused_rather_than_ignored(self) -> None:
+        gate = evaluate_repository_execution_gate(
+            {"repository_run_manifest": "D:/nowhere/run-manifest.json", "files": []}
+        )
+        self.assertFalse(gate["allowed"])
+        self.assertTrue(any("does not exist" in item for item in gate["blockers"]))
+
+    def test_a_workflow_writing_outside_the_unit_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, state = self._gate_workspace(Path(temporary) / "repo" / "G3")
+            state["output_root"] = str(Path(temporary) / "somewhere-else")
+            gate = evaluate_repository_execution_gate(state)
+            self.assertFalse(gate["allowed"])
+            self.assertTrue(any("owns" in item for item in gate["blockers"]))
+
+    def test_an_input_the_manifest_did_not_admit_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, state = self._gate_workspace(Path(temporary) / "repo" / "G4")
+            intruder = Path(temporary) / "elsewhere.lcd"
+            intruder.write_bytes(b"x")
+            state["files"].append({"file_path": str(intruder)})
+            gate = evaluate_repository_execution_gate(state)
+            self.assertFalse(gate["allowed"])
+            self.assertTrue(
+                any("not among the files" in item for item in gate["blockers"]), gate["blockers"]
+            )
+
+    def test_the_wrong_polarity_is_refused(self) -> None:
+        # A run in the wrong polarity produces a complete, validated, entirely void result, and no other
+        # stage flags it.
+        with tempfile.TemporaryDirectory() as temporary:
+            _, state = self._gate_workspace(Path(temporary) / "repo" / "G5")
+            state["ion_mode"] = "Positive"
+            gate = evaluate_repository_execution_gate(state)
+            self.assertFalse(gate["allowed"])
+            self.assertTrue(any("ion mode" in item for item in gate["blockers"]))
+
+    def test_an_undeclared_polarity_does_not_manufacture_a_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, state = self._gate_workspace(
+                Path(temporary) / "repo" / "G6",
+                project={"analysis_unit_id": "unit-1", "ion_mode": "Unknown"},
+            )
+            state["ion_mode"] = "Positive"
+            gate = evaluate_repository_execution_gate(state)
+            self.assertTrue(gate["allowed"], gate["blockers"])
+
     def test_raw_metadata_summary_maps_normalized_contract(self) -> None:
         records = [
             {
@@ -352,6 +605,126 @@ class RepositoryReanalysisTests(unittest.TestCase):
             self.assertEqual(8, updates[-1][4])
             self.assertEqual(1, len(result["input_candidates"]))
 
+    def test_download_lease_uses_bundle_size_for_safety_limit(self) -> None:
+        project = RepositoryProject(
+            repository="mb_post",
+            accession="MPST-BUNDLE",
+            eligible=True,
+            selection_status="eligible",
+            files=[RepositoryFile("sample.mzML", 8, "https://example.org/bundle.tar")],
+            total_download_bytes=8,
+            download_scope={"bundle_bytes": 200},
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "Required repository bundle"):
+                create_download_lease(project, Path(temporary), 100)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RawMetadataPreflightFormatTests(unittest.TestCase):
+    """CLAUDE-C03: a format that can never be checked is not the same as a check that failed."""
+
+    def _workspace(self, root: Path, *, execution_allowed: bool) -> tuple[Path, Path]:
+        data = root / "raw" / "data"
+        provenance = root / "provenance"
+        for directory in (data, provenance):
+            directory.mkdir(parents=True)
+        sample = data / "0555_1_neg.lcd"
+        sample.write_bytes(b"x")
+        manifest = provenance / "run-manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "status": "downloaded",
+                    "workspace": str(root),
+                    "input_candidates": [str(sample)],
+                    "execution_allowed": execution_allowed,
+                    "project": {"analysis_unit_id": "unit-1", "eligible": execution_allowed},
+                }
+            ),
+            encoding="utf-8",
+        )
+        extractor = root / "RawMetadataConsoleApp.exe"
+        extractor.write_bytes(b"stub")
+        return manifest, extractor
+
+    @staticmethod
+    def _completed(returncode: int, stderr: str = ""):
+        from subprocess import CompletedProcess
+
+        return CompletedProcess(args=["stub"], returncode=returncode, stdout="", stderr=stderr)
+
+    def test_an_unsupported_format_is_reported_as_its_own_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor = self._workspace(Path(temporary) / "u1", execution_allowed=False)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run",
+                return_value=self._completed(
+                    82, "unsupported format: .lcd (Shimadzu) has no raw metadata reader: x"
+                ),
+            ):
+                result = run_raw_metadata_preflight(manifest, extractor)
+
+        self.assertEqual("preflight_unsupported_format", result["status"])
+        self.assertEqual([".lcd"], result["raw_metadata_preflight"]["unsupported_formats"])
+        self.assertIn("no metadata reader", result["raw_metadata_preflight"]["advisory"])
+        self.assertEqual(1, len(result["raw_metadata_preflight"]["detail"]))
+
+    def test_an_unsupported_format_cannot_promote_an_ineligible_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor = self._workspace(Path(temporary) / "u2", execution_allowed=False)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run",
+                return_value=self._completed(82),
+            ):
+                result = run_raw_metadata_preflight(manifest, extractor)
+
+        self.assertFalse(result["execution_allowed"])
+
+    def test_an_unsupported_format_does_not_revoke_an_already_eligible_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor = self._workspace(Path(temporary) / "u3", execution_allowed=True)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run",
+                return_value=self._completed(82),
+            ):
+                result = run_raw_metadata_preflight(manifest, extractor)
+
+        self.assertTrue(result["execution_allowed"])
+        self.assertEqual("preflight_unsupported_format", result["status"])
+
+    def test_any_other_failure_is_still_an_unavailable_preflight(self) -> None:
+        # A crash, a missing dependency or a timeout may work on a retry; an absent reader
+        # never will, and only the second is worth telling an agent to stop trying.
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor = self._workspace(Path(temporary) / "u4", execution_allowed=False)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run",
+                return_value=self._completed(1, "System.NullReferenceException"),
+            ):
+                result = run_raw_metadata_preflight(manifest, extractor)
+
+        self.assertEqual("preflight_unavailable", result["status"])
+        self.assertNotIn("unsupported_formats", result["raw_metadata_preflight"])
+        self.assertFalse(result["execution_allowed"])
+
+    def test_the_manifest_records_which_extractor_produced_the_verdict(self) -> None:
+        # A verdict that does not say which binary produced it cannot be tied to a build,
+        # and a stale executable earlier on the search order looks identical to the fix.
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor = self._workspace(Path(temporary) / "u5", execution_allowed=False)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run",
+                return_value=self._completed(82),
+            ):
+                result = run_raw_metadata_preflight(manifest, extractor)
+            expected_path = str(extractor.resolve())
+            expected_size = extractor.stat().st_size
+
+        recorded = result["raw_metadata_preflight"]["extractor"]
+        self.assertEqual(expected_path, recorded["path"])
+        self.assertEqual(expected_size, recorded["size_bytes"])
+        self.assertTrue(recorded["modified_at"])

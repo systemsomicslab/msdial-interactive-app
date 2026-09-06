@@ -20,7 +20,19 @@ from typing import Any
 
 from . import __version__
 from .agent_bridge import create_datamining_handoff, summarize_job, summarize_jobs
-from .agent_workflow import build_guided_plan, estimate_peak_height
+from .agent_workflow import (
+    build_guided_plan,
+    estimate_peak_height,
+    estimate_peak_height_range,
+    select_peak_tuning_representative,
+)
+from .console_management import (
+    build_local_console,
+    fetch_and_compare_source,
+    fetch_and_compare_source,
+    fetch_official_console_releases,
+    prepare_local_console_build,
+)
 from .knowledge import KnowledgeBase, next_parameter_question
 from .library_catalog import catalog_status, download_library, library_directory
 from .literature import evaluate_literature_evidence
@@ -39,16 +51,19 @@ from .repository_qa import propose_repository_qa_targets
 from .repository_reanalysis import (
     ADAPTERS,
     EligibilityPolicy,
-    cleanup_download_lease,
+    evaluate_repository_execution_gate,
+    request_download_cleanup,
     create_download_lease,
     evaluate_eligibility,
     finalize_download_lease,
     project_from_dict,
+    resolve_required_download_bytes,
 )
 from .workflow import (
     console_version,
     console_capabilities,
     discover_console_paths,
+    inspect_console_path,
     expand_paths,
     expand_paths_report,
     find_mdpeak,
@@ -73,7 +88,8 @@ from .workflow import (
     validate_workflow,
 )
 from .user_settings import load_user_settings, save_path_settings, settings_path, user_data_directory
-from .worksets import list_worksets, save_workset
+from .worksets import describe_workset_candidate, list_worksets, save_workset
+from .diagnostic_paths import diagnostic_run_directory, is_diagnostic_artifact
 
 
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
@@ -127,13 +143,50 @@ def _classify_artifact(path: Path) -> str:
     return "other"
 
 
+def _verify_expected_exports(preparation: dict[str, Any]) -> dict[str, Any]:
+    """Compare the analysis exports the run planned against the ones on disk.
+
+    Returns the counts and the missing paths rather than raising, so the caller decides what a
+    shortfall means and the numbers can be recorded either way.
+    """
+    expected = [str(item) for item in preparation.get("expected_analysis_exports") or []]
+    missing = [item for item in expected if not Path(item).is_file()]
+    return {
+        "expected": len(expected),
+        "produced": len(expected) - len(missing),
+        "missing": missing,
+    }
+
+
+def _repository_workspace(state: dict[str, Any]) -> str:
+    """The analysis-unit workspace a repository workflow belongs to, or "" for a local analysis.
+
+    Read from the unit's own manifest rather than derived from the output path, so a workflow cannot
+    steer a diagnostic outside the unit by pointing output_root somewhere else. The manifest is also
+    what states which directory the unit owns.
+    """
+    manifest_text = str(state.get("repository_run_manifest") or "").strip()
+    if not manifest_text:
+        return ""
+    manifest_path = Path(manifest_text).expanduser()
+    if not manifest_path.is_file():
+        return ""
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return ""
+    return str(manifest.get("workspace") or "")
+
+
 def _artifact_files(root: Path) -> list[Path]:
     files = [path for path in root.glob("*") if path.is_file()]
     for child in root.iterdir():
         if not child.is_dir() or child.suffix.casefold() in {".d", ".raw"}:
             continue
+        if is_diagnostic_artifact(child):
+            continue
         files.extend(path for path in child.glob("*") if path.is_file())
-    return files
+    return [path for path in files if not is_diagnostic_artifact(path)]
 
 
 def _changed_run_artifacts(
@@ -273,6 +326,7 @@ def _application_config() -> dict[str, Any]:
         "library_directory": str(library_directory()),
         "library_catalog": catalog_status(),
         "console_discovery": console_discovery,
+        "console_source_root": str(saved.get("console_source_root", "")),
         "lipid_queries": lipid_queries,
     }
 
@@ -308,6 +362,49 @@ def _diagnose_console_failure(logs: list[str], fallback: str) -> str:
             "the WIFF from its original directory."
         )
     return fallback
+
+
+def _write_guided_answers(preparation: dict, plan: dict) -> str:
+    """Keep the answers that produced this run beside the run.
+
+    workflow-settings.json records the resolved workflow: every parameter, with no
+    trace of which of them a person decided and which fell out of a default. That is
+    what a reproduction needs and not what a workset needs, so the answers are written
+    too, and the next dataset can start from a run that already happened.
+    """
+    run_directory = str(preparation.get("run_directory", "")).strip()
+    if not run_directory:
+        return ""
+    path = Path(run_directory).expanduser() / "guided-answers.json"
+    payload = {
+        "schema": "msdial-interactive.guided-answers.v1",
+        "recorded_at": dt.datetime.now().astimezone().isoformat(),
+        "input_path": plan.get("input", {}).get("input_path", ""),
+        "workset_id": (plan.get("workset") or {}).get("id", ""),
+        "answers": plan.get("answers", {}),
+        "workset_suggestion": plan.get("workset_suggestion", {}),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str) + chr(10),
+            encoding="utf-8",
+        )
+    except OSError:
+        # Losing the record must not lose the run.
+        return ""
+    return str(path)
+
+
+def _read_guided_answers(run_directory: str) -> dict:
+    path = Path(run_directory).expanduser() / "guided-answers.json"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{path} does not exist, so the answers this run used cannot be recovered. "
+            "Pass answers explicitly."
+        )
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    return dict(payload.get("answers") or {})
 
 
 def _register_download(path: str | Path) -> str:
@@ -452,8 +549,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(response)
             return
         if parsed.path == "/api/agent/status":
+            query = urllib.parse.parse_qs(parsed.query)
+            limit = max(0, min(100, int(query.get("limit", ["5"])[0])))
+            include_artifacts = query.get("include_artifacts", ["false"])[0].casefold() in {
+                "1", "true", "yes"
+            }
             with JOBS_LOCK:
-                response = summarize_jobs(dict(JOBS))
+                response = summarize_jobs(
+                    dict(JOBS), limit=limit, include_artifacts=include_artifacts
+                )
             self._json(response)
             return
         if parsed.path == "/api/agent/worksets":
@@ -512,6 +616,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/agent/console/check":
                 self._json(discover_console_paths(body.get("search_roots", [])))
+            elif parsed.path == "/api/agent/console/releases":
+                self._json(fetch_official_console_releases())
+            elif parsed.path == "/api/agent/console/source-status":
+                self._json(fetch_and_compare_source(body.get("source_root", "")))
             elif parsed.path == "/api/agent/console/set":
                 path = Path(str(body.get("console_path", ""))).expanduser().resolve()
                 if not path.is_file() or path.name.casefold() not in {
@@ -520,15 +628,44 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError(
                         "console_path must identify an existing MSDIALCUI.exe or MSDIALCUI.dll."
                     )
-                saved = save_path_settings({"console_path": str(path)})
-                self._json(
+                inspected = inspect_console_path(path, "saved setting")
+                source_root = str((inspected.get("git") or {}).get("source_root", ""))
+                saved = save_path_settings(
                     {
-                        "console_path": saved["console_path"],
-                        "version": console_version(saved["console_path"]),
-                        **console_capabilities(saved["console_path"]),
-                        "settings_file": str(settings_path()),
+                        "console_path": str(path),
+                        "console_source_kind": inspected.get("source_kind", "custom"),
+                        "console_source_root": source_root,
                     }
                 )
+                self._json({**inspected, "console_path": saved["console_path"], "settings_file": str(settings_path())})
+            elif parsed.path == "/api/agent/console/build":
+                plan = prepare_local_console_build(
+                    body.get("source_root", ""),
+                    body.get("framework", "net48"),
+                    body.get("configuration", "Release"),
+                )
+                if not bool(body.get("confirmed")):
+                    self._json({"confirmation_required": True, "plan": plan})
+                else:
+                    job_id = uuid.uuid4().hex
+                    with JOBS_LOCK:
+                        JOBS[job_id] = {
+                            "id": job_id,
+                            "status": "queued",
+                            "kind": "console_build",
+                            "logs": [],
+                            "preparation": plan,
+                            "exit_code": None,
+                            "result": None,
+                            "created_at": dt.datetime.now().astimezone().isoformat(),
+                        }
+                        _persist_jobs_locked()
+                    threading.Thread(
+                        target=_run_console_build_job,
+                        args=(job_id, plan, bool(body.get("select_after_build", True))),
+                        daemon=True,
+                    ).start()
+                    self._json({"job_id": job_id, "plan": plan})
             elif parsed.path == "/api/templates/load":
                 self._json(
                     load_parameter_template(
@@ -607,7 +744,16 @@ class Handler(BaseHTTPRequestHandler):
                 maximum_gb = float(body.get("maximum_gb", 20) or 20)
                 if maximum_gb <= 0:
                     raise ValueError("Maximum download size must be greater than zero.")
-                maximum_bytes = int(maximum_gb * 1024**3)
+                maximum_bytes = int(maximum_gb * 1000**3)
+                required_download_bytes = resolve_required_download_bytes(
+                    project.download_scope.get("bundle_bytes"),
+                    project.total_download_bytes,
+                )["required_download_bytes"]
+                if required_download_bytes > maximum_bytes:
+                    raise ValueError(
+                        f"Required repository bundle is {required_download_bytes} bytes; "
+                        f"the configured limit is {maximum_bytes} bytes."
+                    )
                 evaluated = evaluate_eligibility(
                     project,
                     EligibilityPolicy(
@@ -623,7 +769,7 @@ class Handler(BaseHTTPRequestHandler):
                 ):
                     reasons = evaluated.exclusion_reasons or evaluated.review_reasons
                     raise ValueError(
-                        "This repository project is not ready for an untargeted GC-MS/LC-MS download: "
+                        "This repository project is not ready for the untargeted LC-MS/MS DDA/DIA campaign: "
                         + "; ".join(reasons or ["review repository metadata first"])
                     )
                 retention = str(body.get("raw_retention_policy") or "keep")
@@ -638,7 +784,7 @@ class Handler(BaseHTTPRequestHandler):
                         "logs": [],
                         "result": None,
                         "received": 0,
-                        "total": evaluated.total_download_bytes,
+                        "total": required_download_bytes,
                         "progress": 0,
                         "speed_bps": 0,
                         "eta_seconds": None,
@@ -770,14 +916,24 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 )
             elif parsed.path == "/api/agent/worksets/save":
+                answers = dict(body.get("answers") or {})
+                source_run = str(body.get("run_directory", "")).strip()
+                if source_run and not answers:
+                    answers = _read_guided_answers(source_run)
+                saved = save_workset(
+                    body.get("name", ""),
+                    answers,
+                    description=body.get("description", ""),
+                    workflow_overrides=body.get("workflow_overrides", {}),
+                )
                 self._json(
                     {
-                        "workset": save_workset(
-                            body.get("name", ""),
-                            body.get("answers", {}),
-                            description=body.get("description", ""),
-                            workflow_overrides=body.get("workflow_overrides", {}),
-                        )
+                        "workset": saved,
+                        "from_run_directory": source_run,
+                        # What was deliberately not carried, so the next dataset is not
+                        # told it inherited a confirmation it never gave.
+                        "not_reusable": describe_workset_candidate(answers)["not_reusable"],
+                        "caveats": describe_workset_candidate(answers)["caveats"],
                     }
                 )
             elif parsed.path == "/api/agent/prepare":
@@ -794,6 +950,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 messages: list[str] = []
                 preparation = prepare_run(plan["workflow"], messages.append)
+                _write_guided_answers(preparation, plan)
                 self._json(
                     {
                         "plan": plan,
@@ -824,7 +981,21 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     )
                     return
+                gate = evaluate_repository_execution_gate(plan["workflow"])
+                if not gate["allowed"]:
+                    self._json(
+                        {
+                            "started": False,
+                            "execution_allowed": False,
+                            "repository_gate": gate,
+                            "plan": plan,
+                            "error": "This repository analysis unit is not cleared to run MS-DIAL.",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 preparation = prepare_run(plan["workflow"])
+                _write_guided_answers(preparation, plan)
                 job_id = uuid.uuid4().hex
                 artifact_baseline = _snapshot_run_artifacts(preparation)
                 with JOBS_LOCK:
@@ -875,15 +1046,45 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     )
                     return
-                representative = str(body.get("representative_file", "")).strip()
-                if not representative:
-                    representative = workflow["files"][0]["file_path"]
+                gate = evaluate_repository_execution_gate(workflow)
+                if not gate["allowed"]:
+                    self._json(
+                        {
+                            "started": False,
+                            "execution_allowed": False,
+                            "repository_gate": gate,
+                            "error": (
+                                "This repository analysis unit is not cleared to run MS-DIAL. The "
+                                "diagnostic starts the Console too, so it is held by the same gate."
+                            ),
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                profile = select_peak_tuning_representative(
+                    workflow["files"], str(body.get("representative_file", ""))
+                )
+                representative = profile["file_path"]
+                # The job id is minted before the preparation, because the diagnostic's own directory
+                # is named after it. The preparer writes an analysis CSV, a method file and a run
+                # manifest into whatever directory it is given, and it used to be given the production
+                # output directory: a reviewed multi-sample CSV came back holding only this
+                # representative, and every later stage was self-consistent about the wrong study.
+                job_id = uuid.uuid4().hex
+                diagnostic_root = diagnostic_run_directory(
+                    workflow["output_root"],
+                    job_id,
+                    workspace=_repository_workspace(workflow),
+                )
                 preparation = prepare_tuning_run(
                     workflow,
                     representative,
-                    workflow["output_root"],
+                    diagnostic_root,
                 )
-                job_id = uuid.uuid4().hex
+                preparation["peak_tuning_profile"] = {
+                    key: value for key, value in profile.items() if key != "file"
+                }
+                preparation["diagnostic_run_directory"] = str(diagnostic_root)
                 with JOBS_LOCK:
                     JOBS[job_id] = {
                         "id": job_id,
@@ -917,11 +1118,31 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     )
                     return
-                estimate = estimate_peak_height(
-                    job["result"].get("heights", []),
-                    int(body.get("target_peak_count", 0)),
+                target = int(body.get("target_peak_count", 0) or 0)
+                profile = (job.get("preparation") or {}).get("peak_tuning_profile") or {}
+                if target > 0:
+                    estimate = estimate_peak_height(
+                        job["result"].get("heights", []), target
+                    )
+                else:
+                    requested_step = int(body.get("threshold_step", 0) or 0)
+                    threshold_step = requested_step or int(
+                        profile.get("threshold_step", 100) or 100
+                    )
+                    estimate = estimate_peak_height_range(
+                        job["result"].get("heights", []),
+                        int(body.get("target_peak_count_min", 3000) or 3000),
+                        int(body.get("target_peak_count_max", 6000) or 6000),
+                        threshold_step,
+                    )
+                self._json(
+                    {
+                        "ready": True,
+                        "job_id": job_id,
+                        "representative": profile,
+                        "estimate": estimate,
+                    }
                 )
-                self._json({"ready": True, "job_id": job_id, "estimate": estimate})
             elif parsed.path == "/api/validate":
                 state = body.get("workflow", body)
                 self._json(
@@ -1151,6 +1372,18 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/run":
                 state = body.get("workflow", body)
+                gate = evaluate_repository_execution_gate(state)
+                if not gate["allowed"]:
+                    self._json(
+                        {
+                            "started": False,
+                            "execution_allowed": False,
+                            "repository_gate": gate,
+                            "error": "This repository analysis unit is not cleared to run MS-DIAL.",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 preparation = prepare_run(state)
                 preparation["repository_run_manifest"] = str(
                     state.get("repository_run_manifest") or ""
@@ -1187,12 +1420,39 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/tuning/run":
                 state = body.get("workflow", body)
-                preparation = prepare_tuning_run(
-                    state,
-                    body.get("file_path", ""),
-                    state.get("output_root", ""),
+                gate = evaluate_repository_execution_gate(state)
+                if not gate["allowed"]:
+                    self._json(
+                        {
+                            "started": False,
+                            "execution_allowed": False,
+                            "repository_gate": gate,
+                            "error": (
+                                "This repository analysis unit is not cleared to run MS-DIAL. The "
+                                "diagnostic starts the Console too, so it is held by the same gate."
+                            ),
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                profile = select_peak_tuning_representative(
+                    state.get("files", []), body.get("file_path", "")
                 )
                 job_id = uuid.uuid4().hex
+                diagnostic_root = diagnostic_run_directory(
+                    state.get("output_root", ""),
+                    job_id,
+                    workspace=_repository_workspace(state),
+                )
+                preparation = prepare_tuning_run(
+                    state,
+                    profile["file_path"],
+                    diagnostic_root,
+                )
+                preparation["peak_tuning_profile"] = {
+                    key: value for key, value in profile.items() if key != "file"
+                }
+                preparation["diagnostic_run_directory"] = str(diagnostic_root)
                 with JOBS_LOCK:
                     JOBS[job_id] = {
                         "id": job_id,
@@ -1310,6 +1570,38 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
+
+
+def _run_console_build_job(
+    job_id: str, plan: dict[str, Any], select_after_build: bool
+) -> None:
+    def log(message: str) -> None:
+        with JOBS_LOCK:
+            JOBS[job_id]["logs"].append(message)
+            JOBS[job_id]["logs"] = JOBS[job_id]["logs"][-2000:]
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+
+    with JOBS_LOCK:
+        JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+        _persist_jobs_locked()
+    try:
+        result = build_local_console(plan, log, select_after_build)
+        with JOBS_LOCK:
+            JOBS[job_id]["result"] = result
+            JOBS[job_id]["exit_code"] = 0
+            JOBS[job_id]["progress"] = 100
+            JOBS[job_id]["status"] = "completed"
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
+    except Exception as error:
+        log(traceback.format_exc())
+        with JOBS_LOCK:
+            JOBS[job_id]["exit_code"] = 1
+            JOBS[job_id]["status"] = "failed"
+            JOBS[job_id]["error"] = str(error)
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
 
 
 def _run_library_download_job(job_id: str, catalog_id: str) -> None:
@@ -1460,6 +1752,24 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
             baseline = dict(JOBS[job_id].get("artifact_baseline") or {})
         artifacts = _changed_run_artifacts(preparation, baseline)
         artifact_warnings: list[str] = []
+        # The exit code says the Console returned; it does not say the Console produced the study.
+        # MS-DIAL exits 0 having skipped an input it could not read -- a corrupt vendor file, a
+        # missing vendor dependency -- and expected_analysis_exports was computed for every run and
+        # read by nothing, so thirty inputs could become eighteen outputs with no stage anywhere
+        # holding the invariant that the published matrix has as many samples as were approved. The
+        # tuning job has made exactly this check on its own single expected file all along.
+        export_verification = _verify_expected_exports(preparation)
+        if exit_code == 0 and export_verification["missing"]:
+            missing = export_verification["missing"]
+            raise RuntimeError(
+                f"MS-DIAL returned success but produced {export_verification['produced']} of "
+                f"{export_verification['expected']} expected analysis exports. Missing: "
+                + ", ".join(missing[:5])
+                + (f", and {len(missing) - 5} more" if len(missing) > 5 else "")
+                + ". A published result from this run would describe more samples than it contains. "
+                "Check whether the selected Console build can read every input's raw-data format and "
+                "whether its vendor dependencies are installed."
+            )
         if exit_code == 0 and preparation.get("qa_matrix_expected") and not artifacts["qa"]:
             warning = (
                 "LC-MS QA matrix export was requested, but this job did not create or update "
@@ -1509,11 +1819,22 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
                             "cleanup": None,
                         }
                         if retention == "delete_after_validated_output":
-                            cleanup = cleanup_download_lease(
-                                Path(manifest_text), confirmed=True
+                            # The retention policy records a wish, not an approval. Deleting the raw data
+                            # is the only irreversible operation in this pipeline, and the confirmation
+                            # for it belongs to a person who has seen the retained artifacts, the target
+                            # paths and the size that would be freed. A background job supplies none of
+                            # those, so it records the request and stops. The server must never generate
+                            # confirmed=True on the user's behalf.
+                            pending = request_download_cleanup(Path(manifest_text))
+                            repository_retention["cleanup"] = pending
+                            log(
+                                "Validated output retained. Raw-data deletion was REQUESTED by the "
+                                "retention policy and NOT performed; it needs a separate confirmation. "
+                                f"{pending['deletion_file_count']} files, "
+                                f"{pending['deletion_bytes'] / 1e9:.2f} GB under "
+                                f"{pending['deletion_target']} would be removed, and "
+                                f"{pending['retained_artifact_count']} artifacts would be retained."
                             )
-                            repository_retention["cleanup"] = cleanup
-                            log("Validated output retained; downloaded repository raw data were deleted.")
                         else:
                             log("Validated output retained; downloaded repository raw data were kept.")
                     else:
@@ -1537,6 +1858,9 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
             JOBS[job_id]["datamining_handoff"] = handoff
             JOBS[job_id]["artifacts"] = artifacts
             JOBS[job_id]["warnings"] = artifact_warnings
+            # Recorded whether or not it held, so a reader can see the produced-versus-expected count
+            # rather than inferring it from the absence of a failure.
+            JOBS[job_id]["expected_export_verification"] = export_verification
             JOBS[job_id]["repository_retention"] = repository_retention
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             if exit_code == 0:

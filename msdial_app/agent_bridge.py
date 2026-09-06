@@ -6,13 +6,19 @@ from pathlib import Path
 from typing import Any
 
 from .mztab_validation import validate_mztab_outputs
+from .diagnostic_paths import is_diagnostic_artifact
 
 
 HANDOFF_FILENAME = "datamining-handoff.json"
 
 
-def summarize_jobs(jobs: dict[str, dict[str, Any]], limit: int = 10) -> dict[str, Any]:
-    items = [summarize_job(job) for job in jobs.values()]
+def summarize_jobs(
+    jobs: dict[str, dict[str, Any]], limit: int = 5, include_artifacts: bool = False
+) -> dict[str, Any]:
+    items = [
+        summarize_job(job, log_lines=3, include_artifacts=include_artifacts)
+        for job in jobs.values()
+    ]
     items.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "", reverse=True)
     latest = items[0] if items else None
     latest_completed = next((item for item in items if item.get("status") == "completed"), None)
@@ -24,6 +30,9 @@ def summarize_jobs(jobs: dict[str, dict[str, Any]], limit: int = 10) -> dict[str
             "reusable_worksets",
             "single_file_peak_count_tuning",
             "console_path_discovery_and_persistence",
+            "console_release_channel_inspection",
+            "local_source_console_build_with_provenance",
+            "local_source_git_remote_comparison",
             "job_scoped_output_provenance",
             "persistent_job_history",
             "restart_incompatible_local_service",
@@ -126,14 +135,15 @@ def create_datamining_handoff(
 
 
 def summarize_job(
-    job: dict[str, Any] | None, *, log_lines: int = 10
+    job: dict[str, Any] | None, *, log_lines: int = 10, include_artifacts: bool = True
 ) -> dict[str, Any] | None:
     if not job:
         return None
     preparation = job.get("preparation") or {}
     validation = job.get("mztab_validation") or {}
     handoff = job.get("datamining_handoff") or {}
-    return {
+    artifacts = job.get("artifacts") or {}
+    summary = {
         "id": job.get("id", ""),
         "kind": job.get("kind", "run"),
         "status": job.get("status", ""),
@@ -143,9 +153,8 @@ def summarize_job(
         "mztab_status": validation.get("summary", {}).get("status", ""),
         "mztab_file_count": validation.get("summary", {}).get("file_count", 0),
         "handoff_file": handoff.get("handoff_file", ""),
-        "artifacts": {
-            key: list((job.get("artifacts") or {}).get(key, []))
-            for key in ("mztab", "qa", "msdial")
+        "artifact_counts": {
+            key: len(artifacts.get(key, [])) for key in ("mztab", "qa", "msdial")
         },
         "created_at": job.get("created_at", ""),
         "updated_at": job.get("updated_at", ""),
@@ -154,6 +163,11 @@ def summarize_job(
         "progress": job.get("progress"),
         "log_tail": (job.get("logs") or [])[-max(0, log_lines):],
     }
+    if include_artifacts:
+        summary["artifacts"] = {
+            key: list(artifacts.get(key, [])) for key in ("mztab", "qa", "msdial")
+        }
+    return summary
 
 
 def _collect_output_files(run_directory: Path) -> dict[str, list[str]]:
@@ -179,7 +193,9 @@ def _collect_output_files(run_directory: Path) -> dict[str, list[str]]:
         paths: list[Path] = []
         for pattern in globs:
             paths.extend(run_directory.glob(pattern))
-        collected[key] = [str(path) for path in sorted(set(paths))]
+        collected[key] = [
+            str(path) for path in sorted(set(paths)) if not is_diagnostic_artifact(path)
+        ]
     return collected
 
 
@@ -213,7 +229,9 @@ def _select_primary_mztab_file(mztab_files: list[dict[str, Any]]) -> str:
     if not mztab_files:
         return ""
     paths = [Path(item["path"]) for item in mztab_files]
-    existing = [path for path in paths if path.is_file()]
+    existing = [
+        path for path in paths if path.is_file() and not is_diagnostic_artifact(path)
+    ]
     if not existing:
         return mztab_files[0]["path"]
     return str(max(existing, key=lambda path: path.stat().st_mtime))

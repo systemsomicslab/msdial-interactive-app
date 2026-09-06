@@ -90,6 +90,8 @@ td:nth-child(2) { min-width: 360px; color: var(--muted); font-size: 14px; }
 .form-grid input:not([type="checkbox"]):not([type="radio"]), .form-grid select { width: 100%; min-width: 0; }
 .path-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .path-actions { margin-top: 12px; }
+.console-management-grid { margin: 12px 0; }
+#consoleBuildLog { background: #102430; color: #d8eef1; padding: 12px; border-radius: 6px; }
 .job-history { display: grid; gap: 8px; }
 .job-card { border: 1px solid var(--line); border-radius: 7px; padding: 10px 12px; background: #fbfdfe; }
 .job-card.active { border-color: var(--teal); box-shadow: inset 4px 0 0 var(--teal); }

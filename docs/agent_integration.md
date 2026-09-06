@@ -71,9 +71,11 @@ the same Agent Skills package.
 1. Inspect the input folder or analysis metadata CSV.
 2. Ask LC-MS versus GC-MS. Other project types are reported as not yet supported.
 3. For LC-MS, ask positive/negative and metabolomics/lipidomics.
-4. Use template defaults or run a confirmed single-file peak-count diagnostic.
+4. Use template defaults, an exact peak-count target, or run the automatic
+   3,000-6,000 peak diagnostic. Automatic selection prefers a mid-run QC and
+   uses instrument-specific threshold steps.
 5. Optionally configure RT correction.
-6. Use official versioned, existing, or no annotation libraries.
+6. Use official versioned, existing, tiered lipid/MSP, or no annotation libraries.
 7. Optionally configure LC-MS QA and internal standards.
 8. Prepare the reproducible workflow, show the command, and request confirmation.
 9. Run MS-DIAL and call `msdial_complete_guided_analysis` to wait for the exact
@@ -93,6 +95,10 @@ Downloads and production runs require a separate explicit confirmation. A
 workset omits raw-data paths and output paths. An accepted diagnostic threshold
 is retained as part of the reusable scientific method.
 
+Public repository answer seeds use `TimeBasedLinearWeightedMovingAverage` and
+automatic peak-count tuning. This smoother accounts for irregular scan
+intervals while adding a small computational cost.
+
 ## Built-in worksets
 
 - `gcms-metabolomics`
@@ -108,8 +114,12 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 - `msdial_interactive_launch`
 - `msdial_interactive_restart`
 - `msdial_check_console_path` / `msdial_set_console_path`
+- `msdial_check_official_console_releases`
+- `msdial_check_local_console_source`
+- `msdial_build_console_from_local_source` (preview by default; execution requires `confirmed=true`)
 - `msdial_guided_analysis_plan`
 - `msdial_repository_reanalysis_plan`
+- `msdial_repository_batch_plan`
 - `msdial_download_repository_raw`
 - `msdial_repository_raw_metadata_preflight`
 - `msdial_prepare_repository_reanalysis`
@@ -134,6 +144,12 @@ and handoff should receive the exact `job_id` returned by the production run.
 Agent API 0.4 tracks files created or updated by that job and does not silently
 reuse older mzTab-M or `*.qa.tsv` files from the same directory. Publication can
 be generated without QA by setting `run_qa=false`.
+
+Catalog-driven repository runs should pass local `handoff_path` values via
+`analysis_unit_handoff_path` or `analysis_unit_handoff_paths`. This keeps full
+sample and raw-file manifests out of the model context while Interactive reloads
+and validates the complete documents. The default status response is bounded to
+five jobs and artifact counts; request one job explicitly for full artifacts.
 
 The browser UI uses the same provenance model. Its job history can select a
 completed run, after which mzTab-M preview, LC-MS QA, and publication generation

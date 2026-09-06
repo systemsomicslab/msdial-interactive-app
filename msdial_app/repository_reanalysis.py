@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from .diagnostic_paths import is_diagnostic_artifact
 
 
 USER_AGENT = "MS-DIAL-Interactive/0.3 public-reanalysis"
@@ -34,8 +35,8 @@ PROJECT_RESULT_SUFFIXES = {".arf", ".arf2", ".dcl", ".mdproject"}
 @dataclass
 class RepositoryFile:
     name: str
-    size_bytes: int
-    url: str
+    size_bytes: int = 0
+    url: str = ""
     role: str = "raw"
     checksum: str = ""
 
@@ -44,6 +45,8 @@ class RepositoryFile:
 class RepositoryProject:
     repository: str
     accession: str
+    analysis_unit_id: str = ""
+    source_subrecord_id: str = ""
     title: str = ""
     description: str = ""
     public_url: str = ""
@@ -57,6 +60,7 @@ class RepositoryProject:
     sample_count: int | None = None
     files: list[RepositoryFile] = field(default_factory=list)
     publications: list[dict[str, str]] = field(default_factory=list)
+    publication_status: str = "none_recorded"
     metadata_sources: list[str] = field(default_factory=list)
     sample_metadata: list[dict[str, Any]] = field(default_factory=list)
     repository_metadata: dict[str, Any] = field(default_factory=dict)
@@ -67,6 +71,14 @@ class RepositoryProject:
     review_reasons: list[str] = field(default_factory=list)
     eligible: bool = False
     exclusion_reasons: list[str] = field(default_factory=list)
+    download_scope: dict[str, Any] = field(default_factory=dict)
+    class_proposal: dict[str, Any] | None = None
+    blocking_reasons: list[str] = field(default_factory=list)
+    pending_decisions: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.publications and self.publication_status == "none_recorded":
+            self.publication_status = "recorded"
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -78,6 +90,8 @@ class EligibilityPolicy:
     max_samples: int = 40
     require_known_size: bool = True
     require_untargeted: bool = True
+    allowed_separations: tuple[str, ...] = ("LC-MS",)
+    allowed_acquisition_modes: tuple[str, ...] = ("DDA", "DIA", "AIF", "SWATH")
 
 
 class RepositoryHttpClient:
@@ -588,21 +602,21 @@ ADAPTERS = {
 def evaluate_eligibility(project: RepositoryProject, policy: EligibilityPolicy) -> RepositoryProject:
     reasons = []
     review_reasons = []
-    if project.separation not in {"GC-MS", "LC-MS"}:
-        reasons.append("Separation is not confidently GC-MS or LC-MS.")
+    if project.separation == "Unknown":
+        review_reasons.append("Confirm LC-MS separation from repository context or raw scan metadata.")
+    elif project.separation not in set(policy.allowed_separations):
+        reasons.append("Repository reanalysis currently accepts LC-MS data only.")
     if project.separation == "LC-MS":
         if project.acquisition_mode == "Unknown":
-            review_reasons.append("Inspect raw scan metadata to distinguish DDA/DIA/AIF from unsupported acquisition modes.")
-        elif project.acquisition_mode not in {"DDA", "DIA", "AIF"}:
-            reasons.append("LC-MS acquisition is not scan-based DDA/DIA/AIF.")
+            review_reasons.append("Inspect raw scan metadata to distinguish DDA from DIA/AIF/SWATH.")
+        elif project.acquisition_mode not in set(policy.allowed_acquisition_modes):
+            reasons.append("Repository reanalysis currently accepts untargeted DDA or DIA/AIF/SWATH LC-MS/MS acquisition only.")
         if project.ion_mode == "Unknown":
             review_reasons.append("Confirm LC-MS ion mode from raw scan metadata.")
         elif project.ion_mode == "Both":
             review_reasons.append(
                 "Distinguish polarity-switching data from separate positive/negative files before analysis."
             )
-    if project.separation == "GC-MS" and project.acquisition_mode in {"MRM", "SRM", "SIM"}:
-        reasons.append("Targeted GC-MS SIM/MRM/SRM is outside this pilot.")
     if policy.require_untargeted:
         if project.untargeted is False:
             reasons.append("Repository metadata identifies the study as targeted.")
@@ -684,6 +698,31 @@ def discover_candidates(
     }
 
 
+def resolve_required_download_bytes(
+    declared_bundle_bytes: Any, unit_file_bytes: Any
+) -> dict[str, Any]:
+    """Bytes that must actually be transferred for one analysis unit.
+
+    ``download_scope.bundle_bytes`` is copied from the catalog handoff and is
+    unverified until a download job has read the bundle's own Content-Length. A
+    bundle may legitimately be far larger than the unit's files, because several
+    units often share one archive, but it can never be smaller than the files it
+    has to supply. When the declared figure falls below the total recomputed from
+    the file manifest, the recomputed total is the safety-limit quantity and the
+    declared figure is reported as contradicted rather than used. A stale handoff
+    left behind by a re-bundled accession fails this way, not silently.
+    """
+    unit_bytes = max(int(unit_file_bytes or 0), 0)
+    declared = max(int(declared_bundle_bytes or 0), 0)
+    return {
+        "required_download_bytes": max(declared, unit_bytes),
+        "declared_bundle_bytes": declared,
+        "unit_file_bytes": unit_bytes,
+        "bundle_bytes_verified": False,
+        "bundle_bytes_contradicted": bool(declared and unit_bytes and declared < unit_bytes),
+    }
+
+
 def create_download_lease(
     project: RepositoryProject,
     workspace_root: Path,
@@ -697,11 +736,18 @@ def create_download_lease(
     )
     if not downloadable:
         raise ValueError("Only an eligible or explicitly approved preflight project can receive a download lease.")
-    if project.total_download_bytes > maximum_bytes:
-        raise ValueError("Project exceeds the download lease size limit.")
+    size = resolve_required_download_bytes(
+        project.download_scope.get("bundle_bytes"), project.total_download_bytes
+    )
+    required_download_bytes = size["required_download_bytes"]
+    if required_download_bytes > maximum_bytes:
+        raise ValueError(
+            f"Required repository bundle is {required_download_bytes} bytes; "
+            f"the download lease limit is {maximum_bytes} bytes."
+        )
     client = client or RepositoryHttpClient()
     adapter_type = ADAPTERS.get(project.repository)
-    if adapter_type and hasattr(adapter_type, "inspect_metadata"):
+    if not project.analysis_unit_id and adapter_type and hasattr(adapter_type, "inspect_metadata"):
         try:
             detailed = adapter_type(client).inspect_metadata(project.accession)
             project.publications = detailed.publications
@@ -710,6 +756,8 @@ def create_download_lease(
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as error:
             project.warnings.append(f"Detailed repository sample metadata was unavailable: {error}")
     root = workspace_root.resolve() / project.repository / project.accession
+    if project.analysis_unit_id:
+        root = root / project.analysis_unit_id
     raw_root = root / "raw"
     download_root = raw_root / "downloads"
     data_root = raw_root / "data"
@@ -731,7 +779,7 @@ def create_download_lease(
         destination = download_root / filename if archive else data_root / _safe_relative_name(item.name)
         def item_progress(received: int, declared: int) -> None:
             if progress_callback:
-                known_total = project.total_download_bytes or (
+                known_total = required_download_bytes or (
                     downloaded_bytes + declared if declared else 0
                 )
                 progress_callback(
@@ -761,14 +809,17 @@ def create_download_lease(
                 total_objects,
                 item.name,
                 downloaded_bytes,
-                project.total_download_bytes or downloaded_bytes,
+                required_download_bytes or downloaded_bytes,
             )
     extracted = []
     for item in downloads:
         archive_path = Path(item["path"])
         if archive_path.parent == download_root and _is_archive(archive_path):
             extracted.extend(_extract_archive(archive_path, data_root, maximum_bytes * 5))
-    inputs = _find_msdial_inputs(data_root)
+    selected_extracted = _filter_project_allowlist_paths(extracted, data_root, project)
+    checksum_validation = _verify_project_allowlist_checksums(data_root, project)
+    all_inputs = _find_msdial_inputs(data_root)
+    inputs = _filter_inputs_by_project_allowlist(all_inputs, data_root, project)
     analysis_input = _common_input_path(inputs, data_root)
     manifest = {
         "schema": "msdial-public-reanalysis-run.v1",
@@ -780,8 +831,11 @@ def create_download_lease(
         "input_directory": str(data_root),
         "output_directory": str(output),
         "downloads": downloads,
-        "extracted_files": extracted,
+        "extracted_files": selected_extracted,
+        "ignored_extracted_file_count": len(extracted) - len(selected_extracted),
+        "allowlist_checksum_validation": checksum_validation,
         "input_candidates": inputs,
+        "ignored_input_candidate_count": len(all_inputs) - len(inputs),
         "analysis_input_path": analysis_input,
         "execution_allowed": project.eligible,
         "cleanup_allowed": False,
@@ -816,6 +870,8 @@ def finalize_download_lease(manifest_path: Path) -> dict[str, Any]:
         manifest["cleanup_allowed"] = True
     retained = list(mztab_files)
     for path in output.rglob("*") if output.is_dir() else []:
+        if is_diagnostic_artifact(path):
+            continue
         if path.is_file() and (
             path.suffix.casefold() in TEXT_RESULT_SUFFIXES
             or path.suffix.casefold() in {".csv", ".tsv", ".txt", ".json", ".xlsx"}
@@ -845,6 +901,13 @@ def finalize_download_lease(manifest_path: Path) -> dict[str, Any]:
     return {**manifest, "manifest_path": str(manifest_path)}
 
 
+# The extractor selects this when it recognises the format but has no reader for it.
+# It is deliberately distinct from any other non-zero exit: "this vendor format can
+# never be checked here" and "the check did not work this time" call for different
+# decisions, and one failure channel cannot carry both.
+RAW_METADATA_UNSUPPORTED_FORMAT_EXIT_CODE = 82
+
+
 def run_raw_metadata_preflight(
     manifest_path: Path,
     extractor_path: Path,
@@ -869,13 +932,40 @@ def run_raw_metadata_preflight(
         command.extend(["--input", str(path)])
     command.extend(["--output", str(output), "--max-spectrum-headers", "200"])
     completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    extractor_stat = extractor_path.stat()
     manifest["raw_metadata_preflight"] = {
         "command": command,
+        # Which binary produced this verdict, so the verdict can be tied to a build rather
+        # than to whichever executable happened to be first on the search order.
+        "extractor": {
+            "path": str(extractor_path),
+            "size_bytes": extractor_stat.st_size,
+            "modified_at": datetime.fromtimestamp(
+                extractor_stat.st_mtime, tz=timezone.utc
+            ).isoformat(),
+        },
         "exit_code": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
         "output": str(output),
     }
+    if completed.returncode == RAW_METADATA_UNSUPPORTED_FORMAT_EXIT_CODE:
+        # Fails closed exactly as an unavailable preflight does: a unit that was not
+        # already eligible stays ineligible. What changes is that the agent can now tell
+        # that waiting or retrying will never help.
+        manifest["status"] = "preflight_unsupported_format"
+        manifest["execution_allowed"] = previously_allowed
+        manifest["raw_metadata_preflight"]["unsupported_formats"] = sorted(
+            {path.suffix.lower() for path in inputs if path.suffix}
+        )
+        manifest["raw_metadata_preflight"]["detail"] = (completed.stderr or "").strip().splitlines()[:1]
+        manifest["raw_metadata_preflight"]["advisory"] = (
+            "This raw data format has no metadata reader, so a raw-header check cannot "
+            "resolve the unit's technical settings on any retry. Resolve them from "
+            "repository metadata or the publication, or exclude the unit."
+        )
+        _write_json(manifest_path, manifest)
+        return {**manifest, "manifest_path": str(manifest_path)}
     if completed.returncode != 0 or not output.is_file():
         manifest["status"] = "preflight_unavailable"
         manifest["execution_allowed"] = previously_allowed
@@ -917,12 +1007,201 @@ def run_raw_metadata_preflight(
     return {**manifest, "manifest_path": str(manifest_path)}
 
 
+# The manifest states from which a confirmed deletion may proceed. cleanup_pending_confirmation is the
+# state a run leaves behind when its retention policy asked for deletion: the technical preconditions are
+# met and the decision is now waiting for a person.
+CLEANUP_READY_STATUSES = {"mztab_validated", "completed", "cleanup_pending_confirmation"}
+
+
+def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
+    """Decide whether a workflow may start MS-DIAL Console against a repository analysis unit.
+
+    execution_allowed is the gate that holds a downloaded unit back until its technical conditions are
+    settled. A unit whose repository metadata already establishes untargeted LC-MS/MS with a known
+    acquisition mode and polarity gets it at download time; a unit whose metadata is ambiguous may still
+    be downloaded for inspection, but with execution_allowed false, and only a raw-header preflight that
+    re-evaluates eligibility can turn it true.
+
+    The field was written at three points and read for a decision nowhere, so the hold never held. This
+    is that missing read. It applies only to a workflow carrying a repository_run_manifest: an ordinary
+    local analysis has no manifest, no eligibility verdict, and nothing to gate.
+
+    Everything before the Console stays open. Metadata review, applying a Class proposal, the raw-header
+    preflight itself and any dry-run preview are how a unit becomes eligible in the first place, so
+    refusing them would make the gate impossible to pass.
+    """
+    manifest_text = str(state.get("repository_run_manifest") or "").strip()
+    if not manifest_text:
+        return {"gated": False, "allowed": True, "blockers": []}
+
+    blockers: list[str] = []
+    manifest_path = Path(manifest_text).expanduser()
+    if not manifest_path.is_file():
+        return {
+            "gated": True,
+            "allowed": False,
+            "manifest_path": str(manifest_path),
+            "blockers": [
+                "The workflow names a repository run manifest that does not exist: "
+                f"{manifest_path}. A repository unit may not run without the manifest that records "
+                "its eligibility."
+            ],
+        }
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as error:
+        return {
+            "gated": True,
+            "allowed": False,
+            "manifest_path": str(manifest_path),
+            "blockers": [f"The repository run manifest could not be read: {error}"],
+        }
+
+    project = manifest.get("project") or {}
+    if manifest.get("execution_allowed") is not True:
+        blockers.append(
+            "execution_allowed is not true for this analysis unit "
+            f"(status {manifest.get('status', 'unknown')!r}, selection "
+            f"{project.get('selection_status', 'unknown')!r}). Resolve the unit's technical conditions "
+            "with a raw-header preflight before running MS-DIAL."
+        )
+
+    # The manifest and the workflow must be describing the same unit. A workflow that has drifted to
+    # another directory or another file set is no longer covered by this manifest's verdict, whatever
+    # that verdict says.
+    declared_output = str(manifest.get("output_directory") or "").strip()
+    requested_output = str(state.get("output_root") or "").strip()
+    if declared_output and requested_output:
+        if Path(declared_output).resolve() != Path(requested_output).resolve():
+            blockers.append(
+                f"The workflow writes to {requested_output}, but this unit's manifest owns "
+                f"{declared_output}."
+            )
+
+    admitted = {
+        Path(str(item)).resolve()
+        for item in (manifest.get("input_candidates") or [])
+        if str(item).strip()
+    }
+    if admitted:
+        requested = [
+            Path(str(item.get("file_path") or "")).resolve()
+            for item in (state.get("files") or [])
+            if str(item.get("file_path") or "").strip()
+        ]
+        outside = [str(path) for path in requested if path not in admitted]
+        if outside:
+            blockers.append(
+                f"{len(outside)} input files are not among the files this unit's manifest admitted; "
+                f"the first is {outside[0]}."
+            )
+
+    # A run in the wrong polarity produces a complete, validated, entirely void result, and no later
+    # stage flags it. The manifest records what the repository declared for this unit.
+    declared_mode = str(project.get("ion_mode") or "").strip().casefold()
+    requested_mode = str(state.get("ion_mode") or "").strip().casefold()
+    if declared_mode and requested_mode and declared_mode not in {"both", "unknown"}:
+        if declared_mode != requested_mode:
+            blockers.append(
+                f"The workflow is set to {state.get('ion_mode')} ion mode, but this unit is "
+                f"{project.get('ion_mode')}."
+            )
+
+    return {
+        "gated": True,
+        "allowed": not blockers,
+        "manifest_path": str(manifest_path),
+        "analysis_unit_id": project.get("analysis_unit_id"),
+        "execution_allowed": manifest.get("execution_allowed"),
+        "manifest_status": manifest.get("status"),
+        "blockers": blockers,
+    }
+
+
+def _tree_size(root: Path) -> tuple[int, int]:
+    """Return (file count, total bytes) under root, or (0, 0) when it is gone."""
+    if not root.is_dir():
+        return 0, 0
+    files = [path for path in root.rglob("*") if path.is_file()]
+    return len(files), sum(path.stat().st_size for path in files)
+
+
+def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
+    """Describe exactly what a raw-data deletion would remove and what would survive it.
+
+    Deleting downloaded raw data is the only irreversible operation in this pipeline, and the campaign
+    rules require the person approving it to have seen three things first: the artifacts that will be
+    retained, the paths that will be removed, and how much will be freed. This produces those three so a
+    caller can present them; it changes nothing.
+    """
+    manifest_path = manifest_path.resolve()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw_root = Path(manifest.get("raw_directory", "")).resolve()
+    workspace = Path(manifest.get("workspace", "")).resolve()
+    retained = [Path(value) for value in manifest.get("retained_artifacts", [])]
+    missing = [str(path) for path in retained if not path.exists()]
+    file_count, total_bytes = _tree_size(raw_root)
+    within_workspace = raw_root.parent == workspace and raw_root.name == "raw"
+    blockers: list[str] = []
+    if manifest.get("status") not in CLEANUP_READY_STATUSES:
+        blockers.append(
+            f"Manifest status is {manifest.get('status', 'unknown')!r}; deletion requires a validated run."
+        )
+    if not manifest.get("cleanup_allowed"):
+        blockers.append("cleanup_allowed is not true; the run did not produce a validated mzTab-M output.")
+    if not retained:
+        blockers.append("No retained artifacts are recorded, so nothing would survive the deletion.")
+    if missing:
+        blockers.append(f"{len(missing)} recorded retained artifacts are missing from disk.")
+    if not within_workspace:
+        blockers.append("The raw directory is not the expected 'raw' folder inside the project workspace.")
+    return {
+        "manifest_path": str(manifest_path),
+        "status": manifest.get("status"),
+        "retention_policy": manifest.get("raw_retention_policy"),
+        "cleanup_allowed": bool(manifest.get("cleanup_allowed")),
+        "deletion_target": str(raw_root),
+        "deletion_file_count": file_count,
+        "deletion_bytes": total_bytes,
+        "retained_artifact_count": len(retained),
+        "retained_artifact_inventory": manifest.get("retained_artifact_inventory", []),
+        "missing_retained_artifacts": missing,
+        "blockers": blockers,
+        "ready_for_confirmation": not blockers and file_count > 0,
+    }
+
+
+def request_download_cleanup(manifest_path: Path) -> dict[str, Any]:
+    """Record that the run's retention policy asked for deletion, and stop there.
+
+    The retention policy chosen at download time records a wish. Whether the technical preconditions are
+    met is a second, separate thing, recorded as cleanup_allowed. Whether to actually delete, having seen
+    what goes and what stays, is a third, and it belongs to a person. Running a job is not an occasion to
+    make that third decision on their behalf, so this marks the manifest and returns the plan.
+    """
+    manifest_path = manifest_path.resolve()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("cleanup_allowed") and manifest.get("status") in {"mztab_validated", "completed"}:
+        manifest["status"] = "cleanup_pending_confirmation"
+        manifest["cleanup_requested_at"] = datetime.now(timezone.utc).isoformat()
+        _write_json(manifest_path, manifest)
+    plan = plan_download_cleanup(manifest_path)
+    plan["deleted"] = False
+    plan["confirmation_required"] = True
+    return plan
+
+
 def cleanup_download_lease(manifest_path: Path, confirmed: bool = False) -> dict[str, Any]:
     manifest_path = manifest_path.resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not confirmed:
-        return {"deleted": False, "confirmation_required": True, "manifest_path": str(manifest_path)}
-    if manifest.get("status") not in {"mztab_validated", "completed"} or not manifest.get("cleanup_allowed"):
+        # The preview carries the retained artifacts, the target and the size, because a confirmation
+        # given without them is not an informed one. It used to return only the flag.
+        plan = plan_download_cleanup(manifest_path)
+        plan["deleted"] = False
+        plan["confirmation_required"] = True
+        return plan
+    if manifest.get("status") not in CLEANUP_READY_STATUSES or not manifest.get("cleanup_allowed"):
         raise ValueError("Raw cleanup requires a completed/validated manifest with cleanup_allowed=true.")
     retained = [Path(value) for value in manifest.get("retained_artifacts", [])]
     if not retained or any(not path.exists() for path in retained):
@@ -969,6 +1248,117 @@ def project_from_dict(value: dict[str, Any]) -> RepositoryProject:
     return RepositoryProject(**data)
 
 
+def _filter_inputs_by_project_allowlist(
+    inputs: list[str], data_root: Path, project: RepositoryProject
+) -> list[str]:
+    if not project.analysis_unit_id:
+        return inputs
+    allowed = _project_allowlist(project, analysis_only=True)
+    if not allowed:
+        raise ValueError(f"Analysis unit {project.analysis_unit_id} has an empty file allow-list.")
+
+    selected = [
+        item for item in inputs if _path_matches_allowlist(Path(item), data_root, allowed)
+    ]
+    if not selected:
+        raise ValueError(
+            f"Downloaded content did not contain an MS-DIAL input listed for analysis unit "
+            f"{project.analysis_unit_id}. Refusing to fall back to accession-level inputs."
+        )
+    return selected
+
+
+def _project_allowlist(
+    project: RepositoryProject, *, analysis_only: bool = False
+) -> list[str]:
+    return [
+        _safe_relative_name(item.name).as_posix().casefold()
+        for item in project.files
+        if item.name and (not analysis_only or item.role == "raw")
+    ]
+
+
+def _path_matches_allowlist(
+    path: Path,
+    data_root: Path,
+    allowed: list[str],
+    *,
+    allow_directory_descendants: bool = False,
+) -> bool:
+    try:
+        relative = path.resolve().relative_to(data_root.resolve()).as_posix().casefold()
+    except ValueError:
+        return False
+    candidates = {relative}
+    if relative.startswith("files/"):
+        candidates.add(relative[6:])
+    parts = relative.split("/")
+    if len(parts) > 1:
+        without_archive_root = "/".join(parts[1:])
+        candidates.add(without_archive_root)
+        if without_archive_root.startswith("files/"):
+            candidates.add(without_archive_root[6:])
+    for candidate in candidates:
+        for expected in allowed:
+            if candidate == expected:
+                return True
+            if allow_directory_descendants and candidate.startswith(expected.rstrip("/") + "/"):
+                if Path(expected).suffix.casefold() in {".d", ".raw"}:
+                    return True
+    return False
+
+
+def _filter_project_allowlist_paths(
+    paths: list[str], data_root: Path, project: RepositoryProject
+) -> list[str]:
+    if not project.analysis_unit_id:
+        return paths
+    allowed = _project_allowlist(project)
+    return [
+        item
+        for item in paths
+        if _path_matches_allowlist(
+            Path(item), data_root, allowed, allow_directory_descendants=True
+        )
+    ]
+
+
+def _verify_project_allowlist_checksums(
+    data_root: Path, project: RepositoryProject
+) -> dict[str, Any]:
+    if not project.analysis_unit_id:
+        return {"required": False, "verified": 0, "skipped": 0}
+    files = [path for path in data_root.rglob("*") if path.is_file()]
+    verified = 0
+    skipped = 0
+    for item in project.files:
+        checksum = item.checksum.strip().casefold()
+        if not checksum:
+            skipped += 1
+            continue
+        algorithm = {32: "md5", 40: "sha1", 64: "sha256"}.get(len(checksum))
+        if algorithm is None or not re.fullmatch(r"[0-9a-f]+", checksum):
+            raise ValueError(f"Unsupported checksum for allow-listed file {item.name}.")
+        expected = _safe_relative_name(item.name).as_posix().casefold()
+        matches = [
+            path
+            for path in files
+            if _path_matches_allowlist(path, data_root, [expected])
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Allow-listed file {item.name} resolved to {len(matches)} extracted files."
+            )
+        digest = hashlib.new(algorithm)
+        with matches[0].open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest().casefold() != checksum:
+            raise ValueError(f"{algorithm.upper()} checksum mismatch for {item.name}.")
+        verified += 1
+    return {"required": verified > 0, "verified": verified, "skipped": skipped}
+
+
 def _safe_relative_name(value: str) -> Path:
     normalized = value.replace("\\", "/").lstrip("/")
     if normalized.casefold().startswith("files/"):
@@ -989,7 +1379,9 @@ def _archive_project_results(output: Path) -> Path | None:
         return None
     project_files = [
         path for path in output.rglob("*")
-        if path.is_file() and path.suffix.casefold() in PROJECT_RESULT_SUFFIXES
+        if path.is_file()
+        and path.suffix.casefold() in PROJECT_RESULT_SUFFIXES
+        and not is_diagnostic_artifact(path)
     ]
     if not project_files:
         return None
@@ -1421,11 +1813,20 @@ def _extract_publications(*values: Any) -> list[dict[str, str]]:
             pubmed = _metadata_scalar(
                 lowered.get("pubmedid") or lowered.get("pubmed id") or lowered.get("pmid")
             )
+            if pubmed.casefold().startswith("10.") and "/" in pubmed:
+                doi = doi or pubmed
+                pubmed = ""
             title = _metadata_scalar(
                 lowered.get("title") or lowered.get("publication title") or lowered.get("citation")
             )
             if doi or pubmed or title:
-                records.append({"title": title, "doi": doi, "pubmed_id": pubmed})
+                record = {"title": title, "doi": doi, "pubmed_id": pubmed}
+                if not any(
+                    item.get("doi", "").casefold() == doi.casefold()
+                    and item.get("pubmed_id", "").casefold() == pubmed.casefold()
+                    for item in records
+                ):
+                    records.append(record)
     joined = json.dumps(values, ensure_ascii=False) if values else ""
     for doi in re.findall(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", joined, re.IGNORECASE):
         cleaned = doi.rstrip(".,;)]}")
@@ -1488,7 +1889,7 @@ def _metabolights_files(
 def _metabolights_group_rank(group: dict[str, Any]) -> tuple[int, int, int, int]:
     separation = group.get("separation")
     acquisition = group.get("acquisition")
-    supported = separation == "GC-MS" or (separation == "LC-MS" and acquisition in {"DDA", "DIA", "AIF"})
+    supported = separation == "LC-MS" and acquisition in {"DDA", "DIA", "AIF", "SWATH"}
     known_size = group.get("total", 0) > 0
     has_files = bool(group.get("files"))
     # Prefer a directly actionable assay, then one with downloadable files and a known bounded size.
