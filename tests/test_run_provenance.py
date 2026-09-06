@@ -122,3 +122,47 @@ class ManifestProvenanceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlanReportsOneThresholdTests(unittest.TestCase):
+    """A number in the plan has to be the number that runs."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        (self.root / "sample.wiff").write_text("", encoding="ascii")
+        self.console = self.root / "MSDIALCUI.exe"
+        self.console.write_text("", encoding="ascii")
+        self.lbm = self.root / "lab.lbm2"
+        self.lbm.write_text("", encoding="ascii")
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def test_the_per_file_value_is_named_as_a_suggestion(self) -> None:
+        # It used to be reported as minimum_peak_height on every file, contradicting the
+        # single applied value in the same plan and in the method file.
+        plan = build_guided_plan(
+            str(self.root),
+            {
+                "project_type": "lcms",
+                "ion_mode": "Negative",
+                "target_omics": "Lipidomics",
+                "parameter_strategy": "default",
+                "execute_rt_correction": False,
+                "library_strategy": "existing",
+                "libraries": {"lbm_path": str(self.lbm)},
+                "run_qa": False,
+                "generate_materials_methods": False,
+                "console_path": str(self.console),
+                "template_path": str(TEMPLATE),
+                "minimum_peak_height": 300,
+                "class_assignment_confirmed": True,
+            },
+        )
+        for item in plan["input"]["files"]:
+            self.assertNotIn("minimum_peak_height", item)
+            self.assertEqual(100, item["suggested_minimum_peak_height"])
+        self.assertEqual(300, plan["workflow"]["minimum_peak_height"])
+        for item in plan["workflow"]["files"]:
+            self.assertNotIn("minimum_peak_height", item)

@@ -363,6 +363,13 @@ def is_supported(path: Path) -> bool:
 
 
 def detect_raw_format(path: str | Path) -> dict[str, Any]:
+    """What a file's format implies, before anyone has decided anything.
+
+    The peak-height and mass-slice values here are what this vendor and instrument
+    family usually want. They are named as suggestions because the run applies one
+    value chosen elsewhere: reporting a per-file 100 beside an applied 300 states a
+    threshold that governs nothing.
+    """
     target = Path(path)
     suffix = target.suffix.lower()
     if target.is_file() and suffix in {".wiff", ".wiff2"}:
@@ -370,8 +377,8 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
             "vendor": "SCIEX",
             "format": "SCIEX WIFF" if suffix == ".wiff" else "SCIEX WIFF2",
             "instrument_family": "QTOF",
-            "minimum_peak_height": 100,
-            "mass_slice_width": 0.1,
+            "suggested_minimum_peak_height": 100,
+            "suggested_mass_slice_width": 0.1,
             "sidecar_available": (
                 suffix != ".wiff" or Path(str(target) + ".scan").is_file()
             ),
@@ -381,24 +388,24 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
             "vendor": "Waters",
             "format": "Waters .raw folder",
             "instrument_family": "QTOF",
-            "minimum_peak_height": 100,
-            "mass_slice_width": 0.1,
+            "suggested_minimum_peak_height": 100,
+            "suggested_mass_slice_width": 0.1,
         }
     if target.is_file() and suffix == ".raw":
         return {
             "vendor": "Thermo",
             "format": "Thermo .raw file",
             "instrument_family": "Fourier-transform MS",
-            "minimum_peak_height": 10000,
-            "mass_slice_width": 0.05,
+            "suggested_minimum_peak_height": 10000,
+            "suggested_mass_slice_width": 0.05,
         }
     if target.is_file() and suffix in {".lcd", ".qgd"}:
         return {
             "vendor": "Shimadzu",
             "format": "Shimadzu LCD" if suffix == ".lcd" else "Shimadzu QGD",
             "instrument_family": "QTOF" if suffix == ".lcd" else "GC-MS",
-            "minimum_peak_height": 100,
-            "mass_slice_width": 0.1,
+            "suggested_minimum_peak_height": 100,
+            "suggested_mass_slice_width": 0.1,
         }
     if target.is_dir() and suffix == ".d":
         if (target / "AcqData").is_dir():
@@ -413,15 +420,15 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
             "vendor": vendor,
             "format": label,
             "instrument_family": "QTOF",
-            "minimum_peak_height": 100,
-            "mass_slice_width": 0.1,
+            "suggested_minimum_peak_height": 100,
+            "suggested_mass_slice_width": 0.1,
         }
     return {
         "vendor": "Open format" if suffix in {".mzml", ".mzxml", ".cdf"} else "Other",
         "format": suffix.lstrip(".").upper() or "Unknown",
         "instrument_family": "QTOF",
-        "minimum_peak_height": 100,
-        "mass_slice_width": 0.1,
+        "suggested_minimum_peak_height": 100,
+        "suggested_mass_slice_width": 0.1,
     }
 
 
