@@ -130,6 +130,102 @@ def describe_fields(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return fields
 
 
+class ClassProposalMismatch(ValueError):
+    """The approved proposal and the unit's samples do not describe the same study."""
+
+
+def apply_class_proposal(workspace: dict[str, Any], proposal: dict[str, Any]) -> dict[str, Any]:
+    """Project the Catalog's approved per-sample Class assignments onto the workspace rows.
+
+    In a repository reanalysis the scientific decision belongs to the Catalog and the execution belongs
+    here. The Catalog records a purpose, the fields it selected, a rationale, a contrast definition and
+    one Class label per sample, and saving that proposal is a confirmation the user gives. Interactive
+    then re-derived Class from a `hierarchy` argument and never read the assignments, so the approved
+    artifact had no causal connection to what ran: a proposal could be approved and a different
+    grouping executed, with every downstream report internally consistent about the grouping nobody
+    approved.
+
+    The assignments are the source of truth rather than the fields, because they are not always
+    recoverable from the fields. A proposal may merge, rename or hand-correct labels for reasons that
+    live in its rationale, and recombining `selected_fields` reproduces only the mechanical case.
+
+    A sample the proposal does not assign, assigns twice, or assigns without the unit having it, is
+    refused rather than defaulted: each of those is a different study from the approved one.
+    """
+    assignments = proposal.get("assignments") or []
+    if not assignments:
+        raise ClassProposalMismatch(
+            "The approved Class proposal carries no per-sample assignments, so it cannot be applied."
+        )
+    rows = normalize_sample_rows(workspace.get("rows", []))
+    labels: dict[str, str] = {}
+    duplicated: list[str] = []
+    for item in assignments:
+        sample_id = str((item or {}).get("sample_id") or "").strip()
+        if not sample_id:
+            raise ClassProposalMismatch("An assignment in the approved proposal names no sample.")
+        if sample_id in labels:
+            duplicated.append(sample_id)
+        labels[sample_id] = str((item or {}).get("class_label") or "").strip()
+
+    unit_ids = [str(row.get("sample_id") or "").strip() for row in rows]
+    unassigned = sorted({item for item in unit_ids if item and item not in labels})
+    extra = sorted({item for item in labels if item not in set(unit_ids)})
+    unlabelled = sorted({key for key, value in labels.items() if not value})
+    problems = []
+    if duplicated:
+        problems.append(
+            f"assigns {len(set(duplicated))} samples more than once: {sorted(set(duplicated))[:5]}"
+        )
+    if unassigned:
+        problems.append(
+            f"leaves {len(unassigned)} of the unit's samples unassigned: {unassigned[:5]}"
+        )
+    if extra:
+        problems.append(f"assigns {len(extra)} samples the unit does not contain: {extra[:5]}")
+    if unlabelled:
+        problems.append(f"gives {len(unlabelled)} samples an empty Class label: {unlabelled[:5]}")
+    if problems:
+        raise ClassProposalMismatch(
+            "The approved Class proposal and this analysis unit do not describe the same study. "
+            "It " + "; it ".join(problems) + "."
+        )
+
+    for row in rows:
+        label = labels[str(row.get("sample_id") or "").strip()]
+        # Normalised the same way the hierarchy path normalises its tokens: MS-DIAL's Class column has
+        # to survive the same characters whichever route produced the label.
+        row["class_id"] = class_token(label) or "Sample"
+
+    result = dict(workspace)
+    result.update(
+        {
+            "schema": SCHEMA,
+            "rows": rows,
+            "fields": describe_fields(rows),
+            "hierarchy": [
+                clean_field_name(item) for item in proposal.get("selected_fields") or []
+            ],
+            "class_source": "catalog_class_proposal",
+            "class_proposal_provenance": {
+                "proposal_id": str(proposal.get("proposal_id") or ""),
+                "unit_id": str(proposal.get("unit_id") or ""),
+                "purpose": str(proposal.get("purpose") or ""),
+                "selected_fields": list(proposal.get("selected_fields") or []),
+                "rationale": str(proposal.get("rationale") or ""),
+                "contrast_definition": dict(proposal.get("contrast_definition") or {}),
+                "model": str(proposal.get("model") or ""),
+                "prompt_hash": str(proposal.get("prompt_hash") or ""),
+                "status": str(proposal.get("status") or ""),
+                "assignment_count": len(labels),
+                "warnings": list(proposal.get("warnings") or []),
+            },
+            "projected_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    return result
+
+
 def project_class_hierarchy(
     workspace: dict[str, Any],
     hierarchy: Iterable[str],
