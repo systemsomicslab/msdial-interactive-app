@@ -59,6 +59,7 @@ def read_adduct_rules(path: str | Path) -> dict[str, Any]:
         return default
 
     class_column = column("class", "ontology", default=0)
+    mode_column = column("ion mode", "ionmode", "polarity", default=2)
     adduct_column = column("adduct", "adduct type", default=1)
     selected_column = column("isselected", "selected", default=3)
 
@@ -77,7 +78,25 @@ def read_adduct_rules(path: str | Path) -> dict[str, Any]:
             f"No class/adduct combination is selected in {path}; "
             f"{considered} row(s) were read and every one is unselected."
         )
-    return {"path": str(Path(path).resolve()), "selected": selected, "rule_count": considered}
+    by_mode: dict[str, int] = {}
+    for row in rows[1:]:
+        if len(row) <= max(class_column, adduct_column, selected_column):
+            continue
+        if row[selected_column].strip().lower() not in {"true", "1", "yes"}:
+            continue
+        mode = row[mode_column].strip() if 0 <= mode_column < len(row) else ""
+        by_mode[mode or "unspecified"] = by_mode.get(mode or "unspecified", 0) + 1
+    return {
+        "path": str(Path(path).resolve()),
+        "selected": selected,
+        "rule_count": considered,
+        # An annotation search list and a quantification selection list have the same four
+        # columns, and passing one for the other is accepted in silence -- it just keeps
+        # far more rows. These counts make the substitution visible before the numbers are
+        # read: a selection list keeps roughly one adduct per class per polarity.
+        "selected_by_ion_mode": dict(sorted(by_mode.items())),
+        "selected_classes": len({item[0] for item in selected}),
+    }
 
 
 def describe_export(path: str | Path) -> dict[str, Any]:
@@ -108,9 +127,23 @@ def describe_export(path: str | Path) -> dict[str, Any]:
         classes.append(label)
     if not names:
         raise MergeRefused(f"{path} lists no sample columns.")
+    def column(name: str, fallback: int) -> int:
+        # The constants describe the format as it stands; the header is what this file
+        # actually says. Reading the name first means a changed export shifts nothing.
+        try:
+            return column_names.index(name)
+        except ValueError:
+            return fallback
+
     return {
         "path": str(Path(path).resolve()),
         "first_sample_column": start,
+        "columns": {
+            "metabolite_name": column("Metabolite name", METABOLITE_NAME_COLUMN),
+            "adduct": column("Adduct type", ADDUCT_COLUMN),
+            "ontology": column("Ontology", ONTOLOGY_COLUMN),
+            "comment": column("Comment", COMMENT_COLUMN),
+        },
         "sample_names": names,
         "sample_classes": classes,
         "file_types": [
@@ -141,6 +174,20 @@ def compare_sample_order(positive: dict[str, Any], negative: dict[str, Any]) -> 
                 f"position {index + 1}: positive '{positive['sample_names'][index]}' "
                 f"and negative '{negative['sample_names'][index]}' are different samples"
             )
+    if positive["first_sample_column"] != negative["first_sample_column"]:
+        # Rows from both exports are concatenated and then read positionally, so two
+        # exports whose metadata blocks are different widths would put every negative
+        # value under the wrong sample -- quietly, and in every row.
+        problems.append(
+            f"the sample columns begin at index {positive['first_sample_column']} in positive "
+            f"and {negative['first_sample_column']} in negative, so the two tables are not "
+            "the same shape"
+        )
+    if positive.get("columns") != negative.get("columns"):
+        problems.append(
+            "the two exports place their metadata columns differently: "
+            f"{positive.get('columns')} against {negative.get('columns')}"
+        )
     for index in range(min(len(left), len(right))):
         if positive["sample_classes"][index] != negative["sample_classes"][index]:
             problems.append(
@@ -164,14 +211,22 @@ def compare_sample_order(positive: dict[str, Any], negative: dict[str, Any]) -> 
     }
 
 
-def should_keep(row: list[str], rules: dict[str, Any]) -> tuple[bool, str]:
+def should_keep(
+    row: list[str], rules: dict[str, Any], columns: dict[str, int] | None = None
+) -> tuple[bool, str]:
     """Whether one aligned row belongs in the merged lipidome, and why not if it does not."""
-    if len(row) <= ONTOLOGY_COLUMN:
+    columns = columns or {
+        "metabolite_name": METABOLITE_NAME_COLUMN,
+        "adduct": ADDUCT_COLUMN,
+        "ontology": ONTOLOGY_COLUMN,
+        "comment": COMMENT_COLUMN,
+    }
+    if len(row) <= columns["ontology"]:
         return False, "row is too short to carry an ontology"
-    name = row[METABOLITE_NAME_COLUMN].strip()
-    adduct = row[ADDUCT_COLUMN].strip()
-    ontology = row[ONTOLOGY_COLUMN].strip()
-    comment = row[COMMENT_COLUMN].strip() if len(row) > COMMENT_COLUMN else ""
+    name = row[columns["metabolite_name"]].strip()
+    adduct = row[columns["adduct"]].strip()
+    ontology = row[columns["ontology"]].strip()
+    comment = row[columns["comment"]].strip() if len(row) > columns["comment"] else ""
 
     if not name or name == "Unknown":
         return False, "unannotated"
@@ -213,7 +268,7 @@ def merge_pos_neg(
         for row in export["rows"]:
             if not any(cell.strip() for cell in row):
                 continue
-            keep, reason = should_keep(row, rules)
+            keep, reason = should_keep(row, rules, export["columns"])
             if keep:
                 kept.append(row)
                 counts[label] += 1
@@ -221,7 +276,10 @@ def merge_pos_neg(
                 dropped[reason] = dropped.get(reason, 0) + 1
 
     # Ontology then compound name, so a class reads as one block.
-    kept.sort(key=lambda row: (row[ONTOLOGY_COLUMN], row[METABOLITE_NAME_COLUMN]))
+    sort_columns = positive["columns"]
+    kept.sort(
+        key=lambda row: (row[sort_columns["ontology"]], row[sort_columns["metabolite_name"]])
+    )
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,14 +291,20 @@ def merge_pos_neg(
 
     return {
         "output": str(output_path.resolve()),
-        "rules": {"path": rules["path"], "selected_combinations": len(rules["selected"])},
+        "rules": {
+            "path": rules["path"],
+            "selected_combinations": len(rules["selected"]),
+            "selected_classes": rules["selected_classes"],
+            "selected_by_ion_mode": rules["selected_by_ion_mode"],
+            "rows_considered": rules["rule_count"],
+        },
         "sample_pairing": order,
         "kept_rows": len(kept),
         "kept_from_positive": counts["positive"],
         "kept_from_negative": counts["negative"],
         "dropped_rows": sum(dropped.values()),
         "dropped_reasons": dict(sorted(dropped.items(), key=lambda item: -item[1])),
-        "ontologies": sorted({row[ONTOLOGY_COLUMN] for row in kept}),
+        "ontologies": sorted({row[sort_columns["ontology"]] for row in kept}),
     }
 
 

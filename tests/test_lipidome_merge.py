@@ -232,3 +232,69 @@ class MergeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExportGeometryTests(unittest.TestCase):
+    """Rows from both exports are concatenated and then read by position."""
+
+    def _write(self, path: Path, samples: list[tuple[str, str]], width: int) -> Path:
+        global HEADER_WIDTH
+        original = HEADER_WIDTH
+        HEADER_WIDTH = width
+        try:
+            path.write_text(
+                _export(samples, [_row("PC 34:1", "[M+H]+", "PC")]), encoding="utf-8"
+            )
+        finally:
+            HEADER_WIDTH = original
+        return path
+
+    def test_exports_whose_metadata_blocks_differ_in_width_are_refused(self) -> None:
+        # Otherwise every negative value lands under the wrong sample, in every row.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            positive = self._write(directory / "pos.txt", [("A_Pos", "SPF")], 35)
+            negative = self._write(directory / "neg.txt", [("A_Neg", "SPF")], 40)
+            rules = directory / "rules.txt"
+            rules.write_text(RULES, encoding="utf-8")
+            with self.assertRaisesRegex(MergeRefused, "not the same shape"):
+                merge_pos_neg(positive, negative, rules, directory / "out.txt")
+
+    def test_metadata_columns_are_located_by_header_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write(Path(temporary) / "pos.txt", [("A_Pos", "SPF")], 35)
+            columns = describe_export(path)["columns"]
+
+        self.assertEqual(3, columns["metabolite_name"])
+        self.assertEqual(11, columns["ontology"])
+        self.assertEqual(18, columns["comment"])
+
+
+class RuleTableIdentityTests(unittest.TestCase):
+    """A search list and a selection list have the same four columns."""
+
+    def test_the_merge_reports_what_the_rule_table_selects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            rules = directory / "rules.txt"
+            rules.write_text(RULES, encoding="utf-8")
+            read = read_adduct_rules(rules)
+
+        self.assertEqual({"Negative": 1, "Positive": 1}, read["selected_by_ion_mode"])
+        self.assertEqual(2, read["selected_classes"])
+        self.assertEqual(3, read["rule_count"])
+
+    def test_a_table_selecting_many_adducts_per_class_is_visible_as_such(self) -> None:
+        # A selection list keeps about one adduct per class per polarity; a search list
+        # keeps many. The counts say which was passed before its numbers are used.
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "search.txt"
+            lines = ["Class\tAdduct\tIon mode\tIsSelected"]
+            for adduct in ("[M+H]+", "[M+Na]+", "[M+NH4]+"):
+                lines.append(f"PC\t{adduct}\tPositive\tTRUE")
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            read = read_adduct_rules(path)
+
+        self.assertEqual(1, read["selected_classes"])
+        self.assertEqual(3, len(read["selected"]))
+        self.assertEqual({"Positive": 3}, read["selected_by_ion_mode"])
