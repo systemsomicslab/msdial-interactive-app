@@ -136,13 +136,28 @@ def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str
         source_kind = "custom"
     provenance_path = path.parent / CONSOLE_BUILD_PROVENANCE
     provenance: dict[str, Any] = {}
+    recorded: dict[str, Any] = {}
+    # "No record exists" and "a record exists and describes a different binary"
+    # are opposite situations that a boolean reports identically. CLAUDE.md
+    # requires software versions in every retained artifact, so the caller has to
+    # be able to tell them apart -- and a rebuild outside the build tool leaves a
+    # sidecar that still names the previous binary.
+    provenance_status = "absent"
     if provenance_path.is_file():
         try:
             loaded = json.loads(provenance_path.read_text(encoding="utf-8-sig"))
-            if isinstance(loaded, dict) and loaded.get("binary_sha256") == digest.hexdigest():
-                provenance = loaded
         except (OSError, json.JSONDecodeError):
-            pass
+            provenance_status = "unreadable"
+        else:
+            if isinstance(loaded, dict):
+                recorded = loaded
+                if loaded.get("binary_sha256") == digest.hexdigest():
+                    provenance = loaded
+                    provenance_status = "verified"
+                else:
+                    provenance_status = "stale_mismatch"
+            else:
+                provenance_status = "unreadable"
     result = {
         "path": str(path),
         "exists": True,
@@ -154,10 +169,26 @@ def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str
         "binary_modified_at": dt.datetime.fromtimestamp(
             stat.st_mtime, tz=dt.timezone.utc
         ).astimezone().isoformat(),
-        "provenance_verified": bool(provenance),
+        "provenance_verified": provenance_status == "verified",
+        "provenance_status": provenance_status,
         "provenance": provenance,
         **console_capabilities(str(path)),
     }
+    if provenance_status in {"stale_mismatch", "unreadable"}:
+        result["provenance_mismatch"] = {
+            "record_path": str(provenance_path),
+            "recorded_binary_sha256": str(recorded.get("binary_sha256") or ""),
+            "actual_binary_sha256": digest.hexdigest(),
+            "recorded_git_head": str(recorded.get("git_head") or ""),
+            "recorded_built_at": str(recorded.get("built_at") or ""),
+            "detail": (
+                "A build-provenance record sits beside this binary but does not describe it. "
+                "Rebuild through msdial_build_console_from_local_source, or remove the record, "
+                "before relying on recorded software versions."
+            )
+            if provenance_status == "stale_mismatch"
+            else "The build-provenance record beside this binary could not be read.",
+        }
     if source_root:
         result["git"] = console_git_state(source_root)
         if provenance:
