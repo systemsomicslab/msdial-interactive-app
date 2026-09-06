@@ -175,6 +175,99 @@ class ConsoleManagementTests(unittest.TestCase):
         self.assertEqual("state", provenance["working_tree_state_sha256"])
         save.assert_called_once()
 
+    @patch("msdial_app.workflow.console_capabilities")
+    @patch("msdial_app.workflow.console_version", return_value="5.5.0")
+    def test_a_record_for_another_binary_is_stale_not_absent(
+        self, _version: Mock, capabilities: Mock
+    ) -> None:
+        capabilities.return_value = {"capability_probe": "test", "capabilities": []}
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "MSDIALCUI.exe"
+            binary.write_bytes(b"the binary that is actually here")
+            (binary.parent / CONSOLE_BUILD_PROVENANCE).write_text(
+                json.dumps(
+                    {
+                        "binary_sha256": "d2959b97a427fc",
+                        "git_head": "14dc64ff",
+                        "built_at": "2026-09-02T22:13:10+09:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = inspect_console_path(binary)
+
+        self.assertEqual("stale_mismatch", result["provenance_status"])
+        self.assertFalse(result["provenance_verified"])
+        self.assertEqual({}, result["provenance"])
+        mismatch = result["provenance_mismatch"]
+        self.assertEqual("d2959b97a427fc", mismatch["recorded_binary_sha256"])
+        self.assertEqual(result["binary_sha256"], mismatch["actual_binary_sha256"])
+        self.assertEqual("14dc64ff", mismatch["recorded_git_head"])
+        self.assertEqual("2026-09-02T22:13:10+09:00", mismatch["recorded_built_at"])
+
+    @patch("msdial_app.workflow.console_capabilities")
+    @patch("msdial_app.workflow.console_version", return_value="5.5.0")
+    def test_no_record_at_all_is_absent(self, _version: Mock, capabilities: Mock) -> None:
+        capabilities.return_value = {"capability_probe": "test", "capabilities": []}
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "MSDIALCUI.exe"
+            binary.write_bytes(b"console")
+            result = inspect_console_path(binary)
+
+        self.assertEqual("absent", result["provenance_status"])
+        self.assertFalse(result["provenance_verified"])
+        self.assertNotIn("provenance_mismatch", result)
+
+    @patch("msdial_app.workflow.console_capabilities")
+    @patch("msdial_app.workflow.console_version", return_value="5.5.0")
+    def test_an_unreadable_record_is_not_reported_as_absent(
+        self, _version: Mock, capabilities: Mock
+    ) -> None:
+        capabilities.return_value = {"capability_probe": "test", "capabilities": []}
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "MSDIALCUI.exe"
+            binary.write_bytes(b"console")
+            (binary.parent / CONSOLE_BUILD_PROVENANCE).write_text("{ not json", encoding="utf-8")
+            result = inspect_console_path(binary)
+
+        self.assertEqual("unreadable", result["provenance_status"])
+        self.assertFalse(result["provenance_verified"])
+        self.assertIn("provenance_mismatch", result)
+
+    @patch("msdial_app.console_management.save_path_settings")
+    @patch("msdial_app.console_management.inspect_console_path")
+    @patch("msdial_app.console_management.console_git_state")
+    @patch("msdial_app.console_management.subprocess.Popen")
+    def test_a_failed_build_leaves_no_record_rather_than_a_stale_one(
+        self, popen: Mock, git_state: Mock, inspect: Mock, _save: Mock
+    ) -> None:
+        process = Mock()
+        process.stdout = io.StringIO("Build FAILED." + chr(10))
+        process.wait.return_value = 1
+        popen.return_value = process
+        git_state.return_value = {"head": "abc"}
+        inspect.return_value = {"binary_sha256": "hash", "version": "5.5"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "bin/MSDIALCUI.exe"
+            output.parent.mkdir()
+            output.write_bytes(b"console")
+            record = output.parent / CONSOLE_BUILD_PROVENANCE
+            record.write_text(json.dumps({"binary_sha256": "previous"}), encoding="utf-8")
+            plan = {
+                "source_root": str(root),
+                "framework": "net48",
+                "configuration": "Release",
+                "command": ["dotnet", "build"],
+                "command_text": "dotnet build",
+                "output_path": str(output),
+            }
+
+            with self.assertRaises(RuntimeError):
+                build_local_console(plan, lambda _message: None)
+
+            self.assertFalse(record.is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

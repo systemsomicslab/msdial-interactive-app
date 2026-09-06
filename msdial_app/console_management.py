@@ -149,6 +149,16 @@ def build_local_console(
 ) -> dict[str, Any]:
     log("Building MS-DIAL Console from the selected local source tree.")
     log("Command: " + str(plan["command_text"]))
+    # The build overwrites the binary before the new record is written. Remove the
+    # old record first so an interrupted build leaves no provenance at all rather
+    # than a record that appears to describe the binary now on disk.
+    superseded = Path(str(plan["output_path"])).parent / CONSOLE_BUILD_PROVENANCE
+    if superseded.is_file():
+        try:
+            superseded.unlink()
+            log(f"Removed the superseded build-provenance record: {superseded}")
+        except OSError as error:
+            log(f"Could not remove the superseded build-provenance record: {error}")
     process = subprocess.Popen(
         list(plan["command"]),
         cwd=str(plan["source_root"]),
