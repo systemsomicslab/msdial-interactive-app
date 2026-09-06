@@ -20,6 +20,22 @@ Keep `open_browser=false` unless the user asks to inspect or edit the web UI. Th
 
 Do not infer GC-MS versus LC-MS, ion mode, or target omics from a filename alone. Ask when the user has not explicitly supplied the value. Explain that guided execution currently supports LC-MS and GC-MS; direct other project types to the web UI without pretending they are supported.
 
+## Public Repository Reanalysis
+
+When the user supplies a Metabolomics Workbench (`ST...`), MetaboLights
+(`MTBLS...`), MB-POST (`MPST...`), or MetaboBank (`MTBKS...`) accession, use
+the repository MCP workflow rather than asking the user to download files or
+operate the browser UI. Read
+[repository-reanalysis.md](references/repository-reanalysis.md) for the exact
+tool sequence, confirmation boundaries, metadata review, raw-header cross-check,
+QA target handling, and retained-artifact rules.
+
+Never silently accept a projected Class hierarchy, partial filename mapping,
+inferred internal-standard ion, or raw-data deletion policy. Repository and raw
+metadata are evidence; unresolved scientific choices remain questions for the
+user. Exact internal-standard candidates drafted by the desktop agent must be
+reported as reviewable candidates, with RT left unset unless it is recorded.
+
 ## Collect Decisions
 
 Follow `next_question` from `msdial_guided_analysis_plan`. Retain all accepted values in one `answers` object and call the planner again after each answer. Ask one scientific decision at a time unless the user explicitly requests a compact questionnaire.

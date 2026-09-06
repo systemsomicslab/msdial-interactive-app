@@ -28,6 +28,23 @@ from .mztab_validation import list_mztab_outputs, validate_mztab_files, validate
 from .mztab_preview import preview_mztab_outputs
 from .materials_methods import generate_publication_report
 from .quality_assurance import build_lcms_qa_report_from_file, find_qa_files
+from .repository_metadata import (
+    apply_classes_to_analysis_files,
+    metadata_workspace,
+    metadata_workspace_from_file,
+    project_class_hierarchy,
+    save_metadata_review,
+)
+from .repository_qa import propose_repository_qa_targets
+from .repository_reanalysis import (
+    ADAPTERS,
+    EligibilityPolicy,
+    cleanup_download_lease,
+    create_download_lease,
+    evaluate_eligibility,
+    finalize_download_lease,
+    project_from_dict,
+)
 from .workflow import (
     console_version,
     console_capabilities,
@@ -546,6 +563,126 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"job_id": job_id})
             elif parsed.path == "/api/files/import-csv":
                 self._json(read_analysis_csv(body.get("path", "")))
+            elif parsed.path == "/api/repository/metadata/inspect":
+                repository = str(body.get("repository", "")).strip().casefold()
+                accession = str(body.get("accession", "")).strip().upper()
+                aliases = {
+                    "workbench": "metabolomics_workbench",
+                    "metabolomicsworkbench": "metabolomics_workbench",
+                    "metabolomics_workbench": "metabolomics_workbench",
+                    "metabolights": "metabolights",
+                    "mb-post": "mb_post",
+                    "mbpost": "mb_post",
+                    "mb_post": "mb_post",
+                    "metabobank": "metabobank",
+                    "mtbks": "metabobank",
+                }
+                adapter_name = aliases.get(repository, repository)
+                if adapter_name not in ADAPTERS:
+                    raise ValueError("Select Metabolomics Workbench, MetaboLights, MB-POST, or MetaboBank.")
+                if not accession:
+                    raise ValueError("Enter a repository accession.")
+                adapter = ADAPTERS[adapter_name]()
+                inspector = getattr(adapter, "inspect_metadata", adapter.inspect)
+                repository_label = {
+                    "metabolomics_workbench": "Metabolomics Workbench",
+                    "metabolights": "MetaboLights",
+                    "mb_post": "MB-POST",
+                    "metabobank": "MetaboBank",
+                }[adapter_name]
+                try:
+                    project = inspector(accession)
+                except Exception as error:
+                    raise RuntimeError(
+                        f"Could not retrieve {accession} metadata from {repository_label}. "
+                        "This operation reads the public repository API directly; an LLM/API key "
+                        f"is not required. Details: {error}"
+                    ) from error
+                self._json({"project": project.as_dict(), "workspace": metadata_workspace(project.as_dict())})
+            elif parsed.path == "/api/repository/download":
+                project = project_from_dict(body.get("project", {}))
+                workspace_root = Path(str(body.get("workspace_root", "")).strip()).expanduser()
+                if not str(body.get("workspace_root", "")).strip():
+                    raise ValueError("Set a repository workspace root before downloading raw data.")
+                maximum_gb = float(body.get("maximum_gb", 20) or 20)
+                if maximum_gb <= 0:
+                    raise ValueError("Maximum download size must be greater than zero.")
+                maximum_bytes = int(maximum_gb * 1024**3)
+                evaluated = evaluate_eligibility(
+                    project,
+                    EligibilityPolicy(
+                        max_download_bytes=maximum_bytes,
+                        max_samples=max(project.sample_count or 1, 1),
+                        require_known_size=False,
+                        require_untargeted=True,
+                    ),
+                )
+                allow_preflight = bool(body.get("allow_preflight"))
+                if not evaluated.eligible and not (
+                    allow_preflight and evaluated.selection_status == "raw_metadata_required"
+                ):
+                    reasons = evaluated.exclusion_reasons or evaluated.review_reasons
+                    raise ValueError(
+                        "This repository project is not ready for an untargeted GC-MS/LC-MS download: "
+                        + "; ".join(reasons or ["review repository metadata first"])
+                    )
+                retention = str(body.get("raw_retention_policy") or "keep")
+                if retention not in {"keep", "delete_after_validated_output"}:
+                    raise ValueError("Unknown repository raw-data retention policy.")
+                job_id = uuid.uuid4().hex
+                with JOBS_LOCK:
+                    JOBS[job_id] = {
+                        "id": job_id,
+                        "status": "queued",
+                        "kind": "repository_download",
+                        "logs": [],
+                        "result": None,
+                        "received": 0,
+                        "total": evaluated.total_download_bytes,
+                        "progress": 0,
+                        "speed_bps": 0,
+                        "eta_seconds": None,
+                        "repository": evaluated.repository,
+                        "accession": evaluated.accession,
+                        "raw_retention_policy": retention,
+                        "created_at": dt.datetime.now().astimezone().isoformat(),
+                    }
+                    _persist_jobs_locked()
+                threading.Thread(
+                    target=_run_repository_download_job,
+                    args=(job_id, evaluated, workspace_root, maximum_bytes, allow_preflight, retention),
+                    daemon=True,
+                ).start()
+                self._json({"job_id": job_id})
+            elif parsed.path == "/api/repository/metadata/load":
+                self._json({"workspace": metadata_workspace_from_file(body.get("path", ""))})
+            elif parsed.path == "/api/repository/metadata/project":
+                projected = project_class_hierarchy(
+                    body.get("workspace", {}),
+                    body.get("hierarchy", []),
+                    str(body.get("separator", "_")),
+                    str(body.get("missing_value", "NA")),
+                )
+                applied = apply_classes_to_analysis_files(projected, body.get("files", []))
+                self._json({"workspace": projected, "application": applied})
+            elif parsed.path == "/api/repository/metadata/save":
+                self._json(
+                    {
+                        "files": save_metadata_review(
+                            body.get("workspace", {}),
+                            body.get("destination", ""),
+                            body.get("analysis_files", []),
+                        )
+                    }
+                )
+            elif parsed.path == "/api/repository/qa-targets":
+                self._json(
+                    propose_repository_qa_targets(
+                        body.get("workspace", {}),
+                        body.get("workflow", {}),
+                        body.get("llm", {}),
+                    )
+                )
             elif parsed.path == "/api/files/browse":
                 self._json(_browse_filesystem(body.get("path", "")))
             elif parsed.path == "/api/dialog/files":
@@ -1015,6 +1152,12 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/run":
                 state = body.get("workflow", body)
                 preparation = prepare_run(state)
+                preparation["repository_run_manifest"] = str(
+                    state.get("repository_run_manifest") or ""
+                )
+                preparation["repository_raw_retention_policy"] = str(
+                    state.get("repository_raw_retention_policy") or "keep"
+                )
                 job_id = uuid.uuid4().hex
                 artifact_baseline = _snapshot_run_artifacts(preparation)
                 with JOBS_LOCK:
@@ -1095,7 +1238,20 @@ class Handler(BaseHTTPRequestHandler):
                 path = save_rt_correction_selections(state, body.get("rows", []))
                 self._json({"selection_file": path})
             else:
-                self._json({"error": "Unknown endpoint."}, HTTPStatus.NOT_FOUND)
+                self._json(
+                    {
+                        "error": f"Unknown endpoint: {parsed.path}",
+                        "code": "unknown_endpoint",
+                        "requested_path": parsed.path,
+                        "app_version": __version__,
+                        "hint": (
+                            "Refresh the browser. If the control exists in the page, an older "
+                            "MS-DIAL Interactive process may still be using this port; stop old "
+                            "instances and restart the current app."
+                        ),
+                    },
+                    HTTPStatus.NOT_FOUND,
+                )
         except Exception as error:
             self._json(
                 {"error": str(error), "trace": traceback.format_exc()},
@@ -1194,6 +1350,94 @@ def _run_library_download_job(job_id: str, catalog_id: str) -> None:
             _persist_jobs_locked()
 
 
+def _run_repository_download_job(
+    job_id: str,
+    project: Any,
+    workspace_root: Path,
+    maximum_bytes: int,
+    allow_preflight: bool,
+    retention: str,
+) -> None:
+    def log(message: str) -> None:
+        with JOBS_LOCK:
+            JOBS[job_id]["logs"].append(message)
+            JOBS[job_id]["logs"] = JOBS[job_id]["logs"][-2000:]
+
+    with JOBS_LOCK:
+        JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+        _persist_jobs_locked()
+    try:
+        log(
+            f"Downloading {project.repository} {project.accession} into {workspace_root}."
+        )
+        log(
+            "Raw data will be kept."
+            if retention == "keep"
+            else "Raw data will be deleted only after a successful run and validated mzTab-M output."
+        )
+        started = time.monotonic()
+        last_persisted = 0.0
+
+        def progress(
+            index: int, total_objects: int, name: str, received: int, total_bytes: int
+        ) -> None:
+            nonlocal last_persisted
+            elapsed = max(time.monotonic() - started, 1e-6)
+            speed = received / elapsed
+            percent = received / total_bytes * 100 if total_bytes else 0.0
+            eta = (total_bytes - received) / speed if total_bytes and speed > 0 else None
+            now = time.monotonic()
+            with JOBS_LOCK:
+                job = JOBS[job_id]
+                job["received"] = received
+                job["total"] = total_bytes
+                job["progress"] = round(min(100.0, percent), 1)
+                job["speed_bps"] = round(speed)
+                job["eta_seconds"] = round(eta) if eta is not None else None
+                job["current_file"] = name
+                job["download_object"] = index
+                job["download_objects"] = total_objects
+                if now - last_persisted >= 2 or received == total_bytes:
+                    last_persisted = now
+                    job["updated_at"] = dt.datetime.now().astimezone().isoformat()
+                    _persist_jobs_locked()
+
+        lease = create_download_lease(
+            project,
+            workspace_root,
+            maximum_bytes,
+            allow_preflight=allow_preflight,
+            progress_callback=progress,
+        )
+        recognized = expand_paths_report(lease.get("input_candidates", []))
+        result = {
+            "manifest_path": lease["manifest_path"],
+            "workspace": lease["workspace"],
+            "raw_directory": lease["raw_directory"],
+            "input_directory": lease["input_directory"],
+            "output_directory": lease["output_directory"],
+            "analysis_input_path": lease["analysis_input_path"],
+            "input_candidates": lease["input_candidates"],
+            "recognized": recognized,
+            "raw_retention_policy": retention,
+        }
+        log(f"Recognized {len(recognized.get('files', []))} MS-DIAL analysis file(s).")
+        with JOBS_LOCK:
+            JOBS[job_id]["result"] = result
+            JOBS[job_id]["progress"] = 100
+            JOBS[job_id]["status"] = "completed"
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
+    except Exception as error:
+        log(traceback.format_exc())
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "failed"
+            JOBS[job_id]["error"] = str(error)
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
+
+
 def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
     def log(line: str) -> None:
         with JOBS_LOCK:
@@ -1211,6 +1455,7 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
         exit_code = run_console(preparation, log)
         validation = None
         handoff = None
+        repository_retention = None
         with JOBS_LOCK:
             baseline = dict(JOBS[job_id].get("artifact_baseline") or {})
         artifacts = _changed_run_artifacts(preparation, baseline)
@@ -1250,12 +1495,49 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
             )
             if handoff.get("handoff_file"):
                 log("Data-mining handoff: " + handoff["handoff_file"])
+            manifest_text = str(preparation.get("repository_run_manifest") or "").strip()
+            retention = str(
+                preparation.get("repository_raw_retention_policy") or "keep"
+            )
+            if manifest_text:
+                try:
+                    if artifacts["mztab"] and summary.get("failed", 0) == 0:
+                        finalized = finalize_download_lease(Path(manifest_text))
+                        repository_retention = {
+                            "policy": retention,
+                            "finalization": finalized,
+                            "cleanup": None,
+                        }
+                        if retention == "delete_after_validated_output":
+                            cleanup = cleanup_download_lease(
+                                Path(manifest_text), confirmed=True
+                            )
+                            repository_retention["cleanup"] = cleanup
+                            log("Validated output retained; downloaded repository raw data were deleted.")
+                        else:
+                            log("Validated output retained; downloaded repository raw data were kept.")
+                    else:
+                        repository_retention = {
+                            "policy": retention,
+                            "cleanup": None,
+                            "reason": "Raw data were kept because this run did not produce a validated mzTab-M output.",
+                        }
+                        log(repository_retention["reason"])
+                except Exception as retention_error:
+                    repository_retention = {
+                        "policy": retention,
+                        "cleanup": None,
+                        "reason": f"Raw data were kept because retention finalization failed: {retention_error}",
+                    }
+                    artifact_warnings.append(repository_retention["reason"])
+                    log("WARNING: " + repository_retention["reason"])
         with JOBS_LOCK:
             JOBS[job_id]["exit_code"] = exit_code
             JOBS[job_id]["mztab_validation"] = validation
             JOBS[job_id]["datamining_handoff"] = handoff
             JOBS[job_id]["artifacts"] = artifacts
             JOBS[job_id]["warnings"] = artifact_warnings
+            JOBS[job_id]["repository_retention"] = repository_retention
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             if exit_code == 0:
                 JOBS[job_id]["status"] = "completed"
@@ -1495,6 +1777,9 @@ def _pick_reference_file(kind: str) -> str:
         elif kind == "analysis-csv":
             title = "Select MS-DIAL analysis metadata CSV"
             filetypes = [("Analysis metadata CSV", "*.csv"), ("All files", "*.*")]
+        elif kind == "repository-metadata":
+            title = "Select repository metadata or run manifest"
+            filetypes = [("Repository metadata JSON", "*.json"), ("All files", "*.*")]
         else:
             title = "Select RT correction anchor library"
             filetypes = [("MS-DIAL text library", "*.txt *.tsv"), ("All files", "*.*")]
@@ -1503,6 +1788,18 @@ def _pick_reference_file(kind: str) -> str:
         return path
     except Exception:
         return ""
+
+
+class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """Prevent stale and current local app versions from sharing one port on Windows."""
+
+    allow_reuse_address = False
+    allow_reuse_port = False
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 def main() -> None:
@@ -1524,7 +1821,14 @@ def main() -> None:
     if args.lab:
         args.host = "0.0.0.0"
         args.no_browser = True
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        server = ExclusiveThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as error:
+        raise SystemExit(
+            f"Could not start MS-DIAL Interactive on {args.host}:{args.port}. "
+            "Another process is already using this port. Close the old MS-DIAL Interactive "
+            f"instance or choose another --port. Details: {error}"
+        ) from error
     start_path = "/rt-correction" if args.rt_correction else "/"
     url = f"http://{args.host}:{args.port}{start_path}"
     print(f"MS-DIAL Interactive: {url}")

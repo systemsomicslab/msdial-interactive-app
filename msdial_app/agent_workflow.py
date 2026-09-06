@@ -30,7 +30,8 @@ SUPPORTED_ANSWER_KEYS = {
     "library_provenance", "run_qa", "internal_standards",
     "generate_materials_methods", "alignment_light_mode", "output_root",
     "export_folder_path", "height_matrix_export", "console_path", "template_path",
-    "queries_path", "project_store", "workflow_overrides", "gcms_retention_type",
+    "queries_path", "project_store", "workflow_overrides", "repository_metadata_path",
+    "gcms_retention_type",
     "gcms_alignment_index_type", "gcms_ri_compound_type", "gcms_ri_source",
     "gcms_ri_standard_path", "gcms_ri_dictionary_path",
 }
@@ -241,16 +242,19 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
 def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, Any]:
     project_type = str(answers["project_type"]).casefold()
     settings = load_user_settings()
-    queries_path = Path(str(settings.get("queries_path") or RESOURCES / "LbmQueries.txt"))
+    queries_path = _existing_path(
+        answers.get("queries_path") or settings.get("queries_path"),
+        RESOURCES / "LbmQueries.txt",
+    )
     if project_type == "gcms":
-        template = Path(str(answers.get("template_path") or RESOURCES / "gcms_console_param_kovats.txt"))
+        template = _existing_path(
+            answers.get("template_path"),
+            RESOURCES / "gcms_console_param_kovats.txt",
+        )
     else:
-        template = Path(
-            str(
-                answers.get("template_path")
-                or settings.get("template_path")
-                or RESOURCES / "msdial_console_param4lipidomics.txt"
-            )
+        template = _existing_path(
+            answers.get("template_path") or settings.get("template_path"),
+            RESOURCES / "msdial_console_param4lipidomics.txt",
         )
     loaded = load_parameter_template(template, queries_path)
     state = dict(loaded["workflow"])
@@ -298,6 +302,8 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
     if answers.get("minimum_peak_height") is not None:
         state["minimum_peak_height"] = float(answers["minimum_peak_height"])
     acquisition_type = answers.get("acquisition_type")
+    if project_type == "gcms" and not acquisition_type:
+        acquisition_type = "None"
     if acquisition_type:
         for item in state["files"]:
             item["acquisition_type"] = acquisition_type
@@ -332,7 +338,24 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             }
         )
     state.update(dict(answers.get("workflow_overrides") or {}))
+    repository_metadata_path = str(answers.get("repository_metadata_path") or "").strip()
+    if repository_metadata_path:
+        from .repository_metadata import metadata_workspace_from_file
+
+        state["repository_metadata"] = metadata_workspace_from_file(repository_metadata_path)
+        state["repository_metadata_source_path"] = str(
+            Path(repository_metadata_path).expanduser().resolve()
+        )
     return state
+
+
+def _existing_path(configured: Any, fallback: Path) -> Path:
+    value = str(configured or "").strip()
+    if value:
+        candidate = Path(value).expanduser()
+        if candidate.is_file():
+            return candidate.resolve()
+    return fallback.resolve()
 
 
 def _apply_libraries(

@@ -4,7 +4,18 @@ MS-DIAL Interactive uses an Agent Skill for procedure and a local MCP server for
 execution. This matches the intended division: Skills teach a repeatable
 workflow, while MCP connects the model to tools and local data. See the official
 [Claude Skills overview](https://support.claude.com/en/articles/12512176-what-are-skills)
-and [Anthropic MCP documentation](https://docs.anthropic.com/en/docs/mcp).
+and [Anthropic MCP documentation](https://docs.anthropic.com/en/docs/mcp). For
+ChatGPT and Codex, see OpenAI's
+[MCP server documentation](https://developers.openai.com/plugins/concepts/mcp-server)
+and [Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
+
+This connection does not expose Claude or ChatGPT as an API to the browser.
+Instead, the authenticated desktop agent calls MS-DIAL Interactive. Therefore a
+separate model API key is not needed for agent-driven execution. In-app model
+generation remains a separate optional connection under `LLM & agent settings`.
+Claude Desktop supports local MCP servers and desktop extensions. ChatGPT custom
+MCP support is plan-dependent and may require a remote MCP endpoint or secure
+tunnel rather than a direct localhost connection.
 
 ## Install the local MCP server
 
@@ -70,6 +81,14 @@ the same Agent Skills package.
    and create the data-mining handoff.
 10. Optionally save the accepted scientific choices as a reusable workset.
 
+For public accessions, the agent can run the same workflow without browser
+interaction: plan the accession, perform a confirmed bounded download, inspect
+representative raw headers, review and project repository metadata into
+MS-DIAL `Class`, prepare `analysis_files.csv`, and then enter the normal guided
+flow. Internal-standard declarations are exposed as evidence so the desktop
+agent can draft reviewable LC-MS QA targets without requiring an in-app LLM API
+key.
+
 Downloads and production runs require a separate explicit confirmation. A
 workset omits raw-data paths and output paths. An accepted diagnostic threshold
 is retained as part of the reusable scientific method.
@@ -90,6 +109,11 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 - `msdial_interactive_restart`
 - `msdial_check_console_path` / `msdial_set_console_path`
 - `msdial_guided_analysis_plan`
+- `msdial_repository_reanalysis_plan`
+- `msdial_download_repository_raw`
+- `msdial_repository_raw_metadata_preflight`
+- `msdial_prepare_repository_reanalysis`
+- `msdial_repository_qa_evidence`
 - `msdial_list_worksets`
 - `msdial_download_official_library`
 - `msdial_start_peak_count_diagnostic`
@@ -107,7 +131,7 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 
 Run completion, mzTab-M validation/preview, LC-MS QA, publication generation,
 and handoff should receive the exact `job_id` returned by the production run.
-Agent API 0.3 tracks files created or updated by that job and does not silently
+Agent API 0.4 tracks files created or updated by that job and does not silently
 reuse older mzTab-M or `*.qa.tsv` files from the same directory. Publication can
 be generated without QA by setting `run_qa=false`.
 

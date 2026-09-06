@@ -11,6 +11,11 @@ const state = {
   rtCorrectionAnchorsDirty: false,
   rtCorrectionAnchorSourcePath: "",
   analysisCsvSource: "",
+  repositoryMetadata: null,
+  repositoryProject: null,
+  repositoryDownloadJobId: null,
+  repositoryRunManifest: "",
+  repositoryRawRetentionPolicy: "keep",
   config: null,
   outputRootAutomatic: true,
   gcmsRiMap: {},
@@ -75,13 +80,27 @@ async function api(path, options = {}) {
   } catch {
     throw new Error(`The local app returned an invalid response (HTTP ${response.status}).`);
   }
-  if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+  if (!response.ok) {
+    if (response.status === 404 && String(result.error || "").toLowerCase().includes("unknown endpoint")) {
+      const version = result.app_version || state.config?.app_version || "unknown";
+      throw new Error(
+        `The local server does not support ${path} (HTTP 404; app version ${version}). `
+        + "An older MS-DIAL Interactive process may still be using port 8765. "
+        + "Close old instances and restart the current app. Repository metadata inspection does not use an LLM or API key."
+      );
+    }
+    const detail = result.hint ? `${result.error || `HTTP ${response.status}`} ${result.hint}` : result.error;
+    throw new Error(detail || `HTTP ${response.status}`);
+  }
   return result;
 }
 
 function workflow() {
   return {
     files: state.files,
+    repository_metadata: state.repositoryMetadata,
+    repository_run_manifest: state.repositoryRunManifest,
+    repository_raw_retention_policy: state.repositoryRawRetentionPolicy,
     project_type: $("#projectType").value,
     ion_mode: $("#ionMode").value,
     target_omics: $("#targetOmics").value,
@@ -189,13 +208,47 @@ function workflow() {
 }
 
 function llmConfig() {
+  const provider = $("#llmProvider").value;
   return {
-    provider: $("#llmProvider").value,
+    provider,
     endpoint: $("#llmEndpoint").value.trim(),
     deployment: $("#llmDeployment").value.trim(),
-    api_key: $("#llmApiKey").value,
+    api_key: provider === "local-openai-compatible" ? "" : $("#llmApiKey").value,
     api_version: $("#llmApiVersion").value.trim(),
   };
+}
+
+function llmConfigured() {
+  const provider = $("#llmProvider").value;
+  if (provider === "local") return false;
+  if (provider === "local-openai-compatible") {
+    return Boolean(
+      $("#llmEndpoint").value.trim()
+      && $("#llmDeployment").value.trim()
+    );
+  }
+  const uiConfigured = Boolean(
+    $("#llmApiKey").value.trim()
+    && $("#llmEndpoint").value.trim()
+    && $("#llmDeployment").value.trim()
+  );
+  return uiConfigured
+    || (provider === "azure" && Boolean(state.config?.llm_environment?.azure_configured));
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!bytes) return "unknown size";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+  return `${(bytes / (1024 ** index)).toFixed(index >= 3 ? 2 : 1)} ${units[index]}`;
+}
+
+function formatDuration(value) {
+  const seconds = Math.max(0, Math.round(Number(value || 0)));
+  if (seconds < 60) return `${seconds} sec`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ${seconds % 60} sec`;
+  return `${Math.floor(seconds / 3600)} hr ${Math.floor((seconds % 3600) / 60)} min`;
 }
 
 function setStatus(text) { $("#status").textContent = text; }
@@ -279,6 +332,164 @@ function renderFiles() {
   renderVendorTips();
   renderTuningFiles();
   renderGcmsRiMap();
+}
+
+function repositoryHierarchy() {
+  return $$("#repositoryMetadataFields tr")
+    .map((row) => ({
+      name: row.dataset.field,
+      use: row.querySelector("[data-role='use']")?.checked,
+      order: Number(row.querySelector("[data-role='order']")?.value || 999),
+    }))
+    .filter((item) => item.use)
+    .sort((left, right) => left.order - right.order || left.name.localeCompare(right.name))
+    .map((item) => item.name);
+}
+
+function renderRepositoryMetadata() {
+  const workspace = state.repositoryMetadata;
+  const summary = $("#repositoryMetadataSummary");
+  const editor = $("#repositoryMetadataEditor");
+  const rawWorkspace = $("#repositoryRawWorkspace");
+  if (!workspace) {
+    summary.hidden = true;
+    editor.hidden = true;
+    rawWorkspace.hidden = true;
+    return;
+  }
+  const publications = workspace.publications || [];
+  const publicationText = publications.length
+    ? publications.map((item) => item.doi || item.pubmed_id || item.title).filter(Boolean).join("; ")
+    : "not provided by the repository response";
+  summary.hidden = false;
+  summary.innerHTML = `<strong>${escapeHtml(workspace.accession || "Repository metadata")}</strong> | ` +
+    `${escapeHtml(workspace.title || "Untitled project")}<br>` +
+    `${(workspace.rows || []).length} sample row(s), ${(workspace.fields || []).length} metadata field(s). ` +
+    `Publication: ${escapeHtml(publicationText)}`;
+  editor.hidden = false;
+  rawWorkspace.hidden = !state.repositoryProject;
+  if (state.repositoryProject) {
+    const total = Number(state.repositoryProject.total_download_bytes || 0);
+    const estimatedSeconds = total ? total / (100 * 1000 * 1000 / 8) : 0;
+    $("#repositoryDownloadEstimate").textContent = total
+      ? `Declared download: ${formatBytes(total)}. Approx. ${formatDuration(estimatedSeconds)} at 100 Mbps; actual speed and ETA appear after transfer starts.`
+      : "The repository did not declare a complete download size; the configured safety limit still applies.";
+  }
+  const hierarchy = workspace.hierarchy || [];
+  $("#repositoryMissingValue").value = workspace.missing_value || "NA";
+  $("#repositoryClassSeparator").value = workspace.separator || "_";
+  $("#repositoryMetadataFields").innerHTML = (workspace.fields || []).map((field) => {
+    const selectedIndex = hierarchy.indexOf(field.name);
+    return `<tr data-field="${escapeHtml(field.name)}">
+      <td><input data-role="use" type="checkbox" ${selectedIndex >= 0 ? "checked" : ""}></td>
+      <td><input data-role="order" type="number" min="1" value="${selectedIndex >= 0 ? selectedIndex + 1 : ""}" placeholder="-"></td>
+      <td>${escapeHtml(field.name)}</td>
+      <td>${Number(field.non_missing || 0)} / ${(workspace.rows || []).length}</td>
+      <td>${Number(field.unique_count || 0)}</td>
+      <td>${escapeHtml((field.examples || []).join("; "))}</td>
+    </tr>`;
+  }).join("");
+  $$("#repositoryMetadataFields tr").forEach((row) => {
+    const use = row.querySelector("[data-role='use']");
+    const order = row.querySelector("[data-role='order']");
+    use.addEventListener("change", () => {
+      if (use.checked && !order.value) {
+        order.value = String(repositoryHierarchy().length);
+      }
+    });
+  });
+  renderRepositoryMetadataPreview();
+  renderRepositoryQaMetadata();
+}
+
+function repositoryInternalStandardEvidence() {
+  const grouped = new Map();
+  (state.repositoryMetadata?.rows || []).forEach((row) => {
+    Object.entries(row.values || {}).forEach(([field, rawValue]) => {
+      if (!/\b(internal standard|internal standards|is mixture|spiked? standard|reference standard)\b/i.test(field)) return;
+      const value = String(rawValue || "").trim();
+      if (!value) return;
+      const key = `${field.toLowerCase()}\u0000${value.toLowerCase()}`;
+      if (!grouped.has(key)) grouped.set(key, { field, value, count: 0 });
+      grouped.get(key).count += 1;
+    });
+  });
+  return [...grouped.values()];
+}
+
+function renderRepositoryQaMetadata(extraMessage = "") {
+  const panel = $("#repositoryQaMetadata");
+  const evidence = repositoryInternalStandardEvidence();
+  panel.hidden = !evidence.length;
+  if (!evidence.length) return;
+  $("#repositoryQaEvidence").innerHTML = evidence.map((item) =>
+    `<div><code>${escapeHtml(item.field)}</code>: ${escapeHtml(item.value)} <span class="muted">(${item.count} sample row(s))</span></div>`
+  ).join("") + (extraMessage ? `<div class="muted">${escapeHtml(extraMessage)}</div>` : "");
+}
+
+function applyRepositoryProjectDefaults() {
+  const project = state.repositoryProject || {};
+  if (project.separation === "LC-MS") $("#projectType").value = "lcms";
+  if (project.separation === "GC-MS") $("#projectType").value = "gcms";
+  if (["Positive", "Negative"].includes(project.ion_mode)) {
+    $("#ionMode").value = project.ion_mode;
+  }
+  const target = state.repositoryMetadata?.target_omics;
+  if (["Lipidomics", "Metabolomics"].includes(target)) $("#targetOmics").value = target;
+  updateProjectUI();
+  renderLipids();
+  renderAdducts();
+}
+
+function renderRepositoryMetadataPreview() {
+  const workspace = state.repositoryMetadata;
+  if (!workspace) return;
+  const hierarchy = workspace.hierarchy || [];
+  const fields = hierarchy.length ? hierarchy : (workspace.fields || []).slice(0, 6).map((item) => item.name);
+  $("#repositoryMetadataPreviewHead").innerHTML = `<tr>
+    <th>Sample ID</th><th>Raw file</th><th>Class preview</th>
+    ${fields.map((name) => `<th>${escapeHtml(name)}</th>`).join("")}
+  </tr>`;
+  $("#repositoryMetadataPreviewBody").innerHTML = (workspace.rows || []).slice(0, 100).map((row, rowIndex) => `<tr data-row="${rowIndex}">
+    <td><input data-identity="sample_id" value="${escapeHtml(row.sample_id)}"></td>
+    <td><input data-identity="raw_file" value="${escapeHtml(row.raw_file)}"></td>
+    <td><strong>${escapeHtml(row.class_id || "")}</strong></td>
+    ${fields.map((name, fieldIndex) => `<td><input data-field-index="${fieldIndex}" value="${escapeHtml(row.values?.[name] || "")}"></td>`).join("")}
+  </tr>`).join("");
+  $$("#repositoryMetadataPreviewBody tr").forEach((tableRow) => {
+    const row = workspace.rows[Number(tableRow.dataset.row)];
+    tableRow.querySelectorAll("[data-identity]").forEach((input) => {
+      input.addEventListener("input", () => { row[input.dataset.identity] = input.value; });
+    });
+    tableRow.querySelectorAll("[data-field-index]").forEach((input) => {
+      input.addEventListener("input", () => { row.values[fields[Number(input.dataset.fieldIndex)]] = input.value; });
+    });
+  });
+}
+
+async function projectRepositoryMetadata(applyToFiles = false) {
+  if (!state.repositoryMetadata) throw new Error("Inspect or load repository metadata first.");
+  const result = await api("/api/repository/metadata/project", {
+    method: "POST",
+    body: JSON.stringify({
+      workspace: state.repositoryMetadata,
+      hierarchy: repositoryHierarchy(),
+      separator: $("#repositoryClassSeparator").value || "_",
+      missing_value: $("#repositoryMissingValue").value || "NA",
+      files: state.files,
+    }),
+  });
+  state.repositoryMetadata = result.workspace;
+  const application = result.application || {};
+  if (applyToFiles) {
+    state.files = application.files || state.files;
+    renderFiles();
+  }
+  renderRepositoryMetadata();
+  $("#repositoryMetadataApplication").textContent =
+    `${application.matched_count || 0} analysis file(s) matched; ` +
+    `${(application.unmatched || []).length} unmatched; ${(application.ambiguous || []).length} ambiguous.`;
+  return result;
 }
 
 function renderRtCorrectionAnchors() {
@@ -1132,31 +1343,29 @@ function restoreRtWorkspaceState() {
 function updateLlmUI() {
   const provider = $("#llmProvider").value;
   const isLocal = provider === "local";
+  const isLocalModel = provider === "local-openai-compatible";
   ["llmEndpoint", "llmDeployment", "llmApiKey"].forEach((id) => {
     $(`#${id}`).disabled = isLocal;
   });
+  $("#llmApiKey").disabled = isLocal || isLocalModel;
+  $("#llmApiKeyOptional").textContent = isLocalModel ? "(not required)" : "";
   $("#llmApiVersionField").hidden = provider !== "azure";
   if (isLocal) {
     $("#llmStatus").textContent = state.config?.llm_environment?.azure_configured
       ? "Local retrieval is active. Azure OpenAI environment variables are available if Azure is selected."
       : "Local retrieval is active.";
+  } else if (isLocalModel) {
+    $("#llmStatus").textContent =
+      "Use a loopback OpenAI-compatible endpoint, for example Ollama at http://127.0.0.1:11434/v1 or LM Studio at http://127.0.0.1:1234/v1.";
   } else {
     $("#llmStatus").textContent =
       "The key is kept in browser memory only and sent to localhost for each Ask request.";
   }
-  const uiConfigured = Boolean(
-    $("#llmApiKey").value.trim()
-    && $("#llmEndpoint").value.trim()
-    && $("#llmDeployment").value.trim()
-  );
-  const configured = !isLocal && (
-    uiConfigured
-    || (provider === "azure" && Boolean(state.config?.llm_environment?.azure_configured))
-  );
+  const configured = llmConfigured();
   $("#searchLiterature").disabled = !configured;
   $("#literatureStatus").textContent = configured
     ? "Ready to search explicitly licensed open-access Crossref records."
-    : "Configure an API provider and key to enable this search.";
+    : "Configure a cloud API or local model server to enable this search.";
 }
 
 function renderTuningFiles() {
@@ -1527,16 +1736,18 @@ function parseQaInternalStandards() {
       if (index === 0 && fields.some((item) => item.toLowerCase() === "m/z" || item.toLowerCase() === "mz")) return null;
       const hasAdduct = fields.length >= 6;
       const offset = hasAdduct ? 1 : 0;
+      const rtText = fields[2 + offset] || "";
       return {
         name: fields[0] || `Internal standard ${index + 1}`,
         adduct: hasAdduct ? fields[1] : "",
         mz: Number(fields[1 + offset]),
-        rt: Number(fields[2 + offset]),
+        rt: rtText === "" ? null : Number(rtText),
         mz_tolerance: Number(fields[3 + offset] || 0.01),
         rt_tolerance: Number(fields[4 + offset] || 0.5),
       };
     })
-    .filter((item) => item && Number.isFinite(item.mz) && item.mz > 0 && Number.isFinite(item.rt) && item.rt >= 0);
+    .filter((item) => item && Number.isFinite(item.mz) && item.mz > 0
+      && (item.rt === null || (Number.isFinite(item.rt) && item.rt >= 0)));
 }
 
 function parsePublicationLibraryProvenance() {
@@ -2487,6 +2698,202 @@ $("#importAnalysisCsv").addEventListener("click", () => runUiAction(async () => 
   ], result.rejected?.length ? "warning" : "info");
   refreshQuestion();
 }));
+$("#inspectRepositoryMetadata").addEventListener("click", () => runUiAction(async () => {
+  const button = $("#inspectRepositoryMetadata");
+  const originalLabel = button.textContent;
+  const accession = $("#repositoryAccession").value.trim();
+  if (!accession) throw new Error("Enter a repository accession before inspecting metadata.");
+  button.disabled = true;
+  button.textContent = "Inspecting metadata...";
+  $("#repositoryMetadataSummary").hidden = false;
+  $("#repositoryMetadataSummary").textContent =
+    "Reading the public repository API directly. No LLM or API key is used.";
+  setStatus(`Inspecting public repository metadata for ${accession}...`);
+  try {
+    const result = await api("/api/repository/metadata/inspect", {
+      method: "POST",
+      body: JSON.stringify({
+        repository: $("#repositoryName").value,
+        accession,
+      }),
+    });
+    state.repositoryProject = result.project;
+    state.repositoryRunManifest = "";
+    state.repositoryMetadata = result.workspace;
+    renderRepositoryMetadata();
+    applyRepositoryProjectDefaults();
+    setStatus(`Inspected repository metadata for ${result.workspace.accession}.`);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }
+}));
+$("#loadRepositoryMetadata").addEventListener("click", () => runUiAction(async () => {
+  const picked = await api("/api/dialog/reference-file", {
+    method: "POST",
+    body: JSON.stringify({ kind: "repository-metadata" }),
+  });
+  if (!picked.path) return;
+  const result = await api("/api/repository/metadata/load", {
+    method: "POST",
+    body: JSON.stringify({ path: picked.path }),
+  });
+  state.repositoryMetadata = result.workspace;
+  state.repositoryProject = null;
+  $("#repositoryAccession").value = result.workspace.accession || "";
+  renderRepositoryMetadata();
+  setStatus(`Loaded repository metadata: ${picked.path}`);
+}));
+$("#previewRepositoryClasses").addEventListener("click", () => runUiAction(async () => {
+  await projectRepositoryMetadata(false);
+  setStatus("Updated the repository Class preview.");
+}));
+$("#applyRepositoryClasses").addEventListener("click", () => runUiAction(async () => {
+  const result = await projectRepositoryMetadata(true);
+  setStatus(`Applied repository metadata to ${result.application?.matched_count || 0} analysis file(s).`);
+}));
+$("#applyDownloadedRepositoryMetadata").addEventListener("click", () => runUiAction(async () => {
+  const result = await projectRepositoryMetadata(true);
+  setStatus(`Applied repository metadata to ${result.application?.matched_count || 0} downloaded analysis file(s).`);
+}));
+$("#saveRepositoryMetadata").addEventListener("click", () => runUiAction(async () => {
+  await projectRepositoryMetadata(false);
+  if (!$("#outputRoot").value.trim()) setOutputRootFromFirstFile();
+  const destination = $("#outputRoot").value.trim();
+  if (!destination) throw new Error("Set Output root before saving reviewed repository metadata.");
+  const result = await api("/api/repository/metadata/save", {
+    method: "POST",
+    body: JSON.stringify({
+      workspace: state.repositoryMetadata,
+      destination,
+      analysis_files: state.files,
+    }),
+  });
+  const paths = Object.values(result.files || {});
+  setStatus(`Saved reviewed repository metadata: ${paths.join(" | ")}`);
+}));
+$("#chooseRepositoryWorkspace").addEventListener("click", () => runUiAction(async () => {
+  const picked = await api("/api/dialog/directory", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  if (picked.path) $("#repositoryWorkspaceRoot").value = picked.path;
+}));
+$("#downloadRepositoryRaw").addEventListener("click", () => runUiAction(async () => {
+  if (!state.repositoryProject) throw new Error("Inspect repository metadata before downloading raw data.");
+  const workspaceRoot = $("#repositoryWorkspaceRoot").value.trim();
+  if (!workspaceRoot) throw new Error("Set a repository workspace root.");
+  if (state.files.length && !window.confirm(
+    `The recognized repository data will replace the current ${state.files.length} analysis file(s). Continue?`
+  )) return;
+  state.repositoryRawRetentionPolicy = $("#repositoryRawRetention").value;
+  const response = await api("/api/repository/download", {
+    method: "POST",
+    body: JSON.stringify({
+      project: state.repositoryProject,
+      workspace_root: workspaceRoot,
+      maximum_gb: Number($("#repositoryMaximumGb").value || 20),
+      allow_preflight: $("#repositoryDownloadEligibility").value === "allow_preflight",
+      raw_retention_policy: state.repositoryRawRetentionPolicy,
+    }),
+  });
+  state.repositoryDownloadJobId = response.job_id;
+  $("#repositoryDownloadLog").textContent = "Repository download queued.";
+  $("#repositoryDownloadProgress").value = 0;
+  $("#repositoryDownloadProgressText").textContent = "0%";
+  $("#downloadRepositoryRaw").disabled = true;
+  setStatus("Downloading and recognizing repository raw data...");
+  pollRepositoryDownload();
+}));
+
+async function pollRepositoryDownload() {
+  if (!state.repositoryDownloadJobId) return;
+  try {
+    const job = await api(`/api/jobs/${state.repositoryDownloadJobId}?detail=full`);
+    $("#repositoryDownloadLog").textContent = (job.logs || []).join("\n") || job.status;
+    const progress = Number(job.progress || 0);
+    $("#repositoryDownloadProgress").value = progress;
+    const transfer = job.total
+      ? `${formatBytes(job.received)} / ${formatBytes(job.total)}`
+      : formatBytes(job.received);
+    const speed = job.speed_bps ? `${formatBytes(job.speed_bps)}/s` : "measuring speed";
+    const eta = job.eta_seconds !== null && job.eta_seconds !== undefined
+      ? `ETA ${formatDuration(job.eta_seconds)}`
+      : "ETA unavailable";
+    $("#repositoryDownloadProgressText").textContent =
+      `${progress.toFixed(1)}% | ${transfer} | ${speed} | ${eta}`;
+    if (["queued", "running"].includes(job.status)) {
+      setTimeout(pollRepositoryDownload, 1500);
+      return;
+    }
+    $("#downloadRepositoryRaw").disabled = false;
+    if (job.status !== "completed") throw new Error(job.error || "Repository download failed.");
+    const result = job.result || {};
+    const recognized = result.recognized || {};
+    state.files = recognized.files || [];
+    state.analysisCsvSource = "";
+    state.repositoryRunManifest = result.manifest_path || "";
+    state.repositoryRawRetentionPolicy = result.raw_retention_policy || "keep";
+    $("#repositoryRawRetention").value = state.repositoryRawRetentionPolicy;
+    $("#outputRoot").value = result.output_directory || "";
+    state.outputRootAutomatic = false;
+    renderFiles();
+    let metadataApplyWarning = "";
+    if ($("#repositoryAutoApplyMetadata").checked) {
+      try {
+        await projectRepositoryMetadata(true);
+      } catch (metadataError) {
+        metadataApplyWarning = `Automatic metadata application was unavailable: ${metadataError.message || metadataError}`;
+      }
+    }
+    applyFormatStartingValues();
+    showImportMessages([
+      `Recognized ${state.files.length} repository analysis file(s).`,
+      `Run manifest: ${state.repositoryRunManifest}`,
+      metadataApplyWarning,
+      ...(recognized.warnings || []),
+      ...(recognized.rejected || []).map((path) => `Skipped: ${path}`),
+    ], recognized.rejected?.length ? "warning" : "info");
+    setStatus(`Repository raw data ready: ${state.files.length} analysis file(s).`);
+    if (llmConfigured() && repositoryInternalStandardEvidence().length) {
+      try {
+        await draftRepositoryQaTargets(true);
+      } catch (llmError) {
+        renderRepositoryQaMetadata(`Automatic QA target drafting was unavailable: ${llmError.message || llmError}`);
+      }
+    }
+    refreshQuestion();
+  } catch (error) {
+    $("#downloadRepositoryRaw").disabled = false;
+    $("#repositoryDownloadLog").textContent += `\n${error.message || error}`;
+    setStatus(error.message || String(error));
+  }
+}
+
+async function draftRepositoryQaTargets(automatic = false) {
+  if (!state.repositoryMetadata) throw new Error("Inspect repository metadata first.");
+  if (!llmConfigured()) {
+    throw new Error("Configure a cloud API or local model server in LLM & agent settings first.");
+  }
+  renderRepositoryQaMetadata("Drafting m/z candidates with the configured LLM...");
+  const result = await api("/api/repository/qa-targets", {
+    method: "POST",
+    body: JSON.stringify({
+      workspace: state.repositoryMetadata,
+      workflow: workflow(),
+      llm: llmConfig(),
+    }),
+  });
+  const existing = $("#qaInternalStandards").value.split(/\r?\n/).filter(Boolean);
+  const merged = [...new Set([...existing, ...(result.lines || [])])];
+  $("#qaInternalStandards").value = merged.join("\n");
+  const warning = (result.warnings || []).join(" ");
+  renderRepositoryQaMetadata(
+    `${result.candidates?.length || 0} reviewable QA target(s) added${automatic ? " automatically" : ""}. ${warning}`.trim()
+  );
+  setStatus(`Added ${result.candidates?.length || 0} repository-derived QA target draft(s); review before QA.`);
+  return result;
+}
 $("#addPath").addEventListener("click", () => runUiAction(async () => {
   if ($("#serverPath").value.trim()) await addServerPaths([$("#serverPath").value.trim()]);
 }));
@@ -2950,6 +3357,9 @@ $("#loadQaInternalStandardExample").addEventListener("click", () => {
   ].join("\n");
   setStatus("Loaded the FA 16:0 / FA 18:0 pseudo internal-standard example.");
 });
+$("#draftRepositoryQaTargets").addEventListener("click", () =>
+  runUiAction(async () => draftRepositoryQaTargets(false))
+);
 $("#generateQaReport").addEventListener("click", () => runUiAction(async () => {
   const filePath = $("#qaFilePath").value.trim();
   const runDirectory = $("#outputRoot").value.trim();

@@ -98,6 +98,25 @@ class QualityAssuranceTests(unittest.TestCase):
             self.assertIsNone(report["summary"]["median_msms_acquisition_rate"])
             self.assertIsNone(report["samples"][0]["msms_acquisition_rate"])
 
+    def test_internal_standard_can_match_by_mz_without_rt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            qa = Path(temporary) / "mz-only.qa.tsv"
+            qa.write_text(
+                "ID\tFile\tClass\tFile type\tInjection order\tBatch ID\tHeight\tRT\tMZ\tSN\tMSMS\tReference matched\n"
+                "1\tsample\tCase\tSample\t1\t1\t100\t15\t101.000\t10\tTRUE\tTRUE\n"
+                "2\tsample\tCase\tSample\t1\t1\t100\t5\t102.000\t10\tTRUE\tTRUE\n",
+                encoding="utf-8",
+            )
+            report = build_lcms_qa_report(
+                qa,
+                [{"name": "m/z-only IS", "mz": 101.0, "rt": None, "mz_tolerance": 0.01}],
+            )
+            standard = report["internal_standards"][0]
+            self.assertEqual("matched", standard["status"])
+            self.assertEqual("1", standard["alignment_id"])
+            self.assertIsNone(standard["rt"])
+            self.assertIsNone(standard["values"][0]["rt_delta"])
+
 
 if __name__ == "__main__":
     unittest.main()
