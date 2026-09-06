@@ -28,6 +28,7 @@ from msdial_app.repository_reanalysis import (
     discard_download_lease,
     evaluate_eligibility,
     finalize_download_lease,
+    request_download_cleanup,
 )
 
 
@@ -324,6 +325,118 @@ class RepositoryReanalysisTests(unittest.TestCase):
             with zipfile.ZipFile(archive) as handle:
                 self.assertIn("result.arf2", handle.namelist())
             self.assertTrue(result["retained_artifact_inventory"])
+
+    def _validated_unit(self, root: Path) -> tuple[Path, Path]:
+        """A unit whose run finished and validated, standing at the retention decision."""
+        raw = root / "raw"
+        output = root / "output"
+        provenance = root / "provenance"
+        for directory in (raw, output, provenance):
+            directory.mkdir(parents=True)
+        (raw / "sample.lcd").write_bytes(b"x" * 2048)
+        (output / "result.mzTab").write_text(
+            "MTD\tmzTab-version\t2.0.0-M\nSMH\tSML_ID\nSML\t1\n", encoding="ascii"
+        )
+        (output / "sample.mdpeak").write_text("Peak ID\n", encoding="ascii")
+        manifest = provenance / "run-manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "status": "prepared",
+                    "workspace": str(root),
+                    "raw_directory": str(raw),
+                    "output_directory": str(output),
+                    "raw_retention_policy": "delete_after_validated_output",
+                    "cleanup_allowed": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        finalize_download_lease(manifest)
+        return manifest, raw
+
+    def test_requesting_cleanup_deletes_nothing_and_states_what_it_would_remove(self) -> None:
+        # The retention policy chosen at download time records a wish. It is not an approval to delete,
+        # and a background job holds none of what an informed approval needs.
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, raw = self._validated_unit(Path(temporary) / "repo" / "X5")
+
+            pending = request_download_cleanup(manifest)
+
+            self.assertFalse(pending["deleted"])
+            self.assertTrue(pending["confirmation_required"])
+            self.assertTrue(raw.is_dir(), "the raw tree must survive a mere request")
+            self.assertEqual(
+                "cleanup_pending_confirmation",
+                json.loads(manifest.read_text(encoding="utf-8"))["status"],
+            )
+            # The three things a person needs in front of them before answering.
+            self.assertEqual(str(raw.resolve()), pending["deletion_target"])
+            self.assertEqual(1, pending["deletion_file_count"])
+            self.assertEqual(2048, pending["deletion_bytes"])
+            self.assertGreater(pending["retained_artifact_count"], 0)
+            self.assertTrue(pending["ready_for_confirmation"])
+            self.assertEqual([], pending["blockers"])
+
+    def test_an_unconfirmed_cleanup_carries_the_same_inventory(self) -> None:
+        # The preview used to return only a flag, so a caller had nothing to show. A confirmation given
+        # without the target, the size and the retained artifacts is not an informed one.
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, raw = self._validated_unit(Path(temporary) / "repo" / "X6")
+
+            preview = cleanup_download_lease(manifest, confirmed=False)
+
+            self.assertFalse(preview["deleted"])
+            self.assertTrue(raw.is_dir())
+            self.assertEqual(str(raw.resolve()), preview["deletion_target"])
+            self.assertEqual(2048, preview["deletion_bytes"])
+            self.assertTrue(preview["retained_artifact_inventory"])
+
+    def test_a_confirmed_cleanup_still_proceeds_after_a_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, raw = self._validated_unit(Path(temporary) / "repo" / "X7")
+            request_download_cleanup(manifest)
+
+            result = cleanup_download_lease(manifest, confirmed=True)
+
+            self.assertTrue(result["deleted"])
+            self.assertFalse(raw.exists())
+            self.assertEqual(
+                "raw_cleaned", json.loads(manifest.read_text(encoding="utf-8"))["status"]
+            )
+
+    def test_a_request_on_an_unvalidated_run_reports_blockers_and_stays_put(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo" / "X8"
+            raw = root / "raw"
+            provenance = root / "provenance"
+            raw.mkdir(parents=True)
+            provenance.mkdir()
+            (raw / "sample.lcd").write_bytes(b"x")
+            manifest = provenance / "run-manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "status": "prepared",
+                        "workspace": str(root),
+                        "raw_directory": str(raw),
+                        "output_directory": str(root / "output"),
+                        "cleanup_allowed": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            pending = request_download_cleanup(manifest)
+
+            self.assertFalse(pending["ready_for_confirmation"])
+            self.assertTrue(pending["blockers"])
+            self.assertEqual(
+                "prepared",
+                json.loads(manifest.read_text(encoding="utf-8"))["status"],
+                "an unvalidated run must not be advanced to pending confirmation",
+            )
+            self.assertTrue(raw.is_dir())
 
     def test_raw_metadata_summary_maps_normalized_contract(self) -> None:
         records = [

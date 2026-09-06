@@ -51,7 +51,7 @@ from .repository_qa import propose_repository_qa_targets
 from .repository_reanalysis import (
     ADAPTERS,
     EligibilityPolicy,
-    cleanup_download_lease,
+    request_download_cleanup,
     create_download_lease,
     evaluate_eligibility,
     finalize_download_lease,
@@ -1635,11 +1635,22 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
                             "cleanup": None,
                         }
                         if retention == "delete_after_validated_output":
-                            cleanup = cleanup_download_lease(
-                                Path(manifest_text), confirmed=True
+                            # The retention policy records a wish, not an approval. Deleting the raw data
+                            # is the only irreversible operation in this pipeline, and the confirmation
+                            # for it belongs to a person who has seen the retained artifacts, the target
+                            # paths and the size that would be freed. A background job supplies none of
+                            # those, so it records the request and stops. The server must never generate
+                            # confirmed=True on the user's behalf.
+                            pending = request_download_cleanup(Path(manifest_text))
+                            repository_retention["cleanup"] = pending
+                            log(
+                                "Validated output retained. Raw-data deletion was REQUESTED by the "
+                                "retention policy and NOT performed; it needs a separate confirmation. "
+                                f"{pending['deletion_file_count']} files, "
+                                f"{pending['deletion_bytes'] / 1e9:.2f} GB under "
+                                f"{pending['deletion_target']} would be removed, and "
+                                f"{pending['retained_artifact_count']} artifacts would be retained."
                             )
-                            repository_retention["cleanup"] = cleanup
-                            log("Validated output retained; downloaded repository raw data were deleted.")
                         else:
                             log("Validated output retained; downloaded repository raw data were kept.")
                     else:
