@@ -1269,11 +1269,24 @@ def msdial_prepare_repository_reanalysis(
     )
     from .repository_qa import repository_internal_standard_evidence
 
+    # Preparing the analysis CSV is allowed for an ineligible unit -- reviewing its metadata is part of
+    # how a unit becomes eligible. Running MS-DIAL is not, and that refusal happens at the run endpoint.
+    # Stating the verdict here means a caller finds out before it plans a run, not after it starts one.
+    execution_allowed = manifest.get("execution_allowed") is True
+    execution_blockers: list[str] = []
+    if not execution_allowed:
+        execution_blockers.append(
+            "execution_allowed is not true for this analysis unit "
+            f"(status {manifest.get('status', 'unknown')!r}). MS-DIAL will refuse to start until a "
+            "raw-header preflight settles the unit's technical conditions."
+        )
     preview = {
         "download_job_id": download_job_id,
         "manifest_path": manifest["manifest_path"],
         "analysis_input_path": manifest.get("analysis_input_path"),
         "output_root": output_root,
+        "execution_allowed": execution_allowed,
+        "execution_blockers": execution_blockers,
         "class_hierarchy": selected_hierarchy,
         "matched_count": application["matched_count"],
         "recognized_count": len(recognized),
