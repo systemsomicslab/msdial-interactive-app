@@ -32,6 +32,7 @@ SUPPORTED_ANSWER_KEYS = {
     "rt_correction_selection_path", "rt_correction_peak_selection_mode",
     "rt_correction_peak_selection_rt_weight", "library_strategy", "libraries",
     "library_provenance", "run_qa", "internal_standards",
+    "use_retention_time_for_annotation", "retention_time_tolerance", "number_of_threads",
     "generate_materials_methods", "alignment_light_mode", "output_root",
     "export_folder_path", "height_matrix_export", "console_path", "template_path",
     "queries_path", "project_store", "workflow_overrides", "repository_metadata_path",
@@ -157,7 +158,10 @@ def build_guided_plan(
             "Peak-count tuning requires a diagnostic run and an accepted minimum_peak_height."
         )
 
-    workflow = _workflow(inspection, merged) if not questions else None
+    # An unanswered advisory question leaves a conservative default in place, so the
+    # workflow can still be built and shown; only a required one makes it unknowable.
+    pending_required = [item for item in questions if item.get("required", True)]
+    workflow = _workflow(inspection, merged) if not pending_required else None
     validation: list[dict[str, str]] = []
     if workflow is not None:
         validation = validate_workflow(workflow)
@@ -169,8 +173,11 @@ def build_guided_plan(
         "input": inspection,
         "workset": workset,
         "answers": merged,
+        # The first question still to be answered, required or not, so an agent works
+        # through them all; readiness below turns only on the required ones.
         "next_question": questions[0] if questions else None,
         "remaining_questions": questions,
+        "advisory_questions": [item for item in questions if not item.get("required", True)],
         "workflow": workflow,
         "validation": validation,
         "warnings": [
@@ -180,7 +187,7 @@ def build_guided_plan(
         "unknown_answer_keys": unknown_answer_keys,
         "blockers": list(dict.fromkeys(blockers)),
         "official_library": official_library,
-        "ready_to_prepare": not questions and not blockers,
+        "ready_to_prepare": not pending_required and not blockers,
         "requires_diagnostic": tuning_strategy and not _has_minimum_peak_height(merged),
         "post_run_actions": {
             "quality_assurance": _as_bool(merged.get("run_qa")),
@@ -336,13 +343,21 @@ def _is_blank_file(item: dict[str, Any]) -> bool:
 def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
 
-    def ask(identifier: str, prompt: str, choices: list[str] | None = None) -> None:
+    def ask(
+        identifier: str,
+        prompt: str,
+        choices: list[str] | None = None,
+        required: bool = True,
+    ) -> None:
+        # A question is required when proceeding without it would mean guessing. Where a
+        # conservative default exists and is the honest one, the question is still put --
+        # it is the analyst's to answer -- but it does not hold the plan hostage.
         result.append(
             {
                 "id": identifier,
                 "prompt": prompt,
                 "choices": choices or [],
-                "required": True,
+                "required": required,
                 "presentation": "neutral",
             }
         )
@@ -402,6 +417,38 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
         ask(
             "libraries",
             "Provide one msp_paths entry for the high- and low-quality MSP tiers. The official LBM library is used as tier 1.",
+        )
+    # Once a library is settled, how its retention times should be used is the next
+    # decision, and it belongs to the analyst: a library built for this chromatography
+    # is normally scored and filtered on retention time, one built elsewhere must not be,
+    # and no property of the file says which this is.
+    strategy = str(answers.get("library_strategy") or "")
+    library_chosen = strategy in {"official", "existing", "tiered_lipid_msp"} and (
+        strategy != "existing" or _has_existing_library(answers)
+    )
+    if library_chosen and "use_retention_time_for_annotation" not in answers:
+        ask(
+            "use_retention_time_for_annotation",
+            "Does this library carry retention times for this chromatography, so that "
+            "annotation should be scored and filtered on them?",
+            ["true", "false"],
+            required=False,
+        )
+    if (
+        library_chosen
+        and _as_bool(answers.get("use_retention_time_for_annotation"))
+        and answers.get("retention_time_tolerance") is None
+    ):
+        ask(
+            "retention_time_tolerance",
+            "Within how many minutes of the library retention time should a match be accepted?",
+            required=False,
+        )
+    if "number_of_threads" not in answers:
+        ask(
+            "number_of_threads",
+            "How many threads should MS-DIAL use on this machine?",
+            required=False,
         )
     if project_type == "lcms" and "run_qa" not in answers:
         ask("run_qa", "Generate the LC-MS quality-assurance report after analysis?", ["true", "false"])
@@ -485,6 +532,9 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
         for item in state["files"]:
             item["acquisition_type"] = acquisition_type
     _apply_libraries(state, loaded, answers)
+    _apply_retention_time_use(state, answers)
+    if answers.get("number_of_threads") is not None:
+        state["number_of_threads"] = max(1, int(answers["number_of_threads"]))
     if project_type == "lcms":
         ion_mode = str(state["ion_mode"])
         state["selected_adducts"] = [
@@ -533,6 +583,29 @@ def _existing_path(configured: Any, fallback: Path) -> Path:
         if candidate.is_file():
             return candidate.resolve()
     return fallback.resolve()
+
+
+def _apply_retention_time_use(state: dict[str, Any], answers: dict[str, Any]) -> None:
+    """Apply the analyst's decision about retention time to every library in use.
+
+    Whether retention time helps or hurts annotation is a property of the library and
+    the chromatography it was built for, not of the file format, so it is asked once
+    and then applies to whichever library kinds this run actually uses.
+    """
+    if answers.get("use_retention_time_for_annotation") is None:
+        return
+    use_rt = _as_bool(answers.get("use_retention_time_for_annotation"))
+    for kind in ("lbm", "msp", "text"):
+        state[f"{kind}_use_rt_scoring"] = use_rt
+        state[f"{kind}_use_rt_filtering"] = use_rt
+    tolerance = answers.get("retention_time_tolerance")
+    if not use_rt or tolerance is None:
+        return
+    value = float(tolerance)
+    if value <= 0:
+        return
+    for kind in ("lbm", "msp", "text"):
+        state[f"{kind}_rt_tolerance"] = value
 
 
 def _apply_libraries(
