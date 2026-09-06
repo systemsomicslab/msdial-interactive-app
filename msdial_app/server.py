@@ -142,6 +142,21 @@ def _classify_artifact(path: Path) -> str:
     return "other"
 
 
+def _verify_expected_exports(preparation: dict[str, Any]) -> dict[str, Any]:
+    """Compare the analysis exports the run planned against the ones on disk.
+
+    Returns the counts and the missing paths rather than raising, so the caller decides what a
+    shortfall means and the numbers can be recorded either way.
+    """
+    expected = [str(item) for item in preparation.get("expected_analysis_exports") or []]
+    missing = [item for item in expected if not Path(item).is_file()]
+    return {
+        "expected": len(expected),
+        "produced": len(expected) - len(missing),
+        "missing": missing,
+    }
+
+
 def _repository_workspace(state: dict[str, Any]) -> str:
     """The analysis-unit workspace a repository workflow belongs to, or "" for a local analysis.
 
@@ -1682,6 +1697,24 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
             baseline = dict(JOBS[job_id].get("artifact_baseline") or {})
         artifacts = _changed_run_artifacts(preparation, baseline)
         artifact_warnings: list[str] = []
+        # The exit code says the Console returned; it does not say the Console produced the study.
+        # MS-DIAL exits 0 having skipped an input it could not read -- a corrupt vendor file, a
+        # missing vendor dependency -- and expected_analysis_exports was computed for every run and
+        # read by nothing, so thirty inputs could become eighteen outputs with no stage anywhere
+        # holding the invariant that the published matrix has as many samples as were approved. The
+        # tuning job has made exactly this check on its own single expected file all along.
+        export_verification = _verify_expected_exports(preparation)
+        if exit_code == 0 and export_verification["missing"]:
+            missing = export_verification["missing"]
+            raise RuntimeError(
+                f"MS-DIAL returned success but produced {export_verification['produced']} of "
+                f"{export_verification['expected']} expected analysis exports. Missing: "
+                + ", ".join(missing[:5])
+                + (f", and {len(missing) - 5} more" if len(missing) > 5 else "")
+                + ". A published result from this run would describe more samples than it contains. "
+                "Check whether the selected Console build can read every input's raw-data format and "
+                "whether its vendor dependencies are installed."
+            )
         if exit_code == 0 and preparation.get("qa_matrix_expected") and not artifacts["qa"]:
             warning = (
                 "LC-MS QA matrix export was requested, but this job did not create or update "
@@ -1770,6 +1803,9 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
             JOBS[job_id]["datamining_handoff"] = handoff
             JOBS[job_id]["artifacts"] = artifacts
             JOBS[job_id]["warnings"] = artifact_warnings
+            # Recorded whether or not it held, so a reader can see the produced-versus-expected count
+            # rather than inferring it from the absence of a failure.
+            JOBS[job_id]["expected_export_verification"] = export_verification
             JOBS[job_id]["repository_retention"] = repository_retention
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             if exit_code == 0:

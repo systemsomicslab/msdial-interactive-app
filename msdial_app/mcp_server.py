@@ -43,6 +43,35 @@ def _base_url(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> str:
     return f"http://{host}:{int(port)}"
 
 
+class MsdialRequestError(RuntimeError):
+    """A backend call that failed, carrying what the backend said about it.
+
+    The backend already answers a rejected call with a specific, actionable sentence -- "Complete the
+    guided questions and choose target_peak_count before diagnostic tuning", for one. That sentence
+    used to be folded into a formatted string and then dropped at the MCP boundary, so a caller saw
+    only "Error executing tool msdial_start_peak_count_diagnostic" with no reason at all. An agent
+    cannot correct what it cannot read, and every other guard in this server degrades to halting
+    without a reason while this one is missing.
+    """
+
+    def __init__(
+        self, detail: str, *, status: int | None = None, endpoint: str = "", trace: str = ""
+    ) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.status = status
+        self.endpoint = endpoint
+        self.trace = trace
+
+    @property
+    def reason(self) -> str:
+        if self.status is None:
+            return "backend_unavailable"
+        if 400 <= self.status < 500:
+            return "validation_error"
+        return "server_error"
+
+
 def _request_json(
     method: str,
     path: str,
@@ -63,10 +92,25 @@ def _request_json(
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"{method} {url} failed with HTTP {error.code}: {detail}") from error
+        raw = error.read().decode("utf-8", errors="replace")
+        detail, trace = raw, ""
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            # The backend answers a rejected call with {"error": ..., "trace": ...}, and the error is
+            # the sentence a caller can act on. Folding it into a formatted string is what lost it.
+            detail = str(payload.get("error") or payload.get("detail") or raw).strip() or raw
+            trace = str(payload.get("trace") or "")
+        raise MsdialRequestError(
+            detail, status=error.code, endpoint=f"{method} {path}", trace=trace
+        ) from error
     except urllib.error.URLError as error:
-        raise RuntimeError(f"Could not connect to MS-DIAL Interactive at {url}: {error.reason}") from error
+        raise MsdialRequestError(
+            f"Could not connect to MS-DIAL Interactive at {url}: {error.reason}",
+            endpoint=f"{method} {path}",
+        ) from error
 
 
 def _status_or_error(
@@ -142,10 +186,30 @@ def _validated_workspace_root(value: str) -> str:
 
 
 def _structured_validation_errors(function):
+    """Return a failure a caller can act on instead of raising past the MCP boundary.
+
+    A raised exception reaches the client as "Error executing tool <name>" with the message gone, so
+    an unattended caller learns only that something stopped. Every tool that talks to the backend is
+    wrapped, not just the two that were, because the reason is equally unreachable from all of them.
+    """
+
     @wraps(function)
     def wrapped(*args, **kwargs):
         try:
             return function(*args, **kwargs)
+        except MsdialRequestError as error:
+            failure = {
+                "ok": False,
+                "reason": error.reason,
+                "detail": error.detail,
+                "error_type": type(error).__name__,
+                "endpoint": error.endpoint,
+            }
+            if error.status is not None:
+                failure["http_status"] = error.status
+            if error.trace:
+                failure["trace"] = error.trace
+            return failure
         except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
             return {
                 "ok": False,
@@ -650,6 +714,7 @@ def _local_listener(host: str, port: int) -> dict[str, Any]:
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_interactive_status(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
@@ -663,6 +728,7 @@ def msdial_interactive_status(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_check_console_path(
     search_roots: list[str] | None = None,
     host: str = DEFAULT_HOST,
@@ -680,6 +746,7 @@ def msdial_check_console_path(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_set_console_path(
     console_path: str,
     host: str = DEFAULT_HOST,
@@ -697,6 +764,7 @@ def msdial_set_console_path(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_check_official_console_releases(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
@@ -713,6 +781,7 @@ def msdial_check_official_console_releases(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_check_local_console_source(
     source_root: str,
     host: str = DEFAULT_HOST,
@@ -730,6 +799,7 @@ def msdial_check_local_console_source(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_build_console_from_local_source(
     source_root: str,
     framework: str = "net48",
@@ -756,6 +826,7 @@ def msdial_build_console_from_local_source(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_interactive_launch(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
@@ -771,6 +842,7 @@ def msdial_interactive_launch(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_interactive_restart(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
@@ -818,6 +890,7 @@ def msdial_interactive_restart(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_interactive_open(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> dict[str, Any]:
     """Open the MS-DIAL Interactive web UI in the user's browser."""
     url = _base_url(host, port)
@@ -826,6 +899,7 @@ def msdial_interactive_open(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) 
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_guided_analysis_plan(
     input_path: str,
     answers: dict[str, Any] | None = None,
@@ -849,6 +923,7 @@ def msdial_guided_analysis_plan(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_inspect_repository_metadata(
     repository: str,
     accession: str,
@@ -867,6 +942,7 @@ def msdial_inspect_repository_metadata(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_project_repository_classes(
     workspace: dict[str, Any],
     hierarchy: list[str],
@@ -894,6 +970,7 @@ def msdial_project_repository_classes(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_save_repository_metadata(
     workspace: dict[str, Any],
     destination: str,
@@ -988,6 +1065,7 @@ def msdial_repository_reanalysis_plan(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_download_repository_raw(
     repository: str,
     accession: str,
@@ -1165,6 +1243,7 @@ def msdial_repository_batch_plan(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_repository_raw_metadata_preflight(
     download_job_id: str,
     extractor_path: str = "",
@@ -1209,6 +1288,7 @@ def msdial_repository_raw_metadata_preflight(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_cleanup_repository_raw(
     download_job_id: str = "",
     manifest_path: str = "",
@@ -1246,6 +1326,7 @@ def msdial_cleanup_repository_raw(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_prepare_repository_reanalysis(
     download_job_id: str,
     hierarchy: list[str] | None = None,
@@ -1359,6 +1440,7 @@ def msdial_prepare_repository_reanalysis(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_repository_qa_evidence(
     download_job_id: str,
     host: str = DEFAULT_HOST,
@@ -1388,6 +1470,7 @@ def msdial_repository_qa_evidence(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_list_worksets(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
@@ -1397,6 +1480,7 @@ def msdial_list_worksets(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_save_workset(
     name: str,
     answers: dict[str, Any],
@@ -1421,6 +1505,7 @@ def msdial_save_workset(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_download_official_library(
     catalog_id: str,
     confirmed: bool = False,
@@ -1455,6 +1540,7 @@ def msdial_download_official_library(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_prepare_guided_analysis(
     input_path: str,
     answers: dict[str, Any],
@@ -1474,6 +1560,7 @@ def msdial_prepare_guided_analysis(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_start_guided_analysis(
     input_path: str,
     answers: dict[str, Any],
@@ -1499,6 +1586,7 @@ def msdial_start_guided_analysis(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_start_peak_count_diagnostic(
     input_path: str,
     answers: dict[str, Any],
@@ -1526,6 +1614,7 @@ def msdial_start_peak_count_diagnostic(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_estimate_peak_height(
     job_id: str,
     target_peak_count: int = 0,
@@ -1553,6 +1642,7 @@ def msdial_estimate_peak_height(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_interactive_job(
     job_id: str,
     detail: bool = False,
@@ -1568,6 +1658,7 @@ def msdial_interactive_job(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_interactive_wait_for_completion(
     job_id: str,
     host: str = DEFAULT_HOST,
@@ -1587,6 +1678,7 @@ def msdial_interactive_wait_for_completion(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_interactive_create_handoff(
     job_id: str = "",
     run_directory: str = "",
@@ -1606,6 +1698,7 @@ def msdial_interactive_create_handoff(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_interactive_validate_mztab(
     job_id: str = "",
     run_directory: str = "",
@@ -1625,6 +1718,7 @@ def msdial_interactive_validate_mztab(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_interactive_preview_mztab(
     job_id: str = "",
     run_directory: str = "",
@@ -1644,6 +1738,7 @@ def msdial_interactive_preview_mztab(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_generate_lcms_qa(
     job_id: str,
     internal_standards: list[dict[str, Any]] | None = None,
@@ -1667,6 +1762,7 @@ def msdial_generate_lcms_qa(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_generate_publication_report(
     job_id: str,
     run_qa: bool = True,
@@ -1695,6 +1791,7 @@ def msdial_generate_publication_report(
 
 
 @mcp.tool()
+@_structured_validation_errors
 def msdial_complete_guided_analysis(
     job_id: str,
     run_qa: bool = True,
