@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .mztab_validation import validate_mztab_outputs
+from .diagnostic_paths import is_diagnostic_artifact
 
 
 HANDOFF_FILENAME = "datamining-handoff.json"
@@ -192,7 +193,9 @@ def _collect_output_files(run_directory: Path) -> dict[str, list[str]]:
         paths: list[Path] = []
         for pattern in globs:
             paths.extend(run_directory.glob(pattern))
-        collected[key] = [str(path) for path in sorted(set(paths))]
+        collected[key] = [
+            str(path) for path in sorted(set(paths)) if not is_diagnostic_artifact(path)
+        ]
     return collected
 
 
@@ -226,7 +229,9 @@ def _select_primary_mztab_file(mztab_files: list[dict[str, Any]]) -> str:
     if not mztab_files:
         return ""
     paths = [Path(item["path"]) for item in mztab_files]
-    existing = [path for path in paths if path.is_file()]
+    existing = [
+        path for path in paths if path.is_file() and not is_diagnostic_artifact(path)
+    ]
     if not existing:
         return mztab_files[0]["path"]
     return str(max(existing, key=lambda path: path.stat().st_mtime))

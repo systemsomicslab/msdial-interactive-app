@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from .diagnostic_paths import is_diagnostic_artifact
 
 
 USER_AGENT = "MS-DIAL-Interactive/0.3 public-reanalysis"
@@ -845,6 +846,8 @@ def finalize_download_lease(manifest_path: Path) -> dict[str, Any]:
         manifest["cleanup_allowed"] = True
     retained = list(mztab_files)
     for path in output.rglob("*") if output.is_dir() else []:
+        if is_diagnostic_artifact(path):
+            continue
         if path.is_file() and (
             path.suffix.casefold() in TEXT_RESULT_SUFFIXES
             or path.suffix.casefold() in {".csv", ".tsv", ".txt", ".json", ".xlsx"}
@@ -1318,7 +1321,9 @@ def _archive_project_results(output: Path) -> Path | None:
         return None
     project_files = [
         path for path in output.rglob("*")
-        if path.is_file() and path.suffix.casefold() in PROJECT_RESULT_SUFFIXES
+        if path.is_file()
+        and path.suffix.casefold() in PROJECT_RESULT_SUFFIXES
+        and not is_diagnostic_artifact(path)
     ]
     if not project_files:
         return None
