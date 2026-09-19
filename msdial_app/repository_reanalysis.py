@@ -853,6 +853,57 @@ def create_download_lease(
     return {**manifest, "manifest_path": str(manifest_path)}
 
 
+def record_run_failure(
+    manifest_path: Path,
+    reason: str,
+    exit_code: int | None = None,
+    log_tail: list[str] | None = None,
+) -> dict[str, Any]:
+    """Write a failed MS-DIAL run into the analysis unit's own manifest.
+
+    WHAT THIS ENDS. A failed run recorded its status and its diagnosed error in the in-memory JOBS
+    registry and nowhere else. The registry is persisted truncated to the hundred most recently
+    updated jobs, so at the scale this programme is for -- each accession consuming a download job,
+    a tuning job and one or more run jobs -- the record of a failure was evicted by later work, and
+    the unit's own workspace looked exactly like a unit nobody had tried.
+
+    The project contract requires "a failure record when unsuccessful" for every attempted unit. It
+    existed only as prose instructing an agent to write one, which is the defect shape this
+    programme is built against: something judged that is never connected to what actually ran.
+
+    CLEANUP STAYS FORBIDDEN. cleanup_allowed is set false explicitly rather than left alone, because
+    the raw data is what a retry needs and a failed run is exactly when someone is tempted to
+    reclaim the disk. The campaign's retention policy is now "delete after a successful run"; this
+    is the clause that keeps "successful" in it.
+
+    Never raises. A failure while recording a failure would lose both, so any problem writing the
+    manifest is returned rather than thrown -- the caller is already on its error path.
+    """
+    record = {
+        "reason": reason,
+        "exit_code": exit_code,
+        "recorded_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        # The last lines rather than the whole log: enough to tell a missing library from a crash,
+        # small enough that a manifest stays readable. The full log lives with the job while it
+        # survives.
+        "log_tail": [str(line) for line in (log_tail or [])][-40:],
+    }
+    try:
+        manifest_path = Path(manifest_path).resolve()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["status"] = "run_failed"
+        manifest["cleanup_allowed"] = False
+        failures = list(manifest.get("run_failures") or [])
+        failures.append(record)
+        # Appended, not replaced: a unit retried three times and failed three times is a different
+        # thing from a unit tried once, and the difference is what says whether to keep trying.
+        manifest["run_failures"] = failures
+        _write_json(manifest_path, manifest)
+        return {**manifest, "manifest_path": str(manifest_path)}
+    except (OSError, ValueError) as error:
+        return {"status": "run_failed", "manifest_error": str(error), "run_failure": record}
+
+
 def finalize_download_lease(manifest_path: Path) -> dict[str, Any]:
     from .mztab_validation import validate_mztab_outputs
 

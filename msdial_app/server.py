@@ -1727,6 +1727,30 @@ def _run_repository_download_job(
             _persist_jobs_locked()
 
 
+def _record_repository_run_failure(
+    preparation: dict[str, Any],
+    reason: str,
+    exit_code: int | None,
+    logs: list[str],
+) -> None:
+    """Put a failed run into the analysis unit's own manifest, if it belongs to one.
+
+    A failure used to live only in the JOBS registry, which is persisted truncated to the hundred
+    most recently updated jobs. At the scale this is for, later work evicted the record and the
+    unit's workspace looked exactly like a unit nobody had tried -- while the project contract
+    requires a failure record for every attempted unit.
+
+    A local laboratory analysis carries no manifest and gets none of this; there is no unit to
+    record against.
+    """
+    manifest_text = str(preparation.get("repository_run_manifest") or "").strip()
+    if not manifest_text:
+        return
+    from .repository_reanalysis import record_run_failure
+
+    record_run_failure(Path(manifest_text), reason, exit_code, list(logs or []))
+
+
 def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
     def log(line: str) -> None:
         with JOBS_LOCK:
@@ -1868,6 +1892,9 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
                     JOBS[job_id]["logs"],
                     f"MS-DIAL Console exited with code {exit_code}.",
                 )
+                _record_repository_run_failure(
+                    preparation, JOBS[job_id]["error"], exit_code, JOBS[job_id]["logs"]
+                )
             JOBS[job_id].pop("artifact_baseline", None)
             _persist_jobs_locked()
     except Exception as error:
@@ -1878,6 +1905,7 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = message
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _record_repository_run_failure(preparation, message, None, JOBS[job_id]["logs"])
             JOBS[job_id].pop("artifact_baseline", None)
             _persist_jobs_locked()
     finally:
