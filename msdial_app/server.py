@@ -772,8 +772,10 @@ class Handler(BaseHTTPRequestHandler):
                         "This repository project is not ready for the untargeted LC-MS/MS DDA/DIA campaign: "
                         + "; ".join(reasons or ["review repository metadata first"])
                     )
-                retention = str(body.get("raw_retention_policy") or "keep")
-                if retention not in {"keep", "delete_after_validated_output"}:
+                from .repository_reanalysis import RAW_RETENTION_POLICIES
+
+                retention = str(body.get("raw_retention_policy") or "keep").strip()
+                if retention not in RAW_RETENTION_POLICIES:
                     raise ValueError("Unknown repository raw-data retention policy.")
                 job_id = uuid.uuid4().hex
                 with JOBS_LOCK:

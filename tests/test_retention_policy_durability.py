@@ -173,5 +173,93 @@ class TheDownloadWritesThePolicyIntoTheManifest(unittest.TestCase):
         self.assertEqual("keep", manifest["raw_retention_policy"])
 
 
+class AnUnreadablePolicyIsNormalisedAndReported(unittest.TestCase):
+    """An unrecognised policy resolves towards keeping, and the caller is told.
+
+    The download endpoint validates the policy, so the governed chain cannot emit a bad one. A
+    caller that hand-writes answers["workflow_overrides"] reaches prepare_run unchecked, and the
+    comparison downstream was a bare string equality with no casefolding and no strip -- so
+    "delete", "Delete" and a trailing space were all keep-equivalent, and the run logged that the
+    data were kept without ever saying the policy had not been understood. True, and no help to
+    someone who believed they had asked for deletion.
+
+    Found by an adversarial audit of the deletion path on 2026-09-20, which also caught that this
+    project's own regression test pinned the meaningless literal "delete".
+    """
+
+    def test_the_only_value_that_is_not_keep_survives(self) -> None:
+        from msdial_app.repository_reanalysis import normalize_raw_retention_policy
+
+        policy, unrecognized = normalize_raw_retention_policy("delete_after_validated_output")
+
+        self.assertEqual("delete_after_validated_output", policy)
+        self.assertFalse(unrecognized)
+
+    def test_a_near_miss_keeps_the_data_and_says_it_was_not_understood(self) -> None:
+        from msdial_app.repository_reanalysis import normalize_raw_retention_policy
+
+        for wrong in ("delete", "Delete", "DELETE_AFTER_VALIDATED_OUTPUT",
+                      "delete_after_validated_outputs", "remove"):
+            policy, unrecognized = normalize_raw_retention_policy(wrong)
+            self.assertEqual("keep", policy, wrong)
+            self.assertTrue(unrecognized, wrong)
+
+    def test_surrounding_space_is_not_a_different_policy(self) -> None:
+        from msdial_app.repository_reanalysis import normalize_raw_retention_policy
+
+        policy, unrecognized = normalize_raw_retention_policy(" delete_after_validated_output ")
+
+        self.assertEqual("delete_after_validated_output", policy)
+        self.assertFalse(unrecognized, "a trailing space used to make this keep-equivalent")
+
+    def test_saying_nothing_is_the_default_and_is_not_an_error(self) -> None:
+        from msdial_app.repository_reanalysis import normalize_raw_retention_policy
+
+        for empty in ("", None, "   "):
+            policy, unrecognized = normalize_raw_retention_policy(empty)
+            self.assertEqual("keep", policy)
+            self.assertFalse(unrecognized, "an omission is the contract's default, not a mistake")
+
+    def test_prepare_run_warns_rather_than_swallowing_the_request(self) -> None:
+        """The warning reaches the caller before the run, not the log tail after it."""
+        from msdial_app.agent_workflow import build_guided_plan
+        from msdial_app.workflow import prepare_run
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "sample.mzML").write_text("", encoding="ascii")
+            console = root / "MSDIALCUI.exe"
+            console.write_bytes(b"not really a console binary")
+            lbm = root / "lab.lbm2"
+            lbm.write_bytes(b"laboratory library")
+            template = Path(__file__).resolve().parents[1] / "resources" / "msdial_console_param4lipidomics.txt"
+            plan = build_guided_plan(
+                str(root),
+                {
+                    "project_type": "lcms",
+                    "ion_mode": "Negative",
+                    "target_omics": "Lipidomics",
+                    "parameter_strategy": "default",
+                    "execute_rt_correction": False,
+                    "library_strategy": "existing",
+                    "libraries": {"lbm_path": str(lbm)},
+                    "run_qa": False,
+                    "generate_materials_methods": False,
+                    "console_path": str(console),
+                    "template_path": str(template),
+                    "output_root": str(root / "out"),
+                    "class_assignment_confirmed": True,
+                    "workflow_overrides": {"repository_raw_retention_policy": "delete"},
+                },
+            )
+            prepared = prepare_run(plan["workflow"])
+
+        self.assertEqual("keep", prepared["repository_raw_retention_policy"])
+        self.assertTrue(
+            any("not recognised" in item["message"] for item in prepared["warnings"]),
+            prepared["warnings"],
+        )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

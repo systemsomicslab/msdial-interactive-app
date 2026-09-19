@@ -1425,6 +1425,25 @@ def prepare_run(
         method_state,
         command,
     )
+    from .repository_reanalysis import normalize_raw_retention_policy
+
+    retention_policy, retention_unrecognized = normalize_raw_retention_policy(
+        state.get("repository_raw_retention_policy")
+    )
+    retention_warnings = (
+        [
+            {
+                "level": "warning",
+                "message": (
+                    "Repository raw-data retention policy "
+                    f"{str(state.get('repository_raw_retention_policy'))!r} was not recognised; "
+                    f"{retention_policy!r} applies instead. Downloaded raw data will be kept."
+                ),
+            }
+        ]
+        if retention_unrecognized
+        else []
+    )
     return {
         "run_directory": str(run_directory),
         "analysis_type": project_type,
@@ -1468,11 +1487,15 @@ def prepare_run(
         # remember. The state already carries them, put there by the MCP tool's workflow_overrides
         # or by the GUI's own state.
         "repository_run_manifest": str(state.get("repository_run_manifest") or ""),
-        "repository_raw_retention_policy": str(
-            state.get("repository_raw_retention_policy") or "keep"
-        ),
+        # NORMALISED, and an unreadable request is reported rather than quietly becoming "keep".
+        # The download endpoint validates this, so the governed chain cannot produce a bad value --
+        # but a caller that hand-writes answers["workflow_overrides"] reaches here unchecked, and the
+        # comparison downstream is a bare string equality with no casefolding and no strip. "delete",
+        # "Delete" and a trailing space were all keep-equivalent, and the run logged that the data
+        # were kept without ever saying the policy had not been understood.
+        "repository_raw_retention_policy": retention_policy,
         **reproduction,
-        "warnings": [issue for issue in issues if issue["level"] == "warning"],
+        "warnings": [issue for issue in issues if issue["level"] == "warning"] + retention_warnings,
     }
 
 

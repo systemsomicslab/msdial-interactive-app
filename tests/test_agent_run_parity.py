@@ -78,7 +78,10 @@ class AgentRunCarriesTheRepositoryManifest(unittest.TestCase):
         """
         overrides = {
             "repository_run_manifest": str(self.manifest),
-            "repository_raw_retention_policy": "delete",
+            # The real literal. A bare "delete" is meaningless everywhere in this codebase, so
+            # pinning it was pinning a no-op: the test had no opinion about the only value that is
+            # not keep-equivalent.
+            "repository_raw_retention_policy": "delete_after_validated_output",
         }
         plan, prepared = self._prepare(workflow_overrides=overrides)
 
@@ -88,13 +91,16 @@ class AgentRunCarriesTheRepositoryManifest(unittest.TestCase):
             prepared["repository_run_manifest"],
             "an agent-driven run would write no validation record and never release its raw data",
         )
-        self.assertEqual("delete", prepared["repository_raw_retention_policy"])
+        self.assertEqual("delete_after_validated_output", prepared["repository_raw_retention_policy"])
 
     def test_both_paths_prepare_the_same_repository_keys(self) -> None:
         """What the GUI used to add by hand is now what prepare_run returns for either caller."""
         overrides = {
             "repository_run_manifest": str(self.manifest),
-            "repository_raw_retention_policy": "delete",
+            # The real literal. A bare "delete" is meaningless everywhere in this codebase, so
+            # pinning it was pinning a no-op: the test had no opinion about the only value that is
+            # not keep-equivalent.
+            "repository_raw_retention_policy": "delete_after_validated_output",
         }
         _, from_agent = self._prepare(workflow_overrides=overrides)
 

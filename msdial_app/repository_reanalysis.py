@@ -723,6 +723,30 @@ def resolve_required_download_bytes(
     }
 
 
+# The only two retention policies that mean anything. Named once because the HTTP download
+# endpoint validated against an inline set while every other reader compared against a bare literal,
+# so a third reader could -- and did -- accept a string no writer would ever produce.
+RAW_RETENTION_POLICIES = ("keep", "delete_after_validated_output")
+RAW_RETENTION_DEFAULT = "keep"
+
+
+def normalize_raw_retention_policy(value: Any) -> tuple[str, bool]:
+    """The policy to act on, and whether the caller asked for something unrecognised.
+
+    Returns the default rather than the input when the input means nothing, because the only
+    alternative to "keep" is an irreversible deletion and an unreadable request must never resolve
+    towards it. The second value is what lets a caller SAY SO: the old code compared against a bare
+    literal, so "delete", "Delete" and a trailing space were all silently keep-equivalent and the log
+    reported "downloaded repository raw data were kept" -- true, and no help at all to someone who
+    believed they had asked for deletion. At full-repository scale that request vanishes without a
+    word.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return RAW_RETENTION_DEFAULT, False
+    return (text, False) if text in RAW_RETENTION_POLICIES else (RAW_RETENTION_DEFAULT, True)
+
+
 def create_download_lease(
     project: RepositoryProject,
     workspace_root: Path,
