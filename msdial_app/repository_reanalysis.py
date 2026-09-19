@@ -730,6 +730,7 @@ def create_download_lease(
     client: RepositoryHttpClient | None = None,
     allow_preflight: bool = False,
     progress_callback: Any = None,
+    raw_retention_policy: str = "keep",
 ) -> dict[str, Any]:
     downloadable = project.eligible or (
         allow_preflight and project.selection_status == "raw_metadata_required"
@@ -839,6 +840,18 @@ def create_download_lease(
         "analysis_input_path": analysis_input,
         "execution_allowed": project.eligible,
         "cleanup_allowed": False,
+        # WRITTEN HERE BECAUSE THIS IS WHERE IT HAS TO SURVIVE.
+        #
+        # The retention policy is chosen once, at download, and decides whether this unit's raw data
+        # may ever be deleted. It used to be held only in the in-memory job registry, which is
+        # persisted truncated to the hundred most recently updated jobs -- so at campaign scale the
+        # policy was evicted by later work while the data it governed was still on disk, and
+        # cleanup_download_lease's preview reported `manifest.get("raw_retention_policy")`, which
+        # nothing had ever written, as None. A person asked to confirm an irreversible deletion was
+        # shown a blank where the intent should be.
+        #
+        # The manifest is the unit's own durable record and outlives every registry.
+        "raw_retention_policy": raw_retention_policy,
     }
     manifest_path = provenance / "run-manifest.json"
     repository_metadata_path = provenance / "repository-metadata.json"

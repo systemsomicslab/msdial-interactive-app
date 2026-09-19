@@ -1698,6 +1698,7 @@ def _run_repository_download_job(
             maximum_bytes,
             allow_preflight=allow_preflight,
             progress_callback=progress,
+            raw_retention_policy=retention,
         )
         recognized = expand_paths_report(lease.get("input_candidates", []))
         result = {
