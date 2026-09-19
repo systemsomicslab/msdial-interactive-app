@@ -1384,13 +1384,10 @@ class Handler(BaseHTTPRequestHandler):
                         HTTPStatus.BAD_REQUEST,
                     )
                     return
+                # prepare_run carries repository_run_manifest and the retention policy through
+                # itself now, so this path no longer copies them back by hand -- and the agent path
+                # below no longer has to remember to.
                 preparation = prepare_run(state)
-                preparation["repository_run_manifest"] = str(
-                    state.get("repository_run_manifest") or ""
-                )
-                preparation["repository_raw_retention_policy"] = str(
-                    state.get("repository_raw_retention_policy") or "keep"
-                )
                 job_id = uuid.uuid4().hex
                 artifact_baseline = _snapshot_run_artifacts(preparation)
                 with JOBS_LOCK:

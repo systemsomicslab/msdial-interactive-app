@@ -1453,6 +1453,24 @@ def prepare_run(
         "method_file": str(method_path),
         "manifest": str(manifest_path),
         "command": command,
+        # CARRIED THROUGH RATHER THAN RE-COPIED BY EACH CALLER.
+        #
+        # These two decide, in _run_job, whether the unit manifest gets its mzTab validation, its
+        # retained-artifact inventory and its retention verdict at all: the whole block is behind
+        # `if manifest_text:`. prepare_run returns an explicit dict, so they used to be dropped here
+        # and the GUI path copied them back onto the result by hand afterwards. The agent path --
+        # every MCP-driven repository run, which is the only path the reanalysis agents use -- did
+        # not, so an agent-driven run produced no validation record, no artifact inventory, and raw
+        # data that could never be cleaned up, while the same unit run from the GUI produced all
+        # three. Two code paths that were supposed to be one.
+        #
+        # Returning them from here means a caller cannot forget: there is no second place to
+        # remember. The state already carries them, put there by the MCP tool's workflow_overrides
+        # or by the GUI's own state.
+        "repository_run_manifest": str(state.get("repository_run_manifest") or ""),
+        "repository_raw_retention_policy": str(
+            state.get("repository_raw_retention_policy") or "keep"
+        ),
         **reproduction,
         "warnings": [issue for issue in issues if issue["level"] == "warning"],
     }
