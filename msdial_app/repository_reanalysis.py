@@ -941,6 +941,64 @@ def record_run_failure(
         return {"status": "run_failed", "manifest_error": str(error), "run_failure": record}
 
 
+def record_peak_height_diagnostic(
+    manifest_path: Path,
+    estimate: dict[str, Any],
+    representative: dict[str, Any] | None = None,
+    job_id: str = "",
+    diagnostic_directory: str = "",
+) -> dict[str, Any]:
+    """Write a peak-count diagnostic into the analysis unit's own manifest.
+
+    WHAT THIS ENDS. The project contract requires the zero-threshold diagnostic before every
+    production repository run, and requires "the method, representative sample, diagnostic count,
+    threshold step, and accepted threshold" to be retained in provenance. All five were computed and
+    none of them reached the workspace: the estimate went into the HTTP response and into the
+    in-memory JOBS registry, which is persisted truncated to the hundred most recently updated jobs,
+    so at campaign scale the measurement behind every threshold was evicted while the run it
+    justified was still on disk.
+
+    What survived was the number alone, carried by hand into the production answers. An audit
+    reading the retained artifacts could see that a run used 500 and could not see whether 500 had
+    ever been measured on this unit, on a different unit, or at all. That is the defect shape this
+    programme is built against, in the one place the contract names explicitly.
+
+    Appended rather than replaced. Re-running the diagnostic with a different step or a different
+    representative is a normal thing to do, and which thresholds were considered is part of why the
+    accepted one was accepted.
+
+    Never raises. The diagnostic's own result is already in the caller's hands, and losing the
+    record must not also lose the estimate.
+    """
+    record = {
+        "recorded_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "job_id": str(job_id or ""),
+        "diagnostic_run_directory": str(diagnostic_directory or ""),
+        # The representative sample: which file the threshold was measured on, and why that one.
+        # A threshold measured on a blank is a different fact from one measured on the QC nearest
+        # the analytical-order midpoint, and only the record can tell them apart afterwards.
+        "representative": dict(representative or {}),
+        # Every field the estimator produced, unedited. Selecting fields here is how a later change
+        # to the estimator silently stops being recorded.
+        "estimate": dict(estimate or {}),
+        "minimum_peak_height": estimate.get("minimum_peak_height"),
+        "diagnostic_peak_count": estimate.get("diagnostic_peak_count"),
+        "estimated_peak_count": estimate.get("estimated_peak_count"),
+        "threshold_step": estimate.get("threshold_step"),
+        "method": estimate.get("method", ""),
+    }
+    try:
+        manifest_path = Path(manifest_path).resolve()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        diagnostics = list(manifest.get("peak_height_diagnostics") or [])
+        diagnostics.append(record)
+        manifest["peak_height_diagnostics"] = diagnostics
+        _write_json(manifest_path, manifest)
+        return {"recorded": True, "manifest_path": str(manifest_path), "diagnostic": record}
+    except (OSError, ValueError) as error:
+        return {"recorded": False, "manifest_error": str(error), "diagnostic": record}
+
+
 def finalize_download_lease(manifest_path: Path) -> dict[str, Any]:
     from .mztab_validation import validate_mztab_outputs
 

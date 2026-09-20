@@ -158,6 +158,31 @@ def _verify_expected_exports(preparation: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _record_peak_height_diagnostic(
+    preparation: dict[str, Any],
+    estimate: dict[str, Any],
+    representative: dict[str, Any],
+    job_id: str,
+) -> dict[str, Any]:
+    """Put the diagnostic in the unit's manifest, or say plainly that there is no unit.
+
+    A laboratory analysis has no repository manifest and nothing is written, which is correct and
+    is reported rather than left to look like a write that succeeded.
+    """
+    from .repository_reanalysis import record_peak_height_diagnostic
+
+    manifest = str(preparation.get("repository_run_manifest") or "").strip()
+    if not manifest:
+        return {"recorded": False, "reason": "no_repository_manifest"}
+    return record_peak_height_diagnostic(
+        Path(manifest),
+        estimate,
+        representative,
+        job_id=job_id,
+        diagnostic_directory=str(preparation.get("diagnostic_run_directory") or ""),
+    )
+
+
 def _repository_workspace(state: dict[str, Any]) -> str:
     """The analysis-unit workspace a repository workflow belongs to, or "" for a local analysis.
 
@@ -1137,12 +1162,20 @@ class Handler(BaseHTTPRequestHandler):
                         int(body.get("target_peak_count_max", 6000) or 6000),
                         threshold_step,
                     )
+                # The contract requires the diagnostic's method, representative sample, count,
+                # step and accepted threshold in provenance. Until this, all five lived only in
+                # the response and the JOBS registry, which is truncated to a hundred entries, so
+                # the measurement behind a threshold was evicted while the run it justified stood.
+                recorded = _record_peak_height_diagnostic(
+                    job.get("preparation") or {}, estimate, profile, job_id
+                )
                 self._json(
                     {
                         "ready": True,
                         "job_id": job_id,
                         "representative": profile,
                         "estimate": estimate,
+                        "provenance": recorded,
                     }
                 )
             elif parsed.path == "/api/validate":
