@@ -121,7 +121,17 @@ class RetentionTimeReachesTheParameterFileTests(unittest.TestCase):
         )
         self.assertEqual("True", lines["Use retention information for LBM-based annotation scoring"])
         self.assertEqual("True", lines["Use retention information for LBM-based annotation filtering"])
-        self.assertEqual("2.0", lines["RT tolerance for LBM-based annotation"])
+        # A whole-numbered tolerance is now written "2" rather than "2.0". The C# arm for this
+        # key is float.TryParse and reads either, but several sibling keys are int.TryParse and
+        # read only the first, so the writer no longer emits a decimal point it does not need.
+        self.assertEqual("2", lines["RT tolerance for LBM-based annotation"])
+        self.assertEqual(
+            "0.5",
+            self._method_lines(
+                use_retention_time_for_annotation=True, retention_time_tolerance=0.5
+            )["RT tolerance for LBM-based annotation"],
+            "and a fractional tolerance keeps its fraction",
+        )
 
     def test_declining_retention_time_leaves_it_off(self) -> None:
         lines = self._method_lines(use_retention_time_for_annotation=False)

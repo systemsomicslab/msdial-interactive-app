@@ -723,6 +723,30 @@ def resolve_required_download_bytes(
     }
 
 
+# The only two retention policies that mean anything. Named once because the HTTP download
+# endpoint validated against an inline set while every other reader compared against a bare literal,
+# so a third reader could -- and did -- accept a string no writer would ever produce.
+RAW_RETENTION_POLICIES = ("keep", "delete_after_validated_output")
+RAW_RETENTION_DEFAULT = "keep"
+
+
+def normalize_raw_retention_policy(value: Any) -> tuple[str, bool]:
+    """The policy to act on, and whether the caller asked for something unrecognised.
+
+    Returns the default rather than the input when the input means nothing, because the only
+    alternative to "keep" is an irreversible deletion and an unreadable request must never resolve
+    towards it. The second value is what lets a caller SAY SO: the old code compared against a bare
+    literal, so "delete", "Delete" and a trailing space were all silently keep-equivalent and the log
+    reported "downloaded repository raw data were kept" -- true, and no help at all to someone who
+    believed they had asked for deletion. At full-repository scale that request vanishes without a
+    word.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return RAW_RETENTION_DEFAULT, False
+    return (text, False) if text in RAW_RETENTION_POLICIES else (RAW_RETENTION_DEFAULT, True)
+
+
 def create_download_lease(
     project: RepositoryProject,
     workspace_root: Path,
@@ -730,6 +754,7 @@ def create_download_lease(
     client: RepositoryHttpClient | None = None,
     allow_preflight: bool = False,
     progress_callback: Any = None,
+    raw_retention_policy: str = "keep",
 ) -> dict[str, Any]:
     downloadable = project.eligible or (
         allow_preflight and project.selection_status == "raw_metadata_required"
@@ -839,6 +864,18 @@ def create_download_lease(
         "analysis_input_path": analysis_input,
         "execution_allowed": project.eligible,
         "cleanup_allowed": False,
+        # WRITTEN HERE BECAUSE THIS IS WHERE IT HAS TO SURVIVE.
+        #
+        # The retention policy is chosen once, at download, and decides whether this unit's raw data
+        # may ever be deleted. It used to be held only in the in-memory job registry, which is
+        # persisted truncated to the hundred most recently updated jobs -- so at campaign scale the
+        # policy was evicted by later work while the data it governed was still on disk, and
+        # cleanup_download_lease's preview reported `manifest.get("raw_retention_policy")`, which
+        # nothing had ever written, as None. A person asked to confirm an irreversible deletion was
+        # shown a blank where the intent should be.
+        #
+        # The manifest is the unit's own durable record and outlives every registry.
+        "raw_retention_policy": raw_retention_policy,
     }
     manifest_path = provenance / "run-manifest.json"
     repository_metadata_path = provenance / "repository-metadata.json"
@@ -851,6 +888,115 @@ def create_download_lease(
     manifest["sample_metadata_file"] = str(sample_metadata_path)
     _write_json(manifest_path, manifest)
     return {**manifest, "manifest_path": str(manifest_path)}
+
+
+def record_run_failure(
+    manifest_path: Path,
+    reason: str,
+    exit_code: int | None = None,
+    log_tail: list[str] | None = None,
+) -> dict[str, Any]:
+    """Write a failed MS-DIAL run into the analysis unit's own manifest.
+
+    WHAT THIS ENDS. A failed run recorded its status and its diagnosed error in the in-memory JOBS
+    registry and nowhere else. The registry is persisted truncated to the hundred most recently
+    updated jobs, so at the scale this programme is for -- each accession consuming a download job,
+    a tuning job and one or more run jobs -- the record of a failure was evicted by later work, and
+    the unit's own workspace looked exactly like a unit nobody had tried.
+
+    The project contract requires "a failure record when unsuccessful" for every attempted unit. It
+    existed only as prose instructing an agent to write one, which is the defect shape this
+    programme is built against: something judged that is never connected to what actually ran.
+
+    CLEANUP STAYS FORBIDDEN. cleanup_allowed is set false explicitly rather than left alone, because
+    the raw data is what a retry needs and a failed run is exactly when someone is tempted to
+    reclaim the disk. The campaign's retention policy is now "delete after a successful run"; this
+    is the clause that keeps "successful" in it.
+
+    Never raises. A failure while recording a failure would lose both, so any problem writing the
+    manifest is returned rather than thrown -- the caller is already on its error path.
+    """
+    record = {
+        "reason": reason,
+        "exit_code": exit_code,
+        "recorded_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        # The last lines rather than the whole log: enough to tell a missing library from a crash,
+        # small enough that a manifest stays readable. The full log lives with the job while it
+        # survives.
+        "log_tail": [str(line) for line in (log_tail or [])][-40:],
+    }
+    try:
+        manifest_path = Path(manifest_path).resolve()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["status"] = "run_failed"
+        manifest["cleanup_allowed"] = False
+        failures = list(manifest.get("run_failures") or [])
+        failures.append(record)
+        # Appended, not replaced: a unit retried three times and failed three times is a different
+        # thing from a unit tried once, and the difference is what says whether to keep trying.
+        manifest["run_failures"] = failures
+        _write_json(manifest_path, manifest)
+        return {**manifest, "manifest_path": str(manifest_path)}
+    except (OSError, ValueError) as error:
+        return {"status": "run_failed", "manifest_error": str(error), "run_failure": record}
+
+
+def record_peak_height_diagnostic(
+    manifest_path: Path,
+    estimate: dict[str, Any],
+    representative: dict[str, Any] | None = None,
+    job_id: str = "",
+    diagnostic_directory: str = "",
+) -> dict[str, Any]:
+    """Write a peak-count diagnostic into the analysis unit's own manifest.
+
+    WHAT THIS ENDS. The project contract requires the zero-threshold diagnostic before every
+    production repository run, and requires "the method, representative sample, diagnostic count,
+    threshold step, and accepted threshold" to be retained in provenance. All five were computed and
+    none of them reached the workspace: the estimate went into the HTTP response and into the
+    in-memory JOBS registry, which is persisted truncated to the hundred most recently updated jobs,
+    so at campaign scale the measurement behind every threshold was evicted while the run it
+    justified was still on disk.
+
+    What survived was the number alone, carried by hand into the production answers. An audit
+    reading the retained artifacts could see that a run used 500 and could not see whether 500 had
+    ever been measured on this unit, on a different unit, or at all. That is the defect shape this
+    programme is built against, in the one place the contract names explicitly.
+
+    Appended rather than replaced. Re-running the diagnostic with a different step or a different
+    representative is a normal thing to do, and which thresholds were considered is part of why the
+    accepted one was accepted.
+
+    Never raises. The diagnostic's own result is already in the caller's hands, and losing the
+    record must not also lose the estimate.
+    """
+    record = {
+        "recorded_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "job_id": str(job_id or ""),
+        "diagnostic_run_directory": str(diagnostic_directory or ""),
+        # The representative sample: which file the threshold was measured on, and why that one.
+        # A threshold measured on a blank is a different fact from one measured on the QC nearest
+        # the analytical-order midpoint, and only the record can tell them apart afterwards.
+        "representative": dict(representative or {}),
+        # Every field the estimator produced, unedited. Selecting fields here is how a later change
+        # to the estimator silently stops being recorded.
+        "estimate": dict(estimate or {}),
+        "minimum_peak_height": estimate.get("minimum_peak_height"),
+        "diagnostic_peak_count": estimate.get("diagnostic_peak_count"),
+        "estimated_peak_count": estimate.get("estimated_peak_count"),
+        "threshold_step": estimate.get("threshold_step"),
+        "method": estimate.get("method", ""),
+    }
+    try:
+        manifest_path = Path(manifest_path).resolve()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        diagnostics = list(manifest.get("peak_height_diagnostics") or [])
+        diagnostics.append(record)
+        manifest["peak_height_diagnostics"] = diagnostics
+        _write_json(manifest_path, manifest)
+        return {"recorded": True, "manifest_path": str(manifest_path), "diagnostic": record}
+    except (OSError, ValueError) as error:
+        return {"recorded": False, "manifest_error": str(error), "diagnostic": record}
 
 
 def finalize_download_lease(manifest_path: Path) -> dict[str, Any]:

@@ -158,6 +158,31 @@ def _verify_expected_exports(preparation: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _record_peak_height_diagnostic(
+    preparation: dict[str, Any],
+    estimate: dict[str, Any],
+    representative: dict[str, Any],
+    job_id: str,
+) -> dict[str, Any]:
+    """Put the diagnostic in the unit's manifest, or say plainly that there is no unit.
+
+    A laboratory analysis has no repository manifest and nothing is written, which is correct and
+    is reported rather than left to look like a write that succeeded.
+    """
+    from .repository_reanalysis import record_peak_height_diagnostic
+
+    manifest = str(preparation.get("repository_run_manifest") or "").strip()
+    if not manifest:
+        return {"recorded": False, "reason": "no_repository_manifest"}
+    return record_peak_height_diagnostic(
+        Path(manifest),
+        estimate,
+        representative,
+        job_id=job_id,
+        diagnostic_directory=str(preparation.get("diagnostic_run_directory") or ""),
+    )
+
+
 def _repository_workspace(state: dict[str, Any]) -> str:
     """The analysis-unit workspace a repository workflow belongs to, or "" for a local analysis.
 
@@ -772,8 +797,10 @@ class Handler(BaseHTTPRequestHandler):
                         "This repository project is not ready for the untargeted LC-MS/MS DDA/DIA campaign: "
                         + "; ".join(reasons or ["review repository metadata first"])
                     )
-                retention = str(body.get("raw_retention_policy") or "keep")
-                if retention not in {"keep", "delete_after_validated_output"}:
+                from .repository_reanalysis import RAW_RETENTION_POLICIES
+
+                retention = str(body.get("raw_retention_policy") or "keep").strip()
+                if retention not in RAW_RETENTION_POLICIES:
                     raise ValueError("Unknown repository raw-data retention policy.")
                 job_id = uuid.uuid4().hex
                 with JOBS_LOCK:
@@ -1135,12 +1162,20 @@ class Handler(BaseHTTPRequestHandler):
                         int(body.get("target_peak_count_max", 6000) or 6000),
                         threshold_step,
                     )
+                # The contract requires the diagnostic's method, representative sample, count,
+                # step and accepted threshold in provenance. Until this, all five lived only in
+                # the response and the JOBS registry, which is truncated to a hundred entries, so
+                # the measurement behind a threshold was evicted while the run it justified stood.
+                recorded = _record_peak_height_diagnostic(
+                    job.get("preparation") or {}, estimate, profile, job_id
+                )
                 self._json(
                     {
                         "ready": True,
                         "job_id": job_id,
                         "representative": profile,
                         "estimate": estimate,
+                        "provenance": recorded,
                     }
                 )
             elif parsed.path == "/api/validate":
@@ -1384,13 +1419,10 @@ class Handler(BaseHTTPRequestHandler):
                         HTTPStatus.BAD_REQUEST,
                     )
                     return
+                # prepare_run carries repository_run_manifest and the retention policy through
+                # itself now, so this path no longer copies them back by hand -- and the agent path
+                # below no longer has to remember to.
                 preparation = prepare_run(state)
-                preparation["repository_run_manifest"] = str(
-                    state.get("repository_run_manifest") or ""
-                )
-                preparation["repository_raw_retention_policy"] = str(
-                    state.get("repository_raw_retention_policy") or "keep"
-                )
                 job_id = uuid.uuid4().hex
                 artifact_baseline = _snapshot_run_artifacts(preparation)
                 with JOBS_LOCK:
@@ -1701,6 +1733,7 @@ def _run_repository_download_job(
             maximum_bytes,
             allow_preflight=allow_preflight,
             progress_callback=progress,
+            raw_retention_policy=retention,
         )
         recognized = expand_paths_report(lease.get("input_candidates", []))
         result = {
@@ -1728,6 +1761,30 @@ def _run_repository_download_job(
             JOBS[job_id]["error"] = str(error)
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             _persist_jobs_locked()
+
+
+def _record_repository_run_failure(
+    preparation: dict[str, Any],
+    reason: str,
+    exit_code: int | None,
+    logs: list[str],
+) -> None:
+    """Put a failed run into the analysis unit's own manifest, if it belongs to one.
+
+    A failure used to live only in the JOBS registry, which is persisted truncated to the hundred
+    most recently updated jobs. At the scale this is for, later work evicted the record and the
+    unit's workspace looked exactly like a unit nobody had tried -- while the project contract
+    requires a failure record for every attempted unit.
+
+    A local laboratory analysis carries no manifest and gets none of this; there is no unit to
+    record against.
+    """
+    manifest_text = str(preparation.get("repository_run_manifest") or "").strip()
+    if not manifest_text:
+        return
+    from .repository_reanalysis import record_run_failure
+
+    record_run_failure(Path(manifest_text), reason, exit_code, list(logs or []))
 
 
 def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
@@ -1871,6 +1928,9 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
                     JOBS[job_id]["logs"],
                     f"MS-DIAL Console exited with code {exit_code}.",
                 )
+                _record_repository_run_failure(
+                    preparation, JOBS[job_id]["error"], exit_code, JOBS[job_id]["logs"]
+                )
             JOBS[job_id].pop("artifact_baseline", None)
             _persist_jobs_locked()
     except Exception as error:
@@ -1881,6 +1941,7 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = message
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _record_repository_run_failure(preparation, message, None, JOBS[job_id]["logs"])
             JOBS[job_id].pop("artifact_baseline", None)
             _persist_jobs_locked()
     finally:

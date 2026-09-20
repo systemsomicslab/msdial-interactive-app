@@ -5,6 +5,7 @@ import copy
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -1425,6 +1426,25 @@ def prepare_run(
         method_state,
         command,
     )
+    from .repository_reanalysis import normalize_raw_retention_policy
+
+    retention_policy, retention_unrecognized = normalize_raw_retention_policy(
+        state.get("repository_raw_retention_policy")
+    )
+    retention_warnings = (
+        [
+            {
+                "level": "warning",
+                "message": (
+                    "Repository raw-data retention policy "
+                    f"{str(state.get('repository_raw_retention_policy'))!r} was not recognised; "
+                    f"{retention_policy!r} applies instead. Downloaded raw data will be kept."
+                ),
+            }
+        ]
+        if retention_unrecognized
+        else []
+    )
     return {
         "run_directory": str(run_directory),
         "analysis_type": project_type,
@@ -1453,8 +1473,30 @@ def prepare_run(
         "method_file": str(method_path),
         "manifest": str(manifest_path),
         "command": command,
+        # CARRIED THROUGH RATHER THAN RE-COPIED BY EACH CALLER.
+        #
+        # These two decide, in _run_job, whether the unit manifest gets its mzTab validation, its
+        # retained-artifact inventory and its retention verdict at all: the whole block is behind
+        # `if manifest_text:`. prepare_run returns an explicit dict, so they used to be dropped here
+        # and the GUI path copied them back onto the result by hand afterwards. The agent path --
+        # every MCP-driven repository run, which is the only path the reanalysis agents use -- did
+        # not, so an agent-driven run produced no validation record, no artifact inventory, and raw
+        # data that could never be cleaned up, while the same unit run from the GUI produced all
+        # three. Two code paths that were supposed to be one.
+        #
+        # Returning them from here means a caller cannot forget: there is no second place to
+        # remember. The state already carries them, put there by the MCP tool's workflow_overrides
+        # or by the GUI's own state.
+        "repository_run_manifest": str(state.get("repository_run_manifest") or ""),
+        # NORMALISED, and an unreadable request is reported rather than quietly becoming "keep".
+        # The download endpoint validates this, so the governed chain cannot produce a bad value --
+        # but a caller that hand-writes answers["workflow_overrides"] reaches here unchecked, and the
+        # comparison downstream is a bare string equality with no casefolding and no strip. "delete",
+        # "Delete" and a trailing space were all keep-equivalent, and the run logged that the data
+        # were kept without ever saying the policy had not been understood.
+        "repository_raw_retention_policy": retention_policy,
         **reproduction,
-        "warnings": [issue for issue in issues if issue["level"] == "warning"],
+        "warnings": [issue for issue in issues if issue["level"] == "warning"] + retention_warnings,
     }
 
 
@@ -2185,6 +2227,27 @@ def _prepare_gcms_ri_dictionary(
     return dictionary
 
 
+def _method_value(value: Any) -> str:
+    """Render one method-file value the way MS-DIAL's own writer would.
+
+    A Python float prints its decimal point even when it names a whole number, so a minimum peak
+    height of 500 reached the method file as "500.0". MS-DIAL's reader parsed that key with
+    int.TryParse and reported the key as consumed whether or not the parse had succeeded, so the
+    value was discarded, MinimumAmplitude kept its built-in 1000, and the retained method file
+    recorded 500. Every threshold the contract's zero-threshold diagnostic produced was thrown
+    away that way, and no artifact in the workspace could contradict the number.
+
+    The reader has been fixed to accept either spelling. This does not wait for that fix: the
+    Console the pipeline resolves is built from a branch that takes changes from master later, so
+    a method file written today is read by yesterday's parser.
+    """
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def _write_method(path: Path, state: dict[str, Any]) -> None:
     template_path = Path(state["template_path"])
     lines = template_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
@@ -2344,7 +2407,7 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         )
         if matched:
             output_key = output_aliases.get(matched, matched)
-            output.append(f"{_title_for_key(output_key)}: {replacements[matched]}")
+            output.append(f"{_title_for_key(output_key)}: {_method_value(replacements[matched])}")
             found.add(matched)
             found.add(output_key)
             continue
@@ -2387,7 +2450,7 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         if key not in found:
             if project_type == "gcms" and key in gcms_no_auto_insert:
                 continue
-            output.insert(0, f"{_title_for_key(key)}: {value}")
+            output.insert(0, f"{_title_for_key(key)}: {_method_value(value)}")
     if project_type == "gcms":
         if "ri compound" not in found:
             output.append(f"RI compound: {state.get('gcms_ri_compound_type', 'Alkanes')}")

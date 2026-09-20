@@ -57,6 +57,12 @@ def main() -> int:
     download_parser.add_argument("--workspace-root", type=Path, default=_default_workspace())
     download_parser.add_argument("--max-download-gb", type=float, default=5.0)
     download_parser.add_argument("--allow-preflight", action="store_true")
+    # Recorded in the unit's manifest, where it survives; the default is the contract's default.
+    download_parser.add_argument(
+        "--raw-retention-policy",
+        choices=("keep", "delete_after_validated_output"),
+        default="keep",
+    )
 
     finalize_parser = subparsers.add_parser("finalize", help="Validate retained mzTab-M output and unlock safe cleanup.")
     finalize_parser.add_argument("manifest", type=Path)
@@ -139,6 +145,7 @@ def main() -> int:
             args.workspace_root,
             int(args.max_download_gb * 1024**3),
             allow_preflight=args.allow_preflight,
+            raw_retention_policy=args.raw_retention_policy,
         )
     elif args.command == "finalize":
         result = finalize_download_lease(args.manifest)
