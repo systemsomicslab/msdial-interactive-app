@@ -15,6 +15,11 @@ PATH_SETTING_KEYS = {
     "console_source_root",
     "template_path",
     "queries_path",
+    # Where the downloaded spectral libraries live. They used to be pinned under LOCALAPPDATA,
+    # which on a Windows workstation is the system drive, and the public MS/MS libraries alone are
+    # 1.2 GB before any laboratory library is added. A site whose data drive is not C: had no way
+    # to say so.
+    "library_directory",
 }
 
 

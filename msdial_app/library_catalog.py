@@ -70,6 +70,34 @@ LIBRARY_CATALOG: tuple[dict[str, Any], ...] = (
 
 
 def library_directory() -> Path:
+    """Where the downloaded spectral libraries live.
+
+    The default is beside the application's own settings, which on Windows is under LOCALAPPDATA
+    and therefore on the system drive. The public MS/MS libraries alone come to 1.2 GB there
+    before any laboratory library is added, and a site whose data drive is not C: had no way to
+    say so: the location was computed, never read from anywhere.
+
+    Precedence is explicit first. A saved `library_directory` setting is what a person chose
+    through the application and wins; MSDIAL_LIBRARY_DIRECTORY lets a launcher or a scheduled job
+    set it without touching the settings file; the default applies when neither says otherwise.
+    A setting that names something other than a usable directory falls back rather than failing,
+    because a library path that cannot be created must not stop an analysis that has already
+    downloaded its libraries somewhere else.
+    """
+    from .user_settings import load_user_settings
+
+    for candidate in (
+        str(load_user_settings().get("library_directory") or "").strip(),
+        str(os.environ.get("MSDIAL_LIBRARY_DIRECTORY") or "").strip(),
+    ):
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        return path
     return user_data_directory() / "libraries"
 
 

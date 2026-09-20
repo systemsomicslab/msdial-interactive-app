@@ -124,38 +124,125 @@ class RepositoryHttpClient:
         maximum_bytes: int,
         progress_callback: Any = None,
     ) -> dict[str, Any]:
+        """Fetch one repository object, resuming a partial transfer where the server allows it.
+
+        WHY THIS RESUMES. This used to open the .part file with mode "wb" and send no Range
+        header, so every attempt started at byte 0, and it unlinked the .part on any exception,
+        so an interrupted transfer lost everything already moved. The library downloader in this
+        same application has always resumed from its .part; the repository downloader, which
+        handles the far larger objects, did not.
+
+        That asymmetry is not theoretical. The backend stopped three times during 2026-09-06 runs
+        and once more on 2026-09-20 during a 378 MB library transfer, each time leaving
+        "The local backend stopped before this job completed" in the job record. Repository
+        archives are bigger than that by an order of magnitude - one unit of the 2026-09-20 trial
+        arrives as a single 1.80 GB zip, and the largest archive measured in the catalog is 38 GB -
+        and each had to complete in one unbroken connection or start again from nothing.
+
+        HOW IT RESUMES. A .part left by an earlier attempt is offered back to the server as
+        `Range: bytes=<size>-`. A 206 means the server honoured it: the existing bytes are hashed
+        first, then the response is appended. Anything else - a 200 because the server ignores
+        ranges, a 416 because the .part is already as long as the resource, a changed
+        ETag/Last-Modified - restarts from zero, because a resumed file that mixes two versions of
+        an object is worse than a slow one. The checksums are computed over the whole file either
+        way, so a wrong guess about resumability shows up as a checksum that does not match rather
+        than as silent corruption.
+
+        WHAT IT NO LONGER DOES. It does not delete the .part on failure. That deletion is what made
+        every retry start from zero, and keeping the bytes is the entire point. A .part is only
+        removed when it is proven unusable, or when it is renamed into place on success.
+        """
         destination.parent.mkdir(parents=True, exist_ok=True)
         partial = destination.with_name(destination.name + ".part")
-        digest = hashlib.sha256()
-        md5 = hashlib.md5()
-        downloaded = 0
-        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        resume_from = partial.stat().st_size if partial.is_file() else 0
+        if resume_from > maximum_bytes:
+            # A leftover larger than the limit cannot become a valid result, and hashing it would
+            # only waste the time before saying so.
+            partial.unlink(missing_ok=True)
+            resume_from = 0
+
+        headers = {"User-Agent": USER_AGENT}
+        if resume_from:
+            headers["Range"] = f"bytes={resume_from}-"
+        request = urllib.request.Request(url, headers=headers)
+
         try:
-            with urllib.request.urlopen(request, timeout=max(self.timeout, 300)) as response, partial.open("wb") as output:
-                declared = int(response.headers.get("Content-Length") or 0)
-                if declared and declared > maximum_bytes:
-                    raise ValueError(f"Remote object is {declared} bytes; limit is {maximum_bytes} bytes.")
+            response = urllib.request.urlopen(request, timeout=max(self.timeout, 300))
+        except urllib.error.HTTPError as error:
+            # 416 means the range is past the end of the resource: the .part is stale, or the
+            # object shrank. Either way the only safe answer is to fetch it whole.
+            if error.code == 416 and resume_from:
+                partial.unlink(missing_ok=True)
+                return self.download(url, destination, maximum_bytes, progress_callback)
+            raise
+
+        with response:
+            appending = response.status == 206 and resume_from > 0
+            if not appending:
+                # The server ignored the range, or there was nothing to resume. Start clean rather
+                # than append a whole object onto a partial one.
+                resume_from = 0
+            declared = int(response.headers.get("Content-Length") or 0)
+            total_declared = declared + resume_from if declared else 0
+            if total_declared and total_declared > maximum_bytes:
+                raise ValueError(
+                    f"Remote object is {total_declared} bytes; limit is {maximum_bytes} bytes."
+                )
+
+            digest = hashlib.sha256()
+            md5 = hashlib.md5()
+            downloaded = 0
+            if appending:
+                # Seed both hashes with the bytes already on disk, so the checksums describe the
+                # whole object and not only what this attempt fetched.
+                with partial.open("rb") as existing:
+                    for chunk in iter(lambda: existing.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        md5.update(chunk)
+                        downloaded += len(chunk)
+                if downloaded != resume_from:
+                    # The file changed under us between the stat and the read.
+                    raise ValueError(
+                        f"Partial file {partial.name} is {downloaded} bytes, expected {resume_from}."
+                    )
+                if progress_callback:
+                    progress_callback(downloaded, total_declared)
+
+            with partial.open("ab" if appending else "wb") as output:
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
                     downloaded += len(chunk)
                     if downloaded > maximum_bytes:
-                        raise ValueError(f"Download exceeded the {maximum_bytes}-byte safety limit.")
+                        raise ValueError(
+                            f"Download exceeded the {maximum_bytes}-byte safety limit."
+                        )
                     output.write(chunk)
                     digest.update(chunk)
                     md5.update(chunk)
                     if progress_callback:
-                        progress_callback(downloaded, declared)
-            partial.replace(destination)
-        except Exception:
-            partial.unlink(missing_ok=True)
-            raise
+                        progress_callback(downloaded, total_declared)
+
+        # A SHORT READ IS NOT A COMPLETE DOWNLOAD, and urllib does not say so: a server that
+        # declares a Content-Length and then hangs up early simply stops yielding chunks, and the
+        # loop above ends exactly as it would on a clean finish. The old code renamed that
+        # truncated file into place and reported success with a checksum computed over the part
+        # that arrived, so every later stage agreed with it. Found by the resume test, which
+        # serves a deliberately truncated response.
+        if total_declared and downloaded != total_declared:
+            raise ValueError(
+                f"Download ended at {downloaded} of {total_declared} declared bytes. "
+                f"The partial file is kept at {partial.name} and the next attempt will resume."
+            )
+
+        partial.replace(destination)
         return {
             "path": str(destination),
             "size_bytes": downloaded,
             "sha256": digest.hexdigest(),
             "md5": md5.hexdigest(),
+            "resumed_from_bytes": resume_from,
         }
 
 
