@@ -5,6 +5,7 @@ import copy
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -2226,6 +2227,27 @@ def _prepare_gcms_ri_dictionary(
     return dictionary
 
 
+def _method_value(value: Any) -> str:
+    """Render one method-file value the way MS-DIAL's own writer would.
+
+    A Python float prints its decimal point even when it names a whole number, so a minimum peak
+    height of 500 reached the method file as "500.0". MS-DIAL's reader parsed that key with
+    int.TryParse and reported the key as consumed whether or not the parse had succeeded, so the
+    value was discarded, MinimumAmplitude kept its built-in 1000, and the retained method file
+    recorded 500. Every threshold the contract's zero-threshold diagnostic produced was thrown
+    away that way, and no artifact in the workspace could contradict the number.
+
+    The reader has been fixed to accept either spelling. This does not wait for that fix: the
+    Console the pipeline resolves is built from a branch that takes changes from master later, so
+    a method file written today is read by yesterday's parser.
+    """
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def _write_method(path: Path, state: dict[str, Any]) -> None:
     template_path = Path(state["template_path"])
     lines = template_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
@@ -2385,7 +2407,7 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         )
         if matched:
             output_key = output_aliases.get(matched, matched)
-            output.append(f"{_title_for_key(output_key)}: {replacements[matched]}")
+            output.append(f"{_title_for_key(output_key)}: {_method_value(replacements[matched])}")
             found.add(matched)
             found.add(output_key)
             continue
@@ -2428,7 +2450,7 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         if key not in found:
             if project_type == "gcms" and key in gcms_no_auto_insert:
                 continue
-            output.insert(0, f"{_title_for_key(key)}: {value}")
+            output.insert(0, f"{_title_for_key(key)}: {_method_value(value)}")
     if project_type == "gcms":
         if "ri compound" not in found:
             output.append(f"RI compound: {state.get('gcms_ri_compound_type', 'Alkanes')}")
