@@ -16,7 +16,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 from .diagnostic_paths import is_diagnostic_artifact
 
@@ -1481,24 +1481,13 @@ def project_from_dict(value: dict[str, Any]) -> RepositoryProject:
     return RepositoryProject(**data)
 
 
-def _filter_inputs_by_project_allowlist(
-    inputs: list[str], data_root: Path, project: RepositoryProject
-) -> list[str]:
-    if not project.analysis_unit_id:
-        return inputs
-    allowed = _project_allowlist(project, analysis_only=True)
-    if not allowed:
-        raise ValueError(f"Analysis unit {project.analysis_unit_id} has an empty file allow-list.")
-
-    selected = [
-        item for item in inputs if _path_matches_allowlist(Path(item), data_root, allowed)
-    ]
-    if not selected:
-        raise ValueError(
-            f"Downloaded content did not contain an MS-DIAL input listed for analysis unit "
-            f"{project.analysis_unit_id}. Refusing to fall back to accession-level inputs."
-        )
-    return selected
+# The roles MS-DIAL can open as an analysis input. "converted" is mzML and mzXML, which MS-DIAL
+# reads natively and which most repositories prefer to publish; excluding it blocked every
+# MetaboLights unit. Archives are not inputs themselves - their extracted contents are, and those
+# are attributed by _sample_file_names below. Sidecars and auxiliaries are never inputs, and
+# neither is raw_alternate: a .wiff2 beside a .wiff is the same sample in a second encoding, and
+# admitting both analyses that sample twice.
+ANALYSIS_INPUT_ROLES = frozenset({"raw", "converted"})
 
 
 def _project_allowlist(
@@ -1507,8 +1496,87 @@ def _project_allowlist(
     return [
         _safe_relative_name(item.name).as_posix().casefold()
         for item in project.files
-        if item.name and (not analysis_only or item.role == "raw")
+        if item.name and (not analysis_only or item.role in ANALYSIS_INPUT_ROLES)
     ]
+
+
+def _sample_file_names(project: RepositoryProject) -> tuple[set[str], set[str]]:
+    """Every file name this unit's own samples claim, with and without an extension.
+
+    WHY THIS EXISTS. Most repository units do not enumerate their raw files at all: Metabolomics
+    Workbench publishes one archive per study, so the unit's file list is the archive and nothing
+    else. Measured on 2026-09-21, 747 of the 831 campaign-eligible units holding files were in that
+    state, and the analysis allow-list built from the file list alone came out empty for every one
+    of them - after the download had already transferred the data.
+
+    The unit's samples do name their files. Matching against those names is what attributes an
+    extracted archive to one unit, and it is stricter than the archive name it replaces: an archive
+    shared between a positive and a negative unit used to admit all of both, and a sample list
+    belonging to one unit admits only that unit's files.
+
+    Both the full name and the stem are kept, because a repository may record "sample_01" for a
+    file that arrives as "sample_01.mzML" or as a "sample_01.d" directory.
+    """
+    exact: set[str] = set()
+    stems: set[str] = set()
+    for sample in project.sample_metadata or []:
+        raw = str((sample or {}).get("raw_file") or "").strip()
+        if not raw:
+            continue
+        base = PurePosixPath(raw.replace("\\", "/")).name.casefold()
+        if not base:
+            continue
+        exact.add(base)
+        if not PurePosixPath(base).suffix:
+            # ONLY when the repository recorded no extension. Matching on the stem of a name that
+            # HAS one would pull in a second encoding of the same sample: a .wiff2 beside a .wiff
+            # shares its stem, and analysing both analyses that sample twice.
+            stems.add(base)
+    return exact, stems
+
+
+def _matches_sample_file_names(
+    path: Path, names: tuple[set[str], set[str]] | set[str]
+) -> bool:
+    exact, stems = names if isinstance(names, tuple) else (names, set())
+    if not exact and not stems:
+        return False
+    base = path.name.casefold()
+    if base in exact:
+        return True
+    return bool(stems) and PurePosixPath(base).stem in stems
+
+def _filter_inputs_by_project_allowlist(
+    inputs: list[str], data_root: Path, project: RepositoryProject
+) -> list[str]:
+    if not project.analysis_unit_id:
+        return inputs
+    allowed = _project_allowlist(project, analysis_only=True)
+    sample_names = _sample_file_names(project)
+    if not allowed and not any(sample_names):
+        raise ValueError(
+            f"Analysis unit {project.analysis_unit_id} names no analysis input: it declares no "
+            f"file of role {sorted(ANALYSIS_INPUT_ROLES)} and none of its samples names a raw "
+            "file, so there is nothing to attribute the downloaded data to."
+        )
+
+    # Either source is sufficient on its own, and both are scoped to THIS unit: the declared
+    # analysis-input files, and the file names this unit's samples claim. An archive shared with
+    # another unit used to admit all of both units' contents through the archive's own name; the
+    # sample names admit only this unit's.
+    selected = [
+        item
+        for item in inputs
+        if _path_matches_allowlist(Path(item), data_root, allowed)
+        or _matches_sample_file_names(Path(item), sample_names)
+    ]
+    if not selected:
+        raise ValueError(
+            f"Downloaded content did not contain an MS-DIAL input listed for analysis unit "
+            f"{project.analysis_unit_id}. Refusing to fall back to accession-level inputs."
+        )
+    return selected
+
 
 
 def _path_matches_allowlist(
