@@ -1271,12 +1271,18 @@ def msdial_repository_batch_plan(
 def msdial_repository_raw_metadata_preflight(
     download_job_id: str,
     extractor_path: str = "",
-    max_inputs: int = 3,
+    max_inputs: int = 0,
     confirm_untargeted: bool = False,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
-    """Cross-check representative downloaded files with the local raw-metadata parser."""
+    """Read every downloaded input file's header with the local raw-metadata parser.
+
+    max_inputs of 0 inspects every input candidate. A smaller cap is allowed, but MS-DIAL applies an
+    acquisition type to each file, so a capped inspection leaves the unit under review. When the
+    headers disagree about acquisition mode the unit is reported as Mixed, with its files grouped
+    by mode, and cannot be made eligible until it is split.
+    """
     _, manifest = _repository_download_job(download_job_id, host, port)
     candidates = _raw_metadata_extractor_candidates(extractor_path)
     if not candidates:
@@ -1294,10 +1300,14 @@ def msdial_repository_raw_metadata_preflight(
     result = run_raw_metadata_preflight(
         Path(manifest["manifest_path"]),
         Path(candidates[0]),
-        max_inputs=max(1, max_inputs),
+        max_inputs=max(0, max_inputs),
         confirm_untargeted=confirm_untargeted,
     )
     raw = result.get("raw_metadata_preflight") or {}
+    # The per-file verdicts stay in the manifest; a unit of several hundred files would otherwise
+    # put every one of them into the reply.
+    summary = {key: value for key, value in (raw.get("summary") or {}).items() if key != "per_file"}
+    groups = raw.get("acquisition_groups") or {}
     return {
         "completed": True,
         "extractor_found": True,
@@ -1305,7 +1315,8 @@ def msdial_repository_raw_metadata_preflight(
         "manifest_path": result.get("manifest_path"),
         "status": result.get("status"),
         "execution_allowed": result.get("execution_allowed"),
-        "summary": raw.get("summary"),
+        "summary": summary,
+        "acquisition_groups": {mode: len(files) for mode, files in groups.items()},
         "advisory": raw.get("advisory"),
         "unsupported_formats": raw.get("unsupported_formats") or [],
         "retry_can_help": result.get("status") != "preflight_unsupported_format",

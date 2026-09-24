@@ -696,6 +696,11 @@ def evaluate_eligibility(project: RepositoryProject, policy: EligibilityPolicy) 
     if project.separation == "LC-MS":
         if project.acquisition_mode == "Unknown":
             review_reasons.append("Inspect raw scan metadata to distinguish DDA from DIA/AIF/SWATH.")
+        elif project.acquisition_mode == "Mixed":
+            review_reasons.append(
+                "Raw headers show more than one acquisition mode across this unit's files. MS-DIAL "
+                "runs one acquisition mode per analysis; split the unit by per-file acquisition mode."
+            )
         elif project.acquisition_mode not in set(policy.allowed_acquisition_modes):
             reasons.append("Repository reanalysis currently accepts untargeted DDA or DIA/AIF/SWATH LC-MS/MS acquisition only.")
         if project.ion_mode == "Unknown":
@@ -1144,7 +1149,7 @@ RAW_METADATA_UNSUPPORTED_FORMAT_EXIT_CODE = 82
 def run_raw_metadata_preflight(
     manifest_path: Path,
     extractor_path: Path,
-    max_inputs: int = 3,
+    max_inputs: int | None = None,
     confirm_untargeted: bool = False,
 ) -> dict[str, Any]:
     manifest_path = manifest_path.resolve()
@@ -1156,7 +1161,12 @@ def run_raw_metadata_preflight(
         manifest.get("execution_allowed") or manifest.get("project", {}).get("eligible")
     )
     candidates = [Path(value) for value in manifest.get("input_candidates", [])]
-    inputs = [path for path in candidates if path.exists()][0:max(1, max_inputs)]
+    available = [path for path in candidates if path.exists()]
+    # EVERY FILE BY DEFAULT. MS-DIAL reads the acquisition type per analysis file, so a verdict
+    # read from the first three files and applied to the rest is a guess about the files nobody
+    # looked at. A caller may still cap the inspection; the cap is then recorded as partial
+    # coverage and the unit stays under review.
+    inputs = available if not max_inputs or max_inputs <= 0 else available[0:max_inputs]
     if not inputs:
         raise ValueError("No extracted MS-DIAL input candidate is available for metadata preflight.")
     output = manifest_path.parent / "raw-metadata-preflight.json"
@@ -1215,6 +1225,8 @@ def run_raw_metadata_preflight(
     project = project_from_dict(manifest["project"])
     if summary["separation"] != "Unknown":
         project.separation = summary["separation"]
+    # "Mixed" replaces whatever the repository metadata said, because the headers have shown that
+    # label to be wrong for some of the files. "Unknown" still leaves it alone: no header spoke.
     if summary["acquisition_mode"] != "Unknown":
         project.acquisition_mode = summary["acquisition_mode"]
     if summary["ion_mode"] != "Unknown":
@@ -1223,6 +1235,13 @@ def run_raw_metadata_preflight(
         project.untargeted = True
         project.evidence.append("Untargeted status confirmed during raw metadata preflight.")
     project.evidence.extend(summary["evidence"])
+    coverage = {
+        "input_candidates": len(candidates),
+        "available": len(available),
+        "inspected": len(inputs),
+        "complete": len(inputs) == len(candidates),
+    }
+    summary["coverage"] = coverage
     evaluated = evaluate_eligibility(
         project,
         EligibilityPolicy(
@@ -1232,10 +1251,36 @@ def run_raw_metadata_preflight(
             require_untargeted=True,
         ),
     )
+    if not coverage["complete"] and not evaluated.exclusion_reasons:
+        evaluated.review_reasons.append(
+            f"Raw headers were read from {coverage['inspected']} of {coverage['input_candidates']} "
+            "input files, and MS-DIAL applies an acquisition type to each file; inspect every file "
+            "before the unit's acquisition mode is taken as established."
+        )
+        evaluated.eligible = False
+        evaluated.selection_status = "raw_metadata_required"
     manifest["project"] = evaluated.as_dict()
     manifest["raw_metadata_preflight"]["summary"] = summary
     manifest["execution_allowed"] = evaluated.eligible
-    manifest["status"] = "preflight_passed" if evaluated.eligible else "preflight_review_required"
+    if summary["acquisition_mode"] == "Mixed":
+        manifest["status"] = "preflight_mixed_acquisition"
+        groups: dict[str, list[str]] = {}
+        for item in summary["per_file"]:
+            groups.setdefault(item["acquisition_mode"] or "Unknown", []).append(item["file"])
+        manifest["raw_metadata_preflight"]["acquisition_groups"] = {
+            mode: sorted(files) for mode, files in sorted(groups.items())
+        }
+        manifest["raw_metadata_preflight"]["advisory"] = (
+            "The raw headers disagree about acquisition mode ("
+            + ", ".join(f"{mode} {len(files)}" for mode, files in sorted(groups.items()))
+            + "). MS-DIAL runs one acquisition mode per analysis, so this unit cannot run as one. "
+            "Split it into one unit per acquisition group, each with its own workspace, manifest and "
+            "Class assignments, and preflight each part."
+        )
+    elif evaluated.eligible:
+        manifest["status"] = "preflight_passed"
+    else:
+        manifest["status"] = "preflight_review_required"
     _write_json(manifest_path, manifest)
     return {**manifest, "manifest_path": str(manifest_path)}
 
@@ -1340,6 +1385,32 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
                 f"{project.get('ion_mode')}."
             )
 
+    # MS-DIAL deconvolutes each file by the acquisition type written against it, and a file with no
+    # type written against it is DDA. A unit whose headers disagree cannot run as one, whatever else
+    # its manifest says; and where a header has spoken for a file, the type the workflow is about to
+    # use for that file has to agree with it.
+    if str(project.get("acquisition_mode") or "").strip() == "Mixed":
+        blockers.append(
+            "The raw headers show more than one acquisition mode across this unit's files. Split the "
+            "unit by per-file acquisition mode before running MS-DIAL."
+        )
+    header_modes = _header_acquisition_by_file(manifest)
+    if header_modes:
+        disagreeing = []
+        for item in state.get("files") or []:
+            path_text = str(item.get("file_path") or "").strip()
+            if not path_text:
+                continue
+            header = header_modes.get(_file_key(path_text))
+            requested = str(item.get("acquisition_type") or "DDA").strip() or "DDA"
+            if header and requested not in HEADER_ACQUISITION_TO_MSDIAL.get(header, {header}):
+                disagreeing.append(f"{Path(path_text).name} (header {header}, run as {requested})")
+        if disagreeing:
+            blockers.append(
+                f"{len(disagreeing)} input files would run with an acquisition type their raw header "
+                f"contradicts; the first is {disagreeing[0]}."
+            )
+
     return {
         "gated": True,
         "allowed": not blockers,
@@ -1349,6 +1420,32 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
         "manifest_status": manifest.get("status"),
         "blockers": blockers,
     }
+
+
+# Which MS-DIAL AcquisitionType values a raw-header verdict admits. The header reader's "DIA" does not
+# say whether the windows were sequential (SWATH) or all-ion (AIF), so it admits either; what it never
+# admits is DDA, and a DDA header never admits a DIA deconvolution.
+HEADER_ACQUISITION_TO_MSDIAL: dict[str, set[str]] = {
+    "DDA": {"DDA"},
+    "DIA": {"SWATH", "AIF"},
+    "AIF": {"AIF"},
+}
+
+
+def _file_key(path_text: str) -> str:
+    return str(Path(path_text).resolve()).casefold()
+
+
+def _header_acquisition_by_file(manifest: dict[str, Any]) -> dict[str, str]:
+    """The acquisition mode each inspected file's own header reported, keyed by resolved path."""
+    summary = (manifest.get("raw_metadata_preflight") or {}).get("summary") or {}
+    result = {}
+    for item in summary.get("per_file") or []:
+        path_text = str(item.get("file") or "").strip()
+        mode = str(item.get("acquisition_mode") or "").strip()
+        if path_text and mode in HEADER_ACQUISITION_TO_MSDIAL:
+            result[_file_key(path_text)] = mode
+    return result
 
 
 def _tree_size(root: Path) -> tuple[int, int]:
@@ -1804,10 +1901,43 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
         ion_mode = "Both"
     else:
         ion_mode = next(iter(polarities), "Unknown")
+    # MIXED IS NOT UNKNOWN. When the headers disagree, this used to answer "Unknown" - the same
+    # word it uses when no header said anything - and the caller treats "Unknown" as "keep what
+    # the repository metadata said". For MetaboLights MTBLS2207 the repository metadata said DIA
+    # with no evidence behind it; eleven headers said six DDA and five DIA; and the stale DIA
+    # survived the preflight. Confirming untargeted status afterwards would have made the unit
+    # eligible as DIA, and agent_workflow stamps the unit's single mode onto every file, so the
+    # six DDA files would have been deconvoluted as SWATH.
+    #
+    # "Mixed" says what was observed: the files disagree, so no single mode describes the unit,
+    # and the per-file verdicts below are what a split has to be made from.
+    if len(acquisition_values) > 1:
+        acquisition_mode = "Mixed"
+    else:
+        acquisition_mode = next(iter(acquisition_values), "Unknown")
+    per_file = []
+    for item in records:
+        source = item.get("source") or {}
+        acquisition = item.get("acquisition") or {}
+        method = acquisition.get("method")
+        ms_levels = acquisition.get("msLevels")
+        if isinstance(ms_levels, dict):
+            ms_levels = ms_levels.get("value")
+        per_file.append(
+            {
+                "file": str(source.get("filePath") or source.get("fileName") or ""),
+                "acquisition_mode": _metadata_value(item, "acquisition", "method"),
+                "confidence": method.get("confidence") if isinstance(method, dict) else None,
+                "evidence": method.get("evidence") if isinstance(method, dict) else None,
+                "polarity": _metadata_value(item, "acquisition", "polarity"),
+                "ms_levels": ms_levels,
+            }
+        )
     return {
         "files_inspected": len(records),
         "separation": next(iter(separation_values), "Unknown") if len(separation_values) <= 1 else "Unknown",
-        "acquisition_mode": next(iter(acquisition_values), "Unknown") if len(acquisition_values) <= 1 else "Unknown",
+        "acquisition_mode": acquisition_mode,
+        "per_file": per_file,
         "ion_mode": ion_mode if ion_mode in {"Positive", "Negative", "Both"} else "Unknown",
         "observed_separations": sorted(separations),
         "observed_acquisition_methods": sorted(methods),
