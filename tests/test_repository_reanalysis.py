@@ -728,3 +728,206 @@ class RawMetadataPreflightFormatTests(unittest.TestCase):
         self.assertEqual(expected_path, recorded["path"])
         self.assertEqual(expected_size, recorded["size_bytes"])
         self.assertTrue(recorded["modified_at"])
+
+
+class MixedAcquisitionPreflightTests(unittest.TestCase):
+    """A unit whose headers disagree about acquisition mode is Mixed, not Unknown.
+
+    MetaboLights MTBLS2207: repository metadata said DIA with no evidence behind it, eleven headers
+    said six DDA and five DIA, and the preflight answered "Unknown", which the caller reads as "keep
+    what the repository said". Confirming untargeted status would then have made the unit eligible as
+    DIA, and the six DDA files would have been deconvoluted as SWATH.
+    """
+
+    MODES = {"a_DDA_1.mzML": "DDA", "b_DIA_1.mzML": "DIA", "c_DDA_2.mzML": "DDA", "d_DIA_2.mzML": "DIA"}
+
+    def _workspace(self, root: Path, modes: dict[str, str]) -> tuple[Path, Path, list[Path]]:
+        data = root / "raw" / "data"
+        provenance = root / "provenance"
+        output = root / "output"
+        for directory in (data, provenance, output):
+            directory.mkdir(parents=True)
+        files = []
+        for name in modes:
+            path = data / name
+            path.write_bytes(b"x")
+            files.append(path)
+        manifest = provenance / "run-manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "status": "downloaded",
+                    "workspace": str(root),
+                    "output_directory": str(output),
+                    "input_candidates": [str(path) for path in files],
+                    "execution_allowed": False,
+                    "project": {
+                        "repository": "metabolights",
+                        "accession": "MTBLS-MIXED",
+                        "analysis_unit_id": "unit-mixed",
+                        "separation": "LC-MS",
+                        "acquisition_mode": "DIA",
+                        "ion_mode": "Negative",
+                        "files": [{"name": path.name, "size_bytes": 1, "url": ""} for path in files],
+                        "total_download_bytes": len(files),
+                        "sample_count": len(files),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        extractor = root / "RawMetadataConsoleApp.exe"
+        extractor.write_bytes(b"stub")
+        return manifest, extractor, files
+
+    def _extractor(self, modes: dict[str, str]):
+        """A stand-in for the extractor: writes one header record per --input it is given."""
+        from subprocess import CompletedProcess
+
+        def run(command, **_kwargs):
+            inputs = [command[index + 1] for index, token in enumerate(command) if token == "--input"]
+            output = Path(command[command.index("--output") + 1])
+            records = [
+                {
+                    "source": {"filePath": path, "fileName": Path(path).stem},
+                    "acquisition": {
+                        "separation": {"value": "LiquidChromatography"},
+                        "method": {"value": modes[Path(path).name], "confidence": 0.8},
+                        "polarity": {"value": "Negative"},
+                        "msLevels": [1, 2],
+                    },
+                }
+                for path in inputs
+            ]
+            output.write_text(json.dumps(records), encoding="utf-8")
+            return CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+        return run
+
+    def test_disagreeing_headers_are_mixed_and_replace_the_repository_label(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor, _ = self._workspace(Path(temporary) / "u1", self.MODES)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run", side_effect=self._extractor(self.MODES)
+            ):
+                result = run_raw_metadata_preflight(manifest, extractor)
+
+        self.assertEqual("Mixed", result["raw_metadata_preflight"]["summary"]["acquisition_mode"])
+        self.assertEqual("Mixed", result["project"]["acquisition_mode"])
+        self.assertEqual("preflight_mixed_acquisition", result["status"])
+        groups = result["raw_metadata_preflight"]["acquisition_groups"]
+        self.assertEqual({"DDA": 2, "DIA": 2}, {mode: len(files) for mode, files in groups.items()})
+        self.assertIn("Split", result["raw_metadata_preflight"]["advisory"])
+        self.assertEqual(4, len(result["raw_metadata_preflight"]["summary"]["per_file"]))
+
+    def test_confirming_untargeted_cannot_make_a_mixed_unit_eligible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor, _ = self._workspace(Path(temporary) / "u2", self.MODES)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run", side_effect=self._extractor(self.MODES)
+            ):
+                result = run_raw_metadata_preflight(manifest, extractor, confirm_untargeted=True)
+
+        self.assertFalse(result["execution_allowed"])
+        self.assertFalse(result["project"]["eligible"])
+        self.assertTrue(any("split" in reason for reason in result["project"]["review_reasons"]))
+
+    def test_every_candidate_is_inspected_by_default(self) -> None:
+        # A unit whose first three files are all DDA used to be called DDA from a sample of three.
+        modes = {f"s{index:02d}_DDA.mzML": "DDA" for index in range(3)}
+        modes["s99_DIA.mzML"] = "DIA"
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor, _ = self._workspace(Path(temporary) / "u3", modes)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run", side_effect=self._extractor(modes)
+            ):
+                result = run_raw_metadata_preflight(manifest, extractor, confirm_untargeted=True)
+
+        summary = result["raw_metadata_preflight"]["summary"]
+        self.assertEqual(4, summary["files_inspected"])
+        self.assertTrue(summary["coverage"]["complete"])
+        self.assertEqual("Mixed", summary["acquisition_mode"])
+
+    def test_a_capped_inspection_leaves_the_unit_under_review(self) -> None:
+        modes = {f"s{index:02d}_DDA.mzML": "DDA" for index in range(4)}
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor, _ = self._workspace(Path(temporary) / "u4", modes)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run", side_effect=self._extractor(modes)
+            ):
+                result = run_raw_metadata_preflight(
+                    manifest, extractor, max_inputs=3, confirm_untargeted=True
+                )
+
+        self.assertEqual("DDA", result["project"]["acquisition_mode"])
+        self.assertFalse(result["raw_metadata_preflight"]["summary"]["coverage"]["complete"])
+        self.assertFalse(result["execution_allowed"])
+        self.assertTrue(any("3 of 4" in reason for reason in result["project"]["review_reasons"]))
+
+    def test_a_uniform_unit_inspected_in_full_still_passes(self) -> None:
+        modes = {f"s{index:02d}_DDA.mzML": "DDA" for index in range(4)}
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor, _ = self._workspace(Path(temporary) / "u5", modes)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run", side_effect=self._extractor(modes)
+            ):
+                result = run_raw_metadata_preflight(manifest, extractor, confirm_untargeted=True)
+
+        self.assertEqual("preflight_passed", result["status"])
+        self.assertTrue(result["execution_allowed"])
+        self.assertEqual("DDA", result["project"]["acquisition_mode"])
+
+    def _gate_state(self, manifest: Path, files: list[Path], types: dict[str, str]) -> dict:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        entries = []
+        for path in files:
+            entry = {"file_path": str(path)}
+            if path.name in types:
+                entry["acquisition_type"] = types[path.name]
+            entries.append(entry)
+        return {
+            "repository_run_manifest": str(manifest),
+            "output_root": payload["output_directory"],
+            "ion_mode": "Negative",
+            "files": entries,
+        }
+
+    def test_the_gate_refuses_a_mixed_unit_even_if_execution_was_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor, files = self._workspace(Path(temporary) / "g1", self.MODES)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run", side_effect=self._extractor(self.MODES)
+            ):
+                run_raw_metadata_preflight(manifest, extractor, confirm_untargeted=True)
+            # The flag is set by hand; the headers still disagree.
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["execution_allowed"] = True
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            gate = evaluate_repository_execution_gate(
+                self._gate_state(manifest, files, {name: "SWATH" for name in self.MODES})
+            )
+
+        self.assertFalse(gate["allowed"])
+        self.assertTrue(any("more than one acquisition mode" in item for item in gate["blockers"]))
+        self.assertTrue(
+            any("header DDA, run as SWATH" in item for item in gate["blockers"]), gate["blockers"]
+        )
+
+    def test_the_gate_refuses_a_file_run_against_its_own_header(self) -> None:
+        # A unit split and preflighted as DIA, run with no acquisition type written against its
+        # files: MS-DIAL would read each of them as DDA.
+        modes = {f"s{index:02d}_DIA.mzML": "DIA" for index in range(3)}
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor, files = self._workspace(Path(temporary) / "g2", modes)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run", side_effect=self._extractor(modes)
+            ):
+                run_raw_metadata_preflight(manifest, extractor, confirm_untargeted=True)
+            unstamped = evaluate_repository_execution_gate(self._gate_state(manifest, files, {}))
+            stamped = evaluate_repository_execution_gate(
+                self._gate_state(manifest, files, {name: "SWATH" for name in modes})
+            )
+
+        self.assertFalse(unstamped["allowed"])
+        self.assertTrue(any("header DIA, run as DDA" in item for item in unstamped["blockers"]))
+        self.assertTrue(stamped["allowed"], stamped["blockers"])
