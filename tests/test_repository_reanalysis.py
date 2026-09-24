@@ -1011,6 +1011,17 @@ class AcquisitionSplitTests(_MixedUnitFixture, unittest.TestCase):
         self.assertEqual(2, len(parent["split_into"]))
         self.assertFalse(has_own_raw, "a part must read the parent's raw data, not copy it")
 
+    def test_split_parts_do_not_inherit_the_parents_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, _, _ = self._mixed(Path(temporary) / "unit")
+            result = split_unit_by_acquisition(manifest, confirmed=True)
+            part = json.loads(Path(result["parts"][0]["manifest_path"]).read_text(encoding="utf-8"))
+
+        reasons = part["project"]["review_reasons"]
+        self.assertFalse(any("more than one acquisition mode" in item for item in reasons), reasons)
+        self.assertTrue(any("on its own" in item for item in reasons), reasons)
+        self.assertFalse(part["project"]["eligible"])
+
     def test_split_is_refused_for_a_unit_that_is_not_mixed(self) -> None:
         modes = {f"s{index:02d}_DDA.mzML": "DDA" for index in range(3)}
         with tempfile.TemporaryDirectory() as temporary:
