@@ -1415,6 +1415,46 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     }
 
 
+def _part_class_proposal(
+    parent_proposal: dict[str, Any], sample_ids: set[str], parent_unit_id: str, mode: str
+) -> dict[str, Any]:
+    """The parent's accepted Class proposal, restricted to one part's samples, saying so.
+
+    The rationale is the Catalog's own text about the whole unit and is left as written. What a run's
+    provenance has to carry besides it is that this run holds only some of those samples: MTBLS2207's
+    DDA part was about to record "Class ... across 11 samples" for a run of six. The warnings travel
+    into the run's class_proposal_provenance, so that is where it is said.
+    """
+    if not parent_proposal:
+        return {}
+    proposal = copy.deepcopy(parent_proposal)
+    every = list(proposal.get("assignments") or [])
+    kept = [item for item in every if str(item.get("sample_id") or "") in sample_ids]
+    levels = sorted({str(item.get("class_label") or "") for item in kept})
+    proposal["assignments"] = kept
+    proposal["split_from"] = {
+        "parent_analysis_unit_id": parent_unit_id,
+        "split_by": "raw_header_acquisition_mode",
+        "acquisition_mode": mode,
+        "assignments_kept": len(kept),
+        "assignments_in_parent": len(every),
+        "note": "The parent's accepted proposal, restricted to this part's samples. No sample was regrouped.",
+    }
+    warnings = list(proposal.get("warnings") or [])
+    warnings.append(
+        f"This run holds {len(kept)} of the {len(every)} samples the proposal assigned: analysis unit "
+        f"{parent_unit_id} was split by raw-header acquisition mode and this is its {mode} part. The "
+        "rationale describes the whole unit."
+    )
+    if len(levels) < 2:
+        warnings.append(
+            f"After the split this part holds {len(levels)} Class level(s) "
+            f"({', '.join(levels) or 'none'}), so it carries no contrast."
+        )
+    proposal["warnings"] = warnings
+    return proposal
+
+
 def split_unit_by_acquisition(manifest_path: Path, confirmed: bool = False) -> dict[str, Any]:
     """Split a Mixed unit into one part per acquisition mode, each with its own manifest.
 
@@ -1470,24 +1510,13 @@ def split_unit_by_acquisition(manifest_path: Path, confirmed: bool = False) -> d
         # shares the parent's download description rather than being given an empty one.
         project["files"] = matched_files or list(parent_project.get("files") or [])
         project["total_download_bytes"] = sum(int(item.get("size_bytes") or 0) for item in project["files"])
-        proposal = copy.deepcopy(parent_project.get("class_proposal") or {})
+        proposal = _part_class_proposal(
+            parent_project.get("class_proposal") or {},
+            sample_ids,
+            plan["analysis_unit_id"],
+            part["acquisition_mode"],
+        )
         if proposal:
-            proposal["assignments"] = [
-                item for item in proposal.get("assignments") or []
-                if str(item.get("sample_id") or "") in sample_ids
-            ]
-            proposal["split_from"] = {
-                "parent_analysis_unit_id": plan["analysis_unit_id"],
-                "note": (
-                    "The parent's accepted proposal, restricted to this part's samples. No sample "
-                    "was regrouped."
-                ),
-            }
-            if len(part["class_levels"]) < 2:
-                proposal.setdefault("warnings", []).append(
-                    f"After the split this part holds {len(part['class_levels'])} Class level(s) "
-                    f"({', '.join(part['class_levels']) or 'none'}), so it carries no contrast."
-                )
             project["class_proposal"] = proposal
         project["evidence"] = list(project.get("evidence") or []) + [
             f"Split from analysis unit {plan['analysis_unit_id']} by raw-header acquisition mode: "
