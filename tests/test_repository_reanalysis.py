@@ -1022,6 +1022,25 @@ class AcquisitionSplitTests(_MixedUnitFixture, unittest.TestCase):
         self.assertTrue(any("on its own" in item for item in reasons), reasons)
         self.assertFalse(part["project"]["eligible"])
 
+    def test_split_provenance_says_the_run_holds_part_of_the_proposal(self) -> None:
+        # MTBLS2207's DDA part was about to record "Class ... across 11 samples" for a run of six.
+        from msdial_app.repository_metadata import apply_class_proposal, metadata_workspace
+
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, _, _ = self._mixed(Path(temporary) / "unit")
+            result = split_unit_by_acquisition(manifest, confirmed=True)
+            project = json.loads(Path(result["parts"][0]["manifest_path"]).read_text(encoding="utf-8"))["project"]
+        provenance = apply_class_proposal(metadata_workspace(project), project["class_proposal"])[
+            "class_proposal_provenance"
+        ]
+
+        self.assertEqual(2, provenance["assignment_count"])
+        self.assertEqual(
+            {"assignments_kept": 2, "assignments_in_parent": 4},
+            {key: provenance["split_from"][key] for key in ("assignments_kept", "assignments_in_parent")},
+        )
+        self.assertTrue(any("holds 2 of the 4 samples" in item for item in provenance["warnings"]))
+
     def test_split_is_refused_for_a_unit_that_is_not_mixed(self) -> None:
         modes = {f"s{index:02d}_DDA.mzML": "DDA" for index in range(3)}
         with tempfile.TemporaryDirectory() as temporary:

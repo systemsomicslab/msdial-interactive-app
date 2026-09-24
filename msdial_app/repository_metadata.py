@@ -219,6 +219,9 @@ def apply_class_proposal(workspace: dict[str, Any], proposal: dict[str, Any]) ->
                 "status": str(proposal.get("status") or ""),
                 "assignment_count": len(labels),
                 "warnings": list(proposal.get("warnings") or []),
+                # Present when the unit was split by acquisition mode and this run holds only part of
+                # the samples the proposal was made for.
+                **({"split_from": dict(proposal["split_from"])} if proposal.get("split_from") else {}),
             },
             "projected_at": datetime.now(timezone.utc).isoformat(),
         }
