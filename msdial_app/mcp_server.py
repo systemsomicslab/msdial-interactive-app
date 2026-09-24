@@ -26,6 +26,33 @@ REPOSITORY_EXECUTION_SCOPE = {
     "requires_product_ion_spectra": True,
 }
 _EMBEDDED_SERVERS: dict[tuple[str, int], tuple[ThreadingHTTPServer, threading.Thread]] = {}
+# When this process started. A restart relaunches the HTTP listener inside this process, with the code
+# this process has already imported, so it can tell a caller whether the source on disk has moved on.
+_PROCESS_STARTED_AT = time.time()
+
+
+def _restart_code_note() -> dict[str, Any]:
+    """Say what a restart did not do: load source that changed after this process started.
+
+    The restart used to report restarted=true and describe itself as replacing the process "with the
+    current source version". The listener is embedded in this MCP server process, and relaunching it
+    re-uses the modules this process imported, so after a merge the restarted backend was the old
+    code - a missing endpoint answered 404 behind a report of success. Only a new process loads new
+    source; reconnecting the MCP server starts one.
+    """
+    package = Path(__file__).resolve().parent
+    changed = sorted(
+        path.name for path in package.glob("*.py") if path.stat().st_mtime > _PROCESS_STARTED_AT
+    )
+    note: dict[str, Any] = {"code_reloaded": False, "source_changed_since_process_start": changed}
+    if changed:
+        note["warnings"] = [
+            f"{len(changed)} source file(s) changed after this MCP server process started "
+            f"({', '.join(changed[:5])}). The restarted backend runs inside this process with the "
+            "code it already loaded, so those changes are not in effect. Reconnect the "
+            "msdial-interactive MCP server to load them."
+        ]
+    return note
 
 
 try:
@@ -866,7 +893,12 @@ def msdial_interactive_restart(
     confirmed: bool = False,
     open_browser: bool = False,
 ) -> dict[str, Any]:
-    """Replace a recognized local MS-DIAL Interactive process with the current source version."""
+    """Stop the local MS-DIAL Interactive listener and start it again inside this MCP server process.
+
+    This clears a hung or incompatible listener. It does not load new source: the listener runs with
+    the code this process has already imported. The result says which source files changed after the
+    process started; when any did, reconnect the MCP server to load them.
+    """
     current = _status_or_error(host, port)
     if not current["running"]:
         return {"restarted": False, "launched": True, **_launch_local_app(host, port, open_browser)}
@@ -888,7 +920,7 @@ def msdial_interactive_restart(
             embedded[0].server_close()
             embedded[1].join(timeout=5)
         else:
-            return {"restarted": False, "already_current": True, **current}
+            return {"restarted": False, "already_current": True, **_restart_code_note(), **current}
     else:
         process.terminate()
         try:
@@ -903,7 +935,7 @@ def msdial_interactive_restart(
             "The restarted app is still incompatible with this MCP server: "
             + str(launched)
         )
-    return {"restarted": True, "previous_process": process_info, **launched}
+    return {"restarted": True, "previous_process": process_info, **_restart_code_note(), **launched}
 
 
 @mcp.tool()
