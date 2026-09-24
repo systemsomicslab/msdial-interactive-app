@@ -30,6 +30,8 @@ from msdial_app.repository_reanalysis import (
     discard_download_lease,
     evaluate_eligibility,
     evaluate_repository_execution_gate,
+    plan_download_cleanup,
+    split_unit_by_acquisition,
     finalize_download_lease,
     request_download_cleanup,
 )
@@ -730,14 +732,8 @@ class RawMetadataPreflightFormatTests(unittest.TestCase):
         self.assertTrue(recorded["modified_at"])
 
 
-class MixedAcquisitionPreflightTests(unittest.TestCase):
-    """A unit whose headers disagree about acquisition mode is Mixed, not Unknown.
-
-    MetaboLights MTBLS2207: repository metadata said DIA with no evidence behind it, eleven headers
-    said six DDA and five DIA, and the preflight answered "Unknown", which the caller reads as "keep
-    what the repository said". Confirming untargeted status would then have made the unit eligible as
-    DIA, and the six DDA files would have been deconvoluted as SWATH.
-    """
+class _MixedUnitFixture:
+    """A repository unit on disk plus a stand-in raw-header extractor, for the tests below."""
 
     MODES = {"a_DDA_1.mzML": "DDA", "b_DIA_1.mzML": "DIA", "c_DDA_2.mzML": "DDA", "d_DIA_2.mzML": "DIA"}
 
@@ -758,6 +754,8 @@ class MixedAcquisitionPreflightTests(unittest.TestCase):
                 {
                     "status": "downloaded",
                     "workspace": str(root),
+                    "raw_directory": str(root / "raw"),
+                    "input_directory": str(data),
                     "output_directory": str(output),
                     "input_candidates": [str(path) for path in files],
                     "execution_allowed": False,
@@ -768,9 +766,25 @@ class MixedAcquisitionPreflightTests(unittest.TestCase):
                         "separation": "LC-MS",
                         "acquisition_mode": "DIA",
                         "ion_mode": "Negative",
-                        "files": [{"name": path.name, "size_bytes": 1, "url": ""} for path in files],
+                        "files": [
+                            {"name": f"FILES/{path.name}", "size_bytes": 1, "url": "", "role": "converted"}
+                            for path in files
+                        ],
                         "total_download_bytes": len(files),
                         "sample_count": len(files),
+                        "sample_metadata": [
+                            {"sample_id": path.stem, "raw_file": f"FILES/{path.name}", "values": {}}
+                            for path in files
+                        ],
+                        "class_proposal": {
+                            "proposal_id": "p1",
+                            "status": "accepted",
+                            "selected_fields": ["origin"],
+                            "assignments": [
+                                {"sample_id": path.stem, "class_label": "Bio" if index % 3 == 0 else "Chem"}
+                                for index, path in enumerate(files)
+                            ],
+                        },
                     },
                 }
             ),
@@ -780,7 +794,7 @@ class MixedAcquisitionPreflightTests(unittest.TestCase):
         extractor.write_bytes(b"stub")
         return manifest, extractor, files
 
-    def _extractor(self, modes: dict[str, str]):
+    def _extractor(self, modes: dict[str, str], levels: dict[str, list[int]] | None = None):
         """A stand-in for the extractor: writes one header record per --input it is given."""
         from subprocess import CompletedProcess
 
@@ -794,7 +808,7 @@ class MixedAcquisitionPreflightTests(unittest.TestCase):
                         "separation": {"value": "LiquidChromatography"},
                         "method": {"value": modes[Path(path).name], "confidence": 0.8},
                         "polarity": {"value": "Negative"},
-                        "msLevels": [1, 2],
+                        "msLevels": (levels or {}).get(Path(path).name, [1, 2]),
                     },
                 }
                 for path in inputs
@@ -803,6 +817,31 @@ class MixedAcquisitionPreflightTests(unittest.TestCase):
             return CompletedProcess(args=command, returncode=0, stdout="", stderr="")
 
         return run
+
+    def _gate_state(self, manifest: Path, files: list[Path], types: dict[str, str]) -> dict:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        entries = []
+        for path in files:
+            entry = {"file_path": str(path)}
+            if path.name in types:
+                entry["acquisition_type"] = types[path.name]
+            entries.append(entry)
+        return {
+            "repository_run_manifest": str(manifest),
+            "output_root": payload["output_directory"],
+            "ion_mode": "Negative",
+            "files": entries,
+        }
+
+
+class MixedAcquisitionPreflightTests(_MixedUnitFixture, unittest.TestCase):
+    """A unit whose headers disagree about acquisition mode is Mixed, not Unknown.
+
+    MetaboLights MTBLS2207: repository metadata said DIA with no evidence behind it, eleven headers
+    said six DDA and five DIA, and the preflight answered "Unknown", which the caller reads as "keep
+    what the repository said". Confirming untargeted status would then have made the unit eligible as
+    DIA, and the six DDA files would have been deconvoluted as SWATH.
+    """
 
     def test_disagreeing_headers_are_mixed_and_replace_the_repository_label(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -877,21 +916,6 @@ class MixedAcquisitionPreflightTests(unittest.TestCase):
         self.assertTrue(result["execution_allowed"])
         self.assertEqual("DDA", result["project"]["acquisition_mode"])
 
-    def _gate_state(self, manifest: Path, files: list[Path], types: dict[str, str]) -> dict:
-        payload = json.loads(manifest.read_text(encoding="utf-8"))
-        entries = []
-        for path in files:
-            entry = {"file_path": str(path)}
-            if path.name in types:
-                entry["acquisition_type"] = types[path.name]
-            entries.append(entry)
-        return {
-            "repository_run_manifest": str(manifest),
-            "output_root": payload["output_directory"],
-            "ion_mode": "Negative",
-            "files": entries,
-        }
-
     def test_the_gate_refuses_a_mixed_unit_even_if_execution_was_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest, extractor, files = self._workspace(Path(temporary) / "g1", self.MODES)
@@ -931,3 +955,201 @@ class MixedAcquisitionPreflightTests(unittest.TestCase):
         self.assertFalse(unstamped["allowed"])
         self.assertTrue(any("header DIA, run as DDA" in item for item in unstamped["blockers"]))
         self.assertTrue(stamped["allowed"], stamped["blockers"])
+
+
+class AcquisitionSplitTests(_MixedUnitFixture, unittest.TestCase):
+    """A Mixed unit is split into one part per header-read acquisition mode."""
+
+    def _mixed(self, root: Path, levels: dict[str, list[int]] | None = None):
+        manifest, extractor, files = self._workspace(root, self.MODES)
+        with patch(
+            "msdial_app.repository_reanalysis.subprocess.run",
+            side_effect=self._extractor(self.MODES, levels),
+        ):
+            run_raw_metadata_preflight(manifest, extractor)
+        return manifest, extractor, files
+
+    def test_split_preview_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, _, _ = self._mixed(Path(temporary) / "unit")
+            before = manifest.read_text(encoding="utf-8")
+            plan = split_unit_by_acquisition(manifest, confirmed=False)
+            after = manifest.read_text(encoding="utf-8")
+            siblings = sorted(path.name for path in (Path(temporary)).iterdir())
+
+        self.assertFalse(plan["written"])
+        self.assertEqual([], plan["blockers"])
+        self.assertEqual(["DDA", "DIA"], [part["acquisition_mode"] for part in plan["parts"]])
+        self.assertEqual(before, after)
+        self.assertEqual(["unit"], siblings)
+
+    def test_split_writes_one_manifest_per_mode_admitting_only_its_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, _, _ = self._mixed(Path(temporary) / "unit")
+            result = split_unit_by_acquisition(manifest, confirmed=True)
+            parts = {
+                part["acquisition_mode"]: json.loads(Path(part["manifest_path"]).read_text(encoding="utf-8"))
+                for part in result["parts"]
+            }
+            parent = json.loads(manifest.read_text(encoding="utf-8"))
+            dda_root = Path(result["parts"][0]["workspace"])
+            has_own_raw = (dda_root / "raw").exists()
+
+        self.assertTrue(result["written"])
+        self.assertEqual({"a_DDA_1.mzML", "c_DDA_2.mzML"}, {Path(p).name for p in parts["DDA"]["input_candidates"]})
+        self.assertEqual({"b_DIA_1.mzML", "d_DIA_2.mzML"}, {Path(p).name for p in parts["DIA"]["input_candidates"]})
+        self.assertEqual("DDA", parts["DDA"]["project"]["acquisition_mode"])
+        self.assertEqual("unit-mixed-dda", parts["DDA"]["project"]["analysis_unit_id"])
+        self.assertFalse(parts["DDA"]["execution_allowed"])
+        self.assertEqual(
+            ["a_DDA_1", "c_DDA_2"],
+            [item["sample_id"] for item in parts["DDA"]["project"]["class_proposal"]["assignments"]],
+        )
+        self.assertEqual(2, len(parts["DDA"]["project"]["sample_metadata"]))
+        self.assertEqual("split_by_acquisition", parent["status"])
+        self.assertFalse(parent["execution_allowed"])
+        self.assertEqual(2, len(parent["split_into"]))
+        self.assertFalse(has_own_raw, "a part must read the parent's raw data, not copy it")
+
+    def test_split_is_refused_for_a_unit_that_is_not_mixed(self) -> None:
+        modes = {f"s{index:02d}_DDA.mzML": "DDA" for index in range(3)}
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor, _ = self._workspace(Path(temporary) / "unit", modes)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run", side_effect=self._extractor(modes)
+            ):
+                run_raw_metadata_preflight(manifest, extractor)
+            result = split_unit_by_acquisition(manifest, confirmed=True)
+
+        self.assertFalse(result["written"])
+        self.assertTrue(any("Only a unit" in item for item in result["blockers"]))
+
+    def test_split_is_refused_when_some_files_were_never_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor, _ = self._workspace(Path(temporary) / "unit", self.MODES)
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run", side_effect=self._extractor(self.MODES)
+            ):
+                run_raw_metadata_preflight(manifest, extractor, max_inputs=2)
+            result = split_unit_by_acquisition(manifest, confirmed=True)
+
+        self.assertFalse(result["written"])
+        self.assertTrue(any("did not read every input file" in item for item in result["blockers"]))
+
+    def test_split_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, _, _ = self._mixed(Path(temporary) / "unit")
+            first = split_unit_by_acquisition(manifest, confirmed=True)
+            second = split_unit_by_acquisition(manifest, confirmed=True)
+
+        self.assertTrue(second["already_split"])
+        self.assertFalse(second["written"])
+        self.assertEqual(
+            [part["manifest_path"] for part in first["parts"]],
+            [part["manifest_path"] for part in second["parts"]],
+        )
+
+    def test_split_flags_ms_levels_beyond_ms2(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, _, _ = self._mixed(Path(temporary) / "unit", levels={"c_DDA_2.mzML": [1, 2, 3]})
+            result = split_unit_by_acquisition(manifest, confirmed=True)
+            dda = json.loads(Path(result["parts"][0]["manifest_path"]).read_text(encoding="utf-8"))
+            dia = json.loads(Path(result["parts"][1]["manifest_path"]).read_text(encoding="utf-8"))
+
+        self.assertEqual([3], result["parts"][0]["higher_ms_levels"])
+        self.assertTrue(any("MS level(s) [3]" in item for item in dda["project"]["warnings"]))
+        self.assertFalse(any("MS level" in item for item in dia["project"]["warnings"]))
+
+    def test_a_part_preflights_and_runs_only_as_its_own_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, extractor, files = self._mixed(Path(temporary) / "unit")
+            result = split_unit_by_acquisition(manifest, confirmed=True)
+            dia_part = Path(result["parts"][1]["manifest_path"])
+            with patch(
+                "msdial_app.repository_reanalysis.subprocess.run", side_effect=self._extractor(self.MODES)
+            ):
+                preflight = run_raw_metadata_preflight(dia_part, extractor, confirm_untargeted=True)
+            dia_files = [path for path in files if "DIA" in path.name]
+            dda_file = next(path for path in files if "DDA" in path.name)
+            cleared = evaluate_repository_execution_gate(
+                self._gate_state(dia_part, dia_files, {path.name: "SWATH" for path in dia_files})
+            )
+            intruding = evaluate_repository_execution_gate(
+                self._gate_state(
+                    dia_part, dia_files + [dda_file], {path.name: "SWATH" for path in dia_files + [dda_file]}
+                )
+            )
+            cleanup = plan_download_cleanup(dia_part)
+
+        self.assertEqual("preflight_passed", preflight["status"])
+        self.assertEqual("DIA", preflight["project"]["acquisition_mode"])
+        self.assertTrue(cleared["allowed"], cleared["blockers"])
+        self.assertFalse(intruding["allowed"])
+        self.assertTrue(any("not among the files" in item for item in intruding["blockers"]))
+        self.assertTrue(
+            any("not the expected 'raw' folder" in item for item in cleanup["blockers"]),
+            "a part must never delete the raw data it shares with its parent",
+        )
+
+
+class SplitPartJobTests(_MixedUnitFixture, unittest.TestCase):
+    """A part is reachable by the tools that take a download job id, and stays reachable."""
+
+    def _split_through_server(self, root: Path, jobs: dict) -> tuple[dict, str]:
+        from msdial_app import server
+
+        manifest, extractor, _ = self._workspace(root, self.MODES)
+        with patch(
+            "msdial_app.repository_reanalysis.subprocess.run", side_effect=self._extractor(self.MODES)
+        ):
+            run_raw_metadata_preflight(manifest, extractor)
+        jobs["parent"] = {
+            "id": "parent",
+            "kind": "repository_download",
+            "status": "completed",
+            "repository": "metabolights",
+            "accession": "MTBLS-MIXED",
+            "result": {"manifest_path": str(manifest)},
+        }
+        with patch.object(server, "JOBS", jobs), patch.object(server, "_persist_jobs_locked", lambda: None):
+            result = server._split_repository_download({"download_job_id": "parent", "confirmed": True})
+        return result, str(manifest)
+
+    def test_each_part_gets_a_completed_job_naming_its_manifest_and_parent(self) -> None:
+        jobs: dict = {}
+        with tempfile.TemporaryDirectory() as temporary:
+            result, _ = self._split_through_server(Path(temporary) / "unit", jobs)
+            recorded = [
+                json.loads(Path(part["manifest_path"]).read_text(encoding="utf-8"))["job_id"]
+                for part in result["parts"]
+            ]
+
+        part_jobs = [jobs[part["job_id"]] for part in result["parts"]]
+        self.assertEqual({"repository_split_part"}, {job["kind"] for job in part_jobs})
+        self.assertEqual({"completed"}, {job["status"] for job in part_jobs})
+        self.assertEqual({"parent"}, {job["result"]["split_from_job_id"] for job in part_jobs})
+        self.assertEqual([2, 2], [len(job["result"]["recognized"]["files"]) for job in part_jobs])
+        self.assertEqual([part["job_id"] for part in result["parts"]], recorded)
+
+    def test_an_evicted_part_job_is_re_registered_under_the_same_id(self) -> None:
+        from msdial_app import server
+
+        jobs: dict = {}
+        with tempfile.TemporaryDirectory() as temporary:
+            first, _ = self._split_through_server(Path(temporary) / "unit", jobs)
+            evicted = first["parts"][0]["job_id"]
+            del jobs[evicted]
+            with patch.object(server, "JOBS", jobs), patch.object(server, "_persist_jobs_locked", lambda: None):
+                again = server._split_repository_download({"download_job_id": "parent", "confirmed": True})
+
+        self.assertTrue(again["already_split"])
+        self.assertEqual(evicted, again["parts"][0]["job_id"])
+        self.assertIn(evicted, jobs)
+
+    def test_only_a_download_job_can_be_split(self) -> None:
+        from msdial_app import server
+
+        jobs = {"x": {"id": "x", "kind": "repository_split_part", "status": "completed", "result": {}}}
+        with patch.object(server, "JOBS", jobs):
+            with self.assertRaisesRegex(ValueError, "not a repository download job"):
+                server._split_repository_download({"download_job_id": "x", "confirmed": True})

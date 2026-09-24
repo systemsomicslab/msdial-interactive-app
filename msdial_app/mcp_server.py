@@ -289,7 +289,9 @@ def _repository_download_job(
         port=port,
         timeout=30,
     )
-    if job.get("kind") != "repository_download":
+    # A part of a split unit has no download of its own, and is addressed through a job record the
+    # split registered for it; its manifest names the parent whose raw files it reads.
+    if job.get("kind") not in {"repository_download", "repository_split_part"}:
         raise RuntimeError(f"Job {job_id} is not a repository download job.")
     if job.get("status") != "completed":
         raise RuntimeError(
@@ -1321,6 +1323,60 @@ def msdial_repository_raw_metadata_preflight(
         "unsupported_formats": raw.get("unsupported_formats") or [],
         "retry_can_help": result.get("status") != "preflight_unsupported_format",
         "confirm_untargeted_applied": confirm_untargeted,
+    }
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_split_repository_unit(
+    download_job_id: str,
+    confirmed: bool = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Split a unit whose raw headers disagree about acquisition mode into one part per mode.
+
+    Requires a completed raw-header preflight that read every input file and reported the unit as
+    Mixed. With confirmed=false this previews the parts: which files, samples and Class levels each
+    would hold. With confirmed=true it writes one workspace and run manifest per part beside the
+    parent, marks the parent split, and returns a job id per part. Pass that job id to the preflight,
+    prepare and start tools exactly as a download job id. Raw data are shared with the parent, not
+    copied, and each part starts with execution_allowed false until its own preflight passes.
+    """
+    result = _request_json(
+        "POST",
+        "/api/repository/split",
+        host=host,
+        port=port,
+        body={"download_job_id": download_job_id, "confirmed": bool(confirmed)},
+        timeout=120,
+    )
+    parts = []
+    for part in result.get("parts") or []:
+        files = part.get("input_candidates") or []
+        parts.append(
+            {
+                "analysis_unit_id": part.get("analysis_unit_id"),
+                "job_id": part.get("job_id"),
+                "acquisition_mode": part.get("acquisition_mode"),
+                "workspace": part.get("workspace"),
+                "manifest_path": part.get("manifest_path"),
+                "file_count": part.get("file_count", len(files)),
+                "files": [Path(str(item)).name for item in files[:20]],
+                "sample_ids": part.get("sample_ids") or [],
+                "class_levels": part.get("class_levels") or {},
+                "higher_ms_levels": part.get("higher_ms_levels") or [],
+            }
+        )
+    return {
+        "written": bool(result.get("written")),
+        "already_split": bool(result.get("already_split")),
+        "confirmation_required": not confirmed and not result.get("already_split"),
+        "manifest_path": result.get("manifest_path"),
+        "analysis_unit_id": result.get("analysis_unit_id"),
+        "parts": parts,
+        "unclaimed_samples": result.get("unclaimed_samples") or [],
+        "blockers": result.get("blockers") or [],
     }
 
 

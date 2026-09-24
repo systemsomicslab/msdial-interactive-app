@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import copy
 import csv
 import json
 import random
@@ -1283,6 +1284,268 @@ def run_raw_metadata_preflight(
         manifest["status"] = "preflight_review_required"
     _write_json(manifest_path, manifest)
     return {**manifest, "manifest_path": str(manifest_path)}
+
+
+# The status a parent unit carries once it has been split. It is not in CLEANUP_READY_STATUSES and it
+# never sets execution_allowed, so neither MS-DIAL nor a raw deletion can run against the parent.
+SPLIT_PARENT_STATUS = "split_by_acquisition"
+SPLIT_PART_STATUS = "split_from_parent"
+
+
+def _split_part_id(parent_unit_id: str, mode: str) -> str:
+    return f"{parent_unit_id}-{mode.casefold()}"
+
+
+def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
+    """Describe how a Mixed unit would be split by per-file acquisition mode. Changes nothing.
+
+    WHY A SPLIT AND NOT A RELABEL. MS-DIAL deconvolutes each file by the acquisition type written
+    against it, and a DDA file deconvoluted as SWATH, or a DIA file read as DDA, gives a result that
+    completes, validates and is wrong. A unit whose headers disagree therefore cannot run as one,
+    and the only evidence for how to divide it is what each file's own header said. The parts are
+    made from that evidence and nothing else: a file whose header gave no usable mode blocks the
+    split rather than being guessed into a part.
+
+    The parts share the parent's raw data and do not copy it. Their input files are disjoint, and
+    MS-DIAL's per-file intermediates carry a run timestamp, so parts run one after another do not
+    collide. The raw data stay owned by the parent: a part's cleanup is refused, because its raw
+    directory is not its own.
+    """
+    manifest_path = manifest_path.resolve()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    project = manifest.get("project") or {}
+    preflight = manifest.get("raw_metadata_preflight") or {}
+    summary = preflight.get("summary") or {}
+    coverage = summary.get("coverage") or {}
+    parent_id = str(project.get("analysis_unit_id") or "").strip()
+    workspace = Path(str(manifest.get("workspace") or manifest_path.parent.parent))
+    blockers: list[str] = []
+
+    if manifest.get("status") == SPLIT_PARENT_STATUS:
+        already = manifest.get("split_into") or []
+        return {
+            "manifest_path": str(manifest_path),
+            "analysis_unit_id": parent_id,
+            "already_split": True,
+            "parts": already,
+            "blockers": [],
+        }
+    if not parent_id:
+        blockers.append("The manifest names no analysis_unit_id to derive part identifiers from.")
+    if summary.get("acquisition_mode") != "Mixed":
+        blockers.append(
+            "Only a unit whose raw headers disagree about acquisition mode is split here; this one "
+            f"is {summary.get('acquisition_mode') or project.get('acquisition_mode') or 'unknown'!r}."
+        )
+    if not coverage.get("complete"):
+        blockers.append(
+            "The raw-header preflight did not read every input file, so the files it did not read "
+            "cannot be assigned to a part. Re-run it over every file."
+        )
+
+    per_file = {_file_key(str(item.get("file") or "")): item for item in summary.get("per_file") or []}
+    candidates = [str(item) for item in manifest.get("input_candidates") or [] if str(item).strip()]
+    groups: dict[str, list[str]] = {}
+    unassigned: list[str] = []
+    for candidate in candidates:
+        verdict = per_file.get(_file_key(candidate))
+        mode = str((verdict or {}).get("acquisition_mode") or "").strip()
+        if mode in HEADER_ACQUISITION_TO_MSDIAL:
+            groups.setdefault(mode, []).append(candidate)
+        else:
+            unassigned.append(f"{Path(candidate).name} ({mode or 'no header verdict'})")
+    if unassigned:
+        blockers.append(
+            f"{len(unassigned)} input files have no DDA, DIA or AIF header verdict and cannot be put "
+            f"into a part: {', '.join(unassigned[:5])}. Decide whether to exclude them."
+        )
+
+    samples = list(project.get("sample_metadata") or [])
+    assignments = list((project.get("class_proposal") or {}).get("assignments") or [])
+    parts = []
+    claimed_samples: set[int] = set()
+    for mode, files in sorted(groups.items()):
+        names = {Path(item).name.casefold() for item in files}
+        stems = {PurePosixPath(name).stem for name in names}
+        part_samples = []
+        for index, sample in enumerate(samples):
+            raw = PurePosixPath(str((sample or {}).get("raw_file") or "").replace("\\", "/")).name.casefold()
+            if raw and (raw in names or (not PurePosixPath(raw).suffix and raw in stems)):
+                part_samples.append(sample)
+                claimed_samples.add(index)
+        sample_ids = {str(item.get("sample_id") or "") for item in part_samples}
+        part_assignments = [item for item in assignments if str(item.get("sample_id") or "") in sample_ids]
+        levels: dict[str, int] = {}
+        for item in part_assignments:
+            label = str(item.get("class_label") or "")
+            levels[label] = levels.get(label, 0) + 1
+        higher_levels = sorted(
+            {
+                int(level)
+                for item in files
+                for level in ((per_file.get(_file_key(item)) or {}).get("ms_levels") or [])
+                if str(level).isdigit() and int(level) > 2
+            }
+        )
+        part_id = _split_part_id(parent_id, mode)
+        parts.append(
+            {
+                "analysis_unit_id": part_id,
+                "acquisition_mode": mode,
+                "workspace": str(workspace.parent / part_id),
+                "input_candidates": sorted(files),
+                "file_count": len(files),
+                "sample_ids": sorted(sample_ids),
+                "class_levels": levels,
+                "higher_ms_levels": higher_levels,
+            }
+        )
+    unclaimed = [
+        str((sample or {}).get("sample_id") or index)
+        for index, sample in enumerate(samples)
+        if index not in claimed_samples
+    ]
+    return {
+        "manifest_path": str(manifest_path),
+        "analysis_unit_id": parent_id,
+        "already_split": False,
+        "parts": parts,
+        "unclaimed_samples": unclaimed,
+        "blockers": blockers,
+    }
+
+
+def split_unit_by_acquisition(manifest_path: Path, confirmed: bool = False) -> dict[str, Any]:
+    """Split a Mixed unit into one part per acquisition mode, each with its own manifest.
+
+    With confirmed false this is plan_acquisition_split. With confirmed true it writes, for each part,
+    a workspace holding provenance and output directories and a run manifest that:
+
+    - admits only that part's input files, so the execution gate refuses the others;
+    - carries the part's acquisition mode as read from its files' headers, and those headers' own
+      verdicts, so the gate can check each file against its header;
+    - keeps only the samples, and the accepted Class assignments, that belong to its files. The
+      Class decision is the parent's, filtered; it is not a new grouping;
+    - starts with execution_allowed false. Each part is preflighted on its own before it can run.
+
+    The parent is marked split and names its parts. Nothing is copied or deleted.
+    """
+    plan = plan_acquisition_split(manifest_path)
+    if plan["already_split"] or not confirmed or plan["blockers"]:
+        return {**plan, "written": False}
+
+    manifest_path = Path(plan["manifest_path"])
+    parent = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    parent_project = parent.get("project") or {}
+    per_file = {
+        _file_key(str(item.get("file") or "")): item
+        for item in (parent.get("raw_metadata_preflight") or {}).get("summary", {}).get("per_file") or []
+    }
+    from .repository_metadata import metadata_workspace
+
+    now = datetime.now(timezone.utc).isoformat()
+    written = []
+    for part in plan["parts"]:
+        root = Path(part["workspace"])
+        provenance = root / "provenance"
+        output = root / "output"
+        provenance.mkdir(parents=True, exist_ok=True)
+        output.mkdir(parents=True, exist_ok=True)
+        names = {Path(item).name.casefold() for item in part["input_candidates"]}
+        sample_ids = set(part["sample_ids"])
+
+        project = copy.deepcopy(parent_project)
+        project["analysis_unit_id"] = part["analysis_unit_id"]
+        project["acquisition_mode"] = part["acquisition_mode"]
+        project["sample_metadata"] = [
+            sample for sample in parent_project.get("sample_metadata") or []
+            if str((sample or {}).get("sample_id") or "") in sample_ids
+        ]
+        project["sample_count"] = len(project["sample_metadata"]) or part["file_count"]
+        matched_files = [
+            item for item in parent_project.get("files") or []
+            if PurePosixPath(str(item.get("name") or "").replace("\\", "/")).name.casefold() in names
+        ]
+        # An archive unit's file list names the archive, not the files inside it; the part then
+        # shares the parent's download description rather than being given an empty one.
+        project["files"] = matched_files or list(parent_project.get("files") or [])
+        project["total_download_bytes"] = sum(int(item.get("size_bytes") or 0) for item in project["files"])
+        proposal = copy.deepcopy(parent_project.get("class_proposal") or {})
+        if proposal:
+            proposal["assignments"] = [
+                item for item in proposal.get("assignments") or []
+                if str(item.get("sample_id") or "") in sample_ids
+            ]
+            proposal["split_from"] = {
+                "parent_analysis_unit_id": plan["analysis_unit_id"],
+                "note": (
+                    "The parent's accepted proposal, restricted to this part's samples. No sample "
+                    "was regrouped."
+                ),
+            }
+            if len(part["class_levels"]) < 2:
+                proposal.setdefault("warnings", []).append(
+                    f"After the split this part holds {len(part['class_levels'])} Class level(s) "
+                    f"({', '.join(part['class_levels']) or 'none'}), so it carries no contrast."
+                )
+            project["class_proposal"] = proposal
+        project["evidence"] = list(project.get("evidence") or []) + [
+            f"Split from analysis unit {plan['analysis_unit_id']} by raw-header acquisition mode: "
+            f"{part['file_count']} file(s) whose headers read {part['acquisition_mode']}."
+        ]
+        warnings = list(project.get("warnings") or [])
+        if part["higher_ms_levels"]:
+            warnings.append(
+                f"Some files in this part record MS level(s) {part['higher_ms_levels']} as well as "
+                "MS1 and MS2. MS-DIAL reads MS1 and MS2 only; the higher levels are not analysed."
+            )
+        project["warnings"] = warnings
+        project["eligible"] = False
+        project["selection_status"] = "raw_metadata_required"
+
+        part_manifest = {
+            "schema": parent.get("schema", "msdial-public-reanalysis-run.v1"),
+            "created_at": now,
+            "status": SPLIT_PART_STATUS,
+            "project": project,
+            "split_from": {
+                "manifest_path": str(manifest_path),
+                "analysis_unit_id": plan["analysis_unit_id"],
+                "split_by": "raw_header_acquisition_mode",
+                "acquisition_mode": part["acquisition_mode"],
+            },
+            "workspace": str(root),
+            # Shared with the parent and owned by it. A part's cleanup plan refuses this directory
+            # because it is not <workspace>\raw, which is the intended outcome.
+            "raw_directory": parent.get("raw_directory"),
+            "input_directory": parent.get("input_directory"),
+            "output_directory": str(output),
+            "raw_owned_by": str(manifest_path),
+            "input_candidates": part["input_candidates"],
+            "analysis_input_path": parent.get("analysis_input_path"),
+            "execution_allowed": False,
+            "cleanup_allowed": False,
+            "raw_retention_policy": parent.get("raw_retention_policy"),
+            "header_verdicts_from_parent": [
+                per_file[_file_key(item)] for item in part["input_candidates"] if _file_key(item) in per_file
+            ],
+        }
+        repository_metadata_path = provenance / "repository-metadata.json"
+        sample_metadata_path = provenance / "sample-metadata-extracted.json"
+        part_manifest_path = provenance / "run-manifest.json"
+        _write_json(repository_metadata_path, project)
+        _write_json(sample_metadata_path, metadata_workspace(project))
+        part_manifest["repository_metadata_file"] = str(repository_metadata_path)
+        part_manifest["sample_metadata_file"] = str(sample_metadata_path)
+        _write_json(part_manifest_path, part_manifest)
+        written.append({**part, "manifest_path": str(part_manifest_path)})
+
+    parent["status"] = SPLIT_PARENT_STATUS
+    parent["execution_allowed"] = False
+    parent["split_at"] = now
+    parent["split_into"] = written
+    _write_json(manifest_path, parent)
+    return {**plan, "parts": written, "written": True}
 
 
 # The manifest states from which a confirmed deletion may proceed. cleanup_pending_confirmation is the

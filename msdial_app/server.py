@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import json
 import mimetypes
@@ -58,6 +59,7 @@ from .repository_reanalysis import (
     finalize_download_lease,
     project_from_dict,
     resolve_required_download_bytes,
+    split_unit_by_acquisition,
 )
 from .workflow import (
     console_version,
@@ -827,6 +829,8 @@ class Handler(BaseHTTPRequestHandler):
                     daemon=True,
                 ).start()
                 self._json({"job_id": job_id})
+            elif parsed.path == "/api/repository/split":
+                self._json(_split_repository_download(body))
             elif parsed.path == "/api/repository/metadata/load":
                 self._json({"workspace": metadata_workspace_from_file(body.get("path", ""))})
             elif parsed.path == "/api/repository/metadata/project":
@@ -1762,6 +1766,79 @@ def _run_repository_download_job(
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             _persist_jobs_locked()
 
+
+def _register_split_part(parent_job: dict[str, Any], part: dict[str, Any]) -> str:
+    """Give one part of a split unit a job record the reanalysis tools can address.
+
+    Every tool after the download -- preparing the analysis CSV, the raw-header preflight, the run --
+    finds its unit through a completed job's result. A part has no download of its own, so without
+    this it could not be reached at all. The record says what it is: kind repository_split_part, the
+    parent job it came from, and no bytes received. The part's manifest remains the durable record;
+    the registry is truncated to its hundred most recent jobs, so the job id is written into the
+    manifest and a later split call re-registers the same id if the record was evicted.
+    """
+    part_manifest_path = Path(part["manifest_path"])
+    part_manifest = json.loads(part_manifest_path.read_text(encoding="utf-8-sig"))
+    job_id = str(part_manifest.get("job_id") or "").strip() or uuid.uuid4().hex
+    now = dt.datetime.now().astimezone().isoformat()
+    recognized = expand_paths_report(part_manifest.get("input_candidates", []))
+    with JOBS_LOCK:
+        if job_id not in JOBS:
+            JOBS[job_id] = {
+                "id": job_id,
+                "status": "completed",
+                "kind": "repository_split_part",
+                "logs": [
+                    f"Split from repository download job {parent_job.get('id')} by raw-header "
+                    f"acquisition mode ({part['acquisition_mode']}). No data were downloaded; the "
+                    "part reads the parent's raw files in place."
+                ],
+                "result": {
+                    "manifest_path": str(part_manifest_path),
+                    "workspace": part_manifest.get("workspace"),
+                    "raw_directory": part_manifest.get("raw_directory"),
+                    "input_directory": part_manifest.get("input_directory"),
+                    "output_directory": part_manifest.get("output_directory"),
+                    "analysis_input_path": part_manifest.get("analysis_input_path"),
+                    "input_candidates": part_manifest.get("input_candidates", []),
+                    "recognized": recognized,
+                    "raw_retention_policy": part_manifest.get("raw_retention_policy"),
+                    "split_from_job_id": parent_job.get("id"),
+                },
+                "received": 0,
+                "total": 0,
+                "progress": 100,
+                "repository": parent_job.get("repository"),
+                "accession": parent_job.get("accession"),
+                "raw_retention_policy": part_manifest.get("raw_retention_policy") or "keep",
+                "created_at": now,
+                "updated_at": now,
+            }
+            _persist_jobs_locked()
+    if part_manifest.get("job_id") != job_id:
+        part_manifest["job_id"] = job_id
+        part_manifest_path.write_text(
+            json.dumps(part_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    return job_id
+
+
+def _split_repository_download(body: dict[str, Any]) -> dict[str, Any]:
+    job_id = str(body.get("download_job_id") or "").strip()
+    with JOBS_LOCK:
+        parent_job = copy.deepcopy(JOBS.get(job_id))
+    if not parent_job or parent_job.get("kind") != "repository_download":
+        raise ValueError(f"Job {job_id} is not a repository download job.")
+    if parent_job.get("status") != "completed":
+        raise ValueError(f"Repository download job {job_id} is {parent_job.get('status')}.")
+    manifest_path = Path(str((parent_job.get("result") or {}).get("manifest_path") or ""))
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Repository run manifest was not found for job {job_id}: {manifest_path}")
+    result = split_unit_by_acquisition(manifest_path, confirmed=bool(body.get("confirmed")))
+    if result.get("written") or result.get("already_split"):
+        for part in result.get("parts") or []:
+            part["job_id"] = _register_split_part(parent_job, part)
+    return result
 
 def _record_repository_run_failure(
     preparation: dict[str, Any],
