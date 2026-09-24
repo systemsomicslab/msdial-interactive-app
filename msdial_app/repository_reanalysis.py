@@ -1500,8 +1500,24 @@ def split_unit_by_acquisition(manifest_path: Path, confirmed: bool = False) -> d
                 "MS1 and MS2. MS-DIAL reads MS1 and MS2 only; the higher levels are not analysed."
             )
         project["warnings"] = warnings
+        # The parent's verdict was about the parent - "more than one acquisition mode" is exactly
+        # what a part is not - so a part is judged afresh. It is then held back regardless, because
+        # its acquisition mode has so far been read only as one group of the parent's files.
+        evaluated = evaluate_eligibility(
+            project_from_dict(project),
+            EligibilityPolicy(
+                max_download_bytes=max(int(project["total_download_bytes"] or 0), 1),
+                max_samples=max(int(project["sample_count"] or 0), 1),
+                require_known_size=False,
+                require_untargeted=True,
+            ),
+        )
+        project["exclusion_reasons"] = evaluated.exclusion_reasons
+        project["review_reasons"] = list(evaluated.review_reasons) + (
+            [] if evaluated.exclusion_reasons else ["Preflight this part on its own before it can run."]
+        )
         project["eligible"] = False
-        project["selection_status"] = "raw_metadata_required"
+        project["selection_status"] = evaluated.selection_status if evaluated.exclusion_reasons else "raw_metadata_required"
 
         part_manifest = {
             "schema": parent.get("schema", "msdial-public-reanalysis-run.v1"),
