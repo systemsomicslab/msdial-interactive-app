@@ -13,11 +13,12 @@ from pathlib import Path
 from functools import wraps
 from typing import Any
 
+from . import __version__
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-REQUIRED_AGENT_API_VERSION = "0.4"
+REQUIRED_AGENT_API_VERSION = "0.5"
 REPOSITORY_EXECUTION_SCOPE = {
     "project_type": "LC-MS/MS",
     "acquisition_modes": ["DDA", "DIA", "AIF", "SWATH"],
@@ -58,7 +59,7 @@ def _restart_code_note() -> dict[str, Any]:
 try:
     from mcp.server import MCPServer
 
-    mcp = MCPServer("MS-DIAL Interactive")
+    mcp = MCPServer("MS-DIAL Interactive", version=__version__)
 except ImportError as error:
     raise RuntimeError(
         "The MCP Python SDK is required for the MS-DIAL Interactive MCP server. "

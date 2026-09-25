@@ -12,6 +12,17 @@ from msdial_app import mcp_server
 
 
 class McpRepositoryToolsTests(unittest.TestCase):
+    def test_agent_api_04_backend_is_incompatible_with_split_tools(self) -> None:
+        with patch.object(mcp_server, "_request_json", return_value={"agent_api_version": "0.4"}):
+            status = mcp_server._status_or_error("127.0.0.1", 8765)
+        self.assertTrue(status["running"])
+        self.assertFalse(status["compatible"])
+        self.assertEqual("0.5", status["required_agent_api_version"])
+
+        with patch.object(mcp_server, "_request_json", return_value={"agent_api_version": "0.5"}):
+            status = mcp_server._status_or_error("127.0.0.1", 8765)
+        self.assertTrue(status["compatible"])
+
     @staticmethod
     def _unit_handoff(unit_id: str = "unit-neg") -> dict:
         return {

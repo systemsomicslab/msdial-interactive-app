@@ -463,7 +463,7 @@ Core MCP tools:
 - `msdial_repository_qa_evidence`: expose internal-standard declarations for agent-reviewed QA targets
 - `msdial_cleanup_repository_raw`: preview and explicitly confirm post-validation raw-data deletion
 
-Agent API 0.4 binds mzTab-M, QA, publication, and handoff operations to the
+Agent API 0.5 binds mzTab-M, QA, publication, and handoff operations to the
 production `job_id`. Files left by earlier runs in the same output directory are
 excluded. Job summaries are compact by default; full details are opt-in.
 

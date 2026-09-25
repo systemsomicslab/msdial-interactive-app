@@ -4,10 +4,12 @@ import zipfile
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from msdial_app.agent_bridge import create_datamining_handoff, summarize_jobs
+from msdial_app import __version__
 from msdial_app.mztab_preview import preview_mztab_file, preview_mztab_outputs
 from msdial_app.mztab_validation import validate_mztab_file, validate_mztab_files, validate_mztab_outputs
 from msdial_app.workflow import (
@@ -36,6 +38,12 @@ from msdial_app.workflow import (
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_project_version_matches_package_version(self) -> None:
+        project = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+        version = re.search(r'^version = "([^"]+)"$', project, flags=re.MULTILINE)
+        self.assertIsNotNone(version)
+        self.assertEqual(version.group(1), __version__)
+
     def test_mzxml_is_rejected_with_mzml_conversion_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "legacy.mzXML"
@@ -746,9 +754,9 @@ class WorkflowTests(unittest.TestCase):
             manifest = json.loads(
                 Path(result["manifest"]).read_text(encoding="utf-8")
             )
-            self.assertEqual("0.4.8", settings["msdial_interactive_version"])
+            self.assertEqual(__version__, settings["msdial_interactive_version"])
             self.assertEqual("not recorded", settings["msdial_console_version"])
-            self.assertEqual("0.4.8", manifest["msdial_interactive_version"])
+            self.assertEqual(__version__, manifest["msdial_interactive_version"])
             self.assertEqual("21904324", settings["library_provenance"][0]["record_id"])
             self.assertEqual("CC BY 4.0", settings["library_provenance"][0]["license"])
 
@@ -980,7 +988,9 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(Path(handoff["handoff_file"]).is_file())
             status = summarize_jobs({"job1": {**job, "datamining_handoff": handoff}})
             self.assertEqual("job1", status["latest_completed_job"]["id"])
-            self.assertEqual("0.4", status["agent_api_version"])
+            self.assertEqual("0.5", status["agent_api_version"])
+            self.assertEqual(__version__, status["app_version"])
+            self.assertIn("split_repository_unit_by_acquisition", status["capabilities"])
             self.assertIn("create_datamining_handoff", status["capabilities"])
             self.assertIn("inspect_repository_sample_metadata", status["capabilities"])
             self.assertIn("prepare_repository_reanalysis_without_ui", status["capabilities"])

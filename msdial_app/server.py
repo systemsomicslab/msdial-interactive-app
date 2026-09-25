@@ -504,7 +504,7 @@ def _browse_filesystem(path_text: str = "") -> dict[str, Any]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MSDIALInteractive/0.1"
+    server_version = f"MSDIALInteractive/{__version__}"
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)

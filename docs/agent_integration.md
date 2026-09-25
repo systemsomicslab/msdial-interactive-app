@@ -144,7 +144,7 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 
 Run completion, mzTab-M validation/preview, LC-MS QA, publication generation,
 and handoff should receive the exact `job_id` returned by the production run.
-Agent API 0.4 tracks files created or updated by that job and does not silently
+Agent API 0.5 tracks files created or updated by that job and does not silently
 reuse older mzTab-M or `*.qa.tsv` files from the same directory. Publication can
 be generated without QA by setting `run_qa=false`.
 
