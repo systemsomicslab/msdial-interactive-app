@@ -38,25 +38,35 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
   `automatic rt correction reference centrality weight` (0.35), and
   `automatic rt correction interpolate blanks by analytical order` (true).
   Validation requires LC-MS, alignment enabled, no simultaneous user-defined RT
-  correction, at least two minimum anchors, a maximum not below the minimum,
-  positive RT bin width/match tolerance/MAD threshold, and quantiles, coverage,
-  and centrality weight within [0,1]. The template reader, the validator and the
-  method writer share one set of defaults, so an absent value is validated as the
-  value that will be written. The UI and agent expose these settings, and a blank
-  UI field takes its default. The zero-threshold peak diagnostic turns automatic
-  RT correction and alignment light mode off, since it runs without alignment.
+  correction, whole-number anchor counts and reference file ID (-1 or a file ID),
+  at least two minimum anchors, a maximum not below the minimum, positive RT bin
+  width and match tolerance, an outlier MAD threshold of 0 (no outlier rejection,
+  as the Console treats it) or more, and quantiles, coverage and centrality weight
+  within [0,1]. A fractional anchor count is refused rather than truncated: the
+  Console reads these as whole numbers and keeps its default otherwise. The
+  template reader, the validator, the agent answers and the method writer share
+  one set of defaults, so an absent value is validated as the value that will be
+  written. The UI and agent expose these settings, and a blank UI field takes its
+  default. The zero-threshold peak diagnostic turns automatic RT correction and
+  alignment light mode off, since it runs without alignment.
   Methods and Table S1 describe correction only when the Console summary and
   anchor audit TSVs plus `method.keys.json` prove it ran for this run: the
   method-key record must carry the hash of the run's `method.txt`, both TSVs must
   be no older than that record, and at least one file other than the reference
-  must have been corrected from its own detected anchors. With the feature off,
-  Table S1 lists none of its settings. Repository runs warn when Blank models would
+  must have been corrected from its own detected anchors. The Methods text says
+  how many files were corrected from their own anchors, how many Blanks took an
+  interpolated or nearest-sample model and how many kept their original RTs, and
+  that aligned feature RTs, mzTab-M included, are on the reference file's RT axis
+  while per-file peak lists and annotation keep measured RTs. With the feature
+  off, Table S1 lists none of its settings; `Supplementary_Table_MS_DIAL.tsv`
+  still records every workflow key. Repository runs warn when Blank models would
   be interpolated along an analytical order inferred from file names or the file
-  listing. The Console is recognised as implementing the feature by the method key
-  its parser reads or the audit line it writes, both in `MSDIALCUI.exe` itself;
-  the title-case field label is in `MsdialCore.dll` and is not accepted. This
-  requires a Console built from the feature branch; it is not yet on
-  MsdialWorkbench master.
+  listing, if the run has a Blank. The Console is recognised as implementing the
+  feature by the method key its parser reads or the audit line it writes. Both
+  are in the Console assembly: `MSDIALCUI.exe` for net48, and for net8 the
+  `MSDIALCUI.dll` beside the `.exe` launcher, which is read too. The title-case
+  field label is in `MsdialCore.dll` and is not accepted. This requires a Console
+  built from the feature branch; it is not yet on MsdialWorkbench master.
 - Agent-guided runs keep `sample_table_proposal` in the workflow state: how the
   analytical order and dilution factors were proposed, with the alternatives. It
   is listed in `Supplementary_Table_MS_DIAL.tsv`, which records every workflow
@@ -79,6 +89,15 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
 - Unknown raw-retention policies resolve to keep and produce a warning. (#23)
 
 ### Fixed
+- The reproduction scripts in a run bundle (`run-msdial.ps1`, `run-msdial.sh`)
+  read the run's own `method.txt`. The Console writes `method.keys.json` beside
+  the method file it reads and matrix exports to its `Export folder path`, which
+  is the original run directory, so a reproduction overwrote the original run's
+  key record and matrices. The scripts now write a copy into
+  `reproduced-results` with `Export folder path` pointing there, and run from it.
+- The injection-order proposal said Blanks and QCs "keep the place the listing
+  gave them"; the order it proposes places them after every sample. The reason
+  now says so.
 - Integer parameters are written as integers, so the Console can parse them. (#23)
 - Agent-driven runs retain mzTab-M validation, artifact inventory, and the raw
   retention verdict. (#23)
@@ -100,6 +119,9 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
 - The mzXML exclusion is unit-wide: one file listed with role `requires_conversion`,
   or one sample naming an `.mzXML`/`.mzData` file, excludes the whole unit, even
   when its other inputs are vendor raw files or mzML that MS-DIAL can read.
+- The automatic RT-correction evidence compares file modification times, so it
+  is read in the run directory the Console wrote. A copy that does not keep
+  modification times reads as not proven (a warning, never a false claim).
 - Console source builds need an explicit provenance check; the MCP backend is still
   embedded in its process and must be reconnected to load new code.
 - Run-start provenance, instrument family from headers, analytical-order timestamps,

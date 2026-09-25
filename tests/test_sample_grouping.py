@@ -101,6 +101,21 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class InjectionOrderReasonTests(unittest.TestCase):
+    def test_the_reason_says_where_blanks_and_qcs_go(self) -> None:
+        # The reason once said Blanks and QCs "keep the place the listing gave them" while the
+        # code placed them after every sample. The reason is what a reviewer reads.
+        from msdial_app.sample_grouping import propose_injection_order
+
+        names = ["Blank_01", "run_12_a", "run_10_b", "run_11_c"]
+        order = propose_injection_order(names)
+
+        self.assertEqual("embedded", order["chosen"])
+        self.assertEqual(4, order["orders"]["Blank_01"])
+        self.assertIn("placed after the samples", order["reason"])
+        self.assertNotIn("keep the place", order["reason"])
+
+
 class InjectionOrderTests(unittest.TestCase):
     def test_the_sequence_number_in_the_name_is_read_as_the_order(self) -> None:
         from msdial_app.sample_grouping import propose_injection_order

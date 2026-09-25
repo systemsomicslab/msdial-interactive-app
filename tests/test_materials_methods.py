@@ -260,7 +260,8 @@ class MaterialsMethodsTests(unittest.TestCase):
                     "schema": "msdial-method-file-keys.v1",
                     "method_file": "method.txt",
                     "method_file_sha256": digest,
-                    "applied": ["execute automatic rt correction for alignment"],
+                    # As the Console records it: the key as the method file spells it.
+                    "applied": ["Execute automatic RT correction for alignment"],
                     "unrecognised": [],
                     "unusable": [],
                 }
@@ -342,6 +343,40 @@ class MaterialsMethodsTests(unittest.TestCase):
                     any("does not prove that it was performed" in item for item in result["warnings"])
                 )
 
+    def test_automatic_rt_counts_what_the_correction_reached(self) -> None:
+        # A Blank interpolated between two corrected samples is part of a real correction, and
+        # the Methods text says how much of the run was corrected rather than only "applied".
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_automatic_rt_audit(
+                root,
+                summary=(
+                    "0\tQC-reference\tReference\n"
+                    "1\tSample-1\tDetectedAnchors\n"
+                    "2\tBlank-1\tInterpolatedBlank\n"
+                    "3\tSample-2\tDetectedAnchors\n"
+                    "4\tSample-3\tUncorrected\n"
+                ),
+                anchors=(
+                    "0\t1\tTrue\n0\t2\tTrue\n0\t3\tTrue\n"
+                    "1\t1\tTrue\n1\t2\tTrue\n"
+                    "3\t2\tTrue\n3\t3\tTrue\n"
+                    "4\t1\tFalse\n"
+                ),
+            )
+
+            result, evidence = self._automatic_rt_report(root)
+
+        self.assertTrue(evidence["performed"])
+        self.assertEqual(2, evidence["corrected_file_count"])
+        self.assertEqual(3, evidence["selected_anchor_count"])
+        self.assertIn(
+            "of 5 audited file(s), 2 were corrected from their own anchors "
+            "(3 distinct anchor(s) used), 1 Blank file(s) took an interpolated or "
+            "nearest-sample model, and 1 kept their original retention times",
+            result["methods_text"],
+        )
+
     def test_automatic_rt_settings_stay_out_of_table_s1_when_off(self) -> None:
         workflow = {
             "project_type": "lcms",
@@ -399,7 +434,13 @@ class MaterialsMethodsTests(unittest.TestCase):
                 guided = workbook.read("xl/worksheets/sheet2.xml").decode("utf-8")
 
         self.assertIn("reference file QC-reference", result["methods_text"])
-        self.assertIn("2 selected anchor(s)", result["methods_text"])
+        self.assertIn(
+            "1 were corrected from their own anchors (2 distinct anchor(s) used)",
+            result["methods_text"],
+        )
+        self.assertIn(
+            "on the retention-time axis of reference file QC-reference", result["methods_text"]
+        )
         self.assertFalse(
             any("does not prove that it was performed" in item for item in result["warnings"])
         )

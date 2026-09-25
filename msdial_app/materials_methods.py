@@ -283,15 +283,33 @@ def _methods_text(
         )
     automatic_rt_evidence = workflow.get("automatic_rt_correction_evidence") or {}
     if automatic_rt_evidence.get("performed"):
+        reference = (
+            automatic_rt_evidence.get("reference_file_name")
+            or automatic_rt_evidence.get("reference_file_id")
+        )
+        sources = automatic_rt_evidence.get("model_sources") or {}
+        blank_models = int(sources.get("InterpolatedBlank", 0)) + int(sources.get("NearestBlank", 0))
+        uncorrected = int(sources.get("Uncorrected", 0))
+        # The counts say how much of the run the correction reached: "applied" alone read the
+        # same for one corrected file in thirty as for all of them. The axis sentence describes
+        # the Console of MsdialWorkbench#810: alignment keeps the corrected times, so aligned
+        # RTs, mzTab-M included, are on the reference file's axis while .mdpeak and annotation
+        # keep measured ones, and no Console output says so.
         paragraphs.append(
             "After peak detection and annotation on the original retention-time axis, "
             "MS-DIAL learned distributed anchor features and applied file-specific "
             "piecewise-linear retention-time correction during alignment only. The retained "
-            f"Console audit records reference file {automatic_rt_evidence.get('reference_file_name') or automatic_rt_evidence.get('reference_file_id')} "
-            f"and {automatic_rt_evidence.get('selected_anchor_count', 0)} selected anchor(s) "
-            f"across {automatic_rt_evidence.get('files_audited', 0)} audited file(s). The "
-            "per-file models and anchor evidence are documented in Supplementary Table S1 and "
-            "the retained automatic RT-correction TSV files."
+            f"Console audit records reference file {reference}; of "
+            f"{automatic_rt_evidence.get('files_audited', 0)} audited file(s), "
+            f"{automatic_rt_evidence.get('corrected_file_count', 0)} were corrected from their "
+            f"own anchors ({automatic_rt_evidence.get('selected_anchor_count', 0)} distinct "
+            f"anchor(s) used), {blank_models} Blank file(s) took an interpolated or "
+            f"nearest-sample model, and {uncorrected} kept their original retention times. "
+            "Aligned feature retention times, including those exported in mzTab-M, are "
+            f"therefore on the retention-time axis of reference file {reference}; per-file "
+            "peak lists and annotation retention-time evidence keep the measured retention "
+            "times. The per-file models and anchor evidence are documented in Supplementary "
+            "Table S1 and the retained automatic RT-correction TSV files."
         )
     paragraphs.extend(["Quality assurance", _qa_methods_sentence(qa_report, assessment)])
     return "\n\n".join(paragraphs)
@@ -421,6 +439,7 @@ def _automatic_rt_correction_evidence(
         "reference_file_name": "",
         "files_audited": 0,
         "selected_anchor_count": 0,
+        "corrected_file_count": 0,
         "model_sources": {},
         "reason": "not_requested" if not requested else "retained_evidence_missing",
         "summary_file": summary_path.name,
@@ -497,6 +516,7 @@ def _automatic_rt_correction_evidence(
             "reference_file_name": (reference or {}).get("File name", ""),
             "files_audited": len(summary_rows),
             "selected_anchor_count": len(selected_anchor_ids),
+            "corrected_file_count": len(corrected_ids),
             "model_sources": model_sources,
             "reason": "performed" if performed else "audit_does_not_show_correction",
         }

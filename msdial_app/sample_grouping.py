@@ -182,7 +182,7 @@ def propose_injection_order(names: Iterable[str]) -> dict[str, Any]:
 
     # Blanks and quality-control injections carry no sequence number of their own and
     # would defeat the detection for every other file, so the sequence is read from the
-    # samples and they keep the place the listing gave them.
+    # samples and they are placed after every sample, in the order the listing gave them.
     subjects = [
         name for name in all_names if not is_blank(name) and not is_quality_control(name)
     ]
@@ -237,7 +237,8 @@ def propose_injection_order(names: Iterable[str]) -> dict[str, Any]:
             f"({', '.join(str(value) for value in best['numbers'])}), read as the acquisition sequence"
             + ("; it gives the same order as the file listing" if agrees else
                "; it disagrees with the file listing, which would have used a different order")
-            + (f"; {len(others)} blank or quality-control file(s) keep the place the listing gave them"
+            + (f"; {len(others)} blank or quality-control file(s) carry no sequence number and "
+               "are placed after the samples, in listing order"
                if others else "")
         ),
         "agrees_with_listing": agrees,

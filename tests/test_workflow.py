@@ -5,6 +5,8 @@ import importlib.util
 import json
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -577,13 +579,19 @@ class WorkflowTests(unittest.TestCase):
             root = Path(temporary)
             raw = root / "sample.mzML"
             raw.write_text("raw", encoding="ascii")
+            blank = root / "blank_01.mzML"
+            blank.write_text("raw", encoding="ascii")
             console = root / "MSDIALCUI.exe"
             console.write_bytes(b"stub")
             template = root / "method.txt"
             template.write_text("Ion mode: Negative\n", encoding="ascii")
+            files = expand_paths([str(raw), str(blank)])
+            for item in files:
+                if item["file_name"].startswith("blank"):
+                    item["file_type"] = "Blank"
             state = {
                 "project_type": "lcms",
-                "files": expand_paths([str(raw)]),
+                "files": files,
                 "console_path": str(console),
                 "template_path": str(template),
                 "output_root": str(root / "output"),
@@ -621,6 +629,15 @@ class WorkflowTests(unittest.TestCase):
                         ),
                         issues,
                     )
+
+            # With no Blank there is nothing to interpolate, so nothing to warn about.
+            state["files"] = [item for item in files if item["file_type"] != "Blank"]
+            state["sample_table_proposal"] = {"analytical_order": {"derived_from": "listing"}}
+            issues = validate_workflow(state)
+            self.assertFalse(
+                any("not read from the instrument" in item["message"] for item in issues),
+                issues,
+            )
 
     def test_automatic_and_user_defined_rt_correction_are_mutually_exclusive(self) -> None:
         issues = validate_workflow(
@@ -1691,6 +1708,105 @@ class WorkflowTests(unittest.TestCase):
             [message for message in messages if message.startswith("Automatic RT correction")],
             messages,
         )
+
+    def test_automatic_rt_whole_number_settings_are_refused_not_truncated(self) -> None:
+        # int() turned 2.9 into 2 for the check while the method file carried 2.9, which the
+        # Console refuses and replaces with its default of 3.
+        base = {
+            "project_type": "lcms",
+            "together_with_alignment": True,
+            "execute_automatic_rt_correction": True,
+        }
+        cases = {
+            "automatic_rt_correction_minimum_anchors": (2.9, "minimum anchors must be a whole number"),
+            "automatic_rt_correction_maximum_anchors": (6.5, "maximum anchors must be a whole number"),
+            "automatic_rt_correction_reference_file_id": (-2, "reference file ID must be -1"),
+        }
+        for key, (value, message) in cases.items():
+            with self.subTest(key=key):
+                issues = validate_workflow({**base, key: value})
+                self.assertTrue(
+                    any(item["level"] == "error" and message in item["message"] for item in issues),
+                    issues,
+                )
+
+    def test_automatic_rt_outlier_mad_threshold_zero_means_no_rejection(self) -> None:
+        # The Console skips MAD rejection when the threshold is 0; only a negative value is wrong.
+        base = {
+            "project_type": "lcms",
+            "together_with_alignment": True,
+            "execute_automatic_rt_correction": True,
+        }
+        zero = validate_workflow({**base, "automatic_rt_correction_outlier_mad_threshold": 0})
+        negative = validate_workflow({**base, "automatic_rt_correction_outlier_mad_threshold": -1})
+
+        self.assertFalse(any("outlier MAD" in item["message"] for item in zero), zero)
+        self.assertTrue(any("outlier MAD" in item["message"] for item in negative), negative)
+
+    @patch("msdial_app.workflow.subprocess.run")
+    def test_console_capability_reads_the_net8_assembly_beside_its_launcher(self, run: Mock) -> None:
+        # A net8 MSDIALCUI.exe is an apphost; the strings are in MSDIALCUI.dll next to it.
+        run.return_value = Mock(returncode=1, stdout="", stderr="Unknown command")
+        with tempfile.TemporaryDirectory() as temporary:
+            console = Path(temporary) / "MSDIALCUI.exe"
+            console.write_bytes(b"apphost")
+            (Path(temporary) / "MSDIALCUI.dll").write_bytes(
+                "Automatic alignment RT correction audit:".encode("utf-16-le")
+            )
+
+            result = console_capabilities(str(console))
+
+        self.assertIn("automatic_alignment_rt_correction", result["capabilities"])
+
+    def test_reproduction_reads_its_own_method_file(self) -> None:
+        # The Console writes <method>.keys.json beside the method file and matrices to its Export
+        # folder path, the original run directory. A reproduction that read the original method
+        # file overwrote the run's key record and matrices, so it now reads a copy of its own.
+        from msdial_app.workflow import _powershell_script, _shell_script
+
+        powershell = _powershell_script(r"C:\msdial\MSDIALCUI.exe", "lcms")
+        shell = _shell_script("/opt/msdial/MSDIALCUI.dll", "lcms")
+
+        self.assertIn("'-m', $Method", powershell)
+        self.assertNotIn("(Join-Path $Here 'method.txt'), '-p'", powershell)
+        self.assertIn("'Export folder path: ' + $Output", powershell)
+        self.assertIn('-m "$METHOD"', shell)
+        self.assertNotIn('-m "$HERE/method.txt"', shell)
+        self.assertIn('ENVIRON["OUT"]', shell)
+
+    @unittest.skipUnless(shutil.which("bash") and shutil.which("awk"), "bash and awk are required")
+    def test_shell_reproduction_rewrites_only_the_export_folder(self) -> None:
+        from msdial_app.workflow import _shell_script
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "method.txt").write_text(
+                "Ion mode: Negative\n"
+                "Mat file export folder path: keep\n"
+                "Export folder path: /original/run\n",
+                encoding="utf-8",
+            )
+            (root / "analysis_files.csv").write_text("x\n", encoding="utf-8")
+            script = root / "run-msdial.sh"
+            script.write_text(_shell_script("echo", "lcms"), encoding="utf-8", newline="\n")
+
+            # The resolved path, not "bash": Windows looks in System32 before PATH, where
+            # bash.exe is the WSL launcher.
+            completed = subprocess.run(
+                [shutil.which("bash"), script.name],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            copied = (root / "reproduced-results" / "method.txt").read_text(encoding="utf-8")
+            original = (root / "method.txt").read_text(encoding="utf-8")
+
+        self.assertIn("Mat file export folder path: keep", copied)
+        self.assertNotIn("/original/run", copied)
+        self.assertIn("reproduced-results", copied.split("Export folder path: ")[-1])
+        self.assertIn("Export folder path: /original/run", original)
 
     def test_automatic_rt_defaults_are_one_table(self) -> None:
         from msdial_app.workflow import (

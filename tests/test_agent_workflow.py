@@ -251,6 +251,43 @@ class AgentWorkflowTests(unittest.TestCase):
             self.assertEqual(3, plan["workflow"]["automatic_rt_correction_minimum_anchors"])
             self.assertEqual(6, plan["workflow"]["automatic_rt_correction_maximum_anchors"])
 
+    def test_agent_does_not_truncate_a_fractional_anchor_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "sample.mzML").write_text("", encoding="ascii")
+            console = root / "MSDIALCUI.exe"
+            console.write_text("execute automatic rt correction for alignment", encoding="utf-16-le")
+
+            plan = build_guided_plan(
+                str(root),
+                {
+                    "project_type": "lcms",
+                    "ion_mode": "Negative",
+                    "target_omics": "Metabolomics",
+                    "parameter_strategy": "default",
+                    "execute_rt_correction": False,
+                    "execute_automatic_rt_correction": True,
+                    "automatic_rt_correction_minimum_anchors": "2.9",
+                    "automatic_rt_correction_maximum_anchors": 6,
+                    "library_strategy": "none",
+                    "run_qa": False,
+                    "generate_materials_methods": False,
+                    "class_assignment_confirmed": True,
+                    "console_path": str(console),
+                    "template_path": str(
+                        ROOT / "resources" / "msdial_console_param4lipidomics.txt"
+                    ),
+                },
+            )
+
+        # Truncated to 2 it would have passed; kept as 2.9 it is refused.
+        self.assertIsNotNone(plan["workflow"], plan["remaining_questions"])
+        self.assertEqual(2.9, plan["workflow"]["automatic_rt_correction_minimum_anchors"])
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertTrue(
+            any("whole number" in str(item) for item in plan["blockers"]), plan["blockers"]
+        )
+
     def test_agent_rejects_both_rt_correction_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

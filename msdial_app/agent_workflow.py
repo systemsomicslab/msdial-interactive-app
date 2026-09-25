@@ -10,6 +10,8 @@ from .annotation_pipeline import apply_tiered_lcms_annotation
 from .library_catalog import catalog_status
 from .user_settings import load_user_settings
 from .workflow import (
+    AUTOMATIC_RT_CORRECTION_DEFAULTS,
+    automatic_rt_correction_value,
     expand_paths_report,
     discover_console_paths,
     load_parameter_template,
@@ -643,93 +645,14 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             "execute_automatic_rt_correction": _as_bool(
                 answers.get("execute_automatic_rt_correction", False)
             ),
-            "automatic_rt_correction_reference_file_id": int(
-                answers.get(
-                    "automatic_rt_correction_reference_file_id",
-                    state.get("automatic_rt_correction_reference_file_id", -1),
+            # One table of defaults for every entry point; a fractional anchor count is kept
+            # as given so validation refuses it instead of int() truncating it.
+            **{
+                key: automatic_rt_correction_value(
+                    key, answers.get(key, state.get(key, default))
                 )
-            ),
-            "automatic_rt_correction_rt_bin_width": float(
-                answers.get(
-                    "automatic_rt_correction_rt_bin_width",
-                    state.get("automatic_rt_correction_rt_bin_width", 0.5),
-                )
-            ),
-            "automatic_rt_correction_match_rt_tolerance": float(
-                answers.get(
-                    "automatic_rt_correction_match_rt_tolerance",
-                    state.get("automatic_rt_correction_match_rt_tolerance", 0.5),
-                )
-            ),
-            "automatic_rt_correction_minimum_anchors": int(
-                answers.get(
-                    "automatic_rt_correction_minimum_anchors",
-                    state.get("automatic_rt_correction_minimum_anchors", 3),
-                )
-            ),
-            "automatic_rt_correction_maximum_anchors": int(
-                answers.get(
-                    "automatic_rt_correction_maximum_anchors",
-                    state.get("automatic_rt_correction_maximum_anchors", 6),
-                )
-            ),
-            "automatic_rt_correction_minimum_sample_coverage": float(
-                answers.get(
-                    "automatic_rt_correction_minimum_sample_coverage",
-                    state.get("automatic_rt_correction_minimum_sample_coverage", 0.5),
-                )
-            ),
-            "automatic_rt_correction_intensity_quantile": float(
-                answers.get(
-                    "automatic_rt_correction_intensity_quantile",
-                    state.get("automatic_rt_correction_intensity_quantile", 0.75),
-                )
-            ),
-            "automatic_rt_correction_maximum_peak_width_quantile": float(
-                answers.get(
-                    "automatic_rt_correction_maximum_peak_width_quantile",
-                    state.get("automatic_rt_correction_maximum_peak_width_quantile", 0.5),
-                )
-            ),
-            "automatic_rt_correction_minimum_signal_to_noise": float(
-                answers.get(
-                    "automatic_rt_correction_minimum_signal_to_noise",
-                    state.get("automatic_rt_correction_minimum_signal_to_noise", 3),
-                )
-            ),
-            "automatic_rt_correction_minimum_gaussian_similarity": float(
-                answers.get(
-                    "automatic_rt_correction_minimum_gaussian_similarity",
-                    state.get("automatic_rt_correction_minimum_gaussian_similarity", 0),
-                )
-            ),
-            "automatic_rt_correction_minimum_ideal_slope": float(
-                answers.get(
-                    "automatic_rt_correction_minimum_ideal_slope",
-                    state.get("automatic_rt_correction_minimum_ideal_slope", 0),
-                )
-            ),
-            "automatic_rt_correction_outlier_mad_threshold": float(
-                answers.get(
-                    "automatic_rt_correction_outlier_mad_threshold",
-                    state.get("automatic_rt_correction_outlier_mad_threshold", 3.5),
-                )
-            ),
-            "automatic_rt_correction_reference_centrality_weight": float(
-                answers.get(
-                    "automatic_rt_correction_reference_centrality_weight",
-                    state.get("automatic_rt_correction_reference_centrality_weight", 0.35),
-                )
-            ),
-            "automatic_rt_correction_interpolate_blanks_by_analytical_order": _as_bool(
-                answers.get(
-                    "automatic_rt_correction_interpolate_blanks_by_analytical_order",
-                    state.get(
-                        "automatic_rt_correction_interpolate_blanks_by_analytical_order",
-                        True,
-                    ),
-                )
-            ),
+                for key, default in AUTOMATIC_RT_CORRECTION_DEFAULTS.items()
+            },
             "alignment_light_mode": _as_bool(answers.get("alignment_light_mode", False)),
             "library_provenance": copy.deepcopy(
                 answers.get("library_provenance", [])

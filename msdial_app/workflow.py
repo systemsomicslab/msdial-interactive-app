@@ -90,10 +90,22 @@ AUTOMATIC_RT_CORRECTION_DEFAULTS: dict[str, Any] = {
     "automatic_rt_correction_reference_centrality_weight": 0.35,
     "automatic_rt_correction_interpolate_blanks_by_analytical_order": True,
 }
-# Strings only MSDIALCUI itself carries when it implements the feature: the lowercase method
-# key its ConfigParser reads, and the audit line LcmsProcess writes. The title-case field
-# label lives in MsdialCore.dll, so a Console that merely ships beside a newer core, or a
-# byte search that happens to hit the label, would have claimed a feature that never runs.
+# The Console reads these as whole numbers and keeps its default for anything else, so a
+# fractional value must be refused here rather than truncated: truncating it validated one
+# number while the method file carried another.
+AUTOMATIC_RT_CORRECTION_INTEGER_KEYS = frozenset(
+    {
+        "automatic_rt_correction_reference_file_id",
+        "automatic_rt_correction_minimum_anchors",
+        "automatic_rt_correction_maximum_anchors",
+    }
+)
+# Strings only the Console assembly carries when it implements the feature: the lowercase
+# method key its ConfigParser reads, and the audit line LcmsProcess writes. The title-case
+# field label lives in MsdialCore.dll, so a Console that merely ships beside a newer core, or
+# a byte search that happens to hit the label, would have claimed a feature that never runs.
+# The assembly is MSDIALCUI.exe for net48 and MSDIALCUI.dll for net8, whose .exe is only a
+# launcher; console_capabilities reads both.
 AUTOMATIC_RT_CORRECTION_CONSOLE_MARKERS = (
     "execute automatic rt correction for alignment",
     "Automatic alignment RT correction audit:",
@@ -1186,13 +1198,38 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                 }
             )
         defaults = AUTOMATIC_RT_CORRECTION_DEFAULTS
-        minimum_anchors = int(
+        integer_labels = {
+            "automatic_rt_correction_reference_file_id": "reference file ID",
+            "automatic_rt_correction_minimum_anchors": "minimum anchors",
+            "automatic_rt_correction_maximum_anchors": "maximum anchors",
+        }
+        for key, label in integer_labels.items():
+            if not float(state.get(key, defaults[key])).is_integer():
+                issues.append(
+                    {
+                        "level": "error",
+                        "message": f"Automatic RT correction {label} must be a whole number.",
+                    }
+                )
+        if float(
+            state.get(
+                "automatic_rt_correction_reference_file_id",
+                defaults["automatic_rt_correction_reference_file_id"],
+            )
+        ) < -1:
+            issues.append(
+                {
+                    "level": "error",
+                    "message": "Automatic RT correction reference file ID must be -1 (automatic) or a file ID.",
+                }
+            )
+        minimum_anchors = float(
             state.get(
                 "automatic_rt_correction_minimum_anchors",
                 defaults["automatic_rt_correction_minimum_anchors"],
             )
         )
-        maximum_anchors = int(
+        maximum_anchors = float(
             state.get(
                 "automatic_rt_correction_maximum_anchors",
                 defaults["automatic_rt_correction_maximum_anchors"],
@@ -1215,7 +1252,6 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
         positive_fields = (
             ("automatic_rt_correction_rt_bin_width", "RT bin width"),
             ("automatic_rt_correction_match_rt_tolerance", "match RT tolerance"),
-            ("automatic_rt_correction_outlier_mad_threshold", "outlier MAD threshold"),
         )
         for key, label in positive_fields:
             if float(state.get(key, defaults[key])) <= 0:
@@ -1225,6 +1261,22 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                         "message": f"Automatic RT correction {label} must be greater than 0.",
                     }
                 )
+        # The Console skips MAD outlier rejection at 0, so 0 is a setting, not an error.
+        if float(
+            state.get(
+                "automatic_rt_correction_outlier_mad_threshold",
+                defaults["automatic_rt_correction_outlier_mad_threshold"],
+            )
+        ) < 0:
+            issues.append(
+                {
+                    "level": "error",
+                    "message": (
+                        "Automatic RT correction outlier MAD threshold must be 0 "
+                        "(no outlier rejection) or greater."
+                    ),
+                }
+            )
         unit_interval_fields = (
             ("automatic_rt_correction_minimum_sample_coverage", "minimum sample coverage"),
             ("automatic_rt_correction_intensity_quantile", "intensity quantile"),
@@ -1268,6 +1320,12 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
             # moved to the end: an inference as much as the listing is, and for Blank
             # interpolation the worst one, since it places every Blank after every sample.
             and order_source in {"", "listing", "embedded"}
+            # With no Blank there is nothing to interpolate, and a warning that cannot
+            # matter teaches the reader to skip the ones that do.
+            and any(
+                str(item.get("file_type", "")).strip().casefold() == "blank"
+                for item in state.get("files", [])
+            )
         ):
             issues.append(
                 {
@@ -2366,8 +2424,18 @@ def _powershell_script(default_console: str, analysis_type: str) -> str:
         "$Here = Split-Path -Parent $MyInvocation.MyCommand.Path\n"
         "$Output = Join-Path $Here 'reproduced-results'\n"
         "New-Item -ItemType Directory -Force -Path $Output | Out-Null\n"
+        # The Console writes <method>.keys.json beside the method file it reads, and matrix
+        # exports to the method's Export folder path, which is the original run directory.
+        # A reproduction that read the original method.txt overwrote both there, so it reads
+        # a copy in its own directory whose Export folder path points at that directory.
+        "$Method = Join-Path $Output 'method.txt'\n"
+        "$Lines = Get-Content -LiteralPath (Join-Path $Here 'method.txt') -Encoding UTF8 | "
+        "ForEach-Object { if ($_ -match '^\\s*export folder path\\s*:') "
+        "{ 'Export folder path: ' + $Output } else { $_ } }\n"
+        "[System.IO.File]::WriteAllLines($Method, [string[]]$Lines, "
+        "(New-Object System.Text.UTF8Encoding($false)))\n"
         f"$Arguments = @('{analysis_type}', '-i', (Join-Path $Here 'analysis_files.csv'), "
-        "'-o', $Output, '-m', (Join-Path $Here 'method.txt'), '-p')\n"
+        "'-o', $Output, '-m', $Method, '-p')\n"
         "if ($Console.ToLowerInvariant().EndsWith('.dll')) {\n"
         "  & dotnet $Console @Arguments\n"
         "} else {\n"
@@ -2385,12 +2453,17 @@ def _shell_script(default_console: str, analysis_type: str) -> str:
         'HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
         'OUTPUT="$HERE/reproduced-results"\n'
         'mkdir -p "$OUTPUT"\n'
+        # See _powershell_script: the reproduction reads its own copy of the method file.
+        'METHOD="$OUTPUT/method.txt"\n'
+        'OUT="$OUTPUT" awk \'tolower($0) ~ /^[ \\t]*export folder path[ \\t]*:/ '
+        '{ print "Export folder path: " ENVIRON["OUT"]; next } { print }\' '
+        '"$HERE/method.txt" > "$METHOD"\n'
         'if [[ "${CONSOLE,,}" == *.dll ]]; then\n'
         f'  dotnet "$CONSOLE" {analysis_type} -i "$HERE/analysis_files.csv" '
-        '-o "$OUTPUT" -m "$HERE/method.txt" -p\n'
+        '-o "$OUTPUT" -m "$METHOD" -p\n'
         "else\n"
         f'  "$CONSOLE" {analysis_type} -i "$HERE/analysis_files.csv" '
-        '-o "$OUTPUT" -m "$HERE/method.txt" -p\n'
+        '-o "$OUTPUT" -m "$METHOD" -p\n'
         "fi\n"
     )
 
@@ -2994,6 +3067,22 @@ def console_version(console_path: str) -> str:
     return match.group(1) if match else ""
 
 
+def automatic_rt_correction_value(key: str, value: Any) -> Any:
+    """Coerce one automatic RT-correction setting without hiding a value the Console refuses.
+
+    A whole number stays an int for the integer keys, and a fractional one stays a float so
+    validate_workflow can refuse it, rather than int() quietly writing a different number.
+    """
+    if key == "automatic_rt_correction_interpolate_blanks_by_analytical_order":
+        if isinstance(value, str):
+            return value.strip().casefold() in {"1", "true", "yes", "on"}
+        return bool(value)
+    number = float(value)
+    if key in AUTOMATIC_RT_CORRECTION_INTEGER_KEYS and number.is_integer():
+        return int(number)
+    return number
+
+
 def console_capabilities(console_path: str) -> dict[str, Any]:
     path = Path(console_path)
     if not path.is_file():
@@ -3027,6 +3116,13 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
         binary = path.read_bytes()
     except OSError:
         binary = b""
+    # A net8 MSDIALCUI.exe is a launcher; the strings are in the MSDIALCUI.dll beside it.
+    assembly = path.with_suffix(".dll")
+    if path.suffix.casefold() == ".exe" and assembly.is_file():
+        try:
+            binary += assembly.read_bytes()
+        except OSError:
+            pass
     marker = "LC-MS quality-assurance matrix:"
     if marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary:
         capabilities.add(LCMS_QA_CAPABILITY)
