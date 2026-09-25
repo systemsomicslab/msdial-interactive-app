@@ -229,6 +229,15 @@ def propose_injection_order(names: Iterable[str]) -> dict[str, Any]:
     for offset, name in enumerate(others):
         embedded[name] = len(subjects) + offset + 1
     agrees = embedded == listing
+    # The Blanks and QCs were never searched for the sequence, so the reason can only say
+    # where they were put. One that carries a number in the sequence token is named, because
+    # its place after the samples then contradicts a number the reviewer can see.
+    numbered = [
+        name
+        for name in others
+        if len(split_tokens(name)) > best["position"]
+        and _looks_numeric(split_tokens(name)[best["position"]])
+    ]
     return {
         "chosen": "embedded",
         "orders": embedded,
@@ -237,9 +246,12 @@ def propose_injection_order(names: Iterable[str]) -> dict[str, Any]:
             f"({', '.join(str(value) for value in best['numbers'])}), read as the acquisition sequence"
             + ("; it gives the same order as the file listing" if agrees else
                "; it disagrees with the file listing, which would have used a different order")
-            + (f"; {len(others)} blank or quality-control file(s) carry no sequence number and "
-               "are placed after the samples, in listing order"
+            + (f"; {len(others)} blank or quality-control file(s) were left out of the sequence "
+               "detection and placed after the samples, in listing order"
                if others else "")
+            + (f", although {', '.join(numbered)} carr{'ies' if len(numbered) == 1 else 'y'} a "
+               f"number in token {best['position'] + 1}"
+               if numbered else "")
         ),
         "agrees_with_listing": agrees,
         "alternatives": [

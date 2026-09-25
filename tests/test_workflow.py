@@ -1745,48 +1745,76 @@ class WorkflowTests(unittest.TestCase):
 
     @patch("msdial_app.workflow.subprocess.run")
     def test_console_capability_reads_the_net8_assembly_beside_its_launcher(self, run: Mock) -> None:
-        # A net8 MSDIALCUI.exe is an apphost; the strings are in MSDIALCUI.dll next to it.
+        # A net8 MSDIALCUI.exe, or MSDIALCUI on Linux and macOS, is an apphost; the strings are
+        # in MSDIALCUI.dll next to it, and a launcher has a runtimeconfig.json.
+        run.return_value = Mock(returncode=1, stdout="", stderr="Unknown command")
+        for name in ("MSDIALCUI.exe", "MSDIALCUI"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                console = Path(temporary) / name
+                console.write_bytes(b"apphost")
+                (Path(temporary) / "MSDIALCUI.runtimeconfig.json").write_text("{}", encoding="ascii")
+                (Path(temporary) / "MSDIALCUI.dll").write_bytes(
+                    "Automatic alignment RT correction audit:".encode("utf-16-le")
+                )
+
+                result = console_capabilities(str(console))
+
+                self.assertIn("automatic_alignment_rt_correction", result["capabilities"])
+
+    @patch("msdial_app.workflow.subprocess.run")
+    def test_a_stale_dll_does_not_lend_a_net48_console_features(self, run: Mock) -> None:
+        # Unpacking a net48 archive over a net8 one replaces MSDIALCUI.exe and leaves the net8
+        # dll behind. The net48 exe is the assembly itself and has no runtimeconfig.json.
         run.return_value = Mock(returncode=1, stdout="", stderr="Unknown command")
         with tempfile.TemporaryDirectory() as temporary:
             console = Path(temporary) / "MSDIALCUI.exe"
-            console.write_bytes(b"apphost")
+            console.write_bytes(b"net48 assembly without the markers")
             (Path(temporary) / "MSDIALCUI.dll").write_bytes(
                 "Automatic alignment RT correction audit:".encode("utf-16-le")
+                + "LC-MS quality-assurance matrix:".encode("utf-16-le")
             )
 
             result = console_capabilities(str(console))
 
-        self.assertIn("automatic_alignment_rt_correction", result["capabilities"])
+        self.assertNotIn("automatic_alignment_rt_correction", result["capabilities"])
+        self.assertNotIn("lcms_alignment_qa_matrix", result["capabilities"])
 
     def test_reproduction_reads_its_own_method_file(self) -> None:
-        # The Console writes <method>.keys.json beside the method file and matrices to its Export
-        # folder path, the original run directory. A reproduction that read the original method
-        # file overwrote the run's key record and matrices, so it now reads a copy of its own.
+        # The Console writes <method>.keys.json beside the method file, so a reproduction that
+        # read the original method file overwrote the run's key record. It reads a byte copy
+        # under another name in the same directory, so relative paths still resolve, and a CSV
+        # copy in reproduced-results, so the Console's project folder leaves the run too.
         from msdial_app.workflow import _powershell_script, _shell_script
 
-        powershell = _powershell_script(r"C:\msdial\MSDIALCUI.exe", "lcms")
-        shell = _shell_script("/opt/msdial/MSDIALCUI.dll", "lcms")
+        for store_project in (True, False):
+            with self.subTest(store_project=store_project):
+                powershell = _powershell_script(r"C:\msdial\MSDIALCUI.exe", "lcms", store_project)
+                shell = _shell_script("/opt/msdial/MSDIALCUI.dll", "lcms", store_project)
 
-        self.assertIn("'-m', $Method", powershell)
-        self.assertNotIn("(Join-Path $Here 'method.txt'), '-p'", powershell)
-        self.assertIn("'Export folder path: ' + $Output", powershell)
-        self.assertIn('-m "$METHOD"', shell)
-        self.assertNotIn('-m "$HERE/method.txt"', shell)
-        self.assertIn('ENVIRON["OUT"]', shell)
+                self.assertIn("'method.reproduce.txt'", powershell)
+                self.assertIn("'-i', $Inputs, '-o', $Output, '-m', $Method", powershell)
+                self.assertIn("-ErrorAction Stop", powershell)
+                self.assertIn("if ($null -eq $LASTEXITCODE) { exit 1 }", powershell)
+                self.assertIn('METHOD="$HERE/method.reproduce.txt"', shell)
+                self.assertIn('-i "$INPUTS" -o "$OUTPUT" -m "$METHOD"', shell)
+                self.assertNotIn(",,}", shell)  # bash 4 only
+                self.assertEqual(store_project, "'-p'" in powershell)
+                self.assertEqual(store_project, '"$METHOD" -p' in shell)
 
-    @unittest.skipUnless(shutil.which("bash") and shutil.which("awk"), "bash and awk are required")
-    def test_shell_reproduction_rewrites_only_the_export_folder(self) -> None:
+    @staticmethod
+    def _reproduction_bundle(root: Path) -> bytes:
+        method = "\ufeffIon mode: Negative\r\nMsp file path: D:\\\u30e9\u30a4\u30d6\u30e9\u30ea\\a.msp\r\n".encode("utf-8")
+        (root / "method.txt").write_bytes(method)
+        (root / "analysis_files.csv").write_text("file_path\nD:\\raw\\a.mzML\n", encoding="utf-8")
+        return method
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required")
+    def test_shell_reproduction_runs_from_copies_and_leaves_the_run_alone(self) -> None:
         from msdial_app.workflow import _shell_script
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "method.txt").write_text(
-                "Ion mode: Negative\n"
-                "Mat file export folder path: keep\n"
-                "Export folder path: /original/run\n",
-                encoding="utf-8",
-            )
-            (root / "analysis_files.csv").write_text("x\n", encoding="utf-8")
+            method = self._reproduction_bundle(root)
             script = root / "run-msdial.sh"
             script.write_text(_shell_script("echo", "lcms"), encoding="utf-8", newline="\n")
 
@@ -1800,13 +1828,168 @@ class WorkflowTests(unittest.TestCase):
                 timeout=60,
             )
             self.assertEqual(0, completed.returncode, completed.stderr)
-            copied = (root / "reproduced-results" / "method.txt").read_text(encoding="utf-8")
-            original = (root / "method.txt").read_text(encoding="utf-8")
+            self.assertEqual(method, (root / "method.reproduce.txt").read_bytes())
+            self.assertEqual(method, (root / "method.txt").read_bytes())
+            self.assertTrue((root / "reproduced-results" / "analysis_files.csv").is_file())
+            self.assertIn("method.reproduce.txt", completed.stdout)
 
-        self.assertIn("Mat file export folder path: keep", copied)
-        self.assertNotIn("/original/run", copied)
-        self.assertIn("reproduced-results", copied.split("Export folder path: ")[-1])
-        self.assertIn("Export folder path: /original/run", original)
+    @unittest.skipUnless(os.name == "nt" and shutil.which("powershell"), "Windows PowerShell is required")
+    def test_powershell_reproduction_copies_bytes_and_fails_when_nothing_runs(self) -> None:
+        from msdial_app.workflow import _powershell_script
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            method = self._reproduction_bundle(root)
+            fake = root / "fake.cmd"
+            fake.write_text("@echo %*\r\n", encoding="ascii")
+            script = root / "run-msdial.ps1"
+            script.write_text(_powershell_script(str(fake), "lcms"), encoding="utf-8-sig")
+
+            def run(*extra: str) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [shutil.which("powershell"), "-NoProfile", "-ExecutionPolicy", "Bypass",
+                     "-File", str(script), *extra],
+                    capture_output=True, text=True, timeout=120,
+                )
+
+            completed = run()
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(method, (root / "method.reproduce.txt").read_bytes())
+            self.assertEqual(method, (root / "method.txt").read_bytes())
+            self.assertIn("method.reproduce.txt", completed.stdout)
+
+            # A Console that cannot be started must not look like a reproduction that ran.
+            missing = run(str(root / "no-such-console.exe"))
+            self.assertNotEqual(0, missing.returncode)
+
+            # Nor may a failed copy leave an older method file to run on.
+            (root / "method.txt").unlink()
+            no_method = run()
+            self.assertNotEqual(0, no_method.returncode)
+            self.assertNotIn("method.reproduce.txt", no_method.stdout)
+
+    def test_bundle_scripts_carry_the_runs_project_flag_and_a_bom(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "sample.mzML"
+            raw.write_text("raw", encoding="ascii")
+            console = root / "MSDIALCUI.exe"
+            console.write_bytes(b"stub")
+            template = root / "method.txt"
+            template.write_text("Ion mode: Negative\n", encoding="ascii")
+            for store in (True, False):
+                with self.subTest(project_store=store):
+                    prepared = prepare_run(
+                        {
+                            "project_type": "lcms",
+                            "files": expand_paths([str(raw)]),
+                            "console_path": str(console),
+                            "template_path": str(template),
+                            "output_root": str(root / f"output-{store}"),
+                            "ion_mode": "Negative",
+                            "target_omics": "Metabolomics",
+                            "project_store": store,
+                        }
+                    )
+                    run_directory = Path(prepared["run_directory"])
+                    powershell = (run_directory / "run-msdial.ps1").read_bytes()
+                    shell = (run_directory / "run-msdial.sh").read_text(encoding="utf-8")
+
+                    self.assertTrue(powershell.startswith(b"\xef\xbb\xbf"))
+                    self.assertEqual("-p" in prepared["command"], b"'-p'" in powershell)
+                    self.assertEqual("-p" in prepared["command"], '"$METHOD" -p' in shell)
+
+    def test_automatic_rt_values_the_console_would_discard_are_refused(self) -> None:
+        # Each of these was accepted and written to method.txt, where the Console refused it
+        # and used its default, or accepted it and then failed after all peak picking.
+        base = {
+            "project_type": "lcms",
+            "together_with_alignment": True,
+            "execute_automatic_rt_correction": True,
+        }
+        cases = {
+            "automatic_rt_correction_reference_file_id": [3_000_000_000],
+            "automatic_rt_correction_maximum_anchors": [2**31, 1e20],
+            "automatic_rt_correction_match_rt_tolerance": ["nan", float("inf"), "abc", None, ""],
+            "automatic_rt_correction_rt_bin_width": [float("nan")],
+            "automatic_rt_correction_outlier_mad_threshold": ["nan"],
+            "automatic_rt_correction_minimum_signal_to_noise": [-1, "inf"],
+            "automatic_rt_correction_minimum_gaussian_similarity": [5],
+            "automatic_rt_correction_minimum_ideal_slope": [1.5],
+        }
+        for key, values in cases.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    issues = validate_workflow({**base, key: value})
+                    self.assertTrue(
+                        any(
+                            item["level"] == "error" and item["message"].startswith("Automatic RT correction")
+                            for item in issues
+                        ),
+                        issues,
+                    )
+
+    def test_automatic_rt_reference_file_must_be_a_non_blank_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            names = ["blank_01.mzML", "sample_01.mzML", "sample_02.mzML"]
+            for name in names:
+                (root / name).write_text("raw", encoding="ascii")
+            files = expand_paths([str(root / name) for name in names])
+            files[0]["file_type"] = "Blank"
+            base = {
+                "project_type": "lcms",
+                "together_with_alignment": True,
+                "execute_automatic_rt_correction": True,
+                "files": files,
+            }
+            expected = {0: "is a Blank", 3: "is not a file", 1: None, -1: None}
+            for reference, message in expected.items():
+                with self.subTest(reference=reference):
+                    issues = validate_workflow(
+                        {**base, "automatic_rt_correction_reference_file_id": reference}
+                    )
+                    found = [item["message"] for item in issues if "reference file ID" in item["message"]]
+                    if message is None:
+                        self.assertEqual([], found)
+                    else:
+                        self.assertTrue(any(message in text for text in found), found)
+
+    def test_template_whole_number_settings_are_not_truncated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            template = Path(temporary) / "method.txt"
+            template.write_text(
+                "Ion mode: Positive\n"
+                "Automatic RT correction minimum anchors: 2.9\n"
+                "Automatic RT correction maximum anchors: nan\n",
+                encoding="ascii",
+            )
+
+            loaded = load_parameter_template(template)["workflow"]
+
+        self.assertEqual(2.9, loaded["automatic_rt_correction_minimum_anchors"])
+        issues = validate_workflow(
+            {
+                **loaded,
+                "project_type": "lcms",
+                "together_with_alignment": True,
+                "execute_automatic_rt_correction": True,
+            }
+        )
+        messages = [item["message"] for item in issues if item["level"] == "error"]
+        self.assertTrue(any("minimum anchors must be a whole number" in text for text in messages), messages)
+        self.assertTrue(any("maximum anchors must be a finite number" in text for text in messages), messages)
+
+    def test_a_numeric_blank_file_type_counts_as_a_blank(self) -> None:
+        # The Console parses the file type as an enum and accepts its number; Blank is 3.
+        from msdial_app.workflow import is_blank_file_type
+
+        for value in ("Blank", " blank ", "3", "+03", 3):
+            with self.subTest(value=value):
+                self.assertTrue(is_blank_file_type(value))
+        for value in ("Sample", "QC", "Solvent Blank", "0", "", None):
+            with self.subTest(value=value):
+                self.assertFalse(is_blank_file_type(value))
 
     def test_automatic_rt_defaults_are_one_table(self) -> None:
         from msdial_app.workflow import (

@@ -370,12 +370,36 @@ class MaterialsMethodsTests(unittest.TestCase):
         self.assertTrue(evidence["performed"])
         self.assertEqual(2, evidence["corrected_file_count"])
         self.assertEqual(3, evidence["selected_anchor_count"])
+        # The reference is counted on its own, so the three counts partition the other files.
         self.assertIn(
-            "of 5 audited file(s), 2 were corrected from their own anchors "
+            "Of the other 4 audited file(s), 2 were corrected from their own anchors "
             "(3 distinct anchor(s) used), 1 Blank file(s) took an interpolated or "
             "nearest-sample model, and 1 kept their original retention times",
             result["methods_text"],
         )
+        # One file left at its measured RTs means aligned RTs are not all on the reference axis.
+        self.assertNotIn("are therefore on the retention-time axis", result["methods_text"])
+        self.assertIn("only where none of those files contributes", result["methods_text"])
+        self.assertTrue(any("left 1 file(s) uncorrected" in item for item in result["warnings"]))
+
+    def test_automatic_rt_a_value_the_console_discarded_is_not_proof(self) -> None:
+        # The Console records "<key>: <value>" under unusable and runs with its default.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_automatic_rt_audit(root)
+            keys = root / "method.keys.json"
+            record = json.loads(keys.read_text(encoding="utf-8"))
+            record["unusable"] = ["Automatic RT correction maximum anchors: 3000000000"]
+            keys.write_text(json.dumps(record), encoding="utf-8")
+            for path in root.glob("automatic_alignment_rt_correction_*.tsv"):
+                later = keys.stat().st_mtime + 1
+                os.utime(path, (later, later))
+
+            result, evidence = self._automatic_rt_report(root)
+
+        self.assertFalse(evidence["performed"])
+        self.assertEqual("method_key_value_discarded_by_console", evidence["reason"])
+        self.assertEqual(["automatic rt correction maximum anchors"], evidence["discarded_keys"])
 
     def test_automatic_rt_settings_stay_out_of_table_s1_when_off(self) -> None:
         workflow = {
@@ -435,12 +459,17 @@ class MaterialsMethodsTests(unittest.TestCase):
 
         self.assertIn("reference file QC-reference", result["methods_text"])
         self.assertIn(
-            "1 were corrected from their own anchors (2 distinct anchor(s) used)",
+            "reference file QC-reference, which defines the axis and keeps its measured "
+            "retention times. Of the other 1 audited file(s), 1 were corrected from their own "
+            "anchors (2 distinct anchor(s) used)",
             result["methods_text"],
         )
+        # Every other file corrected: the unqualified axis statement holds, with no warning.
         self.assertIn(
-            "on the retention-time axis of reference file QC-reference", result["methods_text"]
+            "are therefore on the retention-time axis of reference file QC-reference",
+            result["methods_text"],
         )
+        self.assertFalse(any("uncorrected" in item for item in result["warnings"]))
         self.assertFalse(
             any("does not prove that it was performed" in item for item in result["warnings"])
         )

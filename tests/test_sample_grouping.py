@@ -97,9 +97,6 @@ class GroupingShapeTests(unittest.TestCase):
         self.assertEqual({}, result["assignments"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class InjectionOrderReasonTests(unittest.TestCase):
     def test_the_reason_says_where_blanks_and_qcs_go(self) -> None:
@@ -114,6 +111,9 @@ class InjectionOrderReasonTests(unittest.TestCase):
         self.assertEqual(4, order["orders"]["Blank_01"])
         self.assertIn("placed after the samples", order["reason"])
         self.assertNotIn("keep the place", order["reason"])
+        # The Blank was never searched for the sequence; its own number is named, not denied.
+        self.assertNotIn("carry no sequence number", order["reason"])
+        self.assertIn("Blank_01 carries a number in token 2", order["reason"])
 
 
 class InjectionOrderTests(unittest.TestCase):
@@ -163,3 +163,7 @@ class InjectionOrderTests(unittest.TestCase):
         result = propose_injection_order(["alpha_ctrl", "beta_ctrl", "gamma_dosed"])
         self.assertEqual("listing", result["chosen"])
         self.assertIn("no token varies numerically", result["reason"])
+
+
+if __name__ == "__main__":
+    unittest.main()

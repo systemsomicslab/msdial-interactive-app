@@ -47,6 +47,15 @@ def generate_publication_report(
             "Automatic alignment RT correction was requested, but the retained Console audit "
             f"does not prove that it was performed ({automatic_rt_evidence.get('reason', 'unknown')})."
         )
+    left_uncorrected = int(
+        (automatic_rt_evidence.get("model_sources") or {}).get("Uncorrected", 0)
+    )
+    if automatic_rt_evidence.get("performed") and left_uncorrected:
+        provenance_warnings.append(
+            f"Automatic alignment RT correction left {left_uncorrected} file(s) uncorrected, so "
+            "aligned retention times, mzTab-M included, mix the reference axis with measured "
+            "retention times wherever those files contribute."
+        )
     methods = _methods_text(
         report_workflow, qa_report, qa_assessment, app_version, console_version
     )
@@ -290,26 +299,42 @@ def _methods_text(
         sources = automatic_rt_evidence.get("model_sources") or {}
         blank_models = int(sources.get("InterpolatedBlank", 0)) + int(sources.get("NearestBlank", 0))
         uncorrected = int(sources.get("Uncorrected", 0))
+        others = max(int(automatic_rt_evidence.get("files_audited", 0)) - 1, 0)
         # The counts say how much of the run the correction reached: "applied" alone read the
-        # same for one corrected file in thirty as for all of them. The axis sentence describes
+        # same for one corrected file in thirty as for all of them. They partition the files
+        # other than the reference, whose model is the identity. The axis sentence describes
         # the Console of MsdialWorkbench#810: alignment keeps the corrected times, so aligned
         # RTs, mzTab-M included, are on the reference file's axis while .mdpeak and annotation
-        # keep measured ones, and no Console output says so.
+        # keep measured ones, and no Console output says so. A file left uncorrected joins
+        # alignment at its measured RTs, so where one exists the axis claim holds only for
+        # features it does not contribute to.
+        if uncorrected:
+            axis = (
+                f"Features from the {uncorrected} file(s) that kept their original retention "
+                "times enter alignment at their measured retention times, so an aligned "
+                "feature retention time, including the mzTab-M retention_time_in_seconds and "
+                f"its start and end, is on the retention-time axis of reference file {reference} "
+                "only where none of those files contributes to the feature, and otherwise "
+                "averages corrected and measured retention times"
+            )
+        else:
+            axis = (
+                "Aligned feature retention times, including those exported in mzTab-M, are "
+                f"therefore on the retention-time axis of reference file {reference}"
+            )
         paragraphs.append(
             "After peak detection and annotation on the original retention-time axis, "
             "MS-DIAL learned distributed anchor features and applied file-specific "
             "piecewise-linear retention-time correction during alignment only. The retained "
-            f"Console audit records reference file {reference}; of "
-            f"{automatic_rt_evidence.get('files_audited', 0)} audited file(s), "
+            f"Console audit records reference file {reference}, which defines the axis and "
+            f"keeps its measured retention times. Of the other {others} audited file(s), "
             f"{automatic_rt_evidence.get('corrected_file_count', 0)} were corrected from their "
             f"own anchors ({automatic_rt_evidence.get('selected_anchor_count', 0)} distinct "
             f"anchor(s) used), {blank_models} Blank file(s) took an interpolated or "
             f"nearest-sample model, and {uncorrected} kept their original retention times. "
-            "Aligned feature retention times, including those exported in mzTab-M, are "
-            f"therefore on the retention-time axis of reference file {reference}; per-file "
-            "peak lists and annotation retention-time evidence keep the measured retention "
-            "times. The per-file models and anchor evidence are documented in Supplementary "
-            "Table S1 and the retained automatic RT-correction TSV files."
+            f"{axis}; per-file peak lists and annotation retention-time evidence keep the "
+            "measured retention times. The per-file models and anchor evidence are documented "
+            "in Supplementary Table S1 and the retained automatic RT-correction TSV files."
         )
     paragraphs.extend(["Quality assurance", _qa_methods_sentence(qa_report, assessment)])
     return "\n\n".join(paragraphs)
@@ -469,6 +494,21 @@ def _automatic_rt_correction_evidence(
     )
     if not evidence["method_key_applied"]:
         evidence["reason"] = "method_key_not_applied"
+        return evidence
+    # The Console records a value it could not read as "<key>: <value>" and runs with its
+    # default, so the settings in Table S1 would not be the ones the correction used.
+    from .workflow import AUTOMATIC_RT_CORRECTION_METHOD_KEYS
+
+    discarded = sorted(
+        {
+            str(item).split(":", 1)[0].strip().casefold()
+            for item in method_keys.get("unusable") or []
+        }
+        & AUTOMATIC_RT_CORRECTION_METHOD_KEYS
+    )
+    if discarded:
+        evidence["reason"] = "method_key_value_discarded_by_console"
+        evidence["discarded_keys"] = discarded
         return evidence
 
     try:

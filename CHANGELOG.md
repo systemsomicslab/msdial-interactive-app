@@ -37,35 +37,46 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
   `automatic rt correction outlier mad threshold` (3.5),
   `automatic rt correction reference centrality weight` (0.35), and
   `automatic rt correction interpolate blanks by analytical order` (true).
-  Validation requires LC-MS, alignment enabled, no simultaneous user-defined RT
-  correction, whole-number anchor counts and reference file ID (-1 or a file ID),
-  at least two minimum anchors, a maximum not below the minimum, positive RT bin
-  width and match tolerance, an outlier MAD threshold of 0 (no outlier rejection,
-  as the Console treats it) or more, and quantiles, coverage and centrality weight
-  within [0,1]. A fractional anchor count is refused rather than truncated: the
-  Console reads these as whole numbers and keeps its default otherwise. The
-  template reader, the validator, the agent answers and the method writer share
-  one set of defaults, so an absent value is validated as the value that will be
-  written. The UI and agent expose these settings, and a blank UI field takes its
+  Validation requires LC-MS, alignment enabled and no simultaneous user-defined RT
+  correction, and refuses every value the Console would not use as written: a
+  value that is not a finite number; an anchor count or reference file ID that is
+  fractional or outside 32 bits; a reference file ID other than -1 (automatic) or
+  the row of a non-Blank file in the file list; fewer than two minimum anchors or
+  a maximum below the minimum; a non-positive RT bin width or match tolerance; a
+  negative outlier MAD threshold (0 turns outlier rejection off, as the Console
+  reads it) or minimum signal-to-noise; and quantiles, coverage, centrality
+  weight, minimum Gaussian similarity and minimum ideal slope outside [0,1]. A
+  fractional count is refused rather than truncated, from the UI, the agent and
+  a parameter template alike: the Console reads these as whole numbers and keeps
+  its default otherwise. The template reader, the validator, the agent answers
+  and the method writer share one set of defaults, so an absent value is
+  validated as the value that will be written. The UI and agent expose these settings, and a blank UI field takes its
   default. The zero-threshold peak diagnostic turns automatic RT correction and
   alignment light mode off, since it runs without alignment.
   Methods and Table S1 describe correction only when the Console summary and
   anchor audit TSVs plus `method.keys.json` prove it ran for this run: the
   method-key record must carry the hash of the run's `method.txt`, both TSVs must
   be no older than that record, and at least one file other than the reference
-  must have been corrected from its own detected anchors. The Methods text says
-  how many files were corrected from their own anchors, how many Blanks took an
-  interpolated or nearest-sample model and how many kept their original RTs, and
-  that aligned feature RTs, mzTab-M included, are on the reference file's RT axis
-  while per-file peak lists and annotation keep measured RTs. With the feature
+  must have been corrected from its own detected anchors; a correction setting
+  the Console recorded as unusable, and so replaced by its default, is not proof.
+  The Methods text names the reference file, which defines the axis and keeps its
+  measured RTs, and says of the other files how many were corrected from their
+  own anchors, how many Blanks took an interpolated or nearest-sample model and
+  how many kept their original RTs. It says that aligned feature RTs, mzTab-M
+  included, are on the reference file's axis only when no file was left
+  uncorrected; otherwise it says they are on that axis only for features no
+  uncorrected file contributes to, and the report warns. Per-file peak lists and
+  annotation keep measured RTs. With the feature
   off, Table S1 lists none of its settings; `Supplementary_Table_MS_DIAL.tsv`
   still records every workflow key. Repository runs warn when Blank models would
   be interpolated along an analytical order inferred from file names or the file
   listing, if the run has a Blank. The Console is recognised as implementing the
   feature by the method key its parser reads or the audit line it writes. Both
   are in the Console assembly: `MSDIALCUI.exe` for net48, and for net8 the
-  `MSDIALCUI.dll` beside the `.exe` launcher, which is read too. The title-case
-  field label is in `MsdialCore.dll` and is not accepted. This requires a Console
+  `MSDIALCUI.dll` beside the launcher (`MSDIALCUI.exe`, or `MSDIALCUI` on Linux
+  and macOS), which is read when a `MSDIALCUI.runtimeconfig.json` shows the file
+  is a launcher, so a stale net8 dll beside a net48 exe lends it nothing. The
+  title-case field label is in `MsdialCore.dll` and is not accepted. This requires a Console
   built from the feature branch; it is not yet on MsdialWorkbench master.
 - Agent-guided runs keep `sample_table_proposal` in the workflow state: how the
   analytical order and dilution factors were proposed, with the alternatives. It
@@ -91,13 +102,27 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
 ### Fixed
 - The reproduction scripts in a run bundle (`run-msdial.ps1`, `run-msdial.sh`)
   read the run's own `method.txt`. The Console writes `method.keys.json` beside
-  the method file it reads and matrix exports to its `Export folder path`, which
-  is the original run directory, so a reproduction overwrote the original run's
-  key record and matrices. The scripts now write a copy into
-  `reproduced-results` with `Export folder path` pointing there, and run from it.
+  the method file it reads, so a reproduction overwrote the original run's key
+  record, on which its automatic RT-correction evidence rests. The scripts now
+  run from a byte copy, `method.reproduce.txt`, beside `method.txt`, so relative
+  paths and the file's encoding are kept and the key record is
+  `method.reproduce.keys.json`; and from a copy of `analysis_files.csv` in
+  `reproduced-results`, so the Console's project folder, the CSV's directory,
+  leaves the run too. A copy that fails stops the script before the Console
+  starts, and a Console that cannot be started exits non-zero instead of 0. The
+  scripts pass `-p` only when the run did, `run-msdial.ps1` is written with a
+  BOM so Windows PowerShell 5.1 reads a non-ASCII Console path, and
+  `run-msdial.sh` no longer needs bash 4. `REPRODUCE.txt` says which paths are
+  absolute, including the MSP/Text annotator settings that name the run
+  directory, and that per-file and alignment intermediates still land beside the
+  inputs. A reproduction's mzTab-M under `reproduced-results` is no longer
+  discovered as the run's own result, which, being newest, it had become.
 - The injection-order proposal said Blanks and QCs "keep the place the listing
   gave them"; the order it proposes places them after every sample. The reason
-  now says so.
+  now says so, and names a Blank or QC that carries a number in the sequence
+  token, since its place after the samples then contradicts that number.
+- The Blank-interpolation warning reads the file type as the Console does, which
+  also accepts the enum number (Blank is 3).
 - Integer parameters are written as integers, so the Console can parse them. (#23)
 - Agent-driven runs retain mzTab-M validation, artifact inventory, and the raw
   retention verdict. (#23)
@@ -119,6 +144,9 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
 - The mzXML exclusion is unit-wide: one file listed with role `requires_conversion`,
   or one sample naming an `.mzXML`/`.mzData` file, excludes the whole unit, even
   when its other inputs are vendor raw files or mzML that MS-DIAL can read.
+- On a net8 launcher the capability probe reads `MSDIALCUI.dll`, but the run
+  manifest still hashes only the launcher, which differs between builds only in
+  its version string.
 - The automatic RT-correction evidence compares file modification times, so it
   is read in the run directory the Console wrote. A copy that does not keep
   modification times reads as not proven (a warning, never a false claim).
