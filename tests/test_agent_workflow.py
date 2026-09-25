@@ -220,8 +220,8 @@ class AgentWorkflowTests(unittest.TestCase):
             (root / "sample.mzML").write_text("", encoding="ascii")
             console = root / "MSDIALCUI.exe"
             console.write_text(
-                "Execute automatic RT correction for alignment",
-                encoding="ascii",
+                "execute automatic rt correction for alignment",
+                encoding="utf-16-le",
             )
 
             plan = build_guided_plan(

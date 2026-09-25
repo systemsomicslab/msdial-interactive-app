@@ -103,17 +103,36 @@ class WorkflowTests(unittest.TestCase):
 
     @patch("msdial_app.workflow.subprocess.run")
     def test_console_capability_detects_automatic_alignment_rt_correction(self, run: Mock) -> None:
+        # The two strings MSDIALCUI.exe of the feature build carries, as UTF-16 .NET literals:
+        # the lowercase key ConfigParser reads and the audit line LcmsProcess writes.
+        run.return_value = Mock(returncode=1, stdout="", stderr="Unknown command")
+        for marker in (
+            "execute automatic rt correction for alignment",
+            "Automatic alignment RT correction audit:",
+        ):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as temporary:
+                console = Path(temporary) / "MSDIALCUI.exe"
+                console.write_bytes(marker.encode("utf-16-le"))
+
+                result = console_capabilities(str(console))
+
+                self.assertIn("automatic_alignment_rt_correction", result["capabilities"])
+                self.assertEqual("automatic RT correction marker", result["capability_probe"])
+
+    @patch("msdial_app.workflow.subprocess.run")
+    def test_console_capability_ignores_the_core_library_field_label(self, run: Mock) -> None:
+        # The title-case label is in MsdialCore.dll, not MSDIALCUI.exe. The probe once looked
+        # for it, so the feature build was reported as lacking the feature, and any file that
+        # happened to hold the label would have been reported as having it.
         run.return_value = Mock(returncode=1, stdout="", stderr="Unknown command")
         with tempfile.TemporaryDirectory() as temporary:
             console = Path(temporary) / "MSDIALCUI.exe"
-            console.write_bytes(
-                "Execute automatic RT correction for alignment".encode("utf-16-le")
-            )
+            label = "Execute automatic RT correction for alignment"
+            console.write_bytes(label.encode("utf-16-le") + label.encode("utf-8"))
 
             result = console_capabilities(str(console))
 
-        self.assertIn("automatic_alignment_rt_correction", result["capabilities"])
-        self.assertEqual("automatic RT correction marker", result["capability_probe"])
+        self.assertNotIn("automatic_alignment_rt_correction", result["capabilities"])
 
     def test_parameter_template_loads_guided_annotation_and_lipid_queries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -425,7 +444,7 @@ class WorkflowTests(unittest.TestCase):
             raw.write_text("raw", encoding="ascii")
             console = root / "MSDIALCUI"
             console.write_bytes(
-                "Execute automatic RT correction for alignment".encode("utf-16-le")
+                "execute automatic rt correction for alignment".encode("utf-16-le")
             )
             template = root / "method.txt"
             template.write_text(
@@ -582,19 +601,26 @@ class WorkflowTests(unittest.TestCase):
                 "automatic_rt_correction_reference_centrality_weight": 0.35,
                 "automatic_rt_correction_interpolate_blanks_by_analytical_order": True,
                 "repository_run_manifest": str(root / "run-manifest.json"),
-                "sample_table_proposal": {
-                    "analytical_order": {"derived_from": "listing"}
-                },
             }
 
-            issues = validate_workflow(state)
+            # "embedded" is a sequence number read out of the file names, with every Blank and
+            # QC placed after the samples: as much an inference as the listing.
+            for source in ("listing", "embedded", ""):
+                with self.subTest(source=source):
+                    state["sample_table_proposal"] = {
+                        "analytical_order": {"derived_from": source}
+                    }
 
-        self.assertTrue(
-            any(
-                item["level"] == "warning" and "repository file listing" in item["message"]
-                for item in issues
-            )
-        )
+                    issues = validate_workflow(state)
+
+                    self.assertTrue(
+                        any(
+                            item["level"] == "warning"
+                            and "not read from the instrument" in item["message"]
+                            for item in issues
+                        ),
+                        issues,
+                    )
 
     def test_automatic_and_user_defined_rt_correction_are_mutually_exclusive(self) -> None:
         issues = validate_workflow(
@@ -1609,6 +1635,95 @@ class WorkflowTests(unittest.TestCase):
                 Path(tuning["run_directory"]),
             )
             self.assertNotIn("-p", tuning["command"])
+
+    def test_tuning_runs_with_alignment_features_switched_off(self) -> None:
+        # The diagnostic runs one file without alignment. With automatic RT correction or light
+        # mode still on from the production state it was refused as "requires Together with
+        # alignment", so a unit that had enabled either could not be tuned.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "sample.mzML"
+            raw.write_text("raw", encoding="ascii")
+            console = root / "MSDIALCUI.exe"
+            console.write_bytes("execute automatic rt correction for alignment".encode("utf-16-le"))
+            template = root / "method.txt"
+            template.write_text(
+                "Ion mode: Negative\n"
+                "Execute automatic RT correction for alignment: True\n"
+                "Automatic RT correction minimum anchors: 3\n"
+                "Alignment light mode: True\n",
+                encoding="ascii",
+            )
+            state = {
+                "files": expand_paths([str(raw)]),
+                "project_type": "lcms",
+                "console_path": str(console),
+                "template_path": str(template),
+                "output_root": str(root / "output"),
+                "ion_mode": "Negative",
+                "target_omics": "Metabolomics",
+                "selected_adducts": ["[M-H]-"],
+                "together_with_alignment": True,
+                "alignment_light_mode": True,
+                "execute_automatic_rt_correction": True,
+            }
+
+            tuning = prepare_tuning_run(state, str(raw.resolve()), root / "diagnostic")
+            method = Path(tuning["method_file"]).read_text(encoding="utf-8").lower()
+
+        self.assertNotIn("automatic rt correction", method)
+        self.assertNotIn("alignment light mode: true", method)
+        self.assertTrue(state["execute_automatic_rt_correction"])  # the production state is untouched
+
+    def test_automatic_rt_validation_uses_the_defaults_the_writer_writes(self) -> None:
+        # An absent tolerance defaulted to 0 in the validator, which refused it, while the writer
+        # would have written 0.5 for the same state.
+        issues = validate_workflow(
+            {
+                "project_type": "lcms",
+                "together_with_alignment": True,
+                "execute_automatic_rt_correction": True,
+            }
+        )
+
+        messages = [item["message"] for item in issues if item["level"] == "error"]
+        self.assertFalse(
+            [message for message in messages if message.startswith("Automatic RT correction")],
+            messages,
+        )
+
+    def test_automatic_rt_defaults_are_one_table(self) -> None:
+        from msdial_app.workflow import (
+            AUTOMATIC_RT_CORRECTION_DEFAULTS,
+            AUTOMATIC_RT_CORRECTION_METHOD_KEYS,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            template = Path(temporary) / "method.txt"
+            template.write_text("Ion mode: Positive\n", encoding="ascii")
+            loaded = load_parameter_template(template)["workflow"]
+            method = Path(temporary) / "written.txt"
+            _write_method(
+                method,
+                {
+                    "project_type": "lcms",
+                    "template_path": str(template),
+                    "target_omics": "Metabolomics",
+                    "execute_automatic_rt_correction": True,
+                },
+            )
+            written = {
+                line.split(":", 1)[0].strip().casefold(): line.split(":", 1)[1].strip()
+                for line in method.read_text(encoding="utf-8").splitlines()
+                if ":" in line
+            }
+
+        for key, default in AUTOMATIC_RT_CORRECTION_DEFAULTS.items():
+            with self.subTest(key=key):
+                self.assertEqual(default, loaded[key])
+                label = key.replace("automatic_rt_correction_", "automatic rt correction ").replace("_", " ")
+                self.assertIn(label, AUTOMATIC_RT_CORRECTION_METHOD_KEYS)
+                self.assertEqual(str(default).casefold(), written[label].casefold())
 
     def test_reads_adduct_resources(self) -> None:
         resource = (

@@ -224,6 +224,11 @@ class FilterTests(unittest.TestCase):
         One zip holds both polarities. Through the archive's own name every file matched, so a
         unit labelled Negative would have analysed the positive files too. Through the unit's
         sample names, only its own ten arrive.
+
+        The sample names are ST003038's with the extension rewritten to mzML, so this is a
+        synthetic variant, not that study. ST003038 as published is mzXML and is refused before
+        download; its real shape is held by
+        test_st003038_parallel_encodings_are_refused_without_a_reviewed_substitution.
         """
         project = _project(
             [RepositoryFile("study_rawdata_mzML.zip", 10, "https://x", role="shared_raw_archive")],

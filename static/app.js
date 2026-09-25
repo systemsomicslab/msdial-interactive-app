@@ -99,6 +99,15 @@ async function api(path, options = {}) {
   return result;
 }
 
+// A blank or missing numeric field takes the documented default. Number("") is 0, so
+// `?? default` never applied and an emptied reference-file field chose file 0; `|| default`
+// replaced a deliberate 0 the validator should have been shown.
+function numberField(selector, fallback) {
+  const raw = $(selector)?.value;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return fallback;
+  return Number(raw);
+}
+
 function workflow() {
   return {
     files: state.files,
@@ -123,19 +132,19 @@ function workflow() {
     alignment_ms1_tolerance: Number($("#alignmentMs1Tolerance").value),
     alignment_light_mode: Boolean($("#alignmentLightMode")?.checked),
     execute_automatic_rt_correction: Boolean($("#executeAutomaticRtCorrection")?.checked),
-    automatic_rt_correction_reference_file_id: Number($("#automaticRtReferenceFileId")?.value ?? -1),
-    automatic_rt_correction_rt_bin_width: Number($("#automaticRtBinWidth")?.value || 0.5),
-    automatic_rt_correction_match_rt_tolerance: Number($("#automaticRtMatchTolerance")?.value || 0.5),
-    automatic_rt_correction_minimum_anchors: Number($("#automaticRtMinimumAnchors")?.value || 3),
-    automatic_rt_correction_maximum_anchors: Number($("#automaticRtMaximumAnchors")?.value || 6),
-    automatic_rt_correction_minimum_sample_coverage: Number($("#automaticRtMinimumSampleCoverage")?.value ?? 0.5),
-    automatic_rt_correction_intensity_quantile: Number($("#automaticRtIntensityQuantile")?.value ?? 0.75),
-    automatic_rt_correction_maximum_peak_width_quantile: Number($("#automaticRtMaximumPeakWidthQuantile")?.value ?? 0.5),
-    automatic_rt_correction_minimum_signal_to_noise: Number($("#automaticRtMinimumSignalToNoise")?.value ?? 3),
-    automatic_rt_correction_minimum_gaussian_similarity: Number($("#automaticRtMinimumGaussianSimilarity")?.value ?? 0),
-    automatic_rt_correction_minimum_ideal_slope: Number($("#automaticRtMinimumIdealSlope")?.value ?? 0),
-    automatic_rt_correction_outlier_mad_threshold: Number($("#automaticRtOutlierMadThreshold")?.value || 3.5),
-    automatic_rt_correction_reference_centrality_weight: Number($("#automaticRtReferenceCentralityWeight")?.value ?? 0.35),
+    automatic_rt_correction_reference_file_id: numberField("#automaticRtReferenceFileId", -1),
+    automatic_rt_correction_rt_bin_width: numberField("#automaticRtBinWidth", 0.5),
+    automatic_rt_correction_match_rt_tolerance: numberField("#automaticRtMatchTolerance", 0.5),
+    automatic_rt_correction_minimum_anchors: numberField("#automaticRtMinimumAnchors", 3),
+    automatic_rt_correction_maximum_anchors: numberField("#automaticRtMaximumAnchors", 6),
+    automatic_rt_correction_minimum_sample_coverage: numberField("#automaticRtMinimumSampleCoverage", 0.5),
+    automatic_rt_correction_intensity_quantile: numberField("#automaticRtIntensityQuantile", 0.75),
+    automatic_rt_correction_maximum_peak_width_quantile: numberField("#automaticRtMaximumPeakWidthQuantile", 0.5),
+    automatic_rt_correction_minimum_signal_to_noise: numberField("#automaticRtMinimumSignalToNoise", 3),
+    automatic_rt_correction_minimum_gaussian_similarity: numberField("#automaticRtMinimumGaussianSimilarity", 0),
+    automatic_rt_correction_minimum_ideal_slope: numberField("#automaticRtMinimumIdealSlope", 0),
+    automatic_rt_correction_outlier_mad_threshold: numberField("#automaticRtOutlierMadThreshold", 3.5),
+    automatic_rt_correction_reference_centrality_weight: numberField("#automaticRtReferenceCentralityWeight", 0.35),
     automatic_rt_correction_interpolate_blanks_by_analytical_order: Boolean($("#automaticRtInterpolateBlanks")?.checked),
     run_qa: $("#projectType").value === "lcms" && Boolean($("#heightMatrixExport")?.checked),
     height_matrix_export: $("#projectType").value === "lcms" && Boolean($("#heightMatrixExport")?.checked),

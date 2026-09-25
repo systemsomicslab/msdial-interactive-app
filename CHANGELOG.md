@@ -40,10 +40,28 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
   Validation requires LC-MS, alignment enabled, no simultaneous user-defined RT
   correction, at least two minimum anchors, a maximum not below the minimum,
   positive RT bin width/match tolerance/MAD threshold, and quantiles, coverage,
-  and centrality weight within [0,1]. The UI and agent expose these settings;
+  and centrality weight within [0,1]. The template reader, the validator and the
+  method writer share one set of defaults, so an absent value is validated as the
+  value that will be written. The UI and agent expose these settings, and a blank
+  UI field takes its default. The zero-threshold peak diagnostic turns automatic
+  RT correction and alignment light mode off, since it runs without alignment.
   Methods and Table S1 describe correction only when the Console summary and
-  anchor audit TSVs plus `method.keys.json` prove it ran. This requires a Console
-  built from the feature branch; it is not yet on MsdialWorkbench master.
+  anchor audit TSVs plus `method.keys.json` prove it ran for this run: the
+  method-key record must carry the hash of the run's `method.txt`, both TSVs must
+  be no older than that record, and at least one file other than the reference
+  must have been corrected from its own detected anchors. With the feature off,
+  Table S1 lists none of its settings. Repository runs warn when Blank models would
+  be interpolated along an analytical order inferred from file names or the file
+  listing. The Console is recognised as implementing the feature by the method key
+  its parser reads or the audit line it writes, both in `MSDIALCUI.exe` itself;
+  the title-case field label is in `MsdialCore.dll` and is not accepted. This
+  requires a Console built from the feature branch; it is not yet on
+  MsdialWorkbench master.
+- Agent-guided runs keep `sample_table_proposal` in the workflow state: how the
+  analytical order and dilution factors were proposed, with the alternatives. It
+  is listed in `Supplementary_Table_MS_DIAL.tsv`, which records every workflow
+  key, and not in the Table S1 workbook, because it is a proposal, not a setting
+  the run used.
 
 ### Changed
 - Raw-header preflight checks all inputs by default; capped inspection is marked
@@ -66,15 +84,22 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
   retention verdict. (#23)
 - Truncated downloads fail while preserving their `.part`; archive-only units do
   not lose their input allow-list. (#24, #25)
-- Conversion-required entries do not appear as eligible analysis inputs, and the
-  real-shape ST003038 fixture checks that a split never uses their sample names.
+- Conversion-required entries do not appear as eligible analysis inputs. A
+  real-shape ST003038 fixture (parallel mzML and mzXML archives, `.mzXML` sample
+  names) checks that the unit is excluded with the mzXML reason, and a split of a
+  unit with `.mzXML` sample names keeps every part excluded for the same reason.
 
 ### Known limitations
-- Runs from 2026-09-03 until this release recorded package version 0.4.7 across
-  different code states; the Interactive commit was not recorded.
+- Runs record the package version (`msdial_interactive_version`) but not the
+  Interactive commit, and this release does not change that. Runs from 2026-09-03
+  until this release all record 0.4.7 across different code states, so the version
+  alone does not identify the code that produced them.
 - Metabolomics Workbench study archives can fail checksum validation after a full
   download. Units with parallel mzML and mzXML archives but `.mzXML` sample names
   remain excluded even when an mzML encoding exists.
+- The mzXML exclusion is unit-wide: one file listed with role `requires_conversion`,
+  or one sample naming an `.mzXML`/`.mzData` file, excludes the whole unit, even
+  when its other inputs are vendor raw files or mzML that MS-DIAL can read.
 - Console source builds need an explicit provenance check; the MCP backend is still
   embedded in its process and must be reconnected to load new code.
 - Run-start provenance, instrument family from headers, analytical-order timestamps,
@@ -86,7 +111,7 @@ This version label appeared across more than one code state before #22 merged.
 
 ### Added
 - Repository reanalysis automation, tiered LC-MS annotation, Console source-build
-  inspection, and release-channel selection. (#11, #19, #21)
+  inspection, and release-channel selection. (86c4da6; reached main with #22)
 - Confirmed raw cleanup after preview; the server no longer deletes raw data
   automatically after a run. (#12)
 - Positive/negative lipidome merge, Class proposals, opt-in input staging, and

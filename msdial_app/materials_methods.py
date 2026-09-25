@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import hashlib
 import json
 import math
 import zipfile
@@ -399,11 +400,19 @@ def _automatic_rt_correction_evidence(
     A workflow setting records intent. It is not evidence that the selected Console understood
     the key or that alignment produced a correction. Publication text therefore requires all
     three independent records: the method-key audit and both Console-generated TSV files.
+
+    The three must also belong to this run. The method-key record carries the hash of the
+    method file the Console read, so a record left from an earlier preparation of the same
+    directory does not match the method.txt there now; and an audit TSV older than that record
+    was written by an earlier run. Only a file other than the reference, corrected from its own
+    detected anchors, shows a correction: the reference's anchors are always marked used, and a
+    run in which every other file kept its original RT would otherwise have read as performed.
     """
     requested = bool(workflow.get("execute_automatic_rt_correction"))
     summary_path = root / "automatic_alignment_rt_correction_summary.tsv"
     anchors_path = root / "automatic_alignment_rt_correction_anchors.tsv"
     method_keys_path = root / "method.keys.json"
+    method_path = root / "method.txt"
     evidence: dict[str, Any] = {
         "requested": requested,
         "performed": False,
@@ -425,6 +434,16 @@ def _automatic_rt_correction_evidence(
         method_keys = json.loads(method_keys_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return evidence
+    if not isinstance(method_keys, dict):
+        return evidence
+    try:
+        method_digest = hashlib.sha256(method_path.read_bytes()).hexdigest()
+    except OSError:
+        return evidence
+    recorded_digest = str(method_keys.get("method_file_sha256") or "").strip().casefold()
+    if not recorded_digest or recorded_digest != method_digest:
+        evidence["reason"] = "method_key_record_not_from_this_method_file"
+        return evidence
     applied = {str(item).strip().casefold() for item in method_keys.get("applied") or []}
     evidence["method_key_applied"] = (
         "execute automatic rt correction for alignment" in applied
@@ -434,6 +453,10 @@ def _automatic_rt_correction_evidence(
         return evidence
 
     try:
+        record_time = method_keys_path.stat().st_mtime
+        if min(summary_path.stat().st_mtime, anchors_path.stat().st_mtime) < record_time:
+            evidence["reason"] = "audit_older_than_method_key_record"
+            return evidence
         with summary_path.open(encoding="utf-8-sig", newline="") as handle:
             summary_rows = list(csv.DictReader(handle, delimiter="\t"))
         with anchors_path.open(encoding="utf-8-sig", newline="") as handle:
@@ -448,24 +471,34 @@ def _automatic_rt_correction_evidence(
         (row for row in summary_rows if row.get("Model source") == "Reference"),
         None,
     )
+    reference_id = str((reference or {}).get("File ID") or "")
     model_sources: dict[str, int] = {}
     for row in summary_rows:
         source = str(row.get("Model source") or "Unknown")
         model_sources[source] = model_sources.get(source, 0) + 1
+    corrected_ids = {
+        str(row.get("File ID") or "")
+        for row in summary_rows
+        if row.get("Model source") == "DetectedAnchors"
+        and str(row.get("File ID") or "") != reference_id
+    }
     selected_anchor_ids = {
         str(row.get("Anchor ID") or "")
         for row in anchor_rows
-        if str(row.get("Used") or "").casefold() == "true" and row.get("Anchor ID")
+        if str(row.get("Used") or "").casefold() == "true"
+        and row.get("Anchor ID")
+        and str(row.get("File ID") or "") in corrected_ids
     }
+    performed = reference is not None and bool(corrected_ids) and bool(selected_anchor_ids)
     evidence.update(
         {
-            "performed": reference is not None and bool(selected_anchor_ids),
+            "performed": performed,
             "reference_file_id": (reference or {}).get("File ID", ""),
             "reference_file_name": (reference or {}).get("File name", ""),
             "files_audited": len(summary_rows),
             "selected_anchor_count": len(selected_anchor_ids),
             "model_sources": model_sources,
-            "reason": "performed" if reference is not None and selected_anchor_ids else "audit_does_not_show_correction",
+            "reason": "performed" if performed else "audit_does_not_show_correction",
         }
     )
     return evidence

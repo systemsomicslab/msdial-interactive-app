@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import os
 import tempfile
 import unittest
 import zipfile
@@ -10,7 +12,11 @@ from subprocess import CompletedProcess
 from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
-from msdial_app.materials_methods import assess_qa, generate_publication_report
+from msdial_app.materials_methods import (
+    _automatic_rt_correction_evidence,
+    assess_qa,
+    generate_publication_report,
+)
 from msdial_app.workflow import console_version
 
 
@@ -227,6 +233,144 @@ class MaterialsMethodsTests(unittest.TestCase):
             any("does not prove that it was performed" in item for item in result["warnings"])
         )
 
+    @staticmethod
+    def _write_automatic_rt_audit(
+        root: Path,
+        summary: str = (
+            "0\tQC-reference\tReference\n"
+            "1\tSample-1\tDetectedAnchors\n"
+        ),
+        anchors: str = (
+            "0\t1\tTrue\n"
+            "0\t2\tTrue\n"
+            "1\t1\tTrue\n"
+            "1\t2\tTrue\n"
+        ),
+        method_digest: str | None = None,
+    ) -> None:
+        """Write the three Console records the way a run leaves them: method file, then its key
+        record carrying the method file's hash, then the two audit TSVs from alignment."""
+        method = root / "method.txt"
+        method.write_text("Execute automatic RT correction for alignment: True\n", encoding="utf-8")
+        digest = method_digest or hashlib.sha256(method.read_bytes()).hexdigest()
+        keys = root / "method.keys.json"
+        keys.write_text(
+            json.dumps(
+                {
+                    "schema": "msdial-method-file-keys.v1",
+                    "method_file": "method.txt",
+                    "method_file_sha256": digest,
+                    "applied": ["execute automatic rt correction for alignment"],
+                    "unrecognised": [],
+                    "unusable": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        summary_path = root / "automatic_alignment_rt_correction_summary.tsv"
+        summary_path.write_text("File ID\tFile name\tModel source\n" + summary, encoding="utf-8")
+        anchors_path = root / "automatic_alignment_rt_correction_anchors.tsv"
+        anchors_path.write_text("File ID\tAnchor ID\tUsed\n" + anchors, encoding="utf-8")
+        record_time = keys.stat().st_mtime
+        for path in (summary_path, anchors_path):
+            os.utime(path, (record_time + 1, record_time + 1))
+
+    def _automatic_rt_report(self, root: Path) -> tuple[dict, dict]:
+        workflow = {
+            "project_type": "lcms",
+            "ion_mode": "Negative",
+            "target_omics": "Metabolomics",
+            "files": [],
+            "execute_automatic_rt_correction": True,
+        }
+        evidence = _automatic_rt_correction_evidence(root, workflow)
+        result = generate_publication_report(
+            workflow, None, root, app_version="0.5.0", console_version="5.5"
+        )
+        return result, evidence
+
+    def test_automatic_rt_evidence_must_come_from_this_method_file(self) -> None:
+        # A key record left by an earlier preparation of the same directory names a method file
+        # that is no longer the one there.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_automatic_rt_audit(root, method_digest="0" * 64)
+
+            result, evidence = self._automatic_rt_report(root)
+
+        self.assertFalse(evidence["performed"])
+        self.assertEqual("method_key_record_not_from_this_method_file", evidence["reason"])
+        self.assertNotIn("learned distributed anchor features", result["methods_text"])
+
+    def test_automatic_rt_audit_older_than_the_key_record_is_not_this_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_automatic_rt_audit(root)
+            record_time = (root / "method.keys.json").stat().st_mtime
+            stale = root / "automatic_alignment_rt_correction_anchors.tsv"
+            os.utime(stale, (record_time - 60, record_time - 60))
+
+            result, evidence = self._automatic_rt_report(root)
+
+        self.assertFalse(evidence["performed"])
+        self.assertEqual("audit_older_than_method_key_record", evidence["reason"])
+
+    def test_automatic_rt_reference_anchors_alone_are_not_a_correction(self) -> None:
+        # The reference file's anchors are always marked used. A run in which every other file
+        # kept its original RT, or where a Blank copied the reference's identity map, corrected
+        # nothing.
+        cases = {
+            "every other file uncorrected": (
+                "0\tQC-reference\tReference\n1\tSample-1\tUncorrected\n",
+                "0\t1\tTrue\n0\t2\tTrue\n1\t1\tFalse\n",
+            ),
+            "blank copies the reference": (
+                "0\tQC-reference\tReference\n1\tBlank-1\tNearestBlank\n",
+                "0\t1\tTrue\n0\t2\tTrue\n",
+            ),
+        }
+        for name, (summary, anchors) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self._write_automatic_rt_audit(root, summary=summary, anchors=anchors)
+
+                result, evidence = self._automatic_rt_report(root)
+
+                self.assertFalse(evidence["performed"])
+                self.assertEqual("audit_does_not_show_correction", evidence["reason"])
+                self.assertTrue(
+                    any("does not prove that it was performed" in item for item in result["warnings"])
+                )
+
+    def test_automatic_rt_settings_stay_out_of_table_s1_when_off(self) -> None:
+        workflow = {
+            "project_type": "lcms",
+            "ion_mode": "Negative",
+            "target_omics": "Metabolomics",
+            "files": [],
+            "execute_automatic_rt_correction": False,
+            "automatic_rt_correction_minimum_anchors": 3,
+            "automatic_rt_correction_outlier_mad_threshold": 3.5,
+            "sample_table_proposal": {"analytical_order": {"derived_from": "listing"}},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result = generate_publication_report(
+                workflow, None, temporary, app_version="0.5.0", console_version="5.5"
+            )
+            with zipfile.ZipFile(result["supplementary_workbook"]) as workbook:
+                guided = workbook.read("xl/worksheets/sheet2.xml").decode("utf-8")
+            with Path(result["supplementary_table"]).open(
+                encoding="utf-8-sig", newline=""
+            ) as handle:
+                parameters = {row["Parameter"] for row in csv.DictReader(handle, delimiter="\t")}
+
+        self.assertNotIn("minimum anchors", guided.casefold())
+        self.assertNotIn("outlier mad", guided.casefold())
+        self.assertNotIn("sample table proposal", guided.casefold())
+        # The full record keeps both.
+        self.assertIn("sample_table_proposal", parameters)
+        self.assertIn("automatic_rt_correction_minimum_anchors", parameters)
+
     def test_automatic_rt_methods_and_table_use_console_audit_files(self) -> None:
         workflow = {
             "project_type": "lcms",
@@ -237,30 +381,7 @@ class MaterialsMethodsTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "method.keys.json").write_text(
-                json.dumps(
-                    {
-                        "applied": ["Execute automatic RT correction for alignment"],
-                        "unrecognised": [],
-                        "unusable": [],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (root / "automatic_alignment_rt_correction_summary.tsv").write_text(
-                "File ID\tFile name\tModel source\n"
-                "0\tQC-reference\tReference\n"
-                "1\tSample-1\tDetectedAnchors\n",
-                encoding="utf-8",
-            )
-            (root / "automatic_alignment_rt_correction_anchors.tsv").write_text(
-                "File ID\tAnchor ID\tUsed\n"
-                "0\t1\tTrue\n"
-                "0\t2\tTrue\n"
-                "1\t1\tTrue\n"
-                "1\t2\tTrue\n",
-                encoding="utf-8",
-            )
+            self._write_automatic_rt_audit(root)
 
             result = generate_publication_report(
                 workflow,

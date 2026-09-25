@@ -71,6 +71,33 @@ AUTOMATIC_RT_CORRECTION_METHOD_KEYS = {
     "automatic rt correction reference centrality weight",
     "automatic rt correction interpolate blanks by analytical order",
 }
+# One set of defaults for the template reader, the validator and the method writer. The
+# validator used to default an absent tolerance to 0 and refuse it, while the writer would
+# have written 0.5 for the same state.
+AUTOMATIC_RT_CORRECTION_DEFAULTS: dict[str, Any] = {
+    "automatic_rt_correction_reference_file_id": -1,
+    "automatic_rt_correction_rt_bin_width": 0.5,
+    "automatic_rt_correction_match_rt_tolerance": 0.5,
+    "automatic_rt_correction_minimum_anchors": 3,
+    "automatic_rt_correction_maximum_anchors": 6,
+    "automatic_rt_correction_minimum_sample_coverage": 0.5,
+    "automatic_rt_correction_intensity_quantile": 0.75,
+    "automatic_rt_correction_maximum_peak_width_quantile": 0.5,
+    "automatic_rt_correction_minimum_signal_to_noise": 3,
+    "automatic_rt_correction_minimum_gaussian_similarity": 0,
+    "automatic_rt_correction_minimum_ideal_slope": 0,
+    "automatic_rt_correction_outlier_mad_threshold": 3.5,
+    "automatic_rt_correction_reference_centrality_weight": 0.35,
+    "automatic_rt_correction_interpolate_blanks_by_analytical_order": True,
+}
+# Strings only MSDIALCUI itself carries when it implements the feature: the lowercase method
+# key its ConfigParser reads, and the audit line LcmsProcess writes. The title-case field
+# label lives in MsdialCore.dll, so a Console that merely ships beside a newer core, or a
+# byte search that happens to hit the label, would have claimed a feature that never runs.
+AUTOMATIC_RT_CORRECTION_CONSOLE_MARKERS = (
+    "execute automatic rt correction for alignment",
+    "Automatic alignment RT correction audit:",
+)
 
 
 def _git_output(root: Path, *arguments: str) -> str:
@@ -877,47 +904,68 @@ def load_parameter_template(
             "execute automatic rt correction for alignment"
         ),
         "automatic_rt_correction_reference_file_id": int(
-            number("automatic rt correction reference file id", default=-1)
+            number(
+                "automatic rt correction reference file id",
+                default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_reference_file_id"],
+            )
         ),
         "automatic_rt_correction_rt_bin_width": number(
-            "automatic rt correction rt bin width", default=0.5
+            "automatic rt correction rt bin width",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_rt_bin_width"],
         ),
         "automatic_rt_correction_match_rt_tolerance": number(
-            "automatic rt correction match rt tolerance", default=0.5
+            "automatic rt correction match rt tolerance",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_match_rt_tolerance"],
         ),
         "automatic_rt_correction_minimum_anchors": int(
-            number("automatic rt correction minimum anchors", default=3)
+            number(
+                "automatic rt correction minimum anchors",
+                default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_minimum_anchors"],
+            )
         ),
         "automatic_rt_correction_maximum_anchors": int(
-            number("automatic rt correction maximum anchors", default=6)
+            number(
+                "automatic rt correction maximum anchors",
+                default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_maximum_anchors"],
+            )
         ),
         "automatic_rt_correction_minimum_sample_coverage": number(
-            "automatic rt correction minimum sample coverage", default=0.5
+            "automatic rt correction minimum sample coverage",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_minimum_sample_coverage"],
         ),
         "automatic_rt_correction_intensity_quantile": number(
-            "automatic rt correction intensity quantile", default=0.75
+            "automatic rt correction intensity quantile",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_intensity_quantile"],
         ),
         "automatic_rt_correction_maximum_peak_width_quantile": number(
-            "automatic rt correction maximum peak width quantile", default=0.5
+            "automatic rt correction maximum peak width quantile",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_maximum_peak_width_quantile"],
         ),
         "automatic_rt_correction_minimum_signal_to_noise": number(
-            "automatic rt correction minimum signal to noise", default=3
+            "automatic rt correction minimum signal to noise",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_minimum_signal_to_noise"],
         ),
         "automatic_rt_correction_minimum_gaussian_similarity": number(
-            "automatic rt correction minimum gaussian similarity", default=0
+            "automatic rt correction minimum gaussian similarity",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_minimum_gaussian_similarity"],
         ),
         "automatic_rt_correction_minimum_ideal_slope": number(
-            "automatic rt correction minimum ideal slope", default=0
+            "automatic rt correction minimum ideal slope",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_minimum_ideal_slope"],
         ),
         "automatic_rt_correction_outlier_mad_threshold": number(
-            "automatic rt correction outlier mad threshold", default=3.5
+            "automatic rt correction outlier mad threshold",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_outlier_mad_threshold"],
         ),
         "automatic_rt_correction_reference_centrality_weight": number(
-            "automatic rt correction reference centrality weight", default=0.35
+            "automatic rt correction reference centrality weight",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_reference_centrality_weight"],
         ),
         "automatic_rt_correction_interpolate_blanks_by_analytical_order": boolean(
             "automatic rt correction interpolate blanks by analytical order",
-            default=True,
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS[
+                "automatic_rt_correction_interpolate_blanks_by_analytical_order"
+            ],
         ),
         "export_folder_path": library_path("export folder path"),
         "height_matrix_export": boolean("height matrix export"),
@@ -1137,8 +1185,19 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                     "message": "Automatic alignment RT correction requires Together with alignment to be enabled.",
                 }
             )
-        minimum_anchors = int(state.get("automatic_rt_correction_minimum_anchors", 3))
-        maximum_anchors = int(state.get("automatic_rt_correction_maximum_anchors", 6))
+        defaults = AUTOMATIC_RT_CORRECTION_DEFAULTS
+        minimum_anchors = int(
+            state.get(
+                "automatic_rt_correction_minimum_anchors",
+                defaults["automatic_rt_correction_minimum_anchors"],
+            )
+        )
+        maximum_anchors = int(
+            state.get(
+                "automatic_rt_correction_maximum_anchors",
+                defaults["automatic_rt_correction_maximum_anchors"],
+            )
+        )
         if minimum_anchors < 2:
             issues.append(
                 {
@@ -1159,7 +1218,7 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
             ("automatic_rt_correction_outlier_mad_threshold", "outlier MAD threshold"),
         )
         for key, label in positive_fields:
-            if float(state.get(key, 0)) <= 0:
+            if float(state.get(key, defaults[key])) <= 0:
                 issues.append(
                     {
                         "level": "error",
@@ -1173,7 +1232,7 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
             ("automatic_rt_correction_reference_centrality_weight", "reference centrality weight"),
         )
         for key, label in unit_interval_fields:
-            value = float(state.get(key, 0))
+            value = float(state.get(key, defaults[key]))
             if not 0 <= value <= 1:
                 issues.append(
                     {
@@ -1205,15 +1264,19 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
             and state.get(
                 "automatic_rt_correction_interpolate_blanks_by_analytical_order", True
             )
-            and order_source in {"", "listing"}
+            # "embedded" is a number read out of the file names, with every Blank and QC
+            # moved to the end: an inference as much as the listing is, and for Blank
+            # interpolation the worst one, since it places every Blank after every sample.
+            and order_source in {"", "listing", "embedded"}
         ):
             issues.append(
                 {
                     "level": "warning",
                     "message": (
                         "Blank RT-correction models would be interpolated using analytical "
-                        "order derived from the repository file listing. Confirm the injection "
-                        "order or disable Blank interpolation before production analysis."
+                        "order inferred from the repository file names or listing, not read "
+                        "from the instrument. Confirm the injection order or disable Blank "
+                        "interpolation before production analysis."
                     ),
                 }
             )
@@ -1714,6 +1777,11 @@ def prepare_tuning_run(
     tuning["project_store"] = False
     tuning["together_with_alignment"] = False
     tuning["execute_rt_correction"] = False
+    # Both are alignment features. The diagnostic runs one file without alignment, and with
+    # either still on it was refused as "requires Together with alignment", so a production
+    # state that had enabled automatic RT correction could not be tuned at all.
+    tuning["execute_automatic_rt_correction"] = False
+    tuning["alignment_light_mode"] = False
     if str(tuning.get("project_type", "lcms")).lower() == "gcms":
         tuning["minimum_peak_height"] = state.get("minimum_peak_height", 1000)
     else:
@@ -2526,54 +2594,16 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
             "rt_correction_peak_selection_rt_weight", 0.5
         ),
     }
-    automatic_rt_replacements = {
+    # Keyed by the method-file label, in the order the Console documents them. Every value
+    # falls back to the shared default, so what is written is what was validated.
+    automatic_rt_replacements: dict[str, Any] = {
         "execute automatic rt correction for alignment": True,
-        "automatic rt correction reference file id": state.get(
-            "automatic_rt_correction_reference_file_id", -1
-        ),
-        "automatic rt correction rt bin width": state.get(
-            "automatic_rt_correction_rt_bin_width", 0.5
-        ),
-        "automatic rt correction match rt tolerance": state.get(
-            "automatic_rt_correction_match_rt_tolerance", 0.5
-        ),
-        "automatic rt correction minimum anchors": state.get(
-            "automatic_rt_correction_minimum_anchors", 3
-        ),
-        "automatic rt correction maximum anchors": state.get(
-            "automatic_rt_correction_maximum_anchors", 6
-        ),
-        "automatic rt correction minimum sample coverage": state.get(
-            "automatic_rt_correction_minimum_sample_coverage", 0.5
-        ),
-        "automatic rt correction intensity quantile": state.get(
-            "automatic_rt_correction_intensity_quantile", 0.75
-        ),
-        "automatic rt correction maximum peak width quantile": state.get(
-            "automatic_rt_correction_maximum_peak_width_quantile", 0.5
-        ),
-        "automatic rt correction minimum signal to noise": state.get(
-            "automatic_rt_correction_minimum_signal_to_noise", 3
-        ),
-        "automatic rt correction minimum gaussian similarity": state.get(
-            "automatic_rt_correction_minimum_gaussian_similarity", 0
-        ),
-        "automatic rt correction minimum ideal slope": state.get(
-            "automatic_rt_correction_minimum_ideal_slope", 0
-        ),
-        "automatic rt correction outlier mad threshold": state.get(
-            "automatic_rt_correction_outlier_mad_threshold", 3.5
-        ),
-        "automatic rt correction reference centrality weight": state.get(
-            "automatic_rt_correction_reference_centrality_weight", 0.35
-        ),
-        "automatic rt correction interpolate blanks by analytical order": bool(
-            state.get(
-                "automatic_rt_correction_interpolate_blanks_by_analytical_order",
-                True,
-            )
-        ),
     }
+    for state_key, default in AUTOMATIC_RT_CORRECTION_DEFAULTS.items():
+        label = state_key.replace("automatic_rt_correction_", "automatic rt correction ").replace("_", " ")
+        automatic_rt_replacements[label] = state.get(state_key, default)
+    interpolate_label = "automatic rt correction interpolate blanks by analytical order"
+    automatic_rt_replacements[interpolate_label] = bool(automatic_rt_replacements[interpolate_label])
     automatic_rt_enabled = bool(
         project_type == "lcms" and state.get("execute_automatic_rt_correction", False)
     )
@@ -3001,8 +3031,10 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
     if marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary:
         capabilities.add(LCMS_QA_CAPABILITY)
         probes.append("QA exporter marker")
-    marker = "Execute automatic RT correction for alignment"
-    if marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary:
+    if any(
+        marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary
+        for marker in AUTOMATIC_RT_CORRECTION_CONSOLE_MARKERS
+    ):
         capabilities.add(AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY)
         probes.append("automatic RT correction marker")
     return {

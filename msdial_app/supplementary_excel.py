@@ -228,7 +228,9 @@ def _guided_sheet(workflow: dict[str, Any]) -> dict[str, Any]:
                 )
             )
 
-    excluded = {"files"} | ANNOTATION_KEYS
+    # sample_table_proposal is how the injection order and dilution factors were guessed,
+    # not a setting the run used; the full workflow record keeps it.
+    excluded = {"files", "sample_table_proposal"} | ANNOTATION_KEYS
     remaining = [
         key
         for key in sorted(workflow)
@@ -238,6 +240,11 @@ def _guided_sheet(workflow: dict[str, Any]) -> dict[str, Any]:
         and key != "gcms_ri_file_map"
         and not (not is_gcms and key.startswith("gcms_"))
         and not (not uses_rt_correction and key.startswith("rt_correction_"))
+        # Hidden above when the feature is off, so they must not reappear here: a table
+        # listing thirteen tuning values for a correction that never ran reads as if it had.
+        and not (
+            not uses_automatic_rt_correction and key.startswith("automatic_rt_correction_")
+        )
         and not (not is_lipidomics and key == "solvent")
     ]
     if remaining:
