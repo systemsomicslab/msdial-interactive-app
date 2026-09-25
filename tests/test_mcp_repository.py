@@ -97,6 +97,25 @@ class McpRepositoryToolsTests(unittest.TestCase):
         self.assertEqual("excluded", project["selection_status"])
         self.assertTrue(any("targeted" in item for item in project["exclusion_reasons"]))
 
+    def test_handoff_preserves_mzxml_conversion_requirement(self) -> None:
+        handoff = self._unit_handoff()
+        handoff["files"][0] = {
+            **handoff["files"][0],
+            "path": "FILES/sample_neg.mzXML",
+            "role": "converted",
+            "requires_conversion": True,
+        }
+        handoff["sample_metadata"][0]["raw_file"] = "sample_neg.mzXML"
+
+        project, _ = mcp_server._project_from_analysis_unit_handoff(handoff)
+
+        self.assertEqual("requires_conversion", project["files"][0]["role"])
+        self.assertFalse(project["eligible"])
+        self.assertEqual("excluded", project["selection_status"])
+        self.assertTrue(
+            any("no mzXML/mzData reader" in item for item in project["exclusion_reasons"])
+        )
+
     def test_handoff_path_and_workspace_root_validation(self) -> None:
         handoff = self._unit_handoff()
         with tempfile.TemporaryDirectory() as directory:

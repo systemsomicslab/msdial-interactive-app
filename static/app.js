@@ -122,6 +122,21 @@ function workflow() {
     alignment_rt_tolerance: Number($("#alignmentRtTolerance").value),
     alignment_ms1_tolerance: Number($("#alignmentMs1Tolerance").value),
     alignment_light_mode: Boolean($("#alignmentLightMode")?.checked),
+    execute_automatic_rt_correction: Boolean($("#executeAutomaticRtCorrection")?.checked),
+    automatic_rt_correction_reference_file_id: Number($("#automaticRtReferenceFileId")?.value ?? -1),
+    automatic_rt_correction_rt_bin_width: Number($("#automaticRtBinWidth")?.value || 0.5),
+    automatic_rt_correction_match_rt_tolerance: Number($("#automaticRtMatchTolerance")?.value || 0.5),
+    automatic_rt_correction_minimum_anchors: Number($("#automaticRtMinimumAnchors")?.value || 3),
+    automatic_rt_correction_maximum_anchors: Number($("#automaticRtMaximumAnchors")?.value || 6),
+    automatic_rt_correction_minimum_sample_coverage: Number($("#automaticRtMinimumSampleCoverage")?.value ?? 0.5),
+    automatic_rt_correction_intensity_quantile: Number($("#automaticRtIntensityQuantile")?.value ?? 0.75),
+    automatic_rt_correction_maximum_peak_width_quantile: Number($("#automaticRtMaximumPeakWidthQuantile")?.value ?? 0.5),
+    automatic_rt_correction_minimum_signal_to_noise: Number($("#automaticRtMinimumSignalToNoise")?.value ?? 3),
+    automatic_rt_correction_minimum_gaussian_similarity: Number($("#automaticRtMinimumGaussianSimilarity")?.value ?? 0),
+    automatic_rt_correction_minimum_ideal_slope: Number($("#automaticRtMinimumIdealSlope")?.value ?? 0),
+    automatic_rt_correction_outlier_mad_threshold: Number($("#automaticRtOutlierMadThreshold")?.value || 3.5),
+    automatic_rt_correction_reference_centrality_weight: Number($("#automaticRtReferenceCentralityWeight")?.value ?? 0.35),
+    automatic_rt_correction_interpolate_blanks_by_analytical_order: Boolean($("#automaticRtInterpolateBlanks")?.checked),
     run_qa: $("#projectType").value === "lcms" && Boolean($("#heightMatrixExport")?.checked),
     height_matrix_export: $("#projectType").value === "lcms" && Boolean($("#heightMatrixExport")?.checked),
     export_folder_path: $("#projectType").value === "lcms" && $("#heightMatrixExport")?.checked
@@ -935,6 +950,19 @@ function applyLoadedParameterTemplate(result) {
     ms2_tolerance: "ms2Tolerance",
     alignment_rt_tolerance: "alignmentRtTolerance",
     alignment_ms1_tolerance: "alignmentMs1Tolerance",
+    automatic_rt_correction_reference_file_id: "automaticRtReferenceFileId",
+    automatic_rt_correction_rt_bin_width: "automaticRtBinWidth",
+    automatic_rt_correction_match_rt_tolerance: "automaticRtMatchTolerance",
+    automatic_rt_correction_minimum_anchors: "automaticRtMinimumAnchors",
+    automatic_rt_correction_maximum_anchors: "automaticRtMaximumAnchors",
+    automatic_rt_correction_minimum_sample_coverage: "automaticRtMinimumSampleCoverage",
+    automatic_rt_correction_intensity_quantile: "automaticRtIntensityQuantile",
+    automatic_rt_correction_maximum_peak_width_quantile: "automaticRtMaximumPeakWidthQuantile",
+    automatic_rt_correction_minimum_signal_to_noise: "automaticRtMinimumSignalToNoise",
+    automatic_rt_correction_minimum_gaussian_similarity: "automaticRtMinimumGaussianSimilarity",
+    automatic_rt_correction_minimum_ideal_slope: "automaticRtMinimumIdealSlope",
+    automatic_rt_correction_outlier_mad_threshold: "automaticRtOutlierMadThreshold",
+    automatic_rt_correction_reference_centrality_weight: "automaticRtReferenceCentralityWeight",
     solvent: "solvent",
     gcms_accuracy_type: "gcmsAccuracyType",
     gcms_ri_compound_type: "gcmsRiCompoundType",
@@ -945,6 +973,12 @@ function applyLoadedParameterTemplate(result) {
   };
   Object.entries(controls).forEach(([key, id]) => setTemplateControl(id, values[key]));
   setTemplateControl("alignmentLightMode", values.alignment_light_mode, true);
+  setTemplateControl("executeAutomaticRtCorrection", values.execute_automatic_rt_correction, true);
+  setTemplateControl(
+    "automaticRtInterpolateBlanks",
+    values.automatic_rt_correction_interpolate_blanks_by_analytical_order,
+    true,
+  );
   setTemplateControl("heightMatrixExport", values.height_matrix_export, true);
   if (result.path) $("#templatePath").value = result.path;
   if (Array.isArray(result.msp_annotators)) state.mspAnnotators = result.msp_annotators;
@@ -1305,11 +1339,13 @@ function updateProjectUI() {
   $("#textAnnotatorPanel").hidden = !isLcms;
   $("#lipidQuerySection").hidden = !isLcms;
   $("#alignmentLightModeField").hidden = !isLcms;
+  $("#automaticRtCorrectionPanel").hidden = !isLcms;
   $("#lcmsQaExportField").hidden = !isLcms;
   const isRtWorkspace = location.pathname.startsWith("/rt-correction");
   $("#rtCorrectionSettings").hidden = !isLcms || !isRtWorkspace;
   $("#rtCorrectionLauncher").hidden = !isLcms || isRtWorkspace;
   if (!isLcms) $("#alignmentLightMode").checked = false;
+  if (!isLcms) $("#executeAutomaticRtCorrection").checked = false;
   if (!isLcms) $("#executeRtCorrection").checked = false;
   $("#ionMode").closest("label").hidden = isGcms;
   $("#solventField").hidden = isGcms;
@@ -1326,8 +1362,17 @@ function updateProjectUI() {
     $("#tuningLog").textContent = "Diagnostic tuning is currently enabled for LC-MS mdpeak and GC-MS mdscan outputs.";
   }
   updateGcmsRiUI();
+  updateAutomaticRtCorrectionUI();
   updateRtCorrectionSelectionUI();
   updateRtCorrectionLauncher();
+}
+
+function updateAutomaticRtCorrectionUI() {
+  const checkbox = $("#executeAutomaticRtCorrection");
+  const enabled = Boolean(checkbox?.checked);
+  $$("#automaticRtCorrectionPanel input").forEach((control) => {
+    if (control !== checkbox) control.disabled = !enabled;
+  });
 }
 
 function updateRtCorrectionSelectionUI() {
@@ -1368,6 +1413,21 @@ function saveRtWorkspaceState() {
     console_path: current.console_path,
     template_path: current.template_path,
     output_root: current.output_root,
+    execute_automatic_rt_correction: current.execute_automatic_rt_correction,
+    automatic_rt_correction_reference_file_id: current.automatic_rt_correction_reference_file_id,
+    automatic_rt_correction_rt_bin_width: current.automatic_rt_correction_rt_bin_width,
+    automatic_rt_correction_match_rt_tolerance: current.automatic_rt_correction_match_rt_tolerance,
+    automatic_rt_correction_minimum_anchors: current.automatic_rt_correction_minimum_anchors,
+    automatic_rt_correction_maximum_anchors: current.automatic_rt_correction_maximum_anchors,
+    automatic_rt_correction_minimum_sample_coverage: current.automatic_rt_correction_minimum_sample_coverage,
+    automatic_rt_correction_intensity_quantile: current.automatic_rt_correction_intensity_quantile,
+    automatic_rt_correction_maximum_peak_width_quantile: current.automatic_rt_correction_maximum_peak_width_quantile,
+    automatic_rt_correction_minimum_signal_to_noise: current.automatic_rt_correction_minimum_signal_to_noise,
+    automatic_rt_correction_minimum_gaussian_similarity: current.automatic_rt_correction_minimum_gaussian_similarity,
+    automatic_rt_correction_minimum_ideal_slope: current.automatic_rt_correction_minimum_ideal_slope,
+    automatic_rt_correction_outlier_mad_threshold: current.automatic_rt_correction_outlier_mad_threshold,
+    automatic_rt_correction_reference_centrality_weight: current.automatic_rt_correction_reference_centrality_weight,
+    automatic_rt_correction_interpolate_blanks_by_analytical_order: current.automatic_rt_correction_interpolate_blanks_by_analytical_order,
     execute_rt_correction: current.execute_rt_correction,
     rt_correction_anchor_path: current.rt_correction_anchor_path,
     rt_correction_anchor_source_path: current.rt_correction_anchor_source_path,
@@ -1406,6 +1466,19 @@ function restoreRtWorkspaceState() {
     consolePath: saved.console_path,
     templatePath: saved.template_path,
     outputRoot: saved.output_root,
+    automaticRtReferenceFileId: saved.automatic_rt_correction_reference_file_id,
+    automaticRtBinWidth: saved.automatic_rt_correction_rt_bin_width,
+    automaticRtMatchTolerance: saved.automatic_rt_correction_match_rt_tolerance,
+    automaticRtMinimumAnchors: saved.automatic_rt_correction_minimum_anchors,
+    automaticRtMaximumAnchors: saved.automatic_rt_correction_maximum_anchors,
+    automaticRtMinimumSampleCoverage: saved.automatic_rt_correction_minimum_sample_coverage,
+    automaticRtIntensityQuantile: saved.automatic_rt_correction_intensity_quantile,
+    automaticRtMaximumPeakWidthQuantile: saved.automatic_rt_correction_maximum_peak_width_quantile,
+    automaticRtMinimumSignalToNoise: saved.automatic_rt_correction_minimum_signal_to_noise,
+    automaticRtMinimumGaussianSimilarity: saved.automatic_rt_correction_minimum_gaussian_similarity,
+    automaticRtMinimumIdealSlope: saved.automatic_rt_correction_minimum_ideal_slope,
+    automaticRtOutlierMadThreshold: saved.automatic_rt_correction_outlier_mad_threshold,
+    automaticRtReferenceCentralityWeight: saved.automatic_rt_correction_reference_centrality_weight,
     rtCorrectionAnchorPath: saved.rt_correction_anchor_path,
     rtCorrectionSelectionPath: saved.rt_correction_selection_path,
     rtCorrectionDiffMethod: saved.rt_correction_diff_method,
@@ -1419,6 +1492,8 @@ function restoreRtWorkspaceState() {
     if (value !== undefined && value !== null && $(`#${id}`)) $(`#${id}`).value = value;
   });
   $("#executeRtCorrection").checked = Boolean(saved.execute_rt_correction);
+  $("#executeAutomaticRtCorrection").checked = Boolean(saved.execute_automatic_rt_correction);
+  $("#automaticRtInterpolateBlanks").checked = saved.automatic_rt_correction_interpolate_blanks_by_analytical_order !== false;
   $("#rtCorrectionSmoothDiff").checked = Boolean(saved.rt_correction_smooth_rt_diff);
   state.rtCorrectionAnchorSourcePath = saved.rt_correction_anchor_source_path
     || saved.rt_correction_anchor_path
@@ -3254,6 +3329,18 @@ $("#rtCorrectionPeakSelectionMode").addEventListener("change", () => {
   updateRtCorrectionSelectionUI();
   refreshQuestion();
 });
+$("#executeAutomaticRtCorrection").addEventListener("change", () => {
+  if ($("#executeAutomaticRtCorrection").checked) $("#executeRtCorrection").checked = false;
+  updateAutomaticRtCorrectionUI();
+  refreshQuestion();
+});
+$("#executeRtCorrection").addEventListener("change", () => {
+  if ($("#executeRtCorrection").checked) {
+    $("#executeAutomaticRtCorrection").checked = false;
+    updateAutomaticRtCorrectionUI();
+  }
+  refreshQuestion();
+});
 $("#browseRtCorrectionAnchor").addEventListener("click", () => runUiAction(async () => {
   if (state.rtCorrectionAnchorsDirty && !window.confirm(
     "Discard unsaved anchor-library edits and choose another file?"
@@ -3317,6 +3404,8 @@ $("#saveRtCorrectionSelections").addEventListener("click", () => runUiAction(asy
   });
   $("#rtCorrectionSelectionPath").value = result.selection_file;
   $("#executeRtCorrection").checked = true;
+  $("#executeAutomaticRtCorrection").checked = false;
+  updateAutomaticRtCorrectionUI();
   updateRtCorrectionLauncher();
   saveRtWorkspaceState();
   $("#rtCorrectionCompletion").hidden = false;

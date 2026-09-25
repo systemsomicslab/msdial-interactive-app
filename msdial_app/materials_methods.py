@@ -33,15 +33,25 @@ def generate_publication_report(
 ) -> dict[str, Any]:
     root = Path(output_root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
+    report_workflow = dict(workflow)
+    report_workflow["automatic_rt_correction_evidence"] = (
+        _automatic_rt_correction_evidence(root, workflow)
+    )
     criteria = _criteria(qa_criteria)
     qa_assessment = assess_qa(qa_report, criteria)
-    provenance_warnings = _library_warnings(workflow)
+    provenance_warnings = _library_warnings(report_workflow)
+    automatic_rt_evidence = report_workflow["automatic_rt_correction_evidence"]
+    if automatic_rt_evidence.get("requested") and not automatic_rt_evidence.get("performed"):
+        provenance_warnings.append(
+            "Automatic alignment RT correction was requested, but the retained Console audit "
+            f"does not prove that it was performed ({automatic_rt_evidence.get('reason', 'unknown')})."
+        )
     methods = _methods_text(
-        workflow, qa_report, qa_assessment, app_version, console_version
+        report_workflow, qa_report, qa_assessment, app_version, console_version
     )
     results = _results_text(qa_report, qa_assessment)
     rows = supplementary_rows(
-        workflow,
+        report_workflow,
         qa_report,
         qa_assessment,
         app_version=app_version,
@@ -68,7 +78,7 @@ def generate_publication_report(
         writer.writerows(rows)
     write_supplementary_workbook(
         workbook_path,
-        workflow,
+        report_workflow,
         qa_report,
         qa_assessment,
         app_version=app_version,
@@ -82,7 +92,7 @@ def generate_publication_report(
         },
         "qa_assessment": qa_assessment,
         "library_provenance_warnings": provenance_warnings,
-        "workflow": workflow,
+        "workflow": report_workflow,
         "qa_report": qa_report,
     }
     audit_path.write_text(
@@ -169,7 +179,13 @@ def supplementary_rows(
         "lbm_reverse_dot_product", "lbm_matched_peaks_percentage",
         "lbm_minimum_spectrum_match", "lbm_use_rt_scoring", "lbm_use_rt_filtering",
     }
-    excluded = {"files", "console_path", "template_path", "output_root"} | annotation_keys
+    excluded = {
+        "files",
+        "console_path",
+        "template_path",
+        "output_root",
+        "automatic_rt_correction_evidence",
+    } | annotation_keys
     for key in sorted(workflow):
         if key not in excluded:
             add("Guided setup", "Workflow", key, workflow[key])
@@ -190,6 +206,30 @@ def supplementary_rows(
         _add_mapping(add, "Annotation", f"Lipid query {index}", lipid)
     for index, library in enumerate(workflow.get("library_provenance", []), start=1):
         _add_mapping(add, "Library provenance", str(library.get("label") or f"Library {index}"), library)
+
+    automatic_rt_evidence = workflow.get("automatic_rt_correction_evidence") or {}
+    if automatic_rt_evidence.get("requested"):
+        for key in (
+            "performed",
+            "method_key_applied",
+            "reference_file_id",
+            "reference_file_name",
+            "files_audited",
+            "selected_anchor_count",
+            "model_sources",
+            "reason",
+            "summary_file",
+            "anchors_file",
+            "method_keys_file",
+        ):
+            add(
+                "Automatic alignment RT correction evidence",
+                "Retained run evidence",
+                key,
+                automatic_rt_evidence.get(key),
+                "Derived from retained Console outputs",
+                "MS-DIAL Console audit",
+            )
 
     if qa_report:
         for key, value in sorted((qa_report.get("summary") or {}).items()):
@@ -239,6 +279,18 @@ def _methods_text(
     if workflow.get("execute_rt_correction"):
         paragraphs.append(
             "Retention-time correction was applied using the anchor library and reviewed peak selections documented in Supplementary Table S1."
+        )
+    automatic_rt_evidence = workflow.get("automatic_rt_correction_evidence") or {}
+    if automatic_rt_evidence.get("performed"):
+        paragraphs.append(
+            "After peak detection and annotation on the original retention-time axis, "
+            "MS-DIAL learned distributed anchor features and applied file-specific "
+            "piecewise-linear retention-time correction during alignment only. The retained "
+            f"Console audit records reference file {automatic_rt_evidence.get('reference_file_name') or automatic_rt_evidence.get('reference_file_id')} "
+            f"and {automatic_rt_evidence.get('selected_anchor_count', 0)} selected anchor(s) "
+            f"across {automatic_rt_evidence.get('files_audited', 0)} audited file(s). The "
+            "per-file models and anchor evidence are documented in Supplementary Table S1 and "
+            "the retained automatic RT-correction TSV files."
         )
     paragraphs.extend(["Quality assurance", _qa_methods_sentence(qa_report, assessment)])
     return "\n\n".join(paragraphs)
@@ -337,6 +389,86 @@ def _library_warnings(workflow: dict[str, Any]) -> list[str]:
                 f"No persistent identifier was recorded for {Path(path).name}. Add a database version, DOI, repository URL, or checksum before publication."
             )
     return warnings
+
+
+def _automatic_rt_correction_evidence(
+    root: Path, workflow: dict[str, Any]
+) -> dict[str, Any]:
+    """Read proof of an executed automatic RT correction from retained run artifacts.
+
+    A workflow setting records intent. It is not evidence that the selected Console understood
+    the key or that alignment produced a correction. Publication text therefore requires all
+    three independent records: the method-key audit and both Console-generated TSV files.
+    """
+    requested = bool(workflow.get("execute_automatic_rt_correction"))
+    summary_path = root / "automatic_alignment_rt_correction_summary.tsv"
+    anchors_path = root / "automatic_alignment_rt_correction_anchors.tsv"
+    method_keys_path = root / "method.keys.json"
+    evidence: dict[str, Any] = {
+        "requested": requested,
+        "performed": False,
+        "method_key_applied": False,
+        "reference_file_id": "",
+        "reference_file_name": "",
+        "files_audited": 0,
+        "selected_anchor_count": 0,
+        "model_sources": {},
+        "reason": "not_requested" if not requested else "retained_evidence_missing",
+        "summary_file": summary_path.name,
+        "anchors_file": anchors_path.name,
+        "method_keys_file": method_keys_path.name,
+    }
+    if not requested:
+        return evidence
+
+    try:
+        method_keys = json.loads(method_keys_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return evidence
+    applied = {str(item).strip().casefold() for item in method_keys.get("applied") or []}
+    evidence["method_key_applied"] = (
+        "execute automatic rt correction for alignment" in applied
+    )
+    if not evidence["method_key_applied"]:
+        evidence["reason"] = "method_key_not_applied"
+        return evidence
+
+    try:
+        with summary_path.open(encoding="utf-8-sig", newline="") as handle:
+            summary_rows = list(csv.DictReader(handle, delimiter="\t"))
+        with anchors_path.open(encoding="utf-8-sig", newline="") as handle:
+            anchor_rows = list(csv.DictReader(handle, delimiter="\t"))
+    except OSError:
+        return evidence
+    if not summary_rows or not anchor_rows:
+        evidence["reason"] = "retained_evidence_empty"
+        return evidence
+
+    reference = next(
+        (row for row in summary_rows if row.get("Model source") == "Reference"),
+        None,
+    )
+    model_sources: dict[str, int] = {}
+    for row in summary_rows:
+        source = str(row.get("Model source") or "Unknown")
+        model_sources[source] = model_sources.get(source, 0) + 1
+    selected_anchor_ids = {
+        str(row.get("Anchor ID") or "")
+        for row in anchor_rows
+        if str(row.get("Used") or "").casefold() == "true" and row.get("Anchor ID")
+    }
+    evidence.update(
+        {
+            "performed": reference is not None and bool(selected_anchor_ids),
+            "reference_file_id": (reference or {}).get("File ID", ""),
+            "reference_file_name": (reference or {}).get("File name", ""),
+            "files_audited": len(summary_rows),
+            "selected_anchor_count": len(selected_anchor_ids),
+            "model_sources": model_sources,
+            "reason": "performed" if reference is not None and selected_anchor_ids else "audit_does_not_show_correction",
+        }
+    )
+    return evidence
 
 
 def _matched_library_provenance(

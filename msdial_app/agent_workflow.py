@@ -31,6 +31,18 @@ SUPPORTED_ANSWER_KEYS = {
     "execute_rt_correction", "rt_correction_anchor_path",
     "rt_correction_selection_path", "rt_correction_peak_selection_mode",
     "rt_correction_peak_selection_rt_weight", "library_strategy", "libraries",
+    "execute_automatic_rt_correction", "automatic_rt_correction_reference_file_id",
+    "automatic_rt_correction_rt_bin_width", "automatic_rt_correction_match_rt_tolerance",
+    "automatic_rt_correction_minimum_anchors", "automatic_rt_correction_maximum_anchors",
+    "automatic_rt_correction_minimum_sample_coverage",
+    "automatic_rt_correction_intensity_quantile",
+    "automatic_rt_correction_maximum_peak_width_quantile",
+    "automatic_rt_correction_minimum_signal_to_noise",
+    "automatic_rt_correction_minimum_gaussian_similarity",
+    "automatic_rt_correction_minimum_ideal_slope",
+    "automatic_rt_correction_outlier_mad_threshold",
+    "automatic_rt_correction_reference_centrality_weight",
+    "automatic_rt_correction_interpolate_blanks_by_analytical_order",
     "library_provenance", "run_qa", "internal_standards",
     "use_retention_time_for_annotation", "retention_time_tolerance", "number_of_threads",
     "stage_inputs", "dilution_factor", "class_assignment_confirmed",
@@ -465,6 +477,16 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
                     "How should an anchor peak be selected?",
                     ["HighestIntensity", "ClosestToReferenceRt", "Weighted"],
                 )
+        elif "execute_automatic_rt_correction" not in answers:
+            ask(
+                "execute_automatic_rt_correction",
+                (
+                    "Apply automatic RT correction only during alignment, using anchors "
+                    "learned from the detected features?"
+                ),
+                ["false", "true"],
+                required=False,
+            )
     if project_type == "gcms" and not answers.get("gcms_retention_type"):
         ask("gcms_retention_type", "Use retention time or retention index?", ["RT", "RI"])
     if project_type == "gcms" and answers.get("gcms_retention_type") == "RI":
@@ -585,6 +607,9 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
     state.update(
         {
             "files": copy.deepcopy(inspection["files"]),
+            "sample_table_proposal": copy.deepcopy(
+                inspection.get("sample_table_proposal", {})
+            ),
             "project_type": project_type,
             "ion_mode": answers.get("ion_mode", "Positive"),
             "target_omics": answers.get("target_omics", "Metabolomics"),
@@ -614,6 +639,96 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             ),
             "rt_correction_peak_selection_rt_weight": float(
                 answers.get("rt_correction_peak_selection_rt_weight", 0.5)
+            ),
+            "execute_automatic_rt_correction": _as_bool(
+                answers.get("execute_automatic_rt_correction", False)
+            ),
+            "automatic_rt_correction_reference_file_id": int(
+                answers.get(
+                    "automatic_rt_correction_reference_file_id",
+                    state.get("automatic_rt_correction_reference_file_id", -1),
+                )
+            ),
+            "automatic_rt_correction_rt_bin_width": float(
+                answers.get(
+                    "automatic_rt_correction_rt_bin_width",
+                    state.get("automatic_rt_correction_rt_bin_width", 0.5),
+                )
+            ),
+            "automatic_rt_correction_match_rt_tolerance": float(
+                answers.get(
+                    "automatic_rt_correction_match_rt_tolerance",
+                    state.get("automatic_rt_correction_match_rt_tolerance", 0.5),
+                )
+            ),
+            "automatic_rt_correction_minimum_anchors": int(
+                answers.get(
+                    "automatic_rt_correction_minimum_anchors",
+                    state.get("automatic_rt_correction_minimum_anchors", 3),
+                )
+            ),
+            "automatic_rt_correction_maximum_anchors": int(
+                answers.get(
+                    "automatic_rt_correction_maximum_anchors",
+                    state.get("automatic_rt_correction_maximum_anchors", 6),
+                )
+            ),
+            "automatic_rt_correction_minimum_sample_coverage": float(
+                answers.get(
+                    "automatic_rt_correction_minimum_sample_coverage",
+                    state.get("automatic_rt_correction_minimum_sample_coverage", 0.5),
+                )
+            ),
+            "automatic_rt_correction_intensity_quantile": float(
+                answers.get(
+                    "automatic_rt_correction_intensity_quantile",
+                    state.get("automatic_rt_correction_intensity_quantile", 0.75),
+                )
+            ),
+            "automatic_rt_correction_maximum_peak_width_quantile": float(
+                answers.get(
+                    "automatic_rt_correction_maximum_peak_width_quantile",
+                    state.get("automatic_rt_correction_maximum_peak_width_quantile", 0.5),
+                )
+            ),
+            "automatic_rt_correction_minimum_signal_to_noise": float(
+                answers.get(
+                    "automatic_rt_correction_minimum_signal_to_noise",
+                    state.get("automatic_rt_correction_minimum_signal_to_noise", 3),
+                )
+            ),
+            "automatic_rt_correction_minimum_gaussian_similarity": float(
+                answers.get(
+                    "automatic_rt_correction_minimum_gaussian_similarity",
+                    state.get("automatic_rt_correction_minimum_gaussian_similarity", 0),
+                )
+            ),
+            "automatic_rt_correction_minimum_ideal_slope": float(
+                answers.get(
+                    "automatic_rt_correction_minimum_ideal_slope",
+                    state.get("automatic_rt_correction_minimum_ideal_slope", 0),
+                )
+            ),
+            "automatic_rt_correction_outlier_mad_threshold": float(
+                answers.get(
+                    "automatic_rt_correction_outlier_mad_threshold",
+                    state.get("automatic_rt_correction_outlier_mad_threshold", 3.5),
+                )
+            ),
+            "automatic_rt_correction_reference_centrality_weight": float(
+                answers.get(
+                    "automatic_rt_correction_reference_centrality_weight",
+                    state.get("automatic_rt_correction_reference_centrality_weight", 0.35),
+                )
+            ),
+            "automatic_rt_correction_interpolate_blanks_by_analytical_order": _as_bool(
+                answers.get(
+                    "automatic_rt_correction_interpolate_blanks_by_analytical_order",
+                    state.get(
+                        "automatic_rt_correction_interpolate_blanks_by_analytical_order",
+                        True,
+                    ),
+                )
             ),
             "alignment_light_mode": _as_bool(answers.get("alignment_light_mode", False)),
             "library_provenance": copy.deepcopy(

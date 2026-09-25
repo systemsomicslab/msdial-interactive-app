@@ -214,6 +214,77 @@ class AgentWorkflowTests(unittest.TestCase):
         self.assertFalse(plan["post_run_actions"]["quality_assurance"])
         self.assertFalse(plan["post_run_actions"]["materials_and_methods"])
 
+    def test_agent_can_select_automatic_alignment_rt_correction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "sample.mzML").write_text("", encoding="ascii")
+            console = root / "MSDIALCUI.exe"
+            console.write_text(
+                "Execute automatic RT correction for alignment",
+                encoding="ascii",
+            )
+
+            plan = build_guided_plan(
+                str(root),
+                {
+                    "project_type": "lcms",
+                    "ion_mode": "Negative",
+                    "target_omics": "Metabolomics",
+                    "parameter_strategy": "default",
+                    "execute_rt_correction": False,
+                    "execute_automatic_rt_correction": True,
+                    "automatic_rt_correction_minimum_anchors": 3,
+                    "automatic_rt_correction_maximum_anchors": 6,
+                    "library_strategy": "none",
+                    "run_qa": False,
+                    "generate_materials_methods": False,
+                    "class_assignment_confirmed": True,
+                    "console_path": str(console),
+                    "template_path": str(
+                        ROOT / "resources" / "msdial_console_param4lipidomics.txt"
+                    ),
+                },
+            )
+
+            self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+            self.assertTrue(plan["workflow"]["execute_automatic_rt_correction"])
+            self.assertEqual(3, plan["workflow"]["automatic_rt_correction_minimum_anchors"])
+            self.assertEqual(6, plan["workflow"]["automatic_rt_correction_maximum_anchors"])
+
+    def test_agent_rejects_both_rt_correction_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "sample.mzML").write_text("", encoding="ascii")
+            anchor = root / "anchors.txt"
+            anchor.write_text("anchors", encoding="ascii")
+            console = root / "MSDIALCUI.exe"
+            console.write_text("", encoding="ascii")
+
+            plan = build_guided_plan(
+                str(root),
+                {
+                    "project_type": "lcms",
+                    "ion_mode": "Negative",
+                    "target_omics": "Metabolomics",
+                    "parameter_strategy": "default",
+                    "execute_rt_correction": True,
+                    "rt_correction_anchor_path": str(anchor),
+                    "rt_correction_peak_selection_mode": "HighestIntensity",
+                    "execute_automatic_rt_correction": True,
+                    "library_strategy": "none",
+                    "run_qa": False,
+                    "generate_materials_methods": False,
+                    "class_assignment_confirmed": True,
+                    "console_path": str(console),
+                    "template_path": str(
+                        ROOT / "resources" / "msdial_console_param4lipidomics.txt"
+                    ),
+                },
+            )
+
+            self.assertFalse(plan["ready_to_prepare"])
+            self.assertTrue(any("cannot be enabled together" in item for item in plan["blockers"]))
+
     def test_peak_height_estimate_uses_target_order_statistic(self) -> None:
         result = estimate_peak_height([1, 2, 3, 4, 5], 2)
 

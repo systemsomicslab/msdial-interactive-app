@@ -8,6 +8,11 @@ by DDA or DIA/AIF/SWATH. The wider Interactive application still supports
 additional LC-MS and GC-MS workflows, but agents must not expand this campaign
 to GC-MS without a separately approved policy change.
 
+MS-DIAL reads mzML but does not provide an mzXML or mzData reader. Treat
+`.mzXML`, `.mzData`, and `.mzData.xml` as `requires_conversion`: do not download
+or queue them as MS-DIAL inputs. Convert them to centroided mzML with a reviewed
+ProteoWizard `msconvert` workflow, then create a new auditable input manifest.
+
 Before selecting an analysis unit, ask what the user wants to learn. Capture the
 scientific question and comparison, whether annotation or comparative profiling
 is central, and required outputs as `analysis_purpose`. Pass it to batch, plan,
@@ -41,8 +46,8 @@ and download tools. Missing purpose is an explicit download blocker.
    value from the accession or filename alone. A Catalog handoff without a
    saved Class proposal remains blocked; preview and save that proposal only
    after explicit confirmation, then regenerate the handoff.
-6. Ask whether raw data should be kept or deleted only after a successful run
-   and validated mzTab-M output.
+6. Record whether the user intends to keep raw data or consider cleanup after a
+   successful run. This retention preference is not permission to delete data.
 7. Call `msdial_download_repository_raw` with the same
    `analysis_unit_handoff_path` and `confirmed=false`. Show the local destination,
    size bound, accession, unit ID, required bundle bytes, and retention policy. Call it again with
@@ -59,6 +64,13 @@ untargeted status uncertain, or when the user requests a raw-header cross-check.
 the sibling `msrawdataworkbench/RawMetadataConsoleApp` build or accept an
 explicit extractor path. Set `confirm_untargeted=true` only after the user has
 explicitly accepted that scientific classification.
+
+If preflight reports `acquisition_mode=Mixed`, call
+`msdial_split_repository_unit` with `confirmed=false` and review every proposed
+child unit. Call it with `confirmed=true` only after the user accepts the split.
+Never run the Mixed parent. Run raw-metadata preflight independently for every
+child, and prepare/start only children whose DDA or DIA/AIF/SWATH mode is
+resolved and scientifically accepted.
 
 Call `msdial_prepare_repository_reanalysis` with `confirmed=false`. Review:
 
@@ -116,7 +128,11 @@ Retain repository/publication metadata, reviewed sample metadata,
 `analysis_files.csv`, parameters, mzTab-M, `mdpeak`/`mdscan`, `mdmsp`, `mdalign`,
 QA, publication artifacts, and the ZIP of `dcl`/`arf` project files. When the
 retention policy requests cleanup, raw data may be deleted only after mzTab-M
-validation succeeds and the retained-artifact inventory is complete.
+validation succeeds and the retained-artifact inventory is complete. Then call
+`msdial_cleanup_repository_raw` with `confirmed=false`, show the exact workspace,
+raw directory, manifest, and retained-artifact inventory, and obtain a separate
+deletion confirmation before calling it with `confirmed=true`. A previously
+accepted retention policy never substitutes for this deletion approval.
 
 ## Example request
 

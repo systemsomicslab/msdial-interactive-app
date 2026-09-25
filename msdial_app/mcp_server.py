@@ -383,6 +383,8 @@ def _required_download_size(project: dict[str, Any]) -> dict[str, Any]:
 def _project_from_analysis_unit_handoff(
     handoff: dict[str, Any], repository: str = "", accession: str = ""
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    from .repository_reanalysis import requires_msdial_conversion
+
     if handoff.get("schema") != "msdial-repository-reanalysis-handoff.v1":
         raise ValueError("Unsupported or missing repository reanalysis handoff schema.")
     handoff_repository = str(handoff.get("repository") or "").strip()
@@ -411,12 +413,17 @@ def _project_from_analysis_unit_handoff(
         url = str(item.get("download_url") or "").strip()
         if not path or not url:
             raise ValueError(f"Analysis unit {unit_id} contains a file without path/download_url.")
+        role = str(item.get("role") or "raw")
+        if role in {"raw", "converted"} and (
+            bool(item.get("requires_conversion")) or requires_msdial_conversion(path)
+        ):
+            role = "requires_conversion"
         files.append(
             {
                 "name": path,
                 "size_bytes": int(item.get("size_bytes") or 0),
                 "url": url,
-                "role": str(item.get("role") or "raw"),
+                "role": role,
                 "checksum": str(item.get("checksum") or ""),
             }
         )

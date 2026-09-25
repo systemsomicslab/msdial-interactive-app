@@ -80,6 +80,26 @@ GUIDED_SECTIONS = [
         ],
     ),
     (
+        "Automatic alignment RT correction",
+        [
+            ("execute_automatic_rt_correction", "Apply automatic correction during alignment", ""),
+            ("automatic_rt_correction_reference_file_id", "Reference file ID (-1 = automatic)", ""),
+            ("automatic_rt_correction_rt_bin_width", "RT bin width", "min"),
+            ("automatic_rt_correction_match_rt_tolerance", "Cross-file RT match tolerance", "min"),
+            ("automatic_rt_correction_minimum_anchors", "Minimum anchors", ""),
+            ("automatic_rt_correction_maximum_anchors", "Maximum anchors", ""),
+            ("automatic_rt_correction_minimum_sample_coverage", "Minimum sample coverage", "0-1"),
+            ("automatic_rt_correction_intensity_quantile", "Intensity quantile", "0-1"),
+            ("automatic_rt_correction_maximum_peak_width_quantile", "Maximum peak-width quantile", "0-1"),
+            ("automatic_rt_correction_minimum_signal_to_noise", "Minimum signal-to-noise", ""),
+            ("automatic_rt_correction_minimum_gaussian_similarity", "Minimum Gaussian similarity", "0-1"),
+            ("automatic_rt_correction_minimum_ideal_slope", "Minimum ideal slope", "0-1"),
+            ("automatic_rt_correction_outlier_mad_threshold", "Outlier MAD threshold", ""),
+            ("automatic_rt_correction_reference_centrality_weight", "Reference centrality weight", "0-1"),
+            ("automatic_rt_correction_interpolate_blanks_by_analytical_order", "Interpolate Blanks by analytical order", ""),
+        ],
+    ),
+    (
         "GC-MS retention index",
         [
             ("gcms_accuracy_type", "Mass accuracy type", ""),
@@ -162,11 +182,14 @@ def _guided_sheet(workflow: dict[str, Any]) -> dict[str, Any]:
     represented: set[str] = set()
     is_gcms = str(workflow.get("project_type", "lcms")).lower() == "gcms"
     uses_rt_correction = bool(workflow.get("execute_rt_correction"))
+    uses_automatic_rt_correction = bool(workflow.get("execute_automatic_rt_correction"))
     is_lipidomics = str(workflow.get("target_omics", "")).lower() == "lipidomics"
     for section, fields in GUIDED_SECTIONS:
         if section == "GC-MS retention index" and not is_gcms:
             continue
         if section == "Retention time correction" and not uses_rt_correction:
+            fields = fields[:1]
+        if section == "Automatic alignment RT correction" and not uses_automatic_rt_correction:
             fields = fields[:1]
         present = [(key, label, note) for key, label, note in fields if key in workflow]
         if not is_lipidomics:
@@ -178,6 +201,32 @@ def _guided_sheet(workflow: dict[str, Any]) -> dict[str, Any]:
         for key, label, note in present:
             rows.append(_row([label, _guided_value(key, workflow.get(key)), note], "body_left"))
             represented.add(key)
+
+    automatic_rt_evidence = workflow.get("automatic_rt_correction_evidence") or {}
+    represented.add("automatic_rt_correction_evidence")
+    if automatic_rt_evidence.get("requested"):
+        rows.append(_section("Automatic alignment RT correction evidence", 3))
+        rows.append(_row(["Field", "Value", "Unit or note"], "header"))
+        evidence_fields = (
+            ("performed", "Correction performed"),
+            ("method_key_applied", "Method key applied by Console"),
+            ("reference_file_id", "Reference file ID"),
+            ("reference_file_name", "Reference file name"),
+            ("files_audited", "Files audited"),
+            ("selected_anchor_count", "Selected anchors"),
+            ("model_sources", "Per-file model sources"),
+            ("reason", "Evidence verdict"),
+            ("summary_file", "Summary audit file"),
+            ("anchors_file", "Anchor audit file"),
+            ("method_keys_file", "Method-key audit file"),
+        )
+        for key, label in evidence_fields:
+            rows.append(
+                _row(
+                    [label, _typed_value(automatic_rt_evidence.get(key)), "Console audit"],
+                    "body_left",
+                )
+            )
 
     excluded = {"files"} | ANNOTATION_KEYS
     remaining = [

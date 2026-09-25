@@ -302,6 +302,33 @@
             <span class="muted">The QA matrix is written to Output root. This requires a Console build containing the LC-MS QA matrix exporter.</span>
           </label>
         </div>
+        <div id="automaticRtCorrectionPanel" class="nested-panel">
+          <h3>Automatic RT correction during LC-MS alignment</h3>
+          <label class="check"><input id="executeAutomaticRtCorrection" type="checkbox"> Learn anchor peaks from detected features and correct RT only during alignment</label>
+          <p class="muted">Peak picking and annotation retain the original RT axis. Before alignment, MS-DIAL selects distributed high-quality anchors, chooses a reference sample, and applies a file-specific piecewise-linear RT map. This mode cannot be combined with the user-defined anchor workflow below.</p>
+          <div class="form-grid">
+            <label>Reference file ID (-1 = automatic)<input id="automaticRtReferenceFileId" type="number" step="1" value="-1"></label>
+            <label>Minimum anchors<input id="automaticRtMinimumAnchors" type="number" min="2" step="1" value="3"></label>
+            <label>Maximum anchors<input id="automaticRtMaximumAnchors" type="number" min="2" step="1" value="6"></label>
+            <label>Minimum sample coverage<input id="automaticRtMinimumSampleCoverage" type="number" min="0" max="1" step="0.05" value="0.5"></label>
+            <label class="check"><input id="automaticRtInterpolateBlanks" type="checkbox" checked> Interpolate Blank correction by analytical order</label>
+          </div>
+          <details>
+            <summary><strong>Anchor quality and matching settings</strong></summary>
+            <div class="form-grid">
+              <label>RT bin width (min)<input id="automaticRtBinWidth" type="number" min="0.001" step="any" value="0.5"></label>
+              <label>Cross-file RT match tolerance (min)<input id="automaticRtMatchTolerance" type="number" min="0.001" step="any" value="0.5"></label>
+              <label>Intensity quantile<input id="automaticRtIntensityQuantile" type="number" min="0" max="1" step="0.05" value="0.75"></label>
+              <label>Maximum peak-width quantile<input id="automaticRtMaximumPeakWidthQuantile" type="number" min="0" max="1" step="0.05" value="0.5"></label>
+              <label>Minimum signal-to-noise<input id="automaticRtMinimumSignalToNoise" type="number" min="0" step="any" value="3"></label>
+              <label>Minimum Gaussian similarity<input id="automaticRtMinimumGaussianSimilarity" type="number" min="0" max="1" step="0.05" value="0"></label>
+              <label>Minimum ideal slope<input id="automaticRtMinimumIdealSlope" type="number" min="0" max="1" step="0.05" value="0"></label>
+              <label>Outlier MAD threshold<input id="automaticRtOutlierMadThreshold" type="number" min="0.001" step="any" value="3.5"></label>
+              <label>Reference centrality weight<input id="automaticRtReferenceCentralityWeight" type="number" min="0" max="1" step="0.05" value="0.35"></label>
+            </div>
+          </details>
+          <p class="muted">The Console writes <code>automatic_alignment_rt_correction_summary.tsv</code> and <code>automatic_alignment_rt_correction_anchors.tsv</code> so the selected reference, anchors, per-file model source, and failures remain auditable.</p>
+        </div>
       </div>
       <div id="rtCorrectionLauncher" class="panel" hidden>
         <div class="section-head compact-head">

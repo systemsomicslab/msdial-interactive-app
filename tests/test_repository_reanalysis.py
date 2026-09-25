@@ -1022,6 +1022,49 @@ class AcquisitionSplitTests(_MixedUnitFixture, unittest.TestCase):
         self.assertTrue(any("on its own" in item for item in reasons), reasons)
         self.assertFalse(part["project"]["eligible"])
 
+    def test_split_with_mzxml_sample_names_keeps_each_part_excluded(self) -> None:
+        """Splitting acquisition modes must not erase a conversion-required verdict."""
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, _, _ = self._mixed(Path(temporary) / "unit")
+            parent = json.loads(manifest.read_text(encoding="utf-8"))
+            parent["project"]["files"] = [
+                {
+                    "name": "ST003038_rawdata_mzML.zip",
+                    "size_bytes": 1,
+                    "url": "",
+                    "role": "shared_raw_archive",
+                },
+                {
+                    "name": "ST003038_rawdata_mzXML.zip",
+                    "size_bytes": 1,
+                    "url": "",
+                    "role": "shared_raw_archive",
+                },
+            ]
+            for sample in parent["project"]["sample_metadata"]:
+                raw_file = str(sample.get("raw_file") or "")
+                sample["raw_file"] = str(Path(raw_file).with_suffix(".mzXML"))
+            manifest.write_text(json.dumps(parent), encoding="utf-8")
+
+            result = split_unit_by_acquisition(manifest, confirmed=True)
+            parts = [
+                json.loads(Path(item["manifest_path"]).read_text(encoding="utf-8"))
+                for item in result["parts"]
+            ]
+
+        self.assertTrue(result["written"])
+        self.assertTrue(parts)
+        for part in parts:
+            self.assertFalse(part["execution_allowed"])
+            self.assertFalse(part["project"]["eligible"])
+            self.assertTrue(
+                any(
+                    "no mzXML/mzData reader" in reason
+                    for reason in part["project"]["exclusion_reasons"]
+                ),
+                part["project"]["exclusion_reasons"],
+            )
+
     def test_split_provenance_says_the_run_holds_part_of_the_proposal(self) -> None:
         # MTBLS2207's DDA part was about to record "Class ... across 11 samples" for a run of six.
         from msdial_app.repository_metadata import apply_class_proposal, metadata_workspace

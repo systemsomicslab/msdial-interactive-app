@@ -28,12 +28,12 @@ SUPPORTED_SUFFIXES = {
     ".ibf",
     ".lcd",
     ".mzml",
-    ".mzxml",
     ".qgd",
     ".raw",
     ".wiff",
     ".wiff2",
 }
+CONVERSION_REQUIRED_SUFFIXES = (".mzxml", ".mzdata", ".mzdata.xml")
 VC2013_DOWNLOAD_URL = (
     "https://support.microsoft.com/en-us/topic/"
     "update-for-visual-c-2013-and-visual-c-redistributable-package-"
@@ -50,7 +50,27 @@ SMOOTHING_METHODS = [
 ]
 LCMS_QA_CAPABILITY = "lcms_alignment_qa_matrix"
 RT_CORRECTION_REVIEW_CAPABILITY = "rt_correction_review"
+AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY = "automatic_alignment_rt_correction"
 CONSOLE_BUILD_PROVENANCE = "msdial-console-build-provenance.json"
+AUTOMATIC_RT_CORRECTION_SUMMARY = "automatic_alignment_rt_correction_summary.tsv"
+AUTOMATIC_RT_CORRECTION_ANCHORS = "automatic_alignment_rt_correction_anchors.tsv"
+AUTOMATIC_RT_CORRECTION_METHOD_KEYS = {
+    "execute automatic rt correction for alignment",
+    "automatic rt correction reference file id",
+    "automatic rt correction rt bin width",
+    "automatic rt correction match rt tolerance",
+    "automatic rt correction minimum anchors",
+    "automatic rt correction maximum anchors",
+    "automatic rt correction minimum sample coverage",
+    "automatic rt correction intensity quantile",
+    "automatic rt correction maximum peak width quantile",
+    "automatic rt correction minimum signal to noise",
+    "automatic rt correction minimum gaussian similarity",
+    "automatic rt correction minimum ideal slope",
+    "automatic rt correction outlier mad threshold",
+    "automatic rt correction reference centrality weight",
+    "automatic rt correction interpolate blanks by analytical order",
+}
 
 
 def _git_output(root: Path, *arguments: str) -> str:
@@ -363,6 +383,11 @@ def is_supported(path: Path) -> bool:
     )
 
 
+def requires_mzml_conversion(path: Path) -> bool:
+    name = path.name.casefold()
+    return any(name.endswith(suffix) for suffix in CONVERSION_REQUIRED_SUFFIXES)
+
+
 def detect_raw_format(path: str | Path) -> dict[str, Any]:
     """What a file's format implies, before anyone has decided anything.
 
@@ -425,7 +450,7 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
             "suggested_mass_slice_width": 0.1,
         }
     return {
-        "vendor": "Open format" if suffix in {".mzml", ".mzxml", ".cdf"} else "Other",
+        "vendor": "Open format" if suffix in {".mzml", ".cdf"} else "Other",
         "format": suffix.lstrip(".").upper() or "Unknown",
         "instrument_family": "QTOF",
         "suggested_minimum_peak_height": 100,
@@ -485,7 +510,12 @@ def read_analysis_csv(path: str | Path) -> dict[str, Any]:
                 rejected.append(f"{analysis_path} (not found; line {line_number})")
                 continue
             if not is_supported(analysis_path):
-                rejected.append(f"{analysis_path} (unsupported; line {line_number})")
+                reason = (
+                    "MS-DIAL has no mzXML/mzData reader; convert to mzML"
+                    if requires_mzml_conversion(analysis_path)
+                    else "unsupported"
+                )
+                rejected.append(f"{analysis_path} ({reason}; line {line_number})")
                 continue
 
             format_info = detect_raw_format(analysis_path)
@@ -539,10 +569,16 @@ def expand_paths_report(paths: Iterable[str]) -> dict[str, Any]:
         elif path.is_dir() and is_supported(path):
             expanded.append(path)
         elif path.is_dir():
-            expanded.extend(
-                child
-                for child in path.iterdir()
-                if is_supported(child)
+            children = list(path.iterdir())
+            expanded.extend(child for child in children if is_supported(child))
+            rejected.extend(
+                f"{child.resolve()} (MS-DIAL has no mzXML/mzData reader; convert to mzML)"
+                for child in children
+                if child.is_file() and requires_mzml_conversion(child)
+            )
+        elif path.is_file() and requires_mzml_conversion(path):
+            rejected.append(
+                f"{path} (MS-DIAL has no mzXML/mzData reader; convert to mzML)"
             )
         elif path.exists():
             rejected.append(str(path))
@@ -837,6 +873,52 @@ def load_parameter_template(
         "alignment_rt_tolerance": number("retention time tolerance for alignment", default=0.1),
         "alignment_ms1_tolerance": number("ms1 tolerance for alignment", default=0.015),
         "alignment_light_mode": boolean("alignment light mode"),
+        "execute_automatic_rt_correction": boolean(
+            "execute automatic rt correction for alignment"
+        ),
+        "automatic_rt_correction_reference_file_id": int(
+            number("automatic rt correction reference file id", default=-1)
+        ),
+        "automatic_rt_correction_rt_bin_width": number(
+            "automatic rt correction rt bin width", default=0.5
+        ),
+        "automatic_rt_correction_match_rt_tolerance": number(
+            "automatic rt correction match rt tolerance", default=0.5
+        ),
+        "automatic_rt_correction_minimum_anchors": int(
+            number("automatic rt correction minimum anchors", default=3)
+        ),
+        "automatic_rt_correction_maximum_anchors": int(
+            number("automatic rt correction maximum anchors", default=6)
+        ),
+        "automatic_rt_correction_minimum_sample_coverage": number(
+            "automatic rt correction minimum sample coverage", default=0.5
+        ),
+        "automatic_rt_correction_intensity_quantile": number(
+            "automatic rt correction intensity quantile", default=0.75
+        ),
+        "automatic_rt_correction_maximum_peak_width_quantile": number(
+            "automatic rt correction maximum peak width quantile", default=0.5
+        ),
+        "automatic_rt_correction_minimum_signal_to_noise": number(
+            "automatic rt correction minimum signal to noise", default=3
+        ),
+        "automatic_rt_correction_minimum_gaussian_similarity": number(
+            "automatic rt correction minimum gaussian similarity", default=0
+        ),
+        "automatic_rt_correction_minimum_ideal_slope": number(
+            "automatic rt correction minimum ideal slope", default=0
+        ),
+        "automatic_rt_correction_outlier_mad_threshold": number(
+            "automatic rt correction outlier mad threshold", default=3.5
+        ),
+        "automatic_rt_correction_reference_centrality_weight": number(
+            "automatic rt correction reference centrality weight", default=0.35
+        ),
+        "automatic_rt_correction_interpolate_blanks_by_analytical_order": boolean(
+            "automatic rt correction interpolate blanks by analytical order",
+            default=True,
+        ),
         "export_folder_path": library_path("export folder path"),
         "height_matrix_export": boolean("height matrix export"),
         "solvent": value("solvent type", default="CH3COONH4"),
@@ -1028,6 +1110,111 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                 {
                     "level": "error",
                     "message": "RT correction peak selection RT weight must be between 0 and 1.",
+                }
+            )
+    if state.get("execute_automatic_rt_correction"):
+        if project_type != "lcms":
+            issues.append(
+                {
+                    "level": "error",
+                    "message": "Automatic alignment RT correction is currently available only for LC-MS.",
+                }
+            )
+        if state.get("execute_rt_correction"):
+            issues.append(
+                {
+                    "level": "error",
+                    "message": (
+                        "User-defined RT correction and automatic alignment RT correction "
+                        "cannot be enabled together because that would correct the RT axis twice."
+                    ),
+                }
+            )
+        if not state.get("together_with_alignment", True):
+            issues.append(
+                {
+                    "level": "error",
+                    "message": "Automatic alignment RT correction requires Together with alignment to be enabled.",
+                }
+            )
+        minimum_anchors = int(state.get("automatic_rt_correction_minimum_anchors", 3))
+        maximum_anchors = int(state.get("automatic_rt_correction_maximum_anchors", 6))
+        if minimum_anchors < 2:
+            issues.append(
+                {
+                    "level": "error",
+                    "message": "Automatic RT correction minimum anchors must be at least 2.",
+                }
+            )
+        if maximum_anchors < minimum_anchors:
+            issues.append(
+                {
+                    "level": "error",
+                    "message": "Automatic RT correction maximum anchors must be at least the minimum anchors.",
+                }
+            )
+        positive_fields = (
+            ("automatic_rt_correction_rt_bin_width", "RT bin width"),
+            ("automatic_rt_correction_match_rt_tolerance", "match RT tolerance"),
+            ("automatic_rt_correction_outlier_mad_threshold", "outlier MAD threshold"),
+        )
+        for key, label in positive_fields:
+            if float(state.get(key, 0)) <= 0:
+                issues.append(
+                    {
+                        "level": "error",
+                        "message": f"Automatic RT correction {label} must be greater than 0.",
+                    }
+                )
+        unit_interval_fields = (
+            ("automatic_rt_correction_minimum_sample_coverage", "minimum sample coverage"),
+            ("automatic_rt_correction_intensity_quantile", "intensity quantile"),
+            ("automatic_rt_correction_maximum_peak_width_quantile", "maximum peak-width quantile"),
+            ("automatic_rt_correction_reference_centrality_weight", "reference centrality weight"),
+        )
+        for key, label in unit_interval_fields:
+            value = float(state.get(key, 0))
+            if not 0 <= value <= 1:
+                issues.append(
+                    {
+                        "level": "error",
+                        "message": f"Automatic RT correction {label} must be between 0 and 1.",
+                    }
+                )
+        console_path = Path(str(state.get("console_path", "")).strip()).expanduser()
+        if console_path.is_file() and (
+            AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY
+            not in console_capabilities(str(console_path))["capabilities"]
+        ):
+            issues.append(
+                {
+                    "level": "error",
+                    "message": (
+                        "Automatic alignment RT correction requires an MS-DIAL Console build "
+                        "that implements this feature. Select a compatible source build or "
+                        "disable automatic alignment RT correction."
+                    ),
+                }
+            )
+        order_proposal = state.get("sample_table_proposal") or {}
+        order_source = str(
+            (order_proposal.get("analytical_order") or {}).get("derived_from", "")
+        ).casefold()
+        if (
+            state.get("repository_run_manifest")
+            and state.get(
+                "automatic_rt_correction_interpolate_blanks_by_analytical_order", True
+            )
+            and order_source in {"", "listing"}
+        ):
+            issues.append(
+                {
+                    "level": "warning",
+                    "message": (
+                        "Blank RT-correction models would be interpolated using analytical "
+                        "order derived from the repository file listing. Confirm the injection "
+                        "order or disable Blank interpolation before production analysis."
+                    ),
                 }
             )
     if state.get("alignment_light_mode") and not state.get("together_with_alignment", True):
@@ -1357,6 +1544,13 @@ def prepare_run(
         str(run_directory / f"{item['file_name']}{analysis_extension}")
         for item in files
     ]
+    expected_automatic_rt_correction_exports: list[str] = []
+    if project_type == "lcms" and method_state.get("execute_automatic_rt_correction"):
+        expected_automatic_rt_correction_exports = [
+            str(run_directory / AUTOMATIC_RT_CORRECTION_SUMMARY),
+            str(run_directory / AUTOMATIC_RT_CORRECTION_ANCHORS),
+        ]
+        expected_analysis_exports.extend(expected_automatic_rt_correction_exports)
     manifest_path = run_directory / "run-manifest.json"
     # A version string and a path cannot identify a binary: the string is whatever the
     # assembly claims, the path can be rebuilt under. inspect_console_path already
@@ -1412,6 +1606,7 @@ def prepare_run(
         "repository_metadata_files": repository_metadata_files,
         "command": command,
         "expected_analysis_exports": expected_analysis_exports,
+        "expected_automatic_rt_correction_exports": expected_automatic_rt_correction_exports,
         "export_folder_path": str(method_state.get("export_folder_path", "")),
         "qa_matrix_expected": bool(
             project_type == "lcms" and method_state.get("height_matrix_export")
@@ -1457,6 +1652,7 @@ def prepare_run(
             "warning": _console_provenance_warning(console),
         },
         "expected_analysis_exports": expected_analysis_exports,
+        "expected_automatic_rt_correction_exports": expected_automatic_rt_correction_exports,
         "export_folder_path": str(method_state.get("export_folder_path", "")),
         "qa_matrix_expected": bool(
             project_type == "lcms" and method_state.get("height_matrix_export")
@@ -2330,6 +2526,59 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
             "rt_correction_peak_selection_rt_weight", 0.5
         ),
     }
+    automatic_rt_replacements = {
+        "execute automatic rt correction for alignment": True,
+        "automatic rt correction reference file id": state.get(
+            "automatic_rt_correction_reference_file_id", -1
+        ),
+        "automatic rt correction rt bin width": state.get(
+            "automatic_rt_correction_rt_bin_width", 0.5
+        ),
+        "automatic rt correction match rt tolerance": state.get(
+            "automatic_rt_correction_match_rt_tolerance", 0.5
+        ),
+        "automatic rt correction minimum anchors": state.get(
+            "automatic_rt_correction_minimum_anchors", 3
+        ),
+        "automatic rt correction maximum anchors": state.get(
+            "automatic_rt_correction_maximum_anchors", 6
+        ),
+        "automatic rt correction minimum sample coverage": state.get(
+            "automatic_rt_correction_minimum_sample_coverage", 0.5
+        ),
+        "automatic rt correction intensity quantile": state.get(
+            "automatic_rt_correction_intensity_quantile", 0.75
+        ),
+        "automatic rt correction maximum peak width quantile": state.get(
+            "automatic_rt_correction_maximum_peak_width_quantile", 0.5
+        ),
+        "automatic rt correction minimum signal to noise": state.get(
+            "automatic_rt_correction_minimum_signal_to_noise", 3
+        ),
+        "automatic rt correction minimum gaussian similarity": state.get(
+            "automatic_rt_correction_minimum_gaussian_similarity", 0
+        ),
+        "automatic rt correction minimum ideal slope": state.get(
+            "automatic_rt_correction_minimum_ideal_slope", 0
+        ),
+        "automatic rt correction outlier mad threshold": state.get(
+            "automatic_rt_correction_outlier_mad_threshold", 3.5
+        ),
+        "automatic rt correction reference centrality weight": state.get(
+            "automatic_rt_correction_reference_centrality_weight", 0.35
+        ),
+        "automatic rt correction interpolate blanks by analytical order": bool(
+            state.get(
+                "automatic_rt_correction_interpolate_blanks_by_analytical_order",
+                True,
+            )
+        ),
+    }
+    automatic_rt_enabled = bool(
+        project_type == "lcms" and state.get("execute_automatic_rt_correction", False)
+    )
+    if automatic_rt_enabled:
+        replacements.update(automatic_rt_replacements)
     if project_type == "lcms":
         replacements["alignment light mode"] = bool(state.get("alignment_light_mode", False))
         if state.get("annotation_pipeline_profile"):
@@ -2393,6 +2642,9 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
     for line in lines:
         stripped = line.lstrip()
         lower = stripped.lower()
+        line_key = lower.split(":", 1)[0].strip()
+        if line_key in AUTOMATIC_RT_CORRECTION_METHOD_KEYS and not automatic_rt_enabled:
+            continue
         if lower.startswith(("solvent type:", "searched lipid class:")):
             continue
         if lower.startswith("adduct list:"):
@@ -2624,6 +2876,21 @@ def _title_for_key(key: str) -> str:
         "extrapolation method (end)": "Extrapolation method (end)",
         "rt correction peak selection mode": "RT correction peak selection mode",
         "rt correction peak selection rt weight": "RT correction peak selection RT weight",
+        "execute automatic rt correction for alignment": "Execute automatic RT correction for alignment",
+        "automatic rt correction reference file id": "Automatic RT correction reference file ID",
+        "automatic rt correction rt bin width": "Automatic RT correction RT bin width",
+        "automatic rt correction match rt tolerance": "Automatic RT correction match RT tolerance",
+        "automatic rt correction minimum anchors": "Automatic RT correction minimum anchors",
+        "automatic rt correction maximum anchors": "Automatic RT correction maximum anchors",
+        "automatic rt correction minimum sample coverage": "Automatic RT correction minimum sample coverage",
+        "automatic rt correction intensity quantile": "Automatic RT correction intensity quantile",
+        "automatic rt correction maximum peak width quantile": "Automatic RT correction maximum peak width quantile",
+        "automatic rt correction minimum signal to noise": "Automatic RT correction minimum signal to noise",
+        "automatic rt correction minimum gaussian similarity": "Automatic RT correction minimum Gaussian similarity",
+        "automatic rt correction minimum ideal slope": "Automatic RT correction minimum ideal slope",
+        "automatic rt correction outlier mad threshold": "Automatic RT correction outlier MAD threshold",
+        "automatic rt correction reference centrality weight": "Automatic RT correction reference centrality weight",
+        "automatic rt correction interpolate blanks by analytical order": "Automatic RT correction interpolate blanks by analytical order",
         "ionization": "Ionization",
         "machine category": "Machine category",
         "accuracy type": "Accuracy type",
@@ -2734,6 +3001,10 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
     if marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary:
         capabilities.add(LCMS_QA_CAPABILITY)
         probes.append("QA exporter marker")
+    marker = "Execute automatic RT correction for alignment"
+    if marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary:
+        capabilities.add(AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY)
+        probes.append("automatic RT correction marker")
     return {
         "capability_probe": " + ".join(probes) if probes else "unsupported",
         "capabilities": sorted(capabilities),

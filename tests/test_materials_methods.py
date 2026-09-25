@@ -205,6 +205,94 @@ class MaterialsMethodsTests(unittest.TestCase):
         self.assertIn("configured RI compound type was Alkanes", result["methods_text"])
         self.assertNotIn("MS1 and MS2 centroid tolerances", result["methods_text"])
 
+    def test_automatic_rt_methods_require_retained_console_evidence(self) -> None:
+        workflow = {
+            "project_type": "lcms",
+            "ion_mode": "Negative",
+            "target_omics": "Metabolomics",
+            "files": [],
+            "execute_automatic_rt_correction": True,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result = generate_publication_report(
+                workflow,
+                None,
+                temporary,
+                app_version="0.5.0",
+                console_version="5.5",
+            )
+
+        self.assertNotIn("learned distributed anchor features", result["methods_text"])
+        self.assertTrue(
+            any("does not prove that it was performed" in item for item in result["warnings"])
+        )
+
+    def test_automatic_rt_methods_and_table_use_console_audit_files(self) -> None:
+        workflow = {
+            "project_type": "lcms",
+            "ion_mode": "Negative",
+            "target_omics": "Metabolomics",
+            "files": [],
+            "execute_automatic_rt_correction": True,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "method.keys.json").write_text(
+                json.dumps(
+                    {
+                        "applied": ["Execute automatic RT correction for alignment"],
+                        "unrecognised": [],
+                        "unusable": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "automatic_alignment_rt_correction_summary.tsv").write_text(
+                "File ID\tFile name\tModel source\n"
+                "0\tQC-reference\tReference\n"
+                "1\tSample-1\tDetectedAnchors\n",
+                encoding="utf-8",
+            )
+            (root / "automatic_alignment_rt_correction_anchors.tsv").write_text(
+                "File ID\tAnchor ID\tUsed\n"
+                "0\t1\tTrue\n"
+                "0\t2\tTrue\n"
+                "1\t1\tTrue\n"
+                "1\t2\tTrue\n",
+                encoding="utf-8",
+            )
+
+            result = generate_publication_report(
+                workflow,
+                None,
+                root,
+                app_version="0.5.0",
+                console_version="5.5",
+            )
+
+            with Path(result["supplementary_table"]).open(
+                encoding="utf-8-sig", newline=""
+            ) as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+            with zipfile.ZipFile(result["supplementary_workbook"]) as workbook:
+                guided = workbook.read("xl/worksheets/sheet2.xml").decode("utf-8")
+
+        self.assertIn("reference file QC-reference", result["methods_text"])
+        self.assertIn("2 selected anchor(s)", result["methods_text"])
+        self.assertFalse(
+            any("does not prove that it was performed" in item for item in result["warnings"])
+        )
+        self.assertTrue(
+            any(
+                row["Section"] == "Automatic alignment RT correction evidence"
+                and row["Parameter"] == "reference_file_name"
+                and row["Value"] == "QC-reference"
+                for row in rows
+            )
+        )
+        self.assertIn("Automatic alignment RT correction evidence", guided)
+        self.assertIn("QC-reference", guided)
+
     def test_console_version_prefers_version_option(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             executable = Path(temporary) / "fake-console.exe"

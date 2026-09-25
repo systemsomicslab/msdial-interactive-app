@@ -24,8 +24,9 @@ from .diagnostic_paths import is_diagnostic_artifact
 
 USER_AGENT = "MS-DIAL-Interactive/0.3 public-reanalysis"
 RAW_SUFFIXES = {
-    ".abf", ".cdf", ".d", ".lcd", ".mzml", ".mzxml", ".qgd", ".raw", ".wiff", ".wiff2",
+    ".abf", ".cdf", ".d", ".lcd", ".mzml", ".qgd", ".raw", ".wiff", ".wiff2",
 }
+CONVERSION_REQUIRED_SUFFIXES = (".mzxml", ".mzdata", ".mzdata.xml")
 ARCHIVE_SUFFIXES = {".zip", ".tar", ".tgz", ".gz"}
 TEXT_RESULT_SUFFIXES = {
     ".mdalign", ".mdmsp", ".mdpeak", ".mdscan", ".mztab", ".mztabm",
@@ -40,6 +41,12 @@ class RepositoryFile:
     url: str = ""
     role: str = "raw"
     checksum: str = ""
+
+
+def requires_msdial_conversion(name: str) -> bool:
+    """Return whether a repository file must be converted to mzML before MS-DIAL can read it."""
+    normalized = str(name or "").replace("\\", "/").casefold()
+    return any(normalized.endswith(suffix) for suffix in CONVERSION_REQUIRED_SUFFIXES)
 
 
 @dataclass
@@ -717,6 +724,30 @@ def evaluate_eligibility(project: RepositoryProject, policy: EligibilityPolicy) 
             review_reasons.append("Confirm untargeted status from repository context or raw scan metadata.")
     if not project.files:
         reasons.append("No downloadable raw data were identified.")
+    conversion_required = {
+        item.name
+        for item in project.files
+        if item.role == "requires_conversion"
+        or (
+            item.role in ANALYSIS_INPUT_ROLES
+            and requires_msdial_conversion(item.name)
+        )
+    }
+    conversion_required.update(
+        str((sample or {}).get("raw_file") or "").strip()
+        for sample in project.sample_metadata or []
+        if requires_msdial_conversion(str((sample or {}).get("raw_file") or ""))
+    )
+    conversion_required.discard("")
+    if conversion_required:
+        ordered_conversion_inputs = sorted(conversion_required, key=str.casefold)
+        preview = ", ".join(ordered_conversion_inputs[:3])
+        if len(conversion_required) > 3:
+            preview += f", and {len(conversion_required) - 3} more"
+        reasons.append(
+            "MS-DIAL has no mzXML/mzData reader. Convert the declared analysis input(s) to mzML "
+            f"with ProteoWizard msconvert before reanalysis: {preview}."
+        )
     if policy.require_known_size and project.total_download_bytes <= 0:
         reasons.append("Download size is unknown.")
     if project.total_download_bytes > policy.max_download_bytes:
@@ -1477,6 +1508,19 @@ def split_unit_by_acquisition(manifest_path: Path, confirmed: bool = False) -> d
     manifest_path = Path(plan["manifest_path"])
     parent = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     parent_project = parent.get("project") or {}
+    parent_conversion_reasons = [
+        reason
+        for reason in evaluate_eligibility(
+            project_from_dict(parent_project),
+            EligibilityPolicy(
+                max_download_bytes=max(int(parent_project.get("total_download_bytes") or 0), 1),
+                max_samples=max(int(parent_project.get("sample_count") or 0), 1),
+                require_known_size=False,
+                require_untargeted=False,
+            ),
+        ).exclusion_reasons
+        if "no mzXML/mzData reader" in reason
+    ]
     per_file = {
         _file_key(str(item.get("file") or "")): item
         for item in (parent.get("raw_metadata_preflight") or {}).get("summary", {}).get("per_file") or []
@@ -1541,12 +1585,18 @@ def split_unit_by_acquisition(manifest_path: Path, confirmed: bool = False) -> d
                 require_untargeted=True,
             ),
         )
-        project["exclusion_reasons"] = evaluated.exclusion_reasons
+        project["exclusion_reasons"] = list(
+            dict.fromkeys([*evaluated.exclusion_reasons, *parent_conversion_reasons])
+        )
         project["review_reasons"] = list(evaluated.review_reasons) + (
-            [] if evaluated.exclusion_reasons else ["Preflight this part on its own before it can run."]
+            []
+            if project["exclusion_reasons"]
+            else ["Preflight this part on its own before it can run."]
         )
         project["eligible"] = False
-        project["selection_status"] = evaluated.selection_status if evaluated.exclusion_reasons else "raw_metadata_required"
+        project["selection_status"] = (
+            "excluded" if project["exclusion_reasons"] else "raw_metadata_required"
+        )
 
         part_manifest = {
             "schema": parent.get("schema", "msdial-public-reanalysis-run.v1"),
@@ -1882,16 +1932,29 @@ def discard_download_lease(manifest_path: Path, confirmed: bool = False) -> dict
 
 def project_from_dict(value: dict[str, Any]) -> RepositoryProject:
     data = dict(value)
-    data["files"] = [RepositoryFile(**item) for item in data.get("files", [])]
+    files = []
+    for item in data.get("files", []):
+        payload = {
+            "name": str(item.get("name") or item.get("path") or ""),
+            "size_bytes": int(item.get("size_bytes") or 0),
+            "url": str(item.get("url") or item.get("download_url") or ""),
+            "role": str(item.get("role") or "raw"),
+            "checksum": str(item.get("checksum") or ""),
+        }
+        if (
+            payload["role"] in ANALYSIS_INPUT_ROLES
+            and (item.get("requires_conversion") or requires_msdial_conversion(payload["name"]))
+        ):
+            payload["role"] = "requires_conversion"
+        files.append(RepositoryFile(**payload))
+    data["files"] = files
     return RepositoryProject(**data)
 
 
-# The roles MS-DIAL can open as an analysis input. "converted" is mzML and mzXML, which MS-DIAL
-# reads natively and which most repositories prefer to publish; excluding it blocked every
-# MetaboLights unit. Archives are not inputs themselves - their extracted contents are, and those
-# are attributed by _sample_file_names below. Sidecars and auxiliaries are never inputs, and
-# neither is raw_alternate: a .wiff2 beside a .wiff is the same sample in a second encoding, and
-# admitting both analyses that sample twice.
+# The roles MS-DIAL can open as an analysis input. "converted" means mzML here. mzXML and mzData
+# require conversion to mzML and are assigned requires_conversion instead. Archives are not inputs
+# themselves - their extracted contents are attributed by _sample_file_names below. Sidecars,
+# auxiliaries and alternate encodings are never independent analysis inputs.
 ANALYSIS_INPUT_ROLES = frozenset({"raw", "converted"})
 
 
@@ -1901,7 +1964,14 @@ def _project_allowlist(
     return [
         _safe_relative_name(item.name).as_posix().casefold()
         for item in project.files
-        if item.name and (not analysis_only or item.role in ANALYSIS_INPUT_ROLES)
+        if item.name
+        and (
+            not analysis_only
+            or (
+                item.role in ANALYSIS_INPUT_ROLES
+                and not requires_msdial_conversion(item.name)
+            )
+        )
     ]
 
 
@@ -1972,8 +2042,11 @@ def _filter_inputs_by_project_allowlist(
     selected = [
         item
         for item in inputs
-        if _path_matches_allowlist(Path(item), data_root, allowed)
-        or _matches_sample_file_names(Path(item), sample_names)
+        if not requires_msdial_conversion(Path(item).name)
+        and (
+            _path_matches_allowlist(Path(item), data_root, allowed)
+            or _matches_sample_file_names(Path(item), sample_names)
+        )
     ]
     if not selected:
         raise ValueError(
@@ -2174,7 +2247,7 @@ def _find_msdial_inputs(root: Path) -> list[str]:
         resolved = path.resolve()
         if any(parent in vendor_roots for parent in resolved.parents):
             continue
-        if path.suffix.casefold() in RAW_SUFFIXES or lower.endswith(".mzdata.xml"):
+        if path.suffix.casefold() in RAW_SUFFIXES:
             result.append(str(resolved))
     return result
 
@@ -2620,7 +2693,12 @@ def _metabolights_files(
         relative = normalized[6:]
         size = file_index.get(relative, file_index.get(Path(relative).name, 0))
         lower_name = relative.casefold()
-        role = "converted" if lower_name.endswith((".mzml", ".mzxml", ".mzdata.xml")) else "raw"
+        if lower_name.endswith(".mzml"):
+            role = "converted"
+        elif requires_msdial_conversion(lower_name):
+            role = "requires_conversion"
+        else:
+            role = "raw"
         files.append(RepositoryFile(raw_name, size, url, role=role))
     return files
 

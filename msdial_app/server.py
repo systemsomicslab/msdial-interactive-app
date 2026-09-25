@@ -2153,7 +2153,7 @@ def _pick_files() -> list[str]:
         paths = filedialog.askopenfilenames(
             title="Select MS-DIAL analysis files",
             filetypes=[
-                ("MS-DIAL raw data", "*.wiff *.wiff2 *.raw *.mzML *.mzXML *.cdf *.abf *.ibf"),
+                ("MS-DIAL raw data", "*.wiff *.wiff2 *.raw *.mzML *.cdf *.abf *.ibf"),
                 ("All files", "*.*"),
             ],
         )

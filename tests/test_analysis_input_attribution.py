@@ -2,10 +2,11 @@
 
 Two defects met here, and both surfaced on the first real download of the 2026-09 trial.
 
-The analysis allow-list accepted only files of role "raw". mzML and mzXML are role "converted" -
-correctly, they are converted open formats - and MS-DIAL reads them natively. Every MetaboLights
-unit was therefore refused, and the refusal came AFTER the download had transferred the data: 587 MB
-of MTBLS2207 landed on disk and then create_download_lease raised "empty file allow-list".
+The analysis allow-list once accepted only files of role "raw". mzML is role "converted" and
+MS-DIAL reads it natively. Every MetaboLights mzML unit was therefore refused, and the refusal came
+AFTER the download had transferred the data: 587 MB of MTBLS2207 landed on disk and then
+create_download_lease raised "empty file allow-list". mzXML is deliberately different: MS-DIAL has
+no reader for it, so it must be converted to mzML before a unit can be analysed.
 
 The deeper one: most units do not enumerate their raw files at all. Metabolomics Workbench
 publishes one archive per study, so the unit's file list is the archive and nothing else. Measured
@@ -25,11 +26,15 @@ from pathlib import Path
 
 from msdial_app.repository_reanalysis import (
     ANALYSIS_INPUT_ROLES,
+    EligibilityPolicy,
     RepositoryFile,
     RepositoryProject,
+    _find_msdial_inputs,
     _filter_inputs_by_project_allowlist,
     _matches_sample_file_names,
     _sample_file_names,
+    evaluate_eligibility,
+    project_from_dict,
 )
 
 
@@ -45,9 +50,75 @@ def _project(files: list[RepositoryFile], samples: list[str]) -> RepositoryProje
 
 class AcceptedRolesTests(unittest.TestCase):
     def test_converted_is_an_analysis_input(self) -> None:
-        """THE FIRST REGRESSION. mzML and mzXML are what MS-DIAL most often reads."""
+        """mzML is a converted open format that MS-DIAL reads natively."""
         self.assertIn("converted", ANALYSIS_INPUT_ROLES)
         self.assertIn("raw", ANALYSIS_INPUT_ROLES)
+
+    def test_mzxml_is_normalized_to_requires_conversion(self) -> None:
+        project = project_from_dict(
+            {
+                "repository": "metabolights",
+                "accession": "MTBLS1",
+                "files": [
+                    {
+                        "name": "FILES/sample.mzXML",
+                        "size_bytes": 10,
+                        "url": "https://x",
+                        "role": "converted",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual("requires_conversion", project.files[0].role)
+
+    def test_mzxml_is_rejected_before_download(self) -> None:
+        project = _project(
+            [RepositoryFile("study.zip", 10, "https://x", role="raw_archive")],
+            ["sample.mzXML"],
+        )
+
+        evaluated = evaluate_eligibility(
+            project,
+            EligibilityPolicy(
+                max_download_bytes=100,
+                max_samples=10,
+                require_known_size=False,
+                require_untargeted=False,
+            ),
+        )
+
+        self.assertFalse(evaluated.eligible)
+        self.assertTrue(any("no mzXML/mzData reader" in item for item in evaluated.exclusion_reasons))
+
+    def test_st003038_parallel_encodings_are_refused_without_a_reviewed_substitution(self) -> None:
+        """Keep the repository's real shape until an explicit substitution rule exists."""
+        project = _project(
+            [
+                RepositoryFile(
+                    "ST003038_rawdata_mzML.zip", 10, "https://x", role="shared_raw_archive"
+                ),
+                RepositoryFile(
+                    "ST003038_rawdata_mzXML.zip", 10, "https://x", role="shared_raw_archive"
+                ),
+            ],
+            [f"211210_SVC_Pozzi__Lipidomics_NEG_S{i:02d}.mzXML" for i in range(1, 11)],
+        )
+
+        evaluated = evaluate_eligibility(
+            project,
+            EligibilityPolicy(
+                max_download_bytes=100,
+                max_samples=20,
+                require_known_size=False,
+                require_untargeted=False,
+            ),
+        )
+
+        self.assertFalse(evaluated.eligible)
+        self.assertTrue(
+            any("no mzXML/mzData reader" in item for item in evaluated.exclusion_reasons)
+        )
 
     def test_an_alternate_encoding_is_not_an_analysis_input(self) -> None:
         """A .wiff2 beside a .wiff is the same sample twice, and an existing test pinned this."""
@@ -148,25 +219,41 @@ class FilterTests(unittest.TestCase):
         self.assertEqual(2, len(selected))
 
     def test_a_shared_archive_admits_only_this_units_files(self) -> None:
-        """THE ST003038 CASE, and the reason this is stricter than what it replaces.
+        """A shared archive is filtered by samples, not admitted wholesale.
 
         One zip holds both polarities. Through the archive's own name every file matched, so a
         unit labelled Negative would have analysed the positive files too. Through the unit's
         sample names, only its own ten arrive.
         """
         project = _project(
-            [RepositoryFile("ST003038_rawdata_mzXML.zip", 10, "https://x", role="shared_raw_archive")],
-            [f"211210_SVC_Pozzi__Lipidomics_NEG_S{i:02d}.mzXML" for i in range(1, 11)],
+            [RepositoryFile("study_rawdata_mzML.zip", 10, "https://x", role="shared_raw_archive")],
+            [f"211210_SVC_Pozzi__Lipidomics_NEG_S{i:02d}.mzML" for i in range(1, 11)],
         )
         inputs = self._inputs(
-            *[f"211210_SVC_Pozzi__Lipidomics_NEG_S{i:02d}.mzXML" for i in range(1, 11)],
-            *[f"211210_SVC_Pozzi__Lipidomics_POS_S{i:02d}.mzXML" for i in range(1, 11)],
+            *[f"211210_SVC_Pozzi__Lipidomics_NEG_S{i:02d}.mzML" for i in range(1, 11)],
+            *[f"211210_SVC_Pozzi__Lipidomics_POS_S{i:02d}.mzML" for i in range(1, 11)],
         )
 
         selected = _filter_inputs_by_project_allowlist(inputs, self.data_root, project)
 
         self.assertEqual(10, len(selected))
         self.assertTrue(all("NEG" in Path(item).name for item in selected))
+
+    def test_mzxml_never_enters_the_msdial_input_set(self) -> None:
+        project = _project([], ["sample.mzXML"])
+        inputs = self._inputs("sample.mzXML")
+
+        with self.assertRaises(ValueError):
+            _filter_inputs_by_project_allowlist(inputs, self.data_root, project)
+
+    def test_input_discovery_ignores_mzxml_and_mzdata(self) -> None:
+        self._inputs("sample.mzML")
+        self._inputs("legacy.mzXML", "older.mzData.xml")
+
+        self.assertEqual(
+            ["sample.mzML"],
+            [Path(item).name for item in _find_msdial_inputs(self.data_root)],
+        )
 
     def test_a_unit_that_names_nothing_at_all_is_still_refused(self) -> None:
         """The guard stays: with no declared input and no sample naming a file, nothing is safe."""
