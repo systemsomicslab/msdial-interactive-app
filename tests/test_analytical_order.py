@@ -15,7 +15,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from msdial_app import mcp_server
-from msdial_app.agent_workflow import _adopt_recorded_analytical_order
+from msdial_app.agent_workflow import (
+    _adopt_recorded_analytical_order,
+    adopted_order_proposal,
+    select_peak_tuning_representative,
+)
+from msdial_app.repository_metadata import save_metadata_review
 from msdial_app.repository_reanalysis import (
     ACQUISITION_ORDER_SOURCE,
     _summarize_raw_metadata,
@@ -90,15 +95,82 @@ class AcquisitionStartOrderTests(unittest.TestCase):
         self.assertEqual(["b.mzML"], order["missing"])
         self.assertNotIn("orders", order)
 
-    def test_equal_times_keep_listing_order_and_are_named(self) -> None:
+    def test_equal_times_within_a_class_keep_listing_order_and_are_named(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            times = {"b.mzML": "2020-01-01T00:00:00+00:00", "a.mzML": "2020-01-01T00:00:00+00:00"}
+            times = {
+                "b.mzML": "2020-01-01T00:00:00+00:00",
+                "a.mzML": "2020-01-01T00:00:00+00:00",
+                "c.mzML": "2019-12-31T00:00:00+00:00",
+            }
+            manifest = _manifest(root, times)
+            order = acquisition_start_order(
+                manifest, [str(root / name) for name in times], ["A", "A", "B"]
+            )
+
+        self.assertEqual(["c.mzML", "b.mzML", "a.mzML"], [item["file"] for item in order["files"]])
+        self.assertEqual(["a.mzML", "b.mzML"], order["tied"])
+
+    def test_times_that_order_nothing_are_not_called_a_header_order(self) -> None:
+        # Every file at one time (a converter's placeholder, say), or files of different
+        # Classes at one time: the listing would decide, so it is not a measurement.
+        cases = {
+            "all equal": ({"a.mzML": "1970-01-01T00:00:00+00:00", "b.mzML": "1970-01-01T00:00:00+00:00"}, ["A", "B"]),
+            "tie across classes": (
+                {"a.mzML": "2020-01-02T00:00:00+00:00", "b.mzML": "2020-01-02T00:00:00+00:00", "c.mzML": "2020-01-01T00:00:00+00:00"},
+                ["A", "B", "B"],
+            ),
+        }
+        for name, (times, classes) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                manifest = _manifest(root, times)
+                order = acquisition_start_order(manifest, [str(root / n) for n in times], classes)
+                self.assertIsNone(order["derived_from"], order)
+                self.assertNotIn("orders", order)
+
+    def test_dotnet_fractions_of_any_length_are_read(self) -> None:
+        # Newtonsoft trims trailing zeros, so a fraction can have 1 to 7 digits; Python 3.10
+        # reads only 3 or 6.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            times = {
+                "a.raw": "2016-05-12T10:48:38.87+00:00",
+                "b.raw": "2010-05-25T18:48:16.6592098+00:00",
+            }
             manifest = _manifest(root, times)
             order = acquisition_start_order(manifest, [str(root / name) for name in times])
 
-        self.assertEqual(["b.mzML", "a.mzML"], [item["file"] for item in order["files"]])
-        self.assertEqual(["a.mzML", "b.mzML"], order["tied"])
+        self.assertEqual(ACQUISITION_ORDER_SOURCE, order["derived_from"], order)
+        self.assertEqual(["b.raw", "a.raw"], [item["file"] for item in order["files"]])
+
+    def test_unread_headers_are_not_said_to_record_nothing(self) -> None:
+        order = acquisition_start_order({}, ["D:/raw/a.mzML"])
+
+        self.assertIsNone(order["derived_from"])
+        self.assertFalse(order["headers_read"])
+        self.assertIn("have not been read", order["reason"])
+
+    def test_an_unreadable_time_is_told_apart_from_a_missing_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            times = {"a.mzML": "yesterday", "b.mzML": None, "c.mzML": "2020-01-01T00:00:00+00:00"}
+            manifest = _manifest(root, times)
+            order = acquisition_start_order(manifest, [str(root / name) for name in times])
+
+        self.assertEqual(["b.mzML"], order["missing"])
+        self.assertEqual(["a.mzML"], order["unreadable"])
+
+    def test_a_split_part_without_its_own_preflight_reads_its_parents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            times = {"b.mzML": "2020-02-01T00:00:00+00:00", "a.mzML": "2020-01-01T00:00:00+00:00"}
+            parent = root / "parent-manifest.json"
+            parent.write_text(json.dumps(_manifest(root, times)), encoding="utf-8")
+            part = {"split_from": {"manifest_path": str(parent)}}
+            order = acquisition_start_order(part, [str(root / name) for name in times])
+
+        self.assertEqual(["a.mzML", "b.mzML"], [item["file"] for item in order["files"]])
 
     def test_mixed_timezone_awareness_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -108,6 +180,23 @@ class AcquisitionStartOrderTests(unittest.TestCase):
             order = acquisition_start_order(manifest, [str(root / name) for name in times])
 
         self.assertIsNone(order["derived_from"])
+
+
+class RepresentativeTests(unittest.TestCase):
+    def test_a_standard_at_the_midpoint_does_not_beat_a_sample(self) -> None:
+        # The header order put MTBLS2207's standard mix at rank 3 of 6, tied with a Sample.
+        files = [
+            {"file_path": f"D:/raw/{name}.mzML", "file_name": name, "file_type": kind, "analytical_order": order}
+            for order, (name, kind) in enumerate(
+                [("NIST", "Sample"), ("IROA", "Sample"), ("A-Std", "Standard"),
+                 ("Plasma", "Sample"), ("Yeast", "Sample"), ("Ecoli", "Sample")],
+                start=1,
+            )
+        ]
+        selected = select_peak_tuning_representative(files)
+
+        self.assertEqual("Plasma", selected["file_name"])
+        self.assertEqual("sample-nearest-run-midpoint", selected["selection_reason"])
 
 
 class PreparedAnalysisCsvTests(unittest.TestCase):
@@ -196,6 +285,52 @@ class PreparedAnalysisCsvTests(unittest.TestCase):
         proposal = state["sample_table_proposal"]["analytical_order"]
         self.assertEqual(ACQUISITION_ORDER_SOURCE, proposal["derived_from"])
         self.assertTrue(proposal["matches_analysis_csv"])
+
+    def test_a_csv_that_no_longer_carries_the_recorded_order_is_not_labelled_measured(self) -> None:
+        # Re-saving the reviewed metadata writes the CSV again without the header order.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path = root / "run-manifest.json"
+            manifest_path.write_text(json.dumps({"analytical_order": {
+                "derived_from": ACQUISITION_ORDER_SOURCE,
+                "reason": "Ranked by the acquisition start time each file's raw header records.",
+                "files": [
+                    {"file": "a.mzML", "analytical_order": 2},
+                    {"file": "b.mzML", "analytical_order": 1},
+                ],
+            }}), encoding="utf-8")
+            listing = [
+                {"file_name": "a", "analytical_order": 1},
+                {"file_name": "b", "analytical_order": 2},
+            ]
+            proposal = adopted_order_proposal(
+                str(manifest_path), listing, {"analytical_order": {"derived_from": "listing"}}
+            )
+
+        self.assertEqual("listing", proposal["analytical_order"]["derived_from"])
+        self.assertFalse(proposal["recorded_header_order"]["matches_analysis_csv"])
+
+    def test_a_failed_prepare_leaves_the_recorded_order_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path = root / "run-manifest.json"
+            record = {"derived_from": ACQUISITION_ORDER_SOURCE, "files": [{"file": "a.mzML", "analytical_order": 1}]}
+            manifest_path.write_text(json.dumps({
+                "analytical_order": record,
+                "project": {"repository": "metabolights", "accession": "MTBLS0", "sample_metadata": []},
+                "output_directory": str(root / "output"),
+            }), encoding="utf-8")
+            job = {
+                "id": "download-job", "kind": "repository_download", "status": "completed",
+                "raw_retention_policy": "keep",
+                "result": {"manifest_path": str(manifest_path), "recognized": {"files": []}},
+            }
+            with patch.object(mcp_server, "_request_json", return_value=job):
+                with self.assertRaises(RuntimeError):
+                    mcp_server.msdial_prepare_repository_reanalysis("download-job", hierarchy=[], confirmed=True)
+            kept = json.loads(manifest_path.read_text(encoding="utf-8"))["analytical_order"]
+
+        self.assertEqual(record, kept)
 
 
 if __name__ == "__main__":

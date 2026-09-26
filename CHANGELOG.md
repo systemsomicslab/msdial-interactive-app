@@ -13,16 +13,27 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   `run@startTimeStamp`, vendor headers) and the summary dropped it; the order
   was the file listing, or a number read out of the names, and a repository
   sample table's declared order overwrote either. The header order is applied
-  last, so it outranks both; a unit where any file lacks a time keeps the old
-  order and the record says which files lack one. Equal times keep listing
-  order and are named, and timezone-aware and naive times are not mixed.
-  `msdial_prepare_repository_reanalysis` shows the order in its preview, writes
-  it into `analysis_files.csv`, and records how it was decided, with every
-  file's start time, as `analytical_order` in the unit's run manifest. A
-  preflight summarised before this release is read through the extractor
-  output it names. The guided plan then reports the order as
-  `raw_header_acquisition_start_time`, and whether the analysis CSV still
-  carries it. Found on MTBLS2207, where the listing put a December 2019
+  last, so it outranks both. Nothing is reordered, and the record says why,
+  when the unit's headers were never read, when a file has no time or an
+  unreadable one, when every file shares one time, or when files of different
+  Classes share a time: in each case the listing, not the headers, would decide.
+  Equal times within one Class keep listing order and are named. .NET fractions
+  of any length are read. The extractor writes every time with an offset,
+  assuming one where the header had none, so each file's extractor evidence is
+  kept with its time. `msdial_prepare_repository_reanalysis` shows the order in
+  its preview, writes it into `analysis_files.csv`, and records how it was
+  decided, with every file's start time, as `analytical_order` in the unit's run
+  manifest, but only once the CSV exists. A preflight summarised before this
+  release is read through the extractor output it names, and a split part
+  without its own preflight through its parent's. The guided plan reports the
+  order as `raw_header_acquisition_start_time`, in both its inspection and its
+  workflow, only while the analysis CSV carries exactly the recorded order;
+  otherwise the name-derived source stands, so the Blank-interpolation warning
+  still fires, and the record is attached as a note.
+- Without a QC, the zero-threshold diagnostic's representative is the Sample
+  nearest the run midpoint, not any non-Blank file: a Standard is a chemical
+  mix, not the matrix the threshold is for. Other non-Blank files are used only
+  when there is no Sample. Found on MTBLS2207, where the listing put a December 2019
   acquisition last, and the only QA criterion the run could evaluate was a
   run-order drift computed against that listing.
 
