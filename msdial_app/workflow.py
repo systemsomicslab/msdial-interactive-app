@@ -107,11 +107,32 @@ AUTOMATIC_RT_CORRECTION_INTEGER_KEYS = frozenset(
 # field label lives in MsdialCore.dll, so a Console that merely ships beside a newer core, or
 # a byte search that happens to hit the label, would have claimed a feature that never runs.
 # The assembly is MSDIALCUI.exe for net48 and MSDIALCUI.dll for net8, whose .exe is only a
-# launcher; console_capabilities reads both.
+# launcher; console_capabilities reads the file console_assembly_path names.
 AUTOMATIC_RT_CORRECTION_CONSOLE_MARKERS = (
     "execute automatic rt correction for alignment",
     "Automatic alignment RT correction audit:",
 )
+
+
+def console_assembly_path(console_path: str | Path) -> Path:
+    """The file that holds the Console's code, which is not always the file that is started.
+
+    A net8 MSDIALCUI.exe, or MSDIALCUI without an extension on Linux and macOS, is an
+    apphost launcher and the code is in the MSDIALCUI.dll beside it. Two launchers built
+    from different commits differ only in their version string, so neither a capability
+    probe nor a checksum of the launcher says what ran. Only a launcher has a
+    runtimeconfig.json: a net48 MSDIALCUI.exe is the assembly itself, and a stale net8 dll
+    left beside it by an unpacked archive is not what runs.
+    """
+    path = Path(console_path)
+    assembly = path.with_suffix(".dll")
+    if (
+        path.suffix.casefold() in {".exe", ""}
+        and assembly.is_file()
+        and path.with_suffix(".runtimeconfig.json").is_file()
+    ):
+        return assembly
+    return path
 
 
 def _git_output(root: Path, *arguments: str) -> str:
@@ -279,14 +300,25 @@ def console_git_state(source_root: str | Path) -> dict[str, Any]:
     }
 
 
-def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str, Any]:
-    path = Path(console_path).expanduser().resolve()
-    if not path.is_file():
-        return {"path": str(path), "exists": False, "source": source or "custom"}
+def _sha256_of(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str, Any]:
+    path = Path(console_path).expanduser().resolve()
+    if not path.is_file():
+        return {"path": str(path), "exists": False, "source": source or "custom"}
+    binary_sha256 = _sha256_of(path)
+    # The launcher's checksum is kept because it names the file that was started, but a
+    # net8 launcher is the same bytes apart from its version string whatever code sits
+    # beside it, so the assembly's checksum is the one that identifies what ran. For a
+    # net48 exe the two are the same file.
+    assembly = console_assembly_path(path).resolve()
+    assembly_sha256 = binary_sha256 if assembly == path else _sha256_of(assembly)
     stat = path.stat()
     source_root = find_console_source_root(path)
     folder_text = str(path.parent).casefold()
@@ -304,6 +336,10 @@ def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str
     # requires software versions in every retained artifact, so the caller has to
     # be able to tell them apart -- and a rebuild outside the build tool leaves a
     # sidecar that still names the previous binary.
+    # The build tool records the assembly it built (MSDIALCUI.dll for net8), so the
+    # record is checked against the assembly. Checked against a net8 launcher, a genuine
+    # build read as stale, and a record of the launcher would still match after the dll
+    # beside it was rebuilt from other code.
     provenance_status = "absent"
     if provenance_path.is_file():
         try:
@@ -313,7 +349,7 @@ def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str
         else:
             if isinstance(loaded, dict):
                 recorded = loaded
-                if loaded.get("binary_sha256") == digest.hexdigest():
+                if loaded.get("binary_sha256") == assembly_sha256:
                     provenance = loaded
                     provenance_status = "verified"
                 else:
@@ -326,11 +362,13 @@ def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str
         "source": source or source_kind.replace("_", " "),
         "source_kind": source_kind,
         "version": console_version(str(path)),
-        "binary_sha256": digest.hexdigest(),
+        "binary_sha256": binary_sha256,
         "binary_size": stat.st_size,
         "binary_modified_at": dt.datetime.fromtimestamp(
             stat.st_mtime, tz=dt.timezone.utc
         ).astimezone().isoformat(),
+        "assembly_path": str(assembly),
+        "assembly_sha256": assembly_sha256,
         "provenance_verified": provenance_status == "verified",
         "provenance_status": provenance_status,
         "provenance": provenance,
@@ -340,7 +378,9 @@ def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str
         result["provenance_mismatch"] = {
             "record_path": str(provenance_path),
             "recorded_binary_sha256": str(recorded.get("binary_sha256") or ""),
-            "actual_binary_sha256": digest.hexdigest(),
+            # What the record was compared with: the assembly, not a net8 launcher.
+            "actual_binary_path": str(assembly),
+            "actual_binary_sha256": assembly_sha256,
             "recorded_git_head": str(recorded.get("git_head") or ""),
             "recorded_built_at": str(recorded.get("built_at") or ""),
             "detail": (
@@ -1601,6 +1641,9 @@ def prepare_run(
             "binary_sha256": console.get("binary_sha256", ""),
             "binary_size": console.get("binary_size", 0),
             "binary_modified_at": console.get("binary_modified_at", ""),
+            # The code that ran: MSDIALCUI.dll beside a net8 launcher, else the binary.
+            "assembly_path": console.get("assembly_path", ""),
+            "assembly_sha256": console.get("assembly_sha256", ""),
             "provenance_status": console.get("provenance_status", "absent"),
             "provenance": console.get("provenance", {}),
             "provenance_mismatch": console.get("provenance_mismatch", {}),
@@ -1679,6 +1722,8 @@ def prepare_run(
         "software_provenance": {
             "status": console.get("provenance_status", "absent"),
             "binary_sha256": console.get("binary_sha256", ""),
+            "assembly_path": console.get("assembly_path", ""),
+            "assembly_sha256": console.get("assembly_sha256", ""),
             "version": method_state["msdial_console_version"],
             "warning": _console_provenance_warning(console),
         },
@@ -3168,24 +3213,12 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
 
     # QA export is not a standalone command, so recognize the exact exporter
     # message embedded in compatible builds and verify the artifact after a run.
+    # The strings are in the assembly, which inspect_console_path also hashes, so the
+    # file a feature is claimed for is the file the run manifest identifies.
     try:
-        binary = path.read_bytes()
+        binary = console_assembly_path(path).read_bytes()
     except OSError:
         binary = b""
-    # A net8 MSDIALCUI.exe, or MSDIALCUI without an extension on Linux and macOS, is a
-    # launcher; the strings are in the MSDIALCUI.dll beside it. Only a launcher has a
-    # runtimeconfig.json: a net48 MSDIALCUI.exe is the assembly itself, and a stale net8
-    # dll left beside it by an unpacked archive must not lend it features it lacks.
-    assembly = path.with_suffix(".dll")
-    if (
-        path.suffix.casefold() in {".exe", ""}
-        and assembly.is_file()
-        and path.with_suffix(".runtimeconfig.json").is_file()
-    ):
-        try:
-            binary += assembly.read_bytes()
-        except OSError:
-            pass
     marker = "LC-MS quality-assurance matrix:"
     if marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary:
         capabilities.add(LCMS_QA_CAPABILITY)

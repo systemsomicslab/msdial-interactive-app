@@ -98,6 +98,21 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
 - MCP restart now reports that it does not reload changed Python source and tells
   callers to reconnect the MCP process. (#29)
 - Unknown raw-retention policies resolve to keep and produce a warning. (#23)
+- The run manifest identifies a net8 Console by its assembly. The `console`
+  block of `run-manifest.json` and the run's `software_provenance` record
+  `assembly_path` and `assembly_sha256` beside the launcher's `binary_sha256`.
+  The assembly is the `MSDIALCUI.dll` beside a launcher (`MSDIALCUI.exe`, or
+  `MSDIALCUI` on Linux and macOS) that has a `MSDIALCUI.runtimeconfig.json`,
+  and otherwise the Console path itself, so for net48 both checksums are the
+  exe's and a stale dll beside it is not recorded. Two net8 launchers differ
+  only in their version string, and not at all after a rebuild at the same
+  commit, so the launcher checksum alone did not identify the code that ran.
+  The capability probe reads the same file. The build-provenance record, which
+  the build tool writes for the assembly it built, is compared with the
+  assembly: a tool-built net8 Console selected by its launcher read as
+  `stale_mismatch` and now reads as `verified`, and a dll rebuilt outside the
+  tool reads as `stale_mismatch` whichever file is selected.
+  `provenance_mismatch` names the file compared as `actual_binary_path`.
 
 ### Fixed
 - The reproduction scripts in a run bundle (`run-msdial.ps1`, `run-msdial.sh`)
@@ -144,9 +159,6 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
 - The mzXML exclusion is unit-wide: one file listed with role `requires_conversion`,
   or one sample naming an `.mzXML`/`.mzData` file, excludes the whole unit, even
   when its other inputs are vendor raw files or mzML that MS-DIAL can read.
-- On a net8 launcher the capability probe reads `MSDIALCUI.dll`, but the run
-  manifest still hashes only the launcher, which differs between builds only in
-  its version string.
 - The automatic RT-correction evidence compares file modification times, so it
   is read in the run directory the Console wrote. A copy that does not keep
   modification times reads as not proven (a warning, never a false claim).
