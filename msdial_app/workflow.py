@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import copy
 import math
+import re
+import struct
 import datetime as dt
 import hashlib
 import json
@@ -2266,7 +2268,8 @@ def _write_reproduction_files(
         (
             "MS-DIAL reproducible Console workflow\n\n"
             "Files:\n"
-            "- analysis_files.csv: original raw-data paths and sample metadata\n"
+            "- analysis_files.csv: absolute input paths (the staged copies under input\\ when\n"
+            "  inputs were staged) and sample metadata\n"
             "- method.txt: final parameter file, including Tune parameters values\n"
             "- msp_annotator_settings.tsv: optional per-MSP LC-MS annotation settings\n"
             "- text_annotator_settings.tsv: optional per-Text-library LC-MS annotation settings\n"
@@ -2284,15 +2287,17 @@ def _write_reproduction_files(
             "  bash run-msdial.sh\n"
             "  bash run-msdial.sh /path/to/MSDIALCUI.dll\n\n"
             "The scripts copy method.txt to method.reproduce.txt beside it and analysis_files.csv into\n"
-            "reproduced-results, and run from the copies, so the Console's key record\n"
-            "(method.reproduce.keys.json) and all -o outputs land apart from the original run.\n"
+            "reproduced-results, and run the Console from this directory on the copies. The Console's\n"
+            "key record is then written as method.reproduce.keys.json beside method.txt instead of\n"
+            "overwriting method.keys.json, and every -o output goes to reproduced-results.\n"
             "MS-DIAL still writes its per-file .dcl/.pai2/_tags.xml and AlignResult-* intermediates\n"
             "beside the input files listed in analysis_files.csv.\n\n"
             "The CSV contains absolute input paths (staged copies under input\\ when inputs were\n"
             "staged). Update them if the data move.\n"
             "Paths in method.txt are absolute too, including the MSP/Text annotator settings files,\n"
             "which name this run directory, and the RT correction files; update them after moving\n"
-            "the bundle. A relative path is read against the directory of method.txt.\n"
+            "the bundle. The scripts run the Console from the directory of method.txt, so a relative\n"
+            "path is read against it.\n"
         ),
         encoding="utf-8",
     )
@@ -2363,6 +2368,12 @@ def _powershell_script(
         "  exit 1\n"
         "}\n"
         f"$Arguments = @('{analysis_type}', '-i', $Inputs, '-o', $Output, '-m', $Method{project})\n"
+        # The LC-MS Console reads library and RT-correction paths against its working
+        # directory, and GC-MS against the method file's; running from the bundle makes a
+        # relative path mean the same in both.
+        # A Console path given relative to the caller's directory must survive the move.
+        "if (Test-Path -LiteralPath $Console) { $Console = (Resolve-Path -LiteralPath $Console).ProviderPath }\n"
+        "Push-Location -LiteralPath $Here\n"
         "try {\n"
         "  if ($Console.ToLowerInvariant().EndsWith('.dll')) {\n"
         "    & dotnet $Console @Arguments\n"
@@ -2371,8 +2382,10 @@ def _powershell_script(
         "  }\n"
         "} catch {\n"
         "  Write-Error \"Could not start the MS-DIAL Console: $_\"\n"
+        "  Pop-Location\n"
         "  exit 1\n"
         "}\n"
+        "Pop-Location\n"
         # A command that never started leaves $LASTEXITCODE unset, and `exit $null` is 0.
         "if ($null -eq $LASTEXITCODE) { exit 1 }\n"
         "exit $LASTEXITCODE\n"
@@ -2392,8 +2405,13 @@ def _shell_script(default_console: str, analysis_type: str, store_project: bool 
         # See _powershell_script for why both inputs are copies.
         'METHOD="$HERE/method.reproduce.txt"\n'
         'INPUTS="$OUTPUT/analysis_files.csv"\n'
-        'cp "$HERE/method.txt" "$METHOD"\n'
-        'cp "$HERE/analysis_files.csv" "$INPUTS"\n'
+        # -f: a read-only source makes a read-only copy, which a plain cp cannot overwrite.
+        'cp -f "$HERE/method.txt" "$METHOD"\n'
+        'cp -f "$HERE/analysis_files.csv" "$INPUTS"\n'
+        # See _powershell_script: run from the bundle so relative paths mean one thing, after
+        # making a Console path given relative to the caller's directory absolute.
+        'case "$CONSOLE" in */*) CONSOLE="$(cd "$(dirname "$CONSOLE")" && pwd)/$(basename "$CONSOLE")" ;; esac\n'
+        'cd "$HERE"\n'
         # A case pattern rather than ${CONSOLE,,}, which needs bash 4 (macOS ships 3.2).
         'case "$CONSOLE" in\n'
         f'  *.[dD][lL][lL]) dotnet "$CONSOLE" {arguments} ;;\n'
@@ -3017,6 +3035,41 @@ AUTOMATIC_RT_CORRECTION_LABELS = {
     "automatic_rt_correction_reference_centrality_weight": "reference centrality weight",
 }
 _INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
+# What int/double.TryParse with the invariant culture accepts. Python's float() also takes
+# "1_000", full-width digits, "nan" and "infinity", which the Console refuses and replaces
+# with its default.
+_INVARIANT_NUMBER = re.compile(r"\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*", re.ASCII)
+
+
+def _as_float32(value: float) -> float:
+    """The value the Console stores for a setting it keeps as a C# float."""
+    try:
+        return struct.unpack("<f", struct.pack("<f", value))[0]
+    except OverflowError:
+        return math.copysign(math.inf, value)
+
+
+def _is_managed_pe(binary: bytes) -> bool:
+    """True for a .NET assembly: a PE image whose CLI header directory is present.
+
+    A net48 MSDIALCUI.exe is one; a net8 apphost launcher is a native PE (or ELF/Mach-O) with
+    no CLI header, and its code is in the MSDIALCUI.dll beside it.
+    """
+    if binary[:2] != b"MZ" or len(binary) < 0x40:
+        return False
+    offset = struct.unpack_from("<I", binary, 0x3C)[0]
+    if binary[offset:offset + 4] != b"PE\0\0":
+        return False
+    optional = offset + 24
+    if len(binary) < optional + 2:
+        return False
+    magic = struct.unpack_from("<H", binary, optional)[0]
+    directories = optional + (96 if magic == 0x10B else 112)
+    cli = directories + 14 * 8
+    if len(binary) < cli + 8:
+        return False
+    rva, size = struct.unpack_from("<II", binary, cli)
+    return rva != 0 and size != 0
 
 
 def is_blank_file_type(value: Any) -> bool:
@@ -3029,10 +3082,9 @@ def is_blank_file_type(value: Any) -> bool:
     text = str(value if value is not None else "").strip()
     if text.casefold() == "blank":
         return True
-    try:
-        return int(text) == 3
-    except ValueError:
-        return False
+    # Enum.TryParse takes an optional sign and ASCII digits; Python's int() also takes "0_3".
+    digits = text[1:] if text[:1] in {"+", "-"} else text
+    return bool(digits) and digits.isascii() and digits.isdigit() and int(text) == 3
 
 
 def _automatic_rt_correction_value_issues(state: dict[str, Any]) -> list[dict[str, str]]:
@@ -3052,9 +3104,15 @@ def _automatic_rt_correction_value_issues(state: dict[str, Any]) -> list[dict[st
     values: dict[str, float] = {}
     for key, label in AUTOMATIC_RT_CORRECTION_LABELS.items():
         raw = state.get(key, AUTOMATIC_RT_CORRECTION_DEFAULTS[key])
+        # float(True) is 1.0, but the method file then says True, which the Console refuses.
+        if isinstance(raw, bool) or (
+            isinstance(raw, str) and not _INVARIANT_NUMBER.fullmatch(raw)
+        ):
+            error(f"{label} must be a number, not {raw!r}.")
+            continue
         try:
             number = float(raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             error(f"{label} must be a number, not {raw!r}.")
             continue
         if not math.isfinite(number):
@@ -3091,12 +3149,24 @@ def _automatic_rt_correction_value_issues(state: dict[str, Any]) -> list[dict[st
         error("minimum anchors must be at least 2.")
     if minimum is not None and maximum is not None and maximum < minimum:
         error("maximum anchors must be at least the minimum anchors.")
+    # Compared as the Console stores them, single precision: 1e-46 is above 0 as a double
+    # and 0 as a float, and the Console refuses 0 after peak picking.
     for key in (
         "automatic_rt_correction_rt_bin_width",
         "automatic_rt_correction_match_rt_tolerance",
     ):
-        if key in values and not values[key] > 0:
+        if key in values and not _as_float32(values[key]) > 0:
             error(f"{AUTOMATIC_RT_CORRECTION_LABELS[key]} must be greater than 0.")
+    # The correction matches anchors within the alignment MS1 tolerance and refuses a
+    # tolerance that is not above 0, again only after every file has been peak-picked.
+    try:
+        ms1_tolerance = float(state.get("alignment_ms1_tolerance", 0.015))
+    except (TypeError, ValueError, OverflowError):
+        ms1_tolerance = math.nan
+    if isinstance(state.get("alignment_ms1_tolerance"), bool) or not (
+        math.isfinite(ms1_tolerance) and _as_float32(ms1_tolerance) > 0
+    ):
+        error("requires an alignment MS1 tolerance greater than 0.")
     # The Console skips MAD outlier rejection at 0, so 0 is a setting, not an error.
     if (
         "automatic_rt_correction_outlier_mad_threshold" in values
@@ -3176,11 +3246,14 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
     # launcher; the strings are in the MSDIALCUI.dll beside it. Only a launcher has a
     # runtimeconfig.json: a net48 MSDIALCUI.exe is the assembly itself, and a stale net8
     # dll left beside it by an unpacked archive must not lend it features it lacks.
+    # A net48 archive unpacked over a net8 folder leaves the runtimeconfig.json behind as
+    # well, so the file's own header decides: a managed PE is the assembly itself.
     assembly = path.with_suffix(".dll")
     if (
         path.suffix.casefold() in {".exe", ""}
         and assembly.is_file()
         and path.with_suffix(".runtimeconfig.json").is_file()
+        and not _is_managed_pe(binary)
     ):
         try:
             binary += assembly.read_bytes()

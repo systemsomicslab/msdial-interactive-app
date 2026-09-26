@@ -1761,6 +1761,37 @@ class WorkflowTests(unittest.TestCase):
 
                 self.assertIn("automatic_alignment_rt_correction", result["capabilities"])
 
+    @staticmethod
+    def _managed_pe() -> bytes:
+        """A minimal PE32 image whose CLI header directory is present, as a net48 exe has."""
+        import struct
+
+        image = bytearray(0x200)
+        image[0:2] = b"MZ"
+        struct.pack_into("<I", image, 0x3C, 0x80)
+        image[0x80:0x84] = b"PE\0\0"
+        optional = 0x80 + 24
+        struct.pack_into("<H", image, optional, 0x10B)
+        struct.pack_into("<II", image, optional + 96 + 14 * 8, 0x2008, 0x48)
+        return bytes(image)
+
+    @patch("msdial_app.workflow.subprocess.run")
+    def test_a_net48_exe_over_a_net8_folder_is_read_as_itself(self, run: Mock) -> None:
+        # Unpacking net48 over net8 leaves the net8 dll and its runtimeconfig.json behind; the
+        # exe's own CLI header says it is the assembly, so the dll is not read.
+        run.return_value = Mock(returncode=1, stdout="", stderr="Unknown command")
+        with tempfile.TemporaryDirectory() as temporary:
+            console = Path(temporary) / "MSDIALCUI.exe"
+            console.write_bytes(self._managed_pe())
+            (Path(temporary) / "MSDIALCUI.runtimeconfig.json").write_text("{}", encoding="ascii")
+            (Path(temporary) / "MSDIALCUI.dll").write_bytes(
+                "Automatic alignment RT correction audit:".encode("utf-16-le")
+            )
+
+            result = console_capabilities(str(console))
+
+        self.assertNotIn("automatic_alignment_rt_correction", result["capabilities"])
+
     @patch("msdial_app.workflow.subprocess.run")
     def test_a_stale_dll_does_not_lend_a_net48_console_features(self, run: Mock) -> None:
         # Unpacking a net48 archive over a net8 one replaces MSDIALCUI.exe and leaves the net8
@@ -1833,6 +1864,28 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue((root / "reproduced-results" / "analysis_files.csv").is_file())
             self.assertIn("method.reproduce.txt", completed.stdout)
 
+            # A protected run record gives read-only copies; a second run must still start.
+            (root / "method.reproduce.txt").unlink()
+            (root / "reproduced-results" / "analysis_files.csv").unlink()
+            for name in ("method.txt", "analysis_files.csv"):
+                (root / name).chmod(0o444)
+            try:
+                for attempt in (1, 2):
+                    again = subprocess.run(
+                        [shutil.which("bash"), script.name],
+                        cwd=root,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                    )
+                    self.assertEqual(0, again.returncode, (attempt, again.stderr))
+            finally:
+                for path in (root / "method.txt", root / "analysis_files.csv",
+                             root / "method.reproduce.txt",
+                             root / "reproduced-results" / "analysis_files.csv"):
+                    if path.exists():
+                        path.chmod(0o644)
+
     @unittest.skipUnless(os.name == "nt" and shutil.which("powershell"), "Windows PowerShell is required")
     def test_powershell_reproduction_copies_bytes_and_fails_when_nothing_runs(self) -> None:
         from msdial_app.workflow import _powershell_script
@@ -1841,7 +1894,7 @@ class WorkflowTests(unittest.TestCase):
             root = Path(temporary)
             method = self._reproduction_bundle(root)
             fake = root / "fake.cmd"
-            fake.write_text("@echo %*\r\n", encoding="ascii")
+            fake.write_text("@echo CWD=%CD% %*\r\n", encoding="ascii")
             script = root / "run-msdial.ps1"
             script.write_text(_powershell_script(str(fake), "lcms"), encoding="utf-8-sig")
 
@@ -1857,6 +1910,19 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(method, (root / "method.reproduce.txt").read_bytes())
             self.assertEqual(method, (root / "method.txt").read_bytes())
             self.assertIn("method.reproduce.txt", completed.stdout)
+            # The Console runs from the bundle, so a relative path in method.txt means one thing.
+            self.assertIn(f"CWD={root.resolve()}".casefold(), completed.stdout.casefold())
+
+            # A Console path given relative to the caller's directory is resolved before the move.
+            elsewhere = root / "elsewhere"
+            elsewhere.mkdir()
+            relative = subprocess.run(
+                [shutil.which("powershell"), "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(script), os.path.join("..", "fake.cmd")],
+                cwd=elsewhere, capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(0, relative.returncode, relative.stderr)
+            self.assertIn("method.reproduce.txt", relative.stdout)
 
             # A Console that cannot be started must not look like a reproduction that ran.
             missing = run(str(root / "no-such-console.exe"))
@@ -1914,8 +1980,14 @@ class WorkflowTests(unittest.TestCase):
             "automatic_rt_correction_rt_bin_width": [float("nan")],
             "automatic_rt_correction_outlier_mad_threshold": ["nan"],
             "automatic_rt_correction_minimum_signal_to_noise": [-1, "inf"],
-            "automatic_rt_correction_minimum_gaussian_similarity": [5],
+            "automatic_rt_correction_minimum_gaussian_similarity": [5, False],
             "automatic_rt_correction_minimum_ideal_slope": [1.5],
+            # The method file would say True, 1_000 or a full-width digit; the Console reads none.
+            "automatic_rt_correction_minimum_sample_coverage": [True],
+            "automatic_rt_correction_reference_file_id": [True, "\uff11"],
+            "automatic_rt_correction_maximum_anchors": ["1_000"],
+            # Above 0 as a double, 0 as the float the Console stores.
+            "automatic_rt_correction_match_rt_tolerance": [1e-46],
         }
         for key, values in cases.items():
             for value in values:
@@ -1928,6 +2000,22 @@ class WorkflowTests(unittest.TestCase):
                         ),
                         issues,
                     )
+
+    def test_automatic_rt_needs_a_positive_alignment_ms1_tolerance(self) -> None:
+        # The correction matches anchors within this tolerance and refuses 0 after peak picking.
+        base = {
+            "project_type": "lcms",
+            "together_with_alignment": True,
+            "execute_automatic_rt_correction": True,
+        }
+        for value, refused in ((0, True), (-0.01, True), ("", True), (True, True), (0.015, False)):
+            with self.subTest(value=value):
+                issues = validate_workflow({**base, "alignment_ms1_tolerance": value})
+                found = any("alignment MS1 tolerance" in item["message"] for item in issues)
+                self.assertEqual(refused, found, issues)
+        # Without the feature the tolerance is not this check's business.
+        issues = validate_workflow({"project_type": "lcms", "alignment_ms1_tolerance": 0})
+        self.assertFalse(any("alignment MS1 tolerance" in item["message"] for item in issues))
 
     def test_automatic_rt_reference_file_must_be_a_non_blank_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1987,7 +2075,7 @@ class WorkflowTests(unittest.TestCase):
         for value in ("Blank", " blank ", "3", "+03", 3):
             with self.subTest(value=value):
                 self.assertTrue(is_blank_file_type(value))
-        for value in ("Sample", "QC", "Solvent Blank", "0", "", None):
+        for value in ("Sample", "QC", "Solvent Blank", "0", "", None, "0_3", "\uff13"):
             with self.subTest(value=value):
                 self.assertFalse(is_blank_file_type(value))
 

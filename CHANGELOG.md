@@ -39,10 +39,14 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
   `automatic rt correction interpolate blanks by analytical order` (true).
   Validation requires LC-MS, alignment enabled and no simultaneous user-defined RT
   correction, and refuses every value the Console would not use as written: a
-  value that is not a finite number; an anchor count or reference file ID that is
+  value that is not a finite number in the invariant-culture spelling the Console
+  parses (so not `True`, `1_000` or a full-width digit); an anchor count or
+  reference file ID that is
   fractional or outside 32 bits; a reference file ID other than -1 (automatic) or
   the row of a non-Blank file in the file list; fewer than two minimum anchors or
-  a maximum below the minimum; a non-positive RT bin width or match tolerance; a
+  a maximum below the minimum; an RT bin width or match tolerance that is not above
+  0 in the single precision the Console stores it in; an alignment MS1 tolerance
+  that is not above 0, which the correction's anchor matching refuses; a
   negative outlier MAD threshold (0 turns outlier rejection off, as the Console
   reads it) or minimum signal-to-noise; and quantiles, coverage, centrality
   weight, minimum Gaussian similarity and minimum ideal slope outside [0,1]. A
@@ -64,9 +68,11 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
   own anchors, how many Blanks took an interpolated or nearest-sample model and
   how many kept their original RTs. It says that aligned feature RTs, mzTab-M
   included, are on the reference file's axis only when no file was left
-  uncorrected; otherwise it says they are on that axis only for features no
-  uncorrected file contributes to, and the report warns. Per-file peak lists and
-  annotation keep measured RTs. With the feature
+  uncorrected. Otherwise it says how each exported value is made: the aligned RT
+  (mzTab-M `retention_time_in_seconds`) is the mean of the contributing apex RTs,
+  on the reference axis only where no uncorrected file contributes, and start and
+  end are single apex RTs, either of which can be measured; the report warns.
+  Per-file peak lists and annotation keep measured RTs. With the feature
   off, Table S1 lists none of its settings; `Supplementary_Table_MS_DIAL.tsv`
   still records every workflow key. Repository runs warn when Blank models would
   be interpolated along an analytical order inferred from file names or the file
@@ -74,8 +80,10 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
   feature by the method key its parser reads or the audit line it writes. Both
   are in the Console assembly: `MSDIALCUI.exe` for net48, and for net8 the
   `MSDIALCUI.dll` beside the launcher (`MSDIALCUI.exe`, or `MSDIALCUI` on Linux
-  and macOS), which is read when a `MSDIALCUI.runtimeconfig.json` shows the file
-  is a launcher, so a stale net8 dll beside a net48 exe lends it nothing. The
+  and macOS), which is read only when the file is a launcher: a
+  `MSDIALCUI.runtimeconfig.json` beside it, and no CLI header in its own image. A
+  net48 exe is a managed assembly, so a stale net8 dll beside it lends it
+  nothing, even after a net48 archive is unpacked over a net8 folder. The
   title-case field label is in `MsdialCore.dll` and is not accepted. This requires a Console
   built from the feature branch; it is not yet on MsdialWorkbench master.
 - Agent-guided runs keep `sample_table_proposal` in the workflow state: how the
@@ -108,8 +116,12 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
   paths and the file's encoding are kept and the key record is
   `method.reproduce.keys.json`; and from a copy of `analysis_files.csv` in
   `reproduced-results`, so the Console's project folder, the CSV's directory,
-  leaves the run too. A copy that fails stops the script before the Console
-  starts, and a Console that cannot be started exits non-zero instead of 0. The
+  leaves the run too. The Console runs from the bundle directory, so a relative
+  path in `method.txt` is read against it in every mode (the LC-MS Console reads
+  library paths against its working directory, GC-MS against the method file's).
+  A copy that fails stops the script before the Console starts, a read-only
+  record does not stop a second reproduction, and a Console that cannot be
+  started exits non-zero instead of 0. The
   scripts pass `-p` only when the run did, `run-msdial.ps1` is written with a
   BOM so Windows PowerShell 5.1 reads a non-ASCII Console path, and
   `run-msdial.sh` no longer needs bash 4. `REPRODUCE.txt` says which paths are

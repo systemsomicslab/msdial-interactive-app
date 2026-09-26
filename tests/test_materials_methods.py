@@ -380,6 +380,10 @@ class MaterialsMethodsTests(unittest.TestCase):
         # One file left at its measured RTs means aligned RTs are not all on the reference axis.
         self.assertNotIn("are therefore on the retention-time axis", result["methods_text"])
         self.assertIn("only where none of those files contributes", result["methods_text"])
+        # retention_time_in_seconds is a mean of apex RTs; start and end are single apex RTs.
+        self.assertIn("is the mean of the contributing peaks' apex retention times", result["methods_text"])
+        self.assertIn("earliest and latest single apex retention times", result["methods_text"])
+        self.assertNotIn("averages corrected and measured", result["methods_text"])
         self.assertTrue(any("left 1 file(s) uncorrected" in item for item in result["warnings"]))
 
     def test_automatic_rt_a_value_the_console_discarded_is_not_proof(self) -> None:

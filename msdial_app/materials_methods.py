@@ -53,8 +53,8 @@ def generate_publication_report(
     if automatic_rt_evidence.get("performed") and left_uncorrected:
         provenance_warnings.append(
             f"Automatic alignment RT correction left {left_uncorrected} file(s) uncorrected, so "
-            "aligned retention times, mzTab-M included, mix the reference axis with measured "
-            "retention times wherever those files contribute."
+            "aligned retention times, mzTab-M included, contain measured retention times wherever "
+            "those files contribute a peak."
         )
     methods = _methods_text(
         report_workflow, qa_report, qa_assessment, app_version, console_version
@@ -309,13 +309,17 @@ def _methods_text(
         # alignment at its measured RTs, so where one exists the axis claim holds only for
         # features it does not contribute to.
         if uncorrected:
+            # The spot RT exported as retention_time_in_seconds is the mean of the detected
+            # peaks' apex RTs; start and end are the earliest and latest single apex RTs.
             axis = (
-                f"Features from the {uncorrected} file(s) that kept their original retention "
-                "times enter alignment at their measured retention times, so an aligned "
-                "feature retention time, including the mzTab-M retention_time_in_seconds and "
-                f"its start and end, is on the retention-time axis of reference file {reference} "
-                "only where none of those files contributes to the feature, and otherwise "
-                "averages corrected and measured retention times"
+                f"Peaks from the {uncorrected} file(s) that kept their original retention times "
+                "enter alignment at their measured retention times. An aligned feature "
+                "retention time, exported as the mzTab-M retention_time_in_seconds, is the mean "
+                "of the contributing peaks' apex retention times: it is on the retention-time "
+                f"axis of reference file {reference} only where none of those files contributes, "
+                "includes their measured retention times otherwise, and is wholly measured for "
+                "a feature detected only in them. Its start and end are the earliest and latest "
+                "single apex retention times, either of which can be a measured one"
             )
         else:
             axis = (
