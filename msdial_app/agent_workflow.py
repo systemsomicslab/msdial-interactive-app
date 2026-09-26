@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 from bisect import bisect_left
 from pathlib import Path
@@ -710,6 +711,7 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             }
         )
     state.update(dict(answers.get("workflow_overrides") or {}))
+    _adopt_recorded_analytical_order(state)
     repository_metadata_path = str(answers.get("repository_metadata_path") or "").strip()
     if repository_metadata_path:
         from .repository_metadata import metadata_workspace_from_file
@@ -719,6 +721,45 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             Path(repository_metadata_path).expanduser().resolve()
         )
     return state
+
+
+def _adopt_recorded_analytical_order(state: dict[str, Any]) -> None:
+    """Say where a repository unit's analytical order came from, as its manifest records it.
+
+    The proposal is read from the file names, so for an analysis CSV whose order was ranked
+    from the raw headers it still said "listing", and the Blank-interpolation warning and any
+    reader of the proposal took a measured order for a guessed one.
+    """
+    manifest_path = str(state.get("repository_run_manifest") or "").strip()
+    if not manifest_path:
+        return
+    try:
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return
+    record = manifest.get("analytical_order") or {}
+    if not record.get("derived_from"):
+        return
+    recorded = {
+        Path(str(item.get("file", ""))).stem.casefold(): item.get("analytical_order")
+        for item in record.get("files") or []
+    }
+    in_csv = {
+        str(item.get("file_name", "")).casefold(): item.get("analytical_order")
+        for item in state.get("files", [])
+    }
+    proposal = dict(state.get("sample_table_proposal") or {})
+    proposal["analytical_order"] = {
+        "derived_from": record["derived_from"],
+        "reason": str(record.get("reason") or ""),
+        "agrees_with_file_listing": record.get("agrees_with_listing"),
+        # The CSV is what the run uses; say so if it no longer carries the recorded order.
+        "matches_analysis_csv": all(
+            in_csv.get(name) == order for name, order in recorded.items()
+        ) and len(recorded) == len(in_csv),
+        "alternatives": ["file listing order"],
+    }
+    state["sample_table_proposal"] = proposal
 
 
 def _existing_path(configured: Any, fallback: Path) -> Path:

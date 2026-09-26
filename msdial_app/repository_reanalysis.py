@@ -2312,6 +2312,9 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
                 "evidence": method.get("evidence") if isinstance(method, dict) else None,
                 "polarity": _metadata_value(item, "acquisition", "polarity"),
                 "ms_levels": ms_levels,
+                # The extractor reads it from the file itself (mzML run@startTimeStamp, vendor
+                # headers); it is the injection order the analysis CSV should carry.
+                "acquisition_start_time": _metadata_value(item, "run", "acquisitionStartTime"),
             }
         )
     return {
@@ -2325,6 +2328,130 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
         "observed_polarities": sorted(polarities),
         "evidence": [f"Raw metadata preflight inspected {len(records)} representative file(s)."],
     }
+
+
+ACQUISITION_ORDER_SOURCE = "raw_header_acquisition_start_time"
+
+
+def _parse_acquisition_time(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _acquisition_start_times(manifest: dict[str, Any]) -> dict[str, str]:
+    """The acquisition start time each file's own header records, keyed by resolved path.
+
+    A preflight summarised before the start time was carried forward has none, so the
+    extractor's own output, which the manifest names, is read for any file the summary lacks.
+    """
+    preflight = manifest.get("raw_metadata_preflight") or {}
+    times: dict[str, str] = {}
+    for item in (preflight.get("summary") or {}).get("per_file") or []:
+        value = str(item.get("acquisition_start_time") or "").strip()
+        if value and item.get("file"):
+            times[_file_key(str(item["file"]))] = value
+    output = Path(str(preflight.get("output") or ""))
+    if output.is_file():
+        try:
+            records = json.loads(output.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            records = []
+        if isinstance(records, dict):
+            records = [records]
+        for record in records if isinstance(records, list) else []:
+            if not isinstance(record, dict):
+                continue
+            source = record.get("source") or {}
+            path = str(source.get("filePath") or "").strip()
+            value = _metadata_value(record, "run", "acquisitionStartTime").strip()
+            if path and value:
+                times.setdefault(_file_key(path), value)
+    return times
+
+
+def acquisition_start_order(manifest: dict[str, Any], file_paths: list[str]) -> dict[str, Any]:
+    """Rank a unit's input files by the acquisition start time in their own headers.
+
+    The analytical order was the file listing, or a number read out of the names, even when
+    every raw header recorded when it was acquired. For MTBLS2207 the listing put a file
+    acquired in December 2019 last and one acquired in September 2020 second, and the only
+    QA criterion the run could evaluate was a run-order drift computed against that listing.
+
+    The header order is used only when every file has a readable time; otherwise the record
+    says which files lack one and nothing is reordered. Equal times keep listing order and are
+    named. Mixing timezone-aware and naive times is refused rather than guessed.
+    """
+    times = _acquisition_start_times(manifest)
+    entries = []
+    missing = []
+    for index, path in enumerate(file_paths):
+        raw = times.get(_file_key(path), "")
+        parsed = _parse_acquisition_time(raw)
+        if parsed is None:
+            missing.append(Path(path).name)
+        else:
+            entries.append((parsed, index, path, raw))
+    if missing or not entries:
+        return {
+            "derived_from": None,
+            "reason": (
+                "No raw header recorded a readable acquisition start time for "
+                + (", ".join(missing) if missing else "any input")
+                + "; the order was not taken from the headers."
+            ),
+            "missing": missing,
+        }
+    if len({entry[0].tzinfo is None for entry in entries}) > 1:
+        return {
+            "derived_from": None,
+            "reason": "Some acquisition start times carry a timezone and some do not, so they cannot be ordered.",
+            "missing": [],
+        }
+    entries.sort(key=lambda entry: (entry[0], entry[1]))
+    ranks = {entry[2]: rank for rank, entry in enumerate(entries, start=1)}
+    tied = sorted(
+        {
+            Path(entry[2]).name
+            for entry in entries
+            if sum(1 for other in entries if other[0] == entry[0]) > 1
+        }
+    )
+    return {
+        "derived_from": ACQUISITION_ORDER_SOURCE,
+        "reason": (
+            "Ranked by the acquisition start time each file's raw header records"
+            + (f"; equal times keep listing order ({', '.join(tied)})" if tied else "")
+            + "."
+        ),
+        "orders": {_file_key(path): rank for path, rank in ranks.items()},
+        "files": [
+            {
+                "file": Path(entry[2]).name,
+                "acquisition_start_time": entry[3],
+                "analytical_order": ranks[entry[2]],
+            }
+            for entry in entries
+        ],
+        "agrees_with_listing": [ranks[path] for path in file_paths] == list(range(1, len(file_paths) + 1)),
+        "tied": tied,
+    }
+
+
+def record_analytical_order(manifest_path: str | Path, record: dict[str, Any]) -> None:
+    """Keep how the analysis CSV's analytical order was decided in the unit's own manifest."""
+    path = Path(manifest_path)
+    manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+    manifest["analytical_order"] = {
+        key: value for key, value in record.items() if key != "orders"
+    } | {"recorded_at": datetime.now(timezone.utc).isoformat()}
+    _write_json(path, manifest)
 
 
 def _metadata_value(record: dict[str, Any], section: str, field_name: str) -> str:

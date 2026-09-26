@@ -430,6 +430,7 @@ def save_metadata_review(
     workspace: dict[str, Any],
     destination: str | Path,
     analysis_files: Iterable[dict[str, Any]] = (),
+    analytical_orders: dict[str, int] | None = None,
 ) -> dict[str, str]:
     destination = Path(destination).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -446,6 +447,13 @@ def save_metadata_review(
     files = list(analysis_files)
     if files:
         applied = apply_classes_to_analysis_files(payload, files)
+        # Applied last, keyed by resolved path: an order measured in the raw headers outranks
+        # one read from the file names or declared in the repository's sample table.
+        if analytical_orders:
+            for item in applied["files"]:
+                key = str(Path(str(item.get("file_path", ""))).resolve()).casefold()
+                if key in analytical_orders:
+                    item["analytical_order"] = analytical_orders[key]
         _write_analysis_csv(analysis_path, applied["files"])
         result["analysis_files_csv"] = str(analysis_path)
     return result

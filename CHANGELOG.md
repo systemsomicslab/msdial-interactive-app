@@ -4,7 +4,29 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
-## [0.5.1] - Unreleased
+## [0.5.2] - Unreleased
+
+### Changed
+- A repository unit's analytical order is the order its files were acquired, as
+  each raw header records it, whenever every input has a readable acquisition
+  start time. The raw-metadata preflight already read that time (mzML
+  `run@startTimeStamp`, vendor headers) and the summary dropped it; the order
+  was the file listing, or a number read out of the names, and a repository
+  sample table's declared order overwrote either. The header order is applied
+  last, so it outranks both; a unit where any file lacks a time keeps the old
+  order and the record says which files lack one. Equal times keep listing
+  order and are named, and timezone-aware and naive times are not mixed.
+  `msdial_prepare_repository_reanalysis` shows the order in its preview, writes
+  it into `analysis_files.csv`, and records how it was decided, with every
+  file's start time, as `analytical_order` in the unit's run manifest. A
+  preflight summarised before this release is read through the extractor
+  output it names. The guided plan then reports the order as
+  `raw_header_acquisition_start_time`, and whether the analysis CSV still
+  carries it. Found on MTBLS2207, where the listing put a December 2019
+  acquisition last, and the only QA criterion the run could evaluate was a
+  run-order drift computed against that listing.
+
+## [0.5.1] - 2026-09-26
 
 ### Fixed
 - The publication report warned that no persistent identifier was recorded for

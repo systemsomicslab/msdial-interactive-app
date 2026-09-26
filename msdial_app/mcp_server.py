@@ -1504,6 +1504,11 @@ def msdial_prepare_repository_reanalysis(
         projected = project_class_hierarchy(workspace, selected_hierarchy)
     recognized = ((job.get("result") or {}).get("recognized") or {}).get("files", [])
     application = apply_classes_to_analysis_files(projected, recognized)
+    from .repository_reanalysis import acquisition_start_order, record_analytical_order
+
+    analytical_order = acquisition_start_order(
+        manifest, [str(item.get("file_path", "")) for item in application["files"]]
+    )
     output_root = str(manifest.get("output_directory") or "")
     raw_retention_policy = str(job.get("raw_retention_policy") or "keep")
     answer_seed = _repository_answer_seed(
@@ -1538,6 +1543,9 @@ def msdial_prepare_repository_reanalysis(
         "ambiguous": application["ambiguous"],
         "answer_seed": answer_seed,
         "qa_internal_standard_evidence": repository_internal_standard_evidence(projected),
+        "analytical_order": {
+            key: value for key, value in analytical_order.items() if key != "orders"
+        },
     }
     if not confirmed:
         return {
@@ -1554,7 +1562,13 @@ def msdial_prepare_repository_reanalysis(
             "Repository metadata did not map uniquely to every recognized raw file. "
             "Review unmatched/ambiguous paths, or explicitly set allow_partial_mapping=true."
         )
-    saved = save_metadata_review(projected, output_root, application["files"])
+    saved = save_metadata_review(
+        projected,
+        output_root,
+        application["files"],
+        analytical_orders=analytical_order.get("orders"),
+    )
+    record_analytical_order(manifest["manifest_path"], analytical_order)
     input_path = saved.get("analysis_files_csv")
     if not input_path:
         raise RuntimeError("No analysis_files.csv was generated from the repository download.")
