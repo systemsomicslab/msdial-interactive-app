@@ -382,12 +382,13 @@ def _annotation_sentence(workflow: dict[str, Any]) -> str:
         types.append("one LBM annotator")
     description = ", ".join(types) if types else "the annotation resources listed in Supplementary Table S1"
     cited = []
-    for _, item in _matched_library_provenance(workflow):
+    for path, item in _matched_library_provenance(workflow):
         if not item:
             continue
-        identifier = item.get("doi") or item.get("record_url")
+        identifier = item.get("doi") or item.get("record_url") or item.get("source")
         if identifier:
-            cited.append(f"{item.get('label') or item.get('filename') or 'library'} ({identifier})")
+            name = item.get("label") or item.get("filename") or Path(path).name or "library"
+            cited.append(f"{name} ({identifier})")
     cited = list(dict.fromkeys(cited))
     citation = f" Downloaded libraries were {', '.join(cited)}." if cited else ""
     return f"Molecular annotation used {description} with the database-specific settings reported in Supplementary Table S1.{citation}"
@@ -402,13 +403,37 @@ def _qa_methods_sentence(qa_report: dict[str, Any] | None, assessment: dict[str,
         f"Analytical quality was assessed from {summary.get('sample_count', 0)} files "
         f"({counts.get('Sample', 0)} {_plural(counts.get('Sample', 0), 'study sample')}, "
         f"{counts.get('QC', 0)} {_plural(counts.get('QC', 0), 'pooled QC sample')}, and "
-        f"{counts.get('Blank', 0)} {_plural(counts.get('Blank', 0), 'blank')}) using feature-intensity distributions, QC precision and detection "
-        "rate, blank separation and carryover, PCA topology, analytical-order drift, MS/MS acquisition, "
-        "raw signal-to-noise ratios, and internal-standard mass and retention-time errors where available."
+        f"{counts.get('Blank', 0)} {_plural(counts.get('Blank', 0), 'blank')})."
     )
-    if not assessment["evaluated"]:
-        return lead + " Prespecified QA criteria could not be evaluated from the available sample types."
-    return lead + f" {assessment['passed']} of {assessment['evaluated']} prespecified, evaluable QA criteria were met; individual criteria and outcomes are reported in Supplementary Table S1."
+    # The battery was recited in full whatever the sample types allowed, so a run with no QC
+    # and no Blank read as having had QC precision and blank separation assessed. Name what
+    # was evaluated and what could not be, and why.
+    return lead + " " + _qa_criteria_sentence(assessment, counts)
+
+
+def _qa_criteria_sentence(assessment: dict[str, Any], counts: dict[str, Any]) -> str:
+    checks = [item for item in assessment.get("checks", []) if isinstance(item, dict)]
+    evaluated = [item["label"] for item in checks if item.get("status") != "not_assessed"]
+    missing = [item["label"] for item in checks if item.get("status") == "not_assessed"]
+    parts = []
+    if evaluated:
+        parts.append(
+            f"Of {len(checks)} prespecified QA criteria, {len(evaluated)} could be evaluated "
+            f"({'; '.join(evaluated)}), and {assessment.get('passed', 0)} of them "
+            f"{'was' if assessment.get('passed', 0) == 1 else 'were'} met."
+        )
+    else:
+        parts.append(f"None of the {len(checks)} prespecified QA criteria could be evaluated.")
+    if missing:
+        reasons = []
+        if int(counts.get("QC", 0) or 0) < 3:
+            reasons.append(f"{counts.get('QC', 0)} QC injection(s), where at least three are needed")
+        if not int(counts.get("Blank", 0) or 0):
+            reasons.append("no Blank files")
+        why = f" because the run had {' and '.join(reasons)}" if reasons else ""
+        parts.append(f"The other {len(missing)} ({'; '.join(missing)}) could not be assessed{why}.")
+    parts.append("Individual criteria and outcomes are reported in Supplementary Table S1.")
+    return " ".join(parts)
 
 
 def _results_text(qa_report: dict[str, Any] | None, assessment: dict[str, Any]) -> str:
@@ -422,7 +447,7 @@ def _results_text(qa_report: dict[str, Any] | None, assessment: dict[str, Any]) 
         pieces.append(f"The median QC detection rate was {summary['median_qc_detection_rate'] * 100:.1f}%.")
     if summary.get("qc_pca_relative_dispersion") is not None:
         pieces.append(f"QC relative dispersion in the first two PCA dimensions was {summary['qc_pca_relative_dispersion']:.3f} compared with all displayed samples.")
-    pieces.append(f"Overall, {assessment['passed']} of {assessment['evaluated']} evaluable prespecified QA criteria were met.")
+    pieces.append(_qa_criteria_sentence(assessment, summary.get("category_counts", {})))
     failed = [item["label"] for item in assessment["checks"] if item["status"] == "fail"]
     if failed:
         pieces.append("Criteria requiring review were: " + "; ".join(failed) + ".")
@@ -432,7 +457,12 @@ def _results_text(qa_report: dict[str, Any] | None, assessment: dict[str, Any]) 
 def _library_warnings(workflow: dict[str, Any]) -> list[str]:
     warnings = []
     for path, item in _matched_library_provenance(workflow):
-        if not item or not (item.get("doi") or item.get("record_url")):
+        # The warning asks for a version, DOI, repository URL or checksum, so any of them is
+        # one; the guided workflow records the repository URL as "source".
+        if not item or not any(
+            str(item.get(key) or "").strip()
+            for key in ("doi", "record_url", "source", "version", "sha256", "md5", "checksum")
+        ):
             warnings.append(
                 f"No persistent identifier was recorded for {Path(path).name}. Add a database version, DOI, repository URL, or checksum before publication."
             )
@@ -576,15 +606,22 @@ def _automatic_rt_correction_evidence(
 def _matched_library_provenance(
     workflow: dict[str, Any]
 ) -> list[tuple[str, dict[str, Any] | None]]:
+    # The guided workflow records a library under "path"; the library catalog uses
+    # "local_path". Matching only the second made every agent-run library look unrecorded, so
+    # the report warned that no identifier existed for libraries whose DOI it held.
     provenance = [item for item in workflow.get("library_provenance", []) if isinstance(item, dict)]
+
+    def recorded_path(item: dict[str, Any]) -> str:
+        return str(item.get("local_path") or item.get("path") or "").strip()
+
     by_path = {
-        _library_path_key(item.get("local_path", "")): item
+        _library_path_key(recorded_path(item)): item
         for item in provenance
-        if str(item.get("local_path", "")).strip()
+        if recorded_path(item)
     }
     by_name: dict[str, list[dict[str, Any]]] = {}
     for item in provenance:
-        name = str(item.get("filename") or Path(str(item.get("local_path", ""))).name).casefold()
+        name = str(item.get("filename") or Path(recorded_path(item)).name).casefold()
         if name:
             by_name.setdefault(name, []).append(item)
 

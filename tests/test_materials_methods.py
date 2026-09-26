@@ -94,8 +94,10 @@ class MaterialsMethodsTests(unittest.TestCase):
             )
 
             self.assertIn("MS-DIAL Console version 5.5.241113", result["methods_text"])
-            self.assertIn("7 of 7 prespecified", result["methods_text"])
-            self.assertIn("7 of 7 evaluable", result["qa_results_text"])
+            self.assertIn("Of 7 prespecified QA criteria, 7 could be evaluated", result["methods_text"])
+            self.assertIn("and 7 of them were met", result["methods_text"])
+            self.assertIn("7 could be evaluated", result["qa_results_text"])
+            self.assertNotIn("could not be assessed", result["methods_text"])
             self.assertEqual([], result["warnings"])
             with Path(result["supplementary_table"]).open(encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.DictReader(handle, delimiter="\t"))
@@ -166,6 +168,71 @@ class MaterialsMethodsTests(unittest.TestCase):
             )
         self.assertIn("No persistent identifier", result["warnings"][0])
         self.assertIn("[VERSION NOT RECORDED]", result["methods_text"])
+
+    def test_guided_workflow_library_records_are_read(self) -> None:
+        # The guided workflow records a library under "path" and its repository URL under
+        # "source". The report looked only for "local_path" and "doi"/"record_url", so every
+        # agent-run library was reported as having no identifier, DOI or not.
+        workflow = {
+            "project_type": "lcms",
+            "files": [],
+            "lbm_path": "D:/libraries/21904324/Msp2025_dev.lbm2",
+            "msp_annotators": [
+                {"msp_file_path": "D:/libraries/21904103/public-neg.msp"},
+                {"msp_file_path": "D:/libraries/21904103/public-neg.msp"},
+            ],
+            "library_provenance": [
+                {
+                    "path": "D:/libraries/21904324/Msp2025_dev.lbm2",
+                    "version": "21904324",
+                    "source": "https://zenodo.org/records/21904324",
+                    "doi": "10.5281/zenodo.21904324",
+                    "license": "CC BY 4.0",
+                },
+                {
+                    "path": "D:/libraries/21904103/public-neg.msp",
+                    "version": "21904103",
+                    "source": "https://zenodo.org/records/21904103",
+                    "doi": "",
+                    "license": "CC BY 4.0",
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result = generate_publication_report(
+                workflow, None, temporary, app_version="0.5.1", console_version="5.5"
+            )
+
+        self.assertEqual([], result["warnings"])
+        self.assertIn("Msp2025_dev.lbm2 (10.5281/zenodo.21904324)", result["methods_text"])
+        self.assertIn("public-neg.msp (https://zenodo.org/records/21904103)", result["methods_text"])
+
+    def test_qa_prose_names_what_could_not_be_assessed(self) -> None:
+        # Six study samples, no QC, no Blank: only the run-order criterion is evaluable. The
+        # Methods text recited QC precision and blank separation anyway.
+        qa = {
+            "summary": {
+                "sample_count": 6,
+                "alignment_spot_count": 100,
+                "category_counts": {"Sample": 6, "QC": 0, "Blank": 0},
+                "run_order_intensity_correlation": 0.2,
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result = generate_publication_report(
+                {"project_type": "lcms", "files": []}, qa, temporary,
+                app_version="0.5.1", console_version="5.5",
+            )
+
+        methods = result["methods_text"]
+        self.assertNotIn("QC precision and detection rate, blank separation", methods)
+        self.assertIn("Of 7 prespecified QA criteria, 1 could be evaluated", methods)
+        self.assertIn(
+            "could not be assessed because the run had 0 QC injection(s), where at least three "
+            "are needed and no Blank files",
+            methods,
+        )
+        self.assertIn("could not be assessed", result["qa_results_text"])
 
     def test_official_library_doi_matches_an_identical_filename_at_another_path(self) -> None:
         workflow = {
