@@ -179,11 +179,14 @@ def build_local_console(
         raise FileNotFoundError(f"Build completed but Console output was not found: {output}")
     git = console_git_state(plan["source_root"])
     unrecorded = inspect_console_path(output, "local source build")
+    # The record names the assembly, which inspect_console_path checks it against. The
+    # output is already the assembly (MSDIALCUI.dll for net8), so this is the same file;
+    # recording it this way keeps the writer and the reader on one file by construction.
     provenance = {
         "schema_version": 1,
         "built_at": dt.datetime.now().astimezone().isoformat(),
-        "binary_path": str(output),
-        "binary_sha256": unrecorded["binary_sha256"],
+        "binary_path": unrecorded["assembly_path"],
+        "binary_sha256": unrecorded["assembly_sha256"],
         "binary_version": unrecorded.get("version", ""),
         "source_root": str(plan["source_root"]),
         "git_branch": git.get("branch", ""),

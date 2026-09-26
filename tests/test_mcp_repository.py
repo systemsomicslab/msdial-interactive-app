@@ -12,6 +12,17 @@ from msdial_app import mcp_server
 
 
 class McpRepositoryToolsTests(unittest.TestCase):
+    def test_agent_api_04_backend_is_incompatible_with_split_tools(self) -> None:
+        with patch.object(mcp_server, "_request_json", return_value={"agent_api_version": "0.4"}):
+            status = mcp_server._status_or_error("127.0.0.1", 8765)
+        self.assertTrue(status["running"])
+        self.assertFalse(status["compatible"])
+        self.assertEqual("0.5", status["required_agent_api_version"])
+
+        with patch.object(mcp_server, "_request_json", return_value={"agent_api_version": "0.5"}):
+            status = mcp_server._status_or_error("127.0.0.1", 8765)
+        self.assertTrue(status["compatible"])
+
     @staticmethod
     def _unit_handoff(unit_id: str = "unit-neg") -> dict:
         return {
@@ -96,6 +107,25 @@ class McpRepositoryToolsTests(unittest.TestCase):
         self.assertFalse(project["eligible"])
         self.assertEqual("excluded", project["selection_status"])
         self.assertTrue(any("targeted" in item for item in project["exclusion_reasons"]))
+
+    def test_handoff_preserves_mzxml_conversion_requirement(self) -> None:
+        handoff = self._unit_handoff()
+        handoff["files"][0] = {
+            **handoff["files"][0],
+            "path": "FILES/sample_neg.mzXML",
+            "role": "converted",
+            "requires_conversion": True,
+        }
+        handoff["sample_metadata"][0]["raw_file"] = "sample_neg.mzXML"
+
+        project, _ = mcp_server._project_from_analysis_unit_handoff(handoff)
+
+        self.assertEqual("requires_conversion", project["files"][0]["role"])
+        self.assertFalse(project["eligible"])
+        self.assertEqual("excluded", project["selection_status"])
+        self.assertTrue(
+            any("no mzXML/mzData reader" in item for item in project["exclusion_reasons"])
+        )
 
     def test_handoff_path_and_workspace_root_validation(self) -> None:
         handoff = self._unit_handoff()

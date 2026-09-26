@@ -13,11 +13,12 @@ from pathlib import Path
 from functools import wraps
 from typing import Any
 
+from . import __version__
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-REQUIRED_AGENT_API_VERSION = "0.4"
+REQUIRED_AGENT_API_VERSION = "0.5"
 REPOSITORY_EXECUTION_SCOPE = {
     "project_type": "LC-MS/MS",
     "acquisition_modes": ["DDA", "DIA", "AIF", "SWATH"],
@@ -58,7 +59,7 @@ def _restart_code_note() -> dict[str, Any]:
 try:
     from mcp.server import MCPServer
 
-    mcp = MCPServer("MS-DIAL Interactive")
+    mcp = MCPServer("MS-DIAL Interactive", version=__version__)
 except ImportError as error:
     raise RuntimeError(
         "The MCP Python SDK is required for the MS-DIAL Interactive MCP server. "
@@ -383,6 +384,8 @@ def _required_download_size(project: dict[str, Any]) -> dict[str, Any]:
 def _project_from_analysis_unit_handoff(
     handoff: dict[str, Any], repository: str = "", accession: str = ""
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    from .repository_reanalysis import requires_msdial_conversion
+
     if handoff.get("schema") != "msdial-repository-reanalysis-handoff.v1":
         raise ValueError("Unsupported or missing repository reanalysis handoff schema.")
     handoff_repository = str(handoff.get("repository") or "").strip()
@@ -411,12 +414,17 @@ def _project_from_analysis_unit_handoff(
         url = str(item.get("download_url") or "").strip()
         if not path or not url:
             raise ValueError(f"Analysis unit {unit_id} contains a file without path/download_url.")
+        role = str(item.get("role") or "raw")
+        if role in {"raw", "converted"} and (
+            bool(item.get("requires_conversion")) or requires_msdial_conversion(path)
+        ):
+            role = "requires_conversion"
         files.append(
             {
                 "name": path,
                 "size_bytes": int(item.get("size_bytes") or 0),
                 "url": url,
-                "role": str(item.get("role") or "raw"),
+                "role": role,
                 "checksum": str(item.get("checksum") or ""),
             }
         )

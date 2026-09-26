@@ -136,6 +136,28 @@ class ExpectedExportVerificationTests(unittest.TestCase):
             {"expected": 0, "produced": 0, "missing": []}, _verify_expected_exports({})
         )
 
+    def test_missing_automatic_rt_audits_are_a_run_shortfall(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mdpeak = root / "sample.mdpeak"
+            mdpeak.write_text("Peak ID\n", encoding="ascii")
+            summary = root / "automatic_alignment_rt_correction_summary.tsv"
+            anchors = root / "automatic_alignment_rt_correction_anchors.tsv"
+
+            result = _verify_expected_exports(
+                {
+                    "expected_analysis_exports": [
+                        str(mdpeak),
+                        str(summary),
+                        str(anchors),
+                    ]
+                }
+            )
+
+        self.assertEqual(3, result["expected"])
+        self.assertEqual(1, result["produced"])
+        self.assertEqual([str(summary), str(anchors)], result["missing"])
+
 
 if __name__ == "__main__":
     unittest.main()

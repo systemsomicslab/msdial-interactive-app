@@ -504,7 +504,7 @@ def _browse_filesystem(path_text: str = "") -> dict[str, Any]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MSDIALInteractive/0.1"
+    server_version = f"MSDIALInteractive/{__version__}"
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -2153,7 +2153,7 @@ def _pick_files() -> list[str]:
         paths = filedialog.askopenfilenames(
             title="Select MS-DIAL analysis files",
             filetypes=[
-                ("MS-DIAL raw data", "*.wiff *.wiff2 *.raw *.mzML *.mzXML *.cdf *.abf *.ibf"),
+                ("MS-DIAL raw data", "*.wiff *.wiff2 *.raw *.mzML *.cdf *.abf *.ibf"),
                 ("All files", "*.*"),
             ],
         )

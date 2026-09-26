@@ -123,6 +123,28 @@ class ProductionDiscoveryTests(unittest.TestCase):
         os.utime(diagnostic, (production_time + 60, production_time + 60))
         return output, production, diagnostic
 
+    def test_a_reproduction_mztab_is_not_the_runs_result(self):
+        # The bundle scripts write into <run>/reproduced-results, and the newest mzTab-M is the
+        # one handed to validation and data mining.
+        with tempfile.TemporaryDirectory() as temporary:
+            run = Path(temporary) / "run"
+            run.mkdir()
+            original = run / "AlignResult-original.mzTab"
+            original.write_text(MZTAB, encoding="ascii")
+            reproduction = run / "reproduced-results" / "AlignResult-later.mzTab"
+            reproduction.parent.mkdir()
+            reproduction.write_text(MZTAB, encoding="ascii")
+
+            found = [path.resolve() for path in find_mztab_files(run)]
+            # A run that itself lives in a folder of that name still finds its own results.
+            nested = Path(temporary) / "reproduced-results" / "run"
+            nested.mkdir(parents=True)
+            (nested / "AlignResult.mzTab").write_text(MZTAB, encoding="ascii")
+            nested_found = find_mztab_files(nested)
+
+        self.assertEqual([original.resolve()], found)
+        self.assertEqual(1, len(nested_found))
+
     def test_a_diagnostic_mztab_is_not_discovered_as_a_run_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             output, production, diagnostic = self._output_with_diagnostic(Path(temporary))

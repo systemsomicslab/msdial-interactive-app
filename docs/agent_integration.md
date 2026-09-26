@@ -74,7 +74,8 @@ the same Agent Skills package.
 4. Use template defaults, an exact peak-count target, or run the automatic
    3,000-6,000 peak diagnostic. Automatic selection prefers a mid-run QC and
    uses instrument-specific threshold steps.
-5. Optionally configure RT correction.
+5. Optionally choose reviewed user-defined RT correction or automatic
+   alignment-only correction learned from detected features. Never enable both.
 6. Use official versioned, existing, tiered lipid/MSP, or no annotation libraries.
 7. Optionally configure LC-MS QA and internal standards.
 8. Prepare the reproducible workflow, show the command, and request confirmation.
@@ -85,7 +86,7 @@ the same Agent Skills package.
 
 For public accessions, the agent can run the same workflow without browser
 interaction: plan the accession, perform a confirmed bounded download, inspect
-representative raw headers, review and project repository metadata into
+every raw header by default, review and project repository metadata into
 MS-DIAL `Class`, prepare `analysis_files.csv`, and then enter the normal guided
 flow. Internal-standard declarations are exposed as evidence so the desktop
 agent can draft reviewable LC-MS QA targets without requiring an in-app LLM API
@@ -122,8 +123,10 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 - `msdial_repository_batch_plan`
 - `msdial_download_repository_raw`
 - `msdial_repository_raw_metadata_preflight`
+- `msdial_split_repository_unit`
 - `msdial_prepare_repository_reanalysis`
 - `msdial_repository_qa_evidence`
+- `msdial_cleanup_repository_raw`
 - `msdial_list_worksets`
 - `msdial_download_official_library`
 - `msdial_start_peak_count_diagnostic`
@@ -141,7 +144,7 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 
 Run completion, mzTab-M validation/preview, LC-MS QA, publication generation,
 and handoff should receive the exact `job_id` returned by the production run.
-Agent API 0.4 tracks files created or updated by that job and does not silently
+Agent API 0.5 tracks files created or updated by that job and does not silently
 reuse older mzTab-M or `*.qa.tsv` files from the same directory. Publication can
 be generated without QA by setting `run_qa=false`.
 

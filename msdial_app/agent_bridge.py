@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .mztab_validation import validate_mztab_outputs
 from .diagnostic_paths import is_diagnostic_artifact
 
@@ -24,7 +25,8 @@ def summarize_jobs(
     latest_completed = next((item for item in items if item.get("status") == "completed"), None)
     return {
         "service": "MS-DIAL Interactive",
-        "agent_api_version": "0.4",
+        "app_version": __version__,
+        "agent_api_version": "0.5",
         "capabilities": [
             "guided_analysis_planning",
             "reusable_worksets",
@@ -52,6 +54,11 @@ def summarize_jobs(
             "cross_check_repository_raw_metadata",
             "prepare_repository_reanalysis_without_ui",
             "inspect_repository_internal_standard_evidence",
+            "split_repository_unit_by_acquisition",
+            "confirmed_repository_raw_cleanup",
+            "resumable_repository_raw_download",
+            "mzxml_requires_conversion_to_mzml",
+            "automatic_alignment_rt_correction",
         ],
         "workflow_outline": [
             "Inspect the input path and collect the guided scientific choices.",

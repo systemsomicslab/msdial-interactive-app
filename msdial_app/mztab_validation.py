@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 from typing import Any
-from .diagnostic_paths import is_diagnostic_artifact
+from .diagnostic_paths import is_diagnostic_artifact, is_reproduction_artifact
 
 
 MZTAB_SUFFIXES = {".mztab", ".mztabm"}
@@ -29,6 +29,10 @@ def find_mztab_files(run_directory: str | Path, limit: int = 200) -> list[Path]:
         # the primary-file choice takes the newest match, so an unfiltered scan would hand a
         # single-sample diagnostic to validation, publication and the data-mining handoff.
         if is_diagnostic_artifact(path):
+            continue
+        # A reproduction run from the bundle writes a newer mzTab-M under the run directory,
+        # and the newest file is the one handed to validation and data mining.
+        if is_reproduction_artifact(path, root):
             continue
         if path.is_file() and _looks_like_mztab(path):
             files.append(path)

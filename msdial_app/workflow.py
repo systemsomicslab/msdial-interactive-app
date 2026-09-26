@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import copy
+import math
 import datetime as dt
 import hashlib
 import json
@@ -19,6 +20,7 @@ from typing import Any, Callable, Iterable
 
 from . import __version__
 from .sample_grouping import file_type_for, propose_grouping, propose_injection_order
+from .diagnostic_paths import REPRODUCTION_DIRECTORY_NAME
 from .user_settings import load_user_settings, user_data_directory
 
 
@@ -28,12 +30,12 @@ SUPPORTED_SUFFIXES = {
     ".ibf",
     ".lcd",
     ".mzml",
-    ".mzxml",
     ".qgd",
     ".raw",
     ".wiff",
     ".wiff2",
 }
+CONVERSION_REQUIRED_SUFFIXES = (".mzxml", ".mzdata", ".mzdata.xml")
 VC2013_DOWNLOAD_URL = (
     "https://support.microsoft.com/en-us/topic/"
     "update-for-visual-c-2013-and-visual-c-redistributable-package-"
@@ -50,7 +52,87 @@ SMOOTHING_METHODS = [
 ]
 LCMS_QA_CAPABILITY = "lcms_alignment_qa_matrix"
 RT_CORRECTION_REVIEW_CAPABILITY = "rt_correction_review"
+AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY = "automatic_alignment_rt_correction"
 CONSOLE_BUILD_PROVENANCE = "msdial-console-build-provenance.json"
+AUTOMATIC_RT_CORRECTION_SUMMARY = "automatic_alignment_rt_correction_summary.tsv"
+AUTOMATIC_RT_CORRECTION_ANCHORS = "automatic_alignment_rt_correction_anchors.tsv"
+AUTOMATIC_RT_CORRECTION_METHOD_KEYS = {
+    "execute automatic rt correction for alignment",
+    "automatic rt correction reference file id",
+    "automatic rt correction rt bin width",
+    "automatic rt correction match rt tolerance",
+    "automatic rt correction minimum anchors",
+    "automatic rt correction maximum anchors",
+    "automatic rt correction minimum sample coverage",
+    "automatic rt correction intensity quantile",
+    "automatic rt correction maximum peak width quantile",
+    "automatic rt correction minimum signal to noise",
+    "automatic rt correction minimum gaussian similarity",
+    "automatic rt correction minimum ideal slope",
+    "automatic rt correction outlier mad threshold",
+    "automatic rt correction reference centrality weight",
+    "automatic rt correction interpolate blanks by analytical order",
+}
+# One set of defaults for the template reader, the validator and the method writer. The
+# validator used to default an absent tolerance to 0 and refuse it, while the writer would
+# have written 0.5 for the same state.
+AUTOMATIC_RT_CORRECTION_DEFAULTS: dict[str, Any] = {
+    "automatic_rt_correction_reference_file_id": -1,
+    "automatic_rt_correction_rt_bin_width": 0.5,
+    "automatic_rt_correction_match_rt_tolerance": 0.5,
+    "automatic_rt_correction_minimum_anchors": 3,
+    "automatic_rt_correction_maximum_anchors": 6,
+    "automatic_rt_correction_minimum_sample_coverage": 0.5,
+    "automatic_rt_correction_intensity_quantile": 0.75,
+    "automatic_rt_correction_maximum_peak_width_quantile": 0.5,
+    "automatic_rt_correction_minimum_signal_to_noise": 3,
+    "automatic_rt_correction_minimum_gaussian_similarity": 0,
+    "automatic_rt_correction_minimum_ideal_slope": 0,
+    "automatic_rt_correction_outlier_mad_threshold": 3.5,
+    "automatic_rt_correction_reference_centrality_weight": 0.35,
+    "automatic_rt_correction_interpolate_blanks_by_analytical_order": True,
+}
+# The Console reads these as whole numbers and keeps its default for anything else, so a
+# fractional value must be refused here rather than truncated: truncating it validated one
+# number while the method file carried another.
+AUTOMATIC_RT_CORRECTION_INTEGER_KEYS = frozenset(
+    {
+        "automatic_rt_correction_reference_file_id",
+        "automatic_rt_correction_minimum_anchors",
+        "automatic_rt_correction_maximum_anchors",
+    }
+)
+# Strings only the Console assembly carries when it implements the feature: the lowercase
+# method key its ConfigParser reads, and the audit line LcmsProcess writes. The title-case
+# field label lives in MsdialCore.dll, so a Console that merely ships beside a newer core, or
+# a byte search that happens to hit the label, would have claimed a feature that never runs.
+# The assembly is MSDIALCUI.exe for net48 and MSDIALCUI.dll for net8, whose .exe is only a
+# launcher; console_capabilities reads the file console_assembly_path names.
+AUTOMATIC_RT_CORRECTION_CONSOLE_MARKERS = (
+    "execute automatic rt correction for alignment",
+    "Automatic alignment RT correction audit:",
+)
+
+
+def console_assembly_path(console_path: str | Path) -> Path:
+    """The file that holds the Console's code, which is not always the file that is started.
+
+    A net8 MSDIALCUI.exe, or MSDIALCUI without an extension on Linux and macOS, is an
+    apphost launcher and the code is in the MSDIALCUI.dll beside it. Two launchers built
+    from different commits differ only in their version string, so neither a capability
+    probe nor a checksum of the launcher says what ran. Only a launcher has a
+    runtimeconfig.json: a net48 MSDIALCUI.exe is the assembly itself, and a stale net8 dll
+    left beside it by an unpacked archive is not what runs.
+    """
+    path = Path(console_path)
+    assembly = path.with_suffix(".dll")
+    if (
+        path.suffix.casefold() in {".exe", ""}
+        and assembly.is_file()
+        and path.with_suffix(".runtimeconfig.json").is_file()
+    ):
+        return assembly
+    return path
 
 
 def _git_output(root: Path, *arguments: str) -> str:
@@ -218,14 +300,25 @@ def console_git_state(source_root: str | Path) -> dict[str, Any]:
     }
 
 
-def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str, Any]:
-    path = Path(console_path).expanduser().resolve()
-    if not path.is_file():
-        return {"path": str(path), "exists": False, "source": source or "custom"}
+def _sha256_of(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str, Any]:
+    path = Path(console_path).expanduser().resolve()
+    if not path.is_file():
+        return {"path": str(path), "exists": False, "source": source or "custom"}
+    binary_sha256 = _sha256_of(path)
+    # The launcher's checksum is kept because it names the file that was started, but a
+    # net8 launcher is the same bytes apart from its version string whatever code sits
+    # beside it, so the assembly's checksum is the one that identifies what ran. For a
+    # net48 exe the two are the same file.
+    assembly = console_assembly_path(path).resolve()
+    assembly_sha256 = binary_sha256 if assembly == path else _sha256_of(assembly)
     stat = path.stat()
     source_root = find_console_source_root(path)
     folder_text = str(path.parent).casefold()
@@ -243,6 +336,10 @@ def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str
     # requires software versions in every retained artifact, so the caller has to
     # be able to tell them apart -- and a rebuild outside the build tool leaves a
     # sidecar that still names the previous binary.
+    # The build tool records the assembly it built (MSDIALCUI.dll for net8), so the
+    # record is checked against the assembly. Checked against a net8 launcher, a genuine
+    # build read as stale, and a record of the launcher would still match after the dll
+    # beside it was rebuilt from other code.
     provenance_status = "absent"
     if provenance_path.is_file():
         try:
@@ -252,7 +349,7 @@ def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str
         else:
             if isinstance(loaded, dict):
                 recorded = loaded
-                if loaded.get("binary_sha256") == digest.hexdigest():
+                if loaded.get("binary_sha256") == assembly_sha256:
                     provenance = loaded
                     provenance_status = "verified"
                 else:
@@ -265,11 +362,13 @@ def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str
         "source": source or source_kind.replace("_", " "),
         "source_kind": source_kind,
         "version": console_version(str(path)),
-        "binary_sha256": digest.hexdigest(),
+        "binary_sha256": binary_sha256,
         "binary_size": stat.st_size,
         "binary_modified_at": dt.datetime.fromtimestamp(
             stat.st_mtime, tz=dt.timezone.utc
         ).astimezone().isoformat(),
+        "assembly_path": str(assembly),
+        "assembly_sha256": assembly_sha256,
         "provenance_verified": provenance_status == "verified",
         "provenance_status": provenance_status,
         "provenance": provenance,
@@ -279,7 +378,9 @@ def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str
         result["provenance_mismatch"] = {
             "record_path": str(provenance_path),
             "recorded_binary_sha256": str(recorded.get("binary_sha256") or ""),
-            "actual_binary_sha256": digest.hexdigest(),
+            # What the record was compared with: the assembly, not a net8 launcher.
+            "actual_binary_path": str(assembly),
+            "actual_binary_sha256": assembly_sha256,
             "recorded_git_head": str(recorded.get("git_head") or ""),
             "recorded_built_at": str(recorded.get("built_at") or ""),
             "detail": (
@@ -363,6 +464,11 @@ def is_supported(path: Path) -> bool:
     )
 
 
+def requires_mzml_conversion(path: Path) -> bool:
+    name = path.name.casefold()
+    return any(name.endswith(suffix) for suffix in CONVERSION_REQUIRED_SUFFIXES)
+
+
 def detect_raw_format(path: str | Path) -> dict[str, Any]:
     """What a file's format implies, before anyone has decided anything.
 
@@ -425,7 +531,7 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
             "suggested_mass_slice_width": 0.1,
         }
     return {
-        "vendor": "Open format" if suffix in {".mzml", ".mzxml", ".cdf"} else "Other",
+        "vendor": "Open format" if suffix in {".mzml", ".cdf"} else "Other",
         "format": suffix.lstrip(".").upper() or "Unknown",
         "instrument_family": "QTOF",
         "suggested_minimum_peak_height": 100,
@@ -485,7 +591,12 @@ def read_analysis_csv(path: str | Path) -> dict[str, Any]:
                 rejected.append(f"{analysis_path} (not found; line {line_number})")
                 continue
             if not is_supported(analysis_path):
-                rejected.append(f"{analysis_path} (unsupported; line {line_number})")
+                reason = (
+                    "MS-DIAL has no mzXML/mzData reader; convert to mzML"
+                    if requires_mzml_conversion(analysis_path)
+                    else "unsupported"
+                )
+                rejected.append(f"{analysis_path} ({reason}; line {line_number})")
                 continue
 
             format_info = detect_raw_format(analysis_path)
@@ -539,10 +650,16 @@ def expand_paths_report(paths: Iterable[str]) -> dict[str, Any]:
         elif path.is_dir() and is_supported(path):
             expanded.append(path)
         elif path.is_dir():
-            expanded.extend(
-                child
-                for child in path.iterdir()
-                if is_supported(child)
+            children = list(path.iterdir())
+            expanded.extend(child for child in children if is_supported(child))
+            rejected.extend(
+                f"{child.resolve()} (MS-DIAL has no mzXML/mzData reader; convert to mzML)"
+                for child in children
+                if child.is_file() and requires_mzml_conversion(child)
+            )
+        elif path.is_file() and requires_mzml_conversion(path):
+            rejected.append(
+                f"{path} (MS-DIAL has no mzXML/mzData reader; convert to mzML)"
             )
         elif path.exists():
             rejected.append(str(path))
@@ -837,6 +954,78 @@ def load_parameter_template(
         "alignment_rt_tolerance": number("retention time tolerance for alignment", default=0.1),
         "alignment_ms1_tolerance": number("ms1 tolerance for alignment", default=0.015),
         "alignment_light_mode": boolean("alignment light mode"),
+        "execute_automatic_rt_correction": boolean(
+            "execute automatic rt correction for alignment"
+        ),
+        # automatic_rt_correction_value, not int(): int() truncated 2.9 to 2, which then passed
+        # validation, and raised on nan and inf.
+        "automatic_rt_correction_reference_file_id": automatic_rt_correction_value(
+            "automatic_rt_correction_reference_file_id",
+            number(
+                "automatic rt correction reference file id",
+                default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_reference_file_id"],
+            ),
+        ),
+        "automatic_rt_correction_rt_bin_width": number(
+            "automatic rt correction rt bin width",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_rt_bin_width"],
+        ),
+        "automatic_rt_correction_match_rt_tolerance": number(
+            "automatic rt correction match rt tolerance",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_match_rt_tolerance"],
+        ),
+        "automatic_rt_correction_minimum_anchors": automatic_rt_correction_value(
+            "automatic_rt_correction_minimum_anchors",
+            number(
+                "automatic rt correction minimum anchors",
+                default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_minimum_anchors"],
+            ),
+        ),
+        "automatic_rt_correction_maximum_anchors": automatic_rt_correction_value(
+            "automatic_rt_correction_maximum_anchors",
+            number(
+                "automatic rt correction maximum anchors",
+                default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_maximum_anchors"],
+            ),
+        ),
+        "automatic_rt_correction_minimum_sample_coverage": number(
+            "automatic rt correction minimum sample coverage",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_minimum_sample_coverage"],
+        ),
+        "automatic_rt_correction_intensity_quantile": number(
+            "automatic rt correction intensity quantile",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_intensity_quantile"],
+        ),
+        "automatic_rt_correction_maximum_peak_width_quantile": number(
+            "automatic rt correction maximum peak width quantile",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_maximum_peak_width_quantile"],
+        ),
+        "automatic_rt_correction_minimum_signal_to_noise": number(
+            "automatic rt correction minimum signal to noise",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_minimum_signal_to_noise"],
+        ),
+        "automatic_rt_correction_minimum_gaussian_similarity": number(
+            "automatic rt correction minimum gaussian similarity",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_minimum_gaussian_similarity"],
+        ),
+        "automatic_rt_correction_minimum_ideal_slope": number(
+            "automatic rt correction minimum ideal slope",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_minimum_ideal_slope"],
+        ),
+        "automatic_rt_correction_outlier_mad_threshold": number(
+            "automatic rt correction outlier mad threshold",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_outlier_mad_threshold"],
+        ),
+        "automatic_rt_correction_reference_centrality_weight": number(
+            "automatic rt correction reference centrality weight",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_reference_centrality_weight"],
+        ),
+        "automatic_rt_correction_interpolate_blanks_by_analytical_order": boolean(
+            "automatic rt correction interpolate blanks by analytical order",
+            default=AUTOMATIC_RT_CORRECTION_DEFAULTS[
+                "automatic_rt_correction_interpolate_blanks_by_analytical_order"
+            ],
+        ),
         "export_folder_path": library_path("export folder path"),
         "height_matrix_export": boolean("height matrix export"),
         "solvent": value("solvent type", default="CH3COONH4"),
@@ -1028,6 +1217,75 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                 {
                     "level": "error",
                     "message": "RT correction peak selection RT weight must be between 0 and 1.",
+                }
+            )
+    if state.get("execute_automatic_rt_correction"):
+        if project_type != "lcms":
+            issues.append(
+                {
+                    "level": "error",
+                    "message": "Automatic alignment RT correction is currently available only for LC-MS.",
+                }
+            )
+        if state.get("execute_rt_correction"):
+            issues.append(
+                {
+                    "level": "error",
+                    "message": (
+                        "User-defined RT correction and automatic alignment RT correction "
+                        "cannot be enabled together because that would correct the RT axis twice."
+                    ),
+                }
+            )
+        if not state.get("together_with_alignment", True):
+            issues.append(
+                {
+                    "level": "error",
+                    "message": "Automatic alignment RT correction requires Together with alignment to be enabled.",
+                }
+            )
+        issues.extend(_automatic_rt_correction_value_issues(state))
+        console_path = Path(str(state.get("console_path", "")).strip()).expanduser()
+        if console_path.is_file() and (
+            AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY
+            not in console_capabilities(str(console_path))["capabilities"]
+        ):
+            issues.append(
+                {
+                    "level": "error",
+                    "message": (
+                        "Automatic alignment RT correction requires an MS-DIAL Console build "
+                        "that implements this feature. Select a compatible source build or "
+                        "disable automatic alignment RT correction."
+                    ),
+                }
+            )
+        order_proposal = state.get("sample_table_proposal") or {}
+        order_source = str(
+            (order_proposal.get("analytical_order") or {}).get("derived_from", "")
+        ).casefold()
+        if (
+            state.get("repository_run_manifest")
+            and state.get(
+                "automatic_rt_correction_interpolate_blanks_by_analytical_order", True
+            )
+            # "embedded" is a number read out of the file names, with every Blank and QC
+            # moved to the end: an inference as much as the listing is, and for Blank
+            # interpolation the worst one, since it places every Blank after every sample.
+            and order_source in {"", "listing", "embedded"}
+            # With no Blank there is nothing to interpolate, and a warning that cannot
+            # matter teaches the reader to skip the ones that do.
+            and any(is_blank_file_type(item.get("file_type")) for item in state.get("files", []))
+        ):
+            issues.append(
+                {
+                    "level": "warning",
+                    "message": (
+                        "Blank RT-correction models would be interpolated using analytical "
+                        "order inferred from the repository file names or listing, not read "
+                        "from the instrument. Confirm the injection order or disable Blank "
+                        "interpolation before production analysis."
+                    ),
                 }
             )
     if state.get("alignment_light_mode") and not state.get("together_with_alignment", True):
@@ -1357,6 +1615,13 @@ def prepare_run(
         str(run_directory / f"{item['file_name']}{analysis_extension}")
         for item in files
     ]
+    expected_automatic_rt_correction_exports: list[str] = []
+    if project_type == "lcms" and method_state.get("execute_automatic_rt_correction"):
+        expected_automatic_rt_correction_exports = [
+            str(run_directory / AUTOMATIC_RT_CORRECTION_SUMMARY),
+            str(run_directory / AUTOMATIC_RT_CORRECTION_ANCHORS),
+        ]
+        expected_analysis_exports.extend(expected_automatic_rt_correction_exports)
     manifest_path = run_directory / "run-manifest.json"
     # A version string and a path cannot identify a binary: the string is whatever the
     # assembly claims, the path can be rebuilt under. inspect_console_path already
@@ -1376,6 +1641,9 @@ def prepare_run(
             "binary_sha256": console.get("binary_sha256", ""),
             "binary_size": console.get("binary_size", 0),
             "binary_modified_at": console.get("binary_modified_at", ""),
+            # The code that ran: MSDIALCUI.dll beside a net8 launcher, else the binary.
+            "assembly_path": console.get("assembly_path", ""),
+            "assembly_sha256": console.get("assembly_sha256", ""),
             "provenance_status": console.get("provenance_status", "absent"),
             "provenance": console.get("provenance", {}),
             "provenance_mismatch": console.get("provenance_mismatch", {}),
@@ -1412,6 +1680,7 @@ def prepare_run(
         "repository_metadata_files": repository_metadata_files,
         "command": command,
         "expected_analysis_exports": expected_analysis_exports,
+        "expected_automatic_rt_correction_exports": expected_automatic_rt_correction_exports,
         "export_folder_path": str(method_state.get("export_folder_path", "")),
         "qa_matrix_expected": bool(
             project_type == "lcms" and method_state.get("height_matrix_export")
@@ -1453,10 +1722,13 @@ def prepare_run(
         "software_provenance": {
             "status": console.get("provenance_status", "absent"),
             "binary_sha256": console.get("binary_sha256", ""),
+            "assembly_path": console.get("assembly_path", ""),
+            "assembly_sha256": console.get("assembly_sha256", ""),
             "version": method_state["msdial_console_version"],
             "warning": _console_provenance_warning(console),
         },
         "expected_analysis_exports": expected_analysis_exports,
+        "expected_automatic_rt_correction_exports": expected_automatic_rt_correction_exports,
         "export_folder_path": str(method_state.get("export_folder_path", "")),
         "qa_matrix_expected": bool(
             project_type == "lcms" and method_state.get("height_matrix_export")
@@ -1518,6 +1790,11 @@ def prepare_tuning_run(
     tuning["project_store"] = False
     tuning["together_with_alignment"] = False
     tuning["execute_rt_correction"] = False
+    # Both are alignment features. The diagnostic runs one file without alignment, and with
+    # either still on it was refused as "requires Together with alignment", so a production
+    # state that had enabled automatic RT correction could not be tuned at all.
+    tuning["execute_automatic_rt_correction"] = False
+    tuning["alignment_light_mode"] = False
     if str(tuning.get("project_type", "lcms")).lower() == "gcms":
         tuning["minimum_peak_height"] = state.get("minimum_peak_height", 1000)
     else:
@@ -2016,13 +2293,16 @@ def _write_reproduction_files(
     default_console = str(state["console_path"])
     analysis_type = str(state.get("project_type", "lcms")).lower()
     powershell_path = run_directory / "run-msdial.ps1"
+    store_project = "-p" in command
+    # Windows PowerShell 5.1 reads a BOM-less script in the ANSI code page, which garbles a
+    # non-ASCII default Console path; PowerShell 7 accepts the BOM too.
     powershell_path.write_text(
-        _powershell_script(default_console, analysis_type),
-        encoding="utf-8",
+        _powershell_script(default_console, analysis_type, store_project),
+        encoding="utf-8-sig",
     )
     shell_path = run_directory / "run-msdial.sh"
     shell_path.write_text(
-        _shell_script(default_console, analysis_type),
+        _shell_script(default_console, analysis_type, store_project),
         encoding="utf-8",
         newline="\n",
     )
@@ -2048,8 +2328,16 @@ def _write_reproduction_files(
             "Bash:\n"
             "  bash run-msdial.sh\n"
             "  bash run-msdial.sh /path/to/MSDIALCUI.dll\n\n"
-            "The CSV contains absolute raw-data paths. Update them if the data move.\n"
-            "RT correction paths in method.txt are also absolute; update them after moving the bundle.\n"
+            "The scripts copy method.txt to method.reproduce.txt beside it and analysis_files.csv into\n"
+            "reproduced-results, and run from the copies, so the Console's key record\n"
+            "(method.reproduce.keys.json) and all -o outputs land apart from the original run.\n"
+            "MS-DIAL still writes its per-file .dcl/.pai2/_tags.xml and AlignResult-* intermediates\n"
+            "beside the input files listed in analysis_files.csv.\n\n"
+            "The CSV contains absolute input paths (staged copies under input\\ when inputs were\n"
+            "staged). Update them if the data move.\n"
+            "Paths in method.txt are absolute too, including the MSP/Text annotator settings files,\n"
+            "which name this run directory, and the RT correction files; update them after moving\n"
+            "the bundle. A relative path is read against the directory of method.txt.\n"
         ),
         encoding="utf-8",
     )
@@ -2095,39 +2383,67 @@ def _write_reproduction_files(
     }
 
 
-def _powershell_script(default_console: str, analysis_type: str) -> str:
+def _powershell_script(
+    default_console: str, analysis_type: str, store_project: bool = True
+) -> str:
     quoted = default_console.replace("'", "''")
+    project = ", '-p'" if store_project else ""
     return (
         "param([string]$Console = '" + quoted + "')\n"
         "$Here = Split-Path -Parent $MyInvocation.MyCommand.Path\n"
-        "$Output = Join-Path $Here 'reproduced-results'\n"
+        f"$Output = Join-Path $Here '{REPRODUCTION_DIRECTORY_NAME}'\n"
         "New-Item -ItemType Directory -Force -Path $Output | Out-Null\n"
-        f"$Arguments = @('{analysis_type}', '-i', (Join-Path $Here 'analysis_files.csv'), "
-        "'-o', $Output, '-m', (Join-Path $Here 'method.txt'), '-p')\n"
-        "if ($Console.ToLowerInvariant().EndsWith('.dll')) {\n"
-        "  & dotnet $Console @Arguments\n"
-        "} else {\n"
-        "  & $Console @Arguments\n"
+        # The Console writes <method>.keys.json beside the method file it reads, so a
+        # reproduction that read method.txt overwrote the run's own key record, the evidence
+        # its automatic RT-correction claim rests on. It reads a byte copy under another name
+        # in the same directory, so relative paths resolve as before and the encoding is kept.
+        # The CSV copy moves the Console's project folder (the CSV's directory) out of the run.
+        "$Method = Join-Path $Here 'method.reproduce.txt'\n"
+        "$Inputs = Join-Path $Output 'analysis_files.csv'\n"
+        "try {\n"
+        "  Copy-Item -LiteralPath (Join-Path $Here 'method.txt') -Destination $Method -Force -ErrorAction Stop\n"
+        "  Copy-Item -LiteralPath (Join-Path $Here 'analysis_files.csv') -Destination $Inputs -Force -ErrorAction Stop\n"
+        "} catch {\n"
+        "  Write-Error \"Could not prepare the reproduction inputs: $_\"\n"
+        "  exit 1\n"
         "}\n"
+        f"$Arguments = @('{analysis_type}', '-i', $Inputs, '-o', $Output, '-m', $Method{project})\n"
+        "try {\n"
+        "  if ($Console.ToLowerInvariant().EndsWith('.dll')) {\n"
+        "    & dotnet $Console @Arguments\n"
+        "  } else {\n"
+        "    & $Console @Arguments\n"
+        "  }\n"
+        "} catch {\n"
+        "  Write-Error \"Could not start the MS-DIAL Console: $_\"\n"
+        "  exit 1\n"
+        "}\n"
+        # A command that never started leaves $LASTEXITCODE unset, and `exit $null` is 0.
+        "if ($null -eq $LASTEXITCODE) { exit 1 }\n"
         "exit $LASTEXITCODE\n"
     )
 
 
-def _shell_script(default_console: str, analysis_type: str) -> str:
+def _shell_script(default_console: str, analysis_type: str, store_project: bool = True) -> str:
+    project = " -p" if store_project else ""
+    arguments = f'{analysis_type} -i "$INPUTS" -o "$OUTPUT" -m "$METHOD"{project}'
     return (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         f"CONSOLE=${{1:-{shlex.quote(default_console)}}}\n"
         'HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
-        'OUTPUT="$HERE/reproduced-results"\n'
+        f'OUTPUT="$HERE/{REPRODUCTION_DIRECTORY_NAME}"\n'
         'mkdir -p "$OUTPUT"\n'
-        'if [[ "${CONSOLE,,}" == *.dll ]]; then\n'
-        f'  dotnet "$CONSOLE" {analysis_type} -i "$HERE/analysis_files.csv" '
-        '-o "$OUTPUT" -m "$HERE/method.txt" -p\n'
-        "else\n"
-        f'  "$CONSOLE" {analysis_type} -i "$HERE/analysis_files.csv" '
-        '-o "$OUTPUT" -m "$HERE/method.txt" -p\n'
-        "fi\n"
+        # See _powershell_script for why both inputs are copies.
+        'METHOD="$HERE/method.reproduce.txt"\n'
+        'INPUTS="$OUTPUT/analysis_files.csv"\n'
+        'cp "$HERE/method.txt" "$METHOD"\n'
+        'cp "$HERE/analysis_files.csv" "$INPUTS"\n'
+        # A case pattern rather than ${CONSOLE,,}, which needs bash 4 (macOS ships 3.2).
+        'case "$CONSOLE" in\n'
+        f'  *.[dD][lL][lL]) dotnet "$CONSOLE" {arguments} ;;\n'
+        f'  *) "$CONSOLE" {arguments} ;;\n'
+        "esac\n"
     )
 
 
@@ -2330,6 +2646,21 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
             "rt_correction_peak_selection_rt_weight", 0.5
         ),
     }
+    # Keyed by the method-file label, in the order the Console documents them. Every value
+    # falls back to the shared default, so what is written is what was validated.
+    automatic_rt_replacements: dict[str, Any] = {
+        "execute automatic rt correction for alignment": True,
+    }
+    for state_key, default in AUTOMATIC_RT_CORRECTION_DEFAULTS.items():
+        label = state_key.replace("automatic_rt_correction_", "automatic rt correction ").replace("_", " ")
+        automatic_rt_replacements[label] = state.get(state_key, default)
+    interpolate_label = "automatic rt correction interpolate blanks by analytical order"
+    automatic_rt_replacements[interpolate_label] = bool(automatic_rt_replacements[interpolate_label])
+    automatic_rt_enabled = bool(
+        project_type == "lcms" and state.get("execute_automatic_rt_correction", False)
+    )
+    if automatic_rt_enabled:
+        replacements.update(automatic_rt_replacements)
     if project_type == "lcms":
         replacements["alignment light mode"] = bool(state.get("alignment_light_mode", False))
         if state.get("annotation_pipeline_profile"):
@@ -2393,6 +2724,9 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
     for line in lines:
         stripped = line.lstrip()
         lower = stripped.lower()
+        line_key = lower.split(":", 1)[0].strip()
+        if line_key in AUTOMATIC_RT_CORRECTION_METHOD_KEYS and not automatic_rt_enabled:
+            continue
         if lower.startswith(("solvent type:", "searched lipid class:")):
             continue
         if lower.startswith("adduct list:"):
@@ -2624,6 +2958,21 @@ def _title_for_key(key: str) -> str:
         "extrapolation method (end)": "Extrapolation method (end)",
         "rt correction peak selection mode": "RT correction peak selection mode",
         "rt correction peak selection rt weight": "RT correction peak selection RT weight",
+        "execute automatic rt correction for alignment": "Execute automatic RT correction for alignment",
+        "automatic rt correction reference file id": "Automatic RT correction reference file ID",
+        "automatic rt correction rt bin width": "Automatic RT correction RT bin width",
+        "automatic rt correction match rt tolerance": "Automatic RT correction match RT tolerance",
+        "automatic rt correction minimum anchors": "Automatic RT correction minimum anchors",
+        "automatic rt correction maximum anchors": "Automatic RT correction maximum anchors",
+        "automatic rt correction minimum sample coverage": "Automatic RT correction minimum sample coverage",
+        "automatic rt correction intensity quantile": "Automatic RT correction intensity quantile",
+        "automatic rt correction maximum peak width quantile": "Automatic RT correction maximum peak width quantile",
+        "automatic rt correction minimum signal to noise": "Automatic RT correction minimum signal to noise",
+        "automatic rt correction minimum gaussian similarity": "Automatic RT correction minimum Gaussian similarity",
+        "automatic rt correction minimum ideal slope": "Automatic RT correction minimum ideal slope",
+        "automatic rt correction outlier mad threshold": "Automatic RT correction outlier MAD threshold",
+        "automatic rt correction reference centrality weight": "Automatic RT correction reference centrality weight",
+        "automatic rt correction interpolate blanks by analytical order": "Automatic RT correction interpolate blanks by analytical order",
         "ionization": "Ionization",
         "machine category": "Machine category",
         "accuracy type": "Accuracy type",
@@ -2697,6 +3046,144 @@ def console_version(console_path: str) -> str:
     return match.group(1) if match else ""
 
 
+AUTOMATIC_RT_CORRECTION_LABELS = {
+    "automatic_rt_correction_reference_file_id": "reference file ID",
+    "automatic_rt_correction_rt_bin_width": "RT bin width",
+    "automatic_rt_correction_match_rt_tolerance": "match RT tolerance",
+    "automatic_rt_correction_minimum_anchors": "minimum anchors",
+    "automatic_rt_correction_maximum_anchors": "maximum anchors",
+    "automatic_rt_correction_minimum_sample_coverage": "minimum sample coverage",
+    "automatic_rt_correction_intensity_quantile": "intensity quantile",
+    "automatic_rt_correction_maximum_peak_width_quantile": "maximum peak-width quantile",
+    "automatic_rt_correction_minimum_signal_to_noise": "minimum signal-to-noise",
+    "automatic_rt_correction_minimum_gaussian_similarity": "minimum Gaussian similarity",
+    "automatic_rt_correction_minimum_ideal_slope": "minimum ideal slope",
+    "automatic_rt_correction_outlier_mad_threshold": "outlier MAD threshold",
+    "automatic_rt_correction_reference_centrality_weight": "reference centrality weight",
+}
+_INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
+
+
+def is_blank_file_type(value: Any) -> bool:
+    """True for a file type the Console reads as Blank.
+
+    The Console parses the analysis-file type with a case-insensitive enum parse, which also
+    accepts the enum's number, and Blank is 3. A literal comparison with "blank" missed a CSV
+    that said 3, and the Console interpolated that file as a Blank all the same.
+    """
+    text = str(value if value is not None else "").strip()
+    if text.casefold() == "blank":
+        return True
+    try:
+        return int(text) == 3
+    except ValueError:
+        return False
+
+
+def _automatic_rt_correction_value_issues(state: dict[str, Any]) -> list[dict[str, str]]:
+    """Refuse every automatic RT-correction value the Console would not use as written.
+
+    The Console reads these as invariant-culture numbers, the counts and the reference ID as
+    32-bit whole numbers, and keeps its default for anything it cannot read. A value it
+    discards is therefore one the method file, Table S1 and the run disagree about, so it is
+    refused here: not a number, not finite, fractional or out of range for a whole-number
+    setting, or outside the range the setting means.
+    """
+    issues: list[dict[str, str]] = []
+
+    def error(message: str) -> None:
+        issues.append({"level": "error", "message": f"Automatic RT correction {message}"})
+
+    values: dict[str, float] = {}
+    for key, label in AUTOMATIC_RT_CORRECTION_LABELS.items():
+        raw = state.get(key, AUTOMATIC_RT_CORRECTION_DEFAULTS[key])
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            error(f"{label} must be a number, not {raw!r}.")
+            continue
+        if not math.isfinite(number):
+            error(f"{label} must be a finite number, not {raw!r}.")
+            continue
+        if key in AUTOMATIC_RT_CORRECTION_INTEGER_KEYS:
+            if not number.is_integer():
+                error(f"{label} must be a whole number.")
+                continue
+            if not _INT32_MIN <= number <= _INT32_MAX:
+                error(f"{label} must be a whole number the Console can read (32-bit).")
+                continue
+        values[key] = number
+
+    reference = values.get("automatic_rt_correction_reference_file_id")
+    files = state.get("files") or []
+    if reference is not None:
+        if reference < -1:
+            error("reference file ID must be -1 (automatic) or a file ID.")
+        elif reference >= 0 and files:
+            # Console file IDs are the 0-based rows of the analysis-file list, and a missing or
+            # Blank reference fails only after every file has been peak-picked.
+            index = int(reference)
+            if index >= len(files):
+                error(
+                    f"reference file ID {index} is not a file: IDs are the rows of the file "
+                    f"list, 0 to {len(files) - 1}."
+                )
+            elif is_blank_file_type(files[index].get("file_type")):
+                error(f"reference file ID {index} is a Blank, which the Console refuses as the reference.")
+    minimum = values.get("automatic_rt_correction_minimum_anchors")
+    maximum = values.get("automatic_rt_correction_maximum_anchors")
+    if minimum is not None and minimum < 2:
+        error("minimum anchors must be at least 2.")
+    if minimum is not None and maximum is not None and maximum < minimum:
+        error("maximum anchors must be at least the minimum anchors.")
+    for key in (
+        "automatic_rt_correction_rt_bin_width",
+        "automatic_rt_correction_match_rt_tolerance",
+    ):
+        if key in values and not values[key] > 0:
+            error(f"{AUTOMATIC_RT_CORRECTION_LABELS[key]} must be greater than 0.")
+    # The Console skips MAD outlier rejection at 0, so 0 is a setting, not an error.
+    if (
+        "automatic_rt_correction_outlier_mad_threshold" in values
+        and not values["automatic_rt_correction_outlier_mad_threshold"] >= 0
+    ):
+        error("outlier MAD threshold must be 0 (no outlier rejection) or greater.")
+    if (
+        "automatic_rt_correction_minimum_signal_to_noise" in values
+        and not values["automatic_rt_correction_minimum_signal_to_noise"] >= 0
+    ):
+        error("minimum signal-to-noise must be 0 or greater.")
+    # Gaussian similarity and ideal slope are scores in [0, 1]; a floor above 1 leaves no
+    # candidate at all, and the Console finds that out only after peak picking.
+    for key in (
+        "automatic_rt_correction_minimum_sample_coverage",
+        "automatic_rt_correction_intensity_quantile",
+        "automatic_rt_correction_maximum_peak_width_quantile",
+        "automatic_rt_correction_reference_centrality_weight",
+        "automatic_rt_correction_minimum_gaussian_similarity",
+        "automatic_rt_correction_minimum_ideal_slope",
+    ):
+        if key in values and not 0 <= values[key] <= 1:
+            error(f"{AUTOMATIC_RT_CORRECTION_LABELS[key]} must be between 0 and 1.")
+    return issues
+
+
+def automatic_rt_correction_value(key: str, value: Any) -> Any:
+    """Coerce one automatic RT-correction setting without hiding a value the Console refuses.
+
+    A whole number stays an int for the integer keys, and a fractional one stays a float so
+    validate_workflow can refuse it, rather than int() quietly writing a different number.
+    """
+    if key == "automatic_rt_correction_interpolate_blanks_by_analytical_order":
+        if isinstance(value, str):
+            return value.strip().casefold() in {"1", "true", "yes", "on"}
+        return bool(value)
+    number = float(value)
+    if key in AUTOMATIC_RT_CORRECTION_INTEGER_KEYS and number.is_integer():
+        return int(number)
+    return number
+
+
 def console_capabilities(console_path: str) -> dict[str, Any]:
     path = Path(console_path)
     if not path.is_file():
@@ -2726,14 +3213,22 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
 
     # QA export is not a standalone command, so recognize the exact exporter
     # message embedded in compatible builds and verify the artifact after a run.
+    # The strings are in the assembly, which inspect_console_path also hashes, so the
+    # file a feature is claimed for is the file the run manifest identifies.
     try:
-        binary = path.read_bytes()
+        binary = console_assembly_path(path).read_bytes()
     except OSError:
         binary = b""
     marker = "LC-MS quality-assurance matrix:"
     if marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary:
         capabilities.add(LCMS_QA_CAPABILITY)
         probes.append("QA exporter marker")
+    if any(
+        marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary
+        for marker in AUTOMATIC_RT_CORRECTION_CONSOLE_MARKERS
+    ):
+        capabilities.add(AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY)
+        probes.append("automatic RT correction marker")
     return {
         "capability_probe": " + ".join(probes) if probes else "unsupported",
         "capabilities": sorted(capabilities),
