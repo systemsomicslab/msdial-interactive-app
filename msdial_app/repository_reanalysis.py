@@ -2353,11 +2353,15 @@ def _parse_acquisition_time(value: Any) -> datetime | None:
         return None
 
 
-def _preflight_start_times(preflight: dict[str, Any]) -> dict[str, tuple[str, str]]:
+def _preflight_start_times(preflight: dict[str, Any]) -> tuple[dict[str, tuple[str, str]], set[str]]:
     times: dict[str, tuple[str, str]] = {}
+    inspected: set[str] = set()
     for item in (preflight.get("summary") or {}).get("per_file") or []:
+        if not isinstance(item, dict) or not item.get("file"):
+            continue
+        inspected.add(_file_key(str(item["file"])))
         value = str(item.get("acquisition_start_time") or "").strip()
-        if value and item.get("file"):
+        if value:
             times[_file_key(str(item["file"]))] = (
                 value, str(item.get("acquisition_start_time_evidence") or "")
             )
@@ -2373,16 +2377,20 @@ def _preflight_start_times(preflight: dict[str, Any]) -> dict[str, tuple[str, st
             if not isinstance(record, dict):
                 continue
             source = record.get("source") or {}
-            path = str(source.get("filePath") or "").strip()
+            path = str(source.get("filePath") or "").strip() if isinstance(source, dict) else ""
+            if path:
+                inspected.add(_file_key(path))
             value = _metadata_value(record, "run", "acquisitionStartTime").strip()
             if path and value:
                 field = (record.get("run") or {}).get("acquisitionStartTime") or {}
                 evidence = str(field.get("evidence") or "") if isinstance(field, dict) else ""
                 times.setdefault(_file_key(path), (value, evidence))
-    return times
+    return times, inspected
 
 
-def _acquisition_start_times(manifest: dict[str, Any]) -> tuple[dict[str, tuple[str, str]], bool]:
+def _acquisition_start_times(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, tuple[str, str]], set[str], bool]:
     """The acquisition start time, and the extractor's evidence for it, of each inspected file.
 
     Read from the unit's own preflight, then from the extractor output it names (a summary
@@ -2391,21 +2399,26 @@ def _acquisition_start_times(manifest: dict[str, Any]) -> tuple[dict[str, tuple[
     recorded a time" is not said of headers nobody read.
     """
     sources = [manifest.get("raw_metadata_preflight") or {}]
-    parent_path = str((manifest.get("split_from") or {}).get("manifest_path") or "")
+    split_from = manifest.get("split_from")
+    parent_path = str(split_from.get("manifest_path") or "") if isinstance(split_from, dict) else ""
     if parent_path and Path(parent_path).is_file():
         try:
             parent = json.loads(Path(parent_path).read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             parent = {}
-        sources.append(parent.get("raw_metadata_preflight") or {})
+        if isinstance(parent, dict):
+            sources.append(parent.get("raw_metadata_preflight") or {})
     times: dict[str, tuple[str, str]] = {}
+    inspected: set[str] = set()
     read = False
-    for preflight in sources:
+    for preflight in (source for source in sources if isinstance(source, dict)):
         if (preflight.get("summary") or {}).get("per_file") or Path(str(preflight.get("output") or "")).is_file():
             read = True
-        for key, value in _preflight_start_times(preflight).items():
+        found, seen = _preflight_start_times(preflight)
+        for key, value in found.items():
             times.setdefault(key, value)
-    return times, read
+        inspected |= seen
+    return times, inspected, read
 
 
 def acquisition_start_order(
@@ -2431,7 +2444,7 @@ def acquisition_start_order(
     supplied one, which cannot be told apart here, so each file's evidence is kept with its
     time rather than presenting the offset as a header fact.
     """
-    times, read = _acquisition_start_times(manifest)
+    times, inspected, read = _acquisition_start_times(manifest)
     if not read:
         return {
             "derived_from": None,
@@ -2446,28 +2459,35 @@ def acquisition_start_order(
     entries = []
     missing = []
     unreadable = []
+    not_inspected = []
     for index, path in enumerate(file_paths):
         raw, evidence = times.get(_file_key(path), ("", ""))
         parsed = _parse_acquisition_time(raw)
-        if not raw:
+        if not raw and _file_key(path) not in inspected:
+            not_inspected.append(Path(path).name)
+        elif not raw:
             missing.append(Path(path).name)
         elif parsed is None:
             unreadable.append(Path(path).name)
         else:
             entries.append((parsed, index, path, raw, evidence))
-    if missing or unreadable or not entries:
+    if missing or unreadable or not_inspected or not entries:
         parts = []
+        if not_inspected:
+            parts.append("the raw header was not read for " + ", ".join(not_inspected))
         if missing:
             parts.append("no acquisition start time was recorded for " + ", ".join(missing))
         if unreadable:
             parts.append("the recorded time could not be read for " + ", ".join(unreadable))
+        text = "; ".join(parts or ["no input file was given"])
         return {
             "derived_from": None,
             "headers_read": True,
-            "reason": "; ".join(parts or ["no input file was given"]).capitalize()
-            + "; the order was not taken from the headers.",
+            # Only the first letter: the rest holds file names, whose case matters.
+            "reason": text[:1].upper() + text[1:] + "; the order was not taken from the headers.",
             "missing": missing,
             "unreadable": unreadable,
+            "not_inspected": not_inspected,
         }
     if len({entry[0].tzinfo is None for entry in entries}) > 1:
         return {

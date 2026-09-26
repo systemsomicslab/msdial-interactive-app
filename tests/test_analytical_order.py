@@ -182,7 +182,49 @@ class AcquisitionStartOrderTests(unittest.TestCase):
         self.assertIsNone(order["derived_from"])
 
 
+class ReasonAndCoverageTests(unittest.TestCase):
+    def test_file_names_keep_their_case_in_the_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = _manifest(root, {"NIST1950_neg.mzML": None, "b.mzML": "2020-01-01T00:00:00+00:00"})
+            order = acquisition_start_order(manifest, [str(root / "NIST1950_neg.mzML"), str(root / "b.mzML")])
+
+        self.assertIn("NIST1950_neg.mzML", order["reason"])
+
+    def test_a_file_no_preflight_inspected_is_not_said_to_have_no_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = _manifest(root, {"a.mzML": "2020-01-01T00:00:00+00:00"})
+            order = acquisition_start_order(manifest, [str(root / "a.mzML"), str(root / "late.mzML")])
+
+        self.assertEqual(["late.mzML"], order["not_inspected"])
+        self.assertEqual([], order["missing"])
+        self.assertIn("was not read for late.mzML", order["reason"])
+
+    def test_a_parent_manifest_that_is_not_an_object_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            parent = root / "parent.json"
+            parent.write_text("[1, 2]", encoding="utf-8")
+            order = acquisition_start_order({"split_from": {"manifest_path": str(parent)}}, [str(root / "a.mzML")])
+
+        self.assertIsNone(order["derived_from"])
+
+
 class RepresentativeTests(unittest.TestCase):
+    def test_numeric_file_types_are_read_as_the_console_reads_them(self) -> None:
+        # Standard is 1 to the Console; the nearest Sample (0) is chosen, and a Blank (3) never.
+        files = [
+            {"file_path": f"D:/raw/{name}.mzML", "file_name": name, "file_type": kind, "analytical_order": order}
+            for order, (name, kind) in enumerate(
+                [("s1", "0"), ("s2", "3"), ("std", "1"), ("s4", "0"), ("s5", "0"), ("s6", "0")], start=1
+            )
+        ]
+        selected = select_peak_tuning_representative(files)
+
+        self.assertEqual("s4", selected["file_name"])
+        self.assertEqual("sample-nearest-run-midpoint", selected["selection_reason"])
+
     def test_a_standard_at_the_midpoint_does_not_beat_a_sample(self) -> None:
         # The header order put MTBLS2207's standard mix at rank 3 of 6, tied with a Sample.
         files = [
@@ -231,6 +273,7 @@ class PreparedAnalysisCsvTests(unittest.TestCase):
                     },
                     "analysis_input_path": str(root / "raw"),
                     "output_directory": str(output),
+                    "input_candidates": [str(root / "raw" / name) for name in names],
                 }
             )
             manifest_path = root / "run-manifest.json"
@@ -273,7 +316,10 @@ class PreparedAnalysisCsvTests(unittest.TestCase):
 
             state = {
                 "repository_run_manifest": str(manifest_path),
-                "files": [{"file_name": name, "analytical_order": int(order)} for name, order in rows.items()],
+                "files": [
+                    {"file_name": name, "file_path": str(root / "raw" / f"{name}.mzML"), "analytical_order": int(order)}
+                    for name, order in rows.items()
+                ],
                 "sample_table_proposal": {"analytical_order": {"derived_from": "listing"}},
             }
             _adopt_recorded_analytical_order(state)
@@ -309,6 +355,51 @@ class PreparedAnalysisCsvTests(unittest.TestCase):
 
         self.assertEqual("listing", proposal["analytical_order"]["derived_from"])
         self.assertFalse(proposal["recorded_header_order"]["matches_analysis_csv"])
+
+    def _record(self, root: Path, ranks: dict[str, int]) -> Path:
+        manifest_path = root / "run-manifest.json"
+        manifest_path.write_text(json.dumps({
+            "input_candidates": [str(root / f"{name}.mzML") for name in ranks],
+            "analytical_order": {
+                "derived_from": ACQUISITION_ORDER_SOURCE,
+                "files": [{"file": f"{name}.mzML", "analytical_order": rank} for name, rank in ranks.items()],
+            },
+        }), encoding="utf-8")
+        return manifest_path
+
+    def test_an_inherited_adoption_does_not_survive_changed_files(self) -> None:
+        # The inspection adopted the record; workflow overrides then replaced the files with
+        # listing ranks. The workflow's proposal must fall back to the names.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path = self._record(root, {"a": 2, "b": 1})
+            files = [
+                {"file_name": "a", "file_path": str(root / "a.mzML"), "analytical_order": 1},
+                {"file_name": "b", "file_path": str(root / "b.mzML"), "analytical_order": 2},
+            ]
+            inherited = {"analytical_order": {"derived_from": ACQUISITION_ORDER_SOURCE, "matches_analysis_csv": True}}
+            proposal = adopted_order_proposal(str(manifest_path), files, inherited)
+
+        self.assertNotEqual(ACQUISITION_ORDER_SOURCE, proposal["analytical_order"]["derived_from"])
+        self.assertFalse(proposal["recorded_header_order"]["matches_analysis_csv"])
+
+    def test_another_units_record_is_not_adopted_on_matching_names(self) -> None:
+        # A workset carries repository_run_manifest; the same names and ranks in another
+        # directory are not that unit's inputs.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "pos").mkdir()
+            manifest_path = self._record(root / "pos", {"a": 1, "b": 2})
+            files = [
+                {"file_name": "a", "file_path": str(root / "neg" / "a.mzML"), "analytical_order": 1},
+                {"file_name": "b", "file_path": str(root / "neg" / "b.mzML"), "analytical_order": 2},
+            ]
+            proposal = adopted_order_proposal(
+                str(manifest_path), files, {"analytical_order": {"derived_from": "listing"}}
+            )
+
+        self.assertEqual("listing", proposal["analytical_order"]["derived_from"])
+        self.assertIn("other input files", proposal["recorded_header_order"]["reason"])
 
     def test_a_failed_prepare_leaves_the_recorded_order_alone(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

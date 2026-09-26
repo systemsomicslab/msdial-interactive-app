@@ -29,13 +29,16 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   order as `raw_header_acquisition_start_time`, in both its inspection and its
   workflow, only while the analysis CSV carries exactly the recorded order;
   otherwise the name-derived source stands, so the Blank-interpolation warning
-  still fires, and the record is attached as a note.
+  still fires, and the record is attached as a note. A record is adopted only
+  for the unit whose inputs it describes. Found on MTBLS2207, where the listing
+  put a December 2019 acquisition last, and the only QA criterion the run could
+  evaluate was a run-order drift computed against that listing.
 - Without a QC, the zero-threshold diagnostic's representative is the Sample
   nearest the run midpoint, not any non-Blank file: a Standard is a chemical
   mix, not the matrix the threshold is for. Other non-Blank files are used only
-  when there is no Sample. Found on MTBLS2207, where the listing put a December 2019
-  acquisition last, and the only QA criterion the run could evaluate was a
-  run-order drift computed against that listing.
+  when there is no Sample. File types are read as the Console reads them,
+  numbers included (Sample 0, Standard 1, QC 2, Blank 3). Found on MTBLS2207,
+  where with the header order the standard mix sat at the DDA midpoint.
 
 ## [0.5.1] - 2026-09-26
 

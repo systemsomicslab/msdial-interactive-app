@@ -12,6 +12,7 @@ from .library_catalog import catalog_status
 from .user_settings import load_user_settings
 from .workflow import (
     AUTOMATIC_RT_CORRECTION_DEFAULTS,
+    console_file_type,
     automatic_rt_correction_value,
     expand_paths_report,
     discover_console_paths,
@@ -386,7 +387,7 @@ def select_peak_tuning_representative(
         # threshold is for. Other non-Blank files only when there is no Sample.
         samples = [
             item for item in files
-            if str(item.get("file_type") or "Sample").strip().casefold() == "sample"
+            if console_file_type(item.get("file_type") or "Sample") == "Sample"
             and not _is_blank_file(item)
         ]
         candidates = qc or samples or [item for item in files if not _is_blank_file(item)] or list(files)
@@ -428,16 +429,15 @@ def _is_qc_file(item: dict[str, Any]) -> bool:
     values = (
         item.get("file_type"), item.get("class_id"), item.get("file_name")
     )
-    return any(str(value or "").strip().casefold() == "qc" for value in values[:2]) or any(
+    return console_file_type(values[0]) == "QC" or str(values[1] or "").strip().casefold() == "qc" or any(
         token == "qc"
         for token in str(values[2] or "").replace("-", "_").casefold().split("_")
     )
 
 
 def _is_blank_file(item: dict[str, Any]) -> bool:
-    return any(
-        str(item.get(key) or "").strip().casefold() == "blank"
-        for key in ("file_type", "class_id")
+    return console_file_type(item.get("file_type")) == "Blank" or (
+        str(item.get("class_id") or "").strip().casefold() == "blank"
     )
 
 
@@ -772,6 +772,17 @@ def adopted_order_proposal(
         for item in record.get("files") or []
         if isinstance(item, dict)
     }
+    # A record names files by name only, so another unit's manifest (a workset carries the
+    # path) could match on names and ranks alone. The files must also be that unit's inputs.
+    candidates = {
+        str(Path(str(path)).resolve()).casefold()
+        for path in manifest.get("input_candidates") or []
+        if str(path).strip()
+    }
+    same_unit = bool(candidates) and all(
+        str(Path(str(item.get("file_path", ""))).resolve()).casefold() in candidates
+        for item in files
+    )
     in_csv: dict[str, Any] = {}
     duplicated = False
     for item in files:
@@ -779,7 +790,8 @@ def adopted_order_proposal(
         duplicated = duplicated or name in in_csv
         in_csv[name] = item.get("analytical_order")
     matches = (
-        not duplicated
+        same_unit
+        and not duplicated
         and len(recorded) == len(files)
         and all(
             name in recorded and str(recorded[name]) == str(order)
@@ -790,8 +802,16 @@ def adopted_order_proposal(
         adopted["recorded_header_order"] = {
             "derived_from": record["derived_from"],
             "matches_analysis_csv": False,
-            "reason": "The analysis CSV does not carry the order the unit manifest records.",
+            "reason": (
+                "The analysis CSV does not carry the order the unit manifest records."
+                if same_unit
+                else "The unit manifest describes other input files than these."
+            ),
         }
+        # An inherited adoption (the inspection's, before workflow overrides replaced the
+        # files) must not survive a mismatch: fall back to the order read from the names.
+        if (adopted.get("analytical_order") or {}).get("derived_from") == record["derived_from"]:
+            adopted["analytical_order"] = _describe_sample_table(files)["analytical_order"]
         return adopted
     adopted["analytical_order"] = {
         "derived_from": record["derived_from"],
