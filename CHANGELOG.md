@@ -4,7 +4,22 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
-## [0.5.0] - Unreleased
+## [0.5.1] - Unreleased
+
+### Fixed
+- The publication report warned that no persistent identifier was recorded for
+  every library of an agent-guided run, including libraries whose DOI and Zenodo
+  record it held. The guided workflow records a library under `path` and its
+  repository URL under `source`; the report looked only for `local_path`, and for
+  `doi` or `record_url`. It now reads both spellings and accepts any identifier the
+  warning asks for (version, DOI, repository URL or checksum). Found by the public
+  reanalysis gate's LIB-1 on the first MTBLS2207 production run.
+- The Methods and QA results text recited the whole QA battery, including QC
+  precision and blank separation, whatever the sample types allowed, and reported
+  "1 of 1 evaluable criteria". It now names the criteria that could be evaluated,
+  those that could not, and why (too few QC injections, no Blank files).
+
+## [0.5.0] - 2026-09-26
 
 Agent API 0.5 rejects a 0.4 backend as incompatible.
 
