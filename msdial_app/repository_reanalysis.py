@@ -2312,6 +2312,14 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
                 "evidence": method.get("evidence") if isinstance(method, dict) else None,
                 "polarity": _metadata_value(item, "acquisition", "polarity"),
                 "ms_levels": ms_levels,
+                # The extractor reads it from the file itself (mzML run@startTimeStamp, vendor
+                # headers); it is the injection order the analysis CSV should carry.
+                "acquisition_start_time": _metadata_value(item, "run", "acquisitionStartTime"),
+                "acquisition_start_time_evidence": str(
+                    ((item.get("run") or {}).get("acquisitionStartTime") or {}).get("evidence") or ""
+                )
+                if isinstance((item.get("run") or {}).get("acquisitionStartTime"), dict)
+                else "",
             }
         )
     return {
@@ -2325,6 +2333,238 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
         "observed_polarities": sorted(polarities),
         "evidence": [f"Raw metadata preflight inspected {len(records)} representative file(s)."],
     }
+
+
+ACQUISITION_ORDER_SOURCE = "raw_header_acquisition_start_time"
+_FRACTION = re.compile(r"(T\d{2}:\d{2}:\d{2})\.(\d+)")
+
+
+def _parse_acquisition_time(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    # The extractor writes .NET fractions of 1 to 7 digits; Python before 3.11 reads only 3 or 6.
+    text = _FRACTION.sub(lambda match: match.group(1) + "." + (match.group(2) + "000000")[:6], text, count=1)
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _preflight_start_times(preflight: dict[str, Any]) -> tuple[dict[str, tuple[str, str]], set[str]]:
+    times: dict[str, tuple[str, str]] = {}
+    inspected: set[str] = set()
+    for item in (preflight.get("summary") or {}).get("per_file") or []:
+        if not isinstance(item, dict) or not item.get("file"):
+            continue
+        inspected.add(_file_key(str(item["file"])))
+        value = str(item.get("acquisition_start_time") or "").strip()
+        if value:
+            times[_file_key(str(item["file"]))] = (
+                value, str(item.get("acquisition_start_time_evidence") or "")
+            )
+    output = Path(str(preflight.get("output") or ""))
+    if output.is_file():
+        try:
+            records = json.loads(output.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            records = []
+        if isinstance(records, dict):
+            records = [records]
+        for record in records if isinstance(records, list) else []:
+            if not isinstance(record, dict):
+                continue
+            source = record.get("source") or {}
+            path = str(source.get("filePath") or "").strip() if isinstance(source, dict) else ""
+            if path:
+                inspected.add(_file_key(path))
+            value = _metadata_value(record, "run", "acquisitionStartTime").strip()
+            if path and value:
+                field = (record.get("run") or {}).get("acquisitionStartTime") or {}
+                evidence = str(field.get("evidence") or "") if isinstance(field, dict) else ""
+                times.setdefault(_file_key(path), (value, evidence))
+    return times, inspected
+
+
+def _acquisition_start_times(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, tuple[str, str]], set[str], bool]:
+    """The acquisition start time, and the extractor's evidence for it, of each inspected file.
+
+    Read from the unit's own preflight, then from the extractor output it names (a summary
+    written before the time was carried forward has none), then from the parent a split part
+    was made from. The flag says whether any preflight was found at all, so "no header
+    recorded a time" is not said of headers nobody read.
+    """
+    sources = [manifest.get("raw_metadata_preflight") or {}]
+    split_from = manifest.get("split_from")
+    parent_path = str(split_from.get("manifest_path") or "") if isinstance(split_from, dict) else ""
+    if parent_path and Path(parent_path).is_file():
+        try:
+            parent = json.loads(Path(parent_path).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            parent = {}
+        if isinstance(parent, dict):
+            sources.append(parent.get("raw_metadata_preflight") or {})
+    times: dict[str, tuple[str, str]] = {}
+    inspected: set[str] = set()
+    read = False
+    for preflight in (source for source in sources if isinstance(source, dict)):
+        if (preflight.get("summary") or {}).get("per_file") or Path(str(preflight.get("output") or "")).is_file():
+            read = True
+        found, seen = _preflight_start_times(preflight)
+        for key, value in found.items():
+            times.setdefault(key, value)
+        inspected |= seen
+    return times, inspected, read
+
+
+def acquisition_start_order(
+    manifest: dict[str, Any],
+    file_paths: list[str],
+    class_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Rank a unit's input files by the acquisition start time in their own headers.
+
+    The analytical order was the file listing, or a number read out of the names, even when
+    every raw header recorded when it was acquired. For MTBLS2207 the listing put a file
+    acquired in December 2019 last and one acquired in September 2020 second, and the only
+    QA criterion the run could evaluate was a run-order drift computed against that listing.
+
+    The header order is used only when it orders something: every file needs a readable time,
+    and files the headers cannot tell apart must not decide the order by listing position
+    across Classes. So nothing is reordered, and the record says why, when a header was never
+    read, when a file has no time or an unreadable one, when every file shares one time, or
+    when files of different Classes share a time. Equal times within one Class keep listing
+    order and are named.
+
+    The extractor writes every time with an offset. Where the header itself carried none it
+    supplied one, which cannot be told apart here, so each file's evidence is kept with its
+    time rather than presenting the offset as a header fact.
+    """
+    times, inspected, read = _acquisition_start_times(manifest)
+    if not read:
+        return {
+            "derived_from": None,
+            "headers_read": False,
+            "reason": (
+                "The raw headers of this unit have not been read (no raw-metadata preflight), "
+                "so the order was not taken from them."
+            ),
+            "missing": [],
+            "unreadable": [],
+        }
+    entries = []
+    missing = []
+    unreadable = []
+    not_inspected = []
+    for index, path in enumerate(file_paths):
+        raw, evidence = times.get(_file_key(path), ("", ""))
+        parsed = _parse_acquisition_time(raw)
+        if not raw and _file_key(path) not in inspected:
+            not_inspected.append(Path(path).name)
+        elif not raw:
+            missing.append(Path(path).name)
+        elif parsed is None:
+            unreadable.append(Path(path).name)
+        else:
+            entries.append((parsed, index, path, raw, evidence))
+    if missing or unreadable or not_inspected or not entries:
+        parts = []
+        if not_inspected:
+            parts.append("the raw header was not read for " + ", ".join(not_inspected))
+        if missing:
+            parts.append("no acquisition start time was recorded for " + ", ".join(missing))
+        if unreadable:
+            parts.append("the recorded time could not be read for " + ", ".join(unreadable))
+        text = "; ".join(parts or ["no input file was given"])
+        return {
+            "derived_from": None,
+            "headers_read": True,
+            # Only the first letter: the rest holds file names, whose case matters.
+            "reason": text[:1].upper() + text[1:] + "; the order was not taken from the headers.",
+            "missing": missing,
+            "unreadable": unreadable,
+            "not_inspected": not_inspected,
+        }
+    if len({entry[0].tzinfo is None for entry in entries}) > 1:
+        return {
+            "derived_from": None,
+            "headers_read": True,
+            "reason": "Some acquisition start times carry a timezone and some do not, so they cannot be ordered.",
+            "missing": [],
+            "unreadable": [],
+        }
+    groups: dict[datetime, list[int]] = {}
+    for entry in entries:
+        groups.setdefault(entry[0], []).append(entry[1])
+    if len(entries) > 1 and len(groups) == 1:
+        return {
+            "derived_from": None,
+            "headers_read": True,
+            "reason": "Every raw header records the same start time, so the headers carry no order.",
+            "missing": [],
+            "unreadable": [],
+        }
+    classes = list(class_ids or [])
+    mixed = sorted(
+        Path(file_paths[index]).name
+        for indexes in groups.values()
+        if len(indexes) > 1 and classes and len({classes[i] for i in indexes if i < len(classes)}) > 1
+        for index in indexes
+    )
+    if mixed:
+        return {
+            "derived_from": None,
+            "headers_read": True,
+            "reason": (
+                "Files of different Classes share a start time (" + ", ".join(mixed)
+                + "), so the headers cannot order them and the listing would decide."
+            ),
+            "missing": [],
+            "unreadable": [],
+        }
+    entries.sort(key=lambda entry: (entry[0], entry[1]))
+    ranks = {entry[2]: rank for rank, entry in enumerate(entries, start=1)}
+    tied = sorted(
+        Path(file_paths[index]).name
+        for indexes in groups.values()
+        if len(indexes) > 1
+        for index in indexes
+    )
+    return {
+        "derived_from": ACQUISITION_ORDER_SOURCE,
+        "headers_read": True,
+        "reason": (
+            "Ranked by the acquisition start time each file's raw header records"
+            + (f"; equal times within one Class keep listing order ({', '.join(tied)})" if tied else "")
+            + "."
+        ),
+        "orders": {_file_key(path): rank for path, rank in ranks.items()},
+        "files": [
+            {
+                "file": Path(entry[2]).name,
+                "acquisition_start_time": entry[3],
+                "evidence": entry[4],
+                "analytical_order": ranks[entry[2]],
+            }
+            for entry in entries
+        ],
+        "agrees_with_listing": [ranks[path] for path in file_paths] == list(range(1, len(file_paths) + 1)),
+        "tied": tied,
+    }
+
+
+def record_analytical_order(manifest_path: str | Path, record: dict[str, Any]) -> None:
+    """Keep how the analysis CSV's analytical order was decided in the unit's own manifest."""
+    path = Path(manifest_path)
+    manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+    manifest["analytical_order"] = {
+        key: value for key, value in record.items() if key != "orders"
+    } | {"recorded_at": datetime.now(timezone.utc).isoformat()}
+    _write_json(path, manifest)
 
 
 def _metadata_value(record: dict[str, Any], section: str, field_name: str) -> str:

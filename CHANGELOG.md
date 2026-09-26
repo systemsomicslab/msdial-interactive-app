@@ -4,7 +4,43 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
-## [0.5.1] - Unreleased
+## [0.5.2] - Unreleased
+
+### Changed
+- A repository unit's analytical order is the order its files were acquired, as
+  each raw header records it, whenever every input has a readable acquisition
+  start time. The raw-metadata preflight already read that time (mzML
+  `run@startTimeStamp`, vendor headers) and the summary dropped it; the order
+  was the file listing, or a number read out of the names, and a repository
+  sample table's declared order overwrote either. The header order is applied
+  last, so it outranks both. Nothing is reordered, and the record says why,
+  when the unit's headers were never read, when a file has no time or an
+  unreadable one, when every file shares one time, or when files of different
+  Classes share a time: in each case the listing, not the headers, would decide.
+  Equal times within one Class keep listing order and are named. .NET fractions
+  of any length are read. The extractor writes every time with an offset,
+  assuming one where the header had none, so each file's extractor evidence is
+  kept with its time. `msdial_prepare_repository_reanalysis` shows the order in
+  its preview, writes it into `analysis_files.csv`, and records how it was
+  decided, with every file's start time, as `analytical_order` in the unit's run
+  manifest, but only once the CSV exists. A preflight summarised before this
+  release is read through the extractor output it names, and a split part
+  without its own preflight through its parent's. The guided plan reports the
+  order as `raw_header_acquisition_start_time`, in both its inspection and its
+  workflow, only while the analysis CSV carries exactly the recorded order;
+  otherwise the name-derived source stands, so the Blank-interpolation warning
+  still fires, and the record is attached as a note. A record is adopted only
+  for the unit whose inputs it describes. Found on MTBLS2207, where the listing
+  put a December 2019 acquisition last, and the only QA criterion the run could
+  evaluate was a run-order drift computed against that listing.
+- Without a QC, the zero-threshold diagnostic's representative is the Sample
+  nearest the run midpoint, not any non-Blank file: a Standard is a chemical
+  mix, not the matrix the threshold is for. Other non-Blank files are used only
+  when there is no Sample. File types are read as the Console reads them,
+  numbers included (Sample 0, Standard 1, QC 2, Blank 3). Found on MTBLS2207,
+  where with the header order the standard mix sat at the DDA midpoint.
+
+## [0.5.1] - 2026-09-26
 
 ### Fixed
 - The publication report warned that no persistent identifier was recorded for
