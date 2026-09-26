@@ -54,7 +54,10 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
   a parameter template alike: the Console reads these as whole numbers and keeps
   its default otherwise. The template reader, the validator, the agent answers
   and the method writer share one set of defaults, so an absent value is
-  validated as the value that will be written. The UI and agent expose these settings, and a blank UI field takes its
+  validated as the value that will be written, and the writer writes each
+  setting as the parsed value: surrounding whitespace or a line break cannot split
+  the method line, and the string `false` for Blank interpolation is written as
+  False, not True. The UI and agent expose these settings, and a blank UI field takes its
   default. The zero-threshold peak diagnostic turns automatic RT correction and
   alignment light mode off, since it runs without alignment.
   Methods and Table S1 describe correction only when the Console summary and
@@ -120,6 +123,9 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
   leaves the run too. The Console runs from the bundle directory, so a relative
   path in `method.txt` is read against it in every mode (the LC-MS Console reads
   library paths against its working directory, GC-MS against the method file's).
+  A Console path the caller gives keeps its meaning: an absolute path is used as
+  given, a relative one is the caller's whether or not it exists, and a bare name
+  is a file in the caller's directory or a command on PATH.
   A copy that fails stops the script before the Console starts, a read-only
   record does not stop a second reproduction, and a Console that cannot be
   started exits non-zero instead of 0. The

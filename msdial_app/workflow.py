@@ -2372,7 +2372,12 @@ def _powershell_script(
         # directory, and GC-MS against the method file's; running from the bundle makes a
         # relative path mean the same in both.
         # A Console path given relative to the caller's directory must survive the move.
-        "if (Test-Path -LiteralPath $Console) { $Console = (Resolve-Path -LiteralPath $Console).ProviderPath }\n"
+        # A relative path is the caller's, whether or not it exists; a bare name is a file here
+        # or a command on PATH.
+        "if (-not [System.IO.Path]::IsPathRooted($Console)) {\n"
+        "  if ($Console -match '[\\\\/]') { $Console = Join-Path (Get-Location).ProviderPath $Console }\n"
+        "  elseif (Test-Path -LiteralPath $Console -PathType Leaf) { $Console = (Resolve-Path -LiteralPath $Console).ProviderPath }\n"
+        "}\n"
         # finally, so the caller's session is back where it was even when the start fails
         # under $ErrorActionPreference = 'Stop'.
         "Push-Location -LiteralPath $Here\n"
@@ -2413,17 +2418,17 @@ def _shell_script(default_console: str, analysis_type: str, store_project: bool 
         'cp -f "$HERE/method.txt" "$METHOD"\n'
         'cp -f "$HERE/analysis_files.csv" "$INPUTS"\n'
         # See _powershell_script: run from the bundle so relative paths mean one thing, after
-        # making a Console path that exists relative to the caller's directory absolute. An
-        # absolute path, Windows or POSIX, is left as given, and so is a name that does not
-        # exist here, which is then looked up on PATH as before. Under MSYS cygpath gives the
-        # Windows form a native dotnet needs.
-        'if [ -e "$CONSOLE" ]; then\n'
-        '  case "$CONSOLE" in\n'
-        '    /*|[A-Za-z]:[\\\\/]*|\\\\\\\\*) ;;\n'
-        '    *) if command -v cygpath >/dev/null 2>&1; then CONSOLE="$(cygpath -am "$CONSOLE")"; '
-        'else CONSOLE="$PWD/$CONSOLE"; fi ;;\n'
-        "  esac\n"
-        "fi\n"
+        # anchoring the Console path to the caller. An absolute path, Windows or POSIX, is left
+        # as given; a relative path is the caller's, whether or not it exists; a bare name is a
+        # file here or a command on PATH. Under MSYS cygpath gives the Windows form a native
+        # dotnet needs.
+        'absolute() { if command -v cygpath >/dev/null 2>&1; then cygpath -am "$1"; '
+        'else printf \'%s/%s\\n\' "$PWD" "$1"; fi; }\n'
+        'case "$CONSOLE" in\n'
+        '  /*|[A-Za-z]:[\\\\/]*|\\\\\\\\*) ;;\n'
+        '  */*|*\\\\*) CONSOLE="$(absolute "$CONSOLE")" ;;\n'
+        '  *) if [ -f "$CONSOLE" ]; then CONSOLE="$(absolute "$CONSOLE")"; fi ;;\n'
+        "esac\n"
         'cd "$HERE"\n'
         # A case pattern rather than ${CONSOLE,,}, which needs bash 4 (macOS ships 3.2).
         'case "$CONSOLE" in\n'
@@ -2637,11 +2642,15 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
     automatic_rt_replacements: dict[str, Any] = {
         "execute automatic rt correction for alignment": True,
     }
+    # The parsed value, not the string given: " 5", "5\n" and "3." are validated as numbers, and
+    # written as given a line break split the method line, while bool("false") wrote True.
     for state_key, default in AUTOMATIC_RT_CORRECTION_DEFAULTS.items():
         label = state_key.replace("automatic_rt_correction_", "automatic rt correction ").replace("_", " ")
-        automatic_rt_replacements[label] = state.get(state_key, default)
-    interpolate_label = "automatic rt correction interpolate blanks by analytical order"
-    automatic_rt_replacements[interpolate_label] = bool(automatic_rt_replacements[interpolate_label])
+        raw = state.get(state_key, default)
+        try:
+            automatic_rt_replacements[label] = automatic_rt_correction_value(state_key, raw)
+        except (TypeError, ValueError, OverflowError):
+            automatic_rt_replacements[label] = raw
     automatic_rt_enabled = bool(
         project_type == "lcms" and state.get("execute_automatic_rt_correction", False)
     )
@@ -3050,9 +3059,9 @@ AUTOMATIC_RT_CORRECTION_LABELS = {
 _INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
 # What int/double.TryParse with the invariant culture accepts. Python's float() also takes
 # "1_000", full-width digits, "nan" and "infinity", which the Console refuses and replaces
-# with its default. Only spaces and tabs may surround it: a CR or LF would split the method
-# line, and the Console would read the key as blank.
-_INVARIANT_NUMBER = re.compile(r"[ \t]*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?[ \t]*", re.ASCII)
+# with its default. Surrounding ASCII whitespace is allowed because the method writer writes
+# the parsed number, not the string it was given, so a CR or LF never reaches the file.
+_INVARIANT_NUMBER = re.compile(r"\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*", re.ASCII)
 
 
 def _as_float32(value: float) -> float:

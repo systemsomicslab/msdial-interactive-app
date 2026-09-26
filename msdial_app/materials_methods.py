@@ -504,11 +504,15 @@ def _automatic_rt_correction_evidence(
     # would not be the ones the correction used.
     from .workflow import AUTOMATIC_RT_CORRECTION_METHOD_KEYS
 
+    # A key also applied was set after all: the Console keeps the last value it applied.
     discarded = sorted(
-        {
-            str(item).split(":", 1)[0].strip().casefold()
-            for item in [*(method_keys.get("unusable") or []), *(method_keys.get("blank") or [])]
-        }
+        (
+            {
+                str(item).split(":", 1)[0].strip().casefold()
+                for item in [*(method_keys.get("unusable") or []), *(method_keys.get("blank") or [])]
+            }
+            - applied
+        )
         & AUTOMATIC_RT_CORRECTION_METHOD_KEYS
     )
     if discarded:

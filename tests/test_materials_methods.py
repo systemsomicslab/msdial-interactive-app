@@ -423,6 +423,25 @@ class MaterialsMethodsTests(unittest.TestCase):
         self.assertFalse(evidence["performed"])
         self.assertEqual(["automatic rt correction minimum anchors"], evidence["discarded_keys"])
 
+    def test_automatic_rt_a_key_applied_once_is_not_discarded(self) -> None:
+        # A key given twice, once blank and once with a value, was set: the Console keeps the
+        # last value it applied.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_automatic_rt_audit(root)
+            keys = root / "method.keys.json"
+            record = json.loads(keys.read_text(encoding="utf-8"))
+            record["applied"].append("Automatic RT correction minimum anchors")
+            record["blank"] = ["Automatic RT correction minimum anchors"]
+            keys.write_text(json.dumps(record), encoding="utf-8")
+            for path in root.glob("automatic_alignment_rt_correction_*.tsv"):
+                later = keys.stat().st_mtime + 1
+                os.utime(path, (later, later))
+
+            result, evidence = self._automatic_rt_report(root)
+
+        self.assertTrue(evidence["performed"], evidence)
+
     def test_automatic_rt_settings_stay_out_of_table_s1_when_off(self) -> None:
         workflow = {
             "project_type": "lcms",

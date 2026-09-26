@@ -1883,6 +1883,38 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(0, bare.returncode, bare.stderr)
             self.assertIn("FAKE-CONSOLE", bare.stdout)
 
+            # A directory named like the Console is not a Console; the name is looked up on PATH.
+            tools = root / "tools"
+            tools.mkdir()
+            on_path = tools / "path-console"
+            on_path.write_text('#!/bin/sh\necho PATH-CONSOLE "$@"\n', encoding="ascii", newline="\n")
+            on_path.chmod(0o755)
+            (caller / "path-console").mkdir()
+            tools_posix = subprocess.run(
+                [shutil.which("bash"), "-c", 'cd "$1" && pwd', "_", str(tools)],
+                capture_output=True, text=True, timeout=60,
+            ).stdout.strip()
+            via_path = subprocess.run(
+                [shutil.which("bash"), "-c",
+                 f'PATH="{tools_posix}:$PATH" "$0" "$1" path-console', "bash", str(script)],
+                cwd=caller, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(0, via_path.returncode, via_path.stderr)
+            self.assertIn("PATH-CONSOLE", via_path.stdout)
+
+            # A relative path missing from the caller's directory fails; it never runs a file
+            # of that name in the bundle the script changes into.
+            (root / "sub").mkdir()
+            decoy = root / "sub" / "decoy-console"
+            decoy.write_text('#!/bin/sh\necho BUNDLE-DECOY\n', encoding="ascii", newline="\n")
+            decoy.chmod(0o755)
+            missing = subprocess.run(
+                [shutil.which("bash"), str(script), "sub/decoy-console"],
+                cwd=caller, capture_output=True, text=True, timeout=60,
+            )
+            self.assertNotEqual(0, missing.returncode)
+            self.assertNotIn("BUNDLE-DECOY", missing.stdout)
+
             # A protected run record gives read-only copies; a second run must still start.
             (root / "method.reproduce.txt").unlink()
             (root / "reproduced-results" / "analysis_files.csv").unlink()
@@ -1942,6 +1974,17 @@ class WorkflowTests(unittest.TestCase):
             )
             self.assertEqual(0, relative.returncode, relative.stderr)
             self.assertIn("method.reproduce.txt", relative.stdout)
+
+            # A relative path missing from the caller's directory is not found in the bundle.
+            (root / "sub").mkdir()
+            (root / "sub" / "decoy.cmd").write_text("@echo BUNDLE-DECOY\r\n", encoding="ascii")
+            decoy = subprocess.run(
+                [shutil.which("powershell"), "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(script), os.path.join("sub", "decoy.cmd")],
+                cwd=elsewhere, capture_output=True, text=True, timeout=120,
+            )
+            self.assertNotEqual(0, decoy.returncode)
+            self.assertNotIn("BUNDLE-DECOY", decoy.stdout)
 
             # A Console that cannot be started must not look like a reproduction that ran.
             missing = run(str(root / "no-such-console.exe"))
@@ -2004,9 +2047,7 @@ class WorkflowTests(unittest.TestCase):
             # The method file would say True, 1_000 or a full-width digit; the Console reads none.
             "automatic_rt_correction_minimum_sample_coverage": [True],
             "automatic_rt_correction_reference_file_id": [True, "\uff11"],
-            "automatic_rt_correction_maximum_anchors": ["1_000", "\n5"],
-            # A CR or LF splits the method line, and the Console reads the key as blank.
-            "automatic_rt_correction_rt_bin_width": ["\r0.2"],
+            "automatic_rt_correction_maximum_anchors": ["1_000"],
             # Above 0 as a double, 0 as the float the Console stores.
             "automatic_rt_correction_match_rt_tolerance": [1e-46],
         }
@@ -2021,6 +2062,34 @@ class WorkflowTests(unittest.TestCase):
                         ),
                         issues,
                     )
+
+    def test_automatic_rt_method_lines_carry_the_validated_value(self) -> None:
+        # Written as given, "\n5" split the method line so the Console read a blank key, and
+        # bool("false") wrote True. The writer writes the parsed value.
+        with tempfile.TemporaryDirectory() as temporary:
+            template = Path(temporary) / "template.txt"
+            template.write_text("Ion mode: Negative\n", encoding="ascii")
+            method = Path(temporary) / "method.txt"
+            _write_method(
+                method,
+                {
+                    "project_type": "lcms",
+                    "template_path": str(template),
+                    "target_omics": "Metabolomics",
+                    "execute_automatic_rt_correction": True,
+                    "automatic_rt_correction_minimum_anchors": "\n5",
+                    "automatic_rt_correction_maximum_anchors": "7.",
+                    "automatic_rt_correction_rt_bin_width": " 0.2\r",
+                    "automatic_rt_correction_interpolate_blanks_by_analytical_order": "false",
+                },
+            )
+            lines = method.read_text(encoding="utf-8").splitlines()
+
+        self.assertIn("Automatic RT correction minimum anchors: 5", lines)
+        self.assertIn("Automatic RT correction maximum anchors: 7", lines)
+        self.assertIn("Automatic RT correction RT bin width: 0.2", lines)
+        self.assertIn("Automatic RT correction interpolate blanks by analytical order: False", lines)
+        self.assertFalse([line for line in lines if line.strip() in {"5", "0.2"}], lines)
 
     def test_automatic_rt_needs_a_positive_alignment_ms1_tolerance(self) -> None:
         # The correction matches anchors within this tolerance and refuses 0 after peak picking.
