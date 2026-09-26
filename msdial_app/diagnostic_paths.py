@@ -43,6 +43,24 @@ _DIAGNOSTIC_DIRECTORY_NAMES = frozenset(
 )
 
 
+# Where a bundle's reproduction scripts write, inside the run directory. A run's own results
+# are never under it, so a scan of the run for its results skips it.
+REPRODUCTION_DIRECTORY_NAME = "reproduced-results"
+
+
+def is_reproduction_artifact(path: str | Path, root: str | Path) -> bool:
+    """True when a path lies under the reproduction directory directly below the scan root.
+
+    Judged relative to the root, not by any path part, so a run that itself sits inside a
+    folder of that name still finds its own results.
+    """
+    try:
+        parts = Path(path).relative_to(Path(root)).parts
+    except (TypeError, ValueError):
+        return False
+    return bool(parts) and parts[0] == REPRODUCTION_DIRECTORY_NAME
+
+
 def is_diagnostic_artifact(path: str | Path) -> bool:
     """True when a path lies under a peak-count diagnostic directory.
 

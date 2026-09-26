@@ -176,6 +176,13 @@ workflow settings, QA, publication-report artifacts, and checksums are kept
 after raw-data cleanup. See [Public repository reanalysis](docs/public_repository_reanalysis.md)
 for commands, eligibility rules, and the pilot validation record.
 
+MS-DIAL reads mzML but has no mzXML/mzData reader. Repository records that name
+those legacy formats are blocked as `requires_conversion` before download and
+must be converted to mzML through a separately reviewed conversion workflow.
+Raw-header results reported as `Mixed` can be split, after explicit confirmation,
+into independent acquisition-mode units with `msdial_split_repository_unit`; the
+Mixed parent is never sent to MS-DIAL.
+
 The Data tab also includes a repository metadata handler. It normalizes
 Metabolomics Workbench, MetaboLights, MB-POST, and MetaboBank sample metadata, previews an
 ordered multi-field grouping hierarchy, and writes the resulting underscore-
@@ -325,6 +332,13 @@ For large LC-MS Console jobs, the Peak detection and alignment panel can write
 MS-DIAL Console light alignment path for text-export workflows and skips GUI
 project serialization.
 
+The same panel can enable automatic alignment-only RT correction. MS-DIAL keeps
+peak picking and annotation on the original RT axis, learns distributed anchor
+features after those steps, chooses a reference file automatically or by file
+ID, and applies a piecewise-linear map only during alignment. Blank models can
+be interpolated by analytical order. This mode is mutually exclusive with the
+user-defined RT-correction workspace and writes summary and anchor audit TSVs.
+
 ## LC-MS retention-time correction
 
 The main app and the dedicated review workspace have separate roles. The main
@@ -443,11 +457,13 @@ Core MCP tools:
 - `msdial_repository_batch_plan`: split Catalog handoffs into independent analysis-unit runs
 - `msdial_repository_reanalysis_plan`: plan an accession or Catalog analysis unit without downloading data
 - `msdial_download_repository_raw`: start a bounded repository download after explicit confirmation
-- `msdial_repository_raw_metadata_preflight`: cross-check representative raw headers with the local parser
+- `msdial_repository_raw_metadata_preflight`: cross-check every raw header by default with the local parser
+- `msdial_split_repository_unit`: split a Mixed acquisition unit after explicit confirmation
 - `msdial_prepare_repository_reanalysis`: review Class matching and prepare `analysis_files.csv`
 - `msdial_repository_qa_evidence`: expose internal-standard declarations for agent-reviewed QA targets
+- `msdial_cleanup_repository_raw`: preview and explicitly confirm post-validation raw-data deletion
 
-Agent API 0.4 binds mzTab-M, QA, publication, and handoff operations to the
+Agent API 0.5 binds mzTab-M, QA, publication, and handoff operations to the
 production `job_id`. Files left by earlier runs in the same output directory are
 excluded. Job summaries are compact by default; full details are opt-in.
 

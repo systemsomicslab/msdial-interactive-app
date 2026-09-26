@@ -10,6 +10,8 @@ from .annotation_pipeline import apply_tiered_lcms_annotation
 from .library_catalog import catalog_status
 from .user_settings import load_user_settings
 from .workflow import (
+    AUTOMATIC_RT_CORRECTION_DEFAULTS,
+    automatic_rt_correction_value,
     expand_paths_report,
     discover_console_paths,
     load_parameter_template,
@@ -31,6 +33,18 @@ SUPPORTED_ANSWER_KEYS = {
     "execute_rt_correction", "rt_correction_anchor_path",
     "rt_correction_selection_path", "rt_correction_peak_selection_mode",
     "rt_correction_peak_selection_rt_weight", "library_strategy", "libraries",
+    "execute_automatic_rt_correction", "automatic_rt_correction_reference_file_id",
+    "automatic_rt_correction_rt_bin_width", "automatic_rt_correction_match_rt_tolerance",
+    "automatic_rt_correction_minimum_anchors", "automatic_rt_correction_maximum_anchors",
+    "automatic_rt_correction_minimum_sample_coverage",
+    "automatic_rt_correction_intensity_quantile",
+    "automatic_rt_correction_maximum_peak_width_quantile",
+    "automatic_rt_correction_minimum_signal_to_noise",
+    "automatic_rt_correction_minimum_gaussian_similarity",
+    "automatic_rt_correction_minimum_ideal_slope",
+    "automatic_rt_correction_outlier_mad_threshold",
+    "automatic_rt_correction_reference_centrality_weight",
+    "automatic_rt_correction_interpolate_blanks_by_analytical_order",
     "library_provenance", "run_qa", "internal_standards",
     "use_retention_time_for_annotation", "retention_time_tolerance", "number_of_threads",
     "stage_inputs", "dilution_factor", "class_assignment_confirmed",
@@ -465,6 +479,16 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
                     "How should an anchor peak be selected?",
                     ["HighestIntensity", "ClosestToReferenceRt", "Weighted"],
                 )
+        elif "execute_automatic_rt_correction" not in answers:
+            ask(
+                "execute_automatic_rt_correction",
+                (
+                    "Apply automatic RT correction only during alignment, using anchors "
+                    "learned from the detected features?"
+                ),
+                ["false", "true"],
+                required=False,
+            )
     if project_type == "gcms" and not answers.get("gcms_retention_type"):
         ask("gcms_retention_type", "Use retention time or retention index?", ["RT", "RI"])
     if project_type == "gcms" and answers.get("gcms_retention_type") == "RI":
@@ -585,6 +609,9 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
     state.update(
         {
             "files": copy.deepcopy(inspection["files"]),
+            "sample_table_proposal": copy.deepcopy(
+                inspection.get("sample_table_proposal", {})
+            ),
             "project_type": project_type,
             "ion_mode": answers.get("ion_mode", "Positive"),
             "target_omics": answers.get("target_omics", "Metabolomics"),
@@ -615,6 +642,17 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             "rt_correction_peak_selection_rt_weight": float(
                 answers.get("rt_correction_peak_selection_rt_weight", 0.5)
             ),
+            "execute_automatic_rt_correction": _as_bool(
+                answers.get("execute_automatic_rt_correction", False)
+            ),
+            # One table of defaults for every entry point; a fractional anchor count is kept
+            # as given so validation refuses it instead of int() truncating it.
+            **{
+                key: automatic_rt_correction_value(
+                    key, answers.get(key, state.get(key, default))
+                )
+                for key, default in AUTOMATIC_RT_CORRECTION_DEFAULTS.items()
+            },
             "alignment_light_mode": _as_bool(answers.get("alignment_light_mode", False)),
             "library_provenance": copy.deepcopy(
                 answers.get("library_provenance", [])

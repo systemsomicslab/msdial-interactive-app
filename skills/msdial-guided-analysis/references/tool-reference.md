@@ -1,5 +1,25 @@
 # MCP Tool Reference
 
+## General interactive utilities
+
+- `msdial_interactive_status`: report backend compatibility, application/API
+  versions, capabilities, and compact job status.
+- `msdial_interactive_launch`: start the local backend when it is not already
+  running. Starting a process does not reload an already-running MCP server.
+- `msdial_interactive_open`: open the local browser UI.
+- `msdial_list_worksets`: list built-in and user-saved reusable scientific
+  settings.
+- `msdial_save_workset`: save reviewed answers and workflow overrides without
+  input or output paths.
+- `msdial_prepare_guided_analysis`: write the reviewed CSV, method, manifest,
+  command, and reproduction bundle without launching MS-DIAL.
+- `msdial_estimate_peak_height`: summarize a completed zero-threshold diagnostic
+  and propose a stepped minimum peak height for review.
+- `msdial_interactive_job`: retrieve one job's current status and optional full
+  details.
+- `msdial_interactive_create_handoff`: create a data-mining handoff from one
+  completed production job.
+
 ## Guided answers
 
 Common keys:
@@ -15,6 +35,11 @@ Common keys:
   "smoothing_method": "TimeBasedLinearWeightedMovingAverage",
   "acquisition_type": "DDA",
   "execute_rt_correction": false,
+  "execute_automatic_rt_correction": true,
+  "automatic_rt_correction_reference_file_id": -1,
+  "automatic_rt_correction_minimum_anchors": 3,
+  "automatic_rt_correction_maximum_anchors": 6,
+  "automatic_rt_correction_minimum_sample_coverage": 0.5,
   "rt_correction_anchor_path": "D:/anchors.txt",
   "rt_correction_peak_selection_mode": "HighestIntensity",
   "library_strategy": "official",
@@ -27,6 +52,14 @@ Common keys:
   "output_root": "D:/analysis-output"
 }
 ```
+
+`execute_rt_correction` and `execute_automatic_rt_correction` are mutually
+exclusive. The former warps the data-point RT axis before peak detection using
+reviewed user anchors. The latter selects anchors after peak detection and
+annotation and applies a piecewise-linear map only during alignment. `-1`
+selects the reference file automatically. The Console retains
+`automatic_alignment_rt_correction_summary.tsv` and
+`automatic_alignment_rt_correction_anchors.tsv` as audit evidence.
 
 `console_path` accepts an absolute path to `MSDIALCUI.exe` or `MSDIALCUI.dll`.
 Use `msdial_check_console_path` before asking the user to locate it manually, and
@@ -180,7 +213,11 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   Reuse the exact handoff path passed to the planner. Download remains blocked
   until both the Class proposal and `analysis_purpose` are present.
 - `msdial_repository_raw_metadata_preflight`: run the local RawMetadataConsoleApp
-  against representative downloaded files when raw-header evidence is needed.
+  against every downloaded analysis input by default. A caller may request a cap,
+  but capped coverage remains partial and cannot establish production readiness.
+- `msdial_split_repository_unit`: preview and, after explicit confirmation,
+  split a raw-preflight result whose acquisition mode is `Mixed`. Never execute
+  the parent unit; preflight and approve each generated child independently.
 - `msdial_prepare_repository_reanalysis`: preview Class matching first, then
   write reviewed metadata and `analysis_files.csv` after confirmation. Its
   `preview.answer_seed` is passed unchanged to `msdial_guided_analysis_plan`.
@@ -189,6 +226,14 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
 - `msdial_repository_qa_evidence`: return internal-standard declarations for a
   desktop-agent draft. It does not claim that a name, adduct, m/z, or RT has
   been experimentally confirmed.
+- `msdial_cleanup_repository_raw`: preview the exact deletion and retained
+  artifacts first, then delete leased raw data only after mzTab-M validation,
+  artifact inventory, and a separate explicit confirmation. A retention policy
+  is not deletion approval.
+
+MS-DIAL accepts mzML, not mzXML or mzData. Files reported as
+`requires_conversion` must be converted to mzML outside the run and entered
+through a new reviewed manifest; do not relabel them as `converted`.
 
 `allow_partial_mapping=true` and raw-data cleanup are explicit user decisions;
 do not infer either from the absence of an error.
@@ -215,5 +260,7 @@ These tools return a preview when `confirmed=false`:
 - `msdial_start_guided_analysis`
 - `msdial_download_repository_raw`
 - `msdial_prepare_repository_reanalysis`
+- `msdial_split_repository_unit`
+- `msdial_cleanup_repository_raw`
 
 Do not set `confirmed=true` until the user approves the corresponding action in the current conversation.

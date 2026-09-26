@@ -20,6 +20,12 @@ DIA/AIF/SWATH with product-ion spectra.
 Ambiguous records are placed in `raw_metadata_required`; they are not silently
 treated as eligible.
 
+MS-DIAL reads mzML but does not support mzXML or mzData. Those legacy formats
+are classified as `requires_conversion` and blocked before download. Convert
+them to centroided mzML with a reviewed ProteoWizard `msconvert` workflow and
+record the conversion in a new input manifest; changing the role label alone is
+not sufficient.
+
 Agent-driven reanalysis also requires a user-reviewed `analysis_purpose` before
 download. That purpose anchors Class/contrast selection, annotation strategy,
 QA, and requested outputs; it is retained with repository provenance.
@@ -177,6 +183,11 @@ If the proprietary reader is unavailable, preflight is recorded as unavailable.
 It does not revoke eligibility that was already explicit in repository metadata,
 but it cannot promote an ambiguous project to executable status.
 
+If raw headers report more than one acquisition mode, the result is `Mixed`.
+Preview `msdial_split_repository_unit`, confirm the proposed DDA and
+DIA/AIF/SWATH child units, then preflight each child independently. The Mixed
+parent must never be passed to an MS-DIAL production run.
+
 ## Finalize and clean up
 
 After MS-DIAL Interactive has produced mzTab-M, QA, and publication artifacts,
@@ -194,6 +205,12 @@ python scripts/repository-reanalysis.py cleanup `
 Use `discard --confirmed` only for a downloaded candidate rejected during
 preflight. It removes the temporary raw data but preserves the rejection and
 download provenance.
+
+For agents, cleanup is a separate confirmation boundary: first preview
+`msdial_cleanup_repository_raw`, report the exact raw directory and retained
+artifact inventory, and call it with `confirmed=true` only after the user
+approves that deletion. Selecting a retention policy earlier in the workflow
+does not authorize deletion.
 
 ## Pilot record
 

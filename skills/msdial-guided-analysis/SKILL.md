@@ -35,6 +35,12 @@ inferred internal-standard ion, or raw-data deletion policy. Repository and raw
 metadata are evidence; unresolved scientific choices remain questions for the
 user. Exact internal-standard candidates drafted by the desktop agent must be
 reported as reviewable candidates, with RT left unset unless it is recorded.
+MS-DIAL accepts mzML but not mzXML/mzData; conversion-required files must never
+be queued as native inputs. A raw preflight result of `Mixed` must be split with
+`msdial_split_repository_unit`, and each child must be preflighted and approved
+independently. Never execute the Mixed parent. Raw cleanup uses
+`msdial_cleanup_repository_raw` and requires a separate deletion confirmation;
+an accepted retention policy is not that confirmation.
 
 ## Collect Decisions
 
@@ -47,7 +53,12 @@ Use these branches:
 1. Select `lcms` or `gcms`.
 2. For LC-MS, collect `ion_mode` and `target_omics`.
 3. Select template defaults, `auto_peak_range`, or an exact `target_peak_count`.
-4. For LC-MS, decide whether to apply retention-time correction. If enabled, collect an anchor library and peak-selection rule.
+4. For LC-MS, choose no correction, user-defined correction before peak
+   detection, or automatic alignment-only correction learned from detected
+   features. The two correction modes are mutually exclusive. User-defined
+   correction requires an anchor library and reviewed peak selections;
+   alignment-only correction retains the original RT for peak picking and
+   annotation and writes two audit TSV files.
 5. Select official, existing, tiered lipid/MSP, or no annotation libraries.
 6. For LC-MS, decide whether to generate QA and collect internal-standard definitions when available. QA without internal standards still evaluates distributions and sample topology, but must not claim internal-standard stability.
 7. Decide whether to generate Materials and Methods and supplementary tables.

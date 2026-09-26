@@ -4,13 +4,18 @@ import zipfile
 import importlib.util
 import json
 import os
+import re
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from msdial_app.agent_bridge import create_datamining_handoff, summarize_jobs
+from msdial_app import __version__
 from msdial_app.mztab_preview import preview_mztab_file, preview_mztab_outputs
 from msdial_app.mztab_validation import validate_mztab_file, validate_mztab_files, validate_mztab_outputs
 from msdial_app.workflow import (
+    _write_method,
     build_console_command,
     console_capabilities,
     detect_raw_format,
@@ -35,6 +40,24 @@ from msdial_app.workflow import (
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_project_version_matches_package_version(self) -> None:
+        project = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+        version = re.search(r'^version = "([^"]+)"$', project, flags=re.MULTILINE)
+        self.assertIsNotNone(version)
+        self.assertEqual(version.group(1), __version__)
+
+    def test_mzxml_is_rejected_with_mzml_conversion_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "legacy.mzXML"
+            path.write_text("", encoding="ascii")
+
+            report = expand_paths_report([str(path)])
+
+            self.assertEqual([], report["files"])
+            self.assertEqual(1, len(report["rejected"]))
+            self.assertIn("no mzXML/mzData reader", report["rejected"][0])
+            self.assertIn("convert to mzML", report["rejected"][0])
+
     def test_shimadzu_lcd_and_qgd_are_supported_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -80,6 +103,39 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual("QA exporter marker", result["capability_probe"])
             self.assertIn("lcms_alignment_qa_matrix", result["capabilities"])
 
+    @patch("msdial_app.workflow.subprocess.run")
+    def test_console_capability_detects_automatic_alignment_rt_correction(self, run: Mock) -> None:
+        # The two strings MSDIALCUI.exe of the feature build carries, as UTF-16 .NET literals:
+        # the lowercase key ConfigParser reads and the audit line LcmsProcess writes.
+        run.return_value = Mock(returncode=1, stdout="", stderr="Unknown command")
+        for marker in (
+            "execute automatic rt correction for alignment",
+            "Automatic alignment RT correction audit:",
+        ):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as temporary:
+                console = Path(temporary) / "MSDIALCUI.exe"
+                console.write_bytes(marker.encode("utf-16-le"))
+
+                result = console_capabilities(str(console))
+
+                self.assertIn("automatic_alignment_rt_correction", result["capabilities"])
+                self.assertEqual("automatic RT correction marker", result["capability_probe"])
+
+    @patch("msdial_app.workflow.subprocess.run")
+    def test_console_capability_ignores_the_core_library_field_label(self, run: Mock) -> None:
+        # The title-case label is in MsdialCore.dll, not MSDIALCUI.exe. The probe once looked
+        # for it, so the feature build was reported as lacking the feature, and any file that
+        # happened to hold the label would have been reported as having it.
+        run.return_value = Mock(returncode=1, stdout="", stderr="Unknown command")
+        with tempfile.TemporaryDirectory() as temporary:
+            console = Path(temporary) / "MSDIALCUI.exe"
+            label = "Execute automatic RT correction for alignment"
+            console.write_bytes(label.encode("utf-16-le") + label.encode("utf-8"))
+
+            result = console_capabilities(str(console))
+
+        self.assertNotIn("automatic_alignment_rt_correction", result["capabilities"])
+
     def test_parameter_template_loads_guided_annotation_and_lipid_queries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -101,6 +157,10 @@ class WorkflowTests(unittest.TestCase):
                 "Lbm file path: library.lbm2\n"
                 "Minimum peak height: 1234\n"
                 "Smoothing method: SavitzkyGolayFilter\n"
+                "Execute automatic RT correction for alignment: True\n"
+                "Automatic RT correction minimum anchors: 4\n"
+                "Automatic RT correction maximum anchors: 8\n"
+                "Automatic RT correction interpolate blanks by analytical order: False\n"
                 "Weighted dot product cutoff for MSP-based annotation: 0.72\n"
                 "adduct list: [M+H]+,[M+Na]+\n"
                 "Searched lipid class: PC [M+H]+\n",
@@ -112,6 +172,14 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual("lcms", result["workflow"]["project_type"])
             self.assertEqual(1234, result["workflow"]["minimum_peak_height"])
             self.assertEqual("SavitzkyGolayFilter", result["workflow"]["smoothing_method"])
+            self.assertTrue(result["workflow"]["execute_automatic_rt_correction"])
+            self.assertEqual(4, result["workflow"]["automatic_rt_correction_minimum_anchors"])
+            self.assertEqual(8, result["workflow"]["automatic_rt_correction_maximum_anchors"])
+            self.assertFalse(
+                result["workflow"][
+                    "automatic_rt_correction_interpolate_blanks_by_analytical_order"
+                ]
+            )
             self.assertEqual(str(msp.resolve()), result["msp_annotators"][0]["msp_file_path"])
             self.assertEqual(str(lbm.resolve()), result["lbm_annotator"]["lbm_file_path"])
             self.assertEqual(0.72, result["msp_annotators"][0]["weighted_dot_product_cutoff"])
@@ -371,6 +439,234 @@ class WorkflowTests(unittest.TestCase):
                 self.assertIn(anchor.name, archive.namelist())
                 self.assertIn(selection.name, archive.namelist())
 
+    def test_prepare_run_writes_automatic_alignment_rt_correction_parameters(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "sample.mzML"
+            raw.write_text("raw", encoding="ascii")
+            console = root / "MSDIALCUI"
+            console.write_bytes(
+                "execute automatic rt correction for alignment".encode("utf-16-le")
+            )
+            template = root / "method.txt"
+            template.write_text(
+                "Ion mode: Positive\nExecute automatic RT correction for alignment: False\n",
+                encoding="ascii",
+            )
+            state = {
+                "project_type": "lcms",
+                "files": expand_paths([str(raw)]),
+                "console_path": str(console),
+                "template_path": str(template),
+                "output_root": str(root / "output"),
+                "ion_mode": "Negative",
+                "target_omics": "Metabolomics",
+                "together_with_alignment": True,
+                "execute_rt_correction": False,
+                "execute_automatic_rt_correction": True,
+                "automatic_rt_correction_reference_file_id": -1,
+                "automatic_rt_correction_rt_bin_width": 0.4,
+                "automatic_rt_correction_match_rt_tolerance": 1.2,
+                "automatic_rt_correction_minimum_anchors": 4,
+                "automatic_rt_correction_maximum_anchors": 9,
+                "automatic_rt_correction_minimum_sample_coverage": 0.7,
+                "automatic_rt_correction_intensity_quantile": 0.8,
+                "automatic_rt_correction_maximum_peak_width_quantile": 0.6,
+                "automatic_rt_correction_minimum_signal_to_noise": 5,
+                "automatic_rt_correction_minimum_gaussian_similarity": 0.3,
+                "automatic_rt_correction_minimum_ideal_slope": 0.4,
+                "automatic_rt_correction_outlier_mad_threshold": 4.5,
+                "automatic_rt_correction_reference_centrality_weight": 0.25,
+                "automatic_rt_correction_interpolate_blanks_by_analytical_order": False,
+            }
+
+            prepared = prepare_run(state)
+            method = Path(prepared["method_file"]).read_text(encoding="utf-8")
+
+            self.assertIn("Execute automatic RT correction for alignment: True", method)
+            self.assertIn("Automatic RT correction reference file ID: -1", method)
+            self.assertIn("Automatic RT correction RT bin width: 0.4", method)
+            self.assertIn("Automatic RT correction match RT tolerance: 1.2", method)
+            self.assertIn("Automatic RT correction minimum anchors: 4", method)
+            self.assertIn("Automatic RT correction maximum anchors: 9", method)
+            self.assertIn("Automatic RT correction minimum sample coverage: 0.7", method)
+            self.assertIn("Automatic RT correction intensity quantile: 0.8", method)
+            self.assertIn("Automatic RT correction maximum peak width quantile: 0.6", method)
+            self.assertIn("Automatic RT correction minimum signal to noise: 5", method)
+            self.assertIn("Automatic RT correction minimum Gaussian similarity: 0.3", method)
+            self.assertIn("Automatic RT correction minimum ideal slope: 0.4", method)
+            self.assertIn("Automatic RT correction outlier MAD threshold: 4.5", method)
+            self.assertIn("Automatic RT correction reference centrality weight: 0.25", method)
+            self.assertIn(
+                "Automatic RT correction interpolate blanks by analytical order: False",
+                method,
+            )
+            self.assertEqual(
+                {
+                    str(Path(prepared["run_directory"]) / "automatic_alignment_rt_correction_summary.tsv"),
+                    str(Path(prepared["run_directory"]) / "automatic_alignment_rt_correction_anchors.tsv"),
+                },
+                set(prepared["expected_automatic_rt_correction_exports"]),
+            )
+
+    def test_automatic_rt_keys_are_omitted_when_disabled_or_not_lcms(self) -> None:
+        for project_type in ("lcms", "gcms"):
+            with self.subTest(project_type=project_type), tempfile.TemporaryDirectory() as temporary:
+                template = Path(temporary) / "template.txt"
+                method = Path(temporary) / "method.txt"
+                template.write_text(
+                    "Ion mode: Positive\n"
+                    "Execute automatic RT correction for alignment: False\n"
+                    "Automatic RT correction minimum anchors: 3\n",
+                    encoding="ascii",
+                )
+
+                _write_method(
+                    method,
+                    {
+                        "project_type": project_type,
+                        "template_path": str(template),
+                        "execute_automatic_rt_correction": False,
+                        "target_omics": "Metabolomics",
+                    },
+                )
+
+                written = method.read_text(encoding="utf-8")
+                self.assertNotIn("automatic rt correction", written.lower())
+
+    def test_automatic_rt_correction_refuses_a_console_without_the_feature(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "sample.mzML"
+            raw.write_text("raw", encoding="ascii")
+            console = root / "MSDIALCUI.exe"
+            console.write_bytes(b"not the feature marker")
+            template = root / "method.txt"
+            template.write_text("Ion mode: Negative\n", encoding="ascii")
+            state = {
+                "project_type": "lcms",
+                "files": expand_paths([str(raw)]),
+                "console_path": str(console),
+                "template_path": str(template),
+                "output_root": str(root / "output"),
+                "target_omics": "Metabolomics",
+                "together_with_alignment": True,
+                "execute_automatic_rt_correction": True,
+                "automatic_rt_correction_minimum_anchors": 3,
+                "automatic_rt_correction_maximum_anchors": 6,
+                "automatic_rt_correction_rt_bin_width": 0.5,
+                "automatic_rt_correction_match_rt_tolerance": 0.5,
+                "automatic_rt_correction_outlier_mad_threshold": 3.5,
+                "automatic_rt_correction_minimum_sample_coverage": 0.5,
+                "automatic_rt_correction_intensity_quantile": 0.75,
+                "automatic_rt_correction_maximum_peak_width_quantile": 0.5,
+                "automatic_rt_correction_reference_centrality_weight": 0.35,
+            }
+
+            issues = validate_workflow(state)
+
+        self.assertTrue(
+            any("requires an MS-DIAL Console build" in item["message"] for item in issues)
+        )
+
+    @patch("msdial_app.workflow.console_capabilities")
+    def test_repository_listing_order_warns_before_blank_interpolation(self, capabilities: Mock) -> None:
+        capabilities.return_value = {
+            "capability_probe": "test",
+            "capabilities": ["automatic_alignment_rt_correction"],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "sample.mzML"
+            raw.write_text("raw", encoding="ascii")
+            blank = root / "blank_01.mzML"
+            blank.write_text("raw", encoding="ascii")
+            console = root / "MSDIALCUI.exe"
+            console.write_bytes(b"stub")
+            template = root / "method.txt"
+            template.write_text("Ion mode: Negative\n", encoding="ascii")
+            files = expand_paths([str(raw), str(blank)])
+            for item in files:
+                if item["file_name"].startswith("blank"):
+                    item["file_type"] = "Blank"
+            state = {
+                "project_type": "lcms",
+                "files": files,
+                "console_path": str(console),
+                "template_path": str(template),
+                "output_root": str(root / "output"),
+                "target_omics": "Metabolomics",
+                "together_with_alignment": True,
+                "execute_automatic_rt_correction": True,
+                "automatic_rt_correction_minimum_anchors": 3,
+                "automatic_rt_correction_maximum_anchors": 6,
+                "automatic_rt_correction_rt_bin_width": 0.5,
+                "automatic_rt_correction_match_rt_tolerance": 0.5,
+                "automatic_rt_correction_outlier_mad_threshold": 3.5,
+                "automatic_rt_correction_minimum_sample_coverage": 0.5,
+                "automatic_rt_correction_intensity_quantile": 0.75,
+                "automatic_rt_correction_maximum_peak_width_quantile": 0.5,
+                "automatic_rt_correction_reference_centrality_weight": 0.35,
+                "automatic_rt_correction_interpolate_blanks_by_analytical_order": True,
+                "repository_run_manifest": str(root / "run-manifest.json"),
+            }
+
+            # "embedded" is a sequence number read out of the file names, with every Blank and
+            # QC placed after the samples: as much an inference as the listing.
+            for source in ("listing", "embedded", ""):
+                with self.subTest(source=source):
+                    state["sample_table_proposal"] = {
+                        "analytical_order": {"derived_from": source}
+                    }
+
+                    issues = validate_workflow(state)
+
+                    self.assertTrue(
+                        any(
+                            item["level"] == "warning"
+                            and "not read from the instrument" in item["message"]
+                            for item in issues
+                        ),
+                        issues,
+                    )
+
+            # With no Blank there is nothing to interpolate, so nothing to warn about.
+            state["files"] = [item for item in files if item["file_type"] != "Blank"]
+            state["sample_table_proposal"] = {"analytical_order": {"derived_from": "listing"}}
+            issues = validate_workflow(state)
+            self.assertFalse(
+                any("not read from the instrument" in item["message"] for item in issues),
+                issues,
+            )
+
+    def test_automatic_and_user_defined_rt_correction_are_mutually_exclusive(self) -> None:
+        issues = validate_workflow(
+            {
+                "project_type": "lcms",
+                "execute_rt_correction": True,
+                "execute_automatic_rt_correction": True,
+                "rt_correction_anchor_path": "missing.txt",
+                "automatic_rt_correction_minimum_anchors": 3,
+                "automatic_rt_correction_maximum_anchors": 6,
+                "automatic_rt_correction_rt_bin_width": 0.5,
+                "automatic_rt_correction_match_rt_tolerance": 0.5,
+                "automatic_rt_correction_outlier_mad_threshold": 3.5,
+                "automatic_rt_correction_minimum_sample_coverage": 0.5,
+                "automatic_rt_correction_intensity_quantile": 0.75,
+                "automatic_rt_correction_maximum_peak_width_quantile": 0.5,
+                "automatic_rt_correction_reference_centrality_weight": 0.35,
+                "files": [],
+                "console_path": "",
+                "template_path": "",
+                "output_root": "",
+                "target_omics": "Metabolomics",
+            }
+        )
+
+        self.assertTrue(
+            any("cannot be enabled together" in issue["message"] for issue in issues)
+        )
+
     def test_expand_paths_and_prepare_run(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -501,9 +797,9 @@ class WorkflowTests(unittest.TestCase):
             manifest = json.loads(
                 Path(result["manifest"]).read_text(encoding="utf-8")
             )
-            self.assertEqual("0.4.7", settings["msdial_interactive_version"])
+            self.assertEqual(__version__, settings["msdial_interactive_version"])
             self.assertEqual("not recorded", settings["msdial_console_version"])
-            self.assertEqual("0.4.7", manifest["msdial_interactive_version"])
+            self.assertEqual(__version__, manifest["msdial_interactive_version"])
             self.assertEqual("21904324", settings["library_provenance"][0]["record_id"])
             self.assertEqual("CC BY 4.0", settings["library_provenance"][0]["license"])
 
@@ -735,7 +1031,9 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(Path(handoff["handoff_file"]).is_file())
             status = summarize_jobs({"job1": {**job, "datamining_handoff": handoff}})
             self.assertEqual("job1", status["latest_completed_job"]["id"])
-            self.assertEqual("0.4", status["agent_api_version"])
+            self.assertEqual("0.5", status["agent_api_version"])
+            self.assertEqual(__version__, status["app_version"])
+            self.assertIn("split_repository_unit_by_acquisition", status["capabilities"])
             self.assertIn("create_datamining_handoff", status["capabilities"])
             self.assertIn("inspect_repository_sample_metadata", status["capabilities"])
             self.assertIn("prepare_repository_reanalysis_without_ui", status["capabilities"])
@@ -1354,6 +1652,555 @@ class WorkflowTests(unittest.TestCase):
                 Path(tuning["run_directory"]),
             )
             self.assertNotIn("-p", tuning["command"])
+
+    def test_tuning_runs_with_alignment_features_switched_off(self) -> None:
+        # The diagnostic runs one file without alignment. With automatic RT correction or light
+        # mode still on from the production state it was refused as "requires Together with
+        # alignment", so a unit that had enabled either could not be tuned.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "sample.mzML"
+            raw.write_text("raw", encoding="ascii")
+            console = root / "MSDIALCUI.exe"
+            console.write_bytes("execute automatic rt correction for alignment".encode("utf-16-le"))
+            template = root / "method.txt"
+            template.write_text(
+                "Ion mode: Negative\n"
+                "Execute automatic RT correction for alignment: True\n"
+                "Automatic RT correction minimum anchors: 3\n"
+                "Alignment light mode: True\n",
+                encoding="ascii",
+            )
+            state = {
+                "files": expand_paths([str(raw)]),
+                "project_type": "lcms",
+                "console_path": str(console),
+                "template_path": str(template),
+                "output_root": str(root / "output"),
+                "ion_mode": "Negative",
+                "target_omics": "Metabolomics",
+                "selected_adducts": ["[M-H]-"],
+                "together_with_alignment": True,
+                "alignment_light_mode": True,
+                "execute_automatic_rt_correction": True,
+            }
+
+            tuning = prepare_tuning_run(state, str(raw.resolve()), root / "diagnostic")
+            method = Path(tuning["method_file"]).read_text(encoding="utf-8").lower()
+
+        self.assertNotIn("automatic rt correction", method)
+        self.assertNotIn("alignment light mode: true", method)
+        self.assertTrue(state["execute_automatic_rt_correction"])  # the production state is untouched
+
+    def test_automatic_rt_validation_uses_the_defaults_the_writer_writes(self) -> None:
+        # An absent tolerance defaulted to 0 in the validator, which refused it, while the writer
+        # would have written 0.5 for the same state.
+        issues = validate_workflow(
+            {
+                "project_type": "lcms",
+                "together_with_alignment": True,
+                "execute_automatic_rt_correction": True,
+            }
+        )
+
+        messages = [item["message"] for item in issues if item["level"] == "error"]
+        self.assertFalse(
+            [message for message in messages if message.startswith("Automatic RT correction")],
+            messages,
+        )
+
+    def test_automatic_rt_whole_number_settings_are_refused_not_truncated(self) -> None:
+        # int() turned 2.9 into 2 for the check while the method file carried 2.9, which the
+        # Console refuses and replaces with its default of 3.
+        base = {
+            "project_type": "lcms",
+            "together_with_alignment": True,
+            "execute_automatic_rt_correction": True,
+        }
+        cases = {
+            "automatic_rt_correction_minimum_anchors": (2.9, "minimum anchors must be a whole number"),
+            "automatic_rt_correction_maximum_anchors": (6.5, "maximum anchors must be a whole number"),
+            "automatic_rt_correction_reference_file_id": (-2, "reference file ID must be -1"),
+        }
+        for key, (value, message) in cases.items():
+            with self.subTest(key=key):
+                issues = validate_workflow({**base, key: value})
+                self.assertTrue(
+                    any(item["level"] == "error" and message in item["message"] for item in issues),
+                    issues,
+                )
+
+    def test_automatic_rt_outlier_mad_threshold_zero_means_no_rejection(self) -> None:
+        # The Console skips MAD rejection when the threshold is 0; only a negative value is wrong.
+        base = {
+            "project_type": "lcms",
+            "together_with_alignment": True,
+            "execute_automatic_rt_correction": True,
+        }
+        zero = validate_workflow({**base, "automatic_rt_correction_outlier_mad_threshold": 0})
+        negative = validate_workflow({**base, "automatic_rt_correction_outlier_mad_threshold": -1})
+
+        self.assertFalse(any("outlier MAD" in item["message"] for item in zero), zero)
+        self.assertTrue(any("outlier MAD" in item["message"] for item in negative), negative)
+
+    @patch("msdial_app.workflow.subprocess.run")
+    def test_console_capability_reads_the_net8_assembly_beside_its_launcher(self, run: Mock) -> None:
+        # A net8 MSDIALCUI.exe, or MSDIALCUI on Linux and macOS, is an apphost; the strings are
+        # in MSDIALCUI.dll next to it, and a launcher has a runtimeconfig.json.
+        run.return_value = Mock(returncode=1, stdout="", stderr="Unknown command")
+        for name in ("MSDIALCUI.exe", "MSDIALCUI"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                console = Path(temporary) / name
+                console.write_bytes(b"apphost")
+                (Path(temporary) / "MSDIALCUI.runtimeconfig.json").write_text("{}", encoding="ascii")
+                (Path(temporary) / "MSDIALCUI.dll").write_bytes(
+                    "Automatic alignment RT correction audit:".encode("utf-16-le")
+                )
+
+                result = console_capabilities(str(console))
+
+                self.assertIn("automatic_alignment_rt_correction", result["capabilities"])
+
+    @staticmethod
+    def _managed_pe() -> bytes:
+        """A minimal PE32 image whose CLI header directory is present, as a net48 exe has."""
+        import struct
+
+        image = bytearray(0x200)
+        image[0:2] = b"MZ"
+        struct.pack_into("<I", image, 0x3C, 0x80)
+        image[0x80:0x84] = b"PE\0\0"
+        optional = 0x80 + 24
+        struct.pack_into("<H", image, optional, 0x10B)
+        struct.pack_into("<II", image, optional + 96 + 14 * 8, 0x2008, 0x48)
+        return bytes(image)
+
+    @patch("msdial_app.workflow.subprocess.run")
+    def test_a_net48_exe_over_a_net8_folder_is_read_as_itself(self, run: Mock) -> None:
+        # Unpacking net48 over net8 leaves the net8 dll and its runtimeconfig.json behind; the
+        # exe's own CLI header says it is the assembly, so the dll is not read.
+        run.return_value = Mock(returncode=1, stdout="", stderr="Unknown command")
+        with tempfile.TemporaryDirectory() as temporary:
+            console = Path(temporary) / "MSDIALCUI.exe"
+            console.write_bytes(self._managed_pe())
+            (Path(temporary) / "MSDIALCUI.runtimeconfig.json").write_text("{}", encoding="ascii")
+            (Path(temporary) / "MSDIALCUI.dll").write_bytes(
+                "Automatic alignment RT correction audit:".encode("utf-16-le")
+            )
+
+            result = console_capabilities(str(console))
+
+        self.assertNotIn("automatic_alignment_rt_correction", result["capabilities"])
+
+    @patch("msdial_app.workflow.subprocess.run")
+    def test_a_stale_dll_does_not_lend_a_net48_console_features(self, run: Mock) -> None:
+        # Unpacking a net48 archive over a net8 one replaces MSDIALCUI.exe and leaves the net8
+        # dll behind. The net48 exe is the assembly itself and has no runtimeconfig.json.
+        run.return_value = Mock(returncode=1, stdout="", stderr="Unknown command")
+        with tempfile.TemporaryDirectory() as temporary:
+            console = Path(temporary) / "MSDIALCUI.exe"
+            console.write_bytes(b"net48 assembly without the markers")
+            (Path(temporary) / "MSDIALCUI.dll").write_bytes(
+                "Automatic alignment RT correction audit:".encode("utf-16-le")
+                + "LC-MS quality-assurance matrix:".encode("utf-16-le")
+            )
+
+            result = console_capabilities(str(console))
+
+        self.assertNotIn("automatic_alignment_rt_correction", result["capabilities"])
+        self.assertNotIn("lcms_alignment_qa_matrix", result["capabilities"])
+
+    def test_reproduction_reads_its_own_method_file(self) -> None:
+        # The Console writes <method>.keys.json beside the method file, so a reproduction that
+        # read the original method file overwrote the run's key record. It reads a byte copy
+        # under another name in the same directory, so relative paths still resolve, and a CSV
+        # copy in reproduced-results, so the Console's project folder leaves the run too.
+        from msdial_app.workflow import _powershell_script, _shell_script
+
+        for store_project in (True, False):
+            with self.subTest(store_project=store_project):
+                powershell = _powershell_script(r"C:\msdial\MSDIALCUI.exe", "lcms", store_project)
+                shell = _shell_script("/opt/msdial/MSDIALCUI.dll", "lcms", store_project)
+
+                self.assertIn("'method.reproduce.txt'", powershell)
+                self.assertIn("'-i', $Inputs, '-o', $Output, '-m', $Method", powershell)
+                self.assertIn("-ErrorAction Stop", powershell)
+                self.assertIn("if ($null -eq $LASTEXITCODE) { exit 1 }", powershell)
+                self.assertIn('METHOD="$HERE/method.reproduce.txt"', shell)
+                self.assertIn('-i "$INPUTS" -o "$OUTPUT" -m "$METHOD"', shell)
+                self.assertNotIn(",,}", shell)  # bash 4 only
+                # Pop-Location in a finally, so a failed start does not strand the caller.
+                self.assertIn("} finally {\n  Pop-Location\n}", powershell)
+                self.assertEqual(store_project, "'-p'" in powershell)
+                self.assertEqual(store_project, '"$METHOD" -p' in shell)
+
+    @staticmethod
+    def _reproduction_bundle(root: Path) -> bytes:
+        method = "\ufeffIon mode: Negative\r\nMsp file path: D:\\\u30e9\u30a4\u30d6\u30e9\u30ea\\a.msp\r\n".encode("utf-8")
+        (root / "method.txt").write_bytes(method)
+        (root / "analysis_files.csv").write_text("file_path\nD:\\raw\\a.mzML\n", encoding="utf-8")
+        return method
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required")
+    def test_shell_reproduction_runs_from_copies_and_leaves_the_run_alone(self) -> None:
+        from msdial_app.workflow import _shell_script
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            method = self._reproduction_bundle(root)
+            script = root / "run-msdial.sh"
+            script.write_text(_shell_script("echo", "lcms"), encoding="utf-8", newline="\n")
+
+            # The resolved path, not "bash": Windows looks in System32 before PATH, where
+            # bash.exe is the WSL launcher.
+            completed = subprocess.run(
+                [shutil.which("bash"), script.name],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(method, (root / "method.reproduce.txt").read_bytes())
+            self.assertEqual(method, (root / "method.txt").read_bytes())
+            self.assertTrue((root / "reproduced-results" / "analysis_files.csv").is_file())
+            self.assertIn("method.reproduce.txt", completed.stdout)
+
+            # A Console named relative to the caller's directory, even by a bare name, is found
+            # there, not in the bundle the script changes into.
+            caller = root / "caller"
+            caller.mkdir()
+            fake = caller / "fake-console"
+            fake.write_text('#!/bin/sh\necho FAKE-CONSOLE "$@"\n', encoding="ascii", newline="\n")
+            fake.chmod(0o755)
+            bare = subprocess.run(
+                [shutil.which("bash"), str(script), "fake-console"],
+                cwd=caller,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(0, bare.returncode, bare.stderr)
+            self.assertIn("FAKE-CONSOLE", bare.stdout)
+
+            # A directory named like the Console is not a Console; the name is looked up on PATH.
+            tools = root / "tools"
+            tools.mkdir()
+            on_path = tools / "path-console"
+            on_path.write_text('#!/bin/sh\necho PATH-CONSOLE "$@"\n', encoding="ascii", newline="\n")
+            on_path.chmod(0o755)
+            (caller / "path-console").mkdir()
+            tools_posix = subprocess.run(
+                [shutil.which("bash"), "-c", 'cd "$1" && pwd', "_", str(tools)],
+                capture_output=True, text=True, timeout=60,
+            ).stdout.strip()
+            via_path = subprocess.run(
+                [shutil.which("bash"), "-c",
+                 f'PATH="{tools_posix}:$PATH" "$0" "$1" path-console', "bash", str(script)],
+                cwd=caller, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(0, via_path.returncode, via_path.stderr)
+            self.assertIn("PATH-CONSOLE", via_path.stdout)
+
+            # A relative path missing from the caller's directory fails; it never runs a file
+            # of that name in the bundle the script changes into.
+            (root / "sub").mkdir()
+            decoy = root / "sub" / "decoy-console"
+            decoy.write_text('#!/bin/sh\necho BUNDLE-DECOY\n', encoding="ascii", newline="\n")
+            decoy.chmod(0o755)
+            missing = subprocess.run(
+                [shutil.which("bash"), str(script), "sub/decoy-console"],
+                cwd=caller, capture_output=True, text=True, timeout=60,
+            )
+            self.assertNotEqual(0, missing.returncode)
+            self.assertNotIn("BUNDLE-DECOY", missing.stdout)
+
+            # A protected run record gives read-only copies; a second run must still start.
+            (root / "method.reproduce.txt").unlink()
+            (root / "reproduced-results" / "analysis_files.csv").unlink()
+            for name in ("method.txt", "analysis_files.csv"):
+                (root / name).chmod(0o444)
+            try:
+                for attempt in (1, 2):
+                    again = subprocess.run(
+                        [shutil.which("bash"), script.name],
+                        cwd=root,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                    )
+                    self.assertEqual(0, again.returncode, (attempt, again.stderr))
+            finally:
+                for path in (root / "method.txt", root / "analysis_files.csv",
+                             root / "method.reproduce.txt",
+                             root / "reproduced-results" / "analysis_files.csv"):
+                    if path.exists():
+                        path.chmod(0o644)
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("powershell"), "Windows PowerShell is required")
+    def test_powershell_reproduction_copies_bytes_and_fails_when_nothing_runs(self) -> None:
+        from msdial_app.workflow import _powershell_script
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            method = self._reproduction_bundle(root)
+            fake = root / "fake.cmd"
+            fake.write_text("@echo CWD=%CD% %*\r\n", encoding="ascii")
+            script = root / "run-msdial.ps1"
+            script.write_text(_powershell_script(str(fake), "lcms"), encoding="utf-8-sig")
+
+            def run(*extra: str) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [shutil.which("powershell"), "-NoProfile", "-ExecutionPolicy", "Bypass",
+                     "-File", str(script), *extra],
+                    capture_output=True, text=True, timeout=120,
+                )
+
+            completed = run()
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(method, (root / "method.reproduce.txt").read_bytes())
+            self.assertEqual(method, (root / "method.txt").read_bytes())
+            self.assertIn("method.reproduce.txt", completed.stdout)
+            # The Console runs from the bundle, so a relative path in method.txt means one thing.
+            self.assertIn(f"CWD={root.resolve()}".casefold(), completed.stdout.casefold())
+
+            # A Console path given relative to the caller's directory is resolved before the move.
+            elsewhere = root / "elsewhere"
+            elsewhere.mkdir()
+            relative = subprocess.run(
+                [shutil.which("powershell"), "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(script), os.path.join("..", "fake.cmd")],
+                cwd=elsewhere, capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(0, relative.returncode, relative.stderr)
+            self.assertIn("method.reproduce.txt", relative.stdout)
+
+            # A relative path missing from the caller's directory is not found in the bundle.
+            (root / "sub").mkdir()
+            (root / "sub" / "decoy.cmd").write_text("@echo BUNDLE-DECOY\r\n", encoding="ascii")
+            decoy = subprocess.run(
+                [shutil.which("powershell"), "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(script), os.path.join("sub", "decoy.cmd")],
+                cwd=elsewhere, capture_output=True, text=True, timeout=120,
+            )
+            self.assertNotEqual(0, decoy.returncode)
+            self.assertNotIn("BUNDLE-DECOY", decoy.stdout)
+
+            # A Console that cannot be started must not look like a reproduction that ran.
+            missing = run(str(root / "no-such-console.exe"))
+            self.assertNotEqual(0, missing.returncode)
+
+            # Nor may a failed copy leave an older method file to run on.
+            (root / "method.txt").unlink()
+            no_method = run()
+            self.assertNotEqual(0, no_method.returncode)
+            self.assertNotIn("method.reproduce.txt", no_method.stdout)
+
+    def test_bundle_scripts_carry_the_runs_project_flag_and_a_bom(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "sample.mzML"
+            raw.write_text("raw", encoding="ascii")
+            console = root / "MSDIALCUI.exe"
+            console.write_bytes(b"stub")
+            template = root / "method.txt"
+            template.write_text("Ion mode: Negative\n", encoding="ascii")
+            for store in (True, False):
+                with self.subTest(project_store=store):
+                    prepared = prepare_run(
+                        {
+                            "project_type": "lcms",
+                            "files": expand_paths([str(raw)]),
+                            "console_path": str(console),
+                            "template_path": str(template),
+                            "output_root": str(root / f"output-{store}"),
+                            "ion_mode": "Negative",
+                            "target_omics": "Metabolomics",
+                            "project_store": store,
+                        }
+                    )
+                    run_directory = Path(prepared["run_directory"])
+                    powershell = (run_directory / "run-msdial.ps1").read_bytes()
+                    shell = (run_directory / "run-msdial.sh").read_text(encoding="utf-8")
+
+                    self.assertTrue(powershell.startswith(b"\xef\xbb\xbf"))
+                    self.assertEqual("-p" in prepared["command"], b"'-p'" in powershell)
+                    self.assertEqual("-p" in prepared["command"], '"$METHOD" -p' in shell)
+
+    def test_automatic_rt_values_the_console_would_discard_are_refused(self) -> None:
+        # Each of these was accepted and written to method.txt, where the Console refused it
+        # and used its default, or accepted it and then failed after all peak picking.
+        base = {
+            "project_type": "lcms",
+            "together_with_alignment": True,
+            "execute_automatic_rt_correction": True,
+        }
+        cases = {
+            "automatic_rt_correction_reference_file_id": [3_000_000_000],
+            "automatic_rt_correction_maximum_anchors": [2**31, 1e20],
+            "automatic_rt_correction_match_rt_tolerance": ["nan", float("inf"), "abc", None, ""],
+            "automatic_rt_correction_rt_bin_width": [float("nan")],
+            "automatic_rt_correction_outlier_mad_threshold": ["nan"],
+            "automatic_rt_correction_minimum_signal_to_noise": [-1, "inf"],
+            "automatic_rt_correction_minimum_gaussian_similarity": [5, False],
+            "automatic_rt_correction_minimum_ideal_slope": [1.5],
+            # The method file would say True, 1_000 or a full-width digit; the Console reads none.
+            "automatic_rt_correction_minimum_sample_coverage": [True],
+            "automatic_rt_correction_reference_file_id": [True, "\uff11"],
+            "automatic_rt_correction_maximum_anchors": ["1_000"],
+            # Above 0 as a double, 0 as the float the Console stores.
+            "automatic_rt_correction_match_rt_tolerance": [1e-46],
+        }
+        for key, values in cases.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    issues = validate_workflow({**base, key: value})
+                    self.assertTrue(
+                        any(
+                            item["level"] == "error" and item["message"].startswith("Automatic RT correction")
+                            for item in issues
+                        ),
+                        issues,
+                    )
+
+    def test_automatic_rt_method_lines_carry_the_validated_value(self) -> None:
+        # Written as given, "\n5" split the method line so the Console read a blank key, and
+        # bool("false") wrote True. The writer writes the parsed value.
+        with tempfile.TemporaryDirectory() as temporary:
+            template = Path(temporary) / "template.txt"
+            template.write_text("Ion mode: Negative\n", encoding="ascii")
+            method = Path(temporary) / "method.txt"
+            _write_method(
+                method,
+                {
+                    "project_type": "lcms",
+                    "template_path": str(template),
+                    "target_omics": "Metabolomics",
+                    "execute_automatic_rt_correction": True,
+                    "automatic_rt_correction_minimum_anchors": "\n5",
+                    "automatic_rt_correction_maximum_anchors": "7.",
+                    "automatic_rt_correction_rt_bin_width": " 0.2\r",
+                    "automatic_rt_correction_interpolate_blanks_by_analytical_order": "false",
+                },
+            )
+            lines = method.read_text(encoding="utf-8").splitlines()
+
+        self.assertIn("Automatic RT correction minimum anchors: 5", lines)
+        self.assertIn("Automatic RT correction maximum anchors: 7", lines)
+        self.assertIn("Automatic RT correction RT bin width: 0.2", lines)
+        self.assertIn("Automatic RT correction interpolate blanks by analytical order: False", lines)
+        self.assertFalse([line for line in lines if line.strip() in {"5", "0.2"}], lines)
+
+    def test_automatic_rt_needs_a_positive_alignment_ms1_tolerance(self) -> None:
+        # The correction matches anchors within this tolerance and refuses 0 after peak picking.
+        base = {
+            "project_type": "lcms",
+            "together_with_alignment": True,
+            "execute_automatic_rt_correction": True,
+        }
+        for value, refused in ((0, True), (-0.01, True), ("", True), (True, True), (0.015, False)):
+            with self.subTest(value=value):
+                issues = validate_workflow({**base, "alignment_ms1_tolerance": value})
+                found = any("alignment MS1 tolerance" in item["message"] for item in issues)
+                self.assertEqual(refused, found, issues)
+        # Without the feature the tolerance is not this check's business.
+        issues = validate_workflow({"project_type": "lcms", "alignment_ms1_tolerance": 0})
+        self.assertFalse(any("alignment MS1 tolerance" in item["message"] for item in issues))
+
+    def test_automatic_rt_reference_file_must_be_a_non_blank_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            names = ["blank_01.mzML", "sample_01.mzML", "sample_02.mzML"]
+            for name in names:
+                (root / name).write_text("raw", encoding="ascii")
+            files = expand_paths([str(root / name) for name in names])
+            files[0]["file_type"] = "Blank"
+            base = {
+                "project_type": "lcms",
+                "together_with_alignment": True,
+                "execute_automatic_rt_correction": True,
+                "files": files,
+            }
+            expected = {0: "is a Blank", 3: "is not a file", 1: None, -1: None}
+            for reference, message in expected.items():
+                with self.subTest(reference=reference):
+                    issues = validate_workflow(
+                        {**base, "automatic_rt_correction_reference_file_id": reference}
+                    )
+                    found = [item["message"] for item in issues if "reference file ID" in item["message"]]
+                    if message is None:
+                        self.assertEqual([], found)
+                    else:
+                        self.assertTrue(any(message in text for text in found), found)
+
+    def test_template_whole_number_settings_are_not_truncated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            template = Path(temporary) / "method.txt"
+            template.write_text(
+                "Ion mode: Positive\n"
+                "Automatic RT correction minimum anchors: 2.9\n"
+                "Automatic RT correction maximum anchors: nan\n",
+                encoding="ascii",
+            )
+
+            loaded = load_parameter_template(template)["workflow"]
+
+        self.assertEqual(2.9, loaded["automatic_rt_correction_minimum_anchors"])
+        issues = validate_workflow(
+            {
+                **loaded,
+                "project_type": "lcms",
+                "together_with_alignment": True,
+                "execute_automatic_rt_correction": True,
+            }
+        )
+        messages = [item["message"] for item in issues if item["level"] == "error"]
+        self.assertTrue(any("minimum anchors must be a whole number" in text for text in messages), messages)
+        self.assertTrue(any("maximum anchors must be a finite number" in text for text in messages), messages)
+
+    def test_a_numeric_blank_file_type_counts_as_a_blank(self) -> None:
+        # The Console parses the file type as an enum and accepts its number; Blank is 3.
+        from msdial_app.workflow import is_blank_file_type
+
+        for value in ("Blank", " blank ", "3", "+03", 3):
+            with self.subTest(value=value):
+                self.assertTrue(is_blank_file_type(value))
+        for value in ("Sample", "QC", "Solvent Blank", "0", "", None, "0_3", "\uff13"):
+            with self.subTest(value=value):
+                self.assertFalse(is_blank_file_type(value))
+
+    def test_automatic_rt_defaults_are_one_table(self) -> None:
+        from msdial_app.workflow import (
+            AUTOMATIC_RT_CORRECTION_DEFAULTS,
+            AUTOMATIC_RT_CORRECTION_METHOD_KEYS,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            template = Path(temporary) / "method.txt"
+            template.write_text("Ion mode: Positive\n", encoding="ascii")
+            loaded = load_parameter_template(template)["workflow"]
+            method = Path(temporary) / "written.txt"
+            _write_method(
+                method,
+                {
+                    "project_type": "lcms",
+                    "template_path": str(template),
+                    "target_omics": "Metabolomics",
+                    "execute_automatic_rt_correction": True,
+                },
+            )
+            written = {
+                line.split(":", 1)[0].strip().casefold(): line.split(":", 1)[1].strip()
+                for line in method.read_text(encoding="utf-8").splitlines()
+                if ":" in line
+            }
+
+        for key, default in AUTOMATIC_RT_CORRECTION_DEFAULTS.items():
+            with self.subTest(key=key):
+                self.assertEqual(default, loaded[key])
+                label = key.replace("automatic_rt_correction_", "automatic rt correction ").replace("_", " ")
+                self.assertIn(label, AUTOMATIC_RT_CORRECTION_METHOD_KEYS)
+                self.assertEqual(str(default).casefold(), written[label].casefold())
 
     def test_reads_adduct_resources(self) -> None:
         resource = (
