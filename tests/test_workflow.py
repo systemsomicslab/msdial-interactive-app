@@ -1829,6 +1829,8 @@ class WorkflowTests(unittest.TestCase):
                 self.assertIn('METHOD="$HERE/method.reproduce.txt"', shell)
                 self.assertIn('-i "$INPUTS" -o "$OUTPUT" -m "$METHOD"', shell)
                 self.assertNotIn(",,}", shell)  # bash 4 only
+                # Pop-Location in a finally, so a failed start does not strand the caller.
+                self.assertIn("} finally {\n  Pop-Location\n}", powershell)
                 self.assertEqual(store_project, "'-p'" in powershell)
                 self.assertEqual(store_project, '"$METHOD" -p' in shell)
 
@@ -1863,6 +1865,23 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(method, (root / "method.txt").read_bytes())
             self.assertTrue((root / "reproduced-results" / "analysis_files.csv").is_file())
             self.assertIn("method.reproduce.txt", completed.stdout)
+
+            # A Console named relative to the caller's directory, even by a bare name, is found
+            # there, not in the bundle the script changes into.
+            caller = root / "caller"
+            caller.mkdir()
+            fake = caller / "fake-console"
+            fake.write_text('#!/bin/sh\necho FAKE-CONSOLE "$@"\n', encoding="ascii", newline="\n")
+            fake.chmod(0o755)
+            bare = subprocess.run(
+                [shutil.which("bash"), str(script), "fake-console"],
+                cwd=caller,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(0, bare.returncode, bare.stderr)
+            self.assertIn("FAKE-CONSOLE", bare.stdout)
 
             # A protected run record gives read-only copies; a second run must still start.
             (root / "method.reproduce.txt").unlink()
@@ -1985,7 +2004,9 @@ class WorkflowTests(unittest.TestCase):
             # The method file would say True, 1_000 or a full-width digit; the Console reads none.
             "automatic_rt_correction_minimum_sample_coverage": [True],
             "automatic_rt_correction_reference_file_id": [True, "\uff11"],
-            "automatic_rt_correction_maximum_anchors": ["1_000"],
+            "automatic_rt_correction_maximum_anchors": ["1_000", "\n5"],
+            # A CR or LF splits the method line, and the Console reads the key as blank.
+            "automatic_rt_correction_rt_bin_width": ["\r0.2"],
             # Above 0 as a double, 0 as the float the Console stores.
             "automatic_rt_correction_match_rt_tolerance": [1e-46],
         }

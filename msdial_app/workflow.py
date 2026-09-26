@@ -2364,7 +2364,7 @@ def _powershell_script(
         "  Copy-Item -LiteralPath (Join-Path $Here 'method.txt') -Destination $Method -Force -ErrorAction Stop\n"
         "  Copy-Item -LiteralPath (Join-Path $Here 'analysis_files.csv') -Destination $Inputs -Force -ErrorAction Stop\n"
         "} catch {\n"
-        "  Write-Error \"Could not prepare the reproduction inputs: $_\"\n"
+        "  Write-Error \"Could not prepare the reproduction inputs: $_\" -ErrorAction Continue\n"
         "  exit 1\n"
         "}\n"
         f"$Arguments = @('{analysis_type}', '-i', $Inputs, '-o', $Output, '-m', $Method{project})\n"
@@ -2373,19 +2373,23 @@ def _powershell_script(
         # relative path mean the same in both.
         # A Console path given relative to the caller's directory must survive the move.
         "if (Test-Path -LiteralPath $Console) { $Console = (Resolve-Path -LiteralPath $Console).ProviderPath }\n"
+        # finally, so the caller's session is back where it was even when the start fails
+        # under $ErrorActionPreference = 'Stop'.
         "Push-Location -LiteralPath $Here\n"
         "try {\n"
-        "  if ($Console.ToLowerInvariant().EndsWith('.dll')) {\n"
-        "    & dotnet $Console @Arguments\n"
-        "  } else {\n"
-        "    & $Console @Arguments\n"
+        "  try {\n"
+        "    if ($Console.ToLowerInvariant().EndsWith('.dll')) {\n"
+        "      & dotnet $Console @Arguments\n"
+        "    } else {\n"
+        "      & $Console @Arguments\n"
+        "    }\n"
+        "  } catch {\n"
+        "    Write-Error \"Could not start the MS-DIAL Console: $_\" -ErrorAction Continue\n"
+        "    exit 1\n"
         "  }\n"
-        "} catch {\n"
-        "  Write-Error \"Could not start the MS-DIAL Console: $_\"\n"
+        "} finally {\n"
         "  Pop-Location\n"
-        "  exit 1\n"
         "}\n"
-        "Pop-Location\n"
         # A command that never started leaves $LASTEXITCODE unset, and `exit $null` is 0.
         "if ($null -eq $LASTEXITCODE) { exit 1 }\n"
         "exit $LASTEXITCODE\n"
@@ -2409,8 +2413,17 @@ def _shell_script(default_console: str, analysis_type: str, store_project: bool 
         'cp -f "$HERE/method.txt" "$METHOD"\n'
         'cp -f "$HERE/analysis_files.csv" "$INPUTS"\n'
         # See _powershell_script: run from the bundle so relative paths mean one thing, after
-        # making a Console path given relative to the caller's directory absolute.
-        'case "$CONSOLE" in */*) CONSOLE="$(cd "$(dirname "$CONSOLE")" && pwd)/$(basename "$CONSOLE")" ;; esac\n'
+        # making a Console path that exists relative to the caller's directory absolute. An
+        # absolute path, Windows or POSIX, is left as given, and so is a name that does not
+        # exist here, which is then looked up on PATH as before. Under MSYS cygpath gives the
+        # Windows form a native dotnet needs.
+        'if [ -e "$CONSOLE" ]; then\n'
+        '  case "$CONSOLE" in\n'
+        '    /*|[A-Za-z]:[\\\\/]*|\\\\\\\\*) ;;\n'
+        '    *) if command -v cygpath >/dev/null 2>&1; then CONSOLE="$(cygpath -am "$CONSOLE")"; '
+        'else CONSOLE="$PWD/$CONSOLE"; fi ;;\n'
+        "  esac\n"
+        "fi\n"
         'cd "$HERE"\n'
         # A case pattern rather than ${CONSOLE,,}, which needs bash 4 (macOS ships 3.2).
         'case "$CONSOLE" in\n'
@@ -3037,8 +3050,9 @@ AUTOMATIC_RT_CORRECTION_LABELS = {
 _INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
 # What int/double.TryParse with the invariant culture accepts. Python's float() also takes
 # "1_000", full-width digits, "nan" and "infinity", which the Console refuses and replaces
-# with its default.
-_INVARIANT_NUMBER = re.compile(r"\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*", re.ASCII)
+# with its default. Only spaces and tabs may surround it: a CR or LF would split the method
+# line, and the Console would read the key as blank.
+_INVARIANT_NUMBER = re.compile(r"[ \t]*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?[ \t]*", re.ASCII)
 
 
 def _as_float32(value: float) -> float:

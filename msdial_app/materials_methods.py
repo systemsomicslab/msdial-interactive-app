@@ -499,14 +499,15 @@ def _automatic_rt_correction_evidence(
     if not evidence["method_key_applied"]:
         evidence["reason"] = "method_key_not_applied"
         return evidence
-    # The Console records a value it could not read as "<key>: <value>" and runs with its
-    # default, so the settings in Table S1 would not be the ones the correction used.
+    # The Console records a value it could not read as "<key>: <value>", and a key with no
+    # value under blank, and runs with its default for both, so the settings in Table S1
+    # would not be the ones the correction used.
     from .workflow import AUTOMATIC_RT_CORRECTION_METHOD_KEYS
 
     discarded = sorted(
         {
             str(item).split(":", 1)[0].strip().casefold()
-            for item in method_keys.get("unusable") or []
+            for item in [*(method_keys.get("unusable") or []), *(method_keys.get("blank") or [])]
         }
         & AUTOMATIC_RT_CORRECTION_METHOD_KEYS
     )

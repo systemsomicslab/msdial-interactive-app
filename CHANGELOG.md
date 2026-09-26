@@ -62,7 +62,8 @@ Agent API 0.5 rejects a 0.4 backend as incompatible.
   method-key record must carry the hash of the run's `method.txt`, both TSVs must
   be no older than that record, and at least one file other than the reference
   must have been corrected from its own detected anchors; a correction setting
-  the Console recorded as unusable, and so replaced by its default, is not proof.
+  the Console recorded as unusable or blank, and so replaced by its default, is
+  not proof.
   The Methods text names the reference file, which defines the axis and keeps its
   measured RTs, and says of the other files how many were corrected from their
   own anchors, how many Blanks took an interpolated or nearest-sample model and
