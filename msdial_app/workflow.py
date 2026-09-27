@@ -3095,19 +3095,33 @@ def _is_managed_pe(binary: bytes) -> bool:
     return rva != 0 and size != 0
 
 
+_CONSOLE_FILE_TYPES = ("Sample", "Standard", "QC", "Blank")
+
+
+def console_file_type(value: Any) -> str:
+    """The analysis-file type as the Console reads it: Sample, Standard, QC or Blank.
+
+    The Console parses it with a case-insensitive enum parse, which also accepts the enum's
+    number (Sample 0, Standard 1, QC 2, Blank 3), and falls back to Sample.
+    """
+    text = str(value if value is not None else "").strip()
+    for name in _CONSOLE_FILE_TYPES:
+        if text.casefold() == name.casefold():
+            return name
+    # Enum.TryParse takes an optional sign and ASCII digits; Python's int() also takes "0_3".
+    digits = text[1:] if text[:1] in {"+", "-"} else text
+    if digits and digits.isascii() and digits.isdigit() and 0 <= int(text) < len(_CONSOLE_FILE_TYPES):
+        return _CONSOLE_FILE_TYPES[int(text)]
+    return "Sample"
+
+
 def is_blank_file_type(value: Any) -> bool:
     """True for a file type the Console reads as Blank.
 
-    The Console parses the analysis-file type with a case-insensitive enum parse, which also
-    accepts the enum's number, and Blank is 3. A literal comparison with "blank" missed a CSV
-    that said 3, and the Console interpolated that file as a Blank all the same.
+    A literal comparison with "blank" missed a CSV that said 3, and the Console interpolated
+    that file as a Blank all the same.
     """
-    text = str(value if value is not None else "").strip()
-    if text.casefold() == "blank":
-        return True
-    # Enum.TryParse takes an optional sign and ASCII digits; Python's int() also takes "0_3".
-    digits = text[1:] if text[:1] in {"+", "-"} else text
-    return bool(digits) and digits.isascii() and digits.isdigit() and int(text) == 3
+    return console_file_type(value) == "Blank"
 
 
 def _automatic_rt_correction_value_issues(state: dict[str, Any]) -> list[dict[str, str]]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 from bisect import bisect_left
 from pathlib import Path
@@ -11,6 +12,7 @@ from .library_catalog import catalog_status
 from .user_settings import load_user_settings
 from .workflow import (
     AUTOMATIC_RT_CORRECTION_DEFAULTS,
+    console_file_type,
     automatic_rt_correction_value,
     expand_paths_report,
     discover_console_paths,
@@ -197,6 +199,11 @@ def build_guided_plan(
         merged["workflow_overrides"] = overrides
     unknown_answer_keys = sorted(set(merged) - SUPPORTED_ANSWER_KEYS)
     inspection = inspect_analysis_input(input_path)
+    manifest_override = str((merged.get("workflow_overrides") or {}).get("repository_run_manifest") or "")
+    if manifest_override:
+        inspection["sample_table_proposal"] = adopted_order_proposal(
+            manifest_override, inspection.get("files", []), inspection.get("sample_table_proposal")
+        )
     questions = _questions(merged)
     blockers: list[str] = []
     official_library: dict[str, Any] | None = None
@@ -376,7 +383,14 @@ def select_peak_tuning_representative(
         reason = "user-selected"
     else:
         qc = [item for item in files if _is_qc_file(item)]
-        candidates = qc or [item for item in files if not _is_blank_file(item)] or list(files)
+        # Without a QC, the nearest Sample: a Standard is a chemical mix, not the matrix the
+        # threshold is for. Other non-Blank files only when there is no Sample.
+        samples = [
+            item for item in files
+            if console_file_type(item.get("file_type") or "Sample") == "Sample"
+            and not _is_blank_file(item)
+        ]
+        candidates = qc or samples or [item for item in files if not _is_blank_file(item)] or list(files)
         orders = [float(item.get("analytical_order") or 0) for item in files]
         midpoint = (min(orders) + max(orders)) / 2 if orders else 0
         selected = min(
@@ -386,7 +400,11 @@ def select_peak_tuning_representative(
                 str(item.get("file_path") or "").casefold(),
             ),
         )
-        reason = "QC-nearest-run-midpoint" if qc else "non-blank-nearest-run-midpoint"
+        reason = (
+            "QC-nearest-run-midpoint" if qc
+            else "sample-nearest-run-midpoint" if samples
+            else "non-blank-nearest-run-midpoint"
+        )
     instrument_family = str(selected.get("instrument_family") or "Unknown")
     family = instrument_family.casefold()
     threshold_step = 1000 if ("fourier" in family or "ft-icr" in family) else 100
@@ -411,16 +429,15 @@ def _is_qc_file(item: dict[str, Any]) -> bool:
     values = (
         item.get("file_type"), item.get("class_id"), item.get("file_name")
     )
-    return any(str(value or "").strip().casefold() == "qc" for value in values[:2]) or any(
+    return console_file_type(values[0]) == "QC" or str(values[1] or "").strip().casefold() == "qc" or any(
         token == "qc"
         for token in str(values[2] or "").replace("-", "_").casefold().split("_")
     )
 
 
 def _is_blank_file(item: dict[str, Any]) -> bool:
-    return any(
-        str(item.get(key) or "").strip().casefold() == "blank"
-        for key in ("file_type", "class_id")
+    return console_file_type(item.get("file_type")) == "Blank" or (
+        str(item.get("class_id") or "").strip().casefold() == "blank"
     )
 
 
@@ -710,6 +727,7 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             }
         )
     state.update(dict(answers.get("workflow_overrides") or {}))
+    _adopt_recorded_analytical_order(state)
     repository_metadata_path = str(answers.get("repository_metadata_path") or "").strip()
     if repository_metadata_path:
         from .repository_metadata import metadata_workspace_from_file
@@ -719,6 +737,98 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             Path(repository_metadata_path).expanduser().resolve()
         )
     return state
+
+
+def adopted_order_proposal(
+    manifest_path: str, files: list[dict[str, Any]], proposal: dict[str, Any] | None
+) -> dict[str, Any]:
+    """The sample-table proposal, saying where the analytical order came from.
+
+    The proposal is read from the file names, so for an analysis CSV whose order was ranked
+    from the raw headers it said "listing". The manifest's record is adopted only while the
+    CSV still carries exactly the recorded order: a CSV re-saved without it, or a record from
+    another unit reached through a workset, would otherwise label a guessed order as measured
+    and silence the Blank-interpolation warning. A record that does not match is attached as a
+    note, and the name-derived source stands.
+    """
+    adopted = dict(proposal or {})
+    if not str(manifest_path or "").strip():
+        return adopted
+    try:
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return adopted
+    record = manifest.get("analytical_order")
+    if not isinstance(record, dict):
+        return adopted
+    if not record.get("derived_from"):
+        adopted["recorded_header_order"] = {
+            "derived_from": None,
+            "reason": str(record.get("reason") or ""),
+        }
+        return adopted
+    recorded = {
+        Path(str(item.get("file", ""))).stem.casefold(): item.get("analytical_order")
+        for item in record.get("files") or []
+        if isinstance(item, dict)
+    }
+    # A record names files by name only, so another unit's manifest (a workset carries the
+    # path) could match on names and ranks alone. The files must also be that unit's inputs.
+    candidates = {
+        str(Path(str(path)).resolve()).casefold()
+        for path in manifest.get("input_candidates") or []
+        if str(path).strip()
+    }
+    same_unit = bool(candidates) and all(
+        str(Path(str(item.get("file_path", ""))).resolve()).casefold() in candidates
+        for item in files
+    )
+    in_csv: dict[str, Any] = {}
+    duplicated = False
+    for item in files:
+        name = str(item.get("file_name", "")).casefold()
+        duplicated = duplicated or name in in_csv
+        in_csv[name] = item.get("analytical_order")
+    matches = (
+        same_unit
+        and not duplicated
+        and len(recorded) == len(files)
+        and all(
+            name in recorded and str(recorded[name]) == str(order)
+            for name, order in in_csv.items()
+        )
+    )
+    if not matches:
+        adopted["recorded_header_order"] = {
+            "derived_from": record["derived_from"],
+            "matches_analysis_csv": False,
+            "reason": (
+                "The analysis CSV does not carry the order the unit manifest records."
+                if same_unit
+                else "The unit manifest describes other input files than these."
+            ),
+        }
+        # An inherited adoption (the inspection's, before workflow overrides replaced the
+        # files) must not survive a mismatch: fall back to the order read from the names.
+        if (adopted.get("analytical_order") or {}).get("derived_from") == record["derived_from"]:
+            adopted["analytical_order"] = _describe_sample_table(files)["analytical_order"]
+        return adopted
+    adopted["analytical_order"] = {
+        "derived_from": record["derived_from"],
+        "reason": str(record.get("reason") or ""),
+        "agrees_with_file_listing": record.get("agrees_with_listing"),
+        "matches_analysis_csv": True,
+        "alternatives": ["file listing order"],
+    }
+    return adopted
+
+
+def _adopt_recorded_analytical_order(state: dict[str, Any]) -> None:
+    manifest_path = str(state.get("repository_run_manifest") or "").strip()
+    if manifest_path:
+        state["sample_table_proposal"] = adopted_order_proposal(
+            manifest_path, state.get("files", []), state.get("sample_table_proposal")
+        )
 
 
 def _existing_path(configured: Any, fallback: Path) -> Path:
