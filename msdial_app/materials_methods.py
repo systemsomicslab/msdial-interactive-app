@@ -9,6 +9,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+from .quality_assurance import with_qc_minimum
 from .supplementary_excel import write_supplementary_workbook
 
 
@@ -34,6 +35,10 @@ def generate_publication_report(
 ) -> dict[str, Any]:
     root = Path(output_root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
+    # A QA report from before 0.5.3 is read as 0.5.3 would have written it, so that the text, the table
+    # and the audit all apply the same QC minimum and carry the same reasons.
+    if qa_report and isinstance(qa_report.get("summary"), dict):
+        qa_report = {**qa_report, "summary": with_qc_minimum(qa_report["summary"])}
     report_workflow = dict(workflow)
     report_workflow["automatic_rt_correction_evidence"] = (
         _automatic_rt_correction_evidence(root, workflow)
@@ -131,6 +136,9 @@ def assess_qa(
 ) -> dict[str, Any]:
     resolved = _criteria(criteria)
     summary = (qa_report or {}).get("summary", {})
+    summary = with_qc_minimum(summary) if qa_report and isinstance(summary, dict) else summary
+    reasons = summary.get("not_assessed_reasons") if isinstance(summary, dict) else None
+    reasons = reasons if isinstance(reasons, dict) else {}
     checks = [
         _check(summary, "median_qc_rsd_percent", "Median QC feature RSD", "<=", resolved["median_qc_rsd_percent_max"], "%"),
         _check(summary, "qc_features_rsd_le_30_percent", "Fraction of QC features with RSD <=30%", ">=", resolved["qc_features_rsd_le_30_fraction_min"], "fraction"),
@@ -140,6 +148,10 @@ def assess_qa(
         _check(summary, "median_blank_carryover_ratio", "Median blank carryover ratio", "<=", resolved["median_blank_carryover_ratio_max"], "fraction"),
         _check(summary, "run_order_intensity_correlation", "Absolute run-order/intensity correlation", "abs<=", resolved["run_order_intensity_abs_correlation_max"], "correlation"),
     ]
+    fallback = "the QA matrix gives no value for it" if qa_report else "no LC-MS QA matrix was supplied"
+    for item in checks:
+        if item["status"] == "not_assessed":
+            item["reason"] = str(reasons.get(item["metric"]) or fallback)
     evaluated = [item for item in checks if item["status"] != "not_assessed"]
     passed = [item for item in evaluated if item["status"] == "pass"]
     return {
@@ -243,11 +255,15 @@ def supplementary_rows(
 
     if qa_report:
         for key, value in sorted((qa_report.get("summary") or {}).items()):
+            if key == "not_assessed_reasons":
+                continue  # each criterion's own row carries its reason
             add("Quality assurance", "Observed metric", key, value)
         for item in qa_assessment.get("checks", []):
             add("Quality assurance", item["label"], "Observed", item.get("value"), item.get("unit", ""))
             add("Quality assurance", item["label"], "Criterion", f"{item['operator']} {item['threshold']}", item.get("unit", ""))
             add("Quality assurance", item["label"], "Assessment", item["status"])
+            if item.get("status") == "not_assessed" and item.get("reason"):
+                add("Quality assurance", item["label"], "Not assessed because", item["reason"])
         for index, standard in enumerate(qa_report.get("internal_standards", []), start=1):
             _add_mapping(add, "Quality assurance", str(standard.get("name") or f"Internal standard {index}"), {key: value for key, value in standard.items() if key != "values"})
     return rows
@@ -425,15 +441,26 @@ def _qa_criteria_sentence(assessment: dict[str, Any], counts: dict[str, Any]) ->
     else:
         parts.append(f"None of the {len(checks)} prespecified QA criteria could be evaluated.")
     if missing:
-        reasons = []
-        if int(counts.get("QC", 0) or 0) < 3:
-            reasons.append(f"{counts.get('QC', 0)} QC injection(s), where at least three are needed")
-        if not int(counts.get("Blank", 0) or 0):
-            reasons.append("no Blank files")
-        why = f" because the run had {' and '.join(reasons)}" if reasons else ""
-        parts.append(f"The other {len(missing)} ({'; '.join(missing)}) could not be assessed{why}.")
+        # Each criterion with the reason it fell to, grouped: "A and B because the run had 0 QC
+        # injection(s), and at least three are needed; C because the run had no Blank files". The
+        # reasons are fixed phrases, so the public reanalysis gate can compare them with the counts.
+        groups: dict[str, list[str]] = {}
+        for item in checks:
+            if item.get("status") == "not_assessed":
+                reason = str(item.get("reason") or "the QA matrix gives no value for it")
+                groups.setdefault(reason, []).append(item["label"])
+        listing = "; ".join(missing)
+        if len(groups) == 1:
+            parts.append(f"The other {len(missing)} ({listing}) could not be assessed because {next(iter(groups))}.")
+        else:
+            clauses = "; ".join(f"{_and_list(labels)} because {reason}" for reason, labels in groups.items())
+            parts.append(f"The other {len(missing)} ({listing}) could not be assessed: {clauses}.")
     parts.append("Individual criteria and outcomes are reported in Supplementary Table S1.")
     return " ".join(parts)
+
+
+def _and_list(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
 
 def _results_text(qa_report: dict[str, Any] | None, assessment: dict[str, Any]) -> str:

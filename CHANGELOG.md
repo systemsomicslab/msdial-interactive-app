@@ -4,6 +4,34 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.3] - Unreleased
+
+### Changed
+- A QC-based QA criterion (median QC feature RSD, the fraction of QC features with
+  RSD <=30%, the median QC detection rate and the QC PCA relative dispersion)
+  is assessed only from three or more QC injections. The QA warning already said
+  three were needed, while an RSD or a dispersion was computed from two QC and a
+  detection rate from one, so a run with two QC was assessed on a precision it
+  cannot show and written up as having too few QC at the same time.
+- Every criterion that could not be assessed now carries the reason it fell to,
+  recorded with the QA summary (`not_assessed_reasons`) and on its check in the
+  assessment (`reason`), from the fixed phrases in
+  `quality_assurance.NOT_ASSESSED_REASON_PHRASES`: no features, too few QC
+  injections, no feature detected in two or more QC, no QC dispersion from the
+  PCA, no Blank files, no feature in both a Blank and a study sample, no Blank
+  after an injection with detected features in its batch, too few injections,
+  run order or intensity not varying, and the QA matrix giving no value; without
+  a QA matrix, that none was supplied. The
+  Methods and QA results name each criterion with its reason ("could not be
+  assessed: A and B because ...; C because ..."), instead of one reason for all
+  that named a QC shortage for blank-based criteria and gave none when the run
+  had three QC and blanks. The Supplementary Table gives each such criterion a
+  "Not assessed because" row, and the workbook the same in its note; the
+  reasons are no longer listed as an observed metric. A QA report written before
+  this release is published as this release would have written it: the QC
+  minimum applied and the reasons filled in, in the text, the table and the
+  audit alike.
+
 ## [0.5.2] - Unreleased
 
 ### Changed

@@ -228,11 +228,76 @@ class MaterialsMethodsTests(unittest.TestCase):
         self.assertNotIn("QC precision and detection rate, blank separation", methods)
         self.assertIn("Of 7 prespecified QA criteria, 1 could be evaluated", methods)
         self.assertIn(
-            "could not be assessed because the run had 0 QC injection(s), where at least three "
-            "are needed and no Blank files",
+            "could not be assessed: Median QC feature RSD, Fraction of QC features with RSD <=30%, "
+            "Median QC detection rate and QC PCA relative dispersion because the run had 0 QC "
+            "injection(s), and at least three are needed; Fraction of features with Sample/Blank >=3 "
+            "and Median blank carryover ratio because the run had no Blank files.",
             methods,
         )
         self.assertIn("could not be assessed", result["qa_results_text"])
+
+    def test_each_unassessed_criterion_is_given_the_reason_it_fell_to(self) -> None:
+        # Two QC and two blanks: every QC criterion falls to the QC count, and carryover to the
+        # blanks' place in the sequence, not to "no Blank files".
+        qa = {
+            "summary": {
+                "sample_count": 9,
+                "alignment_spot_count": 90,
+                "category_counts": {"Sample": 5, "QC": 2, "Blank": 2},
+                "sample_blank_ratio_ge_3": 0.8,
+                "run_order_intensity_correlation": 0.1,
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result = generate_publication_report(
+                {"project_type": "lcms", "files": []}, qa, temporary,
+                app_version="0.5.3", console_version="5.5",
+            )
+            table = Path(result["supplementary_table"]).read_text(encoding="utf-8-sig")
+
+        checks = {item["metric"]: item for item in result["qa_assessment"]["checks"]}
+        self.assertEqual("the run had 2 QC injection(s), and at least three are needed",
+                         checks["median_qc_rsd_percent"]["reason"])
+        self.assertEqual("no Blank file followed an injection with detected features in its batch",
+                         checks["median_blank_carryover_ratio"]["reason"])
+        self.assertNotIn("reason", checks["run_order_intensity_correlation"])
+        self.assertIn(
+            "QC PCA relative dispersion because the run had 2 QC injection(s), and at least three are needed; "
+            "Median blank carryover ratio because no Blank file followed an injection with detected features in its batch.",
+            result["qa_results_text"],
+        )
+        self.assertIn("Median blank carryover ratio\tNot assessed because\tno Blank file followed an injection "
+                      "with detected features in its batch", table)
+        self.assertNotIn("not_assessed_reasons", table)
+
+    def test_a_qa_report_from_before_the_minimum_is_published_with_it(self) -> None:
+        # 0.5.2 computed an RSD from two QC. The text, the table and the audit now all withhold it.
+        qa = {"summary": {"sample_count": 8, "alignment_spot_count": 10,
+                          "category_counts": {"Sample": 6, "QC": 2, "Blank": 0},
+                          "median_qc_rsd_percent": 12.0, "median_qc_detection_rate": 0.9,
+                          "run_order_intensity_correlation": 0.1}}
+        with tempfile.TemporaryDirectory() as temporary:
+            result = generate_publication_report(
+                {"project_type": "lcms", "files": []}, qa, temporary,
+                app_version="0.5.3", console_version="5.5",
+            )
+            audit = json.loads(Path(result["audit_file"]).read_text(encoding="utf-8"))
+
+        checks = {item["metric"]: item for item in result["qa_assessment"]["checks"]}
+        self.assertEqual("not_assessed", checks["median_qc_rsd_percent"]["status"])
+        self.assertNotIn("RSD among QC injections was", result["qa_results_text"])
+        self.assertIsNone(audit["qa_report"]["summary"]["median_qc_rsd_percent"])
+        self.assertEqual(12.0, qa["summary"]["median_qc_rsd_percent"])
+
+    def test_without_a_qa_matrix_every_criterion_says_so(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = generate_publication_report(
+                {"project_type": "lcms", "files": []}, None, temporary,
+                app_version="0.5.3", console_version="5.5",
+            )
+
+        reasons = {item.get("reason") for item in result["qa_assessment"]["checks"]}
+        self.assertEqual({"no LC-MS QA matrix was supplied"}, reasons)
 
     def test_official_library_doi_matches_an_identical_filename_at_another_path(self) -> None:
         workflow = {
