@@ -4,6 +4,32 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.4] - Unreleased
+
+### Changed
+- The absolute run-order/intensity correlation is not assessed where a
+  repository unit's analytical order is the file listing (decided 2026-09-29).
+  Its reason is "the injection order was not recorded for every file", one of
+  `quality_assurance.NOT_ASSESSED_REASON_PHRASES`, and its value is withheld from
+  the assessment, the QA summary, the text and the Supplementary Table alike. The
+  correlation is computed against whatever analytical_order the analysis CSV
+  carries; against the listing it describes the listing, and for a study with no
+  QC it was the one criterion left to report as met.
+- `msdial_prepare_repository_reanalysis` records, with the header decision in the
+  unit manifest's `analytical_order`, what the order was taken from in the end:
+  `order_source` is `raw_header_acquisition_start_time`, `repository_sample_table`
+  (every file's order declared by the repository), `embedded` (a sequence number
+  read out of the file names) or `listing`, with `declared_files` when only some
+  files had a declared order, and None when the recognised order cannot be told
+  apart. The record now lists every file with the order it was given, so a later
+  reader can tell whether the CSV still carries it. The preview shows it too.
+- The publication report reads that source through the run's
+  `repository_run_manifest`, only while the analysis files still carry exactly
+  the recorded order, and writes it to the audit as `analytical_order_source`. A
+  run without such a record (a laboratory analysis, whose order is the analyst's,
+  or a unit prepared before this release other than by header order) is assessed
+  as before. A criterion already withheld for its own reason keeps it.
+
 ## [0.5.3] - Unreleased
 
 0.5.3 is the first version whose every build contains #36 (the automatic

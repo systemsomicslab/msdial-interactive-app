@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from .quality_assurance import with_qc_minimum
+from .quality_assurance import with_qc_minimum, with_recorded_order
 from .supplementary_excel import write_supplementary_workbook
 
 
@@ -37,8 +37,18 @@ def generate_publication_report(
     root.mkdir(parents=True, exist_ok=True)
     # A QA report from before 0.5.3 is read as 0.5.3 would have written it, so that the text, the table
     # and the audit all apply the same QC minimum and carry the same reasons.
+    # A run-order criterion is withheld where the unit manifest records the order as the file listing
+    # and the analysis files still carry it (decided 2026-09-29).
+    from .repository_reanalysis import recorded_order_source
+
+    order_source = recorded_order_source(
+        workflow.get("repository_run_manifest"), list(workflow.get("files") or [])
+    )
     if qa_report and isinstance(qa_report.get("summary"), dict):
-        qa_report = {**qa_report, "summary": with_qc_minimum(qa_report["summary"])}
+        qa_report = {
+            **qa_report,
+            "summary": with_recorded_order(with_qc_minimum(qa_report["summary"]), order_source),
+        }
     report_workflow = dict(workflow)
     report_workflow["automatic_rt_correction_evidence"] = (
         _automatic_rt_correction_evidence(root, workflow)
@@ -106,6 +116,8 @@ def generate_publication_report(
             "msdial_interactive_version": app_version,
         },
         "qa_assessment": qa_assessment,
+        # Where the analytical order came from, as the unit manifest records it (None: not recorded).
+        "analytical_order_source": order_source,
         "library_provenance_warnings": provenance_warnings,
         "workflow": report_workflow,
         "qa_report": qa_report,

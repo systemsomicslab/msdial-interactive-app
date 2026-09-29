@@ -2336,6 +2336,11 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 ACQUISITION_ORDER_SOURCE = "raw_header_acquisition_start_time"
+# Where a unit's analytical order came from when the headers did not give it, in the words
+# sample_grouping.propose_injection_order already uses for the last two.
+DECLARED_ORDER_SOURCE = "repository_sample_table"
+EMBEDDED_ORDER_SOURCE = "embedded"
+LISTING_ORDER_SOURCE = "listing"
 _FRACTION = re.compile(r"(T\d{2}:\d{2}:\d{2})\.(\d+)")
 
 
@@ -2555,6 +2560,120 @@ def acquisition_start_order(
         "agrees_with_listing": [ranks[path] for path in file_paths] == list(range(1, len(file_paths) + 1)),
         "tied": tied,
     }
+
+
+def with_order_source(
+    record: dict[str, Any],
+    files: list[dict[str, Any]],
+    declared_order_files: Iterable[str],
+    recognized: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """The header decision, with what the analysis CSV's order was taken from in the end.
+
+    The record said only whether the raw headers gave the order. When they did not, the order was
+    the repository's declared one, a number read out of the file names, or the file listing, and
+    nothing said which: a drift criterion computed against the listing read like one computed
+    against a measured sequence. The source is recorded, and the files with the order they carry,
+    so that a later reader can tell whether the CSV still has it. A source that cannot be told is
+    None, never a guess.
+    """
+    result = dict(record)
+    if result.get("derived_from") == ACQUISITION_ORDER_SOURCE:
+        result["order_source"] = ACQUISITION_ORDER_SOURCE
+        return result
+    paths = [str(item.get("file_path", "")) for item in files]
+    declared = {_file_key(path) for path in declared_order_files if str(path).strip()}
+    declared_here = sum(1 for path in paths if _file_key(path) in declared)
+    source: str | None
+    if paths and declared_here == len(paths):
+        source = DECLARED_ORDER_SOURCE
+    else:
+        from .sample_grouping import propose_injection_order
+
+        # The order the files were recognised with: re-derived from the same names, and trusted only
+        # where it gives every recognised file the order it has.
+        names = [Path(str(item.get("file_path", ""))).stem for item in recognized]
+        proposal = propose_injection_order(names) if names else {}
+        consistent = bool(names) and all(
+            str((proposal.get("orders") or {}).get(name)) == str(item.get("analytical_order"))
+            for name, item in zip(names, recognized)
+        )
+        chosen = proposal.get("chosen") if consistent else None
+        source = chosen if chosen in {EMBEDDED_ORDER_SOURCE, LISTING_ORDER_SOURCE} else None
+    result["order_source"] = source
+    if 0 < declared_here < len(paths):
+        result["declared_files"] = declared_here
+    result["files"] = [
+        {"file": Path(str(item.get("file_path", ""))).name, "analytical_order": item.get("analytical_order")}
+        for item in files
+    ]
+    return result
+
+
+def recorded_order_match(
+    manifest: dict[str, Any], record: dict[str, Any], files: list[dict[str, Any]]
+) -> tuple[bool, bool]:
+    """(same_unit, matches): whether the files are this unit's inputs, and whether they carry exactly
+    the analytical order the record gives them.
+
+    A record names files by name only, so another unit's manifest (a workset carries the path) could
+    match on names and ranks alone; the files must also be that unit's inputs.
+    """
+    recorded = {
+        Path(str(item.get("file", ""))).stem.casefold(): item.get("analytical_order")
+        for item in record.get("files") or []
+        if isinstance(item, dict)
+    }
+    candidates = {
+        str(Path(str(path)).resolve()).casefold()
+        for path in manifest.get("input_candidates") or []
+        if str(path).strip()
+    }
+    same_unit = bool(candidates) and all(
+        str(Path(str(item.get("file_path", ""))).resolve()).casefold() in candidates
+        for item in files
+    )
+    in_csv: dict[str, Any] = {}
+    duplicated = False
+    for item in files:
+        name = str(item.get("file_name", "")).casefold()
+        duplicated = duplicated or name in in_csv
+        in_csv[name] = item.get("analytical_order")
+    matches = (
+        same_unit
+        and not duplicated
+        and len(recorded) == len(files)
+        and all(
+            name in recorded and str(recorded[name]) == str(order)
+            for name, order in in_csv.items()
+        )
+    )
+    return same_unit, matches
+
+
+def recorded_order_source(manifest_path: Any, files: list[dict[str, Any]]) -> str | None:
+    """Where the analysis CSV's analytical order came from, as the unit manifest records it.
+
+    None unless the files still carry exactly the recorded order: a CSV re-saved or edited since
+    carries an order nobody recorded. A header record from before order_source existed reads as the
+    header source; any other record from before it reads as unknown.
+    """
+    if not str(manifest_path or "").strip():
+        return None
+    try:
+        manifest = json.loads(Path(str(manifest_path)).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    record = manifest.get("analytical_order") if isinstance(manifest, dict) else None
+    if not isinstance(record, dict):
+        return None
+    source = record.get("order_source") or (
+        ACQUISITION_ORDER_SOURCE if record.get("derived_from") == ACQUISITION_ORDER_SOURCE else None
+    )
+    if not source:
+        return None
+    _, matches = recorded_order_match(manifest, record, list(files or []))
+    return str(source) if matches else None
 
 
 def record_analytical_order(manifest_path: str | Path, record: dict[str, Any]) -> None:

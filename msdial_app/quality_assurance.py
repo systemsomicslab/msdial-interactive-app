@@ -39,8 +39,13 @@ NOT_ASSESSED_REASON_PHRASES = (
     "no Blank file followed an injection with detected features in its batch",
     "the run had {n} injection(s), and at least three are needed",
     "run order or median intensity did not vary across injections",
+    "the injection order was not recorded for every file",
     "the QA matrix gives no value for it",
 )
+# The analytical-order sources a run-order criterion is not assessed against (decided 2026-09-29):
+# the file listing is no injection order, and a drift computed against it describes the listing.
+UNRECORDED_ORDER_SOURCES = frozenset({"listing"})
+UNRECORDED_ORDER_REASON = "the injection order was not recorded for every file"
 
 
 def find_qa_files(
@@ -650,6 +655,26 @@ def with_qc_minimum(summary: dict[str, Any]) -> dict[str, Any]:
             metric not in reasons for metric in CRITERION_METRICS
             if result.get(metric) is None or not _is_finite(result.get(metric))):
         result["not_assessed_reasons"] = not_assessed_reasons(result)
+    return result
+
+
+def with_recorded_order(summary: dict[str, Any], order_source: str | None) -> dict[str, Any]:
+    """The summary with the run-order criterion withheld when the run's order is the file listing.
+
+    The correlation is computed against whatever analytical_order the CSV carries. Where the unit
+    manifest records that order as the file listing, it says nothing about drift, and for a study
+    with no QC it was the one criterion left to report as met. A value already withheld keeps the
+    reason it had. The summary passed in is not changed.
+    """
+    metric = "run_order_intensity_correlation"
+    value = summary.get(metric)
+    if order_source not in UNRECORDED_ORDER_SOURCES or value is None or not _is_finite(value):
+        return summary
+    result = dict(summary)
+    result[metric] = None
+    reasons = dict(result.get("not_assessed_reasons") or {})
+    reasons[metric] = UNRECORDED_ORDER_REASON
+    result["not_assessed_reasons"] = reasons
     return result
 
 

@@ -1504,12 +1504,21 @@ def msdial_prepare_repository_reanalysis(
         projected = project_class_hierarchy(workspace, selected_hierarchy)
     recognized = ((job.get("result") or {}).get("recognized") or {}).get("files", [])
     application = apply_classes_to_analysis_files(projected, recognized)
-    from .repository_reanalysis import acquisition_start_order, record_analytical_order
+    from .repository_reanalysis import (
+        acquisition_start_order,
+        record_analytical_order,
+        with_order_source,
+    )
 
-    analytical_order = acquisition_start_order(
-        manifest,
-        [str(item.get("file_path", "")) for item in application["files"]],
-        [str(item.get("class_id", "")) for item in application["files"]],
+    analytical_order = with_order_source(
+        acquisition_start_order(
+            manifest,
+            [str(item.get("file_path", "")) for item in application["files"]],
+            [str(item.get("class_id", "")) for item in application["files"]],
+        ),
+        application["files"],
+        application.get("declared_order_files") or [],
+        recognized,
     )
     output_root = str(manifest.get("output_directory") or "")
     raw_retention_policy = str(job.get("raw_retention_policy") or "keep")
