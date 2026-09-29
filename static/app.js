@@ -2385,6 +2385,11 @@ function rtAuditPlot(series, xLabel, yLabel, { zero = true, nonnegative = false,
   </svg>`;
 }
 
+// "rejected" by the model, "unmatched" to any single peak, "blank" (never used by design), or "used".
+function rtAuditCategory(anchor) {
+  return anchor.category || (anchor.used ? "used" : "rejected");
+}
+
 function rtAuditHasRt(anchor) {
   return Number.isFinite(anchor.original_rt) && Number.isFinite(anchor.reference_rt)
     && Number.isFinite(anchor.offset);
@@ -2419,8 +2424,11 @@ function rtAuditCorrespondence(anchors) {
   const margin = Math.max((Math.max(...values) - Math.min(...values)) * 0.08, 0.1);
   const minimum = Math.min(...values) - margin, maximum = Math.max(...values) + margin;
   const x = (rt) => left + (rt - minimum) * (width - left - right) / (maximum - minimum);
+  const hasBlank = points.some((item) => rtAuditCategory(item) === "blank");
   const marks = points.map((item) => {
-    const color = item.used ? "#007f82" : item.status === "NonMonotonic" ? "#9d2347" : "#b1630a";
+    const category = rtAuditCategory(item);
+    const color = item.used ? "#007f82" : category === "blank" ? "#7b8b94"
+      : item.status === "NonMonotonic" ? "#9d2347" : "#b1630a";
     return `<g><title>Anchor ${escapeHtml(item.anchor_id)}: ${rtAuditNumber(item.original_rt)} to ${rtAuditNumber(item.reference_rt)} min; ${escapeHtml(item.status)}</title>
       <line x1="${x(item.original_rt)}" y1="${upper}" x2="${x(item.reference_rt)}" y2="${lower}" stroke="${color}" stroke-width="2" ${item.used ? "" : 'stroke-dasharray="5 4"'}/>
       <circle cx="${x(item.original_rt)}" cy="${upper}" r="5" fill="${color}"/>
@@ -2429,7 +2437,7 @@ function rtAuditCorrespondence(anchors) {
       <text x="${x(item.reference_rt)}" y="${lower + 22}" text-anchor="middle">${escapeHtml(item.anchor_id)}</text></g>`;
   }).join("");
   const ticks = qaAxisTicks(minimum, maximum, false).map((rt) => `<text x="${x(rt)}" y="275" text-anchor="middle">${rt.toFixed(2)}</text>`).join("");
-  return `<div class="rt-audit-legend"><span><i style="background:#007f82"></i>Accepted (solid)</span><span><i style="background:#b1630a"></i>Rejected (dashed)</span><span><i style="background:#9d2347"></i>NonMonotonic (dashed)</span></div>
+  return `<div class="rt-audit-legend"><span><i style="background:#007f82"></i>Accepted (solid)</span><span><i style="background:#b1630a"></i>Rejected (dashed)</span><span><i style="background:#9d2347"></i>NonMonotonic (dashed)</span>${hasBlank ? `<span><i style="background:#7b8b94"></i>Blank, not used by design (dashed)</span>` : ""}</div>
     <svg class="rt-audit-plot" viewBox="0 0 ${width} 305" role="img" aria-label="Anchor correspondence from sample RT to reference RT. Crossing lines indicate reversed order.">
       <text x="8" y="${upper - 35}">Sample</text><text x="8" y="${lower - 35}">Reference</text>
       <line x1="${left}" y1="${upper}" x2="${width - right}" y2="${upper}" stroke="#627d88"/>
@@ -2492,10 +2500,12 @@ function renderAutomaticRtFile() {
     : [];
   const plotted = numericAnchors.map((item) => ({ ...item,
     corrected: canReconstruct ? rtAuditCorrect(item.original_rt, used) : null }));
+  const blankAnchors = numericAnchors.filter((item) => rtAuditCategory(item) === "blank");
   const shiftPlot = rtAuditPlot([
     { label: "Piecewise RT offset", color: "#007f82", line: true, points: curve },
     { label: "Accepted anchors", color: "#1463a0", points: used.map((item) => [item.original_rt, item.offset]) },
-    { label: "Rejected anchors", color: "#b1630a", points: numericAnchors.filter((item) => !item.used).map((item) => [item.original_rt, item.offset]) },
+    { label: "Rejected anchors", color: "#b1630a", points: numericAnchors.filter((item) => rtAuditCategory(item) === "rejected").map((item) => [item.original_rt, item.offset]) },
+    ...(blankAnchors.length ? [{ label: "Blank anchors, not used by design", color: "#7b8b94", points: blankAnchors.map((item) => [item.original_rt, item.offset]) }] : []),
   ], "Original RT (min)", "RT offset (min)");
   const residualPlot = rtAuditPlot([
     { label: "Before correction", color: "#b1630a", points: numericAnchors.map((item) => [item.original_rt, item.original_rt - item.reference_rt]) },
@@ -2505,7 +2515,8 @@ function renderAutomaticRtFile() {
   const recordedTolerance = Number(review.smoothing_settings?.ms1_tolerance);
   const eicTolerance = recordedTolerance > 0 && recordedTolerance <= 1 ? recordedTolerance : 0.01;
   const missingCount = anchors.length - numericAnchors.length;
-  const rows = anchors.map((item) => `<tr class="${item.used ? "" : "rt-audit-rejected"}"><td>${escapeHtml(item.anchor_id)}</td><td>${rtAuditNumber(item.mz, 5)}</td><td>${rtAuditNumber(item.original_rt)}</td><td>${rtAuditNumber(item.reference_rt)}</td><td>${rtAuditNumber(item.offset, 4)}</td><td>${rtAuditNumber(item.quality_score, 2)}</td><td>${rtAuditNumber(item.coverage, 2)}</td><td>${item.used ? "Yes" : "No"}</td><td>${escapeHtml(item.status)}</td></tr>`).join("");
+  const rowClass = { used: "", rejected: "rt-audit-rejected", unmatched: "rt-audit-unused", blank: "rt-audit-unused" };
+  const rows = anchors.map((item) => `<tr class="${rowClass[rtAuditCategory(item)] ?? "rt-audit-rejected"}"><td>${escapeHtml(item.anchor_id)}</td><td>${rtAuditNumber(item.mz, 5)}</td><td>${rtAuditNumber(item.original_rt)}</td><td>${rtAuditNumber(item.reference_rt)}</td><td>${rtAuditNumber(item.offset, 4)}</td><td>${rtAuditNumber(item.quality_score, 2)}</td><td>${rtAuditNumber(item.coverage, 2)}</td><td>${item.used ? "Yes" : "No"}</td><td>${escapeHtml(item.status)}</td></tr>`).join("");
   panel.innerHTML = `<h3>${escapeHtml(file.name)} | ${escapeHtml(file.model_source)}</h3>
     <p class="muted">${escapeHtml(file.type)} | Order ${escapeHtml(file.order ?? "unknown")} | ${escapeHtml(file.used_anchors ?? 0)} accepted of ${escapeHtml(file.matched_anchors ?? 0)} matched | Reference score ${rtAuditNumber(file.reference_score, 2)}. ${escapeHtml(file.note || "")}</p>
     ${missingCount ? `<p class="muted">${missingCount} anchor record(s) have unavailable RT values. They remain in the table as N/A, but are not plotted or offered for apex-based EIC review. No RT values are imputed.</p>` : ""}
@@ -2552,22 +2563,27 @@ function renderAutomaticRtReview(review) {
   panel.hidden = false;
   const corrected = review.model_counts?.DetectedAnchors || 0;
   const inspected = review.files.length;
-  const refused = review.anchors.filter((item) => !item.used).length;
+  const refused = review.anchors.filter((item) => rtAuditCategory(item) === "rejected").length;
   const ordered = review.files.filter((item) => item.order !== null).sort((a, b) => a.order - b.order);
   const sampled = ordered.length > 500 ? ordered.filter((_, index) => index % Math.ceil(ordered.length / 500) === 0) : ordered;
   const overview = rtAuditPlot([
     { label: "Median absolute offset", color: "#007f82", line: true, points: sampled.filter((item) => item.median_absolute_offset !== null).map((item) => [item.order, item.median_absolute_offset]) },
   ], "Analytical order", "Median |RT offset| (min)", { zero: true, nonnegative: true, integerX: true });
   const warnings = (review.warnings || []).map((message) => `<div class="issue warning">${escapeHtml(message)}</div>`).join("");
+  const notes = (review.notes || []).map((message) => `<p class="muted">${escapeHtml(message)}</p>`).join("");
   const audit = review.method_audit || {};
+  // The publication report takes the same verdict: it describes the correction only when verified.
+  const evidence = audit.status === "verified"
+    ? "verified for this run; the publication report describes this correction"
+    : `not verified (${audit.reason || audit.status || "retained_evidence_missing"}); the publication report does not describe a correction`;
   const fileRows = review.files.slice(0, 200).map((file) => `<tr><td>${escapeHtml(file.file_id)}</td><td>${escapeHtml(file.name)}</td><td>${escapeHtml(file.type)}</td><td>${escapeHtml(file.order ?? "")}</td><td>${escapeHtml(file.model_source)}</td><td>${escapeHtml(file.used_anchors ?? "")}</td><td>${rtAuditNumber(file.median_absolute_offset, 4)}</td><td>${escapeHtml(file.note)}</td></tr>`).join("");
   panel.innerHTML = `<div class="metric-grid">
     <div class="metric"><strong>${inspected}</strong><span>audited files</span></div>
     <div class="metric"><strong>${escapeHtml(review.reference?.file_id ?? "none")}</strong><span>reference file ID</span></div>
     <div class="metric"><strong>${corrected}</strong><span>non-reference files fitted from anchors</span></div>
-    <div class="metric"><strong>${refused}</strong><span>unused anchor records</span></div></div>
-    <p class="muted">Reference: ${escapeHtml(review.reference?.name || "none")}. Model sources: ${escapeHtml(Object.entries(review.model_counts || {}).map(([name, count]) => `${name} ${count}`).join("; "))}. Evidence: ${escapeHtml(audit.status || "missing")} method record.</p>
-    ${warnings}
+    <div class="metric"><strong>${refused}</strong><span>anchors rejected by the model</span></div></div>
+    <p class="muted">Reference: ${escapeHtml(review.reference?.name || "none")}. Model sources: ${escapeHtml(Object.entries(review.model_counts || {}).map(([name, count]) => `${name} ${count}`).join("; "))}. Correction evidence: ${escapeHtml(evidence)}.</p>
+    ${warnings}${notes}
     <details><summary><strong>Recorded anchor-selection criteria and score</strong></summary>
       <div class="table-wrap"><table><thead><tr><th>Criterion</th><th>Value in this run's method.txt</th></tr></thead><tbody>${(review.selection_settings || []).map((item) => `<tr><td>${escapeHtml(item.label)}</td><td>${escapeHtml(item.value ?? "not recorded")}</td></tr>`).join("")}</tbody></table></div>
       <p>Current score weights: normalized log intensity 35%, S/N 20%, Gaussian similarity 15%, ideal slope 15%, symmetry 10%, width 5%. The score ranks candidates; it is not a probability of a correct anchor.</p>

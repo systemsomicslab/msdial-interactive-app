@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
-import hashlib
 import json
 import math
 import zipfile
 from pathlib import Path
 from typing import Any
 
+from .automatic_rt_evidence import automatic_rt_correction_proof, unproven
 from .quality_assurance import with_qc_minimum, with_recorded_order
 from .supplementary_excel import write_supplementary_workbook
 
@@ -538,133 +538,13 @@ def _automatic_rt_correction_evidence(
 ) -> dict[str, Any]:
     """Read proof of an executed automatic RT correction from retained run artifacts.
 
-    A workflow setting records intent. It is not evidence that the selected Console understood
-    the key or that alignment produced a correction. Publication text therefore requires all
-    three independent records: the method-key audit and both Console-generated TSV files.
-
-    The three must also belong to this run. The method-key record carries the hash of the
-    method file the Console read, so a record left from an earlier preparation of the same
-    directory does not match the method.txt there now; and an audit TSV older than that record
-    was written by an earlier run. Only a file other than the reference, corrected from its own
-    detected anchors, shows a correction: the reference's anchors are always marked used, and a
-    run in which every other file kept its original RT would otherwise have read as performed.
+    The judgment is automatic_rt_evidence.automatic_rt_correction_proof, the one the audit
+    viewer also shows, so the viewer cannot call a run verified that this report refuses to
+    describe. Only the request comes from the workflow.
     """
-    requested = bool(workflow.get("execute_automatic_rt_correction"))
-    summary_path = root / "automatic_alignment_rt_correction_summary.tsv"
-    anchors_path = root / "automatic_alignment_rt_correction_anchors.tsv"
-    method_keys_path = root / "method.keys.json"
-    method_path = root / "method.txt"
-    evidence: dict[str, Any] = {
-        "requested": requested,
-        "performed": False,
-        "method_key_applied": False,
-        "reference_file_id": "",
-        "reference_file_name": "",
-        "files_audited": 0,
-        "selected_anchor_count": 0,
-        "corrected_file_count": 0,
-        "model_sources": {},
-        "reason": "not_requested" if not requested else "retained_evidence_missing",
-        "summary_file": summary_path.name,
-        "anchors_file": anchors_path.name,
-        "method_keys_file": method_keys_path.name,
-    }
-    if not requested:
-        return evidence
-
-    try:
-        method_keys = json.loads(method_keys_path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return evidence
-    if not isinstance(method_keys, dict):
-        return evidence
-    try:
-        method_digest = hashlib.sha256(method_path.read_bytes()).hexdigest()
-    except OSError:
-        return evidence
-    recorded_digest = str(method_keys.get("method_file_sha256") or "").strip().casefold()
-    if not recorded_digest or recorded_digest != method_digest:
-        evidence["reason"] = "method_key_record_not_from_this_method_file"
-        return evidence
-    applied = {str(item).strip().casefold() for item in method_keys.get("applied") or []}
-    evidence["method_key_applied"] = (
-        "execute automatic rt correction for alignment" in applied
-    )
-    if not evidence["method_key_applied"]:
-        evidence["reason"] = "method_key_not_applied"
-        return evidence
-    # The Console records a value it could not read as "<key>: <value>", and a key with no
-    # value under blank, and runs with its default for both, so the settings in Table S1
-    # would not be the ones the correction used.
-    from .workflow import AUTOMATIC_RT_CORRECTION_METHOD_KEYS
-
-    # A key also applied was set after all: the Console keeps the last value it applied.
-    discarded = sorted(
-        (
-            {
-                str(item).split(":", 1)[0].strip().casefold()
-                for item in [*(method_keys.get("unusable") or []), *(method_keys.get("blank") or [])]
-            }
-            - applied
-        )
-        & AUTOMATIC_RT_CORRECTION_METHOD_KEYS
-    )
-    if discarded:
-        evidence["reason"] = "method_key_value_discarded_by_console"
-        evidence["discarded_keys"] = discarded
-        return evidence
-
-    try:
-        record_time = method_keys_path.stat().st_mtime
-        if min(summary_path.stat().st_mtime, anchors_path.stat().st_mtime) < record_time:
-            evidence["reason"] = "audit_older_than_method_key_record"
-            return evidence
-        with summary_path.open(encoding="utf-8-sig", newline="") as handle:
-            summary_rows = list(csv.DictReader(handle, delimiter="\t"))
-        with anchors_path.open(encoding="utf-8-sig", newline="") as handle:
-            anchor_rows = list(csv.DictReader(handle, delimiter="\t"))
-    except OSError:
-        return evidence
-    if not summary_rows or not anchor_rows:
-        evidence["reason"] = "retained_evidence_empty"
-        return evidence
-
-    reference = next(
-        (row for row in summary_rows if row.get("Model source") == "Reference"),
-        None,
-    )
-    reference_id = str((reference or {}).get("File ID") or "")
-    model_sources: dict[str, int] = {}
-    for row in summary_rows:
-        source = str(row.get("Model source") or "Unknown")
-        model_sources[source] = model_sources.get(source, 0) + 1
-    corrected_ids = {
-        str(row.get("File ID") or "")
-        for row in summary_rows
-        if row.get("Model source") == "DetectedAnchors"
-        and str(row.get("File ID") or "") != reference_id
-    }
-    selected_anchor_ids = {
-        str(row.get("Anchor ID") or "")
-        for row in anchor_rows
-        if str(row.get("Used") or "").casefold() == "true"
-        and row.get("Anchor ID")
-        and str(row.get("File ID") or "") in corrected_ids
-    }
-    performed = reference is not None and bool(corrected_ids) and bool(selected_anchor_ids)
-    evidence.update(
-        {
-            "performed": performed,
-            "reference_file_id": (reference or {}).get("File ID", ""),
-            "reference_file_name": (reference or {}).get("File name", ""),
-            "files_audited": len(summary_rows),
-            "selected_anchor_count": len(selected_anchor_ids),
-            "corrected_file_count": len(corrected_ids),
-            "model_sources": model_sources,
-            "reason": "performed" if performed else "audit_does_not_show_correction",
-        }
-    )
-    return evidence
+    if not workflow.get("execute_automatic_rt_correction"):
+        return {"requested": False, **unproven(), "reason": "not_requested"}
+    return {"requested": True, **automatic_rt_correction_proof(root)}
 
 
 def _matched_library_provenance(

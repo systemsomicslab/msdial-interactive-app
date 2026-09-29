@@ -7,9 +7,10 @@ const source = fs.readFileSync(path.join(__dirname, "../static/app.js"), "utf8")
 const functions = source.slice(source.indexOf("function rtAuditNumber("),
   source.indexOf("function renderRtCorrectionResult("));
 const elements = {
-  "#rtAuditFileId": { value: "0" },
+  "#rtAuditFileId": { value: "0", addEventListener() {} },
   "#rtAuditFileDetails": { innerHTML: "" },
   "#rtAuditExtractEic": { addEventListener() {} },
+  "#automaticRtReview": { hidden: true, innerHTML: "" },
 };
 const context = vm.createContext({
   state: { automaticRtReview: null },
@@ -77,4 +78,34 @@ const correspondence = context.rtAuditCorrespondence([
 ]);
 assert.ok(correspondence.includes("Crossing lines") && correspondence.includes("NonMonotonic"));
 assert.ok(!correspondence.includes("NaN") && !correspondence.includes("Infinity"));
+assert.ok(!correspondence.includes("not used by design"), "The Blank legend appears only with Blank anchors");
+
+// A Blank's anchors are unused by design: neither styled nor plotted nor counted as rejected.
+const blankAnchor = (id, rt, status) => ({ file_id: "2", anchor_id: id, mz: 100, original_rt: rt,
+  reference_rt: rt - 0.05, offset: -0.05, quality_score: 0.6, coverage: 1, used: false, status, category: "blank" });
+const blankFile = { file_id: "2", name: "Blank-1", type: "Blank", model_source: "InterpolatedBlank",
+  model_reconstructable: false, used_anchors: 0, matched_anchors: 2 };
+context.state.automaticRtReview = { files: [blankFile],
+  anchors: [blankAnchor("1", 2, "BlankInterpolateByOrder"), blankAnchor("2", 4, "BlankInterpolateByOrder")] };
+elements["#rtAuditFileId"].value = "2";
+context.renderAutomaticRtFile();
+html = elements["#rtAuditFileDetails"].innerHTML;
+assert.ok(!html.includes("rt-audit-rejected"), "Blank anchor rows are not styled as rejected");
+assert.ok(html.includes('class="rt-audit-unused"'));
+assert.ok(html.includes("Blank anchors, not used by design"));
+assert.ok(context.rtAuditCorrespondence(context.state.automaticRtReview.anchors).includes("Blank, not used by design"));
+
+const nonMonotonic = { ...accepted("3", 5), file_id: "1", used: false, status: "NonMonotonic", category: "rejected" };
+context.renderAutomaticRtReview({
+  run_directory: "run", files: [{ ...blankFile, order: 3, median_absolute_offset: 0, note: "" }],
+  anchors: [...context.state.automaticRtReview.anchors, { ...missing, category: "unmatched" }, nonMonotonic],
+  reference: null, model_counts: { InterpolatedBlank: 1 },
+  method_audit: { status: "method_key_not_applied", reason: "method_key_not_applied" },
+  warnings: ["Rejected anchors require review: NonMonotonic (1)"],
+  notes: ["2 anchor record(s) are in Blank files, not used by design: BlankInterpolateByOrder (2)."],
+});
+html = elements["#automaticRtReview"].innerHTML;
+assert.match(html, /<strong>1<\/strong><span>anchors rejected by the model/, "Only the model's rejections are counted");
+assert.ok(html.includes('<p class="muted">2 anchor record(s) are in Blank files, not used by design'), "Notes are not warnings");
+assert.ok(html.includes("not verified (method_key_not_applied); the publication report does not describe a correction"));
 console.log("Automatic RT viewer regression checks passed.");

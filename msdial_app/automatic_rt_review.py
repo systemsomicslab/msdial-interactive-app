@@ -1,7 +1,6 @@
 """Read the Console's alignment-only RT correction audit without changing its results."""
 
 import csv
-import hashlib
 import json
 import math
 import subprocess
@@ -9,11 +8,28 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
+from .automatic_rt_evidence import (
+    ANCHORS,
+    METHOD,
+    SUMMARY,
+    automatic_rt_correction_proof,
+    discarded_method_keys,
+    proof_reason_phrase,
+    read_method_key_record,
+)
 
-SUMMARY = "automatic_alignment_rt_correction_summary.tsv"
-ANCHORS = "automatic_alignment_rt_correction_anchors.tsv"
+
 SUMMARY_COLUMNS = {"File ID", "File name", "File type", "Analytical order", "Used anchors", "Model source"}
 ANCHOR_COLUMNS = {"File ID", "Anchor ID", "m/z", "Reference RT (min)", "Original RT (min)", "Quality score", "Used", "Status"}
+# Anchor statuses the Console writes for a record it never meant to use. A Blank file's model
+# is interpolated from, or copied from, neighbouring injections, or it keeps its original RT;
+# its own anchors never fit it, so every anchor record in a Blank is unused by design. Missing
+# and Ambiguous records matched no single peak and so never reached the model. Only the others
+# (MadOutlier, NonMonotonic, InsufficientAnchors, and any status this viewer does not know)
+# are rejections a reviewer has to look at.
+BLANK_ANCHOR_STATUSES = {"BlankInterpolateByOrder", "BlankNotCorrected"}
+UNMATCHED_ANCHOR_STATUSES = {"Missing", "Ambiguous"}
+SMOOTHING_METHOD_KEYS = {"smoothing method", "smoothing level"}
 MAX_AUDIT_BYTES = 32 * 1024 * 1024
 MAX_ROWS = 200_000
 SELECTION_FIELDS = (
@@ -138,6 +154,7 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
 
     anchors = []
     anchors_by_file = {file_id: [] for file_id in file_ids}
+    blank_files = {item["file_id"] for item in files if item["type"].strip().casefold() == "blank"}
     for row in anchor_rows:
         file_id = row["File ID"].strip()
         if file_id not in file_ids:
@@ -147,6 +164,16 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
         offset = reference - original if original is not None and reference is not None else None
         if offset is not None and not math.isfinite(offset):
             offset = None
+        used = row["Used"].strip().casefold() == "true"
+        status = row["Status"].strip()
+        if used:
+            category = "used"
+        elif file_id in blank_files or status in BLANK_ANCHOR_STATUSES:
+            category = "blank"
+        elif status in UNMATCHED_ANCHOR_STATUSES:
+            category = "unmatched"
+        else:
+            category = "rejected"
         anchor = {
             "file_id": file_id,
             "anchor_id": row["Anchor ID"].strip(),
@@ -157,8 +184,9 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
             "rt_available": original is not None and reference is not None and offset is not None,
             "quality_score": _number(row, "Quality score"),
             "coverage": _number(row, "Non-Blank sample coverage"),
-            "used": row["Used"].strip().casefold() == "true",
-            "status": row["Status"],
+            "used": used,
+            "status": status,
+            "category": category,
         }
         anchors.append(anchor)
         anchors_by_file[file_id].append(anchor)
@@ -173,50 +201,64 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
 
     model_counts = dict(Counter(item["model_source"] for item in files))
     reference = next((item for item in files if item["model_source"] == "Reference"), None)
-    rejected = Counter(item["status"] for item in anchors if not item["used"])
-    warnings = []
+    by_category = {
+        category: Counter(item["status"] for item in anchors if item["category"] == category)
+        for category in ("rejected", "unmatched", "blank")
+    }
+    rejected = by_category["rejected"]
+    warnings, notes = [], []
     if not reference:
         warnings.append("No reference file is recorded. Do not interpret the shift curves as validated correction.")
     if model_counts.get("Uncorrected"):
         warnings.append(f"{model_counts['Uncorrected']} file(s) remained on their original RT axis.")
     if rejected:
         warnings.append("Rejected anchors require review: " + ", ".join(f"{key} ({value})" for key, value in sorted(rejected.items())))
+    if by_category["unmatched"]:
+        notes.append(
+            f"{sum(by_category['unmatched'].values())} anchor record(s) in non-Blank files matched no single peak within the tolerances: "
+            + ", ".join(f"{key} ({value})" for key, value in sorted(by_category["unmatched"].items()))
+            + ". They never reached a model; they have no sample RT and remain in the table as N/A."
+        )
+    if by_category["blank"]:
+        notes.append(
+            f"{sum(by_category['blank'].values())} anchor record(s) are in Blank files, not used by design: "
+            + ", ".join(f"{key} ({value})" for key, value in sorted(by_category["blank"].items()))
+            + ". A Blank's model comes from neighbouring injections, or it keeps its original RT; its own anchors never fit it."
+        )
     missing_rt = [item for item in anchors if not item["rt_available"]]
-    if missing_rt:
-        warnings.append(f"{len(missing_rt)} anchor record(s) have unavailable RT values. They remain in the table as N/A and are excluded from numeric plots; no RT values are imputed.")
+    # A record that matched no peak has no sample RT by construction; any other is unexpected.
+    unexplained_missing_rt = [item for item in missing_rt if item["status"] not in UNMATCHED_ANCHOR_STATUSES]
+    if unexplained_missing_rt:
+        warnings.append(f"{len(unexplained_missing_rt)} anchor record(s) other than Missing or Ambiguous have unavailable RT values. They remain in the table as N/A and are excluded from numeric plots; no RT values are imputed.")
     invalid_used_files = sorted({item["file_id"] for item in missing_rt if item["used"]})
     if invalid_used_files:
         warnings.append("Anchors marked Used have unavailable RT values in File ID(s) " + ", ".join(invalid_used_files) + ". Their correction models cannot be reconstructed safely.")
     if any(item["model_source"] in {"InterpolatedBlank", "NearestBlank"} for item in files):
         warnings.append("Blank models are derived from neighboring samples; their control points are not recorded in the anchor TSV, so the viewer does not reconstruct their shift curves.")
 
-    method_audit = {"status": "missing", "applied_count": 0, "unrecognised": [], "unusable": [], "blank": []}
-    keys_path, method_path = root / "method.keys.json", root / "method.txt"
-    if keys_path.is_file() and method_path.is_file():
-        try:
-            record = json.loads(keys_path.read_text(encoding="utf-8-sig"))
-            digest = hashlib.sha256(method_path.read_bytes()).hexdigest()
-            status = "verified" if record.get("method_file_sha256", "").casefold() == digest else "method_mismatch"
-            if status == "verified" and min(summary_path.stat().st_mtime, anchors_path.stat().st_mtime) < keys_path.stat().st_mtime:
-                status = "stale_rt_audit"
-            method_audit = {
-                "status": status,
-                "applied_count": len(record.get("applied") or []),
-                "unrecognised": list(record.get("unrecognised") or []),
-                "unusable": list(record.get("unusable") or []),
-                "blank": list(record.get("blank") or []),
-                "automatic_rt_key_applied": "Execute automatic RT correction for alignment" in (record.get("applied") or []),
-            }
-        except (OSError, ValueError, AttributeError):
-            method_audit["status"] = "unreadable"
-    if method_audit["status"] != "verified":
-        warnings.append(f"Run provenance is not verified ({method_audit['status']}); audit files may belong to an earlier run.")
-    elif not method_audit["automatic_rt_key_applied"]:
-        warnings.append("The Console did not record the automatic RT correction method key as applied.")
+    # The publication report takes its verdict from the same call, so "verified" here is
+    # exactly the case in which the report describes the correction.
+    proof = automatic_rt_correction_proof(root, summary_rows, anchor_rows)
+    record = read_method_key_record(root) or {}
+    method_audit = {
+        "status": "verified" if proof["performed"] else proof["reason"],
+        "reason": proof["reason"],
+        "automatic_rt_key_applied": proof["method_key_applied"],
+        "discarded_keys": list(proof.get("discarded_keys") or []),
+        "applied_count": len(record.get("applied") or []),
+        "unrecognised": list(record.get("unrecognised") or []),
+        "unusable": list(record.get("unusable") or []),
+        "blank": list(record.get("blank") or []),
+    }
+    if not proof["performed"]:
+        warnings.append(
+            f"The retained records do not prove a correction in this run ({proof['reason']}): "
+            f"{proof_reason_phrase(proof)}. The publication report does not describe a correction from them."
+        )
     if method_audit["unusable"]:
         warnings.append(f"{len(method_audit['unusable'])} method parameter value(s) were rejected by the Console.")
 
-    method_values = _method_values(method_path)
+    method_values = _method_values(root / METHOD)
     return {
         "run_directory": str(root),
         "summary_file": str(summary_path),
@@ -226,6 +268,8 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
         "reference": reference,
         "model_counts": model_counts,
         "rejected_status_counts": dict(rejected),
+        "unmatched_status_counts": dict(by_category["unmatched"]),
+        "blank_status_counts": dict(by_category["blank"]),
         "method_audit": method_audit,
         "selection_settings": [{"label": label, "value": method_values.get(key.casefold()) or None}
                                for key, label in SELECTION_FIELDS],
@@ -235,6 +279,7 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
             "ms1_tolerance": method_values.get("ms1 tolerance for centroid") or None,
         },
         "warnings": warnings,
+        "notes": notes,
     }
 
 
@@ -279,7 +324,10 @@ def extract_anchor_eic(directory: str | Path, file_id: str, anchor_id: str, tole
     if not file["model_reconstructable"]:
         raise ValueError("The accepted anchors do not provide a complete, reconstructable RT model for this file.")
     if review["method_audit"]["status"] != "verified":
-        raise ValueError("Run provenance must be verified before extracting an EIC against its RT model.")
+        raise ValueError(
+            "Run provenance must be verified before extracting an EIC against its RT model "
+            f"({review['method_audit']['reason']})."
+        )
 
     input_csv = root / "analysis_files.csv"
     with input_csv.open(encoding="utf-8-sig", newline="") as handle:
@@ -333,18 +381,25 @@ def extract_anchor_eic(directory: str | Path, file_id: str, anchor_id: str, tole
                     raise ValueError("EIC contains more than 1,000,000 points; interactive smoothing review is bounded.")
         smoothing = {**review["smoothing_settings"], "available": False, "note": ""}
         smoothed = None
+        # Match the recorded method only; never substitute another smoother silently. A
+        # smoothing key the Console discarded, as an unusable or a blank value, left it on its
+        # default, which method.txt does not show. That holds even if another line applied the
+        # key: the preview reads method.txt's last line for it, which need not be the value the
+        # Console kept.
+        discarded = discarded_method_keys(review["method_audit"]) & SMOOTHING_METHOD_KEYS
         try:
+            if discarded:
+                raise ValueError(
+                    f"The Console discarded the recorded {' and '.join(sorted(discarded))}; "
+                    "no smoothed preview is inferred."
+                )
             level = int(smoothing["level"])
-            # Match the recorded method only; never substitute another smoother silently.
-            invalid = {str(key).casefold() for key in review["method_audit"]["unusable"]}
-            if invalid & {"smoothing method", "smoothing level"}:
-                raise ValueError("The Console rejected a smoothing setting; no smoothed preview is inferred.")
             smoothed = _smooth_eic(full_points, smoothing["method"], level)
             smoothing["available"] = True
             smoothing["level"] = level
             smoothing["note"] = "Reconstructed for this review EIC using the recorded method, before cropping and RT projection. This does not replace the stored detection metrics."
         except (TypeError, ValueError) as error:
-            smoothing["note"] = str(error) if smoothing["level"] is not None else "No smoothing level was recorded; only the raw EIC is shown."
+            smoothing["note"] = str(error) if discarded or smoothing["level"] is not None else "No smoothing level was recorded; only the raw EIC is shown."
         points = []
         for index, point in enumerate(full_points):
             rt = point["original_rt"]

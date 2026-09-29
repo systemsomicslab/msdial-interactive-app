@@ -574,6 +574,118 @@ class MaterialsMethodsTests(unittest.TestCase):
 
         self.assertTrue(evidence["performed"], evidence)
 
+    # The Console's audit as it writes it, with every column the viewer reads.
+    FULL_SUMMARY = (
+        "File ID\tFile name\tFile type\tAnalytical order\tCandidate count\tMatched anchors\t"
+        "Used anchors\tModel source\tReference score\tMedian absolute offset (min)\t"
+        "Maximum absolute offset (min)\tNote\n"
+        "0\tQC-reference\tQC\t1\t5\t2\t2\tReference\t0.9\t0\t0\t\n"
+        "1\tSample-1\tSample\t2\t5\t2\t2\tDetectedAnchors\t0.8\t0.02\t0.03\t\n"
+        "2\tBlank-1\tBlank\t3\t5\t2\t0\tInterpolatedBlank\t0\t0\t0\t"
+        "Blank model is estimated from neighboring non-Blank injections.\n"
+    )
+    FULL_ANCHORS = (
+        "File ID\tFile name\tAnchor ID\tm/z\tReference RT (min)\tOriginal RT (min)\t"
+        "Offset (min)\tQuality score\tNon-Blank sample coverage\tUsed\tStatus\n"
+        "0\tQC-reference\t1\t100\t2\t2\t0\t0.8\t1\tTrue\tReference\n"
+        "0\tQC-reference\t2\t200\t4\t4\t0\t0.8\t1\tTrue\tReference\n"
+        "1\tSample-1\t1\t100\t2\t2.03\t-0.03\t0.7\t1\tTrue\tUsed\n"
+        "1\tSample-1\t2\t200\t4\t4.01\t-0.01\t0.8\t1\tTrue\tUsed\n"
+        "2\tBlank-1\t1\t100\t2\t2.05\t-0.05\t0.6\t1\tFalse\tBlankInterpolateByOrder\n"
+        "2\tBlank-1\t2\t200\t4\t4.02\t-0.02\t0.6\t1\tFalse\tBlankInterpolateByOrder\n"
+    )
+
+    def _write_full_automatic_rt_audit(self, root: Path, **record_changes) -> None:
+        self._write_automatic_rt_audit(root)
+        keys = root / "method.keys.json"
+        record = json.loads(keys.read_text(encoding="utf-8"))
+        record.update(record_changes)
+        keys.write_text(json.dumps(record), encoding="utf-8")
+        later = keys.stat().st_mtime + 1
+        for name, content in (
+            ("automatic_alignment_rt_correction_summary.tsv", self.FULL_SUMMARY),
+            ("automatic_alignment_rt_correction_anchors.tsv", self.FULL_ANCHORS),
+        ):
+            (root / name).write_text(content, encoding="utf-8")
+            os.utime(root / name, (later, later))
+
+    def test_automatic_rt_report_and_audit_viewer_reach_one_verdict(self) -> None:
+        # The viewer used to judge the same records with its own rule and call a run verified
+        # whose correction the report refused to describe: a key not applied, a discarded
+        # setting, or no file but the reference corrected.
+        from msdial_app.automatic_rt_review import read_automatic_rt_review
+
+        def mismatch(root: Path) -> None:
+            (root / "method.txt").write_text("Different method\n", encoding="utf-8")
+
+        def stale(root: Path) -> None:
+            record_time = (root / "method.keys.json").stat().st_mtime
+            path = root / "automatic_alignment_rt_correction_summary.tsv"
+            os.utime(path, (record_time - 60, record_time - 60))
+
+        def nothing_corrected(root: Path) -> None:
+            path = root / "automatic_alignment_rt_correction_summary.tsv"
+            path.write_text(
+                self.FULL_SUMMARY.replace("\t2\tDetectedAnchors\t", "\t0\tUncorrected\t"),
+                encoding="utf-8",
+            )
+
+        cases = {
+            "performed": ({}, None),
+            "method_key_record_not_from_this_method_file": ({}, mismatch),
+            "audit_older_than_method_key_record": ({}, stale),
+            "method_key_not_applied": ({"applied": []}, None),
+            "method_key_value_discarded_by_console": (
+                {"unusable": ["Automatic RT correction outlier MAD threshold: -1"]}, None
+            ),
+            "audit_does_not_show_correction": ({}, nothing_corrected),
+        }
+        for reason, (record_changes, change) in cases.items():
+            with self.subTest(reason), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self._write_full_automatic_rt_audit(root, **record_changes)
+                if change:
+                    change(root)
+
+                viewer = read_automatic_rt_review(root)["method_audit"]
+                result, evidence = self._automatic_rt_report(root)
+
+                self.assertEqual(reason, evidence["reason"])
+                self.assertEqual(reason, viewer["reason"])
+                self.assertEqual(evidence["performed"], viewer["status"] == "verified")
+                self.assertEqual(
+                    evidence["performed"],
+                    "learned distributed anchor features" in result["methods_text"],
+                )
+
+    def test_automatic_rt_blank_anchors_do_not_stop_a_described_correction(self) -> None:
+        # A Blank's anchors are never used; they neither prove nor disprove the correction.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_full_automatic_rt_audit(root)
+
+            result, evidence = self._automatic_rt_report(root)
+
+        self.assertTrue(evidence["performed"], evidence)
+        self.assertEqual(1, evidence["corrected_file_count"])
+        self.assertEqual(2, evidence["selected_anchor_count"])
+        self.assertIn("1 Blank file(s) took an interpolated or nearest-sample model", result["methods_text"])
+
+    def test_automatic_rt_a_discarded_key_is_read_whatever_its_case_or_value(self) -> None:
+        # The Console spells the key as the method file does and appends the value it refused.
+        for entry in (
+            "AUTOMATIC RT CORRECTION MINIMUM ANCHORS: many",
+            "Automatic RT correction minimum anchors :  ",
+        ):
+            with self.subTest(entry), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self._write_full_automatic_rt_audit(root, unusable=[entry])
+
+                _, evidence = self._automatic_rt_report(root)
+
+                self.assertEqual("method_key_value_discarded_by_console", evidence["reason"])
+                self.assertEqual(["automatic rt correction minimum anchors"], evidence["discarded_keys"])
+
     def test_automatic_rt_settings_stay_out_of_table_s1_when_off(self) -> None:
         workflow = {
             "project_type": "lcms",

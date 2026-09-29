@@ -4,6 +4,51 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.6] - Unreleased
+
+### Fixed
+- The automatic RT correction audit viewer (#36) counted anchors in Blank files
+  as rejected. The Console gives a Blank's matched anchors the status
+  `BlankInterpolateByOrder` or `BlankNotCorrected` and never uses them: a
+  Blank's model is interpolated or copied from neighbouring injections, or it
+  keeps its original RT. So every run with a Blank warned "Rejected anchors
+  require review", and the UI counted, highlighted and plotted those anchors as
+  rejections. Unused anchor records are now reported in three groups:
+  rejections by the model (`MadOutlier`, `NonMonotonic`, `InsufficientAnchors`,
+  and any status the viewer does not know), which keep the warning, the
+  highlight and the count, now labelled "anchors rejected by the model";
+  records in a non-Blank file that matched no single peak (`Missing`,
+  `Ambiguous`); and every record in a Blank file, not used by design. The last
+  two groups are notes, not warnings (`unmatched_status_counts`,
+  `blank_status_counts`, `notes`, and a `category` on each anchor), and a Blank's
+  anchors are drawn in grey. The warning about anchors without an RT counts only
+  records whose status does not explain it: a `Missing` or `Ambiguous` record has
+  none by construction.
+- The smoothed EIC preview was never withheld when the Console had discarded a
+  smoothing setting. The Console records a value it could not use as
+  `<key>: <value>` in `method.keys.json`, and the viewer compared those entries
+  whole with the bare key names, so none ever matched. Entries are now read as
+  the publication report reads them, by the key before the first colon,
+  case-folded, and a smoothing method or level listed under `blank` withholds
+  the preview too. It is withheld even when another line of the method file
+  applied the key, because the preview takes the method file's last line for
+  it, which need not be the value the Console kept.
+- The audit viewer and the publication report judged the same records, the two
+  audit TSVs and `method.keys.json`, with separately written rules, so the
+  viewer could call a run's evidence verified while the report refused to
+  describe its correction: when the Console had not recorded the automatic RT
+  correction key as applied (the viewer warned and still said verified), when
+  it had discarded an automatic RT correction setting, or when no file other
+  than the reference was corrected from its own anchors. Both now take one
+  verdict from `automatic_rt_evidence.automatic_rt_correction_proof`. The viewer
+  calls the evidence verified exactly when the report describes the correction,
+  shows the report's reason code otherwise (`method_audit.reason`), and extracts
+  an EIC only on the same verdict. Its own status names `method_mismatch`,
+  `stale_rt_audit`, `missing` and `unreadable` give way to the report's
+  `method_key_record_not_from_this_method_file`,
+  `audit_older_than_method_key_record` and `retained_evidence_missing`. The
+  report reaches the same verdicts as before.
+
 ## [0.5.5] - Unreleased
 
 ### Fixed
