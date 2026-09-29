@@ -9,7 +9,8 @@ anchors, peak detections, or alignment results.
 2. Open **5. Validate & run** and select the completed job, or enter its output
    directory under **Automatic alignment RT correction audit**.
 3. Click **Review RT correction**. Inspect the reference, model-source counts,
-   rejected-anchor warnings, and method-key interpretation.
+   the correction evidence, the anchors the model rejected, and the method-key
+   interpretation.
 4. Choose a File ID. Compare the accepted and rejected candidates, the
    piecewise-linear shift curve, and anchor RT errors before/after the model.
 5. Select an anchor and click **Extract selected EIC** to inspect the original
@@ -22,10 +23,18 @@ anchors, peak detections, or alignment results.
    accepted/rejected RT pairings. Crossing connectors show reversed elution order.
 
 Required audit files are `automatic_alignment_rt_correction_summary.tsv` and
-`automatic_alignment_rt_correction_anchors.tsv`. The viewer checks the method
-hash against `method.keys.json` and checks for stale audit timestamps. EIC review
-also requires matching `analysis_files.csv`, `run-manifest.json`, the original
-raw data, and an available Console executable.
+`automatic_alignment_rt_correction_anchors.tsv`. Whether they prove this run's
+correction is decided once, in `msdial_app/automatic_rt_evidence.py`, and the
+viewer and the publication report both take that verdict. The records prove it
+only when `method.keys.json` carries the hash of the `method.txt` beside it, the
+Console applied the automatic RT correction key and discarded none of its
+settings (as an unusable or a blank value), neither audit TSV is older than
+`method.keys.json`, and a file other than the reference was corrected from its
+own detected anchors. The viewer calls the evidence verified exactly when the
+report would describe the correction; otherwise it shows the reason code the
+report records in Supplementary Table S1. EIC review requires verified
+evidence, and also matching `analysis_files.csv`, `run-manifest.json`, the
+original raw data, and an available Console executable.
 
 ## Scientific Interpretation
 
@@ -41,8 +50,10 @@ raw data, and an available Console executable.
   cropping or projection. The preview implements the CommonStandard formulas for
   `LinearWeightedMovingAverage`, `TimeBasedLinearWeightedMovingAverage`, and
   `SimpleMovingAverage`, including edge treatment. Other methods, missing levels,
-  or rejected smoothing settings leave only the raw curve and an explicit warning;
-  another smoother is never substituted silently. The preview adds no dependency.
+  or a smoothing method or level the Console discarded (listed in
+  `method.keys.json` as unusable or blank, even if another line applied it)
+  leave only the raw curve and an explicit warning; another smoother is never
+  substituted silently. The preview adds no dependency.
 - A smooth-looking preview is not proof of a correct anchor. Stored shape metrics
   may originate from the initial, wider mass-slice EIC, whereas this review uses
   the displayed extraction tolerance. The preview does not recompute or overwrite
@@ -62,11 +73,21 @@ raw data, and an available Console executable.
   genuine selectivity changes can reverse compound elution order too.
 - Several ions at exactly the same RT do not provide several independent RT
   control points. Duplicate positions can appear as `NonMonotonic` rejections.
-- `Missing` or `Ambiguous` candidates may have no original RT. They remain in
+- Unused anchor records fall into three groups, reported apart. Only
+  `MadOutlier`, `NonMonotonic`, `InsufficientAnchors` (and any status the viewer
+  does not know) are rejections by the model: they are counted, warned about,
+  and highlighted in the tables and plots. `Missing` and `Ambiguous` records in
+  a non-Blank file matched no single peak and never reached a model; they are
+  listed in a note, not a warning. Every record in a Blank file
+  (`BlankInterpolateByOrder`, `BlankNotCorrected`, or a `Missing` or `Ambiguous`
+  one there) is unused by design: a Blank's own anchors never fit its model. They
+  are listed in a note and drawn in grey.
+- `Missing` or `Ambiguous` candidates have no original RT. They remain in
   the table as `N/A`, without preventing other candidates or files from being
   plotted. No missing RT is imputed, and apex-based EIC review is restricted to
-  candidates with available RT values. If a candidate marked `Used` lacks RT,
-  the affected file's model is not reconstructed from an incomplete subset.
+  candidates with available RT values. A record of any other status without an
+  RT is warned about. If a candidate marked `Used` lacks RT, the affected file's
+  model is not reconstructed from an incomplete subset.
 - Blank-interpolated models are identified, but their full control points are
   absent from the current audit TSV. The viewer does not invent their curves.
 - Method-key warnings are not hidden. Unsupported keys are listed separately

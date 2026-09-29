@@ -133,6 +133,7 @@ label .inline-check input { width: auto; }
 .rt-audit-table table { min-width: 850px; }
 .rt-audit-table td:nth-child(2) { min-width: 130px; color: inherit; }
 .rt-audit-rejected { background: #fff7e7; }
+.rt-audit-unused td { color: var(--muted); }
 .rt-audit-eic { margin: 16px 0; padding: 12px; border: 1px solid var(--line); border-radius: 7px; }
 .rt-audit-eic h4 { margin: 0 0 8px; font-size: 15px; }
 .rt-audit-eic .button-row { align-items: end; }
