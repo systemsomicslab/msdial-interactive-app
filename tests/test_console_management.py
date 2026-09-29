@@ -148,7 +148,12 @@ class ConsoleManagementTests(unittest.TestCase):
             "working_tree_state_sha256": "state",
         }
         inspect.side_effect = [
-            {"binary_sha256": "hash", "version": "5.5"},
+            {
+                "binary_sha256": "hash",
+                "assembly_path": "built assembly",
+                "assembly_sha256": "hash",
+                "version": "5.5",
+            },
             {"path": "built.exe", "git": {"short_head": "abc"}},
         ]
         with tempfile.TemporaryDirectory() as temporary:
@@ -173,7 +178,61 @@ class ConsoleManagementTests(unittest.TestCase):
         self.assertTrue(result["selected"])
         self.assertEqual("abc", provenance["git_head"])
         self.assertEqual("state", provenance["working_tree_state_sha256"])
+        self.assertEqual("built assembly", provenance["binary_path"])
+        self.assertEqual("hash", provenance["binary_sha256"])
         save.assert_called_once()
+
+    @patch("msdial_app.console_management.save_path_settings")
+    @patch("msdial_app.console_management.console_git_state", return_value={"head": "abc"})
+    @patch("msdial_app.console_management.subprocess.Popen")
+    @patch("msdial_app.workflow.console_capabilities")
+    @patch("msdial_app.workflow.console_version", return_value="5.5.0")
+    def test_a_tool_built_net8_console_is_graded_by_its_assembly(
+        self, _version: Mock, capabilities: Mock, popen: Mock, _git: Mock, _save: Mock
+    ) -> None:
+        # The build tool records MSDIALCUI.dll for net8. Checked against the launcher beside
+        # it, that genuine build read as stale; and the launcher stays byte-identical when
+        # the dll is rebuilt from other code, so only the dll can show that it was.
+        capabilities.return_value = {"capability_probe": "test", "capabilities": []}
+        process = Mock()
+        process.stdout = io.StringIO("Build succeeded." + chr(10))
+        process.wait.return_value = 0
+        popen.return_value = process
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "bin/Release/net8"
+            folder.mkdir(parents=True)
+            dll = folder / "MSDIALCUI.dll"
+            dll.write_bytes(b"net8 assembly")
+            launcher = folder / "MSDIALCUI.exe"
+            launcher.write_bytes(b"apphost")
+            (folder / "MSDIALCUI.runtimeconfig.json").write_text("{}", encoding="ascii")
+            plan = {
+                "source_root": str(temporary),
+                "framework": "net8",
+                "configuration": "Release",
+                "command": ["dotnet", "build"],
+                "command_text": "dotnet build",
+                "output_path": str(dll),
+            }
+            build_local_console(plan, lambda _message: None)
+
+            by_assembly = inspect_console_path(dll)
+            by_launcher = inspect_console_path(launcher)
+            dll.write_bytes(b"net8 assembly rebuilt outside the tool")
+            rebuilt = inspect_console_path(launcher)
+            resolved_dll = dll.resolve()
+
+        self.assertEqual("verified", by_assembly["provenance_status"])
+        self.assertEqual("verified", by_launcher["provenance_status"])
+        self.assertEqual(by_assembly["assembly_sha256"], by_launcher["assembly_sha256"])
+        self.assertNotEqual(by_launcher["binary_sha256"], by_launcher["assembly_sha256"])
+
+        self.assertEqual(by_launcher["binary_sha256"], rebuilt["binary_sha256"])
+        self.assertEqual("stale_mismatch", rebuilt["provenance_status"])
+        mismatch = rebuilt["provenance_mismatch"]
+        self.assertEqual(by_assembly["assembly_sha256"], mismatch["recorded_binary_sha256"])
+        self.assertEqual(rebuilt["assembly_sha256"], mismatch["actual_binary_sha256"])
+        self.assertEqual(resolved_dll, Path(mismatch["actual_binary_path"]))
 
     @patch("msdial_app.workflow.console_capabilities")
     @patch("msdial_app.workflow.console_version", return_value="5.5.0")

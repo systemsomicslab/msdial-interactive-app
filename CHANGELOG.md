@@ -4,6 +4,28 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.7] - Unreleased
+
+### Changed
+- The run manifest identifies a net8 Console by its assembly, which lifts the
+  0.5.0 known limitation that it hashed only the launcher. The `console` block
+  of `run-manifest.json` and the run's `software_provenance` record
+  `assembly_path` and `assembly_sha256` beside the launcher's `binary_sha256`.
+  The assembly is the `MSDIALCUI.dll` beside a launcher (`MSDIALCUI.exe`, or
+  `MSDIALCUI` on Linux and macOS): a file with a `MSDIALCUI.runtimeconfig.json`
+  beside it and no CLI header in its own image. Otherwise it is the Console
+  path itself, so for net48 both checksums are the exe's, and a stale net8 dll
+  beside it is not recorded, even after a net48 archive is unpacked over a net8
+  folder. Two net8 launchers differ only in their version string, and not at
+  all after a rebuild at the same commit, so the launcher checksum alone did
+  not identify the code that ran. The capability probe reads the same file,
+  through one shared rule. The build-provenance record, which the build tool
+  writes for the assembly it built, is compared with the assembly: a
+  tool-built net8 Console selected by its launcher read as `stale_mismatch` and
+  now reads as `verified`, and a dll rebuilt outside the tool reads as
+  `stale_mismatch` whichever file is selected. `provenance_mismatch` names the
+  file compared as `actual_binary_path`.
+
 ## [0.5.6] - Unreleased
 
 ### Fixed
