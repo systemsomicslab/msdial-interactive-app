@@ -338,6 +338,11 @@ features after those steps, chooses a reference file automatically or by file
 ID, and applies a piecewise-linear map only during alignment. Blank models can
 be interpolated by analytical order. This mode is mutually exclusive with the
 user-defined RT-correction workspace and writes summary and anchor audit TSVs.
+In **5. Validate & run**, the **Automatic alignment RT correction audit** panel
+reads those TSVs, displays accepted/rejected anchors and per-file RT maps, and
+can extract one original-raw MS1 EIC on demand. See
+[the audit viewer guide](docs/automatic_alignment_rt_review.md) for interpretation
+and the boundary between completed-run review and pre-alignment approval.
 
 ## LC-MS retention-time correction
 
