@@ -118,6 +118,29 @@ label .inline-check input { width: auto; }
 .publication-option { padding: 11px 13px; border: 1px solid var(--line); border-radius: 6px; background: #f8fbfc; }
 .publication-option label.check { gap: 8px; margin-top: 0; color: var(--text); }
 .publication-option p { margin: 5px 0 0 25px; line-height: 1.5; }
+.automatic-rt-review { margin-top: 16px; }
+.automatic-rt-review .metric-grid { margin: 14px 0; }
+.automatic-rt-review .metric strong { overflow-wrap: anywhere; }
+.rt-audit-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.rt-audit-grid article { min-width: 0; border: 1px solid var(--line); border-radius: 7px; padding: 12px; }
+.rt-audit-grid h4 { margin: 0 0 8px; font-size: 15px; }
+.rt-audit-plot { display: block; width: 100%; height: auto; min-height: 180px; }
+.rt-audit-plot text { font: 14px Arial, sans-serif; fill: var(--text); }
+.rt-audit-legend { display: flex; flex-wrap: wrap; gap: 12px; font: 14px Arial, sans-serif; }
+.rt-audit-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.rt-audit-legend i { display: inline-block; width: 12px; height: 12px; border-radius: 50%; }
+.rt-audit-table { max-height: 360px; margin: 12px 0; }
+.rt-audit-table table { min-width: 850px; }
+.rt-audit-table td:nth-child(2) { min-width: 130px; color: inherit; }
+.rt-audit-rejected { background: #fff7e7; }
+.rt-audit-eic { margin: 16px 0; padding: 12px; border: 1px solid var(--line); border-radius: 7px; }
+.rt-audit-eic h4 { margin: 0 0 8px; font-size: 15px; }
+.rt-audit-eic .button-row { align-items: end; }
+.rt-audit-eic input { width: 140px; }
+.rt-audit-eic input[type="checkbox"] { width: auto; }
+.rt-audit-eic .rt-audit-grid { grid-template-columns: 1fr; margin-top: 12px; }
+.rt-audit-eic .rt-audit-grid article { padding: 12px; }
+@media (max-width: 900px) { .rt-audit-grid { grid-template-columns: 1fr; } }
 .lipid-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 5px; max-height: 520px; overflow: auto; border: 1px solid var(--line); padding: 10px; }
 .adduct-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 5px; max-height: 300px; overflow: auto; border: 1px solid var(--line); padding: 10px; margin-top: 10px; }
 .adduct-item { display: flex; align-items: center; gap: 7px; padding: 5px; color: var(--text); font-weight: 500; }

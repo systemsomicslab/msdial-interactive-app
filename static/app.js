@@ -35,6 +35,7 @@ const state = {
   selectedMzTabScope: "",
   qaReport: null,
   qaSourceJobId: "",
+  automaticRtReview: null,
   pathPicker: {
     mode: "vendor",
     currentPath: "",
@@ -121,8 +122,8 @@ function workflow() {
     ms2_data_type: $("#ms2Type").value,
     number_of_threads: Number($("#numberOfThreads").value),
     smoothing_method: $("#smoothingMethod").value,
-    minimum_peak_height: Number($("#minimumPeakHeight").value),
-    mass_slice_width: Number($("#massSliceWidth").value),
+    minimum_peak_height: numberField("#minimumPeakHeight", state.config?.default_peak_picking?.minimum_peak_height ?? 300),
+    mass_slice_width: numberField("#massSliceWidth", state.config?.default_peak_picking?.mass_slice_width ?? 0.1),
     minimum_peak_width: Number($("#minimumPeakWidth").value),
     retention_time_begin: Number($("#rtBegin").value),
     retention_time_end: Number($("#rtEnd").value),
@@ -1561,7 +1562,7 @@ function renderTuningFormat() {
   $("#tuningFormat").innerHTML = file
     ? `<strong>${escapeHtml(file.format)}</strong><br>
        Detected as ${escapeHtml(file.vendor)} / ${escapeHtml(file.instrument_family)}.
-       Format-based starting values: Minimum peak height ${file.minimum_peak_height}, Mass slice width ${file.mass_slice_width}.
+       Format-based starting values: Minimum peak height ${file.suggested_minimum_peak_height ?? state.config?.default_peak_picking?.minimum_peak_height ?? 300}, Mass slice width ${file.suggested_mass_slice_width ?? state.config?.default_peak_picking?.mass_slice_width ?? 0.1}.
        ${sidecarNote}`
     : "No representative file selected.";
 }
@@ -1569,10 +1570,12 @@ function renderTuningFormat() {
 function applyFormatStartingValues() {
   const file = selectedTuningFile() || state.files[0];
   if (!file) return;
-  $("#minimumPeakHeight").value = file.minimum_peak_height;
-  $("#massSliceWidth").value = file.mass_slice_width;
-  $("#tuningHeightNumber").value = file.minimum_peak_height;
-  $("#tuningHeight").value = file.minimum_peak_height;
+  const height = file.suggested_minimum_peak_height ?? state.config?.default_peak_picking?.minimum_peak_height ?? 300;
+  const width = file.suggested_mass_slice_width ?? state.config?.default_peak_picking?.mass_slice_width ?? 0.1;
+  $("#minimumPeakHeight").value = height;
+  $("#massSliceWidth").value = width;
+  $("#tuningHeightNumber").value = height;
+  $("#tuningHeight").value = height;
   updateTuningCounts();
 }
 
@@ -1638,7 +1641,7 @@ function renderTuningResult(result) {
   const percentileIndex = Math.max(0, Math.ceil(result.heights.length * 0.99) - 1);
   const sliderMax = Math.max(100, Math.ceil(result.heights[percentileIndex] || maxHeight));
   $("#tuningHeight").max = sliderMax;
-  const startingValue = Number(selectedTuningFile()?.minimum_peak_height || 100);
+  const startingValue = Number(selectedTuningFile()?.suggested_minimum_peak_height ?? 100);
   $("#tuningHeight").value = Math.min(startingValue, sliderMax);
   $("#tuningHeightNumber").value = startingValue;
   $("#tuningSummary").innerHTML = `
@@ -2311,14 +2314,16 @@ async function pollTuningJob() {
   if (!state.tuningJobId) return;
   try {
     const job = await api(`/api/jobs/${state.tuningJobId}`);
-    $("#tuningLog").textContent = job.logs.join("\n") || job.status;
+    $("#tuningLog").textContent = (job.log_tail || job.logs || []).join("\n") || job.status;
     $("#tuningLog").scrollTop = $("#tuningLog").scrollHeight;
     setStatus(`Tuning job ${job.status}`);
     if (["queued", "running"].includes(job.status)) {
       setTimeout(pollTuningJob, 1000);
-    } else if (job.status === "completed" && job.result) {
-      renderTuningResult(job.result);
-      $("#tuningLog").textContent += `\nLoaded ${job.result.source_file}`;
+    } else if (job.status === "completed") {
+      const completed = await api(`/api/jobs/${state.tuningJobId}?detail=full`);
+      if (!completed.result) throw new Error("Diagnostic completed but returned no peak-picking result.");
+      renderTuningResult(completed.result);
+      $("#tuningLog").textContent += `\nLoaded ${completed.result.source_file}`;
     } else if (job.error) {
       $("#tuningLog").textContent += `\n${job.error}`;
     }
@@ -2326,6 +2331,259 @@ async function pollTuningJob() {
     $("#tuningLog").textContent += `\nDiagnostic status error: ${error.message}`;
     setStatus("Tuning job status failed");
   }
+}
+
+function rtAuditNumber(value, digits = 3) {
+  return Number.isFinite(Number(value)) && value !== null ? Number(value).toFixed(digits) : "N/A";
+}
+
+function rtAuditPlot(series, xLabel, yLabel, { zero = true, nonnegative = false, integerX = false, width = 740 } = {}) {
+  series = series.map((item) => ({ ...item, points: item.points.filter((point) =>
+    Number.isFinite(point[0]) && Number.isFinite(point[1])) }));
+  const points = series.flatMap((item) => item.points);
+  if (!points.length) return `<p class="muted">No numeric data available for this plot.</p>`;
+  const height = 300, left = 88, right = 28, top = 18, bottom = 64;
+  const xValues = points.map((point) => point[0]);
+  const yValues = points.map((point) => point[1]);
+  if (zero) yValues.push(0);
+  let xMin = Math.min(...xValues), xMax = Math.max(...xValues);
+  let yMin = Math.min(...yValues), yMax = Math.max(...yValues);
+  if (xMin === xMax) { xMin -= 0.5; xMax += 0.5; }
+  if (yMin === yMax) { yMin -= 0.01; yMax += 0.01; }
+  const yMargin = Math.max((yMax - yMin) * 0.08, 0.002);
+  yMin -= yMargin;
+  yMax += yMargin;
+  if (nonnegative) yMin = 0;
+  const x = (value) => left + (value - xMin) * (width - left - right) / (xMax - xMin);
+  const y = (value) => height - bottom - (value - yMin) * (height - top - bottom) / (yMax - yMin);
+  const yTick = (value) => Math.abs(value) >= 1000 || (Math.abs(value) > 0 && Math.abs(value) < 0.001)
+    ? value.toExponential(1) : value.toFixed(3);
+  const axis = qaAxisTicks(xMin, xMax, integerX).map((xValue) =>
+    `<line x1="${x(xValue)}" y1="${height - bottom}" x2="${x(xValue)}" y2="${height - bottom + 5}" stroke="#627d88"/>
+      <text x="${x(xValue)}" y="${height - 14}" text-anchor="middle">${integerX ? xValue : xValue.toFixed(2)}</text>`
+  ).join("") + [0, 1, 2, 3, 4].map((tick) => {
+    const yValue = yMin + (yMax - yMin) * tick / 4;
+    return `<line x1="${left - 5}" y1="${y(yValue)}" x2="${left}" y2="${y(yValue)}" stroke="#627d88"/>
+      <text x="${left - 8}" y="${y(yValue) + 5}" text-anchor="end">${yTick(yValue)}</text>`;
+  }).join("");
+  const marks = series.map((item) => {
+    const color = item.color;
+    const line = item.line && item.points.length > 1
+      ? `<polyline fill="none" stroke="${color}" stroke-width="2.5" points="${item.points.map((point) => `${x(point[0])},${y(point[1])}`).join(" ")}"/>`
+      : "";
+    const dots = item.points.map((point) => `<circle cx="${x(point[0])}" cy="${y(point[1])}" r="4.3" fill="${color}"/>`).join("");
+    return line + dots;
+  }).join("");
+  const legend = series.map((item) => `<span><i style="background:${item.color}"></i>${escapeHtml(item.label)}</span>`).join("");
+  return `<div class="rt-audit-legend">${legend}</div><svg class="rt-audit-plot" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(yLabel)} by ${escapeHtml(xLabel)}">
+    <line x1="${left}" y1="${top}" x2="${left}" y2="${height - bottom}" stroke="#627d88"/>
+    <line x1="${left}" y1="${height - bottom}" x2="${width - right}" y2="${height - bottom}" stroke="#627d88"/>
+    ${zero ? `<line x1="${left}" y1="${y(0)}" x2="${width - right}" y2="${y(0)}" stroke="#9cadb5" stroke-dasharray="4 4"/>` : ""}
+    ${axis}${marks}
+    <text x="${(left + width - right) / 2}" y="${height - 1}" text-anchor="middle">${escapeHtml(xLabel)}</text>
+    <text x="18" y="${height / 2}" text-anchor="middle" transform="rotate(-90 18 ${height / 2})">${escapeHtml(yLabel)}</text>
+  </svg>`;
+}
+
+function rtAuditHasRt(anchor) {
+  return Number.isFinite(anchor.original_rt) && Number.isFinite(anchor.reference_rt)
+    && Number.isFinite(anchor.offset);
+}
+
+function rtAuditCorrect(originalRt, anchors) {
+  if (!Number.isFinite(originalRt) || anchors.some((item) => item.used && !rtAuditHasRt(item))) return null;
+  const byRt = new Map();
+  anchors.filter((item) => item.used).forEach((item) => {
+    const previous = byRt.get(item.original_rt);
+    if (!previous || (item.quality_score || 0) > (previous.quality_score || 0)) byRt.set(item.original_rt, item);
+  });
+  const points = [...byRt.values()].sort((a, b) => a.original_rt - b.original_rt);
+  if (points.length < 2) return null;
+  if (originalRt <= points[0].original_rt) return originalRt + points[0].offset;
+  if (originalRt >= points[points.length - 1].original_rt) return originalRt + points[points.length - 1].offset;
+  for (let i = 1; i < points.length; i += 1) {
+    if (originalRt > points[i].original_rt) continue;
+    const left = points[i - 1], right = points[i];
+    if (right.original_rt === left.original_rt) return null;
+    const fraction = (originalRt - left.original_rt) / (right.original_rt - left.original_rt);
+    return left.reference_rt + fraction * (right.reference_rt - left.reference_rt);
+  }
+  return null;
+}
+
+function rtAuditCorrespondence(anchors) {
+  const points = anchors.filter(rtAuditHasRt);
+  if (!points.length) return `<p class="muted">No finite RT pairs are available.</p>`;
+  const width = 740, left = 95, right = 30, upper = 65, lower = 210;
+  const values = points.flatMap((item) => [item.original_rt, item.reference_rt]);
+  const margin = Math.max((Math.max(...values) - Math.min(...values)) * 0.08, 0.1);
+  const minimum = Math.min(...values) - margin, maximum = Math.max(...values) + margin;
+  const x = (rt) => left + (rt - minimum) * (width - left - right) / (maximum - minimum);
+  const marks = points.map((item) => {
+    const color = item.used ? "#007f82" : item.status === "NonMonotonic" ? "#9d2347" : "#b1630a";
+    return `<g><title>Anchor ${escapeHtml(item.anchor_id)}: ${rtAuditNumber(item.original_rt)} to ${rtAuditNumber(item.reference_rt)} min; ${escapeHtml(item.status)}</title>
+      <line x1="${x(item.original_rt)}" y1="${upper}" x2="${x(item.reference_rt)}" y2="${lower}" stroke="${color}" stroke-width="2" ${item.used ? "" : 'stroke-dasharray="5 4"'}/>
+      <circle cx="${x(item.original_rt)}" cy="${upper}" r="5" fill="${color}"/>
+      <circle cx="${x(item.reference_rt)}" cy="${lower}" r="5" fill="${color}"/>
+      <text x="${x(item.original_rt)}" y="${upper - 12}" text-anchor="middle">${escapeHtml(item.anchor_id)}</text>
+      <text x="${x(item.reference_rt)}" y="${lower + 22}" text-anchor="middle">${escapeHtml(item.anchor_id)}</text></g>`;
+  }).join("");
+  const ticks = qaAxisTicks(minimum, maximum, false).map((rt) => `<text x="${x(rt)}" y="275" text-anchor="middle">${rt.toFixed(2)}</text>`).join("");
+  return `<div class="rt-audit-legend"><span><i style="background:#007f82"></i>Accepted (solid)</span><span><i style="background:#b1630a"></i>Rejected (dashed)</span><span><i style="background:#9d2347"></i>NonMonotonic (dashed)</span></div>
+    <svg class="rt-audit-plot" viewBox="0 0 ${width} 305" role="img" aria-label="Anchor correspondence from sample RT to reference RT. Crossing lines indicate reversed order.">
+      <text x="8" y="${upper - 35}">Sample</text><text x="8" y="${lower - 35}">Reference</text>
+      <line x1="${left}" y1="${upper}" x2="${width - right}" y2="${upper}" stroke="#627d88"/>
+      <line x1="${left}" y1="${lower}" x2="${width - right}" y2="${lower}" stroke="#627d88"/>
+      ${marks}${ticks}<text x="${width / 2}" y="300" text-anchor="middle">RT (min); labels are anchor IDs</text></svg>`;
+}
+
+function rtAuditEicHtml(result, { showRaw = true, showSmoothed = true, width = 740 } = {}) {
+  const points = result.points || [];
+  const smoothing = result.smoothing || {};
+  const smoothPoints = points.filter((point) => Number.isFinite(point.smoothed_intensity));
+  const maximum = Math.max(0, ...points.map((point) => point.intensity), ...smoothPoints.map((point) => point.smoothed_intensity));
+  const chart = (key, apex, label) => {
+    const series = [];
+    if (showRaw) series.push({ label: "Unsmoothed EIC", color: "#b1630a", line: true,
+      points: points.filter((point) => Number.isFinite(point[key])).map((point) => [point[key], point.intensity]) });
+    if (showSmoothed && smoothing.available) series.push({ label: "Smoothed EIC", color: "#007f82", line: true,
+      points: smoothPoints.filter((point) => Number.isFinite(point[key])).map((point) => [point[key], point.smoothed_intensity]) });
+    if (series.length) series.push({ label, color: "#1463a0", line: true, points: [[apex, 0], [apex, maximum]] });
+    return rtAuditPlot(series, key === "original_rt" ? "Original RT (min)" : "Projected alignment RT (min)", "MS1 intensity", { nonnegative: true, width });
+  };
+  return `<strong>${escapeHtml(result.file_name)} | anchor ${escapeHtml(result.anchor_id)} | m/z ${rtAuditNumber(result.mz, 5)} ± ${rtAuditNumber(result.tolerance, 4)} Da</strong>
+    <p>Recorded smoothing: <strong>${escapeHtml(smoothing.method || "not recorded")}</strong> | Level ${escapeHtml(smoothing.level ?? "not recorded")} | Stored quality ${rtAuditNumber(result.quality_score, 3)} | Non-Blank coverage ${rtAuditNumber(result.coverage, 2)}</p>
+    <p class="${smoothing.available ? "muted" : "issue warning"}">${escapeHtml(smoothing.note || "Smoothing preview is unavailable; only the unsmoothed EIC can be inspected.")}</p>
+    <div class="button-row"><label class="check"><input id="rtAuditShowRaw" type="checkbox" ${showRaw ? "checked" : ""}> Show unsmoothed EIC</label>
+      <label class="check"><input id="rtAuditShowSmoothed" type="checkbox" ${showSmoothed && smoothing.available ? "checked" : ""} ${smoothing.available ? "" : "disabled"}> Show smoothed EIC</label></div>
+    <div class="rt-audit-grid"><article><h4>Original RT axis</h4>${chart("original_rt", result.original_rt, "Selected original apex")}</article>
+      <article><h4>Projected alignment RT axis</h4>${chart("corrected_rt", result.reference_rt, "Reference RT")}</article></div>
+    <p class="muted">${points.length} MS1 points near the anchor. Smoothing uses the full original EIC before cropping; RT projection does not modify its intensities. Raw data and analysis results are not rewritten. A smooth curve or zero fitted residual is not independent evidence of a correct assignment.</p>
+    <p class="muted">The stored score can use shape metrics from the initial mass-slice EIC. This review EIC uses the tolerance above (recorded centroid tolerance: ${escapeHtml(smoothing.ms1_tolerance ?? "not recorded")} Da); the curves and the stored shape metrics are not necessarily based on identical extraction windows.</p>`;
+}
+
+function renderAutomaticRtEic(result, options = {}) {
+  const panel = $("#rtAuditEicResult");
+  panel.innerHTML = rtAuditEicHtml(result, { ...options, width: Math.max(360, (panel.clientWidth || 800) - 28) });
+  ["#rtAuditShowRaw", "#rtAuditShowSmoothed"].forEach((selector) => {
+    $(selector).addEventListener("change", () => {
+      renderAutomaticRtEic(result, {
+        showRaw: $("#rtAuditShowRaw").checked, showSmoothed: $("#rtAuditShowSmoothed").checked,
+      });
+      $(selector).focus();
+    });
+  });
+}
+
+function renderAutomaticRtFile() {
+  const review = state.automaticRtReview;
+  if (!review) return;
+  const id = $("#rtAuditFileId")?.value.trim();
+  const file = review.files.find((item) => item.file_id === id);
+  const panel = $("#rtAuditFileDetails");
+  if (!file) { panel.textContent = "Enter an audited File ID to inspect it."; return; }
+  const anchors = review.anchors.filter((item) => item.file_id === id);
+  const numericAnchors = anchors.filter(rtAuditHasRt);
+  const used = numericAnchors.filter((item) => item.used).sort((a, b) => a.original_rt - b.original_rt);
+  const canReconstruct = file.model_reconstructable === true;
+  const curve = canReconstruct && used.length >= 2
+    ? [used[0].original_rt - 0.5, ...used.map((item) => item.original_rt), used[used.length - 1].original_rt + 0.5]
+      .map((rt) => [rt, rtAuditCorrect(rt, used) - rt])
+    : [];
+  const plotted = numericAnchors.map((item) => ({ ...item,
+    corrected: canReconstruct ? rtAuditCorrect(item.original_rt, used) : null }));
+  const shiftPlot = rtAuditPlot([
+    { label: "Piecewise RT offset", color: "#007f82", line: true, points: curve },
+    { label: "Accepted anchors", color: "#1463a0", points: used.map((item) => [item.original_rt, item.offset]) },
+    { label: "Rejected anchors", color: "#b1630a", points: numericAnchors.filter((item) => !item.used).map((item) => [item.original_rt, item.offset]) },
+  ], "Original RT (min)", "RT offset (min)");
+  const residualPlot = rtAuditPlot([
+    { label: "Before correction", color: "#b1630a", points: numericAnchors.map((item) => [item.original_rt, item.original_rt - item.reference_rt]) },
+    { label: "After model (available anchors)", color: "#007f82", points: plotted.filter((item) => item.corrected !== null).map((item) => [item.original_rt, item.corrected - item.reference_rt]) },
+  ], "Original RT (min)", "RT - reference RT (min)");
+  const eicAnchors = canReconstruct ? numericAnchors.filter((item) => Number.isFinite(item.mz)) : [];
+  const recordedTolerance = Number(review.smoothing_settings?.ms1_tolerance);
+  const eicTolerance = recordedTolerance > 0 && recordedTolerance <= 1 ? recordedTolerance : 0.01;
+  const missingCount = anchors.length - numericAnchors.length;
+  const rows = anchors.map((item) => `<tr class="${item.used ? "" : "rt-audit-rejected"}"><td>${escapeHtml(item.anchor_id)}</td><td>${rtAuditNumber(item.mz, 5)}</td><td>${rtAuditNumber(item.original_rt)}</td><td>${rtAuditNumber(item.reference_rt)}</td><td>${rtAuditNumber(item.offset, 4)}</td><td>${rtAuditNumber(item.quality_score, 2)}</td><td>${rtAuditNumber(item.coverage, 2)}</td><td>${item.used ? "Yes" : "No"}</td><td>${escapeHtml(item.status)}</td></tr>`).join("");
+  panel.innerHTML = `<h3>${escapeHtml(file.name)} | ${escapeHtml(file.model_source)}</h3>
+    <p class="muted">${escapeHtml(file.type)} | Order ${escapeHtml(file.order ?? "unknown")} | ${escapeHtml(file.used_anchors ?? 0)} accepted of ${escapeHtml(file.matched_anchors ?? 0)} matched | Reference score ${rtAuditNumber(file.reference_score, 2)}. ${escapeHtml(file.note || "")}</p>
+    ${missingCount ? `<p class="muted">${missingCount} anchor record(s) have unavailable RT values. They remain in the table as N/A, but are not plotted or offered for apex-based EIC review. No RT values are imputed.</p>` : ""}
+    ${!canReconstruct ? `<p class="issue warning">This file has no reconstructable RT model in the audit. Original candidate offsets remain visible where available; no corrected curve is inferred.</p>` : ""}
+    <div class="rt-audit-grid"><article><h4>File-specific RT shift</h4>${shiftPlot}<p class="muted">The Console uses linear interpolation between accepted anchors and holds the nearest anchor's offset beyond both ends. An RT shift curve is unavailable for Blank-interpolated models because their control points are not in the audit file.</p></article>
+    <article><h4>Anchor RT error before / after model</h4>${residualPlot}<p class="muted">Zero residual at accepted anchors follows from the fitted model, not independent validation. Rejected anchors at a different RT can reveal inconsistent assignments; rejected anchors sharing the same RT are not independent evidence.</p></article></div>
+    <details ${anchors.some((item) => item.status === "NonMonotonic") ? "open" : ""}><summary><strong>Anchor correspondence and reversed order</strong></summary>
+      ${rtAuditCorrespondence(anchors)}<p class="muted">Crossing lines mean that the sample and reference disagree on elution order. Connecting these pairs would make corrected RT decrease as original RT increases. After MAD filtering, the Console rejects the lower-quality member of each conflicting pair (NonMonotonic); equal reference RTs are also rejected. With equal scores, the earlier member on the sample RT axis is removed. Real selectivity changes can also reverse order, so rejection is a model constraint, not proof of a wrong identification.</p></details>
+    <div class="rt-audit-eic"><h4>Inspect the raw chromatographic evidence</h4><p class="muted">Extract one MS1 EIC from this run's original raw file. This may take several minutes for vendor data. The raw data stay in place; the temporary CSV is deleted after reading.</p>
+      <div class="button-row"><label>Anchor <select id="rtAuditEicAnchor">${eicAnchors.map((item) => `<option value="${escapeHtml(item.anchor_id)}">${escapeHtml(item.anchor_id)} | m/z ${rtAuditNumber(item.mz, 5)} | ${escapeHtml(item.status)}</option>`).join("")}</select></label>
+      <label>m/z tolerance (Da)<input id="rtAuditEicTolerance" type="number" min="0.0001" max="1" step="any" value="${eicTolerance}"></label>
+      <button id="rtAuditExtractEic" type="button" class="secondary" ${!eicAnchors.length ? "disabled" : ""}>Extract selected EIC</button></div>
+      <div id="rtAuditEicResult" class="format-summary" hidden></div></div>
+    <div class="table-wrap rt-audit-table"><table><thead><tr><th>Anchor</th><th>m/z</th><th>Original RT</th><th>Reference RT</th><th>Offset (min)</th><th>Quality</th><th>Coverage</th><th>Used</th><th>Status</th></tr></thead><tbody>${rows || `<tr><td colspan="9">No matched anchor candidates were recorded.</td></tr>`}</tbody></table></div>`;
+  $("#rtAuditExtractEic").addEventListener("click", () => runUiAction(async () => {
+    const button = $("#rtAuditExtractEic");
+    const resultPanel = $("#rtAuditEicResult");
+    button.disabled = true;
+    resultPanel.hidden = false;
+    resultPanel.textContent = "Reading the selected raw file and extracting one EIC...";
+    try {
+      const result = await api("/api/automatic-rt/eic", {
+        method: "POST",
+        body: JSON.stringify({
+          run_directory: review.run_directory,
+          file_id: id,
+          anchor_id: $("#rtAuditEicAnchor").value,
+          tolerance: Number($("#rtAuditEicTolerance").value),
+        }),
+      });
+      renderAutomaticRtEic(result);
+    } catch (error) {
+      resultPanel.textContent = `EIC extraction failed: ${error.message}`;
+      throw error;
+    } finally {
+      button.disabled = false;
+    }
+  }));
+}
+
+function renderAutomaticRtReview(review) {
+  state.automaticRtReview = review;
+  const panel = $("#automaticRtReview");
+  panel.hidden = false;
+  const corrected = review.model_counts?.DetectedAnchors || 0;
+  const inspected = review.files.length;
+  const refused = review.anchors.filter((item) => !item.used).length;
+  const ordered = review.files.filter((item) => item.order !== null).sort((a, b) => a.order - b.order);
+  const sampled = ordered.length > 500 ? ordered.filter((_, index) => index % Math.ceil(ordered.length / 500) === 0) : ordered;
+  const overview = rtAuditPlot([
+    { label: "Median absolute offset", color: "#007f82", line: true, points: sampled.filter((item) => item.median_absolute_offset !== null).map((item) => [item.order, item.median_absolute_offset]) },
+  ], "Analytical order", "Median |RT offset| (min)", { zero: true, nonnegative: true, integerX: true });
+  const warnings = (review.warnings || []).map((message) => `<div class="issue warning">${escapeHtml(message)}</div>`).join("");
+  const audit = review.method_audit || {};
+  const fileRows = review.files.slice(0, 200).map((file) => `<tr><td>${escapeHtml(file.file_id)}</td><td>${escapeHtml(file.name)}</td><td>${escapeHtml(file.type)}</td><td>${escapeHtml(file.order ?? "")}</td><td>${escapeHtml(file.model_source)}</td><td>${escapeHtml(file.used_anchors ?? "")}</td><td>${rtAuditNumber(file.median_absolute_offset, 4)}</td><td>${escapeHtml(file.note)}</td></tr>`).join("");
+  panel.innerHTML = `<div class="metric-grid">
+    <div class="metric"><strong>${inspected}</strong><span>audited files</span></div>
+    <div class="metric"><strong>${escapeHtml(review.reference?.file_id ?? "none")}</strong><span>reference file ID</span></div>
+    <div class="metric"><strong>${corrected}</strong><span>non-reference files fitted from anchors</span></div>
+    <div class="metric"><strong>${refused}</strong><span>unused anchor records</span></div></div>
+    <p class="muted">Reference: ${escapeHtml(review.reference?.name || "none")}. Model sources: ${escapeHtml(Object.entries(review.model_counts || {}).map(([name, count]) => `${name} ${count}`).join("; "))}. Evidence: ${escapeHtml(audit.status || "missing")} method record.</p>
+    ${warnings}
+    <details><summary><strong>Recorded anchor-selection criteria and score</strong></summary>
+      <div class="table-wrap"><table><thead><tr><th>Criterion</th><th>Value in this run's method.txt</th></tr></thead><tbody>${(review.selection_settings || []).map((item) => `<tr><td>${escapeHtml(item.label)}</td><td>${escapeHtml(item.value ?? "not recorded")}</td></tr>`).join("")}</tbody></table></div>
+      <p>Current score weights: normalized log intensity 35%, S/N 20%, Gaussian similarity 15%, ideal slope 15%, symmetry 10%, width 5%. The score ranks candidates; it is not a probability of a correct anchor.</p>
+      <p class="muted">Initial shape thresholds filter reference candidates, not all cross-file matches. Gaussian similarity is an area-based measure, not a fitted R². Per-component stored metrics are not present in these audit TSVs. Method values should only be treated as verified run settings when the method record above is verified.</p></details>
+    <details><summary><strong>Method-file interpretation: ${escapeHtml(audit.applied_count ?? 0)} keys applied, ${(audit.unrecognised || []).length} ignored, ${(audit.unusable || []).length} invalid</strong></summary>
+      <p class="muted">The Console accepts a subset of template keys for this mode. Unrecognised keys had no effect; some exports are controlled by the Console run rather than method.txt. This does not by itself mean the run failed. Invalid values are different and need correction.</p>
+      <p><strong>Ignored keys:</strong> ${escapeHtml((audit.unrecognised || []).join(", ") || "none")}</p>
+      <p><strong>Invalid values:</strong> ${escapeHtml((audit.unusable || []).join(", ") || "none")}</p>
+      <p><strong>Blank/defaulted keys:</strong> ${escapeHtml((audit.blank || []).join(", ") || "none")}</p></details>
+    <h3>Run-order overview</h3>${overview}<p class="muted">This is the magnitude of fitted anchor shifts, not a measure of chromatographic peak quality. ${ordered.length > 500 ? `Displayed ${sampled.length} of ${ordered.length} ordered files.` : ""}</p>
+    <h3>Inspect one file</h3><label>File ID<input id="rtAuditFileId" list="rtAuditFileChoices" value="${escapeHtml(review.reference?.file_id || review.files[0]?.file_id || "")}"></label>
+    <datalist id="rtAuditFileChoices">${review.files.map((file) => `<option value="${escapeHtml(file.file_id)}">${escapeHtml(file.name)}</option>`).join("")}</datalist>
+    <div id="rtAuditFileDetails"></div>
+    <details><summary><strong>All files (${inspected}; first 200 shown)</strong></summary><div class="table-wrap rt-audit-table"><table><thead><tr><th>ID</th><th>File</th><th>Type</th><th>Order</th><th>Model</th><th>Used</th><th>Median |offset|</th><th>Note</th></tr></thead><tbody>${fileRows}</tbody></table></div></details>`;
+  $("#rtAuditFileId").addEventListener("change", renderAutomaticRtFile);
+  renderAutomaticRtFile();
 }
 
 function renderRtCorrectionResult(result) {
@@ -2551,15 +2809,17 @@ async function pollRtCorrectionJob() {
   if (!state.rtCorrectionJobId) return;
   try {
     const job = await api(`/api/jobs/${state.rtCorrectionJobId}`);
-    $("#rtCorrectionLog").textContent = job.logs.join("\n") || job.status;
+    $("#rtCorrectionLog").textContent = (job.log_tail || job.logs || []).join("\n") || job.status;
     $("#rtCorrectionLog").scrollTop = $("#rtCorrectionLog").scrollHeight;
     setStatus(`RT correction audit ${job.status}`);
     if (["queued", "running"].includes(job.status)) {
       setTimeout(pollRtCorrectionJob, 1000);
-    } else if (job.status === "completed" && job.result) {
-      renderRtCorrectionResult(job.result);
+    } else if (job.status === "completed") {
+      const completed = await api(`/api/jobs/${state.rtCorrectionJobId}?detail=full`);
+      if (!completed.result) throw new Error("RT correction audit completed but returned no results.");
+      renderRtCorrectionResult(completed.result);
       $("#rtCorrectionLog").textContent +=
-        `\nLoaded ${job.result.rows.length} automatic anchor selections. Review the table, then save the approved peak selections.`;
+        `\nLoaded ${completed.result.rows.length} automatic anchor selections. Review the table, then save the approved peak selections.`;
     } else if (job.error) {
       $("#rtCorrectionLog").textContent += `\n${job.error}`;
     }
@@ -2783,6 +3043,7 @@ async function selectAnalysisJob(jobId, job = null) {
   if (selected.run_directory) {
     $("#runPath").textContent = selected.run_directory;
     $("#publicationRunDirectory").value = selected.run_directory;
+    $("#automaticRtReviewDirectory").value = selected.run_directory;
   }
   state.mztabFiles = jobArtifactFiles(selected, "mztab");
   state.selectedMzTabPath = state.mztabFiles[0]?.file || "";
@@ -2856,6 +3117,10 @@ async function pollJob() {
 
 async function initialize() {
   state.config = await api("/api/config");
+  for (const [id, key] of [["minimumPeakHeight", "minimum_peak_height"], ["massSliceWidth", "mass_slice_width"]]) {
+    const value = state.config.default_peak_picking?.[key];
+    if (Number.isFinite(Number(value)) && $("#" + id)) $("#" + id).value = value;
+  }
   $("#platformPill").textContent =
     `v${state.config.app_version} | ${navigator.platform} | ${state.config.knowledge_cards.ja} JA / ${state.config.knowledge_cards.en} EN cards`;
   renderServerNotice();
@@ -3527,6 +3792,23 @@ $("#runTuning").addEventListener("click", () => runUiAction(async () => {
     $("#tuningLog").textContent = `Diagnostic could not start:\n${error.message}`;
     throw error;
   }
+}));
+$("#useAutomaticRtOutputRoot").addEventListener("click", () => {
+  $("#automaticRtReviewDirectory").value = $("#outputRoot").value.trim();
+  setStatus("RT correction review directory set from Output root.");
+});
+$("#reviewAutomaticRt").addEventListener("click", () => runUiAction(async () => {
+  const runDirectory = $("#automaticRtReviewDirectory").value.trim() || $("#outputRoot").value.trim();
+  if (!runDirectory) throw new Error("Select a completed analysis job or enter its output directory.");
+  const job = state.jobs.find((item) => item.id === state.jobId);
+  const jobId = job?.status === "completed" && job.run_directory === runDirectory ? job.id : "";
+  const review = await api("/api/automatic-rt/review", {
+    method: "POST",
+    body: JSON.stringify({ job_id: jobId, run_directory: runDirectory }),
+  });
+  $("#automaticRtReviewDirectory").value = review.run_directory;
+  renderAutomaticRtReview(review);
+  setStatus(`Reviewed automatic alignment RT correction for ${review.files.length} file(s).`);
 }));
 $("#tuningHeight").addEventListener("input", () => {
   $("#tuningHeightNumber").value = $("#tuningHeight").value;
