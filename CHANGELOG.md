@@ -4,6 +4,27 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.5] - Unreleased
+
+### Fixed
+- **Extract EICs and detect anchors** in the RT correction review workspace
+  (`/api/rt-correction/run`) no longer writes into the folder that holds the
+  parameter template. It passed the template itself to the Console's
+  `rtcorrection` as `-m`, and `ConfigParser.ReadForLcmsParameter`, in the pinned
+  Console (MsdialWorkbench 31dea2b39) and on master, writes
+  `<method stem>.keys.json` beside the method file it reads. For the default
+  template, every audit therefore left
+  `resources/msdial_console_param4lipidomics.keys.json` in the Interactive
+  checkout. The audit now copies the template byte for byte to
+  `rt_correction_method.txt` in its output directory and passes that copy, so
+  the record lands there as `rt_correction_method.keys.json`. The name is its
+  own, so it cannot overwrite the `method.keys.json` of a run in the same
+  directory. `rtcorrection` resolves no path against the method file's folder,
+  so the copy is read exactly as the template was. The job's preparation records
+  both files (`template_file`, `method_file`). MS-DIAL runs and the
+  zero-threshold diagnostic were not affected: they already wrote their own
+  `method.txt` into the run directory.
+
 ## [0.5.4] - Unreleased
 
 ### Changed
