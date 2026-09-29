@@ -58,6 +58,8 @@ AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY = "automatic_alignment_rt_correctio
 CONSOLE_BUILD_PROVENANCE = "msdial-console-build-provenance.json"
 AUTOMATIC_RT_CORRECTION_SUMMARY = "automatic_alignment_rt_correction_summary.tsv"
 AUTOMATIC_RT_CORRECTION_ANCHORS = "automatic_alignment_rt_correction_anchors.tsv"
+# The copy of the parameter template an RT-correction preview hands the Console.
+RT_CORRECTION_METHOD_FILE = "rt_correction_method.txt"
 AUTOMATIC_RT_CORRECTION_METHOD_KEYS = {
     "execute automatic rt correction for alignment",
     "automatic rt correction reference file id",
@@ -2053,6 +2055,13 @@ def prepare_rt_correction_run(state: dict[str, Any]) -> dict[str, Any]:
         if RT_CORRECTION_REVIEW_CAPABILITY in features
         else ["eic", "rtcorrection"]
     )
+    # The Console writes <method>.keys.json beside the method file it reads, so reading the
+    # template wrote into whatever folder held it: for the default template, the resources
+    # folder of this checkout. It reads a byte copy in the preview's own directory instead,
+    # under a name of its own, so the record it leaves there cannot overwrite the
+    # method.keys.json of a run in the same directory. rtcorrection resolves no path against
+    # the method file's folder, so the copy reads exactly as the template did.
+    method_path = output_root / RT_CORRECTION_METHOD_FILE
     command = prefix + rt_command
     for item in files:
         command.extend(["-i", str(Path(str(item["file_path"])).expanduser().resolve())])
@@ -2063,7 +2072,7 @@ def prepare_rt_correction_run(state: dict[str, Any]) -> dict[str, Any]:
             "-o",
             str(eic_path),
             "-m",
-            str(template_path),
+            str(method_path),
             "--ionmode",
             str(state.get("ion_mode", "Negative")),
             "--acquisitiontype",
@@ -2079,11 +2088,17 @@ def prepare_rt_correction_run(state: dict[str, Any]) -> dict[str, Any]:
         result_selection = output_root / "rt_correction_peak_selections_applied.tsv"
     else:
         result_selection = output_root / "rt_correction_peak_selections.tsv"
+    try:
+        shutil.copyfile(template_path, method_path)
+    except shutil.SameFileError:
+        pass
     return {
         "run_directory": str(output_root),
         "analysis_type": "lcms",
         "kind": "rt_correction",
         "command": command,
+        "template_file": str(template_path),
+        "method_file": str(method_path),
         "eic_file": str(eic_path),
         "selection_file": str(result_selection),
     }

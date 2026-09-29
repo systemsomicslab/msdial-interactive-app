@@ -360,6 +360,9 @@ workspace (`/rt-correction`) performs anchor detection and review:
 3. Run **Extract EICs and detect anchors**. The app calls the top-level
    `rtcorrection` command in current MS-DIAL Console builds. For compatibility,
    it falls back to the earlier `eic rtcorrection` command when needed.
+   The Console is given a copy of the parameter template,
+   `rt_correction_method.txt` in the output folder, so the key record it writes
+   beside its method file (`rt_correction_method.keys.json`) stays there too.
    Choose automatic peak selection by highest intensity, closest reference RT,
    or a weighted combination. The RT weight ranges from `0` (intensity only) to
    `1` (RT proximity only).
