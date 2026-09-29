@@ -767,37 +767,9 @@ def adopted_order_proposal(
             "reason": str(record.get("reason") or ""),
         }
         return adopted
-    recorded = {
-        Path(str(item.get("file", ""))).stem.casefold(): item.get("analytical_order")
-        for item in record.get("files") or []
-        if isinstance(item, dict)
-    }
-    # A record names files by name only, so another unit's manifest (a workset carries the
-    # path) could match on names and ranks alone. The files must also be that unit's inputs.
-    candidates = {
-        str(Path(str(path)).resolve()).casefold()
-        for path in manifest.get("input_candidates") or []
-        if str(path).strip()
-    }
-    same_unit = bool(candidates) and all(
-        str(Path(str(item.get("file_path", ""))).resolve()).casefold() in candidates
-        for item in files
-    )
-    in_csv: dict[str, Any] = {}
-    duplicated = False
-    for item in files:
-        name = str(item.get("file_name", "")).casefold()
-        duplicated = duplicated or name in in_csv
-        in_csv[name] = item.get("analytical_order")
-    matches = (
-        same_unit
-        and not duplicated
-        and len(recorded) == len(files)
-        and all(
-            name in recorded and str(recorded[name]) == str(order)
-            for name, order in in_csv.items()
-        )
-    )
+    from .repository_reanalysis import recorded_order_match
+
+    same_unit, matches = recorded_order_match(manifest, record, files)
     if not matches:
         adopted["recorded_header_order"] = {
             "derived_from": record["derived_from"],

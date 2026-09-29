@@ -277,6 +277,7 @@ def apply_classes_to_analysis_files(
     matches = []
     unmatched = []
     ambiguous = []
+    declared_order_files: list[str] = []
     for item in files:
         candidates: list[dict[str, Any]] = []
         seen: set[int] = set()
@@ -301,6 +302,7 @@ def apply_classes_to_analysis_files(
             )
             if analytical_order is not None:
                 item["analytical_order"] = analytical_order
+                declared_order_files.append(str(item.get("file_path", "")))
             if batch_order is not None:
                 item["batch_order"] = batch_order
             acquisition = infer_acquisition_type(
@@ -325,6 +327,8 @@ def apply_classes_to_analysis_files(
         "matched_count": len(matches),
         "unmatched": unmatched,
         "ambiguous": ambiguous,
+        # The files whose analytical order the repository's sample table declared.
+        "declared_order_files": declared_order_files,
     }
 
 
