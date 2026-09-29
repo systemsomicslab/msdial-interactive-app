@@ -16,10 +16,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from msdial_app import mcp_server
-from msdial_app.materials_methods import generate_publication_report
+from msdial_app.materials_methods import assess_qa, generate_publication_report, qa_report_for_run
 from msdial_app.quality_assurance import (
     NOT_ASSESSED_REASON_PHRASES,
     UNRECORDED_ORDER_REASON,
+    with_qc_minimum,
     with_recorded_order,
 )
 from msdial_app.repository_reanalysis import (
@@ -118,6 +119,10 @@ class RecordedSourceTests(unittest.TestCase):
                 self.assertEqual(source, previewed["order_source"])
                 self.assertEqual(source, recorded_order_source(str(manifest_path), _files(rows)))
                 self.assertNotIn("declared_files", record)
+                # The record keeps every file; the preview only says how many.
+                self.assertEqual(3, len(record["files"]))
+                self.assertNotIn("files", previewed)
+                self.assertEqual(3, previewed["files_recorded"])
 
     def test_a_partly_declared_order_names_what_filled_the_rest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -141,11 +146,21 @@ class RecordedSourceTests(unittest.TestCase):
             files = _files(rows)
             files[0]["analytical_order"], files[1]["analytical_order"] = files[1]["analytical_order"], files[0]["analytical_order"]
             edited = recorded_order_source(str(manifest_path), files)
-            other = recorded_order_source(str(manifest_path), [dict(item, file_path=f"D:/elsewhere/{item['file_name']}.mzML")
+            stranger = recorded_order_source(str(manifest_path), [dict(item, file_path="D:/elsewhere/other.mzML")
+                                                                  for item in _files(rows)])
+            moved = recorded_order_source(str(manifest_path), [dict(item, file_path=f"E:/moved/{Path(item['file_path']).name}")
                                                                for item in _files(rows)])
+            kept = _files(rows)
+            dropped = recorded_order_source(str(manifest_path), [item for item in kept if item["analytical_order"] != 2])
+            renumbered = recorded_order_source(str(manifest_path), [dict(item, analytical_order=item["analytical_order"] * 10)
+                                                                    for item in kept])
 
         self.assertIsNone(edited)
-        self.assertIsNone(other)
+        self.assertIsNone(stranger)
+        # The unit is recognised by its input names, and a dropped file or renumbered ranks keep the order.
+        self.assertEqual(LISTING_ORDER_SOURCE, moved)
+        self.assertEqual(LISTING_ORDER_SOURCE, dropped)
+        self.assertEqual(LISTING_ORDER_SOURCE, renumbered)
 
     def test_a_record_from_before_the_source_was_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -205,6 +220,13 @@ def _check(result: dict) -> dict:
 class PublicationTests(unittest.TestCase):
     """The publication report withholds a run-order criterion computed against the file listing."""
 
+    def test_a_number_in_the_file_names_is_no_injection_order_either(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = _publish(Path(temporary), EMBEDDED_ORDER_SOURCE, _qa())
+
+        self.assertEqual("not_assessed", _check(result)["status"])
+        self.assertEqual(UNRECORDED_ORDER_REASON, _check(result)["reason"])
+
     def test_the_listing_is_no_injection_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             result = _publish(Path(temporary), LISTING_ORDER_SOURCE, _qa())
@@ -227,7 +249,7 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(UNRECORDED_ORDER_REASON, audit["qa_report"]["summary"]["not_assessed_reasons"][METRIC])
 
     def test_a_recorded_or_read_order_is_assessed(self) -> None:
-        for source in (ACQUISITION_ORDER_SOURCE, DECLARED_ORDER_SOURCE, EMBEDDED_ORDER_SOURCE, None):
+        for source in (ACQUISITION_ORDER_SOURCE, DECLARED_ORDER_SOURCE, None):
             with self.subTest(source), tempfile.TemporaryDirectory() as temporary:
                 result = _publish(Path(temporary), source, _qa())
                 self.assertEqual("pass", _check(result)["status"])
@@ -254,7 +276,49 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(0.07, summary[METRIC])
         self.assertNotIn("not_assessed_reasons", summary)
         self.assertIsNone(withheld[METRIC])
-        self.assertIs(summary, with_recorded_order(summary, EMBEDDED_ORDER_SOURCE))
+        self.assertIs(summary, with_recorded_order(summary, DECLARED_ORDER_SOURCE))
+        self.assertIsNone(with_recorded_order(summary, EMBEDDED_ORDER_SOURCE)[METRIC])
+
+
+class ConsistencyTests(unittest.TestCase):
+    """The rule gives one answer wherever the run's QA is read, and keeps the counts' precedence."""
+
+    def test_the_counts_decide_before_the_order(self) -> None:
+        few = with_recorded_order(_qa(0.07, injections=2)["summary"], LISTING_ORDER_SOURCE)
+        empty = with_recorded_order(dict(_qa(0.07)["summary"], alignment_spot_count=0), LISTING_ORDER_SOURCE)
+
+        self.assertEqual("the run had 2 injection(s), and at least three are needed", few["not_assessed_reasons"][METRIC])
+        self.assertEqual("the alignment has no features", empty["not_assessed_reasons"][METRIC])
+
+    def test_the_other_order_statistic_is_withheld_with_it(self) -> None:
+        summary = dict(_qa()["summary"], run_order_reference_match_correlation=-0.29)
+
+        self.assertIsNone(with_recorded_order(summary, EMBEDDED_ORDER_SOURCE)["run_order_reference_match_correlation"])
+        self.assertEqual(-0.29, with_recorded_order(summary, DECLARED_ORDER_SOURCE)["run_order_reference_match_correlation"])
+
+    def test_the_reason_does_not_depend_on_the_order_of_calls(self) -> None:
+        withheld = with_recorded_order(_qa()["summary"], LISTING_ORDER_SOURCE)
+        check = next(item for item in assess_qa({"summary": withheld})["checks"] if item["metric"] == METRIC)
+
+        self.assertEqual(UNRECORDED_ORDER_REASON, with_qc_minimum(withheld)["not_assessed_reasons"][METRIC])
+        self.assertEqual(UNRECORDED_ORDER_REASON, check["reason"])
+
+    def test_a_jobs_live_qa_report_says_what_its_publication_will(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = _publish(root, LISTING_ORDER_SOURCE, _qa())
+            run = root / "run"
+            run.mkdir()
+            workflow = json.loads(Path(result["audit_file"]).read_text(encoding="utf-8"))["workflow"]
+            (run / "workflow-settings.json").write_text(json.dumps(workflow), encoding="utf-8")
+            live = qa_report_for_run(_qa(), run)
+            unchanged = qa_report_for_run(_qa(), root / "no-such-run")
+
+        self.assertIsNone(live["summary"][METRIC])
+        self.assertEqual(UNRECORDED_ORDER_REASON, live["summary"]["not_assessed_reasons"][METRIC])
+        self.assertEqual(LISTING_ORDER_SOURCE, live["analytical_order_source"])
+        self.assertEqual(0.07, unchanged["summary"][METRIC])
+        self.assertNotIn("analytical_order_source", unchanged)
 
 
 if __name__ == "__main__":

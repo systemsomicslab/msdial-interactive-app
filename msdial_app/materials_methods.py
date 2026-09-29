@@ -142,6 +142,31 @@ def generate_publication_report(
     }
 
 
+def qa_report_for_run(qa_report: dict[str, Any], run_directory: Any) -> dict[str, Any]:
+    """A job's live QA report, with the run-order statistics withheld as its publication report would.
+
+    The run's own workflow-settings.json names its unit manifest and files. Without them, or for a
+    QA matrix read by path alone, the report is returned unchanged, with no source attached.
+    """
+    from .repository_reanalysis import recorded_order_source
+
+    settings = Path(str(run_directory or "")).expanduser() / "workflow-settings.json"
+    if not str(run_directory or "").strip() or not settings.is_file():
+        return qa_report
+    try:
+        state = json.loads(settings.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return qa_report
+    if not isinstance(state, dict):
+        return qa_report
+    order_source = recorded_order_source(state.get("repository_run_manifest"), list(state.get("files") or []))
+    result = dict(qa_report)
+    if isinstance(result.get("summary"), dict):
+        result["summary"] = with_recorded_order(result["summary"], order_source)
+    result["analytical_order_source"] = order_source
+    return result
+
+
 def assess_qa(
     qa_report: dict[str, Any] | None,
     criteria: dict[str, float] | None = None,

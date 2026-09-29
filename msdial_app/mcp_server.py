@@ -1554,9 +1554,11 @@ def msdial_prepare_repository_reanalysis(
         "ambiguous": application["ambiguous"],
         "answer_seed": answer_seed,
         "qa_internal_standard_evidence": repository_internal_standard_evidence(projected),
+        # The record keeps every file with its order; the preview says how many, so that a large unit's
+        # manifest does not land in the model context.
         "analytical_order": {
-            key: value for key, value in analytical_order.items() if key != "orders"
-        },
+            key: value for key, value in analytical_order.items() if key not in ("orders", "files")
+        } | {"files_recorded": len(analytical_order.get("files") or [])},
     }
     if not confirmed:
         return {

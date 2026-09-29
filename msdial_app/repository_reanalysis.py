@@ -2651,12 +2651,48 @@ def recorded_order_match(
     return same_unit, matches
 
 
+def carries_recorded_order(record: dict[str, Any], files: list[dict[str, Any]]) -> bool:
+    """Whether the files keep the relative order the record gives them.
+
+    A file dropped since (a raw file missing at plan time drops its row), or the remaining ranks
+    renumbered, leaves the order the record describes; a reordered one does not. Every file must be
+    recorded, once, with a rank that reads as a whole number and that no other recorded file has.
+    """
+    recorded: dict[str, int] = {}
+    for item in record.get("files") or []:
+        if not isinstance(item, dict):
+            return False
+        stem = Path(str(item.get("file", ""))).stem.casefold()
+        rank = _whole_number(item.get("analytical_order"))
+        if not stem or stem in recorded or rank is None or rank in recorded.values():
+            return False
+        recorded[stem] = rank
+    carried: list[tuple[int, int]] = []
+    seen: set[str] = set()
+    for item in files:
+        name = str(item.get("file_name", "")).casefold()
+        rank = _whole_number(item.get("analytical_order"))
+        if not name or name in seen or name not in recorded or rank is None:
+            return False
+        seen.add(name)
+        carried.append((recorded[name], rank))
+    carried.sort()
+    return bool(carried) and all(later[1] > earlier[1] for earlier, later in zip(carried, carried[1:]))
+
+
+def _whole_number(value: Any) -> int | None:
+    text = str(value if value is not None else "").strip()
+    return int(text) if text.isdecimal() else None
+
+
 def recorded_order_source(manifest_path: Any, files: list[dict[str, Any]]) -> str | None:
     """Where the analysis CSV's analytical order came from, as the unit manifest records it.
 
-    None unless the files still carry exactly the recorded order: a CSV re-saved or edited since
-    carries an order nobody recorded. A header record from before order_source existed reads as the
-    header source; any other record from before it reads as unknown.
+    None unless the files are among the unit's inputs (by name) and keep the relative order the
+    record gives them: a CSV reordered since carries an order nobody recorded. A header record from
+    before order_source existed reads as the header source; any other record from before it reads
+    as unknown. The test is looser than adopted_order_proposal's exact match, because its answer is
+    only ever used to withhold a criterion, never to call an order measured.
     """
     if not str(manifest_path or "").strip():
         return None
@@ -2672,8 +2708,16 @@ def recorded_order_source(manifest_path: Any, files: list[dict[str, Any]]) -> st
     )
     if not source:
         return None
-    _, matches = recorded_order_match(manifest, record, list(files or []))
-    return str(source) if matches else None
+    inputs = {
+        Path(str(path).replace("\\", "/")).name.casefold()
+        for path in manifest.get("input_candidates") or []
+        if str(path).strip()
+    }
+    files = list(files or [])
+    same_unit = bool(inputs) and all(
+        Path(str(item.get("file_path", "")).replace("\\", "/")).name.casefold() in inputs for item in files
+    )
+    return str(source) if same_unit and carries_recorded_order(record, files) else None
 
 
 def record_analytical_order(manifest_path: str | Path, record: dict[str, Any]) -> None:

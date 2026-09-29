@@ -43,8 +43,9 @@ NOT_ASSESSED_REASON_PHRASES = (
     "the QA matrix gives no value for it",
 )
 # The analytical-order sources a run-order criterion is not assessed against (decided 2026-09-29):
-# the file listing is no injection order, and a drift computed against it describes the listing.
-UNRECORDED_ORDER_SOURCES = frozenset({"listing"})
+# neither the file listing nor a sequence number read out of the file names is a recorded injection
+# order, and a drift computed against either describes the names.
+UNRECORDED_ORDER_SOURCES = frozenset({"listing", "embedded"})
 UNRECORDED_ORDER_REASON = "the injection order was not recorded for every file"
 
 
@@ -654,15 +655,25 @@ def with_qc_minimum(summary: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(reasons, dict) or any(
             metric not in reasons for metric in CRITERION_METRICS
             if result.get(metric) is None or not _is_finite(result.get(metric))):
-        result["not_assessed_reasons"] = not_assessed_reasons(result)
+        # Fill the missing reasons; keep a reason already given unless the QC minimum now decides it,
+        # so that a reason another rule gave (the unrecorded order) survives in any order of calls.
+        computed = not_assessed_reasons(result)
+        given = reasons if isinstance(reasons, dict) else {}
+        below_minimum = qc is not None and qc < MINIMUM_QC_INJECTIONS
+        result["not_assessed_reasons"] = {
+            metric: (given[metric] if metric in given and not (below_minimum and metric in QC_CRITERION_METRICS)
+                     else reason)
+            for metric, reason in computed.items()
+        }
     return result
 
 
 def with_recorded_order(summary: dict[str, Any], order_source: str | None) -> dict[str, Any]:
-    """The summary with the run-order criterion withheld when the run's order is the file listing.
+    """The summary with the run-order criterion withheld when the run's order was read from the names.
 
     The correlation is computed against whatever analytical_order the CSV carries. Where the unit
-    manifest records that order as the file listing, it says nothing about drift, and for a study
+    manifest records that order as the file listing or a number in the file names, it says nothing
+    about drift, and for a study
     with no QC it was the one criterion left to report as met. A value already withheld keeps the
     reason it had. The summary passed in is not changed.
     """
@@ -672,8 +683,17 @@ def with_recorded_order(summary: dict[str, Any], order_source: str | None) -> di
         return summary
     result = dict(summary)
     result[metric] = None
+    # Computed against the same order, so it describes the names too. It is no criterion.
+    if "run_order_reference_match_correlation" in result:
+        result["run_order_reference_match_correlation"] = None
     reasons = dict(result.get("not_assessed_reasons") or {})
-    reasons[metric] = UNRECORDED_ORDER_REASON
+    injections = _known_count(result, "sample_count")
+    features = _known_count(result, "alignment_spot_count")
+    if features == 0 or (injections is not None and injections < MINIMUM_INJECTIONS):
+        # The counts decide first, as they do for a value that was never computed.
+        reasons[metric] = _not_assessed_reason(metric, None, None, injections, features, None)
+    else:
+        reasons[metric] = UNRECORDED_ORDER_REASON
     result["not_assessed_reasons"] = reasons
     return result
 
