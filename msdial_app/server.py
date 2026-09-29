@@ -40,7 +40,7 @@ from .library_catalog import catalog_status, download_library, library_directory
 from .literature import evaluate_literature_evidence
 from .mztab_validation import list_mztab_outputs, validate_mztab_files, validate_mztab_outputs
 from .mztab_preview import preview_mztab_outputs
-from .materials_methods import generate_publication_report
+from .materials_methods import generate_publication_report, qa_report_for_run
 from .quality_assurance import build_lcms_qa_report_from_file, find_qa_files
 from .repository_metadata import (
     apply_classes_to_analysis_files,
@@ -1313,12 +1313,19 @@ class Handler(BaseHTTPRequestHandler):
                     qa_path = qa_files[0]
                 elif not qa_path:
                     raise ValueError("Set job_id or an explicit QA file_path.")
+                qa_report = build_lcms_qa_report_from_file(
+                    qa_path,
+                    body.get("internal_standards", []),
+                )
+                if job_id:
+                    # As its publication report will: a run-order statistic computed against the file
+                    # names is withheld here too.
+                    qa_report = qa_report_for_run(
+                        qa_report, ((job.get("preparation") or {}).get("run_directory", ""))
+                    )
                 self._json(
                     {
-                        "report": build_lcms_qa_report_from_file(
-                            qa_path,
-                            body.get("internal_standards", []),
-                        ),
+                        "report": qa_report,
                         "job_id": job_id,
                         "qa_file": qa_path,
                     }
