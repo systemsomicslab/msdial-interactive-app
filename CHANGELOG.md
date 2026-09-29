@@ -4,7 +4,7 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
-## [0.5.4] - Unreleased
+## [0.5.5] - Unreleased
 
 ### Fixed
 - **Extract EICs and detect anchors** in the RT correction review workspace
@@ -24,6 +24,8 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   both files (`template_file`, `method_file`). MS-DIAL runs and the
   zero-threshold diagnostic were not affected: they already wrote their own
   `method.txt` into the run directory.
+
+## [0.5.4] - Unreleased
 
 ### Changed
 - The absolute run-order/intensity correlation is not assessed where a
