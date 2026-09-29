@@ -373,6 +373,8 @@ def _qa_sheet(
         rows.append(_row(["Metric", "Value", "Unit or note", "Criterion", "Assessment"], "header"))
         checks = {item["metric"]: item for item in qa_assessment.get("checks", [])}
         for key, value in sorted((qa_report.get("summary") or {}).items()):
+            if key == "not_assessed_reasons":
+                continue  # each criterion's own row carries its reason
             if isinstance(value, (dict, list, tuple)):
                 value = _display_value(value)
             check = checks.get(key)
@@ -383,6 +385,8 @@ def _qa_sheet(
                 criterion = f"{check['operator']} {check['threshold']}"
                 status = check["status"]
                 note = check.get("unit", "")
+                if status == "not_assessed" and check.get("reason"):
+                    note = f"not assessed because {check['reason']}"
             label = check["label"] if check else _label(key)
             rows.append(_row([label, _typed_value(value), note, criterion, status], "body_left"))
 

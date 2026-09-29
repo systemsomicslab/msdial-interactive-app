@@ -14,6 +14,33 @@ QA_SUFFIX = ".qa.tsv"
 PCA_FEATURE_LIMIT = 1000
 PCA_SAMPLE_LIMIT = 500
 RESERVOIR_LIMIT = 5000
+# The prespecified QA criteria, by what they are computed from. A QC-based criterion needs at least
+# MINIMUM_QC_INJECTIONS QC injections: an RSD, a detection rate or a dispersion from one or two QC
+# says nothing about precision.
+QC_CRITERION_METRICS = (
+    "median_qc_rsd_percent",
+    "qc_features_rsd_le_30_percent",
+    "median_qc_detection_rate",
+    "qc_pca_relative_dispersion",
+)
+BLANK_CRITERION_METRICS = ("sample_blank_ratio_ge_3", "median_blank_carryover_ratio")
+CRITERION_METRICS = QC_CRITERION_METRICS + BLANK_CRITERION_METRICS + ("run_order_intensity_correlation",)
+MINIMUM_QC_INJECTIONS = 3
+MINIMUM_INJECTIONS = 3
+# Every reason not_assessed_reasons can give; {n} is a count. The public reanalysis gate reads these
+# phrases, so a change here is a change there.
+NOT_ASSESSED_REASON_PHRASES = (
+    "the alignment has no features",
+    "the run had {n} QC injection(s), and at least three are needed",
+    "no feature was detected in two or more QC injections",
+    "the QC dispersion could not be computed from the PCA",
+    "the run had no Blank files",
+    "no feature was detected in both a Blank file and a study sample",
+    "no Blank file followed an injection with detected features in its batch",
+    "the run had {n} injection(s), and at least three are needed",
+    "run order or median intensity did not vary across injections",
+    "the QA matrix gives no value for it",
+)
 
 
 def find_qa_files(
@@ -136,6 +163,7 @@ def build_lcms_qa_report(
         blank_ratios.values,
     )
     summary.update(_pca_qc_metrics(pca))
+    summary = with_qc_minimum(summary)
     return {
         "status": "ok",
         "file": str(target),
@@ -605,12 +633,109 @@ def _summarize_internal_standards(
     return result
 
 
+def with_qc_minimum(summary: dict[str, Any]) -> dict[str, Any]:
+    """The summary with the QC criteria withheld below MINIMUM_QC_INJECTIONS, and why each is missing.
+
+    A summary written before 0.5.3 carried an RSD from two QC and no reasons; read through this, it
+    says what 0.5.3 would have. The summary passed in is not changed.
+    """
+    result = dict(summary)
+    counts = result.get("category_counts") or {}
+    qc = _known_count(counts, "QC")
+    if qc is not None and qc < MINIMUM_QC_INJECTIONS:
+        for metric in QC_CRITERION_METRICS:
+            result[metric] = None
+    reasons = result.get("not_assessed_reasons")
+    if not isinstance(reasons, dict) or any(
+            metric not in reasons for metric in CRITERION_METRICS
+            if result.get(metric) is None or not _is_finite(result.get(metric))):
+        result["not_assessed_reasons"] = not_assessed_reasons(result)
+    return result
+
+
+def not_assessed_reasons(summary: dict[str, Any], pca: dict[str, Any] | None = None) -> dict[str, str]:
+    """Why each prespecified criterion has no value, in words the publication report prints.
+
+    The reason is the condition the value was computed under, so a report can say which criterion
+    fell to which: the QC criteria to too few QC injections, the blank ones to no Blank file, and so
+    on. The wording is fixed; the public reanalysis gate compares it with the counts.
+    """
+    counts = summary.get("category_counts") or {}
+    # A count the summary does not carry is unknown, and a reason resting on it is not given.
+    qc = _known_count(counts, "QC")
+    blank = _known_count(counts, "Blank")
+    injections = _known_count(summary, "sample_count")
+    features = _known_count(summary, "alignment_spot_count")
+    reasons: dict[str, str] = {}
+    for metric in CRITERION_METRICS:
+        value = summary.get(metric)
+        if value is not None and _is_finite(value):
+            continue
+        reasons[metric] = _not_assessed_reason(metric, qc, blank, injections, features, pca)
+    return reasons
+
+
+def _not_assessed_reason(
+    metric: str, qc: int | None, blank: int | None, injections: int | None, features: int | None,
+    pca: dict[str, Any] | None,
+) -> str:
+    if features == 0:
+        return "the alignment has no features"
+    if metric in QC_CRITERION_METRICS:
+        if qc is None:
+            return "the QA matrix gives no value for it"
+        if qc < MINIMUM_QC_INJECTIONS:
+            return f"the run had {qc} QC injection(s), and at least three are needed"
+        if metric in ("median_qc_rsd_percent", "qc_features_rsd_le_30_percent"):
+            return "no feature was detected in two or more QC injections"
+        if metric == "qc_pca_relative_dispersion":
+            return "the QC dispersion could not be computed from the PCA"
+        return "the QA matrix gives no value for it"
+    if metric in BLANK_CRITERION_METRICS:
+        if blank is None:
+            return "the QA matrix gives no value for it"
+        if blank == 0:
+            return "the run had no Blank files"
+        if metric == "sample_blank_ratio_ge_3":
+            return "no feature was detected in both a Blank file and a study sample"
+        # The Blank opened its batch, followed another batch, or followed an injection that detected
+        # nothing: in each case no Blank has a preceding injection to compare with.
+        return "no Blank file followed an injection with detected features in its batch"
+    if metric == "run_order_intensity_correlation":
+        if injections is None:
+            return "the QA matrix gives no value for it"
+        if injections < MINIMUM_INJECTIONS:
+            return f"the run had {injections} injection(s), and at least three are needed"
+        return "run order or median intensity did not vary across injections"
+    return "the QA matrix gives no value for it"
+
+
+def _known_count(mapping: Any, key: str) -> int | None:
+    if not isinstance(mapping, dict) or mapping.get(key) is None:
+        return None
+    return _count(mapping.get(key))
+
+
+def _count(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _is_finite(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _warnings(samples: list[dict[str, Any]], pca: dict[str, Any]) -> list[str]:
     warnings = []
     if not any(item["category"] == "Blank" for item in samples):
         warnings.append("No Blank files were identified; blank separation and carryover cannot be assessed.")
-    if sum(item["category"] == "QC" for item in samples) < 3:
-        warnings.append("At least three QC injections are needed to evaluate QC precision and topology.")
+    if sum(item["category"] == "QC" for item in samples) < MINIMUM_QC_INJECTIONS:
+        warnings.append("At least three QC injections are needed to evaluate QC precision, detection rate and topology.")
     if pca.get("sample_limited"):
         warnings.append(f"PCA was limited to {pca.get('sample_count', PCA_SAMPLE_LIMIT)} representative samples.")
     return warnings

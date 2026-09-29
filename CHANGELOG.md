@@ -4,6 +4,67 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.3] - Unreleased
+
+0.5.3 is the first version whose every build contains #36 (the automatic
+alignment RT correction audit viewer and the UI fixes below). #36 reached main
+at 212675a while the package still read 0.5.2, so a build reading 0.5.2 may be
+6d164c6, without it, or 212675a, with it.
+
+### Added
+- An audit viewer for a completed LC-MS run that used automatic alignment-only
+  RT correction (#36), in **5. Validate & run**. It reads the Console's
+  `automatic_alignment_rt_correction_summary.tsv` and
+  `automatic_alignment_rt_correction_anchors.tsv`, checks the method hash
+  against `method.keys.json`, and shows the reference file, the accepted and
+  rejected anchors, each file's RT shift and the model's warnings. It extracts an
+  anchor's MS1 EIC on demand through the Console recorded by the run, on the
+  original and on the projected alignment RT axis; raw data are neither copied
+  nor changed, and nothing in the run is altered. It needs a Console built with
+  MsdialWorkbench #810 or later; the Console at 31dea2b39 writes neither audit
+  file. See `docs/automatic_alignment_rt_review.md`.
+
+### Fixed
+- Minimum peak height and Mass slice width in the UI take their starting values
+  from the fields the backend returns (`suggested_minimum_peak_height`,
+  `suggested_mass_slice_width`), falling back to the template's peak-picking
+  defaults, now served as `default_peak_picking` by `/api/config` (#36). From
+  0.4.7 until #36, adding the first file, importing a CSV or a repository unit
+  in the UI, or applying the format starting values, emptied both fields, so a
+  run prepared in the UI wrote `Minimum peak height: 0` and `Mass slice width: 0`
+  to method.txt unless the values were typed again, and validation raised
+  nothing. The backend had renamed the fields in 0.4.7 and the UI still read the
+  old names. Runs prepared through the MCP tools do not pass through these
+  fields: both MTBLS2207 production method files read Mass slice width 0.1.
+- The UI's zero-threshold diagnostic and RT-correction jobs read the compact
+  job summary and fetch the full job (`?detail=full`) for its result (#36).
+
+### Changed
+- A QC-based QA criterion (median QC feature RSD, the fraction of QC features with
+  RSD <=30%, the median QC detection rate and the QC PCA relative dispersion)
+  is assessed only from three or more QC injections. The QA warning already said
+  three were needed, while an RSD or a dispersion was computed from two QC and a
+  detection rate from one, so a run with two QC was assessed on a precision it
+  cannot show and written up as having too few QC at the same time.
+- Every criterion that could not be assessed now carries the reason it fell to,
+  recorded with the QA summary (`not_assessed_reasons`) and on its check in the
+  assessment (`reason`), from the fixed phrases in
+  `quality_assurance.NOT_ASSESSED_REASON_PHRASES`: no features, too few QC
+  injections, no feature detected in two or more QC, no QC dispersion from the
+  PCA, no Blank files, no feature in both a Blank and a study sample, no Blank
+  after an injection with detected features in its batch, too few injections,
+  run order or intensity not varying, and the QA matrix giving no value; without
+  a QA matrix, that none was supplied. The
+  Methods and QA results name each criterion with its reason ("could not be
+  assessed: A and B because ...; C because ..."), instead of one reason for all
+  that named a QC shortage for blank-based criteria and gave none when the run
+  had three QC and blanks. The Supplementary Table gives each such criterion a
+  "Not assessed because" row, and the workbook the same in its note; the
+  reasons are no longer listed as an observed metric. A QA report written before
+  this release is published as this release would have written it: the QC
+  minimum applied and the reasons filled in, in the text, the table and the
+  audit alike.
+
 ## [0.5.2] - Unreleased
 
 ### Changed
