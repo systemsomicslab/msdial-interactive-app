@@ -6,6 +6,39 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
 ## [0.5.3] - Unreleased
 
+0.5.3 is the first version whose every build contains #36 (the automatic
+alignment RT correction audit viewer and the UI fixes below). #36 reached main
+at 212675a while the package still read 0.5.2, so a build reading 0.5.2 may be
+6d164c6, without it, or 212675a, with it.
+
+### Added
+- An audit viewer for a completed LC-MS run that used automatic alignment-only
+  RT correction (#36), in **5. Validate & run**. It reads the Console's
+  `automatic_alignment_rt_correction_summary.tsv` and
+  `automatic_alignment_rt_correction_anchors.tsv`, checks the method hash
+  against `method.keys.json`, and shows the reference file, the accepted and
+  rejected anchors, each file's RT shift and the model's warnings. It extracts an
+  anchor's MS1 EIC on demand through the Console recorded by the run, on the
+  original and on the projected alignment RT axis; raw data are neither copied
+  nor changed, and nothing in the run is altered. It needs a Console built with
+  MsdialWorkbench #810 or later; the Console at 31dea2b39 writes neither audit
+  file. See `docs/automatic_alignment_rt_review.md`.
+
+### Fixed
+- Minimum peak height and Mass slice width in the UI take their starting values
+  from the fields the backend returns (`suggested_minimum_peak_height`,
+  `suggested_mass_slice_width`), falling back to the template's peak-picking
+  defaults, now served as `default_peak_picking` by `/api/config` (#36). From
+  0.4.7 until #36, adding the first file, importing a CSV or a repository unit
+  in the UI, or applying the format starting values, emptied both fields, so a
+  run prepared in the UI wrote `Minimum peak height: 0` and `Mass slice width: 0`
+  to method.txt unless the values were typed again, and validation raised
+  nothing. The backend had renamed the fields in 0.4.7 and the UI still read the
+  old names. Runs prepared through the MCP tools do not pass through these
+  fields: both MTBLS2207 production method files read Mass slice width 0.1.
+- The UI's zero-threshold diagnostic and RT-correction jobs read the compact
+  job summary and fetch the full job (`?detail=full`) for its result (#36).
+
 ### Changed
 - A QC-based QA criterion (median QC feature RSD, the fraction of QC features with
   RSD <=30%, the median QC detection rate and the QC PCA relative dispersion)
