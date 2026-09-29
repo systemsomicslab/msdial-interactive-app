@@ -4,6 +4,27 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.8] - Unreleased
+
+### Fixed
+- The method writer reads a template line the way the MS-DIAL Console does:
+  the key before the first `:` or `=`, trimmed and case-folded, and a `#`
+  line as a comment (`workflow.console_method_key`). It treats every spelling
+  the Console reads as one setting as that setting
+  (`workflow.CONSOLE_KEY_ALIASES`, the case labels that share an arm in the
+  Console's ConfigParser at MsdialWorkbench f0583493a). Such a line is
+  rewritten with Interactive's value, as an exact `key:` line already was.
+  Before, only an exact `key:` prefix matched. A template line under an alias
+  (`Console alignment light mode`, `LBM annotation priority`,
+  `MSP search settings file path`, ...), with `=`, or with a space before the
+  colon was left in place, and Interactive inserted its own line at the top of
+  the file. Since MsdialWorkbench #817 every Console reader takes the last line
+  that sets a value, so the template line decided the run: alignment light
+  mode, the LBM annotator priority, the MSP or Text annotator settings file.
+  The main reader was already last-wins, so `Minimum peak height = 1000` after
+  Interactive's `Minimum peak height: 9000` ran at 1000 on every Console. Method
+  files written from the shipped templates are byte-identical to before.
+
 ## [0.5.7] - Unreleased
 
 ### Changed

@@ -2621,6 +2621,50 @@ def _method_value(value: Any) -> str:
     return str(value)
 
 
+# Keys the MS-DIAL Console reads as one setting: the case labels that share an arm in its
+# ConfigParser (MsdialWorkbench f0583493a). A template line under any of them sets what Interactive's
+# own line sets, so the writer treats it as that line rather than leaving it to compete. Since
+# MsdialWorkbench #817 every reader takes the last line that sets a value, so a stray template line
+# after Interactive's would win.
+CONSOLE_KEY_ALIASES: tuple[frozenset[str], ...] = (
+    frozenset({"alignment light mode", "alignment light", "console alignment light mode"}),
+    frozenset({"annotation candidates", "export annotation candidates"}),
+    frozenset({"detailed alignment provenance", "export detailed alignment provenance"}),
+    frozenset({"execute annotation process only for alignment file",
+               "execute annotation process only for alignment file for msp-based annotation"}),
+    frozenset({"lbm annotator priority", "lbm annotation priority"}),
+    frozenset({"matched peaks percentage cutoff", "matched peaks percentage cutoff for msp-based annotation"}),
+    frozenset({"minimum spectrum match", "minimum spectrum match for msp-based annotation"}),
+    frozenset({"msp annotator settings file path", "msp annotation settings file path",
+               "msp search settings file path"}),
+    frozenset({"retention index alignment tolerance", "retention index tolerance for alignment"}),
+    frozenset({"retention index tolerance for identification", "ri tolerance for identification",
+               "ri tolerance for msp-based annotation"}),
+    frozenset({"reverse dot product cutoff", "square root of reverse dot product cutoff for msp-based annotation"}),
+    frozenset({"ri compound", "ri compound type"}),
+    frozenset({"ri dictionary file path", "ri dictionary file paths", "ri index file pathes", "ri index file paths"}),
+    frozenset({"simple dot product cutoff", "square root of simple dot product cutoff for msp-based annotation"}),
+    frozenset({"weighted dot product cutoff", "square root of weighted dot product cutoff for msp-based annotation"}),
+    frozenset({"text annotator settings file path", "text library annotator settings file path",
+               "text db annotator settings file path", "text annotation settings file path"}),
+)
+_CONSOLE_KEY_GROUP = {key: group for group in CONSOLE_KEY_ALIASES for key in group}
+
+
+def console_method_key(line: str) -> str | None:
+    """The key the MS-DIAL Console reads from a method-file line, case-folded, or None.
+
+    As its readFieldValues does: nothing for a blank or '#' line or one without a separator, and
+    otherwise the text before the first ':' or '=', trimmed.
+    """
+    if len(line) < 2 or line.lstrip().startswith("#"):
+        return None
+    separators = [index for index in (line.find(":"), line.find("=")) if index >= 0]
+    if not separators:
+        return None
+    return line[: min(separators)].strip().casefold()
+
+
 def _write_method(path: Path, state: dict[str, Any]) -> None:
     template_path = Path(state["template_path"])
     lines = template_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
@@ -2784,20 +2828,22 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
     )
     for line in lines:
         stripped = line.lstrip()
-        lower = stripped.lower()
-        line_key = lower.split(":", 1)[0].strip()
+        line_key = console_method_key(line)
         if line_key in AUTOMATIC_RT_CORRECTION_METHOD_KEYS and not automatic_rt_enabled:
             continue
-        if lower.startswith(("solvent type:", "searched lipid class:")):
+        if line_key in ("solvent type", "searched lipid class"):
             continue
-        if lower.startswith("adduct list:"):
+        if line_key == "adduct list":
             output.append(
                 f"Searched adduct ions: {replacements['searched adduct ions']}"
             )
             found.add("searched adduct ions")
             continue
-        matched = next(
-            (key for key in replacements if lower.startswith(key + ":")),
+        # The key as the Console reads it, under any spelling it reads as the same setting; every such
+        # line is Interactive's to write, so no template line is left to compete with it.
+        same_setting = _CONSOLE_KEY_GROUP.get(line_key, frozenset({line_key})) if line_key else frozenset()
+        matched = line_key if line_key in replacements else next(
+            (key for key in replacements if key in same_setting),
             None,
         )
         if matched:
