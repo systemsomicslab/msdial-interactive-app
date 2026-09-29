@@ -328,6 +328,7 @@
             </div>
           </details>
           <p class="muted">The Console writes <code>automatic_alignment_rt_correction_summary.tsv</code> and <code>automatic_alignment_rt_correction_anchors.tsv</code> so the selected reference, anchors, per-file model source, and failures remain auditable.</p>
+          <p class="muted">After a run, use the RT correction audit viewer in Validate &amp; run to inspect the chosen reference, accepted and rejected anchors, and file-specific shift curves. The current Console completes alignment in one pass; it cannot pause for approval between anchor selection and alignment.</p>
         </div>
       </div>
       <div id="rtCorrectionLauncher" class="panel" hidden>
@@ -748,6 +749,16 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
           </div>
         </div>
         <pre id="log">Ready.</pre>
+      </div>
+      <div class="panel automatic-rt-review" id="automaticRtReviewPanel">
+        <h2>Automatic alignment RT correction audit</h2>
+        <p class="muted">Review the Console's recorded reference sample, accepted/rejected anchors, and original-to-aligned RT offsets. Extract raw and smoothed MS1 EICs on demand. This viewer audits a completed run; it does not change anchors or approve alignment in advance.</p>
+        <label>Analysis output directory<input id="automaticRtReviewDirectory" placeholder="Output root or selected analysis job"></label>
+        <div class="button-row">
+          <button id="reviewAutomaticRt" type="button" class="secondary">Review RT correction</button>
+          <button id="useAutomaticRtOutputRoot" type="button" class="secondary">Use Output root</button>
+        </div>
+        <div id="automaticRtReview" class="format-summary" hidden></div>
       </div>
     </section>
 

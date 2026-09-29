@@ -21,6 +21,7 @@ from typing import Any
 
 from . import __version__
 from .agent_bridge import create_datamining_handoff, summarize_job, summarize_jobs
+from .automatic_rt_review import extract_anchor_eic, read_automatic_rt_review
 from .agent_workflow import (
     build_guided_plan,
     estimate_peak_height,
@@ -334,8 +335,13 @@ def _application_config() -> dict[str, Any]:
     )
     default_console = str(saved.get("console_path", "")).strip() or _default_console_path()
     lipid_queries = read_lipid_queries(default_queries)
+    peak_picking = {"minimum_peak_height": 300, "mass_slice_width": 0.1}
     try:
         loaded = load_parameter_template(default_template, default_queries)
+        peak_picking = {
+            "minimum_peak_height": loaded["workflow"]["minimum_peak_height"],
+            "mass_slice_width": loaded["workflow"]["mass_slice_width"],
+        }
         if loaded["workflow"].get("target_omics", "").casefold() == "lipidomics":
             for item in lipid_queries:
                 item["selected"] = True
@@ -347,6 +353,7 @@ def _application_config() -> dict[str, Any]:
         "default_console": default_console,
         "default_queries": default_queries,
         "default_template": default_template,
+        "default_peak_picking": peak_picking,
         "default_gcms_template": str(RESOURCES / "gcms_console_param_kovats.txt"),
         "settings_file": str(settings_path()),
         "settings_loaded": bool(saved),
@@ -700,6 +707,28 @@ class Handler(BaseHTTPRequestHandler):
                         body.get("queries_path", "") or None,
                     )
                 )
+            elif parsed.path == "/api/automatic-rt/review":
+                job_id = str(body.get("job_id") or "").strip()
+                directory = str(body.get("run_directory") or "").strip()
+                if job_id:
+                    with JOBS_LOCK:
+                        job = JOBS.get(job_id)
+                    if job and job.get("kind") != "run":
+                        raise ValueError("Select a completed analysis job or provide an output directory.")
+                    if job and job.get("status") != "completed":
+                        raise ValueError("The selected analysis job has not completed.")
+                    if job:
+                        directory = (job.get("preparation") or {}).get("run_directory", "")
+                if not directory:
+                    raise ValueError("Select a run or enter its output directory to review RT correction.")
+                self._json(read_automatic_rt_review(directory))
+            elif parsed.path == "/api/automatic-rt/eic":
+                self._json(extract_anchor_eic(
+                    body.get("run_directory", ""),
+                    str(body.get("file_id", "")),
+                    str(body.get("anchor_id", "")),
+                    float(body.get("tolerance", 0.01)),
+                ))
             elif parsed.path == "/api/libraries/download":
                 catalog_id = str(body.get("catalog_id", "")).strip()
                 if not catalog_id:
