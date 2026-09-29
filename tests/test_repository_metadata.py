@@ -275,6 +275,23 @@ class ApprovedClassProposalTests(unittest.TestCase):
         self.assertEqual("catalog_class_proposal", projected["class_source"])
         self.assertEqual(["Strain"], projected["hierarchy"])
 
+    def test_a_ratified_abstention_runs_every_sample_in_one_class(self) -> None:
+        # The Catalog records an abstention (no usable declared factor) as every sample in the one Class
+        # "All", with no field selected and the abstention in the contrast definition. It is applied
+        # like any approved proposal: nothing is re-derived from the other metadata columns.
+        abstention = self._proposal(
+            selected_fields=[],
+            contrast_definition={"kind": "abstention", "reason": "no_usable_declared_factor", "class_label": "All"},
+            assignments=[{"sample_id": sample, "class_label": "All", "values": {}} for sample in ("A", "B", "C")],
+            status="accepted",
+        )
+
+        projected = apply_class_proposal(self._workspace(), abstention)
+
+        self.assertEqual({"All"}, {row["class_id"] for row in projected["rows"]})
+        self.assertEqual([], projected["hierarchy"])
+        self.assertEqual("abstention", projected["class_proposal_provenance"]["contrast_definition"]["kind"])
+
     def test_a_label_the_fields_cannot_reproduce_still_survives(self) -> None:
         # This is why the assignments are the source of truth and the fields are not: a proposal may
         # merge or rename labels for reasons that live in its rationale, and recombining
