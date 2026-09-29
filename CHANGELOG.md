@@ -25,6 +25,53 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   zero-threshold diagnostic were not affected: they already wrote their own
   `method.txt` into the run directory.
 
+### Changed
+- The absolute run-order/intensity correlation is not assessed where a
+  repository unit's analytical order is the file listing or a sequence number
+  read out of the file names (decided 2026-09-29): neither is a recorded
+  injection order. The correlation is computed against whatever
+  analytical_order the analysis CSV carries; against the names it describes the
+  names, and for a study with no QC it was the one criterion left to report as
+  met. Its reason is "the injection order was not recorded for every file", one
+  of `quality_assurance.NOT_ASSESSED_REASON_PHRASES`, unless the counts decide
+  first (no features, fewer than three injections), as they do for a value that
+  was never computed. The value is withheld from the assessment, the QA summary,
+  the text, the Supplementary Table and the workbook alike, and so is
+  `run_order_reference_match_correlation`, computed against the same order.
+- `msdial_prepare_repository_reanalysis` records, with the header decision in the
+  unit manifest's `analytical_order`, what the order was taken from in the end:
+  `order_source` is `raw_header_acquisition_start_time`, `repository_sample_table`
+  (every file's order declared by the repository), `embedded` or `listing`, with
+  `declared_files` when only some files had a declared order (the rest are
+  named by what filled them, so a partly declared order is withheld too), and
+  None when the recognised order cannot be told apart. The record lists every
+  file with the order it was given; the preview gives only `files_recorded`, the
+  count, so that a large unit does not land in the model context.
+- The publication report reads that source through the run's
+  `repository_run_manifest` and writes it to the audit as
+  `analytical_order_source`. It applies while the run's files are among the
+  unit's inputs (by name) and keep the relative order the record gives them, a
+  file dropped since or the ranks renumbered included; a reordered CSV carries
+  an order nobody recorded and is assessed. The header adoption keeps its exact
+  match, since it calls an order measured.
+- A job's live QA report (`/api/qa/report`, and through it
+  `msdial_generate_lcms_qa`, `msdial_complete_guided_analysis` and the QA panel)
+  withholds the same statistics and carries `analytical_order_source`, read
+  from the run's workflow-settings.json, so that it says what the publication
+  report will. A QA matrix read by path alone is unchanged.
+- `with_qc_minimum` fills the reasons a summary lacks instead of replacing them
+  all, so a reason another rule gave survives whatever order they run in; for a
+  QC criterion below the QC minimum the minimum's reason still decides.
+
+### Not changed
+- A laboratory analysis, whose order is the analyst's, is assessed as before.
+- A repository unit prepared through the GUI writes no order record (the GUI
+  path has never ranked by the raw headers either), so it is assessed as
+  before; the reanalysis campaign prepares units through the MCP tools.
+- A unit prepared before this release is assessed as before unless it is
+  prepared again: the record belongs to the unit, so a report regenerated for
+  an earlier run of a re-prepared unit follows the new record.
+
 ## [0.5.3] - Unreleased
 
 0.5.3 is the first version whose every build contains #36 (the automatic
