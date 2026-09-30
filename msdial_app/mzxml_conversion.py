@@ -21,7 +21,9 @@ energy repeated at spectrum level where RawDataHandler reads the AIF targets - a
 flag that is off by default, and each use is recorded in the conversion record and in the mzML.
 
 A conversion never raises into its caller. It returns a record whose status is "converted" or
-"failed", and a failed conversion leaves no file at the destination. The output bytes depend only
+"failed", and a failed conversion leaves none of this converter's output at the destination. A file
+the converter did not write is never replaced or removed: the conversion fails and leaves it as it
+was, since at the destination it may be the repository's own mzML. The output bytes depend only
 on the mzXML, its name and repository-relative path, the options and the converter identity (which
 names the zlib build), never on the workspace, a clock or the machine, so converting a re-downloaded
 file reproduces the same sha256.
@@ -35,6 +37,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
 import hashlib
 import math
 import os
@@ -143,6 +146,16 @@ _UO_CV = (
 _OUR_SOFTWARE_ID = "MSDIAL_Interactive_mzXML_converter"
 _DEFAULT_INSTRUMENT_ID = "IC1"
 _DATA_PROCESSING_ID = "MSDIAL_Interactive_mzXML_to_mzML"
+# Every output starts with these bytes and records its processing this way before the run. A file
+# holding both is this converter's output, from whichever source and version; nothing else is ever
+# replaced or removed. msconvert and other tools that rewrite such a file change the processing list.
+_OUTPUT_PREFIX = b'<?xml version="1.0" encoding="utf-8"?>\n<mzML xmlns="http://psi.hupo.org/ms/mzml"'
+_OUTPUT_MARK = (
+    '  <dataProcessingList count="1">\n'
+    f'    <dataProcessing id="{_DATA_PROCESSING_ID}">\n'
+    f'      <processingMethod order="0" softwareRef="{_OUR_SOFTWARE_ID}">\n'
+)
+_HEADER_LIMIT = 1 << 20
 
 _DECIMAL_TEXT = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
 _INTEGER_TEXT = re.compile(r"[+-]?\d+")
@@ -208,11 +221,16 @@ def convert_mzxml_to_mzml(
 
     ``source_relative_path`` is the file's path inside the repository listing; it names the source
     in the record and in the mzML, whose bytes must not depend on where the workspace lives.
-    ``previous`` is an earlier record for the same destination: when its source sha256, output
-    sha256, options and converter identity all still hold, the file is not written again.
+    ``previous`` is an earlier record of the same conversion: when its source sha256, name and
+    relative path, output sha256, options and converter identity all hold for this call's files,
+    the file is not written again. The record returned then names this call's paths and times, and
+    keeps where and when the output was written under "reused_from", since the recorded files may
+    have been another unit's or the same files under another spelling of their path.
 
     Never raises. The record's status is "converted" or "failed"; on failure the error says why and
-    nothing is left at the destination.
+    none of this converter's output is left at the destination. Nothing at the destination is
+    touched for an argument error (options, destination, missing source), and a file there that
+    this converter did not write is never replaced or removed.
     """
     started_at = _now()
     source = Path(source)
@@ -239,24 +257,26 @@ def convert_mzxml_to_mzml(
     }
     partial = destination.with_name(destination.name + ".partial")
     body = destination.with_name(destination.name + ".body.partial")
-    # Only an .mzML that is not the source is ever removed, whatever the caller passed.
-    removable = destination.suffix.casefold() == ".mzml" and _distinct(source, destination)
+    # Only an .mzML that is not the source is ever written, whatever the caller passed.
+    acceptable = destination.suffix.casefold() == ".mzml" and _distinct(source, destination)
+    # Set once the arguments hold and the destination is absent or this converter's own output.
+    # Until then a failure touches nothing at the destination, its partial files included.
+    owned = False
     try:
         opts = _options(options)
         record["options"] = asdict(opts)
-        if not removable:
+        if not acceptable:
             raise ConversionError(
                 f"the destination must be an .mzML file other than the source, not {destination.name!r}"
             )
         if not source.is_file():
             raise ConversionError(f"the source mzXML does not exist: {source}")
+        _refuse_foreign_destination(destination, previous, record)
+        owned = True
         integrity = _source_integrity(source)
         record["source"].update(integrity)
         if _reusable(previous, record, destination, identity):
-            reused = dict(previous)
-            reused["reused_previous_record"] = True
-            reused["checked_at"] = _now()
-            return reused
+            return _reused(previous, record)
         embedded = integrity["embedded_sha1"]
         if embedded["status"] in {"mismatch", "malformed"}:
             message = (
@@ -288,25 +308,28 @@ def convert_mzxml_to_mzml(
             raise ConversionError(
                 "the written mzML does not reproduce the mzXML: " + "; ".join(validation["problems"][:3])
             )
+        # A file may have appeared at the destination while the conversion ran.
+        _refuse_foreign_destination(destination, previous, record)
         partial.replace(destination)
         record["status"] = "converted"
     except Exception as exc:  # noqa: BLE001 - a conversion is recorded, never raised
         record["status"] = "failed"
         record["error"] = f"{type(exc).__name__}: {exc}"
-        if removable and destination.is_file():
-            # What sits at the destination is either stale or was never proven; leaving it would let
-            # input discovery pick up an mzML this record says is not a valid conversion.
+        if owned and destination.is_file() and _written_by_converter(destination, previous):
+            # A stale output of this converter; leaving it would let input discovery pick up an mzML
+            # this record says is not a valid conversion.
             try:
                 destination.unlink()
                 record["output"]["removed_after_failure"] = True
             except OSError as unlink_error:
                 record["warnings"].append(f"could not remove {destination}: {unlink_error}")
     finally:
-        for leftover in (partial, body):
-            try:
-                leftover.unlink(missing_ok=True)
-            except OSError:
-                pass
+        if owned:
+            for leftover in (partial, body):
+                try:
+                    leftover.unlink(missing_ok=True)
+                except OSError:
+                    pass
         record["completed_at"] = _now()
     return record
 
@@ -589,8 +612,11 @@ def _reusable(
         return False
     recorded_output = previous.get("output") or {}
     recorded_source = previous.get("source") or {}
+    # The recorded paths are not compared: the bytes are, and every input to them (the source's bytes,
+    # name and relative path, the options and the converter) must hold for this call's files.
     if (
         recorded_source.get("sha256") != record["source"]["sha256"]
+        or recorded_source.get("name") != record["source"]["name"]
         or recorded_source.get("relative_path") != record["source"]["relative_path"]
         or previous.get("options") != record["options"]
         or previous.get("converter") != identity
@@ -599,6 +625,56 @@ def _reusable(
     ):
         return False
     return _sha256_file(destination) == recorded_output["sha256"]
+
+
+def _reused(previous: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    """``previous`` as the record of this call, which names this call's files and times.
+
+    Where and when the output was actually written moves to "reused_from", which a chain of reuses
+    carries unchanged from the conversion that wrote the bytes. ``previous`` is not modified.
+    """
+    reused = copy.deepcopy(previous)
+    reused["reused_from"] = reused.get("reused_from") or {
+        "source_path": (previous.get("source") or {}).get("path"),
+        "output_path": (previous.get("output") or {}).get("path"),
+        "started_at": previous.get("started_at"),
+        "completed_at": previous.get("completed_at"),
+    }
+    reused["source"] = {**(reused.get("source") or {}), **record["source"]}
+    reused["output"] = {**(reused.get("output") or {}), "path": record["output"]["path"]}
+    reused.pop("checked_at", None)
+    reused.update(reused_previous_record=True, started_at=record["started_at"], completed_at=_now())
+    return reused
+
+
+def _written_by_converter(path: Path, previous: dict[str, Any] | None) -> bool:
+    """Whether ``path`` is a regular file this converter wrote.
+
+    It is when it begins as every output does and carries this converter's processing record, or
+    when it is byte for byte the output ``previous`` records. A link is never taken as one.
+    """
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        with open(path, "rb") as handle:
+            header = handle.read(_HEADER_LIMIT).split(b"\n  <run ", 1)[0]
+        if header.startswith(_OUTPUT_PREFIX) and _OUTPUT_MARK.encode("ascii") in header:
+            return True
+        if not isinstance(previous, dict) or previous.get("status") != "converted":
+            return False
+        recorded = previous.get("output") or {}
+        if not recorded.get("sha256") or recorded.get("bytes") != path.stat().st_size:
+            return False
+        return _sha256_file(path) == recorded["sha256"]
+    except OSError:
+        return False
+
+
+def _refuse_foreign_destination(destination: Path, previous: dict[str, Any] | None, record: dict[str, Any]) -> None:
+    """Fail the conversion, leaving the file alone, when something the converter did not write is there."""
+    if os.path.lexists(destination) and not _written_by_converter(destination, previous):
+        record["output"]["foreign_file_kept"] = True
+        raise ConversionError(f"the destination exists and was not written by the converter: {destination}")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1547,12 +1623,7 @@ def _header_xml(
     lines += software_lines
     lines += _instrument_xml(reader, acquisition_refs)
 
-    lines += [
-        '  <dataProcessingList count="1">\n',
-        f'    <dataProcessing id="{_DATA_PROCESSING_ID}">\n',
-        f'      <processingMethod order="0" softwareRef="{_OUR_SOFTWARE_ID}">\n',
-        _cv(i8, ("MS:1000544", "Conversion to mzML")),
-    ]
+    lines += [_OUTPUT_MARK, _cv(i8, ("MS:1000544", "Conversion to mzML"))]
     lines += [_user(i8, f"MS-DIAL Interactive {note['kind']}", note["summary"]) for note in notes]
     lines += ["      </processingMethod>\n", "    </dataProcessing>\n", "  </dataProcessingList>\n"]
     # No startTimeStamp: mzXML records none, and a file time would make the bytes irreproducible.

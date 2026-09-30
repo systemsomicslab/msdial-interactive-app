@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import copy
 import hashlib
 import re
 import shutil
@@ -751,6 +752,141 @@ class IntegrityTests(_Workspace):
         self.assertTrue(again["output"]["removed_after_failure"])
 
 
+class DestinationOwnershipTests(_Workspace):
+    """Only this converter's own output is ever replaced or removed at the destination.
+
+    The destination may hold the repository's own mzML of the same stem. Replacing or deleting it
+    would delete raw data that nobody confirmed for deletion.
+    """
+
+    FOREIGN = b'<?xml version="1.0"?>\n<mzML xmlns="http://psi.hupo.org/ms/mzml">repository bytes</mzML>\n'
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.source = self.write("sample.mzXML", dda_32())
+        self.destination = self.root / "converted" / "sample.mzML"
+
+    def place(self, data: bytes) -> None:
+        self.destination.parent.mkdir(parents=True, exist_ok=True)
+        self.destination.write_bytes(data)
+
+    def assertKept(self, record: dict, data: bytes, fragment: str = "not written by the converter") -> None:
+        self.assertEqual(record["status"], "failed")
+        self.assertIn(fragment, record["error"])
+        self.assertEqual(self.destination.read_bytes(), data)
+        self.assertNotIn("removed_after_failure", record["output"])
+        self.assertEqual([path.name for path in self.destination.parent.iterdir()], [self.destination.name])
+
+    def test_a_foreign_mzml_is_not_replaced_by_a_good_conversion(self) -> None:
+        self.place(self.FOREIGN)
+        record = convert_mzxml_to_mzml(self.source, self.destination)
+        self.assertKept(record, self.FOREIGN)
+        self.assertTrue(record["output"]["foreign_file_kept"])
+
+    def test_a_foreign_mzml_survives_a_failed_conversion(self) -> None:
+        self.place(self.FOREIGN)
+        self.source.write_bytes(dda_32()[:300])
+        self.assertKept(convert_mzxml_to_mzml(self.source, self.destination), self.FOREIGN)
+
+    def test_a_foreign_file_that_arrives_during_the_conversion_is_kept(self) -> None:
+        original = mzxml_conversion._validate
+        for outcome, fragment in (("passed", "not written by the converter"), ("failed", "does not reproduce")):
+            with self.subTest(outcome=outcome):
+
+                def arrive(*arguments, outcome=outcome):
+                    result = original(*arguments)
+                    self.place(self.FOREIGN)
+                    return result if outcome == "passed" else {**result, "status": "failed", "problems": ["forced"]}
+
+                mzxml_conversion._validate = arrive
+                try:
+                    record = convert_mzxml_to_mzml(self.source, self.destination)
+                finally:
+                    mzxml_conversion._validate = original
+                self.assertKept(record, self.FOREIGN, fragment)
+                self.destination.unlink()
+
+    def test_argument_errors_touch_nothing_at_the_destination(self) -> None:
+        record = convert_mzxml_to_mzml(self.source, self.destination)
+        self.assertConverted(record)
+        own = self.destination.read_bytes()
+        partial = self.destination.with_name(self.destination.name + ".partial")
+        for data in (own, self.FOREIGN):
+            self.place(data)
+            partial.write_bytes(b"another call's partial file")
+            for label, options, source in (
+                ("unknown option", {"no_such_option": 1}, self.source),
+                ("invalid option", {"impute_polarity": "both"}, self.source),
+                ("missing source", None, self.root / "data" / "absent.mzXML"),
+            ):
+                with self.subTest(label=label, own=data == own):
+                    again = convert_mzxml_to_mzml(source, self.destination, options, previous=record)
+                    self.assertEqual(again["status"], "failed")
+                    self.assertEqual(self.destination.read_bytes(), data)
+                    self.assertEqual(partial.read_bytes(), b"another call's partial file")
+                    self.assertNotIn("removed_after_failure", again["output"])
+
+    def test_the_converters_own_output_is_recognised_without_a_record(self) -> None:
+        convert_mzxml_to_mzml(self.source, self.destination)
+        self.assertTrue(self.destination.read_bytes().startswith(mzxml_conversion._OUTPUT_PREFIX))
+        replaced = convert_mzxml_to_mzml(self.source, self.destination, {"spectrum_level_collision_energy": True})
+        self.assertConverted(replaced)
+        self.assertEqual(replaced["output"]["sha256"], hashlib.sha256(self.destination.read_bytes()).hexdigest())
+        self.source.write_bytes(dda_32()[:300])
+        failed = convert_mzxml_to_mzml(self.source, self.destination)
+        self.assertTrue(failed["output"]["removed_after_failure"])
+        self.assertFalse(self.destination.exists())
+
+    def test_an_output_another_tool_rewrote_is_foreign(self) -> None:
+        # A tool that rewrites this converter's output adds its own processing, so the file begins
+        # the same way but no longer carries the converter's processing record.
+        convert_mzxml_to_mzml(self.source, self.destination)
+        rewritten = self.destination.read_bytes().replace(
+            b'<dataProcessingList count="1">', b'<dataProcessingList count="2">', 1
+        )
+        self.place(rewritten)
+        self.assertKept(convert_mzxml_to_mzml(self.source, self.destination), rewritten)
+
+    def test_the_recorded_output_is_recognised_by_its_bytes(self) -> None:
+        # An output whose header does not carry the processing record as this writer spells it (an
+        # earlier writer's) is still the converter's when it is exactly what a record says it wrote.
+        record = convert_mzxml_to_mzml(self.source, self.destination)
+        earlier = self.destination.read_bytes().replace(
+            b'<dataProcessingList count="1">', b'<dataProcessingList  count="1">', 1
+        )
+        self.place(earlier)
+        previous = copy.deepcopy(record)
+        previous["output"].update(bytes=len(earlier), sha256=hashlib.sha256(earlier).hexdigest())
+        # Other options, so that the record is not simply reused.
+        options = {"spectrum_level_collision_energy": True}
+        self.assertKept(convert_mzxml_to_mzml(self.source, self.destination, options), earlier)
+        replaced = convert_mzxml_to_mzml(self.source, self.destination, options, previous=previous)
+        self.assertConverted(replaced)
+        self.place(earlier)
+        self.source.write_bytes(dda_32()[:300])
+        failed = convert_mzxml_to_mzml(self.source, self.destination, previous=previous)
+        self.assertTrue(failed["output"]["removed_after_failure"])
+        self.assertFalse(self.destination.exists())
+
+    def test_a_directory_at_the_destination_is_refused_and_kept(self) -> None:
+        self.destination.mkdir(parents=True)
+        (self.destination / "keep").write_bytes(b"keep me")
+        record = convert_mzxml_to_mzml(self.source, self.destination)
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("not written by the converter", record["error"])
+        self.assertEqual((self.destination / "keep").read_bytes(), b"keep me")
+
+
+def _strings(value) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [text for item in value.values() for text in _strings(item)]
+    if isinstance(value, (list, tuple)):
+        return [text for item in value for text in _strings(item)]
+    return []
+
+
 class DeterminismAndResumeTests(_Workspace):
     def test_the_same_mzxml_gives_the_same_bytes_wherever_it_lives(self) -> None:
         first = self.write("sample.mzXML", dda_32(), "one/deep/folder")
@@ -809,6 +945,84 @@ class DeterminismAndResumeTests(_Workspace):
         moved = convert_mzxml_to_mzml(source, destination, options, source_relative_path="FILES/x.mzXML", previous=tampered)
         self.assertFalse(moved["reused_previous_record"])
         self.assertNotEqual(moved["output"]["sha256"], tampered["output"]["sha256"])
+
+    def test_a_record_for_a_source_of_another_name_is_not_reused(self) -> None:
+        # The source's name is written into the mzML, so the same bytes under another name are another output.
+        relative = "FILES/sample.mzXML"
+        record, destination = self.convert(dda_32(), source_relative_path=relative)
+        renamed = self.write("renamed.mzXML", dda_32())
+        copied = self.root / "converted" / "renamed.mzML"
+        shutil.copyfile(destination, copied)
+        again = convert_mzxml_to_mzml(renamed, copied, source_relative_path=relative, previous=record)
+        self.assertFalse(again["reused_previous_record"])
+        self.assertConverted(again)
+        self.assertNotEqual(again["output"]["sha256"], record["output"]["sha256"])
+
+    def test_a_record_reused_for_another_units_files_names_this_calls_files(self) -> None:
+        relative = "FILES/sample.mzXML"
+        sources = [self.write("sample.mzXML", dda_32(), f"{unit}/raw/data/FILES") for unit in ("unitA", "unitB")]
+        outputs = [self.root / unit / "raw" / "converted" / "FILES" / "sample.mzML" for unit in ("unitA", "unitB")]
+        record_a = convert_mzxml_to_mzml(sources[0], outputs[0], source_relative_path=relative)
+        self.assertConverted(record_a)
+        unchanged = copy.deepcopy(record_a)
+        outputs[1].parent.mkdir(parents=True)
+        shutil.copyfile(outputs[0], outputs[1])
+
+        record_b = convert_mzxml_to_mzml(sources[1], outputs[1], source_relative_path=relative, previous=record_a)
+        self.assertTrue(record_b["reused_previous_record"])
+        self.assertEqual(record_b["source"]["path"], str(sources[1]))
+        self.assertEqual(record_b["output"]["path"], str(outputs[1]))
+        self.assertEqual(record_b["output"]["sha256"], record_a["output"]["sha256"])
+        self.assertEqual(
+            record_b["reused_from"],
+            {
+                "source_path": str(sources[0]),
+                "output_path": str(outputs[0]),
+                "started_at": record_a["started_at"],
+                "completed_at": record_a["completed_at"],
+            },
+        )
+        # Outside reused_from, nothing in unit B's record names unit A's files.
+        described = _strings({key: value for key, value in record_b.items() if key != "reused_from"})
+        self.assertFalse([text for text in described if str(self.root / "unitA") in text], described)
+        self.assertEqual(record_a, unchanged)
+
+        # A reuse of the reuse still names the conversion that wrote the bytes.
+        record_c = convert_mzxml_to_mzml(sources[1], outputs[1], source_relative_path=relative, previous=record_b)
+        self.assertTrue(record_c["reused_previous_record"])
+        self.assertEqual(record_c["reused_from"], record_b["reused_from"])
+        self.assertEqual(record_c["output"]["path"], str(outputs[1]))
+
+    def test_a_moved_workspace_is_reused_under_its_new_paths(self) -> None:
+        before, after = self.root / "before", self.root / "after"
+        source = self.write("sample.mzXML", dda_32(), "before/data")
+        record = convert_mzxml_to_mzml(source, before / "converted" / "sample.mzML")
+        self.assertConverted(record)
+        before.rename(after)
+        moved = convert_mzxml_to_mzml(after / "data" / "sample.mzXML", after / "converted" / "sample.mzML", previous=record)
+        self.assertTrue(moved["reused_previous_record"])
+        self.assertEqual(moved["source"]["path"], str(after / "data" / "sample.mzXML"))
+        self.assertEqual(moved["output"]["path"], str(after / "converted" / "sample.mzML"))
+        self.assertEqual(moved["reused_from"]["output_path"], str(before / "converted" / "sample.mzML"))
+
+    @unittest.skipUnless(sys.platform == "win32", "8.3 short names are a Windows spelling")
+    def test_a_short_path_spelling_is_reused_under_this_calls_spelling(self) -> None:
+        import ctypes
+
+        folder = self.root / "a long folder name"
+        source = self.write("sample.mzXML", dda_32(), "a long folder name/data")
+        record = convert_mzxml_to_mzml(source, folder / "converted" / "sample.mzML")
+        self.assertConverted(record)
+        buffer = ctypes.create_unicode_buffer(32768)
+        if not ctypes.windll.kernel32.GetShortPathNameW(str(folder), buffer, len(buffer)):
+            self.skipTest("no short name could be read for the folder")
+        short = Path(buffer.value)
+        if short.name == folder.name:
+            self.skipTest("this volume does not keep 8.3 short names")
+        again = convert_mzxml_to_mzml(short / "data" / "sample.mzXML", short / "converted" / "sample.mzML", previous=record)
+        self.assertTrue(again["reused_previous_record"])
+        self.assertEqual(again["source"]["path"], str(short / "data" / "sample.mzXML"))
+        self.assertEqual(again["output"]["path"], str(short / "converted" / "sample.mzML"))
 
 
 class ChunkBoundaryTests(_Workspace):
