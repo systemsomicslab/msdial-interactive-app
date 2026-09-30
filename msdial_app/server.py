@@ -14,10 +14,11 @@ import traceback
 import urllib.parse
 import uuid
 import webbrowser
+from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 from . import __version__
 from .agent_bridge import create_datamining_handoff, summarize_job, summarize_jobs
@@ -58,10 +59,14 @@ from .repository_reanalysis import (
     create_download_lease,
     evaluate_eligibility,
     finalize_download_lease,
+    live_run_attempt,
     load_unit_manifest,
     project_from_dict,
     read_manifest,
     record_campaign_authorization,
+    record_run_end,
+    record_run_process,
+    record_run_start,
     refresh_retained_artifacts,
     resolve_required_download_bytes,
     split_unit_by_acquisition,
@@ -69,9 +74,12 @@ from .repository_reanalysis import (
     _write_json,
 )
 from .campaign_authorization import CampaignAuthorizationError, authorize, unit_identity
+from .process_liveness import process_created_at
 from .workflow import (
+    CONSOLE_WATCHDOG_PREFIX,
     console_version,
     console_capabilities,
+    console_watch_seconds,
     discover_console_paths,
     inspect_console_path,
     expand_paths,
@@ -108,6 +116,17 @@ RESOURCES = ROOT / "resources"
 KNOWLEDGE = ROOT / "knowledge"
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+# The jobs that can be stopped now, by job id, guarded by JOBS_LOCK: the cancel flag the job's worker
+# checks, the time limits its Console runs under, and the Console's process id once it has one. In memory
+# only; a job an earlier backend process left "running" is not running in this one.
+PROCESSES: dict[str, dict[str, Any]] = {}
+CANCELLABLE_JOB_KINDS = frozenset({"run", "tuning", "repository_download"})
+CONSOLE_JOB_KINDS = frozenset({"run", "tuning"})
+LIVE_JOB_STATUSES = frozenset({"queued", "running"})
+# Repository units a Console job is being set up for, by unit key, guarded by JOBS_LOCK. Held from before
+# the run's preparation writes anything until the job is registered, so that two requests for one unit
+# cannot both pass the single-flight check.
+CONSOLE_SLOTS: dict[str, str] = {}
 
 
 def _jobs_file() -> Path:
@@ -463,6 +482,289 @@ if JOBS:
         _persist_jobs_locked()
 
 
+class UnitBusyError(RuntimeError):
+    """A Console job was asked for a repository unit that already has one live. Answered with 409."""
+
+    def __init__(self, manifest_text: str, live_job_id: str, detail: str) -> None:
+        super().__init__(detail)
+        self.manifest_text = manifest_text
+        self.live_job_id = live_job_id
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "started": False,
+            "error": str(self),
+            "code": "unit_busy",
+            "live_job_id": self.live_job_id,
+            "repository_run_manifest": self.manifest_text,
+        }
+
+
+class RepositoryDownloadCancelled(Exception):
+    """Raised from a repository download's progress callback once its job is cancelled.
+
+    Its text is the reason the unit's lease records as download_failed, so the lease says "cancelled".
+    """
+
+    def __init__(self) -> None:
+        super().__init__("cancelled")
+
+
+def _register_process_locked(
+    job_id: str,
+    kind: str,
+    timeout_seconds: float | None = None,
+    idle_timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Make a job cancellable from the moment it exists, queued or not. The caller holds JOBS_LOCK."""
+    entry = {
+        "kind": kind,
+        "cancel": threading.Event(),
+        "timeout_seconds": timeout_seconds,
+        "idle_timeout_seconds": idle_timeout_seconds,
+        "pid": None,
+    }
+    PROCESSES[job_id] = entry
+    return entry
+
+
+def _console_watch_request(body: dict[str, Any]) -> dict[str, float]:
+    """The Console time limits a run request asked for; none unless given, as before they existed."""
+    watch = {
+        key: console_watch_seconds(body.get(key), key)
+        for key in ("timeout_seconds", "idle_timeout_seconds")
+    }
+    return {key: value for key, value in watch.items() if value is not None}
+
+
+def _unit_key(manifest_text: str) -> str:
+    try:
+        return os.path.normcase(str(Path(manifest_text).expanduser().resolve()))
+    except OSError:
+        return os.path.normcase(os.path.abspath(manifest_text))
+
+
+def _live_console_job_locked(key: str) -> str:
+    for job_id, job in JOBS.items():
+        if job.get("kind") not in CONSOLE_JOB_KINDS or job.get("status") not in LIVE_JOB_STATUSES:
+            continue
+        recorded = str((job.get("preparation") or {}).get("repository_run_manifest") or "").strip()
+        if recorded and _unit_key(recorded) == key:
+            return str(job_id)
+    return ""
+
+
+@contextmanager
+def _single_console_per_unit(manifest_text: Any, job_id: str) -> Iterator[None]:
+    """Hold one repository unit for one new Console job, or raise UnitBusyError naming the live one.
+
+    WHY. Two Consoles on one unit write the same intermediates beside the same raw files and the same unit
+    manifest, and nothing stopped a second from starting. The MCP tool's HTTP call gives up after 120 s
+    while the backend carries on, so a caller that retried a start it could not see succeed - the campaign
+    runner after a timeout, an agent after an error - started another Console on the unit.
+
+    The unit is held from before the preparation writes anything until the job is registered, and the
+    registered job then holds it while it is queued or running. The unit manifest's run attempts are read
+    as well, which is what finds a Console this registry does not know: one orphaned by a backend that
+    stopped, or one started by another backend. A local analysis names no unit and is not held.
+    """
+    text = str(manifest_text or "").strip()
+    if not text:
+        yield
+        return
+    key = _unit_key(text)
+    with JOBS_LOCK:
+        live = CONSOLE_SLOTS.get(key) or _live_console_job_locked(key)
+        if live:
+            raise UnitBusyError(
+                text,
+                live,
+                f"This repository unit already has a live MS-DIAL job, {live}. Wait for it to finish, or "
+                "cancel it, before starting another Console on the same unit.",
+            )
+        CONSOLE_SLOTS[key] = job_id
+    try:
+        orphan = live_run_attempt(text, ignore_backend_pid=os.getpid())
+        if orphan:
+            raise UnitBusyError(
+                text,
+                str(orphan.get("job_id") or ""),
+                f"This repository unit's manifest records run attempt {orphan.get('attempt_id')} of job "
+                f"{orphan.get('job_id') or 'unrecorded'}, whose MS-DIAL Console "
+                + (
+                    f"(process {orphan['console_pid']}) is still running"
+                    if orphan.get("console_pid")
+                    else "is being started by another backend process"
+                )
+                + ". No second Console is started on the same unit.",
+            )
+        yield
+    finally:
+        with JOBS_LOCK:
+            if CONSOLE_SLOTS.get(key) == job_id:
+                del CONSOLE_SLOTS[key]
+
+
+def _cancel_job(job_id: str, reason: str = "") -> tuple[HTTPStatus, dict[str, Any]]:
+    """Ask a run, a diagnostic or a repository download to stop.
+
+    Sets the job's cancel flag: a Console job's watch stops the Console's process tree (exit code -4), and
+    a download stops at its next progress report, recording its lease as download_failed with reason
+    cancelled. A job that is still queued stops before it starts anything. A download past its last byte
+    is extracting and recording, and completes. The job ends as failed and says it was cancelled
+    (stop_reason); this call returns at once and does not wait for that.
+    """
+    now = dt.datetime.now().astimezone().isoformat()
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return HTTPStatus.NOT_FOUND, {"error": f"Job not found: {job_id}", "code": "job_not_found"}
+        kind = str(job.get("kind") or "")
+        status = str(job.get("status") or "")
+        if kind not in CANCELLABLE_JOB_KINDS:
+            return HTTPStatus.BAD_REQUEST, {
+                "error": (
+                    f"A {kind or 'job of unknown kind'} job cannot be cancelled; only run, tuning and "
+                    "repository_download jobs can."
+                ),
+                "code": "not_cancellable",
+                "job_id": job_id,
+                "kind": kind,
+            }
+        entry = PROCESSES.get(job_id)
+        if status not in LIVE_JOB_STATUSES or entry is None:
+            finished = status not in LIVE_JOB_STATUSES
+            return HTTPStatus.OK, {
+                "job_id": job_id,
+                "kind": kind,
+                "status": status,
+                "cancel_requested": False,
+                "reason": "finished" if finished else "console_finished",
+                "detail": (
+                    f"The job is already {status}; there is nothing to stop."
+                    if finished
+                    else "The MS-DIAL Console has already exited. The job is checking and recording its "
+                    "outputs, which is not interrupted."
+                ),
+            }
+        already = entry["cancel"].is_set()
+        entry["cancel"].set()
+        if not already:
+            job["cancel_requested_at"] = now
+            if reason:
+                job["cancel_reason"] = reason
+            job.setdefault("logs", []).append(
+                "Cancellation requested" + (f": {reason}" if reason else "") + "."
+            )
+            job["updated_at"] = now
+            _persist_jobs_locked()
+        return HTTPStatus.OK, {
+            "job_id": job_id,
+            "kind": kind,
+            "status": status,
+            "cancel_requested": True,
+            "already_requested": already,
+            "console_pid": entry.get("pid"),
+        }
+
+
+def _run_console_for_job(
+    job_id: str, kind: str, preparation: dict[str, Any], log: Callable[[str], None]
+) -> int:
+    """Run one job's Console under its watch, with the unit's run attempt recorded on either side.
+
+    The attempt is opened in the unit manifest before the Console starts, given the Console's process id
+    as soon as it has one, and closed with the exit code and the reason when it returns; a local analysis
+    names no manifest and records nothing. The job holds the Console's process id and deadline while it
+    runs, and a cancel reaches the Console through the job's flag.
+    """
+    with JOBS_LOCK:
+        entry = PROCESSES.get(job_id) or _register_process_locked(job_id, kind)
+    manifest_text = str(preparation.get("repository_run_manifest") or "").strip()
+    attempt = None
+    if manifest_text:
+        attempt = record_run_start(
+            Path(manifest_text),
+            job_id,
+            kind,
+            output_directory=str(preparation.get("run_directory") or ""),
+            console=preparation.get("software_provenance") or {},
+            command=preparation.get("command"),
+            timeout_seconds=entry["timeout_seconds"],
+            idle_timeout_seconds=entry["idle_timeout_seconds"],
+        )
+        if not attempt.get("recorded"):
+            log(
+                "WARNING: this run attempt could not be recorded in the unit manifest: "
+                + str(attempt.get("error"))
+            )
+    outcome: dict[str, Any] = {}
+
+    def started(pid: int) -> None:
+        # Records only, none of them worth the run: run_console stops a Console whose on_start raises.
+        created = process_created_at(pid)
+        with JOBS_LOCK:
+            entry["pid"] = pid
+            job = JOBS.get(job_id)
+            if job is not None:
+                job["console_process"] = {
+                    "pid": pid,
+                    "process_created_at": created,
+                    "started_at": outcome.get("started_at"),
+                    "deadline_at": outcome.get("deadline_at"),
+                }
+                job["updated_at"] = dt.datetime.now().astimezone().isoformat()
+                try:
+                    _persist_jobs_locked()
+                except OSError:
+                    pass
+        if attempt and attempt.get("recorded"):
+            record_run_process(Path(manifest_text), attempt["attempt_id"], pid, created)
+
+    try:
+        exit_code = run_console(
+            preparation,
+            log,
+            timeout_seconds=entry["timeout_seconds"],
+            idle_timeout_seconds=entry["idle_timeout_seconds"],
+            cancel_event=entry["cancel"],
+            on_start=started,
+            outcome=outcome,
+        )
+    except BaseException as error:
+        if manifest_text:
+            record_run_end(
+                Path(manifest_text),
+                attempt,
+                None,
+                "error" if outcome.get("pid") else "start_failed",
+                {"error": f"{type(error).__name__}: {error}"},
+            )
+        raise
+    finally:
+        with JOBS_LOCK:
+            PROCESSES.pop(job_id, None)
+            job = JOBS.get(job_id)
+            if job is not None and outcome:
+                job["console_outcome"] = dict(outcome)
+                if outcome.get("reason") not in (None, "exited"):
+                    job["stop_reason"] = outcome["reason"]
+    if manifest_text:
+        stop = {
+            key: outcome[key]
+            for key in ("stop", "process_exit_code", "idle_seconds", "still_running", "output_left_open")
+            if key in outcome
+        }
+        record_run_end(
+            Path(manifest_text),
+            attempt,
+            exit_code,
+            str(outcome.get("reason") or "exited"),
+            {"elapsed_seconds": outcome.get("elapsed_seconds"), **stop} if outcome else None,
+        )
+    return exit_code
+
+
 def _local_ipv4_addresses() -> list[str]:
     addresses: set[str] = set()
     try:
@@ -530,6 +832,17 @@ def _application_config() -> dict[str, Any]:
 
 
 def _diagnose_console_failure(logs: list[str], fallback: str) -> str:
+    # A Console the watch stopped - timed out, gone quiet, or cancelled - failed because it was stopped,
+    # whatever else its log holds; what the log suggests beyond that is added, not substituted.
+    stopped = next(
+        (str(line) for line in reversed(logs) if str(line).startswith(CONSOLE_WATCHDOG_PREFIX)), ""
+    )
+    if stopped:
+        remainder = [line for line in logs if not str(line).startswith(CONSOLE_WATCHDOG_PREFIX)]
+        underlying = _diagnose_console_failure(remainder, "")
+        sentence = stopped[len(CONSOLE_WATCHDOG_PREFIX):]
+        sentence = sentence[:1].upper() + sentence[1:]
+        return sentence + (f" The log also suggests: {underlying}" if underlying else "")
     text = "\n".join(logs).lower()
     if "basedataaccess" in text:
         return (
@@ -802,7 +1115,11 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         try:
             body = self._read_json()
-            if parsed.path == "/api/files/expand":
+            if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/cancel"):
+                job_id = parsed.path[len("/api/jobs/"):-len("/cancel")].strip("/")
+                status, payload = _cancel_job(job_id, str(body.get("reason") or "").strip())
+                self._json(payload, status)
+            elif parsed.path == "/api/files/expand":
                 self._json(expand_paths_report(body.get("paths", [])))
             elif parsed.path == "/api/settings/paths":
                 saved = save_path_settings(body)
@@ -1028,6 +1345,7 @@ class Handler(BaseHTTPRequestHandler):
                         JOBS[job_id]["campaign_authorization"] = {
                             key: crossing.get(key) for key in ("approval_id", "manifest_digest", "boundary")
                         }
+                    _register_process_locked(job_id, "repository_download")
                     _persist_jobs_locked()
                 threading.Thread(
                     target=_run_repository_download_job,
@@ -1211,6 +1529,8 @@ class Handler(BaseHTTPRequestHandler):
                         HTTPStatus.BAD_REQUEST,
                     )
                     return
+                # Time limits for the Console, refused here if they cannot be read; none unless given.
+                watch = _console_watch_request(body)
                 # Checked before the confirmation: an approval that was offered and does not cover this
                 # unit's production run is a refusal even when confirmed=true came with it.
                 authorized = _campaign_crossing(
@@ -1239,31 +1559,36 @@ class Handler(BaseHTTPRequestHandler):
                         HTTPStatus.BAD_REQUEST,
                     )
                     return
-                preparation = prepare_run(plan["workflow"])
-                _write_guided_answers(preparation, plan)
                 job_id = uuid.uuid4().hex
-                artifact_baseline = _snapshot_run_artifacts(preparation)
-                if authorized:
-                    # Before the job exists: a run whose authority cannot be recorded does not start.
-                    record_campaign_authorization(authorized[0], {**authorized[1], "job_id": job_id})
-                with JOBS_LOCK:
-                    JOBS[job_id] = {
-                        "id": job_id,
-                        "status": "queued",
-                        "kind": "run",
-                        "logs": [],
-                        "preparation": preparation,
-                        "exit_code": None,
-                        "created_at": dt.datetime.now().astimezone().isoformat(),
-                        "artifact_baseline": artifact_baseline,
-                        "artifacts": {},
-                    }
-                    _persist_jobs_locked()
-                threading.Thread(
-                    target=_run_job,
-                    args=(job_id, preparation),
-                    daemon=True,
-                ).start()
+                # One live Console per repository unit, held before the preparation writes anything; a
+                # second request for the unit is answered 409 with the live job's id.
+                with _single_console_per_unit(plan["workflow"].get("repository_run_manifest"), job_id):
+                    preparation = prepare_run(plan["workflow"])
+                    _write_guided_answers(preparation, plan)
+                    artifact_baseline = _snapshot_run_artifacts(preparation)
+                    if authorized:
+                        # Before the job exists: a run whose authority cannot be recorded does not start.
+                        record_campaign_authorization(authorized[0], {**authorized[1], "job_id": job_id})
+                    with JOBS_LOCK:
+                        JOBS[job_id] = {
+                            "id": job_id,
+                            "status": "queued",
+                            "kind": "run",
+                            "logs": [],
+                            "preparation": preparation,
+                            "exit_code": None,
+                            "created_at": dt.datetime.now().astimezone().isoformat(),
+                            "artifact_baseline": artifact_baseline,
+                            "artifacts": {},
+                            **({"console_watch": watch} if watch else {}),
+                        }
+                        _register_process_locked(job_id, "run", **watch)
+                        _persist_jobs_locked()
+                    threading.Thread(
+                        target=_run_job,
+                        args=(job_id, preparation),
+                        daemon=True,
+                    ).start()
                 self._json(
                     {
                         "started": True,
@@ -1271,6 +1596,7 @@ class Handler(BaseHTTPRequestHandler):
                         "plan": plan,
                         "preparation": preparation,
                         "download_url": _register_download(preparation["bundle"]),
+                        **({"console_watch": watch} if watch else {}),
                         **({"campaign_authorization": authorized[1]} if authorized else {}),
                     }
                 )
@@ -1285,6 +1611,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError(
                         "Complete the guided questions and choose target_peak_count before diagnostic tuning."
                     )
+                watch = _console_watch_request(body)
                 # The diagnostic starts the Console, so it is boundary 4's as the production run is.
                 authorized = _campaign_crossing(
                     workflow, body.get("campaign_authorization_path"), 4, "peak_count_diagnostic"
@@ -1324,45 +1651,49 @@ class Handler(BaseHTTPRequestHandler):
                 # output directory: a reviewed multi-sample CSV came back holding only this
                 # representative, and every later stage was self-consistent about the wrong study.
                 job_id = uuid.uuid4().hex
-                diagnostic_root = diagnostic_run_directory(
-                    workflow["output_root"],
-                    job_id,
-                    workspace=_repository_workspace(workflow),
-                )
-                preparation = prepare_tuning_run(
-                    workflow,
-                    representative,
-                    diagnostic_root,
-                )
-                preparation["peak_tuning_profile"] = {
-                    key: value for key, value in profile.items() if key != "file"
-                }
-                preparation["diagnostic_run_directory"] = str(diagnostic_root)
-                if authorized:
-                    record_campaign_authorization(authorized[0], {**authorized[1], "job_id": job_id})
-                _write_diagnostic_record(job_id, preparation, "queued")
-                with JOBS_LOCK:
-                    JOBS[job_id] = {
-                        "id": job_id,
-                        "status": "queued",
-                        "kind": "tuning",
-                        "logs": [],
-                        "preparation": preparation,
-                        "exit_code": None,
-                        "result": None,
-                        "created_at": dt.datetime.now().astimezone().isoformat(),
+                with _single_console_per_unit(workflow.get("repository_run_manifest"), job_id):
+                    diagnostic_root = diagnostic_run_directory(
+                        workflow["output_root"],
+                        job_id,
+                        workspace=_repository_workspace(workflow),
+                    )
+                    preparation = prepare_tuning_run(
+                        workflow,
+                        representative,
+                        diagnostic_root,
+                    )
+                    preparation["peak_tuning_profile"] = {
+                        key: value for key, value in profile.items() if key != "file"
                     }
-                    _persist_jobs_locked()
-                threading.Thread(
-                    target=_run_tuning_job,
-                    args=(job_id, preparation),
-                    daemon=True,
-                ).start()
+                    preparation["diagnostic_run_directory"] = str(diagnostic_root)
+                    if authorized:
+                        record_campaign_authorization(authorized[0], {**authorized[1], "job_id": job_id})
+                    _write_diagnostic_record(job_id, preparation, "queued")
+                    with JOBS_LOCK:
+                        JOBS[job_id] = {
+                            "id": job_id,
+                            "status": "queued",
+                            "kind": "tuning",
+                            "logs": [],
+                            "preparation": preparation,
+                            "exit_code": None,
+                            "result": None,
+                            "created_at": dt.datetime.now().astimezone().isoformat(),
+                            **({"console_watch": watch} if watch else {}),
+                        }
+                        _register_process_locked(job_id, "tuning", **watch)
+                        _persist_jobs_locked()
+                    threading.Thread(
+                        target=_run_tuning_job,
+                        args=(job_id, preparation),
+                        daemon=True,
+                    ).start()
                 self._json(
                     {
                         "started": True,
                         "job_id": job_id,
                         "preparation": preparation,
+                        **({"console_watch": watch} if watch else {}),
                         **({"campaign_authorization": authorized[1]} if authorized else {}),
                     }
                 )
@@ -1676,27 +2007,29 @@ class Handler(BaseHTTPRequestHandler):
                 # prepare_run carries repository_run_manifest and the retention policy through
                 # itself now, so this path no longer copies them back by hand -- and the agent path
                 # below no longer has to remember to.
-                preparation = prepare_run(state)
                 job_id = uuid.uuid4().hex
-                artifact_baseline = _snapshot_run_artifacts(preparation)
-                with JOBS_LOCK:
-                    JOBS[job_id] = {
-                        "id": job_id,
-                        "status": "queued",
-                        "kind": "run",
-                        "logs": [],
-                        "preparation": preparation,
-                        "exit_code": None,
-                        "created_at": dt.datetime.now().astimezone().isoformat(),
-                        "artifact_baseline": artifact_baseline,
-                        "artifacts": {},
-                    }
-                    _persist_jobs_locked()
-                threading.Thread(
-                    target=_run_job,
-                    args=(job_id, preparation),
-                    daemon=True,
-                ).start()
+                with _single_console_per_unit(state.get("repository_run_manifest"), job_id):
+                    preparation = prepare_run(state)
+                    artifact_baseline = _snapshot_run_artifacts(preparation)
+                    with JOBS_LOCK:
+                        JOBS[job_id] = {
+                            "id": job_id,
+                            "status": "queued",
+                            "kind": "run",
+                            "logs": [],
+                            "preparation": preparation,
+                            "exit_code": None,
+                            "created_at": dt.datetime.now().astimezone().isoformat(),
+                            "artifact_baseline": artifact_baseline,
+                            "artifacts": {},
+                        }
+                        _register_process_locked(job_id, "run")
+                        _persist_jobs_locked()
+                    threading.Thread(
+                        target=_run_job,
+                        args=(job_id, preparation),
+                        daemon=True,
+                    ).start()
                 self._json(
                     {
                         "job_id": job_id,
@@ -1725,38 +2058,40 @@ class Handler(BaseHTTPRequestHandler):
                     state.get("files", []), body.get("file_path", "")
                 )
                 job_id = uuid.uuid4().hex
-                diagnostic_root = diagnostic_run_directory(
-                    state.get("output_root", ""),
-                    job_id,
-                    workspace=_repository_workspace(state),
-                )
-                preparation = prepare_tuning_run(
-                    state,
-                    profile["file_path"],
-                    diagnostic_root,
-                )
-                preparation["peak_tuning_profile"] = {
-                    key: value for key, value in profile.items() if key != "file"
-                }
-                preparation["diagnostic_run_directory"] = str(diagnostic_root)
-                _write_diagnostic_record(job_id, preparation, "queued")
-                with JOBS_LOCK:
-                    JOBS[job_id] = {
-                        "id": job_id,
-                        "status": "queued",
-                        "kind": "tuning",
-                        "logs": [],
-                        "preparation": preparation,
-                        "exit_code": None,
-                        "result": None,
-                        "created_at": dt.datetime.now().astimezone().isoformat(),
+                with _single_console_per_unit(state.get("repository_run_manifest"), job_id):
+                    diagnostic_root = diagnostic_run_directory(
+                        state.get("output_root", ""),
+                        job_id,
+                        workspace=_repository_workspace(state),
+                    )
+                    preparation = prepare_tuning_run(
+                        state,
+                        profile["file_path"],
+                        diagnostic_root,
+                    )
+                    preparation["peak_tuning_profile"] = {
+                        key: value for key, value in profile.items() if key != "file"
                     }
-                    _persist_jobs_locked()
-                threading.Thread(
-                    target=_run_tuning_job,
-                    args=(job_id, preparation),
-                    daemon=True,
-                ).start()
+                    preparation["diagnostic_run_directory"] = str(diagnostic_root)
+                    _write_diagnostic_record(job_id, preparation, "queued")
+                    with JOBS_LOCK:
+                        JOBS[job_id] = {
+                            "id": job_id,
+                            "status": "queued",
+                            "kind": "tuning",
+                            "logs": [],
+                            "preparation": preparation,
+                            "exit_code": None,
+                            "result": None,
+                            "created_at": dt.datetime.now().astimezone().isoformat(),
+                        }
+                        _register_process_locked(job_id, "tuning")
+                        _persist_jobs_locked()
+                    threading.Thread(
+                        target=_run_tuning_job,
+                        args=(job_id, preparation),
+                        daemon=True,
+                    ).start()
                 self._json({"job_id": job_id, "preparation": preparation})
             elif parsed.path == "/api/rt-correction/run":
                 state = body.get("workflow", body)
@@ -1799,6 +2134,8 @@ class Handler(BaseHTTPRequestHandler):
                     },
                     HTTPStatus.NOT_FOUND,
                 )
+        except UnitBusyError as error:
+            self._json(error.payload(), HTTPStatus.CONFLICT)
         except Exception as error:
             self._json(
                 {"error": str(error), "trace": traceback.format_exc()},
@@ -1946,8 +2283,12 @@ def _run_repository_download_job(
     with JOBS_LOCK:
         JOBS[job_id]["status"] = "running"
         JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+        cancel = (PROCESSES.get(job_id) or _register_process_locked(job_id, "repository_download"))["cancel"]
         _persist_jobs_locked()
     try:
+        if cancel.is_set():
+            # Cancelled while queued: no lease was written and nothing was fetched.
+            raise RepositoryDownloadCancelled()
         log(
             f"Downloading {project.repository} {project.accession} into {workspace_root}."
         )
@@ -1963,6 +2304,10 @@ def _run_repository_download_job(
             index: int, total_objects: int, name: str, received: int, total_bytes: int
         ) -> None:
             nonlocal last_persisted
+            if cancel.is_set():
+                # Raised through the lease, which records itself as download_failed with reason
+                # "cancelled" and keeps the partial file, so a later download of the unit resumes it.
+                raise RepositoryDownloadCancelled()
             elapsed = max(time.monotonic() - started, 1e-6)
             speed = received / elapsed
             percent = received / total_bytes * 100 if total_bytes else 0.0
@@ -2014,6 +2359,18 @@ def _run_repository_download_job(
             JOBS[job_id]["status"] = "completed"
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             _persist_jobs_locked()
+    except RepositoryDownloadCancelled:
+        message = (
+            "The repository download was cancelled on request. A lease already started records itself "
+            "as download_failed with reason 'cancelled', and its partial file is kept for a resume."
+        )
+        log(message)
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "failed"
+            JOBS[job_id]["stop_reason"] = "cancelled"
+            JOBS[job_id]["error"] = message
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
     except Exception as error:
         log(traceback.format_exc())
         with JOBS_LOCK:
@@ -2021,6 +2378,9 @@ def _run_repository_download_job(
             JOBS[job_id]["error"] = str(error)
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             _persist_jobs_locked()
+    finally:
+        with JOBS_LOCK:
+            PROCESSES.pop(job_id, None)
 
 
 def _register_split_part(parent_job: dict[str, Any], part: dict[str, Any]) -> str:
@@ -2173,7 +2533,7 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
         log("Starting MS-DIAL Console run.")
         log("Command: " + " ".join(preparation["command"]))
         log("Large vendor raw files can take several minutes before the first Console message.")
-        exit_code = run_console(preparation, log)
+        exit_code = _run_console_for_job(job_id, "run", preparation, log)
         validation = None
         handoff = None
         repository_retention = None
@@ -2387,7 +2747,7 @@ def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
         _persist_jobs_locked()
     try:
         _write_diagnostic_record(job_id, preparation, "running")
-        exit_code = run_console(preparation, log)
+        exit_code = _run_console_for_job(job_id, "tuning", preparation, log)
         result = None
         result_file = ""
         if exit_code == 0:

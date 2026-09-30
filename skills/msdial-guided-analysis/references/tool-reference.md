@@ -17,6 +17,10 @@
   and propose a stepped minimum peak height for review.
 - `msdial_interactive_job`: retrieve one job's current status and optional full
   details.
+- `msdial_cancel_job`: stop a queued or running run, peak-count diagnostic, or
+  repository download. A stopped Console fails its job with exit code -4; a
+  `timeout_seconds` or `idle_timeout_seconds` passed to the start tools fails it
+  with -3. Stopping a wait does not stop the job; this does.
 - `msdial_interactive_create_handoff`: create a data-mining handoff from one
   completed production job.
 

@@ -468,7 +468,7 @@ class TheJobsWriteWhatTheManifestRouteReads(_Unit, unittest.TestCase):
         }
         seen: list[str] = []
 
-        def console(_preparation, _log):
+        def console(_preparation, _log, **_watch):
             seen.append(read_manifest(directory / server.DIAGNOSTIC_JOB_RECORD)["status"])
             result_file.write_text(
                 "Height\tSimple dot product\tWeighted dot product\tReverse dot product\n100\t0\t0\t0\n",
@@ -511,7 +511,7 @@ class TheJobsWriteWhatTheManifestRouteReads(_Unit, unittest.TestCase):
             "qa_matrix_expected": False,
         }
 
-        def console(_preparation, _log):
+        def console(_preparation, _log, **_watch):
             (output / "result.mzTab").write_text(
                 "MTD\tmzTab-version\t2.0.0-M\nSMH\tSML_ID\nSML\t1\n", encoding="ascii"
             )

@@ -84,13 +84,22 @@ class MsdialRequestError(RuntimeError):
     """
 
     def __init__(
-        self, detail: str, *, status: int | None = None, endpoint: str = "", trace: str = ""
+        self,
+        detail: str,
+        *,
+        status: int | None = None,
+        endpoint: str = "",
+        trace: str = "",
+        payload: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(detail)
         self.detail = detail
         self.status = status
         self.endpoint = endpoint
         self.trace = trace
+        # The backend's whole answer, for the refusals that carry more than a sentence: a busy unit
+        # names the job that holds it.
+        self.payload = dict(payload or {})
 
     @property
     def reason(self) -> str:
@@ -133,7 +142,11 @@ def _request_json(
             detail = str(payload.get("error") or payload.get("detail") or raw).strip() or raw
             trace = str(payload.get("trace") or "")
         raise MsdialRequestError(
-            detail, status=error.code, endpoint=f"{method} {path}", trace=trace
+            detail,
+            status=error.code,
+            endpoint=f"{method} {path}",
+            trace=trace,
+            payload=payload if isinstance(payload, dict) else None,
         ) from error
     except urllib.error.URLError as error:
         raise MsdialRequestError(
@@ -239,6 +252,12 @@ def _structured_validation_errors(function):
                 # Refused by the backend, which checks the approval again before it writes anything.
                 failure["reason"] = "campaign_authorization_refused"
                 failure["codes"] = refused
+            if error.status == 409 and error.payload.get("code") == "unit_busy":
+                # The unit already has a live Console job. Nothing was started; the job named is the
+                # one to wait for or cancel, and a start that timed out on the caller's side is found here.
+                failure["reason"] = "unit_busy"
+                failure["live_job_id"] = str(error.payload.get("live_job_id") or "")
+                failure["repository_run_manifest"] = str(error.payload.get("repository_run_manifest") or "")
             if error.status is not None:
                 failure["http_status"] = error.status
             if error.trace:
@@ -1950,11 +1969,18 @@ def msdial_start_guided_analysis(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     campaign_authorization_path: str = "",
+    timeout_seconds: float = 0,
+    idle_timeout_seconds: float = 0,
 ) -> dict[str, Any]:
     """Start MS-DIAL only when the complete guided plan has been explicitly confirmed.
 
     A campaign approval covering boundary 4 for the repository unit the plan names stands in for
     confirmed=true; the backend checks it and records it in the unit manifest before the run starts.
+
+    timeout_seconds stops the Console when it runs longer than that, and idle_timeout_seconds when
+    neither its output nor its log grows for that long; the job then fails with exit code -3. Both are 0,
+    no limit, unless given. A repository unit runs one Console at a time: a second start for the same
+    unit is refused with reason unit_busy and the live job's id.
     """
     return _request_json(
         "POST",
@@ -1967,6 +1993,8 @@ def msdial_start_guided_analysis(
             "workset_id": workset_id,
             "confirmed": confirmed,
             "campaign_authorization_path": campaign_authorization_path,
+            "timeout_seconds": timeout_seconds,
+            "idle_timeout_seconds": idle_timeout_seconds,
         },
         timeout=120,
     )
@@ -1983,12 +2011,15 @@ def msdial_start_peak_count_diagnostic(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     campaign_authorization_path: str = "",
+    timeout_seconds: float = 0,
+    idle_timeout_seconds: float = 0,
 ) -> dict[str, Any]:
     """Run the zero-threshold single-file diagnostic after explicit confirmation.
 
     The diagnostic starts the Console, so a campaign approval must cover boundary 4 to stand in for
     confirmed=true. The diagnostic records itself in its own directory, which is what lets
-    msdial_estimate_peak_height find it by manifest_path later.
+    msdial_estimate_peak_height find it by manifest_path later. timeout_seconds and
+    idle_timeout_seconds limit the Console as they do for msdial_start_guided_analysis; 0 is no limit.
     """
     return _request_json(
         "POST",
@@ -2002,6 +2033,8 @@ def msdial_start_peak_count_diagnostic(
             "workset_id": workset_id,
             "confirmed": confirmed,
             "campaign_authorization_path": campaign_authorization_path,
+            "timeout_seconds": timeout_seconds,
+            "idle_timeout_seconds": idle_timeout_seconds,
         },
         timeout=120,
     )
@@ -2055,6 +2088,32 @@ def msdial_interactive_job(
         {"detail": "full" if detail else "summary", "log_lines": max(0, log_lines)}
     )
     return _request_json("GET", f"/api/jobs/{job_id}?{query}", host=host, port=port, timeout=10)
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_cancel_job(
+    job_id: str,
+    reason: str = "",
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Stop a running or queued MS-DIAL run, peak-count diagnostic, or repository download.
+
+    A run or diagnostic has its Console's whole process tree stopped and fails with exit code -4; a
+    download stops at its next progress report, and its unit manifest records download_failed with reason
+    cancelled, keeping the partial file for a resume. Returns at once with cancel_requested; poll the job
+    to see it end. Stopping polling, as msdial_interactive_wait_for_completion does on its timeout, never
+    stopped anything; this does.
+    """
+    return _request_json(
+        "POST",
+        f"/api/jobs/{urllib.parse.quote(str(job_id).strip(), safe='')}/cancel",
+        host=host,
+        port=port,
+        body={"reason": reason},
+        timeout=30,
+    )
 
 
 @mcp.tool()

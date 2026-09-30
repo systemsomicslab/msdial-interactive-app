@@ -65,6 +65,10 @@ def summarize_jobs(
             "isolated_job_registry",
             "mzxml_requires_conversion_to_mzml",
             "automatic_alignment_rt_correction",
+            "console_time_limits",
+            "cancel_console_and_download_jobs",
+            "repository_run_attempt_records",
+            "one_console_per_repository_unit",
         ],
         "workflow_outline": [
             "Inspect the input path and collect the guided scientific choices.",
@@ -172,6 +176,8 @@ def summarize_job(
         "created_at": job.get("created_at", ""),
         "updated_at": job.get("updated_at", ""),
         "error": job.get("error", ""),
+        # Set when the job was stopped rather than ending on its own: timeout, idle_timeout, cancelled.
+        "stop_reason": job.get("stop_reason", ""),
         "warnings": list(job.get("warnings") or []),
         "progress": job.get("progress"),
         "log_tail": (job.get("logs") or [])[-max(0, log_lines):],

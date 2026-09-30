@@ -1654,6 +1654,190 @@ def record_run_failure(
         return {"status": "run_failed", "manifest_error": str(error), "run_failure": record}
 
 
+def record_run_start(
+    manifest_path: str | Path,
+    job_id: str,
+    kind: str = "run",
+    *,
+    output_directory: str | Path = "",
+    console: dict[str, Any] | None = None,
+    command: list[str] | None = None,
+    timeout_seconds: float | None = None,
+    idle_timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Open one run attempt in the unit's manifest, before its Console starts. Never raises.
+
+    WHY BEFORE. Every other record of a run is written after the Console returns: the failure record,
+    the finalised run. A backend that stops while the Console runs - a reboot, a crash, an MCP session
+    that ends - writes neither, and the unit then looked exactly like a unit nobody had started, while a
+    Console might still be writing into it. An attempt opened here and closed by record_run_end says a
+    run started, which job started it, from which backend process and with which Console; one left open
+    says it never came back. The Console's process id is added by record_run_process once it exists,
+    which is what lets a later caller tell an orphaned Console that is still running from one that died.
+
+    Appended to run_attempts, never replaced: a unit retried twice is a different thing from a unit tried
+    once. ``attempt`` numbers the attempts of one kind (run, tuning) in the order they were made.
+
+    Returns the entry with recorded=True, or with recorded=False and the error when the manifest could not
+    be written; the run goes ahead either way, since a record that cannot be written is not a reason to
+    lose the run. The Console is identified by its version and checksums, not by its location.
+    """
+    identity = console or {}
+    entry: dict[str, Any] = {
+        "attempt_id": secrets.token_hex(8),
+        "attempt": None,
+        "job_id": str(job_id or ""),
+        "kind": str(kind or "run"),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "ended_at": None,
+        "exit_code": None,
+        "reason": None,
+        "console": {
+            "version": str(identity.get("version") or ""),
+            "binary_sha256": str(identity.get("binary_sha256") or ""),
+            "assembly_sha256": str(identity.get("assembly_sha256") or ""),
+            "provenance_status": str(identity.get("status") or identity.get("provenance_status") or ""),
+        },
+        "command_sha256": (
+            hashlib.sha256(json.dumps([str(part) for part in command]).encode("utf-8")).hexdigest()
+            if command
+            else ""
+        ),
+        "output_directory": str(output_directory or ""),
+        "timeout_seconds": timeout_seconds,
+        "idle_timeout_seconds": idle_timeout_seconds,
+        # The process that starts the Console, identified the way a download lease's owner is.
+        "backend": {
+            "pid": os.getpid(),
+            "process_created_at": process_created_at(),
+            "host": socket.gethostname(),
+        },
+        "console_pid": None,
+        "console_process_created_at": None,
+    }
+
+    def change(manifest: dict[str, Any]) -> None:
+        attempts = list(manifest.get("run_attempts") or [])
+        entry["attempt"] = 1 + sum(
+            1 for item in attempts if isinstance(item, dict) and item.get("kind") == entry["kind"]
+        )
+        manifest["run_attempts"] = [*attempts, entry]
+
+    try:
+        update_manifest(Path(manifest_path), change)
+        return {**entry, "recorded": True}
+    except Exception as error:  # noqa: BLE001 - a record that fails must not stop the run it records
+        return {**entry, "recorded": False, "error": f"{type(error).__name__}: {error}"}
+
+
+def record_run_process(
+    manifest_path: str | Path, attempt_id: str, pid: int, process_created_at: float | None = None
+) -> dict[str, Any]:
+    """Add the Console's process id to an open run attempt, once the process exists. Never raises."""
+
+    def change(manifest: dict[str, Any]) -> None:
+        for item in manifest.get("run_attempts") or []:
+            if isinstance(item, dict) and item.get("attempt_id") == attempt_id:
+                item["console_pid"] = int(pid)
+                item["console_process_created_at"] = process_created_at
+                return
+        raise LookupError(f"run attempt {attempt_id} is not in the manifest")
+
+    try:
+        update_manifest(Path(manifest_path), change)
+        return {"recorded": True}
+    except Exception as error:  # noqa: BLE001
+        return {"recorded": False, "error": f"{type(error).__name__}: {error}"}
+
+
+def record_run_end(
+    manifest_path: str | Path,
+    attempt: dict[str, Any] | None,
+    exit_code: int | None,
+    reason: str,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Close the run attempt record_run_start opened, with how the Console ended. Never raises.
+
+    ``attempt`` is what record_run_start returned. ``reason`` is exited (the Console ended on its own,
+    and ``exit_code`` says how), timeout, idle_timeout, cancelled, sciex_scan_sidecar, start_failed (it
+    never started) or error; ``detail`` holds the rest, such as how a stop was made. When the opening
+    record is missing - it could not be written, or a new lease replaced the manifest meanwhile - the
+    attempt is appended closed and marked start_unrecorded, so the end of a run is not lost with its start.
+    """
+    opened = dict(attempt or {})
+    ended = {
+        "ended_at": datetime.now(timezone.utc).isoformat(),
+        "exit_code": exit_code,
+        "reason": str(reason or ""),
+        **({"detail": dict(detail)} if detail else {}),
+    }
+
+    def change(manifest: dict[str, Any]) -> None:
+        attempts = list(manifest.get("run_attempts") or [])
+        for item in attempts:
+            if (
+                isinstance(item, dict)
+                and opened.get("attempt_id")
+                and item.get("attempt_id") == opened.get("attempt_id")
+            ):
+                item.update(ended)
+                return
+        closed = {key: value for key, value in opened.items() if key not in {"recorded", "error"}}
+        closed.update(ended)
+        closed["start_unrecorded"] = True
+        closed["attempt"] = 1 + sum(
+            1 for item in attempts if isinstance(item, dict) and item.get("kind") == closed.get("kind")
+        )
+        manifest["run_attempts"] = [*attempts, closed]
+
+    try:
+        update_manifest(Path(manifest_path), change)
+        return {"recorded": True, **ended}
+    except Exception as error:  # noqa: BLE001
+        return {"recorded": False, "error": f"{type(error).__name__}: {error}", **ended}
+
+
+def live_run_attempt(
+    manifest_path: str | Path, ignore_backend_pid: int | None = None
+) -> dict[str, Any] | None:
+    """The unit's run attempt whose Console may still be running, or None.
+
+    Read from the manifest, so it answers for Consoles no registry knows any more: one orphaned by a
+    backend that stopped, or one started by another backend process. An attempt counts when its Console
+    is alive (read through process_liveness, never by signalling it), when it is still open and its
+    Console's liveness cannot be read, or when it is still open, names no Console yet, and the backend
+    that opened it is another process that is still alive. ``ignore_backend_pid`` is the caller's own
+    process id: its registry answers for the attempts it opened itself.
+    """
+    try:
+        manifest = read_manifest(manifest_path)
+    except (OSError, ValueError):
+        return None
+    for item in reversed(list(manifest.get("run_attempts") or [])[-20:]):
+        if not isinstance(item, dict):
+            continue
+        still_open = not item.get("ended_at")
+        pid = item.get("console_pid")
+        if pid:
+            created = item.get("console_process_created_at")
+            if not still_open and created is None:
+                # Closed, and without a creation time a later process given the same id looks the same.
+                continue
+            alive = process_is_alive(pid, created)
+            if alive or (alive is None and still_open):
+                return item
+            continue
+        if not still_open:
+            continue
+        backend = item.get("backend") or {}
+        if ignore_backend_pid is not None and backend.get("pid") == ignore_backend_pid:
+            continue
+        if process_is_alive(backend.get("pid"), backend.get("process_created_at")):
+            return item
+    return None
+
+
 def record_peak_height_diagnostic(
     manifest_path: Path,
     estimate: dict[str, Any],
