@@ -332,6 +332,33 @@ class RecordAndInspectTests(unittest.TestCase):
         self.assertEqual("absent", result["provenance_status"])
         self.assertFalse(result["exists"])
 
+    def test_an_extractor_without_a_readable_record_is_still_identified_by_its_files(self) -> None:
+        # The working-checkout build has no record. The vendor libraries it ran with are then
+        # named by the inventory hash and nothing else.
+        _raw, _common, binary = _write_build(self.root)
+        expected = inventory_sha256(extractor_inventory(binary.parent))
+
+        absent = inspect_raw_metadata_extractor(binary)
+        (binary.parent / EXTRACTOR_BUILD_PROVENANCE).write_text("{ not json", encoding="utf-8")
+        unreadable = inspect_raw_metadata_extractor(binary)
+
+        for status, result in (("absent", absent), ("unreadable", unreadable)):
+            with self.subTest(status=status):
+                self.assertEqual(status, result["provenance_status"])
+                self.assertEqual(expected, result["inventory_sha256"])
+                self.assertEqual(7, result["file_count"])
+        (binary.parent / "MassLynxRaw.dll").write_bytes(b"another vendor build")
+        self.assertNotEqual(expected, inspect_raw_metadata_extractor(binary)["inventory_sha256"])
+
+    def test_the_planned_binary_is_compared_after_normalisation(self) -> None:
+        raw, common, binary = _write_build(self.root)
+        spelled = raw / "RawMetadataConsoleApp" / ".." / "RawMetadataConsoleApp" / "bin" / "Release" / "net48"
+        plan = {"binary_path": str(spelled / "RawMetadataConsoleApp.exe")}
+
+        result = self._record(raw, common, binary, plan=plan)
+
+        self.assertEqual("verified", result["provenance_status"])
+
     def test_a_build_folder_is_inspected_through_its_exe(self) -> None:
         raw, common, binary = _write_build(self.root)
         self._record(raw, common, binary)
@@ -493,6 +520,37 @@ class RecordRefusalTests(unittest.TestCase):
         _assembly(elsewhere, f"1.0.0+{RAW_HEAD}", b"extractor")
 
         self._refused(raw, common, elsewhere, "is not inside the msrawdataworkbench tree")
+
+    def test_a_binary_from_another_configuration_or_framework_is_refused(self) -> None:
+        # The record says Release and net48. A Debug build is the same project built
+        # otherwise, and Interactive's candidate list also searches bin\Release\net8.0-windows.
+        for configuration, framework in (
+            ("Debug", "net48"),
+            ("Release", "net8.0-windows"),
+            ("Debug", "net8.0-windows"),
+        ):
+            with self.subTest(configuration=configuration, framework=framework):
+                raw, common, binary = _write_build(self.root / configuration / framework)
+                other = raw / "RawMetadataConsoleApp" / "bin" / configuration / framework
+                other.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(binary.parent), str(other))
+
+                self._refused(raw, common, other / "RawMetadataConsoleApp.exe", "Release/net48 extractor")
+
+    def test_a_file_other_than_the_extractor_is_refused(self) -> None:
+        raw, common, binary = _write_build(self.root)
+
+        self._refused(raw, common, binary.parent / "RawDataHandler.dll", "Release/net48 extractor")
+
+    def test_a_binary_that_is_not_the_planned_one_is_refused(self) -> None:
+        raw, common, binary = _write_build(self.root)
+        planned = extractor.extractor_output_directory(self.root / "other-build" / "msrawdataworkbench")
+        plan = {
+            "trees": {"msrawdataworkbench": {"commit": RAW_HEAD}, "MsdialWorkbench": {"commit": COMMON_HEAD}},
+            "binary_path": str(planned / "RawMetadataConsoleApp.exe"),
+        }
+
+        self._refused(raw, common, binary, "not the planned binary", plan=plan)
 
     def test_a_common_tree_that_is_not_the_referenced_sibling_is_refused(self) -> None:
         raw, _common, binary = _write_build(self.root)

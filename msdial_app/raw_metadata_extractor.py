@@ -577,9 +577,10 @@ def record_build(
     """Write the build record beside a built extractor and return its inspection.
 
     Refuses rather than writes a record the build contradicts: a binary outside the
-    extractor tree, a Common tree that is not the sibling the project references, a restore
-    graph that resolved a project from anywhere else, or an assembly whose embedded
-    revision is not its tree's head. A record is written once; replace=True overwrites it.
+    extractor tree or other than its Release/net48 exe (or the plan's binary), a Common
+    tree that is not the sibling the project references, a restore graph that resolved a
+    project from anywhere else, or an assembly whose embedded revision is not its tree's
+    head. A record is written once; replace=True overwrites it.
     """
     binary = Path(binary_path).expanduser().resolve()
     raw_root = Path(raw_source_root).expanduser().resolve()
@@ -588,6 +589,20 @@ def record_build(
         raise FileNotFoundError(f"The built extractor was not found: {binary}")
     if not _is_within(binary, raw_root):
         raise ValueError(f"{binary} is not inside the {RAW_TREE} tree {raw_root}.")
+    # The record states the configuration and framework, so the binary has to be the one
+    # that build writes. A Debug build, or the net8.0-windows folder Interactive also
+    # searches, would otherwise be recorded as Release/net48.
+    expected = extractor_output_directory(raw_root) / EXTRACTOR_BINARY
+    if _normalized(binary) != _normalized(expected):
+        raise ValueError(
+            f"{binary} is not {expected}, the {EXTRACTOR_CONFIGURATION}/{EXTRACTOR_FRAMEWORK} "
+            "extractor the record describes."
+        )
+    planned_binary = str((plan or {}).get("binary_path") or "")
+    if planned_binary and _normalized(binary) != _normalized(
+        Path(planned_binary).expanduser().resolve()
+    ):
+        raise ValueError(f"{binary} is not the planned binary {planned_binary}.")
     if _normalized(common_root) != _normalized(raw_root.parent / COMMON_TREE):
         raise ValueError(
             f"The project references ..\\..\\{COMMON_TREE}, so the Common tree it compiled is "
@@ -782,8 +797,8 @@ def _inventory_differences(
 _STATUS_DETAIL = {
     "verified": "",
     "absent": (
-        "No build record accompanies this extractor, so what it reads is identified by its "
-        "checksum alone and not by a source revision."
+        "No build record accompanies this extractor, so what it reads is identified by the "
+        "checksums of its exe and its folder alone and not by a source revision."
     ),
     "stale_mismatch": (
         "A build record sits beside this extractor and describes different files, so the "
@@ -802,6 +817,8 @@ def inspect_raw_metadata_extractor(path: str | Path) -> dict[str, Any]:
 
     provenance_status is one of PROVENANCE_STATUSES. Every file of the output folder is
     re-hashed, so a vendor library swapped beside an unchanged exe is stale_mismatch.
+    Whenever the binary exists the result carries inventory_sha256 and file_count, with or
+    without a readable record.
     """
     binary = Path(path).expanduser().resolve()
     if binary.is_dir():
@@ -821,6 +838,10 @@ def inspect_raw_metadata_extractor(path: str | Path) -> dict[str, Any]:
         return result
     stat = binary.stat()
     binary_sha256 = _sha256_file(binary)
+    # Hashed before the record is read: without a readable record, the folder's hash is all
+    # that names the vendor libraries the extractor ran with.
+    inventory = extractor_inventory(binary.parent)
+    current_inventory_sha256 = inventory_sha256(inventory)
     result.update(
         {
             "binary_sha256": binary_sha256,
@@ -829,6 +850,8 @@ def inspect_raw_metadata_extractor(path: str | Path) -> dict[str, Any]:
             .astimezone()
             .isoformat(),
             "product_version": assembly_product_version(binary),
+            "inventory_sha256": current_inventory_sha256,
+            "file_count": len(inventory),
         }
     )
 
@@ -847,12 +870,8 @@ def inspect_raw_metadata_extractor(path: str | Path) -> dict[str, Any]:
 
     sources = record["sources"]
     heads = {tree: str(sources[tree].get("head") or "") for tree in (RAW_TREE, COMMON_TREE)}
-    inventory = extractor_inventory(binary.parent)
-    current_inventory_sha256 = inventory_sha256(inventory)
     result.update(
         {
-            "inventory_sha256": current_inventory_sha256,
-            "file_count": len(inventory),
             "msrawdataworkbench_commit": heads[RAW_TREE],
             "msdialworkbench_commit": heads[COMMON_TREE],
             "pinned": heads[RAW_TREE] == PINNED_MSRAWDATAWORKBENCH_COMMIT
