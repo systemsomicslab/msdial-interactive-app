@@ -1666,17 +1666,7 @@ def prepare_run(
         # One field a reader sees without digging: whether the software this run used
         # can be identified at all.
         "software_provenance_status": console.get("provenance_status", "absent"),
-        "libraries": [
-            {
-                **{
-                    key: entry.get(key, "")
-                    for key in ("path", "version", "source", "doi", "license")
-                },
-                **file_identity(entry.get("path", "")),
-            }
-            for entry in method_state.get("library_provenance", [])
-            if isinstance(entry, dict) and str(entry.get("path", "")).strip()
-        ],
+        "libraries": _manifest_libraries(method_state),
         "project_file_requested": project_file_requested,
         "stage_inputs": stage_inputs,
         "input_csv": str(csv_path),
@@ -1784,6 +1774,28 @@ def prepare_run(
         **reproduction,
         "warnings": [issue for issue in issues if issue["level"] == "warning"] + retention_warnings,
     }
+
+
+def _manifest_libraries(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """The run manifest's library records.
+
+    A repository unit's run is built to be redistributed, and its manifest travels in the workflow bundle,
+    so it names each library the run loads the way every shared artifact does: file name, sha256, size and
+    distribution, and no location. The location stays in workflow-settings.json, which is this machine's. A
+    laboratory run's manifest keeps the provenance entries with their paths, as it always has.
+    """
+    if str(state.get("repository_run_manifest") or "").strip():
+        from .sharing import library_records
+
+        return [library.identity for library in library_records(state)]
+    return [
+        {
+            **{key: entry.get(key, "") for key in ("path", "version", "source", "doi", "license")},
+            **file_identity(entry.get("path", "")),
+        }
+        for entry in state.get("library_provenance", [])
+        if isinstance(entry, dict) and str(entry.get("path", "")).strip()
+    ]
 
 
 def prepare_tuning_run(
@@ -2334,43 +2346,7 @@ def _write_reproduction_files(
         newline="\n",
     )
     readme_path = run_directory / "REPRODUCE.txt"
-    readme_path.write_text(
-        (
-            "MS-DIAL reproducible Console workflow\n\n"
-            "Files:\n"
-            "- analysis_files.csv: absolute input paths (the staged copies under input\\ when\n"
-            "  inputs were staged) and sample metadata\n"
-            "- method.txt: final parameter file, including Tune parameters values\n"
-            "- msp_annotator_settings.tsv: optional per-MSP LC-MS annotation settings\n"
-            "- text_annotator_settings.tsv: optional per-Text-library LC-MS annotation settings\n"
-            "- RT correction anchor/selection files: included when RT correction is enabled\n"
-            "- workflow-settings.json: UI settings used to generate the workflow\n"
-            "- *_repository_metadata_reviewed.json / *_sample_metadata_reviewed.tsv: reviewed repository metadata and Class hierarchy\n"
-            "- command.txt: exact command generated on the original machine\n"
-            "- run-msdial.ps1 / run-msdial.sh: portable launch scripts\n\n"
-            "Edit parameters:\n"
-            "  vim method.txt\n\n"
-            "Windows PowerShell:\n"
-            "  .\\run-msdial.ps1\n"
-            "  .\\run-msdial.ps1 'C:\\path\\to\\MSDIALCUI.exe'\n\n"
-            "Bash:\n"
-            "  bash run-msdial.sh\n"
-            "  bash run-msdial.sh /path/to/MSDIALCUI.dll\n\n"
-            "The scripts copy method.txt to method.reproduce.txt beside it and analysis_files.csv into\n"
-            "reproduced-results, and run the Console from this directory on the copies. The Console's\n"
-            "key record is then written as method.reproduce.keys.json beside method.txt instead of\n"
-            "overwriting method.keys.json, and every -o output goes to reproduced-results.\n"
-            "MS-DIAL still writes its per-file .dcl/.pai2/_tags.xml and AlignResult-* intermediates\n"
-            "beside the input files listed in analysis_files.csv.\n\n"
-            "The CSV contains absolute input paths (staged copies under input\\ when inputs were\n"
-            "staged). Update them if the data move.\n"
-            "Paths in method.txt are absolute too, including the MSP/Text annotator settings files,\n"
-            "which name this run directory, and the RT correction files; update them after moving\n"
-            "the bundle. The scripts run the Console from the directory of method.txt, so a relative\n"
-            "path is read against it.\n"
-        ),
-        encoding="utf-8",
-    )
+    readme_path.write_text(_LOCAL_REPRODUCE_TEXT, encoding="utf-8")
     bundle_path = run_directory / "msdial-workflow-bundle.zip"
     members = [
         run_directory / "analysis_files.csv",
@@ -2400,9 +2376,7 @@ def _write_reproduction_files(
         path = Path(str(value))
         if path.is_file():
             members.append(path)
-    with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for member in members:
-            archive.write(member, member.name)
+    withheld_members = _write_workflow_bundle(bundle_path, members, readme_path, run_directory, state)
     return {
         "settings_file": str(settings_path),
         "command_file": str(command_path),
@@ -2410,7 +2384,160 @@ def _write_reproduction_files(
         "shell_script": str(shell_path),
         "reproduce_readme": str(readme_path),
         "bundle": str(bundle_path),
+        **({"bundle_withheld_members": withheld_members} if withheld_members else {}),
     }
+
+
+_LOCAL_REPRODUCE_TEXT = (
+    "MS-DIAL reproducible Console workflow\n\n"
+    "Files:\n"
+    "- analysis_files.csv: absolute input paths (the staged copies under input\\ when\n"
+    "  inputs were staged) and sample metadata\n"
+    "- method.txt: final parameter file, including Tune parameters values\n"
+    "- msp_annotator_settings.tsv: optional per-MSP LC-MS annotation settings\n"
+    "- text_annotator_settings.tsv: optional per-Text-library LC-MS annotation settings\n"
+    "- RT correction anchor/selection files: included when RT correction is enabled\n"
+    "- workflow-settings.json: UI settings used to generate the workflow\n"
+    "- *_repository_metadata_reviewed.json / *_sample_metadata_reviewed.tsv: reviewed repository metadata and Class hierarchy\n"
+    "- command.txt: exact command generated on the original machine\n"
+    "- run-msdial.ps1 / run-msdial.sh: portable launch scripts\n\n"
+    "Edit parameters:\n"
+    "  vim method.txt\n\n"
+    "Windows PowerShell:\n"
+    "  .\\run-msdial.ps1\n"
+    "  .\\run-msdial.ps1 'C:\\path\\to\\MSDIALCUI.exe'\n\n"
+    "Bash:\n"
+    "  bash run-msdial.sh\n"
+    "  bash run-msdial.sh /path/to/MSDIALCUI.dll\n\n"
+    "The scripts copy method.txt to method.reproduce.txt beside it and analysis_files.csv into\n"
+    "reproduced-results, and run the Console from this directory on the copies. The Console's\n"
+    "key record is then written as method.reproduce.keys.json beside method.txt instead of\n"
+    "overwriting method.keys.json, and every -o output goes to reproduced-results.\n"
+    "MS-DIAL still writes its per-file .dcl/.pai2/_tags.xml and AlignResult-* intermediates\n"
+    "beside the input files listed in analysis_files.csv.\n\n"
+    "The CSV contains absolute input paths (staged copies under input\\ when inputs were\n"
+    "staged). Update them if the data move.\n"
+    "Paths in method.txt are absolute too, including the MSP/Text annotator settings files,\n"
+    "which name this run directory, and the RT correction files; update them after moving\n"
+    "the bundle. The scripts run the Console from the directory of method.txt, so a relative\n"
+    "path is read against it.\n"
+)
+
+_PRIVATE_LIBRARY_NOTE = (
+    "\nPrivate libraries are named by file name only in this bundle's method.txt and annotator\n"
+    "settings, and they are not distributed with it. Place each one beside method.txt, or edit\n"
+    "those files to point at it, before running.\n"
+)
+
+_SHARED_REPRODUCE_TEXT = (
+    "MS-DIAL reproducible Console workflow\n\n"
+    "This bundle follows the shared-path policy {policy}: it carries no path from the machine\n"
+    "that ran it. SHARED-PATHS.json states the policy, names every library by file name and SHA-256,\n"
+    "and says what the placeholders mean.\n\n"
+    "Files:\n"
+    "- analysis_files.csv: input paths relative to this directory, as raw/<path in the analysis\n"
+    "  unit's raw data directory>, and sample metadata\n"
+    "- method.txt: final parameter file, including Tune parameters values; libraries and the\n"
+    "  annotator settings files are named by file name\n"
+    "- msp_annotator_settings.tsv: optional per-MSP LC-MS annotation settings\n"
+    "- text_annotator_settings.tsv: optional per-Text-library LC-MS annotation settings\n"
+    "- RT correction anchor/selection files: included when RT correction is enabled\n"
+    "- workflow-settings.json and run-manifest.json: the settings and the run record, with paths\n"
+    "  made relative to this directory\n"
+    "- *_repository_metadata_reviewed.json / *_sample_metadata_reviewed.tsv: reviewed repository metadata and Class hierarchy\n"
+    "- command.txt: the command generated on the original machine, its paths made relative\n"
+    "- run-msdial.ps1 / run-msdial.sh: portable launch scripts\n"
+    "- SHARED-PATHS.json: the path policy and each library's identity\n\n"
+    "Before running:\n"
+    "- Place the raw data under raw\\ beside method.txt, at the paths analysis_files.csv lists.\n"
+    "- Place each library method.txt and the annotator settings name beside method.txt. A library\n"
+    "  SHARED-PATHS.json marks private is not distributed; its SHA-256 identifies the file.\n"
+    "- A value shown as <local path withheld: NAME> named a file outside the analysis unit's\n"
+    "  workspace; supply that file and edit the value.\n\n"
+    "Edit parameters:\n"
+    "  vim method.txt\n\n"
+    "Windows PowerShell:\n"
+    "  .\\run-msdial.ps1\n"
+    "  .\\run-msdial.ps1 <path to MSDIALCUI.exe>\n\n"
+    "Bash:\n"
+    "  bash run-msdial.sh\n"
+    "  bash run-msdial.sh <path to MSDIALCUI.dll>\n\n"
+    "Without an argument the scripts run MSDIALCUI.exe from this directory or from PATH.\n"
+    "The scripts copy method.txt to method.reproduce.txt beside it and analysis_files.csv into\n"
+    "reproduced-results, and run the Console from this directory on the copies. The Console's\n"
+    "key record is then written as method.reproduce.keys.json beside method.txt instead of\n"
+    "overwriting method.keys.json, and every -o output goes to reproduced-results.\n"
+    "MS-DIAL still writes its per-file .dcl/.pai2/_tags.xml and AlignResult-* intermediates\n"
+    "beside the input files listed in analysis_files.csv.\n"
+)
+
+
+def _write_workflow_bundle(
+    bundle_path: Path,
+    members: list[Path],
+    readme_path: Path,
+    run_directory: Path,
+    state: dict[str, Any],
+) -> list[str]:
+    """Zip the reproduction files as a bundle that may leave this machine. Returns what was left out.
+
+    The files on disk are the ones the Console reads, so they keep their absolute paths. The bundle carries
+    renderings of them. A repository unit's bundle names nothing of this machine - raw inputs as raw/...,
+    the run directory as the bundle itself, libraries and the Console by file name - and declares the
+    shared-path policy by carrying SHARED-PATHS.json. A laboratory run's bundle changes only where a private
+    library would have been located. No library file, no copy of one and no local-only record is ever a
+    member, and a member that still matches what may not be shared after rendering is left out rather than
+    shipped.
+    """
+    from .sharing import PATH_POLICY, SHARED_PATHS_MEMBER, SharingContext, bundle_member_allowed, render_member
+
+    try:
+        recorded = json.loads((run_directory / "run-manifest.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        recorded = {}
+    context = SharingContext.for_state(
+        state,
+        run_directory=run_directory,
+        recorded=(recorded or {}).get("libraries") if isinstance(recorded, dict) else None,
+        bundle=True,
+    )
+    private = any(library.private for library in context.libraries)
+    withheld: list[str] = []
+    with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for member in members:
+            if not bundle_member_allowed(member.name, shared=True):
+                withheld.append(f"{member.name}: a library file or a local-only record")
+                continue
+            if not context.full and not private:
+                archive.write(member, member.name)  # nothing in a laboratory run's bundle to rewrite
+                continue
+            if member == readme_path:
+                text = (
+                    _SHARED_REPRODUCE_TEXT.format(policy=PATH_POLICY) if context.full
+                    else _LOCAL_REPRODUCE_TEXT + _PRIVATE_LIBRARY_NOTE
+                )
+                data = text.encode("utf-8")
+            else:
+                data = render_member(member, context)
+            findings = context.scan(member.name, data)
+            if findings:
+                withheld.append(f"{member.name}: {'; '.join(findings[:3])}")
+                continue
+            info = zipfile.ZipInfo.from_file(member, member.name)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, data)
+        if context.full:
+            archive.writestr(
+                SHARED_PATHS_MEMBER,
+                json.dumps(
+                    {**context.describe(), "libraries": context.identities(), "withheld_members": withheld},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+            )
+    context.assert_shareable(bundle_path)
+    return withheld
 
 
 def _powershell_script(

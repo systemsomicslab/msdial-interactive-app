@@ -28,6 +28,7 @@ result of the study.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -46,6 +47,74 @@ _DIAGNOSTIC_DIRECTORY_NAMES = frozenset(
 # Where a bundle's reproduction scripts write, inside the run directory. A run's own results
 # are never under it, so a scan of the run for its results skips it.
 REPRODUCTION_DIRECTORY_NAME = "reproduced-results"
+
+# Where a campaign unit's MS-DIAL containers go when they leave the raw tree after the run:
+# <output>/msdial-intermediates/<path under the raw directory>. The job that moved each one is in
+# the record, not in the path, which is already longer than the one the Console wrote. They are
+# retained, never results: a container named after a sample whose name holds "mztab" is not the
+# run's mzTab-M.
+INTERMEDIATES_DIRECTORY = "msdial-intermediates"
+
+# LongPathsEnabled is 0 on the campaign host. Without it Windows refuses a file path of MAX_PATH
+# (260) characters or more, and creates no directory of 248 or more, unless the call is given the
+# \\?\ form. A container the Console could write beside its input is 24 characters longer below
+# output\msdial-intermediates\ than below raw\, so its move, and every later look at it, takes
+# that form once a path reaches this length.
+_EXTENDED_FROM = 248
+_EXTENDED = "\\\\?\\"
+_EXTENDED_UNC = "\\\\?\\UNC\\"
+
+
+def extended_path(path: str | Path, *, always: bool = False) -> str:
+    """The path as the Windows file functions take one of any length; elsewhere, as it is.
+
+    ``always`` prefixes a short path too: a walk from it reaches the long paths below it only then.
+    """
+    text = str(path)
+    if os.name != "nt" or text.startswith(_EXTENDED) or (len(text) < _EXTENDED_FROM and not always):
+        return text
+    absolute = os.path.abspath(text)
+    if absolute.startswith("\\\\"):
+        return _EXTENDED_UNC + absolute[2:]
+    return _EXTENDED + absolute
+
+
+def plain_path(text: str) -> str:
+    """A path without the extended-length prefix, as a record names it."""
+    if text.startswith(_EXTENDED_UNC):
+        return "\\\\" + text[len(_EXTENDED_UNC):]
+    if text.startswith(_EXTENDED):
+        return text[len(_EXTENDED):]
+    return text
+
+
+def path_is_file(path: str | Path) -> bool:
+    """Path.is_file(), for a path of any length."""
+    return os.path.isfile(extended_path(path))
+
+
+def intermediate_files(output: str | Path) -> list[Path]:
+    """Every file below <output>/msdial-intermediates, one whose path is longer than MAX_PATH included.
+
+    Path.rglob does not see a file whose path is too long - it is silently left out - so a moved
+    container would be neither retained nor inventoried.
+    """
+    top = extended_path(Path(output) / INTERMEDIATES_DIRECTORY, always=True)
+    found = [
+        Path(plain_path(os.path.join(directory, name)))
+        for directory, _directories, names in os.walk(top)
+        for name in names
+    ]
+    return sorted(found)
+
+
+def is_intermediate_artifact(path: str | Path, root: str | Path) -> bool:
+    """True when a path lies under a relocated-containers directory below the scan root."""
+    try:
+        parts = Path(path).relative_to(Path(root)).parts
+    except (TypeError, ValueError):
+        return False
+    return INTERMEDIATES_DIRECTORY in parts[:-1]
 
 
 def is_reproduction_artifact(path: str | Path, root: str | Path) -> bool:

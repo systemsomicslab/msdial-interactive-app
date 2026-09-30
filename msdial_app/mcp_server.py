@@ -1623,6 +1623,10 @@ def msdial_cleanup_repository_raw(
     when it covers boundary 5 for this unit, the approval states delete_after_validated_output, the
     unit's own manifest recorded that same policy at download, and the preview is ready - every guard of
     the preview still applies. The crossing is recorded in the manifest before anything is deleted.
+
+    A finished run whose MS-DIAL containers could not be moved out of the raw tree holds the deletion
+    (finalisation_holds in the manifest). Both calls retry that move first; while it still fails the preview
+    lists it as a blocker and the deletion is refused.
     """
     from .repository_reanalysis import (
         cleanup_download_lease,
@@ -2242,6 +2246,8 @@ def msdial_generate_publication_report(
 
     manifest_path reaches the run through the unit manifest's finalised-run record. For a repository
     unit the retained-artifact inventory is refreshed afterwards, so it lists the publication artifacts.
+    A unit whose run left an mzTab-M it could not redact, or MS-DIAL's library copy it could not delete, is
+    held from sharing: the step is retried first, and while it still fails nothing is written.
     """
     return _request_json(
         "POST",

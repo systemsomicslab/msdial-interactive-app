@@ -73,6 +73,7 @@ from .repository_reanalysis import (
     update_manifest,
     _write_json,
 )
+from .run_finalisation import finalise_console_run
 from .campaign_authorization import CampaignAuthorizationError, authorize, unit_identity
 from .process_liveness import process_created_at
 from .workflow import (
@@ -893,6 +894,9 @@ def _write_guided_answers(preparation: dict, plan: dict) -> str:
     path = Path(run_directory).expanduser() / "guided-answers.json"
     payload = {
         "schema": "msdial-interactive.guided-answers.v1",
+        # The answers name libraries and data by their locations here, so a workset can start from them.
+        # That makes this file this machine's: it is never a member of a bundle or a shared report.
+        "sharing": "local_only",
         "recorded_at": dt.datetime.now().astimezone().isoformat(),
         "input_path": plan.get("input", {}).get("input_path", ""),
         "workset_id": (plan.get("workset") or {}).get("id", ""),
@@ -2552,6 +2556,19 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
         # holding the invariant that the published matrix has as many samples as were approved. The
         # tuning job has made exactly this check on its own single expected file all along.
         export_verification = _verify_expected_exports(preparation)
+        # Before anything reads the outputs: the mzTab-M loses this machine's locations, and a campaign
+        # unit's MS-DIAL containers leave the raw tree and its loaded-library copy is deleted. What is
+        # validated, inventoried and shared below is what the run keeps.
+        finalisation = finalise_console_run(
+            job_id, preparation, artifacts, exit_code, export_verification, log
+        )
+        # What it could not do is held in the unit manifest; the job says so where a reader looks first.
+        artifact_warnings.extend(
+            f"Finalisation hold on {hold['step']} (blocks {' and '.join(hold['blocks'])}): {hold['reason']}."
+            for hold in finalisation.get("holds") or []
+        )
+        with JOBS_LOCK:
+            JOBS[job_id]["console_run_finalisation"] = finalisation
         if exit_code == 0 and export_verification["missing"]:
             missing = export_verification["missing"]
             raise RuntimeError(

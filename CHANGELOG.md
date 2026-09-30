@@ -4,6 +4,63 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.15] - Unreleased
+
+### Added
+- `msdial_app/sharing.py`, the one rule for what leaves this machine.
+  - A library is identified by `{name, sha256, bytes, private}`. It is public
+    only with a DOI or an https source and no private licence, as the gate's
+    SEC-1 decides it. A library no record describes is private.
+  - A `SharingContext` rewrites locations in every encoding (backslashes,
+    doubled backslashes, forward slashes, `file://`, `%20`). A repository
+    unit's shared artifacts become workspace-relative (`raw/...`,
+    `output/...`), name libraries and the Console by file name, and withhold
+    every other absolute path. Each file is scanned with the gate's own
+    patterns before it is left on disk. A laboratory run changes only where a
+    private library would have been named.
+- `msdial_app/run_finalisation.py`, called once from the production job after
+  the Console returns and before validation.
+  - For every run, the mzTab-M's `database[n]-uri` becomes `null` for a
+    private library and the DOI for a public one, and a `custom[n]` line names
+    the library by file name and sha256 (quoted where the name holds a comma).
+    For a repository unit, `ms_run[n]-location` becomes workspace-relative. The
+    original values go only to `provenance/mztab-redaction.local.json`
+    (`sharing: local_only`).
+  - For a unit with a recorded campaign approval (its own
+    `campaign_authorizations`, or those of the unit it was split from), the
+    finalised run's MS-DIAL containers move from beside the inputs to
+    `output/msdial-intermediates/<raw-relative path>`, chosen by the mzTab-M's
+    alignment timestamp, and are retained and inventoried file by file:
+    `<file>_<ts>.dcl/.pai2/.rtc/.sfs/_tags.xml`, per-energy `.dcl`, and
+    `AlignResult-<ts>.arf2/.dcl/.EIC.aef/_PeakProperties.arf/_DriftSopts.arf/_tags.xml`.
+    Earlier attempts' sets are recorded as superseded and go with the raw data.
+    The loaded-library copy `<project>_Loaded.msp2.dbs` is deleted and
+    recorded by name, size and sha256. The saved project is recorded as not
+    reopenable in place, with what it references. Any other run keeps its
+    containers and library copy, as before, so its project still reopens.
+  - Every file step retries on `PermissionError` within one 60 s budget of
+    waiting, and uses extended-length paths, because a moved container's path
+    can pass MAX_PATH when LongPathsEnabled is 0.
+  - What still fails is recorded in the unit manifest's `finalisation_holds`.
+    An unredacted mzTab-M or an undeleted library copy blocks sharing: the
+    publication report refuses the unit (`finalisation_held [sharing]`). A
+    container still beside the inputs blocks raw deletion: the cleanup plan
+    lists it as a blocker, and cleanup (preview and confirmed) and discard
+    refuse it, a split parent's included. Each of these steps retries the held
+    step first.
+
+### Changed
+- Publication report, Materials and Methods, supplementary TSV and workbook
+  are redacted as above. The report declares `shared_path_policy` and lists
+  libraries by name and sha256; its `workflow` block is redacted. A library
+  with a recorded checksum is no longer warned about as having no identifier.
+- Workflow bundle: portable renderings of `method.txt`, `analysis_files.csv`,
+  the annotator settings, `run-manifest.json` and `workflow-settings.json`,
+  with `SHARED-PATHS.json` as its declaration. No library file, library copy
+  or local-only record is ever a member. `guided-answers.json` is marked
+  `local_only`.
+- A repository unit's `run-manifest.json` names libraries by identity only.
+
 ## [0.5.14] - Unreleased
 
 ### Added
