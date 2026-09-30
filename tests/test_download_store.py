@@ -13,10 +13,15 @@ What these tests hold the store to:
   os.kill terminates the process it is pointed at);
 - a declared MD5 or a remote size that no longer matches the cache causes a fresh fetch, and the
   unit fails only if the fresh bytes do not match its declaration either;
+- fetched bytes meet their declared MD5 before an extractor sees them, a declaration is taken as
+  wrong only once two full fetches agree on other bytes, and a HEAD size a refetch showed to
+  mislead does not send every later consumer to fetch again;
 - a linked file written in place is detected, and the object is fetched or extracted again;
-- an object is deleted only when no claim keeps it and a campaign authorization says delete, and
-  it leaves a tombstone;
-- a failed link falls back to a copy that is recorded as such;
+- an object is deleted only when no claim keeps it and the campaign approval, read from its file,
+  is not revoked, says delete, and covers boundary 5 for every unit that released it; it leaves a
+  tombstone, and a claim written while GC decides waits for the decision;
+- a failed link falls back to a copy that is recorded as such, and a directory past 247 characters
+  is refused before anything is written;
 - removing a unit's tree never touches the store's file, even when it is read-only, because NTFS
   keeps attributes on the file record that every link shares.
 
@@ -44,6 +49,7 @@ from pathlib import Path
 from unittest import mock
 
 from msdial_app import download_store
+from msdial_app.campaign_authorization import CampaignAuthorization
 from msdial_app.download_store import (
     ClientFetcher,
     DeclaredChecksumMismatch,
@@ -64,10 +70,20 @@ URL = "https://repository.example.org/studies/ST000001/sample1.mzML"
 ARCHIVE_URL = "https://repository.example.org/studies/ST000001/ST000001.zip"
 REPOSITORY = "metabolomics_workbench"
 ACCESSION = "ST000001"
+# The record campaign_authorization.py defines, as the campaign runner writes it. Synthetic throughout.
 AUTHORIZATION = {
     "schema": "msdial-campaign-authorization.v1",
     "approval_id": "approval-synthetic-1",
+    "campaign_id": "campaign-synthetic",
+    "manifest_digest": "sha256:" + "0" * 64,
+    "approved_by": "synthetic person",
+    "approved_at": "2026-09-30T00:00:00+00:00",
+    "statement": "synthetic approval for tests",
+    "covers": [1, 3, 4, 5, "split"],
+    "units": ["unit-a", "unit-b", "unit-c", "unit-x"],
     "raw_retention_policy": "delete_after_validated_output",
+    "libraries": [{"name": "Synthetic.msp", "sha256": "ab" * 32}],
+    "revoked_at": None,
 }
 KEEP = {**AUTHORIZATION, "raw_retention_policy": "keep"}
 WINDOWS = os.name == "nt"
@@ -185,6 +201,15 @@ class StoreTestCase(unittest.TestCase):
 
     def unit_data(self, unit_id: str) -> Path:
         return self.workspace / REPOSITORY / ACCESSION / unit_id / "raw" / "data"
+
+    def authorization(self, record: dict | None = None, *, prefix: bytes = b"", **changes) -> Path:
+        """Write a campaign-authorization record to its own file and return the path GC is given."""
+        body = {**(AUTHORIZATION if record is None else record), **changes}
+        descriptor, name = tempfile.mkstemp(suffix=".json", prefix="campaign-authorization-", dir=self.directory.name)
+        os.close(descriptor)
+        path = Path(name)
+        path.write_bytes(prefix + json.dumps(body, indent=2).encode("utf-8"))
+        return path
 
     def fetch(self, unit_id: str, fetcher, url: str = URL, name: str = "sample1.mzML", **options) -> dict:
         return self.store.fetch_or_reuse(url, name, unit_id=unit_id, fetcher=fetcher, **options)
@@ -532,6 +557,7 @@ class DriftTests(StoreTestCase):
         self.assertEqual("changed", second["reuse_check"]["remote_size"])
         self.assertNotEqual(first["object_id"], second["object_id"])
         self.assertEqual(2, len(fetcher.calls))
+        self.assertNotIn("head_size_mismatch", self.store.lookup(URL), "the HEAD was right: the bytes changed")
 
     def test_an_equal_or_unanswered_remote_size_reuses(self) -> None:
         for answer, verdict in ((len(V1), "match"), (0, "not_answered"), (None, "not_answered")):
@@ -655,7 +681,9 @@ class TaintTests(StoreTestCase):
         self.assertIn("hung up", claim["last_error"]["message"])
         partial = self.store.partial_path(self.store.url_key(URL))
         self.assertEqual(100, partial.with_name(partial.name + ".part").stat().st_size)
-        self.assertFalse(self.store.gc(AUTHORIZATION)["partials_removed"], "a claimed partial is kept for the resume")
+        self.assertFalse(
+            self.store.gc(self.authorization())["partials_removed"], "a claimed partial is kept for the resume"
+        )
 
 
 class MaterializeTests(StoreTestCase):
@@ -911,8 +939,10 @@ class GarbageCollectionTests(StoreTestCase):
         self.materialize(unit_id)
         return result
 
-    def clean(self, unit_id: str, authorization=AUTHORIZATION) -> dict:
+    def clean(self, unit_id: str, authorization="the campaign's") -> dict:
         self.assertTrue(unlink_tree(self.unit_data(unit_id).parent)["complete"])
+        if authorization == "the campaign's":
+            authorization = self.authorization()
         return self.store.release_unit(unit_id, "raw_cleaned", authorization=authorization)
 
     def test_a_pending_claim_keeps_the_object_after_another_unit_is_cleaned(self) -> None:
@@ -944,6 +974,11 @@ class GarbageCollectionTests(StoreTestCase):
         self.assertEqual("collected", tombstone["state"])
         self.assertEqual("approval-synthetic-1", tombstone["collected_under"]["approval_id"])
         self.assertRegex(tombstone["collected_under"]["authorization_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(5, tombstone["collected_under"]["boundary"])
+        self.assertEqual(
+            [{"unit_id": "unit-a", "covered_as": "listed"}, {"unit_id": "unit-b", "covered_as": "listed"}],
+            tombstone["collected_under"]["units"],
+        )
         self.assertEqual(
             {("unit-a", "raw_cleaned"), ("unit-b", "raw_cleaned")},
             {(item["unit_id"], item["release_reason"]) for item in tombstone["release_record"]},
@@ -953,11 +988,12 @@ class GarbageCollectionTests(StoreTestCase):
     def test_retention_keep_never_deletes(self) -> None:
         fetcher = FakeFetcher({URL: V1})
         result = self.consume("unit-a", fetcher)
-        cleaned = self.clean("unit-a", authorization=KEEP)
+        cleaned = self.clean("unit-a", authorization=self.authorization(KEEP))
         self.assertFalse(cleaned["gc"]["authorized"])
         self.assertIn("keep", cleaned["gc"]["reason"])
+        self.assertEqual(["retention_keep"], cleaned["gc"]["refusal_codes"])
         self.assertTrue(self.object_file(result).exists())
-        self.assertFalse(self.store.gc(KEEP)["collected"])
+        self.assertFalse(self.store.gc(self.authorization(KEEP))["collected"])
 
     def test_nothing_is_deleted_without_a_campaign_authorization(self) -> None:
         fetcher = FakeFetcher({URL: V1})
@@ -970,7 +1006,7 @@ class GarbageCollectionTests(StoreTestCase):
     def test_a_failed_units_live_claim_keeps_its_object(self) -> None:
         fetcher = FakeFetcher({URL: V1})
         result = self.consume("unit-a", fetcher)  # the run then failed; its claim stays live
-        collected = self.store.gc(AUTHORIZATION)
+        collected = self.store.gc(self.authorization())
         self.assertEqual([], collected["collected"])
         self.assertEqual(["unit-a"], collected["kept"][0]["live_claims"])
         self.assertTrue(self.object_file(result).exists())
@@ -993,15 +1029,16 @@ class GarbageCollectionTests(StoreTestCase):
     def test_an_authorization_is_read_from_its_file_and_a_malformed_one_is_refused(self) -> None:
         fetcher = FakeFetcher({URL: V1})
         self.consume("unit-a", fetcher)
-        path = Path(self.directory.name) / "campaign-authorization.json"
-        path.write_text(json.dumps(AUTHORIZATION), encoding="utf-8")
-        for malformed in (
-            {"schema": "something-else", "approval_id": "x", "raw_retention_policy": "delete_after_validated_output"},
+        path = self.authorization()
+        malformed = (
+            {**AUTHORIZATION, "schema": "something-else"},
             {**AUTHORIZATION, "approval_id": ""},
             {key: value for key, value in AUTHORIZATION.items() if key != "raw_retention_policy"},
-        ):
-            with self.subTest(malformed=malformed), self.assertRaises(StoreError):
-                self.store.gc(malformed)
+            {**AUTHORIZATION, "covers": [1, 3, 4, 5, 6]},
+        )
+        for record in malformed:
+            with self.subTest(record=record), self.assertRaisesRegex(StoreError, "^campaign_authorization_refused"):
+                self.store.gc(self.authorization(record))
         self.assertTrue(unlink_tree(self.unit_data("unit-a").parent)["complete"])
         self.store.release_unit("unit-a", "raw_cleaned")
         self.assertEqual(1, len(self.store.gc(path)["collected"]))
@@ -1011,28 +1048,38 @@ class GarbageCollectionTests(StoreTestCase):
         result = self.consume("unit-a", fetcher)
         self.assertTrue(unlink_tree(self.unit_data("unit-a").parent)["complete"])
         self.store.release_unit("unit-a", "raw_cleaned")
-        handle = self.store.lock(f"u-{self.store.url_key(URL)}").acquire()
-        try:
-            collected = self.store.gc(AUTHORIZATION)
-        finally:
-            handle.release()
-        self.assertEqual([result["object_id"]], collected["busy"])
-        self.assertTrue(self.object_file(result).exists())
+        for name in (f"u-{self.store.url_key(URL)}", f"c-{self.store.url_key(URL)}"):
+            with self.subTest(lock=name):
+                handle = self.store.lock(name).acquire()
+                try:
+                    collected = self.store.gc(self.authorization())
+                finally:
+                    handle.release()
+                self.assertEqual([result["object_id"]], collected["busy"])
+                self.assertTrue(self.object_file(result).exists())
 
     def test_orphan_partials_are_removed_and_claimed_ones_kept(self) -> None:
         orphan = "https://repository.example.org/studies/ST000001/abandoned.zip"
         claimed = "https://repository.example.org/studies/ST000001/in-progress.zip"
-        for url in (orphan, claimed):
+        unclaimed = "https://repository.example.org/studies/ST000001/nobody-claimed.zip"
+        for url in (orphan, claimed, unclaimed):
             partial = self.store.partial_path(self.store.url_key(url)).with_name(f"{self.store.url_key(url)}.part")
             partial.parent.mkdir(parents=True, exist_ok=True)
             partial.write_bytes(b"half an object")
+        self.store.claim(orphan, "unit-x")
+        self.store.release(orphan, "unit-x", "excluded")
         self.store.claim(claimed, "unit-b")
 
-        collected = self.store.gc(AUTHORIZATION)
+        collected = self.store.gc(self.authorization())
 
         self.assertEqual([f"{self.store.url_key(orphan)}.part"], collected["partials_removed"])
         kept = self.store.partial_path(self.store.url_key(claimed))
         self.assertTrue(kept.with_name(f"{kept.name}.part").exists())
+        self.assertEqual(
+            [{"url_key": self.store.url_key(unclaimed), "units": {"": ["no_releasing_unit"]}}],
+            collected["partials_kept"],
+            "a transfer no unit ever claimed has no unit an approval could name",
+        )
 
     def test_the_summary_names_who_keeps_each_object(self) -> None:
         fetcher = FakeFetcher({URL: V1})
@@ -1041,6 +1088,333 @@ class GarbageCollectionTests(StoreTestCase):
         summary = self.store.summary()
         self.assertEqual(["unit-a", "unit-b"], summary["objects"][0]["live_claims"])
         self.assertEqual({"materialized": 1, "pending": 1}, summary["claims"])
+
+
+class AuthorizationScopeTests(StoreTestCase):
+    """GC deletes raw bytes only as far as the campaign approval covers boundary 5 for their units."""
+
+    def released_object(self, *units: str) -> dict:
+        fetcher = FakeFetcher({URL: V1})
+        result: dict = {}
+        for unit in units or ("unit-a",):
+            result = self.fetch(unit, fetcher)
+            self.store.release_unit(unit, "raw_cleaned")
+        return result
+
+    def assert_kept(self, result: dict) -> None:
+        self.assertTrue(self.object_file(result).exists())
+        self.assertEqual("ready", self.store.entry(result["object_id"])["state"])
+
+    def test_a_revoked_approval_deletes_nothing(self) -> None:
+        result = self.released_object()
+        collected = self.store.gc(self.authorization(revoked_at="2026-09-30T01:00:00+00:00"))
+        self.assertFalse(collected["authorized"])
+        self.assertEqual(["revoked"], collected["refusal_codes"])
+        self.assertIn("revoked", collected["reason"])
+        self.assertEqual([], collected["collected"])
+        self.assert_kept(result)
+
+    def test_an_approval_that_does_not_cover_boundary_5_deletes_nothing(self) -> None:
+        result = self.released_object()
+        collected = self.store.gc(self.authorization(covers=[1, 3, 4, "split"]))
+        self.assertFalse(collected["authorized"])
+        self.assertEqual(["boundary_not_covered"], collected["refusal_codes"])
+        self.assert_kept(result)
+
+    def test_an_approval_for_other_units_does_not_delete_this_units_object(self) -> None:
+        result = self.released_object()
+        collected = self.store.gc(self.authorization(units=["some-other-unit"]))
+        self.assertEqual([], collected["collected"])
+        self.assertEqual(
+            [{"object_id": result["object_id"], "units": {"unit-a": ["unit_not_covered"]}}], collected["refused"]
+        )
+        self.assert_kept(result)
+
+    def test_every_unit_whose_release_freed_the_object_must_be_covered(self) -> None:
+        result = self.released_object("unit-a", "unit-outside-the-approval")
+        collected = self.store.gc(self.authorization())
+        self.assertEqual({"unit-outside-the-approval": ["unit_not_covered"]}, collected["refused"][0]["units"])
+        self.assert_kept(result)
+
+    def test_an_object_no_unit_claimed_is_kept(self) -> None:
+        result = self.released_object()
+        for path in (self.store.root / "claims").rglob("*.json"):
+            path.unlink()
+        collected = self.store.gc(self.authorization())
+        self.assertEqual({"": ["no_releasing_unit"]}, collected["refused"][0]["units"])
+        self.assert_kept(result)
+
+    def test_a_bom_prefixed_record_is_read_as_the_campaign_authorization_reads_it(self) -> None:
+        self.released_object()
+        collected = self.store.gc(self.authorization(prefix=b"\xef\xbb\xbf"))
+        self.assertEqual(1, len(collected["collected"]))
+
+    def test_a_record_built_in_memory_is_not_an_authorization(self) -> None:
+        result = self.released_object()
+        for value in (dict(AUTHORIZATION), json.dumps(AUTHORIZATION).encode("utf-8")):
+            with self.subTest(kind=type(value).__name__), self.assertRaisesRegex(StoreError, "path to its record"):
+                self.store.gc(value)
+        self.assert_kept(result)
+
+    def test_a_loaded_record_is_accepted_and_the_tombstone_holds_its_files_digest(self) -> None:
+        result = self.released_object()
+        path = self.authorization()
+        collected = self.store.gc(CampaignAuthorization.load(path))
+        self.assertEqual(1, len(collected["collected"]))
+        under = self.store.entry(result["object_id"])["collected_under"]
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), under["authorization_sha256"])
+        self.assertEqual(("campaign-synthetic", "sha256:" + "0" * 64), (under["campaign_id"], under["manifest_digest"]))
+        self.assertNotIn(path.name, json.dumps(self.store.entry(result["object_id"])), "named by digest, not location")
+
+
+class DeclaredChecksumBeforeExtractionTests(StoreTestCase):
+    """As the per-unit lease did, fetched bytes meet their declared MD5 before any extractor sees them."""
+
+    def test_a_damaged_archive_fails_on_its_md5_and_never_reaches_the_extractor(self) -> None:
+        damaged = b"PK\x03\x04" + b"\x00" * 5000
+        fetcher = FakeFetcher({ARCHIVE_URL: damaged})
+        seen: list[Path] = []
+
+        def extractor(archive: Path, destination: Path) -> dict:
+            seen.append(archive)
+            with zipfile.ZipFile(archive) as handle:
+                handle.extractall(destination)
+            return {}
+
+        declared = _md5(ARCHIVE)
+        for attempt in range(4):
+            with self.subTest(attempt=attempt), self.assertRaisesRegex(
+                DeclaredChecksumMismatch, r"^MD5 checksum mismatch for ST000001\.zip\."
+            ):
+                self.fetch(
+                    "unit-a", fetcher, url=ARCHIVE_URL, name="ST000001.zip", declared_md5=declared, extract=extractor
+                )
+
+        self.assertEqual([], seen, "unverified bytes were never handed to the extractor")
+        self.assertEqual(2, len(fetcher.calls), "a second fetch confirms the bytes; later retries download nothing")
+        memo = self.store.lookup(ARCHIVE_URL)["refuted_declared_md5"][declared]
+        self.assertEqual((2, True), (memo["fetches"], memo["refuted"]))
+        object_id = _sha256(damaged)[:16]
+        self.assertFalse((self.store.object_directory(object_id) / "t").exists())
+        self.assertNotIn("extraction_failures", self.store.entry(object_id))
+        self.assertIn("MD5 checksum mismatch", self.store.read_claim(ARCHIVE_URL, "unit-a")["last_error"]["message"])
+
+    def test_an_error_page_saved_under_an_archive_name_fails_on_its_md5(self) -> None:
+        fetcher = FakeFetcher({ARCHIVE_URL: b"<html>503 Service Unavailable</html>"})
+        extractor = ZipExtractor()
+        with self.assertRaises(DeclaredChecksumMismatch):
+            self.fetch(
+                "unit-a", fetcher, url=ARCHIVE_URL, name="ST000001.zip", declared_md5=_md5(ARCHIVE), extract=extractor
+            )
+        self.assertEqual(0, extractor.calls)
+
+    def test_a_matching_declaration_is_extracted(self) -> None:
+        fetcher = FakeFetcher({ARCHIVE_URL: ARCHIVE})
+        extractor = ZipExtractor()
+        result = self.fetch(
+            "unit-a", fetcher, url=ARCHIVE_URL, name="ST000001.zip", declared_md5=_md5(ARCHIVE), extract=extractor
+        )
+        self.assertTrue(result["declared_checksum_verified"])
+        self.assertEqual(1, extractor.calls)
+        self.assertTrue((Path(result["tree_path"]) / "sub" / "run2.mzML").is_file())
+
+
+V1_DAMAGED = b"X" + V1[1:]  # one byte off, at the published size: what a resume across two versions leaves
+
+
+class TransientCorruptionTests(StoreTestCase):
+    """One bad transfer must not refute a correct declaration; two agreeing fetches do."""
+
+    def test_one_damaged_transfer_does_not_fail_the_unit_for_good(self) -> None:
+        for with_head in (False, True):
+            with self.subTest(with_head=with_head):
+                store = DownloadStore(self.workspace / str(with_head), REPOSITORY, ACCESSION, lock_poll_seconds=0.02)
+                fetcher = (
+                    HeadFetcher({URL: V1_DAMAGED}, {URL: len(V1)}) if with_head else FakeFetcher({URL: V1_DAMAGED})
+                )
+                with self.assertRaisesRegex(DeclaredChecksumMismatch, "fetches it once more"):
+                    store.fetch_or_reuse(URL, "sample1.mzML", unit_id="unit-a", fetcher=fetcher, declared_md5=_md5(V1))
+                memo = store.lookup(URL)["refuted_declared_md5"][_md5(V1)]
+                self.assertEqual((1, False), (memo["fetches"], memo["refuted"]))
+                fetcher.payloads[URL] = V1
+
+                retried = store.fetch_or_reuse(
+                    URL, "sample1.mzML", unit_id="unit-a", fetcher=fetcher, declared_md5=_md5(V1)
+                )
+
+                self.assertTrue(retried["declared_checksum_verified"])
+                self.assertEqual("declared_md5_differs", retried["reuse_reason"])
+                self.assertEqual(2, len(fetcher.calls))
+                self.assertNotIn("refuted_declared_md5", store.lookup(URL), "a satisfied declaration leaves no memo")
+
+    def test_a_consumer_without_a_declaration_does_not_reuse_disputed_bytes(self) -> None:
+        fetcher = FakeFetcher({URL: V1_DAMAGED})
+        with self.assertRaises(DeclaredChecksumMismatch):
+            self.fetch("unit-a", fetcher, declared_md5=_md5(V1))
+        fetcher.payloads[URL] = V1
+
+        second = self.fetch("unit-b", fetcher)
+
+        self.assertEqual(("refetched", "declared_md5_disputed"), (second["action"], second["reuse_reason"]))
+        self.assertEqual(V1, self.object_file(second).read_bytes())
+        again = self.fetch("unit-a", fetcher, declared_md5=_md5(V1))
+        self.assertEqual("reused", again["action"])
+        self.assertEqual(2, len(fetcher.calls))
+
+    def test_a_dispute_a_second_fetch_confirms_refutes_the_declaration(self) -> None:
+        fetcher = FakeFetcher({URL: V1})  # the declaration is the wrong one
+        with self.assertRaises(DeclaredChecksumMismatch):
+            self.fetch("unit-a", fetcher, declared_md5=_md5(V2))
+
+        self.assertEqual("declared_md5_disputed", self.fetch("unit-b", fetcher)["reuse_reason"])
+        self.assertEqual("reused", self.fetch("unit-c", fetcher)["action"])
+        with self.assertRaisesRegex(DeclaredChecksumMismatch, "not downloaded again"):
+            self.fetch("unit-a", fetcher, declared_md5=_md5(V2))
+        self.assertEqual(2, len(fetcher.calls))
+
+    def test_force_refetch_overrides_a_refuted_declaration(self) -> None:
+        fetcher = FakeFetcher({URL: V1})
+        for _ in range(3):
+            with self.assertRaises(DeclaredChecksumMismatch):
+                self.fetch("unit-a", fetcher, declared_md5=_md5(V2))
+        self.assertEqual(2, len(fetcher.calls))
+        fetcher.payloads[URL] = V2
+
+        forced = self.fetch("unit-a", fetcher, declared_md5=_md5(V2), force_refetch=True)
+
+        self.assertEqual(3, len(fetcher.calls))
+        self.assertEqual(("force_refetch", "refetch_forced"), (forced["reuse_reason"], forced["reuse_check"]["cache"]))
+        self.assertTrue(forced["declared_checksum_verified"])
+
+
+class MisleadingHeadTests(StoreTestCase):
+    """HEAD support is unverified for Workbench, MetaboLights and MetaboBank; a wrong one must not multiply GETs."""
+
+    def test_a_head_size_a_refetch_showed_to_mislead_does_not_refetch_every_consumer(self) -> None:
+        fetcher = HeadFetcher({URL: V1}, {URL: len(V1) + 123})
+
+        results = [self.fetch(unit, fetcher) for unit in ("unit-a", "unit-b", "unit-c", "unit-d")]
+
+        self.assertEqual(2, len(fetcher.calls), "one fetch, and one refetch that shows the bytes unchanged")
+        self.assertEqual(["fetched", "refetched", "reused", "reused"], [result["action"] for result in results])
+        self.assertEqual("differs_as_before", results[3]["reuse_check"]["remote_size"])
+        recorded = self.store.lookup(URL)["head_size_mismatch"]
+        self.assertEqual(
+            (results[0]["object_id"], len(V1) + 123, len(V1)),
+            (recorded["object_id"], recorded["head_content_length"], recorded["object_size_bytes"]),
+        )
+
+    def test_a_new_head_size_still_fetches_again(self) -> None:
+        fetcher = HeadFetcher({URL: V1}, {URL: len(V1) + 123})
+        self.fetch("unit-a", fetcher)
+        self.fetch("unit-b", fetcher)
+        fetcher.payloads[URL] = V2
+        fetcher.head_sizes[URL] = len(V2)
+
+        changed = self.fetch("unit-c", fetcher)
+
+        self.assertEqual("remote_size_changed", changed["reuse_reason"])
+        self.assertEqual(V2, self.object_file(changed).read_bytes())
+        self.assertEqual(3, len(fetcher.calls))
+        self.assertNotIn("head_size_mismatch", self.store.lookup(URL), "it named bytes the URL no longer serves")
+
+
+class DirectoryLengthTests(StoreTestCase):
+    """CreateDirectoryW and .NET Framework refuse directories of 248 characters or more."""
+
+    def source_file(self) -> Path:
+        source = Path(self.directory.name) / "s"
+        source.mkdir(exist_ok=True)
+        (source / "f").write_bytes(b"x")
+        return source / "f"
+
+    def test_a_long_directory_with_a_short_file_name_is_refused_before_anything_is_written(self) -> None:
+        source = self.source_file()
+        root = Path(self.directory.name) / "u"
+        base = len(str(root.resolve())) + 1
+        for directory_length in (248, 252, 257):
+            with self.subTest(directory_length=directory_length):
+                name = "d" * (directory_length - base)
+                self.assertLessEqual(directory_length + 2, 259, "the file itself is within MAX_PATH")
+                with self.assertRaises(MaterializationCollision) as caught:
+                    materialize_unit_tree(root, [(source, f"{name}/f")], max_path_length=259, max_directory_length=247)
+                self.assertEqual(
+                    [{"path": name, "kind": "path_too_long", "length": directory_length, "directory": True}],
+                    caught.exception.collisions,
+                )
+                self.assertFalse(root.exists(), "nothing was written")
+
+    def test_a_root_past_the_directory_limit_is_refused(self) -> None:
+        source = self.source_file()
+        parent = Path(self.directory.name).resolve()
+        root = parent / ("r" * (250 - len(str(parent)) - 1))
+        with self.assertRaises(MaterializationCollision) as caught:
+            materialize_unit_tree(root, [(source, "f")], max_path_length=259, max_directory_length=247)
+        collision = caught.exception.collisions[0]
+        self.assertEqual(("", "path_too_long", 250), (collision["path"], collision["kind"], collision["length"]))
+        self.assertFalse(root.exists())
+
+    @unittest.skipUnless(WINDOWS, "MAX_PATH is a Windows limit")
+    def test_the_windows_defaults_refuse_what_createdirectory_would(self) -> None:
+        source = self.source_file()
+        root = Path(self.directory.name) / "u"
+        name = "d" * (252 - len(str(root.resolve())) - 1)
+        with self.assertRaises(MaterializationCollision):
+            materialize_unit_tree(root, [(source, f"{name}/f")])
+
+    def test_the_store_passes_the_limit_through_and_records_the_refusal(self) -> None:
+        self.fetch("unit-a", FakeFetcher({URL: V1}))
+        limit = len(str(self.unit_data("unit-a").resolve())) + 2
+        with self.assertRaises(MaterializationCollision):
+            self.materialize("unit-a", target="sub/sample1.mzML", max_directory_length=limit)
+        self.assertIn("path_too_long", self.store.read_claim(URL, "unit-a")["last_error"]["message"])
+        self.assertFalse(self.unit_data("unit-a").exists())
+
+
+class ClaimLockTests(StoreTestCase):
+    """GC decides under the URL's claim lock; a claim never waits for a transfer."""
+
+    def test_a_claim_written_while_gc_decides_is_never_deleted_from_under(self) -> None:
+        fetcher = FakeFetcher({URL: V1})
+        result = self.fetch("unit-a", fetcher)
+        self.store.release_unit("unit-a", "raw_cleaned")
+        original = DownloadStore.live_claims
+        race: dict = {}
+
+        def racing(store: DownloadStore, object_id: str) -> list:
+            live = original(store, object_id)
+            # A batch pre-claim from the runner process, arriving just after GC read the claims.
+            thread = threading.Thread(
+                target=lambda: race.setdefault("claim", self.store.claim(URL, "unit-b", source="batch_plan"))
+            )
+            thread.start()
+            thread.join(0.5)
+            race["landed_while_gc_decided"] = not thread.is_alive()
+            race["thread"] = thread
+            return live
+
+        with mock.patch.object(DownloadStore, "live_claims", racing):
+            self.store.gc(self.authorization())
+        race["thread"].join(10)
+
+        self.assertFalse(race["landed_while_gc_decided"], "the claim waited for GC's claim lock")
+        tombstone = self.store.entry(result["object_id"])
+        self.assertEqual("collected", tombstone["state"])
+        self.assertNotIn("unit-b", {row["unit_id"] for row in tombstone["release_record"]})
+        self.assertGreaterEqual(race["claim"]["claimed_at"], tombstone["collected_at"])
+        self.assertEqual("refetched", self.fetch("unit-b", fetcher)["action"])
+
+    def test_a_pre_claim_does_not_wait_for_a_transfer_in_progress(self) -> None:
+        transfer = self.store.lock(f"u-{self.store.url_key(URL)}").acquire()
+        claimer = threading.Thread(target=self.store.claim, args=(URL, "unit-b"), kwargs={"source": "batch_plan"})
+        try:
+            claimer.start()
+            claimer.join(5)
+            self.assertFalse(claimer.is_alive(), "a pre-claim waited for the transfer lock")
+        finally:
+            transfer.release()
+            claimer.join(10)
+        self.assertEqual("pending", self.store.read_claim(URL, "unit-b")["state"])
 
 
 class StorePathTests(unittest.TestCase):

@@ -41,7 +41,9 @@ process_is_alive is public so that the campaign runner's lock uses the same help
 WHAT THIS MODULE DOES NOT DO. It does not read archives (archives.py does, through the extract
 callback), decide which URLs a unit needs, prune a unit's tree to its selected inputs, or decide
 retention. Deletion of store objects happens only in gc, and only under a campaign authorization
-record whose retention is delete_after_validated_output.
+(campaign_authorization.py, read exactly as every other entry point reads it) that is not revoked,
+states delete_after_validated_output, and covers boundary 5 for every unit whose release freed the
+object.
 """
 
 from __future__ import annotations
@@ -62,14 +64,19 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
+from .campaign_authorization import CampaignAuthorization, CampaignAuthorizationError, load_campaign_authorization
+
 
 STORE_DIRECTORY = "_dl"
 INDEX_SCHEMA = "msdial-download-store-index.v1"
 OBJECT_SCHEMA = "msdial-download-store-object.v1"
 CLAIM_SCHEMA = "msdial-download-store-claim.v1"
 LOCK_SCHEMA = "msdial-download-store-lock.v1"
-AUTHORIZATION_SCHEMA = "msdial-campaign-authorization.v1"
-GC_RETENTION = "delete_after_validated_output"
+# The contract's confirmation boundary for deleting raw data, which GC is.
+GC_BOUNDARY = 5
+# Full fetches that must return the same bytes before a declared MD5 they disagree with is taken as
+# wrong. One is not enough: a damaged transfer would then fail the unit for good.
+REFUTING_FETCHES = 2
 
 LIVE_CLAIM_STATES = frozenset({"pending", "materialized"})
 RELEASE_REASONS = frozenset({"raw_cleaned", "discarded", "excluded", "failed_terminal", "superseded"})
@@ -81,6 +88,9 @@ LOCK_POLL_SECONDS = 2.0
 BREAK_MARKER_STALE_SECONDS = 60.0
 # LongPathsEnabled is 0 on the campaign host and the .NET Framework Console reads MAX_PATH paths.
 MAX_WINDOWS_PATH = 259
+# CreateDirectoryW keeps room for an 8.3 name below MAX_PATH (248 with the terminator), and .NET
+# Framework refuses a directory name of 248 characters or more, so a directory is held to 247.
+MAX_WINDOWS_DIRECTORY_PATH = 247
 MEMBERS_HEADER = ("path", "size", "crc", "mtime_ns")
 _REPORTED_ITEMS = 50
 # What a collection writes into an entry, and what installing the object again clears.
@@ -637,6 +647,17 @@ class DownloadStore:
         finally:
             handle.release()
 
+    def _claim_lock(self, key: str, *, job_id: str = "") -> contextlib.AbstractContextManager[StoreLock]:
+        """The lock every write of a URL's claims takes, and that gc holds while it decides and collects.
+
+        Not u-<key>: that one is held for a whole transfer, days for the largest archives, and a
+        batch pre-claim must not wait for it. This one is held only for one small write, or for one
+        collection. A claim written while gc works on the URL therefore lands either before gc reads
+        the claims, and keeps the object, or after the object is collected, and fetches it again. It
+        is always taken last, and gc never waits for a lock, so it cannot deadlock.
+        """
+        return self._locked(f"c-{key}", job_id=job_id)
+
     # ---- records ---------------------------------------------------------------------------------
 
     def lookup(self, url: str) -> dict[str, Any] | None:
@@ -655,31 +676,32 @@ class DownloadStore:
         unit_id = _unit_id(unit_id)
         key = self.url_key(url)
         path = self.claim_path(key, unit_id)
-        existing = _read_json(path)
-        if existing and existing.get("state") in LIVE_CLAIM_STATES:
-            return existing
-        history = list((existing or {}).get("history") or [])
-        if existing:
-            history.append(
-                {
-                    "state": existing.get("state"),
-                    "object_id": existing.get("object_id"),
-                    "release_reason": existing.get("release_reason"),
-                    "released_at": existing.get("released_at"),
-                }
-            )
-        record = {
-            "schema": CLAIM_SCHEMA,
-            "url": url,
-            "url_key": key,
-            "unit_id": unit_id,
-            "state": "pending",
-            "object_id": None,
-            "claimed_at": _now(),
-            "claimed_by": {"source": str(source or "lease"), "job_id": str(job_id or "")},
-            "history": history,
-        }
-        _write_json_atomic(path, record)
+        with self._claim_lock(key, job_id=job_id):
+            existing = _read_json(path)
+            if existing and existing.get("state") in LIVE_CLAIM_STATES:
+                return existing
+            history = list((existing or {}).get("history") or [])
+            if existing:
+                history.append(
+                    {
+                        "state": existing.get("state"),
+                        "object_id": existing.get("object_id"),
+                        "release_reason": existing.get("release_reason"),
+                        "released_at": existing.get("released_at"),
+                    }
+                )
+            record = {
+                "schema": CLAIM_SCHEMA,
+                "url": url,
+                "url_key": key,
+                "unit_id": unit_id,
+                "state": "pending",
+                "object_id": None,
+                "claimed_at": _now(),
+                "claimed_by": {"source": str(source or "lease"), "job_id": str(job_id or "")},
+                "history": history,
+            }
+            _write_json_atomic(path, record)
         return record
 
     def read_claim(self, url: str, unit_id: str) -> dict[str, Any] | None:
@@ -705,18 +727,20 @@ class DownloadStore:
         object_id: str,
         record: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        path = self.claim_path(self.url_key(url), _unit_id(unit_id))
-        claim = _read_json(path)
-        if not claim or claim.get("state") not in LIVE_CLAIM_STATES:
-            raise StoreError(f"Unit {unit_id} has no live claim on {url}; claim it before materializing.")
-        claim.update(
-            state="materialized",
-            object_id=object_id,
-            materialized_at=_now(),
-            materialization=dict(record or {}),
-        )
-        claim.pop("last_error", None)
-        _write_json_atomic(path, claim)
+        key = self.url_key(url)
+        path = self.claim_path(key, _unit_id(unit_id))
+        with self._claim_lock(key):
+            claim = _read_json(path)
+            if not claim or claim.get("state") not in LIVE_CLAIM_STATES:
+                raise StoreError(f"Unit {unit_id} has no live claim on {url}; claim it before materializing.")
+            claim.update(
+                state="materialized",
+                object_id=object_id,
+                materialized_at=_now(),
+                materialization=dict(record or {}),
+            )
+            claim.pop("last_error", None)
+            _write_json_atomic(path, claim)
         return claim
 
     def release(
@@ -757,13 +781,14 @@ class DownloadStore:
 
     def _release_claim(self, key: str, unit_id: str, reason: str) -> dict[str, Any] | None:
         path = self.claim_path(key, unit_id)
-        claim = _read_json(path)
-        if not claim:
-            return None
-        if claim.get("state") == "released":
-            return claim
-        claim.update(state="released", release_reason=reason, released_at=_now())
-        _write_json_atomic(path, claim)
+        with self._claim_lock(key):
+            claim = _read_json(path)
+            if not claim:
+                return None
+            if claim.get("state") == "released":
+                return claim
+            claim.update(state="released", release_reason=reason, released_at=_now())
+            _write_json_atomic(path, claim)
         return claim
 
     def _objects_of_claims(self, claims: Iterable[dict[str, Any]], keys: Iterable[str]) -> list[str]:
@@ -805,6 +830,7 @@ class DownloadStore:
         progress_callback: Any = None,
         on_wait: Callable[[dict[str, Any]], None] | None = None,
         lock_timeout: float | None = None,
+        force_refetch: bool = False,
     ) -> dict[str, Any]:
         """Give `unit_id` verified bytes for `url`, transferring them only when no usable copy exists.
 
@@ -816,6 +842,16 @@ class DownloadStore:
         again; a modified extraction member is re-extracted from the kept archive when `extract`
         is given. A waiter on another consumer's fetch is told once through `on_wait`, with the
         status waiting_for_shared_download, and then reuses what that consumer fetched.
+
+        Fetched bytes are compared with the declaration before `extract` sees them, as the per-unit
+        lease did, so a damaged archive fails on its checksum and never reaches 7-Zip. A declaration
+        is taken as wrong, and no longer fetched for, only once REFUTING_FETCHES full fetches have
+        returned the same other bytes; until then a retry fetches again, because one bad transfer
+        must not fail a unit for good. A consumer without a declaration does not reuse bytes that
+        another unit's declaration disputes and that only one fetch has produced. A HEAD size that
+        a refetch showed to disagree with unchanged bytes is remembered and does not force another
+        refetch while the server keeps answering it. `force_refetch` fetches whatever the cache and
+        its memos say, for a retry policy that has reason to distrust them.
 
         The caller decides which checksum applies: MB-POST publishes per-member MD5s, not one for
         the tar, so its lease passes no declared_md5, exactly as the per-unit download did.
@@ -844,8 +880,12 @@ class DownloadStore:
             index = _read_json(self.index_path(key)) or {}
             entry: dict[str, Any] | None = None
             prior_id = index.get("object_id")
+            verified: bool | None = None
             if not prior_id:
                 reuse_check["cache"] = "miss"
+            elif force_refetch:
+                reuse_check["cache"] = "refetch_forced"
+                reason = "force_refetch"
             else:
                 with self._locked(f"o-{prior_id}", job_id=job_id, timeout=lock_timeout):
                     entry = self._ready_entry(prior_id)
@@ -857,8 +897,9 @@ class DownloadStore:
                         if reason == "declared_md5_refuted":
                             self._fail_claim(key, unit_id, f"MD5 checksum mismatch for {object_name}.")
                             raise DeclaredChecksumMismatch(
-                                f"MD5 checksum mismatch for {object_name}. A fresh fetch already showed "
-                                "the URL serves other bytes; it was not downloaded again."
+                                f"MD5 checksum mismatch for {object_name}. {REFUTING_FETCHES} full fetches "
+                                "already returned the same other bytes; it was not downloaded again "
+                                "(force_refetch fetches it anyway)."
                             )
                         if reason == "tree_tainted" and extract is not None:
                             entry = self._extract_locked(entry, extract, unit_id, job_id, reason)
@@ -883,22 +924,42 @@ class DownloadStore:
                     key, url, object_name, fetched, unit_id=unit_id, job_id=job_id,
                     replace_object=reason == "object_tainted",
                 )
-                # Pointed before extracting, so that an extraction failure is retried from the
-                # kept bytes rather than by downloading them again.
-                self._point_index(key, url, object_name, entry, fetched, reason or "fetched")
+                # Pointed before anything else, so that an extraction failure is retried from the
+                # kept bytes rather than by downloading them again, and so that the count of fetches
+                # a declaration disagrees with is on record before the unit fails.
+                pointed = self._point_index(
+                    key, url, object_name, entry, fetched, reason or "fetched",
+                    prior_id=prior_id,
+                    declared=declared,
+                    head_size=(reuse_check.get("remote") or {}).get("content_length"),
+                )
+                action = "refetched" if prior_id else "fetched"
+                if declared:
+                    verified = entry["md5"] == declared
+                    reuse_check["fetched_declared_md5"] = "match" if verified else "mismatch"
+                if verified is False:
+                    # Before extraction: unverified bytes never reach an extractor, and a damaged
+                    # archive fails on its checksum rather than on whatever the extractor raises.
+                    memo = (pointed.get("refuted_declared_md5") or {}).get(declared) or {}
+                    self._fail_claim(key, unit_id, f"MD5 checksum mismatch for {object_name}.")
+                    if memo.get("refuted"):
+                        detail = (
+                            f"{memo.get('fetches')} full fetches returned these same bytes, so later "
+                            "attempts fail without downloading unless the remote size changes or "
+                            "force_refetch is passed."
+                        )
+                    else:
+                        detail = "The next attempt fetches it once more before the declaration is taken as wrong."
+                    raise DeclaredChecksumMismatch(f"MD5 checksum mismatch for {object_name}. {detail}")
                 if extract is not None:
                     with self._locked(f"o-{entry['object_id']}", job_id=job_id, timeout=lock_timeout):
                         if not entry.get("tree") or not self.verify_members(entry["object_id"])["tree_intact"]:
                             entry = self._extract_locked(entry, extract, unit_id, job_id, reason)
-                action = "refetched" if prior_id else "fetched"
             assert entry is not None
-            verified: bool | None = None
-            if declared:
+            if fetched is None and declared:
+                # _reuse_verdict reuses only a matching object; this states it in the result.
                 verified = entry["md5"] == declared
-                if fetched is not None:
-                    reuse_check["fetched_declared_md5"] = "match" if verified else "mismatch"
                 if not verified:
-                    self._refute(key, declared, entry)
                     self._fail_claim(key, unit_id, f"MD5 checksum mismatch for {object_name}.")
                     raise DeclaredChecksumMismatch(f"MD5 checksum mismatch for {object_name}.")
             claim = self._record_fetch(key, unit_id, entry, action, job_id)
@@ -958,29 +1019,47 @@ class DownloadStore:
     ) -> str:
         """Return "" when the cached object may be reused, else the reason it may not.
 
-        A declaration that an earlier fresh fetch already refuted for these same bytes fails the
-        unit without another transfer, unless the server now reports a different size.
+        A declaration that REFUTING_FETCHES full fetches already contradicted with these same bytes
+        fails the unit without another transfer, unless the server now reports a different size.
+        One contradicting fetch is not enough, and a consumer with no declaration of its own does
+        not reuse bytes so disputed either: it fetches them again, which settles the dispute.
         """
+        memos = index.get("refuted_declared_md5") or {}
         refuted = False
         if declared:
             if entry["md5"] == declared:
                 reuse_check["declared_md5"] = "match"
             else:
-                memo = (index.get("refuted_declared_md5") or {}).get(declared) or {}
-                if memo.get("object_id") != entry["object_id"]:
+                memo = memos.get(declared) or {}
+                if memo.get("object_id") != entry["object_id"] or not memo.get("refuted"):
                     reuse_check["declared_md5"] = "differs_from_cache"
                     return "declared_md5_differs"
-                reuse_check["declared_md5"] = "refuted_by_earlier_fetch"
+                reuse_check["declared_md5"] = "refuted_by_earlier_fetches"
                 refuted = True
+        else:
+            disputes = [
+                memo for memo in memos.values()
+                if memo.get("object_id") == entry["object_id"] and not memo.get("refuted")
+            ]
+            if disputes:
+                reuse_check["disputed_by_declarations"] = len(disputes)
+                return "declared_md5_disputed"
         head = getattr(fetcher, "head", None)
         if callable(head):
             answer = _head_answer(head, url)
             reuse_check["remote"] = answer
             size = answer.get("content_length")
+            misleading = index.get("head_size_mismatch") or {}
             if not size:
                 reuse_check["remote_size"] = "not_answered"
             elif int(size) == int(entry["size_bytes"]):
                 reuse_check["remote_size"] = "match"
+            elif (
+                misleading.get("object_id") == entry["object_id"]
+                and int(misleading.get("head_content_length") or 0) == int(size)
+            ):
+                # A refetch already showed that this server answers this size for these bytes.
+                reuse_check["remote_size"] = "differs_as_before"
             else:
                 reuse_check["remote_size"] = "changed"
                 return "remote_size_changed"
@@ -1178,60 +1257,70 @@ class DownloadStore:
         entry: dict[str, Any],
         fetched: Mapping[str, Any],
         reason: str,
-    ) -> None:
+        *,
+        prior_id: str | None = None,
+        declared: str = "",
+        head_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Point the URL at the object one full fetch produced, and update what that fetch proves.
+
+        `prior_id` is the object the URL pointed at before the fetch. When the fetch reproduced it,
+        two full fetches agree on these bytes: that counts against any declaration they contradict,
+        and, for a refetch that a HEAD size sent, shows that the HEAD size is not the body's.
+        """
         path = self.index_path(key)
         index = _read_json(path) or {"schema": INDEX_SCHEMA, "url": url, "url_key": key, "history": []}
+        now = _now()
         previous = index.get("object_id")
         if previous and previous != entry["object_id"]:
             index.setdefault("history", []).append(
-                {"object_id": previous, "replaced_at": _now(), "reason": reason}
+                {"object_id": previous, "replaced_at": now, "reason": reason}
             )
         index.update(
             object_id=entry["object_id"],
             name=name,
-            updated_at=_now(),
+            updated_at=now,
             validators={
                 "etag": fetched.get("etag"),
                 "last_modified": fetched.get("last_modified"),
                 "content_length": fetched.get("content_length") or fetched.get("size_bytes"),
             },
         )
+        _count_contradicting_fetches(index, entry, prior_id, declared, now)
+        reproduced = prior_id == entry["object_id"]
+        if reason == "remote_size_changed" and reproduced and head_size and int(head_size) != int(entry["size_bytes"]):
+            # Without this, a server whose HEAD never answers the body's size (a download script,
+            # a redirect page) would make every later consumer move the whole object again.
+            index["head_size_mismatch"] = {
+                "object_id": entry["object_id"],
+                "head_content_length": int(head_size),
+                "object_size_bytes": int(entry["size_bytes"]),
+                "recorded_at": now,
+            }
+        elif (index.get("head_size_mismatch") or {}).get("object_id") not in {None, entry["object_id"]}:
+            index.pop("head_size_mismatch", None)
         _write_json_atomic(path, index)
-
-    def _refute(self, key: str, declared: str, entry: dict[str, Any]) -> None:
-        """Remember that the URL's current bytes were fetched and do not match this declared MD5.
-
-        Without this, each retry of a unit whose declared checksum is wrong would move the whole
-        object again, and one of these objects is 928 GB.
-        """
-        path = self.index_path(key)
-        index = _read_json(path)
-        if not index:
-            return
-        index.setdefault("refuted_declared_md5", {})[declared] = {
-            "object_id": entry["object_id"],
-            "object_md5": entry["md5"],
-            "refuted_at": _now(),
-        }
-        _write_json_atomic(path, index)
+        return index
 
     def _fail_claim(self, key: str, unit_id: str, message: str) -> None:
         path = self.claim_path(key, unit_id)
-        claim = _read_json(path)
-        if claim:
-            claim["last_error"] = {"at": _now(), "message": message}
-            _write_json_atomic(path, claim)
+        with self._claim_lock(key):
+            claim = _read_json(path)
+            if claim:
+                claim["last_error"] = {"at": _now(), "message": message}
+                _write_json_atomic(path, claim)
 
     def _record_fetch(self, key: str, unit_id: str, entry: dict[str, Any], action: str, job_id: str) -> dict[str, Any]:
         path = self.claim_path(key, unit_id)
-        claim = _read_json(path) or {}
-        if claim.get("state") == "materialized" and claim.get("object_id") != entry["object_id"]:
-            # The unit's tree links an older object; it has to be materialized again.
-            claim["state"] = "pending"
-        claim["object_id"] = entry["object_id"]
-        claim["last_fetch"] = {"action": action, "at": _now(), "job_id": job_id}
-        claim.pop("last_error", None)
-        _write_json_atomic(path, claim)
+        with self._claim_lock(key, job_id=job_id):
+            claim = _read_json(path) or {}
+            if claim.get("state") == "materialized" and claim.get("object_id") != entry["object_id"]:
+                # The unit's tree links an older object; it has to be materialized again.
+                claim["state"] = "pending"
+            claim["object_id"] = entry["object_id"]
+            claim["last_fetch"] = {"action": action, "at": _now(), "job_id": job_id}
+            claim.pop("last_error", None)
+            _write_json_atomic(path, claim)
         return claim
 
     def _note_taint(self, entry: dict[str, Any], check: Mapping[str, Any]) -> None:
@@ -1308,6 +1397,7 @@ class DownloadStore:
         link: Callable[[Path, Path], None] = os.link,
         copy: Callable[[Path, Path], Any] = shutil.copy2,
         max_path_length: int | None = MAX_WINDOWS_PATH if os.name == "nt" else None,
+        max_directory_length: int | None = MAX_WINDOWS_DIRECTORY_PATH if os.name == "nt" else None,
     ) -> dict[str, Any]:
         """Link claimed objects into a unit's own tree and mark its claims materialized.
 
@@ -1351,7 +1441,12 @@ class DownloadStore:
             objects.append((url, object_id))
         try:
             record = materialize_unit_tree(
-                data_root, pairs, link=link, copy=copy, max_path_length=max_path_length
+                data_root,
+                pairs,
+                link=link,
+                copy=copy,
+                max_path_length=max_path_length,
+                max_directory_length=max_directory_length,
             )
         except MaterializationCollision as error:
             for url, _object_id in objects:
@@ -1366,28 +1461,43 @@ class DownloadStore:
     # ---- garbage collection ----------------------------------------------------------------------
 
     def gc(self, authorization: Any, *, object_ids: Iterable[str] | None = None, job_id: str = "") -> dict[str, Any]:
-        """Delete objects no live claim keeps, only under a campaign authorization to delete.
+        """Delete objects no live claim keeps, only where a campaign authorization covers deleting them.
 
-        Without an authorization, or under retention keep, nothing is deleted. A collected object
-        keeps entry.json (as a tombstone naming the authorization and the releases that freed it)
-        and members.tsv; its obj, t and partial files go. An object whose locks are held is left
-        for a later pass rather than waited for.
+        `authorization` is a path to the campaign-authorization record, or the record that
+        CampaignAuthorization.load returned. Without one nothing is deleted. Nothing is deleted
+        either when the approval is revoked, does not cover boundary 5, or keeps raw data. An
+        object, or an abandoned partial transfer, is deleted only when the approval covers
+        boundary 5 for every unit whose released claim left it unclaimed; one no unit ever claimed
+        is kept and reported, because no approval can name the unit it belongs to.
+
+        A collected object keeps entry.json (as a tombstone naming the approval, the sha256 of the
+        record's file, the units it covered and the releases that freed the object) and
+        members.tsv; its obj, t and partial files go. The decision and the collection are made
+        under the URL's claim lock, so a claim written meanwhile is never deleted from under. An
+        object whose locks are held is left for a later pass rather than waited for.
         """
         authority = _gc_authority(authorization)
         result: dict[str, Any] = {
             "store": str(self.root),
             "authorized": False,
-            "raw_retention_policy": authority["raw_retention_policy"] if authority else None,
+            "approval_id": authority.approval_id if authority else None,
+            "raw_retention_policy": authority.raw_retention_policy if authority else None,
             "collected": [],
             "kept": [],
+            "refused": [],
             "busy": [],
             "partials_removed": [],
+            "partials_kept": [],
         }
         if authority is None:
             result["reason"] = "no campaign authorization; the store deletes nothing without one"
             return result
-        if authority["raw_retention_policy"] != GC_RETENTION:
-            result["reason"] = f"campaign retention is {authority['raw_retention_policy']!r}; nothing is deleted"
+        # What the record refuses for every unit alike: asked for no unit, so drop that one code.
+        verdict = authority.check("", GC_BOUNDARY)
+        refusals = [(code, text) for code, text in zip(verdict["codes"], verdict["reasons"]) if code != "unit_unnamed"]
+        if refusals:
+            result["refusal_codes"] = [code for code, _text in refusals]
+            result["reason"] = "Nothing is deleted. " + " ".join(text for _code, text in refusals)
             return result
         result["authorized"] = True
         candidates = sorted(set(object_ids)) if object_ids is not None else [
@@ -1398,7 +1508,8 @@ class DownloadStore:
             if not entry or entry.get("state") == "collected":
                 continue
             keys = sorted({item.get("url_key") for item in entry.get("urls") or [] if item.get("url_key")})
-            with self._try_locks([f"u-{key}" for key in keys] + [f"o-{object_id}"], job_id) as held:
+            names = [f"u-{key}" for key in keys] + [f"o-{object_id}"] + [f"c-{key}" for key in keys]
+            with self._try_locks(names, job_id) as held:
                 if not held:
                     result["busy"].append(object_id)
                     continue
@@ -1412,16 +1523,40 @@ class DownloadStore:
                         {"object_id": object_id, "live_claims": sorted({claim["unit_id"] for claim in live})}
                     )
                     continue
-                result["collected"].append(self._collect(object_id, entry, keys, authority))
-        result["partials_removed"] = self._collect_partials(job_id)
+                release_record = self._release_record(keys, object_id)
+                covered, refused = _deletion_scope(authority, release_record)
+                if refused:
+                    result["refused"].append({"object_id": object_id, "units": refused})
+                    continue
+                result["collected"].append(
+                    self._collect(object_id, entry, keys, authority, release_record, covered)
+                )
+        result["partials_removed"], result["partials_kept"] = self._collect_partials(authority, job_id)
         return result
+
+    def _release_record(self, keys: Iterable[str], object_id: str | None) -> list[dict[str, Any]]:
+        """The claims on these URLs that named the object, or no object yet; None means any object."""
+        record = []
+        for key in keys:
+            for path in _claim_files(self.root / "claims" / key):
+                claim = _read_json(path)
+                if claim and (object_id is None or claim.get("object_id") in {None, object_id}):
+                    record.append(
+                        {
+                            key_name: claim.get(key_name)
+                            for key_name in ("unit_id", "url", "state", "release_reason", "released_at")
+                        }
+                    )
+        return record
 
     def _collect(
         self,
         object_id: str,
         entry: dict[str, Any],
         keys: list[str],
-        authority: Mapping[str, Any],
+        authority: CampaignAuthorization,
+        release_record: list[dict[str, Any]],
+        covered: list[dict[str, Any]],
     ) -> dict[str, Any]:
         directory = self.object_directory(object_id)
         kept = []
@@ -1433,31 +1568,18 @@ class DownloadStore:
                 removed_bytes += removal["removed_bytes"]
                 kept.extend(removal["kept"])
         for key in keys:
-            if not self._live_partial_claims(key):
+            # A partial belongs to the URL, whose claims may also name other objects.
+            _covered, refused = _deletion_scope(authority, self._release_record([key], None))
+            if not self._live_partial_claims(key) and not refused:
                 destination = self.partial_path(key)
                 for path in (destination, destination.with_name(f"{key}.part"), destination.with_name(f"{key}.json")):
                     with contextlib.suppress(FileNotFoundError):
                         removed_bytes += path.stat().st_size
                         path.unlink()
-        release_record = []
-        for key in keys:
-            for path in _claim_files(self.root / "claims" / key):
-                claim = _read_json(path)
-                if claim and claim.get("object_id") in {None, object_id}:
-                    release_record.append(
-                        {
-                            key_name: claim.get(key_name)
-                            for key_name in ("unit_id", "url", "state", "release_reason", "released_at")
-                        }
-                    )
         entry.update(
             state="collected" if not kept else "collection_incomplete",
             collected_at=_now(),
-            collected_under={
-                "approval_id": authority["approval_id"],
-                "authorization_sha256": authority["sha256"],
-                "raw_retention_policy": authority["raw_retention_policy"],
-            },
+            collected_under=_collection_authority(authority, covered),
             collected_bytes=removed_bytes,
             release_record=release_record,
         )
@@ -1480,8 +1602,12 @@ class DownloadStore:
                 return True
         return False
 
-    def _collect_partials(self, job_id: str) -> list[str]:
-        removed = []
+    def _collect_partials(
+        self, authority: CampaignAuthorization, job_id: str
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Remove abandoned partial transfers, under the same per-unit scope as objects."""
+        removed: list[str] = []
+        kept: list[dict[str, Any]] = []
         keys = sorted(
             {
                 path.name.split(".", 1)[0]
@@ -1492,15 +1618,19 @@ class DownloadStore:
         for key in keys:
             if self._live_partial_claims(key):
                 continue
-            with self._try_locks([f"u-{key}"], job_id) as held:
+            with self._try_locks([f"u-{key}", f"c-{key}"], job_id) as held:
                 if not held or self._live_partial_claims(key):
+                    continue
+                _covered, refused = _deletion_scope(authority, self._release_record([key], None))
+                if refused:
+                    kept.append({"url_key": key, "units": refused})
                     continue
                 for path in _sorted_children(self.root / "partial"):
                     if path.name.split(".", 1)[0] == key and path.is_file():
                         with contextlib.suppress(FileNotFoundError):
                             path.unlink()
                             removed.append(path.name)
-        return removed
+        return removed, kept
 
     @contextlib.contextmanager
     def _try_locks(self, names: list[str], job_id: str) -> Iterator[bool]:
@@ -1579,6 +1709,7 @@ def materialize_unit_tree(
     link: Callable[[Path, Path], None] = os.link,
     copy: Callable[[Path, Path], Any] = shutil.copy2,
     max_path_length: int | None = MAX_WINDOWS_PATH if os.name == "nt" else None,
+    max_directory_length: int | None = MAX_WINDOWS_DIRECTORY_PATH if os.name == "nt" else None,
 ) -> dict[str, Any]:
     """Build real directories under `data_root` with one hardlink per source file.
 
@@ -1586,7 +1717,8 @@ def materialize_unit_tree(
     under `target` with their relative paths. Every destination is planned before anything is
     written, and the whole placement is refused when two sources want one path (compared
     case-insensitively, as NTFS does), when a file and a directory want one path, when an existing
-    different file is in the way, or when a path would pass `max_path_length`. Nothing is ever
+    different file is in the way, when a file's path would pass `max_path_length`, or when a
+    directory's path, the root's included, would pass `max_directory_length`. Nothing is ever
     overwritten. A file already linked to the same source is left as it is, so a retry is a no-op.
     A link that fails (another volume, the 1023-link NTFS limit, a filesystem without links) falls
     back to a copy, and the record says so.
@@ -1658,8 +1790,22 @@ def materialize_unit_tree(
                 collisions.append({"path": relative.as_posix(), "kind": "parent_is_a_file"})
                 break
             parent = parent.parent
+    if max_directory_length is not None and len(str(root)) > max_directory_length:
+        collisions.append({"path": "", "kind": "path_too_long", "length": len(str(root)), "directory": True})
     for folded, relative in directories.items():
         destination = root.joinpath(*relative.parts)
+        if max_directory_length is not None and len(str(destination)) > max_directory_length:
+            # Every parent of every file is here, so a short file name under a long directory is
+            # refused now, rather than by CreateDirectoryW after shallower directories exist.
+            collisions.append(
+                {
+                    "path": relative.as_posix(),
+                    "kind": "path_too_long",
+                    "length": len(str(destination)),
+                    "directory": True,
+                }
+            )
+            continue
         if os.path.lexists(destination) and (not destination.is_dir() or _is_link_like(os.lstat(destination))):
             collisions.append({"path": relative.as_posix(), "kind": "exists_as_other_type"})
     if collisions:
@@ -2046,6 +2192,51 @@ def _head_answer(head: Callable[[str], Any], url: str) -> dict[str, Any]:
         return {"content_length": None}
 
 
+def _count_contradicting_fetches(
+    index: dict[str, Any],
+    entry: Mapping[str, Any],
+    prior_id: str | None,
+    declared: str,
+    now: str,
+) -> None:
+    """Update, in `index`, how many full fetches returned bytes each declared MD5 disagrees with.
+
+    Each memo under refuted_declared_md5 names the object those fetches returned and counts them;
+    it is `refuted` once REFUTING_FETCHES agree. Without the memo, every retry of a unit whose
+    declaration is wrong would move the whole object again, and one of these objects is 928 GB;
+    with a count of one, a single damaged transfer would fail the unit for good. A fetch that
+    satisfies a declaration removes its memo, and one that returns other bytes starts it again.
+    The first mismatching fetch counts twice when it reproduced the object the URL already
+    pointed at, because that object was itself a full fetch of this URL.
+    """
+    object_id = entry["object_id"]
+    first_count = 2 if prior_id == object_id else 1
+    memos: dict[str, dict[str, Any]] = {}
+    for digest, memo in (index.get("refuted_declared_md5") or {}).items():
+        if digest == entry["md5"]:
+            continue
+        if memo.get("object_id") == object_id:
+            memos[digest] = dict(memo, fetches=int(memo.get("fetches") or 1) + 1)
+        else:
+            memos[digest] = {
+                "object_id": object_id, "object_md5": entry["md5"], "fetches": first_count, "first_mismatch_at": now,
+            }
+    if declared and declared != entry["md5"] and declared not in memos:
+        memos[declared] = {
+            "object_id": object_id, "object_md5": entry["md5"], "fetches": first_count, "first_mismatch_at": now,
+        }
+    for memo in memos.values():
+        memo["refuted"] = int(memo["fetches"]) >= REFUTING_FETCHES
+        if memo["refuted"]:
+            memo.setdefault("refuted_at", now)
+        else:
+            memo.pop("refuted_at", None)
+    if memos:
+        index["refuted_declared_md5"] = memos
+    else:
+        index.pop("refuted_declared_md5", None)
+
+
 def _hash_file(path: Path) -> tuple[str, str]:
     sha256 = hashlib.sha256()
     md5 = hashlib.md5()
@@ -2056,39 +2247,63 @@ def _hash_file(path: Path) -> tuple[str, str]:
     return sha256.hexdigest(), md5.hexdigest()
 
 
-def _gc_authority(authorization: Any) -> dict[str, Any] | None:
-    """Read the campaign authorization record GC acts under, or None when there is none.
+def _gc_authority(authorization: Any) -> CampaignAuthorization | None:
+    """The campaign approval GC deletes under, or None when none was passed.
 
-    The record is the campaign-authorization artifact (msdial-campaign-authorization.v1) that the
-    campaign runner writes; a path to it or the parsed mapping is accepted. Only its schema, its
-    approval_id and its raw_retention_policy are read here. A malformed record is refused loudly,
-    because a deletion authority that silently fails to parse would look like "keep" forever.
+    Accepted: a path to the msdial-campaign-authorization.v1 record, read by
+    CampaignAuthorization.load exactly as every other entry point reads it, or the record load
+    returned. Not a mapping: the sha256 a tombstone records must be that of the file a person
+    approved, not of a re-serialization, and a dict built in memory approves nothing. A record load
+    refuses is refused here as well, loudly, because a deletion authority that silently failed to
+    parse would look like "keep" forever.
     """
-    if authorization is None:
-        return None
-    if isinstance(authorization, (str, Path)):
-        raw = Path(authorization).read_bytes()
+    if isinstance(authorization, CampaignAuthorization):
+        return authorization
+    if authorization is None or isinstance(authorization, (str, os.PathLike)):
         try:
-            record = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise StoreError(f"The campaign authorization is not readable JSON: {error}") from error
-        digest = hashlib.sha256(raw).hexdigest()
-    elif isinstance(authorization, Mapping):
-        record = dict(authorization)
-        digest = hashlib.sha256(
-            json.dumps(record, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-    else:
-        raise StoreError("A campaign authorization is a record or a path to one.")
-    if not isinstance(record, Mapping) or record.get("schema") != AUTHORIZATION_SCHEMA:
-        raise StoreError(f"Not a campaign authorization record (schema {AUTHORIZATION_SCHEMA} expected).")
-    approval_id = str(record.get("approval_id") or "").strip()
-    if not approval_id:
-        raise StoreError("The campaign authorization names no approval_id.")
-    retention = str(record.get("raw_retention_policy") or "").strip()
-    if not retention:
-        raise StoreError("The campaign authorization records no raw_retention_policy.")
-    return {"approval_id": approval_id, "raw_retention_policy": retention, "sha256": digest}
+            return load_campaign_authorization(authorization)
+        except CampaignAuthorizationError as error:
+            raise StoreError(str(error)) from error
+    raise StoreError(
+        "A campaign authorization is a path to its record, or the record CampaignAuthorization.load "
+        f"returned; not a {type(authorization).__name__}."
+    )
+
+
+def _deletion_scope(
+    authority: CampaignAuthorization, release_record: Iterable[Mapping[str, Any]]
+) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+    """(units the approval covers boundary 5 for, {unit: refusal codes}) for the releasing units.
+
+    Every unit whose claim named the bytes must be covered. With none, nothing is: no approval can
+    name the unit an unclaimed object belongs to, so it is kept for a person to look at.
+    """
+    units = sorted({str(row.get("unit_id") or "") for row in release_record} - {""})
+    if not units:
+        return [], {"": ["no_releasing_unit"]}
+    covered: list[dict[str, Any]] = []
+    refused: dict[str, list[str]] = {}
+    for unit in units:
+        verdict = authority.check(unit, GC_BOUNDARY)
+        if verdict["valid"]:
+            covered.append({"unit_id": unit, "covered_as": verdict["covered_as"]})
+        else:
+            refused[unit] = list(verdict["codes"])
+    return covered, refused
+
+
+def _collection_authority(authority: CampaignAuthorization, covered: list[dict[str, Any]]) -> dict[str, Any]:
+    """What a tombstone records of the approval: identity and digest, never the record's location."""
+    return {
+        "schema": authority.record.get("schema"),
+        "approval_id": authority.approval_id,
+        "campaign_id": authority.campaign_id,
+        "manifest_digest": authority.manifest_digest,
+        "authorization_sha256": authority.sha256,
+        "raw_retention_policy": authority.raw_retention_policy,
+        "boundary": GC_BOUNDARY,
+        "units": covered,
+    }
 
 
 def _sorted_children(directory: Path) -> list[Path]:
