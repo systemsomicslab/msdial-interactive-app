@@ -4,6 +4,57 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.13] - Unreleased
+
+### Added
+- An accession-scoped download store, `msdial_app/download_store.py`, which
+  fetches each repository object once and gives every unit a tree of
+  hardlinks to it. The lease does not use it yet. In the declared pool 489
+  units list a URL that another unit also lists; fetching each URL once
+  instead of once per unit moves 8.22 TB instead of 14.37 TB. No sharing
+  group crosses an accession, so the store lives beside the units it serves,
+  at `<workspace>/<repository>/<accession>/_dl`. Objects are identified by
+  the sha256 of their bytes and found by URL. A URL whose bytes change
+  upstream becomes a new object, and earlier consumers keep the bytes they
+  used.
+  - A cached object is reused only when the unit's declared MD5 matches it, a
+    HEAD Content-Length (when the server answers) matches it, and every file
+    units link to still has its recorded size and mtime_ns. A HEAD size that a
+    refetch showed to be wrong for unchanged bytes is remembered
+    (`head_size_mismatch`). `force_refetch` lets a retry policy ignore the
+    cache.
+  - Fetched bytes are compared with the declared MD5 before anything is
+    extracted, so 7-Zip never sees unverified bytes. A declared MD5 counts as
+    wrong only after two full fetches return the same other bytes: one
+    damaged transfer does not fail a unit for good, and a wrong declaration
+    costs at most two transfers. A consumer with no declaration of its own
+    does not reuse bytes another unit's declaration disputes.
+  - A linked file written in place is detected, because a hardlink is the
+    store's own file record. The object is then fetched again, or the member
+    re-extracted from the kept archive.
+  - Locks are exclusive-create files with a heartbeat. A lock is stale only
+    when its heartbeat has lapsed and its holder is dead, read through
+    OpenProcess or psutil (`msdial_app.process_liveness`), never `os.kill`,
+    which on Windows terminates the process it is pointed at. A second
+    consumer waits (`waiting_for_shared_download`). Claim writes and GC
+    decisions on a URL share a short claim lock, so a batch pre-claim cannot
+    have its object deleted from under it.
+  - `gc` deletes raw data only as far as the campaign approval reaches. It
+    reads the `msdial-campaign-authorization.v1` record from its file
+    (`CampaignAuthorization.load`) and deletes nothing when the approval is
+    revoked, does not cover boundary 5, or keeps raw data. An object or an
+    abandoned partial transfer is deleted only when boundary 5 is covered for
+    every unit whose release freed it; one that no unit ever claimed is kept
+    and reported. It leaves `entry.json` as a tombstone recording the
+    approval, the manifest digest, the sha256 of the record's bytes and the
+    units covered, never the record's location, and keeps the member listing.
+  - Unit-tree materialization refuses any directory path over 247
+    characters during planning (`path_too_long`).
+  - `unlink_tree` never changes the attributes of a file that other links
+    share. NTFS keeps the read-only attribute on the record every link names,
+    so clearing it to delete one unit's link would clear it on the store
+    object and on every other unit's link.
+
 ## [0.5.12] - Unreleased
 
 ### Added

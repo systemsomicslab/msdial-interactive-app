@@ -7,9 +7,8 @@ process through OpenProcess (or psutil) instead, and by its creation time, becau
 process ids: a live process with a different creation time is a different process, and the recorded
 owner is gone.
 
-One helper, so every such record answers the question the same way. The accession download store
-(download_store.py on feat/download-store-module) carries the same two functions under the same names;
-whichever lands second should import these rather than keep a copy.
+One helper, so every such record answers the question the same way: the download lease, the
+accession download store (download_store.py) and the campaign runner's lock all import it.
 """
 
 from __future__ import annotations
