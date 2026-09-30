@@ -59,6 +59,8 @@ CONVERSION_REQUIRED_SUFFIXES = (".mzxml", ".mzdata", ".mzdata.xml")
 # The file roles under which a repository lists an archive of a whole study (Metabolomics Workbench).
 # A per-sample archive (X.raw.zip) is listed under its sample's own role, usually raw.
 ARCHIVE_ROLES = frozenset({"raw_archive", "shared_raw_archive"})
+# The vendor folders an input can be, as _find_msdial_inputs finds them (casefolded suffixes).
+FOLDER_INPUT_SUFFIXES = frozenset({".d", ".raw"})
 # The guards every lease extraction runs under: free space less a reserve, the expansion ratio, the
 # member count and the nesting depth (archives.ExtractionLimits). They replace the old limit of five
 # times the download limit, which the campaign, with no per-unit size limit, could not have set.
@@ -1283,12 +1285,19 @@ def create_download_lease(
         stages.finish("discover", input_candidates=len(all_inputs))
 
         stages.start("attribute")
-        selected_extracted = _filter_project_allowlist_paths(extracted, data_root, project)
+        archive_samples = _archive_sample_attribution(
+            project, archive_extractions, extracted_members, data_root
+        )
+        selected_extracted = _filter_project_allowlist_paths(
+            extracted, data_root, project, archive_samples=archive_samples
+        )
         verified_checksums: dict[str, dict[str, Any]] = {}
         checksum_validation = _verify_project_allowlist_checksums(
             data_root, project, verified_checksums, downloads, archive_extractions
         )
-        inputs = _filter_inputs_by_project_allowlist(all_inputs, data_root, project)
+        inputs = _filter_inputs_by_project_allowlist(
+            all_inputs, data_root, project, archive_samples=archive_samples
+        )
         analysis_input = _common_input_path(inputs, data_root)
         input_lineage = build_input_lineage(
             inputs,
@@ -1849,7 +1858,8 @@ def build_input_lineage(
 
     A member of an archive is not hashed here; the archive's checksums, and whether the published one was
     compared, are carried as its source. ``sample_id`` is filled when exactly one of the unit's samples
-    names the input; ``file_name`` is the analysis CSV's, and belongs to whatever writes that CSV.
+    names the input, or, when none does, names the archive it came out of (_archive_sample_attribution);
+    ``file_name`` is the analysis CSV's, and belongs to whatever writes that CSV.
 
     ``verified_checksums`` is what _verify_project_allowlist_checksums compared, by _file_key: a file or
     an extracted member whose own declared md5, sha1 or sha256 matched records it as declared,
@@ -1863,6 +1873,9 @@ def build_input_lineage(
     verified_checksums = verified_checksums or {}
     extracted_members = extracted_members or {}
     archive_extractions = archive_extractions or []
+    # An input that came out of an archive one sample names (X.zip) is that sample's, although its own
+    # name (X.d) is no sample's.
+    archive_samples = _archive_sample_attribution(project, archive_extractions, extracted_members, data_root)
     # Each extraction's nested archives by label, built once (_nesting_index), so tracing a file to
     # the archives that held it does not walk the whole lineage once per file.
     nesting: dict[int, dict[str, list[dict[str, Any]]]] = {}
@@ -1925,6 +1938,8 @@ def build_input_lineage(
             candidates.add("/".join(parts[1:]))
         base = path.name.casefold()
         matched_samples = sample_names.get(base) or sample_names.get(PurePosixPath(base).stem) or set()
+        if not matched_samples and key in archive_samples:
+            matched_samples = {archive_samples[key]}
         row: dict[str, Any] = {
             "path": str(path),
             "kind": "",
@@ -3734,10 +3749,21 @@ def _matches_sample_file_names(
     return bool(stems) and PurePosixPath(base).stem in stems
 
 def _filter_inputs_by_project_allowlist(
-    inputs: list[str], data_root: Path, project: RepositoryProject
+    inputs: list[str],
+    data_root: Path,
+    project: RepositoryProject,
+    *,
+    archive_samples: dict[str, str] | None = None,
 ) -> list[str]:
+    """The inputs that are this unit's: listed, named by its samples, or out of an archive one names.
+
+    archive_samples is _archive_sample_attribution's: the files, and outermost .d/.raw folders, that
+    came out of an archive exactly one of this unit's samples names (X.zip). Without it, only names
+    are matched, as they always were.
+    """
     if not project.analysis_unit_id:
         return inputs
+    archive_samples = archive_samples or {}
     allowed = _project_allowlist(project, analysis_only=True)
     sample_names = _sample_file_names(project)
     if not allowed and not any(sample_names):
@@ -3758,6 +3784,7 @@ def _filter_inputs_by_project_allowlist(
         and (
             _path_matches_allowlist(Path(item), data_root, allowed)
             or _matches_sample_file_names(Path(item), sample_names)
+            or (bool(archive_samples) and _file_key(item) in archive_samples)
         )
     ]
     if not selected:
@@ -3855,23 +3882,111 @@ def _is_sample_member(path: Path, data_root: Path, names: tuple[set[str], set[st
 
 
 def _filter_project_allowlist_paths(
-    paths: list[str], data_root: Path, project: RepositoryProject
+    paths: list[str],
+    data_root: Path,
+    project: RepositoryProject,
+    *,
+    archive_samples: dict[str, str] | None = None,
 ) -> list[str]:
     """The extracted files that are this unit's: listed, inside a listed folder, or its samples'.
 
     Matching the listed names alone gave [] for every Workbench unit, whose only listed file is the
-    study archive: extracted_files said nothing came out for the unit although its inputs had.
+    study archive: extracted_files said nothing came out for the unit although its inputs had. A file
+    that came out of an archive one of its samples names (archive_samples) is that sample's.
     """
     if not project.analysis_unit_id:
         return paths
     allowed = set(_project_allowlist(project))
     sample_names = _sample_file_names(project)
+    archive_samples = archive_samples or {}
     return [
         item
         for item in paths
         if _path_matches_allowlist(Path(item), data_root, allowed, allow_directory_descendants=True)
         or _is_sample_member(Path(item), data_root, sample_names)
+        or (bool(archive_samples) and _file_key(item) in archive_samples)
     ]
+
+
+def _archive_sample_attribution(
+    project: RepositoryProject,
+    archive_extractions: list[dict[str, Any]],
+    extracted_members: dict[str, dict[str, Any]],
+    data_root: Path,
+) -> dict[str, str]:
+    """The sample each extracted file belongs to through the archive it came out of, by _file_key.
+
+    WHY. A sample may name a plain per-sample archive, X.zip, with no container suffix. In the
+    2026-09-22 Catalog snapshot 4,540 Workbench sample names in 76 units name one inside the study
+    archive (the MoTrPAC ST0026xx studies, and ST000322, ST000329 and ST000354 of the declared pool),
+    and 8,874 MetaboLights sample names in 159 units name one the unit downloads itself. It expands
+    to X/X.d, or to X.d at the data root, and no rule that matches names - exact, extensionless stem,
+    container alias - matches X.d to X.zip, so every such unit failed at the attribute stage. The
+    members listing says which archive each file came out of, so that is what is matched instead: an
+    archive exactly one of this unit's samples names, by its file name, gives that sample every file
+    that came out of it, through any archive nested inside it.
+
+    What is not given: an archive more than one sample names (a batch zip, or one archive every sample
+    names), since which of its files is whose is not known; and a downloaded archive the unit lists as
+    a study archive (raw_archive, shared_raw_archive), whose contents are other samples' and other
+    units' too, whatever a sample calls it. The result holds each file, and the outermost .d/.raw
+    folder holding it, under the sample's id; a folder two samples' archives both wrote into is left
+    out.
+    """
+    named: dict[str, set[str]] = {}
+    for sample in project.sample_metadata or []:
+        raw = PurePosixPath(str((sample or {}).get("raw_file") or "").replace("\\", "/")).name.casefold()
+        sample_id = str((sample or {}).get("sample_id") or "").strip()
+        if raw and sample_id and archives.is_archive_name(raw):
+            named.setdefault(raw, set()).add(sample_id)
+    if not named or not extracted_members:
+        return {}
+
+    def owner(label: str) -> str:
+        samples = named.get(PurePosixPath(label.replace("\\", "/")).name.casefold()) or set()
+        return next(iter(samples)) if len(samples) == 1 else ""
+
+    study_archives = {item.url for item in project.files if item.role in ARCHIVE_ROLES}
+    by_label: dict[tuple[int, str], str] = {}
+    for index, record in enumerate(archive_extractions):
+        outer_label = str(record.get("archive_name") or "")
+        outer = "" if str(record.get("source_url") or "") in study_archives else owner(outer_label)
+        if outer:
+            by_label[(index, outer_label)] = outer
+        pending = [(nested, outer) for nested in record.get("nested") or [] if isinstance(nested, dict)]
+        while pending:
+            nested, inherited = pending.pop()
+            label = str(nested.get("archive_path") or "")
+            sample = owner(label) or inherited
+            if sample:
+                by_label[(index, label)] = sample
+            pending.extend(
+                (child, sample) for child in nested.get("nested") or [] if isinstance(child, dict)
+            )
+    if not by_label:
+        return {}
+
+    data_key = _file_key(str(data_root))
+    attributed: dict[str, str] = {}
+    folders: dict[str, set[str]] = {}
+    for key, listed in extracted_members.items():
+        sample = by_label.get((int(listed.get("extraction", -1)), str(listed.get("archive") or "")))
+        if not sample:
+            continue
+        attributed[key] = sample
+        outermost = ""
+        for parent in Path(key).parents:
+            parent_key = str(parent)
+            if parent_key == data_key or len(parent_key) <= len(data_key):
+                break
+            if parent.suffix in FOLDER_INPUT_SUFFIXES:
+                outermost = parent_key
+        if outermost:
+            folders.setdefault(outermost, set()).add(sample)
+    for folder, samples in folders.items():
+        if len(samples) == 1:
+            attributed[folder] = next(iter(samples))
+    return attributed
 
 
 def _listed_checksum(item: RepositoryFile) -> tuple[str, str]:

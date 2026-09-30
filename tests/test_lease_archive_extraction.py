@@ -669,7 +669,9 @@ class ArchivesInsideAVerifiedStudyArchive(_Workspace):
         inner, study = basis["archives"]
         self.assertEqual(("ST000322/S1.raw.zip", hashlib.sha256(zips["S1"]).hexdigest(), None),
                          (inner["archive_path"], inner["sha256"], inner["declared_verified"]))
-        self.assertEqual((hashlib.sha256(outer).hexdigest(), True), (study["sha256"], study["declared_verified"]))
+        self.assertEqual(
+            (hashlib.sha256(outer).hexdigest(), True), (study["sha256"], study["declared_verified"])
+        )
         self.assertEqual(
             [("container", "ST000322/S1.raw"), ("member", "ST000322/S1.raw.zip")],
             [("container", level["container"]) if "container" in level else ("member", level["member"])
@@ -694,11 +696,98 @@ class ArchivesInsideAVerifiedStudyArchive(_Workspace):
         basis = row["basis"]
         self.assertEqual(("archive_declared_checksum", hashlib.md5(outer).hexdigest()),
                          (basis["kind"], basis["value"]))
-        self.assertEqual(["ST000322/batch1.zip", ""], [item.get("archive_path", "") for item in basis["archives"]])
+        self.assertEqual(
+            ["ST000322/batch1.zip", ""], [item.get("archive_path", "") for item in basis["archives"]]
+        )
         self.assertEqual(
             [("ST000322/batch1/S1.mzML", "ST000322/batch1.zip"), ("ST000322/batch1.zip", "ST000322.zip")],
             [(level["member"], level["listed_archive"]) for level in basis["listing"]],
         )
+
+
+def _agilent(stem: str) -> bytes:
+    """A per-sample zip holding one Agilent folder, as MoTrPAC's ST0026xx studies ship them."""
+    return _zip([(f"{stem}.d/AcqData/MSScan.bin", f"{stem} scan".encode()),
+                 (f"{stem}.d/AcqData/MSPeak.bin", f"{stem} peak".encode())])
+
+
+class ASampleNamingAPlainPerSampleArchive(_Workspace):
+    """A sample names X.zip, with no container suffix, and the archive expands to X/X.d or X.d.
+
+    4,540 Workbench sample names in 76 units name such a zip inside the study archive, and 8,874
+    MetaboLights names in 159 units one the unit downloads itself (2026-09-22 Catalog snapshot). No
+    name rule matches X.d to X.zip, so each of these units failed at the attribute stage.
+    """
+
+    def _study(self, members: list[tuple[str, bytes]], samples: dict[str, str]) -> dict:
+        outer = _zip(members)
+        url = "https://example.org/studydownload/ST002647.zip"
+        project = _unit(
+            [RepositoryFile("ST002647.zip", len(outer), url, role="raw_archive",
+                            checksum=hashlib.md5(outer).hexdigest())],
+            samples,
+            repository="metabolomics_workbench",
+        )
+        return create_download_lease(project, self.root, 10_000_000, client=_Client({url: outer}))
+
+    def test_the_contents_of_a_zip_inside_the_study_archive_are_its_samples(self) -> None:
+        """THE REGRESSION: 'did not contain an MS-DIAL input' with ST002647/20191016-A-P/20191016-A-P.d
+        on disk."""
+        lease = self._study(
+            [(f"ST002647/{stem}.zip", _agilent(stem))
+             for stem in ("20191016-A-P", "20191016-B-P", "20191016-C-N")],
+            {"a": "20191016-A-P.zip", "b": "20191016-B-P.zip"},
+        )
+        data = Path(lease["input_directory"])
+
+        self.assertEqual(
+            ["ST002647/20191016-A-P/20191016-A-P.d", "ST002647/20191016-B-P/20191016-B-P.d"],
+            sorted(Path(item).relative_to(data).as_posix() for item in lease["input_candidates"]),
+            "and the zip no sample of this unit names is not admitted",
+        )
+        rows = _rows(lease)
+        row = rows["20191016-A-P.d"]
+        self.assertEqual(("archived_container", "a"), (row["kind"], row["sample_id"]))
+        self.assertEqual("b", rows["20191016-B-P.d"]["sample_id"])
+        self.assertEqual("archive_declared_checksum", row["basis"]["kind"])
+        self.assertEqual(4, len(lease["extracted_files"]))
+        self.assertNotIn("20191016-C-N", " ".join(lease["extracted_files"]))
+
+    def test_a_zip_that_keeps_its_own_folder_is_attributed_the_same_way(self) -> None:
+        inner = _zip([("20191016-A-P/20191016-A-P.d/AcqData/MSScan.bin", b"scan")])
+        lease = self._study([("ST002647/20191016-A-P.zip", inner)], {"a": "20191016-A-P.zip"})
+
+        rows = _rows(lease)
+        self.assertEqual(["20191016-A-P.d"], list(rows))
+        self.assertEqual("a", rows["20191016-A-P.d"]["sample_id"])
+
+    def test_a_metabolights_per_sample_zip_the_unit_downloads_is_attributed(self) -> None:
+        payloads = {f"https://example.org/FILES/{stem}.zip": _agilent(stem) for stem in ("S1", "S2")}
+        project = _unit(
+            [RepositoryFile(f"FILES/{stem}.zip", 10, f"https://example.org/FILES/{stem}.zip")
+             for stem in ("S1", "S2")],
+            {"sample-1": "FILES/S1.zip", "sample-2": "FILES/S2.zip"},
+        )
+        lease = create_download_lease(project, self.root, 10_000, client=_Client(payloads))
+
+        rows = _rows(lease)
+        self.assertEqual(["S1.d", "S2.d"], sorted(rows))
+        self.assertEqual(("sample-1", "sample-2"), (rows["S1.d"]["sample_id"], rows["S2.d"]["sample_id"]))
+
+    def test_a_zip_two_samples_name_admits_nothing_by_that_name(self) -> None:
+        """Which of its files is whose is not known, so the archive's name gives neither of them."""
+        batch = _zip([("A.d/AcqData/MSScan.bin", b"a"), ("B.d/AcqData/MSScan.bin", b"b")])
+        with self.assertRaisesRegex(ValueError, "did not contain an MS-DIAL input"):
+            self._study([("ST002647/batch.zip", batch)], {"a": "batch.zip", "b": "batch.zip"})
+
+    def test_a_study_archive_a_sample_names_is_not_that_samples(self) -> None:
+        """It holds other samples' and other units' files, whatever one sample calls it."""
+        with self.assertRaisesRegex(ValueError, "did not contain an MS-DIAL input"):
+            self._study(
+                [("ST002647/POS/S1_pos.d/AcqData/MSScan.bin", b"pos"),
+                 ("ST002647/NEG/S1_neg.d/AcqData/MSScan.bin", b"neg")],
+                {"a": "ST002647.zip"},
+            )
 
 
 class EveryArchiveKindIsExtracted(_Workspace):
