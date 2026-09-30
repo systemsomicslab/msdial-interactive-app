@@ -4,6 +4,60 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.14] - Unreleased
+
+### Added
+- A watch on the MS-DIAL Console. `run_console` takes `timeout_seconds` and
+  `idle_timeout_seconds`, a `cancel_event` and an `on_start(pid)` callback.
+  Idle means no output line, and no change in the Console's output and export
+  folders or in the folders holding its inputs (where MS-DIAL writes its
+  intermediates), for that long.
+  - A stop kills the whole process tree: `taskkill /T /F` on Windows, the
+    process group elsewhere. The tree is also stopped whenever anything fails
+    after the process exists (the deadline, `on_start`, a line handler, the
+    watch itself).
+  - Every line the pipe delivered within 10 s of the Console's exit is passed
+    on, however slow the consumer. A child that inherited the pipe and keeps
+    writing cannot hold the job.
+  - Exit codes: -3 for either limit, -4 for a cancel; -2 stays the SCIEX
+    sidecar stop. A limit past ten years is refused before any job is
+    registered (HTTP 400).
+  - With no limit and no cancel flag, the Console runs exactly as before.
+- `POST /api/jobs/<id>/cancel` and the MCP tool `msdial_cancel_job` stop a
+  queued or running run, peak-count diagnostic, or repository download.
+  - A queued job stops before it starts anything.
+  - A Console job fails with exit code -4 and `stop_reason: cancelled`.
+  - A download stops at its next progress report. Its lease records
+    `download_failed` with reason `cancelled` and keeps the partial file for a
+    resume.
+  - Jobs record the Console's process id and deadline (`console_process`) and
+    how it ended (`console_outcome`); job summaries carry `stop_reason`.
+- `timeout_seconds` and `idle_timeout_seconds` on `/api/agent/run`,
+  `/api/agent/tuning/run`, `msdial_start_guided_analysis` and
+  `msdial_start_peak_count_diagnostic`. There is no limit unless one is given.
+- `run_attempts[]` in the unit manifest. `record_run_start` opens an attempt
+  before the Console starts: attempt number per kind, job, UTC start, the
+  backend process, the Console's version and checksums (never its location),
+  the command's sha256, the output directory and the limits.
+  `record_run_process` adds the Console's process id and creation time, and
+  `record_run_end` closes the attempt with the exit code and the reason
+  (exited, timeout, idle_timeout, cancelled, sciex_scan_sidecar, start_failed
+  or error). All three write through the manifest lock and never raise.
+- One live Console per repository unit. A run or diagnostic for a unit that
+  already has one queued or running, or whose `run_attempts` name a Console
+  that is still alive, is refused with HTTP 409 (`code: unit_busy`,
+  `live_job_id`) before anything is prepared; the MCP tools report
+  `reason: unit_busy`. Liveness is read through `process_liveness`.
+- Capabilities `console_time_limits`, `cancel_console_and_download_jobs`,
+  `repository_run_attempt_records` and `one_console_per_repository_unit`.
+
+### Changed
+- When the watch stopped a job's Console, the job's error says so first.
+
+### Known limitations
+- A cancel is noticed at a download's next progress report, so a download
+  whose read has stalled is not stopped until the read returns.
+
 ## [0.5.13] - Unreleased
 
 ### Added
