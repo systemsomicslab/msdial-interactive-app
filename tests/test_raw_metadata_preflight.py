@@ -276,6 +276,24 @@ class IsolationTests(_Scratch):
             {(Path(item["path"]).name, item["reason"]) for item in disposition["excluded_inputs"]},
         )
 
+    def test_outside_a_campaign_an_eligible_unit_with_an_unreadable_file_stays_eligible_as_before(self) -> None:
+        # One unreadable file used to stop the single extractor process: preflight_unavailable, or
+        # preflight_unsupported_format when that file had no reader, and an eligible unit stayed eligible.
+        # Nothing outside a campaign can exclude the file, so holding the unit back would strand it.
+        for bad, status in (("fail", "preflight_unavailable"), ("unsupported", "preflight_unsupported_format")):
+            with self.subTest(bad=bad):
+                manifest, extractor, _ = _unit(self.root / bad, ["a.mzML", "bad.lcd", "c.mzML"], acquisition="DDA")
+                update_manifest(manifest, lambda current: current.update(execution_allowed=True))
+                project_before = read_manifest(manifest)["project"]
+
+                result = self.preflight(manifest, extractor, _Extractor({"bad.lcd": bad}))
+
+                self.assertEqual((status, True), (result["status"], result["execution_allowed"]))
+                self.assertEqual(project_before, result["project"])
+                self.assertIn("already eligible", result["raw_metadata_preflight"]["advisory"])
+                self.assertEqual(3, len(result["raw_metadata_preflight"]["summary"]["per_file"]))
+                self.assertFalse(result["campaign_disposition"]["applied"])
+
     def test_every_input_without_a_reader_is_still_its_own_state(self) -> None:
         manifest, extractor, _ = _unit(self.root / "unit", ["a.lcd", "b.lcd"], acquisition="DDA")
         fake = _Extractor({"a.lcd": "unsupported", "b.lcd": "unsupported"})

@@ -3227,6 +3227,7 @@ def _record_preflight(
         OUTCOME_UNSUPPORTED,
         READ_OUTCOMES,
         decide_disposition,
+        file_key,
     )
 
     # A split unit - split before this preflight, or while its headers were being read - stays split: a
@@ -3344,31 +3345,67 @@ def _record_preflight(
             )
             evaluated.review_reasons.append(
                 f"The headers of {unread} of {len(inputs)} inspected input files could not be read "
-                f"({failures}), so their acquisition mode is not established. Exclude them or resolve "
-                "them before the unit runs."
+                f"({failures}), so their acquisition mode is not established. A campaign disposition "
+                "excludes such files; outside a campaign, resolve them before the unit runs."
             )
             evaluated.eligible = False
             evaluated.selection_status = "raw_metadata_required"
-        current["project"] = evaluated.as_dict()
-        current["execution_allowed"] = evaluated.eligible
-        if summary["acquisition_mode"] == "Mixed":
-            current["status"] = "preflight_mixed_acquisition"
-            groups: dict[str, list[str]] = {}
-            for item in summary["per_file"]:
-                if item.get("outcome", "ok") in READ_OUTCOMES:
-                    groups.setdefault(item["acquisition_mode"] or "Unknown", []).append(item["file"])
-            block["acquisition_groups"] = {mode: sorted(files) for mode, files in sorted(groups.items())}
+        unread_outcomes = [
+            (path, (outcomes.get(file_key(path)) or {}).get("outcome"))
+            for path in inputs
+            if (outcomes.get(file_key(path)) or {}).get("outcome") not in READ_OUTCOMES
+        ]
+        if (
+            campaign is None
+            and previously_allowed
+            and unread_outcomes
+            and not evaluated.exclusion_reasons
+            and summary["acquisition_mode"] != "Mixed"
+        ):
+            # AS BEFORE, OUTSIDE A CAMPAIGN. One unreadable input used to stop the one extractor process, and
+            # the unit ended as an unavailable (or, when that input had no reader, unsupported-format)
+            # preflight that left an eligible unit eligible. Only a campaign disposition can exclude that
+            # input, so outside one the unit keeps what its repository metadata established, and the verdicts
+            # that were read are recorded beside it; the execution gate still holds each file read to its
+            # own header.
+            current["execution_allowed"] = previously_allowed
+            if unread_outcomes[0][1] == OUTCOME_UNSUPPORTED:
+                current["status"] = "preflight_unsupported_format"
+                block["unsupported_formats"] = sorted(
+                    {
+                        path.suffix.lower()
+                        for path, outcome in unread_outcomes
+                        if outcome == OUTCOME_UNSUPPORTED and path.suffix
+                    }
+                )
+            else:
+                current["status"] = "preflight_unavailable"
             block["advisory"] = (
-                "The raw headers disagree about acquisition mode ("
-                + ", ".join(f"{mode} {len(files)}" for mode, files in sorted(groups.items()))
-                + "). MS-DIAL runs one acquisition mode per analysis, so this unit cannot run as one. "
-                "Split it into one unit per acquisition group, each with its own workspace, manifest and "
-                "Class assignments, and preflight each part."
+                f"The headers of {unread} of {len(inputs)} inspected input files could not be read. Repository "
+                "metadata remains authoritative because the project was already eligible before this optional "
+                "check; the headers that were read are recorded in summary.per_file."
             )
-        elif evaluated.eligible:
-            current["status"] = "preflight_passed"
         else:
-            current["status"] = "preflight_review_required"
+            current["project"] = evaluated.as_dict()
+            current["execution_allowed"] = evaluated.eligible
+            if summary["acquisition_mode"] == "Mixed":
+                current["status"] = "preflight_mixed_acquisition"
+                groups: dict[str, list[str]] = {}
+                for item in summary["per_file"]:
+                    if item.get("outcome", "ok") in READ_OUTCOMES:
+                        groups.setdefault(item["acquisition_mode"] or "Unknown", []).append(item["file"])
+                block["acquisition_groups"] = {mode: sorted(files) for mode, files in sorted(groups.items())}
+                block["advisory"] = (
+                    "The raw headers disagree about acquisition mode ("
+                    + ", ".join(f"{mode} {len(files)}" for mode, files in sorted(groups.items()))
+                    + "). MS-DIAL runs one acquisition mode per analysis, so this unit cannot run as one. "
+                    "Split it into one unit per acquisition group, each with its own workspace, manifest and "
+                    "Class assignments, and preflight each part."
+                )
+            elif evaluated.eligible:
+                current["status"] = "preflight_passed"
+            else:
+                current["status"] = "preflight_review_required"
 
     if split_parent:
         # Its status as it was, and the disposition it carries as it was: a campaign acts on whatever

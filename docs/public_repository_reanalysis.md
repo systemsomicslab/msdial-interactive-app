@@ -244,6 +244,10 @@ applied: it sets `execution_allowed`, the status (`preflight_passed`,
 `console_acquisition_type` (DDA, SWATH or AIF; none for an input that does not
 run), and the execution gate then admits each file only as that type.
 
+Outside a campaign, an eligible unit with an unreadable input ends as it always
+did, as `preflight_unavailable` (or `preflight_unsupported_format`) with
+`execution_allowed` kept, since nothing outside a campaign can exclude that input.
+
 No disposition changes a unit that was split, whose run has finished
 (`mztab_validated`, `cleanup_pending_confirmation`, `raw_cleaned`) or whose run
 attempt is still open: a campaign preflight of such a unit reads nothing and
