@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import http.client
 import copy
 import csv
 import json
@@ -11,6 +12,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import stat
 import subprocess
 import tempfile
@@ -140,9 +142,94 @@ class EligibilityPolicy:
     allowed_acquisition_modes: tuple[str, ...] = ("DDA", "DIA", "AIF", "SWATH")
 
 
+# HOW LONG A DOWNLOAD MAY GO WITHOUT A BYTE, AND HOW OFTEN IT IS TRIED AGAIN.
+#
+# A repository object was fetched with a 300 s socket timeout and one attempt. A read that stalled held
+# the lease for five minutes and then failed it as a network error, with the .part kept but nothing to
+# resume it until the whole unit was retried; and a cancel asked for during the stall was heard only
+# when a byte next arrived, which it never did, so the lease recorded a timeout rather than the cancel.
+#
+# Now every read carries an idle timeout (no byte for this long raises), a stalled read or a lost
+# connection is retried from the .part after a backoff, and each attempt is recorded. The caller's
+# progress callback is also called at a stall and through each backoff, so a caller that stops a download
+# by raising from it (a cancelled job) is heard within the idle timeout.
+DOWNLOAD_IDLE_TIMEOUT_SECONDS = 120.0
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_RETRY_BACKOFF_SECONDS = (10.0, 30.0, 90.0)
+
+
+class RetryableDownloadError(Exception):
+    """A transfer that stalled or lost its connection. Its .part is kept, and a later attempt resumes it
+    under the same If-Range rules. ``reason`` names what happened; ``download_attempts``, set on the error
+    a download finally raises, lists every attempt it made."""
+
+    reason = "interrupted"
+
+
+class DownloadStalled(RetryableDownloadError, TimeoutError):
+    reason = "stalled"
+
+
+class DownloadConnectionLost(RetryableDownloadError, ConnectionError):
+    reason = "connection_lost"
+
+
+class DownloadIncomplete(RetryableDownloadError, ValueError):
+    """A response that ended before its declared length: a server that hung up early."""
+
+    reason = "incomplete"
+
+
+# What a lost connection looks like from urllib: a reset or an abort mid-transfer, a server gone before
+# its status line (http.client.RemoteDisconnected is a ConnectionResetError), a chunked body cut short,
+# and a TLS stream closed without its close_notify.
+_CONNECTION_LOST = (
+    ConnectionResetError, ConnectionAbortedError, BrokenPipeError, http.client.IncompleteRead, ssl.SSLEOFError,
+)
+
+
+def download_interruption(error: BaseException, idle_timeout: float) -> RetryableDownloadError | None:
+    """The retryable error an exception from a transfer amounts to, or None when retrying would not help.
+
+    An HTTP status, a refused or unresolvable connection, a limit, a changed file: none of those is
+    answered by trying again, and each is raised as it was.
+    """
+    if isinstance(error, RetryableDownloadError):
+        return error
+    cause: BaseException = error
+    if isinstance(error, urllib.error.URLError) and not isinstance(error, urllib.error.HTTPError):
+        if isinstance(error.reason, BaseException):
+            cause = error.reason
+    if isinstance(cause, TimeoutError):
+        return DownloadStalled(
+            f"No bytes arrived from the server for {idle_timeout:g} s. The partial file is kept and a later "
+            "attempt resumes it."
+        )
+    if isinstance(cause, _CONNECTION_LOST):
+        return DownloadConnectionLost(
+            f"The connection was lost during the transfer ({type(cause).__name__}: {cause}). The partial "
+            "file is kept and a later attempt resumes it."
+        )
+    return None
+
+
 class RepositoryHttpClient:
-    def __init__(self, timeout: int = 60) -> None:
+    def __init__(
+        self,
+        timeout: int = 60,
+        *,
+        idle_timeout: float = DOWNLOAD_IDLE_TIMEOUT_SECONDS,
+        retries: int = DOWNLOAD_RETRIES,
+        retry_backoff_seconds: tuple[float, ...] = DOWNLOAD_RETRY_BACKOFF_SECONDS,
+    ) -> None:
+        """``timeout`` is the socket timeout of a metadata request. A download's is ``idle_timeout``: every
+        socket read carries it, so it is how long a transfer may go without a byte. ``retries`` is how many
+        times a stalled or lost transfer is tried again, after ``retry_backoff_seconds`` (the last value
+        repeats); 0 makes one attempt."""
         self.timeout = timeout
+        self.idle_timeout = float(idle_timeout)
+        self.retries = max(0, int(retries))
+        self.retry_backoff_seconds = tuple(float(value) for value in retry_backoff_seconds) or (0.0,)
 
     def get_bytes(self, url: str) -> bytes:
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -170,7 +257,106 @@ class RepositoryHttpClient:
         maximum_bytes: int,
         progress_callback: Any = None,
     ) -> dict[str, Any]:
-        """Fetch one repository object, resuming a partial transfer where the server allows it.
+        """Fetch one repository object, retrying a stalled or lost transfer from its .part.
+
+        Each attempt is one _download_once, with every socket read under the idle timeout. An attempt
+        that stalls, loses its connection or ends short (download_interruption) is tried again after a
+        backoff, up to ``retries`` times, and resumes from the .part it left. Anything else is raised at
+        once. The result carries ``attempts``: one {attempt, started_at, ended_at, outcome,
+        part_bytes_before, part_bytes_after} per attempt, outcome completed, stalled, connection_lost,
+        incomplete, stopped (the progress callback raised) or failed, with the error of one that did not
+        complete. The error a download finally raises carries the same list as ``download_attempts``, and
+        a retryable one keeps its partial file and its validators for a later resume.
+
+        ``progress_callback(received, declared)`` is called as bytes arrive, and also when a read stalls
+        and about once a second through each backoff, with the last values it was given. A caller that
+        stops a download by raising from it (a cancelled job) is therefore heard within the idle timeout,
+        and the exception it raised is what the download raises: a stop, not a network error.
+        """
+        partial = destination.with_name(destination.name + ".part")
+        attempts: list[dict[str, Any]] = []
+        last = [0, 0]
+        stopped: list[BaseException] = []
+
+        def report(received: int, declared: int) -> None:
+            last[:] = [received, declared]
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(received, declared)
+            except BaseException as error:
+                stopped.append(error)
+                raise
+
+        def part_bytes() -> int:
+            try:
+                return partial.stat().st_size if partial.is_file() else 0
+            except OSError:
+                return 0
+
+        def carry(error: BaseException) -> BaseException:
+            try:
+                error.download_attempts = attempts  # type: ignore[attr-defined]
+            except (AttributeError, TypeError):
+                pass
+            return error
+
+        for number in range(1, self.retries + 2):
+            entry: dict[str, Any] = {
+                "attempt": number,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "part_bytes_before": part_bytes(),
+            }
+            attempts.append(entry)
+            try:
+                result = self._download_once(url, destination, maximum_bytes, report)
+            except BaseException as error:
+                entry.update(ended_at=datetime.now(timezone.utc).isoformat(), part_bytes_after=part_bytes())
+                problem = None if stopped else download_interruption(error, self.idle_timeout)
+                if problem is None:
+                    entry.update(
+                        outcome="stopped" if stopped else "failed",
+                        error=str(error) or type(error).__name__,
+                        error_type=type(error).__name__,
+                    )
+                    raise carry(error)
+                entry.update(outcome=problem.reason, error=str(problem), error_type=type(error).__name__)
+                final = number > self.retries
+                if not final:
+                    entry["retry_after_seconds"] = self.retry_backoff_seconds[
+                        min(number - 1, len(self.retry_backoff_seconds) - 1)
+                    ]
+                try:
+                    # The caller is heard at the stall, not only when a next byte arrives, and through
+                    # the backoff.
+                    report(*last)
+                    deadline = time.monotonic() + (0.0 if final else entry["retry_after_seconds"])
+                    while (remaining := deadline - time.monotonic()) > 0:
+                        time.sleep(min(1.0, remaining))
+                        report(*last)
+                except BaseException as stop:
+                    entry.update(outcome="stopped", stopped_after=problem.reason,
+                                 error=str(stop) or type(stop).__name__, error_type=type(stop).__name__)
+                    raise carry(stop) from error
+                if final:
+                    if problem is error:
+                        raise carry(error)
+                    raise carry(problem) from error
+                continue
+            entry.update(ended_at=datetime.now(timezone.utc).isoformat(), outcome="completed",
+                         part_bytes_after=0)
+            result["attempts"] = attempts
+            return result
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _download_once(
+        self,
+        url: str,
+        destination: Path,
+        maximum_bytes: int,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """One attempt at one repository object, resuming a partial transfer where the server allows it.
 
         WHY THIS RESUMES. This used to open the .part file with mode "wb" and send no Range
         header, so every attempt started at byte 0, and it unlinked the .part on any exception,
@@ -231,14 +417,16 @@ class RepositoryHttpClient:
         request = urllib.request.Request(url, headers=headers)
 
         try:
-            response = urllib.request.urlopen(request, timeout=max(self.timeout, 300))
+            # The socket timeout bounds the connect and every read that follows, so no read waits
+            # longer than the idle timeout for a byte.
+            response = urllib.request.urlopen(request, timeout=self.idle_timeout)
         except urllib.error.HTTPError as error:
             # 416 means the range is past the end of the resource: the .part is stale, or the
             # object shrank. Either way the only safe answer is to fetch it whole.
             if error.code == 416 and resume_from:
                 partial.unlink(missing_ok=True)
                 validators_path.unlink(missing_ok=True)
-                return self.download(url, destination, maximum_bytes, progress_callback)
+                return self._download_once(url, destination, maximum_bytes, progress_callback)
             raise
 
         if response.status == 206 and resume_from and _validators_changed(validators, response):
@@ -248,7 +436,7 @@ class RepositoryHttpClient:
             response.close()
             partial.unlink(missing_ok=True)
             validators_path.unlink(missing_ok=True)
-            return self.download(url, destination, maximum_bytes, progress_callback)
+            return self._download_once(url, destination, maximum_bytes, progress_callback)
 
         with response:
             appending = response.status == 206 and resume_from > 0
@@ -318,7 +506,7 @@ class RepositoryHttpClient:
         # that arrived, so every later stage agreed with it. Found by the resume test, which
         # serves a deliberately truncated response.
         if total_declared and downloaded != total_declared:
-            raise ValueError(
+            raise DownloadIncomplete(
                 f"Download ended at {downloaded} of {total_declared} declared bytes. "
                 f"The partial file is kept at {partial.name} and the next attempt will resume."
             )
@@ -1628,6 +1816,12 @@ def _record_download_failure(
     }
     if stage:
         record["download_failure"]["stage"] = stage
+    attempts = getattr(error, "download_attempts", None)
+    if isinstance(attempts, list):
+        # RepositoryHttpClient.download: each attempt at the object that failed, and how it ended.
+        record["download_failure"]["attempts"] = attempts
+        if isinstance(error, RetryableDownloadError):
+            record["download_failure"]["retryable"] = True
     if isinstance(error, ArchiveError):
         failure = error.record()
         failure["rejected_members"] = failure["rejected_members"][:50]

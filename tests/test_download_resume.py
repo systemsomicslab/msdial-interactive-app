@@ -100,7 +100,9 @@ class ResumeTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.destination = Path(self.directory.name) / "object.zip"
         self.partial = self.destination.with_name("object.zip.part")
-        self.client = RepositoryHttpClient(timeout=10)
+        # One attempt: these tests are about what a single attempt leaves on disk. Retries are
+        # test_download_timeouts'.
+        self.client = RepositoryHttpClient(timeout=10, retries=0)
 
     def tearDown(self) -> None:
         self.directory.cleanup()
@@ -284,7 +286,9 @@ class IfRangeTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.destination = Path(self.directory.name) / "object.zip"
         self.validators = self.destination.with_name("object.zip.part.json")
-        self.client = RepositoryHttpClient(timeout=10)
+        # One attempt: these tests are about what a single attempt leaves on disk. Retries are
+        # test_download_timeouts'.
+        self.client = RepositoryHttpClient(timeout=10, retries=0)
         self.httpd = http.server.HTTPServer(("127.0.0.1", 0), _ValidatingHandler)
         self.httpd.payload = PAYLOAD
         self.httpd.etag = '"v1"'
