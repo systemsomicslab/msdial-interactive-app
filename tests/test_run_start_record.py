@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -22,8 +24,10 @@ from unittest.mock import patch
 _CONFIG = tempfile.TemporaryDirectory()
 with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
     from msdial_app import server
+    from msdial_app.process_liveness import process_is_alive
     from msdial_app.repository_reanalysis import (
         _write_json,
+        live_run_attempt,
         read_manifest,
         record_run_end,
         record_run_process,
@@ -39,6 +43,15 @@ CONSOLE = {
     "assembly_path": "Q:\\synthetic\\console\\MSDIALCUI.dll",
     "warning": "",
 }
+
+
+def _end_leftover(pid: int) -> None:
+    # Only a failed test leaves a stand-in Console running; it is not left behind for the next one.
+    if process_is_alive(pid):
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True, check=False)
+        else:
+            os.kill(pid, signal.SIGKILL)
 
 
 class _Unit:
@@ -268,6 +281,37 @@ class TheJobsRecordTheirAttempts(_Unit, unittest.TestCase):
         self.assertEqual(1.0, attempt["timeout_seconds"])
         self.assertIn("method", attempt["detail"]["stop"])
         self.assertIn("time limit", read_manifest(self.manifest)["run_failures"][-1]["reason"])
+
+    def test_a_time_limit_past_ten_years_is_refused_with_the_request(self) -> None:
+        # What POST /api/agent/run and /api/agent/tuning/run read, before any job is registered.
+        with self.assertRaisesRegex(ValueError, "at most ten years"):
+            server._console_watch_request({"timeout_seconds": 1e12})
+
+    def test_a_console_that_fails_after_its_start_is_stopped_and_frees_its_unit(self) -> None:
+        """The job failed while its Console ran on untracked: no pid recorded, nothing to cancel, and the
+        unit open to a second Console. Here the deadline overflows, as 1e12 s once did."""
+        preparation = self.preparation([sys.executable, "-c", "import time; time.sleep(120)"])
+        self.job("run4", "run", preparation)
+        with server.JOBS_LOCK:
+            server._register_process_locked("run4", "run", timeout_seconds=1e12)
+
+        # The ten-year ceiling lifted, so the deadline overflows after the Console has started.
+        with patch("msdial_app.workflow._WATCH_MAX_SECONDS", float("inf")):
+            server._run_job("run4", preparation)
+        [attempt] = self.attempts()
+        job = self.jobs["run4"]
+        pid = job["console_outcome"]["pid"]
+        self.addCleanup(_end_leftover, pid)
+
+        self.assertEqual("failed", job["status"])
+        self.assertEqual("error", attempt["reason"])
+        self.assertIn("OverflowError", attempt["detail"]["error"])
+        self.assertIn("stop", attempt["detail"], "how the Console was stopped is recorded")
+        deadline = time.monotonic() + 10
+        while process_is_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertIs(False, process_is_alive(pid), "the Console is stopped, not left running")
+        self.assertIsNone(live_run_attempt(self.manifest))
 
     def test_a_local_analysis_records_nothing(self) -> None:
         before = self.manifest.read_bytes()

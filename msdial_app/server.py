@@ -738,7 +738,11 @@ def _run_console_for_job(
                 attempt,
                 None,
                 "error" if outcome.get("pid") else "start_failed",
-                {"error": f"{type(error).__name__}: {error}"},
+                # A Console still running at the error was stopped by run_console; the stop says how.
+                {
+                    "error": f"{type(error).__name__}: {error}",
+                    **({"stop": outcome["stop"]} if "stop" in outcome else {}),
+                },
             )
         raise
     finally:

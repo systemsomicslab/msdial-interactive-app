@@ -88,6 +88,19 @@ class WithoutAWatch(_Console, unittest.TestCase):
             with self.assertRaises(ValueError):
                 console_watch_seconds(value, "timeout_seconds")
 
+    def test_a_time_limit_past_ten_years_is_refused_before_anything_starts(self) -> None:
+        """From about 2.6e11 s the deadline is past the last date Python can represent. It was accepted,
+        and computing the deadline failed with the Console already running and nobody tracking it."""
+        self.assertEqual(3e8, console_watch_seconds(3e8))
+        for value in (1e12, "4e8"):
+            with self.assertRaisesRegex(ValueError, "at most ten years"):
+                console_watch_seconds(value, "timeout_seconds")
+
+        with patch("msdial_app.workflow.subprocess.Popen", side_effect=AssertionError("no Console")):
+            for watch in ({"timeout_seconds": 1e12}, {"idle_timeout_seconds": 1e12}):
+                with self.assertRaisesRegex(ValueError, "at most ten years"):
+                    run_console(self.preparation("pass"), self.lines.append, **watch)
+
 
 class TheTimeLimit(_Console, unittest.TestCase):
     def test_a_console_past_its_time_limit_is_stopped_with_minus_3(self) -> None:
@@ -232,6 +245,101 @@ class TheStartCallback(_Console, unittest.TestCase):
         self.leftover.extend(started)
 
         self.assertTrue(_gone(started[0]))
+
+
+class AFailureOnceItRuns(_Console, unittest.TestCase):
+    """Whatever fails once the Console exists stops it. The caller sees only the failure: it could
+    neither cancel that Console nor keep a second one off its unit."""
+
+    def assert_stopped(self, outcome: dict) -> None:
+        self.leftover.append(outcome["pid"])
+        self.assertTrue(_gone(outcome["pid"]), "the Console is stopped, not left running")
+        self.assertIn("stop", outcome)
+
+    def test_a_deadline_that_cannot_be_computed(self) -> None:
+        outcome: dict = {}
+
+        # The ten-year ceiling lifted, so the deadline overflows as it did before there was one.
+        with patch("msdial_app.workflow._WATCH_MAX_SECONDS", float("inf")):
+            with self.assertRaises(OverflowError):
+                run_console(
+                    self.preparation("import time; time.sleep(120)"),
+                    self.lines.append,
+                    timeout_seconds=1e12,
+                    outcome=outcome,
+                )
+
+        self.assert_stopped(outcome)
+
+    def test_a_line_handler_that_raises_watched_or_not(self) -> None:
+        def evicted(_line: str) -> None:
+            raise KeyError("job evicted")
+
+        for watch in ({"timeout_seconds": 600}, {}):
+            with self.subTest(watch=watch):
+                outcome: dict = {}
+                with self.assertRaises(KeyError):
+                    run_console(
+                        self.preparation("import time; print('hi'); time.sleep(120)"),
+                        evicted,
+                        outcome=outcome,
+                        **watch,
+                    )
+                self.assert_stopped(outcome)
+
+
+class TheDrain(_Console, unittest.TestCase):
+    def test_a_slow_line_handler_loses_none_of_the_console_output(self) -> None:
+        """The pipe is read ahead of the handler. The watch gave up on that backlog a drain time after
+        the Console exited and called the pipe left open, losing the last lines - the Console's
+        closing errors, which the failure diagnosis reads."""
+        count = 2000
+        script = f"import sys\nfor index in range({count}): sys.stdout.write('line %d\\n' % index)\n"
+
+        def slow(line: str) -> None:
+            self.lines.append(line)
+            time.sleep(0.001)
+
+        outcome: dict = {}
+        with patch("msdial_app.workflow._WATCH_DRAIN_SECONDS", 0.25):
+            code = run_console(self.preparation(script), slow, cancel_event=threading.Event(), outcome=outcome)
+        self.leftover.append(outcome["pid"])
+
+        self.assertEqual(0, code)
+        self.assertEqual(count, len(self.lines))
+        self.assertEqual(f"line {count - 1}", self.lines[-1])
+        self.assertNotIn("output_left_open", outcome)
+
+    def test_a_survivor_still_writing_into_the_pipe_does_not_hold_the_job(self) -> None:
+        """A process the Console started keeps the pipe open and keeps writing. What it wrote within the
+        drain time is passed on; the job is not held for the rest."""
+        marker = self.root / "survivor.pid"
+        survivor = (
+            "import sys, time\n"
+            "for index in range(1200):\n"
+            "    sys.stdout.write('tick\\n'); sys.stdout.flush(); time.sleep(0.1)\n"
+        )
+        script = (
+            "import subprocess, sys, time\n"
+            f"child = subprocess.Popen([sys.executable, '-c', {survivor!r}])\n"
+            f"open({str(marker)!r}, 'w').write(str(child.pid))\n"
+            "time.sleep(1)\n"
+            "print('bye', flush=True)\n"
+        )
+        outcome: dict = {}
+        started = time.monotonic()
+        with patch("msdial_app.workflow._WATCH_DRAIN_SECONDS", 1.0):
+            code = run_console(
+                self.preparation(script), self.lines.append, cancel_event=threading.Event(), outcome=outcome
+            )
+        elapsed = time.monotonic() - started
+        self.leftover.extend([outcome["pid"], int(marker.read_text())])
+
+        self.assertEqual(0, code)
+        self.assertIn("bye", self.lines)
+        self.assertIn("tick", self.lines, "the survivor wrote into the Console's pipe")
+        self.assertTrue(outcome.get("output_left_open"))
+        self.assertLess(elapsed, 30, "the survivor's output was not waited on to its end")
 
 
 if __name__ == "__main__":  # pragma: no cover

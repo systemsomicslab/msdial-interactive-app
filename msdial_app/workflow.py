@@ -2517,9 +2517,14 @@ CONSOLE_EXIT_CANCELLED = -4
 # among them - can tell the watch's account of a stop from anything the Console printed.
 CONSOLE_WATCHDOG_PREFIX = "Console watchdog: "
 _WATCH_POLL_SECONDS = 0.25
-# After the Console has exited, how long its remaining output is waited for. A process it started can
-# inherit the pipe and hold it open for as long as it lives; the job does not wait on that.
+# After the Console has exited, how long its pipe is waited on for more output. Everything the pipe
+# delivered within that time is passed on, however long a slow line handler takes over it. A process the
+# Console started can inherit the pipe and hold it open, and write to it, for as long as it lives; the
+# job does not wait on that.
 _WATCH_DRAIN_SECONDS = 10.0
+# The longest time limit accepted: ten years. A longer one is a mistake rather than a limit, and from
+# about 2.6e11 s its deadline is past the last date Python can represent.
+_WATCH_MAX_SECONDS = 10 * 365.25 * 24 * 3600
 _WATCH_KILL_WAIT_SECONDS = 30.0
 _ACTIVITY_SCAN_MAX_SECONDS = 10.0
 _ACTIVITY_ROOT_LIMIT = 64
@@ -2539,6 +2544,10 @@ def console_watch_seconds(value: Any, name: str = "time limit") -> float | None:
         raise ValueError(f"{name} must be a positive number of seconds, or 0 for no limit.")
     if seconds == 0 or math.isinf(seconds):
         return None
+    if seconds > _WATCH_MAX_SECONDS:
+        raise ValueError(
+            f"{name} must be at most ten years ({_WATCH_MAX_SECONDS:.0f} s), or 0 for no limit."
+        )
     return seconds
 
 
@@ -2573,9 +2582,11 @@ def run_console(
 
     ``on_start`` receives the Console's process id as soon as the process exists. If it raises, the
     Console is stopped and the exception propagates, so no Console runs that its caller could not
-    register. ``outcome``, when given, is filled with what happened: the reason (exited, timeout,
-    idle_timeout, cancelled, sciex_scan_sidecar), the process id, the start and end times, and how a stop
-    was made.
+    register. The same holds for anything else that fails once the process exists - ``on_line``, the
+    watch itself: the Console is stopped before the failure reaches the caller, who could otherwise
+    neither see nor stop it. ``outcome``, when given, is filled with what happened: the reason (exited,
+    timeout, idle_timeout, cancelled, sciex_scan_sidecar), the process id, the start and end times, and
+    how a stop was made.
     """
     timeout = console_watch_seconds(timeout_seconds, "timeout_seconds")
     idle = console_watch_seconds(idle_timeout_seconds, "idle_timeout_seconds")
@@ -2616,22 +2627,27 @@ def run_console(
     )
     started = time.monotonic()
     report["pid"] = getattr(process, "pid", None)
-    report["started_at"] = _utc_now()
-    if timeout is not None:
-        report["deadline_at"] = (
-            dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=timeout)
-        ).isoformat()
-    if on_start is not None:
-        try:
+    try:
+        report["started_at"] = _utc_now()
+        if timeout is not None:
+            report["deadline_at"] = (
+                dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=timeout)
+            ).isoformat()
+        if on_start is not None:
             on_start(process.pid)
-        except BaseException:
-            _stop_console_tree(process, group=watched)
-            raise
-    assert process.stdout is not None
-    if watched:
-        code = _watch_console(process, on_line, preparation, timeout, idle, cancel_event, report, started)
-    else:
-        code = _read_console(process, on_line, report)
+        assert process.stdout is not None
+        if watched:
+            code = _watch_console(
+                process, on_line, preparation, timeout, idle, cancel_event, report, started
+            )
+        else:
+            code = _read_console(process, on_line, report)
+    except BaseException:
+        # The caller learns of the failure but not of a Console still running, which it could neither
+        # cancel nor keep a second one off the unit for. A stop the watch already made keeps its record.
+        if process.poll() is None:
+            report.setdefault("stop", _stop_console_tree(process, group=watched))
+        raise
     report["exit_code"] = code
     report["ended_at"] = _utc_now()
     report["elapsed_seconds"] = round(time.monotonic() - started, 3)
@@ -2677,16 +2693,18 @@ def _watch_console(
     report: dict[str, Any],
     started: float,
 ) -> int:
-    lines: queue.Queue[str | None] = queue.Queue()
+    # Each line with the time the pipe delivered it; None once the pipe is closed. Unbounded, so the
+    # Console never waits on a slow line handler - and none of its lines is lost to one either.
+    lines: queue.Queue[tuple[float, str | None]] = queue.Queue()
 
     def read() -> None:
         try:
             for line in process.stdout:
-                lines.put(line)
+                lines.put((time.monotonic(), line))
         except (OSError, ValueError):
             pass
         finally:
-            lines.put(None)
+            lines.put((time.monotonic(), None))
 
     # The pipe is read here, never in the watching thread, so nothing the Console does with its output
     # can keep the watch from acting. on_line is still called only from the caller's thread.
@@ -2705,11 +2723,15 @@ def _watch_console(
         line = ""
         if not at_end:
             try:
-                item = lines.get(timeout=_WATCH_POLL_SECONDS)
+                arrived, item = lines.get(timeout=_WATCH_POLL_SECONDS)
             except queue.Empty:
-                item = ""
+                arrived, item = 0.0, ""
             if item is None:
                 at_end = True
+            elif exited_at is not None and arrived - exited_at >= _WATCH_DRAIN_SECONDS:
+                # Written after the drain time, by something that outlived the Console and holds its pipe.
+                report["output_left_open"] = True
+                break
             else:
                 line = item
         else:
@@ -2729,12 +2751,13 @@ def _watch_console(
                     stop, stopped_at = ("sciex_scan_sidecar", CONSOLE_EXIT_SCIEX_SIDECAR), now
                     report["stop"] = _stop_console_tree(process, group=True)
         if process.poll() is not None:
-            # Exited, on its own or stopped: collect what it still wrote, for a bounded time.
+            # Exited, on its own or stopped. Everything already read from the pipe is passed on, however
+            # long that takes; the pipe itself is waited on for a bounded time.
             if at_end:
                 break
             if exited_at is None:
                 exited_at = now
-            elif now - exited_at >= _WATCH_DRAIN_SECONDS:
+            elif now - exited_at >= _WATCH_DRAIN_SECONDS and lines.empty():
                 report["output_left_open"] = True
                 break
             continue

@@ -1979,8 +1979,8 @@ def msdial_start_guided_analysis(
 
     timeout_seconds stops the Console when it runs longer than that, and idle_timeout_seconds when
     neither its output nor its log grows for that long; the job then fails with exit code -3. Both are 0,
-    no limit, unless given. A repository unit runs one Console at a time: a second start for the same
-    unit is refused with reason unit_busy and the live job's id.
+    no limit, unless given; a limit past ten years is refused. A repository unit runs one Console at a
+    time: a second start for the same unit is refused with reason unit_busy and the live job's id.
     """
     return _request_json(
         "POST",
