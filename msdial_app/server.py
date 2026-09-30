@@ -2556,11 +2556,16 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
         # holding the invariant that the published matrix has as many samples as were approved. The
         # tuning job has made exactly this check on its own single expected file all along.
         export_verification = _verify_expected_exports(preparation)
-        # Before anything reads the outputs: the mzTab-M loses this machine's locations, and a repository
+        # Before anything reads the outputs: the mzTab-M loses this machine's locations, and a campaign
         # unit's MS-DIAL containers leave the raw tree and its loaded-library copy is deleted. What is
         # validated, inventoried and shared below is what the run keeps.
         finalisation = finalise_console_run(
             job_id, preparation, artifacts, exit_code, export_verification, log
+        )
+        # What it could not do is held in the unit manifest; the job says so where a reader looks first.
+        artifact_warnings.extend(
+            f"Finalisation hold on {hold['step']} (blocks {' and '.join(hold['blocks'])}): {hold['reason']}."
+            for hold in finalisation.get("holds") or []
         )
         with JOBS_LOCK:
             JOBS[job_id]["console_run_finalisation"] = finalisation

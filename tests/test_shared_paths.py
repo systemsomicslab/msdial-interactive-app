@@ -15,14 +15,18 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from msdial_app import run_finalisation
 from msdial_app.materials_methods import generate_publication_report
 from msdial_app.mztab_validation import validate_mztab_file
 from msdial_app.repository_reanalysis import _write_json
-from msdial_app.run_finalisation import finalise_console_run, redact_mztab
+from msdial_app.run_finalisation import FinalisationHeld, finalise_console_run, redact_mztab
 from msdial_app.sharing import PATH_POLICY, SHARED_PATHS_MEMBER, SharingContext, library_records
 from msdial_app.workflow import _write_reproduction_files
 
@@ -331,6 +335,108 @@ class MztabRedactionTests(unittest.TestCase):
         result = redact_mztab(path, SharingContext([], [], full=True))
         self.assertFalse(result["changed"])
         self.assertEqual(stamp, path.stat().st_mtime_ns)
+
+    def test_every_custom_param_has_four_fields_as_a_strict_reader_splits_them(self) -> None:
+        # [label, accession, name, value]: a comma inside a name or value must be quoted, or jmzTab-M reads a
+        # fifth field. The identity line used to end "private, not distributed".
+        finalise_console_run("job1", self.unit["preparation"], {"mztab": [str(self.unit["mztab"])]}, 0,
+                             {"missing": []}, lambda _line: None)
+        customs = {key: value for key, value in self._metadata().items() if key.startswith("custom[")}
+
+        self.assertEqual(["custom[1]", "custom[2]", "custom[3]"], sorted(customs))
+        for key, value in customs.items():
+            with self.subTest(param=key):
+                self.assertEqual(4, len(_param_fields(value)), value)
+        self.assertEqual("MS-DIAL library file database[1]", _param_fields(customs["custom[3]"])[2])
+
+    def test_a_library_name_with_a_comma_is_quoted_in_its_identity_line(self) -> None:
+        library = SimpleNamespace(name="MSMS, Private-pos.msp", identity={"sha256": PRIVATE_SHA, "bytes": 5})
+        line = run_finalisation._identity_line(4, "1", library)
+        fields = _param_fields(line.split("\t", 2)[2])
+
+        self.assertEqual(4, len(fields), line)
+        self.assertEqual(f"MSMS, Private-pos.msp; sha256:{PRIVATE_SHA}; 5 bytes; private; not distributed", fields[3])
+
+
+def _param_fields(value: str) -> list[str]:
+    """An mzTab-M Param's fields, as a reader that honours quoting splits them."""
+    text = value.strip()
+    assert text.startswith("[") and text.endswith("]"), text
+    return next(csv.reader([text[1:-1]], skipinitialspace=True))
+
+
+@unittest.skipUnless(os.name == "nt", "Windows refuses to replace a file another handle holds open; POSIX does not")
+class HeldMztabTests(unittest.TestCase):
+    """The Console's mzTab-M held open by another reader - a viewer, the indexer, antivirus - while the job
+    finalises. The redaction used to be skipped with a warning, and the unit kept the private location."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.unit = build_unit(Path(self.directory.name))
+        self.quick = patch.multiple(run_finalisation, RETRY_DELAYS_SECONDS=(0.05,) * 40, RETRY_BUDGET_SECONDS=0.3)
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def test_a_reader_that_lets_go_within_the_budget_costs_nothing(self) -> None:
+        handle = self.unit["mztab"].open("rb")
+        timer = threading.Timer(0.3, handle.close)
+        timer.start()
+        try:
+            with patch.multiple(run_finalisation, RETRY_DELAYS_SECONDS=(0.05,) * 400, RETRY_BUDGET_SECONDS=10.0):
+                record = finalise_console_run("job1", self.unit["preparation"], {"mztab": [str(self.unit["mztab"])]},
+                                              0, {"missing": []}, lambda _line: None)
+        finally:
+            timer.join()
+
+        self.assertEqual([], record["errors"])
+        self.assertEqual([], record["holds"])
+        self.assertIn("MTD\tdatabase[1]-uri\tnull", self.unit["mztab"].read_text(encoding="utf-8"))
+
+    def test_a_laboratory_run_with_no_manifest_carries_its_hold_in_the_job_record(self) -> None:
+        preparation = {**self.unit["preparation"], "repository_run_manifest": ""}
+        before = self.unit["manifest"].read_bytes()
+        with self.unit["mztab"].open("rb"), self.quick:
+            record = finalise_console_run("job1", preparation, {"mztab": [str(self.unit["mztab"])]}, 0,
+                                          {"missing": []}, lambda _line: None)
+
+        self.assertEqual("laboratory", record["scope"])
+        self.assertEqual([(["sharing"], "mztab_redaction")], [(item["blocks"], item["step"]) for item in record["holds"]])
+        self.assertEqual(before, self.unit["manifest"].read_bytes())
+
+    def test_an_mztab_held_past_the_budget_is_held_from_publication_until_a_retry_redacts_it(self) -> None:
+        logs: list[str] = []
+        with self.unit["mztab"].open("rb"), self.quick:
+            record = finalise_console_run("job1", self.unit["preparation"], {"mztab": [str(self.unit["mztab"])]},
+                                          0, {"missing": []}, logs.append)
+            with self.assertRaisesRegex(FinalisationHeld, r"^finalisation_held \[sharing\]: .*held from sharing"):
+                publish(self.unit)
+
+        self.assertEqual(["mztab_redaction"], [item["step"] for item in record["holds"]])
+        self.assertTrue(any("held" in line for line in logs if line.startswith("WARNING")))
+        [hold] = json.loads(self.unit["manifest"].read_text(encoding="utf-8"))["finalisation_holds"]
+        self.assertEqual(["sharing"], hold["blocks"])
+        self.assertIn("file://E:/lab libs/MSMS-Private-pos-VS21.msp", self.unit["mztab"].read_text(encoding="utf-8"))
+        self.assertFalse((self.unit["output"] / "MS_DIAL_publication_report.json").exists())
+        self.assertEqual([], [path.name for path in self.unit["output"].iterdir() if path.name.startswith(".redact-")])
+
+        # Let go: the publication retries the redaction first, then the unit's shared artifacts pass SEC-1.
+        publish(self.unit)
+        text = self.unit["mztab"].read_text(encoding="utf-8")
+        self.assertIn("MTD\tdatabase[1]-uri\tnull", text)
+        self.assertNotIn("lab libs", text)
+        manifest = json.loads(self.unit["manifest"].read_text(encoding="utf-8"))
+        self.assertEqual([], manifest["finalisation_holds"])
+        self.assertEqual(["mztab_redaction"], [item["step"] for item in manifest["finalisation_hold_resolutions"]])
+        kept = json.loads((self.unit["manifest"].parent / "mztab-redaction.local.json").read_text(encoding="utf-8"))
+        self.assertIn("file://E:/lab libs/MSMS-Private-pos-VS21.msp",
+                      [change["original"] for entry in kept["files"] for change in entry["changes"]])
+        gate = _load_gate()
+        if gate is not None:  # the gate is the reanalysis checkout's; it is read, never written
+            report = gate.Report(self.unit["workspace"])
+            gate.check_no_private_path_in_a_shared_artifact(report, self.unit["output"], "before-publish")
+            check = next(item for item in report.checks if item.check_id == "SEC-1")
+            self.assertEqual(gate.PASS, check.status, check.detail)
 
 
 class WorkflowBundleTests(unittest.TestCase):

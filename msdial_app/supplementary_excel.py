@@ -366,7 +366,7 @@ def _annotation_sheet(workflow: dict[str, Any], libraries: list[dict[str, Any]] 
                         item.get("role", ""),
                         item.get("sha256", "") or "not recorded",
                         item.get("bytes") if isinstance(item.get("bytes"), int) else "not recorded",
-                        "private, not distributed" if item.get("private") else "public",
+                        "private; not distributed" if item.get("private") else "public",
                         item.get("doi", "") or item.get("source", ""),
                     ],
                     "body_left",

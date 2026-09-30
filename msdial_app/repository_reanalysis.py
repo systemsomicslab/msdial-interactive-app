@@ -26,7 +26,14 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Iterator
-from .diagnostic_paths import INTERMEDIATES_DIRECTORY, is_diagnostic_artifact, is_intermediate_artifact
+from .diagnostic_paths import (
+    INTERMEDIATES_DIRECTORY,
+    extended_path,
+    intermediate_files,
+    is_diagnostic_artifact,
+    is_intermediate_artifact,
+    path_is_file,
+)
 from .process_liveness import process_created_at, process_is_alive
 
 try:
@@ -1903,14 +1910,12 @@ def _retained_result_paths(
 
     MS-DIAL's per-file and alignment containers, moved out of the raw tree after the run
     (run_finalisation.relocate_intermediates), are kept whatever their names: the raw data they sat beside
-    are deleted, and these are what a restored project would read.
+    are deleted, and these are what a restored project would read. They are listed by a walk that sees a
+    path longer than MAX_PATH, which rglob silently leaves out.
     """
     results = []
     for path in output.rglob("*") if output.is_dir() else []:
-        if is_diagnostic_artifact(path):
-            continue
-        if path.is_file() and is_intermediate_artifact(path, output):
-            results.append(path.resolve())
+        if is_diagnostic_artifact(path) or is_intermediate_artifact(path, output):
             continue
         if path.is_file() and (
             path.suffix.casefold() in TEXT_RESULT_SUFFIXES
@@ -1921,6 +1926,8 @@ def _retained_result_paths(
             )
         ):
             results.append(path.resolve())
+    if output.is_dir():
+        results.extend(intermediate_files(output.resolve()))
     records = [
         path.resolve()
         for path in provenance.rglob("*")
@@ -2012,7 +2019,7 @@ def refresh_retained_artifacts(manifest_path: Path) -> dict[str, Any]:
             current["retained_artifacts"] = combined
             current["retained_artifact_inventory"] = [
                 _artifact_inventory(Path(path))
-                if Path(path).is_file()
+                if path_is_file(path)
                 else previous.get(path, {"path": path})
                 for path in combined
             ]
@@ -2700,13 +2707,18 @@ def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
     rules require the person approving it to have seen three things first: the artifacts that will be
     retained, the paths that will be removed, and how much will be freed. This produces those three so a
     caller can present them; it changes nothing.
+
+    A run whose finalisation could not move MS-DIAL's containers out of the raw tree holds the deletion
+    (run_finalisation.raw_deletion_holds): the containers would go with it.
     """
+    from .run_finalisation import describe_holds, raw_deletion_holds
+
     manifest_path = manifest_path.resolve()
     manifest = read_manifest(manifest_path)
     raw_root = Path(manifest.get("raw_directory", "")).resolve()
     workspace = Path(manifest.get("workspace", "")).resolve()
     retained = [Path(value) for value in manifest.get("retained_artifacts", [])]
-    missing = [str(path) for path in retained if not path.exists()]
+    missing = [str(path) for path in retained if not os.path.exists(extended_path(path))]
     file_count, total_bytes = _tree_size(raw_root)
     within_workspace = raw_root.parent == workspace and raw_root.name == "raw"
     blockers: list[str] = []
@@ -2722,7 +2734,14 @@ def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
         blockers.append(f"{len(missing)} recorded retained artifacts are missing from disk.")
     if not within_workspace:
         blockers.append("The raw directory is not the expected 'raw' folder inside the project workspace.")
+    held = raw_deletion_holds(manifest_path, manifest)
+    if held:
+        blockers.append(
+            "MS-DIAL containers are still in the raw directory, and its deletion would delete them: "
+            + describe_holds(held) + "."
+        )
     return {
+        **({"finalisation_holds": held} if held else {}),
         "manifest_path": str(manifest_path),
         "status": manifest.get("status"),
         "retention_policy": manifest.get("raw_retention_policy"),
@@ -2760,7 +2779,20 @@ def request_download_cleanup(manifest_path: Path) -> dict[str, Any]:
 
 
 def cleanup_download_lease(manifest_path: Path, confirmed: bool = False) -> dict[str, Any]:
+    from .run_finalisation import (
+        BLOCKS_RAW_DELETION,
+        FinalisationHeld,
+        raw_deletion_holds,
+        resolve_finalisation_holds,
+    )
+
     manifest_path = manifest_path.resolve()
+    if raw_deletion_holds(manifest_path):
+        # The move the run's finalisation could not make is retried before the preview is drawn, so that
+        # the preview describes what the deletion would really remove; what it moves joins the retained
+        # inventory. Nothing here deletes.
+        resolve_finalisation_holds(manifest_path)
+        refresh_retained_artifacts(manifest_path)
     manifest = read_manifest(manifest_path)
     if not confirmed:
         # The preview carries the retained artifacts, the target and the size, because a confirmation
@@ -2772,12 +2804,19 @@ def cleanup_download_lease(manifest_path: Path, confirmed: bool = False) -> dict
     if manifest.get("status") not in CLEANUP_READY_STATUSES or not manifest.get("cleanup_allowed"):
         raise ValueError("Raw cleanup requires a completed/validated manifest with cleanup_allowed=true.")
     retained = [Path(value) for value in manifest.get("retained_artifacts", [])]
-    if not retained or any(not path.exists() for path in retained):
+    if not retained or any(not os.path.exists(extended_path(path)) for path in retained):
         raise ValueError("Retained mzTab-M/provenance artifacts are missing; raw cleanup was refused.")
     raw_root = Path(manifest["raw_directory"]).resolve()
     workspace = Path(manifest["workspace"]).resolve()
     if raw_root.parent != workspace or raw_root.name != "raw":
         raise ValueError("Raw directory is outside the expected project workspace.")
+    held = raw_deletion_holds(manifest_path, manifest)
+    if held:
+        raise FinalisationHeld(
+            BLOCKS_RAW_DELETION,
+            "MS-DIAL containers are still in the raw directory, and deleting it would delete them; raw cleanup "
+            "was refused", held,
+        )
     shutil.rmtree(raw_root)
     cleaned_at = datetime.now(timezone.utc).isoformat()
 
@@ -2826,6 +2865,15 @@ def discard_download_lease(manifest_path: Path, confirmed: bool = False) -> dict
     workspace = Path(manifest["workspace"]).resolve()
     if raw_root.parent != workspace or raw_root.name != "raw":
         raise ValueError("Raw directory is outside the expected project workspace.")
+    from .run_finalisation import BLOCKS_RAW_DELETION, FinalisationHeld, raw_deletion_holds
+
+    held = raw_deletion_holds(manifest_path, manifest)
+    if held:
+        raise FinalisationHeld(
+            BLOCKS_RAW_DELETION,
+            "MS-DIAL containers a finished run could not move are still in the raw directory, and the cleanup "
+            "command retries the move; discard was refused", held,
+        )
     if raw_root.exists():
         shutil.rmtree(raw_root)
     discarded_at = datetime.now(timezone.utc).isoformat()
@@ -3122,12 +3170,13 @@ def _archive_project_results(output: Path) -> Path | None:
 
 def _artifact_inventory(path: Path) -> dict[str, Any]:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    # A moved container's path can be longer than MAX_PATH.
+    with open(extended_path(path), "rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     entry = {
         "path": str(path.resolve()),
-        "size_bytes": path.stat().st_size,
+        "size_bytes": os.stat(extended_path(path)).st_size,
         "sha256": digest.hexdigest(),
     }
     # The two kinds a reader must not mistake for ordinary results: a record that holds this machine's

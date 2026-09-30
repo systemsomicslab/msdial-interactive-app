@@ -5,7 +5,7 @@ unit's retained artifacts are inventoried, so that what is validated, inventorie
 run keeps. It never raises: a step that fails is recorded, and the run's own verdict is left to validation and
 the gate.
 
-THREE THINGS, decided by the user on 2026-09-30 for repository analysis units.
+THREE THINGS, decided by the user on 2026-09-30 for the unattended repository campaign.
 
 1. The mzTab-M names no location from this machine. The Console writes ``database[n]-uri`` as
    ``file://<library path>`` and ``ms_run[n]-location`` as ``file://<raw file path>`` (MztabFormatExport.cs).
@@ -24,20 +24,41 @@ THREE THINGS, decided by the user on 2026-09-30 for repository analysis units.
    ``_PeakProperties.arf``, ``_DriftSopts.arf`` and ``_tags.xml``. ``<ts>`` is ``yyyyMdHm`` with no zero padding,
    so it cannot be parsed back into a time, and every earlier attempt - a failed run, a peak-count
    diagnostic - left a set of its own. The finalised run's set is the one whose timestamp its mzTab-M carries
-   (``AlignResult-<ts>.mzTab``), else, per input, the newest; it moves to ``output/<job>/msdial-intermediates/``
-   with its path under the raw directory kept. The other sets of this unit's inputs are recorded as
-   superseded and left to be deleted with the raw tree.
+   (``AlignResult-<ts>.mzTab``), else, per input, the newest; it moves to ``output/msdial-intermediates/``
+   with its path under the raw directory kept, and the job that moved it is named in the record. The other
+   sets of this unit's inputs are recorded as superseded and left to be deleted with the raw tree.
 
 3. ``<project>_Loaded.msp2.dbs``, MS-DIAL's serialised copy of every library the run loaded, is deleted from
    the output once the run is over, its name, size and sha256 recorded. With the private VS21 pair it is a
    copy of the private library in every unit, and it can never be shared.
 
-THE PROJECT CANNOT BE REOPENED AS IT STANDS. The ``.mdproject`` names the output directory and the ``.mddata``;
-the ``.mddata`` names every input by its absolute raw path and every container by its absolute path beside
-it, and the project loader reads the libraries back from ``<project>_Loaded.msp2.dbs``. After this, and after
-the raw data are released, MS-DIAL stops at the missing library copy. Copying ``msdial-intermediates/`` back
-under the raw directory, with the raw files re-downloaded, restores every path the ``.mddata`` names; the
-library copy is not restorable without running again.
+1 applies to every run. 2 and 3 apply only to a unit a campaign approval has been recorded for - in its own
+manifest's campaign_authorizations, or in those of the unit it was split from - because they were decided for
+the campaign, whose raw data are deleted. Any other run, a trial repository unit included whatever its
+retention policy, leaves its containers beside its inputs and its library copy in its output, as it always
+has, and its project can still be reopened in place.
+
+HOLDS. On Windows a file another process holds open without FILE_SHARE_DELETE - a viewer, the search indexer,
+antivirus scanning what the Console has just written - can be neither replaced nor deleted, and a container the
+Console could write can have a path too long for an ordinary move. Every file step is retried on
+PermissionError within one time budget, and the moves use extended-length paths. A step that still fails does
+not end as a log line. It becomes a hold in the unit manifest's ``finalisation_holds``:
+
+- one that blocks ``sharing`` (an mzTab-M that still names a location, a library copy still in the output) is
+  refused by the publication report, and must be refused by anything else built to leave this machine;
+- one that blocks ``raw_deletion`` (containers still beside the inputs) is refused by the raw cleanup and the
+  discard, a split parent's included when one of its parts holds it.
+
+Each of those steps first retries what is held (resolve_finalisation_holds), so a lock let go in the meantime
+clears itself. A laboratory run has no manifest: its hold is in the job record and the log.
+
+THE PROJECT CANNOT BE REOPENED AS IT STANDS once 2 and 3 have run. The ``.mdproject`` names the output
+directory and the ``.mddata``; the ``.mddata`` names every input by its absolute raw path and every container
+by its absolute path beside it, and the project loader reads the libraries back from
+``<project>_Loaded.msp2.dbs``. After this, and after the raw data are released, MS-DIAL stops at the missing
+library copy. Copying ``msdial-intermediates/`` back under the raw directory, with the raw files
+re-downloaded, restores every path the ``.mddata`` names; the library copy is not restorable without running
+again.
 """
 
 from __future__ import annotations
@@ -48,18 +69,28 @@ import hashlib
 import os
 import re
 import shutil
+import time
 import urllib.parse
 import uuid
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
-from .diagnostic_paths import INTERMEDIATES_DIRECTORY
+from .diagnostic_paths import INTERMEDIATES_DIRECTORY, extended_path, path_is_file
 from .sharing import PATH_POLICY, SharingContext, local_path_of
 
 
 SCHEMA = "msdial-console-run-finalisation.v1"
 REDACTION_RECORD = "mztab-redaction.local.json"
 LOADED_LIBRARY_COPY = "*_Loaded.msp2.dbs"
+HOLDS = "finalisation_holds"
+HOLD_RESOLUTIONS = "finalisation_hold_resolutions"
+BLOCKS_SHARING = "sharing"
+BLOCKS_RAW_DELETION = "raw_deletion"
+
+# The pauses between attempts at a file step another process holds, drawn from one budget of waiting per call:
+# a unit whose every container is held waits the budget once, not once per file.
+RETRY_DELAYS_SECONDS = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 15.0)
+RETRY_BUDGET_SECONDS = 60.0
 
 _TIMESTAMP = r"(?P<ts>20\d{6,10})"
 PER_FILE_SUFFIX = re.compile(
@@ -78,6 +109,7 @@ _DATABASE_VERSION = re.compile(r"database\[(\d+)\]-version")
 _DATABASE_LINE = re.compile(r"database\[\d+\]")
 _RUN_LOCATION = re.compile(r"ms_run\[\d+\]-location")
 _CUSTOM = re.compile(r"custom\[(\d+)\]")
+_PREPARATION_KEYS = ("run_directory", "settings_file", "manifest", "repository_run_manifest")
 
 PROJECT_REOPEN = {
     "reopenable_in_place": False,
@@ -100,12 +132,16 @@ def _now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def _sha256(path: Path) -> str:
+def _sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with open(extended_path(path), "rb") as handle:
         for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _size(path: str | Path) -> int:
+    return os.stat(extended_path(path)).st_size
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -115,6 +151,31 @@ def _read_json(path: Path) -> dict[str, Any]:
         return read_manifest(path) if path.is_file() else {}
     except (OSError, ValueError):
         return {}
+
+
+class _Patience:
+    """One budget of waiting for a call's file steps, spent only on PermissionError.
+
+    That is what Windows raises (ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION) for replacing or deleting a file
+    another process has open without FILE_SHARE_DELETE, and the holder usually lets go within seconds. Any other
+    error is not a lock and is not waited for. Only the pauses count against the budget, so hashing a
+    multi-gigabyte library copy first does not use up the patience its deletion needs.
+    """
+
+    def __init__(self, budget: float | None = None) -> None:
+        self.budget = RETRY_BUDGET_SECONDS if budget is None else budget
+        self.waited = 0.0
+
+    def run(self, step: Callable[[], Any]) -> Any:
+        for delay in RETRY_DELAYS_SECONDS:
+            try:
+                return step()
+            except PermissionError:
+                if self.waited + delay > self.budget:
+                    raise
+            self.waited += delay
+            time.sleep(delay)
+        return step()
 
 
 # ---- 1. the mzTab-M ---------------------------------------------------------------------------------
@@ -143,13 +204,27 @@ def _run_location(value: str, context: SharingContext) -> str:
     return urllib.parse.quote(relative, safe="/")
 
 
+def _param_field(text: str) -> str:
+    """One field of an mzTab-M Param, ``[label, accession, name, value]``.
+
+    The specification requires a name or value that holds a comma to be quoted, and a strict reader
+    (jmzTab-M) splits an unquoted one into a fifth field. A tab or line break would end the line, and a double
+    quote (which no Windows file name holds) would end the quoting, so they are replaced.
+    """
+    clean = re.sub(r"[\t\r\n]+", " ", str(text)).replace('"', "'")
+    return f'"{clean}"' if "," in clean else clean
+
+
 def _identity_line(index: int, database: str, library: Any) -> str:
     identity = library.identity
     parts = [library.name, "sha256:" + (identity.get("sha256") or "not recorded")]
     if isinstance(identity.get("bytes"), int):
         parts.append(f"{identity['bytes']} bytes")
-    parts.append("private, not distributed")
-    return f"MTD\tcustom[{index}]\t[,, MS-DIAL library file database[{database}], {'; '.join(parts)}]"
+    # '; ' between the parts, as the Console writes its own custom[n] lines.
+    parts.append("private; not distributed")
+    return (
+        f"MTD\tcustom[{index}]\t[,, MS-DIAL library file database[{database}], {_param_field('; '.join(parts))}]"
+    )
 
 
 def _mtd_fields(text: str) -> list[str] | None:
@@ -157,12 +232,15 @@ def _mtd_fields(text: str) -> list[str] | None:
     return parts if len(parts) == 3 and parts[0] == "MTD" else None
 
 
-def redact_mztab(path: str | Path, context: SharingContext) -> dict[str, Any]:
+def redact_mztab(
+    path: str | Path, context: SharingContext, patience: _Patience | None = None
+) -> dict[str, Any]:
     """Rewrite one Console mzTab-M's metadata locations in place, atomically. Only MTD lines change.
 
     Returns what changed, with the original values under ``changes`` for a local-only record; nothing else
     returned carries a location. The metadata section is read into memory; the tables after it are copied
-    as they are.
+    as they are. The final replace waits, within ``patience``, for another process to let the file go; if it
+    does not, the file is left exactly as it was and the error is raised.
     """
     source = Path(path)
     result: dict[str, Any] = {"file": source.name, "changed": False, "database_uri": 0, "ms_run_location": 0,
@@ -254,7 +332,7 @@ def redact_mztab(path: str | Path, context: SharingContext) -> dict[str, Any]:
             temporary.unlink(missing_ok=True)
             raise
     try:
-        os.replace(temporary, source)
+        (patience or _Patience()).run(lambda: os.replace(temporary, source))
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -308,18 +386,22 @@ def _is_under(path: Path, root: Path) -> bool:
     return True
 
 
-def _move(source: Path, target: Path) -> str:
-    """Move one file; on another volume, copy it, compare the bytes, then remove the source."""
-    target.parent.mkdir(parents=True, exist_ok=True)
+def _move(source: Path, target: Path, patience: _Patience) -> str:
+    """Move one file, at any path length; on another volume, copy it, compare the bytes, then remove the source."""
+    origin, destination = extended_path(source), extended_path(target)
+    Path(extended_path(target.parent)).mkdir(parents=True, exist_ok=True)
     try:
-        os.replace(source, target)
+        patience.run(lambda: os.replace(origin, destination))
         return "rename"
+    except PermissionError:
+        # Still held after the budget. A copy could not remove the source either, so none is made.
+        raise
     except OSError:
-        shutil.copy2(source, target)
-        if _sha256(source) != _sha256(target):
-            target.unlink(missing_ok=True)
+        shutil.copy2(origin, destination)
+        if _sha256(origin) != _sha256(destination):
+            os.unlink(destination)
             raise OSError(f"The copy of {source.name} does not match its source; the source was kept.")
-        source.unlink()
+        patience.run(lambda: os.unlink(origin))
         return "copy"
 
 
@@ -329,10 +411,20 @@ def relocate_intermediates(
     raw_directory: Path,
     output_directory: Path,
     mztab_names: list[str],
+    *,
+    pinned: dict[str, Any] | None = None,
+    patience: _Patience | None = None,
 ) -> dict[str, Any]:
-    """Move the finalised run's MS-DIAL containers from beside its inputs into the unit's output."""
+    """Move the finalised run's MS-DIAL containers from beside its inputs into the unit's output.
+
+    ``pinned`` is an earlier call's choice for the same run - its alignment timestamp and each input's
+    timestamp - and is how a retry moves what that call could not, and nothing else: an input whose set has
+    already left the raw tree is not given an earlier attempt's set in its place. Every path that could not be
+    moved is listed in ``pending``, with the reason in ``errors``.
+    """
+    patience = patience or _Patience()
     raw_root = raw_directory.resolve()
-    destination = output_directory.resolve() / job_id / INTERMEDIATES_DIRECTORY
+    destination = output_directory.resolve() / INTERMEDIATES_DIRECTORY
     record: dict[str, Any] = {
         "schema": "msdial-intermediates-relocation.v1",
         "job_id": job_id,
@@ -346,6 +438,7 @@ def relocate_intermediates(
         "selection": [],
         "left_in_place": [],
         "no_intermediates_found": [],
+        "pending": [],
         "errors": [],
         "project_reopen": dict(PROJECT_REOPEN),
     }
@@ -354,8 +447,11 @@ def relocate_intermediates(
         record["errors"].append("The analysis CSV lists no input, so no container could be attributed.")
         return record
 
+    pinned_inputs = {str(key): str(value) for key, value in ((pinned or {}).get("selection") or {}).items()}
     exported = {match.group("ts") for name in mztab_names for match in [ALIGNMENT_EXPORT.fullmatch(name)] if match}
     alignment_ts = max(exported, key=lambda item: (len(item), item)) if exported else ""
+    if pinned_inputs:
+        alignment_ts = str((pinned or {}).get("alignment_timestamp") or "")
     names_by_directory: dict[Path, list[str]] = {}
     for path_text, name in inputs:
         names_by_directory.setdefault(_directory_of(path_text), []).append(name)
@@ -392,11 +488,13 @@ def relocate_intermediates(
     chosen_timestamps: list[str] = []
     for _path, name in inputs:
         sets = groups.get(name) or {}
-        if not sets:
+        if name in pinned_inputs:
+            timestamp, rule = pinned_inputs[name], "pinned"
+        elif not sets:
             if name not in {item["input"] for item in record["selection"]}:
                 record["no_intermediates_found"].append(name)
             continue
-        if alignment_ts and alignment_ts in sets:
+        elif alignment_ts and alignment_ts in sets:
             timestamp, rule = alignment_ts, "alignment_timestamp"
         else:
             timestamp, rule = max(sets, key=lambda item: newest(sets[item])), "newest"
@@ -406,7 +504,7 @@ def relocate_intermediates(
             target = chosen if ts == timestamp else superseded
             target.extend(("per_file", name, path, ts) for path in paths)
         groups[name] = {}  # an input listed twice is attributed once
-    if not alignment_ts and chosen_timestamps:
+    if not alignment_ts and chosen_timestamps and not pinned_inputs:
         common = max(set(chosen_timestamps), key=chosen_timestamps.count)
         alignment_ts = common if common in alignment_sets else ""
     if alignment_ts in alignment_sets:
@@ -427,25 +525,30 @@ def relocate_intermediates(
             continue
         relative = resolved.relative_to(raw_root)
         target = destination / relative
+        entry: dict[str, Any] = {"relative_path": relative.as_posix(), "path": str(target), "kind": kind,
+                                 "input": name, "timestamp": timestamp}
         try:
-            size = resolved.stat().st_size
-            if target.exists():
-                if target.stat().st_size == size and _sha256(target) == _sha256(resolved):
-                    resolved.unlink()
+            size = _size(resolved)
+            if path_is_file(target):
+                earlier_copy = {"size_bytes": _size(target), "sha256": _sha256(target)}
+                if earlier_copy["size_bytes"] == size and earlier_copy["sha256"] == _sha256(resolved):
+                    patience.run(lambda: os.unlink(extended_path(resolved)))
                     method = "already_moved"
                 else:
-                    record["errors"].append(f"{relative.as_posix()}: a different file is already at the destination")
-                    continue
+                    # An earlier run of this unit, within the same minute, moved a container of this name. This
+                    # run has overwritten that run's outputs of the same names, and its container follows them.
+                    method = _move(resolved, target, patience)
+                    entry["replaced"] = earlier_copy
             else:
-                method = _move(resolved, target)
+                method = _move(resolved, target, patience)
         except OSError as error:
             record["errors"].append(f"{relative.as_posix()}: {error}")
+            record["pending"].append(relative.as_posix())
             continue
-        record["moved"].append({"relative_path": relative.as_posix(), "path": str(target), "size_bytes": size,
-                                "kind": kind, "input": name, "timestamp": timestamp, "method": method})
+        record["moved"].append({**entry, "size_bytes": size, "method": method})
     for kind, name, path, timestamp in superseded:
         try:
-            size = path.stat().st_size
+            size = _size(path)
         except OSError:
             continue
         try:
@@ -459,11 +562,21 @@ def relocate_intermediates(
     return record
 
 
+def _pinned(relocation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "alignment_timestamp": relocation.get("alignment_timestamp") or "",
+        "selection": {item["input"]: item["timestamp"] for item in relocation.get("selection") or []},
+    }
+
+
 # ---- 3. the loaded-library copy ------------------------------------------------------------------------
 
 
-def delete_loaded_library_copies(output_directory: Path) -> tuple[list[dict[str, Any]], list[str]]:
+def delete_loaded_library_copies(
+    output_directory: Path, patience: _Patience | None = None
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Delete MS-DIAL's serialised copies of the loaded libraries, recording each by name, size and sha256."""
+    patience = patience or _Patience()
     deleted: list[dict[str, Any]] = []
     errors: list[str] = []
     if not output_directory.is_dir():
@@ -474,7 +587,7 @@ def delete_loaded_library_copies(output_directory: Path) -> tuple[list[dict[str,
         try:
             size = path.stat().st_size
             digest = _sha256(path)
-            path.unlink()
+            patience.run(path.unlink)
         except OSError as error:
             errors.append(f"{path.name}: {error}")
             continue
@@ -482,7 +595,253 @@ def delete_loaded_library_copies(output_directory: Path) -> tuple[list[dict[str,
     return deleted, errors
 
 
+def _library_copies(directories: list[Path]) -> list[str]:
+    return [str(path) for directory in directories if directory.is_dir()
+            for path in sorted(directory.glob(LOADED_LIBRARY_COPY)) if path.is_file()]
+
+
+# ---- holds -----------------------------------------------------------------------------------------------
+
+
+def _hold(blocks: list[str], step: str, job_id: str, reason: str, **detail: Any) -> dict[str, Any]:
+    return {"id": uuid.uuid4().hex, "blocks": list(blocks), "step": step, "job_id": job_id, "reason": reason,
+            "recorded_at": _now(), **detail}
+
+
+class FinalisationHeld(ValueError):
+    """A step refused because a run's finalisation left something undone that the step would make unsafe.
+
+    A ValueError, so every structured-error path reports it; the message starts with a fixed token and what
+    is blocked, so an unattended caller can tell a held unit from any other refusal without parsing prose.
+    """
+
+    def __init__(self, blocks: str, message: str, holds: list[dict[str, Any]]) -> None:
+        self.blocks = blocks
+        self.holds = list(holds)
+        super().__init__(f"finalisation_held [{blocks}]: {message}: {describe_holds(self.holds)}.")
+
+
+def _hold_summaries(holds: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{key: item[key] for key in ("id", "blocks", "step", "reason")} for item in holds]
+
+
+def standing_holds(manifest: dict[str, Any], blocks: str | None = None) -> list[dict[str, Any]]:
+    """The holds a unit manifest records, or only those that block ``blocks``."""
+    holds = [item for item in manifest.get(HOLDS) or [] if isinstance(item, dict)]
+    return [item for item in holds if blocks is None or blocks in (item.get("blocks") or [])]
+
+
+def _split_parts(manifest: dict[str, Any]) -> list[Path]:
+    return [Path(str(item["manifest_path"])) for item in manifest.get("split_into") or []
+            if isinstance(item, dict) and str(item.get("manifest_path") or "").strip()]
+
+
+def raw_deletion_holds(manifest_path: str | Path, manifest: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """What forbids deleting this unit's raw directory: its own holds, and those of every part split from it.
+
+    A part reads its parent's raw tree and moves its containers out of it, so a part that could not is a hold
+    on the parent's deletion. A part manifest that exists and cannot be read is one too.
+    """
+    from .repository_reanalysis import read_manifest
+
+    path = Path(str(manifest_path)).expanduser().resolve()
+    manifest = manifest if manifest is not None else _read_json(path)
+    found = [{**item, "manifest_path": str(path)} for item in standing_holds(manifest, BLOCKS_RAW_DELETION)]
+    for part in _split_parts(manifest):
+        if not part.is_file():
+            continue
+        part = part.resolve()
+        try:
+            recorded = read_manifest(part)
+        except (OSError, ValueError) as error:
+            found.append({**_hold([BLOCKS_RAW_DELETION], "part_manifest", "",
+                                  f"The manifest of a part split from this unit could not be read: {error}"),
+                          "manifest_path": str(part)})
+            continue
+        found.extend({**item, "manifest_path": str(part)}
+                     for item in standing_holds(recorded, BLOCKS_RAW_DELETION))
+    return found
+
+
+def describe_holds(holds: list[dict[str, Any]]) -> str:
+    """One sentence for a refusal, naming each held step and its run."""
+    return "; ".join(
+        f"{item.get('step')} of run {item.get('job_id') or 'unrecorded'} ({item.get('reason')})" for item in holds
+    )
+
+
+def _retry_hold(
+    hold: dict[str, Any], manifest_path: Path, patience: _Patience
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """(the hold as it stands after one retry, or None; a resolution note, or None)."""
+    step = hold.get("step")
+    now = _now()
+    note = {"hold": hold.get("id"), "step": step, "job_id": hold.get("job_id"), "resolved_at": now}
+    if step == "mztab_redaction":
+        context, _run_directory, _manifest_text = _sharing_context(hold.get("preparation") or {})
+        left, errors, done, changed = [], [], [], []
+        for file in hold.get("files") or []:
+            path = Path(str(file))
+            if not path.is_file():
+                done.append({"file": path.name, "outcome": "gone"})
+                continue
+            try:
+                result = redact_mztab(path, context, patience)
+            except OSError as error:
+                left.append(str(file))
+                errors.append(f"{path.name}: {error}")
+                continue
+            if result["changed"]:
+                changed.append(result)
+            done.append({"file": path.name, "outcome": "redacted" if result["changed"] else "nothing_to_redact"})
+        if changed:
+            try:
+                _record_redactions(manifest_path, str(hold.get("job_id") or ""), changed)
+            except (OSError, ValueError, TypeError) as error:
+                note["local_record_error"] = f"{REDACTION_RECORD}: {error}"
+        if left:
+            return {**hold, "files": left, "errors": errors, "last_retried_at": now}, None
+        return None, {**note, "files": done}
+    if step == "loaded_library_copy":
+        left, errors, deleted = [], [], []
+        for file in hold.get("files") or []:
+            path = Path(str(file))
+            if not path.is_file():
+                continue
+            try:
+                size, digest = path.stat().st_size, _sha256(path)
+                patience.run(path.unlink)
+            except OSError as error:
+                left.append(str(file))
+                errors.append(f"{path.name}: {error}")
+                continue
+            deleted.append({"name": path.name, "size_bytes": size, "sha256": digest, "deleted_at": _now()})
+        if left:
+            return {**hold, "files": left, "errors": errors, "last_retried_at": now}, None
+        return None, {**note, "deleted": deleted}
+    if step == "msdial_intermediates":
+        raw = Path(str(hold.get("raw_directory") or ""))
+        if not str(hold.get("raw_directory") or "").strip() or not raw.is_dir():
+            return None, {**note, "outcome": "the raw directory is gone; nothing is left to move"}
+        relocation = relocate_intermediates(
+            str(hold.get("job_id") or ""), Path(str(hold.get("csv_path") or "")), raw,
+            Path(str(hold.get("output_directory") or "")), list(hold.get("mztab_names") or []),
+            pinned=hold.get("pinned") or {}, patience=patience,
+        )
+        if relocation["errors"]:
+            return {**hold, "errors": relocation["errors"], "pending": relocation["pending"],
+                    "last_retried_at": now}, None
+        return None, {**note, "moved": relocation["moved"], "moved_bytes": relocation["moved_bytes"]}
+    # Recorded when finalisation itself failed: nothing says what is left to do, so a person looks.
+    return hold, None
+
+
+def _resolve_in(manifest_path: Path, patience: _Patience, log: Callable[[str], None]) -> list[dict[str, Any]]:
+    from .repository_reanalysis import update_manifest
+
+    holds = standing_holds(_read_json(manifest_path))
+    if not holds:
+        return []
+    outcomes: dict[str, tuple[dict[str, Any] | None, dict[str, Any] | None]] = {}
+    for hold in holds:
+        try:
+            outcomes[str(hold.get("id"))] = _retry_hold(hold, manifest_path, patience)
+        except Exception as error:  # a retry must not make a refusal into a crash
+            outcomes[str(hold.get("id"))] = (
+                {**hold, "errors": [f"{type(error).__name__}: {error}"], "last_retried_at": _now()}, None
+            )
+    for updated, note in outcomes.values():
+        if note:
+            log(f"Finalisation hold on {note['step']} of run {note['job_id']} resolved on retry.")
+        elif updated is not None and updated.get("errors"):
+            log(f"WARNING: finalisation hold on {updated['step']} of run {updated['job_id']} still stands: "
+                + "; ".join(updated["errors"][:3]))
+
+    def change(current: dict[str, Any]) -> None:
+        kept = []
+        for item in current.get(HOLDS) or []:
+            key = str(item.get("id")) if isinstance(item, dict) else ""
+            if key not in outcomes:
+                kept.append(item)
+                continue
+            updated, note = outcomes[key]
+            if updated is not None:
+                kept.append(updated)
+            if note:
+                current[HOLD_RESOLUTIONS] = [*(current.get(HOLD_RESOLUTIONS) or []), note]
+        current[HOLDS] = kept
+
+    try:
+        update_manifest(manifest_path, change)
+    except (OSError, ValueError) as error:
+        log(f"WARNING: the finalisation holds of {manifest_path.name} could not be updated: {error}")
+        return [{**item, "manifest_path": str(manifest_path)} for item in holds]
+    return [{**updated, "manifest_path": str(manifest_path)} for updated, _note in outcomes.values()
+            if updated is not None]
+
+
+def resolve_finalisation_holds(
+    manifest_path: str | Path, log: Callable[[str], None] | None = None
+) -> list[dict[str, Any]]:
+    """Retry every step a run's finalisation left held on this unit and on the parts split from it.
+
+    Returns the holds that still stand, each naming the manifest it is recorded in. Never raises: a unit whose
+    manifest cannot be read has nothing this can retry, and its caller's own checks refuse it.
+    """
+    path = Path(str(manifest_path or "")).expanduser()
+    if not str(manifest_path or "").strip() or not path.is_file():
+        return []
+    path = path.resolve()
+    patience = _Patience()
+    say = log or (lambda _line: None)
+    standing = _resolve_in(path, patience, say)
+    for part in _split_parts(_read_json(path)):
+        if part.is_file():
+            standing.extend(_resolve_in(part.resolve(), patience, say))
+    return standing
+
+
 # ---- the one call ------------------------------------------------------------------------------------
+
+
+def _sharing_context(preparation: dict[str, Any]) -> tuple[SharingContext, Path, str]:
+    run_directory = Path(str(preparation.get("run_directory") or "")).expanduser()
+    state = _read_json(Path(str(preparation.get("settings_file") or run_directory / "workflow-settings.json")))
+    recorded = _read_json(Path(str(preparation.get("manifest") or run_directory / "run-manifest.json")))
+    # The job's own preparation says whether this is a repository unit's run; the settings follow it.
+    manifest_text = str(preparation.get("repository_run_manifest") or "").strip()
+    state = {**{key: value for key, value in state.items() if key != "repository_run_manifest"},
+             **({"repository_run_manifest": manifest_text} if manifest_text else {})}
+    context = SharingContext.for_state(state, run_directory=run_directory, recorded=recorded.get("libraries"))
+    return context, run_directory, manifest_text
+
+
+def _record_redactions(manifest_path: Path, job_id: str, changed: list[dict[str, Any]]) -> Path:
+    """Append what was rewritten, the original values included, to the unit's local-only record."""
+    from .repository_reanalysis import _write_json
+
+    local = manifest_path.parent / REDACTION_RECORD
+    previous = _read_json(local)
+    entries = [entry for entry in previous.get("files") or [] if isinstance(entry, dict)]
+    entries.extend({"job_id": job_id, "recorded_at": _now(), **item} for item in changed)
+    _write_json(local, {
+        "schema": "msdial-mztab-redaction.v1",
+        # The locations the shared mzTab-M no longer carries. It stays on this machine: no bundle, report or
+        # project archive includes it.
+        "sharing": "local_only",
+        "files": entries,
+    })
+    return local
+
+
+def campaign_approval_recorded(manifest: dict[str, Any]) -> bool:
+    """Whether a campaign approval has been recorded for this unit, or for the unit it was split from."""
+    if any(isinstance(item, dict) for item in manifest.get("campaign_authorizations") or []):
+        return True
+    parent = str((manifest.get("split_from") or {}).get("manifest_path") or "").strip()
+    if not parent:
+        return False
+    return any(isinstance(item, dict) for item in _read_json(Path(parent)).get("campaign_authorizations") or [])
 
 
 def finalise_console_run(
@@ -495,21 +854,29 @@ def finalise_console_run(
 ) -> dict[str, Any]:
     """Everything above, for one production job, once the Console has returned. Never raises.
 
-    A laboratory run gets the mzTab-M's private-library redaction and nothing else. A repository unit gets all
-    three: the containers move only for a run that produced every expected export, since a failed run's set
-    is left to be deleted with the raw tree, and the loaded-library copy is deleted whatever the outcome.
-    ``artifacts`` loses the paths of what was deleted, so no later record names a file that is gone.
+    Every run gets the mzTab-M redaction. A unit a campaign approval covers also gets the other two: the
+    containers move only for a run that produced every expected export, since a failed run's set is left to
+    be deleted with the raw tree, and the loaded-library copy is deleted whatever the outcome. ``artifacts``
+    loses the paths of what was deleted, so no later record names a file that is gone. What could not be done
+    is recorded as a hold in the unit manifest, which the steps it would make unsafe refuse.
     """
-    record: dict[str, Any] = {"schema": SCHEMA, "job_id": job_id, "finalised_at": _now(), "errors": []}
+    record: dict[str, Any] = {
+        "schema": SCHEMA, "job_id": job_id, "finalised_at": _now(), "errors": [], "holds": [],
+    }
+    holds: list[dict[str, Any]] = []
+    manifest_path: Path | None = None
+    campaign = False
+    patience = _Patience()
+    manifest: dict[str, Any] = {}
     try:
-        run_directory = Path(str(preparation.get("run_directory") or "")).expanduser()
-        state = _read_json(Path(str(preparation.get("settings_file") or run_directory / "workflow-settings.json")))
-        recorded = _read_json(Path(str(preparation.get("manifest") or run_directory / "run-manifest.json")))
-        # The job's own preparation says whether this is a repository unit's run; the settings follow it.
+        # First, so that whatever fails below is held in the unit's own manifest.
         manifest_text = str(preparation.get("repository_run_manifest") or "").strip()
-        state = {**{key: value for key, value in state.items() if key != "repository_run_manifest"},
-                 **({"repository_run_manifest": manifest_text} if manifest_text else {})}
-        context = SharingContext.for_state(state, run_directory=run_directory, recorded=recorded.get("libraries"))
+        if manifest_text:
+            manifest_path = Path(manifest_text).expanduser().resolve()
+            manifest = _read_json(manifest_path)
+            campaign = campaign_approval_recorded(manifest)
+            record["campaign_approval_recorded"] = campaign
+        context, run_directory, _manifest_text = _sharing_context(preparation)
         record["scope"] = "repository_unit" if manifest_text else "laboratory"
         if context.full:
             record["shared_path_policy"] = PATH_POLICY
@@ -517,12 +884,15 @@ def finalise_console_run(
         complete = exit_code == 0 and not (export_verification or {}).get("missing")
 
         redactions: list[dict[str, Any]] = []
+        unredacted: list[str] = []
         for path in artifacts.get("mztab") or []:
             try:
-                redactions.append(redact_mztab(path, context))
+                redactions.append(redact_mztab(path, context, patience))
             except OSError as error:
+                unredacted.append(str(path))
                 record["errors"].append(f"mzTab-M {Path(path).name}: {error}")
-                log(f"WARNING: the mzTab-M {Path(path).name} could not be redacted: {error}")
+                log(f"WARNING: the mzTab-M {Path(path).name} could not be redacted, and it is held: nothing "
+                    f"may share it until a retry redacts it. {error}")
         record["mztab_redaction"] = [{key: value for key, value in item.items() if key != "changes"}
                                      for item in redactions]
         for item in redactions:
@@ -532,82 +902,119 @@ def finalise_console_run(
                     f"{item['ms_run_location']} ms_run location(s) and {item['other']} other value(s) "
                     f"rewritten; {item['identity_lines']} library identity line(s) added."
                 )
+        if unredacted:
+            holds.append(_hold(
+                [BLOCKS_SHARING], "mztab_redaction", job_id,
+                "the mzTab-M could not be rewritten; it may still name a library or raw location of this machine",
+                files=unredacted, preparation={key: str(preparation.get(key) or "") for key in _PREPARATION_KEYS},
+            ))
 
-        if not manifest_text:
+        if manifest_path is None:
+            record["holds"] = _hold_summaries(holds)
             return record
-        manifest_path = Path(manifest_text).expanduser().resolve()
-        manifest = _read_json(manifest_path)
         output = Path(str(manifest.get("output_directory") or run_directory)).expanduser()
         changed = [item for item in redactions if item["changed"]]
         if changed:
-            from .repository_reanalysis import _write_json
-
-            local = manifest_path.parent / REDACTION_RECORD
             try:
-                previous = _read_json(local)
-                entries = [entry for entry in previous.get("files") or [] if isinstance(entry, dict)]
-                entries.extend({"job_id": job_id, "recorded_at": _now(), **item} for item in changed)
-                _write_json(local, {
-                    "schema": "msdial-mztab-redaction.v1",
-                    # The locations the shared mzTab-M no longer carries. It stays on this machine: no bundle,
-                    # report or project archive includes it.
-                    "sharing": "local_only",
-                    "files": entries,
-                })
-                record["local_only"] = [str(local)]
+                record["local_only"] = [str(_record_redactions(manifest_path, job_id, changed))]
             except (OSError, ValueError, TypeError) as error:
                 record["errors"].append(f"{REDACTION_RECORD}: {error}")
 
-        if complete:
+        if not campaign:
+            # Decided for the campaign, whose raw data are deleted: a trial or manual run keeps the project
+            # MS-DIAL can reopen, with its containers beside the kept raw data and its library copy.
+            record["left_as_before"] = {
+                "steps": ["msdial_intermediates", "loaded_library_copy"],
+                "reason": "No campaign approval is recorded for this unit, so its MS-DIAL containers stay beside "
+                          "its inputs and the loaded-library copy stays in its output, as before.",
+            }
+        elif complete:
             raw = str(manifest.get("raw_directory") or "").strip()
             if raw:
                 csv_path = Path(str(preparation.get("input_csv") or run_directory / "analysis_files.csv"))
-                relocation = relocate_intermediates(
-                    job_id, csv_path, Path(raw), output,
-                    [Path(str(path)).name for path in artifacts.get("mztab") or []],
-                )
+                mztab_names = [Path(str(path)).name for path in artifacts.get("mztab") or []]
+                relocation = relocate_intermediates(job_id, csv_path, Path(raw), output, mztab_names,
+                                                    patience=patience)
                 record["msdial_intermediates"] = relocation
                 log(
                     f"MS-DIAL intermediates: moved {len(relocation['moved'])} file(s) "
-                    f"({relocation.get('moved_bytes', 0) / 1e6:.1f} MB) into {job_id}/{INTERMEDIATES_DIRECTORY} "
-                    f"in the output; {len(relocation['superseded'])} file(s) of earlier attempts are recorded "
-                    "as superseded and stay in the raw directory."
+                    f"({relocation.get('moved_bytes', 0) / 1e6:.1f} MB) into {INTERMEDIATES_DIRECTORY} in the "
+                    f"output; {len(relocation['superseded'])} file(s) of earlier attempts are recorded as "
+                    "superseded and stay in the raw directory."
                 )
                 for error in relocation["errors"]:
                     log("WARNING: MS-DIAL intermediates: " + error)
+                if relocation["errors"]:
+                    holds.append(_hold(
+                        [BLOCKS_RAW_DELETION], "msdial_intermediates", job_id,
+                        f"{len(relocation['pending']) or 'some'} container(s) could not be moved out of the raw "
+                        "directory, and deleting it would delete them",
+                        csv_path=str(csv_path), raw_directory=raw, output_directory=str(output),
+                        mztab_names=mztab_names, pinned=_pinned(relocation), pending=relocation["pending"],
+                        errors=relocation["errors"],
+                    ))
             else:
                 record["errors"].append("The unit manifest names no raw_directory; no container was moved.")
 
-        deleted, errors = delete_loaded_library_copies(run_directory)
-        if output.resolve() != run_directory.resolve():
-            more, more_errors = delete_loaded_library_copies(output)
-            deleted, errors = deleted + more, errors + more_errors
-        record["loaded_library_copies_deleted"] = deleted
-        record["errors"].extend(errors)
-        for item in deleted:
-            log(f"Deleted MS-DIAL's loaded-library copy {item['name']} ({item['size_bytes']} bytes, "
-                f"sha256 {item['sha256']}).")
-        gone = {item["name"].casefold() for item in deleted}
-        if gone:
-            for kind, paths in list(artifacts.items()):
-                if kind != "records" and isinstance(paths, list):
-                    artifacts[kind] = [path for path in paths if Path(str(path)).name.casefold() not in gone]
-            if isinstance(artifacts.get("records"), list):
-                artifacts["records"] = [item for item in artifacts["records"]
-                                        if Path(str((item or {}).get("path") or "")).name.casefold() not in gone]
-
-        from .repository_reanalysis import update_manifest
-
-        def change(current: dict[str, Any]) -> None:
-            current["console_run_finalisation"] = record
-
-        try:
-            update_manifest(manifest_path, change)
-        except (OSError, ValueError) as error:
-            record["errors"].append(f"unit manifest: {error}")
+        if campaign:
+            directories = [run_directory, *([output] if output.resolve() != run_directory.resolve() else [])]
+            deleted: list[dict[str, Any]] = []
+            for directory in directories:
+                more, errors = delete_loaded_library_copies(directory, patience)
+                deleted.extend(more)
+                record["errors"].extend(errors)
+            record["loaded_library_copies_deleted"] = deleted
+            for item in deleted:
+                log(f"Deleted MS-DIAL's loaded-library copy {item['name']} ({item['size_bytes']} bytes, "
+                    f"sha256 {item['sha256']}).")
+            left = _library_copies(directories)
+            if left:
+                log("WARNING: MS-DIAL's loaded-library copy could not be deleted, and it is held: "
+                    + ", ".join(Path(path).name for path in left))
+                holds.append(_hold(
+                    [BLOCKS_SHARING], "loaded_library_copy", job_id,
+                    "MS-DIAL's copy of every loaded library is still in the output", files=left,
+                ))
+            gone = {item["name"].casefold() for item in deleted}
+            if gone:
+                for kind, paths in list(artifacts.items()):
+                    if kind != "records" and isinstance(paths, list):
+                        artifacts[kind] = [path for path in paths if Path(str(path)).name.casefold() not in gone]
+                if isinstance(artifacts.get("records"), list):
+                    artifacts["records"] = [
+                        item for item in artifacts["records"]
+                        if Path(str((item or {}).get("path") or "")).name.casefold() not in gone
+                    ]
     except Exception as error:  # a defect here must not cost the run its validation
         record["errors"].append(f"{type(error).__name__}: {error}")
         log(f"WARNING: finalising the Console run's outputs failed: {type(error).__name__}: {error}")
+        # Nothing says what was left undone, so a person looks before this unit's outputs are shared or, for a
+        # unit the campaign covers, its raw data deleted.
+        holds.append(_hold(
+            [BLOCKS_SHARING, *([BLOCKS_RAW_DELETION] if campaign else [])], "finalisation", job_id,
+            f"finalisation stopped: {type(error).__name__}: {error}",
+        ))
+
+    record["holds"] = _hold_summaries(holds)
+    if manifest_path is None:
+        return record
+    from .repository_reanalysis import update_manifest
+
+    def change(current: dict[str, Any]) -> None:
+        current["console_run_finalisation"] = record
+        earlier = standing_holds(current)
+        if "msdial_intermediates" in record:
+            # This run's set is the unit's set now. One an earlier run could not move is superseded with it.
+            dropped = [item for item in earlier if item.get("step") == "msdial_intermediates"]
+            if dropped:
+                record["superseded_holds"] = [item.get("id") for item in dropped]
+            earlier = [item for item in earlier if item.get("step") != "msdial_intermediates"]
+        current[HOLDS] = [*earlier, *holds]
+
+    try:
+        update_manifest(manifest_path, change)
+    except (OSError, ValueError) as error:
+        record["errors"].append(f"unit manifest: {error}")
+        if holds:
+            log(f"WARNING: the finalisation holds could not be recorded in the unit manifest: {error}")
     return record
-
-

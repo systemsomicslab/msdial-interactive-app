@@ -56,14 +56,18 @@ step.
 
 MS-DIAL writes its per-file (`<file>_<time>.dcl`, `.pai2`, `_tags.xml`) and
 alignment (`AlignResult-<time>.*`) containers beside the raw files it reads.
-After a repository unit's run, and before validation, the finalised run's set
-moves to `output\<job>\msdial-intermediates\` with its path under the raw
-directory kept, and is retained file by file; sets left by earlier attempts are
-recorded as superseded and go with the raw data. `<project>_Loaded.msp2.dbs`,
-MS-DIAL's copy of every library the run loaded, is deleted and recorded by
-name, size and SHA-256. The saved project cannot then be reopened as it
-stands: its `.mddata` names the containers by their raw-directory paths and its
-loader needs the library copy.
+For a unit a campaign approval has been recorded for (its manifest's
+`campaign_authorizations`, or those of the unit it was split from), after the
+run and before validation, the finalised run's set moves to
+`output\msdial-intermediates\` with its path under the raw directory kept, and
+is retained file by file; the job that moved it is in the record. Sets left by
+earlier attempts are recorded as superseded and go with the raw data.
+`<project>_Loaded.msp2.dbs`, MS-DIAL's copy of every library the run loaded, is
+deleted and recorded by name, size and SHA-256. The saved project cannot then be
+reopened as it stands: its `.mddata` names the containers by their
+raw-directory paths and its loader needs the library copy. Any other run,
+including a trial unit whatever its retention policy, keeps its containers
+beside its inputs and its library copy in its output, as before.
 
 What a repository unit shares carries no path from this machine: the mzTab-M's
 `database[n]-uri` is `null` for a library without a DOI or https source and
@@ -71,6 +75,15 @@ the DOI otherwise, `ms_run[n]-location` is workspace-relative (`raw/...`), and
 the publication report, tables and workflow bundle name libraries by file name
 and SHA-256 and declare `shared_path_policy`. The original locations are kept
 only in `provenance\mztab-redaction.local.json`.
+
+A file another process holds open cannot be replaced or deleted on Windows,
+and a container's path below the output can pass MAX_PATH (moves use
+extended-length paths). Each step is retried for up to a minute. What still
+fails is recorded in the unit manifest's `finalisation_holds`: an mzTab-M that
+could not be redacted, or a library copy that could not be deleted, holds
+sharing, and the publication report refuses the unit; a container that could
+not be moved holds the raw deletion, and the raw cleanup and discard refuse it,
+a split parent's included. Each of those steps retries what is held first.
 
 This order makes disk cleanup routine without allowing an incomplete or failed
 analysis to erase its only input copy.

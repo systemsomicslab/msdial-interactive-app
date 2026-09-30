@@ -35,6 +35,19 @@ def generate_publication_report(
     qa_criteria: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     root = Path(output_root).expanduser().resolve()
+    # A unit whose run left an mzTab-M naming a location of this machine, or MS-DIAL's library copy in its
+    # output, is held: its outputs are not published until a retry has done what the run could not.
+    manifest_text = str(workflow.get("repository_run_manifest") or "").strip()
+    if manifest_text:
+        from .run_finalisation import BLOCKS_SHARING, FinalisationHeld, resolve_finalisation_holds
+
+        held = [item for item in resolve_finalisation_holds(manifest_text)
+                if BLOCKS_SHARING in (item.get("blocks") or [])]
+        if held:
+            raise FinalisationHeld(
+                BLOCKS_SHARING, "this unit's outputs are held from sharing, so no publication report was written",
+                held,
+            )
     root.mkdir(parents=True, exist_ok=True)
     # A QA report from before 0.5.3 is read as 0.5.3 would have written it, so that the text, the table
     # and the audit all apply the same QC minimum and carry the same reasons.
