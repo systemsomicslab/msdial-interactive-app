@@ -1008,6 +1008,155 @@ class CampaignPreflightTests(_Scratch):
         ])
 
 
+def _touch(paths: list[Path]) -> None:
+    """Move each input's modification time on, so the next preflight reads it again instead of reusing it."""
+    for path in paths:
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+
+
+class DispositionHoldTests(_Scratch):
+    """A split parent, a finished unit, a running one and an unpreflighted one keep the state they are in."""
+
+    def split_campaign_parent(self) -> Path:
+        # b's header is DIA with one isolation target: Mixed as the summary reads it, and a DIA file the
+        # disposition cannot type, so a classification applied to the parent would make it runnable as DDA.
+        names = ["a_DDA.mzML", "b_DIA.mzML"]
+        verdicts = {"a_DDA.mzML": {"method": "DDA"}, "b_DIA.mzML": {"method": "DIA", "targets": [675.0]}}
+        manifest, extractor, _ = _unit(self.root / "unit", names)
+        self.preflight(manifest, extractor, _Extractor(verdicts))
+        self.assertTrue(split_unit_by_acquisition(manifest, confirmed=True)["written"])
+        update_manifest(manifest, lambda current: current.update(campaign_authorizations=[dict(_APPROVAL)]))
+        return manifest
+
+    def test_classify_never_makes_a_split_parent_runnable(self) -> None:
+        manifest = self.split_campaign_parent()
+        before = manifest.read_bytes()
+
+        disposition = classify_preflight(manifest)
+
+        self.assertEqual(before, manifest.read_bytes())
+        self.assertFalse(disposition["applied"])
+        self.assertEqual("split_parent", disposition["held"]["reason"])
+        self.assertEqual(("split_by_acquisition", False), tuple(read_manifest(manifest)[key] for key in ("status", "execution_allowed")))
+
+    def test_classify_never_skips_a_split_parent_whose_raw_data_its_parts_read(self) -> None:
+        manifest = self.split_campaign_parent()
+
+        def capped(current: dict) -> None:
+            current["raw_metadata_preflight"]["summary"]["coverage"]["capped"] = True
+
+        update_manifest(manifest, capped)
+        before = read_manifest(manifest).get("campaign_disposition")
+
+        disposition = classify_preflight(manifest)
+        recorded = read_manifest(manifest)
+
+        self.assertEqual("skip", disposition["disposition"])
+        self.assertEqual("split_by_acquisition", recorded["status"])
+        self.assertEqual(before, recorded.get("campaign_disposition"), "a skip reached the split parent's record")
+
+    def test_classify_leaves_a_finished_unit_where_its_run_left_it(self) -> None:
+        manifest, stub, _ = _unit(self.root / "unit", ["a.mzML"], acquisition="DDA")
+        self.preflight(manifest, stub, _Extractor({}))
+        update_manifest(
+            manifest, lambda current: current.update(status="mztab_validated", campaign_authorizations=[dict(_APPROVAL)])
+        )
+        before = manifest.read_bytes()
+
+        disposition = classify_preflight(manifest)
+
+        self.assertEqual(before, manifest.read_bytes())
+        self.assertEqual(("past_preflight", "mztab_validated"), (disposition["held"]["reason"], disposition["held"]["status"]))
+
+    def test_classify_does_not_skip_a_unit_that_was_never_preflighted(self) -> None:
+        manifest, _stub, _ = _unit(self.root / "unit", ["a.mzML"], extra={"campaign_authorizations": [dict(_APPROVAL)]})
+        before = manifest.read_bytes()
+
+        disposition = classify_preflight(manifest)
+
+        self.assertEqual(before, manifest.read_bytes())
+        self.assertEqual(["raw_metadata_preflight_missing"], disposition["reasons"])
+        self.assertEqual("raw_metadata_preflight_missing", disposition["held"]["reason"])
+        self.assertEqual("downloaded", read_manifest(manifest)["status"])
+
+    def test_classify_holds_a_unit_whose_run_is_open(self) -> None:
+        from msdial_app.repository_reanalysis import record_run_start
+
+        manifest, stub, _ = _unit(self.root / "unit", ["a.mzML"], acquisition="DDA")
+        self.preflight(manifest, stub, _Extractor({}))
+        update_manifest(manifest, lambda current: current.update(campaign_authorizations=[dict(_APPROVAL)]))
+        self.assertTrue(record_run_start(manifest, "job-1")["recorded"])
+        before = manifest.read_bytes()
+
+        disposition = classify_preflight(manifest)
+
+        self.assertEqual(before, manifest.read_bytes())
+        self.assertEqual(("run_in_progress", "job-1"), (disposition["held"]["reason"], disposition["held"]["job_id"]))
+
+    def test_a_campaign_preflight_reads_nothing_of_a_split_or_finished_unit(self) -> None:
+        parent = self.split_campaign_parent()
+        finished, _stub, _ = _unit(
+            self.root / "finished", ["a.mzML"],
+            extra={"campaign_authorizations": [dict(_APPROVAL)], "status": "cleanup_pending_confirmation"},
+        )
+        for manifest, reason in ((parent, "split_parent"), (finished, "past_preflight")):
+            with self.subTest(reason=reason):
+                before = manifest.read_bytes()
+                fake = _Extractor({})
+
+                result = self.preflight(manifest, _PinnedExtractor.make(self.root / f"build-{reason}"), fake)
+
+                self.assertEqual([], fake.commands)
+                self.assertEqual(reason, result["preflight_held"]["reason"])
+                self.assertEqual(before, manifest.read_bytes())
+
+    def test_a_campaign_unit_split_while_its_headers_are_read_keeps_the_disposition_it_carries(self) -> None:
+        names = ["a_DDA.mzML", "b_DIA.mzML"]
+        verdicts = {name: {"method": "DIA" if "DIA" in name else "DDA"} for name in names}
+        manifest, _stub, files = _unit(self.root / "unit", names, extra={"campaign_authorizations": [dict(_APPROVAL)]})
+        extractor = _PinnedExtractor.make(self.root / "build")
+        first = self.preflight(manifest, extractor, _Extractor(verdicts))
+        self.assertEqual(("split", True), (first["campaign_disposition"]["disposition"], first["campaign_disposition"]["applied"]))
+        _touch(files)
+        splits: list[dict] = []
+
+        def split_meanwhile(_command) -> None:
+            if not splits:
+                splits.append(split_unit_by_acquisition(manifest, confirmed=True))
+
+        # A capped read would decide skip; the split parent must not take that decision.
+        self.preflight(manifest, extractor, _Extractor(verdicts, during=split_meanwhile), max_inputs=1)
+        recorded = read_manifest(manifest)
+
+        self.assertTrue(splits and splits[0]["written"])
+        self.assertEqual(("split_by_acquisition", False), (recorded["status"], recorded["execution_allowed"]))
+        self.assertEqual(first["campaign_disposition"], recorded["campaign_disposition"])
+
+    def test_a_run_that_starts_while_the_headers_are_read_keeps_its_record(self) -> None:
+        manifest, _stub, files = _unit(
+            self.root / "unit", ["a.mzML"], acquisition="DDA", extra={"campaign_authorizations": [dict(_APPROVAL)]}
+        )
+        extractor = _PinnedExtractor.make(self.root / "build")
+        first = self.preflight(manifest, extractor, _Extractor({}))
+        output = manifest.parent / "raw-metadata-preflight.json"
+        output_before = output.read_bytes()
+        _touch(files)
+
+        def finished_meanwhile(_command) -> None:
+            update_manifest(manifest, lambda current: current.update(status="mztab_validated"))
+
+        result = self.preflight(manifest, extractor, _Extractor({}, during=finished_meanwhile))
+        recorded = read_manifest(manifest)
+
+        self.assertEqual("past_preflight", result["preflight_held"]["reason"])
+        self.assertEqual("mztab_validated", recorded["status"])
+        self.assertEqual(first["raw_metadata_preflight"], recorded["raw_metadata_preflight"])
+        self.assertEqual(first["campaign_disposition"], recorded["campaign_disposition"])
+        self.assertEqual(output_before, output.read_bytes())
+        self.assertNotIn("raw_metadata_preflight_progress", recorded)
+
+
 class UntargetedWordingTests(_Scratch):
     def test_confirm_untargeted_is_recorded_as_an_inference_not_a_confirmation(self) -> None:
         manifest, stub, _ = _unit(self.root / "unit", ["a.mzML"], untargeted=None, acquisition="DDA")

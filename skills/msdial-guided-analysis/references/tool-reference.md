@@ -220,7 +220,9 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   against every downloaded analysis input by default. A caller may request a cap,
   but capped coverage remains partial and cannot establish production readiness.
   Inputs are read 20 per process within per-format time limits; an unreadable
-  input is recorded on its own. The reply carries `campaign_disposition`.
+  input is recorded on its own. The reply carries `campaign_disposition`. A
+  campaign unit that was split, has finished its run or has a run open is not
+  read: `completed` is false and `preflight_held` says why.
 - `msdial_check_raw_metadata_extractor` / `msdial_set_raw_metadata_extractor_path`:
   list the candidate extractors with their provenance and pin status, and save a
   verified one as the `raw_metadata_extractor_path` setting.

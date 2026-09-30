@@ -243,6 +243,14 @@ applied: it sets `execution_allowed`, the status (`preflight_passed`,
 `skipped_by_preflight`, `excluded_by_preflight`) and each input's
 `console_acquisition_type` (DDA, SWATH or AIF).
 
+No disposition changes a unit that was split, whose run has finished
+(`mztab_validated`, `cleanup_pending_confirmation`, `raw_cleaned`) or whose run
+attempt is still open: a campaign preflight of such a unit reads nothing and
+reports `preflight_held`, and `classify_preflight` returns its decision with
+`held` and writes nothing. A split parent that is read all the same (outside a
+campaign, or split while its headers were being read) records the reads for its
+parts and keeps its status and the disposition it carries.
+
 If raw headers report more than one acquisition mode, the result is `Mixed`.
 Preview `msdial_split_repository_unit`, confirm the proposed DDA and
 DIA/AIF/SWATH child units, then preflight each child independently. The Mixed

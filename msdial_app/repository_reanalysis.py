@@ -2547,6 +2547,11 @@ def live_run_attempt(
         manifest = read_manifest(manifest_path)
     except (OSError, ValueError):
         return None
+    return _live_run_attempt_in(manifest, ignore_backend_pid)
+
+
+def _live_run_attempt_in(manifest: dict[str, Any], ignore_backend_pid: int | None = None) -> dict[str, Any] | None:
+    """live_run_attempt for a manifest already read, such as one held under its writer lock."""
     for item in reversed(list(manifest.get("run_attempts") or [])[-20:]):
         if not isinstance(item, dict):
             continue
@@ -2887,6 +2892,40 @@ def preflight_campaign(
     return None
 
 
+def disposition_hold(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """Why no disposition may change this unit's state now, or None when one may. Changes nothing.
+
+    split_parent: the unit was split. A parent owns its parts' raw data and never runs, so a disposition
+    that made it runnable, or skipped it - and a campaign deletes a skipped unit's raw data - would reach
+    the parts. past_preflight: its run finished (mztab_validated, cleanup_pending_confirmation, raw_cleaned
+    and the like) or its raw data were discarded; applied again, a disposition would move a finished unit
+    out of the cleanup-ready states and make it look as if it were waiting to run. run_in_progress: a
+    Console of its own may still be running.
+    """
+    status = str(manifest.get("status") or "")
+    if status == SPLIT_PARENT_STATUS or manifest.get("split_into"):
+        return {
+            "reason": "split_parent",
+            "status": status,
+            "detail": "The unit was split; its parts are preflighted and run, and it never is.",
+        }
+    if status in PAST_PREFLIGHT_STATUSES:
+        return {
+            "reason": "past_preflight",
+            "status": status,
+            "detail": f"The unit is past its preflight ({status}); what recorded that describes it now.",
+        }
+    attempt = _live_run_attempt_in(manifest)
+    if attempt is not None:
+        return {
+            "reason": "run_in_progress",
+            "status": status,
+            "job_id": str(attempt.get("job_id") or ""),
+            "detail": "A run attempt of this unit is open and its process may still be running.",
+        }
+    return None
+
+
 def _declared_technical(manifest: dict[str, Any]) -> dict[str, Any]:
     """What the repository record declared, before any preflight wrote header values into the project.
 
@@ -2974,6 +3013,10 @@ def run_raw_metadata_preflight(
     Under a campaign (an approval passed, or one recorded for the unit) the extractor must inspect as
     verified and pinned, and campaign_disposition is applied to the unit: it decides execution_allowed and
     the status. Outside one the disposition is recorded as advice and nothing else differs from before.
+
+    A campaign unit that disposition_hold holds - split, finished, or with a run of its own open - is not
+    read at all: the manifest is returned as it is, with preflight_held saying why. Its recorded
+    disposition stands, since a campaign acts on whatever disposition the unit carries.
     """
     from .raw_metadata_extractor import RawMetadataExtractorRefused, campaign_refusal
     from .raw_metadata_preflight import run_extractor
@@ -2984,6 +3027,10 @@ def run_raw_metadata_preflight(
         raise FileNotFoundError(f"Raw metadata extractor was not found: {extractor_path}")
     snapshot = read_manifest(manifest_path)
     campaign = preflight_campaign(snapshot, campaign_authorization_path)
+    if campaign is not None:
+        held = disposition_hold(snapshot)
+        if held is not None:
+            return {**snapshot, "manifest_path": str(manifest_path), "preflight_held": held}
     identity = raw_metadata_extractor_identity(extractor_path)
     if campaign is not None or require_pinned_extractor:
         # A campaign decides from these verdicts whether thousands of units run, and then deletes their raw
@@ -3028,12 +3075,20 @@ def run_raw_metadata_preflight(
         previous=_previous_reads(snapshot, manifest_path),
         progress=progress,
     )
-    # Every record read, in input order, where _preflight_start_times and a later reuse find them. Written
-    # even when empty, so an earlier preflight's records never pass for this one's.
-    _write_json(output, execution["records"])
     extractor = _extractor_record(extractor_path, identity, extractor_source)
+    held: dict[str, Any] = {}
 
     def change(current: dict[str, Any]) -> None:
+        hold = disposition_hold(current)
+        if campaign is not None and hold is not None and hold["reason"] != "split_parent":
+            # The unit's run started or ended while its headers were read. What the run recorded stands, and
+            # so do the extractor output and the preflight it was made from; this read is dropped.
+            current.pop("raw_metadata_preflight_progress", None)
+            held.update(hold)
+            return
+        # Every record read, in input order, where _preflight_start_times and a later reuse find them.
+        # Written even when empty, so an earlier preflight's records never pass for this one's.
+        _write_json(output, execution["records"])
         _record_preflight(
             current,
             execution=execution,
@@ -3048,7 +3103,7 @@ def run_raw_metadata_preflight(
         )
 
     written = update_manifest(manifest_path, change)
-    return {**written, "manifest_path": str(manifest_path)}
+    return {**written, "manifest_path": str(manifest_path), **({"preflight_held": held} if held else {})}
 
 
 # Past an attempt's own time limit, the time a stopped extractor and its bookkeeping may take before a
@@ -3146,9 +3201,12 @@ def _record_preflight(
         decide_disposition,
     )
 
-    # A unit split while its headers were being read stays split: a parent is the raw owner of its parts
-    # and never runs, whatever its own headers say. The reads are recorded; the verdicts change nothing.
-    split_meanwhile = current.get("status") == SPLIT_PARENT_STATUS
+    # A split unit - split before this preflight, or while its headers were being read - stays split: a
+    # parent is the raw owner of its parts and never runs, whatever its own headers say. The reads are
+    # recorded, for its parts to reuse; the verdicts change nothing, and the disposition it carries stands.
+    hold = disposition_hold(current)
+    split_parent = hold is not None and hold["reason"] == "split_parent"
+    status_before = current.get("status")
     previously_allowed = bool(
         current.get("execution_allowed") or (current.get("project") or {}).get("eligible")
     )
@@ -3284,17 +3342,20 @@ def _record_preflight(
         else:
             current["status"] = "preflight_review_required"
 
+    if split_parent:
+        # Its status as it was, and the disposition it carries as it was: a campaign acts on whatever
+        # disposition a unit carries, and one decided from a split parent's own headers - skip, say - would
+        # reach the raw data its parts read.
+        current["status"] = status_before
+        current["execution_allowed"] = False
+        return
     disposition = decide_disposition(current, declared=declared, extractor=extractor)
     assignments = disposition.pop("assignments")
-    disposition["applied"] = campaign is not None and not split_meanwhile
+    disposition["applied"] = campaign is not None
     if campaign is not None:
         disposition["campaign"] = dict(campaign)
-        if not split_meanwhile:
-            _apply_disposition(current, disposition, assignments)
+        _apply_disposition(current, disposition, assignments)
     current["campaign_disposition"] = disposition
-    if split_meanwhile:
-        current["status"] = SPLIT_PARENT_STATUS
-        current["execution_allowed"] = False
 
 
 def _apply_disposition(
@@ -3366,29 +3427,39 @@ def classify_preflight(
     or for a manifest written before dispositions existed. The one mapping from verdicts to what a campaign
     does is raw_metadata_preflight.decide_disposition; this is its only writer. Never raises for anything
     in the manifest; only an unreadable manifest or a refused approval raise.
+
+    Nothing is written for a unit disposition_hold holds (split, finished, or running) or one with no
+    preflight recorded: the decision is returned with applied false and ``held`` saying why, and the
+    manifest, with any disposition it carries, is left as it is.
     """
     from .raw_metadata_preflight import decide_disposition
 
     target = Path(manifest_path).resolve()
     campaign = preflight_campaign(read_manifest(target), campaign_authorization_path)
-    decided: dict[str, Any] = {}
-
-    def change(current: dict[str, Any]) -> None:
+    with manifest_lock(target):
+        current = read_manifest(target)
         preflight = current.get("raw_metadata_preflight") or {}
         declared = preflight.get("declared")
         if not isinstance(declared, dict):
             declared = _declared_technical(current)
         disposition = decide_disposition(current, declared=declared)
         assignments = disposition.pop("assignments")
+        held = disposition_hold(current)
+        if held is None and not (preflight.get("summary") or {}):
+            held = {
+                "reason": "raw_metadata_preflight_missing",
+                "status": str(current.get("status") or ""),
+                "detail": "No raw-header preflight is recorded; preflight the unit first.",
+            }
+        if held is not None:
+            return {**disposition, "applied": False, "held": held}
         disposition["applied"] = campaign is not None
         if campaign is not None:
             disposition["campaign"] = dict(campaign)
             _apply_disposition(current, disposition, assignments)
         current["campaign_disposition"] = disposition
-        decided.update(disposition)
-
-    update_manifest(target, change)
-    return decided
+        _write_json(target, current)
+    return disposition
 
 
 # The status a parent unit carries once it has been split. It is not in CLEANUP_READY_STATUSES and it
@@ -3771,6 +3842,9 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
 # state a run leaves behind when its retention policy asked for deletion: the technical preconditions are
 # met and the decision is now waiting for a person.
 CLEANUP_READY_STATUSES = {"mztab_validated", "completed", "cleanup_pending_confirmation"}
+# The states past every preflight: a run finished, or the raw data are gone (raw_cleaned after a run,
+# discarded without one). What recorded them, not a disposition, describes the unit from then on.
+PAST_PREFLIGHT_STATUSES = CLEANUP_READY_STATUSES | {"raw_cleaned", "discarded"}
 
 
 def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:

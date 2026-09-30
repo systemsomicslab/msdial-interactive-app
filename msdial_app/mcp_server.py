@@ -1535,7 +1535,9 @@ def msdial_repository_raw_metadata_preflight(
     unreadable file costs only its own verdict. The reply carries the unit's campaign_disposition (run,
     skip, exclude or split, with reason codes). A unit under a campaign approval - passed here as
     campaign_authorization_path, or recorded for the unit - has the disposition applied, and its extractor
-    must inspect as verified and pinned (msdial_check_raw_metadata_extractor).
+    must inspect as verified and pinned (msdial_check_raw_metadata_extractor). A campaign unit that was
+    split, has finished its run or has a run open is not read: completed is false and preflight_held says
+    why.
 
     Give manifest_path instead of download_job_id to reach a unit whose download job the backend no
     longer holds.
@@ -1576,8 +1578,12 @@ def msdial_repository_raw_metadata_preflight(
     groups = raw.get("acquisition_groups") or {}
     extractor = raw.get("extractor") or {}
     disposition = result.get("campaign_disposition") or {}
+    held = result.get("preflight_held") or None
     return {
-        "completed": True,
+        # False for a campaign unit that is split, finished or running: nothing was recorded, and everything
+        # below is what the unit already carried.
+        "completed": held is None,
+        "preflight_held": held,
         "extractor_found": True,
         "extractor_path": selected["path"],
         "extractor": {
