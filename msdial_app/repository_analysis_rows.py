@@ -674,11 +674,13 @@ def record_analysis_csv(
             if row is None:
                 # No row in this CSV (the disposition excluded it): nothing an earlier CSV said of it stands.
                 item["file_name"] = ""
-                for stale in ("console_path", "console_alias", "file_name_reason"):
+                for stale in ("console_path", "console_alias", "acquisition_type", "file_name_reason"):
                     item.pop(stale, None)
                 continue
             item["file_name"] = row["file_name"]
             item["console_path"] = row["file_path"]
+            # What the execution gate holds the workflow to: the type written from this input's own header.
+            item["acquisition_type"] = row["acquisition_type"]
             if row.get("file_name_reason"):
                 item["file_name_reason"] = row["file_name_reason"]
             else:

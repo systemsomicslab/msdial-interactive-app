@@ -2125,6 +2125,15 @@ def _prepare_repository_rows_from_lineage(
         (job or {}).get("raw_retention_policy") or manifest.get("raw_retention_policy") or "keep"
     )
     answer_seed = _repository_answer_seed(projected, manifest, output_root, raw_retention_policy)
+    # THE ROWS' TYPES, NOT THE UNIT'S. The guided plan writes an answered acquisition_type over every file
+    # (agent_workflow._workflow), and the seed reads the unit's one label, 'DIA' as SWATH: a Waters MSe
+    # unit whose headers say AIF would have run as SWATH. The seed carries the type every row shares, and
+    # none where the rows differ, so each file runs as the CSV says.
+    row_types = {row["acquisition_type"] for row in built["rows"] if row["acquisition_type"]}
+    if len(row_types) == 1:
+        answer_seed["acquisition_type"] = next(iter(row_types))
+    else:
+        answer_seed.pop("acquisition_type", None)
     execution_allowed = manifest.get("execution_allowed") is True
     execution_blockers: list[str] = []
     if not execution_allowed:

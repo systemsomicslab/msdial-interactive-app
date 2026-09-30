@@ -28,6 +28,7 @@ import subprocess
 import tempfile
 import unittest
 import zipfile
+from collections import Counter
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
@@ -36,6 +37,7 @@ _CONFIG = tempfile.TemporaryDirectory()
 with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
     from msdial_app import mcp_server, workflow
     from msdial_app import repository_analysis_rows as rows_module
+    from msdial_app.agent_workflow import build_guided_plan
     from msdial_app.repository_analysis_rows import (
         ALIAS_DIRECTORY,
         blocking_failures,
@@ -1111,6 +1113,99 @@ class TheHeaderOrderIsRecordedByTheNamesTheCsvCarries(unittest.TestCase):
         by_name = {Path(item["file"]).stem: item["analytical_order"] for item in record["files"]}
         self.assertEqual({row["file_name"]: row["analytical_order"] for row in built["rows"]}, by_name)
         self.assertEqual([2, 1], [row["analytical_order"] for row in built["rows"]])
+
+
+TEMPLATE = Path(__file__).resolve().parents[1] / "resources" / "msdial_console_param4lipidomics.txt"
+# MTBKS217 is declared 'DIA'; its headers are made to say SWATH for these folders and AIF for the rest.
+SWATH_FOLDERS = {"190827_025pp.raw", "190827_027pp.raw", "190827_030pp.raw"}
+
+
+class TheRunKeepsEachRowsAcquisitionType(unittest.TestCase):
+    """The guided plan writes an answered acquisition_type over every file (agent_workflow._workflow).
+
+    The answer seed used to read the unit's one label, 'DIA' as SWATH, so a unit whose headers said AIF
+    ran as SWATH, and a header's 'DIA' admits either, so the execution gate did not see it.
+    """
+
+    def _prepare(self, root: Path, types: dict[str, str]) -> tuple[Path, dict]:
+        manifest_path = _leased_unit(root)
+        _set_preflight(manifest_path, types)
+        with patch.object(mcp_server, "_request_json", side_effect=_no_backend):
+            prepared = mcp_server.msdial_prepare_repository_reanalysis(
+                hierarchy=["Plant"], confirmed=True, manifest_path=str(manifest_path)
+            )
+        self.assertTrue(prepared["prepared"], prepared)
+        return manifest_path, prepared
+
+    def _plan(self, root: Path, prepared: dict, **extra) -> dict:
+        console = root / "MSDIALCUI.exe"
+        console.write_bytes(b"not really a console binary")
+        answers = {
+            **prepared["preview"]["answer_seed"],
+            "execute_rt_correction": False,
+            "library_strategy": "none",
+            "minimum_peak_height": 1000,
+            "console_path": str(console),
+            "template_path": str(TEMPLATE),
+            **extra,
+        }
+        plan = build_guided_plan(prepared["input_path"], answers)
+        self.assertIsNotNone(plan["workflow"], plan["remaining_questions"])
+        return plan
+
+    def test_rows_of_two_types_reach_the_console_csv_each_as_written(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ, {"MSDIAL_ASSUME_FOLDER_TYPE_CSV_SUPPORTED": "1"}
+        ):
+            root = Path(temporary)
+            _manifest_path, prepared = self._prepare(root, {"*": "AIF", **{name: "SWATH" for name in SWATH_FOLDERS}})
+            with open(prepared["input_path"], encoding="utf-8-sig", newline="") as handle:
+                written = {row["file_name"]: row["acquisition_type"] for row in csv.DictReader(handle)}
+            # No QA matrix: the stand-in Console has no exporter to be asked for one.
+            plan = self._plan(root, prepared, run_qa=False)
+            run = workflow.prepare_run(plan["workflow"])
+            parsed = _console_rows(Path(run["console_input"]))
+            header = parsed[0]
+            ran = {row[header.index("file_name")]: row[header.index("acquisition_type")] for row in parsed[1:]}
+
+        self.assertNotIn("acquisition_type", prepared["preview"]["answer_seed"])
+        self.assertEqual({"AIF": 9, "SWATH": 3}, dict(Counter(written.values())))
+        self.assertEqual(written, ran)
+
+    def test_rows_that_share_one_type_seed_that_type_not_the_units_label(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ, {"MSDIAL_ASSUME_FOLDER_TYPE_CSV_SUPPORTED": "1"}
+        ):
+            root = Path(temporary)
+            _manifest_path, prepared = self._prepare(root, {"*": "AIF"})
+            plan = self._plan(root, prepared)
+
+        self.assertEqual("AIF", prepared["preview"]["answer_seed"]["acquisition_type"])
+        self.assertEqual({"AIF"}, {item["acquisition_type"] for item in plan["workflow"]["files"]})
+
+    def test_the_gate_refuses_a_type_written_over_the_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path, prepared = self._prepare(root, {"*": "AIF"})
+            files = workflow.read_analysis_csv(Path(prepared["input_path"]))["files"]
+            state = {
+                "repository_run_manifest": str(manifest_path),
+                "output_root": prepared["output_root"],
+                "ion_mode": "Positive",
+                "files": files,
+            }
+            as_written = evaluate_repository_execution_gate(state)
+            rewritten = evaluate_repository_execution_gate(
+                {**state, "files": [{**item, "acquisition_type": "SWATH"} for item in files]}
+            )
+            lineage = read_manifest(manifest_path)["input_lineage"]["rows"]
+
+        self.assertEqual({"AIF"}, {row["acquisition_type"] for row in lineage})
+        self.assertTrue(as_written["allowed"], as_written["blockers"])
+        self.assertFalse(rewritten["allowed"])
+        self.assertEqual(1, len(rewritten["blockers"]), rewritten["blockers"])
+        self.assertIn("12 input files would run with an acquisition type other than", rewritten["blockers"][0])
+        self.assertIn("written AIF, run as SWATH", rewritten["blockers"][0])
 
 
 def _exclude(manifest_path: Path, names: list[str], reason: str = "ion_mobility_out_of_scope", applied: bool = True) -> None:

@@ -4476,6 +4476,26 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
                 f"the first is {outside[0]}."
             )
 
+    # An analysis CSV built from the input lineage wrote each input's acquisition type from its own header
+    # and recorded it on the input's lineage row (repository_analysis_rows). A workflow that has since set
+    # another type for an input - one answer written over every file - would deconvolute it as something
+    # its header did not say, and a header's 'DIA' admits SWATH and AIF alike, so the check below cannot
+    # tell. The type the CSV wrote is the one the input runs as.
+    written = _written_acquisition_by_input(manifest)
+    if written:
+        rewritten = []
+        for item in state.get("files") or []:
+            path_text = str(item.get("file_path") or "").strip()
+            expected = written.get(_file_key(_unit_input_of(path_text, aliases))) if path_text else None
+            requested = str(item.get("acquisition_type") or "DDA").strip() or "DDA"
+            if expected and requested != expected:
+                rewritten.append(f"{Path(path_text).name} (written {expected}, run as {requested})")
+        if rewritten:
+            blockers.append(
+                f"{len(rewritten)} input files would run with an acquisition type other than the one this "
+                f"unit's analysis CSV wrote for them from their raw headers; the first is {rewritten[0]}."
+            )
+
     # A run in the wrong polarity produces a complete, validated, entirely void result, and no later
     # stage flags it. The manifest records what the repository declared for this unit.
     declared_mode = str(project.get("ion_mode") or "").strip().casefold()
@@ -4645,6 +4665,24 @@ def console_alias_inputs(manifest: dict[str, Any]) -> dict[str, str]:
 def _unit_input_of(path_text: str, aliases: dict[str, str]) -> str:
     """The unit's input a CSV row names: itself, or the input its Console alias stands for."""
     return aliases.get(_file_key(path_text), path_text) if aliases else path_text
+
+
+def _written_acquisition_by_input(manifest: dict[str, Any]) -> dict[str, str]:
+    """The acquisition type the unit's lineage-built analysis CSV wrote for each input, by _file_key.
+
+    record_analysis_csv puts it on the input's lineage row. Empty for a unit whose CSV was matched by
+    name, or not yet written.
+    """
+    if ((manifest or {}).get("analysis_csv") or {}).get("status") != "written":
+        return {}
+    result: dict[str, str] = {}
+    for row in ((manifest or {}).get("input_lineage") or {}).get("rows") or []:
+        if not isinstance(row, dict):
+            continue
+        path_text, value = str(row.get("path") or "").strip(), str(row.get("acquisition_type") or "").strip()
+        if path_text and value:
+            result[_file_key(path_text)] = value
+    return result
 
 
 def _tree_size(root: Path) -> tuple[int, int]:
