@@ -419,6 +419,49 @@ class AFolderMustArriveWhole(unittest.TestCase):
 
         self.assertTrue(record["complete"])
 
+    def _d_folder(self, root: Path, files: dict[str, bytes]) -> Path:
+        folder = root / "raw" / "S1.d"
+        folder.mkdir(parents=True)
+        for name, data in files.items():
+            (folder / name).write_bytes(data)
+        return folder
+
+    def test_what_a_reader_stopped_mid_write_left_is_the_readers_too(self) -> None:
+        """SQLite's journal and write-ahead files are baf2sql's while it writes (msdial_app.reader_created)."""
+        with tempfile.TemporaryDirectory() as temporary:
+            self._d_folder(Path(temporary), {
+                "analysis.baf": b"x" * 5, "analysis.sqlite": b"half", "analysis.sqlite-journal": b"j",
+            })
+            record = verify_container_completeness(
+                Path(temporary), _folder_project({"analysis.baf": 5}, "raw/S1.d")
+            )
+
+        self.assertTrue(record["complete"])
+        self.assertEqual(
+            ["raw/S1.d/analysis.sqlite", "raw/S1.d/analysis.sqlite-journal"], record["reader_created_files"]
+        )
+        self.assertEqual([], record["unlisted_files"])
+
+    def test_a_d_folder_no_bruker_reader_opens_holds_no_reader_created_file(self) -> None:
+        """An Agilent .d has no analysis.baf, so baf2sql never writes into it: its analysis.sqlite is unlisted."""
+        with tempfile.TemporaryDirectory() as temporary:
+            self._d_folder(Path(temporary), {"AcqData.bin": b"x" * 5, "analysis.sqlite": b"not a reader's"})
+            record = verify_container_completeness(
+                Path(temporary), _folder_project({"AcqData.bin": 5}, "raw/S1.d")
+            )
+
+        self.assertTrue(record["complete"])
+        self.assertEqual([], record["reader_created_files"])
+        self.assertEqual(["raw/S1.d/analysis.sqlite"], record["unlisted_files"])
+
+    def test_a_listed_file_no_reader_writes_there_is_held_to_its_size(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            self._d_folder(Path(temporary), {"AcqData.bin": b"x" * 5, "analysis.sqlite": b"shorter"})
+            with self.assertRaisesRegex(ValueError, r"of another size: analysis.sqlite \(7 of 10 bytes\)"):
+                verify_container_completeness(
+                    Path(temporary), _folder_project({"AcqData.bin": 5, "analysis.sqlite": 10}, "raw/S1.d")
+                )
+
     def test_a_unit_listing_no_folder_member_requires_nothing(self) -> None:
         project = RepositoryProject(
             repository="metabolights", accession="MTBLS1", analysis_unit_id="u",

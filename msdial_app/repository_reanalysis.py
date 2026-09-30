@@ -41,7 +41,7 @@ from .diagnostic_paths import (
 from .download_store import unlink_tree
 from .mzml_encoding import UNSUPPORTED_MZML_ENCODING, scan_mzml_encoding
 from .process_liveness import process_created_at, process_is_alive
-from .reader_created import reader_created_files, reader_created_names
+from .reader_created import container_members, reader_created_files, reader_created_names
 
 try:
     import msvcrt
@@ -6003,17 +6003,6 @@ def _vendor_container_of(name: str) -> str:
     return ""
 
 
-def _is_reader_created_file(relative: str) -> bool:
-    """Whether a vendor reader writes this file inside the folder it reads (relative to the folder).
-
-    Bruker's baf2sql writes analysis.sqlite into a BAF .d that arrived without one; the pinned raw-metadata
-    extractor was seen doing it, and the Console's reader is the same one. Such a file is neither missing
-    from a downloaded folder nor foreign to it. A shared helper for these is being added with the Console
-    inventory work; this is the minimal local predicate, for that merge to replace.
-    """
-    return str(relative or "").replace("\\", "/").casefold() == "analysis.sqlite"
-
-
 def verify_container_completeness(data_root: Path, project: RepositoryProject) -> dict[str, Any]:
     """Whether every vendor folder the unit lists member by member arrived whole. Raises when one did not.
 
@@ -6024,10 +6013,13 @@ def verify_container_completeness(data_root: Path, project: RepositoryProject) -
     lease reused is not caught by that. So each declared folder must be a directory holding every member
     it lists, each of its listed size, and no partial transfer (.part, .part.json).
 
-    A file inside the folder that the listing does not name is recorded, not refused: a vendor reader may
-    write into the folder it reads (_is_reader_created_file), and anything else is named for a reader of
-    the record. Only files of role vendor_folder_member are checked, so a unit whose listing names no
-    folder member (every handoff before Catalog 0.6.0, an archive unit) records that nothing was required.
+    A file inside the folder that the listing does not name is recorded, not refused: one a vendor reader
+    writes into the folder it reads (msdial_app.reader_created: Bruker's baf2sql writes analysis.sqlite, and
+    its journal while it writes, into a BAF .d) as reader_created_files, and anything else as unlisted, for
+    a reader of the record. A listed member of a name such a reader writes may have been rewritten by it, so
+    its size is not held to the listing. Only files of role vendor_folder_member are checked, so a unit
+    whose listing names no folder member (every handoff before Catalog 0.6.0, an archive unit) records that
+    nothing was required.
     """
     members: dict[str, list[RepositoryFile]] = {}
     spelled: dict[str, str] = {}
@@ -6079,24 +6071,28 @@ def verify_container_completeness(data_root: Path, project: RepositoryProject) -
         for item in listed:
             relative = _safe_relative_name(item.name).as_posix()[offset:]
             expected[relative.casefold()] = (relative, item)
+        # The names a reader may write into this folder: none unless its rule applies (a BAF .d).
+        reader_names = reader_created_names(folder)
         missing: list[str] = []
         resized: list[str] = []
         for relative, item in expected.values():
             path = folder / relative
             if not path.is_file():
                 missing.append(relative)
-            elif item.size_bytes and path.stat().st_size != item.size_bytes and not _is_reader_created_file(relative):
+            elif item.size_bytes and path.stat().st_size != item.size_bytes and relative.casefold() not in reader_names:
                 resized.append(f"{relative} ({path.stat().st_size} of {item.size_bytes} bytes)")
         partial: list[str] = []
+        not_listed: list[str] = []
         for directory, _directories, names in os.walk(folder):
             for name in names:
                 relative = (Path(directory) / name).relative_to(folder).as_posix()
                 if name.casefold().endswith(PARTIAL_TRANSFER_SUFFIXES):
                     partial.append(relative)
                 elif relative.casefold() not in expected:
-                    (reader_created if _is_reader_created_file(relative) else unlisted).append(
-                        f"{container}/{relative}"
-                    )
+                    not_listed.append(relative)
+        own, created = container_members(folder, not_listed, [relative for relative, _item in expected.values()])
+        unlisted.extend(f"{container}/{relative}" for relative in own)
+        reader_created.extend(f"{container}/{relative}" for relative in created)
         for label, found in (("missing", missing), ("of another size", resized), ("partial", partial)):
             if found:
                 problems.append(
