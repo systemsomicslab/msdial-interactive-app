@@ -81,6 +81,7 @@ class PinnedBuildTests(_Scratch):
         self.assertEqual(
             [
                 (fixtures.RAW_HEAD, fixtures.COMMON_HEAD, "built"),
+                (fixtures.PREVIOUS_RAW_HEAD, fixtures.COMMON_HEAD, "built"),
                 (fixtures.PLANNED_RAW_HEAD, fixtures.PLANNED_COMMON_HEAD, "planned"),
             ],
             [(entry["msrawdataworkbench"], entry["MsdialWorkbench"], entry["state"]) for entry in PINNED_BUILDS],

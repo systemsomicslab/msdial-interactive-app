@@ -25,8 +25,10 @@ from msdial_app.raw_metadata_extractor import (
 )
 
 
-# The built pin: msrawdataworkbench #40 (the mzML base64 last-element fix) with MsdialWorkbench master.
-RAW_HEAD = "592b6dbce72177fa14d3e7cd407557b1c64a3046"
+# The current built pin: msrawdataworkbench #41 (Waters DDA, WIFF2, Shimadzu .lcd) with MsdialWorkbench master.
+RAW_HEAD = "a12293c612a4e29b23d1d584f1c19556d76863f6"
+# The pin before it: msrawdataworkbench #40 (the mzML base64 last-element fix), still a built pin.
+PREVIOUS_RAW_HEAD = "592b6dbce72177fa14d3e7cd407557b1c64a3046"
 COMMON_HEAD = "f0583493a44e73723f53ae312e33955f62052dd7"
 # The pair approved on 2026-09-29 and never built.
 PLANNED_RAW_HEAD = "b34c857a5328e8f08c1918b3d890e7dae50b7d6d"
@@ -185,9 +187,15 @@ class BuildCommandTests(unittest.TestCase):
         self.assertEqual(RAW_HEAD, extractor.PINNED_MSRAWDATAWORKBENCH_COMMIT)
         self.assertEqual(COMMON_HEAD, extractor.PINNED_MSDIALWORKBENCH_COMMIT)
         self.assertEqual(
-            "RawMetadataExtractor-592b6dbce-f0583493a",
+            "RawMetadataExtractor-a12293c61-f0583493a",
             extractor_build_root(Path("synthetic-parent")).name,
         )
+
+    def test_the_previous_build_stays_a_built_pin_but_is_not_the_current_one(self) -> None:
+        previous = extractor.pinned_build(PREVIOUS_RAW_HEAD, COMMON_HEAD)
+        self.assertIsNotNone(previous)
+        self.assertEqual(extractor.PIN_BUILT, previous["state"])
+        self.assertNotEqual(PREVIOUS_RAW_HEAD, extractor.PINNED_MSRAWDATAWORKBENCH_COMMIT)
 
     def test_the_build_passes_solution_dir_with_a_trailing_separator(self) -> None:
         root = Path("synthetic build") / "msrawdataworkbench"

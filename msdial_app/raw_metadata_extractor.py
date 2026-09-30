@@ -47,6 +47,17 @@ PIN_BUILT = "built"
 PIN_PLANNED = "planned"
 PINNED_BUILDS: tuple[dict[str, str], ...] = (
     {
+        RAW_TREE: "a12293c612a4e29b23d1d584f1c19556d76863f6",
+        COMMON_TREE: "f0583493a44e73723f53ae312e33955f62052dd7",
+        "state": PIN_BUILT,
+        "recorded": "2026-10-01",
+        # msrawdataworkbench #41 on master ecb5a86 (#40): Waters DDA told from MSe by whether a daughter
+        # function's precursor changes, a WIFF2 the SCIEX Data API cannot open reported as unsupported
+        # (exit 82), and the Shimadzu IoModule kept out of the extractor's application base, so .lcd
+        # files read. Built as RawMetadataExtractor-a12293c61-f0583493a, inventory 5acfab21512e96e3.
+        "note": "Waters DDA, WIFF2 and Shimadzu .lcd metadata (msrawdataworkbench #41) with MsdialWorkbench master",
+    },
+    {
         RAW_TREE: "592b6dbce72177fa14d3e7cd407557b1c64a3046",
         COMMON_TREE: "f0583493a44e73723f53ae312e33955f62052dd7",
         "state": PIN_BUILT,

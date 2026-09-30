@@ -4,6 +4,23 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.19] - Unreleased
+
+### Changed
+- The current pinned raw-metadata extractor is msrawdataworkbench `a12293c61`
+  (#41, on master ecb5a86 with #40) with MsdialWorkbench `f0583493a`, built as
+  `RawMetadataExtractor-a12293c61-f0583493a` (inventory `5acfab21512e96e3`,
+  provenance verified). Compared with the `592b6dbce` build, which stays a built
+  pin:
+  - Waters DDA is DDA at confidence 0.95, told from MSe by whether a daughter
+    function's precursor changes (Xevo G2, Q-TOF Premier and Synapt XS DDA were
+    Unknown at 0.30, so a Waters unit without a declared mode could not run).
+  - A WIFF2 that SCIEX Data API 1.0 cannot open is reported as unsupported
+    (exit 82, naming SQLITE_NOTADB) instead of crashing (exit 1).
+  - Shimadzu `.lcd` files read (DDA, 15 Da SWATH, survey), where every one used
+    to fail.
+  - Every other verdict on the 56-input demo and MTBLS2207 corpus is unchanged.
+
 ## [0.5.18] - Unreleased
 
 ### Fixed
