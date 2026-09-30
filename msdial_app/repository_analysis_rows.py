@@ -42,6 +42,9 @@ classify_preflight) may run a unit while excluding some of its inputs - ion mobi
 MS1-only files beside DIA ones - and leaves them among the input candidates. They get no row, their
 declared inputs and samples are not counted missing, and the CSV record names them with their reasons
 (analysis_csv.excluded_inputs), so the CSV never names an input the disposition keeps out of the run.
+Neither does it name one the lease itself excluded: an mzML whose binary arrays RawDataHandler cannot
+decode is no input candidate at all (excluded_input_candidates, reason unsupported_mzml_encoding), and is
+matched to its declared input and sample, and named with its reason, in the same way.
 
 A UNIT THAT DISAGREES WITH ITSELF FAILS WITH A RECORD. Rows, input candidates, lineage rows, declared
 analysis inputs and sample rows must pair one to one; the failures say where they do not, and the caller
@@ -210,8 +213,8 @@ def build_repository_analysis_rows(
     ``workspace`` is the unit's sample rows with Class projected (apply_class_proposal, or the default
     hierarchy); without it the manifest's own accepted proposal is applied. Returns the rows in the order
     expand_paths_report lists the same inputs, the failures, the counts they were checked against, and the
-    inputs an applied campaign disposition excluded. A row whose input needs a Console alias carries it in
-    ``console_alias`` (path, kind, target); create_console_aliases makes it.
+    inputs the lease or an applied campaign disposition excluded. A row whose input needs a Console alias
+    carries it in ``console_alias`` (path, kind, target); create_console_aliases makes it.
     """
     project = manifest.get("project") or {}
     workspace = workspace if workspace is not None else _unit_workspace(manifest)
@@ -222,6 +225,18 @@ def build_repository_analysis_rows(
     lineage = manifest.get("input_lineage") if isinstance(manifest.get("input_lineage"), dict) else {}
     lineage_rows = [row for row in lineage.get("rows") or [] if isinstance(row, dict)]
     lineage_by_key = {_file_key(str(row.get("path") or "")): row for row in lineage_rows}
+    # What the lease kept out of the input candidates (_exclude_undecodable_inputs) has no lineage row, only
+    # one among the lineage's excluded rows, and is still the declared input and the sample it was fetched for.
+    lease_excluded = {
+        _file_key(str(item["path"])): (str(item["path"]), str(item.get("reason") or ""))
+        for item in manifest.get("excluded_input_candidates") or []
+        if isinstance(item, dict) and str(item.get("path") or "").strip()
+    }
+    excluded_lineage = {
+        _file_key(str(row.get("path") or "")): row
+        for row in lineage.get("excluded") or []
+        if isinstance(row, dict) and str(row.get("path") or "").strip()
+    }
     data_root = Path(str(manifest.get("input_directory") or ""))
     raw_directory = Path(str(manifest.get("raw_directory") or data_root.parent))
     typed = project_from_dict(project)
@@ -230,18 +245,26 @@ def build_repository_analysis_rows(
     unit_mode = str(project.get("acquisition_mode") or "")
     # The execution gate's own readings of an applied campaign disposition: the inputs it excluded, and the
     # type it decided for each input that runs. A disposition only decided (outside a campaign) is neither.
-    excluded = _campaign_excluded_inputs(manifest)
+    # The lease's exclusions are the lease's whatever the disposition says.
+    excluded = {
+        **_campaign_excluded_inputs(manifest),
+        **{key: reason for key, (_path, reason) in lease_excluded.items()},
+    }
     decided_types = _decided_acquisition_by_file(manifest)
     decided_over = _inspected_files(manifest) if _applied_disposition(manifest) else set()
+    # Every input the lease found, whether or not it runs, in the order expand_paths_report would list it.
+    considered = sorted({*candidates, *(path for path, _reason in lease_excluded.values())}, key=str.lower)
     # Which declared input each candidate is, answered as the lease's allow-list answered it: by path, at
     # the place its archive put an archived container, else through the sample its lineage row names.
     matched = (
         match_declared_inputs(
-            candidates,
+            considered,
             data_root,
             declared,
             containers=declared_archive_containers(typed, declared, manifest.get("archive_extractions")),
-            samples={key: str(row.get("sample_id") or "") for key, row in lineage_by_key.items()},
+            samples={
+                key: str(row.get("sample_id") or "") for key, row in {**excluded_lineage, **lineage_by_key}.items()
+            },
         )
         if declared
         else {}
@@ -269,14 +292,16 @@ def build_repository_analysis_rows(
     excluded_forms: set[str] = set()
     excluded_samples: set[str] = set()
     kept: list[str] = []
-    for candidate in candidates:
+    for candidate in considered:
         key = _file_key(candidate)
         if key not in excluded:
             kept.append(candidate)
             continue
         form = declared_of.get(candidate, "")
         sample_id = str(declared[form].get("sample_id") or "").strip() if form else ""
-        sample_id = sample_id or str((lineage_by_key.get(key) or {}).get("sample_id") or "").strip()
+        sample_id = sample_id or str(
+            (lineage_by_key.get(key) or excluded_lineage.get(key) or {}).get("sample_id") or ""
+        ).strip()
         excluded_inputs.append({"path": candidate, "reason": excluded[key], "sample_id": sample_id})
         if form:
             excluded_forms.add(form)
@@ -483,7 +508,7 @@ def build_repository_analysis_rows(
         failures.append(_failure(
             "no_analysis_input",
             "No input of the unit is left to analyse"
-            + (f": the campaign disposition excluded all {len(excluded_inputs)}." if excluded_inputs else "."),
+            + (f": all {len(excluded_inputs)} were excluded (excluded_inputs)." if excluded_inputs else "."),
             [Path(item["path"]).name for item in excluded_inputs],
         ))
     unused_samples = (
@@ -512,7 +537,7 @@ def build_repository_analysis_rows(
         # Where the Catalog declared no inputs (an archive unit), a sample row the download did not deliver
         # is said here rather than failed: its inputs are found after the download, by name.
         "samples_without_input": unused_samples,
-        # The inputs the applied campaign disposition excluded, with its reasons and their samples.
+        # The inputs the lease or the applied campaign disposition excluded, with the reasons and their samples.
         "excluded_inputs": excluded_inputs,
         "aliases": [row["console_alias"] for row in rows if row["console_alias"]],
         "acquisition_types": sorted({row["acquisition_type"] for row in rows if row["acquisition_type"]}),

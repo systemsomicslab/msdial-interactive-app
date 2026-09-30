@@ -68,6 +68,9 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
     )
     from msdial_app.run_finalisation import _directory_of
 
+from msdial_app.mzml_encoding import UNSUPPORTED_MZML_ENCODING
+from test_mzml_encoding import _numpress_mzml, dda_spectra, mzml
+
 # MetaboBank MTBKS217 positive (5b635e6fc36ea3042e2e): the sample id, the folder it names, and what its
 # sample row says about it. Sample x9, Blank x2, Standard x1.
 MTBKS217 = [
@@ -1627,6 +1630,98 @@ class TheCsvWritesTheTypeAnAppliedDispositionDecided(unittest.TestCase):
         self.assertEqual({("DDA", "unit_declaration")}, {
             (row["acquisition_type"], row["acquisition_type_source"]) for row in outside["rows"]
         })
+
+
+def _mzml_unit(root: Path, payloads: dict[str, bytes]) -> Path:
+    """Lease a unit of plain mzML files the Catalog declared one input each (Catalog 0.6.0). Returns its manifest."""
+    base = "https://example.org/MTBLS-MZML/"
+    files, inputs, samples = [], [], []
+    for name, data in payloads.items():
+        stem = Path(name).stem
+        files.append({
+            "path": f"FILES/{name}", "download_url": f"{base}{name}", "size_bytes": len(data),
+            "checksum": hashlib.md5(data).hexdigest(), "role": "raw", "sample_id": stem,
+        })
+        inputs.append({
+            "path": f"FILES/{name}", "kind": "file", "suffix": ".mzml", "format": "mzml",
+            "size_bytes": len(data), "sample_id": stem,
+        })
+        samples.append({"sample_id": stem, "raw_file": f"FILES/{name}", "attributes": {"Group": "g"}})
+    handoff = _handoff(
+        accession="MTBLS-MZML",
+        analysis_unit_id="unit-mzml",
+        technical_settings={
+            "separation": "LC-MS", "ion_mode": "Negative", "acquisition_mode": "DDA", "untargeted": True,
+            "target_omics": "Metabolomics",
+        },
+        files=files,
+        download_scope={
+            "kind": "unit_files", "file_count": len(files), "analysis_file_count": len(inputs),
+            "bundle_bytes": sum(len(data) for data in payloads.values()),
+        },
+        sample_count=len(samples),
+        analytical_sample_count=len(inputs),
+        analysis_input_count=len(inputs),
+        analysis_inputs=inputs,
+        sample_metadata=samples,
+    )
+    project, _workspace = mcp_server._project_from_analysis_unit_handoff(handoff)
+    typed = project_from_dict(project)
+    typed.eligible, typed.selection_status, typed.blocking_reasons = True, "eligible", []
+    client = _Client({f"{base}{name}": data for name, data in payloads.items()})
+    return Path(create_download_lease(typed, root, 10_000_000, client=client)["manifest_path"])
+
+
+class AnMzmlTheLeaseExcludedIsNoRow(unittest.TestCase):
+    """The lease keeps an mzML RawDataHandler cannot decode out of the input candidates (0.5.18).
+
+    It is still the input the Catalog declared for its sample, so the CSV builder must neither count that
+    input and sample missing nor give it a row, and it names it with its reason as it names the inputs a
+    campaign disposition excluded.
+    """
+
+    def _payloads(self) -> dict[str, bytes]:
+        return {"good.mzML": mzml(dda_spectra(6)), "packed.mzML": _numpress_mzml()}
+
+    def test_it_gets_no_row_and_its_declared_input_and_sample_are_not_counted_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = read_manifest(_mzml_unit(Path(temporary), self._payloads()))
+            built = build_repository_analysis_rows(manifest)
+
+        self.assertEqual(["packed.mzML"], [Path(item["path"]).name for item in manifest["excluded_input_candidates"]])
+        self.assertEqual([], built["failures"])
+        self.assertEqual(["good"], [row["file_name"] for row in built["rows"]])
+        self.assertEqual(
+            [("packed.mzML", UNSUPPORTED_MZML_ENCODING, "packed")],
+            [(Path(item["path"]).name, item["reason"], item["sample_id"]) for item in built["excluded_inputs"]],
+        )
+
+    def test_the_csv_record_names_it_with_its_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = _mzml_unit(Path(temporary), self._payloads())
+            with patch.object(mcp_server, "_request_json", side_effect=_no_backend):
+                prepared = mcp_server.msdial_prepare_repository_reanalysis(
+                    hierarchy=["Group"], confirmed=True, manifest_path=str(manifest_path)
+                )
+            with open(prepared["input_path"], encoding="utf-8-sig", newline="") as handle:
+                written = [row["file_name"] for row in csv.DictReader(handle)]
+            manifest = read_manifest(manifest_path)
+
+        self.assertTrue(prepared["prepared"], prepared)
+        self.assertEqual(["good"], written)
+        self.assertEqual(
+            [("packed.mzML", UNSUPPORTED_MZML_ENCODING)],
+            [(Path(item["path"]).name, item["reason"]) for item in manifest["analysis_csv"]["excluded_inputs"]],
+        )
+        self.assertEqual(["good.mzML"], [Path(row["path"]).name for row in manifest["input_lineage"]["rows"]])
+
+    def test_a_unit_whose_every_mzml_the_lease_excluded_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = read_manifest(_mzml_unit(Path(temporary), {"packed.mzML": _numpress_mzml()}))
+            built = build_repository_analysis_rows(manifest)
+
+        self.assertEqual(["no_analysis_input"], [item["code"] for item in blocking_failures(built)])
+        self.assertEqual(["packed.mzML"], built["failures"][0]["inputs"])
 
 
 if __name__ == "__main__":
