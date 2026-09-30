@@ -611,10 +611,10 @@ def _cancel_job(job_id: str, reason: str = "") -> tuple[HTTPStatus, dict[str, An
 
     Sets the job's cancel flag: a Console job's watch stops the Console's process tree (exit code -4), and
     a download stops at its next progress report, recording its lease as download_failed with reason
-    cancelled. A transfer reports at least once a second while bytes arrive, however slowly; one whose
-    bytes have stopped still reports at the idle read timeout and through each retry's backoff
-    (RepositoryHttpClient.download), so the cancel is not taken for a network error. A job that is still
-    queued stops before it starts anything. A download past its last byte
+    cancelled. A transfer reports at least once a second while bytes arrive, however slowly, and while a
+    resume hashes its .part; one whose bytes have stopped still reports at the idle read timeout and
+    through each retry's backoff (RepositoryHttpClient.download), so the cancel is not taken for a network
+    error. A job that is still queued stops before it starts anything. A download past its last byte
     is extracting and recording, and completes. The job ends as failed and says it was cancelled
     (stop_reason); this call returns at once and does not wait for that.
     """

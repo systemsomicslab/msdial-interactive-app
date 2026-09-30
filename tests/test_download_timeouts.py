@@ -14,10 +14,12 @@ that stops arriving, a connection that closes early, and the resume that follows
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import http.server
 import json
+import socket
 import ssl
 import tempfile
 import threading
@@ -25,6 +27,7 @@ import time
 import unittest
 import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from msdial_app import repository_reanalysis
@@ -96,6 +99,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 
 TRICKLE_BYTES = 40          # one every 0.1 s: four seconds of body, and no read anywhere near IDLE
+IMPATIENCE = 0.5            # how long _Impatient waits on a client that reads nothing
+SEED_SECONDS = 0.75         # a hash's first MiB under _slow_hashlib: the read-back of a .part of tens of GB
 
 
 class _Trickle(http.server.BaseHTTPRequestHandler):
@@ -117,6 +122,65 @@ class _Trickle(http.server.BaseHTTPRequestHandler):
                 return      # the client has stopped listening
             if self.server.release.wait(0.1):
                 return
+
+
+class _Impatient(http.server.BaseHTTPRequestHandler):
+    """Serves PAYLOAD under ETAG, or its tail for a Range under a matching If-Range, and drops a client that
+    reads nothing for IMPATIENCE seconds, as nginx's send_timeout (60 s by default) does."""
+
+    def log_message(self, *args) -> None:  # noqa: D102 - quiet
+        pass
+
+    def do_GET(self) -> None:  # noqa: N802 - http.server's interface
+        with self.server.guard:
+            self.server.requests.append({"Range": self.headers.get("Range"),
+                                         "If-Range": self.headers.get("If-Range"), "action": "impatient"})
+        # A small send buffer, so a write blocks soon after the client stops reading, and a timeout on it.
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024)
+        self.connection.settimeout(IMPATIENCE)
+        requested = self.headers.get("Range")
+        start = 0
+        if requested and self.headers.get("If-Range") == ETAG:
+            start = int(requested.split("=", 1)[1].split("-", 1)[0])
+        body = memoryview(PAYLOAD)[start:]
+        self.send_response(206 if start else 200)
+        self.send_header("ETag", ETAG)
+        self.send_header("Content-Length", str(len(body)))
+        if start:
+            self.send_header("Content-Range", f"bytes {start}-{len(PAYLOAD) - 1}/{len(PAYLOAD)}")
+        self.end_headers()
+        try:
+            for offset in range(0, len(body), 64 * 1024):
+                self.wfile.write(body[offset:offset + 64 * 1024])
+        except OSError:     # a TimeoutError among them: the client kept this write waiting
+            self.close_connection = True
+            with contextlib.suppress(OSError):
+                self.connection.shutdown(socket.SHUT_RDWR)
+
+
+class _SlowHash:
+    """A hash that spends ``delay`` seconds on an update of a MiB or more, on every one or only its first."""
+
+    def __init__(self, name: str, delay: float, every: bool, updates: list[tuple[str, int]]) -> None:
+        self._name, self._hash = name, hashlib.new(name)
+        self._delay, self._every, self._slowed, self._updates = delay, every, False, updates
+
+    def update(self, data) -> None:
+        if len(data) >= CHUNK and (self._every or not self._slowed):
+            self._slowed = True
+            time.sleep(self._delay)
+        self._updates.append((self._name, len(data)))
+        self._hash.update(data)
+
+    def hexdigest(self) -> str:
+        return self._hash.hexdigest()
+
+
+def _slow_hashlib(delay: float, every: bool = False, updates: list | None = None) -> SimpleNamespace:
+    """Stands in for repository_reanalysis.hashlib, so a resume's read-back of its .part takes a while."""
+    updates = [] if updates is None else updates
+    return SimpleNamespace(sha256=lambda: _SlowHash("sha256", delay, every, updates),
+                           md5=lambda: _SlowHash("md5", delay, every, updates))
 
 
 class _Server:
@@ -348,6 +412,58 @@ class ASlowTransferIsStillHeard(_Downloads):
         self.assertLess(max(later - earlier for earlier, later in zip(moments, moments[1:])),
                         DOWNLOAD_PROGRESS_INTERVAL_SECONDS + 0.5)
         self.assertGreaterEqual(len(seen), 3, "four seconds of body reported through, not once at its end")
+
+
+class AResumeHashesItsPartBeforeItConnects(_Downloads):
+    """No server waits while a resume reads its .part back.
+
+    The .part was hashed after the connection had opened, and a server that drops a client which reads
+    nothing for a while (nginx's send_timeout, 60 s by default) dropped each resume of a .part that took
+    longer than that to hash: over a minute at 500 MB/s for the catalog's 38 GB archive. Every retry
+    hashed the .part again and was dropped again, so the retries could not recover exactly the objects
+    they are for.
+    """
+
+    def begin_part(self, server: _Server, size: int) -> None:
+        self.partial.write_bytes(PAYLOAD[:size])
+        self.destination.with_name("object.zip.part.json").write_text(json.dumps(
+            {"url": server.url(), "etag": ETAG, "last_modified": "", "content_length": len(PAYLOAD)}
+        ), encoding="utf-8")
+
+    def test_a_server_that_drops_an_idle_client_still_completes_the_resume(self) -> None:
+        """THE REGRESSION."""
+        server = self.server(["impatient"], handler=_Impatient)
+        self.begin_part(server, CHUNK)
+
+        with patch.object(repository_reanalysis, "hashlib", _slow_hashlib(SEED_SECONDS)):
+            result = self.client().download(server.url(), self.destination, 10_000_000)
+
+        self.assertEqual(SHA256, result["sha256"])
+        self.assertEqual(hashlib.md5(PAYLOAD).hexdigest(), result["md5"])
+        self.assertEqual(CHUNK, result["resumed_from_bytes"])
+        self.assertEqual([(f"bytes={CHUNK}-", ETAG)], [(item["Range"], item["If-Range"]) for item in server.requests],
+                         "one attempt, under the stored validator")
+
+    def test_a_cancel_is_heard_while_the_part_is_hashed_and_nothing_is_asked_of_the_server(self) -> None:
+        server = self.server(["serve"])
+        self.begin_part(server, len(PAYLOAD) - 1)     # three MiB reads, the first two slowed
+        updates: list[tuple[str, int]] = []
+        seen: list[tuple[int, int]] = []
+
+        def progress(received: int, declared: int) -> None:
+            seen.append((received, declared))
+            raise Cancelled()
+
+        with patch.object(repository_reanalysis, "hashlib", _slow_hashlib(0.3, every=True, updates=updates)):
+            with self.assertRaises(Cancelled) as raised:
+                self.client(retries=3).download(server.url(), self.destination, 10_000_000,
+                                                progress_callback=progress)
+
+        self.assertEqual([], server.requests, "stopped before it asked the server for anything")
+        self.assertEqual([(len(PAYLOAD) - 1, len(PAYLOAD))], seen, "the bytes held, of the object that began them")
+        self.assertLess(sum(1 for name, _ in updates if name == "sha256"), 3, "heard during the hash, not after it")
+        self.assertEqual("stopped", raised.exception.download_attempts[0]["outcome"])
+        self.assertEqual(len(PAYLOAD) - 1, self.partial.stat().st_size, "and the .part is as it was")
 
 
 class WhatIsRetryable(unittest.TestCase):

@@ -157,7 +157,8 @@ class EligibilityPolicy:
 #
 # A stall is not the only way to go quiet. Each read asked for a whole MiB, and urllib's read(amt) waits
 # until it has one, so a transfer trickling in at 1 KB/s reached the callback once in seventeen minutes
-# while every socket read came well inside the idle timeout. A transfer now reports at least this often.
+# while every socket read came well inside the idle timeout; and a resume hashed its whole .part, tens of
+# seconds for a large one, before the callback first heard from it. Both now report at least this often.
 DOWNLOAD_IDLE_TIMEOUT_SECONDS = 120.0
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_RETRY_BACKOFF_SECONDS = (10.0, 30.0, 90.0)
@@ -277,10 +278,11 @@ class RepositoryHttpClient:
 
         ``progress_callback(received, declared)`` is called as bytes arrive: after each MiB, and after the
         first read to return a second or more since the last call, however few bytes it brought. It is
-        also called when a read stalls, and about once a second through each backoff, with the last values
-        it was given. A caller that stops a download by raising from it (a cancelled job) is therefore
-        heard within the idle timeout and a second, however slowly the bytes come, and the exception it
-        raised is what the download raises: a stop, not a network error.
+        also called about once a second while a resume hashes the .part it already holds, when a read
+        stalls, and about once a second through each backoff, with the last values it was given. A caller
+        that stops a download by raising from it (a cancelled job) is therefore heard within the idle
+        timeout and a second, however slowly the bytes come, and the exception it raised is what the
+        download raises: a stop, not a network error.
         """
         partial = destination.with_name(destination.name + ".part")
         attempts: list[dict[str, Any]] = []
@@ -381,13 +383,18 @@ class RepositoryHttpClient:
         and each had to complete in one unbroken connection or start again from nothing.
 
         HOW IT RESUMES. A .part left by an earlier attempt is offered back to the server as
-        `Range: bytes=<size>-`. A 206 means the server honoured it: the existing bytes are hashed
-        first, then the response is appended. Anything else - a 200 because the server ignores
-        ranges, a 416 because the .part is already as long as the resource, a changed
-        ETag/Last-Modified - restarts from zero, because a resumed file that mixes two versions of
-        an object is worse than a slow one. The checksums are computed over the whole file either
-        way, so a wrong guess about resumability shows up as a checksum that does not match rather
-        than as silent corruption.
+        `Range: bytes=<size>-`. Its bytes are hashed before the request is sent, and a 206 means the
+        server honoured it: the response is appended to the file and to those hashes. Anything else -
+        a 200 because the server ignores ranges, a 416 because the .part is already as long as the
+        resource, a changed ETag/Last-Modified - discards the hashes and restarts from zero, because
+        a resumed file that mixes two versions of an object is worse than a slow one. The checksums
+        are computed over the whole file either way, so a wrong guess about resumability shows up as
+        a checksum that does not match rather than as silent corruption.
+
+        The hashing used to come after the connection opened. The server then waited on a client
+        that read nothing, for over a minute on a .part of tens of GB, and a server that drops such a
+        client (nginx's send_timeout is 60 s by default) dropped every resume of exactly the large
+        objects the retries are for: each retry hashed the .part again and was dropped again.
 
         HOW A CHANGED OBJECT IS TOLD. The validators of the response that started a .part (its
         strong ETag, else its Last-Modified, and its Content-Length) are kept beside it in
@@ -416,6 +423,12 @@ class RepositoryHttpClient:
             partial.unlink(missing_ok=True)
             resume_from = 0
         validators = _read_part_validators(validators_path, url) if resume_from else {}
+        # Before the request, not after: no server waits while a large .part is read back.
+        seeded = (
+            _hash_part(partial, resume_from, int(validators.get("content_length") or 0), progress_callback)
+            if resume_from
+            else None
+        )
 
         headers = {"User-Agent": USER_AGENT}
         if resume_from:
@@ -471,24 +484,17 @@ class RepositoryHttpClient:
                     f"Remote object is {total_declared} bytes; limit is {maximum_bytes} bytes."
                 )
 
-            digest = hashlib.sha256()
-            md5 = hashlib.md5()
-            downloaded = 0
             if appending:
-                # Seed both hashes with the bytes already on disk, so the checksums describe the
-                # whole object and not only what this attempt fetched.
-                with partial.open("rb") as existing:
-                    for chunk in iter(lambda: existing.read(1024 * 1024), b""):
-                        digest.update(chunk)
-                        md5.update(chunk)
-                        downloaded += len(chunk)
-                if downloaded != resume_from:
-                    # The file changed under us between the stat and the read.
-                    raise ValueError(
-                        f"Partial file {partial.name} is {downloaded} bytes, expected {resume_from}."
-                    )
+                # Both hashes already hold the bytes on disk, so the checksums describe the whole
+                # object and not only what this attempt fetched.
+                digest, md5 = seeded
+                downloaded = resume_from
                 if progress_callback:
                     progress_callback(downloaded, total_declared)
+            else:
+                digest = hashlib.sha256()
+                md5 = hashlib.md5()
+                downloaded = 0
 
             # read1 returns what the socket has, up to a MiB. read(amt) waited for the whole MiB, so a
             # slow transfer reached the callback, and through it a cancel and the lease heartbeat, once
@@ -545,6 +551,31 @@ class RepositoryHttpClient:
             if validators.get(key):
                 result[key] = validators[key]
         return result
+
+
+def _hash_part(partial: Path, expected: int, declared: int, progress_callback: Any) -> tuple[Any, Any]:
+    """The sha256 and md5 of the .part a resume would append to, which must be the size the stat found.
+
+    The callback hears (expected, declared) about once a second while the hash runs, so a cancel is
+    heard during a .part of tens of GB and not only after it; ``declared`` is the whole object's length
+    as the response that began the .part gave it, or 0.
+    """
+    digest = hashlib.sha256()
+    md5 = hashlib.md5()
+    hashed = 0
+    reported_at = time.monotonic()
+    with partial.open("rb") as existing:
+        for chunk in iter(lambda: existing.read(_DOWNLOAD_CHUNK_BYTES), b""):
+            digest.update(chunk)
+            md5.update(chunk)
+            hashed += len(chunk)
+            if progress_callback and time.monotonic() - reported_at >= DOWNLOAD_PROGRESS_INTERVAL_SECONDS:
+                progress_callback(expected, declared)
+                reported_at = time.monotonic()
+    if hashed != expected:
+        # The file changed under us between the stat and the read.
+        raise ValueError(f"Partial file {partial.name} is {hashed} bytes, expected {expected}.")
+    return digest, md5
 
 
 def _response_validators(response: Any, url: str) -> dict[str, Any]:
