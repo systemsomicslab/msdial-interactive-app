@@ -1297,11 +1297,13 @@ def create_download_lease(
     - materialise and convert: recorded as not_used. The accession download store and the mzXML
       conversion are wired in here, after extraction and before input discovery, and nothing else in the
       order changes when they are;
-    - discover: the MS-DIAL inputs under the data root;
-    - attribute: the unit's own inputs, extracted files and declared checksums (allowlist_checksum_
-      validation), and one input_lineage row per input. An mzML whose binary arrays RawDataHandler cannot
-      decode is not an input: it is listed in excluded_input_candidates and in input_lineage's excluded
-      rows, with reason unsupported_mzml_encoding and the accessions found (_exclude_undecodable_inputs);
+    - discover: every vendor folder listed member by member checked whole (container_completeness),
+      then the MS-DIAL inputs under the data root, outermost folders only;
+    - attribute: the unit's own inputs - by path, every one, when the Catalog declared them
+      (analysis_inputs) - extracted files and declared checksums (allowlist_checksum_validation), and one
+      input_lineage row per input. An mzML whose binary arrays RawDataHandler cannot decode is not an
+      input: it is listed in excluded_input_candidates and in input_lineage's excluded rows, with reason
+      unsupported_mzml_encoding and the accessions found (_exclude_undecodable_inputs);
     - record: the manifest.
 
     The stages are written into the manifest as they finish, so a lease that stops says where
@@ -1536,8 +1538,18 @@ def create_download_lease(
         stages.not_used("convert", "No input conversion ran in this lease.")
 
         stages.start("discover")
+        # Before anything is discovered: a folder that did not arrive whole is no input at all.
+        container_completeness = verify_container_completeness(data_root, project)
         all_inputs = _find_msdial_inputs(data_root)
-        stages.finish("discover", input_candidates=len(all_inputs))
+        stages.finish(
+            "discover",
+            input_candidates=len(all_inputs),
+            **(
+                {"vendor_folders_complete": container_completeness["containers"]}
+                if container_completeness["required"]
+                else {}
+            ),
+        )
 
         stages.start("attribute")
         archive_samples = _archive_sample_attribution(
@@ -1618,6 +1630,8 @@ def create_download_lease(
         if excluded_inputs:
             # Only where one was, so a unit with nothing excluded records what it always did.
             manifest["excluded_input_candidates"] = excluded_inputs
+        if container_completeness["required"]:
+            manifest["container_completeness"] = container_completeness
         warnings = _archive_warnings(archive_extractions)
         if warnings:
             manifest["archive_warnings"] = warnings
@@ -4236,9 +4250,22 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
             if str((sample or {}).get("sample_id") or "") in sample_ids
         ]
         project["sample_count"] = len(project["sample_metadata"]) or part["file_count"]
+        if project.get("analysis_inputs"):
+            # The Catalog's inputs of this part's samples only, so a part's analysis CSV is held to its own
+            # inputs and not to the parent's.
+            project["analysis_inputs"] = [
+                entry for entry in parent_project.get("analysis_inputs") or []
+                if isinstance(entry, dict) and str(entry.get("sample_id") or "") in sample_ids
+            ]
+        # A folder's files are listed one by one, as its members (Catalog 0.6.0): they go with the part
+        # whose input their folder is, so a part's download description is its own folders'.
         matched_files = [
             item for item in parent_project.get("files") or []
             if PurePosixPath(str(item.get("name") or "").replace("\\", "/")).name.casefold() in names
+            or (
+                str(item.get("role") or "") == VENDOR_FOLDER_MEMBER_ROLE
+                and PurePosixPath(str(item.get("container") or "").replace("\\", "/")).name.casefold() in names
+            )
         ]
         # An archive unit's file list names the archive, not the files inside it; the part then
         # shares the parent's download description rather than being given an empty one.
@@ -4932,6 +4959,9 @@ def _filter_inputs_by_project_allowlist(
     """
     if not project.analysis_unit_id:
         return inputs
+    declared = declared_analysis_inputs(project)
+    if declared:
+        return _select_declared_inputs(inputs, data_root, project, declared)
     archive_samples = archive_samples or {}
     allowed = _project_allowlist(project, analysis_only=True)
     sample_names = _sample_file_names(project)
@@ -4962,6 +4992,84 @@ def _filter_inputs_by_project_allowlist(
             f"{project.analysis_unit_id}. Refusing to fall back to accession-level inputs."
         )
     return selected
+
+
+# The kinds of Catalog analysis input MS-DIAL opens. A declared directory (a Bruker NMR experiment folder)
+# is a sample but never an input, and the Catalog blocks a unit that holds one.
+DECLARED_INPUT_KINDS = frozenset({"file", "vendor_folder", "archived_container"})
+
+
+def declared_analysis_inputs(project: RepositoryProject) -> dict[str, dict[str, Any]]:
+    """The Catalog's declared analysis inputs that MS-DIAL opens, by path relative to the data root.
+
+    Keyed as the lease places them: '/'-separated, casefolded, less a leading FILES/ (_safe_relative_name).
+    Empty when the Catalog declared none. An input it says must be converted first (mzXML) is left out:
+    no reader opens it, and what a conversion writes is attributed through its own record.
+    """
+    result: dict[str, dict[str, Any]] = {}
+    for entry in project.analysis_inputs or []:
+        if not isinstance(entry, dict) or entry.get("requires_conversion"):
+            continue
+        if str(entry.get("kind") or "") not in DECLARED_INPUT_KINDS:
+            continue
+        try:
+            key = _safe_relative_name(str(entry.get("path") or "")).as_posix().casefold()
+        except ValueError:
+            continue
+        result[key] = entry
+    return result
+
+
+def _select_declared_inputs(
+    inputs: list[str],
+    data_root: Path,
+    project: RepositoryProject,
+    declared: dict[str, dict[str, Any]],
+) -> list[str]:
+    """The inputs that are this unit's declared analysis inputs, matched by path, every one of them.
+
+    WHY BY PATH, AND WHY EVERY ONE. Before the Catalog declared its inputs, an input was admitted when a
+    listed name or a sample's file name matched its basename. A Waters folder matched neither - its
+    listing names the files inside it - so a MetaboBank folder unit raised "did not contain an MS-DIAL
+    input" after its whole download; a Bruker folder passed only because its 0-byte marker file X.d/X.d
+    happens to carry the folder's name. The declared path is what the Catalog attributed to a sample row,
+    so it is what is matched, and a declared input that is not on disk stops the lease by name rather than
+    leaving a unit that silently lost a sample. A basename match is not a fallback here: it is how an input
+    another unit shares a name with would get in.
+    """
+    found: dict[str, list[str]] = {key: [] for key in declared}
+    for item in inputs:
+        relative = _relative_to_data_root(Path(item), data_root)
+        if relative is None:
+            continue
+        # The most specific form first, so an input is one declared input's, whichever others share a tail.
+        for form in sorted(_allowlist_forms(relative), key=len, reverse=True):
+            if form in found:
+                found[form].append(item)
+                break
+    missing = [str(declared[key].get("path") or key) for key, matched in found.items() if not matched]
+    doubled = [
+        f"{declared[key].get('path') or key} ({len(matched)} inputs)"
+        for key, matched in found.items()
+        if len(matched) > 1
+    ]
+    if missing or doubled:
+        problems = []
+        if missing:
+            problems.append(
+                f"{len(missing)} of its {len(declared)} declared analysis inputs are not in the download: "
+                + ", ".join(sorted(missing, key=str.casefold)[:5])
+                + (f", and {len(missing) - 5} more" if len(missing) > 5 else "")
+            )
+        if doubled:
+            problems.append("declared inputs found more than once: " + ", ".join(doubled[:5]))
+        raise ValueError(
+            f"Analysis unit {project.analysis_unit_id} declares its analysis inputs, and "
+            + "; ".join(problems)
+            + ". Refusing to run it without them."
+        )
+    selected = {item for matched in found.values() for item in matched}
+    return [item for item in inputs if item in selected]
 
 
 
@@ -5670,6 +5778,141 @@ def _archive_warnings(records: list[dict[str, Any]]) -> list[dict[str, str]]:
     return warnings
 
 
+# The role the Catalog gives a file inside a vendor folder it lists member by member (Catalog 0.6.0). A
+# member is downloaded, checksummed and covered, and is never an input or a sample: its folder is.
+VENDOR_FOLDER_MEMBER_ROLE = "vendor_folder_member"
+# What a partial transfer leaves beside its file (RepositoryHttpClient.download).
+PARTIAL_TRANSFER_SUFFIXES = (".part", ".part.json")
+
+
+def _vendor_container_of(name: str) -> str:
+    """The outermost .d/.raw folder a listed file lies in, as the Catalog's container_of reads it; ''."""
+    parts = [part for part in str(name or "").replace("\\", "/").split("/") if part]
+    for index, part in enumerate(parts[:-1]):
+        lowered = part.casefold()
+        if lowered.endswith(archives.FOLDER_CONTAINER_SUFFIXES) and lowered not in archives.FOLDER_CONTAINER_SUFFIXES:
+            return "/".join(parts[: index + 1])
+    return ""
+
+
+def _is_reader_created_file(relative: str) -> bool:
+    """Whether a vendor reader writes this file inside the folder it reads (relative to the folder).
+
+    Bruker's baf2sql writes analysis.sqlite into a BAF .d that arrived without one; the pinned raw-metadata
+    extractor was seen doing it, and the Console's reader is the same one. Such a file is neither missing
+    from a downloaded folder nor foreign to it. A shared helper for these is being added with the Console
+    inventory work; this is the minimal local predicate, for that merge to replace.
+    """
+    return str(relative or "").replace("\\", "/").casefold() == "analysis.sqlite"
+
+
+def verify_container_completeness(data_root: Path, project: RepositoryProject) -> dict[str, Any]:
+    """Whether every vendor folder the unit lists member by member arrived whole. Raises when one did not.
+
+    WHY. A folder is one data file, so a folder short of one member is a damaged data file, and its reader
+    either fails deep inside a vendor SDK or reads what is there: a Waters .raw missing one _FUNCnnn.DAT has
+    silently lost an acquisition function. The download compares each member's published MD5 as it lands,
+    but a member published without one, a folder whose members were never all fetched, or a workspace a
+    lease reused is not caught by that. So each declared folder must be a directory holding every member
+    it lists, each of its listed size, and no partial transfer (.part, .part.json).
+
+    A file inside the folder that the listing does not name is recorded, not refused: a vendor reader may
+    write into the folder it reads (_is_reader_created_file), and anything else is named for a reader of
+    the record. Only files of role vendor_folder_member are checked, so a unit whose listing names no
+    folder member (every handoff before Catalog 0.6.0, an archive unit) records that nothing was required.
+    """
+    members: dict[str, list[RepositoryFile]] = {}
+    spelled: dict[str, str] = {}
+    for item in project.files:
+        if item.role != VENDOR_FOLDER_MEMBER_ROLE:
+            continue
+        container = str(item.container or "").strip() or _vendor_container_of(item.name)
+        try:
+            key = _safe_relative_name(container).as_posix().casefold() if container else ""
+        except ValueError:
+            key = ""
+        if not key:
+            raise ValueError(f"Folder member {item.name} names no vendor folder it lies in.")
+        members.setdefault(key, []).append(item)
+        spelled.setdefault(key, container)
+    if not members:
+        return {"required": False, "containers": 0, "members": 0}
+
+    # Where each folder is: an archive may have put the listed tree under a folder of its own (MB-POST's
+    # project tar), so folders are found by the same relative forms the allow-list reads, a folder at
+    # exactly the listed path before one that only ends in it.
+    on_disk: dict[str, Path] = {}
+    for directory, directories, _names in os.walk(data_root):
+        for name in list(directories):
+            if not name.casefold().endswith(archives.FOLDER_CONTAINER_SUFFIXES):
+                continue
+            path = Path(directory) / name
+            relative = _relative_to_data_root(path, data_root)
+            if relative is None:
+                continue
+            if relative in members:
+                on_disk[relative] = path
+                continue
+            for form in _allowlist_forms(relative):
+                if form in members:
+                    on_disk.setdefault(form, path)
+
+    problems: list[str] = []
+    reader_created: list[str] = []
+    unlisted: list[str] = []
+    for key, listed in sorted(members.items()):
+        container = spelled[key]
+        folder = on_disk.get(key)
+        if folder is None:
+            problems.append(f"{container}: the folder is not in the download")
+            continue
+        offset = len(_safe_relative_name(container).as_posix()) + 1
+        expected: dict[str, tuple[str, RepositoryFile]] = {}
+        for item in listed:
+            relative = _safe_relative_name(item.name).as_posix()[offset:]
+            expected[relative.casefold()] = (relative, item)
+        missing: list[str] = []
+        resized: list[str] = []
+        for relative, item in expected.values():
+            path = folder / relative
+            if not path.is_file():
+                missing.append(relative)
+            elif item.size_bytes and path.stat().st_size != item.size_bytes and not _is_reader_created_file(relative):
+                resized.append(f"{relative} ({path.stat().st_size} of {item.size_bytes} bytes)")
+        partial: list[str] = []
+        for directory, _directories, names in os.walk(folder):
+            for name in names:
+                relative = (Path(directory) / name).relative_to(folder).as_posix()
+                if name.casefold().endswith(PARTIAL_TRANSFER_SUFFIXES):
+                    partial.append(relative)
+                elif relative.casefold() not in expected:
+                    (reader_created if _is_reader_created_file(relative) else unlisted).append(
+                        f"{container}/{relative}"
+                    )
+        for label, found in (("missing", missing), ("of another size", resized), ("partial", partial)):
+            if found:
+                problems.append(
+                    f"{container}: {len(found)} member(s) {label}: " + ", ".join(sorted(found)[:3])
+                )
+    record: dict[str, Any] = {
+        "required": True,
+        "containers": len(members),
+        "members": sum(len(items) for items in members.values()),
+        "complete": not problems,
+        "reader_created_files": sorted(reader_created),
+        "unlisted_file_count": len(unlisted),
+        "unlisted_files": sorted(unlisted)[:20],
+    }
+    if problems:
+        raise ValueError(
+            f"{len(problems)} of the unit's {len(members)} vendor folders did not arrive whole: "
+            + "; ".join(problems[:5])
+            + (f"; and {len(problems) - 5} more" if len(problems) > 5 else "")
+            + "."
+        )
+    return record
+
+
 def _find_msdial_inputs(root: Path) -> list[str]:
     paths = sorted(root.rglob("*"))
     vendor_roots = {
@@ -5677,7 +5920,13 @@ def _find_msdial_inputs(root: Path) -> list[str]:
         for path in paths
         if path.is_dir() and path.suffix.casefold() in {".d", ".raw"}
     }
-    result = [str(path) for path in sorted(vendor_roots)]
+    # OUTERMOST ROOTS ONLY. A folder is one data file, whatever it holds: an Agilent or Bruker .d may keep
+    # a directory whose name also ends in .d (a method, a calibration), and it is part of its folder, read
+    # by that folder's reader, never an input of its own.
+    outermost = {
+        path for path in vendor_roots if not any(parent in vendor_roots for parent in path.parents)
+    }
+    result = [str(path) for path in sorted(outermost)]
     for path in paths:
         lower = path.name.casefold()
         if not path.is_file() or _is_sidecar_name(path.name):
