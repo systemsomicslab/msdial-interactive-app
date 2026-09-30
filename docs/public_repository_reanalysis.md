@@ -244,8 +244,14 @@ applied: it sets `execution_allowed`, the status (`preflight_passed`,
 `console_acquisition_type` (DDA, SWATH or AIF; none for an input that does not
 run), and the execution gate then admits each file only as that type.
 
-Outside a campaign, an eligible unit with an unreadable input ends as it always
-did, as `preflight_unavailable` (or `preflight_unsupported_format`) with
+A repository declaration of PRM, SRM, MRM, SIM or full scan is a declaration like
+any other: the unit is excluded unless a header of confidence 0.8 or more says
+otherwise, and untargeted status is never inferred over a declared targeted
+acquisition. An input that is missing, or that the recorded preflight never read,
+skips the unit (`inputs_missing`, `raw_metadata_incomplete`) instead of shrinking
+the run; only an input that was read and failed is excluded on its own. Outside a
+campaign, an eligible unit with an unreadable input ends as it always did, as
+`preflight_unavailable` (or `preflight_unsupported_format`) with
 `execution_allowed` kept, since nothing outside a campaign can exclude that input.
 
 No disposition changes a unit that was split, whose run has finished
@@ -255,6 +261,8 @@ reports `preflight_held`, and `classify_preflight` returns its decision with
 `held` and writes nothing. A split parent that is read all the same (outside a
 campaign, or split while its headers were being read) records the reads for its
 parts and keeps its status and the disposition it carries.
+`classify_preflight` decides a summary written before the per-file fields
+existed from the extractor records its preflight left.
 
 If raw headers report more than one acquisition mode, the result is `Mixed`.
 Preview `msdial_split_repository_unit`, confirm the proposed DDA and

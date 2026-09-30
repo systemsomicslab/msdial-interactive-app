@@ -673,10 +673,12 @@ def _manifest(
         entry.update({"outcome": "ok", "format": (formats or {}).get(Path(entry["file"]).name, "mzml")})
         entries.append(entry)
     for name, outcome in (failures or {}).items():
+        # Shaped as _per_input_entries writes an input whose header could not be read.
         entries.append(
             {
                 "file": name, "outcome": outcome, "acquisition_mode": "", "polarity": "",
                 "format": (formats or {}).get(name, "mzml"), "has_ion_mobility": None,
+                "header_console_acquisition_type": None, "console_acquisition_type": None,
             }
         )
     summary["per_file"] = entries
@@ -895,6 +897,63 @@ class DispositionMatrixTests(unittest.TestCase):
         self.assertEqual(["raw_metadata_preflight_missing"], decide_disposition({"input_candidates": ["a"]})["reasons"])
         self.assertEqual(["raw_metadata_incomplete"], decide_disposition(capped)["reasons"])
 
+    def test_an_input_gone_or_never_read_skips_the_unit_rather_than_shrinking_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            converted_later = Path(temporary) / "converted_later.mzML"
+            converted_later.write_bytes(b"x")
+            manifest = _manifest([_header("a.mzML", "DDA")], declared={"acquisition_mode": "DDA"})
+            manifest["input_candidates"] += [str(converted_later), str(Path(temporary) / "never_downloaded.mzML")]
+            disposition = decide_disposition(manifest)
+
+        self.assertEqual("skip", disposition["disposition"])
+        self.assertEqual(["inputs_missing", "raw_metadata_incomplete"], disposition["reasons"])
+        self.assertEqual([], disposition["excluded_inputs"])
+
+    def test_a_declared_targeted_acquisition_is_excluded_unless_a_confident_header_contradicts_it(self) -> None:
+        for method in ("MRM", "SRM", "PRM", "SIM"):
+            with self.subTest(method=method):
+                weak = self.decide([_header("a.mzML", "DDA", confidence=0.5)], declared={"acquisition_mode": method})
+                unreadable = self.decide([], declared={"acquisition_mode": method}, failures={"a.wiff2": "failed"})
+                confident = self.decide([_header("a.mzML", "DDA", confidence=0.9)], declared={"acquisition_mode": method})
+
+                self.assertEqual(("exclude", [f"acquisition_out_of_scope:{method}"]), (weak["disposition"], weak["reasons"]))
+                self.assertIn("acquisition_header_disagrees_low_confidence", weak["warnings"])
+                self.assertEqual(
+                    ("exclude", [f"acquisition_out_of_scope:{method}"]), (unreadable["disposition"], unreadable["reasons"])
+                )
+                self.assertEqual(("run", "DDA"), (confident["disposition"], confident["console_acquisition_type"]))
+                self.assertIn("acquisition_header_overrides_declaration", confident["warnings"])
+
+    def test_srm_and_mrm_are_one_declaration(self) -> None:
+        disposition = self.decide([_header("a.mzML", "MRM", confidence=0.9)], declared={"acquisition_mode": "SRM"})
+
+        self.assertEqual(("exclude", ["acquisition_out_of_scope:MRM"]), (disposition["disposition"], disposition["reasons"]))
+        self.assertNotIn("acquisition_header_overrides_declaration", disposition["warnings"])
+
+    def test_a_declared_full_scan_is_a_declaration(self) -> None:
+        weak = self.decide([_header("a.mzML", "DDA", confidence=0.6)], declared={"acquisition_mode": "FullScan"})
+        unknown = self.decide([_header("w.raw", "Unknown", confidence=0.3)], declared={"acquisition_mode": "FullScan"})
+        confident = self.decide([_header("a.mzML", "DDA", confidence=0.9)], declared={"acquisition_mode": "FullScan"})
+
+        self.assertEqual(("exclude", ["acquisition_out_of_scope:FullScan"]), (weak["disposition"], weak["reasons"]))
+        self.assertEqual(("exclude", ["acquisition_out_of_scope:FullScan"]), (unknown["disposition"], unknown["reasons"]))
+        self.assertEqual("run", confident["disposition"])
+
+    def test_untargeted_is_never_inferred_over_a_declared_targeted_acquisition(self) -> None:
+        targeted = self.decide(
+            [_header("a.mzML", "DDA", confidence=0.9)], declared={"acquisition_mode": "MRM", "untargeted": None}
+        )
+        full_scan = self.decide(
+            [_header("a.mzML", "DDA", confidence=0.9)], declared={"acquisition_mode": "FullScan", "untargeted": None}
+        )
+
+        self.assertEqual(("skip", ["untargeted_unresolved"]), (targeted["disposition"], targeted["reasons"]))
+        self.assertIn("declares MRM acquisition", " ".join(targeted["detail"]))
+        # Full scan names no study design; the headers may still show an untargeted acquisition.
+        self.assertEqual("run", full_scan["disposition"])
+        self.assertIn("untargeted_inferred_from_headers", full_scan["warnings"])
+
+
     def test_the_record_has_the_shared_contract_shape(self) -> None:
         disposition = self.decide([_header("a.mzML", "DDA")])
         disposition.pop("assignments")
@@ -903,6 +962,90 @@ class DispositionMatrixTests(unittest.TestCase):
             self.assertIn(key, disposition)
         self.assertEqual("msdial-campaign-disposition.v1", disposition["schema"])
         self.assertEqual({"sha256", "inventory_sha256", "provenance_status", "pinned"}, set(disposition["extractor"]))
+
+
+def _legacy_entry(path: str, method: str, levels: list[int] | None = None, confidence: float = 0.8) -> dict:
+    """A per-file record as Interactive 0.5.16 and earlier summarised an input."""
+    return {
+        "file": path, "acquisition_mode": method, "confidence": confidence, "evidence": "synthetic",
+        "polarity": "Negative", "ms_levels": [1, 2] if levels is None else levels,
+        "acquisition_start_time": "", "acquisition_start_time_evidence": "",
+    }
+
+
+def _legacy_manifest(entries: list[dict], declared: dict | None = None) -> dict:
+    return {
+        "input_candidates": [entry["file"] for entry in entries],
+        "project": {"analysis_unit_id": "u", "separation": "LC-MS", "untargeted": True, "ion_mode": "Negative",
+                    **(declared or {})},
+        "raw_metadata_preflight": {
+            "exit_code": 0,
+            "summary": {"per_file": entries, "coverage": {"complete": True}, "observed_separations": []},
+        },
+    }
+
+
+class LegacySummaryTests(_Scratch):
+    """Per-file records written before this preflight recorded formats, MS-level flags and isolation."""
+
+    def test_an_ion_mobility_folder_is_told_from_the_disk(self) -> None:
+        folder = self.root / "IM-AI_mltstd_01.d"
+        (folder / "AcqData").mkdir(parents=True)
+        (folder / "AcqData" / "IMSFrame.bin").write_bytes(b"x")
+
+        disposition = decide_disposition(_legacy_manifest([_legacy_entry(str(folder), "AIF")], {"acquisition_mode": "AIF"}))
+
+        self.assertEqual(("exclude", ["ion_mobility_out_of_scope"]), (disposition["disposition"], disposition["reasons"]))
+        self.assertIn("raw_metadata_preflight_legacy", disposition["warnings"])
+
+    def test_ms1_and_ms2_are_read_from_ms_levels(self) -> None:
+        both = decide_disposition(
+            _legacy_manifest([_legacy_entry("a.mzML", "DDA")], {"acquisition_mode": "DDA", "untargeted": None})
+        )
+        ms1_only = decide_disposition(_legacy_manifest([_legacy_entry("a.mzML", "DDA", levels=[1])]))
+
+        self.assertEqual("run", both["disposition"])
+        self.assertIn("untargeted_inferred_from_headers", both["warnings"])
+        self.assertEqual(("exclude", ["acquisition_out_of_scope:FullScan"]), (ms1_only["disposition"], ms1_only["reasons"]))
+
+    def test_a_legacy_aif_verdict_is_aif_without_a_declaration(self) -> None:
+        disposition = decide_disposition(_legacy_manifest([_legacy_entry("a.d", "AIF", confidence=1.0)]))
+
+        self.assertEqual(("run", "AIF"), (disposition["disposition"], disposition["console_acquisition_type"]))
+
+    def test_classify_decides_a_legacy_dia_summary_from_the_extractor_records(self) -> None:
+        manifest, _stub, files = _unit(
+            self.root / "unit", ["a_DIA.mzML", "b_DIA.mzML"], acquisition="DIA",
+            extra={"campaign_authorizations": [dict(_APPROVAL)]},
+        )
+        output = manifest.parent / "raw-metadata-preflight.json"
+        records = [_header(str(path), "DIA", confidence=0.82) for path in files]
+        output.write_text(json.dumps(records), encoding="utf-8")
+
+        def legacy(current: dict) -> None:
+            current["status"] = "preflight_passed"
+            current["raw_metadata_preflight"] = {
+                "exit_code": 0, "output": str(output),
+                "summary": {
+                    "per_file": [_legacy_entry(str(path), "DIA", confidence=0.82) for path in files],
+                    "coverage": {"input_candidates": 2, "inspected": 2, "complete": True},
+                    "observed_separations": ["LiquidChromatography"],
+                },
+            }
+
+        update_manifest(manifest, legacy)
+
+        disposition = classify_preflight(manifest)
+        recorded = read_manifest(manifest)
+
+        self.assertEqual(("run", "SWATH"), (disposition["disposition"], disposition["console_acquisition_type"]))
+        # The windows the extractor recorded decided SWATH, not the declaration.
+        self.assertNotIn("declared_dia_read_as_swath", disposition["warnings"])
+        self.assertIn("raw_metadata_preflight_legacy", disposition["warnings"])
+        entries = recorded["raw_metadata_preflight"]["summary"]["per_file"]
+        self.assertEqual(["SWATH", "SWATH"], [entry["console_acquisition_type"] for entry in entries])
+        # Decided from the records, recorded as it was.
+        self.assertNotIn("header_console_acquisition_type", entries[0])
 
 
 class _PinnedExtractor:
@@ -1062,6 +1205,18 @@ class CampaignPreflightTests(_Scratch):
         self.assertEqual([("b.mzML", "raw_header_unreadable")], [
             (Path(item["path"]).name, item["reason"]) for item in recorded["campaign_disposition"]["excluded_inputs"]
         ])
+
+    def test_a_declared_mrm_unit_with_weak_dda_headers_is_excluded_not_run_as_dda(self) -> None:
+        manifest, _stub, _ = self.campaign_unit(["a.wiff", "b.wiff"], acquisition="MRM", untargeted=None)
+        extractor = _PinnedExtractor.make(self.root / "build")
+        weak = {name: {"method": "DDA", "confidence": 0.55} for name in ("a.wiff", "b.wiff")}
+
+        result = self.preflight(manifest, extractor, _Extractor(weak))
+
+        self.assertEqual("excluded_by_preflight", result["status"])
+        self.assertFalse(result["execution_allowed"])
+        self.assertEqual(["acquisition_out_of_scope:MRM"], result["campaign_disposition"]["reasons"])
+        self.assertIsNot(True, result["project"]["untargeted"])
 
     def test_an_input_the_disposition_excludes_runs_as_no_type(self) -> None:
         manifest, _stub, _ = self.campaign_unit(["a.mzML", "im.mzML"])

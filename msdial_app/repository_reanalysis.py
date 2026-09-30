@@ -3484,6 +3484,40 @@ def _apply_disposition(
         current["status"] = SKIPPED_BY_PREFLIGHT_STATUS if kind == "skip" else EXCLUDED_BY_PREFLIGHT_STATUS
 
 
+def _rebuilt_legacy_per_file(current: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """A summary written before the per-file fields, read again from the extractor's own records.
+
+    Interactive 0.5.16 and earlier summarised each input as acquisition_mode, polarity and ms_levels,
+    with no format, MS-level flags or isolation, so a DIA verdict could not be told SWATH from AIF. Such a
+    summary exists only for a preflight whose one extractor process read every input, and that process's
+    records are in the preflight's output. Returns per-file records in the current shape, for deciding
+    only, or None when the summary is current or the output does not hold a record for every input.
+    """
+    from .raw_metadata_preflight import OUTCOME_OK, file_key, input_format
+
+    preflight = current.get("raw_metadata_preflight") or {}
+    entries = [item for item in (preflight.get("summary") or {}).get("per_file") or [] if isinstance(item, dict)]
+    if not entries or any("header_console_acquisition_type" in item for item in entries):
+        return None
+    try:
+        raw = json.loads(Path(str(preflight.get("output") or "")).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    records: dict[str, dict[str, Any]] = {}
+    for item in [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []:
+        source = (item.get("source") or {}) if isinstance(item, dict) else {}
+        path_text = str(source.get("filePath") or "") if isinstance(source, dict) else ""
+        if path_text:
+            records.setdefault(file_key(path_text), item)
+    keys = [file_key(str(item.get("file") or "")) for item in entries]
+    if not all(key in records for key in keys):
+        return None
+    rebuilt = _summarize_raw_metadata([records[key] for key in keys])["per_file"]
+    for entry, legacy in zip(rebuilt, entries):
+        entry.update(file=str(legacy.get("file") or ""), outcome=OUTCOME_OK, format=input_format(str(legacy["file"])))
+    return rebuilt
+
+
 def classify_preflight(
     manifest_path: str | Path, campaign_authorization_path: str | Path | None = None
 ) -> dict[str, Any]:
@@ -3497,7 +3531,9 @@ def classify_preflight(
 
     Nothing is written for a unit disposition_hold holds (split, finished, or running) or one with no
     preflight recorded: the decision is returned with applied false and ``held`` saying why, and the
-    manifest, with any disposition it carries, is left as it is.
+    manifest, with any disposition it carries, is left as it is. A summary written before the per-file
+    fields is decided from the extractor records its preflight left (_rebuilt_legacy_per_file), and
+    recorded as it was.
     """
     from .raw_metadata_preflight import decide_disposition
 
@@ -3509,8 +3545,19 @@ def classify_preflight(
         declared = preflight.get("declared")
         if not isinstance(declared, dict):
             declared = _declared_technical(current)
-        disposition = decide_disposition(current, declared=declared)
+        view = current
+        rebuilt = _rebuilt_legacy_per_file(current)
+        if rebuilt is not None:
+            view = copy.deepcopy(current)
+            view["raw_metadata_preflight"]["summary"]["per_file"] = rebuilt
+        disposition = decide_disposition(view, declared=declared)
         assignments = disposition.pop("assignments")
+        if rebuilt is not None and "raw_metadata_preflight_legacy" not in disposition["warnings"]:
+            disposition["warnings"].append("raw_metadata_preflight_legacy")
+            disposition["detail"].append(
+                "The per-file records predate recorded formats, MS-level flags and isolation; the unit was "
+                "decided from the extractor records its preflight left."
+            )
         held = disposition_hold(current)
         if held is None and not (preflight.get("summary") or {}):
             held = {

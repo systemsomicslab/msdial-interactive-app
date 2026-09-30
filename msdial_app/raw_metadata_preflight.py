@@ -576,6 +576,13 @@ def _declared_console_type(mode: str) -> tuple[str | None, str]:
 
 def _declared_agrees(declared: str, header: str, header_console: str | None) -> bool:
     declared = str(declared or "").strip().upper()
+    if declared in {"SRM", "MRM"}:
+        # One acquisition under two names; the extractor and the repositories use both.
+        return header in {"SRM", "MRM"}
+    if declared in {"PRM", "SIM"}:
+        return header == declared
+    if declared == "FULLSCAN":
+        return header == "FullScan"
     if declared == "DDA":
         return header == "DDA"
     if declared == "DIA":
@@ -596,6 +603,10 @@ DISPOSITIONS = ("run", "skip", "exclude", "split")
 # A header verdict this confident replaces a repository declaration it contradicts.
 HEADER_OVERRIDE_CONFIDENCE = 0.8
 _DECLARED_MODES = {"DDA", "DIA", "AIF", "SWATH"}
+# Declared acquisitions this campaign does not run, by the name the header uses. They are declarations all
+# the same: the Catalog's and Interactive's own inference write them, and a header has to contradict one
+# with HEADER_OVERRIDE_CONFIDENCE to be believed over it, as for the modes the campaign runs.
+_DECLARED_OUT_OF_SCOPE = {"PRM": "PRM", "SRM": "SRM", "MRM": "MRM", "SIM": "SIM", "FULLSCAN": "FullScan"}
 _POLARITIES = {"Positive", "Negative"}
 _SWITCHING = {"PolaritySwitching", "MixedFunctions"}
 _SEPARATION_NAMES = {
@@ -615,9 +626,27 @@ _OUT_OF_SCOPE_FILE_REASONS = (
 _UNIT_REASON_FOR_FILE_REASON = {
     "polarity_switching": "polarity_switching_out_of_scope",
     "raw_header_unsupported_format": "raw_header_unreadable",
-    "input_missing": "inputs_missing",
-    "raw_header_not_inspected": "raw_metadata_incomplete",
 }
+# A per-file record written before a preflight recorded formats and flags (Interactive 0.5.16 and earlier,
+# one extractor process per unit) has acquisition_mode, polarity and ms_levels, and none of these.
+_CURRENT_PER_FILE_FIELD = "header_console_acquisition_type"
+
+
+def _entry_format(path: str, entry: Mapping[str, Any]) -> str:
+    """The input's format as its preflight recorded it, or, for a record that names none, from the disk."""
+    return str(entry.get("format") or "") or input_format(path)
+
+
+def _entry_flag(entry: Mapping[str, Any], name: str, level: int) -> bool | None:
+    """has_ms1 or has_ms2 as recorded, or read from ms_levels where the record has only those."""
+    value = entry.get(name)
+    if isinstance(value, bool):
+        return value
+    levels = entry.get("ms_levels")
+    if isinstance(levels, dict):
+        levels = levels.get("value")
+    found = {int(item) for item in levels if str(item).isdigit()} if isinstance(levels, list) else set()
+    return level in found if found else None
 
 
 def declared_technical(project: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -736,27 +765,55 @@ def decide_disposition(
         if isinstance(item, dict) and str(item.get("file") or "").strip()
     }
     declared_mode = str(declared.get("acquisition_mode") or "").strip()
-    declared_known = declared_mode.upper() in _DECLARED_MODES
+    declared_out_of_scope = _DECLARED_OUT_OF_SCOPE.get(declared_mode.upper())
+    declared_known = declared_mode.upper() in _DECLARED_MODES or declared_out_of_scope is not None
+    # The mode a file takes on the declaration's word, named as the header names it.
+    declared_as = declared_out_of_scope or declared_mode
     declared_polarity = str(declared.get("ion_mode") or "").strip()
+    if any(_CURRENT_PER_FILE_FIELD not in entry for entry in per_file.values()):
+        warn("raw_metadata_preflight_legacy")
+        detail.append(
+            "Some per-file records predate recorded formats and MS-level flags: their formats were read from the "
+            "inputs on disk and their MS levels from ms_levels, and a DIA verdict among them records no "
+            "isolation, so only the declaration can make it SWATH or AIF."
+        )
 
     def exclude(path: str, reason: str) -> None:
         excluded.append({"path": path, "reason": reason})
 
     readable: list[tuple[str, dict[str, Any]]] = []
     unreadable: list[tuple[str, dict[str, Any]]] = []
+    missing: list[str] = []
+    uninspected: list[str] = []
     for path in candidates:
         entry = per_file.get(file_key(path)) or {}
-        fmt = str(entry.get("format") or "")
         if path.casefold().endswith((".mzxml", ".mzdata", ".mzdata.xml")):
             exclude(path, "conversion_required")
-        elif entry.get("has_ion_mobility") is True or fmt in ION_MOBILITY_FORMATS:
+        elif entry.get("has_ion_mobility") is True or _entry_format(path, entry) in ION_MOBILITY_FORMATS:
             exclude(path, "ion_mobility_out_of_scope")
         elif not entry:
-            exclude(path, "input_missing" if not Path(path).exists() else "raw_header_not_inspected")
+            (missing if not Path(path).exists() else uninspected).append(path)
         elif entry.get("outcome", OUTCOME_OK) in READ_OUTCOMES:
             readable.append((path, entry))
         else:
             unreadable.append((path, entry))
+    if missing or uninspected:
+        # Only an input that was read and failed is excluded on its own. One that is gone, or that this
+        # preflight never read - a partial download, candidates that changed after it - would shrink the run
+        # without a word, so the unit waits for its inputs and a preflight of all of them.
+        if missing:
+            reasons.append("inputs_missing")
+            detail.append(
+                f"{len(missing)} input(s) are not on disk: " + ", ".join(Path(item).name for item in missing[:5]) + "."
+            )
+        if uninspected:
+            reasons.append("raw_metadata_incomplete")
+            detail.append(
+                f"{len(uninspected)} input(s) have no header record from this preflight: "
+                + ", ".join(Path(item).name for item in uninspected[:5])
+                + ". Preflight every input again."
+            )
+        return result("skip")
 
     header_based: set[str] = set()
     decided: list[tuple[str, dict[str, Any], str, str | None, str]] = []
@@ -773,21 +830,26 @@ def decide_disposition(
             for path, entry in unreadable:
                 exclude(path, "raw_header_unreadable")
         else:
-            # Nothing could be read, but the repository says what the data are: they run on its word.
+            # Nothing could be read, but the repository says what the data are: they are taken at its word,
+            # which for an acquisition this campaign does not run excludes them.
             warn("acquisition_declared_only")
             detail.append(
-                "No input's header could be read, so the unit runs on its repository declaration "
-                f"({declared_mode})."
+                "No input's header could be read, so the unit is taken at its repository declaration "
+                f"({declared_as})."
             )
             for path, entry in unreadable:
-                decided.append((path, entry, declared_mode, None, "declaration"))
+                decided.append((path, entry, declared_as, None, "declaration"))
 
     for path, entry in readable:
         header = str(entry.get("acquisition_mode") or "").strip()
         confidence = entry.get("confidence")
         confidence = float(confidence) if isinstance(confidence, (int, float)) else 0.0
-        header_console = entry.get("header_console_acquisition_type")
-        if header == "FullScan" or entry.get("has_ms2") is False:
+        if _CURRENT_PER_FILE_FIELD in entry:
+            header_console = entry.get(_CURRENT_PER_FILE_FIELD)
+        else:
+            # A record that predates it recorded no isolation either: DIA stays unresolved there.
+            header_console, _basis = header_console_acquisition_type(header, None)
+        if header == "FullScan" or _entry_flag(entry, "has_ms2", 2) is False:
             # MS1 only: whatever the declaration says, there is no MS2 to deconvolute.
             decided.append((path, entry, "FullScan", None, "header"))
             header_based.add(path)
@@ -799,7 +861,7 @@ def decide_disposition(
             continue
         if header in {"", "Unknown"}:
             warn("acquisition_declared_only")
-            decided.append((path, entry, declared_mode, None, "declaration"))
+            decided.append((path, entry, declared_as, None, "declaration"))
         elif _declared_agrees(declared_mode, header, header_console):
             decided.append((path, entry, header, header_console, "header"))
             header_based.add(path)
@@ -814,9 +876,9 @@ def decide_disposition(
             warn("acquisition_header_disagrees_low_confidence")
             disagreements.append(
                 {"file": path, "declared": declared_mode, "header": header, "confidence": confidence,
-                 "decided": declared_mode}
+                 "decided": declared_as}
             )
-            decided.append((path, entry, declared_mode, None, "declaration"))
+            decided.append((path, entry, declared_as, None, "declaration"))
 
     included: list[tuple[str, dict[str, Any], str, str]] = []
     ms1_only: list[tuple[str, dict[str, Any]]] = []
@@ -830,7 +892,7 @@ def decide_disposition(
         if mode == "FullScan":
             ms1_only.append((path, entry))
             continue
-        if entry.get("has_ms1") is False:
+        if _entry_flag(entry, "has_ms1", 1) is False:
             # Product-ion-only data have no MS1 survey to find features in.
             exclude(path, "acquisition_out_of_scope:product_ion_only")
             continue
@@ -903,16 +965,22 @@ def decide_disposition(
 
     if declared.get("untargeted") is None:
         runnable = [path for path, _entry, _console, basis in included if basis != "folded_ms1_only"]
-        inferred = all(
+        # A repository that names a targeted acquisition has said how the study was designed, even where a
+        # confident header says the files were acquired otherwise; untargeted is never inferred over it.
+        declared_targeted = declared_out_of_scope in OUT_OF_SCOPE_METHODS
+        inferred = not declared_targeted and all(
             path in header_based
-            and per_file.get(file_key(path), {}).get("has_ms1") is True
-            and per_file.get(file_key(path), {}).get("has_ms2") is True
+            and _entry_flag(per_file.get(file_key(path), {}), "has_ms1", 1) is True
+            and _entry_flag(per_file.get(file_key(path), {}), "has_ms2", 2) is True
             for path in runnable
         )
         if not inferred:
             reasons.append("untargeted_unresolved")
             detail.append(
-                "The repository does not say whether the study is untargeted, and the headers do not show "
+                f"The repository does not say whether the study is untargeted, and declares {declared_as} "
+                "acquisition, so it is not inferred from the headers."
+                if declared_targeted
+                else "The repository does not say whether the study is untargeted, and the headers do not show "
                 "DDA, DIA or AIF acquisition with MS1 and MS2 for every input, so it cannot be inferred."
             )
             return result("skip")
