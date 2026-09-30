@@ -5,11 +5,12 @@ import datetime as dt
 import json
 import math
 import zipfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from .automatic_rt_evidence import automatic_rt_correction_proof, unproven
 from .quality_assurance import with_qc_minimum, with_recorded_order
+from .sharing import PATH_POLICY, SharingContext, SharingError
 from .supplementary_excel import write_supplementary_workbook
 
 
@@ -49,13 +50,18 @@ def generate_publication_report(
             **qa_report,
             "summary": with_recorded_order(with_qc_minimum(qa_report["summary"]), order_source),
         }
+    # Everything below is built to be shared. Evidence is read from the local workflow; what is written is
+    # redacted: a repository unit's report carries no path of this machine and declares that it does not,
+    # and any report names a private library by file name and sha256, never by where it is kept.
+    sharing = SharingContext.for_state(workflow, run_directory=root, recorded=_recorded_libraries(root))
+    libraries = sharing.identities()
     report_workflow = dict(workflow)
     report_workflow["automatic_rt_correction_evidence"] = (
         _automatic_rt_correction_evidence(root, workflow)
     )
     criteria = _criteria(qa_criteria)
     qa_assessment = assess_qa(qa_report, criteria)
-    provenance_warnings = _library_warnings(report_workflow)
+    provenance_warnings = _library_warnings(report_workflow, libraries)
     automatic_rt_evidence = report_workflow["automatic_rt_correction_evidence"]
     if automatic_rt_evidence.get("requested") and not automatic_rt_evidence.get("performed"):
         provenance_warnings.append(
@@ -71,16 +77,22 @@ def generate_publication_report(
             "aligned retention times, mzTab-M included, contain measured retention times wherever "
             "those files contribute a peak."
         )
-    methods = _methods_text(
-        report_workflow, qa_report, qa_assessment, app_version, console_version
-    )
-    results = _results_text(qa_report, qa_assessment)
+    methods = sharing.text(_methods_text(
+        report_workflow, qa_report, qa_assessment, app_version, console_version, libraries
+    ))
+    results = sharing.text(_results_text(qa_report, qa_assessment))
+    provenance_warnings = sharing.view(provenance_warnings)
+    qa_assessment = sharing.view(qa_assessment)
+    report_workflow = sharing.view(report_workflow)
+    qa_report = sharing.view(qa_report) if qa_report is not None else None
     rows = supplementary_rows(
         report_workflow,
         qa_report,
         qa_assessment,
         app_version=app_version,
         console_version=console_version,
+        libraries=libraries,
+        shared_paths=sharing.full,
     )
 
     methods_path = root / "MS_DIAL_Materials_and_Methods.txt"
@@ -108,8 +120,13 @@ def generate_publication_report(
         qa_assessment,
         app_version=app_version,
         console_version=console_version,
+        libraries=libraries,
     )
     audit = {
+        **(
+            # Any value binds the artifacts written with this report, as the gate reads it.
+            {"shared_path_policy": PATH_POLICY, "shared_paths": sharing.describe()} if sharing.full else {}
+        ),
         "generated_at": dt.datetime.now().astimezone().isoformat(),
         "software": {
             "msdial_console_version": console_version or "not recorded",
@@ -119,6 +136,8 @@ def generate_publication_report(
         # Where the analytical order came from, as the unit manifest records it (None: not recorded).
         "analytical_order_source": order_source,
         "library_provenance_warnings": provenance_warnings,
+        # Each library the run loaded, by file name and sha256; never by location.
+        "libraries": libraries,
         "workflow": report_workflow,
         "qa_report": qa_report,
     }
@@ -128,6 +147,15 @@ def generate_publication_report(
     with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in (methods_path, results_path, workbook_path, table_path, audit_path):
             archive.write(path, path.name)
+    written = (methods_path, results_path, table_path, workbook_path, audit_path, bundle_path)
+    try:
+        for path in written:
+            sharing.assert_shareable(path)
+    except SharingError:
+        # A report that failed its own check is not left behind to be shared by hand.
+        for path in written:
+            path.unlink(missing_ok=True)
+        raise
     return {
         "methods_text": methods,
         "qa_results_text": results,
@@ -140,6 +168,16 @@ def generate_publication_report(
         "audit_file": str(audit_path),
         "bundle": str(bundle_path),
     }
+
+
+def _recorded_libraries(run_directory: Path) -> list[dict[str, Any]]:
+    """The run manifest's library records: the checksum of what the run loaded, taken when it was prepared."""
+    try:
+        manifest = json.loads((run_directory / "run-manifest.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return []
+    libraries = manifest.get("libraries") if isinstance(manifest, dict) else None
+    return [item for item in libraries if isinstance(item, dict)] if isinstance(libraries, list) else []
 
 
 def qa_report_for_run(qa_report: dict[str, Any], run_directory: Any) -> dict[str, Any]:
@@ -207,6 +245,8 @@ def supplementary_rows(
     *,
     app_version: str,
     console_version: str,
+    libraries: list[dict[str, Any]] | None = None,
+    shared_paths: bool = False,
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
 
@@ -228,7 +268,10 @@ def supplementary_rows(
         record = str(file.get("file_name") or f"Analysis file {index}")
         for key in ("file_path", "file_name", "file_type", "class_id", "raw_format", "vendor", "acquisition_type", "batch_order", "analytical_order", "factor"):
             if key in file:
-                note = "Local absolute path; review before publication" if key == "file_path" else ""
+                note = "" if key != "file_path" else (
+                    "Path relative to the analysis unit's workspace (raw/: its raw data directory)"
+                    if shared_paths else "Local absolute path; review before publication"
+                )
                 add("Data", record, key, file.get(key), note)
 
     annotation_keys = {
@@ -250,7 +293,11 @@ def supplementary_rows(
             add("Guided setup", "Workflow", key, workflow[key])
     for key in ("console_path", "template_path", "output_root"):
         if key in workflow:
-            add("Run audit", "Local environment", key, workflow[key], "Local path; omit from publication table if required")
+            note = (
+                "File name, or path relative to the analysis unit's workspace" if shared_paths
+                else "Local path; omit from publication table if required"
+            )
+            add("Run audit", "Local environment", key, workflow[key], note)
 
     for index, item in enumerate(workflow.get("msp_annotators", []), start=1):
         _add_mapping(add, "Annotation", str(item.get("annotator_id") or f"MSP annotator {index}"), item)
@@ -265,6 +312,11 @@ def supplementary_rows(
         _add_mapping(add, "Annotation", f"Lipid query {index}", lipid)
     for index, library in enumerate(workflow.get("library_provenance", []), start=1):
         _add_mapping(add, "Library provenance", str(library.get("label") or f"Library {index}"), library)
+    for library in libraries or []:
+        for key in ("role", "sha256", "bytes", "distribution", "doi", "source", "version", "license"):
+            if library.get(key) not in (None, ""):
+                add("Library identity", str(library.get("name") or ""), key, library[key],
+                    "Not distributed" if key == "distribution" and library.get("private") else "")
 
     automatic_rt_evidence = workflow.get("automatic_rt_correction_evidence") or {}
     if automatic_rt_evidence.get("requested"):
@@ -312,6 +364,7 @@ def _methods_text(
     assessment: dict[str, Any],
     app_version: str,
     console_version: str,
+    libraries: list[dict[str, Any]] | None = None,
 ) -> str:
     files = workflow.get("files", [])
     project_type = str(workflow.get("project_type", "lcms")).lower()
@@ -337,7 +390,7 @@ def _methods_text(
             "in Supplementary Table S1."
         ),
         _processing_sentence(workflow, project_type),
-        _annotation_sentence(workflow),
+        _annotation_sentence(workflow, libraries),
     ]
     if workflow.get("execute_rt_correction"):
         paragraphs.append(
@@ -422,7 +475,7 @@ def _processing_sentence(workflow: dict[str, Any], project_type: str) -> str:
     )
 
 
-def _annotation_sentence(workflow: dict[str, Any]) -> str:
+def _annotation_sentence(workflow: dict[str, Any], libraries: list[dict[str, Any]] | None = None) -> str:
     msp_count = len(workflow.get("msp_annotators", []))
     text_count = len(workflow.get("text_annotators", []))
     lbm = bool(str(workflow.get("lbm_path", "")).strip())
@@ -444,7 +497,20 @@ def _annotation_sentence(workflow: dict[str, Any]) -> str:
             cited.append(f"{name} ({identifier})")
     cited = list(dict.fromkeys(cited))
     citation = f" Downloaded libraries were {', '.join(cited)}." if cited else ""
-    return f"Molecular annotation used {description} with the database-specific settings reported in Supplementary Table S1.{citation}"
+    # A private library has no identifier to cite and is not distributed; its file name and digest are what
+    # identify it. Worded so that no sentence here reads as a claim about the inputs' integrity.
+    private = [
+        f"{item['name']} (SHA-256 {item.get('sha256') or 'not recorded'})"
+        for item in libraries or [] if item.get("private") and item.get("name")
+    ]
+    withheld = (
+        f" Libraries that are not distributed are identified by file name and SHA-256 digest: {', '.join(private)}."
+        if private else ""
+    )
+    return (
+        f"Molecular annotation used {description} with the database-specific settings reported in "
+        f"Supplementary Table S1.{citation}{withheld}"
+    )
 
 
 def _qa_methods_sentence(qa_report: dict[str, Any] | None, assessment: dict[str, Any]) -> str:
@@ -518,9 +584,15 @@ def _results_text(qa_report: dict[str, Any] | None, assessment: dict[str, Any]) 
     return " ".join(pieces)
 
 
-def _library_warnings(workflow: dict[str, Any]) -> list[str]:
+def _library_warnings(workflow: dict[str, Any], libraries: list[dict[str, Any]] | None = None) -> list[str]:
     warnings = []
+    # The run manifest's checksum of the file the run loaded is such an identifier too.
+    checksummed = {
+        str(item.get("name") or "").casefold() for item in libraries or [] if str(item.get("sha256") or "").strip()
+    }
     for path, item in _matched_library_provenance(workflow):
+        if PureWindowsPath(path).name.casefold() in checksummed:
+            continue
         # The warning asks for a version, DOI, repository URL or checksum, so any of them is
         # one; the guided workflow records the repository URL as "source".
         if not item or not any(

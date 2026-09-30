@@ -49,10 +49,28 @@ Downloaded raw data are a temporary lease:
 The retained set includes repository and publication metadata, reviewed
 sample metadata, `analysis_files.csv`, parameter/method files, mzTab-M,
 `mdpeak`, `mdscan`, `mdmsp`, and `mdalign`. GUI project artifacts such as
-`dcl`, `arf`, and `arf2` are also collected into
+`dcl`, `arf`, and `arf2` in the output are also collected into
 `msdial-project-artifacts.zip`. The manifest stores SHA-256 and byte size for
 each retained artifact. Original project files are not removed by this archive
 step.
+
+MS-DIAL writes its per-file (`<file>_<time>.dcl`, `.pai2`, `_tags.xml`) and
+alignment (`AlignResult-<time>.*`) containers beside the raw files it reads.
+After a repository unit's run, and before validation, the finalised run's set
+moves to `output\<job>\msdial-intermediates\` with its path under the raw
+directory kept, and is retained file by file; sets left by earlier attempts are
+recorded as superseded and go with the raw data. `<project>_Loaded.msp2.dbs`,
+MS-DIAL's copy of every library the run loaded, is deleted and recorded by
+name, size and SHA-256. The saved project cannot then be reopened as it
+stands: its `.mddata` names the containers by their raw-directory paths and its
+loader needs the library copy.
+
+What a repository unit shares carries no path from this machine: the mzTab-M's
+`database[n]-uri` is `null` for a library without a DOI or https source and
+the DOI otherwise, `ms_run[n]-location` is workspace-relative (`raw/...`), and
+the publication report, tables and workflow bundle name libraries by file name
+and SHA-256 and declare `shared_path_policy`. The original locations are kept
+only in `provenance\mztab-redaction.local.json`.
 
 This order makes disk cleanup routine without allowing an incomplete or failed
 analysis to erase its only input copy.

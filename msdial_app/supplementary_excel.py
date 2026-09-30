@@ -145,6 +145,7 @@ def write_supplementary_workbook(
     *,
     app_version: str,
     console_version: str,
+    libraries: list[dict[str, Any]] | None = None,
 ) -> Path:
     target = Path(path).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -154,7 +155,7 @@ def write_supplementary_workbook(
     sheets = [
         _data_sheet(workbook_state),
         _guided_sheet(workbook_state),
-        _annotation_sheet(workbook_state),
+        _annotation_sheet(workbook_state, libraries),
         _qa_sheet(qa_report, qa_assessment),
     ]
     _write_xlsx(target, sheets)
@@ -277,7 +278,7 @@ def _guided_sheet(workflow: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _annotation_sheet(workflow: dict[str, Any]) -> dict[str, Any]:
+def _annotation_sheet(workflow: dict[str, Any], libraries: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for index, item in enumerate(workflow.get("msp_annotators", []), start=1):
         name = item.get("annotator_id") or f"MSP annotator {index}"
@@ -348,6 +349,25 @@ def _annotation_sheet(workflow: dict[str, Any]) -> dict[str, Any]:
                         item.get("md5", ""),
                         item.get("filename", ""),
                         item.get("local_path", ""),
+                    ],
+                    "body_left",
+                )
+            )
+
+    if libraries:
+        # Each library by the identity that travels: file name and SHA-256, never where it is kept.
+        rows.append(_section("Library identity", 6))
+        rows.append(_row(["File name", "Role", "SHA-256", "Bytes", "Distribution", "DOI or source"], "header"))
+        for item in libraries:
+            rows.append(
+                _row(
+                    [
+                        item.get("name", ""),
+                        item.get("role", ""),
+                        item.get("sha256", "") or "not recorded",
+                        item.get("bytes") if isinstance(item.get("bytes"), int) else "not recorded",
+                        "private, not distributed" if item.get("private") else "public",
+                        item.get("doi", "") or item.get("source", ""),
                     ],
                     "body_left",
                 )

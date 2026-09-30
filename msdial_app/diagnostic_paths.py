@@ -47,6 +47,20 @@ _DIAGNOSTIC_DIRECTORY_NAMES = frozenset(
 # are never under it, so a scan of the run for its results skips it.
 REPRODUCTION_DIRECTORY_NAME = "reproduced-results"
 
+# Where a repository unit's MS-DIAL containers go when they leave the raw tree after the run:
+# <output>/<job>/msdial-intermediates/<path under the raw directory>. They are retained, never
+# results: a container named after a sample whose name holds "mztab" is not the run's mzTab-M.
+INTERMEDIATES_DIRECTORY = "msdial-intermediates"
+
+
+def is_intermediate_artifact(path: str | Path, root: str | Path) -> bool:
+    """True when a path lies under a relocated-containers directory below the scan root."""
+    try:
+        parts = Path(path).relative_to(Path(root)).parts
+    except (TypeError, ValueError):
+        return False
+    return INTERMEDIATES_DIRECTORY in parts[:-1]
+
 
 def is_reproduction_artifact(path: str | Path, root: str | Path) -> bool:
     """True when a path lies under the reproduction directory directly below the scan root.

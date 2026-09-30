@@ -194,6 +194,13 @@ def _qa(value: float | None = 0.07, reasons: dict | None = None, injections: int
 
 
 def _publish(root: Path, source: str | None, qa: dict, *, carry: bool = True) -> dict:
+    output = root / "output"
+    return generate_publication_report(_workflow(root, source, carry=carry), qa, output, app_version="0.5.4",
+                                       console_version="5.5.260929")
+
+
+def _workflow(root: Path, source: str | None, *, carry: bool = True) -> dict:
+    """The run's settings, as its workflow-settings.json holds them, with a unit manifest beside them."""
     names = ["alpha", "beta", "gamma"]
     files = [{"file_name": name, "file_path": str(root / f"{name}.mzML"), "file_type": "Sample", "class_id": "All",
               "analytical_order": index + 1} for index, name in enumerate(names)]
@@ -207,10 +214,8 @@ def _publish(root: Path, source: str | None, qa: dict, *, carry: bool = True) ->
                        "analytical_order": item["analytical_order"] if carry else 9} for item in files],
         },
     }), encoding="utf-8")
-    workflow = {"project_type": "lcms", "ion_mode": "Negative", "files": files,
-                "repository_run_manifest": str(manifest)}
-    output = root / "output"
-    return generate_publication_report(workflow, qa, output, app_version="0.5.4", console_version="5.5.260929")
+    return {"project_type": "lcms", "ion_mode": "Negative", "files": files,
+            "repository_run_manifest": str(manifest)}
 
 
 def _check(result: dict) -> dict:
@@ -306,10 +311,12 @@ class ConsistencyTests(unittest.TestCase):
     def test_a_jobs_live_qa_report_says_what_its_publication_will(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            result = _publish(root, LISTING_ORDER_SOURCE, _qa())
+            _publish(root, LISTING_ORDER_SOURCE, _qa())
             run = root / "run"
             run.mkdir()
-            workflow = json.loads(Path(result["audit_file"]).read_text(encoding="utf-8"))["workflow"]
+            # The run's own settings. The publication report's copy of them is redacted for sharing, so its
+            # manifest path is workspace-relative and no longer names the file on this machine.
+            workflow = _workflow(root, LISTING_ORDER_SOURCE)
             (run / "workflow-settings.json").write_text(json.dumps(workflow), encoding="utf-8")
             live = qa_report_for_run(_qa(), run)
             unchanged = qa_report_for_run(_qa(), root / "no-such-run")

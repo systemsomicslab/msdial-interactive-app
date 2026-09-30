@@ -26,7 +26,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Iterator
-from .diagnostic_paths import is_diagnostic_artifact
+from .diagnostic_paths import INTERMEDIATES_DIRECTORY, is_diagnostic_artifact, is_intermediate_artifact
 from .process_liveness import process_created_at, process_is_alive
 
 try:
@@ -1899,10 +1899,18 @@ def record_peak_height_diagnostic(
 def _retained_result_paths(
     output: Path, provenance: Path, manifest_path: Path
 ) -> tuple[list[Path], list[Path]]:
-    """The output files and the provenance files a validated run keeps."""
+    """The output files and the provenance files a validated run keeps.
+
+    MS-DIAL's per-file and alignment containers, moved out of the raw tree after the run
+    (run_finalisation.relocate_intermediates), are kept whatever their names: the raw data they sat beside
+    are deleted, and these are what a restored project would read.
+    """
     results = []
     for path in output.rglob("*") if output.is_dir() else []:
         if is_diagnostic_artifact(path):
+            continue
+        if path.is_file() and is_intermediate_artifact(path, output):
+            results.append(path.resolve())
             continue
         if path.is_file() and (
             path.suffix.casefold() in TEXT_RESULT_SUFFIXES
@@ -3090,11 +3098,14 @@ def _is_archive(path: Path) -> bool:
 def _archive_project_results(output: Path) -> Path | None:
     if not output.is_dir():
         return None
+    # The containers moved out of the raw tree are retained file by file; zipping them again here would
+    # keep every one of them twice.
     project_files = [
         path for path in output.rglob("*")
         if path.is_file()
         and path.suffix.casefold() in PROJECT_RESULT_SUFFIXES
         and not is_diagnostic_artifact(path)
+        and not is_intermediate_artifact(path, output)
     ]
     if not project_files:
         return None
@@ -3114,11 +3125,18 @@ def _artifact_inventory(path: Path) -> dict[str, Any]:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
-    return {
+    entry = {
         "path": str(path.resolve()),
         "size_bytes": path.stat().st_size,
         "sha256": digest.hexdigest(),
     }
+    # The two kinds a reader must not mistake for ordinary results: a record that holds this machine's
+    # locations and never leaves it, and an MS-DIAL container moved out of the raw tree.
+    if path.name.casefold().endswith(".local.json"):
+        entry["sharing"] = "local_only"
+    elif INTERMEDIATES_DIRECTORY in path.parts[:-1]:
+        entry["role"] = "msdial_intermediate"
+    return entry
 
 
 def _extract_archive(archive: Path, destination: Path, maximum_bytes: int) -> list[str]:
