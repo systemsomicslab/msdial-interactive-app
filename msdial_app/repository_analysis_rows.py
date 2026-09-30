@@ -571,23 +571,36 @@ def _create_junction(target: Path, link: Path) -> None:
         raise OSError((completed.stderr or completed.stdout or "mklink /J failed").strip())
 
 
+# What the SCIEX readers open beside a primary file, named by its stem: Analyst writes x.wiff with
+# x.wiff.scan, and SCIEX OS writes x.wiff2 with x.wiff.scan and x.timeseries.data (MsdialWorkbenchDemo
+# massql_demofiles), so a .wiff2's scan data is not named after the .wiff2.
+SCIEX_COMPANION_SUFFIXES = (".wiff.scan", ".wiff2.scan", ".timeseries.data")
+
+
 def _travelling_files(target: Path) -> list[tuple[Path, str]]:
-    """(sidecar, the suffix it carries past the alias name) for the files that travel with a SCIEX file."""
+    """(sidecar, the suffix it carries past the stem) for the files that travel with a SCIEX file.
+
+    The suffix is what follows the input's stem, so the alias's sidecar is the alias's stem plus it:
+    x.wiff2's x.wiff.scan goes with alias-1234.wiff2 as alias-1234.wiff.scan, where the reader looks.
+    Any x.wiff.<n>.scan is kept as well. A file that is no SCIEX file has none.
+    """
     found: list[tuple[Path, str]] = []
+    if target.suffix.casefold() not in {".wiff", ".wiff2"}:
+        return found
     try:
         entries = list(os.scandir(target.parent))
     except OSError:
         return found
-    name = target.name.casefold()
+    name, stem = target.name.casefold(), target.stem.casefold()
     for entry in entries:
         lowered = entry.name.casefold()
         if not entry.is_file() or lowered == name:
             continue
-        if lowered.startswith(name + ".") and lowered.endswith(".scan"):
-            found.append((Path(entry.path), entry.name[len(target.name):]))
-        elif lowered == target.stem.casefold() + ".timeseries.data":
-            found.append((Path(entry.path), ".timeseries.data"))
-    return found
+        if any(lowered == stem + suffix for suffix in SCIEX_COMPANION_SUFFIXES) or (
+            lowered.startswith(name + ".") and lowered.endswith(".scan")
+        ):
+            found.append((Path(entry.path), entry.name[len(target.stem):]))
+    return sorted(found, key=lambda item: item[0].name.casefold())
 
 
 def _same_file(left: Path, right: Path) -> bool:
@@ -613,7 +626,7 @@ def create_console_aliases(built: dict[str, Any]) -> list[dict[str, Any]]:
         pairs = [(target, link)]
         if alias["kind"] == "hardlink":
             pairs.extend(
-                (sidecar, link.with_name(link.name + rest))
+                (sidecar, link.with_name(link.stem + rest))
                 for sidecar, rest in _travelling_files(target)
             )
         made: list[str] = []

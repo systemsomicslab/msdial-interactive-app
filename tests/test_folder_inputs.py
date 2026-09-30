@@ -1408,5 +1408,60 @@ class ADeclaredArchivedContainerIsFoundWhereItsArchivePutIt(unittest.TestCase):
         self.assertEqual(["B.d", "C.d"], sorted(Path(item).name for item in by_sample))
 
 
+class SciexCompanionsTravelWithTheirAlias(unittest.TestCase):
+    """SCIEX OS writes x.wiff2 beside x.wiff.scan and x.timeseries.data; Analyst writes x.wiff and x.wiff.scan."""
+
+    def _aliased(self, root: Path, primary: str, companions: list[str]) -> tuple[dict, list[str], list]:
+        manifest_path = _hand_made_unit(root, [primary])
+        for name in companions:
+            (root / "raw" / "data" / name).write_bytes(name.encode("utf-8"))
+        built = build_repository_analysis_rows(read_manifest(manifest_path))
+        failures = create_console_aliases(built)
+        alias = Path(built["rows"][0]["file_path"])
+        made = sorted(path.name for path in alias.parent.iterdir())
+        # Each link is the file of the input's stem with the same suffix past it.
+        unlinked = [
+            name for name in made
+            if not os.path.samefile(
+                alias.parent / name, root / "raw" / "data" / (Path(primary).stem + name[len(alias.stem):])
+            )
+        ]
+        return built, made, failures + unlinked
+
+    def test_a_wiff2_alias_takes_the_wiff_scan_and_timeseries_named_by_its_stem(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            built, made, problems = self._aliased(
+                Path(temporary) / "unit", "S1,rep1.wiff2", ["S1,rep1.wiff.scan", "S1,rep1.timeseries.data"]
+            )
+
+        stem = built["rows"][0]["file_name"]
+        self.assertEqual([], problems)
+        self.assertEqual(sorted([f"{stem}.timeseries.data", f"{stem}.wiff.scan", f"{stem}.wiff2"]), made)
+        self.assertEqual(
+            sorted([f"{stem}.timeseries.data", f"{stem}.wiff.scan"]), sorted(built["aliases"][0]["sidecars"])
+        )
+
+    def test_a_wiff_alias_takes_its_scan_where_the_workflow_looks_for_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            built, made, problems = self._aliased(Path(temporary) / "unit", "S1,rep1.wiff", ["S1,rep1.wiff.scan"])
+            issues = workflow.validate_workflow({"files": [
+                {"file_path": built["rows"][0]["file_path"], "file_name": built["rows"][0]["file_name"]}
+            ]})
+
+        stem = built["rows"][0]["file_name"]
+        self.assertEqual([], problems)
+        self.assertEqual([f"{stem}.wiff", f"{stem}.wiff.scan"], made)
+        self.assertFalse([item for item in issues if "WIFF.SCAN" in item["message"]])
+
+    def test_a_file_that_is_no_sciex_file_takes_nothing_beside_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            built, made, problems = self._aliased(
+                Path(temporary) / "unit", "S1,rep1.mzML", ["S1,rep1.timeseries.data"]
+            )
+
+        self.assertEqual([], problems)
+        self.assertEqual([f"{built['rows'][0]['file_name']}.mzML"], made)
+
+
 if __name__ == "__main__":
     unittest.main()
