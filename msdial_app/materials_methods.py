@@ -401,6 +401,7 @@ def _methods_text(
             f"The workflow was configured for {project} {ion}-ion {omics} analysis. Complete sample "
             "metadata, processing parameters, annotation settings, and library provenance are provided "
             "in Supplementary Table S1."
+            + _input_integrity_sentence(workflow)
         ),
         _processing_sentence(workflow, project_type),
         _annotation_sentence(workflow, libraries),
@@ -461,6 +462,26 @@ def _methods_text(
         )
     paragraphs.extend(["Quality assurance", _qa_methods_sentence(qa_report, assessment)])
     return "\n\n".join(paragraphs)
+
+
+def _input_integrity_sentence(workflow: dict[str, Any]) -> str:
+    """' Of the N analysis inputs, ...' for a repository unit some of whose inputs came out of archives.
+
+    The unit manifest's input lineage says what vouches for each such input; an input extracted from
+    an archive whose published MD5 matched was never compared with a checksum of its own, and is not
+    called checksum-verified (the gate's SUM-2). Empty for any other run, which reads as it did.
+    """
+    from .repository_reanalysis import input_integrity_statement, read_manifest
+
+    manifest_path = str(workflow.get("repository_run_manifest") or "").strip()
+    if not manifest_path:
+        return ""
+    try:
+        manifest = read_manifest(manifest_path)
+    except (OSError, ValueError):
+        return ""
+    statement = input_integrity_statement(manifest if isinstance(manifest, dict) else None)
+    return f" {statement}" if statement else ""
 
 
 def _processing_sentence(workflow: dict[str, Any], project_type: str) -> str:

@@ -11,8 +11,8 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
-import tarfile
 import tempfile
 import threading
 import time
@@ -26,6 +26,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Iterator
+from . import archives
+from .archives import ArchiveError, ExtractionLimits
 from .diagnostic_paths import (
     INTERMEDIATES_DIRECTORY,
     extended_path,
@@ -34,6 +36,7 @@ from .diagnostic_paths import (
     is_intermediate_artifact,
     path_is_file,
 )
+from .download_store import unlink_tree
 from .process_liveness import process_created_at, process_is_alive
 
 try:
@@ -48,7 +51,18 @@ RAW_SUFFIXES = {
     ".abf", ".cdf", ".d", ".lcd", ".mzml", ".qgd", ".raw", ".wiff", ".wiff2",
 }
 CONVERSION_REQUIRED_SUFFIXES = (".mzxml", ".mzdata", ".mzdata.xml")
-ARCHIVE_SUFFIXES = {".zip", ".tar", ".tgz", ".gz"}
+# What an archive is, and how it is opened, is decided in one place: archives.py. The lease routes an
+# object by archives.archive_kind_from_name before its bytes exist, and the bytes confirm the kind
+# (archives.detect_archive) before anything is extracted. The suffix set that used to live here named
+# .gz but no .7z, .rar, .bz2, .xz or .lzma, and _is_archive disagreed with it about bare .gz.
+#
+# The file roles under which a repository lists an archive of a whole study (Metabolomics Workbench).
+# A per-sample archive (X.raw.zip) is listed under its sample's own role, usually raw.
+ARCHIVE_ROLES = frozenset({"raw_archive", "shared_raw_archive"})
+# The guards every lease extraction runs under: free space less a reserve, the expansion ratio, the
+# member count and the nesting depth (archives.ExtractionLimits). They replace the old limit of five
+# times the download limit, which the campaign, with no per-unit size limit, could not have set.
+LEASE_EXTRACTION_LIMITS = ExtractionLimits()
 TEXT_RESULT_SUFFIXES = {
     ".mdalign", ".mdmsp", ".mdpeak", ".mdscan", ".mztab", ".mztabm",
 }
@@ -978,6 +992,26 @@ def create_download_lease(
     lease, it is copied byte for byte beside itself before the first write, and the copy is named in
     previous_manifest and superseded_manifests. A split parent is not re-leased at all, and neither is a
     workspace another live lease is still downloading into.
+
+    THE LEASE RUNS IN STAGES, EACH RECORDED (lease_stages, in LEASE_STAGES order):
+
+    - fetch: every object the unit lists, once per URL;
+    - verify_declared_checksums: each object's published MD5 compared with its bytes as it arrives,
+      before the next is fetched, and each archive's format confirmed by its leading bytes;
+    - extract: each archive expanded by archives.extract_archive into a staging tree beside the data
+      root, then moved into it without overwriting anything (archive_extractions, and the member listing
+      in provenance\\archive-members-<sha12>.tsv);
+    - materialise and convert: recorded as not_used. The accession download store and the mzXML
+      conversion are wired in here, after extraction and before input discovery, and nothing else in the
+      order changes when they are;
+    - discover: the MS-DIAL inputs under the data root;
+    - attribute: the unit's own inputs, extracted files and declared checksums (allowlist_checksum_
+      validation), and one input_lineage row per input;
+    - record: the manifest.
+
+    The stages are written into the manifest as they finish, so a lease that stops says where
+    (download_failure.stage), and a unit that has nothing to extract records the same stages with
+    nothing done in extract.
     """
     downloadable = project.eligible or (
         allow_preflight and project.selection_status == "raw_metadata_required"
@@ -1082,19 +1116,33 @@ def create_download_lease(
         lease_record["download_received_bytes"] = received
         _beat_lease(manifest_path, owner["lease_id"], stamp, received)
 
+    stages = _LeaseStages(manifest_path, lease_record, owner["lease_id"])
     downloads: list[dict[str, Any]] = []
+    # The same list, so every stage write says which objects have arrived.
+    lease_record["downloads"] = downloads
+    archive_extractions: list[dict[str, Any]] = []
+    lease_record["archive_extractions"] = archive_extractions
     try:
         unique_urls: dict[str, RepositoryFile] = {}
         for item in project.files:
             unique_urls.setdefault(item.url, item)
         downloaded_bytes = 0
         total_objects = len(unique_urls)
+        # Where each archive expands, by its download path: the data root for a bundle, the directory
+        # it was listed in for a per-sample container or a single compressed file.
+        placements: dict[str, str] = {}
+        taken: set[str] = set()
+        verification = {
+            "objects": 0, "md5_verified": 0, "not_declared": 0, "not_compared": 0, "archives_confirmed": 0,
+        }
+        stages.start("fetch")
+        stages.start("verify_declared_checksums")
         for index, (url, item) in enumerate(unique_urls.items(), start=1):
-            filename = Path(urllib.parse.urlparse(url).path).name or f"{project.accession}_{index}.zip"
-            if project.repository == "mb_post":
-                filename = f"{project.accession}.tar"
-            archive = Path(filename).suffix.casefold() in ARCHIVE_SUFFIXES
-            destination = download_root / filename if archive else data_root / _safe_relative_name(item.name)
+            filename, archive_kind, placement = _route_object(project, url, item, index)
+            if archive_kind:
+                destination = _archive_download_path(download_root, filename, index, taken)
+            else:
+                destination = data_root / _safe_relative_name(item.name)
             def item_progress(received: int, declared: int) -> None:
                 beat(downloaded_bytes + received)
                 if progress_callback:
@@ -1109,6 +1157,7 @@ def create_download_lease(
                         known_total,
                     )
 
+            stages.at("fetch")
             result = client.download(
                 url,
                 destination,
@@ -1118,10 +1167,18 @@ def create_download_lease(
             downloaded_bytes += result["size_bytes"]
             result["source_url"] = url
             result["declared_checksum"] = item.checksum
-            if item.checksum and project.repository != "mb_post" and re.fullmatch(r"[0-9a-fA-F]{32}", item.checksum):
-                if result["md5"].casefold() != item.checksum.casefold():
-                    raise ValueError(f"MD5 checksum mismatch for {filename}.")
-                result["declared_checksum_verified"] = True
+            stages.at("verify_declared_checksums")
+            outcome = _verify_object_checksum(result, item, project.repository, filename)
+            verification["objects"] += 1
+            verification[outcome] += 1
+            if archive_kind:
+                # The name routed it; the bytes must agree before anything is extracted. An error page
+                # saved under the archive's name fails here, as a failed download, not later as "no
+                # inputs".
+                detection = archives.detect_archive(Path(result["path"]), filename)
+                result["archive"] = detection.record()
+                placements[_file_key(result["path"])] = placement
+                verification["archives_confirmed"] += 1
             downloads.append(result)
             beat(downloaded_bytes)
             if progress_callback:
@@ -1132,23 +1189,91 @@ def create_download_lease(
                     downloaded_bytes,
                     required_download_bytes or downloaded_bytes,
                 )
-        extracted = []
+        stages.finish(
+            "fetch",
+            objects_declared=total_objects,
+            objects_completed=len(downloads),
+            bytes=downloaded_bytes,
+            archives=len(placements),
+        )
+        stages.finish("verify_declared_checksums", **verification)
+
+        stages.start("extract")
         # Which archive each extracted file came from, for the input lineage below. The extraction loop
         # used to pool every member into one list and the association was gone.
+        extracted: list[str] = []
         extracted_from: dict[str, dict[str, Any]] = {}
+        extracted_members: dict[str, dict[str, Any]] = {}
         for item in downloads:
-            archive_path = Path(item["path"])
-            if archive_path.parent == download_root and _is_archive(archive_path):
-                members = _extract_archive(archive_path, data_root, maximum_bytes * 5)
-                extracted.extend(members)
-                for member in members:
-                    extracted_from[_file_key(member)] = item
+            if not item.get("archive"):
+                continue
+            record, members = _extract_into_data_root(
+                Path(item["path"]),
+                item,
+                placements[_file_key(item["path"])],
+                data_root,
+                raw_root,
+                provenance,
+                len(archive_extractions) + 1,
+                earlier=archive_extractions,
+            )
+            archive_extractions.append(record)
+            for member_path, member in members:
+                key = _file_key(member_path)
+                extracted.append(member_path)
+                # The first archive to write a file keeps it; a later one that carried the same bytes
+                # found it already there (merge.already_present_files).
+                extracted_from.setdefault(key, item)
+                extracted_members.setdefault(key, {**member, "extraction": len(archive_extractions) - 1})
+        stages.finish(
+            "extract",
+            archives=len(archive_extractions),
+            files=len(extracted),
+            files_already_present=sum(
+                int((record.get("merge") or {}).get("already_present_files") or 0)
+                for record in archive_extractions
+            ),
+        )
+        stages.not_used(
+            "materialise",
+            "Every object was fetched into this unit's own raw tree; no accession download store is in use.",
+        )
+        stages.not_used("convert", "No input conversion ran in this lease.")
+
+        stages.start("discover")
+        all_inputs = _find_msdial_inputs(data_root)
+        stages.finish("discover", input_candidates=len(all_inputs))
+
+        stages.start("attribute")
         selected_extracted = _filter_project_allowlist_paths(extracted, data_root, project)
         verified_checksums: dict[str, dict[str, Any]] = {}
-        checksum_validation = _verify_project_allowlist_checksums(data_root, project, verified_checksums)
-        all_inputs = _find_msdial_inputs(data_root)
+        checksum_validation = _verify_project_allowlist_checksums(
+            data_root, project, verified_checksums, downloads, archive_extractions
+        )
         inputs = _filter_inputs_by_project_allowlist(all_inputs, data_root, project)
         analysis_input = _common_input_path(inputs, data_root)
+        input_lineage = build_input_lineage(
+            inputs,
+            downloads,
+            extracted_from,
+            data_root,
+            download_root,
+            project,
+            verified_checksums,
+            extracted_members=extracted_members,
+            archive_extractions=archive_extractions,
+        )
+        stages.finish(
+            "attribute",
+            input_candidates=len(inputs),
+            ignored_input_candidates=len(all_inputs) - len(inputs),
+            extracted_files=len(selected_extracted),
+            ignored_extracted_files=len(extracted) - len(selected_extracted),
+            declared_files_verified=checksum_validation.get("verified", 0),
+            archives_verified_at_download=checksum_validation.get("archives_verified_at_download", 0),
+        )
+
+        stages.start("record")
         manifest = {
             "schema": "msdial-public-reanalysis-run.v1",
             "created_at": started_at,
@@ -1164,9 +1289,8 @@ def create_download_lease(
             "allowlist_checksum_validation": checksum_validation,
             "input_candidates": inputs,
             "ignored_input_candidate_count": len(all_inputs) - len(inputs),
-            "input_lineage": build_input_lineage(
-                inputs, downloads, extracted_from, data_root, download_root, project, verified_checksums
-            ),
+            "input_lineage": input_lineage,
+            "archive_extractions": archive_extractions,
             "analysis_input_path": analysis_input,
             "execution_allowed": project.eligible,
             "cleanup_allowed": False,
@@ -1185,6 +1309,9 @@ def create_download_lease(
             "download_started_at": started_at,
             "download_completed_at": datetime.now(timezone.utc).isoformat(),
         }
+        warnings = _archive_warnings(archive_extractions)
+        if warnings:
+            manifest["archive_warnings"] = warnings
         for key in ("previous_manifest", "superseded_manifests", "campaign_authorizations", "lease_owner"):
             if key in lease_record:
                 manifest[key] = lease_record[key]
@@ -1196,9 +1323,11 @@ def create_download_lease(
         _write_json(sample_metadata_path, metadata_workspace(project.as_dict()))
         manifest["repository_metadata_file"] = str(repository_metadata_path)
         manifest["sample_metadata_file"] = str(sample_metadata_path)
+        stages.finish("record", persist=False)
+        manifest["lease_stages"] = [dict(entry) for entry in stages.records]
         _write_json(manifest_path, manifest)
     except BaseException as error:
-        _record_download_failure(manifest_path, lease_record, downloads, error)
+        _record_download_failure(manifest_path, lease_record, downloads, error, stage=stages.fail(error))
         raise
     finally:
         # After the last write, success or failure, so the lease is never "not held" while its manifest
@@ -1417,11 +1546,13 @@ def _record_download_failure(
     lease_record: dict[str, Any],
     downloads: list[dict[str, Any]],
     error: BaseException,
+    stage: str = "",
 ) -> None:
     """Say, in the unit's own manifest, that its lease did not finish and why. Never raises.
 
     The caller is already on its error path, and an exception here would replace the one that explains
-    what went wrong.
+    what went wrong. ``stage`` is the lease stage that failed; an archive that was refused also leaves
+    its reason code and the members it refused (archive_failure).
     """
     record = dict(lease_record)
     record["status"] = "download_failed"
@@ -1438,10 +1569,188 @@ def _record_download_failure(
             {str(item.get("url") or "") for item in (record.get("project") or {}).get("files") or []}
         ),
     }
+    if stage:
+        record["download_failure"]["stage"] = stage
+    if isinstance(error, ArchiveError):
+        failure = error.record()
+        failure["rejected_members"] = failure["rejected_members"][:50]
+        record["download_failure"]["archive_failure"] = failure
     try:
         _write_json(manifest_path, record)
     except (OSError, ValueError, TypeError):
         pass
+
+
+# The stages of a download lease, in the order they run. materialise (the accession download store) and
+# convert (mzXML to mzML) are recorded as not_used until they are wired in; they sit where they will run.
+LEASE_STAGES = (
+    "fetch", "verify_declared_checksums", "extract", "materialise", "convert", "discover", "attribute",
+    "record",
+)
+
+
+class _LeaseStages:
+    """The lease's stages as its manifest records them, written as each one finishes.
+
+    Each entry is {stage, status, started_at, finished_at, ...counts}. status is running, completed,
+    failed, interrupted or not_used; a not_used entry says why instead of when. fetch and
+    verify_declared_checksums run object by object, side by side, so the lease says which of them it
+    is in (at); when it fails, that one is failed and the other interrupted.
+
+    The writes are the lease's own keys only (lease_stages, downloads, archive_extractions),
+    read-modified-written under the manifest's lock like the heartbeat, and never raise: a stage that
+    cannot be recorded must not stop the bytes, and the final write or the failure record says the rest.
+    """
+
+    def __init__(self, manifest_path: Path, lease_record: dict[str, Any], lease_id: str) -> None:
+        self.manifest_path = manifest_path
+        self.lease_record = lease_record
+        self.lease_id = lease_id
+        self.records: list[dict[str, Any]] = lease_record.setdefault("lease_stages", [])
+        self.current = ""
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _entry(self, name: str) -> dict[str, Any]:
+        for entry in reversed(self.records):
+            if entry["stage"] == name:
+                return entry
+        raise KeyError(name)
+
+    def start(self, name: str) -> None:
+        self.records.append({"stage": name, "status": "running", "started_at": self._now()})
+        self.current = name
+
+    def at(self, name: str) -> None:
+        """Say which of two stages running side by side the lease is in now."""
+        self.current = name
+
+    def finish(self, name: str, *, persist: bool = True, **summary: Any) -> None:
+        entry = self._entry(name)
+        entry.update(summary)
+        entry["status"] = "completed"
+        entry["finished_at"] = self._now()
+        if persist:
+            self.persist()
+
+    def not_used(self, name: str, reason: str) -> None:
+        self.records.append({"stage": name, "status": "not_used", "reason": reason})
+        self.persist()
+
+    def fail(self, error: BaseException) -> str:
+        """Mark the stage the lease was in as failed, and any other still running as interrupted.
+
+        Returns the failed stage: the one the lease was in, or the last recorded when none was running
+        (the final write itself).
+        """
+        running = [entry for entry in self.records if entry["status"] == "running"]
+        names = [entry["stage"] for entry in running]
+        failed = self.current if self.current in names else (names[-1] if names else "")
+        for entry in running:
+            entry["status"] = "failed" if entry["stage"] == failed else "interrupted"
+            entry["finished_at"] = self._now()
+            if entry["stage"] == failed:
+                entry["error"] = str(error) or type(error).__name__
+        if not failed and self.records:
+            failed = self.records[-1]["stage"]
+        return failed
+
+    def persist(self) -> None:
+        try:
+            with manifest_lock(self.manifest_path, timeout=5):
+                current = read_manifest(self.manifest_path)
+                if current.get("status") != "downloading" or (current.get("lease_owner") or {}).get(
+                    "lease_id"
+                ) != self.lease_id:
+                    return
+                for key in ("lease_stages", "downloads", "archive_extractions"):
+                    current[key] = self.lease_record.get(key)
+                _write_json(self.manifest_path, current)
+        except (OSError, ValueError, TypeError):
+            pass
+
+
+def _route_object(
+    project: RepositoryProject, url: str, item: RepositoryFile, index: int
+) -> tuple[str, str, str]:
+    """(file name, archive kind by name or '', placement) for one repository object.
+
+    The name is the URL's basename, or <accession>.tar for MB-POST's one project tar; a URL with no
+    basename takes the listed name. When the URL names no archive but the unit's own listing names
+    this object as one (a download link without a file name), the listed name is used, so the object
+    is opened as what the repository says it is.
+
+    A file inside a vendor folder (raw/x.d/..., raw/x.raw/...) is never an archive to open, whatever
+    its name: unpacking it would take it out of the folder its reader expects it in.
+
+    placement is where, under the data root, the archive expands. A per-sample container (X.raw.zip)
+    or a single compressed file (x.mzML.gz) expands in the directory it was listed in, as the
+    container it stands for (archives.container_alias); any other archive is a bundle whose members
+    keep their own relative paths at the data root, as they always have.
+    """
+    listed = str(item.name or "").replace("\\", "/")
+    listed_name = PurePosixPath(listed).name
+    filename = (
+        Path(urllib.parse.urlparse(url).path).name or listed_name or f"{project.accession}_{index}.zip"
+    )
+    if project.repository == "mb_post":
+        filename = f"{project.accession}.tar"
+    if listed and _inside_vendor_folder(listed):
+        return filename, "", ""
+    kind = archives.archive_kind_from_name(filename)
+    if not kind and project.repository != "mb_post" and archives.archive_kind_from_name(listed_name):
+        filename, kind = listed_name, archives.archive_kind_from_name(listed_name)
+    if not kind:
+        return filename, "", ""
+    placement = ""
+    names_this_object = bool(listed_name) and listed_name.casefold() == filename.casefold()
+    if names_this_object and (archives.container_alias(filename) or kind in archives.STREAM_KINDS):
+        placement = _safe_relative_name(listed).parent.as_posix()
+        placement = "" if placement == "." else placement
+    return filename, kind, placement
+
+
+def _inside_vendor_folder(name: str) -> bool:
+    parts = [part for part in str(name).replace("\\", "/").split("/") if part]
+    return any(part.casefold().endswith(archives.FOLDER_CONTAINER_SUFFIXES) for part in parts[:-1])
+
+
+def _archive_download_path(download_root: Path, filename: str, index: int, taken: set[str]) -> Path:
+    """Where an archive is downloaded to: raw\\downloads\\<name>, never over another of this lease's.
+
+    Two per-sample archives listed in different directories can share a name (pos/S1.raw.zip and
+    neg/S1.raw.zip); the second goes to downloads\\<object number>\\<name>. The order of a unit's
+    objects is its listing's, so a retry puts each object where the first attempt did.
+    """
+    destination = download_root / filename
+    if str(destination).casefold() in taken:
+        destination = download_root / str(index) / filename
+    taken.add(str(destination).casefold())
+    return destination
+
+
+def _verify_object_checksum(
+    result: dict[str, Any], item: RepositoryFile, repository: str, filename: str
+) -> str:
+    """Compare one downloaded object with its published MD5; raises on a mismatch.
+
+    Returns md5_verified, not_declared or not_compared. Only an MD5 is compared here, because the
+    download computes MD5 and SHA-256 as the bytes arrive and a 32-digit value is what the repositories
+    publish for objects. MB-POST's declared values belong to the files inside its project tar, so they
+    are compared after extraction, as is any SHA-1 or SHA-256 (_verify_project_allowlist_checksums).
+    """
+    declared = str(item.checksum or "").strip()
+    if not declared:
+        return "not_declared"
+    if repository != "mb_post" and re.fullmatch(r"[0-9a-fA-F]{32}", declared):
+        if result["md5"].casefold() != declared.casefold():
+            raise ValueError(f"MD5 checksum mismatch for {filename}.")
+        result["declared_checksum_verified"] = True
+        result["declared_checksum_algorithm"] = "md5"
+        return "md5_verified"
+    return "not_compared"
 
 
 def build_input_lineage(
@@ -1452,6 +1761,9 @@ def build_input_lineage(
     download_root: Path,
     project: RepositoryProject,
     verified_checksums: dict[str, dict[str, Any]] | None = None,
+    *,
+    extracted_members: dict[str, dict[str, Any]] | None = None,
+    archive_extractions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """One row per analysis input: what it is, where its bytes came from, and what vouches for them.
 
@@ -1478,28 +1790,42 @@ def build_input_lineage(
     ``verified_checksums`` is what _verify_project_allowlist_checksums compared, by _file_key: a file or
     an extracted member whose own declared md5, sha1 or sha256 matched records it as declared,
     declared_algorithm and declared_verified. Without it a checked input read as unchecked.
+
+    AN INPUT THAT CAME OUT OF AN ARCHIVE CARRIES ITS BASIS (_archive_basis): the archive whose published
+    checksum matched, or the member's own, and the row of the archive's member listing that accounts for
+    it (``extracted_members`` and ``archive_extractions``, from the lease's extract stage). A listed
+    container archive (X.raw.zip) names its container (X.raw) for declared_names and sample_id.
     """
     verified_checksums = verified_checksums or {}
+    extracted_members = extracted_members or {}
+    archive_extractions = archive_extractions or []
     data_key = _file_key(str(data_root))
     direct: dict[str, dict[str, Any]] = {}
     for item in downloads:
         path = Path(str(item.get("path") or ""))
-        if str(item.get("path") or "") and path.parent != download_root:
+        if str(item.get("path") or "") and path.parent != download_root and not item.get("archive"):
             direct[_file_key(str(path))] = item
 
     declared: dict[str, str] = {}
     for item in project.files:
         if item.name:
             try:
-                declared.setdefault(_safe_relative_name(item.name).as_posix().casefold(), item.name)
+                name = _safe_relative_name(item.name).as_posix().casefold()
             except ValueError:
                 continue
+            declared.setdefault(name, item.name)
+            alias = _container_alias_path(name)
+            if alias:
+                declared.setdefault(alias, item.name)
     sample_names: dict[str, set[str]] = {}
     for sample in project.sample_metadata or []:
         raw = PurePosixPath(str((sample or {}).get("raw_file") or "").replace("\\", "/")).name.casefold()
         sample_id = str((sample or {}).get("sample_id") or "").strip()
         if raw and sample_id:
             sample_names.setdefault(raw, set()).add(sample_id)
+            alias = archives.container_alias(raw).casefold()
+            if alias:
+                sample_names.setdefault(alias, set()).add(sample_id)
 
     folders = {_file_key(item): item for item in inputs if Path(item).is_dir()}
     # Each downloaded or extracted file is attributed to the input folder that encloses it by walking up
@@ -1543,10 +1869,10 @@ def build_input_lineage(
         }
         if key in folder_members:
             members = folder_members[key]
-            archives = {
+            sources = {
                 str(entry.get("path") or ""): entry for _, entry, origin in members if origin == "archive"
             }
-            row["kind"] = "archived_container" if archives else "vendor_folder"
+            row["kind"] = "archived_container" if sources else "vendor_folder"
             downloaded = sorted(
                 (
                     (Path(member).relative_to(Path(key)).as_posix(), entry)
@@ -1555,8 +1881,24 @@ def build_input_lineage(
                 ),
                 key=lambda pair: pair[0],
             )
-            if archives:
-                row["source"] = {"archives": [_archive_source(entry) for entry in archives.values()]}
+            if sources:
+                row["source"] = {"archives": [_archive_source(entry) for entry in sources.values()]}
+                # The archives its files came out of: the downloads, or the per-sample archives inside
+                # a project tar that the files were expanded from.
+                vouching: dict[str, dict[str, Any]] = {}
+                for member, entry, origin in members:
+                    if origin == "archive":
+                        named = _vouching_archive(extracted_members.get(member), archive_extractions, entry)
+                        where = named.get("archive_path") or named.get("download_path") or ""
+                        vouching.setdefault(where, named)
+                row["basis"] = _archive_basis(
+                    list(vouching.values()),
+                    listing=[
+                        _container_listing(record, path)
+                        for record in archive_extractions
+                        if str(record.get("download_path") or "") in sources
+                    ],
+                )
             elif downloaded:
                 row["source"] = {"objects": len(downloaded)}
             else:
@@ -1597,6 +1939,12 @@ def build_input_lineage(
                 # The member's own declared checksum, compared against its extracted bytes. The archive's
                 # checksum, verified or not, stays with the archive in the source.
                 row["checksums"] = _declared_verification(verified_checksums[key])
+            listed = extracted_members.get(key)
+            row["basis"] = _archive_basis(
+                [_vouching_archive(listed, archive_extractions, extracted_from[key])],
+                member_checksums=row["checksums"],
+                listing=[_member_listing(archive_extractions, listed)] if listed else [],
+            )
         else:
             row["kind"] = "vendor_folder" if path.is_dir() else "file"
             row["source"] = {"origin": "not_downloaded_by_this_lease"}
@@ -1621,6 +1969,155 @@ def _archive_source(entry: dict[str, Any]) -> dict[str, Any]:
         "declared_checksum": entry.get("declared_checksum", ""),
         "declared_checksum_verified": True if entry.get("declared_checksum_verified") else None,
     }
+
+
+# How a publication may describe an input by its basis. The gate's SUM-2 reads these phrasings: an
+# input that came out of an archive was never compared with a checksum of its own, so it is "extracted
+# from an archive whose published MD5 matched" and never "checksum-verified".
+ARCHIVE_BASIS_STATEMENTS = {
+    "archive_declared_checksum": "extracted from an archive whose published {algorithm} matched",
+    "member_declared_checksum": "extracted from an archive, and its own published {algorithm} matched",
+    "archive_download_hash": (
+        "extracted from an archive for which no checksum was published, identified only by its SHA-256"
+    ),
+}
+
+
+def _download_archive(entry: dict[str, Any]) -> dict[str, Any]:
+    """A downloaded archive as a basis names it."""
+    return {
+        "download_path": str(entry.get("path") or ""),
+        "url": str(entry.get("source_url") or ""),
+        "sha256": str(entry.get("sha256") or ""),
+        "md5": str(entry.get("md5") or ""),
+        "declared": str(entry.get("declared_checksum") or ""),
+        "declared_algorithm": str(entry.get("declared_checksum_algorithm") or ""),
+        "declared_verified": True if entry.get("declared_checksum_verified") else None,
+    }
+
+
+def _expanded_archive(record: dict[str, Any], nested: dict[str, Any]) -> dict[str, Any]:
+    """An archive that was inside a downloaded one, as a basis names it: where it was, and its digests."""
+    parts = (str(record.get("placement") or ""), str(nested.get("archive_path") or ""))
+    return {
+        "archive_path": "/".join(part for part in parts if part),
+        "inside": str(record.get("download_path") or ""),
+        "sha256": str(nested.get("archive_sha256") or ""),
+        "md5": str(nested.get("archive_md5") or ""),
+        "declared": str(nested.get("declared_checksum") or ""),
+        "declared_algorithm": str(nested.get("declared_checksum_algorithm") or ""),
+        "declared_verified": True if nested.get("declared_checksum_verified") else None,
+    }
+
+
+def _vouching_archive(
+    listed: dict[str, Any] | None, records: list[dict[str, Any]], download: dict[str, Any]
+) -> dict[str, Any]:
+    """The innermost archive a file came out of: a nested one the listing names, else the download."""
+    if listed:
+        index = int(listed.get("extraction", -1))
+        record = records[index] if 0 <= index < len(records) else {}
+        label = str(listed.get("archive") or "")
+        for nested in _nested_records(record):
+            if str(nested.get("archive_path") or "") == label:
+                return _expanded_archive(record, nested)
+    return _download_archive(download)
+
+
+def _archive_basis(
+    archives_named: list[dict[str, Any]],
+    *,
+    member_checksums: dict[str, Any] | None = None,
+    listing: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """What vouches for an input that came out of an archive, strongest first.
+
+    - member_declared_checksum: the file's own published checksum matched its extracted bytes (MB-POST
+      publishes one per file inside its project tar);
+    - archive_declared_checksum: the published checksum of the archive it came out of matched that
+      archive, as downloaded or, for an archive inside another, before it expanded; and the input is in
+      the listing of what came out of it. value is that verified checksum;
+    - archive_download_hash: the archive published none; the SHA-256 computed at download (or, for an
+      archive inside another, before it expanded) identifies it, and nothing more.
+
+    archives_named are the archives it came out of (_download_archive, _expanded_archive): one for a
+    file, one or more for a container. listing names the members-TSV row (or the container) that
+    accounts for the input, so a reader can trace the input to the listing and the listing to the
+    archive without re-reading the raw tree.
+    """
+    basis: dict[str, Any] = {"archives": list(archives_named), "listing": list(listing or [])}
+    if member_checksums and member_checksums.get("declared_verified"):
+        algorithm = str(member_checksums.get("declared_algorithm") or "")
+        basis.update(kind="member_declared_checksum", algorithm=algorithm,
+                     value=str(member_checksums.get("declared") or ""), verified=True)
+    elif archives_named and all(item["declared_verified"] for item in archives_named):
+        algorithm = archives_named[0]["declared_algorithm"] or "md5"
+        value = archives_named[0].get(algorithm) or archives_named[0]["declared"]
+        basis.update(kind="archive_declared_checksum", algorithm=algorithm, value=value, verified=True)
+    else:
+        basis.update(kind="archive_download_hash", algorithm="sha256",
+                     value=archives_named[0]["sha256"] if archives_named else "", verified=None)
+    algorithm_name = {"md5": "MD5", "sha1": "SHA-1", "sha256": "SHA-256"}.get(
+        basis["algorithm"], basis["algorithm"].upper()
+    )
+    basis["statement"] = ARCHIVE_BASIS_STATEMENTS[basis["kind"]].format(algorithm=algorithm_name)
+    return basis
+
+
+def _listing_reference(record: dict[str, Any]) -> dict[str, Any]:
+    tsv = record.get("members_tsv") or {}
+    return {
+        "archive_name": str(record.get("archive_name") or ""),
+        "archive_sha256": str(record.get("archive_sha256") or ""),
+        "members_tsv": str(tsv.get("path") or ""),
+        "members_tsv_sha256": str(tsv.get("sha256") or ""),
+    }
+
+
+def _member_listing(records: list[dict[str, Any]], listed: dict[str, Any]) -> dict[str, Any]:
+    """The listing row for one extracted file: its path in the listing and the archive it came out of."""
+    index = int(listed.get("extraction", -1))
+    record = records[index] if 0 <= index < len(records) else {}
+    return {
+        **_listing_reference(record),
+        "member": str(listed.get("member") or ""),
+        # The archive the listing names for the row: the outer one, or the nested one it expanded.
+        "listed_archive": str(listed.get("archive") or ""),
+    }
+
+
+def _container_listing(record: dict[str, Any], container: Path) -> dict[str, Any]:
+    """The listing that accounts for a container: the listing, and the container's path in it."""
+    try:
+        member = container.relative_to(Path(str(record.get("destination") or ""))).as_posix()
+    except ValueError:
+        member = ""
+    return {**_listing_reference(record), "container": member}
+
+
+def input_integrity_statement(manifest: dict[str, Any] | None) -> str:
+    """One sentence for the methods text on what vouches for inputs that came out of archives.
+
+    Empty for a unit none of whose inputs did, and for a manifest that has no input_lineage, so every
+    publication written before this, and every per-file unit, reads as it did.
+    """
+    rows = [
+        row for row in ((manifest or {}).get("input_lineage") or {}).get("rows") or []
+        if isinstance(row, dict)
+    ]
+    counted: dict[str, int] = {}
+    for row in rows:
+        basis = row.get("basis") if isinstance(row.get("basis"), dict) else None
+        if basis and basis.get("statement"):
+            counted[str(basis["statement"])] = counted.get(str(basis["statement"]), 0) + 1
+    if not counted:
+        return ""
+    clauses = [
+        f"{count} {'was' if count == 1 else 'were'} {statement}"
+        for statement, count in sorted(counted.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    joined = clauses[0] if len(clauses) == 1 else ", ".join(clauses[:-1]) + " and " + clauses[-1]
+    return f"Of the {len(rows)} analysis input{'s' if len(rows) != 1 else ''}, {joined}."
 
 
 def load_unit_manifest(manifest_path: str | Path) -> dict[str, Any]:
@@ -2997,18 +3494,39 @@ ANALYSIS_INPUT_ROLES = frozenset({"raw", "converted"})
 def _project_allowlist(
     project: RepositoryProject, *, analysis_only: bool = False
 ) -> list[str]:
-    return [
-        _safe_relative_name(item.name).as_posix().casefold()
-        for item in project.files
-        if item.name
-        and (
+    """The unit's listed file names, relative and casefolded, as the data root holds them.
+
+    A listed per-sample container archive also stands for the container it unpacks to
+    (archives.container_alias): FILES/X.raw.zip admits X.raw, in the directory it was listed in,
+    which is where the lease expands it. With analysis_only, only what MS-DIAL opens: files of an
+    analysis role, and the container of a listed archive of one, or of an archive listed for this unit
+    alone (raw_archive). A container named by an archive every unit of a study lists
+    (shared_raw_archive) is admitted by this unit's sample names, never by the archive.
+    """
+    names: list[str] = []
+    for item in project.files:
+        if not item.name:
+            continue
+        name = _safe_relative_name(item.name).as_posix().casefold()
+        analysis = item.role in ANALYSIS_INPUT_ROLES and not requires_msdial_conversion(item.name)
+        if not analysis_only or analysis:
+            names.append(name)
+        alias = _container_alias_path(name)
+        if alias and (
             not analysis_only
-            or (
-                item.role in ANALYSIS_INPUT_ROLES
-                and not requires_msdial_conversion(item.name)
-            )
-        )
-    ]
+            or ((analysis or item.role == "raw_archive") and not requires_msdial_conversion(alias))
+        ):
+            names.append(alias)
+    return names
+
+
+def _container_alias_path(name: str) -> str:
+    """'raw/x.raw.zip' -> 'raw/x.raw': a listed archive's path as the container it stands for, or ''."""
+    listed = PurePosixPath(name)
+    alias = archives.container_alias(listed.name)
+    if not alias:
+        return ""
+    return alias if str(listed.parent) in ("", ".") else f"{listed.parent.as_posix()}/{alias}"
 
 
 def _sample_file_names(project: RepositoryProject) -> tuple[set[str], set[str]]:
@@ -3026,7 +3544,8 @@ def _sample_file_names(project: RepositoryProject) -> tuple[set[str], set[str]]:
     belonging to one unit admits only that unit's files.
 
     Both the full name and the stem are kept, because a repository may record "sample_01" for a
-    file that arrives as "sample_01.mzML" or as a "sample_01.d" directory.
+    file that arrives as "sample_01.mzML" or as a "sample_01.d" directory. A name that is a packed
+    container (X.raw.zip) also claims the container (X.raw).
     """
     exact: set[str] = set()
     stems: set[str] = set()
@@ -3038,6 +3557,11 @@ def _sample_file_names(project: RepositoryProject) -> tuple[set[str], set[str]]:
         if not base:
             continue
         exact.add(base)
+        # A sample recorded as its packed container (MetaboLights: X.raw.zip, X.d.zip) is the
+        # container once unpacked, and that is the name the lease finds on disk.
+        alias = archives.container_alias(base)
+        if alias:
+            exact.add(alias.casefold())
         if not PurePosixPath(base).suffix:
             # ONLY when the repository recorded no extension. Matching on the stem of a name that
             # HAS one would pull in a second encoding of the same sample: a .wiff2 beside a .wiff
@@ -3093,17 +3617,12 @@ def _filter_inputs_by_project_allowlist(
 
 
 
-def _path_matches_allowlist(
-    path: Path,
-    data_root: Path,
-    allowed: list[str],
-    *,
-    allow_directory_descendants: bool = False,
-) -> bool:
-    try:
-        relative = path.resolve().relative_to(data_root.resolve()).as_posix().casefold()
-    except ValueError:
-        return False
+def _allowlist_forms(relative: str) -> set[str]:
+    """The names a listed file may carry for a path relative to the data root (casefolded).
+
+    The path itself, less a leading FILES/, and less its first component (the folder an archive
+    unpacks into, such as MB-POST_files_MPST000007.0), again less a FILES/ under it. Nothing deeper.
+    """
     candidates = {relative}
     if relative.startswith("files/"):
         candidates.add(relative[6:])
@@ -3113,35 +3632,128 @@ def _path_matches_allowlist(
         candidates.add(without_archive_root)
         if without_archive_root.startswith("files/"):
             candidates.add(without_archive_root[6:])
-    for candidate in candidates:
-        for expected in allowed:
-            if candidate == expected:
-                return True
-            if allow_directory_descendants and candidate.startswith(expected.rstrip("/") + "/"):
-                if Path(expected).suffix.casefold() in {".d", ".raw"}:
+    return candidates
+
+
+def _relative_to_data_root(path: Path, data_root: Path) -> str | None:
+    """path relative to data_root, '/'-separated and casefolded; None when it lies outside.
+
+    Paths the lease builds are already under the resolved data root, and are compared as written;
+    anything else is resolved first, as the allow-list always was.
+    """
+    try:
+        return path.relative_to(data_root).as_posix().casefold()
+    except ValueError:
+        pass
+    try:
+        return path.resolve().relative_to(data_root.resolve()).as_posix().casefold()
+    except ValueError:
+        return None
+
+
+def _path_matches_allowlist(
+    path: Path,
+    data_root: Path,
+    allowed: Iterable[str],
+    *,
+    allow_directory_descendants: bool = False,
+) -> bool:
+    """Whether path is a listed file, or lies inside a listed .d/.raw folder when descendants count.
+
+    allowed is looked up as a set, so matching every file of a unit is linear in its files and not
+    files times listed names; a MetaboBank folder unit lists 6,844 members.
+    """
+    relative = _relative_to_data_root(path, data_root)
+    if relative is None:
+        return False
+    expected = allowed if isinstance(allowed, (set, frozenset)) else set(allowed)
+    for candidate in _allowlist_forms(relative):
+        if candidate in expected:
+            return True
+        if allow_directory_descendants:
+            parts = candidate.split("/")
+            for index in range(1, len(parts)):
+                prefix = "/".join(parts[:index])
+                if prefix in expected and PurePosixPath(prefix).suffix in {".d", ".raw"}:
                     return True
     return False
+
+
+def _is_sample_member(path: Path, data_root: Path, names: tuple[set[str], set[str]]) -> bool:
+    """Whether an extracted file belongs to one of this unit's samples.
+
+    It is a sample's file; or the .wiff.scan that travels with one; or it lies inside a .d/.raw
+    folder a sample names. This is what lists a Workbench unit's members out of a study archive,
+    whose own name matches none of them.
+    """
+    if not any(names):
+        return False
+    if _matches_sample_file_names(path, names):
+        return True
+    if _is_sidecar_name(path.name) and _matches_sample_file_names(path.with_name(path.name[:-5]), names):
+        return True
+    relative = _relative_to_data_root(path, data_root)
+    if relative is None:
+        return False
+    parts = relative.split("/")
+    return any(
+        PurePosixPath(part).suffix in {".d", ".raw"} and _matches_sample_file_names(Path(part), names)
+        for part in parts[:-1]
+    )
 
 
 def _filter_project_allowlist_paths(
     paths: list[str], data_root: Path, project: RepositoryProject
 ) -> list[str]:
+    """The extracted files that are this unit's: listed, inside a listed folder, or its samples'.
+
+    Matching the listed names alone gave [] for every Workbench unit, whose only listed file is the
+    study archive: extracted_files said nothing came out for the unit although its inputs had.
+    """
     if not project.analysis_unit_id:
         return paths
-    allowed = _project_allowlist(project)
+    allowed = set(_project_allowlist(project))
+    sample_names = _sample_file_names(project)
     return [
         item
         for item in paths
-        if _path_matches_allowlist(
-            Path(item), data_root, allowed, allow_directory_descendants=True
-        )
+        if _path_matches_allowlist(Path(item), data_root, allowed, allow_directory_descendants=True)
+        or _is_sample_member(Path(item), data_root, sample_names)
     ]
+
+
+def _listed_checksum(item: RepositoryFile) -> tuple[str, str]:
+    """(algorithm, value) of an item's declared checksum; ('', '') when none. Raises when unusable."""
+    checksum = item.checksum.strip().casefold()
+    if not checksum:
+        return "", ""
+    algorithm = {32: "md5", 40: "sha1", 64: "sha256"}.get(len(checksum))
+    if algorithm is None or not re.fullmatch(r"[0-9a-f]+", checksum):
+        raise ValueError(f"Unsupported checksum for allow-listed file {item.name}.")
+    return algorithm, checksum
+
+
+def _names_archive_object(item: RepositoryFile, download: dict[str, Any]) -> bool:
+    """Whether a listed item is the archive object a download fetched, rather than a file inside it.
+
+    An archive role says so (Metabolomics Workbench), and so does an item listed under the downloaded
+    archive's own name (MetaboLights X.raw.zip). MB-POST lists the files inside its project tar under
+    the tar's URL, and those are files to find in the extracted tree.
+    """
+    if not download.get("archive"):
+        return False
+    if item.role in ARCHIVE_ROLES:
+        return True
+    listed = PurePosixPath(str(item.name or "").replace("\\", "/")).name.casefold()
+    return bool(listed) and listed == Path(str(download.get("path") or "")).name.casefold()
 
 
 def _verify_project_allowlist_checksums(
     data_root: Path,
     project: RepositoryProject,
     per_file: dict[str, dict[str, Any]] | None = None,
+    downloads: list[dict[str, Any]] | None = None,
+    archive_extractions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Compare every declared md5, sha1 or sha256 with the file it names. Raises on any mismatch.
 
@@ -3149,26 +3761,67 @@ def _verify_project_allowlist_checksums(
     for each file, keyed by _file_key: the input lineage records it on that file's row, where the gate
     reads it. Only the counts used to leave here, so an input whose declared checksum had been checked
     looked unverified to everything that read the lineage.
+
+    AN ARCHIVE IS VERIFIED AS THE OBJECT IT IS. A listed item that is an archive the lease downloaded
+    (``downloads``; see _names_archive_object) is compared with that download's bytes and counted as
+    archives_verified_at_download. It used to be searched for under raw\\data by its own name, where
+    no archive ever is once it has been expanded, so every one of the 661 declared Workbench units
+    raised "resolved to 0 extracted files" after its whole download. What came out of such an archive
+    is vouched for by the archive and the listing of what came out (archive_extractions), not by a
+    checksum of its own; verified and skipped keep counting the files that were listed one by one. An
+    archive verified here also marks its download entry, which is what the input lineage reads.
+
+    A listed file that was itself an archive inside a downloaded one (MB-POST lists an MD5 for each
+    per-sample zip in its project tar) was expanded in place and is gone from the data root. It is
+    compared with the digests archives.py took of it before it expanded (``archive_extractions``),
+    counted as verified like any listed file, and marked in its nested extraction record.
+
+    Each listed name is looked up in one index of the data root's relative paths, so the check is
+    linear in the files, not files times listed names.
     """
     if not project.analysis_unit_id:
         return {"required": False, "verified": 0, "skipped": 0}
-    files = [path for path in data_root.rglob("*") if path.is_file()]
+    archive_downloads = {
+        str(item.get("source_url") or ""): item for item in downloads or [] if item.get("archive")
+    }
+    index: dict[str, list[Path]] = {}
+    for path in data_root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = _relative_to_data_root(path, data_root)
+        if relative is None:
+            continue
+        for form in _allowlist_forms(relative):
+            index.setdefault(form, []).append(path)
+    expanded: dict[str, list[tuple[dict[str, Any], dict[str, Any], str]]] = {}
+    for record in archive_extractions or []:
+        placement = str(record.get("placement") or "")
+        for nested in _nested_records(record):
+            relative = "/".join(part for part in (placement, str(nested.get("archive_path") or "")) if part)
+            for form in _allowlist_forms(relative.casefold()):
+                expanded.setdefault(form, []).append((record, nested, relative))
     verified = 0
     skipped = 0
+    archives_verified: list[dict[str, Any]] = []
+    expanded_verified: list[dict[str, Any]] = []
     for item in project.files:
-        checksum = item.checksum.strip().casefold()
+        algorithm, checksum = _listed_checksum(item)
         if not checksum:
             skipped += 1
             continue
-        algorithm = {32: "md5", 40: "sha1", 64: "sha256"}.get(len(checksum))
-        if algorithm is None or not re.fullmatch(r"[0-9a-f]+", checksum):
-            raise ValueError(f"Unsupported checksum for allow-listed file {item.name}.")
+        download = archive_downloads.get(item.url)
+        if download is not None and _names_archive_object(item, download):
+            archives_verified.append(_verify_archive_object(item, download, algorithm, checksum))
+            continue
         expected = _safe_relative_name(item.name).as_posix().casefold()
-        matches = [
-            path
-            for path in files
-            if _path_matches_allowlist(path, data_root, [expected])
-        ]
+        matches = index.get(expected, [])
+        if not matches and len(expanded.get(expected, [])) == 1:
+            record, nested, relative = expanded[expected][0]
+            expanded_verified.append(
+                _verify_expanded_archive(item, record, nested, relative, algorithm, checksum)
+            )
+            verified += 1
+            continue
         if len(matches) != 1:
             raise ValueError(
                 f"Allow-listed file {item.name} resolved to {len(matches)} extracted files."
@@ -3187,7 +3840,99 @@ def _verify_project_allowlist_checksums(
                 "declared_name": item.name,
                 "verified": True,
             }
-    return {"required": verified > 0, "verified": verified, "skipped": skipped}
+    result: dict[str, Any] = {
+        "required": verified + len(archives_verified) > 0,
+        "verified": verified,
+        "skipped": skipped,
+    }
+    if archive_downloads:
+        # Only where an archive was downloaded, so a unit of files listed one by one records what it
+        # always did.
+        result["archives_verified_at_download"] = len(archives_verified)
+        result["archives"] = archives_verified + expanded_verified
+    return result
+
+
+def _nested_records(record: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    """Every archive expanded inside an extraction record, depth first."""
+    for nested in record.get("nested") or []:
+        if isinstance(nested, dict):
+            yield nested
+            yield from _nested_records(nested)
+
+
+def _verify_expanded_archive(
+    item: RepositoryFile,
+    record: dict[str, Any],
+    nested: dict[str, Any],
+    relative: str,
+    algorithm: str,
+    checksum: str,
+) -> dict[str, Any]:
+    """Compare a listed file that was an archive inside another with its digests from before it expanded."""
+    actual = str(nested.get(f"archive_{algorithm}") or "")
+    if not actual:
+        raise ValueError(
+            f"Allow-listed file {item.name} was expanded inside {record.get('archive_name')} and its "
+            f"{algorithm.upper()} was not recorded before it expanded, so it cannot be compared."
+        )
+    if actual.casefold() != checksum:
+        raise ValueError(f"{algorithm.upper()} checksum mismatch for {item.name}.")
+    nested["declared_name"] = item.name
+    nested["declared_checksum"] = checksum
+    nested["declared_checksum_algorithm"] = algorithm
+    nested["declared_checksum_verified"] = True
+    return {
+        "name": item.name,
+        "role": item.role,
+        "url": item.url,
+        "archive_path": relative,
+        "inside": str(record.get("archive_name") or ""),
+        "declared": checksum,
+        "declared_algorithm": algorithm,
+        "compared": "before_expansion",
+        "verified": True,
+    }
+
+
+def _verify_archive_object(
+    item: RepositoryFile, download: dict[str, Any], algorithm: str, checksum: str
+) -> dict[str, Any]:
+    """Compare a listed archive's declared checksum with the downloaded archive. Raises on a mismatch.
+
+    An MD5 was compared as the bytes arrived (_verify_object_checksum), and that comparison is what
+    is counted; a SHA-256 is compared with the one the download computed; a SHA-1 is computed now,
+    from the archive, which is kept in raw\\downloads beside its extracted tree.
+    """
+    at_download = (
+        algorithm == "md5"
+        and download.get("declared_checksum_verified")
+        and str(download.get("declared_checksum") or "").strip().casefold() == checksum
+    )
+    if at_download:
+        actual = str(download.get("md5") or "")
+    elif algorithm in ("md5", "sha256"):
+        actual = str(download.get(algorithm) or "")
+    else:
+        digest = hashlib.new(algorithm)
+        with Path(str(download["path"])).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        actual = digest.hexdigest()
+    if actual.casefold() != checksum:
+        raise ValueError(f"{algorithm.upper()} checksum mismatch for {item.name}.")
+    download["declared_checksum_verified"] = True
+    download["declared_checksum_algorithm"] = algorithm
+    return {
+        "name": item.name,
+        "role": item.role,
+        "url": item.url,
+        "download_path": str(download.get("path") or ""),
+        "declared": checksum,
+        "declared_algorithm": algorithm,
+        "compared": "as_downloaded" if at_download else "after_download",
+        "verified": True,
+    }
 
 
 def _safe_relative_name(value: str) -> Path:
@@ -3198,11 +3943,6 @@ def _safe_relative_name(value: str) -> Path:
     if not parts or ".." in parts:
         raise ValueError(f"Unsafe repository file path: {value}")
     return Path(*parts)
-
-
-def _is_archive(path: Path) -> bool:
-    lower = path.name.casefold()
-    return lower.endswith((".zip", ".tar", ".tar.gz", ".tgz"))
 
 
 def _archive_project_results(output: Path) -> Path | None:
@@ -3250,49 +3990,248 @@ def _artifact_inventory(path: Path) -> dict[str, Any]:
     return entry
 
 
-def _extract_archive(archive: Path, destination: Path, maximum_bytes: int) -> list[str]:
-    destination = destination.resolve()
-    extracted = []
-    total = 0
-    if tarfile.is_tarfile(archive):
-        with tarfile.open(archive) as handle:
-            for member in handle.getmembers():
-                if member.issym() or member.islnk():
-                    raise ValueError(f"Archive links are not accepted: {member.name}")
-                target = (destination / member.name).resolve()
-                if target != destination and destination not in target.parents:
-                    raise ValueError(f"Archive member escapes the workspace: {member.name}")
-                total += max(0, member.size)
-                if total > maximum_bytes:
-                    raise ValueError("Expanded archive exceeds the extraction safety limit.")
-                if member.isdir():
-                    target.mkdir(parents=True, exist_ok=True)
-                elif member.isfile():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    source = handle.extractfile(member)
-                    if source is not None:
-                        with source, target.open("wb") as output:
-                            shutil.copyfileobj(source, output)
-                        extracted.append(str(target))
-            return extracted
-    if zipfile.is_zipfile(archive):
-        with zipfile.ZipFile(archive) as handle:
-            for member in handle.infolist():
-                target = (destination / member.filename).resolve()
-                if target != destination and destination not in target.parents:
-                    raise ValueError(f"Archive member escapes the workspace: {member.filename}")
-                total += member.file_size
-                if total > maximum_bytes:
-                    raise ValueError("Expanded archive exceeds the extraction safety limit.")
-                if member.is_dir():
-                    target.mkdir(parents=True, exist_ok=True)
+def _extract_into_data_root(
+    archive: Path,
+    download: dict[str, Any],
+    placement: str,
+    data_root: Path,
+    raw_root: Path,
+    provenance: Path,
+    number: int,
+    limits: ExtractionLimits | None = None,
+    earlier: Iterable[dict[str, Any]] = (),
+) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]]]:
+    """Expand one downloaded archive into the unit's data root. Returns (record, members).
+
+    archives.extract_archive builds the tree in a staging directory of its own, raw\\x<number>, which
+    exists only once the tree matches the archive's listing, and writes that listing, for the whole
+    lineage of nested archives, to provenance\\archive-members-<sha12>.tsv with its sha256. The tree is
+    then moved under the data root, at placement (see _route_object), entry by entry. When an earlier
+    archive of this lease had the same bytes under another name (``earlier``), its listing is not
+    written over: this one goes to provenance\\archive-members\\<number>\\.
+
+    NOTHING ALREADY THERE IS OVERWRITTEN. The old extraction wrote every archive into the data root
+    with open("wb"), so two per-sample zips whose members sit at their root (_FUNC001.DAT) wrote over
+    each other and the unit analysed whichever came last. archives.py now gives such an archive a
+    folder of its own; here a file already in place with the same bytes is left as it is and counted
+    as already present, which is what a retried lease finds and what two archives carrying one
+    identical file give, and anything else refuses the whole archive (extraction_collision) before
+    a single entry moves.
+
+    record is extract_archive's, with destination set to where the members now are (the staging
+    directory it verified them in is staging_destination), the placement, the archive's download and
+    what the move did. members is one (data-root path, {member, archive}) per file that came out: its
+    path in the listing, and the archive, outer or nested, that the listing says it came from.
+    """
+    limits = LEASE_EXTRACTION_LIMITS if limits is None else limits
+    staging = raw_root / f"x{number}"
+    if os.path.lexists(staging):
+        # Verified and not yet moved when an earlier lease stopped; nothing else ever refers to it.
+        removal = unlink_tree(staging)
+        if not removal["complete"]:
+            raise ArchiveError(
+                "staging_not_removed",
+                f"{staging}, left by an earlier lease, could not be removed: {removal['kept'][:3]}",
+            )
+    sha256 = str(download.get("sha256") or "")
+    listing_directory = provenance
+    if sha256 and any(str(record.get("archive_sha256") or "") == sha256 for record in earlier):
+        listing_directory = provenance / "archive-members" / str(number)
+    record = archives.extract_archive(
+        archive,
+        staging,
+        archive_sha256=sha256,
+        listing_directory=listing_directory,
+        limits=limits,
+    )
+    target = data_root.joinpath(*placement.split("/")) if placement else data_root
+    try:
+        rows = [
+            row for row in _read_members_listing(Path(record["members_tsv"]["path"]))
+            if row.get("disposition") == "extracted"
+        ]
+        _refuse_long_final_paths(rows, target, limits, archive.name)
+        merge = _merge_extracted_tree(staging, target, archive.name)
+    finally:
+        # What is left is directories the move emptied and files that were already in place.
+        unlink_tree(staging)
+    members: list[tuple[str, dict[str, Any]]] = [
+        (str(target.joinpath(*row["path"].split("/"))), {"member": row["path"], "archive": row["archive"]})
+        for row in rows
+        if row.get("type") == "file"
+    ]
+    container_root = str(record.get("container_root") or "")
+    return (
+        {
+            **record,
+            "staging_destination": record["destination"],
+            "destination": str(target),
+            "placement": placement,
+            # The container an archived container produced, relative to the data root.
+            "container_path": "/".join(part for part in (placement, container_root) if part),
+            "source_url": str(download.get("source_url") or ""),
+            "download_path": str(download.get("path") or ""),
+            "merge": merge,
+            "extracted_file_count": len(members),
+        },
+        members,
+    )
+
+
+def _refuse_long_final_paths(
+    rows: list[dict[str, str]], target: Path, limits: ExtractionLimits, label: str
+) -> None:
+    """Refuse an archive whose members would be too long for the Console where they finally land.
+
+    archives.py holds every path to the limits under the staging directory it extracts into. The
+    members then move under the data root, at their placement, which can be longer: a per-sample
+    container listed in FILES/RAW_FILES/pos/ lands nine characters deeper than raw\\x<n> put it.
+    LongPathsEnabled is 0 on the campaign host and the .NET Framework Console opens MAX_PATH paths.
+    """
+    base = len(str(target))
+    too_long = []
+    for row in rows:
+        path = str(row.get("path") or "")
+        folder = path if row.get("type") == "dir" else path.rpartition("/")[0]
+        if base + 1 + len(path) > limits.max_path_length or (
+            folder and base + 1 + len(folder) > limits.max_directory_length
+        ):
+            too_long.append({"name": path, "reason": "path_too_long"})
+    if too_long:
+        raise ArchiveError(
+            "unsafe_listing",
+            f"{label} was refused before it moved under {target}: {len(too_long)} member path(s) would be "
+            f"longer than {limits.max_path_length} characters there, for example {too_long[0]['name']!r}.",
+            rejected=too_long[:50],
+        )
+
+
+def _same_bytes(left: Path, right: Path) -> bool:
+    if left.stat().st_size != right.stat().st_size:
+        return False
+    with left.open("rb") as first, right.open("rb") as second:
+        while True:
+            chunk = first.read(1024 * 1024)
+            if chunk != second.read(1024 * 1024):
+                return False
+            if not chunk:
+                return True
+
+
+def _merge_extracted_tree(source: Path, target: Path, label: str) -> dict[str, Any]:
+    """Move a verified tree under target, planned in full first, so a collision moves nothing."""
+    moves: list[tuple[Path, Path]] = []
+    already_present: list[str] = []
+    collisions: list[dict[str, str]] = []
+    pending = [(source, target, "")]
+    while pending:
+        here, there, relative = pending.pop()
+        with os.scandir(here) as entries:
+            children = sorted(entries, key=lambda entry: entry.name)
+        for entry in children:
+            destination = there / entry.name
+            path = f"{relative}/{entry.name}" if relative else entry.name
+            if not os.path.lexists(destination):
+                moves.append((Path(entry.path), destination))
+                continue
+            existing = os.lstat(destination)
+            linked = stat.S_ISLNK(existing.st_mode) or bool(
+                getattr(existing, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            )
+            if entry.is_dir(follow_symlinks=False):
+                if stat.S_ISDIR(existing.st_mode) and not linked:
+                    pending.append((Path(entry.path), destination, path))
                     continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with handle.open(member) as source, target.open("wb") as output:
-                    shutil.copyfileobj(source, output)
-                extracted.append(str(target))
-        return extracted
-    return []
+            elif stat.S_ISREG(existing.st_mode) and not linked and _same_bytes(Path(entry.path), destination):
+                already_present.append(path)
+                continue
+            collisions.append({"path": path, "existing": str(destination)})
+    if collisions:
+        raise ArchiveError(
+            "extraction_collision",
+            f"{label} would write {len(collisions)} path(s) under {target} that already hold something "
+            f"else, for example {collisions[0]['path']!r}. Nothing was moved or overwritten.",
+            detail={"collisions": collisions[:20], "collision_count": len(collisions)},
+        )
+    target.mkdir(parents=True, exist_ok=True)
+    for moving, destination in moves:
+        os.replace(moving, destination)
+    return {
+        "moved_entries": len(moves),
+        "already_present_files": len(already_present),
+        "already_present": already_present[:50],
+    }
+
+
+def _read_members_listing(path: Path) -> list[dict[str, str]]:
+    """The rows of an archive-members TSV that archives.extract_archive wrote.
+
+    Split on newlines only: a member name may hold U+2028 or U+0085, which str.splitlines would read
+    as line ends, while archives.py refuses control characters, tabs and newlines in names.
+    """
+    lines = path.read_text(encoding="utf-8").split("\n")
+    header = lines[0].split("\t")
+    return [dict(zip(header, line.split("\t"))) for line in lines[1:] if line]
+
+
+def _archive_warnings(records: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """What the extraction records say a reader of the unit should know, outer and nested archives alike.
+
+    - container_name_mismatch: X.raw.zip holds Y.raw. It is extracted as packed; renaming it would
+      decide which sample it is, so it is attributed only where a sample or a listed file names Y.raw.
+    - nested_skipped: an archive inside an archive that was left packed, and why.
+    - dropped_metadata: operating-system metadata (__MACOSX/, .DS_Store, ._ files, Thumbs.db) that
+      was validated and not written.
+    - no_member_integrity: a format with no per-member check (tar, LZMA-alone), whose members rest
+      on the archive's own hash, or on their own published checksums where the repository lists
+      them (MB-POST).
+    """
+    warnings: list[dict[str, str]] = []
+
+    def visit(record: dict[str, Any]) -> None:
+        name = str(record.get("archive_path") if record.get("depth", 1) != 1 else record.get("archive_name"))
+        if record.get("container_name_mismatch"):
+            warnings.append({
+                "archive": name,
+                "kind": "container_name_mismatch",
+                "message": (
+                    f"{name} stands for {archives.container_alias(str(record.get('archive_name') or ''))} but "
+                    f"holds {record.get('container_root')}; it was extracted as packed and is attributed only "
+                    "where a sample or a listed file names what it holds."
+                ),
+            })
+        for skipped in record.get("nested_skipped") or []:
+            warnings.append({
+                "archive": name,
+                "kind": "nested_skipped",
+                "message": f"{skipped.get('path')} inside {name} was left packed ({skipped.get('reason')}).",
+            })
+        dropped = record.get("dropped_metadata") or {}
+        if dropped.get("members"):
+            warnings.append({
+                "archive": name,
+                "kind": "dropped_metadata",
+                "message": (
+                    f"{dropped['members']} operating-system metadata member(s) of {name} were not written: "
+                    + ", ".join(str(entry) for entry in (dropped.get("entries") or [])[:5])
+                ),
+            })
+        if record.get("crc_verified") is False:
+            warnings.append({
+                "archive": name,
+                "kind": "no_member_integrity",
+                "message": (
+                    f"{name} is {record.get('format')}, which carries no check of its members; what came "
+                    "out of it is vouched for by the archive's hash, or by its own published checksum "
+                    "where one was compared."
+                ),
+            })
+        for nested in record.get("nested") or []:
+            visit(nested)
+
+    for record in records:
+        visit(record)
+    return warnings
 
 
 def _find_msdial_inputs(root: Path) -> list[str]:

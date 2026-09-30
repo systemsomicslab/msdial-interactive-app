@@ -61,6 +61,9 @@ def summarize_jobs(
             "durable_repository_manifests",
             "repository_manifest_reentry",
             "repository_input_lineage",
+            # Leases record their stages, open every archive kind through archives.py, verify a study
+            # archive's published MD5 as the object it is, and give archive-derived inputs their basis.
+            "repository_archive_extraction",
             "campaign_authorization_v1",
             "isolated_job_registry",
             "mzxml_requires_conversion_to_mzml",
