@@ -60,10 +60,17 @@ and download tools. Missing purpose is an explicit download blocker.
 
 After download, call `msdial_repository_raw_metadata_preflight` when repository
 metadata leaves LC-MS/MS, polarity, DDA versus DIA/AIF/SWATH, MS2 status, or
-untargeted status uncertain, or when the user requests a raw-header cross-check. The tool can find
-the sibling `msrawdataworkbench/RawMetadataConsoleApp` build or accept an
-explicit extractor path. Set `confirm_untargeted=true` only after the user has
-explicitly accepted that scientific classification.
+untargeted status uncertain, or when the user requests a raw-header cross-check. The tool uses
+the explicit extractor path, then the `raw_metadata_extractor_path` setting, then
+`MSDIAL_RAW_METADATA_EXTRACTOR`, then the sibling `msrawdataworkbench/RawMetadataConsoleApp`
+build (reported as `working_checkout_default`); `msdial_check_raw_metadata_extractor` shows which
+one and whether its build record verifies. Set `confirm_untargeted=true` only after the user has
+explicitly accepted that scientific classification; it is recorded as an inference, not a
+confirmation.
+
+The reply's `campaign_disposition` says what a campaign would do with the unit (run, skip, exclude
+or split, with reason codes). Outside a campaign it is advice only: report it, and keep every
+confirmation below.
 
 If preflight reports `acquisition_mode=Mixed`, call
 `msdial_split_repository_unit` with `confirmed=false` and review every proposed

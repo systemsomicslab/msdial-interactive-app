@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import test_raw_metadata_extractor as fixtures
+from msdial_app import mcp_server
 from msdial_app import raw_metadata_extractor as extractor
 from msdial_app.raw_metadata_extractor import (
     PINNED_BUILDS,
@@ -265,6 +266,62 @@ class SettingTests(_Scratch):
 
         with self.assertRaisesRegex(ValueError, "RawMetadataConsoleApp.exe"):
             set_raw_metadata_extractor_path(other, allow_unverified=True)
+
+
+def _no_backend(*_args, **_kwargs):
+    raise AssertionError("the extractor tools need no backend")
+
+
+class McpToolTests(_Scratch):
+    def test_the_check_and_set_tools_work_without_a_backend(self) -> None:
+        binary = _recorded_build(self.root / "pinned")
+        with patch.object(mcp_server, "_request_json", side_effect=_no_backend), patch.object(
+            mcp_server, "ROOT", self.root / "app"
+        ):
+            checked = mcp_server.msdial_check_raw_metadata_extractor(extractor_path=str(binary))
+            saved = mcp_server.msdial_set_raw_metadata_extractor_path(extractor_path=str(binary))
+            refused = mcp_server.msdial_set_raw_metadata_extractor_path(extractor_path=str(self.stub("unverified")))
+
+        self.assertEqual("verified", checked["candidates"][0]["provenance_status"])
+        self.assertTrue(checked["campaign_accepts"])
+        self.assertTrue(saved["campaign_accepts"])
+        self.assertEqual(("validation_error", False), (refused["reason"], refused["ok"]))
+
+    def test_the_preflight_tool_reports_a_refused_extractor_under_a_campaign(self) -> None:
+        from test_raw_metadata_preflight import _APPROVAL, _unit
+
+        manifest, stub, _ = _unit(self.root / "unit", ["a.mzML"], extra={"campaign_authorizations": [dict(_APPROVAL)]})
+        with patch.object(mcp_server, "_request_json", side_effect=_no_backend), patch.object(
+            mcp_server, "ROOT", self.root / "app"
+        ), patch("msdial_app.repository_reanalysis.subprocess.run", side_effect=AssertionError("nothing is read")):
+            result = mcp_server.msdial_repository_raw_metadata_preflight(
+                extractor_path=str(stub), manifest_path=str(manifest)
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("raw_metadata_extractor_refused", result["reason"])
+        self.assertEqual(["extractor_absent", "extractor_not_pinned"], result["codes"])
+
+    def test_the_preflight_tool_runs_the_pinned_setting_and_returns_the_disposition(self) -> None:
+        from test_raw_metadata_preflight import _APPROVAL, _Extractor, _unit
+
+        manifest, _stub, _ = _unit(self.root / "unit", ["a.mzML", "b.mzML"], extra={"campaign_authorizations": [dict(_APPROVAL)]})
+        binary = _recorded_build(self.root / "pinned")
+        set_raw_metadata_extractor_path(binary)
+        with patch.object(mcp_server, "_request_json", side_effect=_no_backend), patch.object(
+            mcp_server, "ROOT", self.root / "app"
+        ), patch("msdial_app.repository_reanalysis.subprocess.run", side_effect=_Extractor({"b.mzML": "fail"})):
+            result = mcp_server.msdial_repository_raw_metadata_preflight(manifest_path=str(manifest))
+
+        self.assertTrue(result["completed"], result)
+        self.assertEqual("setting", result["extractor"]["selected_from"])
+        self.assertTrue(result["extractor"]["pinned"])
+        self.assertEqual(1, result["exit_code"])
+        self.assertEqual(
+            {"disposition": "run", "applied": True, "excluded_inputs": 1, "console_acquisition_type": "DDA"},
+            {key: result["campaign_disposition"][key] for key in ("disposition", "applied", "excluded_inputs", "console_acquisition_type")},
+        )
+        self.assertTrue(result["execution_allowed"])
 
 
 if __name__ == "__main__":

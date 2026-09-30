@@ -214,6 +214,35 @@ If the proprietary reader is unavailable, preflight is recorded as unavailable.
 It does not revoke eligibility that was already explicit in repository metadata,
 but it cannot promote an ambiguous project to executable status.
 
+The extractor is chosen in this order: the explicit path, the
+`raw_metadata_extractor_path` setting (`msdial_set_raw_metadata_extractor_path`,
+which refuses a build whose record does not verify), `MSDIAL_RAW_METADATA_EXTRACTOR`,
+and last the build in the sibling `msrawdataworkbench` working checkout, reported
+as `working_checkout_default`. `msdial_check_raw_metadata_extractor` lists every
+candidate with its provenance status and whether it is a pinned build. The pinned
+builds are data (`PINNED_BUILDS` in `raw_metadata_extractor.py`); the current one is
+msrawdataworkbench `592b6dbce` with MsdialWorkbench `f0583493a`. A unit under a
+campaign approval is preflighted only by the first extractor named, and only when it
+inspects as verified and pinned; anything else is refused before a file is read.
+
+The extractor reads at most 20 inputs per process, with no command line over
+32,767 characters, and each process has a time limit made of its inputs' limits:
+five minutes for a metadata reader, plus 1,800 s per GB for Waters `.raw` (which
+has no metadata-only reader) and 600 s per GB for ion-mobility data. A group that
+fails or times out is read again one input at a time, so every input gets its own
+outcome (`ok`, `reused`, `unsupported_format`, `failed`, `timed_out` or `os_error`)
+in `raw_metadata_preflight.summary.per_file`, with only a tail of stderr. An input
+read before by the same extractor binary, at the same size and modification time,
+is not read again; a split part reuses its parent's reads.
+
+Every preflight ends with `campaign_disposition` (`msdial-campaign-disposition.v1`):
+`run`, `skip`, `exclude` or `split`, with reason and warning codes, the inputs it
+excludes and, for a split, the grouping by acquisition and polarity. Outside a
+campaign it is advice and changes nothing else. Under a campaign approval it is
+applied: it sets `execution_allowed`, the status (`preflight_passed`,
+`skipped_by_preflight`, `excluded_by_preflight`) and each input's
+`console_acquisition_type` (DDA, SWATH or AIF).
+
 If raw headers report more than one acquisition mode, the result is `Mixed`.
 Preview `msdial_split_repository_unit`, confirm the proposed DDA and
 DIA/AIF/SWATH child units, then preflight each child independently. The Mixed
