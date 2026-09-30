@@ -51,6 +51,7 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
         ANALYSIS_INPUT_ROLES,
         RepositoryFile,
         RepositoryProject,
+        _file_key,
         _filter_inputs_by_project_allowlist,
         _find_msdial_inputs,
         _tree_size,
@@ -1765,6 +1766,37 @@ class AnMzmlTheLeaseExcludedIsNoRow(unittest.TestCase):
 
         self.assertEqual(["no_analysis_input"], [item["code"] for item in blocking_failures(built)])
         self.assertEqual(["packed.mzML"], built["failures"][0]["inputs"])
+
+    def test_the_records_the_gate_reads_for_it_balance_the_declaration(self) -> None:
+        """What the reanalysis gate reads to account for the excluded mzML (INP-1, CLS-2).
+
+        Once the project carries the Catalog's analysis_inputs, INP-1 - a check that stops a campaign run -
+        compares them with the input candidates, and an exclusion it cannot account for reads as a declared
+        input lost on the way. The declaration is the candidates and the lease's exclusions, the CSV is the
+        candidates, and the excluded lineage row names the sample the exclusion takes out of the run.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = _mzml_unit(Path(temporary), {**self._payloads(), "good2.mzML": mzml(dda_spectra(5))})
+            with patch.object(mcp_server, "_request_json", side_effect=_no_backend):
+                prepared = mcp_server.msdial_prepare_repository_reanalysis(
+                    hierarchy=["Group"], confirmed=True, manifest_path=str(manifest_path)
+                )
+            with open(prepared["input_path"], encoding="utf-8-sig", newline="") as handle:
+                written = [row["file_path"] for row in csv.DictReader(handle)]
+            manifest = read_manifest(manifest_path)
+
+        self.assertTrue(prepared["prepared"], prepared)
+        self.assertEqual(3, len(manifest["project"]["analysis_inputs"]))
+        self.assertEqual(
+            len(manifest["project"]["analysis_inputs"]),
+            len(manifest["input_candidates"]) + len(manifest["excluded_input_candidates"]),
+        )
+        self.assertEqual(sorted(map(_file_key, manifest["input_candidates"])), sorted(map(_file_key, written)))
+        [excluded] = manifest["input_lineage"]["excluded"]
+        self.assertEqual(
+            (_file_key(manifest["excluded_input_candidates"][0]["path"]), "packed", UNSUPPORTED_MZML_ENCODING),
+            (_file_key(excluded["path"]), excluded["sample_id"], excluded["exclusion"]["reason"]),
+        )
 
 
 if __name__ == "__main__":
