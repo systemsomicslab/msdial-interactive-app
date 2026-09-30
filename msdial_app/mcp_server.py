@@ -2193,11 +2193,11 @@ def msdial_cancel_job(
     """Stop a running or queued MS-DIAL run, peak-count diagnostic, or repository download.
 
     A run or diagnostic has its Console's whole process tree stopped and fails with exit code -4; a
-    download stops at its next progress report, which a stalled transfer still makes within the idle read
-    timeout (120 s), and its unit manifest records download_failed with reason cancelled, keeping the
-    partial file for a resume. Returns at once with cancel_requested; poll the job
-    to see it end. Stopping polling, as msdial_interactive_wait_for_completion does on its timeout, never
-    stopped anything; this does.
+    download stops at its next progress report, which a slow transfer makes at least once a second and a
+    stalled one within the idle read timeout (120 s), and its unit manifest records download_failed with
+    reason cancelled, keeping the partial file for a resume. Returns at once with cancel_requested; poll
+    the job to see it end. Stopping polling, as msdial_interactive_wait_for_completion does on its
+    timeout, never stopped anything; this does.
     """
     return _request_json(
         "POST",

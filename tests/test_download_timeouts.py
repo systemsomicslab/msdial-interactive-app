@@ -30,6 +30,7 @@ from unittest.mock import patch
 from msdial_app import repository_reanalysis
 from msdial_app.repository_reanalysis import (
     DOWNLOAD_IDLE_TIMEOUT_SECONDS,
+    DOWNLOAD_PROGRESS_INTERVAL_SECONDS,
     DownloadConnectionLost,
     DownloadIncomplete,
     DownloadStalled,
@@ -44,7 +45,8 @@ from msdial_app.repository_reanalysis import (
 from test_download_lease_record import _project
 
 
-# Larger than the client's 1 MiB read, so a stall after the first half leaves whole chunks on disk.
+# Larger than the client's 1 MiB read, so a stall after the first half (1.5 MiB) falls inside a MiB: the
+# client once lost the bytes of that unfinished MiB and now keeps every byte that arrived.
 PAYLOAD = bytes(range(256)) * (12 * 1024)          # 3 MiB, every byte position distinguishable
 SHA256 = hashlib.sha256(PAYLOAD).hexdigest()
 HALF = len(PAYLOAD) // 2
@@ -93,10 +95,34 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             server.release.wait(server.stall_seconds)
 
 
+TRICKLE_BYTES = 40          # one every 0.1 s: four seconds of body, and no read anywhere near IDLE
+
+
+class _Trickle(http.server.BaseHTTPRequestHandler):
+    """Declares the first TRICKLE_BYTES of PAYLOAD and sends one byte every 0.1 s: never a stall, never a MiB."""
+
+    def log_message(self, *args) -> None:  # noqa: D102 - quiet
+        pass
+
+    def do_GET(self) -> None:  # noqa: N802 - http.server's interface
+        with self.server.guard:
+            self.server.requests.append({"Range": self.headers.get("Range"), "action": "trickle"})
+        self.send_response(200)
+        self.send_header("Content-Length", str(TRICKLE_BYTES))
+        self.end_headers()
+        for index in range(TRICKLE_BYTES):
+            try:
+                self.wfile.write(PAYLOAD[index:index + 1])
+            except OSError:
+                return      # the client has stopped listening
+            if self.server.release.wait(0.1):
+                return
+
+
 class _Server:
-    def __init__(self, plan: list[str], stall_seconds: float = 4.0) -> None:
+    def __init__(self, plan: list[str], stall_seconds: float = 4.0, handler: type = _Handler) -> None:
         # Threaded, so a retry is answered while the stalled request is still held open.
-        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.httpd.daemon_threads = True
         self.httpd.plan = list(plan)
         self.httpd.requests = []
@@ -131,8 +157,8 @@ class _Downloads(unittest.TestCase):
         self.destination = self.root / "object.zip"
         self.partial = self.destination.with_name("object.zip.part")
 
-    def server(self, plan: list[str], stall_seconds: float = 4.0) -> _Server:
-        server = _Server(plan, stall_seconds)
+    def server(self, plan: list[str], stall_seconds: float = 4.0, handler: type = _Handler) -> _Server:
+        server = _Server(plan, stall_seconds, handler)
         self.addCleanup(server.close)
         return server
 
@@ -152,10 +178,10 @@ class AStalledReadTimesOut(_Downloads):
 
         self.assertLess(elapsed, IDLE + 2.5, "not the old five minutes, nor the server's own close")
         self.assertIsInstance(raised.exception, TimeoutError, "still a TimeoutError to any older handler")
-        self.assertEqual(CHUNK, self.partial.stat().st_size, "the whole chunks that arrived are kept")
+        self.assertEqual(HALF, self.partial.stat().st_size, "every byte that arrived is kept, not whole MiBs")
         self.assertTrue(self.destination.with_name("object.zip.part.json").is_file(), "and their validators")
         [attempt] = raised.exception.download_attempts
-        self.assertEqual(("stalled", 0, CHUNK), (attempt["outcome"], attempt["part_bytes_before"],
+        self.assertEqual(("stalled", 0, HALF), (attempt["outcome"], attempt["part_bytes_before"],
                                                  attempt["part_bytes_after"]))
         self.assertNotIn("retry_after_seconds", attempt)
 
@@ -186,11 +212,11 @@ class ARetryResumesFromThePart(_Downloads):
 
         self.assertEqual(SHA256, result["sha256"])
         self.assertEqual(PAYLOAD, self.destination.read_bytes())
-        self.assertEqual(CHUNK, result["resumed_from_bytes"])
-        self.assertEqual({"Range": f"bytes={CHUNK}-", "If-Range": ETAG, "action": "serve"}, server.requests[-1])
+        self.assertEqual(HALF, result["resumed_from_bytes"])
+        self.assertEqual({"Range": f"bytes={HALF}-", "If-Range": ETAG, "action": "serve"}, server.requests[-1])
         self.assertEqual(["stalled", "completed"], [item["outcome"] for item in result["attempts"]])
         self.assertEqual(0.01, result["attempts"][0]["retry_after_seconds"])
-        self.assertEqual(CHUNK, result["attempts"][1]["part_bytes_before"])
+        self.assertEqual(HALF, result["attempts"][1]["part_bytes_before"])
 
     def test_a_connection_closed_early_is_retried(self) -> None:
         server = self.server(["truncate", "serve"])
@@ -250,7 +276,7 @@ class ACancelMeetsAStall(_Downloads):
         [attempt] = raised.exception.download_attempts
         self.assertEqual(("stopped", "stalled", "cancelled"),
                          (attempt["outcome"], attempt["stopped_after"], attempt["error"]))
-        self.assertEqual(CHUNK, self.partial.stat().st_size)
+        self.assertEqual(HALF, self.partial.stat().st_size)
 
     def test_it_is_heard_through_the_backoff(self) -> None:
         server = self.server(["stall"])
@@ -274,6 +300,54 @@ class ACancelMeetsAStall(_Downloads):
         self.assertLess(time.monotonic() - started, IDLE + 4.0, "not after the thirty-second backoff")
         self.assertEqual(30.0, raised.exception.download_attempts[0]["retry_after_seconds"])
         self.assertEqual("stopped", raised.exception.download_attempts[0]["outcome"])
+
+
+class ASlowTransferIsStillHeard(_Downloads):
+    """Bytes slower than a MiB per idle timeout never stall a read, so only the reads can carry a report.
+
+    Each read asked for a whole MiB and urllib's read(amt) waited for all of it, so at 1 KB/s the
+    callback, and through it a cancel and the lease heartbeat, was heard once in seventeen minutes, while
+    every socket read came well inside the idle timeout and none timed out.
+    """
+
+    def test_a_cancel_is_heard_within_a_second_however_slowly_the_bytes_come(self) -> None:
+        """THE REGRESSION. The first report, and so the cancel, came only when the body ended."""
+        server = self.server(["trickle"], handler=_Trickle)
+        asked = threading.Event()
+        timer = threading.Timer(0.3, asked.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+
+        def progress(_received: int, _declared: int) -> None:
+            if asked.is_set():
+                raise Cancelled()
+
+        started = time.monotonic()
+        with self.assertRaises(Cancelled) as raised:
+            self.client(retries=3, backoff=(60.0,)).download(server.url(), self.destination, 10_000_000,
+                                                             progress_callback=progress)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.3 + DOWNLOAD_PROGRESS_INTERVAL_SECONDS + 0.7, "not when the body ends, 4 s on")
+        [attempt] = raised.exception.download_attempts
+        self.assertEqual(("stopped", "cancelled"), (attempt["outcome"], attempt["error"]))
+        self.assertTrue(0 < self.partial.stat().st_size < TRICKLE_BYTES, "what arrived is kept for the resume")
+
+    def test_it_reports_at_least_once_a_second_and_ends_on_the_last_byte(self) -> None:
+        server = self.server(["trickle"], handler=_Trickle)
+        seen: list[tuple[float, int, int]] = []
+        started = time.monotonic()
+
+        self.client().download(server.url(), self.destination, 10_000_000,
+                               progress_callback=lambda received, declared: seen.append(
+                                   (time.monotonic(), received, declared)))
+
+        self.assertEqual(PAYLOAD[:TRICKLE_BYTES], self.destination.read_bytes())
+        self.assertEqual((TRICKLE_BYTES, TRICKLE_BYTES), seen[-1][1:], "the last byte is reported")
+        moments = [started] + [moment for moment, _, _ in seen]
+        self.assertLess(max(later - earlier for earlier, later in zip(moments, moments[1:])),
+                        DOWNLOAD_PROGRESS_INTERVAL_SECONDS + 0.5)
+        self.assertGreaterEqual(len(seen), 3, "four seconds of body reported through, not once at its end")
 
 
 class WhatIsRetryable(unittest.TestCase):
@@ -342,7 +416,7 @@ class TheLeaseRecordsTheAttempts(_Downloads):
         self.assertEqual(["stopped"], [item["outcome"] for item in failure["attempts"]])
         self.assertNotIn("retryable", failure)
         part = self.manifest.parents[1] / "raw" / "data" / "a.mzML.part"
-        self.assertEqual(CHUNK, part.stat().st_size, "kept for the resume")
+        self.assertEqual(HALF, part.stat().st_size, "kept for the resume")
 
     def test_a_stall_past_every_retry_is_recorded_as_retryable(self) -> None:
         server = self.server(["stall"])

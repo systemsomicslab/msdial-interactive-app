@@ -154,9 +154,15 @@ class EligibilityPolicy:
 # connection is retried from the .part after a backoff, and each attempt is recorded. The caller's
 # progress callback is also called at a stall and through each backoff, so a caller that stops a download
 # by raising from it (a cancelled job) is heard within the idle timeout.
+#
+# A stall is not the only way to go quiet. Each read asked for a whole MiB, and urllib's read(amt) waits
+# until it has one, so a transfer trickling in at 1 KB/s reached the callback once in seventeen minutes
+# while every socket read came well inside the idle timeout. A transfer now reports at least this often.
 DOWNLOAD_IDLE_TIMEOUT_SECONDS = 120.0
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_RETRY_BACKOFF_SECONDS = (10.0, 30.0, 90.0)
+DOWNLOAD_PROGRESS_INTERVAL_SECONDS = 1.0
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 class RetryableDownloadError(Exception):
@@ -269,10 +275,12 @@ class RepositoryHttpClient:
         complete. The error a download finally raises carries the same list as ``download_attempts``, and
         a retryable one keeps its partial file and its validators for a later resume.
 
-        ``progress_callback(received, declared)`` is called as bytes arrive, and also when a read stalls
-        and about once a second through each backoff, with the last values it was given. A caller that
-        stops a download by raising from it (a cancelled job) is therefore heard within the idle timeout,
-        and the exception it raised is what the download raises: a stop, not a network error.
+        ``progress_callback(received, declared)`` is called as bytes arrive: after each MiB, and after the
+        first read to return a second or more since the last call, however few bytes it brought. It is
+        also called when a read stalls, and about once a second through each backoff, with the last values
+        it was given. A caller that stops a download by raising from it (a cancelled job) is therefore
+        heard within the idle timeout and a second, however slowly the bytes come, and the exception it
+        raised is what the download raises: a stop, not a network error.
         """
         partial = destination.with_name(destination.name + ".part")
         attempts: list[dict[str, Any]] = []
@@ -482,11 +490,16 @@ class RepositoryHttpClient:
                 if progress_callback:
                     progress_callback(downloaded, total_declared)
 
+            # read1 returns what the socket has, up to a MiB. read(amt) waited for the whole MiB, so a
+            # slow transfer reached the callback, and through it a cancel and the lease heartbeat, once
+            # a MiB however long that took; and the bytes of an unfinished MiB were lost at a stall.
+            read = getattr(response, "read1", None) or response.read
             with partial.open("ab" if appending else "wb") as output:
                 if not appending:
                     _write_part_validators(validators_path, validators)
+                reported, reported_at = downloaded, time.monotonic()
                 while True:
-                    chunk = response.read(1024 * 1024)
+                    chunk = read(_DOWNLOAD_CHUNK_BYTES)
                     if not chunk:
                         break
                     downloaded += len(chunk)
@@ -497,8 +510,14 @@ class RepositoryHttpClient:
                     output.write(chunk)
                     digest.update(chunk)
                     md5.update(chunk)
-                    if progress_callback:
+                    if progress_callback and (
+                        downloaded - reported >= _DOWNLOAD_CHUNK_BYTES
+                        or time.monotonic() - reported_at >= DOWNLOAD_PROGRESS_INTERVAL_SECONDS
+                    ):
                         progress_callback(downloaded, total_declared)
+                        reported, reported_at = downloaded, time.monotonic()
+                if progress_callback and downloaded != reported:
+                    progress_callback(downloaded, total_declared)
 
         # A SHORT READ IS NOT A COMPLETE DOWNLOAD, and urllib does not say so: a server that
         # declares a Content-Length and then hangs up early simply stops yielding chunks, and the
