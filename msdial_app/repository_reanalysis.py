@@ -3364,13 +3364,15 @@ def _apply_disposition(
     """Make a campaign unit what its disposition says: runnable as decided, split, or held back."""
     from .raw_metadata_preflight import file_key
 
+    kind = disposition["disposition"]
     summary = (current.get("raw_metadata_preflight") or {}).get("summary") or {}
     for entry in summary.get("per_file") or []:
-        assigned = assignments.get(file_key(str(entry.get("file") or "")))
-        if assigned:
-            entry["console_acquisition_type"] = assigned["console_acquisition_type"]
-            entry["console_acquisition_basis"] = assigned["basis"]
-    kind = disposition["disposition"]
+        assigned = assignments.get(file_key(str(entry.get("file") or ""))) if kind in {"run", "split"} else None
+        # Under an applied disposition this is the type the file runs as, and an input that does not run -
+        # excluded, or in a unit skipped or excluded - has none; what its header alone meant stays in
+        # header_console_acquisition_type.
+        entry["console_acquisition_type"] = assigned["console_acquisition_type"] if assigned else None
+        entry["console_acquisition_basis"] = assigned["basis"] if assigned else ""
     if kind == "run":
         project = project_from_dict(current["project"])
         project.acquisition_mode = str(disposition["console_acquisition_type"])
@@ -3951,26 +3953,39 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             "unit by per-file acquisition mode before running MS-DIAL."
         )
     header_modes = _header_acquisition_by_file(manifest)
-    # The type a campaign disposition decided a file runs as: the repository's declaration where a
-    # low-confidence header disagreed with it, or DDA for an MS1-only file folded into a DDA run. That
-    # decision is recorded against the file, and it is admitted beside what the header alone admits.
+    # The type an applied campaign disposition decided a file runs as - from its header, from the
+    # repository's declaration where no header could be read or a low-confidence one disagreed, or DDA for
+    # an MS1-only file folded into a DDA run - is the one type that file may run as. A file with no decision
+    # is held to what its header alone admits, as before dispositions existed.
     decided_types = _decided_acquisition_by_file(manifest)
-    if header_modes:
+    if header_modes or decided_types:
         disagreeing = []
+        undecided_as = []
         for item in state.get("files") or []:
             path_text = str(item.get("file_path") or "").strip()
             if not path_text:
                 continue
-            header = header_modes.get(_file_key(path_text))
-            requested = str(item.get("acquisition_type") or "DDA").strip() or "DDA"
+            given = str(item.get("acquisition_type") or "").strip()
             decided = decided_types.get(_file_key(path_text))
-            admitted = HEADER_ACQUISITION_TO_MSDIAL.get(header, {header}) | ({decided} if decided else set())
-            if header and requested not in admitted:
+            if decided:
+                if given != decided:
+                    # A blank type is not the decided one even where the decision is DDA: the Console reads
+                    # a blank, or any value it cannot parse, as DDA without a word.
+                    undecided_as.append(f"{Path(path_text).name} (decided {decided}, run as {given or 'no type'})")
+                continue
+            header = header_modes.get(_file_key(path_text))
+            requested = given or "DDA"
+            if header and requested not in HEADER_ACQUISITION_TO_MSDIAL.get(header, {header}):
                 disagreeing.append(f"{Path(path_text).name} (header {header}, run as {requested})")
         if disagreeing:
             blockers.append(
                 f"{len(disagreeing)} input files would run with an acquisition type their raw header "
                 f"contradicts; the first is {disagreeing[0]}."
+            )
+        if undecided_as:
+            blockers.append(
+                f"{len(undecided_as)} input files would run with an acquisition type other than the one this "
+                f"unit's campaign disposition decided; the first is {undecided_as[0]}."
             )
 
     # An input a campaign disposition excluded - unreadable, ion mobility, out of scope - is not part of

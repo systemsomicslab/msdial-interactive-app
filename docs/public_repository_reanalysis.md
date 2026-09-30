@@ -241,7 +241,8 @@ excludes and, for a split, the grouping by acquisition and polarity. Outside a
 campaign it is advice and changes nothing else. Under a campaign approval it is
 applied: it sets `execution_allowed`, the status (`preflight_passed`,
 `skipped_by_preflight`, `excluded_by_preflight`) and each input's
-`console_acquisition_type` (DDA, SWATH or AIF).
+`console_acquisition_type` (DDA, SWATH or AIF; none for an input that does not
+run), and the execution gate then admits each file only as that type.
 
 No disposition changes a unit that was split, whose run has finished
 (`mztab_validated`, `cleanup_pending_confirmation`, `raw_cleaned`) or whose run

@@ -1007,6 +1007,17 @@ class CampaignPreflightTests(_Scratch):
             (Path(item["path"]).name, item["reason"]) for item in recorded["campaign_disposition"]["excluded_inputs"]
         ])
 
+    def test_an_input_the_disposition_excludes_runs_as_no_type(self) -> None:
+        manifest, _stub, _ = self.campaign_unit(["a.mzML", "im.mzML"])
+        extractor = _PinnedExtractor.make(self.root / "build")
+        mobility = {"im.mzML": {"method": "AIF", "mobility": True, "targets": [], "confidence": 1.0}}
+
+        result = self.preflight(manifest, extractor, _Extractor(mobility))
+
+        entries = {Path(item["file"]).name: item for item in result["raw_metadata_preflight"]["summary"]["per_file"]}
+        self.assertEqual(("DDA", None), (entries["a.mzML"]["console_acquisition_type"], entries["im.mzML"]["console_acquisition_type"]))
+        self.assertEqual("AIF", entries["im.mzML"]["header_console_acquisition_type"])
+
 
 def _touch(paths: list[Path]) -> None:
     """Move each input's modification time on, so the next preflight reads it again instead of reusing it."""
@@ -1155,6 +1166,62 @@ class DispositionHoldTests(_Scratch):
         self.assertEqual(first["campaign_disposition"], recorded["campaign_disposition"])
         self.assertEqual(output_before, output.read_bytes())
         self.assertNotIn("raw_metadata_preflight_progress", recorded)
+
+
+class DecidedTypeGateTests(_Scratch):
+    """Under an applied disposition a file runs as the type it decided, and as no other."""
+
+    def gate(self, manifest: Path, files: list[Path], kind: str) -> dict:
+        return evaluate_repository_execution_gate(
+            {
+                "repository_run_manifest": str(manifest),
+                "output_root": str(manifest.parent.parent / "output"),
+                "ion_mode": "Negative",
+                "files": [{"file_path": str(path), "acquisition_type": kind} for path in files],
+            }
+        )
+
+    def campaign(self, names: list[str], verdicts: dict, **options) -> tuple[Path, list[Path], dict]:
+        manifest, _stub, files = _unit(
+            self.root / "unit", names, extra={"campaign_authorizations": [dict(_APPROVAL)]}, **options
+        )
+        result = self.preflight(manifest, _PinnedExtractor.make(self.root / "build"), _Extractor(verdicts))
+        return manifest, files, result
+
+    def test_a_unit_run_on_its_declaration_runs_only_as_declared(self) -> None:
+        # SCIEX wiff2: the extractor fails on every file, and the declaration decides.
+        manifest, files, result = self.campaign(["a.wiff2", "b.wiff2"], {"a.wiff2": "fail", "b.wiff2": "fail"}, acquisition="DIA")
+        self.assertEqual("SWATH", result["campaign_disposition"]["console_acquisition_type"])
+
+        self.assertTrue(self.gate(manifest, files, "SWATH")["allowed"])
+        for kind in ("DDA", "AIF", ""):
+            with self.subTest(kind=kind):
+                refused = self.gate(manifest, files, kind)
+                self.assertFalse(refused["allowed"])
+                self.assertTrue(any("campaign disposition decided" in item for item in refused["blockers"]))
+
+    def test_a_header_dia_file_decided_swath_does_not_run_as_aif(self) -> None:
+        manifest, files, result = self.campaign(["a.mzML"], {"a.mzML": {"method": "DIA", "confidence": 0.82}}, acquisition="DIA")
+        self.assertEqual("SWATH", result["campaign_disposition"]["console_acquisition_type"])
+
+        self.assertTrue(self.gate(manifest, files, "SWATH")["allowed"])
+        self.assertFalse(self.gate(manifest, files, "AIF")["allowed"])
+
+    def test_a_file_the_declaration_decided_does_not_run_as_its_weak_header_says(self) -> None:
+        manifest, files, result = self.campaign(["a.mzML", "b.mzML"], {"b.mzML": {"method": "DIA", "confidence": 0.6}}, acquisition="DDA")
+        self.assertEqual("DDA", result["campaign_disposition"]["console_acquisition_type"])
+
+        self.assertTrue(self.gate(manifest, files, "DDA")["allowed"])
+        self.assertFalse(self.gate(manifest, files[1:], "SWATH")["allowed"])
+
+    def test_outside_a_campaign_a_file_is_held_to_its_header_as_before(self) -> None:
+        manifest, stub, files = _unit(self.root / "unit", ["a.mzML"], acquisition="DIA")
+        self.preflight(manifest, stub, _Extractor({"a.mzML": {"method": "DIA", "confidence": 0.82}}))
+        update_manifest(manifest, lambda current: current.update(execution_allowed=True))
+
+        self.assertTrue(self.gate(manifest, files, "AIF")["allowed"])
+        self.assertFalse(self.gate(manifest, files, "DDA")["allowed"])
+        self.assertFalse(self.gate(manifest, files, "")["allowed"], "a blank type is DDA to the Console")
 
 
 class UntargetedWordingTests(_Scratch):
