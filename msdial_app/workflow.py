@@ -11,11 +11,15 @@ import json
 import math
 import os
 import platform
+import queue
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -2504,10 +2508,98 @@ def _shell_script(default_console: str, analysis_type: str, store_project: bool 
     )
 
 
+# What run_console returns when it stopped the Console itself rather than the Console exiting. They are
+# negative, which the exit code of a process that ended on its own never is on Windows.
+CONSOLE_EXIT_SCIEX_SIDECAR = -2
+CONSOLE_EXIT_TIMEOUT = -3
+CONSOLE_EXIT_CANCELLED = -4
+# Every line the watch writes into a job's log starts with this, so a reader - the failure diagnosis
+# among them - can tell the watch's account of a stop from anything the Console printed.
+CONSOLE_WATCHDOG_PREFIX = "Console watchdog: "
+_WATCH_POLL_SECONDS = 0.25
+# After the Console has exited, how long its remaining output is waited for. A process it started can
+# inherit the pipe and hold it open for as long as it lives; the job does not wait on that.
+_WATCH_DRAIN_SECONDS = 10.0
+_WATCH_KILL_WAIT_SECONDS = 30.0
+_ACTIVITY_SCAN_MAX_SECONDS = 10.0
+_ACTIVITY_ROOT_LIMIT = 64
+
+
+def console_watch_seconds(value: Any, name: str = "time limit") -> float | None:
+    """A Console time limit in seconds, or None for none. None, '' and 0 all mean no limit."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number of seconds, not {value!r}.")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a number of seconds, not {value!r}.") from error
+    if math.isnan(seconds) or seconds < 0:
+        raise ValueError(f"{name} must be a positive number of seconds, or 0 for no limit.")
+    if seconds == 0 or math.isinf(seconds):
+        return None
+    return seconds
+
+
 def run_console(
     preparation: dict[str, Any],
     on_line: Callable[[str], None],
+    *,
+    timeout_seconds: float | None = None,
+    idle_timeout_seconds: float | None = None,
+    cancel_event: threading.Event | None = None,
+    on_start: Callable[[int], None] | None = None,
+    outcome: dict[str, Any] | None = None,
 ) -> int:
+    """Run the prepared Console command, passing each line of its output to ``on_line``.
+
+    Returns the Console's own exit code, or one of the codes above when this function stopped it:
+    CONSOLE_EXIT_SCIEX_SIDECAR after repeated SCIEX scan-sidecar read failures; CONSOLE_EXIT_TIMEOUT when
+    it ran past ``timeout_seconds``, or when neither its output nor its log grew for
+    ``idle_timeout_seconds``; CONSOLE_EXIT_CANCELLED once ``cancel_event`` is set.
+
+    WHY A WATCH. The Console had no time limit and could not be stopped: its output was read until the
+    pipe closed and the process was then waited for without a timeout. One hung Console held its job,
+    and at campaign scale every unit queued behind it, for ever; a caller that gave up polling could only
+    leave it running. With any of the three given, the output is read in a helper thread and this thread
+    watches the clock, the cancel flag, and the Console's activity: its output lines, and the files in
+    its output and export folders and beside its inputs, where MS-DIAL writes its intermediates. A stop
+    kills the whole process tree - taskkill /T /F on Windows, the process group elsewhere - so a dotnet
+    launcher and anything the Console started go with it, and the watch then gives the Console's
+    remaining output a bounded time to arrive.
+
+    Nothing is watched unless asked: with none of the three, the Console runs exactly as it always has.
+
+    ``on_start`` receives the Console's process id as soon as the process exists. If it raises, the
+    Console is stopped and the exception propagates, so no Console runs that its caller could not
+    register. ``outcome``, when given, is filled with what happened: the reason (exited, timeout,
+    idle_timeout, cancelled, sciex_scan_sidecar), the process id, the start and end times, and how a stop
+    was made.
+    """
+    timeout = console_watch_seconds(timeout_seconds, "timeout_seconds")
+    idle = console_watch_seconds(idle_timeout_seconds, "idle_timeout_seconds")
+    watched = timeout is not None or idle is not None or cancel_event is not None
+    report = outcome if outcome is not None else {}
+    report.update(
+        {
+            "reason": None,
+            "pid": None,
+            "exit_code": None,
+            "timeout_seconds": timeout,
+            "idle_timeout_seconds": idle,
+        }
+    )
+    if cancel_event is not None and cancel_event.is_set():
+        # Cancelled while the job was queued or being prepared: nothing starts, so nothing is left over.
+        on_line(
+            CONSOLE_WATCHDOG_PREFIX
+            + "the job was cancelled before the MS-DIAL Console started (exit code -4)."
+        )
+        report.update(
+            {"reason": "cancelled", "exit_code": CONSOLE_EXIT_CANCELLED, "ended_at": _utc_now()}
+        )
+        return CONSOLE_EXIT_CANCELLED
     process = subprocess.Popen(
         preparation["command"],
         cwd=str(Path(preparation["command"][0]).parent)
@@ -2519,14 +2611,49 @@ def run_console(
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        # Its own process group, so a stop can end everything it started (POSIX; Windows uses taskkill).
+        **({"start_new_session": True} if watched and os.name != "nt" else {}),
     )
+    started = time.monotonic()
+    report["pid"] = getattr(process, "pid", None)
+    report["started_at"] = _utc_now()
+    if timeout is not None:
+        report["deadline_at"] = (
+            dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=timeout)
+        ).isoformat()
+    if on_start is not None:
+        try:
+            on_start(process.pid)
+        except BaseException:
+            _stop_console_tree(process, group=watched)
+            raise
     assert process.stdout is not None
+    if watched:
+        code = _watch_console(process, on_line, preparation, timeout, idle, cancel_event, report, started)
+    else:
+        code = _read_console(process, on_line, report)
+    report["exit_code"] = code
+    report["ended_at"] = _utc_now()
+    report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    return code
+
+
+def _utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def _is_sciex_scan_failure(message: str) -> bool:
+    lower = message.lower()
+    return "required 'scan' file missing" in lower or "required 'scan' file is missing" in lower
+
+
+def _read_console(process: subprocess.Popen, on_line: Callable[[str], None], report: dict[str, Any]) -> int:
+    """The Console's output read to the end, unwatched: how every run went before the watch."""
     scan_file_errors = 0
     for line in process.stdout:
         message = line.rstrip()
         on_line(message)
-        lower = message.lower()
-        if "required 'scan' file missing" in lower or "required 'scan' file is missing" in lower:
+        if _is_sciex_scan_failure(message):
             scan_file_errors += 1
             if scan_file_errors >= 3:
                 on_line(
@@ -2534,8 +2661,229 @@ def run_console(
                 )
                 process.terminate()
                 process.wait(timeout=10)
-                return -2
+                report["reason"] = "sciex_scan_sidecar"
+                return CONSOLE_EXIT_SCIEX_SIDECAR
+    report["reason"] = "exited"
     return process.wait()
+
+
+def _watch_console(
+    process: subprocess.Popen,
+    on_line: Callable[[str], None],
+    preparation: dict[str, Any],
+    timeout: float | None,
+    idle: float | None,
+    cancel_event: threading.Event | None,
+    report: dict[str, Any],
+    started: float,
+) -> int:
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def read() -> None:
+        try:
+            for line in process.stdout:
+                lines.put(line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            lines.put(None)
+
+    # The pipe is read here, never in the watching thread, so nothing the Console does with its output
+    # can keep the watch from acting. on_line is still called only from the caller's thread.
+    threading.Thread(target=read, name=f"msdial-console-output-{process.pid}", daemon=True).start()
+    roots = _console_activity_roots(preparation) if idle is not None else []
+    fingerprint = _activity_fingerprint(roots)
+    scan_every = min(max(idle / 4, _WATCH_POLL_SECONDS), _ACTIVITY_SCAN_MAX_SECONDS) if idle else 0.0
+    next_scan = started + scan_every
+    last_activity = started
+    stop: tuple[str, int] | None = None
+    stopped_at = 0.0
+    exited_at: float | None = None
+    scan_file_errors = 0
+    at_end = False
+    while True:
+        line = ""
+        if not at_end:
+            try:
+                item = lines.get(timeout=_WATCH_POLL_SECONDS)
+            except queue.Empty:
+                item = ""
+            if item is None:
+                at_end = True
+            else:
+                line = item
+        else:
+            try:
+                process.wait(timeout=_WATCH_POLL_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+        now = time.monotonic()
+        if line:
+            last_activity = now
+            message = line.rstrip()
+            on_line(message)
+            if stop is None and _is_sciex_scan_failure(message):
+                scan_file_errors += 1
+                if scan_file_errors >= 3:
+                    on_line("Stopping diagnostic after repeated SCIEX scan-sidecar read failures.")
+                    stop, stopped_at = ("sciex_scan_sidecar", CONSOLE_EXIT_SCIEX_SIDECAR), now
+                    report["stop"] = _stop_console_tree(process, group=True)
+        if process.poll() is not None:
+            # Exited, on its own or stopped: collect what it still wrote, for a bounded time.
+            if at_end:
+                break
+            if exited_at is None:
+                exited_at = now
+            elif now - exited_at >= _WATCH_DRAIN_SECONDS:
+                report["output_left_open"] = True
+                break
+            continue
+        if stop is not None:
+            # Stopped, and it outlived even the fallback kill. Waiting longer changes nothing.
+            if now - stopped_at >= _WATCH_DRAIN_SECONDS:
+                report["still_running"] = True
+                break
+            continue
+        if idle is not None and now >= next_scan:
+            next_scan = now + scan_every
+            current = _activity_fingerprint(roots)
+            if current != fingerprint:
+                fingerprint, last_activity = current, now
+        message = ""
+        if cancel_event is not None and cancel_event.is_set():
+            stop = ("cancelled", CONSOLE_EXIT_CANCELLED)
+            message = "the job was cancelled; stopped the MS-DIAL Console (exit code -4)."
+        elif timeout is not None and now - started >= timeout:
+            stop = ("timeout", CONSOLE_EXIT_TIMEOUT)
+            message = (
+                f"the MS-DIAL Console ran longer than its {timeout:g} s time limit; "
+                "stopped it (exit code -3)."
+            )
+        elif idle is not None and now - last_activity >= idle:
+            stop = ("idle_timeout", CONSOLE_EXIT_TIMEOUT)
+            message = (
+                f"neither the MS-DIAL Console's output nor its log grew for {idle:g} s; "
+                "stopped it (exit code -3)."
+            )
+        if stop is not None:
+            stopped_at = now
+            report["idle_seconds"] = round(now - last_activity, 3)
+            on_line(CONSOLE_WATCHDOG_PREFIX + message)
+            report["stop"] = _stop_console_tree(process, group=True)
+    if at_end:
+        # The reader is done with the pipe. One a survivor still holds open is left to the reader.
+        process.stdout.close()
+    code = process.poll()
+    if stop is not None:
+        report["reason"] = stop[0]
+        report["process_exit_code"] = code
+        return stop[1]
+    report["reason"] = "exited"
+    return code
+
+
+def _stop_console_tree(process: subprocess.Popen, group: bool) -> dict[str, Any]:
+    """End the Console and everything it started, and wait for it. Signals nothing else.
+
+    ``group`` says the Console was started in its own process group (POSIX), which is then what is
+    killed; on Windows taskkill follows the process tree from the Console's own id.
+    """
+    record: dict[str, Any] = {"pid": process.pid}
+    if process.poll() is None:
+        if os.name == "nt":
+            record["method"] = "taskkill /T /F"
+            system_taskkill = Path(os.environ.get("SystemRoot") or r"C:\Windows") / "System32" / "taskkill.exe"
+            try:
+                completed = subprocess.run(
+                    [str(system_taskkill) if system_taskkill.is_file() else "taskkill",
+                     "/T", "/F", "/PID", str(process.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=_WATCH_KILL_WAIT_SECONDS,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                record["returncode"] = completed.returncode
+            except (OSError, subprocess.SubprocessError) as error:
+                record["error"] = str(error)
+        elif group:
+            record["method"] = "killpg SIGKILL"
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError as error:
+                record["error"] = str(error)
+        else:
+            record["method"] = "kill"
+            process.kill()
+    try:
+        process.wait(timeout=_WATCH_KILL_WAIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        # The tree kill did not end it: end this one process directly, the last thing that can be done.
+        record["fallback"] = "kill"
+        process.kill()
+        try:
+            process.wait(timeout=_WATCH_KILL_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            record["still_running"] = True
+    return record
+
+
+def _console_activity_roots(preparation: dict[str, Any]) -> list[Path]:
+    """Where a working Console leaves traces: its output and export folders, and beside its inputs.
+
+    MS-DIAL writes its per-file intermediates (.dcl, .pai2 and the like) beside the files it reads, so
+    the directories that hold the inputs are watched too; the inputs are read from the analysis CSV the
+    run was prepared with.
+    """
+    candidates: list[Any] = [preparation.get("run_directory"), preparation.get("export_folder_path")]
+    csv_text = str(preparation.get("input_csv") or "").strip()
+    if csv_text:
+        try:
+            with open(csv_text, encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    path_text = str(row.get("file_path") or "").strip()
+                    if path_text:
+                        candidates.append(str(Path(path_text).parent))
+        except (OSError, csv.Error, UnicodeDecodeError):
+            pass
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        key = os.path.normcase(os.path.abspath(text))
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(Path(text))
+        if len(roots) >= _ACTIVITY_ROOT_LIMIT:
+            break
+    return roots
+
+
+def _activity_fingerprint(roots: list[Path]) -> tuple[int, int, int]:
+    """Entry count, total file size and newest modification time directly under each root."""
+    count = size = newest = 0
+    for root in roots:
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    try:
+                        # A fresh stat, not the one cached from the directory listing: on Windows the
+                        # listing's size of a file still being written lags behind the file.
+                        stat = os.stat(entry.path, follow_symlinks=False)
+                    except OSError:
+                        try:
+                            stat = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                    count += 1
+                    newest = max(newest, stat.st_mtime_ns)
+                    if entry.is_file(follow_symlinks=False):
+                        size += stat.st_size
+        except OSError:
+            continue
+    return count, size, newest
 
 
 def _write_analysis_csv(
