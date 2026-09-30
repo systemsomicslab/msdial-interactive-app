@@ -37,6 +37,7 @@ from .diagnostic_paths import (
     path_is_file,
 )
 from .download_store import unlink_tree
+from .mzml_encoding import UNSUPPORTED_MZML_ENCODING, scan_mzml_encoding
 from .process_liveness import process_created_at, process_is_alive
 
 try:
@@ -1046,7 +1047,9 @@ def create_download_lease(
       order changes when they are;
     - discover: the MS-DIAL inputs under the data root;
     - attribute: the unit's own inputs, extracted files and declared checksums (allowlist_checksum_
-      validation), and one input_lineage row per input;
+      validation), and one input_lineage row per input. An mzML whose binary arrays RawDataHandler cannot
+      decode is not an input: it is listed in excluded_input_candidates and in input_lineage's excluded
+      rows, with reason unsupported_mzml_encoding and the accessions found (_exclude_undecodable_inputs);
     - record: the manifest.
 
     The stages are written into the manifest as they finish, so a lease that stops says where
@@ -1298,6 +1301,7 @@ def create_download_lease(
         inputs = _filter_inputs_by_project_allowlist(
             all_inputs, data_root, project, archive_samples=archive_samples
         )
+        inputs, excluded_inputs, mzml_scanned = _exclude_undecodable_inputs(inputs)
         analysis_input = _common_input_path(inputs, data_root)
         input_lineage = build_input_lineage(
             inputs,
@@ -1309,11 +1313,14 @@ def create_download_lease(
             verified_checksums,
             extracted_members=extracted_members,
             archive_extractions=archive_extractions,
+            excluded_inputs=excluded_inputs,
         )
         stages.finish(
             "attribute",
             input_candidates=len(inputs),
-            ignored_input_candidates=len(all_inputs) - len(inputs),
+            ignored_input_candidates=len(all_inputs) - len(inputs) - len(excluded_inputs),
+            mzml_encodings_scanned=mzml_scanned,
+            excluded_input_candidates=len(excluded_inputs),
             extracted_files=len(selected_extracted),
             ignored_extracted_files=len(extracted) - len(selected_extracted),
             declared_files_verified=checksum_validation.get("verified", 0),
@@ -1335,7 +1342,7 @@ def create_download_lease(
             "ignored_extracted_file_count": len(extracted) - len(selected_extracted),
             "allowlist_checksum_validation": checksum_validation,
             "input_candidates": inputs,
-            "ignored_input_candidate_count": len(all_inputs) - len(inputs),
+            "ignored_input_candidate_count": len(all_inputs) - len(inputs) - len(excluded_inputs),
             "input_lineage": input_lineage,
             "archive_extractions": archive_extractions,
             "analysis_input_path": analysis_input,
@@ -1356,6 +1363,9 @@ def create_download_lease(
             "download_started_at": started_at,
             "download_completed_at": datetime.now(timezone.utc).isoformat(),
         }
+        if excluded_inputs:
+            # Only where one was, so a unit with nothing excluded records what it always did.
+            manifest["excluded_input_candidates"] = excluded_inputs
         warnings = _archive_warnings(archive_extractions)
         if warnings:
             manifest["archive_warnings"] = warnings
@@ -1837,6 +1847,7 @@ def build_input_lineage(
     *,
     extracted_members: dict[str, dict[str, Any]] | None = None,
     archive_extractions: list[dict[str, Any]] | None = None,
+    excluded_inputs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """One row per analysis input: what it is, where its bytes came from, and what vouches for them.
 
@@ -1869,8 +1880,16 @@ def build_input_lineage(
     checksum matched, or the member's own, and the row of the archive's member listing that accounts for
     it (``extracted_members`` and ``archive_extractions``, from the lease's extract stage). A listed
     container archive (X.raw.zip) names its container (X.raw) for declared_names and sample_id.
+
+    A FILE THE LEASE EXCLUDED is no input, so it has no row: rows stay one per analysis input, which is
+    what the gate resolves inputs against. ``excluded_inputs`` ({path, reason, problems}, from
+    _exclude_undecodable_inputs) are described the same way under ``excluded``, each with its
+    ``exclusion``, so where the bytes of a file that was not analysed came from is still recorded.
     """
     verified_checksums = verified_checksums or {}
+    excluded_inputs = excluded_inputs or []
+    excluded_keys = {_file_key(str(item["path"])): item for item in excluded_inputs}
+    inputs = [*inputs, *(str(item["path"]) for item in excluded_inputs)]
     extracted_members = extracted_members or {}
     archive_extractions = archive_extractions or []
     # An input that came out of an archive one sample names (X.zip) is that sample's, although its own
@@ -2041,7 +2060,59 @@ def build_input_lineage(
             row["kind"] = "vendor_folder" if path.is_dir() else "file"
             row["source"] = {"origin": "not_downloaded_by_this_lease"}
         rows.append(row)
-    return {"schema": "msdial-input-lineage.v1", "rows": rows}
+    table: dict[str, Any] = {
+        "schema": "msdial-input-lineage.v1",
+        "rows": [row for row in rows if _file_key(row["path"]) not in excluded_keys],
+    }
+    if excluded_keys:
+        table["excluded"] = [
+            {
+                **row,
+                "exclusion": {
+                    "reason": excluded_keys[_file_key(row["path"])]["reason"],
+                    "problems": excluded_keys[_file_key(row["path"])].get("problems") or [],
+                },
+            }
+            for row in rows
+            if _file_key(row["path"]) in excluded_keys
+        ]
+    return table
+
+
+def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict[str, Any]], int]:
+    """(inputs RawDataHandler can decode, the excluded ones, the number of mzML scanned).
+
+    RawDataHandler decodes an mzML array only as a 32- or 64-bit float, zlib-compressed or not, and reads
+    anything else - Numpress, integer arrays, a type or compression given only through a param group - as
+    uncompressed floats, so the Console ran such a file and wrote garbage or empty spectra without an error.
+    Each mzML input is scanned over its first few spectra and chromatograms (mzml_encoding); one with a
+    problem is excluded with reason unsupported_mzml_encoding and the accessions found, and the rest of the
+    unit goes on without it. A file the scan could not read is kept: the Console, which reads all of it, is
+    the judge of that. Other formats are not scanned.
+    """
+    kept: list[str] = []
+    excluded: list[dict[str, Any]] = []
+    scanned = 0
+    for text in inputs:
+        path = Path(text)
+        if path.suffix.casefold() != ".mzml" or not path.is_file():
+            kept.append(text)
+            continue
+        scanned += 1
+        scan = scan_mzml_encoding(path)
+        if not scan["problems"]:
+            kept.append(text)
+            continue
+        excluded.append({
+            "path": text,
+            "reason": UNSUPPORTED_MZML_ENCODING,
+            "problems": scan["problems"],
+            "scan": {
+                key: scan.get(key)
+                for key in ("schema", "spectra_scanned", "chromatograms_scanned", "chromatograms_reached")
+            },
+        })
+    return kept, excluded, scanned
 
 
 def _declared_verification(result: dict[str, Any]) -> dict[str, Any]:
@@ -3919,10 +3990,11 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         lineage = parent.get("input_lineage")
         if isinstance(lineage, dict):
             # The part reads the parent's files, so their lineage is the parent's, row for row. Without
-            # it every part would look like a manifest written before lineage existed.
+            # it every part would look like a manifest written before lineage existed. The files the lease
+            # excluded are in no part, and stay recorded in the parent's table only.
             part_keys = {_file_key(item) for item in part["input_candidates"]}
             part_manifest["input_lineage"] = {
-                **{key: value for key, value in lineage.items() if key != "rows"},
+                **{key: value for key, value in lineage.items() if key not in ("rows", "excluded")},
                 "rows": [
                     row for row in lineage.get("rows") or []
                     if isinstance(row, dict) and _file_key(str(row.get("path") or "")) in part_keys
