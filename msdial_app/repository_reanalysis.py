@@ -41,6 +41,7 @@ from .diagnostic_paths import (
 from .download_store import unlink_tree
 from .mzml_encoding import UNSUPPORTED_MZML_ENCODING, scan_mzml_encoding
 from .process_liveness import process_created_at, process_is_alive
+from .reader_created import reader_created_files, reader_created_names
 
 try:
     import msvcrt
@@ -2075,6 +2076,13 @@ def build_input_lineage(
     it (``extracted_members`` and ``archive_extractions``, from the lease's extract stage). A listed
     container archive (X.raw.zip) names its container (X.raw) for declared_names and sample_id.
 
+    A FILE A READER WRITES INTO A CONTAINER (reader_created: Bruker's baf2sql writes analysis.sqlite into
+    a BAF .d that arrived without one) is not one of its members. A container a reader rule applies to
+    carries reader_created_files, the files a reader has already written there that it did not arrive
+    with (none on a first lease; a retry after a preflight finds them), with their size and sha256, and
+    reader_named_members, the files of those names it did arrive with, which stay its own. They are what
+    reader_created_block tells later readers' files from.
+
     A FILE THE LEASE EXCLUDED is no input, so it has no row: rows stay one per analysis input, which is
     what the gate resolves inputs against. ``excluded_inputs`` ({path, reason, problems}, from
     _exclude_undecodable_inputs) are described the same way under ``excluded``, each with its
@@ -2204,6 +2212,13 @@ def build_input_lineage(
                 row["source"] = {"objects": len(downloaded)}
             else:
                 row["source"] = {"origin": "not_downloaded_by_this_lease"}
+            reader_names = reader_created_names(path)
+            if reader_names:
+                arrived = [Path(member).relative_to(Path(key)).as_posix() for member, _, _ in members]
+                row["reader_created_files"] = reader_created_files(path, arrived)
+                own = sorted(relative for relative in arrived if relative in reader_names)
+                if own:
+                    row["reader_named_members"] = own
             if downloaded:
                 # A digest over the member objects' own sha256, so a folder assembled from many downloads
                 # has one checksum that changes when any member does.
@@ -2271,6 +2286,60 @@ def build_input_lineage(
             if _file_key(row["path"]) in excluded_keys
         ]
     return table
+
+
+READER_CREATED_SCHEMA = "msdial-reader-created-files.v1"
+
+
+def reader_created_block(manifest: dict[str, Any], stage: str) -> dict[str, Any] | None:
+    """What readers have written into the unit's container inputs by now, for its reader_created_files.
+
+    One entry per container input holding such a file: {path, files}, each file {path, size, sha256,
+    reader} (msdial_app.reader_created). A file the container arrived with is told by its lineage row's
+    reader_named_members; a container whose row was written before rows carried them (0.5.16 and earlier)
+    reports every file a rule names, with members_known false. None when no container holds one, so a unit
+    without any records nothing. ``stage`` says when it was taken: preflight or run.
+    """
+    lineage = manifest.get("input_lineage")
+    rows = {
+        _file_key(str(row["path"])): row
+        for row in ((lineage or {}).get("rows") or [] if isinstance(lineage, dict) else [])
+        if isinstance(row, dict) and str(row.get("path") or "").strip()
+    }
+    containers = []
+    for text in manifest.get("input_candidates") or []:
+        path = Path(str(text))
+        if not path.is_dir() or not reader_created_names(path):
+            continue
+        row = rows.get(_file_key(str(text))) or {}
+        known = "reader_created_files" in row
+        files = reader_created_files(path, (row.get("reader_named_members") or []) if known else None)
+        if files:
+            containers.append({"path": str(path), "files": files, **({} if known else {"members_known": False})})
+    if not containers:
+        return None
+    return {
+        "schema": READER_CREATED_SCHEMA,
+        "stage": stage,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "containers": containers,
+    }
+
+
+def record_reader_created_files(manifest_path: str | Path, stage: str) -> dict[str, Any] | None:
+    """Write reader_created_block into the unit manifest, after a preflight or a run. Never raises.
+
+    Returns the block written, or None when there was nothing to record or the manifest could not be
+    written. What is recorded replaces the earlier record: the files are still there, and a run may have
+    rewritten one a preflight wrote. The files are hashed before the manifest's lock is taken, not under it.
+    """
+    try:
+        block = reader_created_block(read_manifest(manifest_path), stage)
+        if block:
+            update_manifest(manifest_path, lambda current: current.__setitem__("reader_created_files", block))
+    except (OSError, ValueError, TypeError):
+        return None
+    return block
 
 
 def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict[str, Any]], int]:
