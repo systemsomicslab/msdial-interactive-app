@@ -128,16 +128,25 @@ def _rar5_header(kind: int, flags: int, body: bytes, data_size: int | None = Non
     return struct.pack("<I", zlib.crc32(size + fields) & 0xFFFFFFFF) + size + fields
 
 
-def _rar5_stored(path: Path, entries: list[tuple[str, bytes | None]]) -> Path:
+def _rar5_stored(
+    path: Path, entries: list[tuple[str, bytes | None]], comment: bytes | None = None
+) -> Path:
     """A RAR5 archive of stored entries, per RARLAB's 'RAR 5.0 archive format' description.
 
     Layout: the 8-byte signature, a main archive header (type 1), one file header (type 2) per
     entry followed by its data area, and an end-of-archive header (type 5). Each header is its
     CRC32, its size and type as vints, its flags, and its fields. A file header's fields are file
     flags (0x1 directory, 0x4 CRC32 present), unpacked size, attributes, data CRC32, compression
-    information (0: version 0, method 0 'store'), host OS (0: Windows), and the UTF-8 name.
+    information (0: version 0, method 0 'store'), host OS (0: Windows), and the UTF-8 name. An
+    archive comment is a service header (type 3) laid out like a file header and named 'CMT'.
     """
     out = b"Rar!\x1a\x07\x01\x00" + _rar5_header(1, 0, _vint(0))
+    if comment is not None:
+        body = (
+            _vint(0x0004) + _vint(len(comment)) + _vint(0)
+            + struct.pack("<I", zlib.crc32(comment) & 0xFFFFFFFF) + _vint(0) + _vint(0)
+        )
+        out += _rar5_header(3, 0x0002, body + _vint(3) + b"CMT", len(comment)) + comment
     for name, data in entries:
         encoded = name.encode("utf-8")
         if data is None:
@@ -152,6 +161,18 @@ def _rar5_stored(path: Path, entries: list[tuple[str, bytes | None]]) -> Path:
     out += _rar5_header(5, 0, _vint(0))
     path.write_bytes(out)
     return path
+
+
+def _truncated_zip(path: Path) -> Path:
+    """A zip cut to half its length, which is what an interrupted download leaves."""
+    full = _zip_bytes([(f"S{index}.mzML", os.urandom(20_000)) for index in range(5)])
+    path.write_bytes(full[: len(full) // 2])
+    return path
+
+
+def _directory_room(destination: Path, limit: int) -> int:
+    """How long a top-level directory may be for '<destination>.partial\\<directory>' to be limit."""
+    return limit - (len(str(destination.absolute())) + len(".partial")) - 1
 
 
 def _files_under(root: Path) -> dict[str, bytes]:
@@ -352,6 +373,28 @@ class StandardLibraryExtractionTests(_Workspace):
         self.assertEqual("corrupt_archive", caught.exception.reason)
         self.assertNothingWritten(destination, "bad.zip")
 
+    def test_a_truncated_zip_is_corrupt_even_without_7zip(self) -> None:
+        # zipfile refuses it, which sends it to 7-Zip; with 7-Zip absent the unit used to fail as
+        # sevenzip_not_found, a reason that says nothing about the download that was cut short.
+        archive = _truncated_zip(self.root / "partial.zip")
+        with self.assertRaises(ArchiveError) as caught:
+            extract_archive(archive, self.root / "out",
+                            sevenzip_setting=str(self.root / "no-7zip" / "7z.exe"))
+        self.assertEqual("corrupt_archive", caught.exception.reason)
+        self.assertIn("BadZipFile", caught.exception.detail["stdlib_error"])
+        self.assertEqual("sevenzip_not_found", caught.exception.detail["sevenzip_error"]["reason"])
+        self.assertNothingWritten(self.root / "out", "partial.zip")
+
+    def test_an_unexpected_error_still_leaves_no_tree(self) -> None:
+        archive = self._fixture("zip")
+        destination = self.root / "out"
+        with patch.object(archives, "_write_members_tsv", side_effect=RuntimeError("no room")):
+            with self.assertRaises(ArchiveError) as caught:
+                extract_archive(archive, destination, listing_directory=self.root / "provenance")
+        self.assertEqual("extraction_failed", caught.exception.reason)
+        self.assertIn("RuntimeError", caught.exception.message)
+        self.assertNothingWritten(destination, "bundle.zip")
+
     def test_the_destination_must_not_exist(self) -> None:
         archive = self._fixture("zip")
         (self.root / "out").mkdir()
@@ -473,6 +516,56 @@ class ListingValidationTests(_Workspace):
         self.assertEqual("path_too_long", caught.exception.rejected[0]["reason"])
         self.assertFalse(destination.exists())
 
+    def test_a_directory_longer_than_windows_can_create_is_refused(self) -> None:
+        # Without long-path support CreateDirectoryW stops at 247 characters, 12 short of the file
+        # limit. A member whose file path fitted but whose folder did not failed mid-write with
+        # WinError 206 through zipfile, and succeeded through 7-Zip, which writes \\?\ paths.
+        parent = self.root / "deep"
+        destination = parent / "d"
+        room = _directory_room(destination, 247)
+        if room < 2:
+            self.skipTest("the temporary directory is already too deep for this test")
+        parent.mkdir()
+        fits = _write_zip(self.root / "fits.zip", [("D" * room + "/f.txt", b"x")])
+        self.assertEqual(1, extract_archive(fits, destination)["file_count"])
+        archives._remove_tree(destination)
+        cases = {
+            "file": [("D" * (room + 1) + "/f.txt", b"x")],
+            "directory": [("D" * (room + 1) + "/", b"")],
+        }
+        for label, entries in cases.items():
+            with self.subTest(member=label):
+                archive = _write_zip(self.root / "long.zip", entries)
+                with self.assertRaises(ArchiveError) as caught:
+                    extract_archive(archive, destination)
+                self.assertEqual("unsafe_listing", caught.exception.reason)
+                self.assertEqual(["path_too_long"],
+                                 [item["reason"] for item in caught.exception.rejected])
+                self.assertFalse(destination.exists())
+                self.assertEqual([], os.listdir(parent))
+
+    def test_a_tar_name_that_is_not_utf8_is_refused_before_anything_is_written(self) -> None:
+        # A Japanese instrument PC writes cp932 names. tarfile hands them over with lone
+        # surrogates, which NTFS stores under a name nothing can match and which the listing TSV
+        # cannot encode; that left a complete '<destination>.partial' copy behind.
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w", format=tarfile.GNU_FORMAT,
+                          encoding="cp932") as handle:
+            info = tarfile.TarInfo("\u30b5\u30f3\u30d7\u30eb.mzML")
+            info.size = 7
+            handle.addfile(info, io.BytesIO(b"<mzML/>"))
+        archive = self.root / "sjis.tar"
+        archive.write_bytes(buffer.getvalue())
+        destination = self.root / "out"
+        with self.assertRaises(ArchiveError) as caught:
+            extract_archive(archive, destination, listing_directory=self.root / "provenance")
+        self.assertEqual("unsafe_listing", caught.exception.reason)
+        self.assertEqual(["undecodable_name"], [item["reason"] for item in caught.exception.rejected])
+        # The refusal itself must be writable into a UTF-8 manifest.
+        caught.exception.message.encode("utf-8")
+        caught.exception.rejected[0]["name"].encode("utf-8")
+        self.assertNothingWritten(destination, "sjis.tar")
+
     def test_an_encrypted_zip_is_refused_from_its_listing_without_7zip(self) -> None:
         archive = _write_zip(self.root / "locked.zip", [("a.txt", b"secret")],
                              compression=zipfile.ZIP_STORED)
@@ -547,6 +640,8 @@ class NestedAndContainerTests(_Workspace):
             record = extract_archive(self.root / f"{sample}.raw.zip", self.root / f"out-{sample}")
             self.assertEqual("container_stem", record["destination_rule"])
             self.assertEqual(f"{sample}.raw", record["container_stem"])
+            self.assertEqual(f"{sample}.raw", record["container_root"])
+            self.assertFalse(record["container_name_mismatch"])
             self.assertEqual(
                 {f"{sample}.raw/_FUNC001.DAT": f"{sample}-func".encode(),
                  f"{sample}.raw/_HEADER.TXT": b"h"},
@@ -558,11 +653,67 @@ class NestedAndContainerTests(_Workspace):
         record = extract_archive(self.root / "X.raw.zip", self.root / "rooted")
         self.assertEqual("container_rooted", record["destination_rule"])
         self.assertEqual({"X.raw/_FUNC001.DAT": b"f"}, _files_under(self.root / "rooted"))
+        self.assertEqual(("X.raw", False), (record["container_root"], record["container_name_mismatch"]))
 
         _write_zip(self.root / "T.raw.zip", [("T.raw", b"thermo")])
         record = extract_archive(self.root / "T.raw.zip", self.root / "thermo")
         self.assertEqual("container_single_file", record["destination_rule"])
         self.assertEqual({"T.raw": b"thermo"}, _files_under(self.root / "thermo"))
+        self.assertEqual(("T.raw", False), (record["container_root"], record["container_name_mismatch"]))
+
+        _write_zip(self.root / "ST000001.zip", [("S1.raw/_FUNC001.DAT", b"f")])
+        record = extract_archive(self.root / "ST000001.zip", self.root / "bundle")
+        self.assertEqual(("", False), (record["container_root"], record["container_name_mismatch"]))
+
+    def test_a_container_packed_under_another_name_records_what_it_produced(self) -> None:
+        # A.raw.zip holding B.raw is B.raw on disk. The alias still says A.raw, so the record has
+        # to name the folder that exists rather than leave attribution to guess.
+        _write_zip(self.root / "A.raw.zip", [("B.raw/_FUNC001.DAT", b"f")])
+        record = extract_archive(self.root / "A.raw.zip", self.root / "out")
+        self.assertEqual("container_rooted_other_name", record["destination_rule"])
+        self.assertEqual({"B.raw/_FUNC001.DAT": b"f"}, _files_under(self.root / "out"))
+        self.assertEqual("B.raw", record["container_root"])
+        self.assertTrue(record["container_name_mismatch"])
+        self.assertEqual("A.raw", container_alias("A.raw.zip"))
+
+    def test_operating_system_metadata_is_dropped_and_does_not_defeat_the_rooted_rule(self) -> None:
+        # Finder adds __MACOSX/ (whose S1.d/ would look like a second Bruker folder) and .DS_Store;
+        # tar on macOS writes '._name' AppleDouble files; Explorer leaves Thumbs.db. Any of them
+        # made a second top-level entry, and S1.d.zip was unpacked as S1.d/S1.d/.
+        finder = _write_zip(self.root / "S1.d.zip", [
+            ("S1.d/analysis.tdf", b"t"), ("S1.d/analysis.tdf_bin", b"b"),
+            ("S1.d/.DS_Store", b"finder"), ("S1.d/method.m/.DS_Store", b"finder"),
+            ("__MACOSX/", b""), ("__MACOSX/S1.d/._analysis.tdf", b"apple"), ("Thumbs.db", b"x"),
+        ])
+        record = extract_archive(finder, self.root / "finder", listing_directory=self.root / "p")
+        self.assertEqual("container_rooted", record["destination_rule"])
+        self.assertEqual({"S1.d/analysis.tdf": b"t", "S1.d/analysis.tdf_bin": b"b"},
+                         _files_under(self.root / "finder"))
+        # The folder that held only a .DS_Store was a folder in the archive, and stays one.
+        self.assertTrue((self.root / "finder" / "S1.d" / "method.m").is_dir())
+        self.assertFalse((self.root / "finder" / "__MACOSX").exists())
+        self.assertEqual(("S1.d", False), (record["container_root"], record["container_name_mismatch"]))
+        self.assertEqual(5, record["dropped_metadata"]["members"])
+        self.assertEqual(2, record["file_count"])
+        with open(record["members_tsv"]["path"], encoding="utf-8", newline="") as handle:
+            rows = {row["path"]: row["disposition"] for row in csv.DictReader(handle, delimiter="\t")}
+        self.assertEqual("dropped_metadata", rows["__MACOSX/S1.d/._analysis.tdf"])
+        self.assertEqual("dropped_metadata", rows["S1.d/.DS_Store"])
+        self.assertEqual("extracted", rows["S1.d/analysis.tdf"])
+
+        mac_tar = self.root / "S2.d.tar"
+        mac_tar.write_bytes(_tar_bytes([("._S2.d", b"apple"), ("S2.d", None),
+                                        ("S2.d/analysis.tdf", b"t"), ("S2.d/._analysis.tdf", b"a")]))
+        record = extract_archive(mac_tar, self.root / "tar")
+        self.assertEqual("container_rooted", record["destination_rule"])
+        self.assertEqual({"S2.d/analysis.tdf": b"t"}, _files_under(self.root / "tar"))
+
+        # Root-less, the metadata goes and the container still gets its own folder.
+        _write_zip(self.root / "S3.raw.zip", [("_FUNC001.DAT", b"f"), (".DS_Store", b"finder"),
+                                              ("__MACOSX/._FUNC001.DAT", b"apple")])
+        record = extract_archive(self.root / "S3.raw.zip", self.root / "rootless")
+        self.assertEqual("container_stem", record["destination_rule"])
+        self.assertEqual({"S3.raw/_FUNC001.DAT": b"f"}, _files_under(self.root / "rootless"))
 
     def test_a_study_archive_of_per_sample_archives_expands_without_collisions(self) -> None:
         inner_tar = gzip.compress(_tar_bytes([("batch", None), ("batch/run1.mzML", b"<run1/>")]))
@@ -607,6 +758,47 @@ class NestedAndContainerTests(_Workspace):
         self.assertEqual("2", rows["raw/A.raw/_FUNC001.DAT"]["depth"])
         self.assertEqual("ST000001.zip", rows["raw/notes.gz"]["archive"])
 
+    def test_an_empty_nested_archive_expands_to_an_empty_folder(self) -> None:
+        # The folder the module made for it was reported as an unexpected directory, and the whole
+        # study failed verification.
+        _write_zip(self.root / "study.zip", [("raw/a.mzML", b"a"), ("raw/empty.zip", _zip_bytes([]))])
+        record = extract_archive(self.root / "study.zip", self.root / "out")
+        self.assertEqual({"raw/a.mzML": b"a"}, _files_under(self.root / "out"))
+        self.assertTrue((self.root / "out" / "raw" / "empty").is_dir())
+        self.assertEqual(["raw/empty.zip"], [item["archive_path"] for item in record["nested"]])
+        self.assertEqual(0, record["nested"][0]["member_count"])
+
+        # A nested archive alone in its folder: that folder is still expected once it is unpacked.
+        _write_zip(self.root / "lone.zip", [("raw/X.wiff.zip", _zip_bytes([]))])
+        record = extract_archive(self.root / "lone.zip", self.root / "lone")
+        self.assertEqual("container_files", record["nested"][0]["destination_rule"])
+        self.assertEqual([], os.listdir(self.root / "lone" / "raw"))
+
+    def test_a_nested_archive_whose_expansion_exists_beside_it_is_left_packed(self) -> None:
+        # A study that ships run.mzML and run.mzML.gz used to fail as a whole.
+        packed = gzip.compress(b"<a/>")
+        archive = _write_zip(self.root / "both.zip", [
+            ("run.mzML", b"<a/>"), ("run.mzML.gz", packed),
+            ("S1.zip", _zip_bytes([("x.mzML", b"x")])), ("S1/kept.txt", b"k"),
+            ("other.zip", _zip_bytes([("y.mzML", b"y")])),
+        ])
+        record = extract_archive(archive, self.root / "out", listing_directory=self.root / "p")
+        self.assertEqual(
+            {"run.mzML": b"<a/>", "run.mzML.gz": packed, "S1.zip": _zip_bytes([("x.mzML", b"x")]),
+             "S1/kept.txt": b"k", "other/y.mzML": b"y"},
+            _files_under(self.root / "out"),
+        )
+        self.assertEqual(
+            [{"path": "run.mzML.gz", "reason": "destination_exists", "existing": "run.mzML"},
+             {"path": "S1.zip", "reason": "destination_exists", "existing": "S1"}],
+            sorted(record["nested_skipped"], key=lambda item: item["path"], reverse=True),
+        )
+        self.assertEqual(["other.zip"], [item["archive_path"] for item in record["nested"]])
+        with open(record["members_tsv"]["path"], encoding="utf-8", newline="") as handle:
+            rows = {row["path"]: row["disposition"] for row in csv.DictReader(handle, delimiter="\t")}
+        self.assertEqual("extracted", rows["run.mzML.gz"])
+        self.assertEqual("expanded_archive", rows["other.zip"])
+
     def test_nesting_is_limited_to_three_levels(self) -> None:
         level3 = _zip_bytes([("deep.txt", b"deep")])
         level2 = _zip_bytes([("l3.zip", level3)])
@@ -640,6 +832,40 @@ class ToolRunTests(unittest.TestCase):
         )
         self.assertEqual("insufficient_disk_space", run.killed_reason)
         self.assertLess(time.monotonic() - started, 10)
+
+    def test_a_watchdog_that_raises_kills_the_tool(self) -> None:
+        # A free-space probe that cannot answer is a breach, not a pass.
+        def watch() -> str:
+            raise OSError("the volume went away")
+
+        started = time.monotonic()
+        run = archives._run_tool(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            timeout=120, watch=watch, interval=0.05,
+        )
+        self.assertEqual("watchdog_failed", run.killed_reason)
+        self.assertIn("the volume went away", run.killed_detail)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_nothing_leaves_the_supervision_loop_with_the_tool_still_running(self) -> None:
+        started: list[subprocess.Popen] = []
+        popen = subprocess.Popen
+
+        def spy(*arguments, **options):
+            started.append(popen(*arguments, **options))
+            return started[-1]
+
+        self.addCleanup(lambda: [process.kill() for process in started if process.poll() is None])
+
+        def watch() -> str:
+            raise KeyboardInterrupt
+
+        with patch.object(archives.subprocess, "Popen", spy):
+            with self.assertRaises(KeyboardInterrupt):
+                archives._run_tool([sys.executable, "-c", "import time; time.sleep(60)"],
+                                   timeout=120, watch=watch, interval=0.05)
+        self.assertEqual(1, len(started))
+        self.assertIsNotNone(started[0].poll())
 
     def test_the_timeout_kills_the_tool(self) -> None:
         run = archives._run_tool(
@@ -925,6 +1151,71 @@ class MockedSevenZipListingTests(_Workspace):
                 list_archive(self._rar(), sevenzip=self.TOOL)
         self.assertEqual("unparsable_listing", caught.exception.reason)
 
+    def test_a_multi_line_archive_comment_is_a_value_not_a_warning(self) -> None:
+        # 7-Zip prints a value with line breaks as 'Comment = ', '{', its lines, '}'. Each line was
+        # read as a warning, so every RAR with a multi-line comment was refused.
+        comment = "Comment = \n{\nline one\n\n----------\nPath = not a member\n}\n"
+        commented = RAR5_LISTING.format(extra="").replace("Physical Size = 400\n",
+                                                          "Physical Size = 400\n" + comment)
+        run, _calls = self._fake_run(commented)
+        with patch.object(archives, "_run_tool", run):
+            listing = list_archive(self._rar(), sevenzip=self.TOOL)
+        self.assertEqual(["S1.raw", "S1.raw\\_FUNC001.DAT"], [member.name for member in listing.members])
+
+        unterminated = RAR5_LISTING.format(extra="").replace(
+            "Physical Size = 400\n", "Physical Size = 400\nComment = \n{\nline one\n"
+        ).replace("----------\n", "")
+        run, _calls = self._fake_run(unterminated)
+        with patch.object(archives, "_run_tool", run):
+            with self.assertRaises(ArchiveError) as caught:
+                list_archive(self._rar(), sevenzip=self.TOOL)
+        self.assertEqual("unparsable_listing", caught.exception.reason)
+
+    def test_property_lines_never_decide_why_7zip_failed(self) -> None:
+        # Every zip and rar block carries 'Encrypted = -'. Searching the whole output for
+        # 'encrypted' named every truncated download an encrypted archive, a permanent reason.
+        truncated = RAR5_LISTING.format(extra="").replace(
+            "Type = Rar5\n", "Type = Rar5\nERRORS:\nUnexpected end of archive\n"
+        ) + "\n\nErrors: 1\n"
+        run, _calls = self._fake_run(truncated, exit_code=2)
+        with patch.object(archives, "_run_tool", run):
+            with self.assertRaises(ArchiveError) as caught:
+                list_archive(self._rar(), sevenzip=self.TOOL)
+        self.assertEqual("corrupt_archive", caught.exception.reason)
+        self.assertIn("Unexpected end of archive", caught.exception.message)
+
+        extraction_stdout = (
+            "\n7-Zip 25.01 (x64)\n\nExtracting archive: samples.rar\n--\nPath = samples.rar\n"
+            "Type = Rar5\nEncrypted = -\nComment = \n{\nWrong password? Not a diagnosis.\n}\n\n"
+            "Sub items Errors: 1\n\nArchives with Errors: 1\n"
+        )
+        cases = {
+            "ERROR: CRC Failed : S1.mzML": "corrupt_archive",
+            "ERROR: Data Error : S2.mzML": "corrupt_archive",
+            "ERRORS:\nUnexpected end of archive\n\nERROR: Data Error : S2.mzML": "corrupt_archive",
+            "ERROR: Data Error in encrypted file. Wrong password? : a.txt": "encrypted_archive",
+            "ERROR: CRC Failed in encrypted file. Wrong password? : a.txt": "encrypted_archive",
+            "ERROR: Wrong password : a.txt": "encrypted_archive",
+            "ERROR: x.7z\nCannot open encrypted archive. Wrong password?\n\nERRORS:\nHeaders Error":
+                "encrypted_archive",
+            "ERRORS:\nHeaders Error": "corrupt_archive",
+            "ERROR: x.7z\nOpen ERROR: Cannot open the file as [7z] archive\n\nERRORS:\n"
+            "Unexpected end of archive": "corrupt_archive",
+            "ERROR: x.7z\nOpen ERROR: Cannot open the file as [7z] archive": "not_an_archive",
+            "": "sevenzip_failed",
+        }
+        for stderr, reason in cases.items():
+            with self.subTest(stderr=stderr):
+                error = archives._sevenzip_error(
+                    archives._ToolRun(2, extraction_stdout, stderr, "", 0.01), "samples.rar",
+                    "extraction",
+                )
+                self.assertEqual(reason, error.reason)
+                self.assertNotIn("Encrypted = -", error.message)
+        warned = archives._sevenzip_error(archives._ToolRun(1, extraction_stdout, "", "", 0.01),
+                                          "samples.rar", "extraction")
+        self.assertEqual("sevenzip_warning", warned.reason)
+
 
 @needs_sevenzip
 class SevenZipExtractionTests(_Workspace):
@@ -1010,6 +1301,65 @@ class SevenZipExtractionTests(_Workspace):
                 self.assertFalse((self.root / "out").exists())
                 self.assertFalse((self.root / "out.partial").exists())
 
+    def test_damaged_archives_are_corrupt_not_encrypted(self) -> None:
+        # A truncated download is the common failure, and a retry can mend it; encrypted_archive
+        # is permanent. 7-Zip's 'Encrypted = -' property lines made every one of these encrypted.
+        _truncated_zip(self.root / "partial.zip")
+        whole = _rar5_stored(self.root / "whole.rar",
+                             [(f"f{index}.bin", os.urandom(5000)) for index in range(4)]).read_bytes()
+        (self.root / "partial.rar").write_bytes(whole[: len(whole) - 7000])
+        flipped = _rar5_stored(self.root / "flipped.rar", [("S1.mzML", b"spectrum-bytes" * 200)])
+        data = bytearray(flipped.read_bytes())
+        data[data.find(b"spectrum-bytes") + 5] ^= 0xFF
+        flipped.write_bytes(bytes(data))
+        cases = {
+            "partial.zip": ("auto", "Unexpected end of archive"),
+            "partial.rar": ("auto", "Unexpected end of archive"),
+            "flipped.rar": ("auto", "CRC Failed"),
+        }
+        _truncated_zip(self.root / "partial-7zip-reader.zip")
+        cases["partial-7zip-reader.zip"] = ("sevenzip", "Unexpected end of archive")
+        for name, (reader, evidence) in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(ArchiveError) as caught:
+                    extract_archive(self.root / name, self.root / "out", sevenzip=self.tool,
+                                    reader=reader)
+                self.assertEqual("corrupt_archive", caught.exception.reason)
+                self.assertIn(evidence, caught.exception.message)
+                self.assertFalse((self.root / "out").exists())
+                self.assertFalse((self.root / "out.partial").exists())
+
+    def test_archives_with_multi_line_comments_extract(self) -> None:
+        rar = _rar5_stored(self.root / "commented.rar", [("a.txt", b"hello")],
+                           comment=b"line one\r\n\r\nline three")
+        record = extract_archive(rar, self.root / "rar", sevenzip=self.tool)
+        self.assertEqual({"a.txt": b"hello"}, _files_under(self.root / "rar"))
+        self.assertEqual("Rar5", record["reported_type"])
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as handle:
+            handle.writestr("a.txt", b"hello")
+            handle.comment = b"line one\r\nline two\r\n"
+        (self.root / "commented.zip").write_bytes(buffer.getvalue())
+        record = extract_archive(self.root / "commented.zip", self.root / "zip", sevenzip=self.tool,
+                                 reader="sevenzip")
+        self.assertEqual({"a.txt": b"hello"}, _files_under(self.root / "zip"))
+        self.assertEqual("7-Zip", record["reader"])
+
+    def test_a_directory_too_long_for_windows_is_refused_by_the_7zip_reader_too(self) -> None:
+        # 7-Zip writes \\?\ paths and would create the folder; Python and the Console could not.
+        parent = self.root / "deep"
+        destination = parent / "d"
+        room = _directory_room(destination, 247)
+        if room < 2:
+            self.skipTest("the temporary directory is already too deep for this test")
+        parent.mkdir()
+        archive = _write_zip(self.root / "long.zip", [("D" * (room + 1) + "/f.txt", b"x")])
+        with self.assertRaises(ArchiveError) as caught:
+            extract_archive(archive, destination, sevenzip=self.tool, reader="sevenzip")
+        self.assertEqual(["path_too_long"], [item["reason"] for item in caught.exception.rejected])
+        self.assertEqual([], os.listdir(parent))
+
     def test_unsafe_names_are_refused_before_7zip_can_rewrite_them(self) -> None:
         # The probe: 7z x turned '../evil.txt' into 'evil.txt' and 'C:/abs.txt' into
         # 'C_/abs.txt' and exited 0. Through the 7-Zip reader these must be refused as well.
@@ -1043,6 +1393,27 @@ class SevenZipExtractionTests(_Workspace):
                             limits=ExtractionLimits(reserve_bytes=1, watchdog_interval_seconds=0.05))
         self.assertEqual("insufficient_disk_space", caught.exception.reason)
         self.assertLess(time.monotonic() - started, 10)
+        self.assertNothingWritten(self.root / "out", "zeros.7z")
+
+    def test_a_failing_watchdog_stops_7zip_before_the_tree_is_removed(self) -> None:
+        # The probe raised out of the supervision loop, 7-Zip kept writing, and the cleanup raced it:
+        # the staging directory outlived the call.
+        archive = self.root / "zeros.7z"
+        _sevenzip("a", "-t7z", "-mx=1", "-sizeros.bin", str(archive), cwd=self.root,
+                  data=bytes(50_000_000))
+        calls = {"n": 0}
+
+        def free_bytes(path: Path) -> int:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return 10 ** 15
+            raise OSError("the volume went away")
+
+        with self.assertRaises(ArchiveError) as caught:
+            extract_archive(archive, self.root / "out", sevenzip=self.tool, free_bytes=free_bytes,
+                            limits=ExtractionLimits(reserve_bytes=1, watchdog_interval_seconds=0.05))
+        self.assertEqual("watchdog_failed", caught.exception.reason)
+        self.assertIn("the volume went away", caught.exception.message)
         self.assertNothingWritten(self.root / "out", "zeros.7z")
 
 

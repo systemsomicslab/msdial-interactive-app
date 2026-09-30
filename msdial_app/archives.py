@@ -13,8 +13,10 @@ Three findings shape it.
 validated here, for every format and every reader, before anything is written, and one unsafe
 name refuses the whole archive: traversal, drive and UNC paths, ':' (an alternate data stream on
 NTFS), Windows device names, trailing dots and spaces, names that collide up to case, links and
-reparse points, encrypted members, and paths the .NET Framework Console could not open
-(LongPathsEnabled is 0, so 259 characters at most).
+reparse points, encrypted members, names that are not valid Unicode, and paths the .NET Framework
+Console could not open (LongPathsEnabled is 0, so 259 characters for a file and 247 for a folder).
+What an operating system adds when it packs a folder (__MACOSX/, .DS_Store, '._' AppleDouble
+files, Thumbs.db) is validated like any member and then dropped, with a record of what went.
 
 An encrypted archive must fail, not wait. 7-Zip always runs with stdin closed and a sentinel
 password, so a header-encrypted archive fails at once instead of prompting, and encrypted members
@@ -152,6 +154,8 @@ class ExtractionLimits:
     max_members: int = 1_000_000
     max_depth: int = 3
     max_path_length: int = 259
+    # CreateDirectoryW without long-path support: MAX_PATH less room for an 8.3 file name.
+    max_directory_length: int = 247
     watchdog_interval_seconds: float = 5.0
     timeout_base_seconds: float = 600.0
     timeout_seconds_per_gb: float = 60.0
@@ -605,6 +609,11 @@ def normalise_member_name(name: str) -> tuple[str, str]:
     everything else that 7-Zip or Windows would rewrite, reinterpret or refuse is refused here.
     """
     text = str(name).replace("\\", "/")
+    if any("\ud800" <= character <= "\udfff" for character in text):
+        # tarfile decodes a name that is not UTF-8 (cp932 from a Japanese instrument PC, say) with
+        # surrogateescape. Written out, it is a file no sample name can match and the listing TSV
+        # cannot encode; guessing its code page would be an inference, so it is refused.
+        return "", "undecodable_name"
     if not text.strip("/"):
         return "", "empty_name"
     if text.startswith("//"):
@@ -630,17 +639,26 @@ def normalise_member_name(name: str) -> tuple[str, str]:
     return "/".join(parts), ""
 
 
+def _encodable(name: str) -> str:
+    """name, with any lone surrogate spelled as an escape so a UTF-8 record can hold it."""
+    return name.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def validate_listing(
     members: list[ArchiveMember],
     bases: Iterable[str | os.PathLike[str]] = (),
     *,
     max_path_length: int = 259,
+    max_directory_length: int = 247,
     sizes_known: bool = True,
 ) -> list[dict[str, str]]:
     """Refusals for a listing, one per refused member; also fills each member's path.
 
     bases are the directories the members will be written under. The longest decides the length
     check, so the staging directory, which is longer than the destination, is the one that counts.
+    A file's path is held to max_path_length and the folder it needs (itself, for a directory)
+    to max_directory_length: without long-path support Windows creates no longer folder, and
+    zipfile would fail mid-write where 7-Zip, which writes \\\\?\\ paths, would succeed.
     """
     base_length = max((len(str(base)) for base in bases), default=0)
     rejected: list[dict[str, str]] = []
@@ -671,8 +689,11 @@ def validate_listing(
             reason = member.unsafe_type
         if not reason and sizes_known and not member.is_dir and member.size < 0:
             reason = "unknown_size"
-        if not reason and base_length and base_length + 1 + len(path) > max_path_length:
-            reason = "path_too_long"
+        if not reason and base_length:
+            folder = path if member.is_dir else path.rpartition("/")[0]
+            folder_length = base_length + 1 + len(folder) if folder else base_length
+            if base_length + 1 + len(path) > max_path_length or folder_length > max_directory_length:
+                reason = "path_too_long"
         if not reason:
             parts = path.split("/")
             for index in range(1, len(parts)):
@@ -682,7 +703,7 @@ def validate_listing(
             if not reason:
                 reason = register(path, "dir" if member.is_dir else "file")
         if reason:
-            rejected.append({"name": member.name, "reason": reason})
+            rejected.append({"name": _encodable(member.name), "reason": reason})
     return rejected
 
 
@@ -799,8 +820,10 @@ def _list_tar(path: Path, kind: str, max_members: int) -> list[ArchiveMember]:
 
 
 # 7-Zip's `l -slt` output: a preamble, '--', the archive's own properties, '----------', then one
-# block of 'Key = Value' lines per member, blocks separated by blank lines. Warnings arrive as
-# lines that are not properties, in the archive block or after the last member.
+# block of 'Key = Value' lines per member, blocks separated by blank lines. A value with line
+# breaks (an archive comment) is printed as 'Key = ', then '{', its lines, and '}'. Warnings and
+# errors arrive as lines that are not properties, in the archive block or after the last member,
+# or as the ERROR and WARNING properties.
 def _split_property(line: str) -> tuple[str | None, str]:
     key, separator, value = line.partition(" = ")
     if separator:
@@ -864,12 +887,30 @@ class _SevenZipListing:
         self.messages: list[str] = []
         self.members: list[ArchiveMember] = []
         self.block: dict[str, str] = {}
+        # The last property printed with an empty value, whose lines may follow between braces,
+        # and those lines while they are being read.
+        self._open: tuple[dict[str, str], str] | None = None
+        self._value: list[str] | None = None
 
     def feed(self, line: str) -> None:
         if self.state == "preamble":
             if line == "--":
                 self.state = "archive"
             return
+        if self._value is not None:
+            # Inside a braced value every line is text, blank lines and '----------' included.
+            if line == "}":
+                target, key = self._open
+                target[key] = "\n".join(self._value)
+                self._open = self._value = None
+            else:
+                self._value.append(line)
+            return
+        if self._open is not None:
+            if line == "{":
+                self._value = []
+                return
+            self._open = None
         if self.state == "archive":
             if line == "----------":
                 self.state = "members"
@@ -881,6 +922,8 @@ class _SevenZipListing:
                 self.messages.append(line)
             else:
                 self.archive[key] = value
+                if not value:
+                    self._open = (self.archive, key)
             return
         if not line:
             self._close()
@@ -898,6 +941,16 @@ class _SevenZipListing:
                 "unparsable_listing", f"7-Zip listing repeats {key!r} within one member."
             )
         self.block[key] = value
+        if not value:
+            self._open = (self.block, key)
+
+    def diagnostics(self) -> list[str]:
+        """What 7-Zip said about the archive: its non-property lines and ERROR/WARNING values."""
+        return self.messages + [
+            f"{key}: {self.archive[key]}"
+            for key in ("ERROR", "WARNING", "Errors", "Warnings")
+            if key in self.archive
+        ]
 
     def _close(self) -> None:
         if not self.block:
@@ -912,6 +965,10 @@ class _SevenZipListing:
             )
 
     def finish(self) -> None:
+        if self._value is not None:
+            raise ArchiveError(
+                "unparsable_listing", "The 7-Zip listing ends inside a multi-line value."
+            )
         self._close()
 
 
@@ -922,6 +979,8 @@ class _ToolRun:
     stderr_tail: str
     killed_reason: str
     elapsed_seconds: float
+    # What a watch that raised said, when that is why the tool was killed.
+    killed_detail: str = ""
 
 
 def _tail(chunks: list[bytes], limit: int = 65536) -> str:
@@ -939,8 +998,11 @@ def _run_tool(
     """Run a tool with stdin closed, a timeout and a watchdog; kill it on any breach.
 
     The watch runs once before the first wait, so a breach that exists already stops the tool
-    before it writes, and then every interval. on_line sees stdout line by line; an ArchiveError it
-    raises (a listing over the member limit) kills the tool too.
+    before it writes, and then every interval. A watch that raises is a breach too
+    (watchdog_failed): a free-space probe that cannot answer has not said there is room. on_line
+    sees stdout line by line; an ArchiveError it raises (a listing over the member limit) kills
+    the tool too. Whatever leaves the loop, the tool is dead before this returns or raises, so a
+    caller's cleanup never races it.
     """
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     process = subprocess.Popen(
@@ -980,27 +1042,35 @@ def _run_tool(
         reader.start()
     started = time.monotonic()
     killed = ""
-    while True:
-        if failures:
-            killed = failures[0].reason
-        elif watch is not None:
-            killed = watch() or ""
-        if not killed and time.monotonic() - started > timeout:
-            killed = "tool_timeout"
-        if killed:
+    killed_detail = ""
+    try:
+        while True:
+            if failures:
+                killed = failures[0].reason
+            elif watch is not None:
+                try:
+                    killed = watch() or ""
+                except Exception as error:  # noqa: BLE001 - any failure of the probe is a breach
+                    killed = "watchdog_failed"
+                    killed_detail = f"{type(error).__name__}: {error}"
+            if not killed and time.monotonic() - started > timeout:
+                killed = "tool_timeout"
+            if killed:
+                break
+            try:
+                process.wait(timeout=interval)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        if process.poll() is None:
             process.kill()
             process.wait()
-            break
-        try:
-            process.wait(timeout=interval)
-            break
-        except subprocess.TimeoutExpired:
-            continue
-    for reader in readers:
-        reader.join(timeout=30)
-    for pipe in (process.stdout, process.stderr):
-        if pipe is not None:
-            pipe.close()
+        for reader in readers:
+            reader.join(timeout=30)
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                pipe.close()
     if failures:
         raise failures[0]
     return _ToolRun(
@@ -1009,33 +1079,73 @@ def _run_tool(
         stderr_tail=_tail(stderr_chunks),
         killed_reason=killed,
         elapsed_seconds=round(time.monotonic() - started, 3),
+        killed_detail=killed_detail,
     )
 
 
-def _classify_sevenzip_failure(exit_code: int, text: str) -> str:
-    lower = text.casefold()
-    if "wrong password" in lower or "encrypted" in lower:
-        return "encrypted_archive"
-    if "cannot open the file as" in lower or "is not archive" in lower:
-        return "not_an_archive"
-    if "crc failed" in lower or "data error" in lower or "unexpected end" in lower:
-        return "corrupt_archive"
-    if exit_code == 1:
-        return "sevenzip_warning"
-    return "sevenzip_failed"
+# 7-Zip's own diagnoses, tried in this order. Damage comes first: a truncated download is the
+# common failure and a retry can mend it, while encrypted_archive is permanent. The damage
+# patterns exclude 7-Zip's wrong-password variants ('CRC Failed in encrypted file. Wrong
+# password?', 'Data Error in encrypted file. ...'), so those read as encryption. 'Headers Error'
+# follows encryption because a header-encrypted 7z reports it beside 'Cannot open encrypted
+# archive'.
+_SEVENZIP_DIAGNOSES = (
+    ("corrupt_archive", re.compile(
+        r"crc failed(?! in encrypted)|data error(?! in encrypted)|unexpected end|unavailable data"
+    )),
+    ("encrypted_archive", re.compile(
+        r"wrong password|cannot open encrypted archive|in encrypted file"
+    )),
+    ("corrupt_archive", re.compile(r"headers error")),
+    ("not_an_archive", re.compile(r"can ?not open (?:the )?file as|is not archive")),
+)
 
 
-def _sevenzip_error(run: _ToolRun, archive_name: str, action: str) -> ArchiveError:
-    text = (run.stderr_tail + "\n" + run.stdout_tail).strip()
-    reason = _classify_sevenzip_failure(run.exit_code, text)
-    # 7-Zip puts its diagnosis on stderr; stdout ends with the archive's path and size.
-    last = [line.strip() for line in run.stderr_tail.splitlines() if line.strip()][-3:] or [
+def _classify_sevenzip_failure(exit_code: int, lines: list[str]) -> tuple[str, list[str]]:
+    """(reason, the lines that decided it) for a failed 7-Zip run.
+
+    lines are 7-Zip's messages: stderr, and the stdout lines that are neither a property nor a
+    property's value. Properties are never read. Every zip and rar block carries 'Encrypted = -',
+    and searching the whole output for 'encrypted' named every truncated download encrypted.
+    """
+    for reason, pattern in _SEVENZIP_DIAGNOSES:
+        evidence = [line for line in lines if pattern.search(line.casefold())]
+        if evidence:
+            return reason, evidence
+    return ("sevenzip_warning" if exit_code == 1 else "sevenzip_failed"), []
+
+
+def _stdout_messages(text: str) -> list[str]:
+    """The diagnostic lines of 7-Zip's stdout: after the '--' marker, never properties or values."""
+    parser = _SevenZipListing(sys.maxsize)
+    try:
+        for line in text.replace("\r\n", "\n").split("\n"):
+            parser.feed(line)
+    except ArchiveError:
+        pass  # a tail that does not parse still yields the messages read before it
+    return parser.diagnostics()
+
+
+def _sevenzip_error(
+    run: _ToolRun, archive_name: str, action: str, messages: list[str] | None = None
+) -> ArchiveError:
+    """The ArchiveError for a 7-Zip run that exited non-zero.
+
+    messages are stdout's diagnostic lines when the caller parsed the whole stream (a listing's
+    archive block can be far behind the tail); otherwise they are read from the stdout tail.
+    """
+    stdout_messages = _stdout_messages(run.stdout_tail) if messages is None else messages
+    lines = [line.strip() for line in run.stderr_tail.splitlines() if line.strip()]
+    lines += [line.strip() for line in stdout_messages if line.strip()]
+    reason, evidence = _classify_sevenzip_failure(run.exit_code, lines)
+    shown = evidence[:3] or lines[-3:] or [
         line.strip() for line in run.stdout_tail.splitlines() if line.strip()
     ][-3:]
+    text = (run.stderr_tail + "\n" + run.stdout_tail).strip()
     return ArchiveError(
         reason,
-        f"7-Zip {action} of {archive_name} exited {run.exit_code}: {' | '.join(last)}",
-        detail={"exit_code": run.exit_code, "output_tail": text[-4000:]},
+        f"7-Zip {action} of {archive_name} exited {run.exit_code}: {' | '.join(shown)}",
+        detail={"exit_code": run.exit_code, "messages": lines[-40:], "output_tail": text[-4000:]},
     )
 
 
@@ -1058,15 +1168,13 @@ def _list_sevenzip(
             run.killed_reason, f"7-Zip listing of {archive.name} was stopped: {run.killed_reason}."
         )
     if run.exit_code != 0:
-        raise _sevenzip_error(run, archive.name, "listing")
+        raise _sevenzip_error(run, archive.name, "listing", parser.diagnostics())
     parser.finish()
     if parser.state != "members":
         raise ArchiveError(
             "unparsable_listing", f"7-Zip listed {archive.name} without a member section."
         )
-    warnings = parser.messages + [
-        f"{key}: {parser.archive[key]}" for key in ("Errors", "Warnings") if key in parser.archive
-    ]
+    warnings = parser.diagnostics()
     if warnings:
         # Exit 0 with warnings (data after the end of the archive, for one) is still a warning,
         # and a warning is a failure here.
@@ -1076,6 +1184,12 @@ def _list_sevenzip(
             detail={"warnings": warnings},
         )
     return parser.members, parser.archive, argv
+
+
+# 7-Zip failures that, after zipfile has refused a zip, say only that the zip is damaged.
+_SEVENZIP_READ_FAILURES = frozenset(
+    {"corrupt_archive", "not_an_archive", "sevenzip_failed", "sevenzip_warning"}
+)
 
 
 def list_archive(
@@ -1091,7 +1205,8 @@ def list_archive(
 
     zip, tar and compressed streams are read with the standard library. A zip whose methods it
     cannot read (Deflate64 from Windows Explorer, PPMd, and so on) or that it refuses to open falls
-    back to 7-Zip, as do 7z and rar always. reader='sevenzip' sends a zip to 7-Zip directly.
+    back to 7-Zip, as do 7z and rar always. reader='sevenzip' sends a zip to 7-Zip directly. A zip
+    that zipfile refused and 7-Zip cannot read, or that finds no 7-Zip, is corrupt_archive.
     """
     path = Path(path)
     limits = limits or ExtractionLimits()
@@ -1100,6 +1215,7 @@ def list_archive(
         raise ArchiveError("not_an_archive_name", f"{path.name} does not have an archive suffix.")
     kind = detection.kind
     fallback = ""
+    stdlib_error = ""
     if kind == "zip":
         if reader == "sevenzip":
             fallback = "reader_requested"
@@ -1108,6 +1224,7 @@ def list_archive(
                 members, unsupported = _list_zip(path)
             except (zipfile.BadZipFile, NotImplementedError, ValueError) as error:
                 fallback = f"stdlib_refused:{type(error).__name__}"
+                stdlib_error = f"{type(error).__name__}: {error}"
             else:
                 # Encrypted members are refused whatever the method, so they need no 7-Zip.
                 if not unsupported or any(member.encrypted for member in members):
@@ -1127,59 +1244,131 @@ def list_archive(
         module = {"gz": "gzip", "bz2": "bz2", "xz": "lzma"}[kind]
         member = ArchiveMember(name=archive_stem(path.name), size=-1)
         return ArchiveListing(detection, module, [member], _python_tool(module))
-    tool = sevenzip or find_sevenzip(sevenzip_setting)
-    # Only zip, 7z, rar4 and rar5 reach here, and each names its own -t switch.
-    signature = detection.signature
-    if not tool.supports(signature):
-        raise ArchiveToolError(
-            "format_unsupported_by_sevenzip",
-            f"7-Zip {tool.version} at {tool.executable} lists no {_SEVENZIP_FORMAT_NAME[signature]} "
-            f"handler, so {path.name} cannot be read.",
-        )
-    members, properties, argv = _list_sevenzip(tool, path, signature, limits)
+    try:
+        tool = sevenzip or find_sevenzip(sevenzip_setting)
+        # Only zip, 7z, rar4 and rar5 reach here, and each names its own -t switch.
+        signature = detection.signature
+        if not tool.supports(signature):
+            raise ArchiveToolError(
+                "format_unsupported_by_sevenzip",
+                f"7-Zip {tool.version} at {tool.executable} lists no "
+                f"{_SEVENZIP_FORMAT_NAME[signature]} handler, so {path.name} cannot be read.",
+            )
+        members, properties, argv = _list_sevenzip(tool, path, signature, limits)
+    except ArchiveError as error:
+        if stdlib_error and (
+            isinstance(error, ArchiveToolError) or error.reason in _SEVENZIP_READ_FAILURES
+        ):
+            # zipfile lists any well-formed single-volume zip, whatever its methods; refusing it
+            # means the structure is damaged (a truncated download, as a rule; the Catalog has no
+            # split volumes). 7-Zip was a second opinion, and neither its absence nor its failure
+            # is the unit's reason.
+            unavailable = isinstance(error, ArchiveToolError)
+            raise ArchiveError(
+                "corrupt_archive",
+                f"{path.name} is a damaged zip: Python's zipfile refused it ({stdlib_error}), and "
+                + ("7-Zip, which might have read it, is not available: " if unavailable
+                   else "7-Zip could not read it either: ")
+                + error.message,
+                detail={"stdlib_error": stdlib_error, "sevenzip_error": error.record()},
+            ) from error
+        raise
     return ArchiveListing(
         detection, "7-Zip", members, tool.record(), argv=argv, fallback_reason=fallback,
         reported_type=properties.get("Type", ""), sevenzip=tool,
     )
 
 
+# What an operating system adds when it packs a folder, and never data. Finder writes an
+# AppleDouble copy of every file under __MACOSX/ and a .DS_Store into folders, tar on macOS
+# writes the AppleDouble data as '._<name>' beside each file, and Explorer leaves Thumbs.db.
+# Kept, __MACOSX/S1.d/ looks like a second Bruker folder, and any of them is a second top-level
+# entry that sends S1.d.zip into S1.d/S1.d/.
+_METADATA_DIRECTORY = "__macosx"
+_METADATA_FILES = frozenset({".ds_store", "thumbs.db"})
+
+
+def _metadata_entry(path: str, is_dir: bool = False) -> str:
+    """The entry to drop (a member path, or '__MACOSX') when path is such metadata, else ''."""
+    if not path:
+        return ""
+    first = path.split("/", 1)[0]
+    if first.casefold() == _METADATA_DIRECTORY:
+        return first
+    name = path.rsplit("/", 1)[-1]
+    if not is_dir and (name.casefold() in _METADATA_FILES or name.startswith("._")):
+        return path
+    return ""
+
+
+def _kept_paths(members: list[ArchiveMember], kind: str) -> list[tuple[ArchiveMember, str]]:
+    """(member, normalised path) for the members that are data, before validation fills paths."""
+    kept = []
+    for member in members:
+        path = normalise_member_name(member.name)[0]
+        if path and (kind in STREAM_KINDS or not _metadata_entry(path, member.is_dir)):
+            kept.append((member, path))
+    return kept
+
+
 def destination_rule(
     archive_name: str, members: list[ArchiveMember], *, kind: str = "", nested: bool = False
-) -> tuple[str, str]:
-    """(rule, directory) for where an archive's members go, relative to where it expands.
+) -> tuple[str, str, str]:
+    """(rule, directory, container) for where an archive's members go, relative to where it expands.
 
     A compressed stream is one file beside where the archive was. An archived vendor container
     (X.raw.zip, X.d.zip) keeps a top-level folder of its own name when it has one, and otherwise
     gets one, which is what stops two root-less per-sample zips from writing _FUNC001.DAT over each
     other. A container that is a single file (a Thermo X.raw zipped alone, X.mzML.gz) lands as that
     file. Any other nested archive expands into a directory named after it, unless it already
-    holds exactly that directory; a top-level bundle keeps its own relative paths.
+    holds exactly that directory; a top-level bundle keeps its own relative paths. Operating-system
+    metadata is not an entry here, since it is dropped.
+
+    container is the vendor container the archive produces, relative to where it expands ('' when
+    the archive is not an archived container, or no member can be said to be it). A container
+    packed under another sample's name (A.raw.zip holding B.raw) is extracted as it was packed, and
+    container names B.raw: renaming it would decide which sample it is.
     """
-    if kind in STREAM_KINDS:
-        return "stream_file", ""
     stem = archive_stem(archive_name)
     container = container_suffix(stem)
-    paths = [normalise_member_name(member.name)[0] for member in members]
-    files = [path for member, path in zip(members, paths) if path and not member.is_dir]
-    tops = {path.split("/", 1)[0] for path in paths if path}
+    if kind in STREAM_KINDS:
+        return "stream_file", "", stem if container else ""
+    kept = _kept_paths(members, kind)
+    files = [path for member, path in kept if not member.is_dir]
+    tops = {path.split("/", 1)[0] for _member, path in kept}
     top = next(iter(tops)) if len(tops) == 1 else ""
     top_is_dir = bool(top) and any(
-        path.startswith(top + "/") or (member.is_dir and path == top)
-        for member, path in zip(members, paths)
+        path.startswith(top + "/") or (member.is_dir and path == top) for member, path in kept
     )
     if container:
+        if top_is_dir and top.casefold() == stem.casefold():
+            return "container_rooted", "", top
         if top_is_dir and top.casefold().endswith(container):
-            return "container_rooted", ""
+            return "container_rooted_other_name", "", top
         if len(files) == 1 and "/" not in files[0] and files[0].casefold().endswith(container):
-            return "container_single_file", ""
+            return "container_single_file", "", files[0]
         if container in FOLDER_CONTAINER_SUFFIXES:
-            return "container_stem", stem
-        return "container_files", ""
+            return "container_stem", stem, stem
+        at_root = [path for path in files if "/" not in path and path.casefold().endswith(container)]
+        named = [path for path in at_root if path.casefold() == stem.casefold()]
+        produced = named[0] if named else (at_root[0] if len(at_root) == 1 else "")
+        return "container_files", "", produced
     if nested:
         if top_is_dir and top.casefold() == stem.casefold():
-            return "nested_rooted", ""
-        return "nested_directory", stem
-    return "archive_root", ""
+            return "nested_rooted", "", ""
+        return "nested_directory", stem, ""
+    return "archive_root", "", ""
+
+
+def _container_record(archive_name: str, container: str, relative: str) -> dict[str, Any]:
+    """Where the container an archived container stands for is, and whether it has that name."""
+    alias = container_alias(archive_name)
+    produced = container.rsplit("/", 1)[-1]
+    return {
+        # Relative to the outermost destination, so attribution uses what exists on disk.
+        "container_root": "/".join(part for part in (relative, container) if part) if container else "",
+        "container_name_mismatch": bool(alias) and produced.casefold() != alias.casefold(),
+    }
 
 
 # --- Extraction ------------------------------------------------------------------------------
@@ -1363,6 +1552,10 @@ class _Extraction:
         self.members = 0
         self.expanded = 0
         self.rows: list[dict[str, Any]] = []
+        # Directories under the staging root that exist although no kept row implies them: the
+        # folder a nested archive expanded into, the folder that held it, the folder that held
+        # only metadata that was dropped.
+        self.directories: list[str] = []
         self.counter = 0
 
     # The guards. A compressed stream declares no size, so it is checked as it expands.
@@ -1455,6 +1648,7 @@ class _Extraction:
         members = listing.members
         rejected = validate_listing(
             members, bases, max_path_length=self.limits.max_path_length,
+            max_directory_length=self.limits.max_directory_length,
             sizes_known=kind not in STREAM_KINDS,
         )
         if rejected:
@@ -1526,14 +1720,29 @@ class _Extraction:
                 integrity = "stream_check" if crc_verified else "none"
             else:
                 integrity, crc_verified = "stream_crc32", True
+        # Metadata was validated and written like any member; it goes before the tree is compared,
+        # so the comparison also shows that it went.
+        dropped = [] if kind in STREAM_KINDS else [
+            member for member in members if _metadata_entry(member.path, member.is_dir)
+        ]
+        dropped_entries = sorted({_metadata_entry(member.path, member.is_dir) for member in dropped})
+        for entry in dropped_entries:
+            target = _member_target(work, entry)
+            if os.path.isdir(target) and not os.path.islink(target):
+                _remove_tree(target)
+            elif os.path.lexists(target):
+                os.chmod(target, stat.S_IWRITE)
+                target.unlink()
+        dropped_ids = {id(member) for member in dropped}
+        listed = [member for member in members if member.path and id(member) not in dropped_ids]
+        files = [member for member in listed if not member.is_dir]
         tree = _verify_tree(
             work,
-            {member.path.casefold(): member.size for member in members if not member.is_dir},
-            [member.path for member in members if member.is_dir and member.path],
+            {member.path.casefold(): member.size for member in files},
+            [member.path for member in listed if member.is_dir]
+            + [entry.rsplit("/", 1)[0] for entry in dropped_entries if "/" in entry],
             label,
         )
-        listed = [member for member in members if member.path]
-        files = [member for member in listed if not member.is_dir]
         return {
             **listing.detection.record(),
             "reader": listing.reader,
@@ -1552,6 +1761,12 @@ class _Extraction:
             "expanded_bytes": sum(member.size for member in files),
             "tree": tree,
             "rejected_members": [],
+            # Counted apart from the members above; the listing TSV has a row for each of them.
+            "dropped_metadata": {
+                "members": len(dropped),
+                "bytes": sum(max(0, member.size) for member in dropped if not member.is_dir),
+                "entries": dropped_entries[:50],
+            },
             "integrity": integrity,
             "crc_verified": crc_verified,
             "depth": depth,
@@ -1579,10 +1794,11 @@ class _Extraction:
 
         run = _run_tool(argv, timeout=timeout, watch=watch, interval=limits.watchdog_interval_seconds)
         if run.killed_reason:
+            because = f" ({run.killed_detail})" if run.killed_detail else ""
             raise ArchiveError(
                 run.killed_reason,
-                f"7-Zip was stopped while extracting {label}: {run.killed_reason}.",
-                detail={"elapsed_seconds": run.elapsed_seconds},
+                f"7-Zip was stopped while extracting {label}: {run.killed_reason}{because}.",
+                detail={"elapsed_seconds": run.elapsed_seconds, "watchdog_error": run.killed_detail},
             )
         if run.exit_code != 0:
             raise _sevenzip_error(run, label, "extraction")
@@ -1595,21 +1811,27 @@ class _Extraction:
         depth: int,
         archive_label: str,
         record_key: str,
+        kind: str,
     ) -> None:
         for member in members:
             if not member.path:
                 continue  # the root entry of a tar made from '.'
+            path = f"{relative}/{member.path}" if relative else member.path
+            entry = "" if kind in STREAM_KINDS else _metadata_entry(member.path, member.is_dir)
+            if entry and entry == member.path and "/" in path:
+                # The folder that held a dropped .DS_Store was a folder in the archive; it stays.
+                self.directories.append(path.rsplit("/", 1)[0])
             self.rows.append(
                 {
-                    "path": f"{relative}/{member.path}" if relative else member.path,
+                    "path": path,
                     "type": "dir" if member.is_dir else "file",
                     "size": 0 if member.is_dir else member.size,
                     "crc32": member.crc32,
                     "modified": member.modified,
                     "depth": depth,
                     "archive": archive_label,
-                    "member_name": member.name,
-                    "disposition": "extracted",
+                    "member_name": _encodable(member.name),
+                    "disposition": "dropped_metadata" if entry else "extracted",
                     # Which record a nested archive among these members is filed under. Not
                     # written to the TSV; the outermost archive's key cannot equal a member path.
                     "record_key": record_key,
@@ -1659,10 +1881,21 @@ def _expand_nested(context: _Extraction, staging: Path, records: dict[str, dict[
         depth = int(row["depth"]) + 1
         label = row["path"]
         listing = context.list(archive, detection)
-        rule, prefix = destination_rule(
+        rule, prefix, container = destination_rule(
             archive.name, listing.members, kind=detection.kind, nested=True
         )
         parent = archive.parent
+        # What it would add beside itself. A study that ships run.mzML and run.mzML.gz, or S1/ and
+        # S1.zip, keeps the packed copy as it came rather than losing the whole lineage.
+        entries = [prefix] if prefix else sorted(
+            {path.split("/", 1)[0] for _member, path in _kept_paths(listing.members, detection.kind)}
+        )
+        existing = next((entry for entry in entries if _entry_exists(parent, entry)), "")
+        if existing:
+            parent_record["nested_skipped"].append(
+                {"path": row["path"], "reason": "destination_exists", "existing": existing}
+            )
+            continue
         context.counter += 1
         work = parent / f"~{context.counter}.partial"
         final = parent / prefix if prefix else parent
@@ -1670,6 +1903,7 @@ def _expand_nested(context: _Extraction, staging: Path, records: dict[str, dict[
         record = context.expand(archive, listing, work, depth=depth, label=label, bases=[work, final])
         entries = [prefix] if prefix else os.listdir(work)
         for entry in entries:
+            # The check above saw the same names; the tree was just verified against them.
             if _entry_exists(parent, entry):
                 raise ArchiveError(
                     "nested_destination_exists",
@@ -1686,7 +1920,9 @@ def _expand_nested(context: _Extraction, staging: Path, records: dict[str, dict[
         row["disposition"] = "expanded_archive"
         parent_relative = row["path"].rsplit("/", 1)[0] if "/" in row["path"] else ""
         relative = "/".join(part for part in (parent_relative, prefix) if part)
-        context.add_rows(listing.members, relative, depth, label, label)
+        # Neither folder need be implied by a member: an empty archive, or one alone in its folder.
+        context.directories.extend(part for part in (parent_relative, relative) if part)
+        context.add_rows(listing.members, relative, depth, label, label, detection.kind)
         record.update(
             {
                 "archive_name": archive.name,
@@ -1697,6 +1933,7 @@ def _expand_nested(context: _Extraction, staging: Path, records: dict[str, dict[
                 "archive_sha256": sha256,
                 "destination_rule": rule,
                 "container_stem": prefix if rule == "container_stem" else "",
+                **_container_record(archive.name, container, parent_relative),
                 "nested": [],
                 "nested_skipped": [],
             }
@@ -1736,7 +1973,9 @@ def extract_archive(
     archive_sha256 is the hash the download already computed; without it the archive is hashed
     here. With listing_directory, the member listing of the whole lineage is written there as
     archive-members-<sha12>.tsv and its sha256 recorded. Raises ArchiveError, leaving neither the
-    destination nor the staging directory behind.
+    destination nor the staging directory behind, whatever went wrong: an unexpected exception is
+    wrapped as extraction_failed, and one that is not an Exception (an interrupt) still clears the
+    staging directory on its way out.
     """
     archive = Path(archive).absolute()
     destination = Path(destination).absolute()
@@ -1748,16 +1987,17 @@ def extract_archive(
             "destination_exists", f"The extraction destination {destination} already exists."
         )
     staging = destination.with_name(destination.name + ".partial")
-    removed_stale_staging = os.path.lexists(staging)
-    if removed_stale_staging:
-        _remove_tree(staging)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    context = _Extraction(
-        limits, free_bytes or _free_bytes, sevenzip, sevenzip_setting, reader,
-        archive.stat().st_size,
-    )
     started = _now()
+    finished = False
     try:
+        removed_stale_staging = os.path.lexists(staging)
+        if removed_stale_staging:
+            _remove_tree(staging)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        context = _Extraction(
+            limits, free_bytes or _free_bytes, sevenzip, sevenzip_setting, reader,
+            archive.stat().st_size,
+        )
         detection = detect_archive(archive)
         if detection is None:
             raise ArchiveError(
@@ -1765,10 +2005,12 @@ def extract_archive(
             )
         sha256 = archive_sha256 or file_sha256(archive)
         listing = context.list(archive, detection)
-        rule, prefix = destination_rule(archive.name, listing.members, kind=detection.kind)
+        rule, prefix, container = destination_rule(
+            archive.name, listing.members, kind=detection.kind
+        )
         work = staging / prefix if prefix else staging
         record = context.expand(archive, listing, work, depth=1, label=archive.name, bases=[work])
-        context.add_rows(listing.members, prefix, 1, archive.name, _OUTERMOST)
+        context.add_rows(listing.members, prefix, 1, archive.name, _OUTERMOST, detection.kind)
         record.update(
             {
                 "schema": EXTRACTION_SCHEMA,
@@ -1781,6 +2023,7 @@ def extract_archive(
                 "destination": str(destination),
                 "destination_rule": rule,
                 "container_stem": prefix,
+                **_container_record(archive.name, container, ""),
                 "nested": [],
                 "nested_skipped": [],
                 "limits": limits.record(),
@@ -1790,13 +2033,10 @@ def extract_archive(
         )
         if nested:
             _expand_nested(context, staging, {_OUTERMOST: record})
-        expected = {
-            row["path"].casefold(): row["size"]
-            for row in context.rows
-            if row["type"] == "file" and row["disposition"] == "extracted"
-        }
-        directories = [row["path"] for row in context.rows if row["type"] == "dir"]
-        directories += [prefix] if prefix else []
+        extracted = [row for row in context.rows if row["disposition"] == "extracted"]
+        expected = {row["path"].casefold(): row["size"] for row in extracted if row["type"] == "file"}
+        directories = [row["path"] for row in extracted if row["type"] == "dir"]
+        directories += context.directories + ([prefix] if prefix else [])
         record["tree"] = _verify_tree(staging, expected, directories, archive.name)
         record["lineage"] = {
             "archives": 1 + sum(1 for row in context.rows if row["disposition"] == "expanded_archive"),
@@ -1812,17 +2052,24 @@ def extract_archive(
                 "rows": len(context.rows),
             }
         os.replace(staging, destination)
+        finished = True
     except ArchiveError:
-        _remove_tree(staging)
         raise
     except (zipfile.BadZipFile, EOFError, lzma.LZMAError, zlib.error, tarfile.TarError) as error:
-        _remove_tree(staging)
         raise ArchiveError(
             "corrupt_archive", f"{archive.name} could not be read: {error}"
         ) from error
     except OSError as error:
-        _remove_tree(staging)
         reason = "corrupt_archive" if isinstance(error, gzip.BadGzipFile) else "extraction_failed"
         raise ArchiveError(reason, f"{archive.name} could not be extracted: {error}") from error
+    except Exception as error:  # noqa: BLE001 - a defect here must not leave a tree to pay for
+        raise ArchiveError(
+            "extraction_failed",
+            f"{archive.name} could not be extracted: {type(error).__name__}: {error}",
+            detail={"exception": type(error).__name__},
+        ) from error
+    finally:
+        if not finished:
+            _remove_tree(staging)
     record["finished_at"] = _now()
     return record
