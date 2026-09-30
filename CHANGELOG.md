@@ -4,6 +4,47 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.11] - Unreleased
+
+### Added
+- `msdial_app/mzxml_conversion.py` converts mzXML 2.x and 3.x to the plain
+  mzML that MS-DIAL's RawDataHandler reads, using only the standard library.
+  MS-DIAL has no mzXML reader, so a sample whose only encoding is mzXML could
+  not be analysed. The repository lease does not call it yet.
+  - `convert_mzxml_to_mzml` streams the file with iterparse, flattening
+    nested scans in document order, and writes polarity as a spectrum-level
+    cvParam; the precursorMz as both the isolation target (MS:1000827) and
+    the selected ion (MS:1000744); MS:1000828/829 only where windowWideness
+    is recorded; activation and collision energy only where recorded (an
+    absent method is a userParam, never CID); scan start time in seconds
+    (UO:0000010), 64-bit m/z, intensity at its source precision, and zlib;
+    no self-closed or empty containers, no referenceableParamGroup and no
+    startTimeStamp.
+  - The mzXML's embedded sha1 is verified, and a mismatch fails the file by
+    default. The output bytes depend only on the mzXML, its
+    repository-relative name, the options and the converter identity, which
+    names the zlib build.
+  - `validate_conversion` re-reads the output with an independent expat
+    reader, lints what the pinned parser cannot read, and compares every
+    spectrum and the exact array bytes with the mzXML. A conversion is
+    validated before it is renamed into place.
+  - Every failure is returned as a record (schema
+    `msdial-mzxml-conversion.v1`), never raised. The converter replaces or
+    removes only a destination file it wrote itself (its own mzML header and
+    processing record, or byte for byte the output of the previous record).
+    Anything else at the destination, such as a repository's own mzML, fails
+    the conversion, is left in place, and is flagged `foreign_file_kept`.
+  - A previous record is reused when the source, source file name, output,
+    options and converter still match. The reused record names this call's
+    paths and times, and keeps the original under `reused_from`.
+  - Polarity imputation from the declared ion mode, DIA window inference
+    from a uniform ladder, all-ion window synthesis from the scan range, and
+    the spectrum-level collision energy that AIF deconvolution needs in the
+    pinned Console are each off by default and recorded when used. The
+    spectrum-level collision energy departs from the PSI mapping rules.
+  - Arrays are not padded to hide RawDataHandler's upstream defect of never
+    decoding the last array element.
+
 ## [0.5.10] - Unreleased
 
 ### Added
