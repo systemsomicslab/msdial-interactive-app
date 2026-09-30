@@ -2159,6 +2159,7 @@ def _prepare_repository_rows_from_lineage(
         },
         "console_aliases": len(built["aliases"]),
         "class_id_aliases": built["class_id_aliases"],
+        "excluded_inputs": built["excluded_inputs"],
         "failures": failures,
         "blocking_failures": [item["code"] for item in blocking],
         "answer_seed": answer_seed,

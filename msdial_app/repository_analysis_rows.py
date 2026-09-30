@@ -34,6 +34,12 @@ reads through it and writes its per-file containers beside it, still under the r
 neither can be made the unit fails with a record. The alias is recorded on the input's lineage row
 (console_alias), with the file_name and the path the CSV gives it.
 
+AN INPUT THE CAMPAIGN DISPOSITION EXCLUDED IS NO ROW. An applied campaign_disposition (written only by
+classify_preflight) may run a unit while excluding some of its inputs - ion mobility, an unreadable header,
+MS1-only files beside DIA ones - and leaves them among the input candidates. They get no row, their
+declared inputs and samples are not counted missing, and the CSV record names them with their reasons
+(analysis_csv.excluded_inputs), so the CSV never names an input the disposition keeps out of the run.
+
 A UNIT THAT DISAGREES WITH ITSELF FAILS WITH A RECORD. Rows, input candidates, lineage rows, declared
 analysis inputs and sample rows must pair one to one; the failures say where they do not, and the caller
 records them in the unit's manifest (analysis_csv) instead of raising, so a campaign goes on to the next unit.
@@ -108,6 +114,22 @@ def _per_file_verdicts(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return verdicts
 
 
+def _excluded_by_disposition(manifest: dict[str, Any]) -> dict[str, str]:
+    """The inputs an applied campaign disposition excluded, by _file_key, with the reason.
+
+    The same reading of campaign_disposition (msdial-campaign-disposition.v1) as the execution gate's: a
+    disposition only decided, not applied (a unit outside a campaign), excludes nothing.
+    """
+    disposition = manifest.get("campaign_disposition")
+    if not isinstance(disposition, dict) or disposition.get("applied") is not True:
+        return {}
+    return {
+        _file_key(str(item["path"])): str(item.get("reason") or "")
+        for item in disposition.get("excluded_inputs") or []
+        if isinstance(item, dict) and str(item.get("path") or "").strip()
+    }
+
+
 def _acquisition_type(
     verdict: dict[str, Any] | None, declared: str
 ) -> tuple[str, str, str]:
@@ -175,8 +197,9 @@ def build_repository_analysis_rows(
 
     ``workspace`` is the unit's sample rows with Class projected (apply_class_proposal, or the default
     hierarchy); without it the manifest's own accepted proposal is applied. Returns the rows in the order
-    expand_paths_report lists the same inputs, the failures, and the counts they were checked against. A row whose input needs a Console alias
-    carries it in ``console_alias`` (path, kind, target); create_console_aliases makes it.
+    expand_paths_report lists the same inputs, the failures, the counts they were checked against, and the
+    inputs an applied campaign disposition excluded. A row whose input needs a Console alias carries it in
+    ``console_alias`` (path, kind, target); create_console_aliases makes it.
     """
     project = manifest.get("project") or {}
     workspace = workspace if workspace is not None else _unit_workspace(manifest)
@@ -193,6 +216,7 @@ def build_repository_analysis_rows(
     declared = declared_analysis_inputs(typed)
     verdicts = _per_file_verdicts(manifest)
     unit_mode = str(project.get("acquisition_mode") or "")
+    excluded = _excluded_by_disposition(manifest)
     # Which declared input each candidate is, answered as the lease's allow-list answered it: by path, at
     # the place its archive put an archived container, else through the sample its lineage row names.
     matched = (
@@ -225,9 +249,26 @@ def build_repository_analysis_rows(
     used: dict[str, str] = {}
     declared_order_files: list[str] = []
     rows: list[dict[str, Any]] = []
-    listing = propose_injection_order([Path(item).stem for item in candidates])
+    excluded_inputs: list[dict[str, Any]] = []
+    excluded_forms: set[str] = set()
+    excluded_samples: set[str] = set()
+    kept: list[str] = []
+    for candidate in candidates:
+        key = _file_key(candidate)
+        if key not in excluded:
+            kept.append(candidate)
+            continue
+        form = declared_of.get(candidate, "")
+        sample_id = str(declared[form].get("sample_id") or "") if form else ""
+        sample_id = sample_id or str((lineage_by_key.get(key) or {}).get("sample_id") or "")
+        excluded_inputs.append({"path": candidate, "reason": excluded[key], "sample_id": sample_id})
+        if form:
+            excluded_forms.add(form)
+        if sample_id:
+            excluded_samples.add(sample_id)
+    listing = propose_injection_order([Path(item).stem for item in kept])
 
-    for position, candidate in enumerate(candidates, start=1):
+    for position, candidate in enumerate(kept, start=1):
         path = Path(candidate)
         key = _file_key(candidate)
         lineage_row = lineage_by_key.get(key)
@@ -344,8 +385,15 @@ def build_repository_analysis_rows(
             undeclared,
         ))
     if declared:
-        absent = [str(declared[form].get("path") or form) for form, found in matched.items() if not found]
-        twice = [str(declared[form].get("path") or form) for form, found in matched.items() if len(found) > 1]
+        found_kept = {
+            form: [item for item in found if _file_key(item) not in excluded] for form, found in matched.items()
+        }
+        absent = [
+            str(declared[form].get("path") or form)
+            for form, found in found_kept.items()
+            if not found and form not in excluded_forms
+        ]
+        twice = [str(declared[form].get("path") or form) for form, found in found_kept.items() if len(found) > 1]
         if absent:
             failures.append(_failure(
                 "analysis_input_not_found",
@@ -359,7 +407,9 @@ def build_repository_analysis_rows(
                 twice,
             ))
         without_input = sorted(
-            str(row.get("sample_id") or "") for row in samples if str(row.get("sample_id") or "") not in used
+            str(row.get("sample_id") or "")
+            for row in samples
+            if str(row.get("sample_id") or "") not in used and str(row.get("sample_id") or "") not in excluded_samples
         )
         if without_input:
             failures.append(_failure(
@@ -399,10 +449,21 @@ def build_repository_analysis_rows(
             "can read, so no alias inside it can be.",
             [Path(row["input_path"]).name for row in rows if row["console_alias"]],
         ))
+    if not rows:
+        failures.append(_failure(
+            "no_analysis_input",
+            "No input of the unit is left to analyse"
+            + (f": the campaign disposition excluded all {len(excluded_inputs)}." if excluded_inputs else "."),
+            [Path(item["path"]).name for item in excluded_inputs],
+        ))
     unused_samples = (
         []
         if declared
-        else sorted(str(row.get("sample_id") or "") for row in samples if str(row.get("sample_id") or "") not in used)
+        else sorted(
+            str(row.get("sample_id") or "")
+            for row in samples
+            if str(row.get("sample_id") or "") not in used and str(row.get("sample_id") or "") not in excluded_samples
+        )
     )
     return {
         "schema": SCHEMA,
@@ -421,6 +482,8 @@ def build_repository_analysis_rows(
         # Where the Catalog declared no inputs (an archive unit), a sample row the download did not deliver
         # is said here rather than failed: its inputs are found after the download, by name.
         "samples_without_input": unused_samples,
+        # The inputs the applied campaign disposition excluded, with its reasons and their samples.
+        "excluded_inputs": excluded_inputs,
         "aliases": [row["console_alias"] for row in rows if row["console_alias"]],
         "acquisition_types": sorted({row["acquisition_type"] for row in rows if row["acquisition_type"]}),
     }
@@ -600,6 +663,7 @@ def record_analysis_csv(
         "aliases": len(built["aliases"]),
         "class_id_aliases": dict(built["class_id_aliases"]),
         "samples_without_input": list(built["samples_without_input"]),
+        "excluded_inputs": [dict(item) for item in built.get("excluded_inputs") or []],
         "recorded_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -608,11 +672,17 @@ def record_analysis_csv(
         for item in (lineage or {}).get("rows") or []:
             row = by_key.get(_file_key(str(item.get("path") or "")))
             if row is None:
+                # No row in this CSV (the disposition excluded it): nothing an earlier CSV said of it stands.
+                item["file_name"] = ""
+                for stale in ("console_path", "console_alias", "file_name_reason"):
+                    item.pop(stale, None)
                 continue
             item["file_name"] = row["file_name"]
             item["console_path"] = row["file_path"]
             if row.get("file_name_reason"):
                 item["file_name_reason"] = row["file_name_reason"]
+            else:
+                item.pop("file_name_reason", None)
             if row["console_alias"]:
                 item["console_alias"] = dict(row["console_alias"])
             else:

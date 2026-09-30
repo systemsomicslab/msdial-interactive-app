@@ -1113,6 +1113,111 @@ class TheHeaderOrderIsRecordedByTheNamesTheCsvCarries(unittest.TestCase):
         self.assertEqual([2, 1], [row["analytical_order"] for row in built["rows"]])
 
 
+def _exclude(manifest_path: Path, names: list[str], reason: str = "ion_mobility_out_of_scope", applied: bool = True) -> None:
+    """Record a campaign disposition that runs the unit and excludes the inputs of these names."""
+
+    def change(manifest: dict) -> None:
+        manifest["campaign_disposition"] = {
+            "schema": "msdial-campaign-disposition.v1",
+            "disposition": "run",
+            "applied": applied,
+            "reasons": [],
+            "warnings": [],
+            "excluded_inputs": [
+                {"path": path, "reason": reason} for path in manifest["input_candidates"] if Path(path).name in names
+            ],
+            "split_key": None,
+        }
+
+    update_manifest(manifest_path, change)
+
+
+class AnInputTheDispositionExcludedIsNoRow(unittest.TestCase):
+    """classify_preflight may run a unit and exclude some of its inputs, which stay input candidates."""
+
+    def test_an_excluded_folder_gets_no_row_and_its_sample_is_not_counted_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = _leased_unit(Path(temporary))
+            _set_preflight(manifest_path, {"*": "AIF"})
+            _exclude(manifest_path, ["190827_025pp.raw"])
+            built = build_repository_analysis_rows(read_manifest(manifest_path))
+
+        self.assertEqual([], built["failures"])
+        self.assertEqual(11, len(built["rows"]))
+        self.assertNotIn("190827_025pp", [row["file_name"] for row in built["rows"]])
+        self.assertEqual(
+            [("190827_025pp.raw", "ion_mobility_out_of_scope", "standard sample")],
+            [(Path(item["path"]).name, item["reason"], item["sample_id"]) for item in built["excluded_inputs"]],
+        )
+        self.assertEqual(list(range(1, 12)), sorted(row["listing_order"] for row in built["rows"]))
+
+    def test_the_csv_record_names_the_excluded_input_and_the_lineage_keeps_no_csv_name_for_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = _leased_unit(Path(temporary))
+            _set_preflight(manifest_path, {"*": "AIF"})
+            with patch.object(mcp_server, "_request_json", side_effect=_no_backend):
+                mcp_server.msdial_prepare_repository_reanalysis(
+                    hierarchy=["Plant"], confirmed=True, manifest_path=str(manifest_path)
+                )
+                _exclude(manifest_path, ["190827_025pp.raw"])
+                prepared = mcp_server.msdial_prepare_repository_reanalysis(
+                    hierarchy=["Plant"], confirmed=True, manifest_path=str(manifest_path)
+                )
+            with open(prepared["input_path"], encoding="utf-8-sig", newline="") as handle:
+                written = list(csv.DictReader(handle))
+            manifest = read_manifest(manifest_path)
+            files = workflow.read_analysis_csv(Path(prepared["input_path"]))["files"]
+            gate = evaluate_repository_execution_gate(
+                {"repository_run_manifest": str(manifest_path), "output_root": prepared["output_root"],
+                 "ion_mode": "Positive", "files": files}
+            )
+
+        self.assertEqual(11, len(written))
+        self.assertEqual(
+            ["ion_mobility_out_of_scope"], [item["reason"] for item in manifest["analysis_csv"]["excluded_inputs"]]
+        )
+        self.assertEqual(1, len(prepared["preview"]["excluded_inputs"]))
+        excluded = next(row for row in manifest["input_lineage"]["rows"] if row["path"].endswith("190827_025pp.raw"))
+        self.assertNotIn("console_path", excluded)
+        self.assertNotIn("acquisition_type", excluded)
+        self.assertEqual("", excluded["file_name"])
+        self.assertTrue(gate["allowed"], gate["blockers"])
+
+    def test_a_disposition_decided_but_not_applied_excludes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = _leased_unit(Path(temporary))
+            _set_preflight(manifest_path, {"*": "AIF"})
+            _exclude(manifest_path, ["190827_025pp.raw"], applied=False)
+            built = build_repository_analysis_rows(read_manifest(manifest_path))
+
+        self.assertEqual(12, len(built["rows"]))
+        self.assertEqual([], built["excluded_inputs"])
+
+    def test_an_excluded_input_whose_name_needs_an_alias_gets_none(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "unit"
+            manifest_path = _hand_made_unit(root, ["S1,rep1.raw", "b.mzML"])
+            _exclude(manifest_path, ["S1,rep1.raw"], reason="raw_header_unreadable")
+            built = build_repository_analysis_rows(read_manifest(manifest_path))
+            failures = create_console_aliases(built)
+            made = (root / "raw" / ALIAS_DIRECTORY).exists()
+
+        self.assertEqual([], built["failures"] + failures)
+        self.assertEqual(["b"], [row["file_name"] for row in built["rows"]])
+        self.assertEqual([], built["samples_without_input"])
+        self.assertEqual([], built["aliases"])
+        self.assertFalse(made)
+
+    def test_a_unit_whose_every_input_was_excluded_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = _hand_made_unit(Path(temporary) / "unit", ["a.mzML", "b.mzML"])
+            _exclude(manifest_path, ["a.mzML", "b.mzML"], reason="acquisition_unresolved")
+            built = build_repository_analysis_rows(read_manifest(manifest_path))
+
+        self.assertEqual(["no_analysis_input"], [item["code"] for item in blocking_failures(built)])
+        self.assertEqual(["a.mzML", "b.mzML"], built["failures"][0]["inputs"])
+
+
 def _zip(entries: dict[str, bytes]) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as handle:
