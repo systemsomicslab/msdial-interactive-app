@@ -4,6 +4,44 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.12] - Unreleased
+
+### Added
+- `msdial_app/raw_metadata_extractor.py` gives the raw-metadata extractor the
+  kind of identity the Console already has. Until now preflight knew it only
+  by path, size and mtime, and the binary in use names 448cc99 in its
+  ProductVersion while its tree is at edcc2e6. Nothing selects or runs the
+  extractor differently yet.
+  - `plan_extractor_build` previews a build at msrawdataworkbench b34c857a5
+    and MsdialWorkbench c471463a5 into
+    `RawMetadataExtractor-b34c857a5-c471463a5\{msrawdataworkbench,MsdialWorkbench}`.
+    The trees are local clones (`git clone --no-hardlinks --no-checkout`,
+    then a detached checkout), never worktrees in the checkouts they come
+    from. The command passes `-p:SolutionDir=<tree>\` with its trailing
+    separator and runs without `EAZFUSCATOR_NET_HOME`. The preview clones,
+    builds and writes nothing, reports its blockers, and lists the upstream
+    fetch it leaves out.
+  - `record_build` writes `raw-metadata-extractor-build-provenance.json`
+    beside the exe, once: the binary's sha256; an inventory sha256 over every
+    file in the output folder; the ProductVersion of the exe,
+    `RawDataHandler.dll`, `Common.dll` and `NCDK.dll`; the
+    `project.assets.json` sha256; the git state of both trees, the SDK and the
+    command. It refuses unless the binary is
+    `RawMetadataConsoleApp\bin\Release\net48\RawMetadataConsoleApp.exe` in the
+    recorded tree (and the plan's `binary_path` when a plan is given), and
+    refuses a record the build contradicts: an assembly whose embedded
+    revision is not its tree's head, a restore graph that compiled a project
+    from outside the two trees, or a Common tree that is not the sibling the
+    project references.
+  - `inspect_raw_metadata_extractor` re-hashes the folder and returns
+    `verified`, `absent`, `stale_mismatch` (naming the changed, added and
+    removed files), `unreadable` or `dirty_source`, with `inventory_sha256`
+    and `file_count` whenever the binary exists. A vendor DLL swapped beside
+    an unchanged exe therefore reads as stale, and an extractor without a
+    record is still identified by the files it ran with.
+  - `record_verification` adds the post-build verification block, which is
+    not part of the identity.
+
 ## [0.5.11] - Unreleased
 
 ### Added
