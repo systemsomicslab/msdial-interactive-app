@@ -94,7 +94,14 @@ official releases** reports stable and prerelease Console channels separately.
 **Build and select local source** runs `dotnet build` and writes
 `msdial-console-build-provenance.json` beside the binary. That record contains
 the Git commit, dirty-tree status, build command, timestamp, and binary SHA-256,
-so private developer builds are not mistaken for published releases.
+so private developer builds are not mistaken for published releases. It also
+holds an inventory of every file beside the binary, with the ProductVersions of
+the key assemblies (RawDataHandler.dll, Common.dll, MsdialCore.dll and the other
+MS-DIAL assemblies), so a dependency swapped after the build inspects as
+`stale_mismatch` naming the changed files. A record written before inventories
+still verifies, with the warning `inventory_not_recorded`;
+`scripts/record-console-inventory.py <MSDIALCUI.exe> --confirmed` adds the
+inventory to it without a rebuild.
 **Fetch and compare source** updates only the Git remote-tracking references and
 reports how far the current checkout is ahead of or behind `origin/master`; it
 does not switch branches, merge, or discard local changes. The build action

@@ -13,7 +13,9 @@ from typing import Any, Callable
 from .user_settings import save_path_settings
 from .workflow import (
     CONSOLE_BUILD_PROVENANCE,
+    CONSOLE_INVENTORY_NOT_RECORDED,
     console_git_state,
+    console_inventory,
     inspect_console_path,
 )
 
@@ -198,6 +200,9 @@ def build_local_console(
         "framework": plan["framework"],
         "configuration": plan["configuration"],
         "command": plan["command"],
+        # Every file the build put beside the binary, so a dependency swapped after it (a
+        # RawDataHandler.dll from another package) is not the build this record describes.
+        **_inventory_fields(output.parent, "at_build"),
     }
     provenance_path = output.parent / CONSOLE_BUILD_PROVENANCE
     provenance_path.write_text(
@@ -220,3 +225,88 @@ def build_local_console(
         }
     )
     return result
+
+
+def _inventory_fields(output_directory: Path, when: str) -> dict[str, Any]:
+    """The inventory a build record carries. A folder too large to inventory records only that."""
+    inventory = console_inventory(output_directory)
+    fields: dict[str, Any] = {
+        "inventory_status": inventory["inventory_status"],
+        "inventory_recorded": when,
+        "inventory_recorded_at": dt.datetime.now().astimezone().isoformat(),
+        "key_assemblies": inventory["key_assemblies"],
+    }
+    if inventory["inventory_status"] == "complete":
+        fields.update(
+            {
+                "inventory_sha256": inventory["inventory_sha256"],
+                "inventory_file_count": inventory["inventory_file_count"],
+                "inventory": inventory["inventory"],
+            }
+        )
+    return fields
+
+
+def record_console_inventory(console_path: str | Path, confirmed: bool = False) -> dict[str, Any]:
+    """Add the dependency inventory to an existing build record, without rebuilding.
+
+    A record written before inventories were (the pinned c471463a5 and f56d4478a builds) names
+    MSDIALCUI.exe and the git head only, and inspects as verified with the warning
+    inventory_not_recorded. This adds the sha256 of every file now beside the binary, and the key
+    assemblies' ProductVersions, and leaves every other field of the record as it was. The record
+    says the inventory was taken after the build (inventory_recorded: after_build, and when), since
+    it vouches for the folder as it is now, not as the build left it.
+
+    Only a record that still names this binary takes an inventory: a stale or unreadable one
+    describes something else, and one that already carries an inventory is left alone. With
+    confirmed=False nothing is written and the result is the preview: the record, the digest and
+    the files it would hold. With confirmed=True the record is replaced atomically and the result
+    carries the inspection after the write.
+    """
+    inspected = inspect_console_path(console_path)
+    if not inspected.get("exists"):
+        raise ValueError(f"The MS-DIAL Console was not found: {inspected.get('path')}")
+    record_path = Path(str(inspected["path"])).parent / CONSOLE_BUILD_PROVENANCE
+    status = str(inspected.get("provenance_status") or "absent")
+    plan: dict[str, Any] = {
+        "record_path": str(record_path),
+        "provenance_status": status,
+        "confirmed": bool(confirmed),
+        "written": False,
+    }
+    if status == "verified" and CONSOLE_INVENTORY_NOT_RECORDED not in (
+        inspected.get("provenance_warnings") or []
+    ):
+        # It carries one already, or its build found the folder too large to inventory.
+        return {
+            **plan,
+            "reason": "already_recorded"
+            if "inventory_sha256" in (inspected.get("provenance") or {})
+            else "inventory_too_large",
+            "inventory_sha256": inspected.get("inventory_sha256", ""),
+            "inspection": inspected,
+        }
+    if status != "verified":
+        raise ValueError(
+            f"The build record beside this Console is {status}, so it does not name this binary; "
+            "rebuild through msdial_build_console_from_local_source rather than add an inventory to it."
+        )
+    record = json.loads(record_path.read_text(encoding="utf-8-sig"))
+    fields = _inventory_fields(record_path.parent, "after_build")
+    plan.update(
+        {
+            "inventory_status": fields["inventory_status"],
+            "inventory_sha256": fields.get("inventory_sha256", ""),
+            "inventory_file_count": fields.get("inventory_file_count", 0),
+            "key_assemblies": fields["key_assemblies"],
+            "files": [entry["path"] for entry in fields.get("inventory", [])],
+        }
+    )
+    if not confirmed:
+        return plan
+    record.update(fields)
+    # Beside the record, under a name the inventory leaves out, and moved over it in one step.
+    temporary = record_path.with_name(record_path.name + ".tmp")
+    temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, record_path)
+    return {**plan, "written": True, "inspection": inspect_console_path(console_path)}

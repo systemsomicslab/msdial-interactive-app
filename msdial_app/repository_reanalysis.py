@@ -2500,6 +2500,8 @@ def record_run_start(
             "version": str(identity.get("version") or ""),
             "binary_sha256": str(identity.get("binary_sha256") or ""),
             "assembly_sha256": str(identity.get("assembly_sha256") or ""),
+            # Every file beside the binary, by one digest (workflow.console_inventory).
+            "inventory_sha256": str(identity.get("inventory_sha256") or ""),
             "provenance_status": str(identity.get("status") or identity.get("provenance_status") or ""),
         },
         "command_sha256": (
