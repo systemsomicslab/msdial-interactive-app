@@ -2,7 +2,8 @@
 
 Repository raw data arrive packed. In the declared campaign pool 4,672 distinct URLs are zip, 33 are
 7z, 19 are rar and 9 are tar.gz, and the acquisition-unknown pool adds 159 7z and 161 rar objects and
-a bare .gz. The lease code recognised only .zip, .tar, .tar.gz and .tgz: a .7z or .rar landed as an
+a bare .gz; MTBLS688 publishes its LC-MS files only as legacy LZMA-alone .lzma streams, which have no
+magic bytes. The lease code recognised only .zip, .tar, .tar.gz and .tgz: a .7z or .rar landed as an
 opaque file that input discovery ignored, and a bare .gz was routed as an archive and never opened.
 This module is the one place that decides what an archive is and how it is opened.
 
@@ -70,20 +71,25 @@ _SUFFIX_KINDS = tuple(
             ".tar.bz2": "tar.bz2", ".tbz2": "tar.bz2", ".tbz": "tar.bz2",
             ".tar.xz": "tar.xz", ".txz": "tar.xz",
             ".zip": "zip", ".tar": "tar", ".7z": "7z", ".rar": "rar",
-            ".gz": "gz", ".bz2": "bz2", ".xz": "xz",
+            ".gz": "gz", ".bz2": "bz2", ".xz": "xz", ".lzma": "lzma",
         }.items(),
         key=lambda item: -len(item[0]),
     )
 )
 ARCHIVE_SUFFIXES = frozenset(suffix for suffix, _ in _SUFFIX_KINDS)
 TAR_KINDS = frozenset({"tar", "tar.gz", "tar.bz2", "tar.xz"})
-STREAM_KINDS = frozenset({"gz", "bz2", "xz"})
+# 'lzma' is the legacy LZMA-alone stream of LZMA Utils, which xz replaced. MTBLS688 publishes its
+# two LC-MS units only as x.mzXML.lzma. It has no magic bytes and no checksum (see
+# _looks_like_lzma_alone); a tar inside one is expanded as a nested archive, not read as tar.lzma.
+STREAM_KINDS = frozenset({"gz", "bz2", "xz", "lzma"})
 
 # What an archived vendor container unpacks to. X.raw.zip is the Waters folder X.raw (or a Thermo
 # file of that name), X.d.zip the Agilent or Bruker folder X.d. Only the folder kinds get a directory
 # of their own when their members are stored without it; the file kinds already carry their name.
+# .mzxml is not an MS-DIAL input, but it is converted to one (mzxml_conversion), so x.mzXML.lzma
+# stands for x.mzXML as x.mzML.gz stands for x.mzML.
 CONTAINER_SUFFIXES = (
-    ".raw", ".d", ".wiff", ".wiff2", ".mzml", ".lcd", ".cdf", ".qgd", ".abf",
+    ".raw", ".d", ".wiff", ".wiff2", ".mzml", ".mzxml", ".lcd", ".cdf", ".qgd", ".abf",
 )
 FOLDER_CONTAINER_SUFFIXES = (".raw", ".d")
 
@@ -251,6 +257,43 @@ def _looks_like_tar(block: bytes) -> bool:
     return computed == int(field_text, 8)
 
 
+def _looks_like_lzma_alone(path: Path) -> bool:
+    """Whether the bytes are an LZMA-alone ('.lzma') stream, which has no magic bytes to read.
+
+    Its 13-byte header is decoded instead and held to what LZMA Utils and xz write, the same rules
+    liblzma applies when it has to tell such a stream from noise: a properties byte below 225 whose
+    lc + lp is at most 4; a dictionary size of 2^n or 2^n + 2^(n-1), or 0xFFFFFFFF; an uncompressed
+    size that is unknown (all ones) or below 256 GiB. Then the range coder's first byte, which an
+    encoder always writes as zero, and then the first block must decode. An HTML page named .lzma
+    fails the first test.
+    """
+    with open(path, "rb") as handle:
+        head = handle.read(65536)
+    if len(head) < 14:
+        return False
+    properties = head[0]
+    if properties >= 225:
+        return False
+    literal_context, rest = properties % 9, properties // 9
+    if literal_context + rest % 5 > 4:
+        return False
+    dictionary = int.from_bytes(head[1:5], "little")
+    if dictionary != 0xFFFFFFFF:
+        lowest = dictionary & -dictionary
+        if not dictionary or dictionary // lowest not in (1, 3):
+            return False
+    uncompressed = int.from_bytes(head[5:13], "little")
+    if uncompressed != (1 << 64) - 1 and uncompressed >= 1 << 38:
+        return False
+    if head[13] != 0:
+        return False
+    try:
+        lzma.LZMADecompressor(format=lzma.FORMAT_ALONE).decompress(head, max_length=65536)
+    except (lzma.LZMAError, EOFError):
+        return False
+    return True
+
+
 def _describe_bytes(head: bytes) -> str:
     if not head:
         return "an empty file"
@@ -307,6 +350,9 @@ def detect_archive(
     elif signature in ("gzip", "bzip2", "xz"):
         stream = {"gzip": "gz", "bzip2": "bz2", "xz": "xz"}[signature]
         kind = f"tar.{stream}" if _stream_holds_tar(path, stream) else stream
+    elif not signature and name_kind == "lzma" and _looks_like_lzma_alone(path):
+        # No magic to read, so the name is what claims it and the decoded header what confirms it.
+        kind, signature = "lzma", "lzma_alone"
     if not kind:
         raise ArchiveError(
             "not_an_archive",
@@ -324,6 +370,8 @@ def archive_kind(path: str | os.PathLike[str], name: str | None = None) -> str:
 
 
 def _open_stream(path: Path, stream: str):
+    if stream == "lzma":
+        return lzma.open(path, "rb", format=lzma.FORMAT_ALONE)
     return {"gz": gzip.open, "bz2": bz2.open, "xz": lzma.open}[stream](path, "rb")
 
 
@@ -1241,7 +1289,7 @@ def list_archive(
             ) from error
         return ArchiveListing(detection, "tarfile", members, _python_tool("tarfile"))
     elif kind in STREAM_KINDS:
-        module = {"gz": "gzip", "bz2": "bz2", "xz": "lzma"}[kind]
+        module = {"gz": "gzip", "bz2": "bz2", "xz": "lzma", "lzma": "lzma"}[kind]
         member = ArchiveMember(name=archive_stem(path.name), size=-1)
         return ArchiveListing(detection, module, [member], _python_tool(module))
     try:
@@ -1379,6 +1427,16 @@ def file_sha256(path: str | os.PathLike[str]) -> str:
         for chunk in iter(lambda: handle.read(8 * _CHUNK), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def file_digests(path: str | os.PathLike[str]) -> dict[str, str]:
+    """sha256, md5 and sha1 of a file, in one read."""
+    digests = {name: hashlib.new(name) for name in ("sha256", "md5", "sha1")}
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * _CHUNK), b""):
+            for digest in digests.values():
+                digest.update(chunk)
+    return {name: digest.hexdigest() for name, digest in digests.items()}
 
 
 def _now() -> str:
@@ -1718,6 +1776,9 @@ class _Extraction:
             if kind == "xz":
                 crc_verified = _xz_has_check(archive)
                 integrity = "stream_check" if crc_verified else "none"
+            elif kind == "lzma":
+                # LZMA-alone carries no checksum at all; only the archive's own hash vouches for it.
+                integrity, crc_verified = "none", False
             else:
                 integrity, crc_verified = "stream_crc32", True
         # Metadata was validated and written like any member; it goes before the tree is compared,
@@ -1899,7 +1960,9 @@ def _expand_nested(context: _Extraction, staging: Path, records: dict[str, dict[
         context.counter += 1
         work = parent / f"~{context.counter}.partial"
         final = parent / prefix if prefix else parent
-        sha256 = file_sha256(archive)
+        # All three, because the archive is gone once it has expanded, and a repository may have
+        # published any of them for it: MB-POST lists an MD5 for each per-sample zip in its tar.
+        digests = file_digests(archive)
         record = context.expand(archive, listing, work, depth=depth, label=label, bases=[work, final])
         entries = [prefix] if prefix else os.listdir(work)
         for entry in entries:
@@ -1930,7 +1993,9 @@ def _expand_nested(context: _Extraction, staging: Path, records: dict[str, dict[
                 "archive_path": label,
                 "destination_relative": relative,
                 "archive_bytes": row["size"],
-                "archive_sha256": sha256,
+                "archive_sha256": digests["sha256"],
+                "archive_md5": digests["md5"],
+                "archive_sha1": digests["sha1"],
                 "destination_rule": rule,
                 "container_stem": prefix if rule == "container_stem" else "",
                 **_container_record(archive.name, container, parent_relative),

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import http.server
+import json
 import tempfile
 import threading
 import unittest
@@ -228,6 +229,168 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(60_000, seen[0][0])
         self.assertEqual(len(PAYLOAD), seen[0][1], "and the total is the whole object")
         self.assertEqual(len(PAYLOAD), seen[-1][0])
+
+
+class _ValidatingHandler(http.server.BaseHTTPRequestHandler):
+    """Serves the current object with an ETag, and honours a Range only under a matching If-Range.
+
+    That is what RFC 9110 asks of a server: an If-Range that does not match the current object means
+    "send all of it", so a .part begun on an older version is never continued with a newer tail. The
+    first request can be cut short, which is how a transfer is interrupted. With ignore_if_range set it
+    is the server RFC 9110 does not describe: one that answers any Range with a 206 of the current
+    object, whatever If-Range said.
+    """
+
+    def log_message(self, *args) -> None:  # noqa: D102 - quiet
+        pass
+
+    def do_GET(self) -> None:  # noqa: N802 - http.server's interface
+        server = self.server
+        payload = server.payload
+        requested = self.headers.get("Range")
+        if_range = self.headers.get("If-Range")
+        server.headers_seen.append({"Range": requested, "If-Range": if_range})
+        if server.truncate_next:
+            server.truncate_next = False
+            self.send_response(200)
+            self.send_header("ETag", server.etag)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload[: len(payload) // 4])
+            return
+        honoured = if_range is None or if_range == server.etag or getattr(server, "ignore_if_range", False)
+        if requested and honoured:
+            start = int(requested.split("=", 1)[1].split("-", 1)[0])
+            body = payload[start:]
+            self.send_response(206)
+            self.send_header("ETag", server.etag)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Range", f"bytes {start}-{len(payload) - 1}/{len(payload)}")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(200)
+        self.send_header("ETag", server.etag)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+class IfRangeTests(unittest.TestCase):
+    """A .part keeps the validators it was begun under, and a resume sends them back as If-Range."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.destination = Path(self.directory.name) / "object.zip"
+        self.validators = self.destination.with_name("object.zip.part.json")
+        self.client = RepositoryHttpClient(timeout=10)
+        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), _ValidatingHandler)
+        self.httpd.payload = PAYLOAD
+        self.httpd.etag = '"v1"'
+        self.httpd.truncate_next = True
+        self.httpd.headers_seen = []
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+        self.url = f"http://127.0.0.1:{self.httpd.server_port}/object.zip"
+        with self.assertRaises(ValueError):
+            self.client.download(self.url, self.destination, 10_000_000)
+
+    def test_the_validators_of_an_interrupted_transfer_are_kept_beside_it(self) -> None:
+        recorded = json.loads(self.validators.read_text(encoding="utf-8"))
+        self.assertEqual(
+            ('"v1"', self.url, len(PAYLOAD)), (recorded["etag"], recorded["url"], recorded["content_length"])
+        )
+
+    def test_an_unchanged_object_resumes_under_its_validator(self) -> None:
+        result = self.client.download(self.url, self.destination, 10_000_000)
+
+        self.assertEqual(
+            {"Range": f"bytes={len(PAYLOAD) // 4}-", "If-Range": '"v1"'}, self.httpd.headers_seen[-1]
+        )
+        self.assertEqual(len(PAYLOAD) // 4, result["resumed_from_bytes"])
+        self.assertEqual((SHA256, '"v1"'), (result["sha256"], result["etag"]))
+        self.assertFalse(self.validators.exists(), "the validators go with the .part")
+
+    def test_a_changed_object_restarts_from_zero(self) -> None:
+        """THE POINT. Without If-Range the server would send the new object's tail after the old head."""
+        changed = bytes(reversed(PAYLOAD))
+        self.httpd.payload, self.httpd.etag = changed, '"v2"'
+
+        result = self.client.download(self.url, self.destination, 10_000_000)
+
+        self.assertEqual('"v1"', self.httpd.headers_seen[-1]["If-Range"])
+        self.assertEqual(0, result["resumed_from_bytes"])
+        self.assertEqual(changed, self.destination.read_bytes())
+        self.assertEqual(hashlib.sha256(changed).hexdigest(), result["sha256"])
+        self.assertEqual('"v2"', result["etag"])
+
+    def test_a_weak_etag_is_never_sent_as_if_range(self) -> None:
+        recorded = json.loads(self.validators.read_text(encoding="utf-8"))
+        recorded.update(etag='W/"v1"', last_modified="Wed, 30 Sep 2026 00:00:00 GMT")
+        self.validators.write_text(json.dumps(recorded), encoding="utf-8")
+
+        self.client.download(self.url, self.destination, 10_000_000)
+
+        self.assertEqual("Wed, 30 Sep 2026 00:00:00 GMT", self.httpd.headers_seen[-1]["If-Range"])
+
+    def test_a_refused_restart_leaves_no_old_head_under_the_new_validators(self) -> None:
+        """The old head went only when the new object was written, so a refusal in between armed a mix.
+
+        The object changes and grows past this attempt's limit: the server answers the If-Range with
+        a 200 and the limit refuses it. The .part still held v1's head, and v2's validators had
+        already been written beside it, so the next attempt sent If-Range "v2", got a 206, and
+        returned v1's head with v2's tail as a successful download.
+        """
+        larger = bytes(reversed(PAYLOAD)) * 2
+        self.httpd.payload, self.httpd.etag = larger, '"v2"'
+        with self.assertRaises(ValueError):
+            self.client.download(self.url, self.destination, len(PAYLOAD) + 1)
+
+        result = self.client.download(self.url, self.destination, 10_000_000)
+
+        self.assertEqual({"Range": None, "If-Range": None}, self.httpd.headers_seen[-1])
+        self.assertEqual(0, result["resumed_from_bytes"])
+        self.assertEqual(hashlib.sha256(larger).hexdigest(), result["sha256"])
+
+    def test_a_206_of_a_changed_object_is_not_appended(self) -> None:
+        """A server that ignores If-Range still names, in its 206, the object the tail is from."""
+        changed = bytes(reversed(PAYLOAD))
+        self.httpd.payload, self.httpd.etag = changed, '"v2"'
+        self.httpd.ignore_if_range = True
+
+        result = self.client.download(self.url, self.destination, 10_000_000)
+
+        self.assertEqual('"v1"', self.httpd.headers_seen[-2]["If-Range"], "the resume was offered")
+        self.assertEqual({"Range": None, "If-Range": None}, self.httpd.headers_seen[-1], "then refetched")
+        self.assertEqual(0, result["resumed_from_bytes"])
+        self.assertEqual(changed, self.destination.read_bytes())
+        self.assertEqual('"v2"', result["etag"])
+
+    def test_a_weak_prefix_alone_is_not_a_changed_object(self) -> None:
+        recorded = json.loads(self.validators.read_text(encoding="utf-8"))
+        recorded.update(etag='W/"v1"')
+        self.validators.write_text(json.dumps(recorded), encoding="utf-8")
+        self.httpd.ignore_if_range = True
+
+        result = self.client.download(self.url, self.destination, 10_000_000)
+
+        self.assertEqual(len(PAYLOAD) // 4, result["resumed_from_bytes"])
+        self.assertEqual(SHA256, result["sha256"])
+
+
+class NoValidatorTests(unittest.TestCase):
+    def test_a_server_that_sends_no_validator_leaves_no_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "object.zip"
+            server = _Server("ranges")
+            self.addCleanup(server.close)
+            result = RepositoryHttpClient(timeout=10).download(server.url, destination, 10_000_000)
+
+            self.assertNotIn("etag", result)
+            self.assertNotIn("last_modified", result)
+            self.assertFalse(destination.with_name("object.zip.part.json").exists())
 
 
 if __name__ == "__main__":  # pragma: no cover

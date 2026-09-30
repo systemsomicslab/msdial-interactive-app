@@ -7,6 +7,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
+from msdial_app.archives import ArchiveError
 from msdial_app.repository_reanalysis import (
     EligibilityPolicy,
     RepositoryFile,
@@ -22,7 +23,7 @@ from msdial_app.repository_reanalysis import (
     _metabobank_raw_references,
     _raw_names_from_assay,
     _summarize_raw_metadata,
-    _extract_archive,
+    _extract_into_data_root,
     _common_input_path,
     run_raw_metadata_preflight,
     cleanup_download_lease,
@@ -261,8 +262,15 @@ class RepositoryReanalysisTests(unittest.TestCase):
             archive = root / "bad.zip"
             with zipfile.ZipFile(archive, "w") as handle:
                 handle.writestr("../outside.txt", "unsafe")
-            with self.assertRaises(ValueError):
-                _extract_archive(archive, root / "data", 1024)
+            (root / "data").mkdir()
+            (root / "provenance").mkdir()
+            with self.assertRaises(ArchiveError) as refused:
+                _extract_into_data_root(
+                    archive, {"sha256": ""}, "", root / "data", root, root / "provenance", 1
+                )
+            self.assertEqual("unsafe_listing", refused.exception.reason)
+            self.assertEqual([], list((root / "data").iterdir()))
+            self.assertFalse((root / "outside.txt").exists())
 
     def test_discard_removes_only_rejected_raw_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

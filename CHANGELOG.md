@@ -4,6 +4,81 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.16] - Unreleased
+
+### Fixed
+- Metabolomics Workbench units can be leased. 661 of the 839 declared
+  campaign units list only a study archive with a published MD5.
+  `_verify_project_allowlist_checksums` used to search `raw\data` for the
+  archive's own name, found nothing once it had been extracted, and raised
+  "resolved to 0 extracted files" after the whole download. A downloaded
+  archive item (`raw_archive`, `shared_raw_archive`, or listed under the
+  archive's own name) now counts as `archives_verified_at_download`, from the
+  MD5 comparison made at download. A SHA-256 or SHA-1 on an archive is
+  compared with the archive afterwards, and a per-sample zip inside an MB-POST
+  tar with the digests taken before it expanded. The check uses one
+  relative-path index, so it is linear in the number of files.
+- `extracted_files` lists the unit's own members: the files its samples name,
+  their `.wiff.scan`, and the contents of the `.d`/`.raw` folders they name.
+  It used to be `[]` for every Workbench unit.
+- A per-sample container archive is attributed to its sample: `X.raw.zip`
+  stands for `X.raw` (`archives.container_alias`) in `_project_allowlist`,
+  `_sample_file_names` and the input lineage. A sample that names a plain
+  per-sample archive (`X.zip`) claims the files and the outermost `.d`/`.raw`
+  folder that came out of it. In the 2026-09-22 snapshot that affects 4,540
+  Workbench sample names in 76 units and 8,874 MetaboLights names in 159
+  units, each of which failed at the attribute stage.
+- A repository object is named by its percent-decoded URL basename.
+  MetaboLights serves `130612_EG_NaHCO3_1 mM-1.raw.zip` as `..._1%20mM-1.raw.zip`
+  (1,575 per-sample archives in 67 units), which used to unpack to a folder no
+  sample names. An encoded separator or a name Windows cannot hold is kept as
+  served.
+- Two per-sample zips whose members sit at their root no longer overwrite each
+  other's `_FUNC001.DAT`.
+- `.7z`, `.rar`, bare `.gz` and `.lzma` objects are extracted. An HTML page
+  saved as `.zip` is a failed download, not "no inputs".
+- A download refused after the server sent a changed object whole no longer
+  leaves the old `.part` beside the new object's validators, which let the
+  next attempt append the new object's tail to the old head. A 206 whose
+  ETag or Last-Modified differs from the stored one restarts from zero.
+
+### Changed
+- `create_download_lease` runs, and records in `lease_stages`, these stages:
+  fetch, verify_declared_checksums, extract, materialise and convert
+  (recorded as `not_used` until the download store and the mzXML converter are
+  wired in), discover, attribute and record. A failed lease records
+  `download_failure.stage` and, for an archive refusal, `archive_failure`.
+- Archives are routed and opened only through `archives.py`.
+  `ARCHIVE_SUFFIXES`, `_is_archive`, `_extract_archive` and the
+  five-times-the-download-limit extraction bound are removed. Each archive is
+  expanded into `raw\x<n>` under its guards, then moved into the data root
+  without replacing anything; identical files already in place are counted as
+  present, and any other collision refuses the archive before anything moves.
+  A file inside a vendor folder is never opened as an archive.
+- The manifest gains `archive_extractions[]` and `archive_warnings`. Member
+  listings go to `provenance\archive-members-<sha12>.tsv` with their sha256.
+  `downloads[]` entries record `archive` and `declared_checksum_algorithm`.
+- `input_lineage` rows of kind `extracted_member` and `archived_container`
+  carry a `basis`: `archive_declared_checksum` (the verified archive MD5, with
+  the chain of nested archives to the nearest verified one),
+  `member_declared_checksum` or `archive_download_hash`, and the member-listing
+  row that accounts for them. For such inputs the Materials and Methods say
+  "extracted from an archive whose published MD5 matched", never
+  "checksum-verified".
+- A repository download resumes only under the validator it began with: the
+  strong ETag, or Last-Modified, is kept in `<name>.part.json` and sent back as
+  If-Range.
+- `archives.py` reads legacy LZMA-alone `.lzma` streams, confirmed by decoding
+  the header. `.mzxml` is a container suffix, so `x.mzXML.lzma` stands for
+  `x.mzXML`. Nested archive records keep their sha256, md5 and sha1.
+- New agent capability: `repository_archive_extraction`.
+
+### Known limitations
+- A collision between two archives of one unit refuses the archive even when
+  the colliding file (a README, say) is not an input.
+- A plain archive that more than one sample names still fails at the
+  attribute stage, because whose files it holds is not known.
+
 ## [0.5.15] - Unreleased
 
 ### Added
