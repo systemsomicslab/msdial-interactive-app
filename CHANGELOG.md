@@ -4,6 +4,75 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.9] - Unreleased
+
+### Added
+- Campaign authorization records (`msdial_app/campaign_authorization.py`,
+  schema `msdial-campaign-authorization.v1`), the first piece of an
+  unattended campaign.
+  - A record holds the approval id, the campaign manifest digest, the covered
+    boundaries (1, 3, 4, 5 and `split`), the unit ids, the raw retention, and
+    the libraries by file name and sha256.
+  - `validate(unit_id, boundary)` returns a crossing record or refuses with
+    codes.
+  - Download (boundary 1), split, cleanup (5), preparation (3), run and
+    diagnostic (4) take `campaign_authorization_path`; the plan and batch-plan
+    tools report coverage.
+  - When the record covers the boundary for the unit, it stands in for
+    `confirmed=true`, and the crossing is written to the manifest's
+    `campaign_authorizations` before the step runs. With no record nothing
+    changes.
+  - A record that does not hold is refused (`reason:
+    campaign_authorization_refused`, `codes`), even when `confirmed=true` is
+    also passed. A record lifts no size limit, never covers boundaries 2 or 6,
+    and is refused when it carries a library location.
+- `input_lineage` in the run manifest (`msdial-input-lineage.v1`): one row per
+  analysis input with its kind (file, vendor_folder, archived_container,
+  extracted_member), source, checksums, declared names and sample id. When the
+  allow-list check compared a file's or an extracted member's own declared
+  md5, sha1 or sha256, the row carries `declared`, `declared_algorithm` and
+  `declared_verified: true`. Split parts inherit their rows. A manifest
+  without the block is legacy.
+- Re-entry by `manifest_path` in place of the download or diagnostic job id,
+  for the raw-metadata preflight, split, repository preparation, QA evidence,
+  the peak-height estimate, LC-MS QA and the publication report, after the
+  job registry has forgotten the job. Diagnostics record themselves in
+  `diagnostics/<job>/diagnostic-job.json`, and finalisation records the
+  production run as `finalized_run`.
+- `refresh_retained_artifacts`, called after a repository unit's publication
+  report, so the retained inventory lists the publication artifacts.
+- `MSDIAL_INTERACTIVE_JOBS_FILE` gives a backend its own job registry.
+- `msdial_app.process_liveness` reads whether a process is alive through
+  OpenProcess or psutil, never `os.kill`.
+
+### Changed
+- Unit manifests are written atomically (temporary file, fsync, `os.replace`)
+  under a per-manifest operating-system lock (`<name>.lock`). A crash leaves
+  the previous record readable, and two writers no longer lose each other's
+  update. Lock and temporary files are never retained artifacts.
+- Every unit-manifest reader goes through `read_manifest`, which waits out a
+  concurrent rename (on Windows the rename makes a reader fail with
+  PermissionError) for about 25 s and then raises `ManifestBusyError`. MCP
+  tools report `reason: manifest_busy` (retryable) and `os_error` as
+  structured failures instead of "Error executing tool".
+- `create_download_lease` records the lease before the first byte (`status:
+  downloading`), with `lease_owner` (lease id, job id, process id and creation
+  time, host), and refreshes `download_progress_at` while bytes arrive. A lease
+  that fails is recorded as `download_failed`, with the reason and the objects
+  that arrived, so `discard_download_lease` can release its bytes.
+- A retried lease keeps the record it replaces. Before its first write it
+  copies an existing manifest byte for byte to
+  `provenance\run-manifest.superseded-<UTC>.json`, unless that manifest is
+  itself an unfinished or discarded lease, and records the copy's path and
+  sha256 in `previous_manifest.superseded_copy` and `superseded_manifests`,
+  which every later record carries forward. A split parent
+  (`split_by_acquisition`) is not re-leased, and a lease into a workspace that
+  another live lease is still downloading into is refused.
+- `discard_download_lease` refuses a lease that is still downloading, unless
+  its owner is provably gone (the process has exited or its pid was reused);
+  it then records `stale_lease_discarded`. An owner that is alive, or cannot
+  be read, is still refused.
+
 ## [0.5.8] - Unreleased
 
 ### Fixed

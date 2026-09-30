@@ -57,6 +57,12 @@ def summarize_jobs(
             "split_repository_unit_by_acquisition",
             "confirmed_repository_raw_cleanup",
             "resumable_repository_raw_download",
+            # A campaign runner checks for these before it relies on them.
+            "durable_repository_manifests",
+            "repository_manifest_reentry",
+            "repository_input_lineage",
+            "campaign_authorization_v1",
+            "isolated_job_registry",
             "mzxml_requires_conversion_to_mzml",
             "automatic_alignment_rt_correction",
         ],
