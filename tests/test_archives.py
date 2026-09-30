@@ -216,6 +216,7 @@ class ArchiveDetectionTests(_Workspace):
             "a.tbz2": "tar.bz2", "a.tar.xz": "tar.xz", "a.txz": "tar.xz", "a.bz2": "bz2",
             "a.xz": "xz", "a.7z": "7z", "a.rar": "rar", "a.zip": "zip", "a.tar": "tar",
             "X.RAW.ZIP": "zip", "X.raw": "", "run.mzML": "", ".zip": "",
+            "x.mzXML.lzma": "lzma", "a.lzma": "lzma",
         }
         for name, kind in cases.items():
             with self.subTest(name=name):
@@ -238,6 +239,8 @@ class ArchiveDetectionTests(_Workspace):
             "g.rar": (b"Rar!\x1a\x07\x01\x00" + bytes(24), "rar"),
             "h.rar": (b"Rar!\x1a\x07\x00" + bytes(24), "rar"),
             "i.zip": (b"7z\xbc\xaf\x27\x1c" + bytes(26), "7z"),  # a 7z named .zip
+            "j.lzma": (lzma.compress(b"x" * 100, format=lzma.FORMAT_ALONE), "lzma"),
+            "k.lzma": (lzma.compress(b"x"), "xz"),  # an xz named .lzma
         }
         for name, (data, kind) in fixtures.items():
             with self.subTest(name=name):
@@ -263,7 +266,51 @@ class ArchiveDetectionTests(_Workspace):
         self.assertEqual("not_an_archive", caught.exception.reason)
         self.assertNothingWritten(destination, "ST001234.zip")
 
+    def test_an_lzma_alone_stream_is_confirmed_by_its_decoded_header(self) -> None:
+        """LZMA-alone has no magic bytes, so the name claims it and the header must decode (MTBLS688)."""
+        good = lzma.compress(b"<mzXML/>" * 100, format=lzma.FORMAT_ALONE)
+        self.assertEqual(b"\x5d", good[:1])
+        broken = {
+            "page.lzma": b"<!DOCTYPE html><html><body>404</body></html>" * 4,
+            "properties.lzma": b"\xff" + good[1:],               # lc/lp/pb out of range
+            "literals.lzma": bytes([4 * 9 + 8]) + good[1:],      # lc + lp above 4
+            "dictionary.lzma": good[:1] + (0x12345).to_bytes(4, "little") + good[5:],
+            "size.lzma": good[:5] + (1 << 40).to_bytes(8, "little") + good[13:],
+            "coder.lzma": good[:13] + b"\x01" + good[14:],        # the range coder starts with zero
+            "short.lzma": good[:10],
+        }
+        for name, data in broken.items():
+            with self.subTest(name=name):
+                path = self.root / name
+                path.write_bytes(data)
+                with self.assertRaises(ArchiveError) as caught:
+                    detect_archive(path)
+                self.assertEqual("not_an_archive", caught.exception.reason)
+        path = self.root / "x.mzXML.lzma"
+        path.write_bytes(good)
+        detection = detect_archive(path)
+        self.assertEqual(("lzma", "lzma_alone"), (detection.kind, detection.signature))
+
+    def test_an_lzma_alone_stream_extracts_and_says_it_checks_nothing(self) -> None:
+        payload = b"<mzXML/>" * 1000
+        archive = self.root / "x.mzXML.lzma"
+        archive.write_bytes(lzma.compress(payload, format=lzma.FORMAT_ALONE))
+        record = extract_archive(archive, self.root / "out", listing_directory=self.root / "p")
+        self.assertEqual({"x.mzXML": payload}, _files_under(self.root / "out"))
+        self.assertEqual(("lzma", "lzma", "stream_file"),
+                         (record["format"], record["reader"], record["destination_rule"]))
+        self.assertEqual(("none", False), (record["integrity"], record["crc_verified"]))
+        self.assertEqual("x.mzXML", record["container_root"])
+
+        truncated = self.root / "cut.mzXML.lzma"
+        truncated.write_bytes(archive.read_bytes()[:40])
+        with self.assertRaises(ArchiveError) as caught:
+            extract_archive(truncated, self.root / "cut")
+        self.assertEqual("corrupt_archive", caught.exception.reason)
+        self.assertFalse((self.root / "cut").exists())
+
     def test_the_container_alias_is_one_rule(self) -> None:
+        self.assertEqual("x.mzXML", container_alias("x.mzXML.lzma"))
         self.assertEqual("X.raw", container_alias("X.raw.zip"))
         self.assertEqual("S1.d", container_alias("S1.d.rar"))
         self.assertEqual("run.mzML", container_alias("run.mzML.gz"))
@@ -748,6 +795,12 @@ class NestedAndContainerTests(_Workspace):
             hashlib.sha256(_zip_bytes([("_FUNC001.DAT", b"A-func"), ("_HEADER.TXT", b"A")])).hexdigest(),
             nested["raw/A.raw.zip"]["archive_sha256"],
         )
+        # A nested archive is gone once expanded, so every digest a repository may publish is kept.
+        self.assertEqual(
+            hashlib.md5(_zip_bytes([("_FUNC001.DAT", b"A-func"), ("_HEADER.TXT", b"A")])).hexdigest(),
+            nested["raw/A.raw.zip"]["archive_md5"],
+        )
+        self.assertEqual(40, len(nested["raw/A.raw.zip"]["archive_sha1"]))
         self.assertEqual([{"path": "raw/notes.gz", "reason": "not_an_archive"}], record["nested_skipped"])
         self.assertEqual(5, record["lineage"]["archives"])
 
