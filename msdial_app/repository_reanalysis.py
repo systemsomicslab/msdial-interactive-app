@@ -2993,6 +2993,33 @@ def _previous_reads(manifest: dict[str, Any], manifest_path: Path) -> dict[str, 
     return reads
 
 
+def _reader_created_before(manifest: dict[str, Any]) -> dict[str, list[str]]:
+    """What earlier reads of these inputs - the unit's own, then its split parent's - wrote into them.
+
+    Taken from every earlier per-file record, whatever its outcome: a reader that wrote its cache into a
+    Bruker .d and then failed has still changed the folder.
+    """
+    from .raw_metadata_preflight import file_key
+
+    records = [manifest]
+    parent = str((manifest.get("split_from") or {}).get("manifest_path") or "").strip()
+    if parent and Path(parent).is_file():
+        try:
+            records.append(read_manifest(parent))
+        except (OSError, ValueError):
+            pass
+    created: dict[str, list[str]] = {}
+    for record in records:
+        for entry in ((record.get("raw_metadata_preflight") or {}).get("summary") or {}).get("per_file") or []:
+            if not isinstance(entry, dict) or not str(entry.get("file") or "").strip():
+                continue
+            files = [str(item) for item in entry.get("reader_created_files") or [] if str(item).strip()]
+            if files:
+                key = file_key(str(entry["file"]))
+                created[key] = list(dict.fromkeys([*created.get(key, []), *files]))
+    return created
+
+
 def run_raw_metadata_preflight(
     manifest_path: Path,
     extractor_path: Path,
@@ -3073,6 +3100,7 @@ def run_raw_metadata_preflight(
         manifest_path.parent / PREFLIGHT_CHUNK_DIRECTORY,
         extractor_sha256=str(identity.get("binary_sha256") or ""),
         previous=_previous_reads(snapshot, manifest_path),
+        created_before=_reader_created_before(snapshot),
         progress=progress,
     )
     extractor = _extractor_record(extractor_path, identity, extractor_source)

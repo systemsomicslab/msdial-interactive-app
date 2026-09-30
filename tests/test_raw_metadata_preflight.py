@@ -499,6 +499,44 @@ class ExtractorRecordTests(_Scratch):
         self.assertEqual([str(files[0] / "analysis.sqlite")], entry["reader_created_files"])
         self.assertEqual("bruker_baf", entry["format"])
 
+    def test_what_a_reader_wrote_stays_recorded_when_the_read_is_reused_or_made_again(self) -> None:
+        manifest, extractor, files = _unit(self.root / "unit", ["P_1.d"], folders=("P_1.d",), acquisition="DDA")
+        created = [str(files[0] / "analysis.sqlite")]
+
+        def writes_cache(_command) -> None:
+            cache = files[0] / "analysis.sqlite"
+            if not cache.exists():
+                cache.write_bytes(b"cache")
+
+        self.preflight(manifest, extractor, _Extractor({}, during=writes_cache))
+        reused = self.preflight(manifest, extractor, _Extractor({}, during=writes_cache))
+        extractor.write_bytes(b"a rebuilt extractor, which reads the folder the first one wrote into")
+        again = self.preflight(manifest, extractor, _Extractor({}, during=writes_cache))
+
+        reused_entry = reused["raw_metadata_preflight"]["summary"]["per_file"][0]
+        again_entry = again["raw_metadata_preflight"]["summary"]["per_file"][0]
+        self.assertEqual(("reused", created), (reused_entry["outcome"], reused_entry["reader_created_files"]))
+        self.assertEqual(("ok", created), (again_entry["outcome"], again_entry["reader_created_files"]))
+
+    def test_a_split_part_knows_what_the_reader_wrote_into_its_parents_input(self) -> None:
+        names = ["a_DDA.d", "b_DIA.d"]
+        verdicts = {name: {"method": "DIA" if "DIA" in name else "DDA"} for name in names}
+        manifest, extractor, _ = _unit(self.root / "unit", names, folders=tuple(names))
+
+        def writes_cache(command) -> None:
+            for index, token in enumerate(command):
+                if token == "--input" and not (Path(command[index + 1]) / "analysis.sqlite").exists():
+                    (Path(command[index + 1]) / "analysis.sqlite").write_bytes(b"cache")
+
+        self.preflight(manifest, extractor, _Extractor(verdicts, during=writes_cache))
+        split = split_unit_by_acquisition(manifest, confirmed=True)
+        part = Path(split["parts"][0]["manifest_path"])
+        result = self.preflight(part, extractor, _Extractor(verdicts, during=writes_cache))
+
+        entry = result["raw_metadata_preflight"]["summary"]["per_file"][0]
+        self.assertEqual("reused", entry["outcome"])
+        self.assertEqual([str(Path(entry["file"]) / "analysis.sqlite")], entry["reader_created_files"])
+
 
 class ReuseTests(_Scratch):
     def test_an_unchanged_input_read_by_the_same_extractor_is_not_read_again(self) -> None:

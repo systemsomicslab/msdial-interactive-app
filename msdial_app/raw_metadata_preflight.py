@@ -312,6 +312,7 @@ def run_extractor(
     *,
     extractor_sha256: str = "",
     previous: Mapping[str, Mapping[str, Any]] | None = None,
+    created_before: Mapping[str, Iterable[str]] | None = None,
     chunk_inputs: int = CHUNK_INPUTS,
     command_line_limit: int = COMMAND_LINE_LIMIT,
     runner: Callable[..., Any] | None = None,
@@ -321,6 +322,9 @@ def run_extractor(
 
     ``previous`` maps an input's file_key to an earlier read of it ({"record", "entry", "source"}); it is
     used only when that entry names the same extractor sha256 and the same size and modification time.
+    ``created_before`` maps an input's file_key to the files an earlier read recorded the reader creating
+    in it; they stay in reader_created_files, because a folder read again is compared only with the state
+    the earlier read left it in.
     ``progress`` is told, before each extractor process starts, which attempt it is and its time limit;
     it is how a watcher tells a long read from a stalled one, and nothing it raises stops the reads.
     Returns the records read (input order), one outcome per input keyed by file_key, and the chunk log.
@@ -335,6 +339,12 @@ def run_extractor(
     chunk_log: list[dict[str, Any]] = []
     formats = {file_key(path): input_format(path) for path in inputs}
     signatures = {file_key(path): input_signature(path) for path in inputs}
+
+    def created_earlier(key: str, entry: Mapping[str, Any]) -> list[str]:
+        # What a reader wrote into an input is a fact about the input from then on: the read that finds the
+        # folder as the first one left it sees no difference, and a reused read makes no listing at all.
+        found = [*(entry.get("reader_created_files") or []), *((created_before or {}).get(key) or [])]
+        return list(dict.fromkeys(str(item) for item in found if str(item).strip()))
 
     to_read: list[Path] = []
     for path in inputs:
@@ -357,7 +367,7 @@ def run_extractor(
                 "input_signature": signatures[key],
                 "extractor_sha256": extractor_sha256,
                 "format": formats[key],
-                "reader_created_files": [],
+                "reader_created_files": created_earlier(key, entry),
             }
         else:
             to_read.append(path)
@@ -486,9 +496,9 @@ def run_extractor(
         outcome["input_signature"] = input_signature(path)
         before = listings.get(key)
         after = _folder_listing(path) if before is not None else None
-        outcome["reader_created_files"] = (
-            [str(path / relative) for relative in sorted(after - before)] if before is not None and after else []
-        )
+        created = [str(path / relative) for relative in sorted(after - before)] if before is not None and after else []
+        earlier = ((previous or {}).get(key) or {}).get("entry") or {}
+        outcome["reader_created_files"] = list(dict.fromkeys([*created_earlier(key, earlier), *created]))
     try:
         work_directory.rmdir()
     except OSError:
