@@ -4,6 +4,71 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.10] - Unreleased
+
+### Added
+- `msdial_app/archives.py`, the one place that decides what a downloaded
+  archive is and how it is opened. Nothing calls it yet; the lease
+  integration follows separately.
+  - `archive_kind` reads the name's suffix (`.tar.gz`/`.tgz`,
+    `.tar.bz2`/`.tbz2`, `.tar.xz`/`.txz`, `.zip`, `.tar`, `.7z`, `.rar`, and
+    bare `.gz`/`.bz2`/`.xz`) and confirms it by magic bytes. An HTML error
+    page saved as `.zip` raises `not_an_archive` instead of yielding no
+    inputs. A bare `.gz` that holds a tar is treated as a tar.
+  - zip, tar and compressed streams are read with the standard library. 7z,
+    RAR4/RAR5, and zips whose method Python cannot read (Deflate64 from
+    Windows Explorer, PPMd) go to 7-Zip, found through the injected setting,
+    `MSDIAL_SEVENZIP`, the registry, Program Files, then PATH. It must be
+    25.00 or later, and the sha256 of `7z.exe` and `7z.dll` is recorded.
+  - `7z x` rewrites `../evil.txt` to `evil.txt` and `C:/abs.txt` to
+    `C_/abs.txt` and exits 0, so every listing is validated before anything
+    is written. An archive is refused as a whole for traversal, drive or UNC
+    paths, or `:`; reserved device names, or trailing dots or spaces; names
+    that collide up to case, or file/directory conflicts; links, reparse
+    points or special files; encrypted members; a path over 259 characters or
+    a folder over 247 (`path_too_long`, the CreateDirectoryW limit without
+    long paths); and a tar member name that is not UTF-8
+    (`undecodable_name`).
+  - 7-Zip runs with stdin closed and a sentinel password, so an encrypted
+    archive fails at once instead of waiting for a password. Its failures are
+    named from what it says, damage before encryption: a truncated or
+    CRC-failed zip, 7z or rar is `corrupt_archive`, and only 'Wrong
+    password', 'Cannot open encrypted archive' or '... in encrypted file' make
+    `encrypted_archive`. A zip that zipfile refuses and 7-Zip cannot read is
+    `corrupt_archive`, with the zipfile error in `detail.stdlib_error`. A
+    multi-line archive comment is read as a value, not as warnings.
+  - One budget covers the whole lineage: a disk reserve checked against the
+    exact listing; an expansion ratio limit (100, above 10 GB); at most
+    1,000,000 members and nesting depth 3; a watchdog that kills 7-Zip on a
+    disk or size breach, and a timeout. The watchdog is stopped whatever ends
+    supervision, and a free-space probe that raises stops 7-Zip as
+    `watchdog_failed`.
+  - An archive expands into `<destination>.partial`, is checked against its
+    listing, and only then is renamed. No `.partial` is left after a failure;
+    an unexpected exception becomes `extraction_failed`.
+  - Operating-system metadata (`__MACOSX/`, `.DS_Store`, `._` AppleDouble
+    files, `Thumbs.db`) is validated, then dropped and recorded in
+    `dropped_metadata`, so a Finder-made `S1.d.zip` unpacks as `S1.d/`.
+  - Root-less per-sample containers (`X.raw.zip`, `X.d.zip`) get a folder
+    named after the container, so they no longer write `_FUNC001.DAT` over
+    each other. `container_rooted` requires the top folder to be the
+    archive's own stem; `A.raw.zip` holding `B.raw` is
+    `container_rooted_other_name` and is extracted as packed. Each record
+    names the container it produced (`container_root`) and whether that
+    differs from the alias (`container_name_mismatch`).
+  - An empty nested archive expands to an empty folder. A nested archive
+    whose expansion already exists beside it (`run.mzML.gz` next to
+    `run.mzML`) is left packed and recorded in `nested_skipped` as
+    `destination_exists`.
+  - The returned record carries the reader and its version, the command, the
+    counts, the destination rule and the nested records. The member listing
+    is written as `archive-members-<sha12>.tsv`, with its sha256 recorded.
+
+### Known limitations
+- Zip names without the UTF-8 flag are decoded as cp437 by zipfile, so
+  Shift-JIS names extract as mojibake. A legacy `.lzma` stream is not yet a
+  recognised kind.
+
 ## [0.5.9] - Unreleased
 
 ### Added
