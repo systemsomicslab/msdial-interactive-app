@@ -683,6 +683,20 @@ class TheAnalysisCsvIsBuiltFromTheLineage(unittest.TestCase):
         self.assertTrue(all(row["console_path"] for row in manifest["input_lineage"]["rows"]))
         self.assertIn("analytical_order", manifest)
 
+    def test_a_sample_id_padded_with_spaces_still_names_its_input(self) -> None:
+        """The sample rows' ids are stripped (scalar_text); the Catalog's inputs name them as written."""
+        handoff = _handoff()
+        for key in ("analysis_inputs", "sample_metadata", "files"):
+            for item in handoff[key]:
+                item["sample_id"] = item["sample_id"] + " "
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = _leased_unit(Path(temporary), handoff)
+            _set_preflight(manifest_path, {"*": "AIF"})
+            built = build_repository_analysis_rows(read_manifest(manifest_path))
+
+        self.assertEqual([], built["failures"])
+        self.assertEqual("CSRSPlant_Arabi01", built["rows"][2]["sample_id"])
+
     def test_a_legacy_manifest_is_still_prepared_from_its_recognised_files(self) -> None:
         """No input_lineage: the name-matched path, unchanged (test_manifest_reentry covers it in full)."""
         with tempfile.TemporaryDirectory() as temporary:

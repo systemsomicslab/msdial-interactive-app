@@ -259,8 +259,8 @@ def build_repository_analysis_rows(
             kept.append(candidate)
             continue
         form = declared_of.get(candidate, "")
-        sample_id = str(declared[form].get("sample_id") or "") if form else ""
-        sample_id = sample_id or str((lineage_by_key.get(key) or {}).get("sample_id") or "")
+        sample_id = str(declared[form].get("sample_id") or "").strip() if form else ""
+        sample_id = sample_id or str((lineage_by_key.get(key) or {}).get("sample_id") or "").strip()
         excluded_inputs.append({"path": candidate, "reason": excluded[key], "sample_id": sample_id})
         if form:
             excluded_forms.add(form)
@@ -281,8 +281,11 @@ def build_repository_analysis_rows(
                 undeclared.append(path.name)
 
         # The sample: the one the Catalog attributed the input to, else the lineage's, else the one sample
-        # row whose file name is this input's.
-        sample_id = str((entry or {}).get("sample_id") or "") or str((lineage_row or {}).get("sample_id") or "")
+        # row whose file name is this input's. Stripped, as the sample rows' own ids are (scalar_text).
+        sample_id = (
+            str((entry or {}).get("sample_id") or "").strip()
+            or str((lineage_row or {}).get("sample_id") or "").strip()
+        )
         sample = by_id.get(sample_id) if sample_id else None
         if sample is None and not declared:
             named = {
