@@ -134,6 +134,7 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 - `msdial_prepare_guided_analysis`
 - `msdial_start_guided_analysis`
 - `msdial_interactive_job`
+- `msdial_cancel_job`
 - `msdial_interactive_validate_mztab`
 - `msdial_interactive_preview_mztab`
 - `msdial_generate_lcms_qa`

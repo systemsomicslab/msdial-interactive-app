@@ -453,6 +453,8 @@ Core MCP tools:
 - `msdial_start_guided_analysis`: execute only after explicit confirmation
 - `msdial_interactive_status`: check queued/running/completed jobs
 - `msdial_interactive_wait_for_completion`: wait for one specified job to finish
+- `msdial_cancel_job`: stop a queued or running run, diagnostic, or repository download
+  (the two start tools also take `timeout_seconds` and `idle_timeout_seconds`; none by default)
 - `msdial_interactive_validate_mztab`: validate mzTab-M outputs
 - `msdial_generate_lcms_qa`: build the LC-MS QA report
 - `msdial_generate_publication_report`: create text, Excel, audit, and ZIP files
