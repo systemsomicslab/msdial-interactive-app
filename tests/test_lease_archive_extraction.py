@@ -616,6 +616,90 @@ class PerSampleZipsInsideAProjectTar(_Workspace):
         with self.assertRaisesRegex(ValueError, "MD5 checksum mismatch for FILES/S2.raw.zip"):
             self._lease(corrupt="S2")
 
+    def test_the_basis_names_the_tar_that_held_the_zip_after_it(self) -> None:
+        """The zip's own MD5 is the nearest verified one; the tar, which publishes none, follows it."""
+        basis = _rows(self._lease())["S1.raw"]["basis"]
+
+        self.assertEqual(hashlib.md5(self.zips["S1"]).hexdigest(), basis["value"])
+        self.assertEqual([True, None], [item["declared_verified"] for item in basis["archives"]])
+        self.assertEqual(
+            [("MB-POST_files_MPST-NESTED.0/FILES/S1.raw.zip", "MPST-NESTED.tar")],
+            [(level["member"], level["listed_archive"]) for level in basis["listing"][1:]],
+        )
+
+
+class ArchivesInsideAVerifiedStudyArchive(_Workspace):
+    """ST000322, ST000329 and ST000354: a study archive with a published MD5, holding per-sample zips.
+
+    The zips publish nothing of their own. The basis named only the innermost archive, so every input
+    read as "extracted from an archive for which no checksum was published", in the methods text too,
+    although the study archive's MD5 had matched and its listing names each zip.
+    """
+
+    def _lease(self, members: list[tuple[str, bytes]], samples: dict[str, str]) -> tuple[dict, bytes]:
+        outer = _zip(members)
+        url = "https://example.org/studydownload/ST000322.zip"
+        project = _unit(
+            [RepositoryFile("ST000322.zip", len(outer), url, role="raw_archive",
+                            checksum=hashlib.md5(outer).hexdigest())],
+            samples,
+            repository="metabolomics_workbench",
+        )
+        return create_download_lease(project, self.root, 10_000_000, client=_Client({url: outer})), outer
+
+    def test_a_container_inside_a_per_sample_zip_is_vouched_for_by_the_study_archive(self) -> None:
+        zips = {
+            sample: _zip([("_FUNC001.DAT", f"{sample} spectra".encode()), ("_HEADER.TXT", b"header")])
+            for sample in ("S1", "S2")
+        }
+        lease, outer = self._lease(
+            [(f"ST000322/{sample}.raw.zip", data) for sample, data in zips.items()],
+            {"sample-1": "S1.raw.zip", "sample-2": "S2.raw.zip"},
+        )
+
+        self.assertEqual(1, lease["allowlist_checksum_validation"]["archives_verified_at_download"])
+        row = _rows(lease)["S1.raw"]
+        self.assertEqual(("archived_container", "sample-1"), (row["kind"], row["sample_id"]))
+        basis = row["basis"]
+        self.assertEqual(
+            ("archive_declared_checksum", "md5", hashlib.md5(outer).hexdigest(), True),
+            (basis["kind"], basis["algorithm"], basis["value"], basis["verified"]),
+        )
+        self.assertEqual("extracted from an archive whose published MD5 matched", basis["statement"])
+        inner, study = basis["archives"]
+        self.assertEqual(("ST000322/S1.raw.zip", hashlib.sha256(zips["S1"]).hexdigest(), None),
+                         (inner["archive_path"], inner["sha256"], inner["declared_verified"]))
+        self.assertEqual((hashlib.sha256(outer).hexdigest(), True), (study["sha256"], study["declared_verified"]))
+        self.assertEqual(
+            [("container", "ST000322/S1.raw"), ("member", "ST000322/S1.raw.zip")],
+            [("container", level["container"]) if "container" in level else ("member", level["member"])
+             for level in basis["listing"]],
+        )
+        self.assertEqual("ST000322.zip", basis["listing"][1]["listed_archive"])
+        tsv = Path(basis["listing"][1]["members_tsv"])
+        listed = {tuple(line.split("\t")[i] for i in (0, 6, 8))
+                  for line in tsv.read_text(encoding="utf-8").splitlines()[1:]}
+        self.assertIn(("ST000322/S1.raw.zip", "ST000322.zip", "expanded_archive"), listed)
+        self.assertEqual(
+            "Of the 2 analysis inputs, 2 were extracted from an archive whose published MD5 matched.",
+            input_integrity_statement(lease),
+        )
+
+    def test_a_file_inside_a_zip_inside_the_study_archive_is_traced_level_by_level(self) -> None:
+        batch = _zip([("S1.mzML", b"<mzML>one</mzML>")])
+        lease, outer = self._lease([("ST000322/batch1.zip", batch)], {"sample-1": "S1.mzML"})
+
+        row = _rows(lease)["S1.mzML"]
+        self.assertEqual("extracted_member", row["kind"])
+        basis = row["basis"]
+        self.assertEqual(("archive_declared_checksum", hashlib.md5(outer).hexdigest()),
+                         (basis["kind"], basis["value"]))
+        self.assertEqual(["ST000322/batch1.zip", ""], [item.get("archive_path", "") for item in basis["archives"]])
+        self.assertEqual(
+            [("ST000322/batch1/S1.mzML", "ST000322/batch1.zip"), ("ST000322/batch1.zip", "ST000322.zip")],
+            [(level["member"], level["listed_archive"]) for level in basis["listing"]],
+        )
+
 
 class EveryArchiveKindIsExtracted(_Workspace):
     def _lease_one(self, name: str, data: bytes, samples: dict[str, str], role: str = "raw") -> dict:

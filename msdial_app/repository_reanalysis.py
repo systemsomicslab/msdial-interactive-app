@@ -1863,6 +1863,9 @@ def build_input_lineage(
     verified_checksums = verified_checksums or {}
     extracted_members = extracted_members or {}
     archive_extractions = archive_extractions or []
+    # Each extraction's nested archives by label, built once (_nesting_index), so tracing a file to
+    # the archives that held it does not walk the whole lineage once per file.
+    nesting: dict[int, dict[str, list[dict[str, Any]]]] = {}
     data_key = _file_key(str(data_root))
     direct: dict[str, dict[str, Any]] = {}
     for item in downloads:
@@ -1947,21 +1950,27 @@ def build_input_lineage(
             )
             if sources:
                 row["source"] = {"archives": [_archive_source(entry) for entry in sources.values()]}
-                # The archives its files came out of: the downloads, or the per-sample archives inside
-                # a project tar that the files were expanded from.
-                vouching: dict[str, dict[str, Any]] = {}
+                # The archives its files came out of, innermost first: the per-sample archive inside a
+                # project tar or a study archive that the files were expanded from, then each archive
+                # that held it, ending at the download.
+                vouching: dict[str, list[dict[str, Any]]] = {}
+                enclosing: dict[tuple[str, str], dict[str, Any]] = {}
                 for member, entry, origin in members:
                     if origin == "archive":
-                        named = _vouching_archive(extracted_members.get(member), archive_extractions, entry)
-                        where = named.get("archive_path") or named.get("download_path") or ""
-                        vouching.setdefault(where, named)
+                        listed = extracted_members.get(member)
+                        chain = _vouching_chain(listed, archive_extractions, entry, nesting)
+                        where = chain[0].get("archive_path") or chain[0].get("download_path") or ""
+                        if where not in vouching:
+                            vouching[where] = chain
+                            for level in _enclosing_listing(listed, archive_extractions, nesting):
+                                enclosing.setdefault((level["members_tsv"], level["member"]), level)
                 row["basis"] = _archive_basis(
                     list(vouching.values()),
                     listing=[
                         _container_listing(record, path)
                         for record in archive_extractions
                         if str(record.get("download_path") or "") in sources
-                    ],
+                    ] + list(enclosing.values()),
                 )
             elif downloaded:
                 row["source"] = {"objects": len(downloaded)}
@@ -2005,9 +2014,13 @@ def build_input_lineage(
                 row["checksums"] = _declared_verification(verified_checksums[key])
             listed = extracted_members.get(key)
             row["basis"] = _archive_basis(
-                [_vouching_archive(listed, archive_extractions, extracted_from[key])],
+                [_vouching_chain(listed, archive_extractions, extracted_from[key], nesting)],
                 member_checksums=row["checksums"],
-                listing=[_member_listing(archive_extractions, listed)] if listed else [],
+                listing=(
+                    [_member_listing(archive_extractions, listed),
+                     *_enclosing_listing(listed, archive_extractions, nesting)]
+                    if listed else []
+                ),
             )
         else:
             row["kind"] = "vendor_folder" if path.is_dir() else "file"
@@ -2074,22 +2087,81 @@ def _expanded_archive(record: dict[str, Any], nested: dict[str, Any]) -> dict[st
     }
 
 
-def _vouching_archive(
-    listed: dict[str, Any] | None, records: list[dict[str, Any]], download: dict[str, Any]
-) -> dict[str, Any]:
-    """The innermost archive a file came out of: a nested one the listing names, else the download."""
-    if listed:
-        index = int(listed.get("extraction", -1))
-        record = records[index] if 0 <= index < len(records) else {}
-        label = str(listed.get("archive") or "")
-        for nested in _nested_records(record):
-            if str(nested.get("archive_path") or "") == label:
-                return _expanded_archive(record, nested)
-    return _download_archive(download)
+def _nesting_index(record: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Each archive expanded inside an extraction, by label, with the nested records that lead to it.
+
+    The label is the archive's path in the members listing (its archive_path), which is also what the
+    listing's archive column names for the files that came out of it. The path runs from the archive
+    the download held down to the one labelled.
+    """
+    index: dict[str, list[dict[str, Any]]] = {}
+    pending = [(nested, []) for nested in record.get("nested") or [] if isinstance(nested, dict)]
+    while pending:
+        nested, above = pending.pop()
+        path = [*above, nested]
+        index.setdefault(str(nested.get("archive_path") or ""), path)
+        pending.extend((child, path) for child in nested.get("nested") or [] if isinstance(child, dict))
+    return index
+
+
+def _nesting_path(
+    listed: dict[str, Any] | None,
+    records: list[dict[str, Any]],
+    nesting: dict[int, dict[str, list[dict[str, Any]]]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """(extraction record, nested records from the outermost to the one a file came out of)."""
+    if not listed:
+        return {}, []
+    index = int(listed.get("extraction", -1))
+    record = records[index] if 0 <= index < len(records) else {}
+    if index not in nesting:
+        nesting[index] = _nesting_index(record)
+    return record, nesting[index].get(str(listed.get("archive") or ""), [])
+
+
+def _vouching_chain(
+    listed: dict[str, Any] | None,
+    records: list[dict[str, Any]],
+    download: dict[str, Any],
+    nesting: dict[int, dict[str, list[dict[str, Any]]]],
+) -> list[dict[str, Any]]:
+    """The archives a file came out of, innermost first: nested ones the listing names, then the download.
+
+    A per-sample zip inside a Workbench study archive has no published checksum of its own; the study
+    archive that held it has one. Only the innermost archive used to be named, so such a file read as
+    "extracted from an archive for which no checksum was published", in the methods text too, although
+    the archive it came out of, through the zip, had matched its published MD5. The whole chain is
+    named, and _archive_basis takes the nearest archive in it that was verified.
+    """
+    record, path = _nesting_path(listed, records, nesting)
+    return [_expanded_archive(record, nested) for nested in reversed(path)] + [_download_archive(download)]
+
+
+def _enclosing_listing(
+    listed: dict[str, Any] | None,
+    records: list[dict[str, Any]],
+    nesting: dict[int, dict[str, list[dict[str, Any]]]],
+) -> list[dict[str, Any]]:
+    """The listing rows of the archives that held the one a file came out of, innermost first.
+
+    Each nested archive is itself a row of the members listing (disposition expanded_archive), listed
+    as a member of the archive that held it. With the file's own row, these trace it level by level to
+    the download.
+    """
+    record, path = _nesting_path(listed, records, nesting)
+    rows = []
+    for depth in range(len(path) - 1, -1, -1):
+        holder = path[depth - 1].get("archive_path") if depth else record.get("archive_name")
+        rows.append({
+            **_listing_reference(record),
+            "member": str(path[depth].get("archive_path") or ""),
+            "listed_archive": str(holder or ""),
+        })
+    return rows
 
 
 def _archive_basis(
-    archives_named: list[dict[str, Any]],
+    chains: list[list[dict[str, Any]]],
     *,
     member_checksums: dict[str, Any] | None = None,
     listing: list[dict[str, Any]] | None = None,
@@ -2098,29 +2170,45 @@ def _archive_basis(
 
     - member_declared_checksum: the file's own published checksum matched its extracted bytes (MB-POST
       publishes one per file inside its project tar);
-    - archive_declared_checksum: the published checksum of the archive it came out of matched that
+    - archive_declared_checksum: the published checksum of an archive it came out of matched that
       archive, as downloaded or, for an archive inside another, before it expanded; and the input is in
-      the listing of what came out of it. value is that verified checksum;
-    - archive_download_hash: the archive published none; the SHA-256 computed at download (or, for an
-      archive inside another, before it expanded) identifies it, and nothing more.
+      the listing of what came out of it. The archive is the nearest verified one in the chain: the
+      innermost when it published a checksum, else the one that held it, out to the download. value is
+      that verified checksum;
+    - archive_download_hash: no archive in the chain published one; the SHA-256 of the innermost,
+      computed at download (or, for an archive inside another, before it expanded), identifies it, and
+      nothing more.
 
-    archives_named are the archives it came out of (_download_archive, _expanded_archive): one for a
-    file, one or more for a container. listing names the members-TSV row (or the container) that
-    accounts for the input, so a reader can trace the input to the listing and the listing to the
-    archive without re-reading the raw tree.
+    chains are the archives each input came out of (_vouching_chain), innermost first: one chain for a
+    file, one or more for a container, whose basis is a verified one only when every chain has a
+    verified archive. archives is every archive of every chain, innermost first. listing names the
+    members-TSV rows (or the container) that account for the input, at every level, so a reader can
+    trace the input to the listing and the listing to the archive without re-reading the raw tree.
     """
-    basis: dict[str, Any] = {"archives": list(archives_named), "listing": list(listing or [])}
+    named: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for chain in chains:
+        for archive in chain:
+            key = (str(archive.get("inside") or ""), str(archive.get("archive_path") or ""),
+                   str(archive.get("download_path") or ""))
+            if key not in seen:
+                seen.add(key)
+                named.append(archive)
+    vouchers = [next((item for item in chain if item["declared_verified"]), None) for chain in chains]
+    basis: dict[str, Any] = {"archives": named, "listing": list(listing or [])}
     if member_checksums and member_checksums.get("declared_verified"):
         algorithm = str(member_checksums.get("declared_algorithm") or "")
         basis.update(kind="member_declared_checksum", algorithm=algorithm,
                      value=str(member_checksums.get("declared") or ""), verified=True)
-    elif archives_named and all(item["declared_verified"] for item in archives_named):
-        algorithm = archives_named[0]["declared_algorithm"] or "md5"
-        value = archives_named[0].get(algorithm) or archives_named[0]["declared"]
+    elif vouchers and all(vouchers):
+        voucher = vouchers[0]
+        algorithm = voucher["declared_algorithm"] or "md5"
+        value = voucher.get(algorithm) or voucher["declared"]
         basis.update(kind="archive_declared_checksum", algorithm=algorithm, value=value, verified=True)
     else:
+        innermost = chains[0][0] if chains and chains[0] else {}
         basis.update(kind="archive_download_hash", algorithm="sha256",
-                     value=archives_named[0]["sha256"] if archives_named else "", verified=None)
+                     value=str(innermost.get("sha256") or ""), verified=None)
     algorithm_name = {"md5": "MD5", "sha1": "SHA-1", "sha256": "SHA-256"}.get(
         basis["algorithm"], basis["algorithm"].upper()
     )
