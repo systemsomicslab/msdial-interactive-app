@@ -48,7 +48,7 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-from msdial_app import download_store
+from msdial_app import download_store, process_liveness
 from msdial_app.campaign_authorization import CampaignAuthorization
 from msdial_app.download_store import (
     ClientFetcher,
@@ -472,8 +472,8 @@ class LivenessTests(unittest.TestCase):
         child.wait()
         self.assertIs(False, process_is_alive(child.pid))
         if WINDOWS:
-            self.assertEqual((False, None), download_store._windows_process_probe(child.pid))
-            alive, created = download_store._windows_process_probe(os.getpid())
+            self.assertEqual((False, None), process_liveness._windows_process_probe(child.pid))
+            alive, created = process_liveness._windows_process_probe(os.getpid())
             self.assertIs(True, alive)
             self.assertAlmostEqual(process_created_at(), created, delta=1.0)
 
@@ -483,7 +483,7 @@ class LivenessTests(unittest.TestCase):
             import psutil
         except ImportError:
             self.skipTest("psutil is not installed")
-        alive, created = download_store._windows_process_probe(os.getpid())
+        alive, created = process_liveness._windows_process_probe(os.getpid())
         self.assertTrue(alive)
         self.assertAlmostEqual(psutil.Process().create_time(), created, delta=1.0)
 
