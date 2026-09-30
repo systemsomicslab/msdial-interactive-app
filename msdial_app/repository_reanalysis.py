@@ -4458,9 +4458,10 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
         for item in (manifest.get("input_candidates") or [])
         if str(item).strip()
     }
+    aliases = console_alias_inputs(manifest)
     if admitted:
         requested = [
-            Path(str(item.get("file_path") or "")).resolve()
+            Path(_unit_input_of(str(item.get("file_path") or ""), aliases)).resolve()
             for item in (state.get("files") or [])
             if str(item.get("file_path") or "").strip()
         ]
@@ -4512,7 +4513,7 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
                     # a blank, or any value it cannot parse, as DDA without a word.
                     undecided_as.append(f"{Path(path_text).name} (decided {decided}, run as {given or 'no type'})")
                 continue
-            header = header_modes.get(_file_key(path_text))
+            header = header_modes.get(_file_key(_unit_input_of(path_text, aliases)))
             requested = given or "DDA"
             if header and requested not in HEADER_ACQUISITION_TO_MSDIAL.get(header, {header}):
                 disagreeing.append(f"{Path(path_text).name} (header {header}, run as {requested})")
@@ -4613,12 +4614,67 @@ def _campaign_excluded_inputs(manifest: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def console_alias_inputs(manifest: dict[str, Any]) -> dict[str, str]:
+    """The input each Console alias of the unit stands for, keyed by the alias's _file_key.
+
+    The analysis-CSV builder (repository_analysis_rows) reads an input whose own path the Console cannot
+    read through an ASCII-safe alias in raw\\console-aliases, and records it on the input's lineage row. A
+    directory junction resolves to its input already; a hard link resolves to itself, so every check that
+    asks whether a CSV row is one of the unit's inputs asks it of the input the alias stands for. An alias
+    counts only while it still is that input (os.path.samefile). Empty for a unit with none.
+    """
+    result: dict[str, str] = {}
+    for row in ((manifest or {}).get("input_lineage") or {}).get("rows") or []:
+        alias = row.get("console_alias") if isinstance(row, dict) else None
+        if not isinstance(alias, dict):
+            continue
+        link, target = str(alias.get("path") or ""), str(row.get("path") or "")
+        try:
+            same = bool(link and target) and os.path.samefile(link, target)
+        except OSError:
+            same = False
+        if same:
+            result[_file_key(link)] = target
+    return result
+
+
+def _unit_input_of(path_text: str, aliases: dict[str, str]) -> str:
+    """The unit's input a CSV row names: itself, or the input its Console alias stands for."""
+    return aliases.get(_file_key(path_text), path_text) if aliases else path_text
+
+
 def _tree_size(root: Path) -> tuple[int, int]:
     """Return (file count, total bytes) under root, or (0, 0) when it is gone."""
     if not root.is_dir():
         return 0, 0
-    files = [path for path in root.rglob("*") if path.is_file()]
-    return len(files), sum(path.stat().st_size for path in files)
+    count = size = 0
+    linked: set[tuple[int, int]] = set()
+    for directory, directories, names in os.walk(root):
+        # A directory junction is an alias the analysis CSV reads a folder through (console-aliases), not a
+        # second copy of it, and Path.rglob and os.walk both descend into one. Its bytes are counted once,
+        # where the folder is; so are a hard-linked file's, whichever of its names is met first.
+        directories[:] = [
+            name for name in directories
+            if not (os.path.islink(os.path.join(directory, name)) or _is_junction(os.path.join(directory, name)))
+        ]
+        for name in names:
+            path = Path(directory) / name
+            if not path.is_file():
+                continue
+            status = path.stat()
+            if status.st_nlink > 1:
+                identity = (status.st_dev, status.st_ino)
+                if identity in linked:
+                    continue
+                linked.add(identity)
+            count += 1
+            size += status.st_size
+    return count, size
+
+
+def _is_junction(path: str | Path) -> bool:
+    isjunction = getattr(os.path, "isjunction", None)
+    return bool(isjunction and isjunction(path))
 
 
 def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
@@ -6367,8 +6423,9 @@ def recorded_order_match(
         for path in manifest.get("input_candidates") or []
         if str(path).strip()
     }
+    aliases = console_alias_inputs(manifest)
     same_unit = bool(candidates) and all(
-        str(Path(str(item.get("file_path", ""))).resolve()).casefold() in candidates
+        str(Path(_unit_input_of(str(item.get("file_path", "")), aliases)).resolve()).casefold() in candidates
         for item in files
     )
     in_csv: dict[str, Any] = {}
@@ -6452,8 +6509,10 @@ def recorded_order_source(manifest_path: Any, files: list[dict[str, Any]]) -> st
         if str(path).strip()
     }
     files = list(files or [])
+    aliases = console_alias_inputs(manifest)
     same_unit = bool(inputs) and all(
-        Path(str(item.get("file_path", "")).replace("\\", "/")).name.casefold() in inputs for item in files
+        Path(_unit_input_of(str(item.get("file_path", "")), aliases).replace("\\", "/")).name.casefold() in inputs
+        for item in files
     )
     return str(source) if same_unit and carries_recorded_order(record, files) else None
 

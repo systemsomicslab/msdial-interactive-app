@@ -681,6 +681,35 @@ def discover_console_paths(search_roots: Iterable[str | Path] | None = None) -> 
     }
 
 
+def console_safe_text(value: Any) -> bool:
+    """Whether the Console's analysis-CSV parser reads this value back exactly as it was written.
+
+    The parser (MsdialCoreTestApp AnalysisFilesParser) reads the file as ASCII and splits each line on
+    ',' with no quote handling: a non-ASCII character comes back as '?', and a comma or a quote shifts
+    every column after it. What passes is printable ASCII without either.
+    """
+    text = str(value)
+    return all(" " <= character <= "~" for character in text) and "," not in text and '"' not in text
+
+
+def analysis_input_path(path: str | Path) -> Path:
+    """The absolute path an analysis-CSV row names: resolved, unless that would undo a Console alias.
+
+    An input whose own path the Console cannot read (console_safe_text) is given an ASCII-safe alias, a
+    directory junction or a hard link, when the repository analysis CSV is built. Resolving a junction
+    names the unreadable path again, so a link whose own path is safe and whose target is not is kept as
+    written. Every other path resolves exactly as it always did.
+    """
+    source = Path(path).expanduser()
+    resolved = source.resolve()
+    if console_safe_text(resolved):
+        return resolved
+    absolute = Path(os.path.abspath(source))
+    isjunction = getattr(os.path, "isjunction", None)
+    linked = os.path.islink(absolute) or bool(isjunction and isjunction(absolute))
+    return absolute if linked and console_safe_text(absolute) else resolved
+
+
 def is_supported(path: Path) -> bool:
     return path.suffix.lower() in SUPPORTED_SUFFIXES or (
         path.is_dir() and path.name.lower().endswith((".d", ".raw"))
@@ -809,7 +838,7 @@ def read_analysis_csv(path: str | Path) -> dict[str, Any]:
             analysis_path = Path(raw_path).expanduser()
             if not analysis_path.is_absolute():
                 analysis_path = csv_path.parent / analysis_path
-            analysis_path = analysis_path.resolve()
+            analysis_path = analysis_input_path(analysis_path)
             if not analysis_path.exists():
                 rejected.append(f"{analysis_path} (not found; line {line_number})")
                 continue
@@ -1793,7 +1822,7 @@ def prepare_run(
     if staging_folder is not None:
         staging_folder.mkdir(parents=True, exist_ok=True)
     for index, item in enumerate(files):
-        source = Path(item["file_path"]).resolve()
+        source = analysis_input_path(item["file_path"])
         if staging_folder is None:
             if progress:
                 progress(f"Using original input {index + 1}/{len(files)}: {source}")

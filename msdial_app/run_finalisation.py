@@ -377,10 +377,15 @@ def _console_inputs(csv_path: Path) -> list[tuple[str, str]]:
 
 
 def _directory_of(path_text: str) -> Path:
-    """Path.GetDirectoryName(Path.GetFullPath(p)): a folder named with a trailing separator is its own."""
+    """Path.GetDirectoryName(Path.GetFullPath(p)): a folder named with a trailing separator is its own.
+
+    GetFullPath follows no link, so the Console writes beside the name it was given. An input read through
+    an alias (a directory junction in console-aliases) has its containers beside the alias, which is where
+    they are looked for: the directory is resolved, the name in it is not.
+    """
     if path_text.endswith(("\\", "/")):
         return Path(path_text.rstrip("\\/")).resolve()
-    return Path(path_text).resolve().parent
+    return Path(os.path.abspath(path_text)).parent.resolve()
 
 
 def _is_under(path: Path, root: Path) -> bool:

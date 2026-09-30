@@ -1922,6 +1922,12 @@ def msdial_prepare_repository_reanalysis(
     manifest_path reaches a unit whose download job the backend no longer holds; the recognised files
     are then rebuilt from the manifest's input_candidates, as the download job built them. A campaign
     approval covering boundary 3 for the unit stands in for confirmed=true and is recorded in the manifest.
+
+    A manifest that carries input_lineage (every lease since 0.5.9) is built from it instead, one row per
+    analysis input, a vendor folder being one (repository_analysis_rows). Where its inputs, lineage,
+    declared inputs and sample rows disagree, or an acquisition type cannot be written, nothing is
+    written but the failure, which is recorded in the manifest and returned with ok false, so an
+    unattended caller goes on to its next unit.
     """
     job, manifest = _repository_unit(download_job_id, manifest_path, host, port)
     crossing = _campaign_authorization(
@@ -1959,6 +1965,17 @@ def msdial_prepare_repository_reanalysis(
             hierarchy if hierarchy is not None else workspace.get("hierarchy", [])
         )
         projected = project_class_hierarchy(workspace, selected_hierarchy)
+    if isinstance(manifest.get("input_lineage"), dict):
+        return _prepare_repository_rows_from_lineage(
+            job,
+            manifest,
+            projected,
+            selected_hierarchy,
+            download_job_id=download_job_id,
+            confirmed=confirmed,
+            allow_partial_mapping=allow_partial_mapping,
+            crossing=crossing,
+        )
     if job is not None:
         recognized = ((job.get("result") or {}).get("recognized") or {}).get("files", [])
     else:
@@ -2060,6 +2077,137 @@ def msdial_prepare_repository_reanalysis(
     return {
         "prepared": True,
         "input_path": input_path,
+        "output_root": output_root,
+        "files": saved,
+        "preview": preview,
+        "next_step": (
+            "Pass input_path and preview.answer_seed to msdial_guided_analysis_plan, then "
+            "collect any remaining scientific decisions before execution."
+        ),
+    }
+
+
+def _prepare_repository_rows_from_lineage(
+    job: dict[str, Any] | None,
+    manifest: dict[str, Any],
+    projected: dict[str, Any],
+    selected_hierarchy: list[str],
+    *,
+    download_job_id: str,
+    confirmed: bool,
+    allow_partial_mapping: bool,
+    crossing: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """msdial_prepare_repository_reanalysis for a manifest with input_lineage: one row per analysis input.
+
+    WHY NOT THE RECOGNISED FILES. They were the download job's, and the registry keeps a hundred jobs; they
+    were matched to sample rows by file name, which a folder named raw/x.raw/ in its sample row never
+    matched; and the unit's one acquisition label was written on every row. The rows come from the record
+    the lease wrote for this, and each row's acquisition type from that file's own header.
+    """
+    from .repository_analysis_rows import (
+        blocking_failures,
+        build_repository_analysis_rows,
+        create_console_aliases,
+        order_rows,
+        record_analysis_csv,
+        record_analysis_csv_failure,
+        write_analysis_csv,
+    )
+    from .repository_metadata import save_metadata_review
+    from .repository_qa import repository_internal_standard_evidence
+    from .repository_reanalysis import record_analytical_order, record_campaign_authorization
+
+    built = build_repository_analysis_rows(manifest, projected)
+    analytical_order = order_rows(manifest, built)
+    output_root = str(manifest.get("output_directory") or "")
+    raw_retention_policy = str(
+        (job or {}).get("raw_retention_policy") or manifest.get("raw_retention_policy") or "keep"
+    )
+    answer_seed = _repository_answer_seed(projected, manifest, output_root, raw_retention_policy)
+    execution_allowed = manifest.get("execution_allowed") is True
+    execution_blockers: list[str] = []
+    if not execution_allowed:
+        execution_blockers.append(
+            "execution_allowed is not true for this analysis unit "
+            f"(status {manifest.get('status', 'unknown')!r}). MS-DIAL will refuse to start until a "
+            "raw-header preflight settles the unit's technical conditions."
+        )
+    failures = built["failures"]
+    blocking = blocking_failures(built, allow_partial_mapping)
+    unmatched = next((item["inputs"] for item in failures if item["code"] == "input_without_sample"), [])
+    ambiguous = next((item["inputs"] for item in failures if item["code"] == "sample_with_two_inputs"), [])
+    preview = {
+        "download_job_id": download_job_id,
+        "manifest_path": manifest["manifest_path"],
+        "analysis_input_path": manifest.get("analysis_input_path"),
+        "output_root": output_root,
+        "execution_allowed": execution_allowed,
+        "execution_blockers": execution_blockers,
+        "class_source": projected.get("class_source", "hierarchy"),
+        "class_proposal_provenance": projected.get("class_proposal_provenance"),
+        "class_hierarchy": selected_hierarchy,
+        "built_from": built["built_from"],
+        "counts": built["counts"],
+        "matched_count": sum(1 for row in built["rows"] if row["sample_id"]),
+        "recognized_count": len(built["rows"]),
+        "unmatched": unmatched,
+        "ambiguous": ambiguous,
+        "acquisition_types": {
+            value: sum(1 for row in built["rows"] if row["acquisition_type"] == value)
+            for value in built["acquisition_types"]
+        },
+        "console_aliases": len(built["aliases"]),
+        "class_id_aliases": built["class_id_aliases"],
+        "failures": failures,
+        "blocking_failures": [item["code"] for item in blocking],
+        "answer_seed": answer_seed,
+        "qa_internal_standard_evidence": repository_internal_standard_evidence(projected),
+        "analytical_order": {
+            key: value for key, value in analytical_order.items() if key not in ("orders", "files")
+        } | {"files_recorded": len(analytical_order.get("files") or [])},
+    }
+    if crossing:
+        preview["campaign_authorization"] = crossing
+    if not confirmed and crossing is None:
+        return {
+            "prepared": False,
+            "confirmation_required": True,
+            "preview": preview,
+            "message": (
+                "Review the Class assignments and the one row per analysis input"
+                + (", and the failures that stop the CSV" if blocking else "")
+                + ". Call again with confirmed=true to write reviewed metadata and analysis_files.csv."
+            ),
+        }
+    if crossing:
+        record_campaign_authorization(manifest["manifest_path"], crossing)
+    if not blocking:
+        blocking = create_console_aliases(built)
+    if blocking:
+        # A FAILURE RECORD FOR THIS UNIT, NOT AN EXCEPTION. The unit's own records disagree, or a row
+        # could not be written as the Console reads it; the manifest says which, and nothing is written
+        # that a run could start from.
+        record = record_analysis_csv_failure(manifest["manifest_path"], built, blocking)
+        return {
+            "ok": False,
+            "prepared": False,
+            "reason": "analysis_csv_failed",
+            "codes": sorted({item["code"] for item in blocking}),
+            "detail": " ".join(item["message"] for item in blocking),
+            "analysis_csv": record,
+            "preview": preview,
+        }
+    saved = save_metadata_review(projected, output_root)
+    input_path = write_analysis_csv(built, Path(output_root) / "analysis_files.csv")
+    saved["analysis_files_csv"] = str(input_path)
+    record_analysis_csv(manifest["manifest_path"], built, input_path)
+    # Only once the CSV it describes exists, so a failed prepare cannot replace a valid record.
+    record_analytical_order(manifest["manifest_path"], analytical_order)
+    answer_seed["repository_metadata_path"] = saved["metadata_json"]
+    return {
+        "prepared": True,
+        "input_path": str(input_path),
         "output_root": output_root,
         "files": saved,
         "preview": preview,
