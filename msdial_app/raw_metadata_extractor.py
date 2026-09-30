@@ -36,12 +36,37 @@ from .workflow import console_git_state
 
 EXTRACTOR_BUILD_PROVENANCE = "raw-metadata-extractor-build-provenance.json"
 EXTRACTOR_BUILD_SCHEMA = "msdial-raw-metadata-extractor-build.v1"
-# msrawdataworkbench origin/master as of its last fetch (Merge PR #39), and the production
-# Console's MsdialWorkbench commit, so that the extractor and MS-DIAL share one Common.
-PINNED_MSRAWDATAWORKBENCH_COMMIT = "b34c857a5328e8f08c1918b3d890e7dae50b7d6d"
-PINNED_MSDIALWORKBENCH_COMMIT = "c471463a576626650e0886e26bd064cca53a7ae3"
 RAW_TREE = "msrawdataworkbench"
 COMMON_TREE = "MsdialWorkbench"
+# The approved source pairs, newest first, as data: a new build is a new entry, not an edit to the
+# code that reads them. "built" means a build of the pair was made from clean local clones, recorded
+# by record_build and verified against the demo corpus and MTBLS2207; only a built pin makes an
+# extractor "pinned", which a campaign requires. "planned" is a pair that was approved but never
+# built, kept so that a build of it later is recognised as that pair rather than as a stranger.
+PIN_BUILT = "built"
+PIN_PLANNED = "planned"
+PINNED_BUILDS: tuple[dict[str, str], ...] = (
+    {
+        RAW_TREE: "592b6dbce72177fa14d3e7cd407557b1c64a3046",
+        COMMON_TREE: "f0583493a44e73723f53ae312e33955f62052dd7",
+        "state": PIN_BUILT,
+        "recorded": "2026-09-30",
+        # msrawdataworkbench #40 (the mzML base64 last-element fix, on b34c857a5) and MsdialWorkbench
+        # master. Built as RawMetadataExtractor-592b6dbce-f0583493a, inventory a2cf18fa52775485.
+        "note": "mzML base64 last-element fix (msrawdataworkbench #40) with MsdialWorkbench master",
+    },
+    {
+        RAW_TREE: "b34c857a5328e8f08c1918b3d890e7dae50b7d6d",
+        COMMON_TREE: "c471463a576626650e0886e26bd064cca53a7ae3",
+        "state": PIN_PLANNED,
+        "recorded": "2026-09-29",
+        "note": "msrawdataworkbench origin/master (Merge PR #39) with the c471463a5 Console's Common",
+    },
+)
+# The pair a new build is planned from and a record is compared against by default.
+CURRENT_PIN = PINNED_BUILDS[0]
+PINNED_MSRAWDATAWORKBENCH_COMMIT = CURRENT_PIN[RAW_TREE]
+PINNED_MSDIALWORKBENCH_COMMIT = CURRENT_PIN[COMMON_TREE]
 EXTRACTOR_PROJECT = Path("RawMetadataConsoleApp/RawMetadataConsoleApp.csproj")
 # RawMetadataConsoleApp.csproj and RawDataHandlerStandard.csproj both reference
 # ..\..\MsdialWorkbench\src\Common\CommonStandard, so the Common tree has to be a sibling
@@ -74,6 +99,15 @@ _COMMIT_PATTERN = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 def _now() -> str:
     return dt.datetime.now().astimezone().isoformat()
+
+
+def pinned_build(raw_commit: str, common_commit: str) -> dict[str, str] | None:
+    """The PINNED_BUILDS entry for exactly this pair of full commits, or None."""
+    raw, common = str(raw_commit or "").casefold(), str(common_commit or "").casefold()
+    for entry in PINNED_BUILDS:
+        if entry[RAW_TREE] == raw and entry[COMMON_TREE] == common:
+            return dict(entry)
+    return None
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -870,12 +904,14 @@ def inspect_raw_metadata_extractor(path: str | Path) -> dict[str, Any]:
 
     sources = record["sources"]
     heads = {tree: str(sources[tree].get("head") or "") for tree in (RAW_TREE, COMMON_TREE)}
+    pin = pinned_build(heads[RAW_TREE], heads[COMMON_TREE])
     result.update(
         {
             "msrawdataworkbench_commit": heads[RAW_TREE],
             "msdialworkbench_commit": heads[COMMON_TREE],
-            "pinned": heads[RAW_TREE] == PINNED_MSRAWDATAWORKBENCH_COMMIT
-            and heads[COMMON_TREE] == PINNED_MSDIALWORKBENCH_COMMIT,
+            # A planned pair that someone built is recognised, but it was never verified as a pin.
+            "pinned": bool(pin) and pin["state"] == PIN_BUILT,
+            "pin_state": pin["state"] if pin else "",
             "sdk_version": str(record.get("sdk_version") or ""),
             "recorded_at": str(record.get("recorded_at") or ""),
         }
@@ -941,3 +977,285 @@ def record_verification(binary_path: str | Path, verification: Mapping[str, Any]
     record["verification"] = {"recorded_at": _now(), **dict(verification)}
     _write_record(record_path, record)
     return inspect_raw_metadata_extractor(binary_path)
+
+
+class RawMetadataExtractorRefused(ValueError):
+    """A campaign asked for a verified, pinned extractor and the one selected is not.
+
+    A ValueError, so the structured-error paths report it; the message starts with a fixed token
+    and the codes, as a refused campaign approval's does.
+    """
+
+    def __init__(self, codes: list[str], reasons: list[str], inspection: Mapping[str, Any]) -> None:
+        self.codes = list(dict.fromkeys(codes))
+        self.reasons = list(reasons)
+        self.inspection = dict(inspection)
+        super().__init__(
+            f"raw_metadata_extractor_refused [{', '.join(self.codes)}]: " + " ".join(self.reasons)
+        )
+
+
+def campaign_refusal(inspection: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+    """Why a campaign may not use this extractor: ([], []) when it inspects as verified and pinned.
+
+    A campaign decides from the extractor's verdicts whether several thousand units run, split or
+    are skipped, and deletes their raw data afterwards, so a verdict has to be tied to a build whose
+    source is known: its record must match the files on disk (verified) and name an approved,
+    built pair of commits (pinned). A working-checkout build with no record is neither.
+    """
+    codes: list[str] = []
+    reasons: list[str] = []
+    status = str(inspection.get("provenance_status") or "absent")
+    if status != "verified":
+        codes.append(f"extractor_{status}")
+        reasons.append(
+            f"The extractor at {inspection.get('path') or 'the selected path'} inspects as {status}, "
+            "not verified. " + str(inspection.get("detail") or "")
+        )
+    if not inspection.get("pinned"):
+        codes.append("extractor_not_pinned")
+        state = str(inspection.get("pin_state") or "")
+        reasons.append(
+            "Its commits are "
+            + (
+                f"{str(inspection.get('msrawdataworkbench_commit') or '')[:12]} and "
+                f"{str(inspection.get('msdialworkbench_commit') or '')[:12]}"
+                if inspection.get("msrawdataworkbench_commit")
+                else "not recorded"
+            )
+            + (f", a {state} pair that was never verified as a build" if state else ", not a pinned build")
+            + "; a campaign runs only a pinned build ("
+            + ", ".join(
+                f"{entry[RAW_TREE][:9]}-{entry[COMMON_TREE][:9]}"
+                for entry in PINNED_BUILDS
+                if entry["state"] == PIN_BUILT
+            )
+            + ")."
+        )
+    return codes, reasons
+
+
+def require_campaign_extractor(path: str | Path) -> dict[str, Any]:
+    """The inspection of an extractor a campaign may use, or RawMetadataExtractorRefused."""
+    inspection = inspect_raw_metadata_extractor(path)
+    codes, reasons = campaign_refusal(inspection)
+    if codes:
+        raise RawMetadataExtractorRefused(codes, reasons, inspection)
+    return inspection
+
+
+# ------------------------------------------------------------------------------------------------------
+# Which extractor a preflight runs
+# ------------------------------------------------------------------------------------------------------
+
+EXTRACTOR_ENVIRONMENT_VARIABLE = "MSDIAL_RAW_METADATA_EXTRACTOR"
+EXTRACTOR_PATH_SETTING = "raw_metadata_extractor_path"
+# In the order they are tried. The last is the build that happens to sit in the msrawdataworkbench working
+# checkout beside this one: a moving tree with no build record, named for what it is.
+CANDIDATE_SOURCES = ("argument", "setting", "environment", "working_checkout_default")
+
+
+def working_checkout_extractor_paths(checkout_parent: str | Path | None = None) -> list[Path]:
+    """The builds in the working checkout: net48 first.
+
+    net48 is the framework RawMetadataConsoleApp targets, so it is the build a source fix actually
+    reaches. A net8.0-windows directory can survive a change of target framework and then sit there for
+    weeks, being preferred while describing a version of the code that no longer exists.
+    """
+    parent = Path(checkout_parent) if checkout_parent else _default_source_parent()
+    root = parent / RAW_TREE / EXTRACTOR_PROJECT.parent / "bin" / EXTRACTOR_CONFIGURATION
+    return [root / EXTRACTOR_FRAMEWORK / EXTRACTOR_BINARY, root / "net8.0-windows" / EXTRACTOR_BINARY]
+
+
+def raw_metadata_extractor_candidates(
+    configured: str = "",
+    *,
+    settings: Mapping[str, Any] | None = None,
+    environment: Mapping[str, str] | None = None,
+    checkout_parent: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Every extractor a preflight would consider, in CANDIDATE_SOURCES order, each labelled with its source.
+
+    A folder stands for the RawMetadataConsoleApp.exe in it. A path named twice is listed once, under the
+    first source that named it.
+    """
+    if settings is None:
+        from .user_settings import load_user_settings
+
+        settings = load_user_settings()
+    variables = os.environ if environment is None else environment
+    named = [
+        ("argument", configured),
+        ("setting", settings.get(EXTRACTOR_PATH_SETTING)),
+        ("environment", variables.get(EXTRACTOR_ENVIRONMENT_VARIABLE)),
+        *(("working_checkout_default", str(path)) for path in working_checkout_extractor_paths(checkout_parent)),
+    ]
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source, value in named:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        path = Path(text).expanduser()
+        if path.is_dir():
+            path = path / EXTRACTOR_BINARY
+        try:
+            path = path.resolve()
+        except OSError:
+            pass
+        key = _normalized(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append({"source": source, "path": str(path), "exists": path.is_file()})
+    return candidates
+
+
+def select_raw_metadata_extractor(
+    configured: str = "",
+    *,
+    campaign: bool = False,
+    settings: Mapping[str, Any] | None = None,
+    environment: Mapping[str, str] | None = None,
+    checkout_parent: str | Path | None = None,
+) -> dict[str, Any]:
+    """The extractor a preflight runs, with its source and the candidates it was chosen from.
+
+    Outside a campaign it is the first candidate that exists, as it always was; "path" is "" when none
+    does. In a campaign it is the first candidate named, and it must be usable as it is: a named extractor
+    that is missing is refused rather than passed over for the next one, the working-checkout default is
+    refused whatever it holds, and anything else must inspect as verified and pinned
+    (RawMetadataExtractorRefused).
+    """
+    candidates = raw_metadata_extractor_candidates(
+        configured, settings=settings, environment=environment, checkout_parent=checkout_parent
+    )
+    if not campaign:
+        chosen = next((item for item in candidates if item["exists"]), None)
+        return {**(chosen or {"source": "", "path": "", "exists": False}), "candidates": candidates}
+    if not candidates:
+        raise RawMetadataExtractorRefused(
+            ["extractor_absent"],
+            [
+                "No raw-metadata extractor is named: pass extractor_path, or set one with "
+                "msdial_set_raw_metadata_extractor_path, to a verified, pinned build."
+            ],
+            {},
+        )
+    chosen = candidates[0]
+    if not chosen["exists"]:
+        raise RawMetadataExtractorRefused(
+            ["extractor_missing"],
+            [f"The extractor named by the {chosen['source']} does not exist: {chosen['path']}."],
+            dict(chosen),
+        )
+    inspection = inspect_raw_metadata_extractor(chosen["path"])
+    codes, reasons = campaign_refusal(inspection)
+    if chosen["source"] == "working_checkout_default":
+        codes.insert(0, "extractor_working_checkout_default")
+        reasons.insert(
+            0,
+            "Only the working checkout's own build was found. It is a moving tree, and a campaign runs "
+            "only an extractor named by the argument, the setting or the environment variable.",
+        )
+    if codes:
+        raise RawMetadataExtractorRefused(codes, reasons, {**inspection, "source": chosen["source"]})
+    return {**chosen, "inspection": inspection, "candidates": candidates}
+
+
+_REPORTED_INSPECTION_KEYS = (
+    "provenance_status",
+    "detail",
+    "binary_sha256",
+    "inventory_sha256",
+    "file_count",
+    "product_version",
+    "msrawdataworkbench_commit",
+    "msdialworkbench_commit",
+    "pinned",
+    "pin_state",
+    "provenance_path",
+)
+
+
+def _candidate_report(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    report = dict(candidate)
+    if not candidate.get("exists"):
+        return report
+    inspection = inspect_raw_metadata_extractor(candidate["path"])
+    codes, _reasons = campaign_refusal(inspection)
+    if candidate.get("source") == "working_checkout_default":
+        codes.insert(0, "extractor_working_checkout_default")
+    report.update({key: inspection.get(key) for key in _REPORTED_INSPECTION_KEYS if key in inspection})
+    report["campaign_refusal_codes"] = codes
+    report["campaign_accepts"] = not codes
+    return report
+
+
+def check_raw_metadata_extractors(
+    configured: str = "",
+    *,
+    settings: Mapping[str, Any] | None = None,
+    environment: Mapping[str, str] | None = None,
+    checkout_parent: str | Path | None = None,
+) -> dict[str, Any]:
+    """Every candidate extractor with its inspection, which one a preflight would run, and whether a
+    campaign would accept the one it would run there. Changes nothing."""
+    from .user_settings import load_user_settings, settings_path
+
+    if settings is None:
+        settings = load_user_settings()
+    variables = os.environ if environment is None else environment
+    candidates = [
+        _candidate_report(item)
+        for item in raw_metadata_extractor_candidates(
+            configured, settings=settings, environment=variables, checkout_parent=checkout_parent
+        )
+    ]
+    # Outside a campaign the first that exists runs; in one, the first named runs or nothing does.
+    selected = next((item for item in candidates if item["exists"]), None)
+    campaign_selected = candidates[0] if candidates and candidates[0]["exists"] else None
+    return {
+        "candidates": candidates,
+        "selected": selected,
+        "campaign_selected": campaign_selected,
+        "campaign_accepts": bool(campaign_selected and campaign_selected.get("campaign_accepts")),
+        "setting": str(settings.get(EXTRACTOR_PATH_SETTING) or ""),
+        "environment_variable": EXTRACTOR_ENVIRONMENT_VARIABLE,
+        "environment": str(variables.get(EXTRACTOR_ENVIRONMENT_VARIABLE) or ""),
+        "settings_file": str(settings_path()),
+        "pinned_builds": [dict(entry) for entry in PINNED_BUILDS],
+    }
+
+
+def set_raw_metadata_extractor_path(extractor_path: str | Path, allow_unverified: bool = False) -> dict[str, Any]:
+    """Validate an extractor and save it as the raw_metadata_extractor_path setting.
+
+    Refuses anything that does not inspect as verified unless allow_unverified is passed, and says
+    whether a campaign would accept what was saved: a campaign also needs it pinned.
+    """
+    from .user_settings import save_path_settings, settings_path
+
+    path = Path(str(extractor_path or "")).expanduser()
+    if path.is_dir():
+        path = path / EXTRACTOR_BINARY
+    path = path.resolve()
+    if not path.is_file() or path.name.casefold() != EXTRACTOR_BINARY.casefold():
+        raise ValueError(f"extractor_path must identify an existing {EXTRACTOR_BINARY}: {path}")
+    inspection = inspect_raw_metadata_extractor(path)
+    if inspection["provenance_status"] != "verified" and not allow_unverified:
+        raise ValueError(
+            f"The extractor at {path} inspects as {inspection['provenance_status']}, not verified, so it was "
+            "not saved. " + str(inspection.get("detail") or "")
+            + " Pass allow_unverified=true to save it for work outside a campaign."
+        )
+    saved = save_path_settings({EXTRACTOR_PATH_SETTING: str(path)})
+    codes, reasons = campaign_refusal(inspection)
+    return {
+        **inspection,
+        EXTRACTOR_PATH_SETTING: saved[EXTRACTOR_PATH_SETTING],
+        "settings_file": str(settings_path()),
+        "campaign_accepts": not codes,
+        "campaign_refusal_codes": codes,
+        "campaign_refusal_reasons": reasons,
+    }
