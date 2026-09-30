@@ -19,16 +19,21 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from msdial_app import repository_reanalysis
 from msdial_app.repository_reanalysis import (
+    ManifestBusyError,
     _write_json,
+    evaluate_repository_execution_gate,
     finalize_download_lease,
     is_manifest_scratch_file,
+    load_unit_manifest,
     manifest_lock,
+    plan_download_cleanup,
     read_manifest,
     update_manifest,
 )
@@ -187,6 +192,166 @@ class ConcurrentWritersDoNotLoseEachOther(unittest.TestCase):
             update_manifest(missing, lambda manifest: None)
 
         self.assertFalse(missing.parent.exists())
+
+
+class ReadersWaitOutTheRename(unittest.TestCase):
+    """On Windows a reader that opens the manifest at the instant os.replace renames a new record onto it
+    gets PermissionError. The rename made torn reads impossible; the retry makes the rename invisible."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        unit = Path(self.directory.name) / "unit"
+        (unit / "raw").mkdir(parents=True)
+        (unit / "output").mkdir()
+        self.manifest = unit / "provenance" / "run-manifest.json"
+        self.manifest.parent.mkdir()
+        _write_json(
+            self.manifest,
+            {
+                "status": "mztab_validated",
+                "project": {"analysis_unit_id": "unit"},
+                "workspace": str(unit),
+                "raw_directory": str(unit / "raw"),
+                "output_directory": str(unit / "output"),
+                "execution_allowed": True,
+                "cleanup_allowed": True,
+                "retained_artifacts": [],
+                "rows": ["x" * 200] * 200,
+            },
+        )
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def test_readers_never_raise_while_another_process_rewrites_the_manifest(self) -> None:
+        """THE REGRESSION. With another process running update_manifest, read_manifest raised
+        PermissionError about once in thirty reads and plan_download_cleanup raised OSError, and the
+        execution gate turned the same error into a blocker."""
+        script = (
+            "import sys, time\n"
+            f"sys.path.insert(0, {str(ROOT)!r})\n"
+            "from msdial_app.repository_reanalysis import update_manifest\n"
+            "def change(manifest):\n"
+            "    manifest['n'] = manifest.get('n', 0) + 1\n"
+            "print('ready', flush=True)\n"
+            "end = time.monotonic() + 5\n"
+            "count = 0\n"
+            "while time.monotonic() < end:\n"
+            f"    update_manifest({str(self.manifest)!r}, change)\n"
+            "    count += 1\n"
+            "print(count, flush=True)\n"
+        )
+        writer = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        failures: list[str] = []
+        reads = 0
+        try:
+            self.assertEqual("ready", writer.stdout.readline().strip())
+            end = time.monotonic() + 4
+            while time.monotonic() < end:
+                for reader in (
+                    lambda: read_manifest(self.manifest),
+                    lambda: load_unit_manifest(self.manifest),
+                    lambda: plan_download_cleanup(self.manifest),
+                ):
+                    try:
+                        reader()
+                        reads += 1
+                    except Exception as error:  # noqa: BLE001 - any failure is the finding
+                        failures.append(f"{type(error).__name__}: {error}")
+                gate = evaluate_repository_execution_gate({"repository_run_manifest": str(self.manifest)})
+                failures.extend(item for item in gate["blockers"] if "could not be read" in item)
+        finally:
+            output, _ = writer.communicate(timeout=120)
+
+        self.assertEqual(0, writer.returncode)
+        self.assertGreater(int(output.split()[-1]), 20, "the writer really was rewriting the manifest")
+        self.assertGreater(reads, 30)
+        self.assertEqual([], failures[:5], f"{len(failures)} failed reads")
+
+    def test_a_busy_read_is_retried(self) -> None:
+        original = Path.read_bytes
+        attempts: list[int] = []
+
+        def busy_twice(path: Path) -> bytes:
+            if path == self.manifest and len(attempts) < 2:
+                attempts.append(1)
+                raise PermissionError(13, "The process cannot access the file", str(path))
+            return original(path)
+
+        with patch.object(Path, "read_bytes", busy_twice), patch.object(
+            repository_reanalysis, "_manifest_busy_delay", lambda attempt: 0.0
+        ):
+            manifest = read_manifest(self.manifest)
+
+        self.assertEqual(2, len(attempts))
+        self.assertEqual("mztab_validated", manifest["status"])
+
+    def test_a_read_that_never_clears_is_reported_as_busy(self) -> None:
+        with patch.object(
+            Path, "read_bytes", side_effect=PermissionError(13, "The process cannot access the file")
+        ), patch.object(repository_reanalysis, "_manifest_busy_delay", lambda attempt: 0.0):
+            with self.assertRaises(ManifestBusyError) as raised:
+                read_manifest(self.manifest)
+
+        self.assertIsInstance(raised.exception, TimeoutError, "existing TimeoutError handlers still catch it")
+        self.assertIsInstance(raised.exception.__cause__, PermissionError)
+
+    def test_a_missing_manifest_is_not_waited_for(self) -> None:
+        started = time.monotonic()
+        with self.assertRaises(FileNotFoundError):
+            read_manifest(self.manifest.with_name("absent.json"))
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_a_lock_held_too_long_is_reported_as_busy(self) -> None:
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold() -> None:
+            with manifest_lock(self.manifest):
+                held.set()
+                release.wait(timeout=30)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        try:
+            self.assertTrue(held.wait(timeout=10))
+            with self.assertRaises(ManifestBusyError):
+                with manifest_lock(self.manifest, timeout=0.1):
+                    pass
+        finally:
+            release.set()
+            holder.join(timeout=30)
+
+    def test_the_mcp_layer_reports_a_busy_manifest_as_a_structured_failure(self) -> None:
+        """PermissionError and the lock's TimeoutError are OSErrors, which the tool wrapper did not map,
+        so they reached the client as a bare "Error executing tool"."""
+        from msdial_app.mcp_server import _structured_validation_errors
+
+        @_structured_validation_errors
+        def busy() -> dict:
+            raise ManifestBusyError("run-manifest.json stayed busy or unreadable for 25 s")
+
+        @_structured_validation_errors
+        def disk() -> dict:
+            raise OSError(28, "No space left on device")
+
+        self.assertEqual(
+            {
+                "ok": False,
+                "reason": "manifest_busy",
+                "retryable": True,
+                "detail": "run-manifest.json stayed busy or unreadable for 25 s",
+                "error_type": "ManifestBusyError",
+            },
+            busy(),
+        )
+        failure = disk()
+        self.assertEqual(("os_error", False), (failure["reason"], failure["retryable"]))
 
 
 class TheWritersScratchFilesAreNeverArtifacts(unittest.TestCase):

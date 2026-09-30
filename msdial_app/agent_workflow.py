@@ -754,8 +754,10 @@ def adopted_order_proposal(
     adopted = dict(proposal or {})
     if not str(manifest_path or "").strip():
         return adopted
+    from .repository_reanalysis import read_manifest, recorded_order_match
+
     try:
-        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8-sig"))
+        manifest = read_manifest(manifest_path)
     except (OSError, ValueError):
         return adopted
     record = manifest.get("analytical_order")
@@ -767,8 +769,6 @@ def adopted_order_proposal(
             "reason": str(record.get("reason") or ""),
         }
         return adopted
-    from .repository_reanalysis import recorded_order_match
-
     same_unit, matches = recorded_order_match(manifest, record, files)
     if not matches:
         adopted["recorded_header_order"] = {

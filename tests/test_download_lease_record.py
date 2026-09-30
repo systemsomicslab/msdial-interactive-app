@@ -16,20 +16,36 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import socket
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
+from msdial_app import repository_reanalysis
+from msdial_app.process_liveness import process_created_at
 from msdial_app.repository_reanalysis import (
     LEASE_INCOMPLETE_STATUSES,
     RepositoryFile,
     RepositoryProject,
+    _retained_result_paths,
+    _write_json,
     create_download_lease,
     discard_download_lease,
+    is_manifest_scratch_file,
+    lease_owner_state,
     load_unit_manifest,
     read_manifest,
+    update_manifest,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST = ("metabolights", "MTBLS-LEASE", "unit-a", "provenance", "run-manifest.json")
 
 
 class _Client:
@@ -182,10 +198,15 @@ class TheLeaseIsRecordedBeforeItsFirstByte(unittest.TestCase):
             with self.assertRaises(ValueError):
                 create_download_lease(project, root, 100, client=failing)
             lease = create_download_lease(project, root, 100, client=_Client({"https://example.org/a.mzML": b"abc"}))
+            provenance = Path(lease["manifest_path"]).parent
+            copies = sorted(path.name for path in provenance.glob("run-manifest.superseded-*"))
 
         self.assertEqual("download_failed", lease["previous_manifest"]["status"])
         self.assertEqual(64, len(lease["previous_manifest"]["sha256"]))
         self.assertEqual("prepared", lease["status"])
+        # A failed lease holds nothing the retry does not supersede, so it is summarised, not copied.
+        self.assertNotIn("superseded_copy", lease["previous_manifest"])
+        self.assertEqual([], copies)
 
     def test_the_download_job_path_refuses_an_unfinished_lease_by_manifest_too(self) -> None:
         """A download job had to be completed before anything used it; the manifest route keeps that."""
@@ -249,6 +270,7 @@ class EachInputHasOneLineageRow(unittest.TestCase):
         self.assertEqual(hashlib.sha256(data).hexdigest(), row["checksums"]["sha256"])
         self.assertEqual(md5, row["checksums"]["declared"])
         self.assertTrue(row["checksums"]["declared_verified"])
+        self.assertEqual("md5", row["checksums"]["declared_algorithm"])
         self.assertEqual(["FILES/a.mzML"], row["declared_names"])
         self.assertEqual("a", row["sample_id"])
         self.assertEqual("", row["file_name"], "the CSV builder names the file, not the lease")
@@ -310,6 +332,408 @@ class EachInputHasOneLineageRow(unittest.TestCase):
         self.assertNotEqual(
             row["checksums"]["members_sha256"], self._rows(changed)["S1.raw"]["checksums"]["members_sha256"]
         )
+
+    def test_a_file_whose_declared_sha256_was_verified_says_so(self) -> None:
+        """The download loop compares only a 32-digit md5. The allow-list check compares md5, sha1 and
+        sha256 against the files themselves, and used to return only counts, so a verified input read as
+        unverified in the lineage the gate reads."""
+        data = b"mzml bytes"
+        sha256 = hashlib.sha256(data).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            project = _project(
+                [RepositoryFile("FILES/a.mzML", len(data), "https://example.org/a.mzML", checksum=sha256)],
+                ["a.mzML"],
+            )
+            lease = create_download_lease(
+                project, Path(temporary), 100, client=_Client({"https://example.org/a.mzML": data})
+            )
+
+        row = self._rows(lease)["a.mzML"]
+        self.assertEqual({"required": True, "verified": 1, "skipped": 0}, lease["allowlist_checksum_validation"])
+        self.assertEqual(sha256, row["checksums"]["declared"])
+        self.assertEqual("sha256", row["checksums"]["declared_algorithm"])
+        self.assertIs(True, row["checksums"]["declared_verified"])
+
+    def test_an_extracted_member_whose_declared_checksum_was_verified_says_so(self) -> None:
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("study/a.mzML", b"a-bytes")
+        data = archive.getvalue()
+        md5 = hashlib.md5(b"a-bytes").hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            project = _project(
+                [
+                    RepositoryFile("study.zip", len(data), "https://example.org/study.zip", role="raw_archive"),
+                    RepositoryFile("study/a.mzML", 7, "https://example.org/study.zip", checksum=md5),
+                ],
+                ["a.mzML"],
+            )
+            lease = create_download_lease(
+                project, Path(temporary), 10_000, client=_Client({"https://example.org/study.zip": data})
+            )
+
+        row = self._rows(lease)["a.mzML"]
+        self.assertEqual(1, lease["allowlist_checksum_validation"]["verified"])
+        self.assertEqual("extracted_member", row["kind"])
+        self.assertEqual(
+            {"declared": md5, "declared_algorithm": "md5", "declared_verified": True}, row["checksums"]
+        )
+        # The archive itself published no checksum; the member's does not vouch for it.
+        self.assertIsNone(row["source"]["archive"]["declared_checksum_verified"])
+
+
+class ARetryNeverLosesTheRecordItReplaces(unittest.TestCase):
+    """A lease writes "downloading" before its first byte. A retry over a finished unit that then failed,
+    or was killed, left only that record where the unit's had been - its status, retained artifacts and
+    their inventory, finalised run, failures and campaign crossings - with a five-field summary as the
+    only trace that any of it existed."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.project = _project([RepositoryFile("FILES/a.mzML", 3, "https://example.org/a.mzML")], ["a.mzML"])
+        self.payloads = {"https://example.org/a.mzML": b"abc"}
+        lease = create_download_lease(self.project, self.root, 100, client=_Client(self.payloads))
+        self.manifest_path = Path(lease["manifest_path"])
+
+        def finalise(manifest: dict) -> None:
+            manifest.update(
+                {
+                    "status": "raw_cleaned",
+                    "finalized_at": "2026-09-30T00:00:00+00:00",
+                    "raw_cleaned_at": "2026-09-30T01:00:00+00:00",
+                    "retained_artifacts": ["X:/synthetic/unit/output/result.mzTab"],
+                    "retained_artifact_inventory": [{"path": "X:/synthetic/unit/output/result.mzTab"}],
+                    "finalized_run": {"job_id": "run-1", "run_directory": "X:/synthetic/unit/output/run-1"},
+                    "run_failures": [{"job_id": "run-0", "reason": "console exited 1"}],
+                    "campaign_authorizations": [{"approval_id": "A1", "boundary": 5}],
+                }
+            )
+
+        update_manifest(self.manifest_path, finalise)
+        self.finalised = self.manifest_path.read_bytes()
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def _failing(self) -> _Client:
+        return _Client(self.payloads, fail_on="https://example.org/a.mzML")
+
+    def _assert_recoverable(self, reference: dict) -> Path:
+        copy = Path(reference["path"])
+        self.assertEqual(self.finalised, copy.read_bytes(), "copied byte for byte")
+        self.assertEqual(hashlib.sha256(self.finalised).hexdigest(), reference["sha256"])
+        recovered = read_manifest(copy)
+        self.assertEqual("raw_cleaned", recovered["status"])
+        self.assertEqual({"job_id": "run-1", "run_directory": "X:/synthetic/unit/output/run-1"}, recovered["finalized_run"])
+        self.assertEqual(["X:/synthetic/unit/output/result.mzTab"], recovered["retained_artifacts"])
+        self.assertEqual(1, len(recovered["retained_artifact_inventory"]))
+        self.assertEqual("run-0", recovered["run_failures"][0]["job_id"])
+        self.assertEqual([{"approval_id": "A1", "boundary": 5}], recovered["campaign_authorizations"])
+        return copy
+
+    def test_a_failed_retry_over_a_finalised_manifest_leaves_its_record_recoverable(self) -> None:
+        """THE REGRESSION. The reviewer's reproduction: status download_failed, and finalized_run,
+        retained_artifacts and campaign_authorizations gone, with no copy anywhere."""
+        with self.assertRaisesRegex(ValueError, "Connection reset"):
+            create_download_lease(self.project, self.root, 100, client=self._failing())
+
+        after = read_manifest(self.manifest_path)
+        self.assertEqual("download_failed", after["status"])
+        self.assertEqual("raw_cleaned", after["previous_manifest"]["status"])
+        copy = self._assert_recoverable(after["previous_manifest"]["superseded_copy"])
+        self.assertEqual([str(copy)], [item["path"] for item in after["superseded_manifests"]])
+        self.assertEqual(self.manifest_path.parent, copy.parent)
+        self.assertTrue(copy.name.startswith("run-manifest.superseded-"), copy.name)
+
+    def test_a_retry_killed_mid_transfer_has_already_put_the_record_aside(self) -> None:
+        """A process killed during the retry writes nothing more; what is on disk at the first byte is
+        what survives it."""
+        seen: list[dict] = []
+
+        def observe(_url, _destination):
+            seen.append(read_manifest(self.manifest_path))
+
+        create_download_lease(self.project, self.root, 100, client=_Client(self.payloads, observe=observe))
+
+        self.assertEqual("downloading", seen[0]["status"])
+        self._assert_recoverable(seen[0]["previous_manifest"]["superseded_copy"])
+
+    def test_a_chain_of_retries_keeps_the_pointer_to_the_record_they_replaced(self) -> None:
+        for _ in range(2):
+            with self.assertRaises(ValueError):
+                create_download_lease(self.project, self.root, 100, client=self._failing())
+        lease = create_download_lease(self.project, self.root, 100, client=_Client(self.payloads))
+
+        self.assertEqual("prepared", lease["status"])
+        self.assertEqual("download_failed", lease["previous_manifest"]["status"])
+        self.assertEqual(1, len(lease["superseded_manifests"]), "failed leases are summarised, not copied")
+        self._assert_recoverable(lease["superseded_manifests"][0])
+        self.assertEqual(1, len(list(self.manifest_path.parent.glob("run-manifest.superseded-*"))))
+
+    def test_the_copy_is_a_provenance_record_that_finalisation_keeps(self) -> None:
+        with self.assertRaises(ValueError):
+            create_download_lease(self.project, self.root, 100, client=self._failing())
+        copy = Path(read_manifest(self.manifest_path)["previous_manifest"]["superseded_copy"]["path"])
+
+        _, records = _retained_result_paths(
+            self.manifest_path.parent.parent / "output", self.manifest_path.parent, self.manifest_path.resolve()
+        )
+
+        self.assertFalse(is_manifest_scratch_file(copy))
+        self.assertIn(copy.resolve(), records)
+
+    def test_a_split_parent_is_not_re_leased(self) -> None:
+        """Its parts read its raw files in place and name its manifest, which must stay split."""
+        def split(manifest: dict) -> None:
+            manifest["status"] = "split_by_acquisition"
+            manifest["split_into"] = [{"analysis_unit_id": "unit-a__dda"}, {"analysis_unit_id": "unit-a__dia"}]
+
+        update_manifest(self.manifest_path, split)
+        before = self.manifest_path.read_bytes()
+        calls: list[str] = []
+
+        with self.assertRaisesRegex(ValueError, "split by acquisition mode into 2 part"):
+            create_download_lease(
+                self.project, self.root, 100, client=_Client(self.payloads, observe=lambda url, _: calls.append(url))
+            )
+
+        self.assertEqual(before, self.manifest_path.read_bytes())
+        self.assertEqual([], calls, "nothing was downloaded")
+        self.assertEqual([], list(self.manifest_path.parent.glob("run-manifest.superseded-*")))
+
+
+_CHILD_LEASE = r'''
+import os, sys, time
+sys.path.insert(0, ROOT)
+from pathlib import Path
+from msdial_app.repository_reanalysis import RepositoryFile, RepositoryProject, create_download_lease
+
+class Client:
+    def download(self, url, destination, _maximum, progress_callback=None):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"half of the bytes")
+        print("downloading", flush=True)
+        if MODE == "die":
+            os._exit(1)  # a reboot, or a backend killed mid-transfer
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+        os._exit(2)
+
+project = RepositoryProject(
+    repository="metabolights", accession="MTBLS-LEASE", analysis_unit_id="unit-a", eligible=True,
+    selection_status="eligible", files=[RepositoryFile("FILES/a.mzML", 3, "https://example.org/a.mzML")],
+    total_download_bytes=3, sample_metadata=[{"sample_id": "a", "raw_file": "a.mzML"}],
+)
+create_download_lease(project, Path(WORK), 100, client=Client(), job_id="job-owner")
+'''
+
+
+class ALeaseKnowsItsOwner(unittest.TestCase):
+    """A lease killed together with its process writes nothing and stays "downloading" for good. The
+    manifest recorded no owner, so neither discard nor the runner could tell it from a live one, and
+    the only way out was to download the unit again."""
+
+    def _child(self, work: str, mode: str) -> subprocess.Popen:
+        code = f"ROOT={str(ROOT)!r}\nWORK={work!r}\nMODE={mode!r}\n" + _CHILD_LEASE
+        return subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+
+    def test_a_lease_killed_with_its_process_can_be_discarded(self) -> None:
+        """THE REGRESSION. discard refused "still downloading", and the bytes stayed on disk."""
+        with tempfile.TemporaryDirectory() as temporary:
+            child = self._child(temporary, "die")
+            child.communicate(timeout=120)
+            manifest_path = Path(temporary).joinpath(*MANIFEST)
+            manifest = read_manifest(manifest_path)
+            raw = Path(manifest["raw_directory"])
+
+            self.assertEqual(1, child.returncode)
+            self.assertEqual("downloading", manifest["status"])
+            owner = manifest["lease_owner"]
+            self.assertEqual(child.pid, owner["pid"])
+            self.assertEqual("job-owner", owner["job_id"])
+            self.assertEqual(socket.gethostname(), owner["host"])
+            self.assertIsInstance(owner["process_created_at"], float)
+            self.assertTrue(manifest["download_progress_at"])
+            self.assertTrue(any(path.is_file() for path in raw.rglob("*")), "the bytes did land")
+            self.assertEqual("gone", lease_owner_state(manifest)["state"])
+
+            discarded = discard_download_lease(manifest_path, confirmed=True)
+            after = read_manifest(manifest_path)
+
+            self.assertTrue(discarded["deleted"])
+            self.assertTrue(discarded["stale_lease_discarded"])
+            self.assertFalse(raw.exists())
+            self.assertEqual("discarded", after["status"])
+            record = after["stale_lease_discarded"]
+            self.assertEqual(owner, record["lease_owner"])
+            self.assertIn(f"Process {child.pid}", record["evidence"])
+            self.assertEqual(manifest["download_progress_at"], record["last_heartbeat_at"])
+
+    def test_a_lease_in_a_live_process_is_neither_discarded_nor_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            child = self._child(temporary, "wait")
+            try:
+                self.assertEqual("downloading", child.stdout.readline().strip())
+                manifest_path = Path(temporary).joinpath(*MANIFEST)
+                before = manifest_path.read_bytes()
+                raw = Path(read_manifest(manifest_path)["raw_directory"])
+
+                self.assertEqual("alive", lease_owner_state(read_manifest(manifest_path))["state"])
+                with self.assertRaisesRegex(ValueError, "still downloading"):
+                    discard_download_lease(manifest_path, confirmed=True)
+                with self.assertRaisesRegex(ValueError, "job job-owner.*still downloading into this workspace"):
+                    create_download_lease(
+                        _project([RepositoryFile("FILES/a.mzML", 3, "https://example.org/a.mzML")], ["a.mzML"]),
+                        Path(temporary),
+                        100,
+                        client=_Client({"https://example.org/a.mzML": b"abc"}),
+                    )
+                self.assertEqual(before, manifest_path.read_bytes())
+                self.assertTrue(raw.is_dir())
+            finally:
+                child.kill()
+                child.communicate(timeout=60)
+
+            self.assertEqual("gone", lease_owner_state(read_manifest(manifest_path))["state"])
+            self.assertTrue(discard_download_lease(manifest_path, confirmed=True)["deleted"])
+
+    def test_a_lease_this_process_is_running_is_alive(self) -> None:
+        states: list[str] = []
+        refusals: list[str] = []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = Path(temporary).joinpath(*MANIFEST)
+
+            def observe(_url, _destination):
+                states.append(lease_owner_state(read_manifest(manifest_path))["state"])
+                try:
+                    discard_download_lease(manifest_path, confirmed=True)
+                except ValueError as error:
+                    refusals.append(str(error))
+
+            project = _project([RepositoryFile("FILES/a.mzML", 3, "https://example.org/a.mzML")], ["a.mzML"])
+            lease = create_download_lease(
+                project, Path(temporary), 100, client=_Client({"https://example.org/a.mzML": b"abc"}, observe=observe),
+                job_id="job-here",
+            )
+
+        self.assertEqual(["alive"], states)
+        self.assertEqual(1, len(refusals))
+        self.assertIn("still downloading", refusals[0])
+        self.assertEqual("prepared", lease["status"])
+        self.assertEqual("job-here", lease["lease_owner"]["job_id"], "the final record keeps who downloaded it")
+
+    def _downloading_manifest(self, root: Path, owner: dict) -> Path:
+        raw = root / "raw"
+        (raw / "data").mkdir(parents=True)
+        (raw / "data" / "a.mzML.part").write_bytes(b"x")
+        manifest = root / "provenance" / "run-manifest.json"
+        _write_json(
+            manifest,
+            {
+                "status": "downloading",
+                "workspace": str(root),
+                "raw_directory": str(raw),
+                "output_directory": str(root / "output"),
+                "lease_owner": owner,
+            },
+        )
+        return manifest
+
+    def test_a_lease_naming_this_process_that_it_is_not_running_is_gone(self) -> None:
+        """It ended without recording how, or an earlier process had the same id; either way it is not
+        running, and this process is the one that would be running it."""
+        owner = {
+            "lease_id": "not-held-by-anyone",
+            "pid": os.getpid(),
+            "process_created_at": process_created_at(),
+            "host": socket.gethostname(),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._downloading_manifest(Path(temporary), owner)
+
+            self.assertEqual("gone", lease_owner_state(read_manifest(manifest))["state"])
+            self.assertTrue(discard_download_lease(manifest, confirmed=True)["deleted"])
+
+    def _sleeper(self) -> subprocess.Popen:
+        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        self.addCleanup(lambda: (sleeper.kill(), sleeper.wait(timeout=60)))
+        return sleeper
+
+    def test_a_lease_whose_process_id_now_names_a_later_process_is_gone(self) -> None:
+        """Windows reuses process ids. A running process with the lease's id but a later creation time is
+        a different process."""
+        sleeper = self._sleeper()
+        owner = {
+            "lease_id": "earlier",
+            "pid": sleeper.pid,
+            "process_created_at": 1.0,  # 1970: the id has been reused since
+            "host": socket.gethostname(),
+        }
+        state = lease_owner_state({"lease_owner": owner})
+        alive = lease_owner_state(
+            {"lease_owner": {**owner, "process_created_at": process_created_at(sleeper.pid)}}
+        )
+
+        self.assertEqual("gone", state["state"])
+        self.assertIn("started later", state["reason"])
+        self.assertEqual("alive", alive["state"])
+
+    def test_a_lease_taken_on_another_host_or_with_no_owner_is_not_discarded(self) -> None:
+        for owner in (
+            {"lease_id": "x", "pid": 4, "process_created_at": 1.0, "host": "another-host.invalid"},
+            None,
+        ):
+            with self.subTest(owner=owner), tempfile.TemporaryDirectory() as temporary:
+                manifest = self._downloading_manifest(Path(temporary), owner)
+
+                self.assertEqual("unknown", lease_owner_state(read_manifest(manifest))["state"])
+                preview = discard_download_lease(manifest, confirmed=False)
+                self.assertEqual("unknown", preview["lease_owner_state"]["state"])
+                with self.assertRaisesRegex(ValueError, "not provably gone"):
+                    discard_download_lease(manifest, confirmed=True)
+                self.assertTrue((Path(temporary) / "raw").is_dir())
+
+    def test_liveness_is_never_read_by_signalling(self) -> None:
+        """On Windows os.kill(pid, 0) sends CTRL_C_EVENT; it is not a probe."""
+        sleeper = self._sleeper()
+        with patch("os.kill", side_effect=AssertionError("os.kill is not a liveness probe")):
+            for pid in (sleeper.pid, 999_999_999):
+                lease_owner_state(
+                    {"lease_owner": {"lease_id": "x", "pid": pid, "process_created_at": 1.0, "host": socket.gethostname()}}
+                )
+
+    def test_the_heartbeat_moves_while_bytes_arrive(self) -> None:
+        beats: list[tuple[str, int]] = []
+
+        class _Progressing(_Client):
+            def download(self, url, destination, maximum_bytes, progress_callback=None):
+                for received in (1, 2, 3):
+                    time.sleep(0.01)
+                    progress_callback(received, 3)
+                    current = read_manifest(destination.parents[2] / "provenance" / "run-manifest.json")
+                    beats.append((current["download_progress_at"], current.get("download_received_bytes")))
+                return super().download(url, destination, maximum_bytes, progress_callback)
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            repository_reanalysis, "LEASE_HEARTBEAT_SECONDS", 0.0
+        ):
+            project = _project([RepositoryFile("FILES/a.mzML", 3, "https://example.org/a.mzML")], ["a.mzML"])
+            lease = create_download_lease(
+                project, Path(temporary), 100, client=_Progressing({"https://example.org/a.mzML": b"abc"})
+            )
+
+        self.assertEqual([1, 2, 3], [received for _, received in beats])
+        stamps = [stamp for stamp, _ in beats]
+        self.assertEqual(sorted(stamps), stamps)
+        self.assertLess(lease["download_started_at"], stamps[0])
 
 
 if __name__ == "__main__":  # pragma: no cover

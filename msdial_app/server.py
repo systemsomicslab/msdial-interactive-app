@@ -223,7 +223,7 @@ def _repository_workspace(state: dict[str, Any]) -> str:
     if not manifest_path.is_file():
         return ""
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        manifest = read_manifest(manifest_path)
     except (OSError, ValueError):
         return ""
     return str(manifest.get("workspace") or "")
@@ -1993,6 +1993,7 @@ def _run_repository_download_job(
             campaign_authorization=(
                 {**campaign_authorization, "job_id": job_id} if campaign_authorization else None
             ),
+            job_id=job_id,
         )
         recognized = expand_paths_report(lease.get("input_candidates", []))
         result = {
@@ -2033,7 +2034,7 @@ def _register_split_part(parent_job: dict[str, Any], part: dict[str, Any]) -> st
     manifest and a later split call re-registers the same id if the record was evicted.
     """
     part_manifest_path = Path(part["manifest_path"])
-    part_manifest = json.loads(part_manifest_path.read_text(encoding="utf-8-sig"))
+    part_manifest = read_manifest(part_manifest_path)
     job_id = str(part_manifest.get("job_id") or "").strip() or uuid.uuid4().hex
     now = dt.datetime.now().astimezone().isoformat()
     recognized = expand_paths_report(part_manifest.get("input_candidates", []))

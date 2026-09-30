@@ -259,6 +259,20 @@ def _structured_validation_errors(function):
                 "detail": str(error),
                 "error_type": type(error).__name__,
             }
+        except OSError as error:
+            # A unit manifest held by another writer, or kept unreadable by renames, for longer than the
+            # manifest layer waits: nothing was changed, and the same call can be repeated. These were
+            # unmapped, while the JSONDecodeError a torn read gave before them was mapped.
+            from .repository_reanalysis import ManifestBusyError
+
+            busy = isinstance(error, ManifestBusyError)
+            return {
+                "ok": False,
+                "reason": "manifest_busy" if busy else "os_error",
+                "retryable": busy,
+                "detail": str(error),
+                "error_type": type(error).__name__,
+            }
 
     return wrapped
 
@@ -421,7 +435,9 @@ def _repository_download_job(
         raise FileNotFoundError(
             f"Repository run manifest was not found for job {job_id}: {manifest_path}"
         )
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    from .repository_reanalysis import read_manifest
+
+    manifest = read_manifest(manifest_path)
     manifest["manifest_path"] = str(manifest_path.resolve())
     return job, manifest
 

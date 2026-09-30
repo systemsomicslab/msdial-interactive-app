@@ -8,7 +8,9 @@ import json
 import os
 import random
 import re
+import secrets
 import shutil
+import socket
 import subprocess
 import tarfile
 import tempfile
@@ -25,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Iterator
 from .diagnostic_paths import is_diagnostic_artifact
+from .process_liveness import process_created_at, process_is_alive
 
 try:
     import msvcrt
@@ -891,12 +894,21 @@ def create_download_lease(
     progress_callback: Any = None,
     raw_retention_policy: str = "keep",
     campaign_authorization: dict[str, Any] | None = None,
+    job_id: str = "",
 ) -> dict[str, Any]:
     """Download one unit's objects into its workspace and write the unit's run manifest.
 
     ``campaign_authorization`` is the crossing record a validated campaign approval produced for this
     download (msdial_app.campaign_authorization); it is written into the manifest from the first write
     on. None, the default, writes nothing about a campaign.
+
+    ``job_id`` is the backend job the lease runs in. It is recorded with this process as the lease's
+    owner, so a lease left "downloading" by a process that has since died can be told from a live one.
+
+    A manifest already in the workspace is never lost: unless it is itself an unfinished or discarded
+    lease, it is copied byte for byte beside itself before the first write, and the copy is named in
+    previous_manifest and superseded_manifests. A split parent is not re-leased at all, and neither is a
+    workspace another live lease is still downloading into.
     """
     downloadable = project.eligible or (
         allow_preflight and project.selection_status == "raw_metadata_required"
@@ -943,7 +955,13 @@ def create_download_lease(
     #
     # So the unit says "downloading" before it downloads, and "download_failed", with the reason, when it
     # does not finish. Nothing here is eligible for a run or a cleanup until the full record replaces it.
+    #
+    # It also says who is downloading. A process killed mid-transfer - a reboot, a backend stopped - writes
+    # nothing, and its lease stays "downloading" for good. The owner (job, process id, the process's
+    # creation time, host) and a heartbeat refreshed as bytes arrive are what let discard_download_lease
+    # tell that lease from one still running (lease_owner_state).
     started_at = datetime.now(timezone.utc).isoformat()
+    owner = _new_lease_owner(job_id)
     lease_record: dict[str, Any] = {
         "schema": "msdial-public-reanalysis-run.v1",
         "created_at": started_at,
@@ -958,15 +976,42 @@ def create_download_lease(
         "cleanup_allowed": False,
         "raw_retention_policy": raw_retention_policy,
         "download_started_at": started_at,
+        "lease_owner": owner,
+        "download_progress_at": started_at,
     }
-    previous = _previous_manifest_summary(manifest_path)
-    if previous:
-        # A lease into a workspace that already holds a manifest replaces it, as it always has. What it
-        # replaced is said, so a retry is visibly a retry and not a first attempt.
-        lease_record["previous_manifest"] = previous
     if campaign_authorization:
         lease_record["campaign_authorizations"] = [dict(campaign_authorization)]
-    _write_json(manifest_path, lease_record)
+    # Held before the first write, so this process never reads its own new lease as abandoned.
+    _hold_lease(owner["lease_id"])
+    try:
+        # Under the manifest's lock, so nothing is written between the look at what is there and the
+        # write that replaces it.
+        with manifest_lock(manifest_path):
+            previous, superseded = _supersede_previous_manifest(manifest_path)
+            if previous:
+                # A lease into a workspace that already holds a manifest replaces it, as it always has.
+                # What it replaced is said, so a retry is visibly a retry and not a first attempt, and a
+                # record worth keeping was copied aside first rather than overwritten.
+                lease_record["previous_manifest"] = previous
+            if superseded:
+                lease_record["superseded_manifests"] = superseded
+            _write_json(manifest_path, lease_record)
+    except BaseException:
+        _release_lease(owner["lease_id"])
+        raise
+
+    last_beat = time.monotonic()
+
+    def beat(received: int) -> None:
+        nonlocal last_beat
+        now = time.monotonic()
+        if now - last_beat < LEASE_HEARTBEAT_SECONDS:
+            return
+        last_beat = now
+        stamp = datetime.now(timezone.utc).isoformat()
+        lease_record["download_progress_at"] = stamp
+        lease_record["download_received_bytes"] = received
+        _beat_lease(manifest_path, owner["lease_id"], stamp, received)
 
     downloads: list[dict[str, Any]] = []
     try:
@@ -982,6 +1027,7 @@ def create_download_lease(
             archive = Path(filename).suffix.casefold() in ARCHIVE_SUFFIXES
             destination = download_root / filename if archive else data_root / _safe_relative_name(item.name)
             def item_progress(received: int, declared: int) -> None:
+                beat(downloaded_bytes + received)
                 if progress_callback:
                     known_total = required_download_bytes or (
                         downloaded_bytes + declared if declared else 0
@@ -1008,6 +1054,7 @@ def create_download_lease(
                     raise ValueError(f"MD5 checksum mismatch for {filename}.")
                 result["declared_checksum_verified"] = True
             downloads.append(result)
+            beat(downloaded_bytes)
             if progress_callback:
                 progress_callback(
                     index,
@@ -1028,7 +1075,8 @@ def create_download_lease(
                 for member in members:
                     extracted_from[_file_key(member)] = item
         selected_extracted = _filter_project_allowlist_paths(extracted, data_root, project)
-        checksum_validation = _verify_project_allowlist_checksums(data_root, project)
+        verified_checksums: dict[str, dict[str, Any]] = {}
+        checksum_validation = _verify_project_allowlist_checksums(data_root, project, verified_checksums)
         all_inputs = _find_msdial_inputs(data_root)
         inputs = _filter_inputs_by_project_allowlist(all_inputs, data_root, project)
         analysis_input = _common_input_path(inputs, data_root)
@@ -1048,7 +1096,7 @@ def create_download_lease(
             "input_candidates": inputs,
             "ignored_input_candidate_count": len(all_inputs) - len(inputs),
             "input_lineage": build_input_lineage(
-                inputs, downloads, extracted_from, data_root, download_root, project
+                inputs, downloads, extracted_from, data_root, download_root, project, verified_checksums
             ),
             "analysis_input_path": analysis_input,
             "execution_allowed": project.eligible,
@@ -1068,7 +1116,7 @@ def create_download_lease(
             "download_started_at": started_at,
             "download_completed_at": datetime.now(timezone.utc).isoformat(),
         }
-        for key in ("previous_manifest", "campaign_authorizations"):
+        for key in ("previous_manifest", "superseded_manifests", "campaign_authorizations", "lease_owner"):
             if key in lease_record:
                 manifest[key] = lease_record[key]
         repository_metadata_path = provenance / "repository-metadata.json"
@@ -1083,32 +1131,216 @@ def create_download_lease(
     except BaseException as error:
         _record_download_failure(manifest_path, lease_record, downloads, error)
         raise
+    finally:
+        # After the last write, success or failure, so the lease is never "not held" while its manifest
+        # still says downloading.
+        _release_lease(owner["lease_id"])
     return {**manifest, "manifest_path": str(manifest_path)}
 
 
 # A manifest in either state records a lease that has not delivered its inputs. Nothing that needs
-# input_candidates may start from one; discard_download_lease may act on one.
+# input_candidates may start from one. discard_download_lease may act on a failed one, and on one still
+# "downloading" whose owner is provably gone.
 LEASE_INCOMPLETE_STATUSES = frozenset({"downloading", "download_failed"})
+# A manifest in any other state is a record worth keeping, and a new lease copies it aside before
+# replacing it. These hold nothing a new lease does not supersede, and are summarised only.
+LEASE_REPLACEABLE_STATUSES = LEASE_INCOMPLETE_STATUSES | {"discarded"}
+# How often a running lease refreshes download_progress_at in its manifest while bytes arrive.
+LEASE_HEARTBEAT_SECONDS = 30.0
+
+# The leases this process is running now, by lease_id. A lease that names this process and is not here
+# is not running, whatever the process table says: the process is alive because it is this one.
+_ACTIVE_LEASES: set[str] = set()
+_ACTIVE_LEASES_GUARD = threading.Lock()
 
 
-def _previous_manifest_summary(manifest_path: Path) -> dict[str, Any]:
-    """What a new lease is about to replace, in a few fields. Empty when there is nothing there."""
+def _hold_lease(lease_id: str) -> None:
+    with _ACTIVE_LEASES_GUARD:
+        _ACTIVE_LEASES.add(lease_id)
+
+
+def _release_lease(lease_id: str) -> None:
+    with _ACTIVE_LEASES_GUARD:
+        _ACTIVE_LEASES.discard(lease_id)
+
+
+def _new_lease_owner(job_id: str) -> dict[str, Any]:
+    """Who holds a lease: enough to find the process again, and to tell it from a later one."""
+    return {
+        "lease_id": secrets.token_hex(16),
+        "job_id": str(job_id or ""),
+        "pid": os.getpid(),
+        # Windows reuses process ids; the creation time is what says the id still names this process.
+        "process_created_at": process_created_at(),
+        "host": socket.gethostname(),
+    }
+
+
+def lease_owner_state(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Whether the process holding a lease recorded as downloading is still there.
+
+    ``state`` is one of:
+
+    - alive: this process is running the lease, or the recorded process is running and has the recorded
+      creation time;
+    - gone: provably not running - the recorded process has exited, its id now names a process started
+      later, or the lease names this process and this process is not running it;
+    - unknown: anything else - no owner recorded, another host, or a process whose identity cannot be
+      read. It must be treated as possibly alive.
+
+    Read through OpenProcess or psutil (process_liveness), never os.kill: on Windows signal 0 is
+    CTRL_C_EVENT, not a probe.
+    """
+    owner = manifest.get("lease_owner")
+    evidence = {"lease_owner": owner, "last_heartbeat_at": manifest.get("download_progress_at")}
+    if not isinstance(owner, dict):
+        return {"state": "unknown", "reason": "The lease records no owner process.", **evidence}
     try:
-        data = manifest_path.read_bytes()
-    except OSError:
-        return {}
+        pid = int(owner.get("pid"))
+    except (TypeError, ValueError):
+        return {"state": "unknown", "reason": "The lease records no owner process id.", **evidence}
+    host = str(owner.get("host") or "")
+    if host and host.casefold() != socket.gethostname().casefold():
+        return {
+            "state": "unknown",
+            "reason": f"The lease was taken on host {host}, whose processes cannot be read from here.",
+            **evidence,
+        }
+    if pid == os.getpid():
+        with _ACTIVE_LEASES_GUARD:
+            running = str(owner.get("lease_id") or "") in _ACTIVE_LEASES
+        if running:
+            return {"state": "alive", "reason": "This process is running the lease.", **evidence}
+        return {
+            "state": "gone",
+            "reason": (
+                f"The lease names process {pid}, which is this process and is not running it: the lease "
+                "ended without recording how, or was taken by an earlier process with the same id."
+            ),
+            **evidence,
+        }
+    recorded = owner.get("process_created_at")
+    alive = process_is_alive(pid, recorded)
+    if alive is False:
+        reused = process_created_at(pid) is not None
+        return {
+            "state": "gone",
+            "reason": (
+                f"Process {pid}, which took the lease, has exited"
+                + ("; its id now names a process started later." if reused else ".")
+            ),
+            **evidence,
+        }
+    if alive and recorded is not None and process_created_at(pid) is not None:
+        return {"state": "alive", "reason": f"Process {pid}, which took the lease, is running.", **evidence}
+    return {
+        "state": "unknown",
+        "reason": f"Process {pid} exists, but whether it is the one that took the lease cannot be read.",
+        **evidence,
+    }
+
+
+def _beat_lease(manifest_path: Path, lease_id: str, stamp: str, received: int) -> None:
+    """Refresh a running lease's heartbeat. Never raises, and never waits long: it must not stall bytes.
+
+    Skipped when the manifest no longer records this lease as downloading.
+    """
+    try:
+        with manifest_lock(manifest_path, timeout=5):
+            current = read_manifest(manifest_path)
+            if current.get("status") != "downloading" or (current.get("lease_owner") or {}).get(
+                "lease_id"
+            ) != lease_id:
+                return
+            current["download_progress_at"] = stamp
+            current["download_received_bytes"] = received
+            _write_json(manifest_path, current)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _superseded_copy_path(manifest_path: Path) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    candidate = manifest_path.with_name(f"{manifest_path.stem}.superseded-{stamp}{manifest_path.suffix}")
+    counter = 1
+    while candidate.exists():
+        candidate = manifest_path.with_name(
+            f"{manifest_path.stem}.superseded-{stamp}-{counter}{manifest_path.suffix}"
+        )
+        counter += 1
+    return candidate
+
+
+def _supersede_previous_manifest(manifest_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Make room for a new lease's first write without losing what the workspace already records.
+
+    Called under the manifest's writer lock. Returns the summary recorded as previous_manifest and the
+    list recorded as superseded_manifests; both are empty when there is no manifest.
+
+    WHY A COPY. The lease writes "downloading" before its first byte, so a retry that fails, or is killed,
+    used to leave only that record where a finalised unit's had been: its status, its retained artifacts
+    and their inventory, its finalised run, its failures and its campaign crossings were gone, and a
+    summary of five fields was all that said they had existed. A manifest that is anything but an
+    unfinished or discarded lease is therefore copied byte for byte to run-manifest.superseded-<UTC>.json
+    first. The copies accumulate in superseded_manifests, carried from each record to the next, so a chain
+    of failed retries never drops the pointer to the record they replaced. The copy sits in provenance,
+    where finalisation keeps every file and raw cleanup removes none.
+
+    Refused, before anything is written: a split parent, whose parts read its raw files in place and name
+    its manifest, which must stay split_by_acquisition; and a workspace another live lease is still
+    downloading into. Raises when the manifest is there but cannot be read, rather than replace it unseen.
+    """
+    try:
+        data = _read_manifest_bytes(manifest_path)
+    except FileNotFoundError:
+        return {}, []
     summary: dict[str, Any] = {"sha256": hashlib.sha256(data).hexdigest(), "size_bytes": len(data)}
     try:
         previous = json.loads(data.decode("utf-8-sig"))
     except ValueError:
-        return {**summary, "readable": False}
-    if isinstance(previous, dict):
-        for key in (
-            "status", "created_at", "finalized_at", "raw_cleaned_at", "discarded_at", "download_failed_at",
-        ):
-            if previous.get(key):
-                summary[key] = previous[key]
-    return summary
+        previous = None
+    if not isinstance(previous, dict):
+        summary["readable"] = False
+        previous = {}
+    for key in ("status", "created_at", "finalized_at", "raw_cleaned_at", "discarded_at", "download_failed_at"):
+        if previous.get(key):
+            summary[key] = previous[key]
+    superseded = [dict(item) for item in previous.get("superseded_manifests") or [] if isinstance(item, dict)]
+    status = str(previous.get("status") or "")
+    if status == SPLIT_PARENT_STATUS:
+        parts = [
+            str(item.get("analysis_unit_id") or item.get("manifest_path") or "")
+            for item in previous.get("split_into") or []
+            if isinstance(item, dict)
+        ]
+        raise ValueError(
+            f"This unit was split by acquisition mode into {len(parts)} part(s) ({', '.join(parts)}), which "
+            "read its raw files in place and name this manifest as their parent. A new lease would replace "
+            "that record; the parent is not re-leased."
+        )
+    if status == "downloading":
+        state = lease_owner_state(previous)
+        summary["lease_owner"] = previous.get("lease_owner")
+        summary["lease_owner_state"] = state["state"]
+        if state["state"] == "alive":
+            job = str((previous.get("lease_owner") or {}).get("job_id") or "") or "unrecorded"
+            raise ValueError(
+                f"Another lease (job {job}) is still downloading into this workspace: {state['reason']}"
+            )
+    if status not in LEASE_REPLACEABLE_STATUSES:
+        copy = _superseded_copy_path(manifest_path)
+        # Its own name, so no lock of its own; written whole or not at all, like every record here.
+        _replace_atomically(copy, data)
+        entry = {
+            "path": str(copy),
+            "sha256": summary["sha256"],
+            "size_bytes": len(data),
+            "status": status or None,
+            "superseded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        summary["superseded_copy"] = {"path": entry["path"], "sha256": entry["sha256"]}
+        superseded.append(entry)
+    return summary, superseded
 
 
 def _record_download_failure(
@@ -1150,6 +1382,7 @@ def build_input_lineage(
     data_root: Path,
     download_root: Path,
     project: RepositoryProject,
+    verified_checksums: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """One row per analysis input: what it is, where its bytes came from, and what vouches for them.
 
@@ -1172,7 +1405,12 @@ def build_input_lineage(
     A member of an archive is not hashed here; the archive's checksums, and whether the published one was
     compared, are carried as its source. ``sample_id`` is filled when exactly one of the unit's samples
     names the input; ``file_name`` is the analysis CSV's, and belongs to whatever writes that CSV.
+
+    ``verified_checksums`` is what _verify_project_allowlist_checksums compared, by _file_key: a file or
+    an extracted member whose own declared md5, sha1 or sha256 matched records it as declared,
+    declared_algorithm and declared_verified. Without it a checked input read as unchecked.
     """
+    verified_checksums = verified_checksums or {}
     data_key = _file_key(str(data_root))
     direct: dict[str, dict[str, Any]] = {}
     for item in downloads:
@@ -1273,8 +1511,12 @@ def build_input_lineage(
                 "sha256": entry.get("sha256", ""),
                 "md5": entry.get("md5", ""),
                 "declared": entry.get("declared_checksum", ""),
+                # The download loop compares only a 32-digit declared value, and only against the md5.
+                "declared_algorithm": "md5" if entry.get("declared_checksum_verified") else "",
                 "declared_verified": True if entry.get("declared_checksum_verified") else None,
             }
+            if key in verified_checksums:
+                row["checksums"].update(_declared_verification(verified_checksums[key]))
         elif key in extracted_from:
             row["kind"] = "extracted_member"
             try:
@@ -1282,11 +1524,23 @@ def build_input_lineage(
             except ValueError:
                 member = path.name
             row["source"] = {"archive": _archive_source(extracted_from[key]), "member": member}
+            if key in verified_checksums:
+                # The member's own declared checksum, compared against its extracted bytes. The archive's
+                # checksum, verified or not, stays with the archive in the source.
+                row["checksums"] = _declared_verification(verified_checksums[key])
         else:
             row["kind"] = "vendor_folder" if path.is_dir() else "file"
             row["source"] = {"origin": "not_downloaded_by_this_lease"}
         rows.append(row)
     return {"schema": "msdial-input-lineage.v1", "rows": rows}
+
+
+def _declared_verification(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "declared": str(result.get("declared") or ""),
+        "declared_algorithm": str(result.get("declared_algorithm") or ""),
+        "declared_verified": True if result.get("verified") else None,
+    }
 
 
 def _archive_source(entry: dict[str, Any]) -> dict[str, Any]:
@@ -1606,7 +1860,7 @@ def run_raw_metadata_preflight(
     extractor_path = extractor_path.resolve()
     if not extractor_path.is_file():
         raise FileNotFoundError(f"Raw metadata extractor was not found: {extractor_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = read_manifest(manifest_path)
     previously_allowed = bool(
         manifest.get("execution_allowed") or manifest.get("project", {}).get("eligible")
     )
@@ -1761,7 +2015,7 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     directory is not its own.
     """
     manifest_path = manifest_path.resolve()
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    manifest = read_manifest(manifest_path)
     project = manifest.get("project") or {}
     preflight = manifest.get("raw_metadata_preflight") or {}
     summary = preflight.get("summary") or {}
@@ -1924,7 +2178,7 @@ def split_unit_by_acquisition(manifest_path: Path, confirmed: bool = False) -> d
         return {**plan, "written": False}
 
     manifest_path = Path(plan["manifest_path"])
-    parent = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    parent = read_manifest(manifest_path)
     parent_project = parent.get("project") or {}
     parent_conversion_reasons = [
         reason
@@ -2117,7 +2371,7 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             ],
         }
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        manifest = read_manifest(manifest_path)
     except (OSError, ValueError) as error:
         return {
             "gated": True,
@@ -2256,7 +2510,7 @@ def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
     caller can present them; it changes nothing.
     """
     manifest_path = manifest_path.resolve()
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = read_manifest(manifest_path)
     raw_root = Path(manifest.get("raw_directory", "")).resolve()
     workspace = Path(manifest.get("workspace", "")).resolve()
     retained = [Path(value) for value in manifest.get("retained_artifacts", [])]
@@ -2315,7 +2569,7 @@ def request_download_cleanup(manifest_path: Path) -> dict[str, Any]:
 
 def cleanup_download_lease(manifest_path: Path, confirmed: bool = False) -> dict[str, Any]:
     manifest_path = manifest_path.resolve()
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = read_manifest(manifest_path)
     if not confirmed:
         # The preview carries the retained artifacts, the target and the size, because a confirmation
         # given without them is not an informed one. It used to return only the flag.
@@ -2347,19 +2601,32 @@ def discard_download_lease(manifest_path: Path, confirmed: bool = False) -> dict
     from .mztab_validation import find_mztab_files
 
     manifest_path = manifest_path.resolve()
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = read_manifest(manifest_path)
+    downloading = manifest.get("status") == "downloading"
+    owner_state = lease_owner_state(manifest) if downloading else None
     if not confirmed:
-        return {"deleted": False, "confirmation_required": True, "manifest_path": str(manifest_path)}
+        preview = {"deleted": False, "confirmation_required": True, "manifest_path": str(manifest_path)}
+        if owner_state is not None:
+            preview["lease_owner_state"] = owner_state
+        return preview
     if manifest.get("status") in {"mztab_validated", "completed", "raw_cleaned"}:
         raise ValueError("Validated/completed runs must use the normal cleanup command.")
-    if manifest.get("status") == "downloading":
+    stale: dict[str, Any] | None = None
+    if downloading:
         # Written before the first byte of a lease. A lease that is still running writes into the tree
-        # this would delete, and a stopped one resumes on the next attempt, which then records either
-        # its inputs or download_failed.
-        raise ValueError(
-            "This unit's lease is recorded as still downloading; retry or finish the lease before "
-            "discarding its raw data."
-        )
+        # this would delete. One whose process is provably gone - killed with it by a reboot or a
+        # backend stop, so it never wrote download_failed - never will, and its bytes are released here
+        # rather than kept until someone downloads the unit again. Possibly alive is not gone.
+        if owner_state["state"] != "gone":
+            raise ValueError(
+                "This unit's lease is recorded as still downloading, and its owner is not provably gone "
+                f"({owner_state['reason']}); retry or finish the lease before discarding its raw data."
+            )
+        stale = {
+            "lease_owner": manifest.get("lease_owner"),
+            "evidence": owner_state["reason"],
+            "last_heartbeat_at": manifest.get("download_progress_at"),
+        }
     output = Path(manifest.get("output_directory", ""))
     if find_mztab_files(output):
         raise ValueError("mzTab-M output exists; finalize the run before deleting raw data.")
@@ -2372,14 +2639,29 @@ def discard_download_lease(manifest_path: Path, confirmed: bool = False) -> dict
     discarded_at = datetime.now(timezone.utc).isoformat()
 
     def change(current: dict[str, Any]) -> None:
+        if stale is not None and (current.get("lease_owner") or {}).get("lease_id") != (
+            (stale["lease_owner"] or {}).get("lease_id")
+        ):
+            # Another lease took the workspace over after the check. Its record is not this discard's.
+            raise ValueError(
+                "A new lease took this workspace over while its stale lease was being discarded; the new "
+                "lease's record was left as it is."
+            )
         current["status"] = "discarded"
         current["discarded_at"] = discarded_at
         current["discard_reason"] = (
             "Preflight/download was rejected before a retained mzTab-M result was produced."
+            if stale is None
+            else "The lease's process stopped before it recorded its inputs or its failure."
         )
+        if stale is not None:
+            current["stale_lease_discarded"] = {**stale, "discarded_at": discarded_at}
 
     update_manifest(manifest_path, change)
-    return {"deleted": True, "raw_directory": str(raw_root), "manifest_path": str(manifest_path)}
+    result = {"deleted": True, "raw_directory": str(raw_root), "manifest_path": str(manifest_path)}
+    if stale is not None:
+        result["stale_lease_discarded"] = True
+    return result
 
 
 def project_from_dict(value: dict[str, Any]) -> RepositoryProject:
@@ -2555,8 +2837,17 @@ def _filter_project_allowlist_paths(
 
 
 def _verify_project_allowlist_checksums(
-    data_root: Path, project: RepositoryProject
+    data_root: Path,
+    project: RepositoryProject,
+    per_file: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Compare every declared md5, sha1 or sha256 with the file it names. Raises on any mismatch.
+
+    Returns the counts the manifest records. ``per_file``, when given, is filled with what was verified
+    for each file, keyed by _file_key: the input lineage records it on that file's row, where the gate
+    reads it. Only the counts used to leave here, so an input whose declared checksum had been checked
+    looked unverified to everything that read the lineage.
+    """
     if not project.analysis_unit_id:
         return {"required": False, "verified": 0, "skipped": 0}
     files = [path for path in data_root.rglob("*") if path.is_file()]
@@ -2587,6 +2878,13 @@ def _verify_project_allowlist_checksums(
         if digest.hexdigest().casefold() != checksum:
             raise ValueError(f"{algorithm.upper()} checksum mismatch for {item.name}.")
         verified += 1
+        if per_file is not None:
+            per_file[_file_key(str(matches[0]))] = {
+                "declared": checksum,
+                "declared_algorithm": algorithm,
+                "declared_name": item.name,
+                "verified": True,
+            }
     return {"required": verified > 0, "verified": verified, "skipped": skipped}
 
 
@@ -2860,7 +3158,7 @@ def _acquisition_start_times(
     parent_path = str(split_from.get("manifest_path") or "") if isinstance(split_from, dict) else ""
     if parent_path and Path(parent_path).is_file():
         try:
-            parent = json.loads(Path(parent_path).read_text(encoding="utf-8-sig"))
+            parent = read_manifest(parent_path)
         except (OSError, ValueError):
             parent = {}
         if isinstance(parent, dict):
@@ -3149,7 +3447,7 @@ def recorded_order_source(manifest_path: Any, files: list[dict[str, Any]]) -> st
     if not str(manifest_path or "").strip():
         return None
     try:
-        manifest = json.loads(Path(str(manifest_path)).read_text(encoding="utf-8-sig"))
+        manifest = read_manifest(str(manifest_path))
     except (OSError, ValueError):
         return None
     record = manifest.get("analytical_order") if isinstance(manifest, dict) else None
@@ -3843,10 +4141,28 @@ def _is_sidecar_name(name: str) -> bool:
 # manifest in one rename, so a reader sees the old record or the new one and never a fragment. Writers
 # take a lock beside the file first. The lock is an operating-system lock on a file that is never deleted,
 # so a writer that dies releases it with its handle and there is no stale lock to recover or process to
-# probe for liveness. Readers take no lock: the rename is what keeps them safe.
+# probe for liveness. Readers take no lock: the rename is what keeps them from a fragment, and a retry is
+# what keeps them from the rename itself (read_manifest).
 MANIFEST_LOCK_SUFFIX = ".lock"
 MANIFEST_TEMPORARY_SUFFIX = ".tmp"
 MANIFEST_LOCK_TIMEOUT_SECONDS = 120.0
+# How often, and how patiently, a rename onto the manifest and a read of it are retried while the other
+# holds the file. One schedule for both: about 25 s in all, far longer than either holds it.
+_MANIFEST_BUSY_ATTEMPTS = 50
+
+
+def _manifest_busy_delay(attempt: int) -> float:
+    return 0.02 * (attempt + 1)
+
+
+class ManifestBusyError(TimeoutError):
+    """A manifest stayed locked, or unreadable, for longer than a writer or a reader waits for it.
+
+    Nothing was changed. A TimeoutError, as the lock's timeout always was, so existing handlers still
+    catch it; its own type is what lets the MCP layer report it as busy rather than as a crash.
+    """
+
+
 _MANIFEST_THREAD_LOCKS: dict[str, threading.RLock] = {}
 _MANIFEST_THREAD_LOCKS_GUARD = threading.Lock()
 _MANIFEST_LOCK_DEPTH: dict[str, int] = {}
@@ -3869,7 +4185,7 @@ def _lock_file_handle(lock_path: Path, deadline: float) -> Any:
         except OSError:
             if time.monotonic() >= deadline:
                 handle.close()
-                raise TimeoutError(
+                raise ManifestBusyError(
                     f"Another writer held {lock_path.name} for longer than "
                     f"{MANIFEST_LOCK_TIMEOUT_SECONDS:.0f} s; the manifest was not changed."
                 )
@@ -3901,7 +4217,9 @@ def manifest_lock(path: str | Path, timeout: float = MANIFEST_LOCK_TIMEOUT_SECON
         thread_lock = _MANIFEST_THREAD_LOCKS.setdefault(key, threading.RLock())
     deadline = time.monotonic() + max(float(timeout), 0.0)
     if not thread_lock.acquire(timeout=max(float(timeout), 0.0)):
-        raise TimeoutError(f"Another thread held the lock on {target.name}; the manifest was not changed.")
+        raise ManifestBusyError(
+            f"Another thread held the lock on {target.name}; the manifest was not changed."
+        )
     try:
         depth = _MANIFEST_LOCK_DEPTH.get(key, 0)
         if depth:
@@ -3943,14 +4261,14 @@ def _replace_atomically(path: Path, data: bytes) -> None:
         # On Windows a rename onto a file that another process has open for reading is refused for as
         # long as that reader holds it. Readers take no lock and hold the file for milliseconds, so the
         # replacement is retried briefly rather than failing the write.
-        for attempt in range(50):
+        for attempt in range(_MANIFEST_BUSY_ATTEMPTS):
             try:
                 os.replace(temporary, path)
                 break
             except PermissionError:
-                if attempt == 49:
+                if attempt == _MANIFEST_BUSY_ATTEMPTS - 1:
                     raise
-                time.sleep(0.02 * (attempt + 1))
+                time.sleep(_manifest_busy_delay(attempt))
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -3979,8 +4297,35 @@ def _write_json(path: Path, value: Any) -> None:
         _replace_atomically(path, data)
 
 
+def _read_manifest_bytes(path: str | Path) -> bytes:
+    """A manifest's bytes, waiting out the instant a writer renames a new record onto it.
+
+    On Windows a file that os.replace is replacing cannot be opened for that instant: the open fails with
+    PermissionError rather than returning a partial file. With the campaign runner and the backend both
+    touching one manifest, that surfaced as sporadic unstructured tool failures, and as an execution gate
+    refusing a unit whose record "could not be read". The open is retried on the rename's own schedule. A
+    missing file is reported at once; only a busy one is waited for.
+    """
+    target = Path(path)
+    for attempt in range(_MANIFEST_BUSY_ATTEMPTS):
+        try:
+            return target.read_bytes()
+        except PermissionError as error:
+            if attempt == _MANIFEST_BUSY_ATTEMPTS - 1:
+                waited = sum(_manifest_busy_delay(index) for index in range(attempt))
+                raise ManifestBusyError(
+                    f"{target.name} stayed busy or unreadable for {waited:.0f} s: {error}"
+                ) from error
+            time.sleep(_manifest_busy_delay(attempt))
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 def read_manifest(path: str | Path) -> dict[str, Any]:
-    manifest = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    """One JSON record written by _write_json - a unit manifest, a diagnostic record - read safely.
+
+    Every reader of a unit manifest goes through here, so none of them mistakes a rename for an error.
+    """
+    manifest = json.loads(_read_manifest_bytes(path).decode("utf-8-sig"))
     if not isinstance(manifest, dict):
         raise ValueError(f"{Path(path).name} does not hold one JSON object.")
     return manifest
