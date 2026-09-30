@@ -401,7 +401,7 @@ class RunJobTests(unittest.TestCase):
         }
 
     def _console(self, exit_code: int = 0, hold: tuple[str, ...] = ()):
-        def console(_preparation, _log):
+        def console(_preparation, _log, **_watch):
             for name in self.INPUTS:
                 for suffix in (".dcl", ".pai2", "_tags.xml"):
                     _write(self.data / f"{name}_{CURRENT}{suffix}", suffix.encode())
