@@ -236,7 +236,9 @@ class _ValidatingHandler(http.server.BaseHTTPRequestHandler):
 
     That is what RFC 9110 asks of a server: an If-Range that does not match the current object means
     "send all of it", so a .part begun on an older version is never continued with a newer tail. The
-    first request can be cut short, which is how a transfer is interrupted.
+    first request can be cut short, which is how a transfer is interrupted. With ignore_if_range set it
+    is the server RFC 9110 does not describe: one that answers any Range with a 206 of the current
+    object, whatever If-Range said.
     """
 
     def log_message(self, *args) -> None:  # noqa: D102 - quiet
@@ -256,7 +258,8 @@ class _ValidatingHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload[: len(payload) // 4])
             return
-        if requested and (if_range is None or if_range == server.etag):
+        honoured = if_range is None or if_range == server.etag or getattr(server, "ignore_if_range", False)
+        if requested and honoured:
             start = int(requested.split("=", 1)[1].split("-", 1)[0])
             body = payload[start:]
             self.send_response(206)
@@ -331,6 +334,50 @@ class IfRangeTests(unittest.TestCase):
         self.client.download(self.url, self.destination, 10_000_000)
 
         self.assertEqual("Wed, 30 Sep 2026 00:00:00 GMT", self.httpd.headers_seen[-1]["If-Range"])
+
+    def test_a_refused_restart_leaves_no_old_head_under_the_new_validators(self) -> None:
+        """The old head went only when the new object was written, so a refusal in between armed a mix.
+
+        The object changes and grows past this attempt's limit: the server answers the If-Range with
+        a 200 and the limit refuses it. The .part still held v1's head, and v2's validators had
+        already been written beside it, so the next attempt sent If-Range "v2", got a 206, and
+        returned v1's head with v2's tail as a successful download.
+        """
+        larger = bytes(reversed(PAYLOAD)) * 2
+        self.httpd.payload, self.httpd.etag = larger, '"v2"'
+        with self.assertRaises(ValueError):
+            self.client.download(self.url, self.destination, len(PAYLOAD) + 1)
+
+        result = self.client.download(self.url, self.destination, 10_000_000)
+
+        self.assertEqual({"Range": None, "If-Range": None}, self.httpd.headers_seen[-1])
+        self.assertEqual(0, result["resumed_from_bytes"])
+        self.assertEqual(hashlib.sha256(larger).hexdigest(), result["sha256"])
+
+    def test_a_206_of_a_changed_object_is_not_appended(self) -> None:
+        """A server that ignores If-Range still names, in its 206, the object the tail is from."""
+        changed = bytes(reversed(PAYLOAD))
+        self.httpd.payload, self.httpd.etag = changed, '"v2"'
+        self.httpd.ignore_if_range = True
+
+        result = self.client.download(self.url, self.destination, 10_000_000)
+
+        self.assertEqual('"v1"', self.httpd.headers_seen[-2]["If-Range"], "the resume was offered")
+        self.assertEqual({"Range": None, "If-Range": None}, self.httpd.headers_seen[-1], "then refetched")
+        self.assertEqual(0, result["resumed_from_bytes"])
+        self.assertEqual(changed, self.destination.read_bytes())
+        self.assertEqual('"v2"', result["etag"])
+
+    def test_a_weak_prefix_alone_is_not_a_changed_object(self) -> None:
+        recorded = json.loads(self.validators.read_text(encoding="utf-8"))
+        recorded.update(etag='W/"v1"')
+        self.validators.write_text(json.dumps(recorded), encoding="utf-8")
+        self.httpd.ignore_if_range = True
+
+        result = self.client.download(self.url, self.destination, 10_000_000)
+
+        self.assertEqual(len(PAYLOAD) // 4, result["resumed_from_bytes"])
+        self.assertEqual(SHA256, result["sha256"])
 
 
 class NoValidatorTests(unittest.TestCase):

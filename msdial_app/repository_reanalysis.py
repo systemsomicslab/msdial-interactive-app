@@ -199,7 +199,10 @@ class RepositoryHttpClient:
         repository that publishes no checksum (MetaboLights) nothing later would discover it. This
         used to be said here and not done: no validator was ever sent or stored. A .part with no
         validators beside it, left by an earlier version, resumes as it always did. The validators
-        are returned (etag, last_modified), for the download record and the download store.
+        are returned (etag, last_modified), for the download record and the download store. A .part
+        and its validators always describe the same object: a refused restart removes the old head
+        before the new validators exist, and a 206 whose own validator differs from the stored one
+        (a server that ignores If-Range) is not appended.
 
         WHAT IT NO LONGER DOES. It does not delete the .part on failure. That deletion is what made
         every retry start from zero, and keeping the bytes is the entire point. A .part is only
@@ -235,15 +238,32 @@ class RepositoryHttpClient:
                 return self.download(url, destination, maximum_bytes, progress_callback)
             raise
 
+        if response.status == 206 and resume_from and _validators_changed(validators, response):
+            # A server that honours Range but ignores If-Range sends the new object's tail anyway.
+            # Its 206 still names the object the tail came from, and that is not the one the .part
+            # began on, so start again rather than join the two.
+            response.close()
+            partial.unlink(missing_ok=True)
+            validators_path.unlink(missing_ok=True)
+            return self.download(url, destination, maximum_bytes, progress_callback)
+
         with response:
             appending = response.status == 206 and resume_from > 0
             if not appending:
                 # The server ignored the range, or there was nothing to resume, or the object changed
                 # since the .part began. Start clean rather than append a whole object onto a partial
                 # one, and keep this response's validators for the next resume.
+                #
+                # The old head goes first, before anything below can refuse. Writing the new
+                # validators beside it and then refusing (an object now over the limit, a malformed
+                # Content-Length, a .part a scanner holds open) left the old head under the new
+                # object's validators, so the next If-Range matched and the server sent the new tail
+                # onto the old head: the mixing If-Range is there to prevent. The new validators are
+                # written only once the .part has been opened afresh for this object.
+                partial.unlink(missing_ok=True)
+                validators_path.unlink(missing_ok=True)
                 resume_from = 0
                 validators = _response_validators(response, url)
-                _write_part_validators(validators_path, validators)
             declared = int(response.headers.get("Content-Length") or 0)
             total_declared = declared + resume_from if declared else 0
             if total_declared and total_declared > maximum_bytes:
@@ -271,6 +291,8 @@ class RepositoryHttpClient:
                     progress_callback(downloaded, total_declared)
 
             with partial.open("ab" if appending else "wb") as output:
+                if not appending:
+                    _write_part_validators(validators_path, validators)
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
@@ -349,6 +371,22 @@ def _if_range_value(validators: dict[str, Any]) -> str:
     if etag and not etag.startswith("W/"):
         return etag
     return str(validators.get("last_modified") or "")
+
+
+def _validators_changed(validators: dict[str, Any], response: Any) -> bool:
+    """Whether a 206 names a different object from the one its .part began on.
+
+    Only a validator present on both sides is compared, so a .part with none (an earlier version's)
+    or a server that sends none resumes as before. ETags are compared weakly (RFC 9110 8.8.3.2): a
+    W/ prefix alone is not a change, but a different opaque tag is.
+    """
+    stored_etag = str(validators.get("etag") or "").strip()
+    served_etag = str(response.headers.get("ETag") or "").strip()
+    if stored_etag and served_etag:
+        return stored_etag.removeprefix("W/") != served_etag.removeprefix("W/")
+    stored_date = str(validators.get("last_modified") or "").strip()
+    served_date = str(response.headers.get("Last-Modified") or "").strip()
+    return bool(stored_date and served_date and stored_date != served_date)
 
 
 class MetabolomicsWorkbenchAdapter:
