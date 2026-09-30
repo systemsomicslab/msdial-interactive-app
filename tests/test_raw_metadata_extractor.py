@@ -25,8 +25,12 @@ from msdial_app.raw_metadata_extractor import (
 )
 
 
-RAW_HEAD = "b34c857a5328e8f08c1918b3d890e7dae50b7d6d"
-COMMON_HEAD = "c471463a576626650e0886e26bd064cca53a7ae3"
+# The built pin: msrawdataworkbench #40 (the mzML base64 last-element fix) with MsdialWorkbench master.
+RAW_HEAD = "592b6dbce72177fa14d3e7cd407557b1c64a3046"
+COMMON_HEAD = "f0583493a44e73723f53ae312e33955f62052dd7"
+# The pair approved on 2026-09-29 and never built.
+PLANNED_RAW_HEAD = "b34c857a5328e8f08c1918b3d890e7dae50b7d6d"
+PLANNED_COMMON_HEAD = "c471463a576626650e0886e26bd064cca53a7ae3"
 # The MsdialWorkbench merge commit the unpinned build's Common.dll carries.
 OTHER_HEAD = "73391e2fd27543852c3f38e4f6bf41fdc9a77c6d"
 # A NuGet feed and package folder as project.assets.json lists them; neither may reach the
@@ -181,7 +185,7 @@ class BuildCommandTests(unittest.TestCase):
         self.assertEqual(RAW_HEAD, extractor.PINNED_MSRAWDATAWORKBENCH_COMMIT)
         self.assertEqual(COMMON_HEAD, extractor.PINNED_MSDIALWORKBENCH_COMMIT)
         self.assertEqual(
-            "RawMetadataExtractor-b34c857a5-c471463a5",
+            "RawMetadataExtractor-592b6dbce-f0583493a",
             extractor_build_root(Path("synthetic-parent")).name,
         )
 

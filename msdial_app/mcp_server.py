@@ -272,6 +272,17 @@ def _structured_validation_errors(function):
                 "error_type": type(error).__name__,
             }
         except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
+            refused = _refused_extractor_codes(str(error))
+            if refused is not None:
+                # A campaign asked for a verified, pinned raw-metadata extractor and the one selected is
+                # not. A missing precondition of the campaign, not a failure of the unit.
+                return {
+                    "ok": False,
+                    "reason": "raw_metadata_extractor_refused",
+                    "codes": refused,
+                    "detail": str(error),
+                    "error_type": type(error).__name__,
+                }
             return {
                 "ok": False,
                 "reason": "validation_error",
@@ -296,12 +307,19 @@ def _structured_validation_errors(function):
     return wrapped
 
 
-def _refused_authorization_codes(detail: str) -> list[str] | None:
+def _refused_codes(detail: str, token: str) -> list[str] | None:
     text = str(detail or "")
-    token = "campaign_authorization_refused ["
     if not text.startswith(token) or "]" not in text:
         return None
     return [item.strip() for item in text[len(token):text.index("]")].split(",") if item.strip()]
+
+
+def _refused_authorization_codes(detail: str) -> list[str] | None:
+    return _refused_codes(detail, "campaign_authorization_refused [")
+
+
+def _refused_extractor_codes(detail: str) -> list[str] | None:
+    return _refused_codes(detail, "raw_metadata_extractor_refused [")
 
 
 def _campaign_authorization(
@@ -809,25 +827,19 @@ def _repository_answer_seed(
 
 
 def _raw_metadata_extractor_candidates(configured: str = "") -> list[str]:
-    # net48 first: it is the framework RawMetadataConsoleApp targets, so it is the build
-    # that a source fix actually reaches. A net8.0-windows directory can survive a change
-    # of target framework and then sit here for weeks, being preferred while describing a
-    # version of the code that no longer exists.
-    build_root = ROOT.parent / "msrawdataworkbench" / "RawMetadataConsoleApp" / "bin" / "Release"
-    candidates = [
-        configured,
-        os.environ.get("MSDIAL_RAW_METADATA_EXTRACTOR", ""),
-        str(build_root / "net48" / "RawMetadataConsoleApp.exe"),
-        str(build_root / "net8.0-windows" / "RawMetadataConsoleApp.exe"),
+    """The extractors that exist, in the order a preflight tries them.
+
+    The argument, then the raw_metadata_extractor_path setting, then MSDIAL_RAW_METADATA_EXTRACTOR, then the
+    build in the msrawdataworkbench working checkout beside this one. raw_metadata_extractor_candidates
+    labels each with its source; a campaign runs only the first, and never the working-checkout default.
+    """
+    from .raw_metadata_extractor import raw_metadata_extractor_candidates
+
+    return [
+        item["path"]
+        for item in raw_metadata_extractor_candidates(configured, checkout_parent=ROOT.parent)
+        if item["exists"]
     ]
-    result = []
-    for value in candidates:
-        path = Path(str(value or "")).expanduser()
-        if str(value or "").strip() and path.is_file():
-            resolved = str(path.resolve())
-            if resolved not in result:
-                result.append(resolved)
-    return result
 
 
 def _launch_local_app(host: str, port: int, open_browser: bool) -> dict[str, Any]:
@@ -1469,6 +1481,38 @@ def msdial_repository_batch_plan(
 
 @mcp.tool()
 @_structured_validation_errors
+def msdial_check_raw_metadata_extractor(extractor_path: str = "") -> dict[str, Any]:
+    """List the raw-metadata extractors a preflight would consider, with each one's build identity.
+
+    The order is extractor_path, then the saved raw_metadata_extractor_path setting, then the
+    MSDIAL_RAW_METADATA_EXTRACTOR environment variable, then the build in the msrawdataworkbench working
+    checkout (labelled working_checkout_default). Each existing candidate is inspected: provenance_status
+    (verified, absent, stale_mismatch, unreadable, dirty_source), whether its commits are a pinned build, and
+    whether a campaign would accept it. Outside a campaign a preflight runs the first that exists; in a
+    campaign it runs the first named, only if that one is verified and pinned. Changes nothing, needs no
+    backend.
+    """
+    from .raw_metadata_extractor import check_raw_metadata_extractors
+
+    return check_raw_metadata_extractors(extractor_path, checkout_parent=ROOT.parent)
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_set_raw_metadata_extractor_path(extractor_path: str, allow_unverified: bool = False) -> dict[str, Any]:
+    """Validate a RawMetadataConsoleApp.exe and persist it as the raw_metadata_extractor_path setting.
+
+    Refused unless its build record verifies against the files on disk; allow_unverified=true saves it
+    anyway for work outside a campaign. The reply says whether a campaign would accept it, which also
+    needs its commits to be a pinned build.
+    """
+    from .raw_metadata_extractor import set_raw_metadata_extractor_path
+
+    return set_raw_metadata_extractor_path(extractor_path, allow_unverified=allow_unverified)
+
+
+@mcp.tool()
+@_structured_validation_errors
 def msdial_repository_raw_metadata_preflight(
     download_job_id: str = "",
     extractor_path: str = "",
@@ -1477,6 +1521,7 @@ def msdial_repository_raw_metadata_preflight(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     manifest_path: str = "",
+    campaign_authorization_path: str = "",
 ) -> dict[str, Any]:
     """Read every downloaded input file's header with the local raw-metadata parser.
 
@@ -1485,47 +1530,90 @@ def msdial_repository_raw_metadata_preflight(
     headers disagree about acquisition mode the unit is reported as Mixed, with its files grouped
     by mode, and cannot be made eligible until it is split.
 
+    The extractor reads at most 20 inputs per process, each process within a time limit set by its
+    inputs' formats and sizes, and a failed or timed-out group is read again one input at a time, so an
+    unreadable file costs only its own verdict. The reply carries the unit's campaign_disposition (run,
+    skip, exclude or split, with reason codes). A unit under a campaign approval - passed here as
+    campaign_authorization_path, or recorded for the unit - has the disposition applied, and its extractor
+    must inspect as verified and pinned (msdial_check_raw_metadata_extractor). A campaign unit that was
+    split, has finished its run or has a run open is not read: completed is false and preflight_held says
+    why.
+
     Give manifest_path instead of download_job_id to reach a unit whose download job the backend no
     longer holds.
     """
     _, manifest = _repository_unit(download_job_id, manifest_path, host, port)
-    candidates = _raw_metadata_extractor_candidates(extractor_path)
-    if not candidates:
+    from .raw_metadata_extractor import select_raw_metadata_extractor
+    from .repository_reanalysis import preflight_campaign, run_raw_metadata_preflight
+
+    campaign = preflight_campaign(manifest, campaign_authorization_path)
+    selected = select_raw_metadata_extractor(
+        extractor_path, campaign=campaign is not None, checkout_parent=ROOT.parent
+    )
+    if not selected.get("path"):
         return {
             "completed": False,
             "extractor_found": False,
             "manifest_path": manifest["manifest_path"],
             "message": (
-                "Set extractor_path or MSDIAL_RAW_METADATA_EXTRACTOR to a built "
+                "Set extractor_path, the raw_metadata_extractor_path setting "
+                "(msdial_set_raw_metadata_extractor_path) or MSDIAL_RAW_METADATA_EXTRACTOR to a built "
                 "RawMetadataConsoleApp executable. Repository metadata remains available."
             ),
         }
-    from .repository_reanalysis import run_raw_metadata_preflight
 
     result = run_raw_metadata_preflight(
         Path(manifest["manifest_path"]),
-        Path(candidates[0]),
+        Path(selected["path"]),
         max_inputs=max(0, max_inputs),
         confirm_untargeted=confirm_untargeted,
+        campaign_authorization_path=campaign_authorization_path or None,
+        require_pinned_extractor=campaign is not None,
+        extractor_source=str(selected.get("source") or ""),
     )
     raw = result.get("raw_metadata_preflight") or {}
     # The per-file verdicts stay in the manifest; a unit of several hundred files would otherwise
     # put every one of them into the reply.
     summary = {key: value for key, value in (raw.get("summary") or {}).items() if key != "per_file"}
     groups = raw.get("acquisition_groups") or {}
+    extractor = raw.get("extractor") or {}
+    disposition = result.get("campaign_disposition") or {}
+    held = result.get("preflight_held") or None
     return {
-        "completed": True,
+        # False for a campaign unit that is split, finished or running: nothing was recorded, and everything
+        # below is what the unit already carried.
+        "completed": held is None,
+        "preflight_held": held,
         "extractor_found": True,
-        "extractor_path": candidates[0],
+        "extractor_path": selected["path"],
+        "extractor": {
+            key: extractor.get(key)
+            for key in (
+                "selected_from", "sha256", "inventory_sha256", "provenance_status", "pinned", "pin_state",
+                "msrawdataworkbench_commit", "msdialworkbench_commit",
+            )
+        },
         "manifest_path": result.get("manifest_path"),
         "status": result.get("status"),
         "execution_allowed": result.get("execution_allowed"),
+        "exit_code": raw.get("exit_code"),
+        "outcomes": raw.get("outcomes") or {},
         "summary": summary,
         "acquisition_groups": {mode: len(files) for mode, files in groups.items()},
         "advisory": raw.get("advisory"),
         "unsupported_formats": raw.get("unsupported_formats") or [],
         "retry_can_help": result.get("status") != "preflight_unsupported_format",
         "confirm_untargeted_applied": confirm_untargeted,
+        "campaign_disposition": {
+            "disposition": disposition.get("disposition"),
+            "applied": disposition.get("applied"),
+            "reasons": disposition.get("reasons") or [],
+            "warnings": disposition.get("warnings") or [],
+            "excluded_inputs": len(disposition.get("excluded_inputs") or []),
+            "split_by": (disposition.get("split_key") or {}).get("by") or [],
+            "console_acquisition_type": disposition.get("console_acquisition_type"),
+            "ion_mode": disposition.get("ion_mode"),
+        },
     }
 
 

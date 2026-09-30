@@ -2547,6 +2547,11 @@ def live_run_attempt(
         manifest = read_manifest(manifest_path)
     except (OSError, ValueError):
         return None
+    return _live_run_attempt_in(manifest, ignore_backend_pid)
+
+
+def _live_run_attempt_in(manifest: dict[str, Any], ignore_backend_pid: int | None = None) -> dict[str, Any] | None:
+    """live_run_attempt for a manifest already read, such as one held under its writer lock."""
     for item in reversed(list(manifest.get("run_attempts") or [])[-20:]):
         if not isinstance(item, dict):
             continue
@@ -2775,149 +2780,809 @@ def refresh_retained_artifacts(manifest_path: Path) -> dict[str, Any]:
 RAW_METADATA_UNSUPPORTED_FORMAT_EXIT_CODE = 82
 
 
+PREFLIGHT_OUTPUT_NAME = "raw-metadata-preflight.json"
+# Where the chunk outputs are written while a preflight runs; emptied and removed when it ends.
+PREFLIGHT_CHUNK_DIRECTORY = "raw-metadata-preflight-chunks"
+SKIPPED_BY_PREFLIGHT_STATUS = "skipped_by_preflight"
+EXCLUDED_BY_PREFLIGHT_STATUS = "excluded_by_preflight"
+_EXTRACTOR_IDENTITIES: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+_EXTRACTOR_IDENTITIES_GUARD = threading.Lock()
+
+
+def raw_metadata_extractor_identity(extractor_path: Path) -> dict[str, Any]:
+    """inspect_raw_metadata_extractor, re-hashed only when a file of the extractor's folder has changed.
+
+    A campaign preflights thousands of units with one build, and inspecting it hashes every file of its
+    folder. The folder's listing - every file's path, size and modification time - is what decides whether
+    the hashes are still the ones computed.
+    """
+    from .raw_metadata_extractor import inspect_raw_metadata_extractor
+
+    binary = Path(extractor_path).resolve()
+    folder = binary.parent
+    try:
+        listing = tuple(
+            sorted(
+                (str(item.relative_to(folder)), stat.st_size, stat.st_mtime_ns)
+                for item in folder.rglob("*")
+                if item.is_file()
+                for stat in (item.stat(),)
+            )
+        )
+    except OSError:
+        listing = ()
+    key = os.path.normcase(str(binary))
+    with _EXTRACTOR_IDENTITIES_GUARD:
+        cached = _EXTRACTOR_IDENTITIES.get(key)
+    if cached and listing and cached[0] == listing:
+        return copy.deepcopy(cached[1])
+    inspection = inspect_raw_metadata_extractor(binary)
+    with _EXTRACTOR_IDENTITIES_GUARD:
+        _EXTRACTOR_IDENTITIES[key] = (listing, copy.deepcopy(inspection))
+    return inspection
+
+
+def _extractor_record(extractor_path: Path, identity: dict[str, Any], source: str) -> dict[str, Any]:
+    stat = extractor_path.stat()
+    return {
+        "path": str(extractor_path),
+        "size_bytes": stat.st_size,
+        "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+        # Which build produced the verdicts, by checksum and by the commits its record names, so a verdict
+        # is tied to code rather than to whichever executable came first on the search order.
+        "sha256": str(identity.get("binary_sha256") or ""),
+        "inventory_sha256": str(identity.get("inventory_sha256") or ""),
+        "file_count": identity.get("file_count"),
+        "provenance_status": str(identity.get("provenance_status") or ""),
+        "provenance_path": str(identity.get("provenance_path") or ""),
+        "msrawdataworkbench_commit": str(identity.get("msrawdataworkbench_commit") or ""),
+        "msdialworkbench_commit": str(identity.get("msdialworkbench_commit") or ""),
+        "product_version": str(identity.get("product_version") or ""),
+        "pinned": bool(identity.get("pinned")),
+        "pin_state": str(identity.get("pin_state") or ""),
+        "selected_from": str(source or "argument"),
+    }
+
+
+def _campaign_crossings(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """The campaign approvals recorded for this unit, or for the unit it was split from."""
+    own = [item for item in manifest.get("campaign_authorizations") or [] if isinstance(item, dict)]
+    if own:
+        return own
+    parent = str((manifest.get("split_from") or {}).get("manifest_path") or "").strip()
+    if not parent or not Path(parent).is_file():
+        return []
+    try:
+        record = read_manifest(parent)
+    except (OSError, ValueError):
+        return []
+    return [item for item in record.get("campaign_authorizations") or [] if isinstance(item, dict)]
+
+
+def preflight_campaign(
+    manifest: dict[str, Any], campaign_authorization_path: str | Path | None = None
+) -> dict[str, Any] | None:
+    """The campaign a unit's preflight runs under, or None outside one.
+
+    An approval passed in must name the unit - a preflight crosses no confirmation boundary itself, but it
+    decides whether the unit reaches the runs the approval covers (boundary 4) - and one that does not is
+    refused, as at every other entry point. Without one, an approval already recorded for the unit or its
+    split parent means the unit is a campaign unit: the download that made it was approved as one.
+    """
+    from .campaign_authorization import CampaignAuthorizationError, load_campaign_authorization, unit_identity
+
+    authorization = load_campaign_authorization(campaign_authorization_path)
+    if authorization is not None:
+        unit, parent = unit_identity(manifest)
+        verdict = authorization.check(unit, 4, parent_unit_id=parent)
+        if not verdict["valid"]:
+            raise CampaignAuthorizationError(verdict["codes"], verdict["reasons"])
+        return {
+            "approval_id": authorization.approval_id,
+            "manifest_digest": authorization.manifest_digest,
+            "basis": "authorization_passed",
+        }
+    crossings = _campaign_crossings(manifest)
+    if crossings:
+        return {
+            "approval_id": str(crossings[0].get("approval_id") or ""),
+            "manifest_digest": str(crossings[0].get("manifest_digest") or ""),
+            "basis": "authorization_recorded",
+        }
+    return None
+
+
+def disposition_hold(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """Why no disposition may change this unit's state now, or None when one may. Changes nothing.
+
+    split_parent: the unit was split. A parent owns its parts' raw data and never runs, so a disposition
+    that made it runnable, or skipped it - and a campaign deletes a skipped unit's raw data - would reach
+    the parts. past_preflight: its run finished (mztab_validated, cleanup_pending_confirmation, raw_cleaned
+    and the like) or its raw data were discarded; applied again, a disposition would move a finished unit
+    out of the cleanup-ready states and make it look as if it were waiting to run. run_in_progress: a
+    Console of its own may still be running.
+    """
+    status = str(manifest.get("status") or "")
+    if status == SPLIT_PARENT_STATUS or manifest.get("split_into"):
+        return {
+            "reason": "split_parent",
+            "status": status,
+            "detail": "The unit was split; its parts are preflighted and run, and it never is.",
+        }
+    if status in PAST_PREFLIGHT_STATUSES:
+        return {
+            "reason": "past_preflight",
+            "status": status,
+            "detail": f"The unit is past its preflight ({status}); what recorded that describes it now.",
+        }
+    attempt = _live_run_attempt_in(manifest)
+    if attempt is not None:
+        return {
+            "reason": "run_in_progress",
+            "status": status,
+            "job_id": str(attempt.get("job_id") or ""),
+            "detail": "A run attempt of this unit is open and its process may still be running.",
+        }
+    return None
+
+
+def _declared_technical(manifest: dict[str, Any]) -> dict[str, Any]:
+    """What the repository record declared, before any preflight wrote header values into the project.
+
+    A preflight replaces the project's acquisition mode, polarity and separation with what the headers
+    said, so a second preflight reading the project would take the first one's verdict for the
+    declaration. The copy of the project written when the unit was made (repository-metadata.json; for a
+    split part, the part as the split wrote it) comes first, then an earlier preflight's record.
+    """
+    from .raw_metadata_preflight import declared_technical
+
+    path = str(manifest.get("repository_metadata_file") or "").strip()
+    if path and Path(path).is_file():
+        try:
+            return declared_technical(read_manifest(path))
+        except (OSError, ValueError):
+            pass
+    earlier = (manifest.get("raw_metadata_preflight") or {}).get("declared")
+    if isinstance(earlier, dict):
+        return dict(earlier)
+    return declared_technical(manifest.get("project"))
+
+
+def _previous_reads(manifest: dict[str, Any], manifest_path: Path) -> dict[str, dict[str, Any]]:
+    """Earlier reads that may stand for this one: the unit's own last preflight, then its split parent's.
+
+    run_extractor uses one only for the same extractor sha256 and the same size and modification time.
+    A split part reads its parent's files, so its own preflight need not read a Waters folder again.
+    """
+    from .raw_metadata_preflight import READ_OUTCOMES, file_key
+
+    sources: list[tuple[Path, dict[str, Any]]] = [(manifest_path, manifest)]
+    parent = str((manifest.get("split_from") or {}).get("manifest_path") or "").strip()
+    if parent and Path(parent).is_file():
+        try:
+            sources.append((Path(parent), read_manifest(parent)))
+        except (OSError, ValueError):
+            pass
+    reads: dict[str, dict[str, Any]] = {}
+    for source, record in sources:
+        preflight = record.get("raw_metadata_preflight") or {}
+        entries = [
+            item for item in (preflight.get("summary") or {}).get("per_file") or []
+            if isinstance(item, dict)
+            and item.get("outcome") in READ_OUTCOMES
+            and item.get("extractor_sha256")
+            and item.get("input_signature")
+        ]
+        output = Path(str(preflight.get("output") or ""))
+        if not entries or not output.is_file():
+            continue
+        try:
+            raw = json.loads(output.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        raw_records = {}
+        for item in [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []:
+            source_record = (item.get("source") or {}) if isinstance(item, dict) else {}
+            path_text = str(source_record.get("filePath") or "") if isinstance(source_record, dict) else ""
+            if path_text:
+                raw_records.setdefault(file_key(path_text), item)
+        for entry in entries:
+            key = file_key(str(entry.get("file") or ""))
+            if key in raw_records and key not in reads:
+                reads[key] = {"record": raw_records[key], "entry": entry, "source": str(source)}
+    return reads
+
+
+def _reader_created_before(manifest: dict[str, Any]) -> dict[str, list[str]]:
+    """What earlier reads of these inputs - the unit's own, then its split parent's - wrote into them.
+
+    Taken from every earlier per-file record, whatever its outcome: a reader that wrote its cache into a
+    Bruker .d and then failed has still changed the folder.
+    """
+    from .raw_metadata_preflight import file_key
+
+    records = [manifest]
+    parent = str((manifest.get("split_from") or {}).get("manifest_path") or "").strip()
+    if parent and Path(parent).is_file():
+        try:
+            records.append(read_manifest(parent))
+        except (OSError, ValueError):
+            pass
+    created: dict[str, list[str]] = {}
+    for record in records:
+        for entry in ((record.get("raw_metadata_preflight") or {}).get("summary") or {}).get("per_file") or []:
+            if not isinstance(entry, dict) or not str(entry.get("file") or "").strip():
+                continue
+            files = [str(item) for item in entry.get("reader_created_files") or [] if str(item).strip()]
+            if files:
+                key = file_key(str(entry["file"]))
+                created[key] = list(dict.fromkeys([*created.get(key, []), *files]))
+    return created
+
+
 def run_raw_metadata_preflight(
     manifest_path: Path,
     extractor_path: Path,
     max_inputs: int | None = None,
     confirm_untargeted: bool = False,
+    *,
+    campaign_authorization_path: str | Path | None = None,
+    require_pinned_extractor: bool = False,
+    extractor_source: str = "",
 ) -> dict[str, Any]:
+    """Read every input's raw header, record what was read, and decide the unit's campaign disposition.
+
+    The extractor runs in bounded chunks (raw_metadata_preflight.run_extractor), outside the manifest's
+    lock, for as long as the reads take. What it found is then written through update_manifest: the change
+    is applied to the manifest as it is on disk when the reads end, so nothing another writer recorded in
+    the meantime - an approval, a lease heartbeat, a split - is overwritten by the copy read at the start.
+
+    Under a campaign (an approval passed, or one recorded for the unit) the extractor must inspect as
+    verified and pinned, and campaign_disposition is applied to the unit: it decides execution_allowed and
+    the status. Outside one the disposition is recorded as advice and nothing else differs from before.
+
+    A campaign unit that disposition_hold holds - split, finished, or with a run of its own open - is not
+    read at all: the manifest is returned as it is, with preflight_held saying why. Its recorded
+    disposition stands, since a campaign acts on whatever disposition the unit carries.
+    """
+    from .raw_metadata_extractor import RawMetadataExtractorRefused, campaign_refusal
+    from .raw_metadata_preflight import run_extractor
+
     manifest_path = manifest_path.resolve()
     extractor_path = extractor_path.resolve()
     if not extractor_path.is_file():
         raise FileNotFoundError(f"Raw metadata extractor was not found: {extractor_path}")
-    manifest = read_manifest(manifest_path)
-    previously_allowed = bool(
-        manifest.get("execution_allowed") or manifest.get("project", {}).get("eligible")
-    )
-    candidates = [Path(value) for value in manifest.get("input_candidates", [])]
+    snapshot = read_manifest(manifest_path)
+    campaign = preflight_campaign(snapshot, campaign_authorization_path)
+    if campaign is not None:
+        held = disposition_hold(snapshot)
+        if held is not None:
+            return {**snapshot, "manifest_path": str(manifest_path), "preflight_held": held}
+    identity = raw_metadata_extractor_identity(extractor_path)
+    if campaign is not None or require_pinned_extractor:
+        # A campaign decides from these verdicts whether thousands of units run, and then deletes their raw
+        # data, so they have to come from a build whose source is known. Refused before anything is read.
+        codes, reasons = campaign_refusal(identity)
+        if codes:
+            raise RawMetadataExtractorRefused(codes, reasons, identity)
+    candidates = [Path(value) for value in snapshot.get("input_candidates", [])]
     available = [path for path in candidates if path.exists()]
     # EVERY FILE BY DEFAULT. MS-DIAL reads the acquisition type per analysis file, so a verdict
     # read from the first three files and applied to the rest is a guess about the files nobody
     # looked at. A caller may still cap the inspection; the cap is then recorded as partial
     # coverage and the unit stays under review.
+    capped = bool(max_inputs and max_inputs > 0 and max_inputs < len(available))
     inputs = available if not max_inputs or max_inputs <= 0 else available[0:max_inputs]
     if not inputs:
         raise ValueError("No extracted MS-DIAL input candidate is available for metadata preflight.")
-    output = manifest_path.parent / "raw-metadata-preflight.json"
-    command = [str(extractor_path)]
-    for path in inputs:
-        command.extend(["--input", str(path)])
-    command.extend(["--output", str(output), "--max-spectrum-headers", "200"])
-    completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    extractor_stat = extractor_path.stat()
-    manifest["raw_metadata_preflight"] = {
-        "command": command,
-        # Which binary produced this verdict, so the verdict can be tied to a build rather
-        # than to whichever executable happened to be first on the search order.
-        "extractor": {
-            "path": str(extractor_path),
-            "size_bytes": extractor_stat.st_size,
-            "modified_at": datetime.fromtimestamp(
-                extractor_stat.st_mtime, tz=timezone.utc
-            ).isoformat(),
-        },
-        "exit_code": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
-        "output": str(output),
+    output = manifest_path.parent / PREFLIGHT_OUTPUT_NAME
+    declared = _declared_technical(snapshot)
+    started_at = datetime.now(timezone.utc).isoformat()
+    owner = {"pid": os.getpid(), "process_created_at": process_created_at()}
+
+    def progress(note: dict[str, Any]) -> None:
+        # The extractor's own deadline for the process about to start, and who is running it, where the
+        # campaign runner reads them (preflight_progress_state): a preflight is timed out only here, and the
+        # runner, which only watches for a stall, needs to know how long this one may legitimately take.
+        def change(current: dict[str, Any]) -> None:
+            current["raw_metadata_preflight_progress"] = {
+                "started_at": started_at,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "owner": owner,
+                **note,
+            }
+
+        update_manifest(manifest_path, change)
+
+    execution = run_extractor(
+        extractor_path,
+        inputs,
+        manifest_path.parent / PREFLIGHT_CHUNK_DIRECTORY,
+        extractor_sha256=str(identity.get("binary_sha256") or ""),
+        previous=_previous_reads(snapshot, manifest_path),
+        created_before=_reader_created_before(snapshot),
+        progress=progress,
+    )
+    extractor = _extractor_record(extractor_path, identity, extractor_source)
+    held: dict[str, Any] = {}
+
+    def change(current: dict[str, Any]) -> None:
+        hold = disposition_hold(current)
+        if campaign is not None and hold is not None and hold["reason"] != "split_parent":
+            # The unit's run started or ended while its headers were read. What the run recorded stands, and
+            # so do the extractor output and the preflight it was made from; this read is dropped.
+            current.pop("raw_metadata_preflight_progress", None)
+            held.update(hold)
+            return
+        # Every record read, in input order, where _preflight_start_times and a later reuse find them.
+        # Written even when empty, so an earlier preflight's records never pass for this one's.
+        _write_json(output, execution["records"])
+        _record_preflight(
+            current,
+            execution=execution,
+            extractor=extractor,
+            inputs=inputs,
+            output=output,
+            declared=declared,
+            confirm_untargeted=confirm_untargeted,
+            capped=capped,
+            campaign=campaign,
+            started_at=started_at,
+        )
+
+    written = update_manifest(manifest_path, change)
+    return {**written, "manifest_path": str(manifest_path), **({"preflight_held": held} if held else {})}
+
+
+# Past an attempt's own time limit, the time a stopped extractor and its bookkeeping may take before a
+# preflight that has not moved on is called overdue.
+PREFLIGHT_PROGRESS_MARGIN_SECONDS = 120.0
+
+
+def preflight_progress_state(manifest: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    """Whether a preflight recorded as running is still reading, for a watcher that only detects stalls.
+
+    none: no preflight is recorded as running. running: its process is alive, or cannot be read, and the
+    current extractor attempt is within its own limit plus PREFLIGHT_PROGRESS_MARGIN_SECONDS. overdue:
+    alive but past that, which the extractor's own limit should have made impossible. gone: the process
+    that ran it is not alive, so the record will never be completed. Changes nothing, never raises.
+    """
+    note = manifest.get("raw_metadata_preflight_progress")
+    if not isinstance(note, dict):
+        return {"state": "none"}
+    owner = note.get("owner") if isinstance(note.get("owner"), dict) else {}
+    alive = process_is_alive(owner.get("pid"), owner.get("process_created_at"))
+    if alive is False:
+        return {"state": "gone", "owner": owner, "attempt": note.get("attempt")}
+    try:
+        started = datetime.fromisoformat(str(note.get("updated_at") or note.get("started_at")))
+        deadline = started.timestamp() + float(note.get("timeout_seconds") or 0.0) + PREFLIGHT_PROGRESS_MARGIN_SECONDS
+    except (TypeError, ValueError):
+        return {"state": "running", "owner": owner, "attempt": note.get("attempt"), "deadline_at": None}
+    current = (now or datetime.now(timezone.utc)).timestamp()
+    return {
+        "state": "overdue" if current > deadline else "running",
+        "owner": owner,
+        "attempt": note.get("attempt"),
+        "deadline_at": datetime.fromtimestamp(deadline, tz=timezone.utc).isoformat(),
     }
-    if completed.returncode == RAW_METADATA_UNSUPPORTED_FORMAT_EXIT_CODE:
-        # Fails closed exactly as an unavailable preflight does: a unit that was not
-        # already eligible stays ineligible. What changes is that the agent can now tell
-        # that waiting or retrying will never help.
-        manifest["status"] = "preflight_unsupported_format"
-        manifest["execution_allowed"] = previously_allowed
-        manifest["raw_metadata_preflight"]["unsupported_formats"] = sorted(
-            {path.suffix.lower() for path in inputs if path.suffix}
-        )
-        manifest["raw_metadata_preflight"]["detail"] = (completed.stderr or "").strip().splitlines()[:1]
-        manifest["raw_metadata_preflight"]["advisory"] = (
-            "This raw data format has no metadata reader, so a raw-header check cannot "
-            "resolve the unit's technical settings on any retry. Resolve them from "
-            "repository metadata or the publication, or exclude the unit."
-        )
-        _write_json(manifest_path, manifest)
-        return {**manifest, "manifest_path": str(manifest_path)}
-    if completed.returncode != 0 or not output.is_file():
-        manifest["status"] = "preflight_unavailable"
-        manifest["execution_allowed"] = previously_allowed
-        manifest["raw_metadata_preflight"]["advisory"] = (
-            "Raw header inspection was unavailable. Repository metadata remains authoritative "
-            "only when the project was already eligible before this optional check."
-        )
-        _write_json(manifest_path, manifest)
-        return {**manifest, "manifest_path": str(manifest_path)}
-    records = json.loads(output.read_text(encoding="utf-8-sig"))
-    if isinstance(records, dict):
-        records = [records]
-    summary = _summarize_raw_metadata(records)
-    project = project_from_dict(manifest["project"])
-    if summary["separation"] != "Unknown":
-        project.separation = summary["separation"]
-    # "Mixed" replaces whatever the repository metadata said, because the headers have shown that
-    # label to be wrong for some of the files. "Unknown" still leaves it alone: no header spoke.
-    if summary["acquisition_mode"] != "Unknown":
-        project.acquisition_mode = summary["acquisition_mode"]
-    if summary["ion_mode"] != "Unknown":
-        project.ion_mode = summary["ion_mode"]
-    if confirm_untargeted:
-        project.untargeted = True
-        project.evidence.append("Untargeted status confirmed during raw metadata preflight.")
-    project.evidence.extend(summary["evidence"])
+
+
+def _per_input_entries(
+    per_file: list[dict[str, Any]], outcomes: dict[str, dict[str, Any]], inputs: list[Path]
+) -> list[dict[str, Any]]:
+    """One record per inspected input: its header verdict, if it had one, and how its read went."""
+    from .raw_metadata_preflight import file_key
+
+    by_key = {file_key(str(item.get("file") or "")): item for item in per_file if str(item.get("file") or "")}
+    entries = []
+    seen = set()
+    for path in inputs:
+        key = file_key(path)
+        seen.add(key)
+        entry = by_key.get(key)
+        if entry is None:
+            entry = {
+                "file": str(path),
+                "acquisition_mode": "",
+                "confidence": None,
+                "evidence": None,
+                "method_source": "",
+                "polarity": "",
+                "ms_levels": None,
+                "has_ms1": None,
+                "has_ms2": None,
+                "has_ion_mobility": None,
+                "separation": "",
+                "isolation_window_count": None,
+                "collision_energy_count": None,
+                "header_console_acquisition_type": None,
+                "header_console_acquisition_basis": "",
+                "console_acquisition_type": None,
+                "console_acquisition_basis": "",
+                "acquisition_start_time": "",
+                "acquisition_start_time_evidence": "",
+            }
+        entry.update({name: value for name, value in (outcomes.get(key) or {}).items()})
+        entries.append(entry)
+    entries.extend(item for key, item in by_key.items() if key not in seen)
+    return entries
+
+
+def _record_preflight(
+    current: dict[str, Any],
+    *,
+    execution: dict[str, Any],
+    extractor: dict[str, Any],
+    inputs: list[Path],
+    output: Path,
+    declared: dict[str, Any],
+    confirm_untargeted: bool,
+    capped: bool,
+    campaign: dict[str, Any] | None,
+    started_at: str,
+) -> None:
+    """Write one preflight's results into the manifest as it is now. The change update_manifest applies."""
+    from .raw_metadata_preflight import (
+        OUTCOME_UNSUPPORTED,
+        READ_OUTCOMES,
+        decide_disposition,
+        file_key,
+    )
+
+    # A split unit - split before this preflight, or while its headers were being read - stays split: a
+    # parent is the raw owner of its parts and never runs, whatever its own headers say. The reads are
+    # recorded, for its parts to reuse; the verdicts change nothing, and the disposition it carries stands.
+    hold = disposition_hold(current)
+    split_parent = hold is not None and hold["reason"] == "split_parent"
+    status_before = current.get("status")
+    previously_allowed = bool(
+        current.get("execution_allowed") or (current.get("project") or {}).get("eligible")
+    )
+    candidates = [str(value) for value in current.get("input_candidates") or [] if str(value).strip()]
+    outcomes = execution["outcomes"]
+    records = execution["records"]
+    counts = execution["counts"]
+    read = sum(1 for item in outcomes.values() if item.get("outcome") in READ_OUTCOMES)
+    failing = next((entry for entry in execution["chunks"] if entry.get("exit_code") != 0), None)
+    block: dict[str, Any] = {
+        # The command as each chunk ran it, with the inputs and the chunk output elided: several hundred
+        # full paths per unit used to be stored here, and the whole stdout beside them.
+        "command_template": execution["command_template"],
+        "chunks": [
+            {key: value for key, value in entry.items() if key != "stderr_tail"} for entry in execution["chunks"]
+        ],
+        "extractor": extractor,
+        "exit_code": execution["exit_code"],
+        "stderr_tail": list((failing or {}).get("stderr_tail") or []),
+        "output": str(output),
+        "outcomes": counts,
+        "declared": declared,
+        "started_at": started_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    current["raw_metadata_preflight"] = block
+    current.pop("raw_metadata_preflight_progress", None)
     coverage = {
         "input_candidates": len(candidates),
-        "available": len(available),
+        "available": sum(1 for value in candidates if Path(value).exists()),
         "inspected": len(inputs),
         "complete": len(inputs) == len(candidates),
+        "capped": capped,
+        "read": read,
+        **{name: counts.get(name, 0) for name in ("reused", "unsupported_format", "failed", "timed_out", "os_error")},
     }
+    summary = _summarize_raw_metadata(records)
+    summary["per_file"] = _per_input_entries(summary["per_file"], outcomes, inputs)
     summary["coverage"] = coverage
-    evaluated = evaluate_eligibility(
-        project,
-        EligibilityPolicy(
-            max_download_bytes=max(project.total_download_bytes, 1),
-            max_samples=max(project.sample_count or 0, 1),
-            require_known_size=False,
-            require_untargeted=True,
-        ),
-    )
-    if not coverage["complete"] and not evaluated.exclusion_reasons:
-        evaluated.review_reasons.append(
-            f"Raw headers were read from {coverage['inspected']} of {coverage['input_candidates']} "
-            "input files, and MS-DIAL applies an acquisition type to each file; inspect every file "
-            "before the unit's acquisition mode is taken as established."
-        )
-        evaluated.eligible = False
-        evaluated.selection_status = "raw_metadata_required"
-    manifest["project"] = evaluated.as_dict()
-    manifest["raw_metadata_preflight"]["summary"] = summary
-    manifest["execution_allowed"] = evaluated.eligible
-    if summary["acquisition_mode"] == "Mixed":
-        manifest["status"] = "preflight_mixed_acquisition"
-        groups: dict[str, list[str]] = {}
-        for item in summary["per_file"]:
-            groups.setdefault(item["acquisition_mode"] or "Unknown", []).append(item["file"])
-        manifest["raw_metadata_preflight"]["acquisition_groups"] = {
-            mode: sorted(files) for mode, files in sorted(groups.items())
-        }
-        manifest["raw_metadata_preflight"]["advisory"] = (
-            "The raw headers disagree about acquisition mode ("
-            + ", ".join(f"{mode} {len(files)}" for mode, files in sorted(groups.items()))
-            + "). MS-DIAL runs one acquisition mode per analysis, so this unit cannot run as one. "
-            "Split it into one unit per acquisition group, each with its own workspace, manifest and "
-            "Class assignments, and preflight each part."
-        )
-    elif evaluated.eligible:
-        manifest["status"] = "preflight_passed"
+    block["summary"] = summary
+
+    if not records:
+        current["execution_allowed"] = previously_allowed
+        if outcomes and all(item.get("outcome") == OUTCOME_UNSUPPORTED for item in outcomes.values()):
+            # Fails closed exactly as an unavailable preflight does: a unit that was not
+            # already eligible stays ineligible. What changes is that the agent can now tell
+            # that waiting or retrying will never help.
+            current["status"] = "preflight_unsupported_format"
+            block["unsupported_formats"] = sorted({path.suffix.lower() for path in inputs if path.suffix})
+            block["detail"] = block["stderr_tail"][:1]
+            block["advisory"] = (
+                "This raw data format has no metadata reader, so a raw-header check cannot "
+                "resolve the unit's technical settings on any retry. Resolve them from "
+                "repository metadata or the publication, or exclude the unit."
+            )
+        else:
+            current["status"] = "preflight_unavailable"
+            block["advisory"] = (
+                "Raw header inspection was unavailable. Repository metadata remains authoritative "
+                "only when the project was already eligible before this optional check."
+            )
     else:
-        manifest["status"] = "preflight_review_required"
-    _write_json(manifest_path, manifest)
-    return {**manifest, "manifest_path": str(manifest_path)}
+        project = project_from_dict(current["project"])
+        if summary["separation"] != "Unknown":
+            project.separation = summary["separation"]
+        # "Mixed" replaces whatever the repository metadata said, because the headers have shown that
+        # label to be wrong for some of the files. "Unknown" still leaves it alone: no header spoke.
+        if summary["acquisition_mode"] != "Unknown":
+            project.acquisition_mode = summary["acquisition_mode"]
+        if summary["ion_mode"] != "Unknown":
+            project.ion_mode = summary["ion_mode"]
+        if confirm_untargeted:
+            project.untargeted = True
+            # What the caller asserted, on the strength of what the headers show. The headers show how the
+            # data were acquired, not why, so this is an inference and is recorded as one.
+            project.evidence.append(
+                "Untargeted status was accepted at the raw-metadata preflight on the caller's instruction "
+                "(confirm_untargeted): an inference from the acquisition the headers show, not a repository "
+                "declaration."
+            )
+        project.evidence.extend(summary["evidence"])
+        evaluated = evaluate_eligibility(
+            project,
+            EligibilityPolicy(
+                max_download_bytes=max(project.total_download_bytes, 1),
+                max_samples=max(project.sample_count or 0, 1),
+                require_known_size=False,
+                require_untargeted=True,
+            ),
+        )
+        if not coverage["complete"] and not evaluated.exclusion_reasons:
+            evaluated.review_reasons.append(
+                f"Raw headers were read from {coverage['inspected']} of {coverage['input_candidates']} "
+                "input files, and MS-DIAL applies an acquisition type to each file; inspect every file "
+                "before the unit's acquisition mode is taken as established."
+            )
+            evaluated.eligible = False
+            evaluated.selection_status = "raw_metadata_required"
+        unread = len(inputs) - read
+        if unread and not evaluated.exclusion_reasons:
+            # One unreadable file used to fail the whole preflight, so nothing was learnt from the rest.
+            # Now the rest are read, and the files that could not be are named rather than assumed.
+            failures = ", ".join(
+                f"{name} {counts[name]}"
+                for name in ("unsupported_format", "failed", "timed_out", "os_error")
+                if counts.get(name)
+            )
+            evaluated.review_reasons.append(
+                f"The headers of {unread} of {len(inputs)} inspected input files could not be read "
+                f"({failures}), so their acquisition mode is not established. A campaign disposition "
+                "excludes such files; outside a campaign, resolve them before the unit runs."
+            )
+            evaluated.eligible = False
+            evaluated.selection_status = "raw_metadata_required"
+        unread_outcomes = [
+            (path, (outcomes.get(file_key(path)) or {}).get("outcome"))
+            for path in inputs
+            if (outcomes.get(file_key(path)) or {}).get("outcome") not in READ_OUTCOMES
+        ]
+        if (
+            campaign is None
+            and previously_allowed
+            and unread_outcomes
+            and not evaluated.exclusion_reasons
+            and summary["acquisition_mode"] != "Mixed"
+        ):
+            # AS BEFORE, OUTSIDE A CAMPAIGN. One unreadable input used to stop the one extractor process, and
+            # the unit ended as an unavailable (or, when that input had no reader, unsupported-format)
+            # preflight that left an eligible unit eligible. Only a campaign disposition can exclude that
+            # input, so outside one the unit keeps what its repository metadata established, and the verdicts
+            # that were read are recorded beside it; the execution gate still holds each file read to its
+            # own header.
+            current["execution_allowed"] = previously_allowed
+            if unread_outcomes[0][1] == OUTCOME_UNSUPPORTED:
+                current["status"] = "preflight_unsupported_format"
+                block["unsupported_formats"] = sorted(
+                    {
+                        path.suffix.lower()
+                        for path, outcome in unread_outcomes
+                        if outcome == OUTCOME_UNSUPPORTED and path.suffix
+                    }
+                )
+            else:
+                current["status"] = "preflight_unavailable"
+            block["advisory"] = (
+                f"The headers of {unread} of {len(inputs)} inspected input files could not be read. Repository "
+                "metadata remains authoritative because the project was already eligible before this optional "
+                "check; the headers that were read are recorded in summary.per_file."
+            )
+        else:
+            current["project"] = evaluated.as_dict()
+            current["execution_allowed"] = evaluated.eligible
+            if summary["acquisition_mode"] == "Mixed":
+                current["status"] = "preflight_mixed_acquisition"
+                groups: dict[str, list[str]] = {}
+                for item in summary["per_file"]:
+                    if item.get("outcome", "ok") in READ_OUTCOMES:
+                        groups.setdefault(item["acquisition_mode"] or "Unknown", []).append(item["file"])
+                block["acquisition_groups"] = {mode: sorted(files) for mode, files in sorted(groups.items())}
+                block["advisory"] = (
+                    "The raw headers disagree about acquisition mode ("
+                    + ", ".join(f"{mode} {len(files)}" for mode, files in sorted(groups.items()))
+                    + "). MS-DIAL runs one acquisition mode per analysis, so this unit cannot run as one. "
+                    "Split it into one unit per acquisition group, each with its own workspace, manifest and "
+                    "Class assignments, and preflight each part."
+                )
+            elif evaluated.eligible:
+                current["status"] = "preflight_passed"
+            else:
+                current["status"] = "preflight_review_required"
+
+    if split_parent:
+        # Its status as it was, and the disposition it carries as it was: a campaign acts on whatever
+        # disposition a unit carries, and one decided from a split parent's own headers - skip, say - would
+        # reach the raw data its parts read.
+        current["status"] = status_before
+        current["execution_allowed"] = False
+        return
+    disposition = decide_disposition(current, declared=declared, extractor=extractor)
+    assignments = disposition.pop("assignments")
+    disposition["applied"] = campaign is not None
+    if campaign is not None:
+        disposition["campaign"] = dict(campaign)
+        _apply_disposition(current, disposition, assignments)
+    current["campaign_disposition"] = disposition
+
+
+def _apply_disposition(
+    current: dict[str, Any], disposition: dict[str, Any], assignments: dict[str, dict[str, Any]]
+) -> None:
+    """Make a campaign unit what its disposition says: runnable as decided, split, or held back."""
+    from .raw_metadata_preflight import file_key
+
+    kind = disposition["disposition"]
+    summary = (current.get("raw_metadata_preflight") or {}).get("summary") or {}
+    for entry in summary.get("per_file") or []:
+        assigned = assignments.get(file_key(str(entry.get("file") or ""))) if kind in {"run", "split"} else None
+        # Under an applied disposition this is the type the file runs as, and an input that does not run -
+        # excluded, or in a unit skipped or excluded - has none; what its header alone meant stays in
+        # header_console_acquisition_type.
+        entry["console_acquisition_type"] = assigned["console_acquisition_type"] if assigned else None
+        entry["console_acquisition_basis"] = assigned["basis"] if assigned else ""
+    if kind == "run":
+        project = project_from_dict(current["project"])
+        project.acquisition_mode = str(disposition["console_acquisition_type"])
+        project.ion_mode = str(disposition["ion_mode"])
+        # A run disposition is an LC-MS one: the repository said LC-MS, or said nothing and the headers did.
+        # A header that guessed otherwise must not reach the answer seed, which picks the project type
+        # from this field.
+        project.separation = "LC-MS"
+        warnings = set(disposition.get("warnings") or [])
+        lines = []
+        if "untargeted_inferred_from_headers" in warnings and project.untargeted is None:
+            project.untargeted = True
+            lines.append(
+                "Untargeted status was inferred from the raw headers, which show DDA, DIA or AIF acquisition "
+                "with MS1 and MS2 in every input that runs: an inference, not a repository declaration."
+            )
+        lines.append(
+            f"Campaign disposition: run as {project.acquisition_mode} {project.ion_mode}"
+            + (
+                f", with {len(disposition['excluded_inputs'])} input(s) excluded"
+                if disposition.get("excluded_inputs")
+                else ""
+            )
+            + "."
+        )
+        project.evidence.extend(line for line in lines if line not in project.evidence)
+        evaluated = evaluate_eligibility(
+            project,
+            EligibilityPolicy(
+                max_download_bytes=max(project.total_download_bytes, 1),
+                max_samples=max(project.sample_count or 0, 1),
+                require_known_size=False,
+                require_untargeted=True,
+            ),
+        )
+        current["project"] = evaluated.as_dict()
+        current["execution_allowed"] = True
+        current["status"] = "preflight_passed"
+    elif kind == "split":
+        # The split itself is the next step, and its parts are preflighted on their own.
+        current["execution_allowed"] = False
+    else:
+        current["execution_allowed"] = False
+        current["status"] = SKIPPED_BY_PREFLIGHT_STATUS if kind == "skip" else EXCLUDED_BY_PREFLIGHT_STATUS
+
+
+def _rebuilt_legacy_per_file(current: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """A summary written before the per-file fields, read again from the extractor's own records.
+
+    Interactive 0.5.16 and earlier summarised each input as acquisition_mode, polarity and ms_levels,
+    with no format, MS-level flags or isolation, so a DIA verdict could not be told SWATH from AIF. Such a
+    summary exists only for a preflight whose one extractor process read every input, and that process's
+    records are in the preflight's output. Returns per-file records in the current shape, for deciding
+    only, or None when the summary is current or the output does not hold a record for every input.
+    """
+    from .raw_metadata_preflight import OUTCOME_OK, file_key, input_format
+
+    preflight = current.get("raw_metadata_preflight") or {}
+    entries = [item for item in (preflight.get("summary") or {}).get("per_file") or [] if isinstance(item, dict)]
+    if not entries or any("header_console_acquisition_type" in item for item in entries):
+        return None
+    try:
+        raw = json.loads(Path(str(preflight.get("output") or "")).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    records: dict[str, dict[str, Any]] = {}
+    for item in [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []:
+        source = (item.get("source") or {}) if isinstance(item, dict) else {}
+        path_text = str(source.get("filePath") or "") if isinstance(source, dict) else ""
+        if path_text:
+            records.setdefault(file_key(path_text), item)
+    keys = [file_key(str(item.get("file") or "")) for item in entries]
+    if not all(key in records for key in keys):
+        return None
+    rebuilt = _summarize_raw_metadata([records[key] for key in keys])["per_file"]
+    for entry, legacy in zip(rebuilt, entries):
+        entry.update(file=str(legacy.get("file") or ""), outcome=OUTCOME_OK, format=input_format(str(legacy["file"])))
+    return rebuilt
+
+
+def classify_preflight(
+    manifest_path: str | Path, campaign_authorization_path: str | Path | None = None
+) -> dict[str, Any]:
+    """Decide, record and, for a campaign unit, apply the disposition of an already preflighted unit.
+
+    run_raw_metadata_preflight does this as its last step; this is the same step alone, for a unit whose
+    preflight is recorded and whose disposition is wanted again - after the unit became a campaign unit,
+    or for a manifest written before dispositions existed. The one mapping from verdicts to what a campaign
+    does is raw_metadata_preflight.decide_disposition; this is its only writer. Never raises for anything
+    in the manifest; only an unreadable manifest or a refused approval raise.
+
+    Nothing is written for a unit disposition_hold holds (split, finished, or running) or one with no
+    preflight recorded: the decision is returned with applied false and ``held`` saying why, and the
+    manifest, with any disposition it carries, is left as it is. A summary written before the per-file
+    fields is decided from the extractor records its preflight left (_rebuilt_legacy_per_file), and
+    recorded as it was.
+    """
+    from .raw_metadata_preflight import decide_disposition
+
+    target = Path(manifest_path).resolve()
+    campaign = preflight_campaign(read_manifest(target), campaign_authorization_path)
+    with manifest_lock(target):
+        current = read_manifest(target)
+        preflight = current.get("raw_metadata_preflight") or {}
+        declared = preflight.get("declared")
+        if not isinstance(declared, dict):
+            declared = _declared_technical(current)
+        view = current
+        rebuilt = _rebuilt_legacy_per_file(current)
+        if rebuilt is not None:
+            view = copy.deepcopy(current)
+            view["raw_metadata_preflight"]["summary"]["per_file"] = rebuilt
+        disposition = decide_disposition(view, declared=declared)
+        assignments = disposition.pop("assignments")
+        if rebuilt is not None and "raw_metadata_preflight_legacy" not in disposition["warnings"]:
+            disposition["warnings"].append("raw_metadata_preflight_legacy")
+            disposition["detail"].append(
+                "The per-file records predate recorded formats, MS-level flags and isolation; the unit was "
+                "decided from the extractor records its preflight left."
+            )
+        held = disposition_hold(current)
+        if held is None and not (preflight.get("summary") or {}):
+            held = {
+                "reason": "raw_metadata_preflight_missing",
+                "status": str(current.get("status") or ""),
+                "detail": "No raw-header preflight is recorded; preflight the unit first.",
+            }
+        if held is not None:
+            return {**disposition, "applied": False, "held": held}
+        disposition["applied"] = campaign is not None
+        if campaign is not None:
+            disposition["campaign"] = dict(campaign)
+            _apply_disposition(current, disposition, assignments)
+        current["campaign_disposition"] = disposition
+        _write_json(target, current)
+    return disposition
 
 
 # The status a parent unit carries once it has been split. It is not in CLEANUP_READY_STATUSES and it
 # never sets execution_allowed, so neither MS-DIAL nor a raw deletion can run against the parent.
 SPLIT_PARENT_STATUS = "split_by_acquisition"
 SPLIT_PART_STATUS = "split_from_parent"
+
+
+DECIDED_TYPE_PART_MODE = {"DDA": "DDA", "SWATH": "DIA", "AIF": "AIF"}
 
 
 def _split_part_id(parent_unit_id: str, mode: str) -> str:
@@ -2960,7 +3625,12 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
         }
     if not parent_id:
         blockers.append("The manifest names no analysis_unit_id to derive part identifiers from.")
-    if summary.get("acquisition_mode") != "Mixed":
+    disposition = _applied_disposition(manifest)
+    # A campaign disposition splits SWATH from AIF too, and both of those read "DIA" in the header.
+    split_by_acquisition = disposition.get("disposition") == "split" and "acquisition" in (
+        (disposition.get("split_key") or {}).get("by") or []
+    )
+    if summary.get("acquisition_mode") != "Mixed" and not split_by_acquisition:
         blockers.append(
             "Only a unit whose raw headers disagree about acquisition mode is split here; this one "
             f"is {summary.get('acquisition_mode') or project.get('acquisition_mode') or 'unknown'!r}."
@@ -2973,11 +3643,23 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
 
     per_file = {_file_key(str(item.get("file") or "")): item for item in summary.get("per_file") or []}
     candidates = [str(item) for item in manifest.get("input_candidates") or [] if str(item).strip()]
+    decided = _decided_acquisition_by_file(manifest)
+    excluded = _campaign_excluded_inputs(manifest)
     groups: dict[str, list[str]] = {}
     unassigned: list[str] = []
+    left_out: list[dict[str, str]] = []
     for candidate in candidates:
+        if _file_key(candidate) in excluded:
+            # The disposition excluded it; it belongs to no part, and it does not block the others.
+            left_out.append({"path": candidate, "reason": excluded[_file_key(candidate)]})
+            continue
         verdict = per_file.get(_file_key(candidate))
         mode = str((verdict or {}).get("acquisition_mode") or "").strip()
+        console = decided.get(_file_key(candidate))
+        if console in DECIDED_TYPE_PART_MODE:
+            # The type an applied campaign disposition decided, named as the header names it (a SWATH file
+            # is in the DIA part), so a DDA/DIA split keeps the part identifiers it always had.
+            mode = DECIDED_TYPE_PART_MODE[console]
         if mode in HEADER_ACQUISITION_TO_MSDIAL:
             groups.setdefault(mode, []).append(candidate)
         else:
@@ -3039,6 +3721,7 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
         "already_split": False,
         "parts": parts,
         "unclaimed_samples": unclaimed,
+        "excluded_inputs": left_out,
         "blockers": blockers,
     }
 
@@ -3097,9 +3780,20 @@ def split_unit_by_acquisition(manifest_path: Path, confirmed: bool = False) -> d
     - starts with execution_allowed false. Each part is preflighted on its own before it can run.
 
     The parent is marked split and names its parts. Nothing is copied or deleted.
+
+    A confirmed split holds the parent manifest's writer lock from its plan to its last write, so the plan
+    is made from the manifest the parent is marked on: a preflight finishing meanwhile, or a second split
+    of the same unit, waits and then sees the split instead of racing it.
     """
+    if not confirmed:
+        return {**plan_acquisition_split(manifest_path), "written": False}
+    with manifest_lock(Path(manifest_path)):
+        return _split_unit_locked(Path(manifest_path))
+
+
+def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
     plan = plan_acquisition_split(manifest_path)
-    if plan["already_split"] or not confirmed or plan["blockers"]:
+    if plan["already_split"] or plan["blockers"]:
         return {**plan, "written": False}
 
     manifest_path = Path(plan["manifest_path"])
@@ -3250,6 +3944,9 @@ def split_unit_by_acquisition(manifest_path: Path, confirmed: bool = False) -> d
         current["execution_allowed"] = False
         current["split_at"] = now
         current["split_into"] = written
+        if plan.get("excluded_inputs"):
+            # The parent's inputs are its parts' plus these, each exactly once.
+            current["split_excluded_inputs"] = plan["excluded_inputs"]
 
     update_manifest(manifest_path, change)
     return {**plan, "parts": written, "written": True}
@@ -3259,6 +3956,9 @@ def split_unit_by_acquisition(manifest_path: Path, confirmed: bool = False) -> d
 # state a run leaves behind when its retention policy asked for deletion: the technical preconditions are
 # met and the decision is now waiting for a person.
 CLEANUP_READY_STATUSES = {"mztab_validated", "completed", "cleanup_pending_confirmation"}
+# The states past every preflight: a run finished, or the raw data are gone (raw_cleaned after a run,
+# discarded without one). What recorded them, not a disposition, describes the unit from then on.
+PAST_PREFLIGHT_STATUSES = CLEANUP_READY_STATUSES | {"raw_cleaned", "discarded"}
 
 
 def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
@@ -3365,20 +4065,54 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             "unit by per-file acquisition mode before running MS-DIAL."
         )
     header_modes = _header_acquisition_by_file(manifest)
-    if header_modes:
+    # The type an applied campaign disposition decided a file runs as - from its header, from the
+    # repository's declaration where no header could be read or a low-confidence one disagreed, or DDA for
+    # an MS1-only file folded into a DDA run - is the one type that file may run as. A file with no decision
+    # is held to what its header alone admits, as before dispositions existed.
+    decided_types = _decided_acquisition_by_file(manifest)
+    if header_modes or decided_types:
         disagreeing = []
+        undecided_as = []
         for item in state.get("files") or []:
             path_text = str(item.get("file_path") or "").strip()
             if not path_text:
                 continue
+            given = str(item.get("acquisition_type") or "").strip()
+            decided = decided_types.get(_file_key(path_text))
+            if decided:
+                if given != decided:
+                    # A blank type is not the decided one even where the decision is DDA: the Console reads
+                    # a blank, or any value it cannot parse, as DDA without a word.
+                    undecided_as.append(f"{Path(path_text).name} (decided {decided}, run as {given or 'no type'})")
+                continue
             header = header_modes.get(_file_key(path_text))
-            requested = str(item.get("acquisition_type") or "DDA").strip() or "DDA"
+            requested = given or "DDA"
             if header and requested not in HEADER_ACQUISITION_TO_MSDIAL.get(header, {header}):
                 disagreeing.append(f"{Path(path_text).name} (header {header}, run as {requested})")
         if disagreeing:
             blockers.append(
                 f"{len(disagreeing)} input files would run with an acquisition type their raw header "
                 f"contradicts; the first is {disagreeing[0]}."
+            )
+        if undecided_as:
+            blockers.append(
+                f"{len(undecided_as)} input files would run with an acquisition type other than the one this "
+                f"unit's campaign disposition decided; the first is {undecided_as[0]}."
+            )
+
+    # An input a campaign disposition excluded - unreadable, ion mobility, out of scope - is not part of
+    # the run that disposition allowed, whatever the input list still names.
+    excluded = _campaign_excluded_inputs(manifest)
+    if excluded:
+        named = [
+            f"{Path(str(item.get('file_path'))).name} ({excluded[_file_key(str(item.get('file_path')))]})"
+            for item in state.get("files") or []
+            if str(item.get("file_path") or "").strip() and _file_key(str(item.get("file_path"))) in excluded
+        ]
+        if named:
+            blockers.append(
+                f"{len(named)} input files were excluded by this unit's campaign disposition; the first is "
+                f"{named[0]}."
             )
 
     return {
@@ -3390,6 +4124,12 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
         "manifest_status": manifest.get("status"),
         "blockers": blockers,
     }
+
+
+# The extractor's RawAcquisitionMethod values (msrawdataworkbench RawDataMetadata.cs) other than Unknown.
+# The targeted ones are outside the campaign's untargeted DDA/DIA scope.
+HEADER_ACQUISITION_METHODS = frozenset({"FullScan", "DDA", "DIA", "AIF", "SIM", "SRM", "MRM", "PRM"})
+OUT_OF_SCOPE_HEADER_METHODS = ("PRM", "SRM", "MRM", "SIM")
 
 
 # Which MS-DIAL AcquisitionType values a raw-header verdict admits. The header reader's "DIA" does not
@@ -3416,6 +4156,34 @@ def _header_acquisition_by_file(manifest: dict[str, Any]) -> dict[str, str]:
         if path_text and mode in HEADER_ACQUISITION_TO_MSDIAL:
             result[_file_key(path_text)] = mode
     return result
+
+
+def _applied_disposition(manifest: dict[str, Any]) -> dict[str, Any]:
+    disposition = manifest.get("campaign_disposition")
+    return disposition if isinstance(disposition, dict) and disposition.get("applied") is True else {}
+
+
+def _decided_acquisition_by_file(manifest: dict[str, Any]) -> dict[str, str]:
+    """The Console acquisition type an applied campaign disposition decided for each file."""
+    if not _applied_disposition(manifest):
+        return {}
+    summary = (manifest.get("raw_metadata_preflight") or {}).get("summary") or {}
+    result = {}
+    for item in summary.get("per_file") or []:
+        path_text = str(item.get("file") or "").strip()
+        decided = str(item.get("console_acquisition_type") or "").strip()
+        if path_text and decided:
+            result[_file_key(path_text)] = decided
+    return result
+
+
+def _campaign_excluded_inputs(manifest: dict[str, Any]) -> dict[str, str]:
+    """The inputs an applied campaign disposition excluded, keyed by resolved path, with the reason."""
+    return {
+        _file_key(str(item.get("path"))): str(item.get("reason") or "")
+        for item in _applied_disposition(manifest).get("excluded_inputs") or []
+        if isinstance(item, dict) and str(item.get("path") or "").strip()
+    }
 
 
 def _tree_size(root: Path) -> tuple[int, int]:
@@ -4544,9 +5312,10 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
     separation_values = {separation_map.get(value, "Unknown") for value in separations}
     separation_values.discard("Unknown")
-    acquisition_values = {
-        value for value in methods if value in {"FullScan", "DDA", "DIA", "AIF", "SIM", "MRM", "SRM"}
-    }
+    # PRM is one of the extractor's RawAcquisitionMethod values (RawDataMetadata.cs) and was the one this
+    # list left out, so a PRM unit summarised as "Unknown" - the word for "no header spoke" - rather than
+    # as the targeted acquisition it is.
+    acquisition_values = {value for value in methods if value in HEADER_ACQUISITION_METHODS}
     if len(polarities) > 1 or "PolaritySwitching" in polarities or "MixedFunctions" in polarities:
         ion_mode = "Both"
     else:
@@ -4565,6 +5334,8 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
         acquisition_mode = "Mixed"
     else:
         acquisition_mode = next(iter(acquisition_values), "Unknown")
+    from .raw_metadata_preflight import header_console_acquisition_type
+
     per_file = []
     for item in records:
         source = item.get("source") or {}
@@ -4573,14 +5344,43 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
         ms_levels = acquisition.get("msLevels")
         if isinstance(ms_levels, dict):
             ms_levels = ms_levels.get("value")
+        levels = {int(level) for level in ms_levels if str(level).isdigit()} if isinstance(ms_levels, list) else set()
+        targets = acquisition.get("isolationWindowTargets")
+        energies = acquisition.get("collisionEnergies")
+        header_mode = _metadata_value(item, "acquisition", "method")
+        console, console_basis = header_console_acquisition_type(header_mode, targets)
         per_file.append(
             {
                 "file": str(source.get("filePath") or source.get("fileName") or ""),
-                "acquisition_mode": _metadata_value(item, "acquisition", "method"),
+                "acquisition_mode": header_mode,
                 "confidence": method.get("confidence") if isinstance(method, dict) else None,
                 "evidence": method.get("evidence") if isinstance(method, dict) else None,
+                # VendorHeader or SpectrumStatistics: a mode read from a vendor's method record and one
+                # inferred from how the spectra recur are different kinds of evidence, and an artifact
+                # must not call the second "header-confirmed".
+                "method_source": str(method.get("source") or "") if isinstance(method, dict) else "",
                 "polarity": _metadata_value(item, "acquisition", "polarity"),
                 "ms_levels": ms_levels,
+                "has_ms1": _metadata_flag(item, "hasMs1", 1 in levels if levels else None),
+                "has_ms2": _metadata_flag(item, "hasMs2", 2 in levels if levels else None),
+                "has_ion_mobility": _metadata_flag(item, "hasIonMobility", None),
+                "separation": _metadata_value(item, "acquisition", "separation"),
+                "isolation_window_count": len(targets) if isinstance(targets, list) else None,
+                "collision_energy_count": len(energies) if isinstance(energies, list) else None,
+                # What the header alone means to the Console (DDA, SWATH, AIF or None). The disposition of
+                # a campaign unit may replace console_acquisition_type with the type the file runs as.
+                "header_console_acquisition_type": console,
+                "header_console_acquisition_basis": console_basis,
+                "console_acquisition_type": console,
+                "console_acquisition_basis": console_basis if console else "",
+                "reader": str(source.get("readerName") or ""),
+                "extractor_warnings": sorted(
+                    {
+                        str(warning.get("code") or "")
+                        for warning in item.get("warnings") or []
+                        if isinstance(warning, dict) and warning.get("code")
+                    }
+                ),
                 # The extractor reads it from the file itself (mzML run@startTimeStamp, vendor
                 # headers); it is the injection order the analysis CSV should carry.
                 "acquisition_start_time": _metadata_value(item, "run", "acquisitionStartTime"),
@@ -4600,8 +5400,18 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
         "observed_separations": sorted(separations),
         "observed_acquisition_methods": sorted(methods),
         "observed_polarities": sorted(polarities),
+        "out_of_scope_methods": sorted(methods & set(OUT_OF_SCOPE_HEADER_METHODS)),
+        "evidence_kinds": sorted({entry["method_source"] for entry in per_file if entry["method_source"]}),
         "evidence": [f"Raw metadata preflight inspected {len(records)} representative file(s)."],
     }
+
+
+def _metadata_flag(record: dict[str, Any], field_name: str, fallback: bool | None) -> bool | None:
+    """A boolean the extractor records under acquisition, or the fallback when it records none."""
+    value = (record.get("acquisition") or {}).get(field_name)
+    if isinstance(value, dict):
+        value = value.get("value")
+    return value if isinstance(value, bool) else fallback
 
 
 ACQUISITION_ORDER_SOURCE = "raw_header_acquisition_start_time"
@@ -4632,6 +5442,10 @@ def _preflight_start_times(preflight: dict[str, Any]) -> tuple[dict[str, tuple[s
     inspected: set[str] = set()
     for item in (preflight.get("summary") or {}).get("per_file") or []:
         if not isinstance(item, dict) or not item.get("file"):
+            continue
+        # A per-file record now exists for every input a preflight attempted; one whose header could not be
+        # read was not inspected, and "no header recorded a time" must not be said of it.
+        if item.get("outcome", "ok") not in {"ok", "reused"}:
             continue
         inspected.add(_file_key(str(item["file"])))
         value = str(item.get("acquisition_start_time") or "").strip()
@@ -4686,7 +5500,12 @@ def _acquisition_start_times(
     inspected: set[str] = set()
     read = False
     for preflight in (source for source in sources if isinstance(source, dict)):
-        if (preflight.get("summary") or {}).get("per_file") or Path(str(preflight.get("output") or "")).is_file():
+        entries = (preflight.get("summary") or {}).get("per_file") or []
+        # The output file is written by every preflight now, empty when nothing could be read, so it
+        # counts as a read only for a summary from before per-file records.
+        if any(isinstance(item, dict) and item.get("outcome", "ok") in {"ok", "reused"} for item in entries) or (
+            not entries and Path(str(preflight.get("output") or "")).is_file()
+        ):
             read = True
         found, seen = _preflight_start_times(preflight)
         for key, value in found.items():

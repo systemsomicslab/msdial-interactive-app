@@ -20,6 +20,9 @@ PATH_SETTING_KEYS = {
     # 1.2 GB before any laboratory library is added. A site whose data drive is not C: had no way
     # to say so.
     "library_directory",
+    # The RawMetadataConsoleApp preflight runs. Without it the extractor was whichever build sat in
+    # the working checkout beside this one, which is a moving tree with no build record.
+    "raw_metadata_extractor_path",
 }
 
 

@@ -4,6 +4,70 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.17] - Unreleased
+
+### Added
+- `msdial_check_raw_metadata_extractor` and `msdial_set_raw_metadata_extractor_path`.
+  They list the extractors a preflight would consider, each with its source,
+  provenance status, commits and pin state, and save one as the new
+  `raw_metadata_extractor_path` setting. The setter refuses a build whose record does
+  not verify unless `allow_unverified=true`. The candidate order is the argument, the
+  setting, `MSDIAL_RAW_METADATA_EXTRACTOR`, then the sibling working checkout's build,
+  reported as `working_checkout_default`.
+- Pinned extractor builds are data (`PINNED_BUILDS`). The built pin is
+  msrawdataworkbench `592b6dbce` with MsdialWorkbench `f0583493a`; `b34c857a5`/`c471463a5`
+  is kept as planned. Under a campaign approval a preflight runs only the first
+  extractor named, and refuses one that does not inspect as verified and pinned
+  (`raw_metadata_extractor_refused`); the working-checkout build never qualifies.
+- `campaign_disposition` (`msdial-campaign-disposition.v1`), written by every preflight
+  and by `classify_preflight`: run, skip, exclude or split, with reason and warning
+  codes, the excluded inputs, the split grouping by acquisition and polarity, and the
+  extractor's identity. Under a campaign approval it is applied: `execution_allowed`,
+  the status (`preflight_passed`, `skipped_by_preflight`, `excluded_by_preflight`) and
+  each input's `console_acquisition_type` follow it, the execution gate admits each
+  file only as its decided type and refuses excluded inputs, and the split planner
+  leaves excluded inputs out. Outside a campaign it is advice only.
+  - Rules: the header decides where the repository metadata is silent, and an
+    unresolved header skips the unit; a declared mode stands when the headers are
+    unreadable (`acquisition_declared_only`), and yields only to a header of
+    confidence 0.8 or more; ion mobility is excluded (`ion_mobility_out_of_scope`);
+    PRM/SRM/MRM/SIM and declared full scan are out of scope; MS1-only files beside DDA
+    files run with them; mixed acquisition or polarity splits; unreadable files are
+    excluded and the rest run; a missing or never-read input skips the unit.
+  - A unit that was split, whose run finished, or that has an open run attempt is
+    never changed by a disposition (`disposition_hold`).
+- `raw_metadata_preflight_progress` records each extractor attempt's deadline and
+  owner process; `preflight_progress_state` says whether it is running, overdue or
+  gone.
+
+### Changed
+- The extractor reads at most 20 inputs per process, with no command line over
+  32,767 characters. Each process's limit is the sum of its inputs' limits: 300 s per
+  metadata reader, plus 1,800 s/GB for Waters and other full-spectrum formats, plus
+  600 s/GB for ion-mobility data, at most 12 h per input. A group that fails or times
+  out is read again one input at a time. OSError and TimeoutExpired are recorded.
+- Every input has its own record in `summary.per_file`: outcome, format,
+  `console_acquisition_type` (DDA, SWATH or AIF; a DIA verdict is resolved by its
+  recorded isolation, never by default), `has_ms1`, `has_ms2`, `has_ion_mobility`,
+  `method_source` and `reader_created_files`.
+- The manifest keeps a command template, a chunk log and stderr tails instead of the
+  full command and output. An input read before by the same extractor binary at the
+  same size and modification time is not read again; a split part reuses its
+  parent's reads.
+- The preflight writes the manifest through `update_manifest`, so a write made
+  meanwhile is kept, and a confirmed split holds the parent manifest's lock from plan
+  to last write.
+- Outside a campaign, an eligible unit with an unreadable input ends as before
+  (`preflight_unavailable` or `preflight_unsupported_format`, `execution_allowed`
+  kept).
+
+### Fixed
+- A unit of more than about 250 inputs can be preflighted; its single command line
+  used to exceed the Windows limit.
+- PRM is recognised; PRM, SRM, MRM and SIM are out of scope instead of "Unknown".
+- `confirm_untargeted` is recorded as an inference from the headers, not as a
+  confirmation.
+
 ## [0.5.16] - Unreleased
 
 ### Fixed
