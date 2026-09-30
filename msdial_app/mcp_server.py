@@ -14,6 +14,7 @@ from functools import wraps
 from typing import Any
 
 from . import __version__
+from .campaign_authorization import CampaignAuthorizationError
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HOST = "127.0.0.1"
@@ -233,11 +234,24 @@ def _structured_validation_errors(function):
                 "error_type": type(error).__name__,
                 "endpoint": error.endpoint,
             }
+            refused = _refused_authorization_codes(error.detail)
+            if refused is not None:
+                # Refused by the backend, which checks the approval again before it writes anything.
+                failure["reason"] = "campaign_authorization_refused"
+                failure["codes"] = refused
             if error.status is not None:
                 failure["http_status"] = error.status
             if error.trace:
                 failure["trace"] = error.trace
             return failure
+        except CampaignAuthorizationError as error:
+            return {
+                "ok": False,
+                "reason": "campaign_authorization_refused",
+                "codes": list(error.codes),
+                "detail": str(error),
+                "error_type": type(error).__name__,
+            }
         except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
             return {
                 "ok": False,
@@ -247,6 +261,81 @@ def _structured_validation_errors(function):
             }
 
     return wrapped
+
+
+def _refused_authorization_codes(detail: str) -> list[str] | None:
+    text = str(detail or "")
+    token = "campaign_authorization_refused ["
+    if not text.startswith(token) or "]" not in text:
+        return None
+    return [item.strip() for item in text[len(token):text.index("]")].split(",") if item.strip()]
+
+
+def _campaign_authorization(
+    path: str,
+    manifest_or_project: dict[str, Any],
+    boundary: Any,
+    entry_point: str,
+    raw_retention_policy: str | None = None,
+) -> dict[str, Any] | None:
+    """Validate a campaign approval for one unit and boundary; None when none was passed.
+
+    Accepts a unit manifest (which may name a split parent) or a project from a handoff.
+    """
+    from .campaign_authorization import authorize, unit_identity
+
+    if not str(path or "").strip():
+        return None
+    if isinstance(manifest_or_project.get("project"), dict):
+        unit, parent = unit_identity(manifest_or_project)
+    else:
+        unit, parent = str(manifest_or_project.get("analysis_unit_id") or ""), ""
+    return authorize(
+        path,
+        unit,
+        boundary,
+        entry_point=entry_point,
+        parent_unit_id=parent,
+        raw_retention_policy=raw_retention_policy,
+    )
+
+
+def _campaign_coverage(path: str, unit_id: str, raw_retention_policy: str) -> dict[str, Any] | None:
+    """Whether a campaign approval would cover one unit's download, for the plan tools.
+
+    A unit it does not cover is reported, not refused; only a record that cannot be read, or is itself
+    invalid, raises.
+    """
+    from .campaign_authorization import load_campaign_authorization
+
+    authorization = load_campaign_authorization(path)
+    if authorization is None:
+        return None
+    verdict = authorization.check(unit_id, 1, raw_retention_policy=raw_retention_policy)
+    return {
+        "approval_id": authorization.approval_id,
+        "manifest_digest": authorization.manifest_digest,
+        "valid": verdict["valid"],
+        "codes": verdict["codes"],
+        "reasons": verdict["reasons"],
+    }
+
+
+def _repository_unit(
+    download_job_id: str, manifest_path: str, host: str, port: int
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """The unit a repository tool acts on: by manifest when one is named, else by its download job.
+
+    The manifest route needs no backend and no registry entry, which is the point: the job registry keeps
+    only its hundred newest jobs, and a unit reached weeks after its download would otherwise be lost.
+    """
+    if str(manifest_path or "").strip():
+        from .repository_reanalysis import load_unit_manifest
+
+        return None, load_unit_manifest(manifest_path)
+    if not str(download_job_id or "").strip():
+        raise ValueError("Provide download_job_id or manifest_path.")
+    return _repository_download_job(download_job_id, host, port)
 
 
 def _analysis_intent(value: str) -> dict[str, Any]:
@@ -1063,10 +1152,13 @@ def msdial_repository_reanalysis_plan(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     analysis_purpose: str = "",
+    campaign_authorization_path: str = "",
 ) -> dict[str, Any]:
     """Inspect one public accession and return metadata, QA evidence, and download decisions.
 
     ``maximum_gb`` is decimal GB (1e9 bytes), matching how repositories report size.
+    ``campaign_authorization_path`` reports whether a campaign approval covers this unit's download; it
+    changes no limit and starts nothing.
     """
     workspace_root = _validated_workspace_root(workspace_root)
     project, workspace = _repository_inspection(
@@ -1083,6 +1175,11 @@ def msdial_repository_reanalysis_plan(
     blocking_reasons = _repository_download_blockers(
         project, intent, required_bytes, maximum_bytes, allow_preflight=False
     )
+    coverage = _campaign_coverage(
+        campaign_authorization_path, str(project.get("analysis_unit_id") or ""), raw_retention_policy
+    )
+    if coverage and not coverage["valid"]:
+        blocking_reasons.extend(f"campaign_authorization:{code}" for code in coverage["codes"])
 
     return {
         "execution_scope": dict(REPOSITORY_EXECUTION_SCOPE),
@@ -1113,6 +1210,7 @@ def msdial_repository_reanalysis_plan(
             "confirmation_required": True,
             "ready": bool(project.get("eligible")) and not blocking_reasons,
             "blocking_reasons": blocking_reasons,
+            **({"campaign_authorization": coverage} if coverage else {}),
         },
         "next_decisions": [
             intent["prompt"],
@@ -1139,10 +1237,16 @@ def msdial_download_repository_raw(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     analysis_purpose: str = "",
+    campaign_authorization_path: str = "",
 ) -> dict[str, Any]:
     """Download and recognize repository raw data only after explicit user confirmation.
 
     ``maximum_gb`` is decimal GB (1e9 bytes), matching how repositories report size.
+
+    ``campaign_authorization_path`` names a recorded campaign approval. When it covers boundary 1 for
+    this unit, with this retention policy, it stands in for confirmed=true and is written into the unit's
+    manifest; when it does not, the download is refused even with confirmed=true. It lifts no limit:
+    maximum_gb applies as before. Without it nothing changes.
     """
     workspace_root = _validated_workspace_root(workspace_root)
     project, workspace = _repository_inspection(
@@ -1156,6 +1260,13 @@ def msdial_download_repository_raw(
     intent = _analysis_intent(analysis_purpose)
     blocking_reasons = _repository_download_blockers(
         project, intent, required_bytes, maximum_bytes, allow_preflight
+    )
+    crossing = _campaign_authorization(
+        campaign_authorization_path,
+        project,
+        1,
+        "msdial_download_repository_raw",
+        raw_retention_policy=raw_retention_policy,
     )
     preview = {
         "execution_scope": dict(REPOSITORY_EXECUTION_SCOPE),
@@ -1173,6 +1284,8 @@ def msdial_download_repository_raw(
         "within_size_limit": required_bytes <= maximum_bytes,
         "blocking_reasons": blocking_reasons,
     }
+    if crossing:
+        preview["campaign_authorization"] = crossing
     if blocking_reasons:
         detail = "; ".join(blocking_reasons)
         return {
@@ -1182,7 +1295,7 @@ def msdial_download_repository_raw(
             "preview": preview,
             "message": f"Resolve all download blockers before continuing: {detail}",
         }
-    if not confirmed:
+    if not confirmed and crossing is None:
         return {
             "started": False,
             "confirmation_required": True,
@@ -1212,6 +1325,11 @@ def msdial_download_repository_raw(
             "maximum_gb": maximum_gb,
             "raw_retention_policy": raw_retention_policy,
             "allow_preflight": allow_preflight,
+            **(
+                {"campaign_authorization_path": campaign_authorization_path}
+                if crossing
+                else {}
+            ),
         },
         timeout=30,
     )
@@ -1227,11 +1345,13 @@ def msdial_repository_batch_plan(
     maximum_gb_per_unit: float = 20,
     raw_retention_policy: str = "keep",
     analysis_purpose: str = "",
+    campaign_authorization_path: str = "",
 ) -> dict[str, Any]:
     """Expand a mixed repository accession into independent analysis-unit run plans.
 
     ``maximum_gb_per_unit`` is decimal GB (1e9 bytes), matching how repositories
-    report size.
+    report size. ``campaign_authorization_path`` reports, per unit, whether a campaign approval covers
+    its download; a unit it does not cover is not ready under it.
     """
     workspace_root = _validated_workspace_root(workspace_root)
     if float(maximum_gb_per_unit) <= 0:
@@ -1268,6 +1388,9 @@ def msdial_repository_batch_plan(
         required_bytes = size["required_download_bytes"]
         if required_bytes > maximum_bytes:
             blocking.append("size_limit:exceeded")
+        coverage = _campaign_coverage(campaign_authorization_path, unit_id, raw_retention_policy)
+        if coverage and not coverage["valid"]:
+            blocking.extend(f"campaign_authorization:{code}" for code in coverage["codes"])
         pending_decisions = list(project.get("pending_decisions", []))
         pending_decisions.extend(intent["pending_decisions"])
         runs.append(
@@ -1291,6 +1414,7 @@ def msdial_repository_batch_plan(
                 "pending_decisions": list(dict.fromkeys(pending_decisions)),
                 "ready": bool(project.get("eligible")) and not blocking,
                 "next_tool": "msdial_download_repository_raw",
+                **({"campaign_authorization": coverage} if coverage else {}),
             }
         )
     return {
@@ -1311,12 +1435,13 @@ def msdial_repository_batch_plan(
 @mcp.tool()
 @_structured_validation_errors
 def msdial_repository_raw_metadata_preflight(
-    download_job_id: str,
+    download_job_id: str = "",
     extractor_path: str = "",
     max_inputs: int = 0,
     confirm_untargeted: bool = False,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    manifest_path: str = "",
 ) -> dict[str, Any]:
     """Read every downloaded input file's header with the local raw-metadata parser.
 
@@ -1324,8 +1449,11 @@ def msdial_repository_raw_metadata_preflight(
     acquisition type to each file, so a capped inspection leaves the unit under review. When the
     headers disagree about acquisition mode the unit is reported as Mixed, with its files grouped
     by mode, and cannot be made eligible until it is split.
+
+    Give manifest_path instead of download_job_id to reach a unit whose download job the backend no
+    longer holds.
     """
-    _, manifest = _repository_download_job(download_job_id, host, port)
+    _, manifest = _repository_unit(download_job_id, manifest_path, host, port)
     candidates = _raw_metadata_extractor_candidates(extractor_path)
     if not candidates:
         return {
@@ -1369,10 +1497,12 @@ def msdial_repository_raw_metadata_preflight(
 @mcp.tool()
 @_structured_validation_errors
 def msdial_split_repository_unit(
-    download_job_id: str,
+    download_job_id: str = "",
     confirmed: bool = False,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    manifest_path: str = "",
+    campaign_authorization_path: str = "",
 ) -> dict[str, Any]:
     """Split a unit whose raw headers disagree about acquisition mode into one part per mode.
 
@@ -1382,13 +1512,23 @@ def msdial_split_repository_unit(
     parent, marks the parent split, and returns a job id per part. Pass that job id to the preflight,
     prepare and start tools exactly as a download job id. Raw data are shared with the parent, not
     copied, and each part starts with execution_allowed false until its own preflight passes.
+
+    manifest_path reaches the parent after its download job has left the registry. A campaign approval
+    covering "split" for the unit stands in for confirmed=true and is recorded on the parent.
     """
+    if not str(download_job_id or "").strip() and not str(manifest_path or "").strip():
+        raise ValueError("Provide download_job_id or manifest_path.")
     result = _request_json(
         "POST",
         "/api/repository/split",
         host=host,
         port=port,
-        body={"download_job_id": download_job_id, "confirmed": bool(confirmed)},
+        body={
+            "download_job_id": download_job_id,
+            "manifest_path": manifest_path,
+            "confirmed": bool(confirmed),
+            "campaign_authorization_path": campaign_authorization_path,
+        },
         timeout=120,
     )
     parts = []
@@ -1408,15 +1548,17 @@ def msdial_split_repository_unit(
                 "higher_ms_levels": part.get("higher_ms_levels") or [],
             }
         )
+    authorized = result.get("campaign_authorization")
     return {
         "written": bool(result.get("written")),
         "already_split": bool(result.get("already_split")),
-        "confirmation_required": not confirmed and not result.get("already_split"),
+        "confirmation_required": not confirmed and not authorized and not result.get("already_split"),
         "manifest_path": result.get("manifest_path"),
         "analysis_unit_id": result.get("analysis_unit_id"),
         "parts": parts,
         "unclaimed_samples": result.get("unclaimed_samples") or [],
         "blockers": result.get("blockers") or [],
+        **({"campaign_authorization": authorized} if authorized else {}),
     }
 
 
@@ -1428,6 +1570,7 @@ def msdial_cleanup_repository_raw(
     confirmed: bool = False,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    campaign_authorization_path: str = "",
 ) -> dict[str, Any]:
     """Preview, and only on explicit confirmation perform, deletion of one unit's downloaded raw data.
 
@@ -1440,8 +1583,17 @@ def msdial_cleanup_repository_raw(
     Either identifier works. manifest_path is accepted because the job registry keeps only the most
     recently updated jobs and downgrades running jobs on restart, so a unit whose download job has aged
     out would otherwise have no way back to its own raw data.
+
+    campaign_authorization_path names a recorded campaign approval. It stands in for confirmed=true only
+    when it covers boundary 5 for this unit, the approval states delete_after_validated_output, the
+    unit's own manifest recorded that same policy at download, and the preview is ready - every guard of
+    the preview still applies. The crossing is recorded in the manifest before anything is deleted.
     """
-    from .repository_reanalysis import cleanup_download_lease
+    from .repository_reanalysis import (
+        cleanup_download_lease,
+        read_manifest,
+        record_campaign_authorization,
+    )
 
     resolved = Path(str(manifest_path or "")).expanduser()
     if not resolved.is_file():
@@ -1449,6 +1601,26 @@ def msdial_cleanup_repository_raw(
             raise ValueError("Provide either download_job_id or a manifest_path that exists.")
         _, manifest = _repository_download_job(download_job_id, host, port)
         resolved = Path(manifest["manifest_path"])
+    if str(campaign_authorization_path or "").strip():
+        manifest = read_manifest(resolved)
+        crossing = _campaign_authorization(
+            campaign_authorization_path,
+            manifest,
+            5,
+            "msdial_cleanup_repository_raw",
+            raw_retention_policy=str(manifest.get("raw_retention_policy") or "keep"),
+        )
+        preview = cleanup_download_lease(resolved, confirmed=False)
+        if not preview.get("ready_for_confirmation"):
+            return {
+                **preview,
+                "campaign_authorization": crossing,
+                "message": (
+                    "Nothing was deleted: the approval covers this unit, but the preview is not ready."
+                ),
+            }
+        record_campaign_authorization(resolved, crossing or {})
+        return {**cleanup_download_lease(resolved, confirmed=True), "campaign_authorization": crossing}
     result = cleanup_download_lease(resolved, confirmed=confirmed)
     if not confirmed:
         result["message"] = (
@@ -1461,15 +1633,25 @@ def msdial_cleanup_repository_raw(
 @mcp.tool()
 @_structured_validation_errors
 def msdial_prepare_repository_reanalysis(
-    download_job_id: str,
+    download_job_id: str = "",
     hierarchy: list[str] | None = None,
     confirmed: bool = False,
     allow_partial_mapping: bool = False,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    manifest_path: str = "",
+    campaign_authorization_path: str = "",
 ) -> dict[str, Any]:
-    """Project repository metadata into Class and prepare an analysis CSV after review."""
-    job, manifest = _repository_download_job(download_job_id, host, port)
+    """Project repository metadata into Class and prepare an analysis CSV after review.
+
+    manifest_path reaches a unit whose download job the backend no longer holds; the recognised files
+    are then rebuilt from the manifest's input_candidates, as the download job built them. A campaign
+    approval covering boundary 3 for the unit stands in for confirmed=true and is recorded in the manifest.
+    """
+    job, manifest = _repository_unit(download_job_id, manifest_path, host, port)
+    crossing = _campaign_authorization(
+        campaign_authorization_path, manifest, 3, "msdial_prepare_repository_reanalysis"
+    )
     from .repository_metadata import (
         apply_classes_to_analysis_files,
         metadata_workspace,
@@ -1502,7 +1684,12 @@ def msdial_prepare_repository_reanalysis(
             hierarchy if hierarchy is not None else workspace.get("hierarchy", [])
         )
         projected = project_class_hierarchy(workspace, selected_hierarchy)
-    recognized = ((job.get("result") or {}).get("recognized") or {}).get("files", [])
+    if job is not None:
+        recognized = ((job.get("result") or {}).get("recognized") or {}).get("files", [])
+    else:
+        from .workflow import expand_paths_report
+
+        recognized = expand_paths_report(list(manifest.get("input_candidates") or [])).get("files", [])
     application = apply_classes_to_analysis_files(projected, recognized)
     from .repository_reanalysis import (
         acquisition_start_order,
@@ -1521,7 +1708,9 @@ def msdial_prepare_repository_reanalysis(
         recognized,
     )
     output_root = str(manifest.get("output_directory") or "")
-    raw_retention_policy = str(job.get("raw_retention_policy") or "keep")
+    raw_retention_policy = str(
+        (job or {}).get("raw_retention_policy") or manifest.get("raw_retention_policy") or "keep"
+    )
     answer_seed = _repository_answer_seed(
         projected, manifest, output_root, raw_retention_policy
     )
@@ -1560,7 +1749,9 @@ def msdial_prepare_repository_reanalysis(
             key: value for key, value in analytical_order.items() if key not in ("orders", "files")
         } | {"files_recorded": len(analytical_order.get("files") or [])},
     }
-    if not confirmed:
+    if crossing:
+        preview["campaign_authorization"] = crossing
+    if not confirmed and crossing is None:
         return {
             "prepared": False,
             "confirmation_required": True,
@@ -1575,6 +1766,10 @@ def msdial_prepare_repository_reanalysis(
             "Repository metadata did not map uniquely to every recognized raw file. "
             "Review unmatched/ambiguous paths, or explicitly set allow_partial_mapping=true."
         )
+    if crossing:
+        from .repository_reanalysis import record_campaign_authorization
+
+        record_campaign_authorization(manifest["manifest_path"], crossing)
     saved = save_metadata_review(
         projected,
         output_root,
@@ -1603,12 +1798,13 @@ def msdial_prepare_repository_reanalysis(
 @mcp.tool()
 @_structured_validation_errors
 def msdial_repository_qa_evidence(
-    download_job_id: str,
+    download_job_id: str = "",
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    manifest_path: str = "",
 ) -> dict[str, Any]:
     """Return repository declarations that may identify LC-MS internal-standard QA targets."""
-    _, manifest = _repository_download_job(download_job_id, host, port)
+    _, manifest = _repository_unit(download_job_id, manifest_path, host, port)
     from .repository_metadata import metadata_workspace
     from .repository_qa import repository_internal_standard_evidence
 
@@ -1737,8 +1933,13 @@ def msdial_start_guided_analysis(
     confirmed: bool = False,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    campaign_authorization_path: str = "",
 ) -> dict[str, Any]:
-    """Start MS-DIAL only when the complete guided plan has been explicitly confirmed."""
+    """Start MS-DIAL only when the complete guided plan has been explicitly confirmed.
+
+    A campaign approval covering boundary 4 for the repository unit the plan names stands in for
+    confirmed=true; the backend checks it and records it in the unit manifest before the run starts.
+    """
     return _request_json(
         "POST",
         "/api/agent/run",
@@ -1749,6 +1950,7 @@ def msdial_start_guided_analysis(
             "answers": answers,
             "workset_id": workset_id,
             "confirmed": confirmed,
+            "campaign_authorization_path": campaign_authorization_path,
         },
         timeout=120,
     )
@@ -1764,8 +1966,14 @@ def msdial_start_peak_count_diagnostic(
     confirmed: bool = False,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    campaign_authorization_path: str = "",
 ) -> dict[str, Any]:
-    """Run the zero-threshold single-file diagnostic after explicit confirmation."""
+    """Run the zero-threshold single-file diagnostic after explicit confirmation.
+
+    The diagnostic starts the Console, so a campaign approval must cover boundary 4 to stand in for
+    confirmed=true. The diagnostic records itself in its own directory, which is what lets
+    msdial_estimate_peak_height find it by manifest_path later.
+    """
     return _request_json(
         "POST",
         "/api/agent/tuning/run",
@@ -1777,6 +1985,7 @@ def msdial_start_peak_count_diagnostic(
             "representative_file": representative_file,
             "workset_id": workset_id,
             "confirmed": confirmed,
+            "campaign_authorization_path": campaign_authorization_path,
         },
         timeout=120,
     )
@@ -1792,8 +2001,13 @@ def msdial_estimate_peak_height(
     threshold_step: int = 0,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    manifest_path: str = "",
 ) -> dict[str, Any]:
-    """Estimate a stepped Minimum peak height from a completed zero-threshold diagnostic."""
+    """Estimate a stepped Minimum peak height from a completed zero-threshold diagnostic.
+
+    With manifest_path, a diagnostic the backend no longer holds is found in the unit's diagnostics
+    directory by its job_id and its result file is read again, instead of running the Console again.
+    """
     return _request_json(
         "POST",
         "/api/agent/tuning/estimate",
@@ -1801,6 +2015,7 @@ def msdial_estimate_peak_height(
         port=port,
         body={
             "job_id": job_id,
+            "manifest_path": manifest_path,
             "target_peak_count": target_peak_count,
             "target_peak_count_min": target_peak_count_min,
             "target_peak_count_max": target_peak_count_max,
@@ -1909,13 +2124,18 @@ def msdial_interactive_preview_mztab(
 @mcp.tool()
 @_structured_validation_errors
 def msdial_generate_lcms_qa(
-    job_id: str,
+    job_id: str = "",
     internal_standards: list[dict[str, Any]] | None = None,
     file_path: str = "",
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    manifest_path: str = "",
 ) -> dict[str, Any]:
-    """Generate LC-MS QA only from the matrix created or updated by one job."""
+    """Generate LC-MS QA only from the matrix created or updated by one job.
+
+    manifest_path reaches that job's matrix through the run the unit manifest recorded when it was
+    finalised, after the backend has forgotten the job.
+    """
     return _request_json(
         "POST",
         "/api/qa/report",
@@ -1923,6 +2143,7 @@ def msdial_generate_lcms_qa(
         port=port,
         body={
             "job_id": job_id,
+            "manifest_path": manifest_path,
             "file_path": file_path,
             "internal_standards": internal_standards or [],
         },
@@ -1933,15 +2154,20 @@ def msdial_generate_lcms_qa(
 @mcp.tool()
 @_structured_validation_errors
 def msdial_generate_publication_report(
-    job_id: str,
+    job_id: str = "",
     run_qa: bool = True,
     internal_standards: list[dict[str, Any]] | None = None,
     qa_file_path: str = "",
     qa_criteria: dict[str, Any] | None = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    manifest_path: str = "",
 ) -> dict[str, Any]:
-    """Generate Materials and Methods, QA Results, and supplementary Excel/TSV artifacts."""
+    """Generate Materials and Methods, QA Results, and supplementary Excel/TSV artifacts.
+
+    manifest_path reaches the run through the unit manifest's finalised-run record. For a repository
+    unit the retained-artifact inventory is refreshed afterwards, so it lists the publication artifacts.
+    """
     return _request_json(
         "POST",
         "/api/publication/report",
@@ -1949,6 +2175,7 @@ def msdial_generate_publication_report(
         port=port,
         body={
             "job_id": job_id,
+            "manifest_path": manifest_path,
             "use_saved_run": True,
             "run_qa": run_qa,
             "qa_file_path": qa_file_path,

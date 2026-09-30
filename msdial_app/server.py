@@ -58,10 +58,17 @@ from .repository_reanalysis import (
     create_download_lease,
     evaluate_eligibility,
     finalize_download_lease,
+    load_unit_manifest,
     project_from_dict,
+    read_manifest,
+    record_campaign_authorization,
+    refresh_retained_artifacts,
     resolve_required_download_bytes,
     split_unit_by_acquisition,
+    update_manifest,
+    _write_json,
 )
+from .campaign_authorization import CampaignAuthorizationError, authorize, unit_identity
 from .workflow import (
     console_version,
     console_capabilities,
@@ -101,7 +108,23 @@ RESOURCES = ROOT / "resources"
 KNOWLEDGE = ROOT / "knowledge"
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
-JOBS_FILE = user_data_directory() / "agent-jobs.json"
+
+
+def _jobs_file() -> Path:
+    """Where this backend keeps its job registry.
+
+    One file per user used to be the only choice, so two backends - an interactive session's and a
+    campaign's - wrote the same agent-jobs.json. Each overwrote the other's records, and each, on
+    restart, marked the other's running jobs interrupted. MSDIAL_INTERACTIVE_JOBS_FILE gives a backend a
+    registry of its own; unset, the per-user file is used as before.
+    """
+    configured = str(os.environ.get("MSDIAL_INTERACTIVE_JOBS_FILE") or "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return user_data_directory() / "agent-jobs.json"
+
+
+JOBS_FILE = _jobs_file()
 DOWNLOADS: dict[str, Path] = {}
 KB = KnowledgeBase(KNOWLEDGE)
 
@@ -204,6 +227,147 @@ def _repository_workspace(state: dict[str, Any]) -> str:
     except (OSError, ValueError):
         return ""
     return str(manifest.get("workspace") or "")
+
+
+# Written into a diagnostic's own directory when it starts and again when it ends, so the estimate can be
+# made from disk after the registry has forgotten the job. The heights themselves stay in the Console's
+# result file, which is re-read rather than copied.
+DIAGNOSTIC_JOB_RECORD = "diagnostic-job.json"
+
+
+def _same_path(left: Any, right: Any) -> bool:
+    if not str(left or "").strip() or not str(right or "").strip():
+        return False
+    return os.path.normcase(str(Path(str(left)).expanduser().resolve())) == os.path.normcase(
+        str(Path(str(right)).expanduser().resolve())
+    )
+
+
+def _campaign_crossing(
+    workflow: dict[str, Any], authorization_path: Any, boundary: Any, entry_point: str
+) -> tuple[str, dict[str, Any]] | None:
+    """Check a campaign approval against the repository unit a workflow runs.
+
+    None when no approval was passed, and the caller asks for its confirmation as before. An approval
+    that does not cover this unit and boundary raises, whatever else the request says.
+    """
+    if not str(authorization_path or "").strip():
+        return None
+    manifest_text = str((workflow or {}).get("repository_run_manifest") or "").strip()
+    if not manifest_text:
+        raise CampaignAuthorizationError(
+            ["not_a_repository_unit"],
+            [
+                "A campaign approval covers repository analysis units, and this workflow names no unit "
+                "manifest."
+            ],
+        )
+    unit, parent = unit_identity(read_manifest(manifest_text))
+    crossing = authorize(
+        authorization_path, unit, boundary, entry_point=entry_point, parent_unit_id=parent
+    )
+    return manifest_text, crossing or {}
+
+
+def _require_same_unit(job: dict[str, Any], manifest_text: str) -> None:
+    """A registered job and a manifest named together must be about the same unit."""
+    recorded = str((job.get("preparation") or {}).get("repository_run_manifest") or "")
+    if not _same_path(recorded, manifest_text):
+        raise ValueError(
+            f"Job {job.get('id')} belongs to {recorded or 'no repository unit'}, not to {manifest_text}."
+        )
+
+
+def _diagnostic_job_from_manifest(manifest_text: str, job_id: str) -> dict[str, Any]:
+    """A diagnostic job rebuilt from its own directory, for a unit whose registry entry is gone."""
+    manifest = load_unit_manifest(manifest_text)
+    if not job_id:
+        raise ValueError("Name the diagnostic job_id; a unit may hold several diagnostics.")
+    directory = diagnostic_run_directory(
+        manifest.get("output_directory") or "", job_id, workspace=manifest.get("workspace") or None
+    )
+    record_path = directory / DIAGNOSTIC_JOB_RECORD
+    if not record_path.is_file():
+        raise FileNotFoundError(
+            f"Diagnostic {job_id} left no {DIAGNOSTIC_JOB_RECORD} in {directory}; it was started by a "
+            "version that did not record one, or never started. Run the diagnostic again."
+        )
+    record = read_manifest(record_path)
+    if str(record.get("job_id") or "") != job_id or not _same_path(
+        record.get("repository_run_manifest"), manifest["manifest_path"]
+    ):
+        raise ValueError(f"{record_path} does not describe diagnostic {job_id} of this unit.")
+    job = {
+        "id": job_id,
+        "kind": "tuning",
+        "status": str(record.get("status") or "unknown"),
+        "result": None,
+        "preparation": {
+            "peak_tuning_profile": record.get("peak_tuning_profile") or {},
+            "repository_run_manifest": manifest["manifest_path"],
+            "diagnostic_run_directory": str(directory),
+        },
+        "recovered_from": str(record_path),
+    }
+    if job["status"] == "completed":
+        result_file = str(record.get("diagnostic_result_file") or "")
+        if str(record.get("analysis_type") or "lcms").lower() == "gcms":
+            job["result"] = parse_mdscan(result_file or find_mdscan(str(directory)))
+        else:
+            job["result"] = parse_mdpeak(result_file or find_mdpeak(str(directory)))
+    return job
+
+
+def _run_job_from_manifest(manifest_text: str, job_id: str = "") -> dict[str, Any]:
+    """The production job a unit's manifest recorded at finalisation, for QA and publication."""
+    manifest = load_unit_manifest(manifest_text)
+    run = manifest.get("finalized_run")
+    if not isinstance(run, dict) or not str(run.get("run_directory") or "").strip():
+        raise ValueError(
+            "This unit's manifest records no finalised production run - it predates that record, or its "
+            "run never finished - so it cannot say which QA matrix the run produced. Pass the job_id while "
+            "the job is still registered, or name the QA file explicitly."
+        )
+    if job_id and str(run.get("job_id") or "") != job_id:
+        raise ValueError(f"The unit's finalised run is job {run.get('job_id')}, not {job_id}.")
+    return {
+        "id": str(run.get("job_id") or ""),
+        "kind": "run",
+        "status": "completed",
+        "preparation": {
+            "run_directory": str(run["run_directory"]),
+            "repository_run_manifest": manifest["manifest_path"],
+        },
+        "artifacts": dict(run.get("artifacts") or {}),
+        "recovered_from": manifest["manifest_path"],
+    }
+
+
+def _recovered_from(job: dict[str, Any] | None) -> dict[str, Any]:
+    """Name the manifest a job was rebuilt from, so a reply says it did not come from the registry."""
+    return {"recovered_from": job["recovered_from"]} if (job or {}).get("recovered_from") else {}
+
+
+def _scoped_run_job(body: dict[str, Any]) -> dict[str, Any] | None:
+    """The production job a QA or publication request is scoped to, from the registry or the manifest.
+
+    A job_id the registry still holds is used as it always was. A manifest_path reaches the same job
+    after the registry has forgotten it, through the run the manifest recorded at finalisation. Named
+    together, they must agree.
+    """
+    job_id = str(body.get("job_id", "")).strip()
+    manifest_text = str(body.get("manifest_path") or "").strip()
+    job = None
+    if job_id:
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+        if job is None and not manifest_text:
+            raise ValueError(f"Job not found: {job_id}")
+    if job is not None and manifest_text:
+        _require_same_unit(job, manifest_text)
+    if job is None and manifest_text:
+        job = _run_job_from_manifest(manifest_text, job_id)
+    return job
 
 
 def _artifact_files(root: Path) -> list[Path]:
@@ -833,6 +997,15 @@ class Handler(BaseHTTPRequestHandler):
                 retention = str(body.get("raw_retention_policy") or "keep").strip()
                 if retention not in RAW_RETENTION_POLICIES:
                     raise ValueError("Unknown repository raw-data retention policy.")
+                # Checked again here although the MCP tool already checked it: this is the process that
+                # writes the manifest the crossing is recorded in. The size limit above still applies.
+                crossing = authorize(
+                    body.get("campaign_authorization_path"),
+                    evaluated.analysis_unit_id,
+                    1,
+                    entry_point="repository_download",
+                    raw_retention_policy=retention,
+                )
                 job_id = uuid.uuid4().hex
                 with JOBS_LOCK:
                     JOBS[job_id] = {
@@ -851,13 +1024,20 @@ class Handler(BaseHTTPRequestHandler):
                         "raw_retention_policy": retention,
                         "created_at": dt.datetime.now().astimezone().isoformat(),
                     }
+                    if crossing:
+                        JOBS[job_id]["campaign_authorization"] = {
+                            key: crossing.get(key) for key in ("approval_id", "manifest_digest", "boundary")
+                        }
                     _persist_jobs_locked()
                 threading.Thread(
                     target=_run_repository_download_job,
                     args=(job_id, evaluated, workspace_root, maximum_bytes, allow_preflight, retention),
+                    kwargs={"campaign_authorization": crossing},
                     daemon=True,
                 ).start()
-                self._json({"job_id": job_id})
+                self._json(
+                    {"job_id": job_id, **({"campaign_authorization": crossing} if crossing else {})}
+                )
             elif parsed.path == "/api/repository/split":
                 self._json(_split_repository_download(body))
             elif parsed.path == "/api/repository/metadata/load":
@@ -1031,7 +1211,12 @@ class Handler(BaseHTTPRequestHandler):
                         HTTPStatus.BAD_REQUEST,
                     )
                     return
-                if body.get("confirmed") is not True:
+                # Checked before the confirmation: an approval that was offered and does not cover this
+                # unit's production run is a refusal even when confirmed=true came with it.
+                authorized = _campaign_crossing(
+                    plan["workflow"], body.get("campaign_authorization_path"), 4, "agent_run"
+                )
+                if body.get("confirmed") is not True and authorized is None:
                     self._json(
                         {
                             "started": False,
@@ -1058,6 +1243,9 @@ class Handler(BaseHTTPRequestHandler):
                 _write_guided_answers(preparation, plan)
                 job_id = uuid.uuid4().hex
                 artifact_baseline = _snapshot_run_artifacts(preparation)
+                if authorized:
+                    # Before the job exists: a run whose authority cannot be recorded does not start.
+                    record_campaign_authorization(authorized[0], {**authorized[1], "job_id": job_id})
                 with JOBS_LOCK:
                     JOBS[job_id] = {
                         "id": job_id,
@@ -1083,6 +1271,7 @@ class Handler(BaseHTTPRequestHandler):
                         "plan": plan,
                         "preparation": preparation,
                         "download_url": _register_download(preparation["bundle"]),
+                        **({"campaign_authorization": authorized[1]} if authorized else {}),
                     }
                 )
             elif parsed.path == "/api/agent/tuning/run":
@@ -1096,7 +1285,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError(
                         "Complete the guided questions and choose target_peak_count before diagnostic tuning."
                     )
-                if body.get("confirmed") is not True:
+                # The diagnostic starts the Console, so it is boundary 4's as the production run is.
+                authorized = _campaign_crossing(
+                    workflow, body.get("campaign_authorization_path"), 4, "peak_count_diagnostic"
+                )
+                if body.get("confirmed") is not True and authorized is None:
                     self._json(
                         {
                             "started": False,
@@ -1145,6 +1338,9 @@ class Handler(BaseHTTPRequestHandler):
                     key: value for key, value in profile.items() if key != "file"
                 }
                 preparation["diagnostic_run_directory"] = str(diagnostic_root)
+                if authorized:
+                    record_campaign_authorization(authorized[0], {**authorized[1], "job_id": job_id})
+                _write_diagnostic_record(job_id, preparation, "queued")
                 with JOBS_LOCK:
                     JOBS[job_id] = {
                         "id": job_id,
@@ -1162,11 +1358,25 @@ class Handler(BaseHTTPRequestHandler):
                     args=(job_id, preparation),
                     daemon=True,
                 ).start()
-                self._json({"started": True, "job_id": job_id, "preparation": preparation})
+                self._json(
+                    {
+                        "started": True,
+                        "job_id": job_id,
+                        "preparation": preparation,
+                        **({"campaign_authorization": authorized[1]} if authorized else {}),
+                    }
+                )
             elif parsed.path == "/api/agent/tuning/estimate":
                 job_id = str(body.get("job_id", "")).strip()
+                manifest_text = str(body.get("manifest_path") or "").strip()
                 with JOBS_LOCK:
                     job = dict(JOBS.get(job_id) or {})
+                if job and manifest_text:
+                    _require_same_unit(job, manifest_text)
+                if not job and manifest_text:
+                    # The heights used to live only in the registry, so an evicted diagnostic meant
+                    # running the Console again. Its directory says what it measured and where.
+                    job = _diagnostic_job_from_manifest(manifest_text, job_id)
                 if not job:
                     raise ValueError(f"Diagnostic job not found: {job_id}")
                 if job.get("status") != "completed" or not job.get("result"):
@@ -1299,11 +1509,9 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/qa/report":
                 job_id = str(body.get("job_id", "")).strip()
                 qa_path = str(body.get("file_path", "")).strip()
-                if job_id:
-                    with JOBS_LOCK:
-                        job = JOBS.get(job_id)
-                    if job is None:
-                        raise ValueError(f"Job not found: {job_id}")
+                job = _scoped_run_job(body)
+                if job is not None:
+                    job_id = job_id or str(job.get("id") or "")
                     qa_files = _job_artifact_paths(job, "qa")
                     if not qa_files:
                         raise FileNotFoundError(
@@ -1312,12 +1520,12 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     qa_path = qa_files[0]
                 elif not qa_path:
-                    raise ValueError("Set job_id or an explicit QA file_path.")
+                    raise ValueError("Set job_id, manifest_path or an explicit QA file_path.")
                 qa_report = build_lcms_qa_report_from_file(
                     qa_path,
                     body.get("internal_standards", []),
                 )
-                if job_id:
+                if job is not None:
                     # As its publication report will: a run-order statistic computed against the file
                     # names is withheld here too.
                     qa_report = qa_report_for_run(
@@ -1328,17 +1536,15 @@ class Handler(BaseHTTPRequestHandler):
                         "report": qa_report,
                         "job_id": job_id,
                         "qa_file": qa_path,
+                        **_recovered_from(job),
                     }
                 )
             elif parsed.path == "/api/publication/report":
                 state = body.get("workflow", {})
                 job_id = str(body.get("job_id", "")).strip()
-                job = None
-                if job_id:
-                    with JOBS_LOCK:
-                        job = JOBS.get(job_id)
-                    if job is None:
-                        raise ValueError(f"Job not found: {job_id}")
+                job = _scoped_run_job(body)
+                if job is not None:
+                    job_id = job_id or str(job.get("id") or "")
                 run_directory = str(
                     body.get("run_directory", "")
                     or ((job or {}).get("preparation") or {}).get("run_directory", "")
@@ -1400,6 +1606,12 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                     qa_criteria=body.get("qa_criteria"),
                 )
+                # The retained inventory a raw deletion is judged against was taken before this report
+                # existed; it now has to list what was just written.
+                unit_manifest = str(
+                    ((job or {}).get("preparation") or {}).get("repository_run_manifest") or ""
+                )
+                retained_refresh = refresh_retained_artifacts(Path(unit_manifest)) if unit_manifest else None
                 self._json(
                     {
                         "report": result,
@@ -1416,6 +1628,8 @@ class Handler(BaseHTTPRequestHandler):
                         "qa_file": qa_path,
                         "job_id": job_id,
                         "qa_included": bool(qa_report),
+                        **({"retained_artifacts_refresh": retained_refresh} if retained_refresh else {}),
+                        **_recovered_from(job),
                     }
                 )
             elif parsed.path == "/api/agent/handoff":
@@ -1525,6 +1739,7 @@ class Handler(BaseHTTPRequestHandler):
                     key: value for key, value in profile.items() if key != "file"
                 }
                 preparation["diagnostic_run_directory"] = str(diagnostic_root)
+                _write_diagnostic_record(job_id, preparation, "queued")
                 with JOBS_LOCK:
                     JOBS[job_id] = {
                         "id": job_id,
@@ -1721,6 +1936,7 @@ def _run_repository_download_job(
     maximum_bytes: int,
     allow_preflight: bool,
     retention: str,
+    campaign_authorization: dict[str, Any] | None = None,
 ) -> None:
     def log(message: str) -> None:
         with JOBS_LOCK:
@@ -1774,6 +1990,9 @@ def _run_repository_download_job(
             allow_preflight=allow_preflight,
             progress_callback=progress,
             raw_retention_policy=retention,
+            campaign_authorization=(
+                {**campaign_authorization, "job_id": job_id} if campaign_authorization else None
+            ),
         )
         recognized = expand_paths_report(lease.get("input_candidates", []))
         result = {
@@ -1825,9 +2044,14 @@ def _register_split_part(parent_job: dict[str, Any], part: dict[str, Any]) -> st
                 "status": "completed",
                 "kind": "repository_split_part",
                 "logs": [
-                    f"Split from repository download job {parent_job.get('id')} by raw-header "
-                    f"acquisition mode ({part['acquisition_mode']}). No data were downloaded; the "
-                    "part reads the parent's raw files in place."
+                    (
+                        f"Split from repository download job {parent_job.get('id')}"
+                        if parent_job.get("id")
+                        else "Split from the unit manifest "
+                        + str((part_manifest.get("split_from") or {}).get("manifest_path") or "")
+                    )
+                    + f" by raw-header acquisition mode ({part['acquisition_mode']}). No data were "
+                    "downloaded; the part reads the parent's raw files in place."
                 ],
                 "result": {
                     "manifest_path": str(part_manifest_path),
@@ -1852,28 +2076,62 @@ def _register_split_part(parent_job: dict[str, Any], part: dict[str, Any]) -> st
             }
             _persist_jobs_locked()
     if part_manifest.get("job_id") != job_id:
-        part_manifest["job_id"] = job_id
-        part_manifest_path.write_text(
-            json.dumps(part_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
+
+        def change(current: dict[str, Any]) -> None:
+            current["job_id"] = job_id
+
+        update_manifest(part_manifest_path, change)
     return job_id
 
 
 def _split_repository_download(body: dict[str, Any]) -> dict[str, Any]:
     job_id = str(body.get("download_job_id") or "").strip()
-    with JOBS_LOCK:
-        parent_job = copy.deepcopy(JOBS.get(job_id))
-    if not parent_job or parent_job.get("kind") != "repository_download":
-        raise ValueError(f"Job {job_id} is not a repository download job.")
-    if parent_job.get("status") != "completed":
-        raise ValueError(f"Repository download job {job_id} is {parent_job.get('status')}.")
-    manifest_path = Path(str((parent_job.get("result") or {}).get("manifest_path") or ""))
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"Repository run manifest was not found for job {job_id}: {manifest_path}")
-    result = split_unit_by_acquisition(manifest_path, confirmed=bool(body.get("confirmed")))
+    manifest_text = str(body.get("manifest_path") or "").strip()
+    if manifest_text:
+        # By manifest, for a unit whose download job the registry has already forgotten. The parent job
+        # the parts are registered against is then described from the manifest, and names no job.
+        manifest = load_unit_manifest(manifest_text)
+        manifest_path = Path(manifest["manifest_path"])
+        project = manifest.get("project") or {}
+        parent_job = {
+            "id": str(manifest.get("job_id") or ""),
+            "repository": project.get("repository"),
+            "accession": project.get("accession"),
+        }
+    else:
+        with JOBS_LOCK:
+            parent_job = copy.deepcopy(JOBS.get(job_id))
+        if not parent_job or parent_job.get("kind") != "repository_download":
+            raise ValueError(f"Job {job_id} is not a repository download job.")
+        if parent_job.get("status") != "completed":
+            raise ValueError(f"Repository download job {job_id} is {parent_job.get('status')}.")
+        manifest_path = Path(str((parent_job.get("result") or {}).get("manifest_path") or ""))
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Repository run manifest was not found for job {job_id}: {manifest_path}")
+        manifest = None
+    crossing = None
+    if str(body.get("campaign_authorization_path") or "").strip():
+        unit, parent_unit = unit_identity(manifest or read_manifest(manifest_path))
+        crossing = authorize(
+            body.get("campaign_authorization_path"),
+            unit,
+            "split",
+            entry_point="repository_split",
+            parent_unit_id=parent_unit,
+        )
+    # A covering approval stands in for confirmed=true, and is recorded on the parent before anything is
+    # written - but only when there is a split to make, so a preview or a refused plan records nothing.
+    confirmed = bool(body.get("confirmed")) or crossing is not None
+    if crossing:
+        plan = split_unit_by_acquisition(manifest_path, confirmed=False)
+        if not plan.get("already_split") and not plan.get("blockers"):
+            record_campaign_authorization(manifest_path, crossing)
+    result = split_unit_by_acquisition(manifest_path, confirmed=confirmed)
     if result.get("written") or result.get("already_split"):
         for part in result.get("parts") or []:
             part["job_id"] = _register_split_part(parent_job, part)
+    if crossing:
+        result["campaign_authorization"] = crossing
     return result
 
 def _record_repository_run_failure(
@@ -1982,7 +2240,14 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
             if manifest_text:
                 try:
                     if artifacts["mztab"] and summary.get("failed", 0) == 0:
-                        finalized = finalize_download_lease(Path(manifest_text))
+                        finalized = finalize_download_lease(
+                            Path(manifest_text),
+                            run={
+                                "job_id": job_id,
+                                "run_directory": preparation.get("run_directory", ""),
+                                "artifacts": artifacts,
+                            },
+                        )
                         repository_retention = {
                             "policy": retention,
                             "finalization": finalized,
@@ -2069,6 +2334,46 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
             _cleanup_temporary_input_folder(preparation.get("temporary_input_folder"), log)
 
 
+def _write_diagnostic_record(
+    job_id: str, preparation: dict[str, Any], status: str, **details: Any
+) -> None:
+    """Keep a diagnostic's identity and state in its own directory. Never raises.
+
+    The registry held the only record of which file a diagnostic measured and where its result lies,
+    and it forgets jobs. The record is how the estimate is made again from disk; losing it costs that,
+    not the diagnostic, so a failure to write it is not a failure of the run.
+    """
+    directory = str(preparation.get("diagnostic_run_directory") or "").strip()
+    if not directory:
+        return
+    path = Path(directory) / DIAGNOSTIC_JOB_RECORD
+    now = dt.datetime.now().astimezone().isoformat()
+    try:
+        record = read_manifest(path) if path.is_file() else {}
+    except (OSError, ValueError):
+        record = {}
+    record.update(
+        {
+            "schema": "msdial-peak-count-diagnostic-job.v1",
+            "job_id": job_id,
+            "status": status,
+            "repository_run_manifest": str(preparation.get("repository_run_manifest") or ""),
+            "analysis_type": str(preparation.get("analysis_type") or "lcms"),
+            "diagnostic_result_file": str(
+                record.get("diagnostic_result_file") or preparation.get("diagnostic_result_file") or ""
+            ),
+            "peak_tuning_profile": dict(preparation.get("peak_tuning_profile") or {}),
+            "updated_at": now,
+            **details,
+        }
+    )
+    record.setdefault("requested_at", now)
+    try:
+        _write_json(path, record)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
 def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
     def log(line: str) -> None:
         with JOBS_LOCK:
@@ -2080,16 +2385,20 @@ def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
         JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
         _persist_jobs_locked()
     try:
+        _write_diagnostic_record(job_id, preparation, "running")
         exit_code = run_console(preparation, log)
         result = None
+        result_file = ""
         if exit_code == 0:
             analysis_type = str(preparation.get("analysis_type", "lcms")).lower()
             diagnostic_result = preparation.get("diagnostic_result_file")
             try:
                 if analysis_type == "gcms":
-                    result = parse_mdscan(diagnostic_result or find_mdscan(preparation["run_directory"]))
+                    result_file = str(diagnostic_result or find_mdscan(preparation["run_directory"]))
+                    result = parse_mdscan(result_file)
                 else:
-                    result = parse_mdpeak(diagnostic_result or find_mdpeak(preparation["run_directory"]))
+                    result_file = str(diagnostic_result or find_mdpeak(preparation["run_directory"]))
+                    result = parse_mdpeak(result_file)
             except FileNotFoundError as missing:
                 raise RuntimeError(
                     "MS-DIAL finished without generating the expected diagnostic result file. "
@@ -2107,6 +2416,16 @@ def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
                 )
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             _persist_jobs_locked()
+            error_text = str(JOBS[job_id].get("error") or "")
+        _write_diagnostic_record(
+            job_id,
+            preparation,
+            "completed" if exit_code == 0 else "failed",
+            exit_code=exit_code,
+            ended_at=dt.datetime.now().astimezone().isoformat(),
+            **({"diagnostic_result_file": result_file} if result_file else {}),
+            **({"error": error_text} if error_text else {}),
+        )
     except Exception as error:
         with JOBS_LOCK:
             message = _diagnose_console_failure(JOBS[job_id]["logs"], str(error))
@@ -2116,6 +2435,13 @@ def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
             JOBS[job_id]["error"] = message
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             _persist_jobs_locked()
+        _write_diagnostic_record(
+            job_id,
+            preparation,
+            "failed",
+            ended_at=dt.datetime.now().astimezone().isoformat(),
+            error=message,
+        )
     finally:
         _cleanup_temporary_input_folder(
             preparation.get("diagnostic_input_folder") or preparation.get("temporary_input_folder"),

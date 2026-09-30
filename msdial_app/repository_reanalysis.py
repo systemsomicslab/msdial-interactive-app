@@ -5,21 +5,32 @@ import html
 import copy
 import csv
 import json
+import os
 import random
 import re
 import shutil
 import subprocess
 import tarfile
+import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 from .diagnostic_paths import is_diagnostic_artifact
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
+    import fcntl
 
 
 USER_AGENT = "MS-DIAL-Interactive/0.3 public-reanalysis"
@@ -879,7 +890,14 @@ def create_download_lease(
     allow_preflight: bool = False,
     progress_callback: Any = None,
     raw_retention_policy: str = "keep",
+    campaign_authorization: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Download one unit's objects into its workspace and write the unit's run manifest.
+
+    ``campaign_authorization`` is the crossing record a validated campaign approval produced for this
+    download (msdial_app.campaign_authorization); it is written into the manifest from the first write
+    on. None, the default, writes nothing about a campaign.
+    """
     downloadable = project.eligible or (
         allow_preflight and project.selection_status == "raw_metadata_required"
     )
@@ -914,104 +932,420 @@ def create_download_lease(
     output = root / "output"
     for directory in (download_root, data_root, provenance, output):
         directory.mkdir(parents=True, exist_ok=True)
-    downloads = []
-    unique_urls: dict[str, RepositoryFile] = {}
-    for item in project.files:
-        unique_urls.setdefault(item.url, item)
-    downloaded_bytes = 0
-    total_objects = len(unique_urls)
-    for index, (url, item) in enumerate(unique_urls.items(), start=1):
-        filename = Path(urllib.parse.urlparse(url).path).name or f"{project.accession}_{index}.zip"
-        if project.repository == "mb_post":
-            filename = f"{project.accession}.tar"
-        archive = Path(filename).suffix.casefold() in ARCHIVE_SUFFIXES
-        destination = download_root / filename if archive else data_root / _safe_relative_name(item.name)
-        def item_progress(received: int, declared: int) -> None:
-            if progress_callback:
-                known_total = required_download_bytes or (
-                    downloaded_bytes + declared if declared else 0
-                )
-                progress_callback(
-                    index,
-                    total_objects,
-                    item.name,
-                    downloaded_bytes + received,
-                    known_total,
-                )
-
-        result = client.download(
-            url,
-            destination,
-            maximum_bytes - downloaded_bytes,
-            progress_callback=item_progress,
-        )
-        downloaded_bytes += result["size_bytes"]
-        result["source_url"] = url
-        result["declared_checksum"] = item.checksum
-        if item.checksum and project.repository != "mb_post" and re.fullmatch(r"[0-9a-fA-F]{32}", item.checksum):
-            if result["md5"].casefold() != item.checksum.casefold():
-                raise ValueError(f"MD5 checksum mismatch for {filename}.")
-        downloads.append(result)
-        if progress_callback:
-            progress_callback(
-                index,
-                total_objects,
-                item.name,
-                downloaded_bytes,
-                required_download_bytes or downloaded_bytes,
-            )
-    extracted = []
-    for item in downloads:
-        archive_path = Path(item["path"])
-        if archive_path.parent == download_root and _is_archive(archive_path):
-            extracted.extend(_extract_archive(archive_path, data_root, maximum_bytes * 5))
-    selected_extracted = _filter_project_allowlist_paths(extracted, data_root, project)
-    checksum_validation = _verify_project_allowlist_checksums(data_root, project)
-    all_inputs = _find_msdial_inputs(data_root)
-    inputs = _filter_inputs_by_project_allowlist(all_inputs, data_root, project)
-    analysis_input = _common_input_path(inputs, data_root)
-    manifest = {
+    manifest_path = provenance / "run-manifest.json"
+    # WRITTEN BEFORE THE FIRST BYTE, AND AGAIN IF THE LEASE FAILS.
+    #
+    # The manifest used to be written once, after every object had arrived and been extracted. A lease
+    # that failed on the way - a checksum mismatch, an allow-list that attributed nothing, a backend that
+    # stopped - left bytes under raw\ and no record of whose they were or why they were there, and
+    # discard_download_lease, which reads the manifest to find the raw directory it may remove, could not
+    # act on them. At campaign scale that is disk filling with orphans nobody can release.
+    #
+    # So the unit says "downloading" before it downloads, and "download_failed", with the reason, when it
+    # does not finish. Nothing here is eligible for a run or a cleanup until the full record replaces it.
+    started_at = datetime.now(timezone.utc).isoformat()
+    lease_record: dict[str, Any] = {
         "schema": "msdial-public-reanalysis-run.v1",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "status": "prepared",
+        "created_at": started_at,
+        "status": "downloading",
         "project": project.as_dict(),
         "workspace": str(root),
         "raw_directory": str(raw_root),
         "input_directory": str(data_root),
         "output_directory": str(output),
-        "downloads": downloads,
-        "extracted_files": selected_extracted,
-        "ignored_extracted_file_count": len(extracted) - len(selected_extracted),
-        "allowlist_checksum_validation": checksum_validation,
-        "input_candidates": inputs,
-        "ignored_input_candidate_count": len(all_inputs) - len(inputs),
-        "analysis_input_path": analysis_input,
-        "execution_allowed": project.eligible,
+        "downloads": [],
+        "execution_allowed": False,
         "cleanup_allowed": False,
-        # WRITTEN HERE BECAUSE THIS IS WHERE IT HAS TO SURVIVE.
-        #
-        # The retention policy is chosen once, at download, and decides whether this unit's raw data
-        # may ever be deleted. It used to be held only in the in-memory job registry, which is
-        # persisted truncated to the hundred most recently updated jobs -- so at campaign scale the
-        # policy was evicted by later work while the data it governed was still on disk, and
-        # cleanup_download_lease's preview reported `manifest.get("raw_retention_policy")`, which
-        # nothing had ever written, as None. A person asked to confirm an irreversible deletion was
-        # shown a blank where the intent should be.
-        #
-        # The manifest is the unit's own durable record and outlives every registry.
         "raw_retention_policy": raw_retention_policy,
+        "download_started_at": started_at,
     }
-    manifest_path = provenance / "run-manifest.json"
-    repository_metadata_path = provenance / "repository-metadata.json"
-    sample_metadata_path = provenance / "sample-metadata-extracted.json"
-    from .repository_metadata import metadata_workspace
+    previous = _previous_manifest_summary(manifest_path)
+    if previous:
+        # A lease into a workspace that already holds a manifest replaces it, as it always has. What it
+        # replaced is said, so a retry is visibly a retry and not a first attempt.
+        lease_record["previous_manifest"] = previous
+    if campaign_authorization:
+        lease_record["campaign_authorizations"] = [dict(campaign_authorization)]
+    _write_json(manifest_path, lease_record)
 
-    _write_json(repository_metadata_path, project.as_dict())
-    _write_json(sample_metadata_path, metadata_workspace(project.as_dict()))
-    manifest["repository_metadata_file"] = str(repository_metadata_path)
-    manifest["sample_metadata_file"] = str(sample_metadata_path)
-    _write_json(manifest_path, manifest)
+    downloads: list[dict[str, Any]] = []
+    try:
+        unique_urls: dict[str, RepositoryFile] = {}
+        for item in project.files:
+            unique_urls.setdefault(item.url, item)
+        downloaded_bytes = 0
+        total_objects = len(unique_urls)
+        for index, (url, item) in enumerate(unique_urls.items(), start=1):
+            filename = Path(urllib.parse.urlparse(url).path).name or f"{project.accession}_{index}.zip"
+            if project.repository == "mb_post":
+                filename = f"{project.accession}.tar"
+            archive = Path(filename).suffix.casefold() in ARCHIVE_SUFFIXES
+            destination = download_root / filename if archive else data_root / _safe_relative_name(item.name)
+            def item_progress(received: int, declared: int) -> None:
+                if progress_callback:
+                    known_total = required_download_bytes or (
+                        downloaded_bytes + declared if declared else 0
+                    )
+                    progress_callback(
+                        index,
+                        total_objects,
+                        item.name,
+                        downloaded_bytes + received,
+                        known_total,
+                    )
+
+            result = client.download(
+                url,
+                destination,
+                maximum_bytes - downloaded_bytes,
+                progress_callback=item_progress,
+            )
+            downloaded_bytes += result["size_bytes"]
+            result["source_url"] = url
+            result["declared_checksum"] = item.checksum
+            if item.checksum and project.repository != "mb_post" and re.fullmatch(r"[0-9a-fA-F]{32}", item.checksum):
+                if result["md5"].casefold() != item.checksum.casefold():
+                    raise ValueError(f"MD5 checksum mismatch for {filename}.")
+                result["declared_checksum_verified"] = True
+            downloads.append(result)
+            if progress_callback:
+                progress_callback(
+                    index,
+                    total_objects,
+                    item.name,
+                    downloaded_bytes,
+                    required_download_bytes or downloaded_bytes,
+                )
+        extracted = []
+        # Which archive each extracted file came from, for the input lineage below. The extraction loop
+        # used to pool every member into one list and the association was gone.
+        extracted_from: dict[str, dict[str, Any]] = {}
+        for item in downloads:
+            archive_path = Path(item["path"])
+            if archive_path.parent == download_root and _is_archive(archive_path):
+                members = _extract_archive(archive_path, data_root, maximum_bytes * 5)
+                extracted.extend(members)
+                for member in members:
+                    extracted_from[_file_key(member)] = item
+        selected_extracted = _filter_project_allowlist_paths(extracted, data_root, project)
+        checksum_validation = _verify_project_allowlist_checksums(data_root, project)
+        all_inputs = _find_msdial_inputs(data_root)
+        inputs = _filter_inputs_by_project_allowlist(all_inputs, data_root, project)
+        analysis_input = _common_input_path(inputs, data_root)
+        manifest = {
+            "schema": "msdial-public-reanalysis-run.v1",
+            "created_at": started_at,
+            "status": "prepared",
+            "project": project.as_dict(),
+            "workspace": str(root),
+            "raw_directory": str(raw_root),
+            "input_directory": str(data_root),
+            "output_directory": str(output),
+            "downloads": downloads,
+            "extracted_files": selected_extracted,
+            "ignored_extracted_file_count": len(extracted) - len(selected_extracted),
+            "allowlist_checksum_validation": checksum_validation,
+            "input_candidates": inputs,
+            "ignored_input_candidate_count": len(all_inputs) - len(inputs),
+            "input_lineage": build_input_lineage(
+                inputs, downloads, extracted_from, data_root, download_root, project
+            ),
+            "analysis_input_path": analysis_input,
+            "execution_allowed": project.eligible,
+            "cleanup_allowed": False,
+            # WRITTEN HERE BECAUSE THIS IS WHERE IT HAS TO SURVIVE.
+            #
+            # The retention policy is chosen once, at download, and decides whether this unit's raw data
+            # may ever be deleted. It used to be held only in the in-memory job registry, which is
+            # persisted truncated to the hundred most recently updated jobs -- so at campaign scale the
+            # policy was evicted by later work while the data it governed was still on disk, and
+            # cleanup_download_lease's preview reported `manifest.get("raw_retention_policy")`, which
+            # nothing had ever written, as None. A person asked to confirm an irreversible deletion was
+            # shown a blank where the intent should be.
+            #
+            # The manifest is the unit's own durable record and outlives every registry.
+            "raw_retention_policy": raw_retention_policy,
+            "download_started_at": started_at,
+            "download_completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        for key in ("previous_manifest", "campaign_authorizations"):
+            if key in lease_record:
+                manifest[key] = lease_record[key]
+        repository_metadata_path = provenance / "repository-metadata.json"
+        sample_metadata_path = provenance / "sample-metadata-extracted.json"
+        from .repository_metadata import metadata_workspace
+
+        _write_json(repository_metadata_path, project.as_dict())
+        _write_json(sample_metadata_path, metadata_workspace(project.as_dict()))
+        manifest["repository_metadata_file"] = str(repository_metadata_path)
+        manifest["sample_metadata_file"] = str(sample_metadata_path)
+        _write_json(manifest_path, manifest)
+    except BaseException as error:
+        _record_download_failure(manifest_path, lease_record, downloads, error)
+        raise
     return {**manifest, "manifest_path": str(manifest_path)}
+
+
+# A manifest in either state records a lease that has not delivered its inputs. Nothing that needs
+# input_candidates may start from one; discard_download_lease may act on one.
+LEASE_INCOMPLETE_STATUSES = frozenset({"downloading", "download_failed"})
+
+
+def _previous_manifest_summary(manifest_path: Path) -> dict[str, Any]:
+    """What a new lease is about to replace, in a few fields. Empty when there is nothing there."""
+    try:
+        data = manifest_path.read_bytes()
+    except OSError:
+        return {}
+    summary: dict[str, Any] = {"sha256": hashlib.sha256(data).hexdigest(), "size_bytes": len(data)}
+    try:
+        previous = json.loads(data.decode("utf-8-sig"))
+    except ValueError:
+        return {**summary, "readable": False}
+    if isinstance(previous, dict):
+        for key in (
+            "status", "created_at", "finalized_at", "raw_cleaned_at", "discarded_at", "download_failed_at",
+        ):
+            if previous.get(key):
+                summary[key] = previous[key]
+    return summary
+
+
+def _record_download_failure(
+    manifest_path: Path,
+    lease_record: dict[str, Any],
+    downloads: list[dict[str, Any]],
+    error: BaseException,
+) -> None:
+    """Say, in the unit's own manifest, that its lease did not finish and why. Never raises.
+
+    The caller is already on its error path, and an exception here would replace the one that explains
+    what went wrong.
+    """
+    record = dict(lease_record)
+    record["status"] = "download_failed"
+    record["execution_allowed"] = False
+    record["cleanup_allowed"] = False
+    # The objects that did arrive, so the bytes on disk are accounted for and a retry can be compared.
+    record["downloads"] = list(downloads)
+    record["download_failed_at"] = datetime.now(timezone.utc).isoformat()
+    record["download_failure"] = {
+        "reason": str(error) or type(error).__name__,
+        "error_type": type(error).__name__,
+        "objects_completed": len(downloads),
+        "objects_declared": len(
+            {str(item.get("url") or "") for item in (record.get("project") or {}).get("files") or []}
+        ),
+    }
+    try:
+        _write_json(manifest_path, record)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def build_input_lineage(
+    inputs: list[str],
+    downloads: list[dict[str, Any]],
+    extracted_from: dict[str, dict[str, Any]],
+    data_root: Path,
+    download_root: Path,
+    project: RepositoryProject,
+) -> dict[str, Any]:
+    """One row per analysis input: what it is, where its bytes came from, and what vouches for them.
+
+    WHY ONE TABLE. Every later reader of an input asks the same question in a different place - the
+    gate's checksum coverage, the analysis-CSV builder, the conversion step, the archive checks - and each
+    was about to answer it from its own reading of downloads, extracted_files and the allow-list. One
+    record, written where the facts are known, is what they read instead.
+
+    Kinds, decided by shape and by how the bytes arrived:
+
+    - file: a file downloaded as its own repository object;
+    - vendor_folder: a .d/.raw directory assembled from objects downloaded one by one;
+    - archived_container: a .d/.raw directory that came out of an archive;
+    - extracted_member: a file that came out of an archive;
+    - converted: written by a conversion step, which records its own rows (none exist yet).
+
+    An input this lease neither downloaded nor extracted - a file already in a reused workspace - keeps
+    its shape's kind and says so in its source, rather than borrowing another object's checksums.
+
+    A member of an archive is not hashed here; the archive's checksums, and whether the published one was
+    compared, are carried as its source. ``sample_id`` is filled when exactly one of the unit's samples
+    names the input; ``file_name`` is the analysis CSV's, and belongs to whatever writes that CSV.
+    """
+    data_key = _file_key(str(data_root))
+    direct: dict[str, dict[str, Any]] = {}
+    for item in downloads:
+        path = Path(str(item.get("path") or ""))
+        if str(item.get("path") or "") and path.parent != download_root:
+            direct[_file_key(str(path))] = item
+
+    declared: dict[str, str] = {}
+    for item in project.files:
+        if item.name:
+            try:
+                declared.setdefault(_safe_relative_name(item.name).as_posix().casefold(), item.name)
+            except ValueError:
+                continue
+    sample_names: dict[str, set[str]] = {}
+    for sample in project.sample_metadata or []:
+        raw = PurePosixPath(str((sample or {}).get("raw_file") or "").replace("\\", "/")).name.casefold()
+        sample_id = str((sample or {}).get("sample_id") or "").strip()
+        if raw and sample_id:
+            sample_names.setdefault(raw, set()).add(sample_id)
+
+    folders = {_file_key(item): item for item in inputs if Path(item).is_dir()}
+    # Each downloaded or extracted file is attributed to the input folder that encloses it by walking up
+    # its own parents, so the cost grows with the number of files, not files times folders.
+    folder_members: dict[str, list[tuple[str, dict[str, Any], str]]] = {key: [] for key in folders}
+    if folders:
+        for origin, entries in (("download", direct), ("archive", extracted_from)):
+            for member_key, entry in entries.items():
+                for parent in Path(member_key).parents:
+                    parent_key = str(parent).casefold()
+                    if parent_key in folder_members:
+                        folder_members[parent_key].append((member_key, entry, origin))
+                        break
+                    if parent_key == data_key or len(parent_key) < len(data_key):
+                        break
+
+    rows = []
+    for text in inputs:
+        path = Path(text)
+        key = _file_key(text)
+        try:
+            relative = path.resolve().relative_to(data_root.resolve()).as_posix()
+        except ValueError:
+            relative = ""
+        candidates = {relative.casefold()} if relative else set()
+        if relative.casefold().startswith("files/"):
+            candidates.add(relative.casefold()[6:])
+        parts = relative.casefold().split("/") if relative else []
+        if len(parts) > 1:
+            candidates.add("/".join(parts[1:]))
+        base = path.name.casefold()
+        matched_samples = sample_names.get(base) or sample_names.get(PurePosixPath(base).stem) or set()
+        row: dict[str, Any] = {
+            "path": str(path),
+            "kind": "",
+            "declared_names": sorted({declared[item] for item in candidates if item in declared}),
+            "sample_id": next(iter(matched_samples)) if len(matched_samples) == 1 else "",
+            "file_name": "",
+            "source": {},
+            "checksums": {},
+        }
+        if key in folder_members:
+            members = folder_members[key]
+            archives = {
+                str(entry.get("path") or ""): entry for _, entry, origin in members if origin == "archive"
+            }
+            row["kind"] = "archived_container" if archives else "vendor_folder"
+            downloaded = sorted(
+                (
+                    (Path(member).relative_to(Path(key)).as_posix(), entry)
+                    for member, entry, origin in members
+                    if origin == "download"
+                ),
+                key=lambda pair: pair[0],
+            )
+            if archives:
+                row["source"] = {"archives": [_archive_source(entry) for entry in archives.values()]}
+            elif downloaded:
+                row["source"] = {"objects": len(downloaded)}
+            else:
+                row["source"] = {"origin": "not_downloaded_by_this_lease"}
+            if downloaded:
+                # A digest over the member objects' own sha256, so a folder assembled from many downloads
+                # has one checksum that changes when any member does.
+                lines = "".join(
+                    f"{relative_name}\t{entry.get('size_bytes', 0)}\t{entry.get('sha256', '')}\n"
+                    for relative_name, entry in downloaded
+                )
+                row["checksums"] = {
+                    "member_objects": len(downloaded),
+                    "members_sha256": hashlib.sha256(lines.encode("utf-8")).hexdigest(),
+                }
+        elif key in direct:
+            entry = direct[key]
+            row["kind"] = "file"
+            row["source"] = {"url": entry.get("source_url", ""), "download_path": entry.get("path", "")}
+            row["checksums"] = {
+                "sha256": entry.get("sha256", ""),
+                "md5": entry.get("md5", ""),
+                "declared": entry.get("declared_checksum", ""),
+                "declared_verified": True if entry.get("declared_checksum_verified") else None,
+            }
+        elif key in extracted_from:
+            row["kind"] = "extracted_member"
+            try:
+                member = path.resolve().relative_to(data_root.resolve()).as_posix()
+            except ValueError:
+                member = path.name
+            row["source"] = {"archive": _archive_source(extracted_from[key]), "member": member}
+        else:
+            row["kind"] = "vendor_folder" if path.is_dir() else "file"
+            row["source"] = {"origin": "not_downloaded_by_this_lease"}
+        rows.append(row)
+    return {"schema": "msdial-input-lineage.v1", "rows": rows}
+
+
+def _archive_source(entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "url": entry.get("source_url", ""),
+        "download_path": entry.get("path", ""),
+        "sha256": entry.get("sha256", ""),
+        "md5": entry.get("md5", ""),
+        "declared_checksum": entry.get("declared_checksum", ""),
+        "declared_checksum_verified": True if entry.get("declared_checksum_verified") else None,
+    }
+
+
+def load_unit_manifest(manifest_path: str | Path) -> dict[str, Any]:
+    """A unit's run manifest, read directly, for the steps that used to need its download job.
+
+    WHY. Preflight, split, preparation, the diagnostic estimate, QA and publication each found their unit
+    through a completed job in the backend's registry, which is persisted truncated to its hundred newest
+    jobs and forgets running ones on restart. At campaign scale a unit's download job is evicted long
+    before its later steps run, and the unit became unreachable although its manifest sat on disk. The
+    manifest is the durable record, so it is accepted in place of the job.
+
+    What the job check guaranteed is kept: a lease that has not delivered its inputs - still downloading,
+    or failed - is refused here exactly as an incomplete download job was.
+    """
+    path = Path(str(manifest_path or "")).expanduser()
+    if not str(manifest_path or "").strip() or not path.is_file():
+        raise FileNotFoundError(f"Repository run manifest was not found: {path}")
+    path = path.resolve()
+    manifest = read_manifest(path)
+    if not isinstance(manifest.get("project"), dict):
+        raise ValueError(f"{path} is not a repository run manifest: it records no project.")
+    status = str(manifest.get("status") or "")
+    if status in LEASE_INCOMPLETE_STATUSES:
+        reason = (manifest.get("download_failure") or {}).get("reason") or "unrecorded"
+        raise ValueError(
+            f"The repository download for this unit is {status}, so it has no analysis inputs yet. "
+            + (
+                f"Recorded reason: {reason}."
+                if status == "download_failed"
+                else "Wait for the lease to finish."
+            )
+        )
+    manifest["manifest_path"] = str(path)
+    return manifest
+
+
+def record_campaign_authorization(manifest_path: str | Path, crossing: dict[str, Any]) -> dict[str, Any]:
+    """Append one boundary crossing made under a campaign approval to the unit's manifest.
+
+    Raises when it cannot write, unlike the failure recorders: the crossing is written before the step it
+    authorizes, and a step whose authority cannot be recorded does not run.
+    """
+    entry = dict(crossing)
+
+    def change(manifest: dict[str, Any]) -> None:
+        manifest["campaign_authorizations"] = [*(manifest.get("campaign_authorizations") or []), entry]
+
+    return update_manifest(Path(manifest_path), change)
 
 
 def record_run_failure(
@@ -1049,9 +1383,7 @@ def record_run_failure(
         # survives.
         "log_tail": [str(line) for line in (log_tail or [])][-40:],
     }
-    try:
-        manifest_path = Path(manifest_path).resolve()
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    def change(manifest: dict[str, Any]) -> None:
         manifest["status"] = "run_failed"
         manifest["cleanup_allowed"] = False
         failures = list(manifest.get("run_failures") or [])
@@ -1059,7 +1391,10 @@ def record_run_failure(
         # Appended, not replaced: a unit retried three times and failed three times is a different
         # thing from a unit tried once, and the difference is what says whether to keep trying.
         manifest["run_failures"] = failures
-        _write_json(manifest_path, manifest)
+
+    try:
+        manifest_path = Path(manifest_path).resolve()
+        manifest = update_manifest(manifest_path, change)
         return {**manifest, "manifest_path": str(manifest_path)}
     except (OSError, ValueError) as error:
         return {"status": "run_failed", "manifest_error": str(error), "run_failure": record}
@@ -1111,34 +1446,23 @@ def record_peak_height_diagnostic(
         "threshold_step": estimate.get("threshold_step"),
         "method": estimate.get("method", ""),
     }
+
+    def change(manifest: dict[str, Any]) -> None:
+        manifest["peak_height_diagnostics"] = [*(manifest.get("peak_height_diagnostics") or []), record]
+
     try:
         manifest_path = Path(manifest_path).resolve()
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        diagnostics = list(manifest.get("peak_height_diagnostics") or [])
-        diagnostics.append(record)
-        manifest["peak_height_diagnostics"] = diagnostics
-        _write_json(manifest_path, manifest)
+        update_manifest(manifest_path, change)
         return {"recorded": True, "manifest_path": str(manifest_path), "diagnostic": record}
     except (OSError, ValueError) as error:
         return {"recorded": False, "manifest_error": str(error), "diagnostic": record}
 
 
-def finalize_download_lease(manifest_path: Path) -> dict[str, Any]:
-    from .mztab_validation import validate_mztab_outputs
-
-    manifest_path = manifest_path.resolve()
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    output = Path(manifest["output_directory"]).resolve()
-    validation = validate_mztab_outputs(output)
-    summary = validation.get("summary", {})
-    mztab_files = [Path(item["file"]).resolve() for item in validation.get("files", [])]
-    if not mztab_files or summary.get("failed", 0):
-        manifest["status"] = "validation_failed"
-        manifest["cleanup_allowed"] = False
-    else:
-        manifest["status"] = "mztab_validated"
-        manifest["cleanup_allowed"] = True
-    retained = list(mztab_files)
+def _retained_result_paths(
+    output: Path, provenance: Path, manifest_path: Path
+) -> tuple[list[Path], list[Path]]:
+    """The output files and the provenance files a validated run keeps."""
+    results = []
     for path in output.rglob("*") if output.is_dir() else []:
         if is_diagnostic_artifact(path):
             continue
@@ -1150,25 +1474,119 @@ def finalize_download_lease(manifest_path: Path) -> dict[str, Any]:
                 for token in ("quality", "qa", "publication", "method", "parameter", "analysis_files")
             )
         ):
-            retained.append(path.resolve())
-    project_archive = _archive_project_results(output)
-    if project_archive:
-        retained.append(project_archive)
-    provenance = manifest_path.parent
-    retained.extend(
+            results.append(path.resolve())
+    records = [
         path.resolve()
         for path in provenance.rglob("*")
-        if path.is_file() and path.resolve() != manifest_path
-    )
-    manifest["mztab_validation"] = validation
-    manifest["retained_artifacts"] = list(dict.fromkeys(str(path) for path in retained))
-    manifest["retained_artifact_inventory"] = [
-        _artifact_inventory(Path(path)) for path in manifest["retained_artifacts"]
+        # The writer lock and any unfinished temporary file of a durable write are not records.
+        if path.is_file() and path.resolve() != manifest_path and not is_manifest_scratch_file(path)
     ]
-    manifest["project_archive"] = str(project_archive) if project_archive else ""
-    manifest["finalized_at"] = datetime.now(timezone.utc).isoformat()
-    _write_json(manifest_path, manifest)
+    return results, records
+
+
+def finalize_download_lease(manifest_path: Path, run: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Validate a finished run's mzTab-M and record what it retains.
+
+    ``run`` is the production job that produced the output - its id, run directory and the artifacts it
+    created or updated - recorded as ``finalized_run``. It is what lets QA and publication be generated
+    from the manifest after the job registry has forgotten the job: without it, the only thing that says
+    which QA matrix belongs to this run is a registry truncated to its hundred newest jobs.
+    """
+    from .mztab_validation import validate_mztab_outputs
+
+    manifest_path = manifest_path.resolve()
+    manifest = read_manifest(manifest_path)
+    output = Path(manifest["output_directory"]).resolve()
+    validation = validate_mztab_outputs(output)
+    summary = validation.get("summary", {})
+    mztab_files = [Path(item["file"]).resolve() for item in validation.get("files", [])]
+    validated = bool(mztab_files) and not summary.get("failed", 0)
+    results, records = _retained_result_paths(output, manifest_path.parent, manifest_path)
+    project_archive = _archive_project_results(output)
+    retained = [*mztab_files, *results, *([project_archive] if project_archive else []), *records]
+    retained_artifacts = list(dict.fromkeys(str(path) for path in retained))
+    inventory = [_artifact_inventory(Path(path)) for path in retained_artifacts]
+    finalized_at = datetime.now(timezone.utc).isoformat()
+
+    # Everything slow happened above, unlocked. The update itself re-reads the manifest under its writer
+    # lock, so a record another writer added meanwhile is kept rather than overwritten.
+    def change(current: dict[str, Any]) -> None:
+        current["status"] = "mztab_validated" if validated else "validation_failed"
+        current["cleanup_allowed"] = validated
+        current["mztab_validation"] = validation
+        current["retained_artifacts"] = retained_artifacts
+        current["retained_artifact_inventory"] = inventory
+        current["project_archive"] = str(project_archive) if project_archive else ""
+        current["finalized_at"] = finalized_at
+        if run:
+            artifacts = run.get("artifacts") or {}
+            current["finalized_run"] = {
+                "job_id": str(run.get("job_id") or ""),
+                "run_directory": str(run.get("run_directory") or ""),
+                "artifacts": {
+                    kind: [str(path) for path in artifacts.get(kind) or []] for kind in ("mztab", "qa")
+                },
+                "recorded_at": finalized_at,
+            }
+
+    manifest = update_manifest(manifest_path, change)
     return {**manifest, "manifest_path": str(manifest_path)}
+
+
+def refresh_retained_artifacts(manifest_path: Path) -> dict[str, Any]:
+    """Add what was written after finalisation to the retained inventory. Never raises.
+
+    The inventory a raw-data deletion is judged against was computed when the run finished, before any
+    publication artifact existed, so the report, its bundle and the supplementary tables were outside
+    it: a deletion could be confirmed against an inventory that did not list them. This adds every file
+    the finalisation rule would now keep, re-hashes every retained path that still exists, and keeps a
+    listed path that has gone missing listed, so the cleanup plan still reports it missing.
+
+    Only a manifest that has been finalised is refreshed; anything else is reported and left alone.
+    """
+    manifest_path = Path(manifest_path).resolve()
+    try:
+        manifest = read_manifest(manifest_path)
+        if not manifest.get("finalized_at"):
+            return {"refreshed": False, "reason": "not_finalized", "manifest_path": str(manifest_path)}
+        output = Path(str(manifest.get("output_directory") or "")).resolve()
+        results, records = _retained_result_paths(output, manifest_path.parent, manifest_path)
+        found = [str(path) for path in (*results, *records)]
+        refreshed_at = datetime.now(timezone.utc).isoformat()
+        added: list[str] = []
+
+        def change(current: dict[str, Any]) -> None:
+            listed = [str(item) for item in current.get("retained_artifacts") or []]
+            combined = list(dict.fromkeys([*listed, *found]))
+            previous = {
+                str(item.get("path")): item
+                for item in current.get("retained_artifact_inventory") or []
+                if isinstance(item, dict)
+            }
+            current["retained_artifacts"] = combined
+            current["retained_artifact_inventory"] = [
+                _artifact_inventory(Path(path))
+                if Path(path).is_file()
+                else previous.get(path, {"path": path})
+                for path in combined
+            ]
+            current["retained_artifacts_refreshed_at"] = refreshed_at
+            added[:] = [path for path in combined if path not in listed]
+
+        update_manifest(manifest_path, change)
+        return {
+            "refreshed": True,
+            "manifest_path": str(manifest_path),
+            "added": added,
+            "refreshed_at": refreshed_at,
+        }
+    except (OSError, ValueError) as error:
+        return {
+            "refreshed": False,
+            "reason": "manifest_error",
+            "detail": str(error),
+            "manifest_path": str(manifest_path),
+        }
 
 
 # The extractor selects this when it recognises the format but has no reader for it.
@@ -1625,6 +2043,19 @@ def split_unit_by_acquisition(manifest_path: Path, confirmed: bool = False) -> d
                 per_file[_file_key(item)] for item in part["input_candidates"] if _file_key(item) in per_file
             ],
         }
+        lineage = parent.get("input_lineage")
+        if isinstance(lineage, dict):
+            # The part reads the parent's files, so their lineage is the parent's, row for row. Without
+            # it every part would look like a manifest written before lineage existed.
+            part_keys = {_file_key(item) for item in part["input_candidates"]}
+            part_manifest["input_lineage"] = {
+                **{key: value for key, value in lineage.items() if key != "rows"},
+                "rows": [
+                    row for row in lineage.get("rows") or []
+                    if isinstance(row, dict) and _file_key(str(row.get("path") or "")) in part_keys
+                ],
+                "inherited_from": str(manifest_path),
+            }
         repository_metadata_path = provenance / "repository-metadata.json"
         sample_metadata_path = provenance / "sample-metadata-extracted.json"
         part_manifest_path = provenance / "run-manifest.json"
@@ -1635,11 +2066,13 @@ def split_unit_by_acquisition(manifest_path: Path, confirmed: bool = False) -> d
         _write_json(part_manifest_path, part_manifest)
         written.append({**part, "manifest_path": str(part_manifest_path)})
 
-    parent["status"] = SPLIT_PARENT_STATUS
-    parent["execution_allowed"] = False
-    parent["split_at"] = now
-    parent["split_into"] = written
-    _write_json(manifest_path, parent)
+    def change(current: dict[str, Any]) -> None:
+        current["status"] = SPLIT_PARENT_STATUS
+        current["execution_allowed"] = False
+        current["split_at"] = now
+        current["split_into"] = written
+
+    update_manifest(manifest_path, change)
     return {**plan, "parts": written, "written": True}
 
 
@@ -1868,11 +2301,12 @@ def request_download_cleanup(manifest_path: Path) -> dict[str, Any]:
     make that third decision on their behalf, so this marks the manifest and returns the plan.
     """
     manifest_path = manifest_path.resolve()
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("cleanup_allowed") and manifest.get("status") in {"mztab_validated", "completed"}:
-        manifest["status"] = "cleanup_pending_confirmation"
-        manifest["cleanup_requested_at"] = datetime.now(timezone.utc).isoformat()
-        _write_json(manifest_path, manifest)
+    with manifest_lock(manifest_path):
+        manifest = read_manifest(manifest_path)
+        if manifest.get("cleanup_allowed") and manifest.get("status") in {"mztab_validated", "completed"}:
+            manifest["status"] = "cleanup_pending_confirmation"
+            manifest["cleanup_requested_at"] = datetime.now(timezone.utc).isoformat()
+            _write_json(manifest_path, manifest)
     plan = plan_download_cleanup(manifest_path)
     plan["deleted"] = False
     plan["confirmation_required"] = True
@@ -1899,9 +2333,13 @@ def cleanup_download_lease(manifest_path: Path, confirmed: bool = False) -> dict
     if raw_root.parent != workspace or raw_root.name != "raw":
         raise ValueError("Raw directory is outside the expected project workspace.")
     shutil.rmtree(raw_root)
-    manifest["status"] = "raw_cleaned"
-    manifest["raw_cleaned_at"] = datetime.now(timezone.utc).isoformat()
-    _write_json(manifest_path, manifest)
+    cleaned_at = datetime.now(timezone.utc).isoformat()
+
+    def change(current: dict[str, Any]) -> None:
+        current["status"] = "raw_cleaned"
+        current["raw_cleaned_at"] = cleaned_at
+
+    update_manifest(manifest_path, change)
     return {"deleted": True, "raw_directory": str(raw_root), "manifest_path": str(manifest_path)}
 
 
@@ -1914,6 +2352,14 @@ def discard_download_lease(manifest_path: Path, confirmed: bool = False) -> dict
         return {"deleted": False, "confirmation_required": True, "manifest_path": str(manifest_path)}
     if manifest.get("status") in {"mztab_validated", "completed", "raw_cleaned"}:
         raise ValueError("Validated/completed runs must use the normal cleanup command.")
+    if manifest.get("status") == "downloading":
+        # Written before the first byte of a lease. A lease that is still running writes into the tree
+        # this would delete, and a stopped one resumes on the next attempt, which then records either
+        # its inputs or download_failed.
+        raise ValueError(
+            "This unit's lease is recorded as still downloading; retry or finish the lease before "
+            "discarding its raw data."
+        )
     output = Path(manifest.get("output_directory", ""))
     if find_mztab_files(output):
         raise ValueError("mzTab-M output exists; finalize the run before deleting raw data.")
@@ -1923,10 +2369,16 @@ def discard_download_lease(manifest_path: Path, confirmed: bool = False) -> dict
         raise ValueError("Raw directory is outside the expected project workspace.")
     if raw_root.exists():
         shutil.rmtree(raw_root)
-    manifest["status"] = "discarded"
-    manifest["discarded_at"] = datetime.now(timezone.utc).isoformat()
-    manifest["discard_reason"] = "Preflight/download was rejected before a retained mzTab-M result was produced."
-    _write_json(manifest_path, manifest)
+    discarded_at = datetime.now(timezone.utc).isoformat()
+
+    def change(current: dict[str, Any]) -> None:
+        current["status"] = "discarded"
+        current["discarded_at"] = discarded_at
+        current["discard_reason"] = (
+            "Preflight/download was rejected before a retained mzTab-M result was produced."
+        )
+
+    update_manifest(manifest_path, change)
     return {"deleted": True, "raw_directory": str(raw_root), "manifest_path": str(manifest_path)}
 
 
@@ -2722,12 +3174,14 @@ def recorded_order_source(manifest_path: Any, files: list[dict[str, Any]]) -> st
 
 def record_analytical_order(manifest_path: str | Path, record: dict[str, Any]) -> None:
     """Keep how the analysis CSV's analytical order was decided in the unit's own manifest."""
-    path = Path(manifest_path)
-    manifest = json.loads(path.read_text(encoding="utf-8-sig"))
-    manifest["analytical_order"] = {
-        key: value for key, value in record.items() if key != "orders"
-    } | {"recorded_at": datetime.now(timezone.utc).isoformat()}
-    _write_json(path, manifest)
+    kept = {key: value for key, value in record.items() if key != "orders"} | {
+        "recorded_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    def change(manifest: dict[str, Any]) -> None:
+        manifest["analytical_order"] = kept
+
+    update_manifest(Path(manifest_path), change)
 
 
 def _metadata_value(record: dict[str, Any], section: str, field_name: str) -> str:
@@ -3375,6 +3829,176 @@ def _is_sidecar_name(name: str) -> bool:
     return value.endswith(".wiff.scan") or value.endswith(".wiff2.scan")
 
 
+# DURABLE MANIFEST WRITES.
+#
+# The unit manifest is the only record of a unit that outlives every registry, and it used to be written
+# with a plain write_text: open for writing, which truncates, then write. A process killed between the two
+# - a reboot, a backend restart, a full disk - left an empty or half-written file, and at campaign scale,
+# with weeks of crash-and-resume, the record a resumed run needs was exactly the one most likely to have
+# been caught mid-write. Two writers were also possible: the campaign runner calls these functions in its
+# own process while the backend's run job finalises the same manifest, and each would have read, changed
+# and written the whole file over the other's change.
+#
+# Now every write goes to a temporary file in the same directory, is flushed to disk, and replaces the
+# manifest in one rename, so a reader sees the old record or the new one and never a fragment. Writers
+# take a lock beside the file first. The lock is an operating-system lock on a file that is never deleted,
+# so a writer that dies releases it with its handle and there is no stale lock to recover or process to
+# probe for liveness. Readers take no lock: the rename is what keeps them safe.
+MANIFEST_LOCK_SUFFIX = ".lock"
+MANIFEST_TEMPORARY_SUFFIX = ".tmp"
+MANIFEST_LOCK_TIMEOUT_SECONDS = 120.0
+_MANIFEST_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_MANIFEST_THREAD_LOCKS_GUARD = threading.Lock()
+_MANIFEST_LOCK_DEPTH: dict[str, int] = {}
+
+
+def _manifest_lock_key(path: Path) -> str:
+    return os.path.normcase(str(Path(path).resolve()))
+
+
+def _lock_file_handle(lock_path: Path, deadline: float) -> Any:
+    handle = open(lock_path, "a+b")
+    while True:
+        try:
+            if msvcrt is not None:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except OSError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise TimeoutError(
+                    f"Another writer held {lock_path.name} for longer than "
+                    f"{MANIFEST_LOCK_TIMEOUT_SECONDS:.0f} s; the manifest was not changed."
+                )
+            time.sleep(0.02)
+
+
+def _unlock_file_handle(handle: Any) -> None:
+    try:
+        if msvcrt is not None:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+@contextmanager
+def manifest_lock(path: str | Path, timeout: float = MANIFEST_LOCK_TIMEOUT_SECONDS) -> Iterator[Path]:
+    """Hold the writer lock of one JSON record, across threads and processes.
+
+    Re-entrant within a thread, so a read-modify-write that holds it may call _write_json, which takes it
+    again. The lock file sits beside the record as <name>.lock and is never removed: removing it would let
+    a second writer lock a new file while a first still held the old one.
+    """
+    target = Path(path).resolve()
+    key = _manifest_lock_key(target)
+    with _MANIFEST_THREAD_LOCKS_GUARD:
+        thread_lock = _MANIFEST_THREAD_LOCKS.setdefault(key, threading.RLock())
+    deadline = time.monotonic() + max(float(timeout), 0.0)
+    if not thread_lock.acquire(timeout=max(float(timeout), 0.0)):
+        raise TimeoutError(f"Another thread held the lock on {target.name}; the manifest was not changed.")
+    try:
+        depth = _MANIFEST_LOCK_DEPTH.get(key, 0)
+        if depth:
+            _MANIFEST_LOCK_DEPTH[key] = depth + 1
+            try:
+                yield target
+            finally:
+                _MANIFEST_LOCK_DEPTH[key] -= 1
+            return
+        handle = _lock_file_handle(target.with_name(target.name + MANIFEST_LOCK_SUFFIX), deadline)
+        _MANIFEST_LOCK_DEPTH[key] = 1
+        try:
+            yield target
+        finally:
+            _MANIFEST_LOCK_DEPTH.pop(key, None)
+            _unlock_file_handle(handle)
+    finally:
+        thread_lock.release()
+
+
+def is_manifest_scratch_file(path: str | Path) -> bool:
+    """A lock or an unfinished temporary file of a durable write, which is never an artifact."""
+    name = Path(path).name
+    return name.endswith(MANIFEST_LOCK_SUFFIX) or (
+        name.startswith(".") and name.endswith(MANIFEST_TEMPORARY_SUFFIX)
+    )
+
+
+def _replace_atomically(path: Path, data: bytes) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=MANIFEST_TEMPORARY_SUFFIX, dir=str(path.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # On Windows a rename onto a file that another process has open for reading is refused for as
+        # long as that reader holds it. Readers take no lock and hold the file for milliseconds, so the
+        # replacement is retried briefly rather than failing the write.
+        for attempt in range(50):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 49:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    if hasattr(os, "O_DIRECTORY"):
+        # POSIX only: make the rename itself durable. Windows cannot open a directory this way, and
+        # NTFS journals the rename.
+        try:
+            directory = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory)
+        except OSError:
+            pass
+        finally:
+            os.close(directory)
+
+
 def _write_json(path: Path, value: Any) -> None:
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    # Serialised and encoded before anything on disk is touched, so a value that cannot be written
+    # leaves the previous record exactly as it was.
+    data = (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    with manifest_lock(path):
+        _replace_atomically(path, data)
+
+
+def read_manifest(path: str | Path) -> dict[str, Any]:
+    manifest = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"{Path(path).name} does not hold one JSON object.")
+    return manifest
+
+
+def update_manifest(path: str | Path, change: Any) -> dict[str, Any]:
+    """Read, change and write one manifest under its writer lock, so a concurrent writer is not lost.
+
+    ``change`` receives the manifest as it is on disk now and edits it in place; its return value is
+    ignored. The written manifest is returned.
+    """
+    target = Path(path).resolve()
+    if not target.is_file():
+        # Before the lock, whose file would otherwise be the first thing created in a directory that
+        # holds no manifest.
+        raise FileNotFoundError(f"Manifest was not found: {target}")
+    with manifest_lock(target):
+        manifest = read_manifest(target)
+        change(manifest)
+        _write_json(target, manifest)
+    return manifest
