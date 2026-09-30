@@ -1477,5 +1477,157 @@ class SciexCompanionsTravelWithTheirAlias(unittest.TestCase):
         self.assertEqual([f"{built['rows'][0]['file_name']}.mzML"], made)
 
 
+def _dispose(
+    manifest_path: Path,
+    decided: dict[str, str | None],
+    headers: dict[str, str] | None = None,
+    excluded: dict[str, str] | None = None,
+    kind: str = "run",
+    applied: bool = True,
+) -> None:
+    """Record a preflight and a campaign disposition over it as classify_preflight leaves them (0.5.17).
+
+    ``decided`` is each input's console_acquisition_type by file name, None where the disposition gave it
+    none; ``headers`` is what its header said (acquisition_mode, DIA by default); ``excluded`` names the
+    inputs the disposition excluded, with their reasons.
+    """
+    headers, excluded = headers or {}, excluded or {}
+
+    def change(manifest: dict) -> None:
+        per_file = []
+        for path in manifest["input_candidates"]:
+            name = Path(path).name
+            header = headers.get(name, "DIA")
+            per_file.append({
+                "file": path, "acquisition_mode": header, "polarity": "Negative", "ms_levels": [1, 2],
+                "header_console_acquisition_type": header if header in ("DDA", "AIF") else None,
+                "console_acquisition_type": decided.get(name),
+                "console_acquisition_basis": "declaration" if decided.get(name) else "",
+            })
+        manifest["raw_metadata_preflight"] = {"summary": {"per_file": per_file}}
+        manifest["campaign_disposition"] = {
+            "schema": "msdial-campaign-disposition.v1",
+            "disposition": kind,
+            "applied": applied,
+            "reasons": [],
+            "warnings": [],
+            "excluded_inputs": [
+                {"path": path, "reason": excluded[Path(path).name]}
+                for path in manifest["input_candidates"]
+                if Path(path).name in excluded
+            ],
+            "split_key": None,
+        }
+
+    update_manifest(manifest_path, change)
+
+
+class AnAliasedInputIsHeldToItsDisposition(unittest.TestCase):
+    """What a campaign disposition decided is recorded against the input, and a CSV row may name its alias.
+
+    A hard link resolves to itself, not to the input it stands for, so the execution gate looks an aliased
+    row's decided type and exclusion up as the input the alias stands for (_unit_input_of), as it already
+    did its header.
+    """
+
+    NAMES = ["\uff7b\uff9d\uff8c\uff9f\uff9904.mzML", "plain_05.mzML"]
+
+    def _recorded(self, root: Path) -> tuple[dict, dict]:
+        """Build, alias, write and record the unit's CSV. Returns the rows and the gate state they make."""
+        manifest_path = root / "provenance" / "run-manifest.json"
+        built = build_repository_analysis_rows(read_manifest(manifest_path))
+        self.assertEqual([], built["failures"] + create_console_aliases(built))
+        csv_path = write_analysis_csv(built, root / "output" / "analysis_files.csv")
+        record_analysis_csv(manifest_path, built, csv_path)
+        state = {
+            "repository_run_manifest": str(manifest_path),
+            "output_root": str(root / "output"),
+            "ion_mode": "Negative",
+            "files": workflow.read_analysis_csv(csv_path)["files"],
+        }
+        return built, state
+
+    def test_a_decided_type_is_the_aliased_inputs_own_whatever_its_header_said(self) -> None:
+        """A low-confidence DDA header the repository's SWATH declaration overrode (basis: declaration)."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "unit"
+            manifest_path = _hand_made_unit(root, self.NAMES, mode="SWATH")
+            _dispose(manifest_path, {name: "SWATH" for name in self.NAMES}, headers={self.NAMES[0]: "DDA"})
+            built, state = self._recorded(root)
+            gate = evaluate_repository_execution_gate(state)
+            as_aif = evaluate_repository_execution_gate(
+                {**state, "files": [{**item, "acquisition_type": "AIF"} for item in state["files"]]}
+            )
+
+        aliased = next(row for row in built["rows"] if row["console_alias"])
+        self.assertEqual("hardlink", aliased["console_alias"]["kind"])
+        self.assertTrue(gate["allowed"], gate["blockers"])
+        self.assertFalse(as_aif["allowed"])
+        self.assertTrue(
+            any(
+                "campaign disposition decided" in item and "decided SWATH, run as AIF" in item
+                for item in as_aif["blockers"]
+            ),
+            as_aif["blockers"],
+        )
+        self.assertFalse(any("raw header contradicts" in item for item in as_aif["blockers"]), as_aif["blockers"])
+
+    def test_an_aliased_input_the_disposition_excluded_after_its_csv_is_refused_by_its_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "unit"
+            manifest_path = _hand_made_unit(root, self.NAMES, mode="SWATH")
+            _dispose(manifest_path, {name: "SWATH" for name in self.NAMES})
+            built, state = self._recorded(root)
+            before = evaluate_repository_execution_gate(state)
+            # A later preflight excluded the aliased input; the workflow still holds the CSV written before it.
+            _dispose(manifest_path, {self.NAMES[1]: "SWATH"}, excluded={self.NAMES[0]: "raw_header_unreadable"})
+            after = evaluate_repository_execution_gate(state)
+
+        alias_name = Path(next(row for row in built["rows"] if row["console_alias"])["file_path"]).name
+        self.assertTrue(before["allowed"], before["blockers"])
+        self.assertFalse(after["allowed"])
+        self.assertTrue(
+            any(
+                "excluded by this unit's campaign disposition" in item
+                and f"{alias_name} (raw_header_unreadable)" in item
+                for item in after["blockers"]
+            ),
+            after["blockers"],
+        )
+
+
+class TheCsvWritesTheTypeAnAppliedDispositionDecided(unittest.TestCase):
+    """Under an applied disposition the type decided for an input is the type it runs as (0.5.17)."""
+
+    def test_each_row_takes_the_decided_type_and_says_so(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = _hand_made_unit(Path(temporary) / "unit", ["a.mzML", "b.mzML"], mode="DIA")
+            _dispose(manifest_path, {"a.mzML": "SWATH", "b.mzML": "SWATH"})
+            built = build_repository_analysis_rows(read_manifest(manifest_path))
+
+        self.assertEqual([], built["failures"])
+        self.assertEqual(
+            [("SWATH", "campaign_disposition")] * 2,
+            [(row["acquisition_type"], row["acquisition_type_source"]) for row in built["rows"]],
+        )
+
+    def test_an_input_the_applied_disposition_decided_nothing_for_is_not_given_the_units_declaration(self) -> None:
+        """A skipped unit's inputs have no console_acquisition_type; the unit's DDA is not written for them."""
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = _hand_made_unit(Path(temporary) / "unit", ["a.mzML", "b.mzML"], mode="DDA")
+            headers = {"a.mzML": "DDA", "b.mzML": "DDA"}
+            _dispose(manifest_path, {}, headers=headers, kind="skip")
+            skipped = build_repository_analysis_rows(read_manifest(manifest_path))
+            _dispose(manifest_path, {}, headers=headers, kind="skip", applied=False)
+            outside = build_repository_analysis_rows(read_manifest(manifest_path))
+
+        self.assertEqual(["acquisition_type_not_decided"], [item["code"] for item in blocking_failures(skipped)])
+        self.assertEqual(["a.mzML", "b.mzML"], skipped["failures"][0]["inputs"])
+        self.assertEqual([], outside["failures"], "outside a campaign the unit's declaration stands, as before")
+        self.assertEqual({("DDA", "unit_declaration")}, {
+            (row["acquisition_type"], row["acquisition_type_source"]) for row in outside["rows"]
+        })
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4476,11 +4476,12 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
                 f"the first is {outside[0]}."
             )
 
-    # An analysis CSV built from the input lineage wrote each input's acquisition type from its own header
-    # and recorded it on the input's lineage row (repository_analysis_rows). A workflow that has since set
-    # another type for an input - one answer written over every file - would deconvolute it as something
-    # its header did not say, and a header's 'DIA' admits SWATH and AIF alike, so the check below cannot
-    # tell. The type the CSV wrote is the one the input runs as.
+    # An analysis CSV built from the input lineage wrote each input's acquisition type - the one an applied
+    # campaign disposition decided, else its own header's - and recorded it on the input's lineage row
+    # (repository_analysis_rows). A workflow that has since set another type for an input - one answer
+    # written over every file - would deconvolute it as something its header did not say, and a header's
+    # 'DIA' admits SWATH and AIF alike, so the check below cannot tell. The type the CSV wrote is the one
+    # the input runs as.
     written = _written_acquisition_by_input(manifest)
     if written:
         rewritten = []
@@ -4493,7 +4494,7 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
         if rewritten:
             blockers.append(
                 f"{len(rewritten)} input files would run with an acquisition type other than the one this "
-                f"unit's analysis CSV wrote for them from their raw headers; the first is {rewritten[0]}."
+                f"unit's analysis CSV wrote for them; the first is {rewritten[0]}."
             )
 
     # A run in the wrong polarity produces a complete, validated, entirely void result, and no later
@@ -4520,7 +4521,8 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
     # The type an applied campaign disposition decided a file runs as - from its header, from the
     # repository's declaration where no header could be read or a low-confidence one disagreed, or DDA for
     # an MS1-only file folded into a DDA run - is the one type that file may run as. A file with no decision
-    # is held to what its header alone admits, as before dispositions existed.
+    # is held to what its header alone admits, as before dispositions existed. Both are recorded against the
+    # input, so a row that reads it through a Console alias is looked up as that input.
     decided_types = _decided_acquisition_by_file(manifest)
     if header_modes or decided_types:
         disagreeing = []
@@ -4529,15 +4531,16 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             path_text = str(item.get("file_path") or "").strip()
             if not path_text:
                 continue
+            input_key = _file_key(_unit_input_of(path_text, aliases))
             given = str(item.get("acquisition_type") or "").strip()
-            decided = decided_types.get(_file_key(path_text))
+            decided = decided_types.get(input_key)
             if decided:
                 if given != decided:
                     # A blank type is not the decided one even where the decision is DDA: the Console reads
                     # a blank, or any value it cannot parse, as DDA without a word.
                     undecided_as.append(f"{Path(path_text).name} (decided {decided}, run as {given or 'no type'})")
                 continue
-            header = header_modes.get(_file_key(_unit_input_of(path_text, aliases)))
+            header = header_modes.get(input_key)
             requested = given or "DDA"
             if header and requested not in HEADER_ACQUISITION_TO_MSDIAL.get(header, {header}):
                 disagreeing.append(f"{Path(path_text).name} (header {header}, run as {requested})")
@@ -4553,14 +4556,15 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             )
 
     # An input a campaign disposition excluded - unreadable, ion mobility, out of scope - is not part of
-    # the run that disposition allowed, whatever the input list still names.
+    # the run that disposition allowed, whatever the input list still names, and whatever alias names it.
     excluded = _campaign_excluded_inputs(manifest)
     if excluded:
-        named = [
-            f"{Path(str(item.get('file_path'))).name} ({excluded[_file_key(str(item.get('file_path')))]})"
-            for item in state.get("files") or []
-            if str(item.get("file_path") or "").strip() and _file_key(str(item.get("file_path"))) in excluded
-        ]
+        named = []
+        for item in state.get("files") or []:
+            path_text = str(item.get("file_path") or "").strip()
+            reason = excluded.get(_file_key(_unit_input_of(path_text, aliases))) if path_text else None
+            if reason is not None:
+                named.append(f"{Path(path_text).name} ({reason})")
         if named:
             blockers.append(
                 f"{len(named)} input files were excluded by this unit's campaign disposition; the first is "

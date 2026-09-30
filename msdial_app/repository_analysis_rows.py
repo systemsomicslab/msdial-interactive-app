@@ -16,8 +16,11 @@ EACH ROW:
 - file_type: inferred from the sample row (Sample, Blank, QC, Standard), else from the input's name;
 - class_id: the sample's Class as projected from the unit's accepted proposal - "All" for every sample
   where the Catalog abstained - folded to ASCII when it has to be, the grouping unchanged;
-- acquisition_type: DDA, SWATH or AIF, from the file's own console_acquisition_type (raw-metadata preflight);
-  where a preflight recorded none, the unit's declared DDA, SWATH or AIF. A bare 'DIA' is never written:
+- acquisition_type: DDA, SWATH or AIF. Under an applied campaign disposition, the type it decided for the
+  input (console_acquisition_type, 0.5.17), which the execution gate holds the input to; an input it read
+  and decided none for is refused with acquisition_type_not_decided, never given the unit's declaration.
+  Otherwise the file's own console_acquisition_type (raw-metadata preflight); where a preflight recorded
+  none, the unit's declared DDA, SWATH or AIF. A bare 'DIA' is never written:
   it is SWATH for windowed MS2 and AIF for all-ion MS2, and which one it is is the header's to say, so
   the unit is refused with acquisition_type_ambiguous. The pinned Console reads an unparsable value as
   DDA without a word, so nothing else may reach the column;
@@ -66,6 +69,9 @@ from .repository_metadata import (
     metadata_workspace,
 )
 from .repository_reanalysis import (
+    _applied_disposition,
+    _campaign_excluded_inputs,
+    _decided_acquisition_by_file,
     _file_key,
     acquisition_start_order,
     declared_analysis_inputs,
@@ -114,26 +120,32 @@ def _per_file_verdicts(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return verdicts
 
 
-def _excluded_by_disposition(manifest: dict[str, Any]) -> dict[str, str]:
-    """The inputs an applied campaign disposition excluded, by _file_key, with the reason.
-
-    The same reading of campaign_disposition (msdial-campaign-disposition.v1) as the execution gate's: a
-    disposition only decided, not applied (a unit outside a campaign), excludes nothing.
-    """
-    disposition = manifest.get("campaign_disposition")
-    if not isinstance(disposition, dict) or disposition.get("applied") is not True:
-        return {}
+def _inspected_files(manifest: dict[str, Any]) -> set[str]:
+    """The _file_key of every input the unit's own raw-metadata preflight recorded, as a disposition read them."""
+    summary = (manifest.get("raw_metadata_preflight") or {}).get("summary") or {}
     return {
-        _file_key(str(item["path"])): str(item.get("reason") or "")
-        for item in disposition.get("excluded_inputs") or []
-        if isinstance(item, dict) and str(item.get("path") or "").strip()
+        _file_key(str(item["file"]))
+        for item in summary.get("per_file") or []
+        if isinstance(item, dict) and str(item.get("file") or "").strip()
     }
 
 
 def _acquisition_type(
-    verdict: dict[str, Any] | None, declared: str
+    verdict: dict[str, Any] | None, declared: str, decided: str | None = None
 ) -> tuple[str, str, str]:
-    """(acquisition_type, source, failure code) for one input; the type is '' when a code is given."""
+    """(acquisition_type, source, failure code) for one input; the type is '' when a code is given.
+
+    ``decided`` is the type an applied campaign disposition decided for the input, '' where it decided none
+    for an input the preflight read, and None where no disposition was applied or no preflight read the
+    input. A decided type is the one the execution gate holds the input to (_decided_acquisition_by_file);
+    an input the disposition read and decided none for does not run under it, and is not given the unit's
+    declaration instead.
+    """
+    if decided is not None:
+        value = decided.strip().upper()
+        if value in CONSOLE_ACQUISITION_TYPES:
+            return value, "campaign_disposition", ""
+        return "", "", "acquisition_type_not_decided"
     value = str((verdict or {}).get("console_acquisition_type") or "").strip().upper()
     if value in CONSOLE_ACQUISITION_TYPES:
         return value, "raw_header", ""
@@ -216,7 +228,11 @@ def build_repository_analysis_rows(
     declared = declared_analysis_inputs(typed)
     verdicts = _per_file_verdicts(manifest)
     unit_mode = str(project.get("acquisition_mode") or "")
-    excluded = _excluded_by_disposition(manifest)
+    # The execution gate's own readings of an applied campaign disposition: the inputs it excluded, and the
+    # type it decided for each input that runs. A disposition only decided (outside a campaign) is neither.
+    excluded = _campaign_excluded_inputs(manifest)
+    decided_types = _decided_acquisition_by_file(manifest)
+    decided_over = _inspected_files(manifest) if _applied_disposition(manifest) else set()
     # Which declared input each candidate is, answered as the lease's allow-list answered it: by path, at
     # the place its archive put an archived container, else through the sample its lineage row names.
     matched = (
@@ -302,7 +318,9 @@ def build_repository_analysis_rows(
                 doubled.append(f"{path.name} and {Path(used[owner]).name} ({owner})")
             used.setdefault(owner, candidate)
 
-        acquisition, source, code = _acquisition_type(verdicts.get(key), unit_mode)
+        acquisition, source, code = _acquisition_type(
+            verdicts.get(key), unit_mode, decided_types.get(key, "" if key in decided_over else None)
+        )
         if code:
             acquisition_failures.setdefault(code, []).append(path.name)
         # As the Console names its outputs, and as expand_paths_report always named them: the name less its
@@ -433,15 +451,24 @@ def build_repository_analysis_rows(
             doubled,
         ))
     for code, inputs in sorted(acquisition_failures.items()):
-        message = (
-            f"{len(inputs)} input(s) have no acquisition type MS-DIAL can be given: their raw-header "
-            "record gives no console_acquisition_type of DDA, SWATH or AIF, and the unit is declared 'DIA', "
-            "which is SWATH for windowed MS2 and AIF for all-ion MS2. The header has to say which."
-            if code == "acquisition_type_ambiguous"
-            else f"{len(inputs)} input(s) have no acquisition type: their raw-header record gives no "
-            f"console_acquisition_type of DDA, SWATH or AIF, and the unit's declared mode "
-            f"{unit_mode or 'Unknown'!r} is none of them."
-        )
+        if code == "acquisition_type_ambiguous":
+            message = (
+                f"{len(inputs)} input(s) have no acquisition type MS-DIAL can be given: their raw-header "
+                "record gives no console_acquisition_type of DDA, SWATH or AIF, and the unit is declared "
+                "'DIA', which is SWATH for windowed MS2 and AIF for all-ion MS2. The header has to say which."
+            )
+        elif code == "acquisition_type_not_decided":
+            message = (
+                f"{len(inputs)} input(s) have no acquisition type: the unit's applied campaign disposition "
+                "read them and decided none of DDA, SWATH or AIF for them, which it does for an input that "
+                "does not run, and for every input of a unit it skips or excludes."
+            )
+        else:
+            message = (
+                f"{len(inputs)} input(s) have no acquisition type: their raw-header record gives no "
+                f"console_acquisition_type of DDA, SWATH or AIF, and the unit's declared mode "
+                f"{unit_mode or 'Unknown'!r} is none of them."
+            )
         failures.append(_failure(code, message, inputs))
 
     alias_root = raw_directory / ALIAS_DIRECTORY
