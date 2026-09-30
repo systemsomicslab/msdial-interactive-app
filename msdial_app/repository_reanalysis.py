@@ -177,22 +177,37 @@ class RepositoryHttpClient:
         way, so a wrong guess about resumability shows up as a checksum that does not match rather
         than as silent corruption.
 
+        HOW A CHANGED OBJECT IS TOLD. The validators of the response that started a .part (its
+        strong ETag, else its Last-Modified, and its Content-Length) are kept beside it in
+        <name>.part.json, and a resume sends them back as If-Range. A server whose object has
+        changed since then answers with the whole new object (200), not the tail of it, so the
+        restart above is decided by the server rather than discovered later as a mismatch; for a
+        repository that publishes no checksum (MetaboLights) nothing later would discover it. This
+        used to be said here and not done: no validator was ever sent or stored. A .part with no
+        validators beside it, left by an earlier version, resumes as it always did. The validators
+        are returned (etag, last_modified), for the download record and the download store.
+
         WHAT IT NO LONGER DOES. It does not delete the .part on failure. That deletion is what made
         every retry start from zero, and keeping the bytes is the entire point. A .part is only
         removed when it is proven unusable, or when it is renamed into place on success.
         """
         destination.parent.mkdir(parents=True, exist_ok=True)
         partial = destination.with_name(destination.name + ".part")
+        validators_path = destination.with_name(destination.name + ".part.json")
         resume_from = partial.stat().st_size if partial.is_file() else 0
         if resume_from > maximum_bytes:
             # A leftover larger than the limit cannot become a valid result, and hashing it would
             # only waste the time before saying so.
             partial.unlink(missing_ok=True)
             resume_from = 0
+        validators = _read_part_validators(validators_path, url) if resume_from else {}
 
         headers = {"User-Agent": USER_AGENT}
         if resume_from:
             headers["Range"] = f"bytes={resume_from}-"
+            if_range = _if_range_value(validators)
+            if if_range:
+                headers["If-Range"] = if_range
         request = urllib.request.Request(url, headers=headers)
 
         try:
@@ -202,15 +217,19 @@ class RepositoryHttpClient:
             # object shrank. Either way the only safe answer is to fetch it whole.
             if error.code == 416 and resume_from:
                 partial.unlink(missing_ok=True)
+                validators_path.unlink(missing_ok=True)
                 return self.download(url, destination, maximum_bytes, progress_callback)
             raise
 
         with response:
             appending = response.status == 206 and resume_from > 0
             if not appending:
-                # The server ignored the range, or there was nothing to resume. Start clean rather
-                # than append a whole object onto a partial one.
+                # The server ignored the range, or there was nothing to resume, or the object changed
+                # since the .part began. Start clean rather than append a whole object onto a partial
+                # one, and keep this response's validators for the next resume.
                 resume_from = 0
+                validators = _response_validators(response, url)
+                _write_part_validators(validators_path, validators)
             declared = int(response.headers.get("Content-Length") or 0)
             total_declared = declared + resume_from if declared else 0
             if total_declared and total_declared > maximum_bytes:
@@ -266,13 +285,56 @@ class RepositoryHttpClient:
             )
 
         partial.replace(destination)
-        return {
+        validators_path.unlink(missing_ok=True)
+        result = {
             "path": str(destination),
             "size_bytes": downloaded,
             "sha256": digest.hexdigest(),
             "md5": md5.hexdigest(),
             "resumed_from_bytes": resume_from,
         }
+        # Only what the server said, so a record of a server that sends none reads as it always did.
+        for key in ("etag", "last_modified"):
+            if validators.get(key):
+                result[key] = validators[key]
+        return result
+
+
+def _response_validators(response: Any, url: str) -> dict[str, Any]:
+    return {
+        "url": url,
+        "etag": str(response.headers.get("ETag") or "").strip(),
+        "last_modified": str(response.headers.get("Last-Modified") or "").strip(),
+        "content_length": int(response.headers.get("Content-Length") or 0),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _write_part_validators(path: Path, validators: dict[str, Any]) -> None:
+    """Keep a transfer's validators beside its .part; a transfer that sent none leaves no file."""
+    if not (validators.get("etag") or validators.get("last_modified")):
+        path.unlink(missing_ok=True)
+        return
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(validators, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _read_part_validators(path: Path, url: str) -> dict[str, Any]:
+    """The validators of the response that started a .part, when they are for this URL."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) and value.get("url") == url else {}
+
+
+def _if_range_value(validators: dict[str, Any]) -> str:
+    """A strong ETag, else a Last-Modified date: If-Range takes no weak validator (RFC 9110 13.1.5)."""
+    etag = str(validators.get("etag") or "")
+    if etag and not etag.startswith("W/"):
+        return etag
+    return str(validators.get("last_modified") or "")
 
 
 class MetabolomicsWorkbenchAdapter:
