@@ -38,6 +38,11 @@ the campaign, whose raw data are deleted. Any other run, a trial repository unit
 retention policy, leaves its containers beside its inputs and its library copy in its output, as it always
 has, and its project can still be reopened in place.
 
+Every repository run also records what a raw-data reader wrote into its container inputs, such as the
+analysis.sqlite Bruker's baf2sql writes into a BAF .d that arrived without one (``reader_created_files`` in the
+unit manifest, msdial_app.reader_created). That is no MS-DIAL container: it is neither moved nor retained, and
+it goes with the raw tree.
+
 HOLDS. On Windows a file another process holds open without FILE_SHARE_DELETE - a viewer, the search indexer,
 antivirus scanning what the Console has just written - can be neither replaced nor deleted, and a container the
 Console could write can have a path too long for an ordinary move. Every file step is retried on
@@ -868,6 +873,7 @@ def finalise_console_run(
     campaign = False
     patience = _Patience()
     manifest: dict[str, Any] = {}
+    reader_created: dict[str, Any] | None = None
     try:
         # First, so that whatever fails below is held in the unit's own manifest.
         manifest_text = str(preparation.get("repository_run_manifest") or "").strip()
@@ -919,6 +925,21 @@ def finalise_console_run(
                 record["local_only"] = [str(_record_redactions(manifest_path, job_id, changed))]
             except (OSError, ValueError, TypeError) as error:
                 record["errors"].append(f"{REDACTION_RECORD}: {error}")
+
+        # What a reader wrote into the unit's container inputs during the run (Bruker's baf2sql writes
+        # analysis.sqlite into a BAF .d that arrived without one): no MS-DIAL container, so it is neither
+        # moved nor retained, only recorded in the unit manifest, and it goes with the raw tree.
+        from .repository_reanalysis import reader_created_block
+
+        try:
+            reader_created = reader_created_block(manifest, "run")
+        except (OSError, ValueError) as error:
+            # A record, not a step anything waits on: the containers still move and the copy is still deleted.
+            record["errors"].append(f"reader_created_files: {error}")
+        if reader_created:
+            record["reader_created_files"] = sum(len(item["files"]) for item in reader_created["containers"])
+            log(f"Reader-created files inside the inputs: {record['reader_created_files']} file(s) in "
+                f"{len(reader_created['containers'])} container(s), recorded as reader_created_files.")
 
         if not campaign:
             # Decided for the campaign, whose raw data are deleted: a trial or manual run keeps the project
@@ -1002,6 +1023,8 @@ def finalise_console_run(
 
     def change(current: dict[str, Any]) -> None:
         current["console_run_finalisation"] = record
+        if reader_created:
+            current["reader_created_files"] = reader_created
         earlier = standing_holds(current)
         if "msdial_intermediates" in record:
             # This run's set is the unit's set now. One an earlier run could not move is superseded with it.

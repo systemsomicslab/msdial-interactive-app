@@ -60,6 +60,44 @@ LCMS_QA_CAPABILITY = "lcms_alignment_qa_matrix"
 RT_CORRECTION_REVIEW_CAPABILITY = "rt_correction_review"
 AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY = "automatic_alignment_rt_correction"
 CONSOLE_BUILD_PROVENANCE = "msdial-console-build-provenance.json"
+# THE CONSOLE IS ITS WHOLE OUTPUT FOLDER, NOT MSDIALCUI.exe ALONE.
+#
+# The build record named MSDIALCUI.exe's sha256 and the git head and nothing else. The mzML base64 fix
+# lives in RawDataHandler.dll, a package the Console only references, so a folder whose RawDataHandler.dll
+# had been swapped for another build still inspected as verified while the code that read every mzML had
+# changed. The record now carries an inventory, the sha256 of every file in the folder, and a record that
+# has one is checked file by file (inspect_console_path).
+#
+# Not part of it: the build record itself, and what a run or a person leaves beside the Console - logs,
+# temporary files, crash dumps.
+CONSOLE_INVENTORY_EXCLUDED_NAMES = frozenset(
+    name.casefold() for name in (CONSOLE_BUILD_PROVENANCE, CONSOLE_BUILD_PROVENANCE + ".tmp")
+)
+CONSOLE_INVENTORY_EXCLUDED_SUFFIXES = (".log", ".tmp", ".dmp")
+CONSOLE_INVENTORY_EXCLUDED_DIRECTORIES = frozenset({"log", "logs"})
+# A Console output folder holds a few hundred files and a few hundred megabytes. One placed among other
+# data is not hashed through: past either bound the inventory is too_large and names nothing.
+CONSOLE_INVENTORY_MAX_FILES = 5000
+CONSOLE_INVENTORY_MAX_BYTES = 4 * 1024 * 1024 * 1024
+# The assemblies whose ProductVersion is recorded beside their sha256: MS-DIAL's own, built from the
+# MsdialWorkbench tree, and RawDataHandler, the reader, which comes from its own package.
+CONSOLE_KEY_ASSEMBLIES = (
+    "MSDIALCUI.exe",
+    "MSDIALCUI.dll",
+    "MsdialCore.dll",
+    "MsdialLcMsApi.dll",
+    "MsdialLcImMsApi.dll",
+    "MsdialGcMsApi.dll",
+    "MsdialDimsCore.dll",
+    "MsdialImmsCore.dll",
+    "MsdialIntegrate.dll",
+    "Common.dll",
+    "RawDataHandler.dll",
+)
+# A build record written before inventories were names the binary only. It still inspects as verified,
+# with this warning.
+CONSOLE_INVENTORY_NOT_RECORDED = "inventory_not_recorded"
+CONSOLE_INVENTORY_TOO_LARGE = "inventory_too_large"
 AUTOMATIC_RT_CORRECTION_SUMMARY = "automatic_alignment_rt_correction_summary.tsv"
 AUTOMATIC_RT_CORRECTION_ANCHORS = "automatic_alignment_rt_correction_anchors.tsv"
 # The copy of the parameter template an RT-correction preview hands the Console.
@@ -241,14 +279,21 @@ def _console_provenance_warning(console: dict[str, Any]) -> str:
     """What to tell the analyst about a binary whose identity is not established."""
     status = console.get("provenance_status", "absent")
     if status == "verified":
+        notes = []
         dirty = (console.get("git") or {}).get("dirty")
         if dirty:
-            return (
+            notes.append(
                 "The recorded build matches this binary, but it was built from a working "
                 "tree with uncommitted changes, so the git revision does not fully "
                 "describe the code that ran."
             )
-        return ""
+        if CONSOLE_INVENTORY_NOT_RECORDED in (console.get("provenance_warnings") or []):
+            notes.append(
+                "The build record names this binary but not the files beside it, so a "
+                "changed RawDataHandler.dll or other dependency would go unnoticed; "
+                "console_management.record_console_inventory adds the inventory."
+            )
+        return " ".join(notes)
     if status == "stale_mismatch":
         return (
             "A build record sits beside this binary and describes a different one, so the "
@@ -322,6 +367,120 @@ def _sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _console_inventory_excluded(relative: Path) -> bool:
+    name = relative.name.casefold()
+    if name in CONSOLE_INVENTORY_EXCLUDED_NAMES or name.endswith(CONSOLE_INVENTORY_EXCLUDED_SUFFIXES):
+        return True
+    return any(part.casefold() in CONSOLE_INVENTORY_EXCLUDED_DIRECTORIES for part in relative.parts[:-1])
+
+
+def console_inventory(output_directory: str | Path) -> dict[str, Any]:
+    """The Console's output folder, file by file: what a build record's inventory holds.
+
+    Returns {inventory_status, inventory, inventory_sha256, inventory_file_count, key_assemblies}.
+    inventory lists {path, sha256, size} by path relative to the folder, in POSIX form, and
+    inventory_sha256 is taken over its "path<TAB>sha256" lines, as the raw-metadata extractor's is.
+    key_assemblies gives, for each of CONSOLE_KEY_ASSEMBLIES at the top of the folder, its ProductVersion
+    and sha256. inventory_status is complete, or too_large past CONSOLE_INVENTORY_MAX_FILES or
+    CONSOLE_INVENTORY_MAX_BYTES, when nothing is hashed and the inventory is empty. A file that cannot be
+    read is listed with an empty sha256, which no record matches.
+    """
+    # Imported here: raw_metadata_extractor imports this module.
+    from .raw_metadata_extractor import assembly_product_version, inventory_sha256
+
+    root = Path(output_directory)
+    listed: list[tuple[str, Path, int]] = []
+    total = 0
+    too_large = False
+    for current, directories, names in os.walk(root):
+        directories.sort()
+        for name in sorted(names):
+            path = Path(current) / name
+            relative = path.relative_to(root)
+            if _console_inventory_excluded(relative) or not path.is_file():
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            listed.append((relative.as_posix(), path, size))
+            total += size
+            if len(listed) > CONSOLE_INVENTORY_MAX_FILES or total > CONSOLE_INVENTORY_MAX_BYTES:
+                too_large = True
+                break
+        if too_large:
+            break
+    entries: list[dict[str, Any]] = []
+    if not too_large:
+        for relative, path, size in listed:
+            try:
+                digest = _sha256_of(path)
+            except OSError:
+                digest = ""
+            entries.append({"path": relative, "sha256": digest, "size": size})
+        entries.sort(key=lambda entry: entry["path"])
+    by_path = {entry["path"].casefold(): entry for entry in entries}
+    key_assemblies: dict[str, dict[str, str]] = {}
+    for name in CONSOLE_KEY_ASSEMBLIES:
+        path = root / name
+        if path.is_file():
+            key_assemblies[name] = {
+                "product_version": assembly_product_version(path),
+                "sha256": str((by_path.get(name.casefold()) or {}).get("sha256") or ""),
+            }
+    return {
+        "inventory_status": "too_large" if too_large else "complete",
+        "inventory": entries,
+        "inventory_sha256": "" if too_large else inventory_sha256(entries),
+        "inventory_file_count": len(entries),
+        "key_assemblies": key_assemblies,
+    }
+
+
+def _console_inventory_mismatch(
+    recorded: dict[str, Any], current: dict[str, Any]
+) -> dict[str, Any] | None:
+    """How the folder differs from the inventory a build record carries: {} when it does not, None
+    when the record's inventory is not a list of {path, sha256} it can be held to."""
+    entries = recorded.get("inventory")
+    if not isinstance(entries, list) or not all(
+        isinstance(entry, dict) and "path" in entry and "sha256" in entry for entry in entries
+    ):
+        return None
+    before = {str(entry["path"]): str(entry["sha256"]) for entry in entries}
+    # A folder too large to inventory has no list to compare, and every recorded file would read as
+    # removed; it is named by its status instead.
+    complete = current["inventory_status"] == "complete"
+    after = {str(entry["path"]): str(entry["sha256"]) for entry in current["inventory"]} if complete else before
+    recorded_versions = recorded.get("key_assemblies")
+    recorded_versions = recorded_versions if isinstance(recorded_versions, dict) else {}
+    versions = current["key_assemblies"]
+
+    def version(table: dict[str, Any], name: str) -> str:
+        entry = table.get(name)
+        return str(entry.get("product_version") or "") if isinstance(entry, dict) else ""
+
+    difference: dict[str, Any] = {
+        "changed": sorted(name for name in before.keys() & after.keys() if before[name] != after[name]),
+        "added": sorted(after.keys() - before.keys()),
+        "removed": sorted(before.keys() - after.keys()),
+        "product_version_changed": {
+            name: {"recorded": version(recorded_versions, name), "actual": version(versions, name)}
+            for name in sorted(set(recorded_versions) | set(versions))
+            if version(recorded_versions, name) != version(versions, name)
+        },
+    }
+    if not complete:
+        difference["inventory_status"] = current["inventory_status"]
+    elif not any(difference.values()) and str(recorded.get("inventory_sha256") or "") == current["inventory_sha256"]:
+        return {}
+    return {
+        "recorded_inventory_sha256": str(recorded.get("inventory_sha256") or ""),
+        "actual_inventory_sha256": current["inventory_sha256"],
+        **difference,
+    }
+
+
 def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str, Any]:
     path = Path(console_path).expanduser().resolve()
     if not path.is_file():
@@ -354,6 +513,15 @@ def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str
     # record is checked against the assembly. Checked against a net8 launcher, a genuine
     # build read as stale, and a record of the launcher would still match after the dll
     # beside it was rebuilt from other code.
+    #
+    # The folder is inventoried whether or not a record sits there, so a run manifest names the files the
+    # Console ran with even where nothing vouches for them. A record written before inventories were
+    # names the binary only: it still verifies, with the warning inventory_not_recorded, so the builds
+    # recorded that way (c471463a5, f56d4478a) keep working until
+    # console_management.record_console_inventory adds one.
+    inventory = console_inventory(path.parent)
+    warnings: list[str] = []
+    inventory_mismatch: dict[str, Any] | None = {}
     provenance_status = "absent"
     if provenance_path.is_file():
         try:
@@ -363,13 +531,28 @@ def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str
         else:
             if isinstance(loaded, dict):
                 recorded = loaded
-                if loaded.get("binary_sha256") == assembly_sha256:
-                    provenance = loaded
+                if "inventory" in loaded:
+                    inventory_mismatch = _console_inventory_mismatch(loaded, inventory)
+                else:
+                    warnings.append(
+                        CONSOLE_INVENTORY_TOO_LARGE
+                        if loaded.get("inventory_status") == "too_large"
+                        else CONSOLE_INVENTORY_NOT_RECORDED
+                    )
+                if inventory_mismatch is None:
+                    # An inventory that is not a list of {path, sha256} says nothing it can be held to.
+                    provenance_status = "unreadable"
+                elif loaded.get("binary_sha256") == assembly_sha256 and not inventory_mismatch:
+                    # The list stays in the record beside the binary; its digest and the key assemblies
+                    # are what travels into a run manifest.
+                    provenance = {key: value for key, value in loaded.items() if key != "inventory"}
                     provenance_status = "verified"
                 else:
                     provenance_status = "stale_mismatch"
             else:
                 provenance_status = "unreadable"
+    if inventory["inventory_status"] == "too_large" and CONSOLE_INVENTORY_TOO_LARGE not in warnings:
+        warnings.append(CONSOLE_INVENTORY_TOO_LARGE)
     result = {
         "path": str(path),
         "exists": True,
@@ -386,9 +569,39 @@ def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str
         "provenance_verified": provenance_status == "verified",
         "provenance_status": provenance_status,
         "provenance": provenance,
+        "provenance_warnings": warnings,
+        "inventory_status": inventory["inventory_status"],
+        "inventory_sha256": inventory["inventory_sha256"],
+        "inventory_file_count": inventory["inventory_file_count"],
+        "key_assemblies": inventory["key_assemblies"],
         **console_capabilities(str(path)),
     }
     if provenance_status in {"stale_mismatch", "unreadable"}:
+        if provenance_status == "unreadable":
+            detail = "The build-provenance record beside this binary could not be read."
+        elif recorded.get("binary_sha256") == assembly_sha256 and inventory_mismatch:
+            named = [
+                *inventory_mismatch["changed"],
+                *(f"{name} (added)" for name in inventory_mismatch["added"]),
+                *(f"{name} (removed)" for name in inventory_mismatch["removed"]),
+            ]
+            if named:
+                which = ": " + ", ".join(named[:10]) + (f" and {len(named) - 10} more" if len(named) > 10 else "")
+            elif inventory_mismatch.get("inventory_status"):
+                which = " (the folder is now too large to inventory)"
+            else:
+                which = " (the recorded inventory digest does not match its own list)"
+            detail = (
+                "The build-provenance record names this binary, but the files beside it are not the "
+                f"ones it recorded{which}. Rebuild through msdial_build_console_from_local_source "
+                "before relying on recorded software versions."
+            )
+        else:
+            detail = (
+                "A build-provenance record sits beside this binary but does not describe it. "
+                "Rebuild through msdial_build_console_from_local_source, or remove the record, "
+                "before relying on recorded software versions."
+            )
         result["provenance_mismatch"] = {
             "record_path": str(provenance_path),
             "recorded_binary_sha256": str(recorded.get("binary_sha256") or ""),
@@ -397,13 +610,9 @@ def inspect_console_path(console_path: str | Path, source: str = "") -> dict[str
             "actual_binary_sha256": assembly_sha256,
             "recorded_git_head": str(recorded.get("git_head") or ""),
             "recorded_built_at": str(recorded.get("built_at") or ""),
-            "detail": (
-                "A build-provenance record sits beside this binary but does not describe it. "
-                "Rebuild through msdial_build_console_from_local_source, or remove the record, "
-                "before relying on recorded software versions."
-            )
-            if provenance_status == "stale_mismatch"
-            else "The build-provenance record beside this binary could not be read.",
+            # Which files changed, where the record carries an inventory.
+            **(inventory_mismatch or {}),
+            "detail": detail,
         }
     if source_root:
         result["git"] = console_git_state(source_root)
@@ -1661,6 +1870,12 @@ def prepare_run(
             "provenance_status": console.get("provenance_status", "absent"),
             "provenance": console.get("provenance", {}),
             "provenance_mismatch": console.get("provenance_mismatch", {}),
+            "provenance_warnings": console.get("provenance_warnings", []),
+            # Every file the Console ran with, by one digest (console_inventory), and the
+            # versions of the assemblies that decide what it did.
+            "inventory_sha256": console.get("inventory_sha256", ""),
+            "inventory_file_count": console.get("inventory_file_count", 0),
+            "key_assemblies": console.get("key_assemblies", {}),
             "git": console.get("git", {}),
         },
         # One field a reader sees without digging: whether the software this run used
@@ -1728,6 +1943,7 @@ def prepare_run(
             "binary_sha256": console.get("binary_sha256", ""),
             "assembly_path": console.get("assembly_path", ""),
             "assembly_sha256": console.get("assembly_sha256", ""),
+            "inventory_sha256": console.get("inventory_sha256", ""),
             "version": method_state["msdial_console_version"],
             "warning": _console_provenance_warning(console),
         },

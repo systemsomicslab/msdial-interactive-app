@@ -120,6 +120,17 @@ class ManifestProvenanceTests(unittest.TestCase):
         self.assertEqual("absent", provenance["status"])
         self.assertTrue(provenance["binary_sha256"])
 
+    def test_the_console_block_names_every_file_beside_the_binary(self) -> None:
+        # A RawDataHandler.dll swapped beside an unchanged MSDIALCUI.exe changes this digest, where
+        # it changed neither checksum above.
+        console = self._manifest()["console"]
+        self.assertRegex(console["inventory_sha256"], r"^[0-9a-f]{64}$")
+        self.assertGreater(console["inventory_file_count"], 0)
+        self.assertEqual({"MSDIALCUI.exe"}, set(console["key_assemblies"]))
+        self.assertEqual("", console["key_assemblies"]["MSDIALCUI.exe"]["product_version"],
+                         "a stand-in binary carries no version resource")
+        self.assertEqual(console["inventory_sha256"], self.prepared["software_provenance"]["inventory_sha256"])
+
     def test_two_net8_launchers_over_different_code_record_different_identities(self) -> None:
         # A net8 MSDIALCUI.exe is an apphost: builds from different commits differ only in
         # its version string, and a dirty rebuild at one HEAD not at all. The code is in the

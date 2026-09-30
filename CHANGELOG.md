@@ -4,6 +4,46 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.18] - Unreleased
+
+### Fixed
+- An mzML whose binary arrays RawDataHandler cannot decode is no longer run.
+  RawDataHandler decodes only 32- and 64-bit float arrays, zlib-compressed or not.
+  Numpress, other compressions, integer arrays, and type or compression terms given
+  only through a param group reached a branch that only logs, and produced garbage or
+  empty spectra without an error. `mzml_encoding` scans each mzML input's first
+  spectra and chromatograms; the lease excludes such a file as
+  `unsupported_mzml_encoding` with the accessions found, in `excluded_input_candidates`,
+  `input_lineage.excluded` and the attribute stage. `mzml_encoding_problems(path)`
+  returns the problems.
+- A swapped Console dependency is no longer inspected as verified. The build record
+  carries an inventory of every file beside MSDIALCUI.exe (logs and temporary files
+  left out) and the ProductVersions of the key assemblies (RawDataHandler.dll,
+  Common.dll, MsdialCore.dll and the other MS-DIAL assemblies). A changed, added or
+  removed file is `stale_mismatch`, named. A record without an inventory verifies with
+  the warning `inventory_not_recorded`;
+  `scripts/record-console-inventory.py <MSDIALCUI.exe> --confirmed` adds one without a
+  rebuild. The run manifest's Console block and each run attempt record
+  `inventory_sha256`.
+- A stalled repository download no longer holds its lease and then fails as a network
+  error. Every read carries an idle timeout (`RepositoryHttpClient(idle_timeout=...)`,
+  default 120 s); a stall, a lost connection or a short body is retried up to 3 times
+  after 10, 30 and 90 s and resumes from the `.part` under the If-Range rules, each
+  attempt recorded. Reads take what the socket has (`read1`), and progress is reported
+  at least once a second, so a cancel is heard within the idle timeout plus a second
+  however slowly bytes arrive; a stalled `.part` keeps every byte that arrived.
+- A resume hashes its `.part` before it connects, reporting about once a second. It
+  used to connect first and read nothing while hashing, and a server that drops an
+  idle client dropped every resume of a large `.part`.
+
+### Added
+- `reader_created`: files a raw-data reader writes into an input container, such as
+  the `analysis.sqlite` Bruker's baf2sql writes into a BAF `.d` that arrived without
+  one. They are not inputs, container members or checksum failures. The container's
+  lineage row carries `reader_created_files`, and the unit manifest lists them with
+  size and sha256 after each repository run and wherever `record_reader_created_files`
+  is called.
+
 ## [0.5.17] - Unreleased
 
 ### Added

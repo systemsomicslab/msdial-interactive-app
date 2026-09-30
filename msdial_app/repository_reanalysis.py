@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import http.client
 import copy
 import csv
 import json
@@ -11,6 +12,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import stat
 import subprocess
 import tempfile
@@ -37,7 +39,9 @@ from .diagnostic_paths import (
     path_is_file,
 )
 from .download_store import unlink_tree
+from .mzml_encoding import UNSUPPORTED_MZML_ENCODING, scan_mzml_encoding
 from .process_liveness import process_created_at, process_is_alive
+from .reader_created import reader_created_files, reader_created_names
 
 try:
     import msvcrt
@@ -139,9 +143,101 @@ class EligibilityPolicy:
     allowed_acquisition_modes: tuple[str, ...] = ("DDA", "DIA", "AIF", "SWATH")
 
 
+# HOW LONG A DOWNLOAD MAY GO WITHOUT A BYTE, AND HOW OFTEN IT IS TRIED AGAIN.
+#
+# A repository object was fetched with a 300 s socket timeout and one attempt. A read that stalled held
+# the lease for five minutes and then failed it as a network error, with the .part kept but nothing to
+# resume it until the whole unit was retried; and a cancel asked for during the stall was heard only
+# when a byte next arrived, which it never did, so the lease recorded a timeout rather than the cancel.
+#
+# Now every read carries an idle timeout (no byte for this long raises), a stalled read or a lost
+# connection is retried from the .part after a backoff, and each attempt is recorded. The caller's
+# progress callback is also called at a stall and through each backoff, so a caller that stops a download
+# by raising from it (a cancelled job) is heard within the idle timeout.
+#
+# A stall is not the only way to go quiet. Each read asked for a whole MiB, and urllib's read(amt) waits
+# until it has one, so a transfer trickling in at 1 KB/s reached the callback once in seventeen minutes
+# while every socket read came well inside the idle timeout; and a resume hashed its whole .part, tens of
+# seconds for a large one, before the callback first heard from it. Both now report at least this often.
+DOWNLOAD_IDLE_TIMEOUT_SECONDS = 120.0
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_RETRY_BACKOFF_SECONDS = (10.0, 30.0, 90.0)
+DOWNLOAD_PROGRESS_INTERVAL_SECONDS = 1.0
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+class RetryableDownloadError(Exception):
+    """A transfer that stalled or lost its connection. Its .part is kept, and a later attempt resumes it
+    under the same If-Range rules. ``reason`` names what happened; ``download_attempts``, set on the error
+    a download finally raises, lists every attempt it made."""
+
+    reason = "interrupted"
+
+
+class DownloadStalled(RetryableDownloadError, TimeoutError):
+    reason = "stalled"
+
+
+class DownloadConnectionLost(RetryableDownloadError, ConnectionError):
+    reason = "connection_lost"
+
+
+class DownloadIncomplete(RetryableDownloadError, ValueError):
+    """A response that ended before its declared length: a server that hung up early."""
+
+    reason = "incomplete"
+
+
+# What a lost connection looks like from urllib: a reset or an abort mid-transfer, a server gone before
+# its status line (http.client.RemoteDisconnected is a ConnectionResetError), a chunked body cut short,
+# and a TLS stream closed without its close_notify.
+_CONNECTION_LOST = (
+    ConnectionResetError, ConnectionAbortedError, BrokenPipeError, http.client.IncompleteRead, ssl.SSLEOFError,
+)
+
+
+def download_interruption(error: BaseException, idle_timeout: float) -> RetryableDownloadError | None:
+    """The retryable error an exception from a transfer amounts to, or None when retrying would not help.
+
+    An HTTP status, a refused or unresolvable connection, a limit, a changed file: none of those is
+    answered by trying again, and each is raised as it was.
+    """
+    if isinstance(error, RetryableDownloadError):
+        return error
+    cause: BaseException = error
+    if isinstance(error, urllib.error.URLError) and not isinstance(error, urllib.error.HTTPError):
+        if isinstance(error.reason, BaseException):
+            cause = error.reason
+    if isinstance(cause, TimeoutError):
+        return DownloadStalled(
+            f"No bytes arrived from the server for {idle_timeout:g} s. The partial file is kept and a later "
+            "attempt resumes it."
+        )
+    if isinstance(cause, _CONNECTION_LOST):
+        return DownloadConnectionLost(
+            f"The connection was lost during the transfer ({type(cause).__name__}: {cause}). The partial "
+            "file is kept and a later attempt resumes it."
+        )
+    return None
+
+
 class RepositoryHttpClient:
-    def __init__(self, timeout: int = 60) -> None:
+    def __init__(
+        self,
+        timeout: int = 60,
+        *,
+        idle_timeout: float = DOWNLOAD_IDLE_TIMEOUT_SECONDS,
+        retries: int = DOWNLOAD_RETRIES,
+        retry_backoff_seconds: tuple[float, ...] = DOWNLOAD_RETRY_BACKOFF_SECONDS,
+    ) -> None:
+        """``timeout`` is the socket timeout of a metadata request. A download's is ``idle_timeout``: every
+        socket read carries it, so it is how long a transfer may go without a byte. ``retries`` is how many
+        times a stalled or lost transfer is tried again, after ``retry_backoff_seconds`` (the last value
+        repeats); 0 makes one attempt."""
         self.timeout = timeout
+        self.idle_timeout = float(idle_timeout)
+        self.retries = max(0, int(retries))
+        self.retry_backoff_seconds = tuple(float(value) for value in retry_backoff_seconds) or (0.0,)
 
     def get_bytes(self, url: str) -> bytes:
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -169,7 +265,109 @@ class RepositoryHttpClient:
         maximum_bytes: int,
         progress_callback: Any = None,
     ) -> dict[str, Any]:
-        """Fetch one repository object, resuming a partial transfer where the server allows it.
+        """Fetch one repository object, retrying a stalled or lost transfer from its .part.
+
+        Each attempt is one _download_once, with every socket read under the idle timeout. An attempt
+        that stalls, loses its connection or ends short (download_interruption) is tried again after a
+        backoff, up to ``retries`` times, and resumes from the .part it left. Anything else is raised at
+        once. The result carries ``attempts``: one {attempt, started_at, ended_at, outcome,
+        part_bytes_before, part_bytes_after} per attempt, outcome completed, stalled, connection_lost,
+        incomplete, stopped (the progress callback raised) or failed, with the error of one that did not
+        complete. The error a download finally raises carries the same list as ``download_attempts``, and
+        a retryable one keeps its partial file and its validators for a later resume.
+
+        ``progress_callback(received, declared)`` is called as bytes arrive: after each MiB, and after the
+        first read to return a second or more since the last call, however few bytes it brought. It is
+        also called about once a second while a resume hashes the .part it already holds, when a read
+        stalls, and about once a second through each backoff, with the last values it was given. A caller
+        that stops a download by raising from it (a cancelled job) is therefore heard within the idle
+        timeout and a second, however slowly the bytes come, and the exception it raised is what the
+        download raises: a stop, not a network error.
+        """
+        partial = destination.with_name(destination.name + ".part")
+        attempts: list[dict[str, Any]] = []
+        last = [0, 0]
+        stopped: list[BaseException] = []
+
+        def report(received: int, declared: int) -> None:
+            last[:] = [received, declared]
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(received, declared)
+            except BaseException as error:
+                stopped.append(error)
+                raise
+
+        def part_bytes() -> int:
+            try:
+                return partial.stat().st_size if partial.is_file() else 0
+            except OSError:
+                return 0
+
+        def carry(error: BaseException) -> BaseException:
+            try:
+                error.download_attempts = attempts  # type: ignore[attr-defined]
+            except (AttributeError, TypeError):
+                pass
+            return error
+
+        for number in range(1, self.retries + 2):
+            entry: dict[str, Any] = {
+                "attempt": number,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "part_bytes_before": part_bytes(),
+            }
+            attempts.append(entry)
+            try:
+                result = self._download_once(url, destination, maximum_bytes, report)
+            except BaseException as error:
+                entry.update(ended_at=datetime.now(timezone.utc).isoformat(), part_bytes_after=part_bytes())
+                problem = None if stopped else download_interruption(error, self.idle_timeout)
+                if problem is None:
+                    entry.update(
+                        outcome="stopped" if stopped else "failed",
+                        error=str(error) or type(error).__name__,
+                        error_type=type(error).__name__,
+                    )
+                    raise carry(error)
+                entry.update(outcome=problem.reason, error=str(problem), error_type=type(error).__name__)
+                final = number > self.retries
+                if not final:
+                    entry["retry_after_seconds"] = self.retry_backoff_seconds[
+                        min(number - 1, len(self.retry_backoff_seconds) - 1)
+                    ]
+                try:
+                    # The caller is heard at the stall, not only when a next byte arrives, and through
+                    # the backoff.
+                    report(*last)
+                    deadline = time.monotonic() + (0.0 if final else entry["retry_after_seconds"])
+                    while (remaining := deadline - time.monotonic()) > 0:
+                        time.sleep(min(1.0, remaining))
+                        report(*last)
+                except BaseException as stop:
+                    entry.update(outcome="stopped", stopped_after=problem.reason,
+                                 error=str(stop) or type(stop).__name__, error_type=type(stop).__name__)
+                    raise carry(stop) from error
+                if final:
+                    if problem is error:
+                        raise carry(error)
+                    raise carry(problem) from error
+                continue
+            entry.update(ended_at=datetime.now(timezone.utc).isoformat(), outcome="completed",
+                         part_bytes_after=0)
+            result["attempts"] = attempts
+            return result
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _download_once(
+        self,
+        url: str,
+        destination: Path,
+        maximum_bytes: int,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """One attempt at one repository object, resuming a partial transfer where the server allows it.
 
         WHY THIS RESUMES. This used to open the .part file with mode "wb" and send no Range
         header, so every attempt started at byte 0, and it unlinked the .part on any exception,
@@ -185,13 +383,18 @@ class RepositoryHttpClient:
         and each had to complete in one unbroken connection or start again from nothing.
 
         HOW IT RESUMES. A .part left by an earlier attempt is offered back to the server as
-        `Range: bytes=<size>-`. A 206 means the server honoured it: the existing bytes are hashed
-        first, then the response is appended. Anything else - a 200 because the server ignores
-        ranges, a 416 because the .part is already as long as the resource, a changed
-        ETag/Last-Modified - restarts from zero, because a resumed file that mixes two versions of
-        an object is worse than a slow one. The checksums are computed over the whole file either
-        way, so a wrong guess about resumability shows up as a checksum that does not match rather
-        than as silent corruption.
+        `Range: bytes=<size>-`. Its bytes are hashed before the request is sent, and a 206 means the
+        server honoured it: the response is appended to the file and to those hashes. Anything else -
+        a 200 because the server ignores ranges, a 416 because the .part is already as long as the
+        resource, a changed ETag/Last-Modified - discards the hashes and restarts from zero, because
+        a resumed file that mixes two versions of an object is worse than a slow one. The checksums
+        are computed over the whole file either way, so a wrong guess about resumability shows up as
+        a checksum that does not match rather than as silent corruption.
+
+        The hashing used to come after the connection opened. The server then waited on a client
+        that read nothing, for over a minute on a .part of tens of GB, and a server that drops such a
+        client (nginx's send_timeout is 60 s by default) dropped every resume of exactly the large
+        objects the retries are for: each retry hashed the .part again and was dropped again.
 
         HOW A CHANGED OBJECT IS TOLD. The validators of the response that started a .part (its
         strong ETag, else its Last-Modified, and its Content-Length) are kept beside it in
@@ -220,6 +423,12 @@ class RepositoryHttpClient:
             partial.unlink(missing_ok=True)
             resume_from = 0
         validators = _read_part_validators(validators_path, url) if resume_from else {}
+        # Before the request, not after: no server waits while a large .part is read back.
+        seeded = (
+            _hash_part(partial, resume_from, int(validators.get("content_length") or 0), progress_callback)
+            if resume_from
+            else None
+        )
 
         headers = {"User-Agent": USER_AGENT}
         if resume_from:
@@ -230,14 +439,16 @@ class RepositoryHttpClient:
         request = urllib.request.Request(url, headers=headers)
 
         try:
-            response = urllib.request.urlopen(request, timeout=max(self.timeout, 300))
+            # The socket timeout bounds the connect and every read that follows, so no read waits
+            # longer than the idle timeout for a byte.
+            response = urllib.request.urlopen(request, timeout=self.idle_timeout)
         except urllib.error.HTTPError as error:
             # 416 means the range is past the end of the resource: the .part is stale, or the
             # object shrank. Either way the only safe answer is to fetch it whole.
             if error.code == 416 and resume_from:
                 partial.unlink(missing_ok=True)
                 validators_path.unlink(missing_ok=True)
-                return self.download(url, destination, maximum_bytes, progress_callback)
+                return self._download_once(url, destination, maximum_bytes, progress_callback)
             raise
 
         if response.status == 206 and resume_from and _validators_changed(validators, response):
@@ -247,7 +458,7 @@ class RepositoryHttpClient:
             response.close()
             partial.unlink(missing_ok=True)
             validators_path.unlink(missing_ok=True)
-            return self.download(url, destination, maximum_bytes, progress_callback)
+            return self._download_once(url, destination, maximum_bytes, progress_callback)
 
         with response:
             appending = response.status == 206 and resume_from > 0
@@ -273,30 +484,28 @@ class RepositoryHttpClient:
                     f"Remote object is {total_declared} bytes; limit is {maximum_bytes} bytes."
                 )
 
-            digest = hashlib.sha256()
-            md5 = hashlib.md5()
-            downloaded = 0
             if appending:
-                # Seed both hashes with the bytes already on disk, so the checksums describe the
-                # whole object and not only what this attempt fetched.
-                with partial.open("rb") as existing:
-                    for chunk in iter(lambda: existing.read(1024 * 1024), b""):
-                        digest.update(chunk)
-                        md5.update(chunk)
-                        downloaded += len(chunk)
-                if downloaded != resume_from:
-                    # The file changed under us between the stat and the read.
-                    raise ValueError(
-                        f"Partial file {partial.name} is {downloaded} bytes, expected {resume_from}."
-                    )
+                # Both hashes already hold the bytes on disk, so the checksums describe the whole
+                # object and not only what this attempt fetched.
+                digest, md5 = seeded
+                downloaded = resume_from
                 if progress_callback:
                     progress_callback(downloaded, total_declared)
+            else:
+                digest = hashlib.sha256()
+                md5 = hashlib.md5()
+                downloaded = 0
 
+            # read1 returns what the socket has, up to a MiB. read(amt) waited for the whole MiB, so a
+            # slow transfer reached the callback, and through it a cancel and the lease heartbeat, once
+            # a MiB however long that took; and the bytes of an unfinished MiB were lost at a stall.
+            read = getattr(response, "read1", None) or response.read
             with partial.open("ab" if appending else "wb") as output:
                 if not appending:
                     _write_part_validators(validators_path, validators)
+                reported, reported_at = downloaded, time.monotonic()
                 while True:
-                    chunk = response.read(1024 * 1024)
+                    chunk = read(_DOWNLOAD_CHUNK_BYTES)
                     if not chunk:
                         break
                     downloaded += len(chunk)
@@ -307,8 +516,14 @@ class RepositoryHttpClient:
                     output.write(chunk)
                     digest.update(chunk)
                     md5.update(chunk)
-                    if progress_callback:
+                    if progress_callback and (
+                        downloaded - reported >= _DOWNLOAD_CHUNK_BYTES
+                        or time.monotonic() - reported_at >= DOWNLOAD_PROGRESS_INTERVAL_SECONDS
+                    ):
                         progress_callback(downloaded, total_declared)
+                        reported, reported_at = downloaded, time.monotonic()
+                if progress_callback and downloaded != reported:
+                    progress_callback(downloaded, total_declared)
 
         # A SHORT READ IS NOT A COMPLETE DOWNLOAD, and urllib does not say so: a server that
         # declares a Content-Length and then hangs up early simply stops yielding chunks, and the
@@ -317,7 +532,7 @@ class RepositoryHttpClient:
         # that arrived, so every later stage agreed with it. Found by the resume test, which
         # serves a deliberately truncated response.
         if total_declared and downloaded != total_declared:
-            raise ValueError(
+            raise DownloadIncomplete(
                 f"Download ended at {downloaded} of {total_declared} declared bytes. "
                 f"The partial file is kept at {partial.name} and the next attempt will resume."
             )
@@ -336,6 +551,31 @@ class RepositoryHttpClient:
             if validators.get(key):
                 result[key] = validators[key]
         return result
+
+
+def _hash_part(partial: Path, expected: int, declared: int, progress_callback: Any) -> tuple[Any, Any]:
+    """The sha256 and md5 of the .part a resume would append to, which must be the size the stat found.
+
+    The callback hears (expected, declared) about once a second while the hash runs, so a cancel is
+    heard during a .part of tens of GB and not only after it; ``declared`` is the whole object's length
+    as the response that began the .part gave it, or 0.
+    """
+    digest = hashlib.sha256()
+    md5 = hashlib.md5()
+    hashed = 0
+    reported_at = time.monotonic()
+    with partial.open("rb") as existing:
+        for chunk in iter(lambda: existing.read(_DOWNLOAD_CHUNK_BYTES), b""):
+            digest.update(chunk)
+            md5.update(chunk)
+            hashed += len(chunk)
+            if progress_callback and time.monotonic() - reported_at >= DOWNLOAD_PROGRESS_INTERVAL_SECONDS:
+                progress_callback(expected, declared)
+                reported_at = time.monotonic()
+    if hashed != expected:
+        # The file changed under us between the stat and the read.
+        raise ValueError(f"Partial file {partial.name} is {hashed} bytes, expected {expected}.")
+    return digest, md5
 
 
 def _response_validators(response: Any, url: str) -> dict[str, Any]:
@@ -1046,7 +1286,9 @@ def create_download_lease(
       order changes when they are;
     - discover: the MS-DIAL inputs under the data root;
     - attribute: the unit's own inputs, extracted files and declared checksums (allowlist_checksum_
-      validation), and one input_lineage row per input;
+      validation), and one input_lineage row per input. An mzML whose binary arrays RawDataHandler cannot
+      decode is not an input: it is listed in excluded_input_candidates and in input_lineage's excluded
+      rows, with reason unsupported_mzml_encoding and the accessions found (_exclude_undecodable_inputs);
     - record: the manifest.
 
     The stages are written into the manifest as they finish, so a lease that stops says where
@@ -1298,6 +1540,7 @@ def create_download_lease(
         inputs = _filter_inputs_by_project_allowlist(
             all_inputs, data_root, project, archive_samples=archive_samples
         )
+        inputs, excluded_inputs, mzml_scanned = _exclude_undecodable_inputs(inputs)
         analysis_input = _common_input_path(inputs, data_root)
         input_lineage = build_input_lineage(
             inputs,
@@ -1309,11 +1552,14 @@ def create_download_lease(
             verified_checksums,
             extracted_members=extracted_members,
             archive_extractions=archive_extractions,
+            excluded_inputs=excluded_inputs,
         )
         stages.finish(
             "attribute",
             input_candidates=len(inputs),
-            ignored_input_candidates=len(all_inputs) - len(inputs),
+            ignored_input_candidates=len(all_inputs) - len(inputs) - len(excluded_inputs),
+            mzml_encodings_scanned=mzml_scanned,
+            excluded_input_candidates=len(excluded_inputs),
             extracted_files=len(selected_extracted),
             ignored_extracted_files=len(extracted) - len(selected_extracted),
             declared_files_verified=checksum_validation.get("verified", 0),
@@ -1335,7 +1581,7 @@ def create_download_lease(
             "ignored_extracted_file_count": len(extracted) - len(selected_extracted),
             "allowlist_checksum_validation": checksum_validation,
             "input_candidates": inputs,
-            "ignored_input_candidate_count": len(all_inputs) - len(inputs),
+            "ignored_input_candidate_count": len(all_inputs) - len(inputs) - len(excluded_inputs),
             "input_lineage": input_lineage,
             "archive_extractions": archive_extractions,
             "analysis_input_path": analysis_input,
@@ -1356,6 +1602,9 @@ def create_download_lease(
             "download_started_at": started_at,
             "download_completed_at": datetime.now(timezone.utc).isoformat(),
         }
+        if excluded_inputs:
+            # Only where one was, so a unit with nothing excluded records what it always did.
+            manifest["excluded_input_candidates"] = excluded_inputs
         warnings = _archive_warnings(archive_extractions)
         if warnings:
             manifest["archive_warnings"] = warnings
@@ -1618,6 +1867,12 @@ def _record_download_failure(
     }
     if stage:
         record["download_failure"]["stage"] = stage
+    attempts = getattr(error, "download_attempts", None)
+    if isinstance(attempts, list):
+        # RepositoryHttpClient.download: each attempt at the object that failed, and how it ended.
+        record["download_failure"]["attempts"] = attempts
+        if isinstance(error, RetryableDownloadError):
+            record["download_failure"]["retryable"] = True
     if isinstance(error, ArchiveError):
         failure = error.record()
         failure["rejected_members"] = failure["rejected_members"][:50]
@@ -1837,6 +2092,7 @@ def build_input_lineage(
     *,
     extracted_members: dict[str, dict[str, Any]] | None = None,
     archive_extractions: list[dict[str, Any]] | None = None,
+    excluded_inputs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """One row per analysis input: what it is, where its bytes came from, and what vouches for them.
 
@@ -1869,8 +2125,23 @@ def build_input_lineage(
     checksum matched, or the member's own, and the row of the archive's member listing that accounts for
     it (``extracted_members`` and ``archive_extractions``, from the lease's extract stage). A listed
     container archive (X.raw.zip) names its container (X.raw) for declared_names and sample_id.
+
+    A FILE A READER WRITES INTO A CONTAINER (reader_created: Bruker's baf2sql writes analysis.sqlite into
+    a BAF .d that arrived without one) is not one of its members. A container a reader rule applies to
+    carries reader_created_files, the files a reader has already written there that it did not arrive
+    with (none on a first lease; a retry after a preflight finds them), with their size and sha256, and
+    reader_named_members, the files of those names it did arrive with, which stay its own. They are what
+    reader_created_block tells later readers' files from.
+
+    A FILE THE LEASE EXCLUDED is no input, so it has no row: rows stay one per analysis input, which is
+    what the gate resolves inputs against. ``excluded_inputs`` ({path, reason, problems}, from
+    _exclude_undecodable_inputs) are described the same way under ``excluded``, each with its
+    ``exclusion``, so where the bytes of a file that was not analysed came from is still recorded.
     """
     verified_checksums = verified_checksums or {}
+    excluded_inputs = excluded_inputs or []
+    excluded_keys = {_file_key(str(item["path"])): item for item in excluded_inputs}
+    inputs = [*inputs, *(str(item["path"]) for item in excluded_inputs)]
     extracted_members = extracted_members or {}
     archive_extractions = archive_extractions or []
     # An input that came out of an archive one sample names (X.zip) is that sample's, although its own
@@ -1991,6 +2262,13 @@ def build_input_lineage(
                 row["source"] = {"objects": len(downloaded)}
             else:
                 row["source"] = {"origin": "not_downloaded_by_this_lease"}
+            reader_names = reader_created_names(path)
+            if reader_names:
+                arrived = [Path(member).relative_to(Path(key)).as_posix() for member, _, _ in members]
+                row["reader_created_files"] = reader_created_files(path, arrived)
+                own = sorted(relative for relative in arrived if relative in reader_names)
+                if own:
+                    row["reader_named_members"] = own
             if downloaded:
                 # A digest over the member objects' own sha256, so a folder assembled from many downloads
                 # has one checksum that changes when any member does.
@@ -2041,7 +2319,113 @@ def build_input_lineage(
             row["kind"] = "vendor_folder" if path.is_dir() else "file"
             row["source"] = {"origin": "not_downloaded_by_this_lease"}
         rows.append(row)
-    return {"schema": "msdial-input-lineage.v1", "rows": rows}
+    table: dict[str, Any] = {
+        "schema": "msdial-input-lineage.v1",
+        "rows": [row for row in rows if _file_key(row["path"]) not in excluded_keys],
+    }
+    if excluded_keys:
+        table["excluded"] = [
+            {
+                **row,
+                "exclusion": {
+                    "reason": excluded_keys[_file_key(row["path"])]["reason"],
+                    "problems": excluded_keys[_file_key(row["path"])].get("problems") or [],
+                },
+            }
+            for row in rows
+            if _file_key(row["path"]) in excluded_keys
+        ]
+    return table
+
+
+READER_CREATED_SCHEMA = "msdial-reader-created-files.v1"
+
+
+def reader_created_block(manifest: dict[str, Any], stage: str) -> dict[str, Any] | None:
+    """What readers have written into the unit's container inputs by now, for its reader_created_files.
+
+    One entry per container input holding such a file: {path, files}, each file {path, size, sha256,
+    reader} (msdial_app.reader_created). A file the container arrived with is told by its lineage row's
+    reader_named_members; a container whose row was written before rows carried them (0.5.16 and earlier)
+    reports every file a rule names, with members_known false. None when no container holds one, so a unit
+    without any records nothing. ``stage`` says when it was taken: preflight or run.
+    """
+    lineage = manifest.get("input_lineage")
+    rows = {
+        _file_key(str(row["path"])): row
+        for row in ((lineage or {}).get("rows") or [] if isinstance(lineage, dict) else [])
+        if isinstance(row, dict) and str(row.get("path") or "").strip()
+    }
+    containers = []
+    for text in manifest.get("input_candidates") or []:
+        path = Path(str(text))
+        if not path.is_dir() or not reader_created_names(path):
+            continue
+        row = rows.get(_file_key(str(text))) or {}
+        known = "reader_created_files" in row
+        files = reader_created_files(path, (row.get("reader_named_members") or []) if known else None)
+        if files:
+            containers.append({"path": str(path), "files": files, **({} if known else {"members_known": False})})
+    if not containers:
+        return None
+    return {
+        "schema": READER_CREATED_SCHEMA,
+        "stage": stage,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "containers": containers,
+    }
+
+
+def record_reader_created_files(manifest_path: str | Path, stage: str) -> dict[str, Any] | None:
+    """Write reader_created_block into the unit manifest, after a preflight or a run. Never raises.
+
+    Returns the block written, or None when there was nothing to record or the manifest could not be
+    written. What is recorded replaces the earlier record: the files are still there, and a run may have
+    rewritten one a preflight wrote. The files are hashed before the manifest's lock is taken, not under it.
+    """
+    try:
+        block = reader_created_block(read_manifest(manifest_path), stage)
+        if block:
+            update_manifest(manifest_path, lambda current: current.__setitem__("reader_created_files", block))
+    except (OSError, ValueError, TypeError):
+        return None
+    return block
+
+
+def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict[str, Any]], int]:
+    """(inputs RawDataHandler can decode, the excluded ones, the number of mzML scanned).
+
+    RawDataHandler decodes an mzML array only as a 32- or 64-bit float, zlib-compressed or not, and reads
+    anything else - Numpress, integer arrays, a type or compression given only through a param group - as
+    uncompressed floats, so the Console ran such a file and wrote garbage or empty spectra without an error.
+    Each mzML input is scanned over its first few spectra and chromatograms (mzml_encoding); one with a
+    problem is excluded with reason unsupported_mzml_encoding and the accessions found, and the rest of the
+    unit goes on without it. A file the scan could not read is kept: the Console, which reads all of it, is
+    the judge of that. Other formats are not scanned.
+    """
+    kept: list[str] = []
+    excluded: list[dict[str, Any]] = []
+    scanned = 0
+    for text in inputs:
+        path = Path(text)
+        if path.suffix.casefold() != ".mzml" or not path.is_file():
+            kept.append(text)
+            continue
+        scanned += 1
+        scan = scan_mzml_encoding(path)
+        if not scan["problems"]:
+            kept.append(text)
+            continue
+        excluded.append({
+            "path": text,
+            "reason": UNSUPPORTED_MZML_ENCODING,
+            "problems": scan["problems"],
+            "scan": {
+                key: scan.get(key)
+                for key in ("schema", "spectra_scanned", "chromatograms_scanned", "chromatograms_reached")
+            },
+        })
+    return kept, excluded, scanned
 
 
 def _declared_verification(result: dict[str, Any]) -> dict[str, Any]:
@@ -2429,6 +2813,8 @@ def record_run_start(
             "version": str(identity.get("version") or ""),
             "binary_sha256": str(identity.get("binary_sha256") or ""),
             "assembly_sha256": str(identity.get("assembly_sha256") or ""),
+            # Every file beside the binary, by one digest (workflow.console_inventory).
+            "inventory_sha256": str(identity.get("inventory_sha256") or ""),
             "provenance_status": str(identity.get("status") or identity.get("provenance_status") or ""),
         },
         "command_sha256": (
@@ -3919,10 +4305,11 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         lineage = parent.get("input_lineage")
         if isinstance(lineage, dict):
             # The part reads the parent's files, so their lineage is the parent's, row for row. Without
-            # it every part would look like a manifest written before lineage existed.
+            # it every part would look like a manifest written before lineage existed. The files the lease
+            # excluded are in no part, and stay recorded in the parent's table only.
             part_keys = {_file_key(item) for item in part["input_candidates"]}
             part_manifest["input_lineage"] = {
-                **{key: value for key, value in lineage.items() if key != "rows"},
+                **{key: value for key, value in lineage.items() if key not in ("rows", "excluded")},
                 "rows": [
                     row for row in lineage.get("rows") or []
                     if isinstance(row, dict) and _file_key(str(row.get("path") or "")) in part_keys

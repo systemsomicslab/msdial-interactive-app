@@ -39,6 +39,7 @@ CONSOLE = {
     "version": "5.5.250930",
     "binary_sha256": "ab" * 32,
     "assembly_sha256": "cd" * 32,
+    "inventory_sha256": "ef" * 32,
     # A location, which the attempt must not carry: the Console is named by version and checksum.
     "assembly_path": "Q:\\synthetic\\console\\MSDIALCUI.dll",
     "warning": "",
@@ -101,7 +102,7 @@ class TheRecords(_Unit, unittest.TestCase):
         self.assertIsNotNone(attempt["backend"]["process_created_at"])
         self.assertEqual(
             {"version": "5.5.250930", "binary_sha256": "ab" * 32, "assembly_sha256": "cd" * 32,
-             "provenance_status": "verified"},
+             "inventory_sha256": "ef" * 32, "provenance_status": "verified"},
             attempt["console"],
         )
         self.assertEqual(64, len(attempt["command_sha256"]))
