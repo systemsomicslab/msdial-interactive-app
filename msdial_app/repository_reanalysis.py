@@ -1715,10 +1715,17 @@ def _route_object(
 ) -> tuple[str, str, str]:
     """(file name, archive kind by name or '', placement) for one repository object.
 
-    The name is the URL's basename, or <accession>.tar for MB-POST's one project tar; a URL with no
-    basename takes the listed name. When the URL names no archive but the unit's own listing names
-    this object as one (a download link without a file name), the listed name is used, so the object
-    is opened as what the repository says it is.
+    The name is the URL's basename, percent-decoded, or <accession>.tar for MB-POST's one project
+    tar; a URL with no basename takes the listed name. When the decoded basename is the listed name
+    but for case, the listed spelling is kept. When the URL names no archive but the unit's own
+    listing names this object as one (a download link without a file name), the listed name is used,
+    so the object is opened as what the repository says it is.
+
+    WHY DECODED. MetaboLights lists '130612_EG_NaHCO3_1 mM-1.raw.zip' and serves it from
+    '.../130612_EG_NaHCO3_1%20mM-1.raw.zip' (1,575 per-sample archives in 67 units of the
+    2026-09-22 Catalog snapshot). Taken undecoded, the name did not match the listing, so the object
+    was placed as a bundle, and an unrooted X.raw.zip unpacked to a folder named '..._1%20mM-1.raw'
+    that no sample names; a rooted one drew a container_name_mismatch warning for every archive.
 
     A file inside a vendor folder (raw/x.d/..., raw/x.raw/...) is never an archive to open, whatever
     its name: unpacking it would take it out of the folder its reader expects it in.
@@ -1730,9 +1737,9 @@ def _route_object(
     """
     listed = str(item.name or "").replace("\\", "/")
     listed_name = PurePosixPath(listed).name
-    filename = (
-        Path(urllib.parse.urlparse(url).path).name or listed_name or f"{project.accession}_{index}.zip"
-    )
+    filename = _url_basename(url) or listed_name or f"{project.accession}_{index}.zip"
+    if listed_name and listed_name.casefold() == filename.casefold():
+        filename = listed_name
     if project.repository == "mb_post":
         filename = f"{project.accession}.tar"
     if listed and _inside_vendor_folder(listed):
@@ -1748,6 +1755,25 @@ def _route_object(
         placement = _safe_relative_name(listed).parent.as_posix()
         placement = "" if placement == "." else placement
     return filename, kind, placement
+
+
+def _url_basename(url: str) -> str:
+    """A URL's last path segment, percent-decoded when what it decodes to is one safe file name.
+
+    Decoding comes after the segment is taken, so an encoded separator (%2F, %5C) would put a
+    directory into what is used as a file name; such a segment, or one that decodes to a name
+    Windows cannot hold, is kept as it was served.
+    """
+    served = Path(urllib.parse.urlparse(url).path).name
+    decoded = urllib.parse.unquote(served)
+    if (
+        decoded in {"", ".", ".."}
+        or any(character in decoded for character in '/\\<>:"|?*')
+        or any(ord(character) < 32 for character in decoded)
+        or decoded != decoded.rstrip(" .")
+    ):
+        return served
+    return decoded
 
 
 def _inside_vendor_folder(name: str) -> bool:

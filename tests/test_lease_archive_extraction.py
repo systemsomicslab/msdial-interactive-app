@@ -494,6 +494,51 @@ class PerSampleContainerArchivesAreAttributed(_Workspace):
             )
             self.assertIn(record["archive_name"], listing.read_text(encoding="utf-8"))
 
+    def _percent_encoded(self, rooted: bool) -> dict:
+        """MTBLS113 lists '..._1 mM-1.raw.zip' and serves it as '..._1%20mM-1.raw.zip'."""
+        payloads, files, samples = {}, [], {}
+        for number in (1, 2):
+            name = f"130612_EG_NaHCO3_1 mM-{number}"
+            prefix = f"{name}.raw/" if rooted else ""
+            url = f"https://example.org/MTBLS113/FILES/{name.replace(' ', '%20')}.raw.zip"
+            payloads[url] = _zip([(prefix + "_FUNC001.DAT", name.encode()), (prefix + "_HEADER.TXT", b"h")])
+            files.append(RepositoryFile(f"FILES/{name}.raw.zip", 10, url))
+            samples[f"sample-{number}"] = f"{name}.raw.zip"
+        return create_download_lease(_unit(files, samples), self.root, 10_000, client=_Client(payloads))
+
+    def test_a_percent_encoded_url_names_the_container_its_listing_names(self) -> None:
+        """THE REGRESSION (1,575 archives in 67 units of the 2026-09-22 snapshot): the URL's name was
+        taken undecoded, so the zip was placed as a bundle, unpacked to '..._1%20mM-1.raw', and no
+        sample named what was on disk."""
+        lease = self._percent_encoded(rooted=False)
+        data = Path(lease["input_directory"])
+
+        self.assertEqual(
+            ["130612_EG_NaHCO3_1 mM-1.raw", "130612_EG_NaHCO3_1 mM-2.raw"],
+            sorted(Path(item).name for item in lease["input_candidates"]),
+        )
+        self.assertEqual(b"130612_EG_NaHCO3_1 mM-1",
+                         (data / "130612_EG_NaHCO3_1 mM-1.raw" / "_FUNC001.DAT").read_bytes())
+        self.assertEqual("sample-1", _rows(lease)["130612_EG_NaHCO3_1 mM-1.raw"]["sample_id"])
+        self.assertEqual(
+            {"130612_EG_NaHCO3_1 mM-1.raw.zip", "130612_EG_NaHCO3_1 mM-2.raw.zip"},
+            {Path(item["path"]).name for item in lease["downloads"]},
+        )
+
+    def test_a_percent_encoded_rooted_container_draws_no_name_mismatch(self) -> None:
+        lease = self._percent_encoded(rooted=True)
+
+        self.assertEqual(2, len(lease["input_candidates"]))
+        self.assertEqual([], [warning["kind"] for warning in lease.get("archive_warnings", [])])
+
+    def test_an_encoded_separator_is_never_decoded_into_a_file_name(self) -> None:
+        basename = repository_reanalysis._url_basename
+        self.assertEqual("a b.raw.zip", basename("https://example.org/FILES/a%20b.raw.zip"))
+        self.assertEqual("..%2F..%2Fx.zip", basename("https://example.org/FILES/..%2F..%2Fx.zip"))
+        self.assertEqual("a%5Cb.zip", basename("https://example.org/FILES/a%5Cb.zip"))
+        self.assertEqual("a%3Ab.zip", basename("https://example.org/FILES/a%3Ab.zip"))
+        self.assertEqual("x.zip%20", basename("https://example.org/FILES/x.zip%20"))
+
     def test_the_alias_is_one_rule_for_samples(self) -> None:
         exact, _stems = _sample_file_names(
             _unit([], {"a": "FILES/X.d.zip", "b": "Y.raw.rar", "c": "z.mzXML.lzma"})
