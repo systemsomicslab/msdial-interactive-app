@@ -82,6 +82,10 @@ class RepositoryFile:
     url: str = ""
     role: str = "raw"
     checksum: str = ""
+    # The analysis input this file belongs to, as the Catalog lists it: the vendor folder a member lies in
+    # (raw/x.raw for raw/x.raw/_FUNC001.DAT), or the container a per-sample archive unpacks to. "" for a
+    # file that is an input of its own.
+    container: str = ""
 
 
 def requires_msdial_conversion(name: str) -> bool:
@@ -124,6 +128,15 @@ class RepositoryProject:
     class_proposal: dict[str, Any] | None = None
     blocking_reasons: list[str] = field(default_factory=list)
     pending_decisions: list[str] = field(default_factory=list)
+    # ONE ANALYSIS INPUT PER VENDOR CONTAINER (Catalog 0.6.0, analysis_input_model one-input-per-sample.v1).
+    # What MS-DIAL opens, one entry per sample row: a file, a vendor folder whose members `files` lists one
+    # by one, or the container a per-sample archive unpacks to. Empty when the Catalog declared none - a unit
+    # whose data sit inside a study archive finds its inputs after the download, by its sample names, as
+    # every unit did before.
+    analysis_inputs: list[dict[str, Any]] = field(default_factory=list)
+    analysis_inputs_declared: bool = False
+    analysis_input_issues: list[dict[str, Any]] = field(default_factory=list)
+    split_hint: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.publications and self.publication_status == "none_recorded":
@@ -4795,6 +4808,7 @@ def project_from_dict(value: dict[str, Any]) -> RepositoryProject:
             "url": str(item.get("url") or item.get("download_url") or ""),
             "role": str(item.get("role") or "raw"),
             "checksum": str(item.get("checksum") or ""),
+            "container": str(item.get("container") or ""),
         }
         if (
             payload["role"] in ANALYSIS_INPUT_ROLES
