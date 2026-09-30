@@ -20,12 +20,14 @@ from __future__ import annotations
 import codecs
 import csv
 import hashlib
+import io
 import json
 import os
 import shutil
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
@@ -52,6 +54,8 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
         _tree_size,
         _write_json,
         create_download_lease,
+        declared_analysis_inputs,
+        declared_archive_containers,
         evaluate_repository_execution_gate,
         project_from_dict,
         read_manifest,
@@ -1107,6 +1111,101 @@ class TheHeaderOrderIsRecordedByTheNamesTheCsvCarries(unittest.TestCase):
         by_name = {Path(item["file"]).stem: item["analytical_order"] for item in record["files"]}
         self.assertEqual({row["file_name"]: row["analytical_order"] for row in built["rows"]}, by_name)
         self.assertEqual([2, 1], [row["analytical_order"] for row in built["rows"]])
+
+
+def _zip(entries: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as handle:
+        for name, data in entries.items():
+            handle.writestr(zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0)), data)
+    return buffer.getvalue()
+
+
+class ADeclaredArchivedContainerIsFoundWhereItsArchivePutIt(unittest.TestCase):
+    """MetaboLights per-sample archives: A.d.zip holding B.d is extracted as B.d (container_rooted_other_name).
+
+    The Catalog names the input after its archive, raw/A.d, since the listing shows nothing inside it.
+    """
+
+    BASE = "https://example.org/MTBLS-X/"
+
+    def _handoff(self) -> tuple[dict, dict[str, bytes]]:
+        archives = {
+            "raw/A.d.zip": _zip({"B.d/analysis.baf": b"b" * 10, "B.d/B.d": b""}),
+            "raw/C.d.zip": _zip({"C.d/analysis.baf": b"c" * 10}),
+        }
+        files, inputs, samples = [], [], []
+        for index, (path, data) in enumerate(archives.items(), start=1):
+            files.append({"path": path, "download_url": self.BASE + path, "size_bytes": len(data),
+                          "checksum": hashlib.md5(data).hexdigest(), "role": "raw", "container": path[:-4]})
+            inputs.append({"path": path[:-4], "kind": "archived_container", "archive": path, "suffix": ".d",
+                           "member_count": 1, "size_bytes": len(data), "sample_id": f"S{index}"})
+            samples.append({"sample_id": f"S{index}", "raw_file": path, "attributes": {"Group": "g"}})
+        handoff = _handoff(
+            files=files, analysis_inputs=inputs, sample_metadata=samples, sample_count=2,
+            analytical_sample_count=2, analysis_input_count=2, repository="metabolights", accession="MTBLS-X",
+            download_scope={"kind": "unit_files", "file_count": 2, "analysis_file_count": 2,
+                            "bundle_bytes": sum(len(data) for data in archives.values())},
+        )
+        return handoff, {self.BASE + path: data for path, data in archives.items()}
+
+    def _lease(self, root: Path) -> dict:
+        handoff, payloads = self._handoff()
+        project, _workspace = mcp_server._project_from_analysis_unit_handoff(handoff)
+        typed = project_from_dict(project)
+        typed.eligible, typed.selection_status, typed.blocking_reasons = True, "eligible", []
+        return create_download_lease(typed, root, 10_000_000, client=_Client(payloads))
+
+    def test_the_lease_admits_the_container_its_archive_produced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lease = self._lease(Path(temporary))
+            manifest = read_manifest(lease["manifest_path"])
+
+        self.assertEqual(["B.d", "C.d"], sorted(Path(item).name for item in lease["input_candidates"]))
+        self.assertEqual(
+            {"B.d": "S1", "C.d": "S2"},
+            {Path(row["path"]).name: row["sample_id"] for row in manifest["input_lineage"]["rows"]},
+        )
+
+    def test_the_csv_gives_it_the_row_of_the_sample_it_was_declared_for(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lease = self._lease(Path(temporary))
+            manifest_path = Path(lease["manifest_path"])
+            _set_preflight(manifest_path, {"*": "DDA"})
+            built = build_repository_analysis_rows(read_manifest(manifest_path))
+
+        self.assertEqual([], built["failures"])
+        self.assertEqual([("B", "S1"), ("C", "S2")], [(row["file_name"], row["sample_id"]) for row in built["rows"]])
+
+    def test_the_extraction_record_says_where_the_container_went(self) -> None:
+        handoff, _payloads = self._handoff()
+        project = project_from_dict(mcp_server._project_from_analysis_unit_handoff(handoff)[0])
+        records = [
+            {"source_url": self.BASE + "raw/A.d.zip", "container_path": "raw/B.d"},
+            {"source_url": self.BASE + "raw/C.d.zip", "container_path": "raw/C.d"},
+            {"source_url": "https://example.org/another-unit.zip", "container_path": "raw/Z.d"},
+        ]
+
+        self.assertEqual(
+            {"raw/b.d": "raw/a.d"},
+            declared_archive_containers(project, declared_analysis_inputs(project), records),
+        )
+
+    def test_without_a_record_the_archive_its_sample_names_decides(self) -> None:
+        handoff, _payloads = self._handoff()
+        project = project_from_dict(mcp_server._project_from_analysis_unit_handoff(handoff)[0])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for name in ("raw/B.d", "raw/C.d", "raw/D.d"):
+                (root / name).mkdir(parents=True)
+            inputs = _find_msdial_inputs(root)
+            by_sample = _filter_inputs_by_project_allowlist(
+                inputs, root, project, archive_samples={str(root / "raw" / "B.d").casefold(): "S1"}
+            )
+            with self.assertRaisesRegex(ValueError, "not in the download: raw/A.d"):
+                _filter_inputs_by_project_allowlist(inputs, root, project)
+
+        self.assertEqual(["B.d", "C.d"], sorted(Path(item).name for item in by_sample))
 
 
 if __name__ == "__main__":

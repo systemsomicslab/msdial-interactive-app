@@ -60,11 +60,11 @@ from .repository_metadata import (
     metadata_workspace,
 )
 from .repository_reanalysis import (
-    _allowlist_forms,
     _file_key,
-    _relative_to_data_root,
     acquisition_start_order,
     declared_analysis_inputs,
+    declared_archive_containers,
+    match_declared_inputs,
     project_from_dict,
     update_manifest,
     with_order_source,
@@ -189,9 +189,24 @@ def build_repository_analysis_rows(
     lineage_by_key = {_file_key(str(row.get("path") or "")): row for row in lineage_rows}
     data_root = Path(str(manifest.get("input_directory") or ""))
     raw_directory = Path(str(manifest.get("raw_directory") or data_root.parent))
-    declared = declared_analysis_inputs(project_from_dict(project))
+    typed = project_from_dict(project)
+    declared = declared_analysis_inputs(typed)
     verdicts = _per_file_verdicts(manifest)
     unit_mode = str(project.get("acquisition_mode") or "")
+    # Which declared input each candidate is, answered as the lease's allow-list answered it: by path, at
+    # the place its archive put an archived container, else through the sample its lineage row names.
+    matched = (
+        match_declared_inputs(
+            candidates,
+            data_root,
+            declared,
+            containers=declared_archive_containers(typed, declared, manifest.get("archive_extractions")),
+            samples={key: str(row.get("sample_id") or "") for key, row in lineage_by_key.items()},
+        )
+        if declared
+        else {}
+    )
+    declared_of = {candidate: form for form, found in matched.items() for candidate in found}
 
     samples = [row for row in workspace.get("rows") or [] if isinstance(row, dict)]
     by_id: dict[str, dict[str, Any]] = {}
@@ -207,7 +222,6 @@ def build_repository_analysis_rows(
     unmatched: list[str] = []
     doubled: list[str] = []
     acquisition_failures: dict[str, list[str]] = {}
-    matched_declared: dict[str, list[str]] = {}
     used: dict[str, str] = {}
     declared_order_files: list[str] = []
     rows: list[dict[str, Any]] = []
@@ -221,14 +235,7 @@ def build_repository_analysis_rows(
             missing_lineage.append(path.name)
         entry: dict[str, Any] | None = None
         if declared:
-            relative = _relative_to_data_root(path, data_root)
-            # The most specific form first, as the lease's allow-list matched it.
-            forms = sorted(_allowlist_forms(relative), key=len, reverse=True) if relative else []
-            for form in forms:
-                if form in declared:
-                    entry = declared[form]
-                    matched_declared.setdefault(form, []).append(candidate)
-                    break
+            entry = declared.get(declared_of.get(candidate, ""))
             if entry is None:
                 undeclared.append(path.name)
 
@@ -337,8 +344,8 @@ def build_repository_analysis_rows(
             undeclared,
         ))
     if declared:
-        absent = [str(declared[form].get("path") or form) for form in declared if form not in matched_declared]
-        twice = [str(declared[form].get("path") or form) for form, found in matched_declared.items() if len(found) > 1]
+        absent = [str(declared[form].get("path") or form) for form, found in matched.items() if not found]
+        twice = [str(declared[form].get("path") or form) for form, found in matched.items() if len(found) > 1]
         if absent:
             failures.append(_failure(
                 "analysis_input_not_found",

@@ -1563,7 +1563,11 @@ def create_download_lease(
             data_root, project, verified_checksums, downloads, archive_extractions
         )
         inputs = _filter_inputs_by_project_allowlist(
-            all_inputs, data_root, project, archive_samples=archive_samples
+            all_inputs,
+            data_root,
+            project,
+            archive_samples=archive_samples,
+            archive_extractions=archive_extractions,
         )
         inputs, excluded_inputs, mzml_scanned = _exclude_undecodable_inputs(inputs)
         analysis_input = _common_input_path(inputs, data_root)
@@ -5006,18 +5010,27 @@ def _filter_inputs_by_project_allowlist(
     project: RepositoryProject,
     *,
     archive_samples: dict[str, str] | None = None,
+    archive_extractions: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """The inputs that are this unit's: listed, named by its samples, or out of an archive one names.
 
     archive_samples is _archive_sample_attribution's: the files, and outermost .d/.raw folders, that
     came out of an archive exactly one of this unit's samples names (X.zip). Without it, only names
-    are matched, as they always were.
+    are matched, as they always were. archive_extractions is the lease's extraction records, which say
+    where a declared archived container really is (declared_archive_containers).
     """
     if not project.analysis_unit_id:
         return inputs
     declared = declared_analysis_inputs(project)
     if declared:
-        return _select_declared_inputs(inputs, data_root, project, declared)
+        return _select_declared_inputs(
+            inputs,
+            data_root,
+            project,
+            declared,
+            archive_samples=archive_samples,
+            archive_extractions=archive_extractions,
+        )
     archive_samples = archive_samples or {}
     allowed = _project_allowlist(project, analysis_only=True)
     sample_names = _sample_file_names(project)
@@ -5076,11 +5089,110 @@ def declared_analysis_inputs(project: RepositoryProject) -> dict[str, dict[str, 
     return result
 
 
+def declared_archive_containers(
+    project: RepositoryProject,
+    declared: dict[str, dict[str, Any]],
+    archive_extractions: list[dict[str, Any]] | None,
+) -> dict[str, str]:
+    """Where each declared archived container really is, relative to the data root: {that path: its key}.
+
+    The Catalog names an archived container after its archive - raw/A.d for raw/A.d.zip - because the
+    listing shows nothing inside it. archives.destination_rule extracts a container as it was packed, so
+    A.d.zip holding B.d is B.d (container_rooted_other_name): renaming it would decide which sample it is.
+    The extraction record of the container's own archive, found by the archive's download URL, says where
+    it went (container_path). Only paths that differ from the declared one are returned, keyed as
+    declared_analysis_inputs keys them.
+    """
+    archives_of: dict[str, str] = {}
+    for key, entry in declared.items():
+        if str(entry.get("kind") or "") != "archived_container" or not str(entry.get("archive") or "").strip():
+            continue
+        try:
+            archives_of[_safe_relative_name(str(entry["archive"])).as_posix().casefold()] = key
+        except ValueError:
+            continue
+    if not archives_of or not archive_extractions:
+        return {}
+    by_url: dict[str, str] = {}
+    for item in project.files:
+        try:
+            name = _safe_relative_name(item.name).as_posix().casefold()
+        except ValueError:
+            continue
+        if name in archives_of and item.url:
+            by_url.setdefault(item.url, archives_of[name])
+    result: dict[str, str] = {}
+    for record in archive_extractions:
+        if not isinstance(record, dict):
+            continue
+        key = by_url.get(str(record.get("source_url") or ""))
+        container = str(record.get("container_path") or "").replace("\\", "/").strip("/") if key else ""
+        if not container:
+            continue
+        try:
+            located = _safe_relative_name(container).as_posix().casefold()
+        except ValueError:
+            continue
+        if located != key:
+            result.setdefault(located, key)
+    return result
+
+
+def match_declared_inputs(
+    inputs: list[str],
+    data_root: Path,
+    declared: dict[str, dict[str, Any]],
+    *,
+    containers: dict[str, str] | None = None,
+    samples: dict[str, str] | None = None,
+) -> dict[str, list[str]]:
+    """Which inputs are which declared analysis input: {declared key: [inputs]}, every key present.
+
+    The lease's allow-list and the analysis-CSV builder both ask this, and must answer it alike. An input
+    is matched by its path relative to the data root, the most specific form first (_allowlist_forms),
+    so it is one declared input's whichever others share a tail; else at the path its archive's
+    extraction record gives a declared archived container (``containers``, declared_archive_containers).
+    An input still unmatched is an archived container's when ``samples`` (by _file_key) gives it the one
+    sample that container is declared for and no input was matched to it: the attribution through the
+    archive that sample names (_archive_sample_attribution, or a lineage row's sample_id), which is how
+    such a container was admitted before the Catalog declared its inputs.
+    """
+    containers = containers or {}
+    samples = samples or {}
+    found: dict[str, list[str]] = {key: [] for key in declared}
+    unmatched: list[str] = []
+    for item in inputs:
+        relative = _relative_to_data_root(Path(item), data_root)
+        if relative is None:
+            continue
+        forms = sorted(_allowlist_forms(relative), key=len, reverse=True)
+        key = next((form for form in forms if form in found), None)
+        if key is None:
+            key = next((containers[form] for form in forms if form in containers), None)
+        if key is None:
+            unmatched.append(item)
+        else:
+            found[key].append(item)
+    waiting: dict[str, str] = {}
+    for key, entry in declared.items():
+        sample = str(entry.get("sample_id") or "").strip()
+        if str(entry.get("kind") or "") == "archived_container" and sample and not found[key]:
+            waiting[sample] = key
+    for item in unmatched if waiting and samples else []:
+        key = waiting.get(str(samples.get(_file_key(item)) or "").strip())
+        if key is not None:
+            found[key].append(item)
+    return found
+
+
 def _select_declared_inputs(
     inputs: list[str],
     data_root: Path,
     project: RepositoryProject,
     declared: dict[str, dict[str, Any]],
+    *,
+    archive_samples: dict[str, str] | None = None,
+    archive_extractions: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """The inputs that are this unit's declared analysis inputs, matched by path, every one of them.
 
@@ -5091,18 +5203,16 @@ def _select_declared_inputs(
     happens to carry the folder's name. The declared path is what the Catalog attributed to a sample row,
     so it is what is matched, and a declared input that is not on disk stops the lease by name rather than
     leaving a unit that silently lost a sample. A basename match is not a fallback here: it is how an input
-    another unit shares a name with would get in.
+    another unit shares a name with would get in. An archived container is matched where its archive put
+    it, and through the archive its sample names (match_declared_inputs).
     """
-    found: dict[str, list[str]] = {key: [] for key in declared}
-    for item in inputs:
-        relative = _relative_to_data_root(Path(item), data_root)
-        if relative is None:
-            continue
-        # The most specific form first, so an input is one declared input's, whichever others share a tail.
-        for form in sorted(_allowlist_forms(relative), key=len, reverse=True):
-            if form in found:
-                found[form].append(item)
-                break
+    found = match_declared_inputs(
+        inputs,
+        data_root,
+        declared,
+        containers=declared_archive_containers(project, declared, archive_extractions),
+        samples=archive_samples,
+    )
     missing = [str(declared[key].get("path") or key) for key, matched in found.items() if not matched]
     doubled = [
         f"{declared[key].get('path') or key} ({len(matched)} inputs)"
