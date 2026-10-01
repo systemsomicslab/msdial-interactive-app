@@ -2669,7 +2669,8 @@ def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict
 # vendor container or an mzML of the same sample beside an mzXML (an mzML archive beside an mzXML archive),
 # the readable one is analysed in its place and the mzXML is not converted (encoding_preference). The rule
 # is the Catalog's, applied here only to what an archive showed: a listing the Catalog saw it already
-# decided. Every inference the converter offers stays off (ConversionOptions()).
+# decided. It is given the files of one sample's place, never another folder's file of the same name
+# (_sample_locus). Every inference the converter offers stays off (ConversionOptions()).
 #
 # A FILE WHOSE CONVERSION FAILS is no input: it is kept out of the candidates with reason conversion_failed,
 # like an mzML RawDataHandler cannot decode, and the rest of the unit runs. A unit left with no input is
@@ -2765,15 +2766,26 @@ def _encoding_choices(
 
     An mzML whose arrays RawDataHandler cannot decode (mzml_encoding) is no readable twin: the lease would
     exclude it, and a convertible mzXML outranks an unreadable twin, as the user decided on 2026-09-30.
+
+    WHICH FILES ARE ONE SAMPLE'S. The Catalog pairs files by name within one unit's listing. A data root an
+    accession archive expanded into holds other units' files too - a study archive with a folder per
+    polarity or per column, a QC_01 in each - and pairing by name across all of it would let the positive
+    unit's POS/QC_01.mzML displace the negative unit's NEG/QC_01.mzXML. So the rule is given only files
+    whose folders agree once the words that name an encoding are set aside (_sample_locus): mzML/x.mzML
+    and mzXML/x.mzXML are one sample's, POS/x.mzML and NEG/x.mzXML are not.
     """
-    by_stem: dict[str, list[str]] = {}
+    by_sample: dict[tuple[str, tuple[tuple[str, ...], ...]], list[str]] = {}
     for item in readable:
-        by_stem.setdefault(encoding_preference.stem(Path(item).name), []).append(item)
+        key = (encoding_preference.stem(Path(item).name), _sample_locus(item, data_root))
+        by_sample.setdefault(key, []).append(item)
     choices: list[dict[str, Any]] = []
     winners: dict[str, str] = {}
     for source in sources:
         twins = [
-            item for item in by_stem.get(encoding_preference.stem(Path(source).name)) or []
+            item
+            for item in by_sample.get(
+                (encoding_preference.stem(Path(source).name), _sample_locus(source, data_root))
+            ) or []
             if not (
                 Path(item).suffix.casefold() == ".mzml" and Path(item).is_file()
                 and scan_mzml_encoding(Path(item))["problems"]
@@ -2800,6 +2812,37 @@ def _encoding_choices(
             ),
         })
     return choices, winners
+
+
+# The words of a folder's name that say which encoding it holds rather than whose samples: ST003038's
+# mzML/ beside its mzXML/, an archive's raw/ beside its mzXML/, NEG_mzML/ beside NEG_mzXML/. A one-letter
+# word (the .d of Agilent and Bruker) names too much else to be set aside.
+_ENCODING_FOLDER_WORDS = frozenset(
+    suffix[1:]
+    for suffix in (
+        *encoding_preference.VENDOR_SUFFIXES, *encoding_preference.OPEN_SUFFIXES, ".mzxml", ".mzdata",
+    )
+    if len(suffix) > 2
+)
+
+
+def _sample_locus(path: str, data_root: Path) -> tuple[tuple[str, ...], ...]:
+    """The folders a file lies in below the data root, each as its words less those naming an encoding.
+
+    Two encodings of a name are one sample's only where these agree (_encoding_choices). A folder whose
+    every word names an encoding (mzML, RAW) is no place of its own, so x.mzML at the root and mzXML/x.mzXML
+    agree, and NEG_mzML and NEG_mzXML are both NEG.
+    """
+    relative = _relative_to_data_root(Path(path), data_root)
+    folders = PurePosixPath(relative).parts[:-1] if relative else ()
+    locus = []
+    for folder in folders:
+        words = tuple(
+            word for word in re.split(r"[\W_]+", folder.casefold()) if word and word not in _ENCODING_FOLDER_WORDS
+        )
+        if words:
+            locus.append(words)
+    return tuple(locus)
 
 
 def _extracted_keys(extracted_members: dict[str, dict[str, Any]], data_root: Path) -> set[str]:

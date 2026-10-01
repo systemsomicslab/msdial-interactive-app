@@ -42,6 +42,7 @@ from msdial_app.repository_reanalysis import (
     RepositoryFile,
     RepositoryProject,
     _file_key,
+    _sample_locus,
     create_download_lease,
     declared_analysis_inputs,
     lineage_stands_for,
@@ -472,6 +473,51 @@ class TheLeaseConvertsTheUnitsMzxml(_Scratch):
         built = build_repository_analysis_rows(manifest)
         self.assertEqual([], built["failures"])
         self.assertEqual(samples, [item["sample_id"] for item in built["rows"]])
+
+    def test_another_folders_mzml_of_the_same_name_does_not_displace_the_mzxml(self) -> None:
+        """A study archive with a folder per polarity holds a QC_01 in each. The positive unit's POS/QC_01.mzML is
+        no encoding of the negative unit's NEG/QC_01.mzXML, which is converted and analysed as its own sample."""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as handle:
+            handle.writestr("ST009999/NEG/QC_01.mzXML", dda_32())
+            handle.writestr("ST009999/NEG/S_01.mzXML", dda_32())
+            handle.writestr("ST009999/POS/QC_01.mzML", mzml(dda_spectra(6)))
+        data = buffer.getvalue()
+        name = "ST009999_Rawdata.zip"
+        project = RepositoryProject(
+            repository="metabolomics_workbench", accession="ST009999", analysis_unit_id="an009999-neg",
+            eligible=True, selection_status="eligible", separation="LC-MS", acquisition_mode="DDA",
+            ion_mode="Negative", untargeted=True, total_download_bytes=len(data),
+            files=[RepositoryFile(name, len(data), f"https://example.org/{name}", role="shared_raw_archive",
+                                  checksum=hashlib.md5(data).hexdigest())],
+            sample_metadata=[{"sample_id": stem, "raw_file": f"{stem}.mzXML"} for stem in ("QC_01", "S_01")],
+        )
+
+        manifest = self.lease({name: data}, project)
+        converted = Path(manifest["raw_directory"]) / "converted" / "ST009999" / "NEG"
+
+        self.assertEqual([str((converted / f"{stem}.mzML").resolve()) for stem in ("QC_01", "S_01")],
+                         manifest["input_candidates"])
+        self.assertEqual([], manifest["input_conversions"]["encoding_choices"])
+        self.assertEqual((2, 0), (_stage(manifest, "convert")["converted"],
+                                  _stage(manifest, "convert")["not_converted_readable_encoding"]))
+        built = build_repository_analysis_rows(manifest)
+        self.assertEqual([], built["failures"])
+        self.assertEqual(manifest["input_candidates"], sorted(item["file_path"] for item in built["rows"]))
+
+    def test_one_samples_encodings_are_told_by_their_folders_less_the_words_naming_an_encoding(self) -> None:
+        root = self.root / "raw" / "data"
+
+        def one_sample(first: str, second: str) -> bool:
+            return _sample_locus(str(root / first), root) == _sample_locus(str(root / second), root)
+
+        self.assertTrue(one_sample("mzML/x.mzML", "mzXML/x.mzXML"), "ST003038's archives")
+        self.assertTrue(one_sample("ST1/NEG_mzML/x.mzML", "ST1/neg-mzXML/x.mzXML"))
+        self.assertTrue(one_sample("x.mzML", "mzXML/x.mzXML"))
+        self.assertTrue(one_sample("RAW/x.raw", "mzXML/x.mzXML"))
+        self.assertFalse(one_sample("POS/x.mzML", "NEG/x.mzXML"))
+        self.assertFalse(one_sample("HILIC_POS_mzML/x.mzML", "HILIC_NEG_mzXML/x.mzXML"))
+        self.assertFalse(one_sample("Batch_D/x.mzML", "Batch_E/x.mzXML"), "a one-letter word is not set aside")
 
     def test_an_mzml_twin_nothing_can_decode_does_not_outrank_the_mzxml(self) -> None:
         """A convertible mzXML outranks an unreadable twin (2026-09-30): a Numpress mzML is one."""

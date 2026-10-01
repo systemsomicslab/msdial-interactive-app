@@ -36,8 +36,11 @@ unit left with no input is excluded with the reason, and its preflight skips it.
 A re-lease reuses a conversion whose record still holds. Where extraction shows
 a vendor container or an mzML of the same sample beside an mzXML, the Catalog's
 encoding rule (shared test vectors `tests/vectors/encoding_preference.v1.json`)
-analyses that one and the mzXML is not converted. mzData, which nothing
-converts, still excludes its unit before download.
+analyses that one and the mzXML is not converted. Files are one sample's only
+where their folders agree once the words naming an encoding are set aside:
+`mzML/x.mzML` and `mzXML/x.mzXML` are, but a study archive's `POS/QC_01.mzML` is
+no encoding of `NEG/QC_01.mzXML`. mzData, which nothing converts, still excludes
+its unit before download.
 
 Agent-driven reanalysis also requires a user-reviewed `analysis_purpose` before
 download. That purpose anchors Class/contrast selection, annotation strategy,
