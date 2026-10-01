@@ -4,6 +4,79 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.20] - Unreleased
+
+### Added
+- One analysis input per vendor folder (Catalog 0.6.0, `analysis_input_model`
+  `one-input-per-sample.v1`). The handoff mapper keeps each
+  `vendor_folder_member` as a member of the folder it names. It reads
+  `analysis_inputs` (inline, or from `analysis_input_manifest_path`),
+  `analysis_inputs_declared`, `analysis_input_issues` and `split_hint`. When a
+  handoff's counts disagree with its own listing, that unit is excluded with
+  `analysis_input:count_mismatch`; the batch no longer raises. MetaboBank
+  MTBKS217 positive is 12 inputs, not 477 samples.
+- `container_completeness`. Before discovery, the lease checks every folder the
+  unit lists, member by member: the folder is there, every member has its
+  listed size, and nothing is left as `.part`. A folder short of a member stops
+  the lease by name. Files a reader writes into the folder it reads are told
+  apart by the shared rules in `msdial_app.reader_created`. Only a Bruker BAF
+  `.d` has them: baf2sql's `analysis.sqlite`, with its journal and write-ahead
+  files. An `analysis.sqlite` in an Agilent `.d` is recorded as unlisted.
+- The analysis CSV of a manifest with `input_lineage` is built from the lineage
+  (`repository_analysis_rows`), one row per analysis input.
+  - `acquisition_type` is, in order:
+    - under an applied campaign disposition, the type the disposition decided;
+    - otherwise the file's own `console_acquisition_type`;
+    - failing that, the unit's declared DDA, SWATH or AIF.
+  - A bare `DIA` is refused as `acquisition_type_ambiguous`. An input the
+    disposition read and decided no type for is refused as
+    `acquisition_type_not_decided`.
+  - Some paths or names cannot be read back by the Console's parser (a comma, a
+    quote, non-ASCII). Such an input is read through an alias in
+    `raw\console-aliases`. A folder gets a junction. A file gets a hard link,
+    and so do its SCIEX companions (`{stem}.wiff.scan`, `{stem}.wiff2.scan`,
+    `{stem}.timeseries.data`).
+  - When a unit's records disagree, `analysis_csv` is recorded as failed with
+    codes, and the tool returns `ok: false`.
+- Two kinds of excluded input get no CSV row:
+  - inputs an applied `campaign_disposition` excluded;
+  - an mzML the lease excluded as `unsupported_mzml_encoding` (0.5.18).
+  Each is named with its reason and sample in `analysis_csv.excluded_inputs`.
+  Its declared input and its sample are not counted missing.
+- The execution gate refuses a workflow that runs an input with a different
+  acquisition type than its lineage-built CSV row. That type is recorded on
+  the input's lineage row. The gate reads a Console alias as the input it
+  stands for.
+
+### Changed
+- Declared inputs are matched by path, and every one is required. A basename
+  match is no longer a fallback (`match_declared_inputs`). A declared archived
+  container is also found:
+  - at the `container_path` recorded when its own archive was extracted;
+  - failing that, through the sample its archive names.
+  A MetaboLights `A.d.zip` holding `B.d` is therefore B.d's sample's input.
+- The execution gate now looks up an input's decided type and its disposition
+  exclusion through its Console alias, as it already did its header.
+- The CSV builder reads the campaign disposition through the execution gate's
+  own readers.
+- `_find_msdial_inputs` returns only the outermost `.d`/`.raw` folders.
+- A split part keeps only its own folders' inputs and members.
+- A Console is trusted to read folder inputs on the strength of its
+  `msdial-console-build-provenance.json`, not its path. The record's git head
+  must descend from 77a42a87c (#739). Both pinned Consoles and 31dea2b39 are
+  accepted, and `MSDIAL_ASSUME_FOLDER_TYPE_CSV_SUPPORTED=1` still overrides.
+- The lineage path's answer seed carries the acquisition type every row
+  shares, and none where the rows differ. It used to carry the unit's label
+  ('DIA' as SWATH), which the guided plan wrote over every file.
+- `_tree_size` counts an aliased folder or a hard-linked file once.
+
+### Known limitations
+- The gate's INP-1 counts only a binding disposition's `excluded_inputs` beside
+  the input candidates until its next release, so a declared unit whose lease
+  excluded an undecodable mzML FAILs INP-1 although its CSV is correct. That
+  gate change must land before a campaign runs. CLS-2 and ORD-1's recorded-order
+  source do not yet read aliased rows, folded Class labels or excluded inputs.
+
 ## [0.5.19] - Unreleased
 
 ### Changed

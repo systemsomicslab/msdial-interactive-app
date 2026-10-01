@@ -41,7 +41,7 @@ from .diagnostic_paths import (
 from .download_store import unlink_tree
 from .mzml_encoding import UNSUPPORTED_MZML_ENCODING, scan_mzml_encoding
 from .process_liveness import process_created_at, process_is_alive
-from .reader_created import reader_created_files, reader_created_names
+from .reader_created import container_members, reader_created_files, reader_created_names
 
 try:
     import msvcrt
@@ -82,6 +82,10 @@ class RepositoryFile:
     url: str = ""
     role: str = "raw"
     checksum: str = ""
+    # The analysis input this file belongs to, as the Catalog lists it: the vendor folder a member lies in
+    # (raw/x.raw for raw/x.raw/_FUNC001.DAT), or the container a per-sample archive unpacks to. "" for a
+    # file that is an input of its own.
+    container: str = ""
 
 
 def requires_msdial_conversion(name: str) -> bool:
@@ -124,6 +128,15 @@ class RepositoryProject:
     class_proposal: dict[str, Any] | None = None
     blocking_reasons: list[str] = field(default_factory=list)
     pending_decisions: list[str] = field(default_factory=list)
+    # ONE ANALYSIS INPUT PER VENDOR CONTAINER (Catalog 0.6.0, analysis_input_model one-input-per-sample.v1).
+    # What MS-DIAL opens, one entry per sample row: a file, a vendor folder whose members `files` lists one
+    # by one, or the container a per-sample archive unpacks to. Empty when the Catalog declared none - a unit
+    # whose data sit inside a study archive finds its inputs after the download, by its sample names, as
+    # every unit did before.
+    analysis_inputs: list[dict[str, Any]] = field(default_factory=list)
+    analysis_inputs_declared: bool = False
+    analysis_input_issues: list[dict[str, Any]] = field(default_factory=list)
+    split_hint: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.publications and self.publication_status == "none_recorded":
@@ -1284,11 +1297,13 @@ def create_download_lease(
     - materialise and convert: recorded as not_used. The accession download store and the mzXML
       conversion are wired in here, after extraction and before input discovery, and nothing else in the
       order changes when they are;
-    - discover: the MS-DIAL inputs under the data root;
-    - attribute: the unit's own inputs, extracted files and declared checksums (allowlist_checksum_
-      validation), and one input_lineage row per input. An mzML whose binary arrays RawDataHandler cannot
-      decode is not an input: it is listed in excluded_input_candidates and in input_lineage's excluded
-      rows, with reason unsupported_mzml_encoding and the accessions found (_exclude_undecodable_inputs);
+    - discover: every vendor folder listed member by member checked whole (container_completeness),
+      then the MS-DIAL inputs under the data root, outermost folders only;
+    - attribute: the unit's own inputs - by path, every one, when the Catalog declared them
+      (analysis_inputs) - extracted files and declared checksums (allowlist_checksum_validation), and one
+      input_lineage row per input. An mzML whose binary arrays RawDataHandler cannot decode is not an
+      input: it is listed in excluded_input_candidates and in input_lineage's excluded rows, with reason
+      unsupported_mzml_encoding and the accessions found (_exclude_undecodable_inputs);
     - record: the manifest.
 
     The stages are written into the manifest as they finish, so a lease that stops says where
@@ -1523,8 +1538,18 @@ def create_download_lease(
         stages.not_used("convert", "No input conversion ran in this lease.")
 
         stages.start("discover")
+        # Before anything is discovered: a folder that did not arrive whole is no input at all.
+        container_completeness = verify_container_completeness(data_root, project)
         all_inputs = _find_msdial_inputs(data_root)
-        stages.finish("discover", input_candidates=len(all_inputs))
+        stages.finish(
+            "discover",
+            input_candidates=len(all_inputs),
+            **(
+                {"vendor_folders_complete": container_completeness["containers"]}
+                if container_completeness["required"]
+                else {}
+            ),
+        )
 
         stages.start("attribute")
         archive_samples = _archive_sample_attribution(
@@ -1538,7 +1563,11 @@ def create_download_lease(
             data_root, project, verified_checksums, downloads, archive_extractions
         )
         inputs = _filter_inputs_by_project_allowlist(
-            all_inputs, data_root, project, archive_samples=archive_samples
+            all_inputs,
+            data_root,
+            project,
+            archive_samples=archive_samples,
+            archive_extractions=archive_extractions,
         )
         inputs, excluded_inputs, mzml_scanned = _exclude_undecodable_inputs(inputs)
         analysis_input = _common_input_path(inputs, data_root)
@@ -1605,6 +1634,8 @@ def create_download_lease(
         if excluded_inputs:
             # Only where one was, so a unit with nothing excluded records what it always did.
             manifest["excluded_input_candidates"] = excluded_inputs
+        if container_completeness["required"]:
+            manifest["container_completeness"] = container_completeness
         warnings = _archive_warnings(archive_extractions)
         if warnings:
             manifest["archive_warnings"] = warnings
@@ -4223,9 +4254,22 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
             if str((sample or {}).get("sample_id") or "") in sample_ids
         ]
         project["sample_count"] = len(project["sample_metadata"]) or part["file_count"]
+        if project.get("analysis_inputs"):
+            # The Catalog's inputs of this part's samples only, so a part's analysis CSV is held to its own
+            # inputs and not to the parent's.
+            project["analysis_inputs"] = [
+                entry for entry in parent_project.get("analysis_inputs") or []
+                if isinstance(entry, dict) and str(entry.get("sample_id") or "") in sample_ids
+            ]
+        # A folder's files are listed one by one, as its members (Catalog 0.6.0): they go with the part
+        # whose input their folder is, so a part's download description is its own folders'.
         matched_files = [
             item for item in parent_project.get("files") or []
             if PurePosixPath(str(item.get("name") or "").replace("\\", "/")).name.casefold() in names
+            or (
+                str(item.get("role") or "") == VENDOR_FOLDER_MEMBER_ROLE
+                and PurePosixPath(str(item.get("container") or "").replace("\\", "/")).name.casefold() in names
+            )
         ]
         # An archive unit's file list names the archive, not the files inside it; the part then
         # shares the parent's download description rather than being given an empty one.
@@ -4418,9 +4462,10 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
         for item in (manifest.get("input_candidates") or [])
         if str(item).strip()
     }
+    aliases = console_alias_inputs(manifest)
     if admitted:
         requested = [
-            Path(str(item.get("file_path") or "")).resolve()
+            Path(_unit_input_of(str(item.get("file_path") or ""), aliases)).resolve()
             for item in (state.get("files") or [])
             if str(item.get("file_path") or "").strip()
         ]
@@ -4429,6 +4474,27 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             blockers.append(
                 f"{len(outside)} input files are not among the files this unit's manifest admitted; "
                 f"the first is {outside[0]}."
+            )
+
+    # An analysis CSV built from the input lineage wrote each input's acquisition type - the one an applied
+    # campaign disposition decided, else its own header's - and recorded it on the input's lineage row
+    # (repository_analysis_rows). A workflow that has since set another type for an input - one answer
+    # written over every file - would deconvolute it as something its header did not say, and a header's
+    # 'DIA' admits SWATH and AIF alike, so the check below cannot tell. The type the CSV wrote is the one
+    # the input runs as.
+    written = _written_acquisition_by_input(manifest)
+    if written:
+        rewritten = []
+        for item in state.get("files") or []:
+            path_text = str(item.get("file_path") or "").strip()
+            expected = written.get(_file_key(_unit_input_of(path_text, aliases))) if path_text else None
+            requested = str(item.get("acquisition_type") or "DDA").strip() or "DDA"
+            if expected and requested != expected:
+                rewritten.append(f"{Path(path_text).name} (written {expected}, run as {requested})")
+        if rewritten:
+            blockers.append(
+                f"{len(rewritten)} input files would run with an acquisition type other than the one this "
+                f"unit's analysis CSV wrote for them; the first is {rewritten[0]}."
             )
 
     # A run in the wrong polarity produces a complete, validated, entirely void result, and no later
@@ -4455,7 +4521,8 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
     # The type an applied campaign disposition decided a file runs as - from its header, from the
     # repository's declaration where no header could be read or a low-confidence one disagreed, or DDA for
     # an MS1-only file folded into a DDA run - is the one type that file may run as. A file with no decision
-    # is held to what its header alone admits, as before dispositions existed.
+    # is held to what its header alone admits, as before dispositions existed. Both are recorded against the
+    # input, so a row that reads it through a Console alias is looked up as that input.
     decided_types = _decided_acquisition_by_file(manifest)
     if header_modes or decided_types:
         disagreeing = []
@@ -4464,15 +4531,16 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             path_text = str(item.get("file_path") or "").strip()
             if not path_text:
                 continue
+            input_key = _file_key(_unit_input_of(path_text, aliases))
             given = str(item.get("acquisition_type") or "").strip()
-            decided = decided_types.get(_file_key(path_text))
+            decided = decided_types.get(input_key)
             if decided:
                 if given != decided:
                     # A blank type is not the decided one even where the decision is DDA: the Console reads
                     # a blank, or any value it cannot parse, as DDA without a word.
                     undecided_as.append(f"{Path(path_text).name} (decided {decided}, run as {given or 'no type'})")
                 continue
-            header = header_modes.get(_file_key(path_text))
+            header = header_modes.get(input_key)
             requested = given or "DDA"
             if header and requested not in HEADER_ACQUISITION_TO_MSDIAL.get(header, {header}):
                 disagreeing.append(f"{Path(path_text).name} (header {header}, run as {requested})")
@@ -4488,14 +4556,15 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             )
 
     # An input a campaign disposition excluded - unreadable, ion mobility, out of scope - is not part of
-    # the run that disposition allowed, whatever the input list still names.
+    # the run that disposition allowed, whatever the input list still names, and whatever alias names it.
     excluded = _campaign_excluded_inputs(manifest)
     if excluded:
-        named = [
-            f"{Path(str(item.get('file_path'))).name} ({excluded[_file_key(str(item.get('file_path')))]})"
-            for item in state.get("files") or []
-            if str(item.get("file_path") or "").strip() and _file_key(str(item.get("file_path"))) in excluded
-        ]
+        named = []
+        for item in state.get("files") or []:
+            path_text = str(item.get("file_path") or "").strip()
+            reason = excluded.get(_file_key(_unit_input_of(path_text, aliases))) if path_text else None
+            if reason is not None:
+                named.append(f"{Path(path_text).name} ({reason})")
         if named:
             blockers.append(
                 f"{len(named)} input files were excluded by this unit's campaign disposition; the first is "
@@ -4573,12 +4642,85 @@ def _campaign_excluded_inputs(manifest: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def console_alias_inputs(manifest: dict[str, Any]) -> dict[str, str]:
+    """The input each Console alias of the unit stands for, keyed by the alias's _file_key.
+
+    The analysis-CSV builder (repository_analysis_rows) reads an input whose own path the Console cannot
+    read through an ASCII-safe alias in raw\\console-aliases, and records it on the input's lineage row. A
+    directory junction resolves to its input already; a hard link resolves to itself, so every check that
+    asks whether a CSV row is one of the unit's inputs asks it of the input the alias stands for. An alias
+    counts only while it still is that input (os.path.samefile). Empty for a unit with none.
+    """
+    result: dict[str, str] = {}
+    for row in ((manifest or {}).get("input_lineage") or {}).get("rows") or []:
+        alias = row.get("console_alias") if isinstance(row, dict) else None
+        if not isinstance(alias, dict):
+            continue
+        link, target = str(alias.get("path") or ""), str(row.get("path") or "")
+        try:
+            same = bool(link and target) and os.path.samefile(link, target)
+        except OSError:
+            same = False
+        if same:
+            result[_file_key(link)] = target
+    return result
+
+
+def _unit_input_of(path_text: str, aliases: dict[str, str]) -> str:
+    """The unit's input a CSV row names: itself, or the input its Console alias stands for."""
+    return aliases.get(_file_key(path_text), path_text) if aliases else path_text
+
+
+def _written_acquisition_by_input(manifest: dict[str, Any]) -> dict[str, str]:
+    """The acquisition type the unit's lineage-built analysis CSV wrote for each input, by _file_key.
+
+    record_analysis_csv puts it on the input's lineage row. Empty for a unit whose CSV was matched by
+    name, or not yet written.
+    """
+    if ((manifest or {}).get("analysis_csv") or {}).get("status") != "written":
+        return {}
+    result: dict[str, str] = {}
+    for row in ((manifest or {}).get("input_lineage") or {}).get("rows") or []:
+        if not isinstance(row, dict):
+            continue
+        path_text, value = str(row.get("path") or "").strip(), str(row.get("acquisition_type") or "").strip()
+        if path_text and value:
+            result[_file_key(path_text)] = value
+    return result
+
+
 def _tree_size(root: Path) -> tuple[int, int]:
     """Return (file count, total bytes) under root, or (0, 0) when it is gone."""
     if not root.is_dir():
         return 0, 0
-    files = [path for path in root.rglob("*") if path.is_file()]
-    return len(files), sum(path.stat().st_size for path in files)
+    count = size = 0
+    linked: set[tuple[int, int]] = set()
+    for directory, directories, names in os.walk(root):
+        # A directory junction is an alias the analysis CSV reads a folder through (console-aliases), not a
+        # second copy of it, and Path.rglob and os.walk both descend into one. Its bytes are counted once,
+        # where the folder is; so are a hard-linked file's, whichever of its names is met first.
+        directories[:] = [
+            name for name in directories
+            if not (os.path.islink(os.path.join(directory, name)) or _is_junction(os.path.join(directory, name)))
+        ]
+        for name in names:
+            path = Path(directory) / name
+            if not path.is_file():
+                continue
+            status = path.stat()
+            if status.st_nlink > 1:
+                identity = (status.st_dev, status.st_ino)
+                if identity in linked:
+                    continue
+                linked.add(identity)
+            count += 1
+            size += status.st_size
+    return count, size
+
+
+def _is_junction(path: str | Path) -> bool:
+    isjunction = getattr(os.path, "isjunction", None)
+    return bool(isjunction and isjunction(path))
 
 
 def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
@@ -4795,6 +4937,7 @@ def project_from_dict(value: dict[str, Any]) -> RepositoryProject:
             "url": str(item.get("url") or item.get("download_url") or ""),
             "role": str(item.get("role") or "raw"),
             "checksum": str(item.get("checksum") or ""),
+            "container": str(item.get("container") or ""),
         }
         if (
             payload["role"] in ANALYSIS_INPUT_ROLES
@@ -4909,15 +5052,27 @@ def _filter_inputs_by_project_allowlist(
     project: RepositoryProject,
     *,
     archive_samples: dict[str, str] | None = None,
+    archive_extractions: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """The inputs that are this unit's: listed, named by its samples, or out of an archive one names.
 
     archive_samples is _archive_sample_attribution's: the files, and outermost .d/.raw folders, that
     came out of an archive exactly one of this unit's samples names (X.zip). Without it, only names
-    are matched, as they always were.
+    are matched, as they always were. archive_extractions is the lease's extraction records, which say
+    where a declared archived container really is (declared_archive_containers).
     """
     if not project.analysis_unit_id:
         return inputs
+    declared = declared_analysis_inputs(project)
+    if declared:
+        return _select_declared_inputs(
+            inputs,
+            data_root,
+            project,
+            declared,
+            archive_samples=archive_samples,
+            archive_extractions=archive_extractions,
+        )
     archive_samples = archive_samples or {}
     allowed = _project_allowlist(project, analysis_only=True)
     sample_names = _sample_file_names(project)
@@ -4948,6 +5103,181 @@ def _filter_inputs_by_project_allowlist(
             f"{project.analysis_unit_id}. Refusing to fall back to accession-level inputs."
         )
     return selected
+
+
+# The kinds of Catalog analysis input MS-DIAL opens. A declared directory (a Bruker NMR experiment folder)
+# is a sample but never an input, and the Catalog blocks a unit that holds one.
+DECLARED_INPUT_KINDS = frozenset({"file", "vendor_folder", "archived_container"})
+
+
+def declared_analysis_inputs(project: RepositoryProject) -> dict[str, dict[str, Any]]:
+    """The Catalog's declared analysis inputs that MS-DIAL opens, by path relative to the data root.
+
+    Keyed as the lease places them: '/'-separated, casefolded, less a leading FILES/ (_safe_relative_name).
+    Empty when the Catalog declared none. An input it says must be converted first (mzXML) is left out:
+    no reader opens it, and what a conversion writes is attributed through its own record.
+    """
+    result: dict[str, dict[str, Any]] = {}
+    for entry in project.analysis_inputs or []:
+        if not isinstance(entry, dict) or entry.get("requires_conversion"):
+            continue
+        if str(entry.get("kind") or "") not in DECLARED_INPUT_KINDS:
+            continue
+        try:
+            key = _safe_relative_name(str(entry.get("path") or "")).as_posix().casefold()
+        except ValueError:
+            continue
+        result[key] = entry
+    return result
+
+
+def declared_archive_containers(
+    project: RepositoryProject,
+    declared: dict[str, dict[str, Any]],
+    archive_extractions: list[dict[str, Any]] | None,
+) -> dict[str, str]:
+    """Where each declared archived container really is, relative to the data root: {that path: its key}.
+
+    The Catalog names an archived container after its archive - raw/A.d for raw/A.d.zip - because the
+    listing shows nothing inside it. archives.destination_rule extracts a container as it was packed, so
+    A.d.zip holding B.d is B.d (container_rooted_other_name): renaming it would decide which sample it is.
+    The extraction record of the container's own archive, found by the archive's download URL, says where
+    it went (container_path). Only paths that differ from the declared one are returned, keyed as
+    declared_analysis_inputs keys them.
+    """
+    archives_of: dict[str, str] = {}
+    for key, entry in declared.items():
+        if str(entry.get("kind") or "") != "archived_container" or not str(entry.get("archive") or "").strip():
+            continue
+        try:
+            archives_of[_safe_relative_name(str(entry["archive"])).as_posix().casefold()] = key
+        except ValueError:
+            continue
+    if not archives_of or not archive_extractions:
+        return {}
+    by_url: dict[str, str] = {}
+    for item in project.files:
+        try:
+            name = _safe_relative_name(item.name).as_posix().casefold()
+        except ValueError:
+            continue
+        if name in archives_of and item.url:
+            by_url.setdefault(item.url, archives_of[name])
+    result: dict[str, str] = {}
+    for record in archive_extractions:
+        if not isinstance(record, dict):
+            continue
+        key = by_url.get(str(record.get("source_url") or ""))
+        container = str(record.get("container_path") or "").replace("\\", "/").strip("/") if key else ""
+        if not container:
+            continue
+        try:
+            located = _safe_relative_name(container).as_posix().casefold()
+        except ValueError:
+            continue
+        if located != key:
+            result.setdefault(located, key)
+    return result
+
+
+def match_declared_inputs(
+    inputs: list[str],
+    data_root: Path,
+    declared: dict[str, dict[str, Any]],
+    *,
+    containers: dict[str, str] | None = None,
+    samples: dict[str, str] | None = None,
+) -> dict[str, list[str]]:
+    """Which inputs are which declared analysis input: {declared key: [inputs]}, every key present.
+
+    The lease's allow-list and the analysis-CSV builder both ask this, and must answer it alike. An input
+    is matched by its path relative to the data root, the most specific form first (_allowlist_forms),
+    so it is one declared input's whichever others share a tail; else at the path its archive's
+    extraction record gives a declared archived container (``containers``, declared_archive_containers).
+    An input still unmatched is an archived container's when ``samples`` (by _file_key) gives it the one
+    sample that container is declared for and no input was matched to it: the attribution through the
+    archive that sample names (_archive_sample_attribution, or a lineage row's sample_id), which is how
+    such a container was admitted before the Catalog declared its inputs.
+    """
+    containers = containers or {}
+    samples = samples or {}
+    found: dict[str, list[str]] = {key: [] for key in declared}
+    unmatched: list[str] = []
+    for item in inputs:
+        relative = _relative_to_data_root(Path(item), data_root)
+        if relative is None:
+            continue
+        forms = sorted(_allowlist_forms(relative), key=len, reverse=True)
+        key = next((form for form in forms if form in found), None)
+        if key is None:
+            key = next((containers[form] for form in forms if form in containers), None)
+        if key is None:
+            unmatched.append(item)
+        else:
+            found[key].append(item)
+    waiting: dict[str, str] = {}
+    for key, entry in declared.items():
+        sample = str(entry.get("sample_id") or "").strip()
+        if str(entry.get("kind") or "") == "archived_container" and sample and not found[key]:
+            waiting[sample] = key
+    for item in unmatched if waiting and samples else []:
+        key = waiting.get(str(samples.get(_file_key(item)) or "").strip())
+        if key is not None:
+            found[key].append(item)
+    return found
+
+
+def _select_declared_inputs(
+    inputs: list[str],
+    data_root: Path,
+    project: RepositoryProject,
+    declared: dict[str, dict[str, Any]],
+    *,
+    archive_samples: dict[str, str] | None = None,
+    archive_extractions: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    """The inputs that are this unit's declared analysis inputs, matched by path, every one of them.
+
+    WHY BY PATH, AND WHY EVERY ONE. Before the Catalog declared its inputs, an input was admitted when a
+    listed name or a sample's file name matched its basename. A Waters folder matched neither - its
+    listing names the files inside it - so a MetaboBank folder unit raised "did not contain an MS-DIAL
+    input" after its whole download; a Bruker folder passed only because its 0-byte marker file X.d/X.d
+    happens to carry the folder's name. The declared path is what the Catalog attributed to a sample row,
+    so it is what is matched, and a declared input that is not on disk stops the lease by name rather than
+    leaving a unit that silently lost a sample. A basename match is not a fallback here: it is how an input
+    another unit shares a name with would get in. An archived container is matched where its archive put
+    it, and through the archive its sample names (match_declared_inputs).
+    """
+    found = match_declared_inputs(
+        inputs,
+        data_root,
+        declared,
+        containers=declared_archive_containers(project, declared, archive_extractions),
+        samples=archive_samples,
+    )
+    missing = [str(declared[key].get("path") or key) for key, matched in found.items() if not matched]
+    doubled = [
+        f"{declared[key].get('path') or key} ({len(matched)} inputs)"
+        for key, matched in found.items()
+        if len(matched) > 1
+    ]
+    if missing or doubled:
+        problems = []
+        if missing:
+            problems.append(
+                f"{len(missing)} of its {len(declared)} declared analysis inputs are not in the download: "
+                + ", ".join(sorted(missing, key=str.casefold)[:5])
+                + (f", and {len(missing) - 5} more" if len(missing) > 5 else "")
+            )
+        if doubled:
+            problems.append("declared inputs found more than once: " + ", ".join(doubled[:5]))
+        raise ValueError(
+            f"Analysis unit {project.analysis_unit_id} declares its analysis inputs, and "
+            + "; ".join(problems)
+            + ". Refusing to run it without them."
+        )
+    selected = {item for matched in found.values() for item in matched}
+    return [item for item in inputs if item in selected]
 
 
 
@@ -5656,6 +5986,137 @@ def _archive_warnings(records: list[dict[str, Any]]) -> list[dict[str, str]]:
     return warnings
 
 
+# The role the Catalog gives a file inside a vendor folder it lists member by member (Catalog 0.6.0). A
+# member is downloaded, checksummed and covered, and is never an input or a sample: its folder is.
+VENDOR_FOLDER_MEMBER_ROLE = "vendor_folder_member"
+# What a partial transfer leaves beside its file (RepositoryHttpClient.download).
+PARTIAL_TRANSFER_SUFFIXES = (".part", ".part.json")
+
+
+def _vendor_container_of(name: str) -> str:
+    """The outermost .d/.raw folder a listed file lies in, as the Catalog's container_of reads it; ''."""
+    parts = [part for part in str(name or "").replace("\\", "/").split("/") if part]
+    for index, part in enumerate(parts[:-1]):
+        lowered = part.casefold()
+        if lowered.endswith(archives.FOLDER_CONTAINER_SUFFIXES) and lowered not in archives.FOLDER_CONTAINER_SUFFIXES:
+            return "/".join(parts[: index + 1])
+    return ""
+
+
+def verify_container_completeness(data_root: Path, project: RepositoryProject) -> dict[str, Any]:
+    """Whether every vendor folder the unit lists member by member arrived whole. Raises when one did not.
+
+    WHY. A folder is one data file, so a folder short of one member is a damaged data file, and its reader
+    either fails deep inside a vendor SDK or reads what is there: a Waters .raw missing one _FUNCnnn.DAT has
+    silently lost an acquisition function. The download compares each member's published MD5 as it lands,
+    but a member published without one, a folder whose members were never all fetched, or a workspace a
+    lease reused is not caught by that. So each declared folder must be a directory holding every member
+    it lists, each of its listed size, and no partial transfer (.part, .part.json).
+
+    A file inside the folder that the listing does not name is recorded, not refused: one a vendor reader
+    writes into the folder it reads (msdial_app.reader_created: Bruker's baf2sql writes analysis.sqlite, and
+    its journal while it writes, into a BAF .d) as reader_created_files, and anything else as unlisted, for
+    a reader of the record. A listed member of a name such a reader writes may have been rewritten by it, so
+    its size is not held to the listing. Only files of role vendor_folder_member are checked, so a unit
+    whose listing names no folder member (every handoff before Catalog 0.6.0, an archive unit) records that
+    nothing was required.
+    """
+    members: dict[str, list[RepositoryFile]] = {}
+    spelled: dict[str, str] = {}
+    for item in project.files:
+        if item.role != VENDOR_FOLDER_MEMBER_ROLE:
+            continue
+        container = str(item.container or "").strip() or _vendor_container_of(item.name)
+        try:
+            key = _safe_relative_name(container).as_posix().casefold() if container else ""
+        except ValueError:
+            key = ""
+        if not key:
+            raise ValueError(f"Folder member {item.name} names no vendor folder it lies in.")
+        members.setdefault(key, []).append(item)
+        spelled.setdefault(key, container)
+    if not members:
+        return {"required": False, "containers": 0, "members": 0}
+
+    # Where each folder is: an archive may have put the listed tree under a folder of its own (MB-POST's
+    # project tar), so folders are found by the same relative forms the allow-list reads, a folder at
+    # exactly the listed path before one that only ends in it.
+    on_disk: dict[str, Path] = {}
+    for directory, directories, _names in os.walk(data_root):
+        for name in list(directories):
+            if not name.casefold().endswith(archives.FOLDER_CONTAINER_SUFFIXES):
+                continue
+            path = Path(directory) / name
+            relative = _relative_to_data_root(path, data_root)
+            if relative is None:
+                continue
+            if relative in members:
+                on_disk[relative] = path
+                continue
+            for form in _allowlist_forms(relative):
+                if form in members:
+                    on_disk.setdefault(form, path)
+
+    problems: list[str] = []
+    reader_created: list[str] = []
+    unlisted: list[str] = []
+    for key, listed in sorted(members.items()):
+        container = spelled[key]
+        folder = on_disk.get(key)
+        if folder is None:
+            problems.append(f"{container}: the folder is not in the download")
+            continue
+        offset = len(_safe_relative_name(container).as_posix()) + 1
+        expected: dict[str, tuple[str, RepositoryFile]] = {}
+        for item in listed:
+            relative = _safe_relative_name(item.name).as_posix()[offset:]
+            expected[relative.casefold()] = (relative, item)
+        # The names a reader may write into this folder: none unless its rule applies (a BAF .d).
+        reader_names = reader_created_names(folder)
+        missing: list[str] = []
+        resized: list[str] = []
+        for relative, item in expected.values():
+            path = folder / relative
+            if not path.is_file():
+                missing.append(relative)
+            elif item.size_bytes and path.stat().st_size != item.size_bytes and relative.casefold() not in reader_names:
+                resized.append(f"{relative} ({path.stat().st_size} of {item.size_bytes} bytes)")
+        partial: list[str] = []
+        not_listed: list[str] = []
+        for directory, _directories, names in os.walk(folder):
+            for name in names:
+                relative = (Path(directory) / name).relative_to(folder).as_posix()
+                if name.casefold().endswith(PARTIAL_TRANSFER_SUFFIXES):
+                    partial.append(relative)
+                elif relative.casefold() not in expected:
+                    not_listed.append(relative)
+        own, created = container_members(folder, not_listed, [relative for relative, _item in expected.values()])
+        unlisted.extend(f"{container}/{relative}" for relative in own)
+        reader_created.extend(f"{container}/{relative}" for relative in created)
+        for label, found in (("missing", missing), ("of another size", resized), ("partial", partial)):
+            if found:
+                problems.append(
+                    f"{container}: {len(found)} member(s) {label}: " + ", ".join(sorted(found)[:3])
+                )
+    record: dict[str, Any] = {
+        "required": True,
+        "containers": len(members),
+        "members": sum(len(items) for items in members.values()),
+        "complete": not problems,
+        "reader_created_files": sorted(reader_created),
+        "unlisted_file_count": len(unlisted),
+        "unlisted_files": sorted(unlisted)[:20],
+    }
+    if problems:
+        raise ValueError(
+            f"{len(problems)} of the unit's {len(members)} vendor folders did not arrive whole: "
+            + "; ".join(problems[:5])
+            + (f"; and {len(problems) - 5} more" if len(problems) > 5 else "")
+            + "."
+        )
+    return record
+
+
 def _find_msdial_inputs(root: Path) -> list[str]:
     paths = sorted(root.rglob("*"))
     vendor_roots = {
@@ -5663,7 +6124,13 @@ def _find_msdial_inputs(root: Path) -> list[str]:
         for path in paths
         if path.is_dir() and path.suffix.casefold() in {".d", ".raw"}
     }
-    result = [str(path) for path in sorted(vendor_roots)]
+    # OUTERMOST ROOTS ONLY. A folder is one data file, whatever it holds: an Agilent or Bruker .d may keep
+    # a directory whose name also ends in .d (a method, a calibration), and it is part of its folder, read
+    # by that folder's reader, never an input of its own.
+    outermost = {
+        path for path in vendor_roots if not any(parent in vendor_roots for parent in path.parents)
+    }
+    result = [str(path) for path in sorted(outermost)]
     for path in paths:
         lower = path.name.casefold()
         if not path.is_file() or _is_sidecar_name(path.name):
@@ -6104,8 +6571,9 @@ def recorded_order_match(
         for path in manifest.get("input_candidates") or []
         if str(path).strip()
     }
+    aliases = console_alias_inputs(manifest)
     same_unit = bool(candidates) and all(
-        str(Path(str(item.get("file_path", ""))).resolve()).casefold() in candidates
+        str(Path(_unit_input_of(str(item.get("file_path", "")), aliases)).resolve()).casefold() in candidates
         for item in files
     )
     in_csv: dict[str, Any] = {}
@@ -6189,8 +6657,10 @@ def recorded_order_source(manifest_path: Any, files: list[dict[str, Any]]) -> st
         if str(path).strip()
     }
     files = list(files or [])
+    aliases = console_alias_inputs(manifest)
     same_unit = bool(inputs) and all(
-        Path(str(item.get("file_path", "")).replace("\\", "/")).name.casefold() in inputs for item in files
+        Path(_unit_input_of(str(item.get("file_path", "")), aliases).replace("\\", "/")).name.casefold() in inputs
+        for item in files
     )
     return str(source) if same_unit and carries_recorded_order(record, files) else None
 

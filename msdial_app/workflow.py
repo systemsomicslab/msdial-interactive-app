@@ -681,6 +681,35 @@ def discover_console_paths(search_roots: Iterable[str | Path] | None = None) -> 
     }
 
 
+def console_safe_text(value: Any) -> bool:
+    """Whether the Console's analysis-CSV parser reads this value back exactly as it was written.
+
+    The parser (MsdialCoreTestApp AnalysisFilesParser) reads the file as ASCII and splits each line on
+    ',' with no quote handling: a non-ASCII character comes back as '?', and a comma or a quote shifts
+    every column after it. What passes is printable ASCII without either.
+    """
+    text = str(value)
+    return all(" " <= character <= "~" for character in text) and "," not in text and '"' not in text
+
+
+def analysis_input_path(path: str | Path) -> Path:
+    """The absolute path an analysis-CSV row names: resolved, unless that would undo a Console alias.
+
+    An input whose own path the Console cannot read (console_safe_text) is given an ASCII-safe alias, a
+    directory junction or a hard link, when the repository analysis CSV is built. Resolving a junction
+    names the unreadable path again, so a link whose own path is safe and whose target is not is kept as
+    written. Every other path resolves exactly as it always did.
+    """
+    source = Path(path).expanduser()
+    resolved = source.resolve()
+    if console_safe_text(resolved):
+        return resolved
+    absolute = Path(os.path.abspath(source))
+    isjunction = getattr(os.path, "isjunction", None)
+    linked = os.path.islink(absolute) or bool(isjunction and isjunction(absolute))
+    return absolute if linked and console_safe_text(absolute) else resolved
+
+
 def is_supported(path: Path) -> bool:
     return path.suffix.lower() in SUPPORTED_SUFFIXES or (
         path.is_dir() and path.name.lower().endswith((".d", ".raw"))
@@ -809,7 +838,7 @@ def read_analysis_csv(path: str | Path) -> dict[str, Any]:
             analysis_path = Path(raw_path).expanduser()
             if not analysis_path.is_absolute():
                 analysis_path = csv_path.parent / analysis_path
-            analysis_path = analysis_path.resolve()
+            analysis_path = analysis_input_path(analysis_path)
             if not analysis_path.exists():
                 rejected.append(f"{analysis_path} (not found; line {line_number})")
                 continue
@@ -1654,7 +1683,11 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                 "level": "error",
                 "message": (
                     "The selected MS-DIAL Console does not support folder-type raw-data "
-                    "paths in analysis_files.csv. Use the patched source build: "
+                    "paths in analysis_files.csv, as far as its build record shows: a Console "
+                    "qualifies when its msdial-console-build-provenance.json verifies against "
+                    f"the binary and records a commit descending from {FOLDER_TYPE_CSV_COMMIT[:9]} "
+                    "(#739) in its own source checkout. msdial_build_console_from_local_source "
+                    "writes that record; the patched source build is, for example, at "
                     f"{_patched_console_path_hint()}"
                 ),
             }
@@ -1789,7 +1822,7 @@ def prepare_run(
     if staging_folder is not None:
         staging_folder.mkdir(parents=True, exist_ok=True)
     for index, item in enumerate(files):
-        source = Path(item["file_path"]).resolve()
+        source = analysis_input_path(item["file_path"])
         if staging_folder is None:
             if progress:
                 progress(f"Using original input {index + 1}/{len(files)}: {source}")
@@ -2089,15 +2122,76 @@ def _patched_console_path_hint() -> str:
     )
 
 
+# The MsdialWorkbench commit that taught the Console's analysis-CSV parser to accept a directory as an
+# analysis file (#739, "Fix console CSV metadata and vendor folder inputs").
+FOLDER_TYPE_CSV_COMMIT = "77a42a87c844715a251950e2ee4c57dbeb898a48"
+_FOLDER_TYPE_CSV_VERDICTS: dict[tuple[str, int, int, int], bool] = {}
+
+
 def _console_supports_folder_type_csv(console_path: str) -> bool:
+    """Whether this Console reads a Waters .raw or Agilent/Bruker .d folder named in analysis_files.csv.
+
+    DECIDED BY WHAT THE BINARY IS, NOT WHERE IT IS. This used to look for the substring
+    \\MsdialWorkbench\\tests\\MSDIAL5\\MsdialCoreTestApp\\bin\\ in the path. The campaign's pinned
+    Consoles live in their own checkouts (MsdialWorkbench-console-c471463a5, -f56d4478a), so every folder
+    unit was refused on the Console that could read it, while any binary copied under a folder of the right
+    name would have been accepted. The Console qualifies when its build record verifies against the
+    assembly on disk and the commit it records descends from #739 (FOLDER_TYPE_CSV_COMMIT). The ancestry
+    is read with git merge-base in the Console's own source checkout; a Console with no record, a record
+    that describes another binary, or no checkout that knows the commit does not qualify.
+
+    MSDIAL_ASSUME_FOLDER_TYPE_CSV_SUPPORTED=1 still overrides it, for a Console built elsewhere.
+    """
     if os.environ.get("MSDIAL_ASSUME_FOLDER_TYPE_CSV_SUPPORTED") == "1":
         return True
-    path_text = str(console_path or "")
-    lowered = path_text.replace("/", "\\").lower()
-    return (
-        "\\msdialworkbench\\tests\\msdial5\\msdialcoretestapp\\bin\\" in lowered
-        and path_text.lower().endswith(("msdialcui.exe", "msdialcui.dll"))
-    )
+    text = str(console_path or "").strip()
+    if not text:
+        return False
+    path = Path(text).expanduser()
+    record = path.parent / CONSOLE_BUILD_PROVENANCE
+    try:
+        assembly = console_assembly_path(path)
+        binary, sidecar = assembly.stat(), record.stat()
+    except OSError:
+        return False
+    # The verdict costs a hash of the assembly and a git call; it holds while neither file changes.
+    key = (str(assembly.resolve()).casefold(), binary.st_size, binary.st_mtime_ns, sidecar.st_mtime_ns)
+    if key not in _FOLDER_TYPE_CSV_VERDICTS:
+        _FOLDER_TYPE_CSV_VERDICTS[key] = _build_descends_from(path, assembly, record, FOLDER_TYPE_CSV_COMMIT)
+    return _FOLDER_TYPE_CSV_VERDICTS[key]
+
+
+def _build_descends_from(console_path: Path, assembly: Path, record: Path, commit: str) -> bool:
+    """Whether the build record verifies against the assembly and records a commit descending from commit."""
+    try:
+        provenance = json.loads(record.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(provenance, dict) or provenance.get("binary_sha256") != _sha256_of(assembly):
+        return False
+    head = str(provenance.get("git_head") or "").strip()
+    root = find_console_source_root(console_path)
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", head) or root is None:
+        return False
+    return _is_ancestor(root, commit, head)
+
+
+def _is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
+    """git merge-base --is-ancestor, read-only: False when either commit is unknown to the checkout."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor", ancestor, descendant],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            encoding="utf-8",
+            errors="replace",
+            # A pinned Console's checkout is not this program's to write, and git takes no index lock then.
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def _prepare_temporary_console_input_folder(sources: list[Path], purpose: str) -> Path:

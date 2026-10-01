@@ -8,6 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from collections import Counter
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from functools import wraps
@@ -523,6 +524,129 @@ def _required_download_size(project: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+# The blocking reason a unit carries when the Catalog's analysis-input counts and its own listing disagree.
+ANALYSIS_INPUT_COUNT_MISMATCH = "analysis_input:count_mismatch"
+# Catalog issue codes that already block the unit, and under which sample rows and inputs may not pair up.
+_CATALOG_BLOCKING_INPUT_ISSUES = frozenset(
+    {
+        "container_shared_by_samples",
+        "sample_without_container",
+        "container_without_sample",
+        "declared_directory_not_msdial_input",
+    }
+)
+
+
+def _handoff_analysis_inputs(
+    handoff: dict[str, Any],
+    unit_id: str,
+    files: list[dict[str, Any]],
+    samples: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The Catalog's declared analysis inputs, and whether its counts agree with its own listing.
+
+    Catalog 0.6.0 lists one analysis input per sample row (analysis_input_model one-input-per-sample.v1):
+    a Waters .raw or Agilent/Bruker .d folder is one input and its files are members. The list is inline,
+    or in analysis_input_manifest_path when the handoff omits it, as files and samples may be. A handoff
+    without analysis_input_model predates it and returns ([], {}).
+
+    The check compares the counts the handoff states with the lists it carries: analysis_input_count,
+    analytical_sample_count and download_scope.analysis_file_count against the inputs; each vendor folder
+    against the members listed for it; and, where no Catalog issue already blocks the unit, the sample rows
+    against the inputs, one each. A disagreement is returned as {"status": "failed", "problems": [...]},
+    for the caller to record against this unit, never raised.
+    """
+    if "analysis_input_model" not in handoff:
+        return [], {}
+    payload = handoff.get("analysis_inputs") or []
+    if handoff.get("analysis_inputs_omitted") or (
+        not payload and handoff.get("analysis_inputs_declared") and handoff.get("analysis_input_manifest_path")
+    ):
+        path = Path(str(handoff.get("analysis_input_manifest_path") or "")).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"External analysis-input manifest for analysis unit {unit_id} was not found: {path}"
+            )
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(payload, list):
+            raise ValueError("External analysis-unit input manifest must contain a JSON array.")
+    inputs = [dict(item) for item in payload if isinstance(item, dict)]
+    problems: list[str] = []
+    declared = handoff.get("analysis_inputs_declared")
+    if declared is not None and bool(declared) != bool(inputs):
+        problems.append(
+            f"the handoff says analysis_inputs_declared={bool(declared)} but lists {len(inputs)} inputs"
+        )
+    scope = handoff.get("download_scope") or {}
+    for label, value in (
+        ("analysis_input_count", handoff.get("analysis_input_count")),
+        ("analytical_sample_count", handoff.get("analytical_sample_count")),
+        ("download_scope.analysis_file_count", scope.get("analysis_file_count")),
+    ):
+        if value is not None and int(value or 0) != len(inputs):
+            problems.append(f"{label} is {int(value or 0)} but {len(inputs)} analysis inputs are listed")
+    paths = [str(item.get("path") or "").replace("\\", "/").strip().rstrip("/").casefold() for item in inputs]
+    if "" in paths:
+        problems.append("an analysis input names no path")
+    doubled = sorted(path for path, count in Counter(paths).items() if path and count > 1)
+    if doubled:
+        problems.append("analysis inputs listed twice: " + ", ".join(doubled[:5]))
+    listed_members: dict[str, int] = {}
+    for item in files:
+        if item["role"] == "vendor_folder_member":
+            key = str(item.get("container") or "").replace("\\", "/").strip().rstrip("/").casefold()
+            listed_members[key] = listed_members.get(key, 0) + 1
+    folders = {
+        path: item for path, item in zip(paths, inputs) if str(item.get("kind") or "") == "vendor_folder"
+    }
+    for path, item in folders.items():
+        count = listed_members.get(path, 0)
+        if not count:
+            problems.append(f"vendor folder {item.get('path')} has no member in the file listing")
+        elif item.get("member_count") is not None and int(item.get("member_count") or 0) != count:
+            problems.append(
+                f"vendor folder {item.get('path')} declares {int(item.get('member_count') or 0)} members "
+                f"but the file listing holds {count}"
+            )
+    orphans = sorted(key or "(none)" for key in listed_members if key not in folders)
+    if orphans:
+        problems.append("folder members of a folder no analysis input names: " + ", ".join(orphans[:5]))
+    listed_names = {str(item["name"]).replace("\\", "/").casefold() for item in files}
+    for item in inputs:
+        archive = str(item.get("archive") or "").replace("\\", "/").casefold()
+        if str(item.get("kind") or "") == "archived_container" and archive and archive not in listed_names:
+            problems.append(f"archived container {item.get('path')} names an archive the file listing lacks")
+    blocked = {
+        str(item.get("code") or "")
+        for item in handoff.get("analysis_input_issues") or []
+        if isinstance(item, dict) and item.get("blocking")
+    } & _CATALOG_BLOCKING_INPUT_ISSUES
+    if inputs and not blocked:
+        # One input per sample row, each naming a row that exists. Where the Catalog already blocks the
+        # unit for the way rows and folders pair, the pairing is its issue to report, not a count mismatch.
+        claimed = [str(item.get("sample_id") or "") for item in inputs]
+        rows = {str(item.get("sample_id") or "") for item in samples}
+        if len(samples) != len(inputs):
+            problems.append(f"{len(samples)} sample rows are listed for {len(inputs)} analysis inputs")
+        if any(not value or value not in rows for value in claimed):
+            problems.append("an analysis input names no sample row of this unit")
+        if len(set(claimed)) != len(claimed):
+            problems.append("two analysis inputs name the same sample row")
+    if not problems:
+        return inputs, {"status": "passed", "analysis_inputs": len(inputs), "members": sum(listed_members.values())}
+    return inputs, {
+        "status": "failed",
+        "code": ANALYSIS_INPUT_COUNT_MISMATCH,
+        "problems": [
+            f"Analysis unit {unit_id}: the Catalog's analysis-input counts disagree with its listing: {problem}."
+            for problem in problems
+        ],
+        "analysis_inputs": len(inputs),
+        "sample_rows": len(samples),
+        "members": sum(listed_members.values()),
+    }
+
+
 def _project_from_analysis_unit_handoff(
     handoff: dict[str, Any], repository: str = "", accession: str = ""
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -556,6 +680,9 @@ def _project_from_analysis_unit_handoff(
         url = str(item.get("download_url") or "").strip()
         if not path or not url:
             raise ValueError(f"Analysis unit {unit_id} contains a file without path/download_url.")
+        # A vendor_folder_member keeps its role: it is downloaded and checksummed, and is never an input,
+        # so neither eligibility nor the allow-list reads it as one (a Waters _FUNC001.DAT is not a .dat
+        # file to convert). Its container says which folder it makes up.
         role = str(item.get("role") or "raw")
         if role in {"raw", "converted"} and (
             bool(item.get("requires_conversion")) or requires_msdial_conversion(path)
@@ -568,6 +695,7 @@ def _project_from_analysis_unit_handoff(
                 "url": url,
                 "role": role,
                 "checksum": str(item.get("checksum") or ""),
+                "container": str(item.get("container") or ""),
             }
         )
     if not files:
@@ -616,6 +744,7 @@ def _project_from_analysis_unit_handoff(
         raise ValueError(
             f"Analysis unit {unit_id} declares {declared_sample_count} sample rows but provides {len(samples)}."
         )
+    analysis_inputs, input_check = _handoff_analysis_inputs(handoff, unit_id, files, samples)
     untargeted = _optional_bool(settings.get("untargeted"))
     project = {
         "repository": handoff_repository,
@@ -649,7 +778,15 @@ def _project_from_analysis_unit_handoff(
         "blocking_reasons": [],
         "pending_decisions": [],
         "repository_metadata": {"catalog_handoff": handoff},
+        "analysis_inputs": analysis_inputs,
+        "analysis_inputs_declared": bool(analysis_inputs),
+        "analysis_input_issues": [
+            dict(item) for item in handoff.get("analysis_input_issues") or [] if isinstance(item, dict)
+        ],
+        "split_hint": handoff.get("split_hint") if isinstance(handoff.get("split_hint"), dict) else None,
     }
+    if input_check:
+        project["repository_metadata"]["analysis_input_check"] = input_check
     from .repository_reanalysis import EligibilityPolicy, evaluate_eligibility, project_from_dict
 
     typed = evaluate_eligibility(
@@ -668,6 +805,17 @@ def _project_from_analysis_unit_handoff(
         typed.review_reasons = list(dict.fromkeys([*typed.review_reasons, *technical_blocks]))
         typed.eligible = False
         typed.selection_status = "raw_metadata_required"
+    if input_check.get("status") == "failed":
+        # A FAILURE RECORD FOR THIS UNIT, NOT AN EXCEPTION FOR THE BATCH. The Catalog's counts and its own
+        # listing disagree, so which folder is which sample cannot be relied on; the unit is excluded with
+        # the reason, and a batch or campaign planning it goes on to the next unit.
+        decision_blocks.append(ANALYSIS_INPUT_COUNT_MISMATCH)
+        typed.exclusion_reasons = list(
+            dict.fromkeys([*typed.exclusion_reasons, *input_check["problems"]])
+        )
+        typed.review_reasons = []
+        typed.eligible = False
+        typed.selection_status = "excluded"
     typed.blocking_reasons = list(dict.fromkeys(decision_blocks))
     typed.pending_decisions = [
         "class_proposal" for item in decision_blocks if item == "class_proposal:missing"
@@ -1774,6 +1922,12 @@ def msdial_prepare_repository_reanalysis(
     manifest_path reaches a unit whose download job the backend no longer holds; the recognised files
     are then rebuilt from the manifest's input_candidates, as the download job built them. A campaign
     approval covering boundary 3 for the unit stands in for confirmed=true and is recorded in the manifest.
+
+    A manifest that carries input_lineage (every lease since 0.5.9) is built from it instead, one row per
+    analysis input, a vendor folder being one (repository_analysis_rows). Where its inputs, lineage,
+    declared inputs and sample rows disagree, or an acquisition type cannot be written, nothing is
+    written but the failure, which is recorded in the manifest and returned with ok false, so an
+    unattended caller goes on to its next unit.
     """
     job, manifest = _repository_unit(download_job_id, manifest_path, host, port)
     crossing = _campaign_authorization(
@@ -1811,6 +1965,17 @@ def msdial_prepare_repository_reanalysis(
             hierarchy if hierarchy is not None else workspace.get("hierarchy", [])
         )
         projected = project_class_hierarchy(workspace, selected_hierarchy)
+    if isinstance(manifest.get("input_lineage"), dict):
+        return _prepare_repository_rows_from_lineage(
+            job,
+            manifest,
+            projected,
+            selected_hierarchy,
+            download_job_id=download_job_id,
+            confirmed=confirmed,
+            allow_partial_mapping=allow_partial_mapping,
+            crossing=crossing,
+        )
     if job is not None:
         recognized = ((job.get("result") or {}).get("recognized") or {}).get("files", [])
     else:
@@ -1912,6 +2077,147 @@ def msdial_prepare_repository_reanalysis(
     return {
         "prepared": True,
         "input_path": input_path,
+        "output_root": output_root,
+        "files": saved,
+        "preview": preview,
+        "next_step": (
+            "Pass input_path and preview.answer_seed to msdial_guided_analysis_plan, then "
+            "collect any remaining scientific decisions before execution."
+        ),
+    }
+
+
+def _prepare_repository_rows_from_lineage(
+    job: dict[str, Any] | None,
+    manifest: dict[str, Any],
+    projected: dict[str, Any],
+    selected_hierarchy: list[str],
+    *,
+    download_job_id: str,
+    confirmed: bool,
+    allow_partial_mapping: bool,
+    crossing: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """msdial_prepare_repository_reanalysis for a manifest with input_lineage: one row per analysis input.
+
+    WHY NOT THE RECOGNISED FILES. They were the download job's, and the registry keeps a hundred jobs; they
+    were matched to sample rows by file name, which a folder named raw/x.raw/ in its sample row never
+    matched; and the unit's one acquisition label was written on every row. The rows come from the record
+    the lease wrote for this, and each row's acquisition type from that file's own header.
+    """
+    from .repository_analysis_rows import (
+        blocking_failures,
+        build_repository_analysis_rows,
+        create_console_aliases,
+        order_rows,
+        record_analysis_csv,
+        record_analysis_csv_failure,
+        write_analysis_csv,
+    )
+    from .repository_metadata import save_metadata_review
+    from .repository_qa import repository_internal_standard_evidence
+    from .repository_reanalysis import record_analytical_order, record_campaign_authorization
+
+    built = build_repository_analysis_rows(manifest, projected)
+    analytical_order = order_rows(manifest, built)
+    output_root = str(manifest.get("output_directory") or "")
+    raw_retention_policy = str(
+        (job or {}).get("raw_retention_policy") or manifest.get("raw_retention_policy") or "keep"
+    )
+    answer_seed = _repository_answer_seed(projected, manifest, output_root, raw_retention_policy)
+    # THE ROWS' TYPES, NOT THE UNIT'S. The guided plan writes an answered acquisition_type over every file
+    # (agent_workflow._workflow), and the seed reads the unit's one label, 'DIA' as SWATH: a Waters MSe
+    # unit whose headers say AIF would have run as SWATH. The seed carries the type every row shares, and
+    # none where the rows differ, so each file runs as the CSV says.
+    row_types = {row["acquisition_type"] for row in built["rows"] if row["acquisition_type"]}
+    if len(row_types) == 1:
+        answer_seed["acquisition_type"] = next(iter(row_types))
+    else:
+        answer_seed.pop("acquisition_type", None)
+    execution_allowed = manifest.get("execution_allowed") is True
+    execution_blockers: list[str] = []
+    if not execution_allowed:
+        execution_blockers.append(
+            "execution_allowed is not true for this analysis unit "
+            f"(status {manifest.get('status', 'unknown')!r}). MS-DIAL will refuse to start until a "
+            "raw-header preflight settles the unit's technical conditions."
+        )
+    failures = built["failures"]
+    blocking = blocking_failures(built, allow_partial_mapping)
+    unmatched = next((item["inputs"] for item in failures if item["code"] == "input_without_sample"), [])
+    ambiguous = next((item["inputs"] for item in failures if item["code"] == "sample_with_two_inputs"), [])
+    preview = {
+        "download_job_id": download_job_id,
+        "manifest_path": manifest["manifest_path"],
+        "analysis_input_path": manifest.get("analysis_input_path"),
+        "output_root": output_root,
+        "execution_allowed": execution_allowed,
+        "execution_blockers": execution_blockers,
+        "class_source": projected.get("class_source", "hierarchy"),
+        "class_proposal_provenance": projected.get("class_proposal_provenance"),
+        "class_hierarchy": selected_hierarchy,
+        "built_from": built["built_from"],
+        "counts": built["counts"],
+        "matched_count": sum(1 for row in built["rows"] if row["sample_id"]),
+        "recognized_count": len(built["rows"]),
+        "unmatched": unmatched,
+        "ambiguous": ambiguous,
+        "acquisition_types": {
+            value: sum(1 for row in built["rows"] if row["acquisition_type"] == value)
+            for value in built["acquisition_types"]
+        },
+        "console_aliases": len(built["aliases"]),
+        "class_id_aliases": built["class_id_aliases"],
+        "excluded_inputs": built["excluded_inputs"],
+        "failures": failures,
+        "blocking_failures": [item["code"] for item in blocking],
+        "answer_seed": answer_seed,
+        "qa_internal_standard_evidence": repository_internal_standard_evidence(projected),
+        "analytical_order": {
+            key: value for key, value in analytical_order.items() if key not in ("orders", "files")
+        } | {"files_recorded": len(analytical_order.get("files") or [])},
+    }
+    if crossing:
+        preview["campaign_authorization"] = crossing
+    if not confirmed and crossing is None:
+        return {
+            "prepared": False,
+            "confirmation_required": True,
+            "preview": preview,
+            "message": (
+                "Review the Class assignments and the one row per analysis input"
+                + (", and the failures that stop the CSV" if blocking else "")
+                + ". Call again with confirmed=true to write reviewed metadata and analysis_files.csv."
+            ),
+        }
+    if crossing:
+        record_campaign_authorization(manifest["manifest_path"], crossing)
+    if not blocking:
+        blocking = create_console_aliases(built)
+    if blocking:
+        # A FAILURE RECORD FOR THIS UNIT, NOT AN EXCEPTION. The unit's own records disagree, or a row
+        # could not be written as the Console reads it; the manifest says which, and nothing is written
+        # that a run could start from.
+        record = record_analysis_csv_failure(manifest["manifest_path"], built, blocking)
+        return {
+            "ok": False,
+            "prepared": False,
+            "reason": "analysis_csv_failed",
+            "codes": sorted({item["code"] for item in blocking}),
+            "detail": " ".join(item["message"] for item in blocking),
+            "analysis_csv": record,
+            "preview": preview,
+        }
+    saved = save_metadata_review(projected, output_root)
+    input_path = write_analysis_csv(built, Path(output_root) / "analysis_files.csv")
+    saved["analysis_files_csv"] = str(input_path)
+    record_analysis_csv(manifest["manifest_path"], built, input_path)
+    # Only once the CSV it describes exists, so a failed prepare cannot replace a valid record.
+    record_analytical_order(manifest["manifest_path"], analytical_order)
+    answer_seed["repository_metadata_path"] = saved["metadata_json"]
+    return {
+        "prepared": True,
+        "input_path": str(input_path),
         "output_root": output_root,
         "files": saved,
         "preview": preview,
