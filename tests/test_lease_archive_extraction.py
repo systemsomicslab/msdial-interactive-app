@@ -843,17 +843,30 @@ class EveryArchiveKindIsExtracted(_Workspace):
         )
         self.assertIn("no_member_integrity", {warning["kind"] for warning in lease["archive_warnings"]})
 
-    def test_an_mtbls688_mzxml_lzma_is_extracted_and_waits_for_conversion(self) -> None:
-        """MTBLS688 publishes only x.mzXML.lzma. It comes out as x.mzXML, which no lease converts yet."""
-        payload = b"<mzXML/>" * 50
-        with self.assertRaisesRegex(ValueError, "did not contain an MS-DIAL input"):
-            packed = lzma.compress(payload, format=lzma.FORMAT_ALONE)
-            self._lease_one("x.mzXML.lzma", packed, {"a": "x.mzXML.lzma"})
-        manifest = read_manifest(_manifest_path(self.root))
+    def test_an_mtbls688_mzxml_lzma_is_extracted_and_converted(self) -> None:
+        """MTBLS688 publishes only x.mzXML.lzma. It comes out as x.mzXML, which the convert stage writes as mzML."""
+        from test_mzxml_conversion import dda_32
 
-        self.assertEqual("attribute", manifest["download_failure"]["stage"])
-        self.assertEqual("x.mzXML", manifest["archive_extractions"][0]["container_path"])
-        self.assertEqual(payload, (Path(manifest["input_directory"]) / "x.mzXML").read_bytes())
+        payload = dda_32()
+        lease = self._lease_one("x.mzXML.lzma", lzma.compress(payload, format=lzma.FORMAT_ALONE), {"a": "x.mzXML.lzma"})
+
+        self.assertEqual("x.mzXML", lease["archive_extractions"][0]["container_path"])
+        self.assertEqual(payload, (Path(lease["input_directory"]) / "x.mzXML").read_bytes())
+        self.assertEqual(
+            [str((Path(lease["raw_directory"]) / "converted" / "x.mzML").resolve())], lease["input_candidates"]
+        )
+        self.assertEqual("converted", _rows(lease)["x.mzML"]["kind"])
+
+    def test_an_mzxml_lzma_that_is_no_mzxml_leaves_the_unit_with_no_input(self) -> None:
+        """What the extract stage unpacked is not an mzXML: its conversion fails, recorded, and nothing raises."""
+        payload = b"<mzXML/>" * 50
+        lease = self._lease_one("x.mzXML.lzma", lzma.compress(payload, format=lzma.FORMAT_ALONE), {"a": "x.mzXML.lzma"})
+
+        self.assertEqual("prepared", lease["status"])
+        self.assertEqual([], lease["input_candidates"])
+        self.assertEqual(["conversion_failed"], [item["reason"] for item in lease["excluded_input_candidates"]])
+        self.assertFalse(lease["execution_allowed"])
+        self.assertEqual("excluded", lease["project"]["selection_status"])
 
     def test_an_html_page_saved_as_a_zip_is_a_failed_download(self) -> None:
         page = b"<!DOCTYPE html><html><body>502 Bad Gateway</body></html>"

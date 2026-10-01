@@ -8,10 +8,16 @@ by DDA or DIA/AIF/SWATH. The wider Interactive application still supports
 additional LC-MS and GC-MS workflows, but agents must not expand this campaign
 to GC-MS without a separately approved policy change.
 
-MS-DIAL reads mzML but does not provide an mzXML or mzData reader. Treat
-`.mzXML`, `.mzData`, and `.mzData.xml` as `requires_conversion`: do not download
-or queue them as MS-DIAL inputs. Convert them to centroided mzML with a reviewed
-ProteoWizard `msconvert` workflow, then create a new auditable input manifest.
+MS-DIAL reads mzML but does not provide an mzXML or mzData reader, so
+`.mzXML`, `.mzData`, and `.mzData.xml` are `requires_conversion` and are never
+queued as MS-DIAL inputs themselves. An mzXML is converted in the download
+lease: its `convert` stage writes each of the unit's mzXML as mzML under
+`raw\converted` with Interactive's converter, every inference flag off, records
+each conversion (`input_conversions`, `provenance\input-conversions.json`, and
+`input_lineage` rows of kind `converted`), and the converted mzML are the unit's
+inputs. A file whose conversion fails is excluded with reason
+`conversion_failed` and the rest run. Do not convert mzXML by hand or relabel it
+as `converted`. mzData, which nothing converts, still excludes its unit.
 
 Before selecting an analysis unit, ask what the user wants to learn. Capture the
 scientific question and comparison, whether annotation or comparative profiling

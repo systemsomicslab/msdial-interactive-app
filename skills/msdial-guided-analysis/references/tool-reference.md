@@ -242,9 +242,10 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   artifact inventory, and a separate explicit confirmation. A retention policy
   is not deletion approval.
 
-MS-DIAL accepts mzML, not mzXML or mzData. Files reported as
-`requires_conversion` must be converted to mzML outside the run and entered
-through a new reviewed manifest; do not relabel them as `converted`.
+MS-DIAL accepts mzML, not mzXML or mzData. An mzXML reported as
+`requires_conversion` is converted to mzML by the download lease itself (its
+`convert` stage, recorded in `input_conversions`); an mzData unit stays
+excluded. Do not relabel either as `converted`.
 
 `allow_partial_mapping=true` and raw-data cleanup are explicit user decisions;
 do not infer either from the absence of an error.

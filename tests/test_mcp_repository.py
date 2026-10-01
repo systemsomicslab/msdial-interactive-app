@@ -109,6 +109,7 @@ class McpRepositoryToolsTests(unittest.TestCase):
         self.assertTrue(any("targeted" in item for item in project["exclusion_reasons"]))
 
     def test_handoff_preserves_mzxml_conversion_requirement(self) -> None:
+        """The mzXML keeps its role, and the unit plans its conversion rather than being excluded for it."""
         handoff = self._unit_handoff()
         handoff["files"][0] = {
             **handoff["files"][0],
@@ -121,10 +122,28 @@ class McpRepositoryToolsTests(unittest.TestCase):
         project, _ = mcp_server._project_from_analysis_unit_handoff(handoff)
 
         self.assertEqual("requires_conversion", project["files"][0]["role"])
+        self.assertTrue(project["eligible"], project["exclusion_reasons"])
+        self.assertEqual(["FILES/sample_neg.mzXML", "sample_neg.mzXML"], project["conversion_plan"]["names"])
+
+    def test_handoff_mzdata_still_excludes_the_unit(self) -> None:
+        from msdial_app.repository_reanalysis import UNCONVERTIBLE_INPUT_REASON
+
+        handoff = self._unit_handoff()
+        handoff["files"][0] = {
+            **handoff["files"][0],
+            "path": "FILES/sample_neg.mzData",
+            "role": "converted",
+            "requires_conversion": True,
+        }
+        handoff["sample_metadata"][0]["raw_file"] = "sample_neg.mzData"
+
+        project, _ = mcp_server._project_from_analysis_unit_handoff(handoff)
+
+        self.assertEqual("requires_conversion", project["files"][0]["role"])
         self.assertFalse(project["eligible"])
         self.assertEqual("excluded", project["selection_status"])
         self.assertTrue(
-            any("no mzXML/mzData reader" in item for item in project["exclusion_reasons"])
+            any(item.startswith(UNCONVERTIBLE_INPUT_REASON) for item in project["exclusion_reasons"])
         )
 
     def test_handoff_path_and_workspace_root_validation(self) -> None:

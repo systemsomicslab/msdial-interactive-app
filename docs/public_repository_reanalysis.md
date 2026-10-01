@@ -20,11 +20,24 @@ DIA/AIF/SWATH with product-ion spectra.
 Ambiguous records are placed in `raw_metadata_required`; they are not silently
 treated as eligible.
 
-MS-DIAL reads mzML but does not support mzXML or mzData. Those legacy formats
-are classified as `requires_conversion` and blocked before download. Convert
-them to centroided mzML with a reviewed ProteoWizard `msconvert` workflow and
-record the conversion in a new input manifest; changing the role label alone is
-not sufficient.
+MS-DIAL reads mzML but does not support mzXML or mzData. Both are classified as
+`requires_conversion`. An mzXML (packed or not) only plans a conversion
+(`project.conversion_plan`): the download lease's `convert` stage, after
+extraction and before input discovery, writes each of the unit's mzXML as mzML
+under `raw\converted\<relative path>.mzML` with `msdial_app.mzxml_conversion`,
+with every inference flag off, and the converted mzML are the unit's input
+candidates. Each conversion is recorded in the manifest's `input_conversions`
+and in `provenance\input-conversions.json`; each converted input has an
+`input_lineage` row of kind `converted` whose `source.conversion` names the mzXML
+it was read from (path, sha256, md5), the output's sha256, the converter and the
+validation, and carries the mzXML's own row (`source_row`). A file whose
+conversion fails is kept out with reason `conversion_failed` and the rest run; a
+unit left with no input is excluded with the reason, and its preflight skips it.
+A re-lease reuses a conversion whose record still holds. Where extraction shows
+a vendor container or an mzML of the same sample beside an mzXML, the Catalog's
+encoding rule (shared test vectors `tests/vectors/encoding_preference.v1.json`)
+analyses that one and the mzXML is not converted. mzData, which nothing
+converts, still excludes its unit before download.
 
 Agent-driven reanalysis also requires a user-reviewed `analysis_purpose` before
 download. That purpose anchors Class/contrast selection, annotation strategy,

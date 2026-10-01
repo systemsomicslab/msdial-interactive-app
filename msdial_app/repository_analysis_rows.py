@@ -79,6 +79,7 @@ from .repository_reanalysis import (
     acquisition_start_order,
     declared_analysis_inputs,
     declared_archive_containers,
+    lineage_stands_for,
     match_declared_inputs,
     project_from_dict,
     update_manifest,
@@ -255,7 +256,8 @@ def build_repository_analysis_rows(
     # Every input the lease found, whether or not it runs, in the order expand_paths_report would list it.
     considered = sorted({*candidates, *(path for path, _reason in lease_excluded.values())}, key=str.lower)
     # Which declared input each candidate is, answered as the lease's allow-list answered it: by path, at
-    # the place its archive put an archived container, else through the sample its lineage row names.
+    # the place its archive put an archived container, else through the sample its lineage row names. An
+    # mzML the lease converted from a declared mzXML is matched through that mzXML (lineage_stands_for).
     matched = (
         match_declared_inputs(
             considered,
@@ -265,6 +267,7 @@ def build_repository_analysis_rows(
             samples={
                 key: str(row.get("sample_id") or "") for key, row in {**excluded_lineage, **lineage_by_key}.items()
             },
+            stands_for=lineage_stands_for(manifest),
         )
         if declared
         else {}

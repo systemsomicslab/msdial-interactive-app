@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Iterator
-from . import archives
+from . import archives, encoding_preference
 from .archives import ArchiveError, ExtractionLimits
 from .diagnostic_paths import (
     INTERMEDIATES_DIRECTORY,
@@ -40,6 +40,7 @@ from .diagnostic_paths import (
 )
 from .download_store import unlink_tree
 from .mzml_encoding import UNSUPPORTED_MZML_ENCODING, scan_mzml_encoding
+from .mzxml_conversion import CONVERTER_NAME, ConversionOptions, convert_mzxml_to_mzml, converter_identity
 from .process_liveness import process_created_at, process_is_alive
 from .reader_created import container_members, reader_created_files, reader_created_names
 
@@ -54,7 +55,26 @@ USER_AGENT = "MS-DIAL-Interactive/0.3 public-reanalysis"
 RAW_SUFFIXES = {
     ".abf", ".cdf", ".d", ".lcd", ".mzml", ".qgd", ".raw", ".wiff", ".wiff2",
 }
-CONVERSION_REQUIRED_SUFFIXES = (".mzxml", ".mzdata", ".mzdata.xml")
+# MS-DIAL HAS NO READER FOR EITHER, AND ONLY ONE OF THEM IS CONVERTED. The user decided on 2026-09-30 that
+# mzXML-only data are converted to mzML and run: the lease's convert stage writes each mzXML input as mzML
+# under raw\converted (msdial_app.mzxml_conversion, every inference off). Nothing converts mzData, so a
+# unit that needs it is still excluded. A packed mzXML (x.mzXML.lzma, x.mzXML.gz) is the mzXML it unpacks
+# to, and is converted once the extract stage has unpacked it.
+CONVERTIBLE_SUFFIXES = (".mzxml",)
+UNSUPPORTED_ENCODING_SUFFIXES = (".mzdata", ".mzdata.xml")
+CONVERSION_REQUIRED_SUFFIXES = CONVERTIBLE_SUFFIXES + UNSUPPORTED_ENCODING_SUFFIXES
+# Where the convert stage writes, beside raw\data and raw\downloads: released with the raw tree, never
+# mixed with a repository's own mzML, and outside the trees the discovery walk and the checksum index read.
+CONVERTED_DIRECTORY = "converted"
+# The reason a file whose conversion failed is kept out of the input candidates, and the provenance record
+# every conversion of a lease is written to (also the manifest's input_conversions).
+CONVERSION_FAILED = "conversion_failed"
+INPUT_CONVERSIONS_SCHEMA = "msdial-input-conversions.v1"
+INPUT_CONVERSIONS_NAME = "input-conversions.json"
+CONVERSION_PLAN_SCHEMA = "msdial-mzxml-conversion-plan.v1"
+# The exclusion reasons evaluate_eligibility gives for these, which a split part inherits from its parent.
+UNCONVERTIBLE_INPUT_REASON = "MS-DIAL cannot read these analysis inputs, and nothing converts them to mzML"
+NO_CONVERTED_INPUT_REASON = "No analysis input survived its conversion from mzXML to mzML"
 # What an archive is, and how it is opened, is decided in one place: archives.py. The lease routes an
 # object by archives.archive_kind_from_name before its bytes exist, and the bytes confirm the kind
 # (archives.detect_archive) before anything is extracted. The suffix set that used to live here named
@@ -92,6 +112,11 @@ def requires_msdial_conversion(name: str) -> bool:
     """Return whether a repository file must be converted to mzML before MS-DIAL can read it."""
     normalized = str(name or "").replace("\\", "/").casefold()
     return any(normalized.endswith(suffix) for suffix in CONVERSION_REQUIRED_SUFFIXES)
+
+
+def is_convertible_input(name: str) -> bool:
+    """Whether a repository file is an mzXML, packed or not, which the lease converts to mzML."""
+    return encoding_preference.is_convertible(str(name or "").replace("\\", "/"))
 
 
 @dataclass
@@ -137,13 +162,20 @@ class RepositoryProject:
     analysis_inputs_declared: bool = False
     analysis_input_issues: list[dict[str, Any]] = field(default_factory=list)
     split_hint: dict[str, Any] | None = None
+    # What evaluate_eligibility found to convert from mzXML (CONVERSION_PLAN_SCHEMA), and, once a lease
+    # ran its convert stage, what came of it ("outcome"). Empty for a unit with nothing to convert, and then
+    # not written at all, so such a unit's project reads as it always did.
+    conversion_plan: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.publications and self.publication_status == "none_recorded":
             self.publication_status = "recorded"
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        if not value["conversion_plan"]:
+            del value["conversion_plan"]
+        return value
 
 
 @dataclass
@@ -1084,6 +1116,40 @@ ADAPTERS = {
 }
 
 
+def _conversion_plan(names: list[str], outcome: dict[str, Any] | None = None) -> dict[str, Any]:
+    """What a unit will convert from mzXML, as evaluate_eligibility records it before any byte is fetched.
+
+    ``names`` are the listed files and the sample rows' raw files that are mzXML; for a unit that lists only
+    a study archive, the samples' names are all there is until the archive is extracted, and the convert
+    stage decides there which files are converted (an mzXML a readable encoding of the same sample came
+    out beside is not). ``outcome`` is what an earlier lease's convert stage recorded, kept.
+    """
+    plan: dict[str, Any] = {
+        "schema": CONVERSION_PLAN_SCHEMA,
+        "target": "mzML",
+        "converter": CONVERTER_NAME,
+        # Every inference flag off, as the user decided on 2026-09-30: nothing the mzXML does not record
+        # is supplied.
+        "options": asdict(ConversionOptions()),
+        "stage": "the download lease's convert stage, after extraction and before input discovery",
+        "named_inputs": len(names),
+        "names": names[:50],
+    }
+    if isinstance(outcome, dict) and outcome:
+        plan["outcome"] = outcome
+    return plan
+
+
+def _no_converted_input_reason(outcome: Any) -> str:
+    """The exclusion reason of a unit whose lease converted mzXML and was left with no input, else ''."""
+    if not isinstance(outcome, dict) or outcome.get("analysis_inputs") != 0 or not outcome.get("failed"):
+        return ""
+    return (
+        f"{NO_CONVERTED_INPUT_REASON}: {outcome['failed']} of the unit's mzXML file(s) failed their "
+        f"conversion ({CONVERSION_FAILED}), and no other input of the unit remains."
+    )
+
+
 def evaluate_eligibility(project: RepositoryProject, policy: EligibilityPolicy) -> RepositoryProject:
     reasons = []
     review_reasons = []
@@ -1114,30 +1180,37 @@ def evaluate_eligibility(project: RepositoryProject, policy: EligibilityPolicy) 
             review_reasons.append("Confirm untargeted status from repository context or raw scan metadata.")
     if not project.files:
         reasons.append("No downloadable raw data were identified.")
-    conversion_required = {
-        item.name
-        for item in project.files
-        if item.role == "requires_conversion"
-        or (
-            item.role in ANALYSIS_INPUT_ROLES
-            and requires_msdial_conversion(item.name)
-        )
-    }
-    conversion_required.update(
-        str((sample or {}).get("raw_file") or "").strip()
-        for sample in project.sample_metadata or []
-        if requires_msdial_conversion(str((sample or {}).get("raw_file") or ""))
-    )
-    conversion_required.discard("")
-    if conversion_required:
-        ordered_conversion_inputs = sorted(conversion_required, key=str.casefold)
-        preview = ", ".join(ordered_conversion_inputs[:3])
-        if len(conversion_required) > 3:
-            preview += f", and {len(conversion_required) - 3} more"
-        reasons.append(
-            "MS-DIAL has no mzXML/mzData reader. Convert the declared analysis input(s) to mzML "
-            f"with ProteoWizard msconvert before reanalysis: {preview}."
-        )
+    # WHAT MS-DIAL CANNOT READ: CONVERTED, OR A REASON TO EXCLUDE. An mzXML used to exclude the whole unit
+    # here, before any byte was fetched. It is now converted to mzML in the lease (CONVERTIBLE_SUFFIXES),
+    # so it only plans a conversion; what nothing converts - mzData, and whatever else the Catalog marks as
+    # needing a conversion it has no route for - still excludes the unit.
+    convertible: set[str] = set()
+    unconvertible: set[str] = set()
+    for item in project.files:
+        if item.role == "requires_conversion" or (
+            item.role in ANALYSIS_INPUT_ROLES and requires_msdial_conversion(item.name)
+        ):
+            (convertible if is_convertible_input(item.name) else unconvertible).add(item.name)
+    for sample in project.sample_metadata or []:
+        raw_file = str((sample or {}).get("raw_file") or "").strip()
+        if is_convertible_input(raw_file):
+            convertible.add(raw_file)
+        elif requires_msdial_conversion(raw_file):
+            unconvertible.add(raw_file)
+    if unconvertible:
+        ordered = sorted(unconvertible, key=str.casefold)
+        preview = ", ".join(ordered[:3])
+        if len(ordered) > 3:
+            preview += f", and {len(ordered) - 3} more"
+        reasons.append(f"{UNCONVERTIBLE_INPUT_REASON} (mzData or another format; only mzXML is converted): {preview}.")
+    outcome = (project.conversion_plan or {}).get("outcome")
+    if convertible:
+        project.conversion_plan = _conversion_plan(sorted(convertible, key=str.casefold), outcome)
+    elif not outcome:
+        project.conversion_plan = {}
+    survivor = _no_converted_input_reason(outcome)
+    if survivor:
+        reasons.append(survivor)
     if policy.require_known_size and project.total_download_bytes <= 0:
         reasons.append("Download size is unknown.")
     if project.total_download_bytes > policy.max_download_bytes:
@@ -1294,16 +1367,21 @@ def create_download_lease(
     - extract: each archive expanded by archives.extract_archive into a staging tree beside the data
       root, then moved into it without overwriting anything (archive_extractions, and the member listing
       in provenance\\archive-members-<sha12>.tsv);
-    - materialise and convert: recorded as not_used. The accession download store and the mzXML
-      conversion are wired in here, after extraction and before input discovery, and nothing else in the
-      order changes when they are;
+    - materialise: recorded as not_used. The accession download store is wired in here, after extraction;
+    - convert: each of the unit's mzXML written as mzML under raw\\converted, every inference off, and
+      recorded (input_conversions, provenance\\input-conversions.json); where extraction shows a readable
+      encoding of the same sample beside an mzXML, that one is analysed instead. Not used where the unit
+      has no mzXML. See the notes above _find_mzxml_files;
     - discover: every vendor folder listed member by member checked whole (container_completeness),
-      then the MS-DIAL inputs under the data root, outermost folders only;
+      then the MS-DIAL inputs under the data root, outermost folders only, and the mzML converted;
     - attribute: the unit's own inputs - by path, every one, when the Catalog declared them
-      (analysis_inputs) - extracted files and declared checksums (allowlist_checksum_validation), and one
-      input_lineage row per input. An mzML whose binary arrays RawDataHandler cannot decode is not an
-      input: it is listed in excluded_input_candidates and in input_lineage's excluded rows, with reason
-      unsupported_mzml_encoding and the accessions found (_exclude_undecodable_inputs);
+      (analysis_inputs); a converted mzML through the mzXML it was read from - extracted files and
+      declared checksums (allowlist_checksum_validation), and one input_lineage row per input. An mzML
+      whose binary arrays RawDataHandler cannot decode is not an input: it is listed in
+      excluded_input_candidates and in input_lineage's excluded rows, with reason
+      unsupported_mzml_encoding and the accessions found (_exclude_undecodable_inputs). Nor is an mzXML
+      whose conversion failed (conversion_failed); a unit left with no input is recorded, excluded, and
+      not raised;
     - record: the manifest.
 
     The stages are written into the manifest as they finish, so a lease that stops says where
@@ -1535,12 +1613,65 @@ def create_download_lease(
             "materialise",
             "Every object was fetched into this unit's own raw tree; no accession download store is in use.",
         )
-        stages.not_used("convert", "No input conversion ran in this lease.")
+
+        # The unit's mzXML, written as mzML under raw\converted (see the notes above _find_mzxml_files). A unit
+        # with none records the stage as not used, as every lease did before.
+        archive_samples = _archive_sample_attribution(
+            project, archive_extractions, extracted_members, data_root
+        )
+        mzxml_found = _find_mzxml_files(data_root)
+        conversion_sources = _select_conversion_sources(
+            mzxml_found, data_root, project, archive_samples, archive_extractions
+        )
+        conversion: dict[str, Any] | None = None
+        stands_for: dict[str, str] = {}
+        if conversion_sources:
+            stages.start("convert")
+            choices, stands_for = _encoding_choices(
+                conversion_sources,
+                data_root,
+                _find_msdial_inputs(data_root),
+                _extracted_keys(extracted_members, data_root),
+            )
+            chosen_over = {_file_key(item["mzxml"]) for item in choices}
+
+            def between(name: str) -> None:
+                beat(downloaded_bytes)
+                if progress_callback:
+                    # Where a cancelled job is heard during the conversions: the callback raises.
+                    progress_callback(
+                        total_objects, total_objects, f"converting {name}", downloaded_bytes,
+                        required_download_bytes or downloaded_bytes,
+                    )
+
+            conversion = _run_lease_conversions(
+                [item for item in conversion_sources if _file_key(item) not in chosen_over],
+                data_root,
+                raw_root,
+                provenance,
+                choices,
+                between=between,
+            )
+            stands_for = {**stands_for, **conversion["outputs"]}
+            stages.finish("convert", mzxml_found=len(mzxml_found), **conversion["block"]["counts"])
+        else:
+            stages.not_used(
+                "convert",
+                "No mzXML found here is one of this unit's inputs." if mzxml_found
+                else "No input conversion ran in this lease.",
+            )
 
         stages.start("discover")
         # Before anything is discovered: a folder that did not arrive whole is no input at all.
         container_completeness = verify_container_completeness(data_root, project)
         all_inputs = _find_msdial_inputs(data_root)
+        if conversion is not None:
+            # The mzML the convert stage wrote, beside the data root rather than under it.
+            all_inputs += [
+                str(Path(item["output"]["path"]).resolve())
+                for item in conversion["block"]["records"]
+                if item.get("status") == "converted"
+            ]
         stages.finish(
             "discover",
             input_candidates=len(all_inputs),
@@ -1552,9 +1683,6 @@ def create_download_lease(
         )
 
         stages.start("attribute")
-        archive_samples = _archive_sample_attribution(
-            project, archive_extractions, extracted_members, data_root
-        )
         selected_extracted = _filter_project_allowlist_paths(
             extracted, data_root, project, archive_samples=archive_samples
         )
@@ -1568,9 +1696,28 @@ def create_download_lease(
             project,
             archive_samples=archive_samples,
             archive_extractions=archive_extractions,
+            stands_for=stands_for,
+            set_aside=[item["path"] for item in (conversion or {}).get("failed") or []],
         )
         inputs, excluded_inputs, mzml_scanned = _exclude_undecodable_inputs(inputs)
+        ignored_inputs = len(all_inputs) - len(inputs) - len(excluded_inputs)
+        if conversion is not None:
+            # An mzXML whose conversion failed is no candidate, as an undecodable mzML is none.
+            excluded_inputs = [*conversion["failed"], *excluded_inputs]
         analysis_input = _common_input_path(inputs, data_root)
+        kept = {_file_key(item) for item in inputs}
+        conversions, conversion_rows = _conversion_lineage(
+            conversion,
+            kept,
+            downloads,
+            extracted_from,
+            data_root,
+            download_root,
+            project,
+            verified_checksums,
+            extracted_members=extracted_members,
+            archive_extractions=archive_extractions,
+        )
         input_lineage = build_input_lineage(
             inputs,
             downloads,
@@ -1582,11 +1729,15 @@ def create_download_lease(
             extracted_members=extracted_members,
             archive_extractions=archive_extractions,
             excluded_inputs=excluded_inputs,
+            conversions=conversions,
+            stands_for={key: value for key, value in stands_for.items() if key in kept},
         )
+        if conversion_rows:
+            input_lineage["conversion_sources"] = conversion_rows
         stages.finish(
             "attribute",
             input_candidates=len(inputs),
-            ignored_input_candidates=len(all_inputs) - len(inputs) - len(excluded_inputs),
+            ignored_input_candidates=ignored_inputs,
             mzml_encodings_scanned=mzml_scanned,
             excluded_input_candidates=len(excluded_inputs),
             extracted_files=len(selected_extracted),
@@ -1610,7 +1761,7 @@ def create_download_lease(
             "ignored_extracted_file_count": len(extracted) - len(selected_extracted),
             "allowlist_checksum_validation": checksum_validation,
             "input_candidates": inputs,
-            "ignored_input_candidate_count": len(all_inputs) - len(inputs) - len(excluded_inputs),
+            "ignored_input_candidate_count": ignored_inputs,
             "input_lineage": input_lineage,
             "archive_extractions": archive_extractions,
             "analysis_input_path": analysis_input,
@@ -1634,6 +1785,13 @@ def create_download_lease(
         if excluded_inputs:
             # Only where one was, so a unit with nothing excluded records what it always did.
             manifest["excluded_input_candidates"] = excluded_inputs
+        if conversion is not None:
+            # Only where the convert stage ran. The gate's SUM-1 follows each converted input to its record
+            # here, and its CONV-1 holds the mzML to it; provenance\input-conversions.json is the same block.
+            manifest["input_conversions"] = conversion["block"]
+            _record_conversion_outcome(project, conversion, inputs)
+            manifest["project"] = project.as_dict()
+            manifest["execution_allowed"] = project.eligible
         if container_completeness["required"]:
             manifest["container_completeness"] = container_completeness
         warnings = _archive_warnings(archive_extractions)
@@ -1914,8 +2072,9 @@ def _record_download_failure(
         pass
 
 
-# The stages of a download lease, in the order they run. materialise (the accession download store) and
-# convert (mzXML to mzML) are recorded as not_used until they are wired in; they sit where they will run.
+# The stages of a download lease, in the order they run. materialise (the accession download store) is
+# recorded as not_used until it is wired in, where it will run; convert (mzXML to mzML) is not_used in a
+# unit with no mzXML of its own.
 LEASE_STAGES = (
     "fetch", "verify_declared_checksums", "extract", "materialise", "convert", "discover", "attribute",
     "record",
@@ -2124,6 +2283,8 @@ def build_input_lineage(
     extracted_members: dict[str, dict[str, Any]] | None = None,
     archive_extractions: list[dict[str, Any]] | None = None,
     excluded_inputs: list[dict[str, Any]] | None = None,
+    conversions: dict[str, dict[str, Any]] | None = None,
+    stands_for: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """One row per analysis input: what it is, where its bytes came from, and what vouches for them.
 
@@ -2138,7 +2299,12 @@ def build_input_lineage(
     - vendor_folder: a .d/.raw directory assembled from objects downloaded one by one;
     - archived_container: a .d/.raw directory that came out of an archive;
     - extracted_member: a file that came out of an archive;
-    - converted: written by a conversion step, which records its own rows (none exist yet).
+    - converted: an mzML the convert stage wrote from an mzXML (``conversions``, by the mzML's _file_key:
+      {record, index, source_row}). Its checksums are the mzML's own sha256, and source.conversion names the
+      mzXML it was read from - its path, sha256, md5 and sha1 - with the converter and the validation, and
+      carries that mzXML's own row (source_row), built here as any input's would be, so whatever vouches for
+      the repository's bytes vouches for this input through it. The mzXML is no input, and has no row of
+      its own among the rows; it is listed under ``conversion_sources`` instead, with what it became.
 
     An input this lease neither downloaded nor extracted - a file already in a reused workspace - keeps
     its shape's kind and says so in its source, rather than borrowing another object's checksums.
@@ -2166,11 +2332,18 @@ def build_input_lineage(
 
     A FILE THE LEASE EXCLUDED is no input, so it has no row: rows stay one per analysis input, which is
     what the gate resolves inputs against. ``excluded_inputs`` ({path, reason, problems}, from
-    _exclude_undecodable_inputs) are described the same way under ``excluded``, each with its
-    ``exclusion``, so where the bytes of a file that was not analysed came from is still recorded.
+    _exclude_undecodable_inputs, or an mzXML whose conversion failed) are described the same way under
+    ``excluded``, each with its ``exclusion``, so where the bytes of a file that was not analysed came from
+    is still recorded.
+
+    AN INPUT THAT STANDS FOR AN MZXML - one converted from it, or a readable encoding of its sample the lease
+    chose over it (``stands_for``, by _file_key; the latter's row carries encoding_choice) - is given the
+    sample and the declared names of that mzXML wherever its own name gives none.
     """
     verified_checksums = verified_checksums or {}
     excluded_inputs = excluded_inputs or []
+    conversions = conversions or {}
+    stands_for = stands_for or {}
     excluded_keys = {_file_key(str(item["path"])): item for item in excluded_inputs}
     inputs = [*inputs, *(str(item["path"]) for item in excluded_inputs)]
     extracted_members = extracted_members or {}
@@ -2224,10 +2397,8 @@ def build_input_lineage(
                     if parent_key == data_key or len(parent_key) < len(data_key):
                         break
 
-    rows = []
-    for text in inputs:
-        path = Path(text)
-        key = _file_key(text)
+    def naming(path: Path, key: str) -> tuple[set[str], set[str]]:
+        """(the declared-name forms of a path relative to the data root, the samples its name gives)."""
         try:
             relative = path.resolve().relative_to(data_root.resolve()).as_posix()
         except ValueError:
@@ -2239,9 +2410,23 @@ def build_input_lineage(
         if len(parts) > 1:
             candidates.add("/".join(parts[1:]))
         base = path.name.casefold()
-        matched_samples = sample_names.get(base) or sample_names.get(PurePosixPath(base).stem) or set()
-        if not matched_samples and key in archive_samples:
-            matched_samples = {archive_samples[key]}
+        matched = sample_names.get(base) or sample_names.get(PurePosixPath(base).stem) or set()
+        if not matched and key in archive_samples:
+            matched = {archive_samples[key]}
+        return candidates, matched
+
+    rows = []
+    for text in inputs:
+        path = Path(text)
+        key = _file_key(text)
+        candidates, matched_samples = naming(path, key)
+        stand = stands_for.get(key, "")
+        if stand:
+            stand_candidates, stand_samples = naming(Path(stand), _file_key(stand))
+            if not {item for item in candidates if item in declared}:
+                candidates = stand_candidates
+            if not matched_samples:
+                matched_samples = stand_samples
         row: dict[str, Any] = {
             "path": str(path),
             "kind": "",
@@ -2251,7 +2436,15 @@ def build_input_lineage(
             "source": {},
             "checksums": {},
         }
-        if key in folder_members:
+        if key in conversions:
+            conversion = conversions[key]
+            record = conversion["record"]
+            row["kind"] = "converted"
+            row["source"] = {
+                "conversion": _conversion_reference(record, conversion.get("source_row"), conversion["index"])
+            }
+            row["checksums"] = {"sha256": str((record.get("output") or {}).get("sha256") or "")}
+        elif key in folder_members:
             members = folder_members[key]
             sources = {
                 str(entry.get("path") or ""): entry for _, entry, origin in members if origin == "archive"
@@ -2349,6 +2542,9 @@ def build_input_lineage(
         else:
             row["kind"] = "vendor_folder" if path.is_dir() else "file"
             row["source"] = {"origin": "not_downloaded_by_this_lease"}
+        if stand and key not in conversions:
+            # Chosen over an mzXML of the same sample that came out of an archive beside it (_encoding_choices).
+            row["encoding_choice"] = {"stands_for": stand, "rule": "encoding_preference.v1"}
         rows.append(row)
     table: dict[str, Any] = {
         "schema": "msdial-input-lineage.v1",
@@ -2457,6 +2653,390 @@ def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict
             },
         })
     return kept, excluded, scanned
+
+
+# ---- The convert stage: mzXML written as the mzML MS-DIAL reads ------------------------------------------
+#
+# WHERE IT RUNS, AND WHY THERE. After extract, because a packed mzXML (x.mzXML.lzma) and an mzXML inside a
+# study archive exist only once their archives are open; before discover, because the input candidates are
+# found there, and they are the mzML written here. The mzXML stays where it arrived, under raw\data, as the
+# repository's file; its mzML goes to raw\converted, at the same relative path, so it is never mixed with a
+# repository's own mzML, the checksum index of raw\data never sees it, and MS-DIAL's per-file intermediates
+# land beside it inside the raw tree, released with it.
+#
+# WHAT IS CONVERTED. The unit's own mzXML only - listed for analysis, declared by the Catalog, or named by
+# its samples - and of those only the ones the Catalog's encoding rule keeps: where extraction shows a
+# vendor container or an mzML of the same sample beside an mzXML (an mzML archive beside an mzXML archive),
+# the readable one is analysed in its place and the mzXML is not converted (encoding_preference). The rule
+# is the Catalog's, applied here only to what an archive showed: a listing the Catalog saw it already
+# decided. Every inference the converter offers stays off (ConversionOptions()).
+#
+# A FILE WHOSE CONVERSION FAILS is no input: it is kept out of the candidates with reason conversion_failed,
+# like an mzML RawDataHandler cannot decode, and the rest of the unit runs. A unit left with no input is
+# recorded as such, never raised: its project is excluded with NO_CONVERTED_INPUT_REASON, its preflight
+# skips it, and the campaign goes on.
+#
+# RESUMABLE. Each conversion's record is written to provenance\input-conversions.json as it completes, and a
+# lease that finds one for the same output passes it to the converter, which reuses the output when the
+# mzXML, the options and the converter are what the record says and the mzML still has its recorded sha256.
+
+
+def _find_mzxml_files(root: Path) -> list[str]:
+    """Every mzXML under the data root, outside vendor folders, resolved, in path order."""
+    found: list[str] = []
+    for directory, folders, files in os.walk(root):
+        folders[:] = sorted(name for name in folders if Path(name).suffix.casefold() not in FOLDER_INPUT_SUFFIXES)
+        for name in sorted(files):
+            if name.casefold().endswith(CONVERTIBLE_SUFFIXES):
+                found.append(str((Path(directory) / name).resolve()))
+    return sorted(found, key=str.casefold)
+
+
+def _select_conversion_sources(
+    found: list[str],
+    data_root: Path,
+    project: RepositoryProject,
+    archive_samples: dict[str, str],
+    archive_extractions: list[dict[str, Any]],
+) -> list[str]:
+    """The mzXML that are this unit's to analyse, as the attribute stage will admit what is written from them.
+
+    The Catalog's declared inputs, matched by path, where it declared them. Otherwise a file the listing
+    names is converted only when the listing gives it for analysis (requires_conversion; an mzXML the
+    Catalog demoted to raw_alternate beside a vendor file is not), and a file only an archive held when one
+    of the unit's samples names it, or it came out of the archive one sample names.
+    """
+    if not project.analysis_unit_id:
+        return list(found)
+    declared = declared_analysis_inputs(project)
+    if declared:
+        convertible = {
+            key: entry
+            for key, entry in declared.items()
+            if is_convertible_input(key) or str(entry.get("conversion_target") or "").casefold() == "mzml"
+        }
+        if not convertible:
+            return []
+        matched = match_declared_inputs(
+            found,
+            data_root,
+            convertible,
+            containers=declared_archive_containers(project, convertible, archive_extractions),
+            samples=archive_samples,
+        )
+        chosen = {item for items in matched.values() for item in items}
+        return [item for item in found if item in chosen]
+    listed: set[str] = set()
+    for item in project.files:
+        try:
+            name = _safe_relative_name(item.name).as_posix().casefold()
+        except ValueError:
+            continue
+        listed.add(name)
+        alias = _container_alias_path(name)
+        if alias:
+            listed.add(alias)
+    sources = set(_project_allowlist(project, analysis_only=True, convertible=True))
+    sample_names = _sample_file_names(project)
+    selected = []
+    for item in found:
+        relative = _relative_to_data_root(Path(item), data_root)
+        forms = _allowlist_forms(relative) if relative is not None else set()
+        if forms & listed:
+            if forms & sources:
+                selected.append(item)
+        elif _matches_sample_file_names(Path(item), sample_names) or _file_key(item) in archive_samples:
+            selected.append(item)
+    return selected
+
+
+def _encoding_choices(
+    sources: list[str],
+    data_root: Path,
+    readable: list[str],
+    extracted: set[str],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Where extraction showed a readable encoding of an mzXML's sample: (the choices, {winner key: mzXML}).
+
+    The Catalog's rule (encoding_preference.prefer_encodings) decides between each mzXML and the readable
+    files of its sample's name found on disk - vendor containers, folders and mzML. It is applied only where
+    the mzXML or the encoding that wins came out of an archive (``extracted``, by _file_key, members and the
+    folders that hold them): what the repository listed file by file, the Catalog already decided.
+
+    An mzML whose arrays RawDataHandler cannot decode (mzml_encoding) is no readable twin: the lease would
+    exclude it, and a convertible mzXML outranks an unreadable twin, as the user decided on 2026-09-30.
+    """
+    by_stem: dict[str, list[str]] = {}
+    for item in readable:
+        by_stem.setdefault(encoding_preference.stem(Path(item).name), []).append(item)
+    choices: list[dict[str, Any]] = []
+    winners: dict[str, str] = {}
+    for source in sources:
+        twins = [
+            item for item in by_stem.get(encoding_preference.stem(Path(source).name)) or []
+            if not (
+                Path(item).suffix.casefold() == ".mzml" and Path(item).is_file()
+                and scan_mzml_encoding(Path(item))["problems"]
+            )
+        ]
+        if not twins:
+            continue
+        names = {item: (_relative_to_data_root(Path(item), data_root) or Path(item).name) for item in [source, *twins]}
+        roles = encoding_preference.prefer_encodings(list(names.values()))
+        if roles.get(names[source]) != encoding_preference.ALTERNATE:
+            continue
+        chosen = [item for item in twins if roles.get(names[item]) == encoding_preference.RAW]
+        if not chosen or not (_file_key(source) in extracted or any(_file_key(item) in extracted for item in chosen)):
+            continue
+        for item in chosen:
+            winners.setdefault(_file_key(item), source)
+        choices.append({
+            "mzxml": source,
+            "analysed_instead": chosen,
+            "rule": "encoding_preference.v1",
+            "reason": (
+                "A readable encoding of the same sample came out of an archive beside it, and the Catalog's "
+                "encoding rule analyses that one; the mzXML is not converted."
+            ),
+        })
+    return choices, winners
+
+
+def _extracted_keys(extracted_members: dict[str, dict[str, Any]], data_root: Path) -> set[str]:
+    """Every extracted file, and every folder under the data root holding one, by _file_key."""
+    keys = set(extracted_members)
+    stop = _file_key(str(data_root))
+    for key in list(extracted_members):
+        for parent in Path(key).parents:
+            parent_key = str(parent)
+            if parent_key == stop or len(parent_key) <= len(stop) or parent_key in keys:
+                break
+            keys.add(parent_key)
+    return keys
+
+
+def _previous_conversion_records(provenance: Path) -> dict[str, dict[str, Any]]:
+    """An earlier lease's completed conversion records of this unit, by their output's _file_key."""
+    path = provenance / INPUT_CONVERSIONS_NAME
+    try:
+        block = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    records = block.get("records") if isinstance(block, dict) and block.get("schema") == INPUT_CONVERSIONS_SCHEMA else None
+    previous: dict[str, dict[str, Any]] = {}
+    for record in records if isinstance(records, list) else []:
+        output = record.get("output") if isinstance(record, dict) else None
+        if isinstance(output, dict) and record.get("status") == "converted" and str(output.get("path") or ""):
+            previous[_file_key(str(output["path"]))] = record
+    return previous
+
+
+def _converted_destination(source: str, data_root: Path, raw_root: Path) -> tuple[Path, str]:
+    """(where an mzXML's mzML is written, the mzXML's path relative to the data root)."""
+    try:
+        relative = Path(source).resolve().relative_to(data_root.resolve())
+    except ValueError:
+        relative = Path(Path(source).name)
+    return raw_root / CONVERTED_DIRECTORY / relative.with_suffix(".mzML"), relative.as_posix()
+
+
+def _run_lease_conversions(
+    sources: list[str],
+    data_root: Path,
+    raw_root: Path,
+    provenance: Path,
+    choices: list[dict[str, Any]],
+    *,
+    between: Any = None,
+) -> dict[str, Any]:
+    """Convert each mzXML, recording as it goes; never raises for a conversion, only for an unwritable record.
+
+    Returns the input_conversions block (INPUT_CONVERSIONS_SCHEMA, with the converter's records), the mzML
+    written by _file_key with the mzXML each was written from, and the exclusion entry of each mzXML whose
+    conversion failed. ``between(name)`` is called before each file, where the lease beats its heartbeat
+    and hears a cancel.
+    """
+    previous = _previous_conversion_records(provenance)
+    options = ConversionOptions()
+    block: dict[str, Any] = {
+        "schema": INPUT_CONVERSIONS_SCHEMA,
+        "status": "running",
+        "converter": converter_identity(),
+        "options": asdict(options),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "records": [],
+        "encoding_choices": choices,
+    }
+    record_path = provenance / INPUT_CONVERSIONS_NAME
+    outputs: dict[str, str] = {}
+    failed: list[dict[str, Any]] = []
+    for source in sources:
+        if between is not None:
+            between(Path(source).name)
+        destination, relative = _converted_destination(source, data_root, raw_root)
+        record = convert_mzxml_to_mzml(
+            source,
+            destination,
+            options,
+            source_relative_path=relative,
+            previous=previous.get(_file_key(str(destination))),
+        )
+        block["records"].append(record)
+        if record.get("status") == "converted":
+            outputs[_file_key(str(destination))] = source
+        else:
+            failed.append({
+                "path": source,
+                "reason": CONVERSION_FAILED,
+                "problems": [str(record.get("error") or "the conversion did not complete")],
+                "conversion": {"output": str(destination), "record": len(block["records"]) - 1},
+            })
+        # As each completes, so a lease that stops keeps what was done.
+        _write_json(record_path, block)
+    records = block["records"]
+    block["counts"] = {
+        "sources": len(sources),
+        "converted": sum(1 for item in records if item.get("status") == "converted"),
+        "reused": sum(1 for item in records if item.get("reused_previous_record")),
+        "failed": len(failed),
+        "not_converted_readable_encoding": len(choices),
+    }
+    block["status"] = "completed"
+    block["completed_at"] = datetime.now(timezone.utc).isoformat()
+    block["record_path"] = str(record_path)
+    _write_json(record_path, block)
+    return {"block": block, "outputs": outputs, "failed": failed}
+
+
+def lineage_stands_for(manifest: dict[str, Any]) -> dict[str, str]:
+    """{_file_key of an input: the mzXML it stands for}, read from the manifest's input_lineage rows.
+
+    A converted row stands for the mzXML its conversion read (source.conversion.source_path); a readable
+    encoding the lease chose over an mzXML of the same sample (encoding_choice.stands_for) for that mzXML.
+    The allow-list, the split plan and the analysis-CSV builder attribute such an input through it.
+    """
+    lineage = manifest.get("input_lineage") if isinstance(manifest.get("input_lineage"), dict) else {}
+    result: dict[str, str] = {}
+    for row in lineage.get("rows") or []:
+        if not isinstance(row, dict) or not str(row.get("path") or "").strip():
+            continue
+        source = row.get("source") if isinstance(row.get("source"), dict) else {}
+        conversion = source.get("conversion") if isinstance(source.get("conversion"), dict) else {}
+        choice = row.get("encoding_choice") if isinstance(row.get("encoding_choice"), dict) else {}
+        stand = str(conversion.get("source_path") or choice.get("stands_for") or "").strip()
+        if stand:
+            result[_file_key(str(row["path"]))] = stand
+    return result
+
+
+def _conversion_reference(record: dict[str, Any], source_row: dict[str, Any] | None, index: int) -> dict[str, Any]:
+    """What a converted input's lineage row says about the conversion that wrote it.
+
+    The fields the gate's SUM-1 follows to the mzXML (source_path, source_sha256, source_row) and those its
+    CONV-1 holds the mzML to (output_sha256, the converter, the validation), read from the record itself.
+    """
+    source = record.get("source") or {}
+    output = record.get("output") or {}
+    converter = record.get("converter") or {}
+    validation = record.get("validation") or {}
+    reference: dict[str, Any] = {
+        "source_path": str(source.get("path") or ""),
+        "source_relative_path": str(source.get("relative_path") or ""),
+        "source_sha256": str(source.get("sha256") or ""),
+        "source_md5": str(source.get("md5") or ""),
+        "source_sha1": str(source.get("sha1") or ""),
+        "source_bytes": source.get("bytes"),
+        "output_sha256": str(output.get("sha256") or ""),
+        "output_bytes": output.get("bytes"),
+        "converter": {key: converter.get(key) for key in ("name", "version", "module_sha256")},
+        "validation": {key: validation.get(key) for key in ("schema", "status", "spectra_compared", "problem_count")},
+        "record": index,
+    }
+    if source_row is not None:
+        reference["source_row"] = source_row
+    return reference
+
+
+def _conversion_lineage(
+    conversion: dict[str, Any] | None,
+    kept: set[str],
+    downloads: list[dict[str, Any]],
+    extracted_from: dict[str, dict[str, Any]],
+    data_root: Path,
+    download_root: Path,
+    project: RepositoryProject,
+    verified_checksums: dict[str, dict[str, Any]],
+    *,
+    extracted_members: dict[str, dict[str, Any]],
+    archive_extractions: list[dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """(build_input_lineage's conversions, by the mzML's _file_key; the rows of the mzXML they were read from).
+
+    Each mzXML's row is built as an input's row would be - a file downloaded as itself, or a member of the
+    archive it came out of, with its declared checksum where one was verified - so that a converted input
+    carries it (source.conversion.source_row) and is vouched for by what vouches for the repository's file.
+    Only conversions whose mzML is an input (``kept``) are given to the rows; every completed one is listed,
+    saying what it became.
+    """
+    if conversion is None:
+        return {}, []
+    converted = [
+        (index, record) for index, record in enumerate(conversion["block"]["records"])
+        if record.get("status") == "converted"
+    ]
+    if not converted:
+        return {}, []
+    table = build_input_lineage(
+        [str(record["source"]["path"]) for _index, record in converted],
+        downloads,
+        extracted_from,
+        data_root,
+        download_root,
+        project,
+        verified_checksums,
+        extracted_members=extracted_members,
+        archive_extractions=archive_extractions,
+    )
+    source_rows = {_file_key(str(row["path"])): row for row in table["rows"]}
+    conversions: dict[str, dict[str, Any]] = {}
+    listed: list[dict[str, Any]] = []
+    for index, record in converted:
+        output_key = _file_key(str(record["output"]["path"]))
+        row = source_rows.get(_file_key(str(record["source"]["path"])))
+        if row is None:
+            continue
+        listed.append({**row, "converted_to": str(record["output"]["path"]), "is_input": output_key in kept})
+        if output_key in kept:
+            conversions[output_key] = {"record": record, "index": index, "source_row": row}
+    return conversions, listed
+
+
+def _record_conversion_outcome(project: RepositoryProject, conversion: dict[str, Any], inputs: list[str]) -> None:
+    """Write what the convert stage did into the project's conversion plan, and exclude a unit it left empty.
+
+    evaluate_eligibility reads the outcome back (_no_converted_input_reason), so a unit every later step
+    judges again - a preflight, a campaign disposition, a split - stays what the lease found it to be:
+    eligible where an input survived the conversion, excluded where none did.
+    """
+    counts = conversion["block"]["counts"]
+    outcome = {
+        "converted": counts["converted"],
+        "reused": counts["reused"],
+        "failed": counts["failed"],
+        "not_converted_readable_encoding": counts["not_converted_readable_encoding"],
+        "analysis_inputs": len(inputs),
+    }
+    plan = dict(project.conversion_plan or {}) or _conversion_plan(
+        sorted({Path(str(record["source"]["path"])).name for record in conversion["block"]["records"]}, key=str.casefold)
+    )
+    plan["outcome"] = outcome
+    project.conversion_plan = plan
+    reason = _no_converted_input_reason(outcome)
+    if reason:
+        project.exclusion_reasons = list(dict.fromkeys([*project.exclusion_reasons, reason]))
+        project.review_reasons = []
+        project.eligible = False
+        project.selection_status = "excluded"
 
 
 def _declared_verification(result: dict[str, Any]) -> dict[str, Any]:
@@ -3437,6 +4017,12 @@ def _reader_created_before(manifest: dict[str, Any]) -> dict[str, list[str]]:
     return created
 
 
+def _conversion_left_no_input(manifest: dict[str, Any]) -> bool:
+    """Whether the lease converted this unit's mzXML and no input survived (the project records why)."""
+    plan = (manifest.get("project") or {}).get("conversion_plan")
+    return bool(_no_converted_input_reason((plan or {}).get("outcome") if isinstance(plan, dict) else None))
+
+
 def run_raw_metadata_preflight(
     manifest_path: Path,
     extractor_path: Path,
@@ -3490,7 +4076,10 @@ def run_raw_metadata_preflight(
     # coverage and the unit stays under review.
     capped = bool(max_inputs and max_inputs > 0 and max_inputs < len(available))
     inputs = available if not max_inputs or max_inputs <= 0 else available[0:max_inputs]
-    if not inputs:
+    # A unit whose every mzXML failed its conversion has no input to read, and that is its answer: the
+    # preflight is recorded with nothing read, and the disposition skips the unit, rather than failing it.
+    converted_to_nothing = not candidates and _conversion_left_no_input(snapshot)
+    if not inputs and not converted_to_nothing:
         raise ValueError("No extracted MS-DIAL input candidate is available for metadata preflight.")
     output = manifest_path.parent / PREFLIGHT_OUTPUT_NAME
     declared = _declared_technical(snapshot)
@@ -3511,15 +4100,18 @@ def run_raw_metadata_preflight(
 
         update_manifest(manifest_path, change)
 
-    execution = run_extractor(
-        extractor_path,
-        inputs,
-        manifest_path.parent / PREFLIGHT_CHUNK_DIRECTORY,
-        extractor_sha256=str(identity.get("binary_sha256") or ""),
-        previous=_previous_reads(snapshot, manifest_path),
-        created_before=_reader_created_before(snapshot),
-        progress=progress,
-    )
+    if converted_to_nothing:
+        execution = {"outcomes": {}, "records": [], "counts": {}, "chunks": [], "command_template": [], "exit_code": None}
+    else:
+        execution = run_extractor(
+            extractor_path,
+            inputs,
+            manifest_path.parent / PREFLIGHT_CHUNK_DIRECTORY,
+            extractor_sha256=str(identity.get("binary_sha256") or ""),
+            previous=_previous_reads(snapshot, manifest_path),
+            created_before=_reader_created_before(snapshot),
+            progress=progress,
+        )
     extractor = _extractor_record(extractor_path, identity, extractor_source)
     held: dict[str, Any] = {}
 
@@ -3696,7 +4288,14 @@ def _record_preflight(
 
     if not records:
         current["execution_allowed"] = previously_allowed
-        if outcomes and all(item.get("outcome") == OUTCOME_UNSUPPORTED for item in outcomes.values()):
+        if not inputs and _conversion_left_no_input(current):
+            # Nothing to read: the lease converted the unit's mzXML and none of them survived. Its status stays
+            # what the lease left; the disposition below skips it.
+            block["advisory"] = (
+                "No input of this unit survived its conversion from mzXML to mzML, so there was no header to "
+                "read. The unit has nothing to run, and its campaign disposition skips it."
+            )
+        elif outcomes and all(item.get("outcome") == OUTCOME_UNSUPPORTED for item in outcomes.values()):
             # Fails closed exactly as an unavailable preflight does: a unit that was not
             # already eligible stays ineligible. What changes is that the agent can now tell
             # that waiting or retrying will never help.
@@ -4089,10 +4688,15 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
 
     samples = list(project.get("sample_metadata") or [])
     assignments = list((project.get("class_proposal") or {}).get("assignments") or [])
+    # An mzML converted from an mzXML, or chosen over one, is that mzXML's sample's: the sample names the
+    # repository's file, not what the lease wrote from it.
+    stands_for = lineage_stands_for(manifest)
     parts = []
     claimed_samples: set[int] = set()
     for mode, files in sorted(groups.items()):
-        names = {Path(item).name.casefold() for item in files}
+        names = {Path(item).name.casefold() for item in files} | {
+            Path(stands_for[_file_key(item)]).name.casefold() for item in files if _file_key(item) in stands_for
+        }
         stems = {PurePosixPath(name).stem for name in names}
         part_samples = []
         for index, sample in enumerate(samples):
@@ -4227,8 +4831,9 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 require_untargeted=False,
             ),
         ).exclusion_reasons
-        if "no mzXML/mzData reader" in reason
+        if reason.startswith(UNCONVERTIBLE_INPUT_REASON)
     ]
+    stands_for = lineage_stands_for(parent)
     per_file = {
         _file_key(str(item.get("file") or "")): item
         for item in (parent.get("raw_metadata_preflight") or {}).get("summary", {}).get("per_file") or []
@@ -4243,7 +4848,12 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         output = root / "output"
         provenance.mkdir(parents=True, exist_ok=True)
         output.mkdir(parents=True, exist_ok=True)
-        names = {Path(item).name.casefold() for item in part["input_candidates"]}
+        # A converted input's listed file is the mzXML it was converted from.
+        names = {Path(item).name.casefold() for item in part["input_candidates"]} | {
+            Path(stands_for[_file_key(item)]).name.casefold()
+            for item in part["input_candidates"]
+            if _file_key(item) in stands_for
+        }
         sample_ids = set(part["sample_ids"])
 
         project = copy.deepcopy(parent_project)
@@ -4350,10 +4960,14 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         if isinstance(lineage, dict):
             # The part reads the parent's files, so their lineage is the parent's, row for row. Without
             # it every part would look like a manifest written before lineage existed. The files the lease
-            # excluded are in no part, and stay recorded in the parent's table only.
+            # excluded are in no part, and stay recorded in the parent's table only, as do the mzXML it
+            # converted: each converted row carries its own mzXML's row (source.conversion.source_row).
             part_keys = {_file_key(item) for item in part["input_candidates"]}
             part_manifest["input_lineage"] = {
-                **{key: value for key, value in lineage.items() if key not in ("rows", "excluded")},
+                **{
+                    key: value for key, value in lineage.items()
+                    if key not in ("rows", "excluded", "conversion_sources")
+                },
                 "rows": [
                     row for row in lineage.get("rows") or []
                     if isinstance(row, dict) and _file_key(str(row.get("path") or "")) in part_keys
@@ -4957,7 +5571,7 @@ ANALYSIS_INPUT_ROLES = frozenset({"raw", "converted"})
 
 
 def _project_allowlist(
-    project: RepositoryProject, *, analysis_only: bool = False
+    project: RepositoryProject, *, analysis_only: bool = False, convertible: bool = False
 ) -> list[str]:
     """The unit's listed file names, relative and casefolded, as the data root holds them.
 
@@ -4967,6 +5581,9 @@ def _project_allowlist(
     analysis role, and the container of a listed archive of one, or of an archive listed for this unit
     alone (raw_archive). A container named by an archive every unit of a study lists
     (shared_raw_archive) is admitted by this unit's sample names, never by the archive.
+
+    With convertible as well, the mzXML the unit lists for analysis (requires_conversion, packed or not)
+    counts as what MS-DIAL opens: the convert stage writes it as the mzML that is opened.
     """
     names: list[str] = []
     for item in project.files:
@@ -4974,12 +5591,16 @@ def _project_allowlist(
             continue
         name = _safe_relative_name(item.name).as_posix().casefold()
         analysis = item.role in ANALYSIS_INPUT_ROLES and not requires_msdial_conversion(item.name)
-        if not analysis_only or analysis:
+        source = convertible and item.role in {*ANALYSIS_INPUT_ROLES, "requires_conversion"} and is_convertible_input(
+            item.name
+        )
+        if not analysis_only or analysis or source:
             names.append(name)
         alias = _container_alias_path(name)
         if alias and (
             not analysis_only
             or ((analysis or item.role == "raw_archive") and not requires_msdial_conversion(alias))
+            or (source and is_convertible_input(alias))
         ):
             names.append(alias)
     return names
@@ -5053,6 +5674,8 @@ def _filter_inputs_by_project_allowlist(
     *,
     archive_samples: dict[str, str] | None = None,
     archive_extractions: list[dict[str, Any]] | None = None,
+    stands_for: dict[str, str] | None = None,
+    set_aside: list[str] | None = None,
 ) -> list[str]:
     """The inputs that are this unit's: listed, named by its samples, or out of an archive one names.
 
@@ -5060,9 +5683,16 @@ def _filter_inputs_by_project_allowlist(
     came out of an archive exactly one of this unit's samples names (X.zip). Without it, only names
     are matched, as they always were. archive_extractions is the lease's extraction records, which say
     where a declared archived container really is (declared_archive_containers).
+
+    stands_for maps an input, by _file_key, to the mzXML it stands for (the convert stage's
+    stands_for): an mzML converted from it, or a readable encoding of its sample chosen over it. Such an
+    input is this unit's when it, or the mzXML, is. set_aside is the mzXML of this unit whose conversion
+    failed: a declared input they are is not missing, and a unit left with nothing else selects nothing
+    rather than raising, so the lease can record why.
     """
     if not project.analysis_unit_id:
         return inputs
+    stands_for = stands_for or {}
     declared = declared_analysis_inputs(project)
     if declared:
         return _select_declared_inputs(
@@ -5072,32 +5702,42 @@ def _filter_inputs_by_project_allowlist(
             declared,
             archive_samples=archive_samples,
             archive_extractions=archive_extractions,
+            stands_for=stands_for,
+            set_aside=set_aside,
         )
     archive_samples = archive_samples or {}
     allowed = _project_allowlist(project, analysis_only=True)
+    sources = set(_project_allowlist(project, analysis_only=True, convertible=True)) if stands_for else set()
     sample_names = _sample_file_names(project)
-    if not allowed and not any(sample_names):
+    if not allowed and not sources and not any(sample_names):
         raise ValueError(
             f"Analysis unit {project.analysis_unit_id} names no analysis input: it declares no "
             f"file of role {sorted(ANALYSIS_INPUT_ROLES)} and none of its samples names a raw "
             "file, so there is nothing to attribute the downloaded data to."
         )
 
+    def admitted(path: Path, listed: Iterable[str]) -> bool:
+        return (
+            _path_matches_allowlist(path, data_root, listed)
+            or _matches_sample_file_names(path, sample_names)
+            or (bool(archive_samples) and _file_key(str(path)) in archive_samples)
+        )
+
     # Either source is sufficient on its own, and both are scoped to THIS unit: the declared
     # analysis-input files, and the file names this unit's samples claim. An archive shared with
     # another unit used to admit all of both units' contents through the archive's own name; the
     # sample names admit only this unit's.
+    allowed_set = set(allowed)
     selected = [
         item
         for item in inputs
         if not requires_msdial_conversion(Path(item).name)
         and (
-            _path_matches_allowlist(Path(item), data_root, allowed)
-            or _matches_sample_file_names(Path(item), sample_names)
-            or (bool(archive_samples) and _file_key(item) in archive_samples)
+            admitted(Path(item), allowed_set)
+            or (_file_key(item) in stands_for and admitted(Path(stands_for[_file_key(item)]), sources))
         )
     ]
-    if not selected:
+    if not selected and not set_aside:
         raise ValueError(
             f"Downloaded content did not contain an MS-DIAL input listed for analysis unit "
             f"{project.analysis_unit_id}. Refusing to fall back to accession-level inputs."
@@ -5114,12 +5754,19 @@ def declared_analysis_inputs(project: RepositoryProject) -> dict[str, dict[str, 
     """The Catalog's declared analysis inputs that MS-DIAL opens, by path relative to the data root.
 
     Keyed as the lease places them: '/'-separated, casefolded, less a leading FILES/ (_safe_relative_name).
-    Empty when the Catalog declared none. An input it says must be converted first (mzXML) is left out:
-    no reader opens it, and what a conversion writes is attributed through its own record.
+    Empty when the Catalog declared none. An input it says must be converted first is kept only when it is
+    an mzXML (conversion_target mzML): the mzML the convert stage writes from it stands for it, and is
+    matched to it through the mzXML it was converted from (match_declared_inputs, stands_for). One nothing
+    converts (mzData) is left out: no reader opens it, and its unit is excluded.
     """
     result: dict[str, dict[str, Any]] = {}
     for entry in project.analysis_inputs or []:
-        if not isinstance(entry, dict) or entry.get("requires_conversion"):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("requires_conversion") and not (
+            str(entry.get("conversion_target") or "").casefold() == "mzml"
+            or is_convertible_input(str(entry.get("path") or ""))
+        ):
             continue
         if str(entry.get("kind") or "") not in DECLARED_INPUT_KINDS:
             continue
@@ -5187,6 +5834,7 @@ def match_declared_inputs(
     *,
     containers: dict[str, str] | None = None,
     samples: dict[str, str] | None = None,
+    stands_for: dict[str, str] | None = None,
 ) -> dict[str, list[str]]:
     """Which inputs are which declared analysis input: {declared key: [inputs]}, every key present.
 
@@ -5198,21 +5846,35 @@ def match_declared_inputs(
     sample that container is declared for and no input was matched to it: the attribution through the
     archive that sample names (_archive_sample_attribution, or a lineage row's sample_id), which is how
     such a container was admitted before the Catalog declared its inputs.
+
+    An input ``stands_for`` names (by _file_key) is matched as the mzXML it stands for wherever it is not
+    matched as itself: the mzML converted from raw\\data\\X.mzXML lies in raw\\converted, outside the data
+    root, and is the declared FILES/X.mzXML's input.
     """
     containers = containers or {}
     samples = samples or {}
+    stands_for = stands_for or {}
     found: dict[str, list[str]] = {key: [] for key in declared}
     unmatched: list[str] = []
-    for item in inputs:
-        relative = _relative_to_data_root(Path(item), data_root)
+
+    def match(path_text: str) -> str | None:
+        relative = _relative_to_data_root(Path(path_text), data_root)
         if relative is None:
-            continue
+            return None
         forms = sorted(_allowlist_forms(relative), key=len, reverse=True)
         key = next((form for form in forms if form in found), None)
         if key is None:
             key = next((containers[form] for form in forms if form in containers), None)
+        return key
+
+    for item in inputs:
+        source = stands_for.get(_file_key(item))
+        key = match(item)
+        if key is None and source:
+            key = match(source)
         if key is None:
-            unmatched.append(item)
+            if _relative_to_data_root(Path(item), data_root) is not None or source:
+                unmatched.append(item)
         else:
             found[key].append(item)
     waiting: dict[str, str] = {}
@@ -5221,7 +5883,9 @@ def match_declared_inputs(
         if str(entry.get("kind") or "") == "archived_container" and sample and not found[key]:
             waiting[sample] = key
     for item in unmatched if waiting and samples else []:
-        key = waiting.get(str(samples.get(_file_key(item)) or "").strip())
+        source = stands_for.get(_file_key(item))
+        sample = samples.get(_file_key(item)) or (samples.get(_file_key(source)) if source else "")
+        key = waiting.get(str(sample or "").strip())
         if key is not None:
             found[key].append(item)
     return found
@@ -5235,8 +5899,13 @@ def _select_declared_inputs(
     *,
     archive_samples: dict[str, str] | None = None,
     archive_extractions: list[dict[str, Any]] | None = None,
+    stands_for: dict[str, str] | None = None,
+    set_aside: list[str] | None = None,
 ) -> list[str]:
     """The inputs that are this unit's declared analysis inputs, matched by path, every one of them.
+
+    An input converted from a declared mzXML is matched through it (``stands_for``); a declared mzXML whose
+    conversion failed (``set_aside``) is accounted for by that failure, recorded with it, not missing.
 
     WHY BY PATH, AND WHY EVERY ONE. Before the Catalog declared its inputs, an input was admitted when a
     listed name or a sample's file name matched its basename. A Waters folder matched neither - its
@@ -5248,14 +5917,25 @@ def _select_declared_inputs(
     another unit shares a name with would get in. An archived container is matched where its archive put
     it, and through the archive its sample names (match_declared_inputs).
     """
+    containers = declared_archive_containers(project, declared, archive_extractions)
     found = match_declared_inputs(
         inputs,
         data_root,
         declared,
-        containers=declared_archive_containers(project, declared, archive_extractions),
+        containers=containers,
         samples=archive_samples,
+        stands_for=stands_for,
     )
-    missing = [str(declared[key].get("path") or key) for key, matched in found.items() if not matched]
+    failed = (
+        {key for key, matched in match_declared_inputs(
+            list(set_aside), data_root, declared, containers=containers, samples=archive_samples
+        ).items() if matched}
+        if set_aside
+        else set()
+    )
+    missing = [
+        str(declared[key].get("path") or key) for key, matched in found.items() if not matched and key not in failed
+    ]
     doubled = [
         f"{declared[key].get('path') or key} ({len(matched)} inputs)"
         for key, matched in found.items()

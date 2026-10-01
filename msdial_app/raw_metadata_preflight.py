@@ -727,7 +727,20 @@ def decide_disposition(
     candidates = [str(item) for item in manifest.get("input_candidates") or [] if str(item).strip()]
     if not candidates:
         reasons.append("no_inputs")
-        detail.append("The unit has no input files.")
+        failed = [
+            item for item in manifest.get("excluded_input_candidates") or []
+            if isinstance(item, dict) and item.get("reason") == "conversion_failed"
+        ]
+        if failed:
+            # The lease's convert stage wrote the unit's mzXML as mzML and every conversion failed; each failure
+            # is recorded with its error in input_conversions.
+            reasons.append("conversion_failed")
+            detail.append(
+                f"The unit has no input files: the conversion of its {len(failed)} mzXML file(s) to mzML failed, "
+                "and no other input remains."
+            )
+        else:
+            detail.append("The unit has no input files.")
         return result("skip")
     if coverage.get("capped"):
         reasons.append("raw_metadata_incomplete")
