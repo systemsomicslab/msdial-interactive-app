@@ -479,6 +479,8 @@ class TheLeaseConvertsTheUnitsMzxml(_Scratch):
         choices = manifest["input_conversions"]["encoding_choices"]
         self.assertEqual([str((data / "mzXML" / f"{name}.mzXML").resolve()) for name in samples],
                          [item["mzxml"] for item in choices])
+        # The samples name the mzXML, so the unit admits no mzML by itself: the folders pair them.
+        self.assertEqual({"same_folder"}, {item["paired_by"] for item in choices})
         rows = _rows(manifest)
         for name in samples:
             row = rows[f"{name}.mzML"]
@@ -519,6 +521,58 @@ class TheLeaseConvertsTheUnitsMzxml(_Scratch):
         built = build_repository_analysis_rows(manifest)
         self.assertEqual([], built["failures"])
         self.assertEqual(manifest["input_candidates"], sorted(item["file_path"] for item in built["rows"]))
+
+    def _vendor_beside_mzxml(self, raw_folder: str, mzxml_folder: str, raw_file: str = "{}") -> dict:
+        """A study archive holding each sample as a Thermo .raw and as an .mzXML, in folders of their own."""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as handle:
+            for stem in ("QC_01", "S_01"):
+                handle.writestr(f"ST000777/{raw_folder}/{stem}.raw", f"thermo raw bytes {stem}".encode())
+                handle.writestr(f"ST000777/{mzxml_folder}/{stem}.mzXML", dda_32())
+        data = buffer.getvalue()
+        name = "ST000777_Rawdata.zip"
+        project = RepositoryProject(
+            repository="metabolomics_workbench", accession="ST000777", analysis_unit_id="an000777-pos",
+            eligible=True, selection_status="eligible", separation="LC-MS", acquisition_mode="DDA",
+            ion_mode="Positive", untargeted=True, total_download_bytes=len(data),
+            files=[RepositoryFile(name, len(data), f"https://example.org/{name}", role="raw_archive",
+                                  checksum=hashlib.md5(data).hexdigest())],
+            sample_metadata=[{"sample_id": stem, "raw_file": raw_file.format(stem)} for stem in ("QC_01", "S_01")],
+        )
+        return self.lease({name: data}, project)
+
+    def test_a_vendor_file_the_unit_admits_is_its_samples_encoding_whatever_its_folder(self) -> None:
+        """Samples named without an extension, as a Workbench RAW_FILE_NAME often is, admit QC_01.raw by its stem,
+        in whichever folder it lies. Converting QC_01.mzXML as well would give the sample two inputs and the unit
+        no analysis CSV (sample_with_two_inputs); the vendor file is analysed and the mzXML is not converted."""
+        for raw_folder, mzxml_folder in (("Thermo_RAW", "mzXML"), ("RAW", "converted_mzXML"), ("RAW", "mzXML")):
+            with self.subTest(raw=raw_folder, mzxml=mzxml_folder), tempfile.TemporaryDirectory() as temporary:
+                self.root = Path(temporary).resolve()
+                manifest = self._vendor_beside_mzxml(raw_folder, mzxml_folder)
+                data = Path(manifest["input_directory"]) / "ST000777"
+
+                self.assertEqual([str((data / raw_folder / f"{stem}.raw").resolve()) for stem in ("QC_01", "S_01")],
+                                 manifest["input_candidates"])
+                convert = _stage(manifest, "convert")
+                self.assertEqual((0, 2), (convert["converted"], convert["not_converted_readable_encoding"]))
+                choices = manifest["input_conversions"]["encoding_choices"]
+                self.assertEqual([str((data / mzxml_folder / f"{stem}.mzXML").resolve()) for stem in ("QC_01", "S_01")],
+                                 [item["mzxml"] for item in choices])
+                self.assertEqual({"admitted_by_unit"}, {item["paired_by"] for item in choices})
+                self.assertFalse((Path(manifest["raw_directory"]) / "converted").exists())
+                built = build_repository_analysis_rows(manifest)
+                self.assertEqual([], built["failures"])
+                self.assertEqual(["QC_01", "S_01"], sorted(item["sample_id"] for item in built["rows"]))
+
+    def test_samples_that_name_the_mzxml_do_not_admit_another_folders_vendor_file(self) -> None:
+        """Where the samples name QC_01.mzXML, a QC_01.raw in a folder of other words is no file the unit admits,
+        and is not taken for its sample's encoding: the mzXML is converted, as the unit asks."""
+        manifest = self._vendor_beside_mzxml("Thermo_RAW", "mzXML", raw_file="{}.mzXML")
+        converted = Path(manifest["raw_directory"]) / "converted" / "ST000777" / "mzXML"
+
+        self.assertEqual([str((converted / f"{stem}.mzML").resolve()) for stem in ("QC_01", "S_01")],
+                         manifest["input_candidates"])
+        self.assertEqual([], manifest["input_conversions"]["encoding_choices"])
 
     def test_one_samples_encodings_are_told_by_their_folders_less_the_words_naming_an_encoding(self) -> None:
         root = self.root / "raw" / "data"

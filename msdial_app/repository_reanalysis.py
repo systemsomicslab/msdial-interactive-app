@@ -1696,11 +1696,13 @@ def create_download_lease(
         stands_for: dict[str, str] = {}
         if conversion_sources:
             stages.start("convert")
+            readable = _find_msdial_inputs(data_root)
             choices, stands_for = _encoding_choices(
                 conversion_sources,
                 data_root,
-                _find_msdial_inputs(data_root),
+                readable,
                 _extracted_keys(extracted_members, data_root),
+                _readable_inputs_admitted(readable, data_root, project, archive_samples),
             )
             chosen_over = {_file_key(item["mzxml"]) for item in choices}
 
@@ -2744,7 +2746,9 @@ def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict
 # the readable one is analysed in its place and the mzXML is not converted (encoding_preference). The rule
 # is the Catalog's, applied here only to what an archive showed: a listing the Catalog saw it already
 # decided. It is given the files of one sample's place, never another folder's file of the same name
-# (_sample_locus). Every inference the converter offers stays off (ConversionOptions()).
+# (_sample_locus), and wherever they are the readable files the unit admits by itself, which are its inputs
+# in any case (_readable_inputs_admitted). Every inference the converter offers stays off
+# (ConversionOptions()).
 #
 # A FILE WHOSE CONVERSION FAILS is no input: it is kept out of the candidates with reason conversion_failed,
 # like an mzML RawDataHandler cannot decode, and the rest of the unit runs. A unit left with no input is
@@ -2833,13 +2837,15 @@ def _encoding_choices(
     data_root: Path,
     readable: list[str],
     extracted: set[str],
+    admitted: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    """Where extraction showed a readable encoding of an mzXML's sample: (the choices, {winner key: mzXML}).
+    """Where the unit holds a readable encoding of an mzXML's sample: (the choices, {winner key: mzXML}).
 
     The Catalog's rule (encoding_preference.prefer_encodings) decides between each mzXML and the readable
     files of its sample's name found on disk - vendor containers, folders and mzML. It is applied only where
     the mzXML or the encoding that wins came out of an archive (``extracted``, by _file_key, members and the
-    folders that hold them): what the repository listed file by file, the Catalog already decided.
+    folders that hold them): what the repository listed file by file, the Catalog already decided. A twin the
+    unit admits by itself is the exception (below).
 
     An mzML whose arrays RawDataHandler cannot decode (mzml_encoding) is no readable twin: the lease would
     exclude it, and a convertible mzXML outranks an unreadable twin, as the user decided on 2026-09-30.
@@ -2847,23 +2853,27 @@ def _encoding_choices(
     WHICH FILES ARE ONE SAMPLE'S. The Catalog pairs files by name within one unit's listing. A data root an
     accession archive expanded into holds other units' files too - a study archive with a folder per
     polarity or per column, a QC_01 in each - and pairing by name across all of it would let the positive
-    unit's POS/QC_01.mzML displace the negative unit's NEG/QC_01.mzXML. So the rule is given only files
+    unit's POS/QC_01.mzML displace the negative unit's NEG/QC_01.mzXML. So the rule is given the files
     whose folders agree once the words that name an encoding are set aside (_sample_locus): mzML/x.mzML
-    and mzXML/x.mzXML are one sample's, POS/x.mzML and NEG/x.mzXML are not.
+    and mzXML/x.mzXML are one sample's, POS/x.mzML and NEG/x.mzXML are not. It is also given, whatever
+    their folders, the readable files the unit admits by itself (``admitted``, by _file_key;
+    _readable_inputs_admitted): a Thermo_RAW/x.raw that a sample named x admits is that sample's input
+    whatever else is converted, so converting mzXML/x.mzXML as well would give the sample two inputs and
+    the unit no analysis CSV. Such a twin is paired whether or not an archive held it, for the same reason.
     """
-    by_sample: dict[tuple[str, tuple[tuple[str, ...], ...]], list[str]] = {}
+    admitted = admitted or set()
+    by_stem: dict[str, list[str]] = {}
     for item in readable:
-        key = (encoding_preference.stem(Path(item).name), _sample_locus(item, data_root))
-        by_sample.setdefault(key, []).append(item)
+        by_stem.setdefault(encoding_preference.stem(Path(item).name), []).append(item)
     choices: list[dict[str, Any]] = []
     winners: dict[str, str] = {}
     for source in sources:
+        locus = _sample_locus(source, data_root)
         twins = [
             item
-            for item in by_sample.get(
-                (encoding_preference.stem(Path(source).name), _sample_locus(source, data_root))
-            ) or []
-            if not (
+            for item in by_stem.get(encoding_preference.stem(Path(source).name)) or []
+            if (_file_key(item) in admitted or _sample_locus(item, data_root) == locus)
+            and not (
                 Path(item).suffix.casefold() == ".mzml" and Path(item).is_file()
                 and scan_mzml_encoding(Path(item))["problems"]
             )
@@ -2875,7 +2885,10 @@ def _encoding_choices(
         if roles.get(names[source]) != encoding_preference.ALTERNATE:
             continue
         chosen = [item for item in twins if roles.get(names[item]) == encoding_preference.RAW]
-        if not chosen or not (_file_key(source) in extracted or any(_file_key(item) in extracted for item in chosen)):
+        by_unit = any(_file_key(item) in admitted for item in chosen)
+        if not chosen or not (
+            by_unit or _file_key(source) in extracted or any(_file_key(item) in extracted for item in chosen)
+        ):
             continue
         for item in chosen:
             winners.setdefault(_file_key(item), source)
@@ -2883,8 +2896,13 @@ def _encoding_choices(
             "mzxml": source,
             "analysed_instead": chosen,
             "rule": "encoding_preference.v1",
+            "paired_by": "admitted_by_unit" if by_unit else "same_folder",
             "reason": (
-                "A readable encoding of the same sample came out of an archive beside it, and the Catalog's "
+                "The unit admits a readable encoding of the same sample by itself - its listing, its sample "
+                "names, or the archive a sample names - and the Catalog's encoding rule analyses that one; the "
+                "mzXML is not converted."
+                if by_unit
+                else "A readable encoding of the same sample came out of an archive beside it, and the Catalog's "
                 "encoding rule analyses that one; the mzXML is not converted."
             ),
         })
@@ -5815,6 +5833,44 @@ def _matches_sample_file_names(
         return True
     return bool(stems) and PurePosixPath(base).stem in stems
 
+
+def _admitted_by_unit(
+    path: Path,
+    data_root: Path,
+    listed: Iterable[str],
+    sample_names: tuple[set[str], set[str]],
+    archive_samples: dict[str, str],
+) -> bool:
+    """Whether an undeclared unit admits a file by itself: listed, named by its samples, or out of an archive
+    one of its samples names (archive_samples, by _file_key)."""
+    return (
+        _path_matches_allowlist(path, data_root, listed)
+        or _matches_sample_file_names(path, sample_names)
+        or (bool(archive_samples) and _file_key(str(path)) in archive_samples)
+    )
+
+
+def _readable_inputs_admitted(
+    readable: list[str], data_root: Path, project: RepositoryProject, archive_samples: dict[str, str]
+) -> set[str]:
+    """The readable inputs an undeclared unit admits by itself, by _file_key, as its attribute stage will.
+
+    The convert stage pairs an mzXML with these whatever their folders (_encoding_choices): such a file is
+    the unit's input in any case, so converting its sample's mzXML as well would give the sample two
+    inputs. Empty for a declared unit, whose inputs are the Catalog's, one per sample, by path.
+    """
+    if not project.analysis_unit_id or declared_analysis_inputs(project):
+        return set()
+    listed = set(_project_allowlist(project, analysis_only=True))
+    sample_names = _sample_file_names(project)
+    return {
+        _file_key(item)
+        for item in readable
+        if not requires_msdial_conversion(Path(item).name)
+        and _admitted_by_unit(Path(item), data_root, listed, sample_names, archive_samples)
+    }
+
+
 def _filter_inputs_by_project_allowlist(
     inputs: list[str],
     data_root: Path,
@@ -5865,11 +5921,7 @@ def _filter_inputs_by_project_allowlist(
         )
 
     def admitted(path: Path, listed: Iterable[str]) -> bool:
-        return (
-            _path_matches_allowlist(path, data_root, listed)
-            or _matches_sample_file_names(path, sample_names)
-            or (bool(archive_samples) and _file_key(str(path)) in archive_samples)
-        )
+        return _admitted_by_unit(path, data_root, listed, sample_names, archive_samples)
 
     # Either source is sufficient on its own, and both are scoped to THIS unit: the declared
     # analysis-input files, and the file names this unit's samples claim. An archive shared with
