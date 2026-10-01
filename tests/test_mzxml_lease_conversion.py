@@ -622,6 +622,58 @@ class TheLeaseConvertsTheUnitsMzxml(_Scratch):
         self.assertNotIn("excluded_input_candidates", manifest)
         self.assertTrue(manifest["execution_allowed"])
 
+    def _held_at_the_second(self, times: int):
+        """Path.replace refusing the second conversion's .partial while another process holds it, ``times`` times."""
+        replace = Path.replace
+        calls: list[str] = []
+
+        def refuse(path: Path, target):
+            if str(path).endswith(".mzML.partial"):
+                calls.append(Path(path).name)
+                if Path(path).name.startswith("S02") and calls.count(Path(path).name) <= times:
+                    raise PermissionError(errno.EACCES, "The process cannot access the file because it is being "
+                                                        "used by another process")
+            return replace(path, target)
+
+        return patch.object(Path, "replace", refuse)
+
+    def test_a_file_held_for_a_moment_is_converted_once_it_is_let_go(self) -> None:
+        payloads = {"S01.mzXML": dda_32(), "S02.mzXML": dda_32(), "S03.mzXML": dda_32()}
+
+        with self._held_at_the_second(times=1), patch.object(mzxml_conversion, "RENAME_RETRY_DELAYS_SECONDS", (0.0,)):
+            manifest = self.lease(payloads)
+
+        self.assertEqual(["S01.mzML", "S02.mzML", "S03.mzML"], [Path(item).name for item in manifest["input_candidates"]])
+        self.assertNotIn("excluded_input_candidates", manifest)
+        self.assertEqual(2, manifest["input_conversions"]["records"][1]["output"]["rename_attempts"])
+
+    def test_a_file_another_process_keeps_stops_the_lease_and_a_retry_converts_the_rest(self) -> None:
+        """A held file is not the mzXML's fault, as a full disk is not: no sample is excluded for it, and the lease
+        fails so that the unit is retried, reusing what was converted."""
+        payloads = {"S01.mzXML": dda_32(), "S02.mzXML": dda_32(), "S03.mzXML": dda_32()}
+
+        with self._held_at_the_second(times=100), patch.object(mzxml_conversion, "RENAME_RETRY_DELAYS_SECONDS", (0.0,)):
+            with self.assertRaises(OSError) as raised:
+                self.lease(payloads)
+
+        self.assertEqual(errno.EACCES, raised.exception.errno)
+        self.assertIn("Another process held a file of S02.mzXML", str(raised.exception))
+        stopped = read_manifest(self.root / "metabolights" / "MTBLS417" / "mtbls417-pos" / "provenance" / "run-manifest.json")
+        self.assertEqual(("download_failed", "convert"), (stopped["status"], stopped["download_failure"]["stage"]))
+        self.assertFalse(stopped["execution_allowed"])
+        self.assertNotIn("excluded_input_candidates", stopped)
+        block = json.loads((Path(stopped["workspace"]) / "provenance" / "input-conversions.json").read_text(encoding="utf-8"))
+        self.assertEqual(("stopped", ["converted", "failed"]), (block["status"], [item["status"] for item in block["records"]]))
+        self.assertEqual(errno.EACCES, block["records"][1]["error_errno"])
+
+        manifest = self.lease(payloads)
+
+        self.assertEqual(["S01.mzML", "S02.mzML", "S03.mzML"], [Path(item).name for item in manifest["input_candidates"]])
+        self.assertEqual([True, False, False],
+                         [item["reused_previous_record"] for item in manifest["input_conversions"]["records"]])
+        self.assertNotIn("excluded_input_candidates", manifest)
+        self.assertTrue(manifest["execution_allowed"])
+
     def test_an_mzml_twin_nothing_can_decode_does_not_outrank_the_mzxml(self) -> None:
         """A convertible mzXML outranks an unreadable twin (2026-09-30): a Numpress mzML is one."""
         manifest = self._st003038(_numpress_mzml())

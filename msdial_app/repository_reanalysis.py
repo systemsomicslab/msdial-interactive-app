@@ -73,9 +73,12 @@ CONVERTED_DIRECTORY = "converted"
 # The reason a file whose conversion failed is kept out of the input candidates, and the provenance record
 # every conversion of a lease is written to (also the manifest's input_conversions).
 CONVERSION_FAILED = "conversion_failed"
-# The system errors that fail a conversion through no fault of its file - the disk or the quota is full - and
+# The system errors that fail a conversion through no fault of its file - the disk or the quota is full, or
+# another process (a virus scanner, an indexer) still held the file after the converter waited for it - and
 # stop the lease instead, so that the unit is retried rather than run without that sample.
 FULL_DISK_ERRNOS = frozenset(code for code in (errno.ENOSPC, getattr(errno, "EDQUOT", None)) if code is not None)
+HELD_FILE_ERRNOS = frozenset({errno.EACCES, errno.EPERM})
+LEASE_STOPPING_ERRNOS = FULL_DISK_ERRNOS | HELD_FILE_ERRNOS
 INPUT_CONVERSIONS_SCHEMA = "msdial-input-conversions.v1"
 INPUT_CONVERSIONS_NAME = "input-conversions.json"
 CONVERSION_PLAN_SCHEMA = "msdial-mzxml-conversion-plan.v1"
@@ -2753,8 +2756,9 @@ def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict
 # A FILE WHOSE CONVERSION FAILS is no input: it is kept out of the candidates with reason conversion_failed,
 # like an mzML RawDataHandler cannot decode, and the rest of the unit runs. A unit left with no input is
 # recorded as such, never raised: its project is excluded with NO_CONVERTED_INPUT_REASON, its preflight
-# skips it, and the campaign goes on. A full disk is not the file's fault: the lease stops there, keeping
-# the records written so far, so that a retry converts what is left (FULL_DISK_ERRNOS).
+# skips it, and the campaign goes on. A full disk is not the file's fault, nor a file another process still
+# held after the converter waited for it: the lease stops there, keeping the records written so far, so that
+# a retry converts what is left (LEASE_STOPPING_ERRNOS).
 #
 # RESUMABLE. Each conversion's record is written to provenance\input-conversions.json as it completes, and a
 # lease that finds one for the same output passes it to the converter, which reuses the output when the
@@ -2994,7 +2998,8 @@ def _run_lease_conversions(
     conversion failed. ``between(name)`` is called before each file, where the lease beats its heartbeat
     and hears a cancel.
 
-    A conversion the disk filled under (FULL_DISK_ERRNOS) says nothing about its mzXML, so it excludes no
+    A conversion the disk filled under (FULL_DISK_ERRNOS), or one stopped by a file another process held
+    after the converter waited for it (HELD_FILE_ERRNOS), says nothing about its mzXML, so it excludes no
     sample: the block is written as stopped, with every record so far, and OSError is raised, which fails
     the lease at its convert stage. A retry reuses what was converted and converts the rest.
     """
@@ -3026,14 +3031,19 @@ def _run_lease_conversions(
         block["records"].append(record)
         if record.get("status") == "converted":
             outputs[_file_key(str(destination))] = source
-        elif record.get("error_errno") in FULL_DISK_ERRNOS:
+        elif record.get("error_errno") in LEASE_STOPPING_ERRNOS:
             block["status"] = "stopped"
             block["stopped_at"] = datetime.now(timezone.utc).isoformat()
             _write_json(record_path, block)
+            what = (
+                f"The disk filled while {Path(source).name} was converted to mzML"
+                if record["error_errno"] in FULL_DISK_ERRNOS
+                else f"Another process held a file of {Path(source).name}'s conversion to mzML"
+            )
             raise OSError(
                 record["error_errno"],
-                f"The disk filled while {Path(source).name} was converted to mzML ({record.get('error')}). "
-                "The lease stops here rather than exclude the file, so that a retry converts it and the rest.",
+                f"{what} ({record.get('error')}). The lease stops here rather than exclude the file, so that a "
+                "retry converts it and the rest.",
             )
         else:
             failed.append({

@@ -44,19 +44,21 @@ conversion fails is kept out with reason `conversion_failed` and the rest run:
 the unit's `campaign_disposition` lists it in `excluded_inputs`, as it lists an
 mzML excluded as `unsupported_mzml_encoding`, so the gate's INP-1 accounts for
 the declared input. A unit left with no input is excluded with the reason, and
-its preflight skips it. A full disk is not a failed conversion: the lease stops
-at its `convert` stage (`download_failed`), keeping the records written so far,
-and a retry converts the rest. A re-lease reuses a conversion whose record still
-holds. Where the unit holds a vendor container or an mzML of the same sample
-beside an mzXML, the Catalog's encoding rule (shared test vectors
-`tests/vectors/encoding_preference.v1.json`) analyses that one and the mzXML is
-not converted. Files are one sample's where their folders agree once the words
-naming an encoding are set aside (`mzML/x.mzML` and `mzXML/x.mzXML`), or where
-the unit admits the readable file by itself, by its listing, its sample names or
-the archive a sample names, whatever its folder (`Thermo_RAW/x.raw` beside
-`mzXML/x.mzXML` for a sample named `x`); a study archive's `POS/QC_01.mzML` is
-no encoding of `NEG/QC_01.mzXML` for a unit whose samples name `QC_01.mzXML`.
-mzData, which nothing converts, excludes its unit in a campaign too.
+its preflight skips it. A full disk, or a file another process holds
+(`EACCES`/`EPERM`, after the converter has waited for it), is not a failed
+conversion: the lease stops at its `convert` stage (`download_failed`), keeping
+the records written so far, and a retry converts the rest. A re-lease reuses a
+conversion whose record still holds. Where the unit holds a vendor container or
+an mzML of the same sample beside an mzXML, the Catalog's encoding rule (shared
+test vectors `tests/vectors/encoding_preference.v1.json`) analyses that one and
+the mzXML is not converted. Files are one sample's where their folders agree
+once the words naming an encoding are set aside (`mzML/x.mzML` and
+`mzXML/x.mzXML`), or where the unit admits the readable file by itself, by its
+listing, its sample names or the archive a sample names, whatever its folder
+(`Thermo_RAW/x.raw` beside `mzXML/x.mzXML` for a sample named `x`); a study
+archive's `POS/QC_01.mzML` is no encoding of `NEG/QC_01.mzXML` for a unit whose
+samples name `QC_01.mzXML`. mzData, which nothing converts, excludes its unit in
+a campaign too.
 
 Agent-driven reanalysis also requires a user-reviewed `analysis_purpose` before
 download. That purpose anchors Class/contrast selection, annotation strategy,

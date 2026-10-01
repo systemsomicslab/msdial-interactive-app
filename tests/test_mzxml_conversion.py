@@ -695,6 +695,40 @@ class IntegrityTests(_Workspace):
         self.assertFailedCleanly(record, destination, "No space left on device")
         self.assertEqual(errno.ENOSPC, record["error_errno"])
 
+    def _held(self, times: int):
+        """Path.replace refusing the written .partial as Windows does while another process reads it."""
+        replace = Path.replace
+        calls: list[str] = []
+
+        def refuse(path: Path, target):
+            if str(path).endswith(".mzML.partial"):
+                calls.append(str(path))
+                if len(calls) <= times:
+                    raise PermissionError(errno.EACCES, "The process cannot access the file because it is being "
+                                                        "used by another process")
+            return replace(path, target)
+
+        return patch.object(Path, "replace", refuse), calls
+
+    def test_a_rename_another_process_held_up_is_tried_again(self) -> None:
+        """A virus scanner reading the file just closed refuses its rename for a moment: that is no failure."""
+        held, calls = self._held(times=2)
+        with held, patch.object(mzxml_conversion, "RENAME_RETRY_DELAYS_SECONDS", (0.0, 0.0, 0.0)):
+            record, destination = self.convert(dda_32())
+        self.assertConverted(record)
+        self.assertEqual(3, len(calls))
+        self.assertEqual(3, record["output"]["rename_attempts"])
+        self.assertTrue(destination.is_file())
+
+    def test_a_rename_held_up_throughout_names_its_system_error(self) -> None:
+        """So that a caller can tell a file another process kept from one that will never convert."""
+        held, calls = self._held(times=100)
+        with held, patch.object(mzxml_conversion, "RENAME_RETRY_DELAYS_SECONDS", (0.0, 0.0)):
+            record, destination = self.convert(dda_32())
+        self.assertFailedCleanly(record, destination, "PermissionError")
+        self.assertEqual(3, len(calls))
+        self.assertEqual(errno.EACCES, record["error_errno"])
+
     def test_a_sha1_mismatch_fails_by_default(self) -> None:
         data = dda_32().replace(b"Q Exactive", b"Q Exactivf")
         record, destination = self.convert(data)

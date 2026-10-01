@@ -45,6 +45,7 @@ import platform
 import re
 import shutil
 import sys
+import time
 import xml.etree.ElementTree as ET
 import zlib
 from array import array
@@ -69,6 +70,12 @@ _CHUNK = 1 << 20
 _SHA1_TAIL = 1 << 16
 _MAX_LISTED = 256
 _MAX_PROBLEMS = 25
+# The pauses before the written mzML is renamed into place again when another process holds it. Windows
+# refuses a rename (PermissionError: ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION) while a virus scanner or
+# an indexer reads the file just closed, and it usually lets go within seconds. Nothing else is waited for:
+# a file still held after these is a failed conversion whose error names its errno, which a caller can tell
+# from a file that will never convert.
+RENAME_RETRY_DELAYS_SECONDS = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 
 # RawDataHandler 1.3.9699.469 decodes these and nothing else in a binaryDataArray. MS:1000519 is
 # read as a 32-bit float and Numpress is not decoded, so neither may ever be written.
@@ -231,6 +238,8 @@ def convert_mzxml_to_mzml(
     "error_errno" where a system error stopped it) and none of this converter's output is left at the
     destination. Nothing at the destination is touched for an argument error (options, destination,
     missing source), and a file there that this converter did not write is never replaced or removed.
+    The written mzML is renamed into place once another process lets go of it, for a few seconds
+    (RENAME_RETRY_DELAYS_SECONDS); a record that needed more than one attempt says how many.
     """
     started_at = _now()
     source = Path(source)
@@ -310,7 +319,9 @@ def convert_mzxml_to_mzml(
             )
         # A file may have appeared at the destination while the conversion ran.
         _refuse_foreign_destination(destination, previous, record)
-        partial.replace(destination)
+        attempts = _rename_patiently(partial, destination)
+        if attempts > 1:
+            record["output"]["rename_attempts"] = attempts
         record["status"] = "converted"
     except Exception as exc:  # noqa: BLE001 - a conversion is recorded, never raised
         record["status"] = "failed"
@@ -397,6 +408,21 @@ def _options(options: ConversionOptions | dict[str, Any] | None) -> ConversionOp
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _rename_patiently(partial: Path, destination: Path) -> int:
+    """Rename the written mzML into place, waiting for another process to let go of it; the attempts made.
+
+    Only PermissionError is waited for (RENAME_RETRY_DELAYS_SECONDS); the last attempt's error is raised.
+    """
+    for attempt, delay in enumerate(RENAME_RETRY_DELAYS_SECONDS, start=1):
+        try:
+            partial.replace(destination)
+            return attempt
+        except PermissionError:
+            time.sleep(delay)
+    partial.replace(destination)
+    return len(RENAME_RETRY_DELAYS_SECONDS) + 1
 
 
 def _sha256_file(path: Path) -> str:
