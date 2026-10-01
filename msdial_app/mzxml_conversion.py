@@ -539,10 +539,13 @@ def _source_integrity(path: Path) -> dict[str, Any]:
     The mzXML schema says the sha1 covers the file from its first byte up to and including the
     opening <sha1> tag. Writers are not all known, so a digest that stops just before the tag is
     also accepted, and the record says which span matched.
+
+    The md5 is taken in the same pass because it is what the repositories publish: a source whose
+    declared MD5 was verified can then be tied to the very bytes this conversion read.
     """
     size = path.stat().st_size
     declared, tag_offset = _embedded_sha1(path, size)
-    whole256, whole1 = hashlib.sha256(), hashlib.sha1()
+    whole256, whole1, whole5 = hashlib.sha256(), hashlib.sha1(), hashlib.md5()
     prefix = hashlib.sha1() if tag_offset is not None else None
     before_tag = including_tag = None
     boundary_before = tag_offset if tag_offset is not None else -1
@@ -552,6 +555,7 @@ def _source_integrity(path: Path) -> dict[str, Any]:
         for chunk in iter(lambda: handle.read(_CHUNK), b""):
             whole256.update(chunk)
             whole1.update(chunk)
+            whole5.update(chunk)
             if prefix is not None and position < boundary_including:
                 piece = chunk[: boundary_including - position]
                 if before_tag is None and position + len(piece) >= boundary_before:
@@ -578,6 +582,7 @@ def _source_integrity(path: Path) -> dict[str, Any]:
         "bytes": size,
         "sha256": whole256.hexdigest(),
         "sha1": whole1.hexdigest(),
+        "md5": whole5.hexdigest(),
         "embedded_sha1": {
             "status": status,
             "declared": declared,

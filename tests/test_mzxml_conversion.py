@@ -354,6 +354,16 @@ class Mzxml32MappingTests(_Workspace):
         self.assertEqual(self.record["source"]["embedded_sha1"]["span"], "through_opening_tag")
         self.assertEqual(self.record["converter"], converter_identity())
 
+    def test_the_source_is_hashed_as_repositories_publish_it(self) -> None:
+        # The md5 beside the sha256 and sha1: a source whose declared MD5 was verified is then tied to the very
+        # bytes this conversion read.
+        source = self.record["source"]
+        self.assertEqual(
+            (hashlib.sha256(dda_32()).hexdigest(), hashlib.sha1(dda_32()).hexdigest(), hashlib.md5(dda_32()).hexdigest()),
+            (source["sha256"], source["sha1"], source["md5"]),
+        )
+        self.assertEqual(len(dda_32()), source["bytes"])
+
     def test_spectrum_list_count_equals_the_spectra(self) -> None:
         spectrum_list = self.root_element.find(f"{MZML}run/{MZML}spectrumList")
         self.assertEqual(spectrum_list.get("count"), "4")
