@@ -15,6 +15,7 @@ run the reanalysis gate's own script, where it is on this machine, on a workspac
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -29,7 +30,7 @@ from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
 
-from msdial_app import mcp_server
+from msdial_app import mcp_server, mzxml_conversion
 from msdial_app.mzxml_conversion import ConversionOptions
 from msdial_app.repository_analysis_rows import build_repository_analysis_rows, write_analysis_csv
 from msdial_app.repository_reanalysis import (
@@ -518,6 +519,40 @@ class TheLeaseConvertsTheUnitsMzxml(_Scratch):
         self.assertFalse(one_sample("POS/x.mzML", "NEG/x.mzXML"))
         self.assertFalse(one_sample("HILIC_POS_mzML/x.mzML", "HILIC_NEG_mzXML/x.mzXML"))
         self.assertFalse(one_sample("Batch_D/x.mzML", "Batch_E/x.mzXML"), "a one-letter word is not set aside")
+
+    def test_a_full_disk_stops_the_lease_and_a_retry_converts_the_rest(self) -> None:
+        """A full disk is not the mzXML's fault: no sample is excluded for it, and the lease fails so that the unit
+        is retried, reusing what was converted."""
+        payloads = {"S01.mzXML": dda_32(), "S02.mzXML": dda_32(), "S03.mzXML": dda_32()}
+        write = mzxml_conversion._write_mzml
+        calls: list[str] = []
+
+        def fill_at_the_second(*args, **kwargs):
+            calls.append("write")
+            if len(calls) == 2:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return write(*args, **kwargs)
+
+        with patch.object(mzxml_conversion, "_write_mzml", side_effect=fill_at_the_second):
+            with self.assertRaises(OSError) as raised:
+                self.lease(payloads)
+
+        self.assertEqual(errno.ENOSPC, raised.exception.errno)
+        stopped = read_manifest(self.root / "metabolights" / "MTBLS417" / "mtbls417-pos" / "provenance" / "run-manifest.json")
+        self.assertEqual(("download_failed", "convert"), (stopped["status"], stopped["download_failure"]["stage"]))
+        self.assertFalse(stopped["execution_allowed"])
+        self.assertNotIn("excluded_input_candidates", stopped)
+        block = json.loads((Path(stopped["workspace"]) / "provenance" / "input-conversions.json").read_text(encoding="utf-8"))
+        self.assertEqual(("stopped", ["converted", "failed"]), (block["status"], [item["status"] for item in block["records"]]))
+        self.assertEqual(errno.ENOSPC, block["records"][1]["error_errno"])
+
+        manifest = self.lease(payloads)
+
+        self.assertEqual(["S01.mzML", "S02.mzML", "S03.mzML"], [Path(item).name for item in manifest["input_candidates"]])
+        self.assertEqual([True, False, False],
+                         [item["reused_previous_record"] for item in manifest["input_conversions"]["records"]])
+        self.assertNotIn("excluded_input_candidates", manifest)
+        self.assertTrue(manifest["execution_allowed"])
 
     def test_an_mzml_twin_nothing_can_decode_does_not_outrank_the_mzxml(self) -> None:
         """A convertible mzXML outranks an unreadable twin (2026-09-30): a Numpress mzML is one."""

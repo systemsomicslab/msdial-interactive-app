@@ -189,10 +189,11 @@ writes each mzXML as mzML under `raw\converted` with Interactive's own converter
 (`msdial_app.mzxml_conversion`, every inference flag off), records each conversion
 in `input_conversions` and `provenance\input-conversions.json`, and runs what
 converted. A file whose conversion fails is excluded with reason
-`conversion_failed`, and the rest of the unit runs. Where an archive holds a
-readable encoding of the same sample beside the mzXML, the Catalog's encoding
-rule analyses that one instead. mzData, which nothing converts, still excludes
-its unit before download.
+`conversion_failed`, and the rest of the unit runs; a full disk instead stops
+the lease, so that the unit is retried. Where an archive holds a readable
+encoding of the same sample beside the mzXML, the Catalog's encoding rule
+analyses that one instead. mzData, which nothing converts, still excludes its
+unit before download.
 Raw-header results reported as `Mixed` can be split, after explicit confirmation,
 into independent acquisition-mode units with `msdial_split_repository_unit`; the
 Mixed parent is never sent to MS-DIAL.

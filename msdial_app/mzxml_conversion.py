@@ -227,10 +227,10 @@ def convert_mzxml_to_mzml(
     keeps where and when the output was written under "reused_from", since the recorded files may
     have been another unit's or the same files under another spelling of their path.
 
-    Never raises. The record's status is "converted" or "failed"; on failure the error says why and
-    none of this converter's output is left at the destination. Nothing at the destination is
-    touched for an argument error (options, destination, missing source), and a file there that
-    this converter did not write is never replaced or removed.
+    Never raises. The record's status is "converted" or "failed"; on failure the error says why (with
+    "error_errno" where a system error stopped it) and none of this converter's output is left at the
+    destination. Nothing at the destination is touched for an argument error (options, destination,
+    missing source), and a file there that this converter did not write is never replaced or removed.
     """
     started_at = _now()
     source = Path(source)
@@ -315,6 +315,10 @@ def convert_mzxml_to_mzml(
     except Exception as exc:  # noqa: BLE001 - a conversion is recorded, never raised
         record["status"] = "failed"
         record["error"] = f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, OSError) and isinstance(exc.errno, int):
+            # Which system error stopped it, so that a caller can tell a full disk, which a retry may get
+            # past, from a file that will never convert.
+            record["error_errno"] = exc.errno
         if owned and destination.is_file() and _written_by_converter(destination, previous):
             # A stale output of this converter; leaving it would let input discovery pick up an mzML
             # this record says is not a valid conversion.

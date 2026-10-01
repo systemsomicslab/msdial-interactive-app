@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import base64
 import copy
+import errno
 import hashlib
 import re
 import shutil
@@ -28,6 +29,7 @@ import unittest
 import xml.etree.ElementTree as ET
 import zlib
 from pathlib import Path
+from unittest.mock import patch
 
 from msdial_app import mzxml_conversion
 from msdial_app.mzxml_conversion import (
@@ -683,6 +685,15 @@ class IntegrityTests(_Workspace):
         data = dda_32()
         record, destination = self.convert(data[: len(data) // 2])
         self.assertFailedCleanly(record, destination, "ParseError")
+        self.assertNotIn("error_errno", record, "a file that will never convert names no system error")
+
+    def test_a_full_disk_is_recorded_with_its_system_error(self) -> None:
+        """So that a caller can tell a disk a retry may get past from a file that will never convert."""
+        full = OSError(errno.ENOSPC, "No space left on device")
+        with patch.object(mzxml_conversion, "_write_mzml", side_effect=full):
+            record, destination = self.convert(dda_32())
+        self.assertFailedCleanly(record, destination, "No space left on device")
+        self.assertEqual(errno.ENOSPC, record["error_errno"])
 
     def test_a_sha1_mismatch_fails_by_default(self) -> None:
         data = dda_32().replace(b"Q Exactive", b"Q Exactivf")

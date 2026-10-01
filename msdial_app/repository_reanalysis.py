@@ -5,6 +5,7 @@ import html
 import http.client
 import copy
 import csv
+import errno
 import json
 import os
 import random
@@ -69,6 +70,9 @@ CONVERTED_DIRECTORY = "converted"
 # The reason a file whose conversion failed is kept out of the input candidates, and the provenance record
 # every conversion of a lease is written to (also the manifest's input_conversions).
 CONVERSION_FAILED = "conversion_failed"
+# The system errors that fail a conversion through no fault of its file - the disk or the quota is full - and
+# stop the lease instead, so that the unit is retried rather than run without that sample.
+FULL_DISK_ERRNOS = frozenset(code for code in (errno.ENOSPC, getattr(errno, "EDQUOT", None)) if code is not None)
 INPUT_CONVERSIONS_SCHEMA = "msdial-input-conversions.v1"
 INPUT_CONVERSIONS_NAME = "input-conversions.json"
 CONVERSION_PLAN_SCHEMA = "msdial-mzxml-conversion-plan.v1"
@@ -2675,7 +2679,8 @@ def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict
 # A FILE WHOSE CONVERSION FAILS is no input: it is kept out of the candidates with reason conversion_failed,
 # like an mzML RawDataHandler cannot decode, and the rest of the unit runs. A unit left with no input is
 # recorded as such, never raised: its project is excluded with NO_CONVERTED_INPUT_REASON, its preflight
-# skips it, and the campaign goes on.
+# skips it, and the campaign goes on. A full disk is not the file's fault: the lease stops there, keeping
+# the records written so far, so that a retry converts what is left (FULL_DISK_ERRNOS).
 #
 # RESUMABLE. Each conversion's record is written to provenance\input-conversions.json as it completes, and a
 # lease that finds one for the same output passes it to the converter, which reuses the output when the
@@ -2892,12 +2897,16 @@ def _run_lease_conversions(
     *,
     between: Any = None,
 ) -> dict[str, Any]:
-    """Convert each mzXML, recording as it goes; never raises for a conversion, only for an unwritable record.
+    """Convert each mzXML, recording as it goes; raises only for a full disk or an unwritable record.
 
     Returns the input_conversions block (INPUT_CONVERSIONS_SCHEMA, with the converter's records), the mzML
     written by _file_key with the mzXML each was written from, and the exclusion entry of each mzXML whose
     conversion failed. ``between(name)`` is called before each file, where the lease beats its heartbeat
     and hears a cancel.
+
+    A conversion the disk filled under (FULL_DISK_ERRNOS) says nothing about its mzXML, so it excludes no
+    sample: the block is written as stopped, with every record so far, and OSError is raised, which fails
+    the lease at its convert stage. A retry reuses what was converted and converts the rest.
     """
     previous = _previous_conversion_records(provenance)
     options = ConversionOptions()
@@ -2927,6 +2936,15 @@ def _run_lease_conversions(
         block["records"].append(record)
         if record.get("status") == "converted":
             outputs[_file_key(str(destination))] = source
+        elif record.get("error_errno") in FULL_DISK_ERRNOS:
+            block["status"] = "stopped"
+            block["stopped_at"] = datetime.now(timezone.utc).isoformat()
+            _write_json(record_path, block)
+            raise OSError(
+                record["error_errno"],
+                f"The disk filled while {Path(source).name} was converted to mzML ({record.get('error')}). "
+                "The lease stops here rather than exclude the file, so that a retry converts it and the rest.",
+            )
         else:
             failed.append({
                 "path": source,
