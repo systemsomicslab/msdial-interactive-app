@@ -1030,14 +1030,8 @@ class AcquisitionSplitTests(_MixedUnitFixture, unittest.TestCase):
         self.assertTrue(any("on its own" in item for item in reasons), reasons)
         self.assertFalse(part["project"]["eligible"])
 
-    def test_split_with_mzdata_sample_names_keeps_each_part_excluded(self) -> None:
-        """Splitting acquisition modes must not erase the verdict that nothing converts the unit's inputs.
-
-        The samples name mzData, which MS-DIAL cannot read and nothing converts. An mzXML is converted in the
-        lease, and its parts are not excluded for it (test_mzxml_lease_conversion.AMixedConvertedUnitSplits).
-        """
-        from msdial_app.repository_reanalysis import UNCONVERTIBLE_INPUT_REASON
-
+    def test_split_with_mzxml_sample_names_keeps_each_part_excluded(self) -> None:
+        """Splitting acquisition modes must not erase a conversion-required verdict."""
         with tempfile.TemporaryDirectory() as temporary:
             manifest, _, _ = self._mixed(Path(temporary) / "unit")
             parent = json.loads(manifest.read_text(encoding="utf-8"))
@@ -1049,7 +1043,7 @@ class AcquisitionSplitTests(_MixedUnitFixture, unittest.TestCase):
                     "role": "shared_raw_archive",
                 },
                 {
-                    "name": "ST003038_rawdata_mzData.zip",
+                    "name": "ST003038_rawdata_mzXML.zip",
                     "size_bytes": 1,
                     "url": "",
                     "role": "shared_raw_archive",
@@ -1057,7 +1051,7 @@ class AcquisitionSplitTests(_MixedUnitFixture, unittest.TestCase):
             ]
             for sample in parent["project"]["sample_metadata"]:
                 raw_file = str(sample.get("raw_file") or "")
-                sample["raw_file"] = str(Path(raw_file).with_suffix(".mzData"))
+                sample["raw_file"] = str(Path(raw_file).with_suffix(".mzXML"))
             manifest.write_text(json.dumps(parent), encoding="utf-8")
 
             result = split_unit_by_acquisition(manifest, confirmed=True)
@@ -1073,11 +1067,44 @@ class AcquisitionSplitTests(_MixedUnitFixture, unittest.TestCase):
             self.assertFalse(part["project"]["eligible"])
             self.assertTrue(
                 any(
-                    reason.startswith(UNCONVERTIBLE_INPUT_REASON)
+                    "no mzXML/mzData reader" in reason
                     for reason in part["project"]["exclusion_reasons"]
                 ),
                 part["project"]["exclusion_reasons"],
             )
+
+    def test_a_campaign_split_keeps_what_nothing_converts_excluded_and_converts_mzxml(self) -> None:
+        """In a campaign an mzXML is converted in the lease, so its parts are not excluded for it; mzData, which
+        nothing converts, still excludes each part (test_mzxml_lease_conversion.AMixedConvertedUnitSplits)."""
+        from msdial_app.repository_reanalysis import CONVERSION_REQUIRED_REASON, UNCONVERTIBLE_INPUT_REASON
+
+        for suffix in (".mzXML", ".mzData"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as temporary:
+                manifest, _, _ = self._mixed(Path(temporary) / "unit")
+                parent = json.loads(manifest.read_text(encoding="utf-8"))
+                parent["campaign_authorizations"] = [
+                    {"approval_id": "approval-1", "manifest_digest": "sha256:" + "0" * 64, "boundary": 1}
+                ]
+                parent["project"]["files"] = [
+                    {"name": f"ST003038_rawdata_{kind}.zip", "size_bytes": 1, "url": "", "role": "shared_raw_archive"}
+                    for kind in ("mzML", suffix[1:])
+                ]
+                for sample in parent["project"]["sample_metadata"]:
+                    sample["raw_file"] = str(Path(str(sample.get("raw_file") or "")).with_suffix(suffix))
+                manifest.write_text(json.dumps(parent), encoding="utf-8")
+
+                result = split_unit_by_acquisition(manifest, confirmed=True)
+                parts = [
+                    json.loads(Path(item["manifest_path"]).read_text(encoding="utf-8")) for item in result["parts"]
+                ]
+
+                self.assertTrue(result["written"])
+                self.assertTrue(parts)
+                for part in parts:
+                    reasons = part["project"]["exclusion_reasons"]
+                    self.assertFalse(any(reason.startswith(CONVERSION_REQUIRED_REASON) for reason in reasons), reasons)
+                    unconvertible = any(reason.startswith(UNCONVERTIBLE_INPUT_REASON) for reason in reasons)
+                    self.assertEqual(suffix == ".mzData", unconvertible, reasons)
 
     def test_split_provenance_says_the_run_holds_part_of_the_proposal(self) -> None:
         # MTBLS2207's DDA part was about to record "Class ... across 11 samples" for a run of six.

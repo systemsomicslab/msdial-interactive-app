@@ -5,9 +5,9 @@ Two defects met here, and both surfaced on the first real download of the 2026-0
 The analysis allow-list once accepted only files of role "raw". mzML is role "converted" and
 MS-DIAL reads it natively. Every MetaboLights mzML unit was therefore refused, and the refusal came
 AFTER the download had transferred the data: 587 MB of MTBLS2207 landed on disk and then
-create_download_lease raised "empty file allow-list". mzXML is different: MS-DIAL has no reader for it,
-so the lease converts it to mzML (its convert stage) and the unit analyses what was written; mzData, which
-nothing converts, still excludes its unit.
+create_download_lease raised "empty file allow-list". mzXML is deliberately different: MS-DIAL has
+no reader for it, so it must be converted to mzML before a unit can be analysed. Only a campaign's lease
+converts it (EligibilityPolicy.convert_mzxml); everywhere else it still excludes its unit.
 
 The deeper one: most units do not enumerate their raw files at all. Metabolomics Workbench
 publishes one archive per study, so the unit's file list is the archive and nothing else. Measured
@@ -74,8 +74,7 @@ class AcceptedRolesTests(unittest.TestCase):
 
         self.assertEqual("requires_conversion", project.files[0].role)
 
-    def test_an_mzxml_sample_plans_its_conversion_before_download(self) -> None:
-        """It used to exclude the unit here; the lease converts it to mzML instead (2026-09-30)."""
+    def test_mzxml_is_rejected_before_download(self) -> None:
         project = _project(
             [RepositoryFile("study.zip", 10, "https://x", role="raw_archive")],
             ["sample.mzXML"],
@@ -91,35 +90,11 @@ class AcceptedRolesTests(unittest.TestCase):
             ),
         )
 
-        # Nothing excludes it; what keeps it under review is only its unknown separation and modes.
-        self.assertEqual([], evaluated.exclusion_reasons)
-        self.assertEqual("raw_metadata_required", evaluated.selection_status)
-        self.assertEqual(["sample.mzXML"], evaluated.conversion_plan["names"])
-
-    def test_mzdata_is_rejected_before_download(self) -> None:
-        project = _project(
-            [RepositoryFile("study.zip", 10, "https://x", role="raw_archive")],
-            ["sample.mzData"],
-        )
-
-        evaluated = evaluate_eligibility(
-            project,
-            EligibilityPolicy(
-                max_download_bytes=100,
-                max_samples=10,
-                require_known_size=False,
-                require_untargeted=False,
-            ),
-        )
-
         self.assertFalse(evaluated.eligible)
-        self.assertTrue(any(item.startswith(UNCONVERTIBLE_INPUT_REASON) for item in evaluated.exclusion_reasons))
-        self.assertEqual({}, evaluated.conversion_plan)
+        self.assertTrue(any("no mzXML/mzData reader" in item for item in evaluated.exclusion_reasons))
 
-    def test_st003038_parallel_encodings_wait_for_their_archives(self) -> None:
-        """An mzML archive beside an mzXML archive, the samples naming .mzXML. Which encoding of each sample is
-        analysed is decided after extraction, by the Catalog's encoding rule; before download the unit only
-        plans its conversion (test_mzxml_lease_conversion holds the lease's choice)."""
+    def test_st003038_parallel_encodings_are_refused_without_a_reviewed_substitution(self) -> None:
+        """Keep the repository's real shape until an explicit substitution rule exists."""
         project = _project(
             [
                 RepositoryFile(
@@ -142,10 +117,10 @@ class AcceptedRolesTests(unittest.TestCase):
             ),
         )
 
-        # Nothing excludes it; what keeps it under review is only its unknown separation and modes.
-        self.assertEqual([], evaluated.exclusion_reasons)
-        self.assertEqual("raw_metadata_required", evaluated.selection_status)
-        self.assertEqual(10, evaluated.conversion_plan["named_inputs"])
+        self.assertFalse(evaluated.eligible)
+        self.assertTrue(
+            any("no mzXML/mzData reader" in item for item in evaluated.exclusion_reasons)
+        )
 
     def test_an_alternate_encoding_is_not_an_analysis_input(self) -> None:
         """A .wiff2 beside a .wiff is the same sample twice, and an existing test pinned this."""
@@ -167,6 +142,73 @@ class AcceptedRolesTests(unittest.TestCase):
         """A .wiff.scan is read through its .wiff, never opened on its own."""
         self.assertNotIn("sidecar", ANALYSIS_INPUT_ROLES)
         self.assertNotIn("auxiliary", ANALYSIS_INPUT_ROLES)
+
+
+class InACampaignAnMzxmlPlansItsConversion(unittest.TestCase):
+    """The user decided on 2026-09-30 that a campaign's mzXML-only data are converted and run. A campaign unit
+    is judged with convert_mzxml, and its mzXML only plans a conversion; mzData still excludes it."""
+
+    @staticmethod
+    def _evaluate(project: RepositoryProject, max_samples: int = 10) -> RepositoryProject:
+        return evaluate_eligibility(
+            project,
+            EligibilityPolicy(
+                max_download_bytes=100,
+                max_samples=max_samples,
+                require_known_size=False,
+                require_untargeted=False,
+                convert_mzxml=True,
+            ),
+        )
+
+    def test_an_mzxml_sample_plans_its_conversion_before_download(self) -> None:
+        evaluated = self._evaluate(
+            _project([RepositoryFile("study.zip", 10, "https://x", role="raw_archive")], ["sample.mzXML"])
+        )
+
+        # Nothing excludes it; what keeps it under review is only its unknown separation and modes.
+        self.assertEqual([], evaluated.exclusion_reasons)
+        self.assertEqual("raw_metadata_required", evaluated.selection_status)
+        self.assertEqual(["sample.mzXML"], evaluated.conversion_plan["names"])
+
+    def test_mzdata_is_rejected_before_download(self) -> None:
+        evaluated = self._evaluate(
+            _project([RepositoryFile("study.zip", 10, "https://x", role="raw_archive")], ["sample.mzData"])
+        )
+
+        self.assertFalse(evaluated.eligible)
+        self.assertTrue(any(item.startswith(UNCONVERTIBLE_INPUT_REASON) for item in evaluated.exclusion_reasons))
+        self.assertEqual({}, evaluated.conversion_plan)
+
+    def test_st003038_parallel_encodings_wait_for_their_archives(self) -> None:
+        """An mzML archive beside an mzXML archive, the samples naming .mzXML. Which encoding of each sample is
+        analysed is decided after extraction, by the Catalog's encoding rule; before download the unit only
+        plans its conversion (test_mzxml_lease_conversion holds the lease's choice)."""
+        project = _project(
+            [
+                RepositoryFile("ST003038_rawdata_mzML.zip", 10, "https://x", role="shared_raw_archive"),
+                RepositoryFile("ST003038_rawdata_mzXML.zip", 10, "https://x", role="shared_raw_archive"),
+            ],
+            [f"211210_SVC_Pozzi__Lipidomics_NEG_S{i:02d}.mzXML" for i in range(1, 11)],
+        )
+
+        evaluated = self._evaluate(project, max_samples=20)
+
+        self.assertEqual([], evaluated.exclusion_reasons)
+        self.assertEqual("raw_metadata_required", evaluated.selection_status)
+        self.assertEqual(10, evaluated.conversion_plan["named_inputs"])
+
+    def test_a_project_with_no_analysis_unit_converts_nothing(self) -> None:
+        """An accession-level project has no Catalog decision of which files are its inputs: even with the flag,
+        its mzXML is requires_conversion, as before."""
+        project = _project([RepositoryFile("FILES/A.mzXML", 10, "https://x", role="requires_conversion")], ["A"])
+        project.analysis_unit_id = ""
+
+        evaluated = self._evaluate(project)
+
+        self.assertFalse(evaluated.eligible)
+        self.assertTrue(any("no mzXML/mzData reader" in item for item in evaluated.exclusion_reasons))
+        self.assertEqual({}, evaluated.conversion_plan)
 
 
 class SampleFileNameTests(unittest.TestCase):
@@ -253,8 +295,9 @@ class FilterTests(unittest.TestCase):
         sample names, only its own ten arrive.
 
         The sample names are ST003038's with the extension rewritten to mzML, so this is a
-        synthetic variant, not that study. ST003038 as published names its mzXML; its real shape is held
-        by test_st003038_parallel_encodings_wait_for_their_archives.
+        synthetic variant, not that study. ST003038 as published is mzXML and is refused before
+        download; its real shape is held by
+        test_st003038_parallel_encodings_are_refused_without_a_reviewed_substitution.
         """
         project = _project(
             [RepositoryFile("study_rawdata_mzML.zip", 10, "https://x", role="shared_raw_archive")],

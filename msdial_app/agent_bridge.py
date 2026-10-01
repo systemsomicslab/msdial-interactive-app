@@ -66,9 +66,11 @@ def summarize_jobs(
             "repository_archive_extraction",
             "campaign_authorization_v1",
             "isolated_job_registry",
-            # The lease converts a unit's mzXML to mzML in its convert stage (mzxml_conversion, every
-            # inference off), records input_conversions, and runs what converted; mzData is still excluded.
-            "mzxml_converted_to_mzml",
+            # Outside a campaign an mzXML or mzData still excludes its unit before download. A campaign's lease
+            # converts its unit's mzXML to mzML in its convert stage (mzxml_conversion, every inference off),
+            # records input_conversions, and runs what converted; mzData is excluded there too.
+            "mzxml_requires_conversion_to_mzml",
+            "campaign_mzxml_converted_to_mzml",
             "automatic_alignment_rt_correction",
             "console_time_limits",
             "cancel_console_and_download_jobs",

@@ -183,17 +183,20 @@ workflow settings, QA, publication-report artifacts, and checksums are kept
 after raw-data cleanup. See [Public repository reanalysis](docs/public_repository_reanalysis.md)
 for commands, eligibility rules, and the pilot validation record.
 
-MS-DIAL reads mzML but has no mzXML/mzData reader. A unit whose samples exist
-only as mzXML is converted in its download lease: the lease's `convert` stage
-writes each mzXML as mzML under `raw\converted` with Interactive's own converter
-(`msdial_app.mzxml_conversion`, every inference flag off), records each conversion
-in `input_conversions` and `provenance\input-conversions.json`, and runs what
-converted. A file whose conversion fails is excluded with reason
+MS-DIAL reads mzML but has no mzXML/mzData reader. Repository records that name
+those legacy formats are blocked as `requires_conversion` before download and
+must be converted to mzML through a separately reviewed conversion workflow.
+Only in a campaign, where a campaign authorization covers the unit, is an
+mzXML converted by the download lease itself: its `convert` stage writes each
+of the unit's mzXML as mzML under `raw\converted` with Interactive's own
+converter (`msdial_app.mzxml_conversion`, every inference flag off), records
+each conversion in `input_conversions` and `provenance\input-conversions.json`,
+and runs what converted. A file whose conversion fails is excluded with reason
 `conversion_failed`, and the rest of the unit runs; a full disk instead stops
 the lease, so that the unit is retried. Where an archive holds a readable
 encoding of the same sample beside the mzXML, the Catalog's encoding rule
-analyses that one instead. mzData, which nothing converts, still excludes its
-unit before download.
+analyses that one instead. mzData, which nothing converts, excludes its unit
+there too.
 Raw-header results reported as `Mixed` can be split, after explicit confirmation,
 into independent acquisition-mode units with `msdial_split_repository_unit`; the
 Mixed parent is never sent to MS-DIAL.

@@ -56,11 +56,14 @@ USER_AGENT = "MS-DIAL-Interactive/0.3 public-reanalysis"
 RAW_SUFFIXES = {
     ".abf", ".cdf", ".d", ".lcd", ".mzml", ".qgd", ".raw", ".wiff", ".wiff2",
 }
-# MS-DIAL HAS NO READER FOR EITHER, AND ONLY ONE OF THEM IS CONVERTED. The user decided on 2026-09-30 that
-# mzXML-only data are converted to mzML and run: the lease's convert stage writes each mzXML input as mzML
-# under raw\converted (msdial_app.mzxml_conversion, every inference off). Nothing converts mzData, so a
-# unit that needs it is still excluded. A packed mzXML (x.mzXML.lzma, x.mzXML.gz) is the mzXML it unpacks
-# to, and is converted once the extract stage has unpacked it.
+# MS-DIAL HAS NO READER FOR EITHER, AND ONLY ONE OF THEM IS CONVERTED, AND ONLY IN A CAMPAIGN. Outside a
+# campaign a unit that needs either is requires_conversion and is excluded before download, as it always
+# was: it needs a reviewed ProteoWizard-to-mzML conversion with new provenance. The user decided on
+# 2026-09-30 that a campaign's mzXML-only data are converted to mzML and run: the lease's convert stage,
+# given a campaign authorization, writes each of the unit's mzXML as mzML under raw\converted
+# (msdial_app.mzxml_conversion, every inference off). Nothing converts mzData, so a unit that needs it is
+# excluded in a campaign too. A packed mzXML (x.mzXML.lzma, x.mzXML.gz) is the mzXML it unpacks to, and is
+# converted once the extract stage has unpacked it.
 CONVERTIBLE_SUFFIXES = (".mzxml",)
 UNSUPPORTED_ENCODING_SUFFIXES = (".mzdata", ".mzdata.xml")
 CONVERSION_REQUIRED_SUFFIXES = CONVERTIBLE_SUFFIXES + UNSUPPORTED_ENCODING_SUFFIXES
@@ -76,7 +79,10 @@ FULL_DISK_ERRNOS = frozenset(code for code in (errno.ENOSPC, getattr(errno, "EDQ
 INPUT_CONVERSIONS_SCHEMA = "msdial-input-conversions.v1"
 INPUT_CONVERSIONS_NAME = "input-conversions.json"
 CONVERSION_PLAN_SCHEMA = "msdial-mzxml-conversion-plan.v1"
-# The exclusion reasons evaluate_eligibility gives for these, which a split part inherits from its parent.
+# The exclusion reasons evaluate_eligibility gives for these, which a split part inherits from its parent:
+# outside a campaign, for an mzXML or mzData; in one, for what nothing converts, and for a unit whose lease
+# converted and was left with no input.
+CONVERSION_REQUIRED_REASON = "MS-DIAL has no mzXML/mzData reader"
 UNCONVERTIBLE_INPUT_REASON = "MS-DIAL cannot read these analysis inputs, and nothing converts them to mzML"
 NO_CONVERTED_INPUT_REASON = "No analysis input survived its conversion from mzXML to mzML"
 # What an archive is, and how it is opened, is decided in one place: archives.py. The lease routes an
@@ -190,6 +196,11 @@ class EligibilityPolicy:
     require_untargeted: bool = True
     allowed_separations: tuple[str, ...] = ("LC-MS",)
     allowed_acquisition_modes: tuple[str, ...] = ("DDA", "DIA", "AIF", "SWATH")
+    # Set only for a campaign unit: one a campaign approval covers, or one whose manifest records one
+    # (_converts_mzxml). Its mzXML then plans a conversion that the lease makes. Off, an mzXML or mzData
+    # excludes the unit before download, as it always did: outside a campaign it needs a reviewed
+    # ProteoWizard-to-mzML conversion with new provenance.
+    convert_mzxml: bool = False
 
 
 # HOW LONG A DOWNLOAD MAY GO WITHOUT A BYTE, AND HOW OFTEN IT IS TRIED AGAIN.
@@ -1154,6 +1165,83 @@ def _no_converted_input_reason(outcome: Any) -> str:
     )
 
 
+def _conversion_required_reasons(project: RepositoryProject) -> list[str]:
+    """Outside a campaign: a unit that names an mzXML or mzData is excluded before any byte is fetched.
+
+    MS-DIAL has no reader for either. Such a unit is requires_conversion and needs a reviewed
+    ProteoWizard-to-mzML conversion with new provenance before it is reanalysed, as it always did; only a
+    campaign's lease converts (_campaign_conversion_reasons). A conversion plan is not kept: nothing
+    here converts. What a campaign lease recorded converting (an outcome) is.
+    """
+    if not (project.conversion_plan or {}).get("outcome"):
+        project.conversion_plan = {}
+    conversion_required = {
+        item.name
+        for item in project.files
+        if item.role == "requires_conversion"
+        or (
+            item.role in ANALYSIS_INPUT_ROLES
+            and requires_msdial_conversion(item.name)
+        )
+    }
+    conversion_required.update(
+        str((sample or {}).get("raw_file") or "").strip()
+        for sample in project.sample_metadata or []
+        if requires_msdial_conversion(str((sample or {}).get("raw_file") or ""))
+    )
+    conversion_required.discard("")
+    if not conversion_required:
+        return []
+    ordered_conversion_inputs = sorted(conversion_required, key=str.casefold)
+    preview = ", ".join(ordered_conversion_inputs[:3])
+    if len(conversion_required) > 3:
+        preview += f", and {len(conversion_required) - 3} more"
+    return [
+        f"{CONVERSION_REQUIRED_REASON}. Convert the declared analysis input(s) to mzML "
+        f"with ProteoWizard msconvert before reanalysis: {preview}."
+    ]
+
+
+def _campaign_conversion_reasons(project: RepositoryProject) -> list[str]:
+    """In a campaign: an mzXML plans its conversion, and what nothing converts excludes the unit.
+
+    The user decided on 2026-09-30 that a campaign's mzXML-only data are converted to mzML and run. The
+    lease's convert stage does it (CONVERTIBLE_SUFFIXES), so here an mzXML, packed or not, only plans a
+    conversion (project.conversion_plan); what nothing converts - mzData, and whatever else the Catalog
+    marks as needing a conversion it has no route for - still excludes the unit. So does a lease's record
+    that no input survived its conversions.
+    """
+    reasons: list[str] = []
+    convertible: set[str] = set()
+    unconvertible: set[str] = set()
+    for item in project.files:
+        if item.role == "requires_conversion" or (
+            item.role in ANALYSIS_INPUT_ROLES and requires_msdial_conversion(item.name)
+        ):
+            (convertible if is_convertible_input(item.name) else unconvertible).add(item.name)
+    for sample in project.sample_metadata or []:
+        raw_file = str((sample or {}).get("raw_file") or "").strip()
+        if is_convertible_input(raw_file):
+            convertible.add(raw_file)
+        elif requires_msdial_conversion(raw_file):
+            unconvertible.add(raw_file)
+    if unconvertible:
+        ordered = sorted(unconvertible, key=str.casefold)
+        preview = ", ".join(ordered[:3])
+        if len(ordered) > 3:
+            preview += f", and {len(ordered) - 3} more"
+        reasons.append(f"{UNCONVERTIBLE_INPUT_REASON} (mzData or another format; only mzXML is converted): {preview}.")
+    outcome = (project.conversion_plan or {}).get("outcome")
+    if convertible:
+        project.conversion_plan = _conversion_plan(sorted(convertible, key=str.casefold), outcome)
+    elif not outcome:
+        project.conversion_plan = {}
+    survivor = _no_converted_input_reason(outcome)
+    if survivor:
+        reasons.append(survivor)
+    return reasons
+
+
 def evaluate_eligibility(project: RepositoryProject, policy: EligibilityPolicy) -> RepositoryProject:
     reasons = []
     review_reasons = []
@@ -1184,37 +1272,12 @@ def evaluate_eligibility(project: RepositoryProject, policy: EligibilityPolicy) 
             review_reasons.append("Confirm untargeted status from repository context or raw scan metadata.")
     if not project.files:
         reasons.append("No downloadable raw data were identified.")
-    # WHAT MS-DIAL CANNOT READ: CONVERTED, OR A REASON TO EXCLUDE. An mzXML used to exclude the whole unit
-    # here, before any byte was fetched. It is now converted to mzML in the lease (CONVERTIBLE_SUFFIXES),
-    # so it only plans a conversion; what nothing converts - mzData, and whatever else the Catalog marks as
-    # needing a conversion it has no route for - still excludes the unit.
-    convertible: set[str] = set()
-    unconvertible: set[str] = set()
-    for item in project.files:
-        if item.role == "requires_conversion" or (
-            item.role in ANALYSIS_INPUT_ROLES and requires_msdial_conversion(item.name)
-        ):
-            (convertible if is_convertible_input(item.name) else unconvertible).add(item.name)
-    for sample in project.sample_metadata or []:
-        raw_file = str((sample or {}).get("raw_file") or "").strip()
-        if is_convertible_input(raw_file):
-            convertible.add(raw_file)
-        elif requires_msdial_conversion(raw_file):
-            unconvertible.add(raw_file)
-    if unconvertible:
-        ordered = sorted(unconvertible, key=str.casefold)
-        preview = ", ".join(ordered[:3])
-        if len(ordered) > 3:
-            preview += f", and {len(ordered) - 3} more"
-        reasons.append(f"{UNCONVERTIBLE_INPUT_REASON} (mzData or another format; only mzXML is converted): {preview}.")
-    outcome = (project.conversion_plan or {}).get("outcome")
-    if convertible:
-        project.conversion_plan = _conversion_plan(sorted(convertible, key=str.casefold), outcome)
-    elif not outcome:
-        project.conversion_plan = {}
-    survivor = _no_converted_input_reason(outcome)
-    if survivor:
-        reasons.append(survivor)
+    # WHAT MS-DIAL CANNOT READ. Only a campaign unit's mzXML is converted, and only a unit's own: an
+    # accession-level project has no Catalog decision of which files are its inputs.
+    if policy.convert_mzxml and project.analysis_unit_id:
+        reasons.extend(_campaign_conversion_reasons(project))
+    else:
+        reasons.extend(_conversion_required_reasons(project))
     if policy.require_known_size and project.total_download_bytes <= 0:
         reasons.append("Download size is unknown.")
     if project.total_download_bytes > policy.max_download_bytes:
@@ -1374,8 +1437,9 @@ def create_download_lease(
     - materialise: recorded as not_used. The accession download store is wired in here, after extraction;
     - convert: each of the unit's mzXML written as mzML under raw\\converted, every inference off, and
       recorded (input_conversions, provenance\\input-conversions.json); where extraction shows a readable
-      encoding of the same sample beside an mzXML, that one is analysed instead. Not used where the unit
-      has no mzXML. See the notes above _find_mzxml_files;
+      encoding of the same sample beside an mzXML, that one is analysed instead. Only under a
+      ``campaign_authorization``: not used outside a campaign, where an mzXML is no input, nor where the
+      unit has no mzXML. See the notes above _find_mzxml_files;
     - discover: every vendor folder listed member by member checked whole (container_completeness),
       then the MS-DIAL inputs under the data root, outermost folders only, and the mzML converted;
     - attribute: the unit's own inputs - by path, every one, when the Catalog declared them
@@ -1618,15 +1682,16 @@ def create_download_lease(
             "Every object was fetched into this unit's own raw tree; no accession download store is in use.",
         )
 
-        # The unit's mzXML, written as mzML under raw\converted (see the notes above _find_mzxml_files). A unit
-        # with none records the stage as not used, as every lease did before.
+        # The unit's mzXML, written as mzML under raw\converted (see the notes above _find_mzxml_files). Only a
+        # campaign's lease converts: without a campaign authorization, and in a unit with no mzXML of its own,
+        # the stage is not used, as in every lease before, and an mzXML is no input.
         archive_samples = _archive_sample_attribution(
             project, archive_extractions, extracted_members, data_root
         )
-        mzxml_found = _find_mzxml_files(data_root)
+        mzxml_found = _find_mzxml_files(data_root) if campaign_authorization else []
         conversion_sources = _select_conversion_sources(
             mzxml_found, data_root, project, archive_samples, archive_extractions
-        )
+        ) if mzxml_found else []
         conversion: dict[str, Any] | None = None
         stands_for: dict[str, str] = {}
         if conversion_sources:
@@ -2661,6 +2726,11 @@ def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict
 
 # ---- The convert stage: mzXML written as the mzML MS-DIAL reads ------------------------------------------
 #
+# ONLY IN A CAMPAIGN. The stage runs where the lease was given a campaign authorization, for a unit with an
+# analysis_unit_id, and evaluate_eligibility plans it only for such a unit (EligibilityPolicy.convert_mzxml).
+# Outside a campaign an mzXML or mzData still excludes its unit before download: it needs a reviewed
+# ProteoWizard-to-mzML conversion with new provenance, and the stage is recorded as not used.
+#
 # WHERE IT RUNS, AND WHY THERE. After extract, because a packed mzXML (x.mzXML.lzma) and an mzXML inside a
 # study archive exist only once their archives are open; before discover, because the input candidates are
 # found there, and they are the mzML written here. The mzXML stays where it arrived, under raw\data, as the
@@ -2710,10 +2780,12 @@ def _select_conversion_sources(
     The Catalog's declared inputs, matched by path, where it declared them. Otherwise a file the listing
     names is converted only when the listing gives it for analysis (requires_conversion; an mzXML the
     Catalog demoted to raw_alternate beside a vendor file is not), and a file only an archive held when one
-    of the unit's samples names it, or it came out of the archive one sample names.
+    of the unit's samples names it, or it came out of the archive one sample names. A project with no
+    analysis unit has no Catalog decision of which files are its inputs, and converts none: every mzXML of
+    an accession would be converted beside the vendor files of the same samples.
     """
     if not project.analysis_unit_id:
-        return list(found)
+        return []
     declared = declared_analysis_inputs(project)
     if declared:
         convertible = {
@@ -3917,6 +3989,15 @@ def _campaign_crossings(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in record.get("campaign_authorizations") or [] if isinstance(item, dict)]
 
 
+def _converts_mzxml(manifest: dict[str, Any]) -> bool:
+    """Whether a unit's mzXML is converted when it is judged again: only a campaign unit's is.
+
+    A campaign approval recorded for the unit, or for the unit it was split from, made its download a
+    campaign's, and only a campaign's lease converts (EligibilityPolicy.convert_mzxml).
+    """
+    return bool(_campaign_crossings(manifest))
+
+
 def preflight_campaign(
     manifest: dict[str, Any], campaign_authorization_path: str | Path | None = None
 ) -> dict[str, Any] | None:
@@ -4401,6 +4482,7 @@ def _record_preflight(
                 max_samples=max(project.sample_count or 0, 1),
                 require_known_size=False,
                 require_untargeted=True,
+                convert_mzxml=_converts_mzxml(current),
             ),
         )
         if not coverage["complete"] and not evaluated.exclusion_reasons:
@@ -4548,6 +4630,7 @@ def _apply_disposition(
                 max_samples=max(project.sample_count or 0, 1),
                 require_known_size=False,
                 require_untargeted=True,
+                convert_mzxml=_converts_mzxml(current),
             ),
         )
         current["project"] = evaluated.as_dict()
@@ -4881,6 +4964,8 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
     manifest_path = Path(plan["manifest_path"])
     parent = read_manifest(manifest_path)
     parent_project = parent.get("project") or {}
+    # A campaign parent's mzXML were converted, and so are its parts'; any other unit's still require it.
+    converts = _converts_mzxml(parent)
     parent_conversion_reasons = [
         reason
         for reason in evaluate_eligibility(
@@ -4890,9 +4975,10 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 max_samples=max(int(parent_project.get("sample_count") or 0), 1),
                 require_known_size=False,
                 require_untargeted=False,
+                convert_mzxml=converts,
             ),
         ).exclusion_reasons
-        if reason.startswith(UNCONVERTIBLE_INPUT_REASON)
+        if reason.startswith((CONVERSION_REQUIRED_REASON, UNCONVERTIBLE_INPUT_REASON))
     ]
     stands_for = lineage_stands_for(parent)
     per_file = {
@@ -4975,6 +5061,7 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 max_samples=max(int(project["sample_count"] or 0), 1),
                 require_known_size=False,
                 require_untargeted=True,
+                convert_mzxml=converts,
             ),
         )
         project["exclusion_reasons"] = list(

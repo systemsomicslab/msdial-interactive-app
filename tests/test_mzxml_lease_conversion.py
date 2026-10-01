@@ -1,4 +1,4 @@
-"""A unit whose samples exist only as mzXML is converted in its download lease and run, not excluded.
+"""A campaign unit whose samples exist only as mzXML is converted in its download lease and run, not excluded.
 
 MS-DIAL has no mzXML reader, so one mzXML anywhere in a unit used to exclude the whole unit before a byte
 was fetched: MetaboLights MTBLS417 (four units, 60 files each), MTBLS1572 and MTBLS1842, and the 35
@@ -7,6 +7,10 @@ Workbench units whose study archives hold mzXML, about 280 GB of the declared po
 off; that a file which fails its conversion is excluded with a reason while the rest run; and that mzData,
 which nothing converts, is still excluded. The lease's convert stage (a placeholder since 0.5.16) does it,
 after extract and before discover, into raw\\converted.
+
+Only in a campaign. Outside one - no campaign authorization, a legacy manifest - an mzXML still excludes its
+unit before download and needs a reviewed ProteoWizard conversion, as the project contract says, and no lease
+converts it (OutsideACampaignNothingIsConverted). The leases here are a campaign's unless a test says otherwise.
 
 The fixtures are the converter's own synthetic mzXML (test_mzxml_conversion), served by a stand-in for the
 network (test_download_lease_record._Client). The raw-metadata extractor is a stand-in too. The gate tests
@@ -129,7 +133,9 @@ class _Scratch(unittest.TestCase):
         self._directory.cleanup()
 
     def lease(self, payloads: dict[str, bytes], project: RepositoryProject | None = None, **options) -> dict:
+        """A campaign's lease of the unit, unless campaign_authorization=None is passed."""
         project = project or _project(payloads)
+        options.setdefault("campaign_authorization", dict(_APPROVAL))
         client = _Client({f"https://example.org/{name}": data for name, data in payloads.items()})
         lease = create_download_lease(project, self.root, 10**9, client=client, **options)
         return read_manifest(lease["manifest_path"])
@@ -147,7 +153,8 @@ def _rows(manifest: dict) -> dict[str, dict]:
 
 
 class AnMzxmlUnitIsEligibleWithAConversionPlan(unittest.TestCase):
-    """evaluate_eligibility used to exclude every unit holding an mzXML; it now plans the conversion."""
+    """evaluate_eligibility excludes every unit holding an mzXML; a campaign unit's (convert_mzxml) plans the
+    conversion instead."""
 
     @staticmethod
     def _handoff(paths: list[str], *, convertible: bool = True) -> dict:
@@ -192,7 +199,7 @@ class AnMzxmlUnitIsEligibleWithAConversionPlan(unittest.TestCase):
     def test_an_mtbls417_shaped_unit_is_eligible_with_a_conversion_plan(self) -> None:
         paths = [f"FILES/MTBLS417_POS_{index:02d}.mzXML" for index in range(1, 5)]
 
-        project, _workspace = mcp_server._project_from_analysis_unit_handoff(self._handoff(paths))
+        project, _workspace = mcp_server._project_from_analysis_unit_handoff(self._handoff(paths), convert_mzxml=True)
 
         self.assertTrue(project["eligible"], project["exclusion_reasons"])
         self.assertEqual("eligible", project["selection_status"])
@@ -213,14 +220,16 @@ class AnMzxmlUnitIsEligibleWithAConversionPlan(unittest.TestCase):
 
     def test_a_packed_mzxml_plans_its_conversion(self) -> None:
         """MTBLS688 publishes its LC-MS units only as x.mzXML.lzma, which unpack to mzXML."""
-        project, _ = mcp_server._project_from_analysis_unit_handoff(self._handoff(["FILES/NEG1/s_Seg1Ev2.mzXML.lzma"]))
+        project, _ = mcp_server._project_from_analysis_unit_handoff(
+            self._handoff(["FILES/NEG1/s_Seg1Ev2.mzXML.lzma"]), convert_mzxml=True
+        )
 
         self.assertTrue(project["eligible"], project["exclusion_reasons"])
         self.assertEqual(["FILES/NEG1/s_Seg1Ev2.mzXML.lzma"], project["conversion_plan"]["names"])
 
     def test_a_unit_with_only_mzdata_stays_excluded(self) -> None:
         project, _ = mcp_server._project_from_analysis_unit_handoff(
-            self._handoff(["FILES/a.mzData", "FILES/b.mzData.xml"], convertible=False)
+            self._handoff(["FILES/a.mzData", "FILES/b.mzData.xml"], convertible=False), convert_mzxml=True
         )
 
         self.assertFalse(project["eligible"])
@@ -240,7 +249,7 @@ class AnMzxmlUnitIsEligibleWithAConversionPlan(unittest.TestCase):
                                            "sample_id": "b", "conversion_target": ""})
         handoff.update(sample_count=2, analysis_input_count=2)
 
-        project, _ = mcp_server._project_from_analysis_unit_handoff(handoff)
+        project, _ = mcp_server._project_from_analysis_unit_handoff(handoff, convert_mzxml=True)
 
         self.assertFalse(project["eligible"])
         self.assertTrue(any(item.startswith(UNCONVERTIBLE_INPUT_REASON) for item in project["exclusion_reasons"]))
@@ -381,7 +390,10 @@ class TheLeaseConvertsTheUnitsMzxml(_Scratch):
         project = _project(payloads)
         client = _Client({f"https://example.org/{name}": data for name, data in payloads.items()})
         with self.assertRaises(_Cancelled):
-            create_download_lease(project, self.root, 10**9, client=client, progress_callback=cancel_at_the_second)
+            create_download_lease(
+                project, self.root, 10**9, client=client, progress_callback=cancel_at_the_second,
+                campaign_authorization=dict(_APPROVAL),
+            )
         stopped = read_manifest(self.root / "metabolights" / "MTBLS417" / "mtbls417-pos" / "provenance" / "run-manifest.json")
         self.assertEqual(("download_failed", "convert"), (stopped["status"], stopped["download_failure"]["stage"]))
         record_path = Path(stopped["workspace"]) / "provenance" / "input-conversions.json"
@@ -418,7 +430,9 @@ class TheLeaseConvertsTheUnitsMzxml(_Scratch):
             total_download_bytes=len(packed), sample_metadata=[{"sample_id": "a", "raw_file": "FILES/x.mzXML.lzma"}],
         )
 
-        lease = create_download_lease(project, self.root, 10**9, client=_Client({url: packed}))
+        lease = create_download_lease(
+            project, self.root, 10**9, client=_Client({url: packed}), campaign_authorization=dict(_APPROVAL)
+        )
 
         self.assertEqual(["x.mzML"], [Path(item).name for item in lease["input_candidates"]])
         self.assertEqual("x.mzXML", lease["input_conversions"]["records"][0]["source"]["relative_path"])
@@ -634,8 +648,8 @@ class AMixedConvertedUnitSplits(_Scratch):
         verdicts = {Path(name).with_suffix(".mzML").name: {"method": mode, "polarity": "Positive"}
                     for name, mode in self.MODES.items()}
         fake = _Extractor(verdicts)
-        extractor = self.root / "RawMetadataConsoleApp.exe"
-        extractor.write_bytes(b"stub")
+        # A campaign's preflight runs a verified, pinned extractor only.
+        extractor = _PinnedExtractor.make(self.root / "build")
         with patch("msdial_app.repository_reanalysis.subprocess.run", side_effect=fake):
             preflighted = run_raw_metadata_preflight(path, extractor)
         self.assertEqual("Mixed", preflighted["raw_metadata_preflight"]["summary"]["acquisition_mode"])
@@ -657,6 +671,65 @@ class AMixedConvertedUnitSplits(_Scratch):
             self.assertEqual({"converted"}, {row["kind"] for row in part["input_lineage"]["rows"]})
             self.assertTrue(all(row["source"]["conversion"]["source_row"] for row in part["input_lineage"]["rows"]))
             self.assertNotIn("conversion_sources", part["input_lineage"])
+
+
+# ---- outside a campaign ------------------------------------------------------------------------------------------
+
+
+class OutsideACampaignNothingIsConverted(_Scratch):
+    """The project contract keeps the old rule outside a campaign: an mzXML is requires_conversion, its unit stops
+    before download, and a reviewed ProteoWizard conversion with new provenance is needed. Nothing here converts."""
+
+    def test_an_mtbls417_handoff_is_excluded_as_it_always_was(self) -> None:
+        paths = [f"FILES/MTBLS417_POS_{index:02d}.mzXML" for index in range(1, 3)]
+
+        project, _ = mcp_server._project_from_analysis_unit_handoff(AnMzxmlUnitIsEligibleWithAConversionPlan._handoff(paths))
+
+        self.assertEqual((False, "excluded"), (project["eligible"], project["selection_status"]))
+        self.assertEqual(1, len(project["exclusion_reasons"]))
+        self.assertTrue(project["exclusion_reasons"][0].startswith(
+            "MS-DIAL has no mzXML/mzData reader. Convert the declared analysis input(s) to mzML with ProteoWizard "
+            "msconvert before reanalysis: FILES/MTBLS417_POS_01.mzXML"), project["exclusion_reasons"])
+        self.assertNotIn("conversion_plan", project)
+
+    def test_a_lease_without_a_campaign_authorization_converts_nothing(self) -> None:
+        """Even of a project marked eligible: the mzXML is no input, and the lease stops as it did before."""
+        payloads = {"S01.mzXML": dda_32(), "S02.mzXML": dda_32()}
+
+        with self.assertRaisesRegex(ValueError, "did not contain an MS-DIAL input"):
+            self.lease(payloads, campaign_authorization=None)
+
+        manifest = read_manifest(self.root / "metabolights" / "MTBLS417" / "mtbls417-pos" / "provenance" / "run-manifest.json")
+        self.assertEqual(("download_failed", "attribute"), (manifest["status"], manifest["download_failure"]["stage"]))
+        self.assertEqual(("not_used", "No input conversion ran in this lease."),
+                         (_stage(manifest, "convert")["status"], _stage(manifest, "convert")["reason"]))
+        self.assertNotIn("input_conversions", manifest)
+        self.assertFalse((Path(manifest["raw_directory"]) / "converted").exists())
+
+    def test_a_project_with_no_analysis_unit_converts_nothing_even_in_a_campaign(self) -> None:
+        """An accession-level listing with each sample as a vendor .raw and an .mzXML: with no unit, no Catalog
+        decision says which are inputs, and converting every mzXML would analyse each sample twice."""
+        payloads = {"FILES/A.raw": b"thermo raw A", "FILES/A.mzXML": dda_32(),
+                    "FILES/B.raw": b"thermo raw B", "FILES/B.mzXML": dda_32()}
+        files = [
+            RepositoryFile(name, len(data), f"https://example.org/{name}",
+                           role="requires_conversion" if name.endswith(".mzXML") else "raw",
+                           checksum=hashlib.md5(data).hexdigest())
+            for name, data in payloads.items()
+        ]
+        project = RepositoryProject(
+            repository="example_repository", accession="EX1", eligible=True, selection_status="eligible",
+            separation="LC-MS", acquisition_mode="DDA", ion_mode="Positive", untargeted=True, files=files,
+            total_download_bytes=sum(item.size_bytes for item in files),
+            sample_metadata=[{"sample_id": name, "raw_file": f"FILES/{name}.raw"} for name in ("A", "B")],
+        )
+
+        manifest = self.lease(payloads, project)
+
+        self.assertEqual(["A.raw", "B.raw"], [Path(item).name for item in manifest["input_candidates"]])
+        self.assertEqual("not_used", _stage(manifest, "convert")["status"])
+        self.assertNotIn("input_conversions", manifest)
+        self.assertEqual([], build_repository_analysis_rows(manifest)["failures"])
 
 
 # ---- what the gate reads ---------------------------------------------------------------------------------------

@@ -1302,6 +1302,19 @@ class Handler(BaseHTTPRequestHandler):
                         f"Required repository bundle is {required_download_bytes} bytes; "
                         f"the configured limit is {maximum_bytes} bytes."
                     )
+                retention = str(body.get("raw_retention_policy") or "keep").strip()
+                # Checked again here although the MCP tool already checked it: this is the process that
+                # writes the manifest the crossing is recorded in. The size limit above still applies. It is
+                # checked before the project is judged because only a campaign unit's mzXML is converted
+                # (EligibilityPolicy.convert_mzxml); without an approval nothing is checked and nothing
+                # changes.
+                crossing = authorize(
+                    body.get("campaign_authorization_path"),
+                    project.analysis_unit_id,
+                    1,
+                    entry_point="repository_download",
+                    raw_retention_policy=retention,
+                )
                 evaluated = evaluate_eligibility(
                     project,
                     EligibilityPolicy(
@@ -1309,6 +1322,7 @@ class Handler(BaseHTTPRequestHandler):
                         max_samples=max(project.sample_count or 1, 1),
                         require_known_size=False,
                         require_untargeted=True,
+                        convert_mzxml=crossing is not None,
                     ),
                 )
                 allow_preflight = bool(body.get("allow_preflight"))
@@ -1322,18 +1336,8 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 from .repository_reanalysis import RAW_RETENTION_POLICIES
 
-                retention = str(body.get("raw_retention_policy") or "keep").strip()
                 if retention not in RAW_RETENTION_POLICIES:
                     raise ValueError("Unknown repository raw-data retention policy.")
-                # Checked again here although the MCP tool already checked it: this is the process that
-                # writes the manifest the crossing is recorded in. The size limit above still applies.
-                crossing = authorize(
-                    body.get("campaign_authorization_path"),
-                    evaluated.analysis_unit_id,
-                    1,
-                    entry_point="repository_download",
-                    raw_retention_policy=retention,
-                )
                 job_id = uuid.uuid4().hex
                 with JOBS_LOCK:
                     JOBS[job_id] = {
