@@ -954,6 +954,35 @@ class DispositionMatrixTests(unittest.TestCase):
         self.assertIn("untargeted_inferred_from_headers", full_scan["warnings"])
 
 
+    def test_what_the_lease_kept_out_is_excluded_in_every_disposition_with_its_reason(self) -> None:
+        """An mzXML whose conversion failed and an mzML RawDataHandler cannot decode are no input candidates, but the
+        Catalog declared them, and the gate's INP-1 accounts for a declared input that is no candidate only through
+        the binding disposition's excluded_inputs. They decide nothing about the rest of the unit."""
+        kept_out = [
+            {"path": "S03.mzXML", "reason": "conversion_failed", "problems": ["ParseError: unclosed token"]},
+            {"path": "n.mzML", "reason": "unsupported_mzml_encoding", "problems": ["MS:1002312"]},
+        ]
+        cases = {
+            "run": _manifest([_header("a.mzML", "DDA")], declared={"acquisition_mode": "DDA"}),
+            "split": _manifest([_header("a.mzML", "DDA", polarity="Positive"), _header("b.mzML", "DDA")]),
+            "skip": _manifest([_header("w.raw", "Unknown", confidence=0.3)]),
+            "exclude": _manifest([_header("a.mzML", "DDA", polarity="PolaritySwitching")]),
+        }
+        for kind, manifest in cases.items():
+            with self.subTest(disposition=kind):
+                manifest["excluded_input_candidates"] = kept_out
+                disposition = decide_disposition(manifest)
+                alone = decide_disposition({**manifest, "excluded_input_candidates": []})
+
+                self.assertEqual(kind, disposition["disposition"])
+                self.assertEqual(
+                    [("S03.mzXML", "conversion_failed"), ("n.mzML", "unsupported_mzml_encoding")],
+                    [(item["path"], item["reason"]) for item in disposition["excluded_inputs"][:2]],
+                )
+                self.assertEqual(alone["excluded_inputs"], disposition["excluded_inputs"][2:])
+                for key in ("disposition", "reasons", "warnings", "split_key"):
+                    self.assertEqual(alone[key], disposition[key], key)
+
     def test_the_record_has_the_shared_contract_shape(self) -> None:
         disposition = self.decide([_header("a.mzML", "DDA")])
         disposition.pop("assignments")

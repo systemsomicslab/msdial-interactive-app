@@ -19,9 +19,10 @@ mzXML as mzML under `raw\converted` with Interactive's converter, every
 inference flag off, records each conversion (`input_conversions`,
 `provenance\input-conversions.json`, and `input_lineage` rows of kind
 `converted`), and the converted mzML are the unit's inputs. A file whose
-conversion fails is excluded with reason `conversion_failed` and the rest run.
-Do not convert mzXML by hand or relabel it as `converted`. mzData, which
-nothing converts, still excludes its unit.
+conversion fails is excluded with reason `conversion_failed`, listed in the
+unit's `campaign_disposition`, and the rest run. Do not convert mzXML by hand
+or relabel it as `converted`. mzData, which nothing converts, still excludes
+its unit.
 
 Before selecting an analysis unit, ask what the user wants to learn. Capture the
 scientific question and comparison, whether annotation or comparative profiling

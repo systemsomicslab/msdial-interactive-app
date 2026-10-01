@@ -740,8 +740,21 @@ class TheGateFollowsEachConversion(_Scratch):
     """The gate's SUM-1 follows a converted input to the mzXML it was read from, and its CONV-1 holds the mzML to
     its record. Both are run here, by the gate's own script, on a workspace this lease and CSV builder wrote."""
 
-    def gate(self, payloads: dict[str, bytes], project: RepositoryProject) -> dict[str, dict]:
+    def gate(
+        self, payloads: dict[str, bytes], project: RepositoryProject, preflight: dict[str, dict] | None = None
+    ) -> dict[str, dict]:
+        """The before-production gate on a campaign lease of the unit, preflighted first with these header
+        verdicts (by the converted mzML's name) where they are given, so that its disposition binds."""
         manifest = self.lease(payloads, project)
+        if preflight is not None:
+            path = Path(manifest["workspace"]) / "provenance" / "run-manifest.json"
+            with patch("msdial_app.repository_reanalysis.subprocess.run", side_effect=_Extractor(preflight)):
+                run_raw_metadata_preflight(path, _PinnedExtractor.make(self.root / "build"))
+            manifest = read_manifest(path)
+        return self.checks(manifest)
+
+    def checks(self, manifest: dict) -> dict[str, dict]:
+        """The before-production gate on a unit, with the analysis CSV its manifest gives."""
         built = build_repository_analysis_rows(manifest)
         self.assertEqual([], built["failures"])
         write_analysis_csv(built, Path(manifest["output_directory"]) / "analysis_files.csv")
@@ -798,6 +811,53 @@ class TheGateFollowsEachConversion(_Scratch):
         self.assertEqual(1, checks["CONV-1"]["evidence"]["failed"])
         self.assertEqual("pass", checks["SUM-1"]["status"], checks["SUM-1"]["detail"])
         self.assertEqual("pass", checks["CNT-1"]["status"], checks["CNT-1"]["detail"])
+
+    def test_a_declared_unit_with_a_failed_conversion_runs_the_rest_under_its_disposition(self) -> None:
+        """Every Catalog 0.6.1 handoff declares its inputs, and under a campaign an INP-1 FAIL stops the run, so a
+        declared unit is the case that matters. Its disposition lists the mzXML whose conversion failed, which INP-1
+        accounts for beside the candidates: the rest of the unit runs, and CONV-1 warns of the one that did not."""
+        payloads = {"S01.mzXML": dda_32(), "S02.mzXML": dda_32(), "S03.mzXML": _truncated()}
+
+        checks = self.gate(
+            payloads,
+            _project(payloads, declared=True),
+            preflight={name: {"polarity": "Positive", "method": "DDA"} for name in ("S01.mzML", "S02.mzML")},
+        )
+
+        self.assertEqual("pass", checks["INP-1"]["status"], checks["INP-1"]["detail"])
+        self.assertEqual(["S03.mzXML"], checks["INP-1"]["evidence"]["excluded"])
+        self.assertEqual("warn", checks["CONV-1"]["status"], checks["CONV-1"]["detail"])
+        for check_id in ("ELIG-1", "SUM-1", "CNT-1", "ACQ-1"):
+            self.assertEqual("pass", checks[check_id]["status"], f"{check_id}: {checks[check_id]['detail']}")
+
+    def test_the_parts_of_a_declared_mixed_unit_with_a_failed_conversion_pass_inp1(self) -> None:
+        """MTBLS1572's shape, declared, with one mzXML that does not convert: the parent's disposition (split) lists
+        it, and each part's INP-1 accounts for it beside the parent's candidates."""
+        modes = {**AMixedConvertedUnitSplits.MODES, "e_DDA_3.mzXML": "DDA"}
+        payloads = {name: dda_32() if mode == "DDA" else swath_32() for name, mode in modes.items()}
+        payloads["e_DDA_3.mzXML"] = _truncated()
+        manifest = self.lease(payloads, _project(payloads, declared=True, acquisition="DIA", unit="mtbls1572-pos"))
+        path = Path(manifest["workspace"]) / "provenance" / "run-manifest.json"
+        verdicts = {Path(name).with_suffix(".mzML").name: {"method": mode, "polarity": "Positive"}
+                    for name, mode in modes.items()}
+        extractor = _PinnedExtractor.make(self.root / "build")
+        with patch("msdial_app.repository_reanalysis.subprocess.run", side_effect=_Extractor(verdicts)):
+            disposition = run_raw_metadata_preflight(path, extractor)["campaign_disposition"]
+        self.assertEqual("split", disposition["disposition"])
+        self.assertEqual([("e_DDA_3.mzXML", CONVERSION_FAILED)],
+                         [(Path(item["path"]).name, item["reason"]) for item in disposition["excluded_inputs"]])
+
+        result = split_unit_by_acquisition(path, confirmed=True)
+
+        self.assertTrue(result["written"], result["blockers"])
+        for part in result["parts"]:
+            with self.subTest(part=part["acquisition_mode"]):
+                with patch("msdial_app.repository_reanalysis.subprocess.run", side_effect=_Extractor(verdicts)):
+                    run_raw_metadata_preflight(Path(part["manifest_path"]), extractor)
+                checks = self.checks(read_manifest(part["manifest_path"]))
+                for check_id in ("INP-1", "SPL-1", "CNT-1"):
+                    self.assertEqual("pass", checks[check_id]["status"], f"{check_id}: {checks[check_id]['detail']}")
+                self.assertEqual(["e_DDA_3.mzXML"], checks["INP-1"]["evidence"]["excluded"])
 
 
 if __name__ == "__main__":  # pragma: no cover
