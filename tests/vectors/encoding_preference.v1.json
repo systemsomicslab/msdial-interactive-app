@@ -1,0 +1,236 @@
+{
+  "schema": "msdial-encoding-preference-vectors.v1",
+  "purpose": "One rule for choosing which encoding of a sample MS-DIAL analyses, with the cases both the Catalog and MS-DIAL Interactive must decide the same way. The Catalog applies it wherever a repository lists files; Interactive applies it after extraction, to files an archive held. Each case lists the paths of one unit and the role every path must end with, every path marked requires_conversion (none when the key is omitted) and, where given, each conversion_target and the file each packed path unpacks_to.",
+  "rule": [
+    "Files name the same sample when their basenames match with the container suffix removed; a per-sample archive (x.d.zip, x.mzML.gz, x.mzXML.lzma) is read as the file it unpacks to, for every rule below, and a vendor folder listed through its members (x.raw/_FUNC001.DAT) as the folder.",
+    "A container listed both unpacked (a file, or a folder through its members) and as its own archive is analysed unpacked, and the archive becomes raw_alternate.",
+    "Among files of one sample, a vendor container (.raw, .d, .wiff, .wiff2, .lcd, .qgd, .abf, .ibf, .cdf, .lrp) is analysed and every other encoding becomes raw_alternate.",
+    "With no vendor container, a converted container MS-DIAL reads (.mzML, .imzML) is analysed, and a format MS-DIAL cannot read becomes raw_alternate.",
+    "With neither, an mzXML, which is converted to mzML, is analysed, and a format MS-DIAL cannot read and nothing converts (.mzData, .mgf, .ibd, .dat, .scan) becomes raw_alternate (decided by the user on 2026-09-30). The rule never demotes a vendor container, a vendor folder or an mzML, because it applies only where none of them is published for the sample.",
+    "Two containers of equal preference are both left in place: no preference was stated between them, and none is invented.",
+    "A .wiff2 always wins over the .wiff of the same sample, decided by the analyst on 2026-09-21.",
+    "A format MS-DIAL cannot read (.mzXML, .mzData, .mgf, .ibd, .dat, .scan) is marked requires_conversion wherever it appears; only mzXML is marked for conversion to mzML (decided by the user on 2026-09-30).",
+    "The exception is what travels with a SCIEX acquisition: a .wiff.scan or .wiff2.scan is a sidecar and a .timeseries.data an auxiliary file, packed or not. Neither is an input, competes, or is marked requires_conversion, although .scan on its own is a format MS-DIAL cannot read.",
+    "Files inside a vendor folder are its members and never compete."
+  ],
+  "cases": [
+    {
+      "name": "vendor file beats mzXML (MTBKS157)",
+      "files": ["raw/01026_Bread_nega.RAW", "raw/01026_Bread_nega.mzXML"],
+      "roles": {"raw/01026_Bread_nega.RAW": "raw", "raw/01026_Bread_nega.mzXML": "raw_alternate"},
+      "requires_conversion": ["raw/01026_Bread_nega.mzXML"]
+    },
+    {
+      "name": "vendor file beats mzML",
+      "files": ["raw/s.d", "raw/s.mzML"],
+      "roles": {"raw/s.d": "raw", "raw/s.mzML": "raw_alternate"}
+    },
+    {
+      "name": "mzML beats mzXML",
+      "files": ["raw/s.mzML", "raw/s.mzXML"],
+      "roles": {"raw/s.mzML": "raw", "raw/s.mzXML": "raw_alternate"},
+      "requires_conversion": ["raw/s.mzXML"]
+    },
+    {
+      "name": "vendor folder beats mzML",
+      "files": ["raw/s.raw/_FUNC001.DAT", "raw/s.raw/_HEADER.TXT", "raw/s.mzML"],
+      "roles": {
+        "raw/s.raw/_FUNC001.DAT": "vendor_folder_member",
+        "raw/s.raw/_HEADER.TXT": "vendor_folder_member",
+        "raw/s.mzML": "raw_alternate"
+      }
+    },
+    {
+      "name": "packed vendor container beats mzML",
+      "files": ["FILES/s.d.zip", "FILES/s.mzML"],
+      "roles": {"FILES/s.d.zip": "raw", "FILES/s.mzML": "raw_alternate"}
+    },
+    {
+      "name": "packed vendor container beats packed mzML (MTBLS243)",
+      "files": ["FILES/s.d.zip", "FILES/s.mzML.zip"],
+      "roles": {"FILES/s.d.zip": "raw", "FILES/s.mzML.zip": "raw_alternate"}
+    },
+    {
+      "name": "packed vendor container beats mgf (MTBLS1963)",
+      "files": ["FILES/s.d.zip", "FILES/s.mgf"],
+      "roles": {"FILES/s.d.zip": "raw", "FILES/s.mgf": "raw_alternate"},
+      "requires_conversion": ["FILES/s.mgf"]
+    },
+    {
+      "name": "wiff2 beats wiff",
+      "files": ["raw/s.wiff", "raw/s.wiff2"],
+      "roles": {"raw/s.wiff": "raw_alternate", "raw/s.wiff2": "raw"}
+    },
+    {
+      "name": "two vendor containers: no preference is invented",
+      "files": ["raw/s.raw", "raw/s.d"],
+      "roles": {"raw/s.raw": "raw", "raw/s.d": "raw"}
+    },
+    {
+      "name": "different samples are never paired",
+      "files": ["raw/s_01.d", "raw/s_02.mzML"],
+      "roles": {"raw/s_01.d": "raw", "raw/s_02.mzML": "raw"}
+    },
+    {
+      "name": "mzXML alone is the input, marked for conversion to mzML",
+      "files": ["raw/s.mzXML"],
+      "roles": {"raw/s.mzXML": "raw"},
+      "requires_conversion": ["raw/s.mzXML"],
+      "conversion_target": {"raw/s.mzXML": "mzML"}
+    },
+    {
+      "name": "mzData alone is the input, with no conversion planned",
+      "files": ["raw/s.mzData"],
+      "roles": {"raw/s.mzData": "raw"},
+      "requires_conversion": ["raw/s.mzData"],
+      "conversion_target": {}
+    },
+    {
+      "name": "a .wiff.scan is the sidecar of its .wiff, not a format to convert",
+      "files": ["raw/s.wiff", "raw/s.wiff.scan"],
+      "roles": {"raw/s.wiff": "raw", "raw/s.wiff.scan": "sidecar"},
+      "requires_conversion": []
+    },
+    {
+      "name": "a .wiff2.scan is a sidecar too",
+      "files": ["raw/s.wiff2", "raw/s.wiff2.scan"],
+      "roles": {"raw/s.wiff2": "raw", "raw/s.wiff2.scan": "sidecar"},
+      "requires_conversion": []
+    },
+    {
+      "name": "a .timeseries.data is auxiliary",
+      "files": ["raw/s.wiff2", "raw/s.timeseries.data"],
+      "roles": {"raw/s.wiff2": "raw", "raw/s.timeseries.data": "auxiliary"},
+      "requires_conversion": []
+    },
+    {
+      "name": "a packed sidecar is a sidecar",
+      "files": ["raw/s.wiff", "raw/s.wiff.scan.zip"],
+      "roles": {"raw/s.wiff": "raw", "raw/s.wiff.scan.zip": "sidecar"},
+      "requires_conversion": [],
+      "unpacks_to": {"raw/s.wiff.scan.zip": "raw/s.wiff.scan"}
+    },
+    {
+      "name": "a packed .wiff with its packed sidecar and auxiliary file",
+      "files": ["raw/s.wiff.zip", "raw/s.wiff.scan.zip", "raw/s.timeseries.data.gz"],
+      "roles": {"raw/s.wiff.zip": "raw", "raw/s.wiff.scan.zip": "sidecar", "raw/s.timeseries.data.gz": "auxiliary"},
+      "requires_conversion": [],
+      "unpacks_to": {
+        "raw/s.wiff.zip": "raw/s.wiff",
+        "raw/s.wiff.scan.zip": "raw/s.wiff.scan",
+        "raw/s.timeseries.data.gz": "raw/s.timeseries.data"
+      }
+    },
+    {
+      "name": "packed wiff2 beats packed wiff",
+      "files": ["raw/s.wiff.zip", "raw/s.wiff2.zip"],
+      "roles": {"raw/s.wiff.zip": "raw_alternate", "raw/s.wiff2.zip": "raw"}
+    },
+    {
+      "name": "packed mzXML alone is the input, marked for conversion to mzML",
+      "files": ["raw/s.mzXML.gz"],
+      "roles": {"raw/s.mzXML.gz": "raw"},
+      "requires_conversion": ["raw/s.mzXML.gz"],
+      "conversion_target": {"raw/s.mzXML.gz": "mzML"},
+      "unpacks_to": {"raw/s.mzXML.gz": "raw/s.mzXML"}
+    },
+    {
+      "name": "lzma-packed mzXML alone is the input, marked for conversion to mzML (MTBLS688)",
+      "files": ["FILES/s.mzXML.lzma"],
+      "roles": {"FILES/s.mzXML.lzma": "raw"},
+      "requires_conversion": ["FILES/s.mzXML.lzma"],
+      "conversion_target": {"FILES/s.mzXML.lzma": "mzML"},
+      "unpacks_to": {"FILES/s.mzXML.lzma": "FILES/s.mzXML"}
+    },
+    {
+      "name": "packed mzXML loses to a vendor container",
+      "files": ["raw/s.raw", "raw/s.mzXML.zip"],
+      "roles": {"raw/s.raw": "raw", "raw/s.mzXML.zip": "raw_alternate"},
+      "requires_conversion": ["raw/s.mzXML.zip"]
+    },
+    {
+      "name": "a vendor folder beats its own archive",
+      "files": ["raw/s.raw/_FUNC001.DAT", "raw/s.raw/_HEADER.TXT", "raw/s.raw.zip"],
+      "roles": {
+        "raw/s.raw/_FUNC001.DAT": "vendor_folder_member",
+        "raw/s.raw/_HEADER.TXT": "vendor_folder_member",
+        "raw/s.raw.zip": "raw_alternate"
+      }
+    },
+    {
+      "name": "a file beats its own archive",
+      "files": ["raw/s.mzML", "raw/s.mzML.gz"],
+      "roles": {"raw/s.mzML": "raw", "raw/s.mzML.gz": "raw_alternate"}
+    },
+    {
+      "name": "lzma-packed mzXML beats a .dat of the same sample (MTBLS688)",
+      "files": ["FILES/DERIVED_FILES/NEG1/s_Seg1Ev2.mzXML.lzma", "FILES/RAW_FILES/NEG1/s_Seg1Ev2.dat"],
+      "roles": {"FILES/DERIVED_FILES/NEG1/s_Seg1Ev2.mzXML.lzma": "raw", "FILES/RAW_FILES/NEG1/s_Seg1Ev2.dat": "raw_alternate"},
+      "requires_conversion": ["FILES/DERIVED_FILES/NEG1/s_Seg1Ev2.mzXML.lzma", "FILES/RAW_FILES/NEG1/s_Seg1Ev2.dat"],
+      "conversion_target": {"FILES/DERIVED_FILES/NEG1/s_Seg1Ev2.mzXML.lzma": "mzML"},
+      "unpacks_to": {"FILES/DERIVED_FILES/NEG1/s_Seg1Ev2.mzXML.lzma": "FILES/DERIVED_FILES/NEG1/s_Seg1Ev2.mzXML"}
+    },
+    {
+      "name": "mzXML beats a .dat",
+      "files": ["raw/s.mzXML", "raw/s.dat"],
+      "roles": {"raw/s.mzXML": "raw", "raw/s.dat": "raw_alternate"},
+      "requires_conversion": ["raw/s.mzXML", "raw/s.dat"],
+      "conversion_target": {"raw/s.mzXML": "mzML"}
+    },
+    {
+      "name": "mzXML beats mzData and mgf",
+      "files": ["raw/s.mzXML", "raw/s.mzData", "raw/s.mgf"],
+      "roles": {"raw/s.mzXML": "raw", "raw/s.mzData": "raw_alternate", "raw/s.mgf": "raw_alternate"},
+      "requires_conversion": ["raw/s.mzXML", "raw/s.mzData", "raw/s.mgf"],
+      "conversion_target": {"raw/s.mzXML": "mzML"}
+    },
+    {
+      "name": "two mzXML encodings of one sample are both left, and the .dat is the alternate",
+      "files": ["raw/s.mzXML.gz", "raw/s.mzXML.lzma", "raw/s.dat"],
+      "roles": {"raw/s.mzXML.gz": "raw", "raw/s.mzXML.lzma": "raw", "raw/s.dat": "raw_alternate"},
+      "requires_conversion": ["raw/s.mzXML.gz", "raw/s.mzXML.lzma", "raw/s.dat"]
+    },
+    {
+      "name": "two formats nothing converts: no preference is invented",
+      "files": ["raw/s.dat", "raw/s.mzData"],
+      "roles": {"raw/s.dat": "raw", "raw/s.mzData": "raw"},
+      "requires_conversion": ["raw/s.dat", "raw/s.mzData"],
+      "conversion_target": {}
+    },
+    {
+      "name": "a vendor container still beats both mzXML and .dat",
+      "files": ["raw/s.raw", "raw/s.mzXML", "raw/s.dat"],
+      "roles": {"raw/s.raw": "raw", "raw/s.mzXML": "raw_alternate", "raw/s.dat": "raw_alternate"},
+      "requires_conversion": ["raw/s.mzXML", "raw/s.dat"]
+    },
+    {
+      "name": "a vendor folder still beats both mzXML and .dat",
+      "files": ["raw/s.raw/_FUNC001.DAT", "raw/s.raw/_HEADER.TXT", "raw/s.mzXML", "raw/s.dat"],
+      "roles": {
+        "raw/s.raw/_FUNC001.DAT": "vendor_folder_member",
+        "raw/s.raw/_HEADER.TXT": "vendor_folder_member",
+        "raw/s.mzXML": "raw_alternate",
+        "raw/s.dat": "raw_alternate"
+      },
+      "requires_conversion": ["raw/s.mzXML", "raw/s.dat"]
+    },
+    {
+      "name": "an mzML still beats both mzXML and .dat",
+      "files": ["raw/s.mzML", "raw/s.mzXML.lzma", "raw/s.dat"],
+      "roles": {"raw/s.mzML": "raw", "raw/s.mzXML.lzma": "raw_alternate", "raw/s.dat": "raw_alternate"},
+      "requires_conversion": ["raw/s.mzXML.lzma", "raw/s.dat"]
+    },
+    {
+      "name": "names that differ are different samples, however alike (MTBLS688)",
+      "files": ["FILES/DERIVED_FILES/NEG1/10plus_1k5_10ul_1_Seg1Ev2.mzXML.lzma", "FILES/RAW_FILES/NEG1/10_plus__1k5_10ul_1_Seg1Ev2.dat"],
+      "roles": {
+        "FILES/DERIVED_FILES/NEG1/10plus_1k5_10ul_1_Seg1Ev2.mzXML.lzma": "raw",
+        "FILES/RAW_FILES/NEG1/10_plus__1k5_10ul_1_Seg1Ev2.dat": "raw"
+      },
+      "requires_conversion": [
+        "FILES/DERIVED_FILES/NEG1/10plus_1k5_10ul_1_Seg1Ev2.mzXML.lzma",
+        "FILES/RAW_FILES/NEG1/10_plus__1k5_10ul_1_Seg1Ev2.dat"
+      ]
+    }
+  ]
+}

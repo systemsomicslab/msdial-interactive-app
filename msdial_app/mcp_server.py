@@ -373,6 +373,19 @@ def _campaign_coverage(path: str, unit_id: str, raw_retention_policy: str) -> di
     }
 
 
+def _campaign_converts_mzxml(path: str, unit_id: str, raw_retention_policy: str | None) -> bool:
+    """Whether a unit's mzXML is converted: only where a campaign approval covers its download (boundary 1).
+
+    Only a campaign converts (EligibilityPolicy.convert_mzxml). An approval that does not cover the unit
+    converts nothing here, and the tool that crosses the boundary refuses it; only a record that cannot be
+    read, or is itself invalid, raises, as it would there.
+    """
+    if not str(path or "").strip() or not unit_id:
+        return False
+    coverage = _campaign_coverage(path, unit_id, raw_retention_policy)
+    return bool(coverage and coverage["valid"])
+
+
 def _repository_unit(
     download_job_id: str, manifest_path: str, host: str, port: int
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
@@ -648,8 +661,14 @@ def _handoff_analysis_inputs(
 
 
 def _project_from_analysis_unit_handoff(
-    handoff: dict[str, Any], repository: str = "", accession: str = ""
+    handoff: dict[str, Any], repository: str = "", accession: str = "", *, convert_mzxml: bool = False
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """A Catalog handoff as the project the download tools judge.
+
+    ``convert_mzxml`` is set only where a campaign approval covers the unit (_campaign_converts_mzxml): its
+    mzXML then plans a conversion the lease makes. Otherwise an mzXML or mzData excludes the unit before
+    download, as it always did.
+    """
     from .repository_reanalysis import requires_msdial_conversion
 
     if handoff.get("schema") != "msdial-repository-reanalysis-handoff.v1":
@@ -796,6 +815,7 @@ def _project_from_analysis_unit_handoff(
             max_samples=max(project["sample_count"], 1),
             require_known_size=False,
             require_untargeted=True,
+            convert_mzxml=convert_mzxml,
         ),
     )
     declared_blocks = [str(item) for item in handoff.get("blocking_reasons") or []]
@@ -835,13 +855,27 @@ def _repository_inspection(
     analysis_unit_handoff_path: str,
     host: str,
     port: int,
+    campaign_authorization_path: str = "",
+    raw_retention_policy: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The project and sample workspace of one unit's handoff, or of an accession inspected by the backend.
+
+    A unit's mzXML plans a conversion only where ``campaign_authorization_path`` covers its download
+    (_campaign_converts_mzxml); an accession inspected without a handoff is no campaign unit.
+    """
     analysis_unit_handoff = _load_analysis_unit_handoff(
         analysis_unit_handoff, analysis_unit_handoff_path
     )
     if analysis_unit_handoff:
         return _project_from_analysis_unit_handoff(
-            analysis_unit_handoff, repository, accession
+            analysis_unit_handoff,
+            repository,
+            accession,
+            convert_mzxml=_campaign_converts_mzxml(
+                campaign_authorization_path,
+                str(analysis_unit_handoff.get("analysis_unit_id") or "").strip(),
+                raw_retention_policy,
+            ),
         )
     response = _request_json(
         "POST",
@@ -1357,7 +1391,14 @@ def msdial_repository_reanalysis_plan(
     """
     workspace_root = _validated_workspace_root(workspace_root)
     project, workspace = _repository_inspection(
-        repository, accession, analysis_unit_handoff, analysis_unit_handoff_path, host, port
+        repository,
+        accession,
+        analysis_unit_handoff,
+        analysis_unit_handoff_path,
+        host,
+        port,
+        campaign_authorization_path=campaign_authorization_path,
+        raw_retention_policy=raw_retention_policy,
     )
     from .repository_qa import repository_internal_standard_evidence
 
@@ -1445,7 +1486,14 @@ def msdial_download_repository_raw(
     """
     workspace_root = _validated_workspace_root(workspace_root)
     project, workspace = _repository_inspection(
-        repository, accession, analysis_unit_handoff, analysis_unit_handoff_path, host, port
+        repository,
+        accession,
+        analysis_unit_handoff,
+        analysis_unit_handoff_path,
+        host,
+        port,
+        campaign_authorization_path=campaign_authorization_path,
+        raw_retention_policy=raw_retention_policy,
     )
     if float(maximum_gb) <= 0:
         raise ValueError("maximum_gb must be greater than zero.")
@@ -1563,7 +1611,14 @@ def msdial_repository_batch_plan(
     seen: set[str] = set()
     runs = []
     for handoff in handoffs:
-        project, workspace = _project_from_analysis_unit_handoff(handoff)
+        project, workspace = _project_from_analysis_unit_handoff(
+            handoff,
+            convert_mzxml=_campaign_converts_mzxml(
+                campaign_authorization_path,
+                str(handoff.get("analysis_unit_id") or "").strip(),
+                raw_retention_policy,
+            ),
+        )
         unit_id = str(project["analysis_unit_id"])
         if unit_id in seen:
             raise ValueError(f"Duplicate analysis_unit_id in batch: {unit_id}")

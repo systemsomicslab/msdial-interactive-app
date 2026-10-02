@@ -45,6 +45,7 @@ import platform
 import re
 import shutil
 import sys
+import time
 import xml.etree.ElementTree as ET
 import zlib
 from array import array
@@ -69,6 +70,12 @@ _CHUNK = 1 << 20
 _SHA1_TAIL = 1 << 16
 _MAX_LISTED = 256
 _MAX_PROBLEMS = 25
+# The pauses before the written mzML is renamed into place again when another process holds it. Windows
+# refuses a rename (PermissionError: ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION) while a virus scanner or
+# an indexer reads the file just closed, and it usually lets go within seconds. Nothing else is waited for:
+# a file still held after these is a failed conversion whose error names its errno, which a caller can tell
+# from a file that will never convert.
+RENAME_RETRY_DELAYS_SECONDS = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 
 # RawDataHandler 1.3.9699.469 decodes these and nothing else in a binaryDataArray. MS:1000519 is
 # read as a 32-bit float and Numpress is not decoded, so neither may ever be written.
@@ -227,10 +234,12 @@ def convert_mzxml_to_mzml(
     keeps where and when the output was written under "reused_from", since the recorded files may
     have been another unit's or the same files under another spelling of their path.
 
-    Never raises. The record's status is "converted" or "failed"; on failure the error says why and
-    none of this converter's output is left at the destination. Nothing at the destination is
-    touched for an argument error (options, destination, missing source), and a file there that
-    this converter did not write is never replaced or removed.
+    Never raises. The record's status is "converted" or "failed"; on failure the error says why (with
+    "error_errno" where a system error stopped it) and none of this converter's output is left at the
+    destination. Nothing at the destination is touched for an argument error (options, destination,
+    missing source), and a file there that this converter did not write is never replaced or removed.
+    The written mzML is renamed into place once another process lets go of it, for a few seconds
+    (RENAME_RETRY_DELAYS_SECONDS); a record that needed more than one attempt says how many.
     """
     started_at = _now()
     source = Path(source)
@@ -310,11 +319,17 @@ def convert_mzxml_to_mzml(
             )
         # A file may have appeared at the destination while the conversion ran.
         _refuse_foreign_destination(destination, previous, record)
-        partial.replace(destination)
+        attempts = _rename_patiently(partial, destination)
+        if attempts > 1:
+            record["output"]["rename_attempts"] = attempts
         record["status"] = "converted"
     except Exception as exc:  # noqa: BLE001 - a conversion is recorded, never raised
         record["status"] = "failed"
         record["error"] = f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, OSError) and isinstance(exc.errno, int):
+            # Which system error stopped it, so that a caller can tell a full disk, which a retry may get
+            # past, from a file that will never convert.
+            record["error_errno"] = exc.errno
         if owned and destination.is_file() and _written_by_converter(destination, previous):
             # A stale output of this converter; leaving it would let input discovery pick up an mzML
             # this record says is not a valid conversion.
@@ -393,6 +408,21 @@ def _options(options: ConversionOptions | dict[str, Any] | None) -> ConversionOp
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _rename_patiently(partial: Path, destination: Path) -> int:
+    """Rename the written mzML into place, waiting for another process to let go of it; the attempts made.
+
+    Only PermissionError is waited for (RENAME_RETRY_DELAYS_SECONDS); the last attempt's error is raised.
+    """
+    for attempt, delay in enumerate(RENAME_RETRY_DELAYS_SECONDS, start=1):
+        try:
+            partial.replace(destination)
+            return attempt
+        except PermissionError:
+            time.sleep(delay)
+    partial.replace(destination)
+    return len(RENAME_RETRY_DELAYS_SECONDS) + 1
 
 
 def _sha256_file(path: Path) -> str:
@@ -539,10 +569,13 @@ def _source_integrity(path: Path) -> dict[str, Any]:
     The mzXML schema says the sha1 covers the file from its first byte up to and including the
     opening <sha1> tag. Writers are not all known, so a digest that stops just before the tag is
     also accepted, and the record says which span matched.
+
+    The md5 is taken in the same pass because it is what the repositories publish: a source whose
+    declared MD5 was verified can then be tied to the very bytes this conversion read.
     """
     size = path.stat().st_size
     declared, tag_offset = _embedded_sha1(path, size)
-    whole256, whole1 = hashlib.sha256(), hashlib.sha1()
+    whole256, whole1, whole5 = hashlib.sha256(), hashlib.sha1(), hashlib.md5()
     prefix = hashlib.sha1() if tag_offset is not None else None
     before_tag = including_tag = None
     boundary_before = tag_offset if tag_offset is not None else -1
@@ -552,6 +585,7 @@ def _source_integrity(path: Path) -> dict[str, Any]:
         for chunk in iter(lambda: handle.read(_CHUNK), b""):
             whole256.update(chunk)
             whole1.update(chunk)
+            whole5.update(chunk)
             if prefix is not None and position < boundary_including:
                 piece = chunk[: boundary_including - position]
                 if before_tag is None and position + len(piece) >= boundary_before:
@@ -578,6 +612,7 @@ def _source_integrity(path: Path) -> dict[str, Any]:
         "bytes": size,
         "sha256": whole256.hexdigest(),
         "sha1": whole1.hexdigest(),
+        "md5": whole5.hexdigest(),
         "embedded_sha1": {
             "status": status,
             "declared": declared,

@@ -373,6 +373,118 @@ class TheDownloadUnderAnApproval(_Records, unittest.TestCase):
         self.assertEqual([crossing], read_manifest(lease["manifest_path"])["campaign_authorizations"])
 
 
+def _mzxml_handoff(unit_id: str = "unit-neg") -> dict:
+    """The same unit, its one sample published only as mzXML, as the Catalog lists it (MTBLS417's shape)."""
+    handoff = _handoff(unit_id)
+    handoff["files"] = [{
+        "path": "FILES/sample_neg.mzXML", "role": "raw", "size_bytes": 1024,
+        "download_url": "https://example.org/sample_neg.mzXML",
+        "requires_conversion": "MS-DIAL has no reader for this format", "conversion_target": "mzML",
+    }]
+    handoff["sample_metadata"] = [{"sample_id": "sample_neg", "raw_file": "FILES/sample_neg.mzXML", "attributes": {}}]
+    return handoff
+
+
+class AnMzxmlUnitIsConvertedOnlyUnderAnApproval(_Records, unittest.TestCase):
+    """Outside a campaign an mzXML is requires_conversion and stops its unit before download, as the project
+    contract says; only where a campaign approval covers the unit does the lease convert it (2026-09-30)."""
+
+    PURPOSE = "Annotate every experimental spectrum."
+    RETENTION = "delete_after_validated_output"
+
+    def test_without_an_approval_the_unit_is_blocked_before_any_byte(self) -> None:
+        with patch.object(mcp_server, "_request_json") as request:
+            downloaded = mcp_server.msdial_download_repository_raw(
+                "mb_post", "MPST-CAMPAIGN", str(self.root / "analysis"), confirmed=True,
+                analysis_unit_handoff=_mzxml_handoff(), analysis_purpose=self.PURPOSE,
+            )
+            planned = mcp_server.msdial_repository_reanalysis_plan(
+                "mb_post", "MPST-CAMPAIGN", str(self.root / "analysis"),
+                analysis_unit_handoff=_mzxml_handoff(), analysis_purpose=self.PURPOSE,
+            )
+
+        request.assert_not_called()
+        self.assertTrue(downloaded["blocked"])
+        self.assertTrue(any("no mzXML/mzData reader" in item for item in downloaded["preview"]["blocking_reasons"]))
+        self.assertFalse(planned["download"]["ready"])
+        self.assertTrue(any("no mzXML/mzData reader" in item for item in planned["download"]["blocking_reasons"]))
+
+    def test_a_covering_approval_plans_the_conversion_and_starts_the_download(self) -> None:
+        path = str(self.write())
+        with patch.object(mcp_server, "_request_json", return_value={"job_id": "download-job"}) as request:
+            result = mcp_server.msdial_download_repository_raw(
+                "mb_post", "MPST-CAMPAIGN", str(self.root / "analysis"), raw_retention_policy=self.RETENTION,
+                analysis_unit_handoff=_mzxml_handoff(), analysis_purpose=self.PURPOSE,
+                campaign_authorization_path=path,
+            )
+
+        self.assertTrue(result["started"], result)
+        project = request.call_args.kwargs["body"]["project"]
+        self.assertTrue(project["eligible"], project["exclusion_reasons"])
+        self.assertEqual(["FILES/sample_neg.mzXML"], project["conversion_plan"]["names"])
+
+    def test_an_approval_converts_only_the_units_it_covers(self) -> None:
+        batch = mcp_server.msdial_repository_batch_plan(
+            [_mzxml_handoff("unit-neg"), _mzxml_handoff("unit-pos")],
+            str(self.root / "analysis"),
+            raw_retention_policy=self.RETENTION,
+            analysis_purpose=self.PURPOSE,
+            campaign_authorization_path=str(self.write()),
+        )
+        runs = {run["analysis_unit_id"]: run for run in batch["runs"]}
+
+        self.assertTrue(runs["unit-neg"]["ready"], runs["unit-neg"]["blocking_reasons"])
+        self.assertFalse(runs["unit-pos"]["ready"])
+        self.assertTrue(any("no mzXML/mzData reader" in item for item in runs["unit-pos"]["blocking_reasons"]))
+
+    def test_the_backend_judges_the_unit_again_and_converts_only_under_the_approval(self) -> None:
+        project, _ = mcp_server._project_from_analysis_unit_handoff(_mzxml_handoff(), convert_mzxml=True)
+        started: list[tuple] = []
+        backend = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=backend.serve_forever, daemon=True)
+        thread.start()
+
+        def post(body: dict) -> tuple[int, dict]:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{backend.server_port}/api/repository/download",
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as error:
+                payload = json.loads(error.read().decode("utf-8"))
+                error.close()
+                return error.code, payload
+
+        try:
+            with patch.object(server, "_run_repository_download_job", lambda *a, **k: started.append((a, k))),                     patch.object(server, "_persist_jobs_locked", lambda: None), patch.object(server, "JOBS", {}):
+                body = {
+                    "project": project,
+                    "workspace_root": str(self.root / "analysis"),
+                    "maximum_gb": 1,
+                    "raw_retention_policy": self.RETENTION,
+                }
+                # A project a campaign planned, sent without the approval, is judged as any other unit.
+                refused = post(body)
+                accepted = post({**body, "campaign_authorization_path": str(self.write())})
+        finally:
+            backend.shutdown()
+            backend.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(400, refused[0], refused[1])
+        self.assertIn("no mzXML/mzData reader", refused[1]["error"])
+        self.assertEqual(200, accepted[0], accepted[1])
+        self.assertEqual(1, len(started))
+        evaluated = started[0][0][1]
+        self.assertTrue(evaluated.eligible, evaluated.exclusion_reasons)
+        self.assertEqual(["FILES/sample_neg.mzXML"], evaluated.conversion_plan["names"])
+        self.assertEqual("approval-0001", started[0][1]["campaign_authorization"]["approval_id"])
+
+
 class _ValidatedUnit(_Records):
     def unit(self, retention: str = "delete_after_validated_output", status_after: str = "") -> tuple[Path, Path]:
         root = self.root / "analysis" / "mb_post" / "MPST-CAMPAIGN" / "unit-neg"

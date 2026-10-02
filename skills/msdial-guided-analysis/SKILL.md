@@ -36,11 +36,13 @@ metadata are evidence; unresolved scientific choices remain questions for the
 user. Exact internal-standard candidates drafted by the desktop agent must be
 reported as reviewable candidates, with RT left unset unless it is recorded.
 MS-DIAL accepts mzML but not mzXML/mzData; conversion-required files must never
-be queued as native inputs. A raw preflight result of `Mixed` must be split with
-`msdial_split_repository_unit`, and each child must be preflighted and approved
-independently. Never execute the Mixed parent. Raw cleanup uses
-`msdial_cleanup_repository_raw` and requires a separate deletion confirmation;
-an accepted retention policy is not that confirmation.
+be queued as native inputs. Only in a campaign, under a campaign authorization
+that covers the unit, does the download lease convert its mzXML to mzML itself
+and run the converted files; mzData stays excluded. A raw preflight result of
+`Mixed` must be split with `msdial_split_repository_unit`, and each child must
+be preflighted and approved independently. Never execute the Mixed parent.
+Raw cleanup uses `msdial_cleanup_repository_raw` and requires a separate
+deletion confirmation; an accepted retention policy is not that confirmation.
 
 ## Collect Decisions
 

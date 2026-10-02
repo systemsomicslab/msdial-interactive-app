@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import base64
 import copy
+import errno
 import hashlib
 import re
 import shutil
@@ -28,6 +29,7 @@ import unittest
 import xml.etree.ElementTree as ET
 import zlib
 from pathlib import Path
+from unittest.mock import patch
 
 from msdial_app import mzxml_conversion
 from msdial_app.mzxml_conversion import (
@@ -354,6 +356,16 @@ class Mzxml32MappingTests(_Workspace):
         self.assertEqual(self.record["source"]["embedded_sha1"]["span"], "through_opening_tag")
         self.assertEqual(self.record["converter"], converter_identity())
 
+    def test_the_source_is_hashed_as_repositories_publish_it(self) -> None:
+        # The md5 beside the sha256 and sha1: a source whose declared MD5 was verified is then tied to the very
+        # bytes this conversion read.
+        source = self.record["source"]
+        self.assertEqual(
+            (hashlib.sha256(dda_32()).hexdigest(), hashlib.sha1(dda_32()).hexdigest(), hashlib.md5(dda_32()).hexdigest()),
+            (source["sha256"], source["sha1"], source["md5"]),
+        )
+        self.assertEqual(len(dda_32()), source["bytes"])
+
     def test_spectrum_list_count_equals_the_spectra(self) -> None:
         spectrum_list = self.root_element.find(f"{MZML}run/{MZML}spectrumList")
         self.assertEqual(spectrum_list.get("count"), "4")
@@ -673,6 +685,49 @@ class IntegrityTests(_Workspace):
         data = dda_32()
         record, destination = self.convert(data[: len(data) // 2])
         self.assertFailedCleanly(record, destination, "ParseError")
+        self.assertNotIn("error_errno", record, "a file that will never convert names no system error")
+
+    def test_a_full_disk_is_recorded_with_its_system_error(self) -> None:
+        """So that a caller can tell a disk a retry may get past from a file that will never convert."""
+        full = OSError(errno.ENOSPC, "No space left on device")
+        with patch.object(mzxml_conversion, "_write_mzml", side_effect=full):
+            record, destination = self.convert(dda_32())
+        self.assertFailedCleanly(record, destination, "No space left on device")
+        self.assertEqual(errno.ENOSPC, record["error_errno"])
+
+    def _held(self, times: int):
+        """Path.replace refusing the written .partial as Windows does while another process reads it."""
+        replace = Path.replace
+        calls: list[str] = []
+
+        def refuse(path: Path, target):
+            if str(path).endswith(".mzML.partial"):
+                calls.append(str(path))
+                if len(calls) <= times:
+                    raise PermissionError(errno.EACCES, "The process cannot access the file because it is being "
+                                                        "used by another process")
+            return replace(path, target)
+
+        return patch.object(Path, "replace", refuse), calls
+
+    def test_a_rename_another_process_held_up_is_tried_again(self) -> None:
+        """A virus scanner reading the file just closed refuses its rename for a moment: that is no failure."""
+        held, calls = self._held(times=2)
+        with held, patch.object(mzxml_conversion, "RENAME_RETRY_DELAYS_SECONDS", (0.0, 0.0, 0.0)):
+            record, destination = self.convert(dda_32())
+        self.assertConverted(record)
+        self.assertEqual(3, len(calls))
+        self.assertEqual(3, record["output"]["rename_attempts"])
+        self.assertTrue(destination.is_file())
+
+    def test_a_rename_held_up_throughout_names_its_system_error(self) -> None:
+        """So that a caller can tell a file another process kept from one that will never convert."""
+        held, calls = self._held(times=100)
+        with held, patch.object(mzxml_conversion, "RENAME_RETRY_DELAYS_SECONDS", (0.0, 0.0)):
+            record, destination = self.convert(dda_32())
+        self.assertFailedCleanly(record, destination, "PermissionError")
+        self.assertEqual(3, len(calls))
+        self.assertEqual(errno.EACCES, record["error_errno"])
 
     def test_a_sha1_mismatch_fails_by_default(self) -> None:
         data = dda_32().replace(b"Q Exactive", b"Q Exactivf")

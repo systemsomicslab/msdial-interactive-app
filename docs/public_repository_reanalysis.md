@@ -26,6 +26,40 @@ them to centroided mzML with a reviewed ProteoWizard `msconvert` workflow and
 record the conversion in a new input manifest; changing the role label alone is
 not sufficient.
 
+In a campaign, and only there, an mzXML is converted by Interactive itself. A
+unit a campaign authorization covers (`campaign_authorization_path` on the plan
+and download tools, recorded in the manifest's `campaign_authorizations`) is
+judged with `EligibilityPolicy.convert_mzxml`: an mzXML (packed or not) only
+plans a conversion (`project.conversion_plan`), and the download lease's
+`convert` stage, after extraction and before input discovery, writes each of the
+unit's mzXML as mzML under `raw\converted\<relative path>.mzML` with
+`msdial_app.mzxml_conversion`, with every inference flag off. The converted mzML
+are the unit's input candidates. A project with no `analysis_unit_id` converts
+nothing. Each conversion is recorded in the manifest's `input_conversions` and
+in `provenance\input-conversions.json`; each converted input has an
+`input_lineage` row of kind `converted` whose `source.conversion` names the
+mzXML it was read from (path, sha256, md5), the output's sha256, the converter
+and the validation, and carries the mzXML's own row (`source_row`). A file whose
+conversion fails is kept out with reason `conversion_failed` and the rest run:
+the unit's `campaign_disposition` lists it in `excluded_inputs`, as it lists an
+mzML excluded as `unsupported_mzml_encoding`, so the gate's INP-1 accounts for
+the declared input. A unit left with no input is excluded with the reason, and
+its preflight skips it. A full disk, or a file another process holds
+(`EACCES`/`EPERM`, after the converter has waited for it), is not a failed
+conversion: the lease stops at its `convert` stage (`download_failed`), keeping
+the records written so far, and a retry converts the rest. A re-lease reuses a
+conversion whose record still holds. Where the unit holds a vendor container or
+an mzML of the same sample beside an mzXML, the Catalog's encoding rule (shared
+test vectors `tests/vectors/encoding_preference.v1.json`) analyses that one and
+the mzXML is not converted. Files are one sample's where their folders agree
+once the words naming an encoding are set aside (`mzML/x.mzML` and
+`mzXML/x.mzXML`), or where the unit admits the readable file by itself, by its
+listing, its sample names or the archive a sample names, whatever its folder
+(`Thermo_RAW/x.raw` beside `mzXML/x.mzXML` for a sample named `x`); a study
+archive's `POS/QC_01.mzML` is no encoding of `NEG/QC_01.mzXML` for a unit whose
+samples name `QC_01.mzXML`. mzData, which nothing converts, excludes its unit in
+a campaign too.
+
 Agent-driven reanalysis also requires a user-reviewed `analysis_purpose` before
 download. That purpose anchors Class/contrast selection, annotation strategy,
 QA, and requested outputs; it is retained with repository provenance.

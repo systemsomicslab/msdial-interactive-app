@@ -678,6 +678,13 @@ def decide_disposition(
     Returns the campaign_disposition record (msdial-campaign-disposition.v1), plus ``assignments``: for
     each input that would run, its Console acquisition type, polarity and the basis of the type. The
     caller strips ``assignments`` before persisting and applies them to the per-file records.
+
+    WHAT THE LEASE ITSELF KEPT OUT of the input candidates (excluded_input_candidates: an mzXML whose
+    conversion failed, an mzML whose arrays RawDataHandler cannot decode) is listed first among the
+    excluded inputs of every disposition, with the lease's reason. The Catalog declared it, and a declared
+    input that is no candidate is accounted for only through the binding disposition's excluded_inputs
+    (the gate's INP-1): without it, one file that failed its conversion would stop the rest of a declared
+    unit. It decides nothing about the unit; what remains is decided below as before.
     """
     def mapping(value: Any) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
@@ -690,6 +697,11 @@ def decide_disposition(
     reasons: list[str] = []
     warnings: list[str] = []
     excluded: list[dict[str, str]] = []
+    lease_excluded = [
+        {"path": str(item["path"]), "reason": str(item.get("reason") or "")}
+        for item in manifest.get("excluded_input_candidates") or []
+        if isinstance(item, dict) and str(item.get("path") or "").strip()
+    ]
     detail: list[str] = []
     disagreements: list[dict[str, Any]] = []
     assignments: dict[str, dict[str, Any]] = {}
@@ -704,7 +716,7 @@ def decide_disposition(
             "disposition": disposition,
             "reasons": list(dict.fromkeys(reasons)),
             "warnings": warnings,
-            "excluded_inputs": excluded,
+            "excluded_inputs": [*lease_excluded, *excluded],
             "split_key": split_key,
             "decided_at": decided_at or _now(),
             "extractor": {
@@ -727,7 +739,17 @@ def decide_disposition(
     candidates = [str(item) for item in manifest.get("input_candidates") or [] if str(item).strip()]
     if not candidates:
         reasons.append("no_inputs")
-        detail.append("The unit has no input files.")
+        failed = [item for item in lease_excluded if item["reason"] == "conversion_failed"]
+        if failed:
+            # The lease's convert stage wrote the unit's mzXML as mzML and every conversion failed; each failure
+            # is recorded with its error in input_conversions.
+            reasons.append("conversion_failed")
+            detail.append(
+                f"The unit has no input files: the conversion of its {len(failed)} mzXML file(s) to mzML failed, "
+                "and no other input remains."
+            )
+        else:
+            detail.append("The unit has no input files.")
         return result("skip")
     if coverage.get("capped"):
         reasons.append("raw_metadata_incomplete")

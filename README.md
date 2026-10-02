@@ -186,6 +186,18 @@ for commands, eligibility rules, and the pilot validation record.
 MS-DIAL reads mzML but has no mzXML/mzData reader. Repository records that name
 those legacy formats are blocked as `requires_conversion` before download and
 must be converted to mzML through a separately reviewed conversion workflow.
+Only in a campaign, where a campaign authorization covers the unit, is an
+mzXML converted by the download lease itself: its `convert` stage writes each
+of the unit's mzXML as mzML under `raw\converted` with Interactive's own
+converter (`msdial_app.mzxml_conversion`, every inference flag off), records
+each conversion in `input_conversions` and `provenance\input-conversions.json`,
+and runs what converted. A file whose conversion fails is excluded with reason
+`conversion_failed`, listed in the unit's `campaign_disposition`, and the rest
+of the unit runs; a full disk, or a file another process holds, instead stops
+the lease, so that the unit is retried. Where the unit holds a readable
+encoding of the same sample beside the mzXML, in the same place or anywhere it
+admits that file by itself, the Catalog's encoding rule analyses that one
+instead. mzData, which nothing converts, excludes its unit there too.
 Raw-header results reported as `Mixed` can be split, after explicit confirmation,
 into independent acquisition-mode units with `msdial_split_repository_unit`; the
 Mixed parent is never sent to MS-DIAL.

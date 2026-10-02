@@ -244,7 +244,10 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
 
 MS-DIAL accepts mzML, not mzXML or mzData. Files reported as
 `requires_conversion` must be converted to mzML outside the run and entered
-through a new reviewed manifest; do not relabel them as `converted`.
+through a new reviewed manifest; do not relabel them as `converted`. In a
+campaign only, an mzXML of a unit the campaign authorization covers is
+converted by the download lease itself (its `convert` stage, recorded in
+`input_conversions`); an mzData unit stays excluded there too.
 
 `allow_partial_mapping=true` and raw-data cleanup are explicit user decisions;
 do not infer either from the absence of an error.

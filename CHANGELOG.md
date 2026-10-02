@@ -4,6 +4,57 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.21] - Unreleased
+
+### Added
+- A campaign unit whose samples exist only as mzXML is converted to mzML and run,
+  instead of being excluded (the user's decision of 2026-09-30). This happens only
+  where a campaign authorization covers the unit; outside a campaign an mzXML or
+  mzData still excludes its unit before download, as before, and mzData excludes a
+  campaign unit too.
+  - Eligibility (`EligibilityPolicy.convert_mzxml`) records
+    `project.conversion_plan` (`msdial-mzxml-conversion-plan.v1`) for such a unit,
+    in the MCP plan, download and batch-plan tools, the backend's download route,
+    the preflight, the disposition and the split.
+  - The lease's `convert` stage, a placeholder since 0.5.16, runs after `extract`
+    and before `discover`. It writes each of the unit's mzXML, packed or not, to
+    `raw\converted\<relative path>.mzML` with `mzxml_conversion`, every inference
+    flag off. Conversions are recorded as they complete in `input_conversions` and
+    `provenance\input-conversions.json`, and a re-lease reuses a record whose
+    mzXML, options, converter and output still hold.
+  - Each converted input gets an `input_lineage` row of kind `converted` whose
+    `source.conversion` holds the mzXML's path, sha256, md5 and sha1, the output's
+    sha256, the converter's identity, the validation and the mzXML's own row; the
+    mzXML rows are listed under `conversion_sources`. These are what the gate's
+    SUM-1 converted link and CONV-1 read. `lineage_stands_for` attributes a
+    converted `X.mzML` to `FILES/X.mzXML` and its sample everywhere an input is
+    matched.
+  - A file whose conversion fails is excluded as `conversion_failed`, and the rest
+    of the unit runs. A unit left with no input is excluded and its preflight skips
+    it. A full disk, or a file another process still holds after about 16 s of
+    rename retries, stops the lease at `convert`, so that a retry converts the rest.
+- `msdial_app.encoding_preference`: the Catalog's rule for which encoding of a
+  sample is analysed, held to the Catalog's own vectors. The lease applies it to
+  files an archive revealed: a readable twin is analysed instead of the mzXML where
+  it lies in the same place once folder words naming an encoding are set aside, or
+  wherever the unit admits it by itself. A convertible mzXML outranks a twin that
+  RawDataHandler cannot decode. Each choice is recorded with `paired_by`.
+- Agent capability `campaign_mzxml_converted_to_mzml`.
+
+### Changed
+- `CONVERSION_REQUIRED_SUFFIXES` is split into `CONVERTIBLE_SUFFIXES` (`.mzxml`)
+  and `UNSUPPORTED_ENCODING_SUFFIXES` (`.mzdata`, `.mzdata.xml`).
+- Every campaign disposition lists the inputs the lease kept out
+  (`excluded_input_candidates`: `conversion_failed`, `unsupported_mzml_encoding`)
+  in `excluded_inputs` with the lease's reason, so the gate's INP-1 accounts for a
+  declared input that is not a candidate.
+
+### Known limitations
+- Converted units take the mzML defaults for the MS1/MS2 data type and the
+  threshold step (Centroid, QTOF).
+- MTBLS688's roughly 105 `.dat` files spelled differently from their mzXML still
+  need a conversion nothing performs, so that unit stays excluded.
+
 ## [0.5.20] - Unreleased
 
 ### Added
