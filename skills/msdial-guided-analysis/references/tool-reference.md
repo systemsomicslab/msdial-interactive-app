@@ -249,7 +249,11 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   artifacts first, then delete leased raw data only after mzTab-M validation,
   artifact inventory, and a separate explicit confirmation. A retention policy
   is not deletion approval. On a split parent's manifest it releases the raw
-  tree its parts read, only once every part has ended.
+  tree its parts read, only once every part has ended. For a unit leased
+  through the download store, show the preview's `download_store` too: a
+  person's confirmation frees none of the bytes its tree links from the store
+  (`tree_bytes_kept_by_store`), which only a collection under a campaign
+  approval deletes.
 - `msdial_discard_repository_raw`: preview, then on a separate explicit
   confirmation delete the raw data of a unit that produced no validated output
   (skipped, excluded, download or run failed). In a campaign only, a recorded

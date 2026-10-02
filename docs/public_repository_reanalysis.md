@@ -158,7 +158,15 @@ no live claim still holds, leaving its record as a tombstone. A batch
 pre-claim (`msdial_repository_batch_plan` with `pre_claim=true`) keeps an
 object for units that have not run yet, a split parent's claims stand for its
 parts, a person's confirmation releases claims without deleting store objects,
-and an approval that keeps raw data deletes nothing.
+and an approval that keeps raw data deletes nothing. A deletion's preview says
+so: its `download_store` gives the bytes of the tree's links to the store's
+files, which deleting the tree does not free (`tree_bytes_kept_by_store`), and
+what a collection under an approval would delete with the release
+(`bytes_collectable_after_release`, an archive's extraction tree included). A
+store object is collected only under an approval that covers boundary 5 for
+every unit that released it, so what a person's confirmation leaves - under
+`store_mode` `always` outside a campaign, every object - stays in `_dl` until a
+cleanup or discard is repeated under such an approval.
 
 A cleanup, discard or split-parent release asked for again deletes nothing and
 releases what is still unreleased, so one whose release failed or stopped is

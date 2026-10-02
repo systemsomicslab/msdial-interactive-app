@@ -12,7 +12,7 @@ have moved its 928 GB archive. These tests hold the lease, the deletions and the
 - a Workbench study archive shared by a positive and a negative unit is fetched once and extracted once,
   and each unit's tree keeps only its own samples - with what the SCIEX reader opens beside each;
 - a release asked for again keeps the record of the first, and finishes one a failure left unmade, a
-  cleanup's included;
+  cleanup's included; a deletion's preview says which of its bytes the store keeps;
 - a lease waiting for another lease's transfer says so (waiting_for_shared_download), and is heard;
 - _dl and _campaigns are never units, and without a campaign or store_mode "always" nothing changes.
 
@@ -540,6 +540,53 @@ class ACleanupRepeatedFinishesTheReleaseItLeftUnmade(_Workspace):
         again = cleanup_download_lease(manifest, campaign_authorization_path=approval)
         self.assertFalse(again["deleted"])
         self.assertNotIn("already_cleaned", again)
+
+
+class TheDeletionPreviewSaysWhatTheStoreKeeps(_Workspace):
+    """The preview's deletion_bytes counted the tree's links to the store's files as freed, and its
+    bytes_collectable_after_release left out an archive's extraction tree."""
+
+    def test_a_confirmation_frees_none_of_the_bytes_linked_from_the_store(self) -> None:
+        payload = _mzml("a" * 1000)
+        lease = create_download_lease(_project("unit-gui", {"FILES/a.mzML": BASE + "a.mzML"}), self.root, 10**9,
+                                      client=_Client({BASE + "a.mzML": payload}), store_mode="always",
+                                      raw_retention_policy=DELETE)
+        manifest = Path(lease["manifest_path"])
+        self.validate(manifest)
+        (Path(lease["input_directory"]) / "a_2026100210.dcl").write_bytes(b"intermediate")
+
+        preview = plan_download_cleanup(manifest)
+
+        store = preview["download_store"]
+        self.assertEqual(len(payload) + len(b"intermediate"), preview["deletion_bytes"])
+        self.assertEqual(len(payload), store["tree_bytes_kept_by_store"], "the link's bytes are the store's")
+        self.assertEqual(0, store["store_bytes_freed_by_a_confirmation"])
+        self.assertEqual(len(payload), store["bytes_collectable_after_release"])
+        self.assertIn("frees none of them", store["collection"])
+
+    def test_an_archives_collectable_bytes_count_its_extraction_tree(self) -> None:
+        data = _zip({f"st/S{index}.mzML": _mzml("x" * 4000 + str(index)) for index in range(3)})
+        url = "https://example.org/st.zip"
+        project = RepositoryProject(
+            repository="metabolomics_workbench", accession="ST000077", analysis_unit_id="an000077",
+            eligible=True, selection_status="eligible", separation="LC-MS", acquisition_mode="DDA",
+            ion_mode="Positive", untargeted=True,
+            files=[RepositoryFile(name="st.zip", size_bytes=len(data), url=url, role="shared_raw_archive",
+                                  checksum=hashlib.md5(data).hexdigest())],
+            total_download_bytes=len(data),
+            sample_metadata=[{"sample_id": f"S{index}", "raw_file": f"S{index}.mzML"} for index in range(3)],
+        )
+        approval = self.approval(["an000077"])
+        manifest = Path(self.campaign_lease(project, _Client({url: data}), approval)["manifest_path"])
+        self.validate(manifest)
+
+        preview = plan_download_cleanup(manifest)["download_store"]
+        cleaned = cleanup_download_lease(manifest, campaign_authorization_path=approval)
+
+        removed = sum(item["removed_bytes"] for item in cleaned["download_store"]["gc"]["collected"])
+        self.assertGreater(removed, len(data))
+        self.assertEqual(removed, preview["bytes_collectable_after_release"])
+        self.assertEqual(removed - len(data), preview["tree_bytes_kept_by_store"], "the three members' links")
 
 
 class ASplitParentKeepsItsClaimWhileItsPartsAreLive(_Workspace, _MixedUnitFixture):

@@ -2022,9 +2022,11 @@ def msdial_cleanup_repository_raw(
     (finalisation_holds in the manifest). Both calls retry that move first; while it still fails the preview
     lists it as a blocker and the deletion is refused.
 
-    A unit leased through the accession download store releases its store claims with its tree. Asked again
-    once made, the cleanup deletes nothing (already_cleaned) and makes a store release the first one left
-    unmade.
+    A unit leased through the accession download store releases its store claims with its tree. The
+    preview's download_store says how many of the tree's bytes are links to the store's files
+    (tree_bytes_kept_by_store), which a person's confirmation does not free: store objects are deleted only
+    under a campaign approval covering every unit that released them. Asked again once made, the cleanup
+    deletes nothing (already_cleaned) and makes a store release the first one left unmade.
     """
     from .repository_reanalysis import cleanup_download_lease
 
@@ -2105,10 +2107,11 @@ def msdial_download_store_status(
     accession fetch, once, kept by one claim per unit (pending: claimed before its lease; materialized: its
     raw tree links the object; released). For each store: its objects with the units whose live claims keep
     them, its claims by state and by unit (with each unit's manifest status), partial transfers, lock
-    holders, objects no live claim holds (which a collection under a campaign approval deletes) and live
-    claims of units whose raw data are already released. ``repository`` and ``accession`` narrow it to one
-    store, ``analysis_unit_id`` to one unit's claims. ``store_mode`` is the saved setting: "campaign" (the
-    default) uses the store for campaign units only, "always" for every lease.
+    holders, objects no live claim holds (which a collection under a campaign approval deletes once it covers
+    every unit that released them) and live claims of units whose raw data are already released.
+    ``repository`` and ``accession`` narrow it to one store, ``analysis_unit_id`` to one unit's claims.
+    ``store_mode`` is the saved setting: "campaign" (the default) uses the store for campaign units only,
+    "always" for every lease.
     """
     from .repository_reanalysis import download_store_status
 

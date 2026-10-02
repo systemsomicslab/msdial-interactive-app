@@ -6730,10 +6730,21 @@ def _written_acquisition_by_input(manifest: dict[str, Any]) -> dict[str, str]:
 
 def _tree_size(root: Path) -> tuple[int, int]:
     """Return (file count, total bytes) under root, or (0, 0) when it is gone."""
+    count, size, _elsewhere = _tree_census(root)
+    return count, size
+
+
+def _tree_census(root: Path) -> tuple[int, int, int]:
+    """(file count, total bytes, bytes held elsewhere too) under root; (0, 0, 0) when it is gone.
+
+    The third is the bytes of the hard-linked files with a name outside the tree, which deleting the tree
+    does not free: a store lease's links to the download store's files (raw_storage).
+    """
     if not root.is_dir():
-        return 0, 0
+        return 0, 0, 0
     count = size = 0
-    linked: set[tuple[int, int]] = set()
+    # (st_dev, st_ino) of each multiply-linked file met: its link count, size and names met in the tree.
+    linked: dict[tuple[int, int], list[int]] = {}
     for directory, directories, names in os.walk(root):
         # A directory junction is an alias the analysis CSV reads a folder through (console-aliases), not a
         # second copy of it, and Path.rglob and os.walk both descend into one. Its bytes are counted once,
@@ -6750,11 +6761,13 @@ def _tree_size(root: Path) -> tuple[int, int]:
             if status.st_nlink > 1:
                 identity = (status.st_dev, status.st_ino)
                 if identity in linked:
+                    linked[identity][2] += 1
                     continue
-                linked.add(identity)
+                linked[identity] = [status.st_nlink, status.st_size, 1]
             count += 1
             size += status.st_size
-    return count, size
+    elsewhere = sum(file_size for links, file_size, met in linked.values() if met < links)
+    return count, size, elsewhere
 
 
 def _is_junction(path: str | Path) -> bool:
@@ -6813,7 +6826,7 @@ def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
     workspace = Path(manifest.get("workspace", "")).resolve()
     retained = [Path(value) for value in manifest.get("retained_artifacts", [])]
     missing = [str(path) for path in retained if not os.path.exists(extended_path(path))]
-    file_count, total_bytes = _tree_size(raw_root)
+    file_count, total_bytes, linked_bytes = _tree_census(raw_root)
     within_workspace = raw_root.parent == workspace and raw_root.name == "raw"
     blockers: list[str] = []
     if manifest.get("status") not in CLEANUP_READY_STATUSES:
@@ -6840,7 +6853,7 @@ def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
             "MS-DIAL containers are still in the raw directory, and its deletion would delete them: "
             + describe_holds(held) + "."
         )
-    store = _store_release_preview(manifest)
+    store = _store_release_preview(manifest, linked_bytes)
     return {
         **({"finalisation_holds": held} if held else {}),
         **({"download_store": store} if store else {}),
@@ -7438,11 +7451,17 @@ def _store_release_repeat(record: dict[str, Any]) -> dict[str, Any]:
     return note
 
 
-def _store_release_preview(manifest: dict[str, Any]) -> dict[str, Any] | None:
+def _store_release_preview(manifest: dict[str, Any], linked_bytes: int) -> dict[str, Any] | None:
     """What releasing this unit's store claims would free, and what the store keeps, for which units.
 
-    For a deletion's preview: the bytes of an object freed only when it is collected, which happens under a
-    campaign approval and only once no other live claim holds it. Changes nothing. None without claims.
+    For a deletion's preview. Of the bytes the deletion counts in the unit's tree (deletion_bytes), those of its
+    links to the store's files are freed by no deletion of the tree (tree_bytes_kept_by_store): they are the
+    store's, and go only when the store collects the object they belong to. That happens under a campaign
+    approval that covers boundary 5 for every unit that released the object, once no other live claim holds
+    it (bytes_collectable_after_release: an archive's extraction tree with it); a person's confirmation
+    releases the claims and deletes no store object (store_bytes_freed_by_a_confirmation, 0). ``linked_bytes``
+    is the third of _tree_census for the unit's raw tree, which the preview has walked. Changes nothing.
+    None without claims.
     """
     store = _unit_store(manifest)
     unit = str((manifest.get("project") or {}).get("analysis_unit_id") or "")
@@ -7466,24 +7485,33 @@ def _store_release_preview(manifest: dict[str, Any]) -> dict[str, Any] | None:
                     "claim_state": claim.get("state"),
                     "object_state": (entry or {}).get("state"),
                     "size_bytes": (entry or {}).get("size_bytes"),
+                    "tree_bytes": int(((entry or {}).get("tree") or {}).get("bytes") or 0),
                     "kept_for_units": others,
                 }
             )
     except (StoreError, OSError) as error:
         return {"store": str(store.root), "error": f"{type(error).__name__}: {error}"}
+    # One object per id: two claims of a unit (two URLs of the same bytes) name one object.
+    distinct = {str(item["object_id"]): item for item in objects if item["object_id"]}
+    collectable = sum(
+        int(item.get("size_bytes") or 0) + item["tree_bytes"]
+        for item in distinct.values()
+        if not item["kept_for_units"] and item.get("object_state") == "ready"
+    )
     return {
         "store": str(store.root),
         "claims": len(claims),
         "objects": objects,
-        "bytes_collectable_after_release": sum(
-            int(item.get("size_bytes") or 0)
-            for item in objects
-            if not item["kept_for_units"] and item.get("object_state") == "ready"
-        ),
+        "tree_bytes_kept_by_store": linked_bytes,
+        "store_bytes_freed_by_a_confirmation": 0,
+        "bytes_collectable_after_release": collectable,
         "collection": (
-            "An object is deleted only under a campaign approval that covers boundary 5 for every unit that "
-            "released it, and only once no live claim holds it; a person's confirmation releases the claims "
-            "and deletes no store object."
+            f"{linked_bytes} of the bytes in this unit's raw tree are links to the download store's files, which "
+            "deleting the tree does not free. A store object is deleted only under a campaign approval that "
+            "covers boundary 5 for every unit that released it, and only once no live claim holds it: under "
+            f"such an approval {collectable} bytes would be collected with this release. A person's "
+            "confirmation releases the claims and deletes no store object, so it frees none of them; a cleanup "
+            "or discard of this unit repeated later under an approval that covers it collects what it left."
         ),
     }
 
@@ -7510,7 +7538,8 @@ def download_store_status(
     Per store: its objects (state, size, the units whose live claims keep each), its claims by state, its
     partial transfers and its lock holders (DownloadStore.summary), and, read from each unit's own manifest,
     the claims of units whose raw data are already released (raw_cleaned, discarded) yet still live, and
-    the objects no live claim holds, which the next collection under a campaign approval deletes.
+    the objects no live claim holds, which a collection under a campaign approval deletes only when it covers
+    boundary 5 for every unit that released them: one released under a person's confirmation alone stays.
     ``repository`` and ``accession`` narrow it to one store, ``unit_id`` to the claims of one unit. Only the
     _dl directory of each accession is read; _dl and _campaigns are never taken for units.
     """
@@ -7782,7 +7811,7 @@ def plan_download_discard(manifest_path: Path, *, authorized: bool = False) -> d
     workspace = Path(str(manifest.get("workspace") or "")).resolve()
     output = Path(str(manifest.get("output_directory") or ""))
     mztab = _mztab_outputs(output)
-    file_count, total_bytes = _tree_size(raw_root)
+    file_count, total_bytes, linked_bytes = _tree_census(raw_root)
     blockers: list[str] = []
     if status in {"mztab_validated", "completed", "cleanup_pending_confirmation", "raw_cleaned"}:
         blockers.append("Validated/completed runs must use the normal cleanup command.")
@@ -7819,7 +7848,7 @@ def plan_download_discard(manifest_path: Path, *, authorized: bool = False) -> d
             "finalisation_held [raw_deletion]: MS-DIAL containers a finished run could not move are still in the raw "
             "directory: " + describe_holds(held) + "."
         )
-    store = _store_release_preview(manifest)
+    store = _store_release_preview(manifest, linked_bytes)
     return {
         **({"finalisation_holds": held} if held else {}),
         **({"download_store": store} if store else {}),
@@ -8330,11 +8359,11 @@ def plan_split_parent_cleanup(manifest_path: Path) -> dict[str, Any]:
             "MS-DIAL containers are still in the raw directory, and its deletion would delete them: "
             + describe_holds(held) + "."
         )
-    file_count, total_bytes = _tree_size(raw_root)
+    file_count, total_bytes, linked_bytes = _tree_census(raw_root)
     release = manifest.get("raw_release") if isinstance(manifest.get("raw_release"), dict) else {}
     already = release.get("state") == "deleted" and not raw_root.exists()
     # The parent's claims stand for every part (parts never claim), and are released with its tree.
-    store = _store_release_preview(manifest)
+    store = _store_release_preview(manifest, linked_bytes)
     return {
         **({"download_store": store} if store else {}),
         "manifest_path": str(manifest_path),
