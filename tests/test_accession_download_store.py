@@ -11,6 +11,8 @@ have moved its 928 GB archive. These tests hold the lease, the deletions and the
 - a split parent's claims stand for its parts, and go only with the parent's own release;
 - a Workbench study archive shared by a positive and a negative unit is fetched once and extracted once,
   and each unit's tree keeps only its own samples - with what the SCIEX reader opens beside each;
+- a release asked for again keeps the record of the first, and finishes one a failure left unmade, a
+  cleanup's included;
 - a lease waiting for another lease's transfer says so (waiting_for_shared_download), and is heard;
 - _dl and _campaigns are never units, and without a campaign or store_mode "always" nothing changes.
 
@@ -54,6 +56,7 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
         pre_claim_downloads,
         project_from_dict,
         read_manifest,
+        record_run_failure,
         run_raw_metadata_preflight,
         split_unit_by_acquisition,
         travels_with_sciex_file,
@@ -424,6 +427,119 @@ class RetentionKeepNeverDeletes(_Workspace):
         self.assertEqual([], swept["collected"])
         self.assertTrue((store.object_directory(object_id) / "obj" / "shared.mzML").is_file())
         self.assertEqual({"released"}, {claim["state"] for claim in store.all_claims()})
+
+
+class ARepeatedReleaseKeepsTheRecordOfTheFirst(_Workspace):
+    """A repeated discard or release wrote a new download_store_release over the first: a person's confirmed
+    repeat after a campaign's discard replaced the record of the store's collection with gc unauthorized."""
+
+    def test_a_confirmed_repeat_of_a_campaign_discard_is_noted_and_replaces_nothing(self) -> None:
+        approval = self.approval(["unit-a"])
+        client = _Client({BASE + "shared.mzML": _mzml("shared")})
+        lease = self.campaign_lease(_project("unit-a", {"FILES/shared.mzML": BASE + "shared.mzML"}), client, approval)
+        manifest = Path(lease["manifest_path"])
+        record_run_failure(manifest, {"reason": "MS-DIAL Console exited with code 1.", "exit_code": 1})
+        discard_download_lease(manifest, campaign_authorization_path=approval)
+        first = read_manifest(manifest)["download_store_release"]
+        self.assertTrue(first["gc"]["authorized"])
+        self.assertEqual(1, len(first["gc"]["collected"]))
+
+        again = discard_download_lease(manifest, confirmed=True)
+
+        self.assertTrue(again["already_discarded"])
+        self.assertEqual("repeat", again["download_store"]["recorded_as"])
+        self.assertFalse(again["download_store"]["gc"]["authorized"], "what the repeat itself did")
+        after = read_manifest(manifest)["download_store_release"]
+        self.assertEqual(first, {key: value for key, value in after.items() if key != "repeats"},
+                         "the first release's record, its collection included, stands")
+        self.assertEqual([{"at": again["download_store"]["released_at"], "reason": "failed_terminal",
+                           "gc": {"authorized": False}}], after["repeats"])
+
+    def test_a_later_release_that_collects_replaces_the_record_and_keeps_the_earlier(self) -> None:
+        # store_mode "always" outside a campaign: a person's confirmation releases the claim and collects
+        # nothing; a cleanup repeated under an approval that covers the unit collects what it left.
+        client = _Client({BASE + "a.mzML": _mzml("a")})
+        lease = create_download_lease(_project("unit-gui", {"FILES/a.mzML": BASE + "a.mzML"}), self.root, 10**9,
+                                      client=client, store_mode="always", raw_retention_policy=DELETE)
+        manifest = Path(lease["manifest_path"])
+        object_id = _download(lease, "a.mzML")["cache_object_id"]
+        self.validate(manifest)
+        cleaned = cleanup_download_lease(manifest, confirmed=True)
+        self.assertTrue(cleaned["deleted"])
+        self.assertFalse(cleaned["download_store"]["gc"]["authorized"])
+        store = self.store()
+        self.assertTrue((store.object_directory(object_id) / "obj").is_dir(), "a confirmation deletes no store object")
+
+        collected = cleanup_download_lease(manifest, campaign_authorization_path=self.approval(["unit-gui"]))
+
+        self.assertTrue(collected["already_cleaned"])
+        self.assertEqual("release", collected["download_store"]["recorded_as"])
+        self.assertEqual([object_id], [item["object_id"] for item in collected["download_store"]["gc"]["collected"]])
+        self.assertFalse((store.object_directory(object_id) / "obj").exists())
+        record = read_manifest(manifest)["download_store_release"]
+        self.assertTrue(record["gc"]["authorized"])
+        (earlier,) = record["earlier"]
+        self.assertEqual((cleaned["download_store"]["released_at"], False, 1),
+                         (earlier["released_at"], earlier["gc"]["authorized"], earlier["claim_count"]))
+        self.assertNotIn("claims", earlier)
+
+
+class ACleanupRepeatedFinishesTheReleaseItLeftUnmade(_Workspace):
+    """A cleanup whose claim release failed was never released again: raw_cleaned is no ready status, so
+    a repeat under the approval was not ready and a confirmed one was refused, and the claims stayed live,
+    keeping the store's object, for good."""
+
+    def failed_release(self) -> tuple[Path, Path, str]:
+        approval = self.approval(["unit-a"])
+        client = _Client({BASE + "a.mzML": _mzml("a")})
+        lease = self.campaign_lease(_project("unit-a", {"FILES/a.mzML": BASE + "a.mzML"}), client, approval)
+        manifest = Path(lease["manifest_path"])
+        self.validate(manifest)
+        with patch.object(DownloadStore, "release_unit", side_effect=OSError("the claims could not be read")):
+            cleaned = cleanup_download_lease(manifest, campaign_authorization_path=approval)
+        self.assertTrue(cleaned["deleted"])
+        self.assertIn("OSError", cleaned["download_store"]["error"])
+        self.assertEqual({"materialized"}, {claim["state"] for claim in self.store().claims_for_unit("unit-a")})
+        return manifest, approval, _download(lease, "a.mzML")["cache_object_id"]
+
+    def test_a_repeat_under_the_approval_releases_and_collects(self) -> None:
+        manifest, approval, object_id = self.failed_release()
+
+        again = cleanup_download_lease(manifest, campaign_authorization_path=approval)
+
+        self.assertEqual((True, True), (again["deleted"], again["already_cleaned"]))
+        self.assertEqual("deleted", again["raw_deletion"]["state"], "the deletion's own record, unchanged")
+        self.assertEqual({"released"}, {claim["state"] for claim in self.store().claims_for_unit("unit-a")})
+        self.assertEqual([object_id], [item["object_id"] for item in again["download_store"]["gc"]["collected"]])
+        record = read_manifest(manifest)["download_store_release"]
+        self.assertNotIn("error", record)
+        self.assertIn("OSError", record["earlier"][0]["error"])
+        self.assertEqual([], [unit for item in repository_reanalysis.download_store_status(self.root)["stores"]
+                              for unit in item["live_claims_of_released_units"]])
+
+    def test_a_persons_repeat_releases_the_claims(self) -> None:
+        manifest, _approval, object_id = self.failed_release()
+
+        again = cleanup_download_lease(manifest, confirmed=True)
+
+        self.assertTrue(again["already_cleaned"])
+        self.assertEqual({"released"}, {claim["state"] for claim in self.store().claims_for_unit("unit-a")})
+        self.assertFalse(again["download_store"]["gc"]["authorized"])
+        self.assertTrue((self.store().object_directory(object_id) / "obj").is_dir())
+
+    def test_a_unit_without_store_claims_is_refused_as_it_always_was(self) -> None:
+        approval = self.approval(["unit-a"])
+        lease = create_download_lease(_project("unit-a", {"FILES/a.mzML": BASE + "a.mzML"}), self.root, 10**9,
+                                      client=_Client({BASE + "a.mzML": _mzml("a")}), raw_retention_policy=DELETE)
+        manifest = Path(lease["manifest_path"])
+        self.validate(manifest)
+        self.assertTrue(cleanup_download_lease(manifest, confirmed=True)["deleted"])
+
+        with self.assertRaisesRegex(ValueError, "requires a completed/validated manifest"):
+            cleanup_download_lease(manifest, confirmed=True)
+        again = cleanup_download_lease(manifest, campaign_authorization_path=approval)
+        self.assertFalse(again["deleted"])
+        self.assertNotIn("already_cleaned", again)
 
 
 class ASplitParentKeepsItsClaimWhileItsPartsAreLive(_Workspace, _MixedUnitFixture):

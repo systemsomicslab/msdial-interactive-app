@@ -2021,6 +2021,10 @@ def msdial_cleanup_repository_raw(
     A finished run whose MS-DIAL containers could not be moved out of the raw tree holds the deletion
     (finalisation_holds in the manifest). Both calls retry that move first; while it still fails the preview
     lists it as a blocker and the deletion is refused.
+
+    A unit leased through the accession download store releases its store claims with its tree. Asked again
+    once made, the cleanup deletes nothing (already_cleaned) and makes a store release the first one left
+    unmade.
     """
     from .repository_reanalysis import cleanup_download_lease
 

@@ -40,6 +40,7 @@ from .diagnostic_paths import (
     plain_path,
 )
 from .download_store import (
+    LIVE_CLAIM_STATES,
     STORE_DIRECTORY,
     DeclaredChecksumMismatch,
     DownloadStore,
@@ -7124,6 +7125,11 @@ def cleanup_download_lease(
 
     A split parent is released by cleanup_split_parent, which this calls for one. A part's own raw directory
     is its parent's, so its cleanup is refused as before; its preview carries its parent's plan.
+
+    A unit that holds download-store claims and was cleaned already, asked again under either, deletes
+    nothing and records no crossing: its claims are released again (already_cleaned), which finishes a
+    release that failed or stopped after the deletion and, under an approval, lets the store collect what
+    the first release left (release_store_claims). Any other cleaned unit is refused as it always was.
     """
     from .run_finalisation import (
         BLOCKS_RAW_DELETION,
@@ -7165,6 +7171,15 @@ def cleanup_download_lease(
     raw_root = Path(str(manifest.get("raw_directory") or "")).resolve()
     with _raw_deletion_lock(manifest_path):
         manifest = read_manifest(manifest_path)
+        finished = _cleanup_finished(manifest, raw_root)
+        if finished is not None and _holds_store_claims(manifest):
+            # Asked again once it was made, a cleanup deletes nothing; the store release it left unmade - one
+            # that failed, or a stop between the deletion and the release - is made now, as a repeated discard
+            # or split-parent release makes it. A unit with no store claims is refused as it always was.
+            made = _cleanup_made(manifest_path, raw_root, finished, crossing)
+            if crossing is not None:
+                made["campaign_authorization"] = crossing
+            return made
         resuming = _resumable_deletion(manifest, "cleanup", raw_root)
         if crossing is not None:
             plan = plan_download_cleanup(manifest_path)
@@ -7230,6 +7245,53 @@ def cleanup_download_lease(
     return result
 
 
+def _cleanup_finished(manifest: dict[str, Any], raw_root: Path) -> dict[str, Any] | None:
+    """The deletion record of this unit's cleanup when the cleanup was made and has finished, else None.
+
+    Finished: the unit is raw_cleaned, its raw tree holds no file, and its raw_deletion is a cleanup of this
+    tree, deleted; a unit cleaned before deletions were recorded carries none ({}).
+    """
+    if manifest.get("status") != "raw_cleaned" or _tree_size(raw_root)[0]:
+        return None
+    record = manifest.get("raw_deletion")
+    if not isinstance(record, dict):
+        return {}
+    same = record.get("kind") == "cleanup" and _file_key(str(record.get("target") or "")) == _file_key(str(raw_root))
+    return record if same and record.get("state") == "deleted" else None
+
+
+def _holds_store_claims(manifest: dict[str, Any]) -> bool:
+    """Whether the unit has claims, in any state, in a download store; a store that cannot be read counts,
+    so that the release records why."""
+    store = _unit_store(manifest)
+    unit = str((manifest.get("project") or {}).get("analysis_unit_id") or "")
+    if store is None or not unit:
+        return False
+    try:
+        return bool(store.claims_for_unit(unit))
+    except (StoreError, OSError):
+        return True
+
+
+def _cleanup_made(
+    manifest_path: Path, raw_root: Path, record: dict[str, Any], crossing: dict[str, Any] | None
+) -> dict[str, Any]:
+    """A cleanup asked for again once it has finished: nothing is deleted, and no crossing recorded; the unit's
+    store claims are released (release_store_claims, which releases nothing already released and keeps the
+    first release's record unless this one changes something)."""
+    result: dict[str, Any] = {
+        "deleted": True,
+        "already_cleaned": True,
+        "raw_directory": str(raw_root),
+        "manifest_path": str(manifest_path),
+        **({"raw_deletion": record} if record else {}),
+    }
+    released = release_store_claims(manifest_path, "raw_cleaned", crossing)
+    if released is not None:
+        result["download_store"] = released
+    return result
+
+
 def _unit_store(manifest: dict[str, Any]) -> DownloadStore | None:
     """The accession download store that may hold claims of this unit's; None when there is none.
 
@@ -7268,9 +7330,16 @@ def release_store_claims(
     boundary 5), the store's GC then deletes each released object no live claim still holds
     (DownloadStore.gc: a pending pre-claim of a unit that has not run yet keeps it, as does a materialized
     claim of a unit still reading it); with a person's confirmation alone the claims are released and the
-    store deletes nothing, because its objects are deleted only under a campaign approval. A release asked
-    for again releases nothing more. The record is written into the manifest as download_store_release.
-    None when no store holds claims of this unit's.
+    store deletes nothing, because its objects are deleted only under a campaign approval.
+
+    A release asked for again - a deletion repeated, or one that stopped, or failed, between its deletion and
+    its release - releases nothing already released, and asks the GC again under the repeat's approval. The
+    manifest's download_store_release is the record of the release that last changed something: released a
+    claim, collected an object or a partial transfer, or followed one that failed. A repeat that changes
+    nothing leaves that record as it is and is noted in its ``repeats``, so a person's confirmation repeated
+    after a campaign's collection never replaces the evidence of that collection; a record a later release
+    replaces is kept in its ``earlier``, without its claim list. Returns what this call did, with
+    recorded_as release or repeat. None when no store holds claims of this unit's.
     """
     try:
         manifest = read_manifest(manifest_path)
@@ -7283,9 +7352,12 @@ def release_store_claims(
     at = datetime.now(timezone.utc).isoformat()
     authorization = str((crossing or {}).get("authorization_path") or "").strip() or None
     record: dict[str, Any] = {"schema": STORE_RELEASE_SCHEMA, "released_at": at, "reason": reason, "store": str(store.root)}
+    changed = False
     try:
-        if not store.claims_for_unit(unit):
+        claims = store.claims_for_unit(unit)
+        if not claims:
             return None
+        live = [claim for claim in claims if claim.get("state") in LIVE_CLAIM_STATES]
         released = store.release_unit(unit, reason, authorization=authorization)
     except (StoreError, OSError) as error:
         record["error"] = f"{type(error).__name__}: {error}"
@@ -7319,15 +7391,51 @@ def release_store_claims(
                 busy=list(gc.get("busy") or []),
                 partials_removed=len(gc.get("partials_removed") or []),
             )
+        changed = bool(live or record["gc"].get("collected") or record["gc"].get("partials_removed"))
+    recorded_as: list[str] = []
 
     def change(current: dict[str, Any]) -> None:
+        existing = current.get("download_store_release")
+        existing = existing if isinstance(existing, dict) and existing.get("schema") == STORE_RELEASE_SCHEMA else None
+        if existing is not None and not existing.get("error") and not changed:
+            current["download_store_release"] = {
+                **existing,
+                "repeats": [*(existing.get("repeats") or []), _store_release_repeat(record)][-_STORE_RELEASE_HISTORY:],
+            }
+            recorded_as[:] = ["repeat"]
+            return
+        if existing is not None:
+            replaced = {key: value for key, value in existing.items() if key not in {"claims", "earlier", "repeats"}}
+            replaced.update(claim_count=len(existing.get("claims") or []), repeat_count=len(existing.get("repeats") or []))
+            record["earlier"] = [*(existing.get("earlier") or []), replaced][-_STORE_RELEASE_HISTORY:]
         current["download_store_release"] = record
+        recorded_as[:] = ["release"]
 
     try:
         update_manifest(manifest_path, change)
     except (OSError, ValueError):
         pass
-    return record
+    return {**record, "recorded_as": recorded_as[0] if recorded_as else "not_recorded"}
+
+
+# How many repeats of a store release, and earlier records a release replaced, its record keeps.
+_STORE_RELEASE_HISTORY = 10
+
+
+def _store_release_repeat(record: dict[str, Any]) -> dict[str, Any]:
+    """The note a release that changed nothing leaves in the standing record's repeats."""
+    note: dict[str, Any] = {"at": record["released_at"], "reason": record["reason"]}
+    if record.get("error"):
+        note["error"] = record["error"]
+        return note
+    gc = record.get("gc") or {}
+    note["gc"] = {
+        "authorized": bool(gc.get("authorized")),
+        **({"approval_id": gc["approval_id"]} if gc.get("approval_id") else {}),
+        **({"refusal_codes": gc["refusal_codes"]} if gc.get("refusal_codes") else {}),
+        **{key: len(gc.get(key) or []) for key in ("kept", "refused", "busy") if key in gc},
+    }
+    return note
 
 
 def _store_release_preview(manifest: dict[str, Any]) -> dict[str, Any] | None:

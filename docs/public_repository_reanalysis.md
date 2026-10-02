@@ -158,7 +158,15 @@ no live claim still holds, leaving its record as a tombstone. A batch
 pre-claim (`msdial_repository_batch_plan` with `pre_claim=true`) keeps an
 object for units that have not run yet, a split parent's claims stand for its
 parts, a person's confirmation releases claims without deleting store objects,
-and an approval that keeps raw data deletes nothing. `_dl` and `_campaigns` are
+and an approval that keeps raw data deletes nothing.
+
+A cleanup, discard or split-parent release asked for again deletes nothing and
+releases what is still unreleased, so one whose release failed or stopped is
+finished by its repeat (`already_cleaned`, `already_discarded`,
+`already_released`). `download_store_release` stays the record of the release
+that last changed something - released a claim, or collected an object or a
+partial transfer - with the repeats that changed nothing listed in its
+`repeats` and a record it replaced in `earlier`. `_dl` and `_campaigns` are
 never taken for units. `msdial_download_store_status` shows every store, read
 only.
 
