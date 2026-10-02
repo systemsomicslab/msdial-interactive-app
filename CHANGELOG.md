@@ -4,6 +4,58 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.22] - Unreleased
+
+### Added
+- One split key. `plan_acquisition_split` keys a part on its acquisition mode, its
+  ion-mobility regime (the header's `has_ion_mobility`, or an ion-mobility container
+  such as a Bruker TDF folder) and its polarity (an applied disposition's, else the
+  header's). The part id names every part of the key in which the parts differ:
+  `<unit>-dda`/`<unit>-dia` as before, `<unit>-dda-im`, `<unit>-dda-neg`/`-pos`. The
+  plan and the parent record `split_key` (`msdial-split-key.v1`).
+  - An ion-mobility part is written excluded (`ion_mobility_out_of_scope`, the
+    LC-IM-MS reason) and stays excluded.
+  - A polarity part carries its polarity as its ion mode.
+  - A part lists only its own entries of the parent's file list, its folders'
+    members matched by path before name, and its samples matched by their
+    `raw_file`'s path, so a polarity split of same-named folders (`pos/S1.raw`,
+    `neg/S1.raw`) gives each part only its own samples.
+- Split-parent release. `plan_split_parent_cleanup` and `cleanup_split_parent`
+  release a split parent's raw tree once every part has ended: validated, failed
+  after its retries (3 recorded run failures), skipped, excluded, or discarded. The
+  release needs delete_after_validated_output, parts that partition the parent's
+  inputs, no live Console, no artifact under the tree and no finalisation hold; it
+  takes a lock, records `raw_release` (`msdial-split-parent-raw-release.v1`) before
+  the first file goes, and resumes when stopped. The parent stays
+  `split_by_acquisition`.
+- `msdial_discard_repository_raw`: preview and perform a discard, with
+  `campaign_authorization_path`.
+- Capabilities `split_key_acquisition_ion_mobility_polarity`,
+  `split_parent_raw_release` and `campaign_authorized_raw_cleanup_and_discard`.
+
+### Changed
+- `cleanup_download_lease`, `discard_download_lease` and `cleanup_split_parent`
+  take `campaign_authorization_path`. It stands in for `confirmed=true` when it
+  covers boundary 5 for the unit (or the unit it was split from) and the approval
+  and the unit both state `delete_after_validated_output`. A refusal returns
+  blockers with nothing recorded or deleted.
+- Under such an approval, a failed unit whose output holds an unvalidated or
+  invalid mzTab-M is discarded. The mzTab-M is kept in place, and its validation
+  and the failure record go to `output/failure-artifacts/`, written through the
+  unit's sharing context: no log lines, hosts or local paths. A discard asked for
+  again returns its record (`already_discarded`) and writes nothing.
+- Every raw deletion refuses while a retained artifact lies under its target or a
+  run attempt's Console may be running, unlinks multiply-linked files without
+  touching their attributes, and records `raw_deletion` (`msdial-raw-deletion.v1`).
+- A run whose Console exits 0 without a validated mzTab-M is recorded as a failed
+  run, so a split part that fails this way three times ends and its parent can be
+  released.
+- The execution gate refuses `raw_cleaned` and `discarded` units, a unit whose
+  deletion has begun, and a part whose parent's raw tree was released.
+- The post-run hook only records the pending plan (`raw_release_pending` on the
+  parent for a split part). In a campaign the runner is the one trigger of every
+  deletion.
+
 ## [0.5.21] - Unreleased
 
 ### Added
