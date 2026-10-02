@@ -122,6 +122,62 @@ a split parent's included. Each of those steps retries what is held first.
 This order makes disk cleanup routine without allowing an incomplete or failed
 analysis to erase its only input copy.
 
+### The accession download store
+
+A campaign's lease, and any other only when the `store_mode` setting is
+`always` (the default, `campaign`, keeps every other lease as it was), fetches
+through the accession download store,
+`<workspace_root>\<repository>\<accession>\_dl`. Each object is fetched once for
+every unit of the accession that lists it, under one claim per unit, with the
+download's idle timeouts and retries, and its published MD5 compared before
+anything else reads it; each archive is extracted there once. The unit's own
+`raw\data` is then a tree of hardlinks to the store's files, placed where the
+per-unit lease put them (a bundle at the data root, a per-sample container in
+its listed directory, nothing overwritten); a link that fails is a copy. Once
+the lease knows the unit's inputs, members and sidecars, the links to anything
+else (the other polarity's samples in a shared study archive, say) are pruned.
+What the SCIEX reader opens beside a kept `.wiff` or `.wiff2` stays with it
+(`x.wiff2`'s `x.wiff.scan` and `x.timeseries.data`, any `x.wiff.<n>.scan`), by
+the rule the analysis CSV's aliases carry them by. MS-DIAL's containers are
+written beside the links, in the unit's tree, and never reach the store.
+
+The manifest records `download_cache` (the store, each object, whether it was
+fetched or reused, the claims), `raw_storage` (`materialization`: hardlink,
+copy or mixed; the bytes linked from the store and those the unit holds itself;
+what was pruned), and on each `downloads[]` entry `cache_object_path`,
+`sha256_origin` (`fetched_by_this_unit` or `inherited_from_cache`) and
+`declared_checksum_verified`. A per-file object's `path` is the unit's link; an
+archive's is the store's object. A lease that waits for another lease's
+transfer or extraction of the same object shows the job state
+`waiting_for_shared_download`, and can still be cancelled.
+
+The unit's cleanup, discard, or a split parent's release, once its tree is
+gone, releases its claims (`download_store_release`); under the campaign
+approval that covered the deletion, the store then deletes each released object
+no live claim still holds, leaving its record as a tombstone. A batch
+pre-claim (`msdial_repository_batch_plan` with `pre_claim=true`) keeps an
+object for units that have not run yet, a split parent's claims stand for its
+parts, a person's confirmation releases claims without deleting store objects,
+and an approval that keeps raw data deletes nothing. A deletion's preview says
+so: its `download_store` gives the bytes of the tree's links to the store's
+files, which deleting the tree does not free (`tree_bytes_kept_by_store`), and
+what a collection under an approval would delete with the release
+(`bytes_collectable_after_release`, an archive's extraction tree included). A
+store object is collected only under an approval that covers boundary 5 for
+every unit that released it, so what a person's confirmation leaves - under
+`store_mode` `always` outside a campaign, every object - stays in `_dl` until a
+cleanup or discard is repeated under such an approval.
+
+A cleanup, discard or split-parent release asked for again deletes nothing and
+releases what is still unreleased, so one whose release failed or stopped is
+finished by its repeat (`already_cleaned`, `already_discarded`,
+`already_released`). `download_store_release` stays the record of the release
+that last changed something - released a claim, or collected an object or a
+partial transfer - with the repeats that changed nothing listed in its
+`repeats` and a record it replaced in `earlier`. `_dl` and `_campaigns` are
+never taken for units. `msdial_download_store_status` shows every store, read
+only.
+
 ## Reproducible candidate selection
 
 Run commands from the repository root with the Python used for MS-DIAL

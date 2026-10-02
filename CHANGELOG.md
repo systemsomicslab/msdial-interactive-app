@@ -4,6 +4,59 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.23] - Unreleased
+
+### Added
+- The download lease fetches through the accession download store
+  (`<workspace_root>\<repository>\<accession>\_dl`, 0.5.13). A campaign's lease
+  always does; any other lease does only when the new `store_mode` setting is
+  `always` (`user_settings.save_download_store_mode`, or POST
+  `/api/settings/store-mode`). With the default, `campaign`, every other lease is
+  what it was.
+  - fetch: each object is fetched once for every unit of the accession that lists
+    it, under one claim per unit, with the client's idle timeouts and retries, and
+    its published MD5 is compared before anything reads it.
+  - extract: each archive is extracted once, in the store
+    (`DownloadStore.ensure_extracted`); its member listing is copied into the
+    unit's provenance.
+  - materialise: the unit's `raw\data` becomes hardlinks to the store's files at
+    the placements the per-unit lease used. A failed link is a copy, and so is a
+    file a reader rewrites in place (a BAF `.d`'s `analysis.sqlite`).
+  - prune: once the unit's inputs, members and sidecars are known, other links are
+    removed. What the SCIEX reader opens beside a kept input stays
+    (`x.wiff2`'s `x.wiff.scan` and `x.timeseries.data`, an Analyst `x.wiff`'s
+    `x.wiff.<n>.scan`; `travels_with_sciex_file`).
+  - The manifest records `download_cache`, `raw_storage` (hardlink, copy or mixed;
+    bytes linked and held; what was pruned) and, on each `downloads[]` entry,
+    `cache_object_path`, `sha256_origin` and `declared_checksum_verified`.
+- Cleanup, discard and split-parent release release the unit's store claims once
+  its raw tree is gone (`download_store_release`). Under the campaign approval that
+  covered the deletion (boundary 5), the store then collects each released object
+  no live claim holds, and leaves a tombstone. A batch pre-claim keeps an object for
+  units that have not run, a split parent's claims stand for its parts, and an
+  approval that keeps raw data deletes nothing. A person's confirmation releases
+  claims and deletes no store object. A repeated release is recorded under
+  `repeats` and never overwrites the release that changed something; a release that
+  stopped after the deletion is finished by a repeat.
+- `msdial_repository_batch_plan` returns `download_plan`: distinct objects with
+  their consumers, per-unit against distinct bytes (unknown sizes counted, never
+  priced at 0), objects already in the store, sharing groups, and a `run_order`
+  that keeps each group together. With a campaign approval, `pre_claim=true`
+  records a pending claim for each covered ready unit.
+- The download preview of a store lease reports what the store already holds and
+  `distinct_bytes_to_transfer`; deletion previews say which bytes the store keeps.
+- New read-only MCP tool `msdial_download_store_status`.
+- New live job state `waiting_for_shared_download`: a lease waiting for another
+  lease's transfer or extraction of the same object. It polls, beats the lease
+  heartbeat, hears a cancel, and the GUI keeps polling through it.
+- `_dl` and `_campaigns` are refused as repository, accession or unit names, and
+  are never listed as units.
+
+### Known limitations
+- Under `store_mode` `always` outside a campaign, a person's confirmation leaves a
+  released object in `_dl` until a cleanup or discard is repeated under a campaign
+  approval that covers it.
+
 ## [0.5.22] - Unreleased
 
 ### Added

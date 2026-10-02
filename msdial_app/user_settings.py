@@ -26,6 +26,16 @@ PATH_SETTING_KEYS = {
 }
 
 
+# WHETHER A LEASE OUTSIDE A CAMPAIGN USES THE ACCESSION DOWNLOAD STORE (msdial_app.download_store).
+#
+# A campaign's lease always does: the user decided on 2026-09-30 that a shared object is downloaded once.
+# Any other lease downloads into its unit's own raw tree, as every lease did before the store, unless this
+# setting is "always". "campaign", the default, is that behaviour; anything else reads as it.
+STORE_MODE_SETTING = "store_mode"
+STORE_MODES = ("campaign", "always")
+STORE_MODE_DEFAULT = "campaign"
+
+
 def user_config_directory() -> Path:
     if os.name == "nt":
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
@@ -72,3 +82,25 @@ def save_path_settings(values: dict[str, Any]) -> dict[str, str]:
     )
     temporary.replace(path)
     return {key: str(current.get(key, "")) for key in sorted(PATH_SETTING_KEYS)}
+
+
+def download_store_mode(settings: dict[str, Any] | None = None) -> str:
+    """The saved store_mode, or the default when none is saved or the saved value means nothing."""
+    value = str((load_user_settings() if settings is None else settings).get(STORE_MODE_SETTING) or "")
+    value = value.strip().casefold()
+    return value if value in STORE_MODES else STORE_MODE_DEFAULT
+
+
+def save_download_store_mode(value: Any) -> str:
+    """Save store_mode; refuses a value that is not one of STORE_MODES rather than guess at it."""
+    mode = str(value or "").strip().casefold()
+    if mode not in STORE_MODES:
+        raise ValueError(f"store_mode must be one of {list(STORE_MODES)}, not {value!r}.")
+    current = load_user_settings()
+    current[STORE_MODE_SETTING] = mode
+    path = settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(current, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    return mode

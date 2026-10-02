@@ -206,7 +206,15 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   expand mixed accessions into independent analysis-unit workspaces. Prefer
   `analysis_unit_handoff_paths` over inlining file/sample manifests. It never
   downloads or executes data. Pass the reviewed `analysis_purpose`; omission is
-  reported as a pending decision.
+  reported as a pending decision. Its `download_plan` lists the distinct
+  objects with the units that consume each, per-unit against distinct bytes,
+  and a `run_order` that keeps units sharing an object together; with a
+  campaign approval, `pre_claim=true` records a store claim for each covered
+  unit so a shared object is kept until it has run.
+- `msdial_download_store_status`: read-only view of the accession download
+  stores (`<workspace_root>\<repository>\<accession>\_dl`): each object and the
+  units whose claims keep it, partial transfers, lock holders, unclaimed
+  objects, and live claims of units whose raw data are already released.
 - `msdial_repository_reanalysis_plan`: inspect metadata, eligibility, the
   default Class hierarchy, and internal-standard declarations without
   downloading raw data. Pass `analysis_unit_handoff_path` for Catalog-driven
@@ -241,7 +249,11 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   artifacts first, then delete leased raw data only after mzTab-M validation,
   artifact inventory, and a separate explicit confirmation. A retention policy
   is not deletion approval. On a split parent's manifest it releases the raw
-  tree its parts read, only once every part has ended.
+  tree its parts read, only once every part has ended. For a unit leased
+  through the download store, show the preview's `download_store` too: a
+  person's confirmation frees none of the bytes its tree links from the store
+  (`tree_bytes_kept_by_store`), which only a collection under a campaign
+  approval deletes.
 - `msdial_discard_repository_raw`: preview, then on a separate explicit
   confirmation delete the raw data of a unit that produced no validated output
   (skipped, excluded, download or run failed). In a campaign only, a recorded

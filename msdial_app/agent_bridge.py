@@ -82,6 +82,12 @@ def summarize_jobs(
             "split_key_acquisition_ion_mobility_polarity",
             "split_parent_raw_release",
             "campaign_authorized_raw_cleanup_and_discard",
+            # A campaign's lease (and any other under store_mode "always") fetches each object once per
+            # accession into its download store and gives the unit a tree of links; a unit's release releases its
+            # claims, and the store collects what no live claim holds under the approval that covered it.
+            "accession_download_store",
+            "waiting_for_shared_download_job_state",
+            "batch_plan_distinct_objects_and_pre_claims",
         ],
         "workflow_outline": [
             "Inspect the input path and collect the guided scientific choices.",

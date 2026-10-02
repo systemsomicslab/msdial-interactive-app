@@ -1529,6 +1529,29 @@ def msdial_download_repository_raw(
     }
     if crossing:
         preview["campaign_authorization"] = crossing
+    from .user_settings import download_store_mode
+
+    if crossing or download_store_mode() == "always":
+        # The lease fetches through the accession download store: what it already holds transfers nothing.
+        # required_download_bytes stays the approval quantity; this is what the transfer will actually move.
+        from .repository_reanalysis import plan_batch_downloads, unit_download_objects
+
+        store_plan = plan_batch_downloads(
+            [{
+                "analysis_unit_id": project.get("analysis_unit_id"),
+                "repository": project.get("repository"),
+                "accession": project.get("accession"),
+                "objects": unit_download_objects(project),
+            }],
+            workspace_root,
+        )
+        preview["download_store"] = {
+            key: store_plan[key]
+            for key in (
+                "object_count", "objects_in_store", "distinct_bytes", "distinct_bytes_lower_bound",
+                "unknown_size_objects", "distinct_bytes_to_transfer",
+            )
+        }
     if blocking_reasons:
         detail = "; ".join(blocking_reasons)
         return {
@@ -1589,13 +1612,31 @@ def msdial_repository_batch_plan(
     raw_retention_policy: str = "keep",
     analysis_purpose: str = "",
     campaign_authorization_path: str = "",
+    pre_claim: bool = False,
 ) -> dict[str, Any]:
     """Expand a mixed repository accession into independent analysis-unit run plans.
 
     ``maximum_gb_per_unit`` is decimal GB (1e9 bytes), matching how repositories
     report size. ``campaign_authorization_path`` reports, per unit, whether a campaign approval covers
     its download; a unit it does not cover is not ready under it.
+
+    ``download_plan`` is what the accession download store makes of the batch: the distinct objects with
+    the units that consume each, per-unit and distinct bytes (per_unit_known_bytes against
+    distinct_bytes), the sharing groups, and ``run_order``, which keeps each group together. ``pre_claim``
+    records, for each ready unit the approval covers, a pending store claim on each of its objects, so a
+    shared object is kept for units that have not run yet; it needs ``campaign_authorization_path``.
     """
+    from .repository_reanalysis import (
+        is_reserved_workspace_name,
+        plan_batch_downloads,
+        pre_claim_downloads,
+        unit_download_objects,
+    )
+
+    if pre_claim and not str(campaign_authorization_path or "").strip():
+        raise ValueError(
+            "pre_claim records store claims for a campaign's approved units, and needs campaign_authorization_path."
+        )
     workspace_root = _validated_workspace_root(workspace_root)
     if float(maximum_gb_per_unit) <= 0:
         raise ValueError("maximum_gb_per_unit must be greater than zero.")
@@ -1610,6 +1651,7 @@ def msdial_repository_batch_plan(
     intent = _analysis_intent(analysis_purpose)
     seen: set[str] = set()
     runs = []
+    download_units = []
     for handoff in handoffs:
         project, workspace = _project_from_analysis_unit_handoff(
             handoff,
@@ -1634,6 +1676,9 @@ def msdial_repository_batch_plan(
         )
         if not intent["confirmed"]:
             blocking.append("analysis_purpose:missing")
+        if any(is_reserved_workspace_name(project[key]) for key in ("repository", "accession", "analysis_unit_id")):
+            # _dl is the accession's download store and _campaigns the runner's; neither is ever a unit.
+            blocking.append("workspace_name:reserved")
         size = _required_download_size(project)
         required_bytes = size["required_download_bytes"]
         if required_bytes > maximum_bytes:
@@ -1667,7 +1712,27 @@ def msdial_repository_batch_plan(
                 **({"campaign_authorization": coverage} if coverage else {}),
             }
         )
-    return {
+        download_units.append(
+            {
+                "analysis_unit_id": unit_id,
+                "repository": project["repository"],
+                "accession": project["accession"],
+                "objects": unit_download_objects(project),
+            }
+        )
+    download_plan = plan_batch_downloads(download_units, workspace_root)
+    by_unit = {item["analysis_unit_id"]: item for item in download_plan["units"]}
+    for run in runs:
+        unit = by_unit[run["analysis_unit_id"]]
+        run.update(
+            download_object_count=unit["object_count"],
+            unit_object_bytes=unit["bytes"],
+            unit_object_known_bytes=unit["known_bytes"],
+            shared_object_count=unit["shared_object_count"],
+            sharing_group=unit["sharing_group"],
+            run_position=unit["run_position"],
+        )
+    plan = {
         "schema": "msdial-repository-batch-plan.v1",
         "execution_scope": dict(REPOSITORY_EXECUTION_SCOPE),
         "analysis_intent": intent,
@@ -1679,7 +1744,26 @@ def msdial_repository_batch_plan(
         "blocked_count": sum(not bool(item["ready"]) for item in runs),
         "execution_model": "sequential-independent-analysis-units",
         "runs": runs,
+        "run_order": download_plan["run_order"],
+        "download_plan": download_plan,
     }
+    if pre_claim:
+        covered = {
+            run["analysis_unit_id"] for run in runs
+            if run["ready"] and (run.get("campaign_authorization") or {}).get("valid")
+        }
+        plan["pre_claimed"] = pre_claim_downloads(
+            workspace_root, [unit for unit in download_units if unit["analysis_unit_id"] in covered]
+        )
+        plan["not_pre_claimed"] = [
+            {
+                "analysis_unit_id": run["analysis_unit_id"],
+                "reason": "blocked" if not run["ready"] else "not_covered_by_the_campaign_approval",
+            }
+            for run in runs
+            if run["analysis_unit_id"] not in covered
+        ]
+    return plan
 
 
 @mcp.tool()
@@ -1937,6 +2021,12 @@ def msdial_cleanup_repository_raw(
     A finished run whose MS-DIAL containers could not be moved out of the raw tree holds the deletion
     (finalisation_holds in the manifest). Both calls retry that move first; while it still fails the preview
     lists it as a blocker and the deletion is refused.
+
+    A unit leased through the accession download store releases its store claims with its tree. The
+    preview's download_store says how many of the tree's bytes are links to the store's files
+    (tree_bytes_kept_by_store), which a person's confirmation does not free: store objects are deleted only
+    under a campaign approval covering every unit that released them. Asked again once made, the cleanup
+    deletes nothing (already_cleaned) and makes a store release the first one left unmade.
     """
     from .repository_reanalysis import cleanup_download_lease
 
@@ -2001,6 +2091,33 @@ def msdial_discard_repository_raw(
             "again with confirmed=true only after an explicit answer."
         )
     return result
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_download_store_status(
+    workspace_root: str,
+    repository: str = "",
+    accession: str = "",
+    analysis_unit_id: str = "",
+) -> dict[str, Any]:
+    """Show the accession download stores under a workspace root. Read-only: nothing is fetched or deleted.
+
+    A store, <workspace_root>\\<repository>\\<accession>\\_dl, holds each object one or more units of the
+    accession fetch, once, kept by one claim per unit (pending: claimed before its lease; materialized: its
+    raw tree links the object; released). For each store: its objects with the units whose live claims keep
+    them, its claims by state and by unit (with each unit's manifest status), partial transfers, lock
+    holders, objects no live claim holds (which a collection under a campaign approval deletes once it covers
+    every unit that released them) and live claims of units whose raw data are already released.
+    ``repository`` and ``accession`` narrow it to one store, ``analysis_unit_id`` to one unit's claims.
+    ``store_mode`` is the saved setting: "campaign" (the default) uses the store for campaign units only,
+    "always" for every lease.
+    """
+    from .repository_reanalysis import download_store_status
+
+    return download_store_status(
+        _validated_workspace_root(workspace_root), repository=repository, accession=accession, unit_id=analysis_unit_id
+    )
 
 
 @mcp.tool()

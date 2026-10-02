@@ -72,6 +72,7 @@ from .repository_metadata import (
     metadata_workspace,
 )
 from .repository_reanalysis import (
+    SCIEX_SUFFIXES,
     _applied_disposition,
     _campaign_excluded_inputs,
     _decided_acquisition_by_file,
@@ -82,6 +83,7 @@ from .repository_reanalysis import (
     lineage_stands_for,
     match_declared_inputs,
     project_from_dict,
+    travels_with_sciex_file,
     update_manifest,
     with_order_source,
 )
@@ -629,34 +631,23 @@ def _create_junction(target: Path, link: Path) -> None:
         raise OSError((completed.stderr or completed.stdout or "mklink /J failed").strip())
 
 
-# What the SCIEX readers open beside a primary file, named by its stem: Analyst writes x.wiff with
-# x.wiff.scan, and SCIEX OS writes x.wiff2 with x.wiff.scan and x.timeseries.data (MsdialWorkbenchDemo
-# massql_demofiles), so a .wiff2's scan data is not named after the .wiff2.
-SCIEX_COMPANION_SUFFIXES = (".wiff.scan", ".wiff2.scan", ".timeseries.data")
-
-
 def _travelling_files(target: Path) -> list[tuple[Path, str]]:
     """(sidecar, the suffix it carries past the stem) for the files that travel with a SCIEX file.
 
-    The suffix is what follows the input's stem, so the alias's sidecar is the alias's stem plus it:
-    x.wiff2's x.wiff.scan goes with alias-1234.wiff2 as alias-1234.wiff.scan, where the reader looks.
-    Any x.wiff.<n>.scan is kept as well. A file that is no SCIEX file has none.
+    Which files those are is travels_with_sciex_file's to say (x.wiff2's x.wiff.scan and x.timeseries.data,
+    any x.wiff.<n>.scan), the rule the store lease's prune keeps them by. The suffix is what follows the
+    input's stem, so the alias's sidecar is the alias's stem plus it: x.wiff2's x.wiff.scan goes with
+    alias-1234.wiff2 as alias-1234.wiff.scan, where the reader looks. A file that is no SCIEX file has none.
     """
     found: list[tuple[Path, str]] = []
-    if target.suffix.casefold() not in {".wiff", ".wiff2"}:
+    if target.suffix.casefold() not in SCIEX_SUFFIXES:
         return found
     try:
         entries = list(os.scandir(target.parent))
     except OSError:
         return found
-    name, stem = target.name.casefold(), target.stem.casefold()
     for entry in entries:
-        lowered = entry.name.casefold()
-        if not entry.is_file() or lowered == name:
-            continue
-        if any(lowered == stem + suffix for suffix in SCIEX_COMPANION_SUFFIXES) or (
-            lowered.startswith(name + ".") and lowered.endswith(".scan")
-        ):
+        if entry.is_file() and travels_with_sciex_file(entry.name, target.name):
             found.append((Path(entry.path), entry.name[len(target.stem):]))
     return sorted(found, key=lambda item: item[0].name.casefold())
 
