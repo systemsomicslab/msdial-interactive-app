@@ -10,7 +10,7 @@ have moved its 928 GB archive. These tests hold the lease, the deletions and the
   pending pre-claim keeps it, and a campaign that keeps raw data never deletes;
 - a split parent's claims stand for its parts, and go only with the parent's own release;
 - a Workbench study archive shared by a positive and a negative unit is fetched once and extracted once,
-  and each unit's tree keeps only its own samples;
+  and each unit's tree keeps only its own samples - with what the SCIEX reader opens beside each;
 - a lease waiting for another lease's transfer says so (waiting_for_shared_download), and is heard;
 - _dl and _campaigns are never units, and without a campaign or store_mode "always" nothing changes.
 
@@ -39,6 +39,7 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
     from msdial_app.archives import ExtractionLimits
     from msdial_app.campaign_authorization import CampaignAuthorizationError, authorize
     from msdial_app.download_store import DownloadStore
+    from msdial_app.repository_analysis_rows import _travelling_files
     from msdial_app.repository_reanalysis import (
         LEASE_STAGES,
         RepositoryFile,
@@ -55,6 +56,7 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
         read_manifest,
         run_raw_metadata_preflight,
         split_unit_by_acquisition,
+        travels_with_sciex_file,
         unit_download_objects,
     )
     from msdial_app.user_settings import save_download_store_mode
@@ -594,6 +596,69 @@ class AWorkbenchStudyArchiveIsFetchedOnceAndExtractedOnce(_Workspace):
         self.assertEqual(1, lease["archive_extractions"][1]["merge"]["already_present_files"])
         self.assertEqual(["study/README.txt"], lease["archive_extractions"][1]["merge"]["already_present"])
         self.assertEqual(1, lease["raw_storage"]["duplicate_source_files"])
+
+
+class WhatTheSciexReaderOpensStaysWithItsInput(_Workspace):
+    """The prune kept only <input>.scan, so x.wiff2 lost the x.wiff.scan and x.timeseries.data SCIEX OS writes
+    beside it, and x.wiff its x.wiff.<n>.scan: the per-unit lease had kept them all, the analysis CSV's alias
+    found none to carry, and the reader could not open the input."""
+
+    def lease(self, members: dict[str, bytes], raw_file: str, *, store: bool) -> dict:
+        data = _zip(members)
+        url = "https://example.org/study.zip"
+        accession = "ST000009" if store else "ST000010"
+        project = RepositoryProject(
+            repository="metabolomics_workbench", accession=accession, analysis_unit_id=f"an-{accession}",
+            eligible=True, selection_status="eligible", separation="LC-MS", acquisition_mode="DDA",
+            ion_mode="Positive", untargeted=True,
+            files=[RepositoryFile(name="study.zip", size_bytes=len(data), url=url, role="shared_raw_archive")],
+            total_download_bytes=len(data),
+            sample_metadata=[{"sample_id": "S1", "raw_file": raw_file}],
+        )
+        return create_download_lease(
+            project, self.root, 10**9, client=_Client({url: data}), store_mode="always" if store else "campaign"
+        )
+
+    def trees(self, members: dict[str, bytes], raw_file: str) -> tuple[list[str], list[str], dict]:
+        per_unit, stored = (self.lease(members, raw_file, store=store) for store in (False, True))
+        self.assertNotIn("download_cache", per_unit)
+        names = [sorted(path.name for path in (Path(lease["input_directory"]) / "study").iterdir())
+                 for lease in (per_unit, stored)]
+        return names[0], names[1], stored
+
+    def test_a_wiff2_keeps_the_wiff_scan_and_timeseries_the_per_unit_lease_kept(self) -> None:
+        members = {
+            f"study/{sample}{suffix}": f"{sample}{suffix}".encode("ascii")
+            for sample in ("S1", "S2") for suffix in (".wiff2", ".wiff.scan", ".timeseries.data")
+        }
+        per_unit, stored, lease = self.trees(members, "S1.wiff2")
+
+        self.assertEqual(["S1.timeseries.data", "S1.wiff.scan", "S1.wiff2"], stored)
+        self.assertEqual([name for name in per_unit if name.startswith("S1.")], stored,
+                         "the store's tree is the per-unit tree less the other samples")
+        self.assertEqual(3, lease["raw_storage"]["pruned"]["removed_files"], "S2's three files")
+        (input_path,) = [Path(item) for item in lease["input_candidates"]]
+        # What the analysis CSV's alias carries beside the input, by the same rule.
+        self.assertEqual([".timeseries.data", ".wiff.scan"], [rest for _path, rest in _travelling_files(input_path)])
+
+    def test_an_analyst_wiff_keeps_every_part_of_its_scan(self) -> None:
+        members = {
+            f"study/{name}": name.encode("ascii")
+            for name in ("S1.wiff", "S1.wiff.scan", "S1.wiff.1.scan", "S1.wiff.2.scan", "S2.wiff", "S2.wiff.scan")
+        }
+        per_unit, stored, _lease = self.trees(members, "S1.wiff")
+
+        self.assertEqual(["S1.wiff", "S1.wiff.1.scan", "S1.wiff.2.scan", "S1.wiff.scan"], stored)
+        self.assertEqual([name for name in per_unit if name.startswith("S1.")], stored)
+
+    def test_what_travels_with_a_sciex_file(self) -> None:
+        for name, primary, expected in (
+            ("x.wiff.scan", "x.wiff2", True), ("X.TIMESERIES.DATA", "x.wiff2", True), ("x.wiff2.scan", "x.wiff2", True),
+            ("x.wiff.scan", "x.wiff", True), ("x.wiff.3.scan", "x.wiff", True), ("x.wiff2", "x.wiff2", False),
+            ("y.wiff.scan", "x.wiff2", False), ("x.timeseries.data", "x.mzML", False), ("x.wiff.scan.bak", "x.wiff", False),
+        ):
+            with self.subTest(name=name, primary=primary):
+                self.assertIs(expected, travels_with_sciex_file(name, primary))
 
 
 class ALeaseWaitsForAnotherLeasesTransfer(_Workspace):

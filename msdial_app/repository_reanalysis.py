@@ -2980,9 +2980,12 @@ class _StoreLease:
 
         ``keep`` is every path the lease found to be the unit's: its inputs (a folder keeps all it holds),
         the inputs it excluded, the mzXML it converted or chose against, its members of the archives, the
-        files whose declared checksums it verified, and its own per-file objects. A .wiff.scan stays with
-        its .wiff. A name is removed only if it is the store's file (or this lease's copy of one); a file
-        the unit holds itself is never removed here, because deleting raw data is not a lease's to do.
+        files whose declared checksums it verified, and its own per-file objects. What the SCIEX reader opens
+        beside a kept .wiff or .wiff2 stays with it (travels_with_sciex_file: x.wiff2's x.wiff.scan and
+        x.timeseries.data, x.wiff.<n>.scan), as the per-unit lease left it, so that the Console and the
+        analysis CSV's alias find them. A name is removed only if it is the store's file (or this lease's copy
+        of one); a file the unit holds itself is never removed here, because deleting raw data is not a
+        lease's to do.
         """
         files: set[str] = set()
         folders: set[str] = set()
@@ -2992,6 +2995,11 @@ class _StoreLease:
                 continue
             key = _file_key(text)
             (folders if Path(text).is_dir() else files).add(key)
+        # The kept SCIEX files by their directory, whose companions travel with them.
+        sciex: dict[str, list[str]] = {}
+        for key in files:
+            if Path(key).suffix in SCIEX_SUFFIXES:
+                sciex.setdefault(str(Path(key).parent), []).append(Path(key).name)
         removed = removed_bytes = directories = 0
         kept_failures: list[dict[str, Any]] = []
         emptied: set[Path] = set()
@@ -3002,7 +3010,7 @@ class _StoreLease:
             key = _file_key(str(path))
             if key in files or any(str(parent) in folders for parent in Path(key).parents):
                 continue
-            if _is_sidecar_name(path.name) and _file_key(str(path.with_name(path.name.rsplit(".", 1)[0]))) in files:
+            if any(travels_with_sciex_file(path.name, primary) for primary in sciex.get(str(Path(key).parent), ())):
                 continue
             try:
                 ours = info["how"] == "copied" or os.path.samefile(path, info["source"])
@@ -10902,6 +10910,34 @@ def _parse_int(value: str) -> int | None:
 def _is_sidecar_name(name: str) -> bool:
     value = name.casefold()
     return value.endswith(".wiff.scan") or value.endswith(".wiff2.scan")
+
+
+# What the SCIEX readers open beside a primary file, named by its stem: Analyst writes x.wiff with
+# x.wiff.scan (and x.wiff.<n>.scan for a multi-part one), and SCIEX OS writes x.wiff2 with x.wiff.scan and
+# x.timeseries.data (MsdialWorkbenchDemo massql_demofiles), so a .wiff2's scan data is not named after the
+# .wiff2. The analysis CSV's aliases (repository_analysis_rows) and the store lease's prune both read it here,
+# so that what an alias carries and what a unit's tree keeps are the same files.
+SCIEX_SUFFIXES = (".wiff", ".wiff2")
+SCIEX_COMPANION_SUFFIXES = (".wiff.scan", ".wiff2.scan", ".timeseries.data")
+
+
+def travels_with_sciex_file(name: str, primary: str) -> bool:
+    """Whether a file named ``name``, beside the SCIEX file named ``primary``, is one its reader opens with it.
+
+    Its stem with a companion suffix (SCIEX_COMPANION_SUFFIXES), or its whole name with a part and .scan
+    (x.wiff.1.scan). Never the primary itself, and nothing travels with a file that is no .wiff or .wiff2.
+    """
+    primary_name = str(primary).casefold()
+    suffix = PurePosixPath(primary_name).suffix
+    if suffix not in SCIEX_SUFFIXES:
+        return False
+    lowered = str(name).casefold()
+    if lowered == primary_name:
+        return False
+    stem = primary_name[: -len(suffix)]
+    return any(lowered == stem + item for item in SCIEX_COMPANION_SUFFIXES) or (
+        lowered.startswith(primary_name + ".") and lowered.endswith(".scan")
+    )
 
 
 # DURABLE MANIFEST WRITES.

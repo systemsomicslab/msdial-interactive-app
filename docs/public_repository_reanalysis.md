@@ -136,8 +136,10 @@ per-unit lease put them (a bundle at the data root, a per-sample container in
 its listed directory, nothing overwritten); a link that fails is a copy. Once
 the lease knows the unit's inputs, members and sidecars, the links to anything
 else (the other polarity's samples in a shared study archive, say) are pruned.
-MS-DIAL's containers are written beside the links, in the unit's tree, and never
-reach the store.
+What the SCIEX reader opens beside a kept `.wiff` or `.wiff2` stays with it
+(`x.wiff2`'s `x.wiff.scan` and `x.timeseries.data`, any `x.wiff.<n>.scan`), by
+the rule the analysis CSV's aliases carry them by. MS-DIAL's containers are
+written beside the links, in the unit's tree, and never reach the store.
 
 The manifest records `download_cache` (the store, each object, whether it was
 fetched or reused, the claims), `raw_storage` (`materialization`: hardlink,
