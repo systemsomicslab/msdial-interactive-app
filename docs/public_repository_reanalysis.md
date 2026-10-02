@@ -303,6 +303,22 @@ Preview `msdial_split_repository_unit`, confirm the proposed DDA and
 DIA/AIF/SWATH child units, then preflight each child independently. The Mixed
 parent must never be passed to an MS-DIAL production run.
 
+The split key has three parts: the acquisition mode, the ion-mobility regime
+(the header's `has_ion_mobility`, or an ion-mobility container such as a Bruker
+TDF folder) and the polarity. A unit whose inputs differ in any of them is
+split along every part in which they differ, and the part id names each of
+those parts after the acquisition mode: `<unit>-dda` and `<unit>-dia` as
+before, `<unit>-dda-im` for the ion-mobility part of a BAF/TDF unit, and
+`<unit>-dda-neg` / `<unit>-dda-pos` for a polarity split. An ion-mobility part
+is written excluded (`excluded_by_preflight`, `split_exclusion`
+`ion_mobility_out_of_scope`): LC-IM-MS is outside this campaign's scope. A
+part split by polarity carries its polarity as its ion mode, and each part
+lists only its own entries of the parent's file list, its folders' members
+matched by path, and its own samples: those its declared inputs or its lineage
+name, and otherwise those whose `raw_file` matches its inputs' paths, a sample's
+name being used only where no path accounts for it. An input two samples match
+equally well is neither one's, and those samples are reported unclaimed.
+
 ## Finalize and clean up
 
 After MS-DIAL Interactive has produced mzTab-M, QA, and publication artifacts,
@@ -325,7 +341,44 @@ For agents, cleanup is a separate confirmation boundary: first preview
 `msdial_cleanup_repository_raw`, report the exact raw directory and retained
 artifact inventory, and call it with `confirmed=true` only after the user
 approves that deletion. Selecting a retention policy earlier in the workflow
-does not authorize deletion.
+does not authorize deletion. `msdial_discard_repository_raw` previews and
+performs the discard of a unit that produced no validated output.
+
+In a campaign, `campaign_authorization_path` stands in for `confirmed=true` on
+both tools (and on `cleanup_download_lease`, `discard_download_lease` and
+`cleanup_split_parent` called in-process) when the approval covers boundary 5
+for the unit, or the unit it was split from, and the approval and the unit both
+state `delete_after_validated_output`. Under it a failed unit whose output
+holds an unvalidated or invalid mzTab-M may be discarded: that mzTab-M, its
+validation (`failure-artifacts/output-validation.json`) and the failure record
+(`failure-artifacts/run-failure-record.json`) are kept under output and listed
+in `failure_artifacts`. Both are written as shared artifacts: they declare
+`shared_path_policy`, the raw directory reads `raw/`, a workspace path is
+relative, any other location is withheld, and the failure record carries each
+failure's reason, exit code and time and each attempt's identifiers, never a
+log line, a host or an output directory; the full record stays in the
+provenance manifest. Every deletion refuses while a retained artifact lies
+under its target, unlinks a multiply-linked file without touching its
+attributes, and records what it removed and kept (`raw_deletion`); one that a
+held file or a crash stopped is resumed by the next call, keeping the failure
+artifacts it wrote first. A discard that has finished, asked for again, returns
+its record (`already_discarded`) and writes nothing.
+
+A split parent's raw tree, which every part reads, is released by
+`cleanup_split_parent` (also reached through either tool on the parent's
+manifest) once every part has ended: validated, failed after its retries
+(three recorded run failures), skipped, excluded, or discarded by its own
+authorized discard. A run is recorded as failed (`run_failures`) when its
+Console exits non-zero, and also when it exits 0 without a validated mzTab-M:
+it wrote none, what it wrote failed validation, or finalisation found another
+mzTab-M in the output that fails (the status `validation_failed` is kept). The
+job itself stays `completed`. The release takes a lock, writes `raw_release`
+before the first file goes, marks validated parts `raw_cleaned` with
+`raw_released_by`, and leaves the parent `split_by_acquisition`. A finished
+run's post-run hook only records the parent's pending plan
+(`raw_release_pending`); in a campaign the runner is the one trigger of every
+deletion. A unit whose raw data were released (`raw_cleaned`, `discarded`, or a
+part of a released parent) never passes the execution gate again.
 
 ## Pilot record
 

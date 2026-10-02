@@ -11,7 +11,6 @@ import os
 import random
 import re
 import secrets
-import shutil
 import socket
 import ssl
 import stat
@@ -38,6 +37,7 @@ from .diagnostic_paths import (
     is_diagnostic_artifact,
     is_intermediate_artifact,
     path_is_file,
+    plain_path,
 )
 from .download_store import unlink_tree
 from .mzml_encoding import UNSUPPORTED_MZML_ENCODING, scan_mzml_encoding
@@ -3496,6 +3496,8 @@ def record_run_failure(
     reason: str,
     exit_code: int | None = None,
     log_tail: list[str] | None = None,
+    *,
+    status: str = "run_failed",
 ) -> dict[str, Any]:
     """Write a failed MS-DIAL run into the analysis unit's own manifest.
 
@@ -3514,6 +3516,11 @@ def record_run_failure(
     reclaim the disk. The campaign's retention policy is now "delete after a successful run"; this
     is the clause that keeps "successful" in it.
 
+    A Console that exits 0 and leaves the unit without a validated mzTab-M has failed too, and is
+    recorded here like one that exits non-zero, so the run failures count every run that did not
+    validate. ``status`` is validation_failed for such a run that finalize_download_lease has
+    already finalised as validation_failed, which it keeps; anything else is run_failed.
+
     Never raises. A failure while recording a failure would lose both, so any problem writing the
     manifest is returned rather than thrown -- the caller is already on its error path.
     """
@@ -3527,7 +3534,7 @@ def record_run_failure(
         "log_tail": [str(line) for line in (log_tail or [])][-40:],
     }
     def change(manifest: dict[str, Any]) -> None:
-        manifest["status"] = "run_failed"
+        manifest["status"] = status
         manifest["cleanup_allowed"] = False
         failures = list(manifest.get("run_failures") or [])
         failures.append(record)
@@ -3540,7 +3547,7 @@ def record_run_failure(
         manifest = update_manifest(manifest_path, change)
         return {**manifest, "manifest_path": str(manifest_path)}
     except (OSError, ValueError) as error:
-        return {"status": "run_failed", "manifest_error": str(error), "run_failure": record}
+        return {"status": status, "manifest_error": str(error), "run_failure": record}
 
 
 def record_run_start(
@@ -4064,10 +4071,11 @@ def disposition_hold(manifest: dict[str, Any]) -> dict[str, Any] | None:
 
     split_parent: the unit was split. A parent owns its parts' raw data and never runs, so a disposition
     that made it runnable, or skipped it - and a campaign deletes a skipped unit's raw data - would reach
-    the parts. past_preflight: its run finished (mztab_validated, cleanup_pending_confirmation, raw_cleaned
-    and the like) or its raw data were discarded; applied again, a disposition would move a finished unit
-    out of the cleanup-ready states and make it look as if it were waiting to run. run_in_progress: a
-    Console of its own may still be running.
+    the parts. excluded_at_split: a part of ion-mobility inputs, excluded when its parent was split
+    (split_exclusion). past_preflight: its run finished (mztab_validated, cleanup_pending_confirmation,
+    raw_cleaned and the like) or its raw data were discarded; applied again, a disposition would move a
+    finished unit out of the cleanup-ready states and make it look as if it were waiting to run.
+    run_in_progress: a Console of its own may still be running.
     """
     status = str(manifest.get("status") or "")
     if status == SPLIT_PARENT_STATUS or manifest.get("split_into"):
@@ -4075,6 +4083,16 @@ def disposition_hold(manifest: dict[str, Any]) -> dict[str, Any] | None:
             "reason": "split_parent",
             "status": status,
             "detail": "The unit was split; its parts are preflighted and run, and it never is.",
+        }
+    if manifest.get("split_exclusion"):
+        # A part of ion-mobility inputs ended at its split: a disposition decided from its own headers would
+        # say the same, and one that made it runnable would run LC-IM-MS data as LC-MS.
+        return {
+            "reason": "excluded_at_split",
+            "status": status,
+            "detail": "The part was excluded when its parent was split: "
+            + str((manifest.get("split_exclusion") or {}).get("reason") or "excluded")
+            + ".",
         }
     if status in PAST_PREFLIGHT_STATUSES:
         return {
@@ -4414,7 +4432,11 @@ def _record_preflight(
     # recorded, for its parts to reuse; the verdicts change nothing, and the disposition it carries stands.
     hold = disposition_hold(current)
     split_parent = hold is not None and hold["reason"] == "split_parent"
+    # A part excluded at its split is read like any unit, and stays excluded: outside a campaign nothing
+    # else here knows that ion mobility is out of scope.
+    excluded_part = hold is not None and hold["reason"] == "excluded_at_split"
     status_before = current.get("status")
+    project_before = copy.deepcopy(current.get("project") or {})
     previously_allowed = bool(
         current.get("execution_allowed") or (current.get("project") or {}).get("eligible")
     )
@@ -4594,12 +4616,14 @@ def _record_preflight(
             else:
                 current["status"] = "preflight_review_required"
 
-    if split_parent:
+    if split_parent or excluded_part:
         # Its status as it was, and the disposition it carries as it was: a campaign acts on whatever
         # disposition a unit carries, and one decided from a split parent's own headers - skip, say - would
-        # reach the raw data its parts read.
+        # reach the raw data its parts read. A part excluded at its split keeps its exclusion the same way.
         current["status"] = status_before
         current["execution_allowed"] = False
+        if excluded_part:
+            current["project"] = project_before
         return
     disposition = decide_disposition(current, declared=declared, extractor=extractor)
     assignments = disposition.pop("assignments")
@@ -4772,13 +4796,172 @@ SPLIT_PART_STATUS = "split_from_parent"
 
 DECIDED_TYPE_PART_MODE = {"DDA": "DDA", "SWATH": "DIA", "AIF": "AIF"}
 
+# ONE SPLIT KEY. A part is one acquisition mode, one ion-mobility regime and one polarity: MS-DIAL runs one
+# acquisition type and one ion mode per analysis, and the campaign runs LC-MS only. The key was the
+# acquisition mode alone, so a BAF and a TDF folder of one DDA unit landed in one part (or, keyed by
+# container as well, under one id twice), and a unit whose files differed only in polarity could not be
+# split at all. A part whose files carry ion mobility is written excluded: LC-IM-MS is outside the campaign's
+# scope, and Interactive runs no ion-mobility project. The part id names every key part in which the parts
+# differ, after the acquisition mode it always named, so a DDA/DIA split keeps <unit>-dda and <unit>-dia.
+SPLIT_KEY_SCHEMA = "msdial-split-key.v1"
+SPLIT_KEY_PARTS = ("acquisition", "ion_mobility", "polarity")
+ION_MOBILITY_PART_TOKEN = "im"
+POLARITY_PART_TOKENS = {"Positive": "pos", "Negative": "neg"}
+ION_MOBILITY_EXCLUSION = "ion_mobility_out_of_scope"
+ION_MOBILITY_EXCLUSION_REASON = (
+    "LC-IM-MS is outside this campaign's LC-MS/MS scope: these inputs carry an ion-mobility dimension, by their "
+    "raw header (has_ion_mobility) or their container format, and Interactive runs no ion-mobility project."
+)
 
-def _split_part_id(parent_unit_id: str, mode: str) -> str:
-    return f"{parent_unit_id}-{mode.casefold()}"
+
+def _split_part_id(parent_unit_id: str, mode: str, ion_mobility: bool = False, polarity: str = "") -> str:
+    tokens = [mode.casefold()]
+    if ion_mobility:
+        tokens.append(ION_MOBILITY_PART_TOKEN)
+    if polarity:
+        tokens.append(POLARITY_PART_TOKENS[polarity])
+    return f"{parent_unit_id}-{'-'.join(tokens)}"
+
+
+def _input_ion_mobility(verdict: dict[str, Any] | None, path: str) -> bool:
+    """Whether an input carries ion mobility: its header says so, or its container format is a mobility one.
+
+    Either is enough, as for the campaign disposition (decide_disposition), which excludes such an input by
+    the same reading: a TDF folder whose header read no mobility is still a timsTOF acquisition.
+    """
+    from .raw_metadata_preflight import ION_MOBILITY_FORMATS, input_format
+
+    entry = verdict or {}
+    if entry.get("has_ion_mobility") is True:
+        return True
+    return (str(entry.get("format") or "") or input_format(path)) in ION_MOBILITY_FORMATS
+
+
+def _disposition_polarities(disposition: dict[str, Any]) -> dict[str, str]:
+    """The polarity an applied split disposition gave each input, by _file_key."""
+    result: dict[str, str] = {}
+    for group in ((disposition.get("split_key") or {}).get("groups") or []) if disposition else []:
+        polarity = str((group or {}).get("polarity") or "") if isinstance(group, dict) else ""
+        if polarity in POLARITY_PART_TOKENS:
+            for item in group.get("inputs") or []:
+                result[_file_key(str(item))] = polarity
+    return result
+
+
+def _input_samples(manifest: dict[str, Any], candidates: list[str]) -> dict[str, str]:
+    """The sample each input is, by _file_key: the Catalog's declared input it is, else its lineage row's.
+
+    Asked as the analysis-CSV builder asks it (match_declared_inputs), so a part holds the samples its CSV
+    will. A name alone cannot say it where two folders share one, as pos/S1.raw and neg/S1.raw do.
+    """
+    lineage = manifest.get("input_lineage") if isinstance(manifest.get("input_lineage"), dict) else {}
+    lineage_samples = {
+        _file_key(str(row.get("path") or "")): str(row.get("sample_id") or "").strip()
+        for row in lineage.get("rows") or []
+        if isinstance(row, dict) and str(row.get("path") or "").strip()
+    }
+    result = {key: value for key, value in lineage_samples.items() if value}
+    project_record = manifest.get("project") or {}
+    data_root = str(manifest.get("input_directory") or "").strip()
+    if not project_record.get("analysis_inputs") or not data_root:
+        return result
+    try:
+        project = project_from_dict(project_record)
+    except (TypeError, ValueError):
+        return result
+    declared = declared_analysis_inputs(project)
+    if not declared:
+        return result
+    matched = match_declared_inputs(
+        candidates,
+        Path(data_root),
+        declared,
+        containers=declared_archive_containers(project, declared, manifest.get("archive_extractions")),
+        samples=lineage_samples,
+        stands_for=lineage_stands_for(manifest),
+    )
+    for form, found in matched.items():
+        sample = str(declared[form].get("sample_id") or "").strip()
+        for item in found if sample else []:
+            result[_file_key(item)] = sample
+    return result
+
+
+def _sample_parts_by_path(
+    samples: list[dict[str, Any]],
+    groups: dict[tuple[str, bool, str], list[str]],
+    sample_of: dict[str, str],
+    stands_for: dict[str, str],
+    data_root: Path | None,
+) -> dict[int, set[tuple[str, bool, str]]]:
+    """The parts (group keys) of each sample no input names (sample_of), by the sample's index.
+
+    A sample's raw_file is matched against the paths of the parts' unnamed inputs under the data root, in the
+    forms a listed file may carry for them (_allowlist_forms), as _files_of_parts matches the file list: the
+    full path before any shorter form. Only a raw_file no input's path accounts for is matched by its name
+    (or its stem, when it records no extension), as every sample used to be. An input is then the sample's
+    that matched it best; where two samples match it equally well, neither has it. By name alone pos/S1.raw and
+    neg/S1.raw are one file, and each polarity part held the samples of both.
+    """
+    forms: dict[str, list[tuple[int, tuple[str, bool, str], str]]] = {}
+    bare_forms: dict[str, list[tuple[int, tuple[str, bool, str], str]]] = {}
+    names: dict[str, list[tuple[tuple[str, bool, str], str]]] = {}
+    stems: dict[str, list[tuple[tuple[str, bool, str], str]]] = {}
+    for key, files in groups.items():
+        for item in files:
+            item_key = _file_key(item)
+            if sample_of.get(item_key):
+                continue
+            for source in (item, stands_for.get(item_key, "")):
+                if not source:
+                    continue
+                name = Path(source).name.casefold()
+                names.setdefault(name, []).append((key, item_key))
+                stems.setdefault(PurePosixPath(name).stem, []).append((key, item_key))
+                relative = _relative_to_data_root(Path(source), data_root) if data_root is not None else None
+                if relative is None:
+                    continue
+                exact = {relative, relative[6:] if relative.startswith("files/") else relative}
+                for form in _allowlist_forms(relative):
+                    entry = (2 if form in exact else 1, key, item_key)
+                    forms.setdefault(form, []).append(entry)
+                    bare = PurePosixPath(form)
+                    bare_forms.setdefault(str(bare.with_name(bare.stem)) if bare.suffix else form, []).append(entry)
+    # input -> {sample index: how well it matched}: 3 and 2 by path, the full path or a shorter form; 1 by name.
+    claims: dict[str, dict[int, int]] = {}
+    for index, sample in enumerate(samples):
+        text = str((sample or {}).get("raw_file") or "").strip()
+        raw = PurePosixPath(text.replace("\\", "/")).name.casefold()
+        if not raw:
+            continue
+        no_extension = not PurePosixPath(raw).suffix
+        listed = _listed_key(text)
+        alias = _container_alias_path(listed) if listed else ""
+        table = bare_forms if no_extension else forms
+        found = [*(table.get(listed) or []), *(forms.get(alias) or [] if alias else [])] if listed else []
+        if found:
+            best = max(rank for rank, _key, _item in found)
+            matched = [(rank + 1, item) for rank, _key, item in found if rank == best]
+        else:
+            alias_name = archives.container_alias(raw).casefold()
+            by_name = [*(names.get(raw) or []), *(names.get(alias_name) or [] if alias_name else [])]
+            if no_extension:
+                by_name.extend(stems.get(raw) or [])
+            matched = [(1, item) for _key, item in by_name]
+        for level, item in matched:
+            claims.setdefault(item, {})[index] = max(level, claims.get(item, {}).get(index, 0))
+    part_of = {_file_key(item): key for key, files in groups.items() for item in files}
+    result: dict[int, set[tuple[str, bool, str]]] = {}
+    for item, by_sample in claims.items():
+        best = max(by_sample.values())
+        owners = [index for index, level in by_sample.items() if level == best]
+        if len(owners) == 1:
+            result.setdefault(owners[0], set()).add(part_of[item])
+    return result
 
 
 def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
-    """Describe how a Mixed unit would be split by per-file acquisition mode. Changes nothing.
+    """Describe how a unit would be split by its split key. Changes nothing.
 
     WHY A SPLIT AND NOT A RELABEL. MS-DIAL deconvolutes each file by the acquisition type written
     against it, and a DDA file deconvoluted as SWATH, or a DIA file read as DDA, gives a result that
@@ -4787,10 +4970,18 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     made from that evidence and nothing else: a file whose header gave no usable mode blocks the
     split rather than being guessed into a part.
 
+    THE KEY is the acquisition mode, the ion-mobility regime and the polarity (SPLIT_KEY_PARTS). A unit
+    is split when its headers disagree about acquisition mode, when an applied campaign disposition
+    splits it, or when its inputs differ in any part of the key. Polarity is the header's, or the one an
+    applied disposition gave the input; it is part of the key only where the inputs differ in it, and
+    then an input with no single polarity blocks the split. A part of ion-mobility inputs is planned
+    excluded (ION_MOBILITY_EXCLUSION), so its inputs are accounted for and none of them runs.
+
     The parts share the parent's raw data and do not copy it. Their input files are disjoint, and
     MS-DIAL's per-file intermediates carry a run timestamp, so parts run one after another do not
     collide. The raw data stay owned by the parent: a part's cleanup is refused, because its raw
-    directory is not its own.
+    directory is not its own, and the parent's tree is released only by plan_split_parent_cleanup's
+    rule, once every part has ended.
     """
     manifest_path = manifest_path.resolve()
     manifest = read_manifest(manifest_path)
@@ -4814,15 +5005,11 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     if not parent_id:
         blockers.append("The manifest names no analysis_unit_id to derive part identifiers from.")
     disposition = _applied_disposition(manifest)
-    # A campaign disposition splits SWATH from AIF too, and both of those read "DIA" in the header.
-    split_by_acquisition = disposition.get("disposition") == "split" and "acquisition" in (
-        (disposition.get("split_key") or {}).get("by") or []
+    # A campaign disposition splits SWATH from AIF too, and both of those read "DIA" in the header; and it
+    # splits by polarity where the inputs' headers differ in it.
+    split_by_disposition = disposition.get("disposition") == "split" and bool(
+        set((disposition.get("split_key") or {}).get("by") or []) & {"acquisition", "polarity"}
     )
-    if summary.get("acquisition_mode") != "Mixed" and not split_by_acquisition:
-        blockers.append(
-            "Only a unit whose raw headers disagree about acquisition mode is split here; this one "
-            f"is {summary.get('acquisition_mode') or project.get('acquisition_mode') or 'unknown'!r}."
-        )
     if not coverage.get("complete"):
         blockers.append(
             "The raw-header preflight did not read every input file, so the files it did not read "
@@ -4833,7 +5020,8 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     candidates = [str(item) for item in manifest.get("input_candidates") or [] if str(item).strip()]
     decided = _decided_acquisition_by_file(manifest)
     excluded = _campaign_excluded_inputs(manifest)
-    groups: dict[str, list[str]] = {}
+    decided_polarity = _disposition_polarities(disposition)
+    keyed: list[tuple[str, str, bool, str]] = []
     unassigned: list[str] = []
     left_out: list[dict[str, str]] = []
     for candidate in candidates:
@@ -4848,14 +5036,46 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
             # The type an applied campaign disposition decided, named as the header names it (a SWATH file
             # is in the DIA part), so a DDA/DIA split keeps the part identifiers it always had.
             mode = DECIDED_TYPE_PART_MODE[console]
-        if mode in HEADER_ACQUISITION_TO_MSDIAL:
-            groups.setdefault(mode, []).append(candidate)
-        else:
+        if mode not in HEADER_ACQUISITION_TO_MSDIAL:
             unassigned.append(f"{Path(candidate).name} ({mode or 'no header verdict'})")
+            continue
+        polarity = decided_polarity.get(_file_key(candidate)) or str((verdict or {}).get("polarity") or "").strip()
+        keyed.append(
+            (
+                candidate,
+                mode,
+                _input_ion_mobility(verdict, candidate),
+                polarity if polarity in POLARITY_PART_TOKENS else "",
+            )
+        )
     if unassigned:
         blockers.append(
             f"{len(unassigned)} input files have no DDA, DIA or AIF header verdict and cannot be put "
             f"into a part: {', '.join(unassigned[:5])}. Decide whether to exclude them."
+        )
+    by_polarity = len({polarity for *_, polarity in keyed if polarity}) > 1
+    if by_polarity:
+        unpolarised = [Path(candidate).name for candidate, *_, polarity in keyed if not polarity]
+        if unpolarised:
+            blockers.append(
+                f"The inputs differ in polarity, and {len(unpolarised)} of them record no single polarity, so "
+                f"they cannot be put into a part: {', '.join(unpolarised[:5])}. Decide whether to exclude them."
+            )
+    groups: dict[tuple[str, bool, str], list[str]] = {}
+    for candidate, mode, mobility, polarity in keyed:
+        if by_polarity and not polarity:
+            continue
+        groups.setdefault((mode, mobility, polarity if by_polarity else ""), []).append(candidate)
+    varying = [
+        name
+        for name, index in (("acquisition", 0), ("ion_mobility", 1), ("polarity", 2))
+        if len({key[index] for key in groups}) > 1
+    ]
+    if summary.get("acquisition_mode") != "Mixed" and not split_by_disposition and not varying:
+        described = summary.get("acquisition_mode") or project.get("acquisition_mode") or "unknown"
+        blockers.append(
+            "Only a unit whose raw headers disagree about acquisition mode, ion-mobility regime or polarity is "
+            f"split here; this one is {described!r} in one regime and one polarity."
         )
 
     samples = list(project.get("sample_metadata") or [])
@@ -4863,17 +5083,29 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     # An mzML converted from an mzXML, or chosen over one, is that mzXML's sample's: the sample names the
     # repository's file, not what the lease wrote from it.
     stands_for = lineage_stands_for(manifest)
+    sample_of = _input_samples(manifest, candidates)
+    named_anywhere = set(sample_of.values())
+    data_root_text = str(manifest.get("input_directory") or "").strip()
+    # The rest are matched by their raw_file's path, and only where no path accounts for it by name.
+    by_path = _sample_parts_by_path(
+        samples, groups, sample_of, stands_for, Path(data_root_text) if data_root_text else None
+    )
     parts = []
     claimed_samples: set[int] = set()
-    for mode, files in sorted(groups.items()):
-        names = {Path(item).name.casefold() for item in files} | {
-            Path(stands_for[_file_key(item)]).name.casefold() for item in files if _file_key(item) in stands_for
-        }
-        stems = {PurePosixPath(name).stem for name in names}
+    for group_key, files in sorted(groups.items()):
+        mode, mobility, polarity = group_key
+        # A sample the declared inputs or the lineage attribute is matched by that; only the rest by path.
+        named = {sample_of[_file_key(item)] for item in files if sample_of.get(_file_key(item))}
         part_samples = []
         for index, sample in enumerate(samples):
-            raw = PurePosixPath(str((sample or {}).get("raw_file") or "").replace("\\", "/")).name.casefold()
-            if raw and (raw in names or (not PurePosixPath(raw).suffix and raw in stems)):
+            sample_id = str((sample or {}).get("sample_id") or "").strip()
+            if sample_id and sample_id in named:
+                matched = True
+            elif sample_id and sample_id in named_anywhere:
+                matched = False
+            else:
+                matched = group_key in by_path.get(index, set())
+            if matched:
                 part_samples.append(sample)
                 claimed_samples.add(index)
         sample_ids = {str(item.get("sample_id") or "") for item in part_samples}
@@ -4890,19 +5122,23 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
                 if str(level).isdigit() and int(level) > 2
             }
         )
-        part_id = _split_part_id(parent_id, mode)
-        parts.append(
-            {
-                "analysis_unit_id": part_id,
-                "acquisition_mode": mode,
-                "workspace": str(workspace.parent / part_id),
-                "input_candidates": sorted(files),
-                "file_count": len(files),
-                "sample_ids": sorted(sample_ids),
-                "class_levels": levels,
-                "higher_ms_levels": higher_levels,
-            }
-        )
+        part_id = _split_part_id(parent_id, mode, ion_mobility=mobility, polarity=polarity)
+        part = {
+            "analysis_unit_id": part_id,
+            "acquisition_mode": mode,
+            "ion_mobility": mobility,
+            "polarity": polarity,
+            "split_key": {"acquisition": mode, "ion_mobility": mobility, "polarity": polarity},
+            "workspace": str(workspace.parent / part_id),
+            "input_candidates": sorted(files),
+            "file_count": len(files),
+            "sample_ids": sorted(sample_ids),
+            "class_levels": levels,
+            "higher_ms_levels": higher_levels,
+        }
+        if mobility:
+            part["excluded"] = {"reason": ION_MOBILITY_EXCLUSION, "detail": ION_MOBILITY_EXCLUSION_REASON}
+        parts.append(part)
     unclaimed = [
         str((sample or {}).get("sample_id") or index)
         for index, sample in enumerate(samples)
@@ -4912,6 +5148,7 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
         "manifest_path": str(manifest_path),
         "analysis_unit_id": parent_id,
         "already_split": False,
+        "split_key": {"schema": SPLIT_KEY_SCHEMA, "parts": list(SPLIT_KEY_PARTS), "by": varying},
         "parts": parts,
         "unclaimed_samples": unclaimed,
         "excluded_inputs": left_out,
@@ -4919,8 +5156,19 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     }
 
 
+def _part_label(part: dict[str, Any]) -> str:
+    """'DDA', or 'DDA ion-mobility Negative': the part's key as words, for evidence and warnings."""
+    return " ".join(
+        [
+            str(part.get("acquisition_mode") or ""),
+            *(["ion-mobility"] if part.get("ion_mobility") else []),
+            *([str(part["polarity"])] if part.get("polarity") else []),
+        ]
+    )
+
+
 def _part_class_proposal(
-    parent_proposal: dict[str, Any], sample_ids: set[str], parent_unit_id: str, mode: str
+    parent_proposal: dict[str, Any], sample_ids: set[str], parent_unit_id: str, mode: str, label: str = ""
 ) -> dict[str, Any]:
     """The parent's accepted Class proposal, restricted to one part's samples, saying so.
 
@@ -4931,6 +5179,7 @@ def _part_class_proposal(
     """
     if not parent_proposal:
         return {}
+    label = label or mode
     proposal = copy.deepcopy(parent_proposal)
     every = list(proposal.get("assignments") or [])
     kept = [item for item in every if str(item.get("sample_id") or "") in sample_ids]
@@ -4938,7 +5187,7 @@ def _part_class_proposal(
     proposal["assignments"] = kept
     proposal["split_from"] = {
         "parent_analysis_unit_id": parent_unit_id,
-        "split_by": "raw_header_acquisition_mode",
+        "split_by": "raw_header_acquisition_mode" if label == mode else "raw_header_split_key",
         "acquisition_mode": mode,
         "assignments_kept": len(kept),
         "assignments_in_parent": len(every),
@@ -4947,8 +5196,9 @@ def _part_class_proposal(
     warnings = list(proposal.get("warnings") or [])
     warnings.append(
         f"This run holds {len(kept)} of the {len(every)} samples the proposal assigned: analysis unit "
-        f"{parent_unit_id} was split by raw-header acquisition mode and this is its {mode} part. The "
-        "rationale describes the whole unit."
+        f"{parent_unit_id} was split by raw-header "
+        + ("acquisition mode" if label == mode else "acquisition mode, ion-mobility regime and polarity")
+        + f" and this is its {label} part. The rationale describes the whole unit."
     )
     if len(levels) < 2:
         warnings.append(
@@ -4959,18 +5209,128 @@ def _part_class_proposal(
     return proposal
 
 
+def _listed_key(name: str) -> str:
+    """A listed file's path as the lease places it (_safe_relative_name), casefolded; '' when unsafe."""
+    try:
+        return _safe_relative_name(str(name or "")).as_posix().casefold()
+    except ValueError:
+        return ""
+
+
+def _files_of_parts(
+    listed: list[dict[str, Any]],
+    parts: list[dict[str, Any]],
+    data_root: Path | None,
+    stands_for: dict[str, str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Each part's entries of its parent's file list: its inputs' own, and its folders' members.
+
+    A member belongs to the part whose input its container is, matched by the container's path under the
+    data root (as the lease's allow-list matches it, _allowlist_forms), the full path before any shorter
+    form; only an entry no input's path accounts for is matched by name, as every entry used to be. By name
+    alone, pos/S1.raw and neg/S1.raw are one folder, and each polarity part listed both folders' members.
+    A converted input is listed as the mzXML it was converted from.
+    """
+    forms: dict[str, dict[str, int]] = {}
+    names: dict[str, set[str]] = {}
+    for part in parts:
+        part_id = part["analysis_unit_id"]
+        for item in part["input_candidates"]:
+            for source in (item, stands_for.get(_file_key(item), "")):
+                if not source:
+                    continue
+                names.setdefault(Path(source).name.casefold(), set()).add(part_id)
+                relative = _relative_to_data_root(Path(source), data_root) if data_root is not None else None
+                if relative is None:
+                    continue
+                exact = {relative, relative[6:] if relative.startswith("files/") else relative}
+                for form in _allowlist_forms(relative):
+                    rank = 2 if form in exact else 1
+                    owners = forms.setdefault(form, {})
+                    owners[part_id] = max(owners.get(part_id, 0), rank)
+    result: dict[str, list[dict[str, Any]]] = {part["analysis_unit_id"]: [] for part in parts}
+    for entry in listed:
+        if not isinstance(entry, dict):
+            continue
+        member = str(entry.get("role") or "") == VENDOR_FOLDER_MEMBER_ROLE
+        name = str((entry.get("container") if member else entry.get("name") or entry.get("path")) or "")
+        key = _listed_key(name)
+        owners = (forms.get(key) or forms.get(_container_alias_path(key)) or {}) if key else {}
+        if owners:
+            best = max(owners.values())
+            chosen = {part_id for part_id, rank in owners.items() if rank == best}
+        else:
+            chosen = names.get(PurePosixPath(name.replace("\\", "/")).name.casefold(), set())
+        for part_id in chosen:
+            result[part_id].append(entry)
+    return result
+
+
+def _excluded_part_disposition(
+    parent: dict[str, Any], part_manifest: dict[str, Any], decided_at: str
+) -> dict[str, Any]:
+    """The campaign disposition of a part planned excluded, decided by the one mapping (decide_disposition).
+
+    Decided from the parent's header verdicts for the part's inputs, which is all a part has before its own
+    preflight; it excludes every ion-mobility input, so the part is excluded whole. It is applied when the
+    parent is a campaign unit, so a campaign acts on it as on any excluded unit's.
+    """
+    from .raw_metadata_preflight import decide_disposition
+
+    preflight = parent.get("raw_metadata_preflight") or {}
+    summary = preflight.get("summary") or {}
+    view = {
+        "raw_metadata_preflight": {
+            "summary": {
+                **{key: value for key, value in summary.items() if key not in ("per_file", "coverage")},
+                "per_file": list(part_manifest.get("header_verdicts_from_parent") or []),
+                "coverage": {**(summary.get("coverage") or {}), "complete": True, "capped": False},
+            },
+            "declared": preflight.get("declared"),
+            "extractor": preflight.get("extractor"),
+        },
+        "input_candidates": list(part_manifest.get("input_candidates") or []),
+        "project": part_manifest.get("project") or {},
+    }
+    declared = preflight.get("declared") if isinstance(preflight.get("declared"), dict) else None
+    disposition = decide_disposition(view, declared=declared, extractor=preflight.get("extractor"), decided_at=decided_at)
+    disposition.pop("assignments", None)
+    if disposition.get("disposition") not in {"exclude", "skip"}:
+        # Not reachable while decide_disposition excludes ion mobility; a part of mobility data never runs.
+        disposition.update(
+            disposition="exclude",
+            reasons=[ION_MOBILITY_EXCLUSION],
+            excluded_inputs=[
+                {"path": item, "reason": ION_MOBILITY_EXCLUSION} for item in part_manifest.get("input_candidates") or []
+            ],
+            split_key=None,
+        )
+    disposition["decided_from"] = "split_parent_preflight"
+    campaign = preflight_campaign(parent)
+    disposition["applied"] = campaign is not None
+    if campaign is not None:
+        disposition["campaign"] = dict(campaign)
+    return disposition
+
+
 def split_unit_by_acquisition(manifest_path: Path, confirmed: bool = False) -> dict[str, Any]:
-    """Split a Mixed unit into one part per acquisition mode, each with its own manifest.
+    """Split a unit into one part per value of its split key, each with its own manifest.
 
     With confirmed false this is plan_acquisition_split. With confirmed true it writes, for each part,
     a workspace holding provenance and output directories and a run manifest that:
 
     - admits only that part's input files, so the execution gate refuses the others;
     - carries the part's acquisition mode as read from its files' headers, and those headers' own
-      verdicts, so the gate can check each file against its header;
+      verdicts, so the gate can check each file against its header; and, for a part split by polarity,
+      that polarity as its ion mode;
     - keeps only the samples, and the accepted Class assignments, that belong to its files. The
       Class decision is the parent's, filtered; it is not a new grouping;
+    - lists only its own entries of the parent's file list, its folders' members among them;
     - starts with execution_allowed false. Each part is preflighted on its own before it can run.
+
+    A part of ion-mobility inputs is written excluded (status excluded_by_preflight, split_exclusion, and
+    the campaign disposition the one mapping gives it), so it never runs and it counts as ended for the
+    release of its parent's raw data.
 
     The parent is marked split and names its parts. Nothing is copied or deleted.
 
@@ -5013,6 +5373,13 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         _file_key(str(item.get("file") or "")): item
         for item in (parent.get("raw_metadata_preflight") or {}).get("summary", {}).get("per_file") or []
     }
+    data_root = str(parent.get("input_directory") or "").strip()
+    files_of = _files_of_parts(
+        list(parent_project.get("files") or []),
+        plan["parts"],
+        Path(data_root) if data_root else None,
+        stands_for,
+    )
     from .repository_metadata import metadata_workspace
 
     now = datetime.now(timezone.utc).isoformat()
@@ -5023,17 +5390,14 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         output = root / "output"
         provenance.mkdir(parents=True, exist_ok=True)
         output.mkdir(parents=True, exist_ok=True)
-        # A converted input's listed file is the mzXML it was converted from.
-        names = {Path(item).name.casefold() for item in part["input_candidates"]} | {
-            Path(stands_for[_file_key(item)]).name.casefold()
-            for item in part["input_candidates"]
-            if _file_key(item) in stands_for
-        }
         sample_ids = set(part["sample_ids"])
+        label = _part_label(part)
 
         project = copy.deepcopy(parent_project)
         project["analysis_unit_id"] = part["analysis_unit_id"]
         project["acquisition_mode"] = part["acquisition_mode"]
+        if part.get("polarity"):
+            project["ion_mode"] = part["polarity"]
         project["sample_metadata"] = [
             sample for sample in parent_project.get("sample_metadata") or []
             if str((sample or {}).get("sample_id") or "") in sample_ids
@@ -5047,30 +5411,30 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 if isinstance(entry, dict) and str(entry.get("sample_id") or "") in sample_ids
             ]
         # A folder's files are listed one by one, as its members (Catalog 0.6.0): they go with the part
-        # whose input their folder is, so a part's download description is its own folders'.
-        matched_files = [
-            item for item in parent_project.get("files") or []
-            if PurePosixPath(str(item.get("name") or "").replace("\\", "/")).name.casefold() in names
-            or (
-                str(item.get("role") or "") == VENDOR_FOLDER_MEMBER_ROLE
-                and PurePosixPath(str(item.get("container") or "").replace("\\", "/")).name.casefold() in names
-            )
-        ]
-        # An archive unit's file list names the archive, not the files inside it; the part then
-        # shares the parent's download description rather than being given an empty one.
-        project["files"] = matched_files or list(parent_project.get("files") or [])
+        # whose input their folder is, so a part's download description is its own folders'. An archive
+        # unit's file list names the archive, not the files inside it; the part then shares the parent's
+        # download description rather than being given an empty one.
+        project["files"] = files_of[part["analysis_unit_id"]] or list(parent_project.get("files") or [])
         project["total_download_bytes"] = sum(int(item.get("size_bytes") or 0) for item in project["files"])
         proposal = _part_class_proposal(
             parent_project.get("class_proposal") or {},
             sample_ids,
             plan["analysis_unit_id"],
             part["acquisition_mode"],
+            label,
         )
         if proposal:
             project["class_proposal"] = proposal
         project["evidence"] = list(project.get("evidence") or []) + [
-            f"Split from analysis unit {plan['analysis_unit_id']} by raw-header acquisition mode: "
-            f"{part['file_count']} file(s) whose headers read {part['acquisition_mode']}."
+            (
+                f"Split from analysis unit {plan['analysis_unit_id']} by raw-header acquisition mode: "
+                f"{part['file_count']} file(s) whose headers read {part['acquisition_mode']}."
+            )
+            if label == part["acquisition_mode"]
+            else (
+                f"Split from analysis unit {plan['analysis_unit_id']} by raw-header acquisition mode, ion-mobility "
+                f"regime and polarity: {part['file_count']} file(s) read as {label}."
+            )
         ]
         warnings = list(project.get("warnings") or [])
         if part["higher_ms_levels"]:
@@ -5092,8 +5456,15 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 convert_mzxml=converts,
             ),
         )
+        excluded_part = part.get("excluded")
         project["exclusion_reasons"] = list(
-            dict.fromkeys([*evaluated.exclusion_reasons, *parent_conversion_reasons])
+            dict.fromkeys(
+                [
+                    *evaluated.exclusion_reasons,
+                    *parent_conversion_reasons,
+                    *([excluded_part["detail"]] if excluded_part else []),
+                ]
+            )
         )
         project["review_reasons"] = list(evaluated.review_reasons) + (
             []
@@ -5113,8 +5484,9 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
             "split_from": {
                 "manifest_path": str(manifest_path),
                 "analysis_unit_id": plan["analysis_unit_id"],
-                "split_by": "raw_header_acquisition_mode",
+                "split_by": "raw_header_acquisition_mode" if label == part["acquisition_mode"] else "raw_header_split_key",
                 "acquisition_mode": part["acquisition_mode"],
+                **({"split_key": part["split_key"]} if label != part["acquisition_mode"] else {}),
             },
             "workspace": str(root),
             # Shared with the parent and owned by it. A part's cleanup plan refuses this directory
@@ -5132,6 +5504,14 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 per_file[_file_key(item)] for item in part["input_candidates"] if _file_key(item) in per_file
             ],
         }
+        if excluded_part:
+            # Ended at the split: it never runs, and its parent's raw data are released once the others end.
+            disposition = _excluded_part_disposition(parent, part_manifest, now)
+            part_manifest["status"] = (
+                SKIPPED_BY_PREFLIGHT_STATUS if disposition["disposition"] == "skip" else EXCLUDED_BY_PREFLIGHT_STATUS
+            )
+            part_manifest["split_exclusion"] = {**excluded_part, "decided_at": now}
+            part_manifest["campaign_disposition"] = disposition
         lineage = parent.get("input_lineage")
         if isinstance(lineage, dict):
             # The part reads the parent's files, so their lineage is the parent's, row for row. Without
@@ -5165,6 +5545,7 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         current["execution_allowed"] = False
         current["split_at"] = now
         current["split_into"] = written
+        current["split_key"] = plan["split_key"]
         if plan.get("excluded_inputs"):
             # The parent's inputs are its parts' plus these, each exactly once.
             current["split_excluded_inputs"] = plan["excluded_inputs"]
@@ -5234,6 +5615,29 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             f"{project.get('selection_status', 'unknown')!r}). Resolve the unit's technical conditions "
             "with a raw-header preflight before running MS-DIAL."
         )
+    # A unit whose raw data were deleted never runs again: its inputs are gone, and a run against what is left
+    # - a re-created folder, a file that one deletion pass kept - would record a result for data that are not
+    # the unit's. Its execution_allowed is left as it was, because the gate reads it. A part's raw tree is its
+    # parent's, released by the parent's raw_release.
+    status = str(manifest.get("status") or "")
+    if status in RAW_RELEASED_STATUSES:
+        blockers.append(
+            f"This unit's raw data were deleted (status {status!r}); a unit whose raw data were released is never "
+            "run again. Download it into a new lease to analyse it again."
+        )
+    elif str((manifest.get("raw_deletion") or {}).get("state") or "") in DELETION_RESUMABLE_STATES:
+        blockers.append("A deletion of this unit's raw data has begun and not finished; the unit cannot run.")
+    owner_path = _owner_manifest_path(manifest, manifest_path.resolve())
+    if owner_path is not None:
+        try:
+            owner_release = (read_manifest(owner_path).get("raw_release") or {}) if owner_path.is_file() else {}
+        except (OSError, ValueError):
+            owner_release = {}
+        if str(owner_release.get("state") or "") in {*DELETION_RESUMABLE_STATES, "deleted"}:
+            blockers.append(
+                "This part's raw data are its parent's, and the parent's raw tree has been released "
+                f"(raw_release {owner_release.get('state')!r}); the part cannot run."
+            )
 
     # The manifest and the workflow must be describing the same unit. A workflow that has drifted to
     # another directory or another file set is no longer covered by this manifest's verdict, whatever
@@ -5513,6 +5917,37 @@ def _is_junction(path: str | Path) -> bool:
     return bool(isjunction and isjunction(path))
 
 
+# ---- deleting raw data ----------------------------------------------------------------------------------
+#
+# Three deletions, one way of making them. cleanup_download_lease deletes a validated unit's raw tree,
+# discard_download_lease one that produced no validated output, and cleanup_split_parent a split parent's
+# tree once every part has ended. Each takes either a person's confirmed=true or a campaign approval that
+# covers boundary 5 for the unit and states delete_after_validated_output (campaign_authorization), and each:
+#
+# - refuses while a retained artifact lies under the tree it would delete;
+# - holds a deletion lock in the unit's provenance (raw-deletion.lock), so two deletions never interleave;
+# - writes its intent into the manifest before the first file goes (raw_deletion, or raw_release for a
+#   split parent, state deleting), so a deletion a crash or a held file stopped is a record, not a guess;
+# - removes the tree with download_store.unlink_tree: a multiply-linked file loses this name only, and its
+#   attributes, which every other name of it shares, are never touched;
+# - records what went (files, links, bytes) and what stayed (the retained artifacts, the failure artifacts,
+#   anything unlink_tree had to keep), and resumes from a deleting or partial record when called again.
+RAW_DELETION_SCHEMA = "msdial-raw-deletion.v1"
+SPLIT_PARENT_RELEASE_SCHEMA = "msdial-split-parent-raw-release.v1"
+FAILURE_ARTIFACTS_SCHEMA = "msdial-failure-artifacts.v1"
+FAILURE_ARTIFACTS_DIRECTORY = "failure-artifacts"
+FAILURE_VALIDATION_RECORD = "output-validation.json"
+FAILURE_RUN_RECORD = "run-failure-record.json"
+RAW_DELETION_LOCK = "raw-deletion"
+# removed: a split parent's tree is gone and its parts are still being told; resumed like the others.
+DELETION_RESUMABLE_STATES = ("deleting", "partial", "removed")
+RAW_RELEASED_STATUSES = frozenset({"raw_cleaned", "discarded"})
+# "A failed unit is retried twice, then its raw data are deleted" (the user's rule of 2026-09-30): a split
+# part with this many recorded run failures has ended, and no longer holds its parent's raw data.
+CAMPAIGN_RUN_ATTEMPTS = 3
+_REPORTED_DELETION_ITEMS = 20
+
+
 def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
     """Describe exactly what a raw-data deletion would remove and what would survive it.
 
@@ -5522,7 +5957,8 @@ def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
     caller can present them; it changes nothing.
 
     A run whose finalisation could not move MS-DIAL's containers out of the raw tree holds the deletion
-    (run_finalisation.raw_deletion_holds): the containers would go with it.
+    (run_finalisation.raw_deletion_holds): the containers would go with it. So does a retained artifact
+    that lies under the raw tree, whatever put it there.
     """
     from .run_finalisation import describe_holds, raw_deletion_holds
 
@@ -5547,6 +5983,12 @@ def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
         blockers.append(f"{len(missing)} recorded retained artifacts are missing from disk.")
     if not within_workspace:
         blockers.append("The raw directory is not the expected 'raw' folder inside the project workspace.")
+    under = _paths_under([str(path) for path in retained], raw_root)
+    if under:
+        blockers.append(
+            f"{len(under)} retained artifact(s) lie under the raw directory, so its deletion would delete them; "
+            f"the first is {under[0]}."
+        )
     held = raw_deletion_holds(manifest_path, manifest)
     if held:
         blockers.append(
@@ -5565,6 +6007,7 @@ def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
         "retained_artifact_count": len(retained),
         "retained_artifact_inventory": manifest.get("retained_artifact_inventory", []),
         "missing_retained_artifacts": missing,
+        **({"raw_deletion": manifest["raw_deletion"]} if isinstance(manifest.get("raw_deletion"), dict) else {}),
         "blockers": blockers,
         "ready_for_confirmation": not blockers and file_count > 0,
     }
@@ -5575,8 +6018,9 @@ def request_download_cleanup(manifest_path: Path) -> dict[str, Any]:
 
     The retention policy chosen at download time records a wish. Whether the technical preconditions are
     met is a second, separate thing, recorded as cleanup_allowed. Whether to actually delete, having seen
-    what goes and what stays, is a third, and it belongs to a person. Running a job is not an occasion to
-    make that third decision on their behalf, so this marks the manifest and returns the plan.
+    what goes and what stays, is a third, and it belongs to a person - or, in a campaign, to the runner
+    acting under the recorded approval, which calls the cleanup itself. Running a job is not an occasion to
+    make that third decision on anyone's behalf, so this marks the manifest and returns the plan.
     """
     manifest_path = manifest_path.resolve()
     with manifest_lock(manifest_path):
@@ -5591,7 +6035,250 @@ def request_download_cleanup(manifest_path: Path) -> dict[str, Any]:
     return plan
 
 
-def cleanup_download_lease(manifest_path: Path, confirmed: bool = False) -> dict[str, Any]:
+def _paths_under(paths: Iterable[str], root: Path) -> list[str]:
+    """The paths that are root itself or lie under it, compared as resolved, casefolded paths."""
+    base = _file_key(str(root))
+    return [
+        str(path) for path in paths
+        if str(path).strip() and (_file_key(str(path)) == base or _file_key(str(path)).startswith(base + os.sep))
+    ]
+
+
+def _is_split_parent(manifest: dict[str, Any]) -> bool:
+    return manifest.get("status") == SPLIT_PARENT_STATUS or bool(manifest.get("split_into"))
+
+
+def _owner_manifest_path(manifest: dict[str, Any], manifest_path: Path) -> Path | None:
+    """The manifest of the unit whose raw tree this one reads, when that is another unit's: a split part's parent."""
+    owner = str(manifest.get("raw_owned_by") or "").strip()
+    if not owner:
+        return None
+    path = Path(owner).expanduser()
+    return None if _file_key(str(path)) == _file_key(str(manifest_path)) else path
+
+
+def _deletion_crossing(
+    campaign_authorization_path: str | Path | None, manifest: dict[str, Any], entry_point: str
+) -> dict[str, Any] | None:
+    """The boundary-5 crossing a campaign approval gives this unit's deletion; None when none was passed.
+
+    It must cover boundary 5 for the unit, or for the unit it was split from, and the unit's own manifest
+    must record the approval's delete_after_validated_output: an approval that keeps raw data, or a unit
+    that chose to keep its own, is a refusal (CampaignAuthorizationError), never a fallback to confirmed.
+    """
+    from .campaign_authorization import authorize, unit_identity
+
+    if campaign_authorization_path is None or not str(campaign_authorization_path).strip():
+        return None
+    unit, parent = unit_identity(manifest)
+    return authorize(
+        campaign_authorization_path,
+        unit,
+        5,
+        entry_point=entry_point,
+        parent_unit_id=parent,
+        raw_retention_policy=str(manifest.get("raw_retention_policy") or "keep"),
+    )
+
+
+@contextmanager
+def _raw_deletion_lock(manifest_path: Path) -> Iterator[None]:
+    """Hold the unit's deletion lock for one deletion; another one already under way is a refusal, not a wait.
+
+    Its own lock file in the unit's provenance, not the manifest's writer lock: a deletion of tens of GB takes
+    longer than any manifest writer waits, and the manifest is written several times while it runs.
+    """
+    lock = manifest_lock(Path(manifest_path).parent / RAW_DELETION_LOCK, timeout=0)
+    try:
+        lock.__enter__()
+    except ManifestBusyError as error:
+        raise ManifestBusyError(
+            f"Another deletion of this unit's raw data holds {RAW_DELETION_LOCK}{MANIFEST_LOCK_SUFFIX}; nothing "
+            "was deleted. Call again once it has finished: a deletion it left unfinished is resumed."
+        ) from error
+    try:
+        yield
+    finally:
+        lock.__exit__(None, None, None)
+
+
+def _remove_raw_tree(raw_root: Path) -> dict[str, Any]:
+    """unlink_tree on the raw tree, by its extended-length path so a container deeper than MAX_PATH goes too."""
+    target = Path(extended_path(raw_root, always=True))
+    if not os.path.lexists(target):
+        return {
+            "root": str(raw_root), "removed_files": 0, "removed_links": 0, "removed_directories": 0,
+            "removed_reparse_points": 0, "removed_bytes": 0, "kept": [], "kept_count": 0, "complete": True,
+            "absent": True,
+        }
+    result = unlink_tree(target)
+    result["root"] = plain_path(str(result.get("root") or target))
+    result["kept"] = [{**item, "path": plain_path(str(item.get("path") or ""))} for item in result.get("kept") or []]
+    return result
+
+
+def _deletion_pass(removal: dict[str, Any], at: str) -> dict[str, Any]:
+    return {
+        "at": at,
+        **{
+            key: removal.get(key, 0)
+            for key in ("removed_files", "removed_links", "removed_directories", "removed_reparse_points", "removed_bytes")
+        },
+        "kept_count": removal.get("kept_count", 0),
+        "kept": list(removal.get("kept") or [])[:_REPORTED_DELETION_ITEMS],
+        "complete": bool(removal.get("complete")),
+        **({"tree_absent": True} if removal.get("absent") else {}),
+    }
+
+
+def _deletion_refusal(removal: dict[str, Any]) -> str:
+    reasons = sorted({str(item.get("reason") or "not_removed") for item in removal.get("kept") or []})
+    return (
+        f"{removal.get('kept_count', 0)} entries of the raw tree could not be removed "
+        f"({', '.join(reasons) or 'not removed'}); the deletion was recorded as partial, and it resumes where it "
+        "stopped when called again."
+    )
+
+
+def _delete_raw_tree(
+    manifest_path: Path,
+    raw_root: Path,
+    *,
+    kind: str,
+    authorized_by: dict[str, Any],
+    kept: dict[str, Any],
+    finish: Any,
+    record_key: str = "raw_deletion",
+    extra: dict[str, Any] | None = None,
+    final_state: str = "deleted",
+    guard: Any = None,
+) -> dict[str, Any]:
+    """Write the intent, remove the tree, and record what went and what stayed. Called under the deletion lock.
+
+    ``finish(current)`` makes the unit's own change once the tree is gone (raw_cleaned, discarded), in the same
+    write that records the tree as ``final_state``. ``guard(current)``, when given, raises in the intent's own
+    write if the manifest is no longer the one this deletion was judged on, so nothing is deleted. A record left
+    deleting, partial or removed by an earlier call of the same kind on the same tree is resumed, keeping when
+    it was planned and how much it found.
+    """
+    planned_count, planned_bytes = _tree_size(raw_root)
+    started = datetime.now(timezone.utc).isoformat()
+    record: dict[str, Any] = {}
+
+    def intent(current: dict[str, Any]) -> None:
+        if guard is not None:
+            guard(current)
+        previous = current.get(record_key)
+        resumed = (
+            isinstance(previous, dict)
+            and previous.get("state") in DELETION_RESUMABLE_STATES
+            and previous.get("kind") == kind
+            and _file_key(str(previous.get("target") or "")) == _file_key(str(raw_root))
+        )
+        if resumed:
+            entry = dict(previous)
+            entry["resumed_at"] = [*(previous.get("resumed_at") or []), started]
+        else:
+            entry = {
+                "schema": SPLIT_PARENT_RELEASE_SCHEMA if record_key == "raw_release" else RAW_DELETION_SCHEMA,
+                "kind": kind,
+                "target": str(raw_root),
+                "planned_at": started,
+                "file_count": planned_count,
+                "bytes": planned_bytes,
+                "authorized_by": authorized_by,
+                "kept": kept,
+                "passes": [],
+                **(extra or {}),
+            }
+        entry["state"] = "deleting"
+        current[record_key] = entry
+        record.clear()
+        record.update(entry)
+
+    update_manifest(manifest_path, intent)
+    removal = _remove_raw_tree(raw_root)
+    ended = datetime.now(timezone.utc).isoformat()
+    step = _deletion_pass(removal, ended)
+    if not removal["complete"]:
+        remaining_count, remaining_bytes = _tree_size(raw_root)
+
+        def partial(current: dict[str, Any]) -> None:
+            entry = current.get(record_key) if isinstance(current.get(record_key), dict) else dict(record)
+            entry["state"] = "partial"
+            entry["passes"] = [*(entry.get("passes") or []), step]
+            entry["remaining_file_count"] = remaining_count
+            entry["remaining_bytes"] = remaining_bytes
+            current[record_key] = entry
+            record.clear()
+            record.update(entry)
+
+        update_manifest(manifest_path, partial)
+        return {
+            "deleted": False,
+            "partial": True,
+            "raw_directory": str(raw_root),
+            "manifest_path": str(manifest_path),
+            record_key: record,
+            "blockers": [_deletion_refusal(removal)],
+        }
+
+    def done(current: dict[str, Any]) -> None:
+        entry = current.get(record_key) if isinstance(current.get(record_key), dict) else dict(record)
+        entry["state"] = final_state
+        entry["removed_at" if final_state != "deleted" else "deleted_at"] = ended
+        entry["passes"] = [*(entry.get("passes") or []), step]
+        entry.pop("remaining_file_count", None)
+        entry.pop("remaining_bytes", None)
+        current[record_key] = entry
+        finish(current)
+        record.clear()
+        record.update(entry)
+
+    update_manifest(manifest_path, done)
+    return {"deleted": True, "raw_directory": str(raw_root), "manifest_path": str(manifest_path), record_key: record}
+
+
+def _resumable_deletion(manifest: dict[str, Any], kind: str, raw_root: Path, record_key: str = "raw_deletion") -> bool:
+    previous = manifest.get(record_key)
+    return (
+        isinstance(previous, dict)
+        and previous.get("state") in DELETION_RESUMABLE_STATES
+        and previous.get("kind") == kind
+        and _file_key(str(previous.get("target") or "")) == _file_key(str(raw_root))
+    )
+
+
+def _retained_kept(manifest: dict[str, Any]) -> dict[str, Any]:
+    """What a cleanup leaves: the retained artifacts, by count and by one digest over their inventory."""
+    inventory = [item for item in manifest.get("retained_artifact_inventory") or [] if isinstance(item, dict)]
+    lines = "".join(
+        f"{item.get('path', '')}\t{item.get('size_bytes', 0)}\t{item.get('sha256', '')}\n" for item in inventory
+    )
+    return {
+        "retained_artifact_count": len(manifest.get("retained_artifacts") or []),
+        "retained_artifact_inventory_sha256": hashlib.sha256(lines.encode("utf-8")).hexdigest(),
+    }
+
+
+def cleanup_download_lease(
+    manifest_path: Path,
+    confirmed: bool = False,
+    *,
+    campaign_authorization_path: str | Path | None = None,
+    entry_point: str = "cleanup_download_lease",
+) -> dict[str, Any]:
+    """Delete a validated unit's raw tree, on a person's confirmation or under a campaign approval.
+
+    With neither, this is the preview: plan_download_cleanup, deleting nothing. ``campaign_authorization_path``
+    stands in for confirmed=true only when it covers boundary 5 for the unit (or the unit it was split from)
+    and the approval and the unit both state delete_after_validated_output; it is refused otherwise. Under it
+    every guard of the preview still applies, and nothing is recorded or deleted until the preview is ready;
+    the crossing is then written into the manifest before the first file goes.
+
+    A split parent is released by cleanup_split_parent, which this calls for one. A part's own raw directory
+    is its parent's, so its cleanup is refused as before; its preview carries its parent's plan.
+    """
     from .run_finalisation import (
         BLOCKS_RAW_DELETION,
         FinalisationHeld,
@@ -5600,6 +6287,13 @@ def cleanup_download_lease(manifest_path: Path, confirmed: bool = False) -> dict
     )
 
     manifest_path = manifest_path.resolve()
+    if _is_split_parent(read_manifest(manifest_path)):
+        return cleanup_split_parent(
+            manifest_path,
+            confirmed=confirmed,
+            campaign_authorization_path=campaign_authorization_path,
+            entry_point=entry_point,
+        )
     if raw_deletion_holds(manifest_path):
         # The move the run's finalisation could not make is retried before the preview is drawn, so that
         # the preview describes what the deletion would really remove; what it moves joins the retained
@@ -5607,113 +6301,976 @@ def cleanup_download_lease(manifest_path: Path, confirmed: bool = False) -> dict
         resolve_finalisation_holds(manifest_path)
         refresh_retained_artifacts(manifest_path)
     manifest = read_manifest(manifest_path)
-    if not confirmed:
+    crossing = _deletion_crossing(campaign_authorization_path, manifest, entry_point)
+    if not confirmed and crossing is None:
         # The preview carries the retained artifacts, the target and the size, because a confirmation
         # given without them is not an informed one. It used to return only the flag.
         plan = plan_download_cleanup(manifest_path)
         plan["deleted"] = False
         plan["confirmation_required"] = True
+        owner = _owner_manifest_path(manifest, manifest_path)
+        if owner is not None and owner.is_file():
+            # A part's raw tree is its parent's, released with the parent's once every part has ended.
+            try:
+                plan["split_parent_plan"] = plan_split_parent_cleanup(owner)
+            except (OSError, ValueError) as error:
+                plan["split_parent_plan"] = {"error": str(error)}
         return plan
-    if manifest.get("status") not in CLEANUP_READY_STATUSES or not manifest.get("cleanup_allowed"):
-        raise ValueError("Raw cleanup requires a completed/validated manifest with cleanup_allowed=true.")
-    retained = [Path(value) for value in manifest.get("retained_artifacts", [])]
-    if not retained or any(not os.path.exists(extended_path(path)) for path in retained):
-        raise ValueError("Retained mzTab-M/provenance artifacts are missing; raw cleanup was refused.")
-    raw_root = Path(manifest["raw_directory"]).resolve()
-    workspace = Path(manifest["workspace"]).resolve()
+    raw_root = Path(str(manifest.get("raw_directory") or "")).resolve()
+    with _raw_deletion_lock(manifest_path):
+        manifest = read_manifest(manifest_path)
+        resuming = _resumable_deletion(manifest, "cleanup", raw_root)
+        if crossing is not None:
+            plan = plan_download_cleanup(manifest_path)
+            if plan["blockers"] or not (plan["deletion_file_count"] > 0 or resuming):
+                owner = _owner_manifest_path(manifest, manifest_path)
+                if owner is not None and owner.is_file():
+                    try:
+                        plan["split_parent_plan"] = plan_split_parent_cleanup(owner)
+                    except (OSError, ValueError) as error:
+                        plan["split_parent_plan"] = {"error": str(error)}
+                return {
+                    **plan,
+                    "deleted": False,
+                    "confirmation_required": False,
+                    "campaign_authorization": crossing,
+                    "message": "Nothing was deleted: the approval covers this unit, but the deletion is not ready.",
+                }
+        else:
+            if manifest.get("status") not in CLEANUP_READY_STATUSES or not manifest.get("cleanup_allowed"):
+                raise ValueError("Raw cleanup requires a completed/validated manifest with cleanup_allowed=true.")
+            retained = [Path(value) for value in manifest.get("retained_artifacts", [])]
+            if not retained or any(not os.path.exists(extended_path(path)) for path in retained):
+                raise ValueError("Retained mzTab-M/provenance artifacts are missing; raw cleanup was refused.")
+            workspace = Path(manifest["workspace"]).resolve()
+            if raw_root.parent != workspace or raw_root.name != "raw":
+                raise ValueError("Raw directory is outside the expected project workspace.")
+            under = _paths_under([str(path) for path in retained], raw_root)
+            if under:
+                raise ValueError(
+                    f"{len(under)} retained artifact(s) lie under the raw directory, and deleting it would delete "
+                    f"them (the first is {under[0]}); raw cleanup was refused."
+                )
+            held = raw_deletion_holds(manifest_path, manifest)
+            if held:
+                raise FinalisationHeld(
+                    BLOCKS_RAW_DELETION,
+                    "MS-DIAL containers are still in the raw directory, and deleting it would delete them; raw "
+                    "cleanup was refused", held,
+                )
+        if crossing is not None:
+            record_campaign_authorization(manifest_path, crossing)
+        cleaned_at = datetime.now(timezone.utc).isoformat()
+
+        def change(current: dict[str, Any]) -> None:
+            current["status"] = "raw_cleaned"
+            current["raw_cleaned_at"] = cleaned_at
+
+        result = _delete_raw_tree(
+            manifest_path,
+            raw_root,
+            kind="cleanup",
+            authorized_by=_authorized_by(crossing),
+            kept=_retained_kept(manifest),
+            finish=change,
+        )
+    if crossing is not None:
+        result["campaign_authorization"] = crossing
+    return result
+
+
+def _authorized_by(crossing: dict[str, Any] | None) -> dict[str, Any]:
+    if crossing is None:
+        return {"kind": "confirmed"}
+    return {
+        "kind": "campaign_authorization",
+        **{
+            key: crossing.get(key)
+            for key in ("approval_id", "campaign_id", "manifest_digest", "authorization_sha256", "covered_as", "boundary")
+        },
+    }
+
+
+def _write_failure_record(path: Path, value: Any, minimal: Any, context: Any) -> dict[str, Any]:
+    """Write one failure artifact, atomically and with no lock file beside it, and describe it.
+
+    It lies under output, which is shared, so it is written as a shared artifact: ``value`` has been through
+    ``context`` (sharing.SharingContext), and its bytes are scanned with the gate's patterns before they are
+    written. Should anything still match, ``minimal`` - identifiers, codes and times, no free text - is written
+    instead; should that match too, SharingError is raised and nothing is written.
+    """
+    from .sharing import SharingError
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    reduced = bool(context.scan(path.name, data))
+    if reduced:
+        data = (json.dumps(minimal, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        findings = context.scan(path.name, data)
+        if findings:
+            raise SharingError(path.name, findings)
+    _replace_atomically(path, data)
+    return {
+        "path": str(path),
+        "size_bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        **({"free_text_withheld": True} if reduced else {}),
+    }
+
+
+# A run attempt's fields a shared failure record carries: no output directory, backend host or process, and
+# no stop detail, all of which are this machine's.
+_SHARED_ATTEMPT_FIELDS = (
+    "attempt_id", "attempt", "job_id", "kind", "started_at", "ended_at", "exit_code", "reason", "command_sha256",
+    "timeout_seconds", "idle_timeout_seconds", "start_unrecorded",
+)
+_SHARED_CONSOLE_FIELDS = ("version", "binary_sha256", "assembly_sha256", "inventory_sha256", "provenance_status")
+
+
+def _shared_run_failure(item: dict[str, Any], context: Any, *, free_text: bool = True) -> dict[str, Any]:
+    """One run failure as a shared record carries it: its reason redacted, and no log lines.
+
+    The log tail stays in the provenance manifest only. It is the Console's own output, and the Console prints a
+    library's full location when it cannot open it ("MSP file was not found: <location>").
+    """
+    tail = item.get("log_tail") if isinstance(item.get("log_tail"), list) else []
+    return {
+        **({"reason": context.text(str(item.get("reason") or ""))} if free_text else {}),
+        "exit_code": item.get("exit_code"),
+        "recorded_at": item.get("recorded_at"),
+        "log_tail_line_count": len(tail),
+    }
+
+
+def _shared_run_attempt(item: dict[str, Any], context: Any) -> dict[str, Any]:
+    console = item.get("console") if isinstance(item.get("console"), dict) else {}
+    shared = {key: item[key] for key in _SHARED_ATTEMPT_FIELDS if key in item}
+    shared["console"] = {key: console[key] for key in _SHARED_CONSOLE_FIELDS if key in console}
+    return context.view(shared)
+
+
+def _validation_minimal(validation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "summary": validation.get("summary") or {},
+        "files": [
+            {
+                "file_name": str(item.get("file_name") or ""),
+                "status": item.get("status"),
+                "error_count": len(item.get("errors") or []),
+                "warning_count": len(item.get("warnings") or []),
+            }
+            for item in validation.get("files") or []
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _failure_artifacts(manifest_path: Path, manifest: dict[str, Any], output: Path, at: str) -> dict[str, Any] | None:
+    """Keep what a failed run left as failure artifacts under its output: its mzTab-M, validated now, and its
+    failure record. None when there is neither an mzTab-M nor a recorded failure.
+
+    The mzTab-M stays where the run wrote it and is never deleted: it is evidence of how the run failed. Its
+    validation and the unit's failure record are written beside the outputs, in failure-artifacts/, because
+    the manifest that also holds them is no file anyone shares. Neither name holds "mztab", which is how
+    find_mztab_files recognises an mzTab-M by name.
+
+    Output is what is shared, so both are written as the unit's other shared artifacts are
+    (sharing.SharingContext for its manifest; shared_path_policy declared): the raw directory becomes raw/,
+    the workspace the root of a relative path, and any other location is withheld. The failure record carries
+    each failure's reason, exit code and time and each attempt's identifiers, never a log line, a backend's
+    host or an output directory: the full record stays in the provenance manifest.
+    """
+    from .mztab_validation import validate_mztab_files
+    from .sharing import PATH_POLICY, SharingContext
+
+    mztab = [Path(item) for item in _mztab_outputs(output)]
+    failures = [item for item in manifest.get("run_failures") or [] if isinstance(item, dict)]
+    if not mztab and not failures:
+        return None
+    context = SharingContext.for_state({"repository_run_manifest": str(manifest_path)}, run_directory=output)
+    declared = {"shared_path_policy": PATH_POLICY, "shared_paths": context.describe()}
+    directory = output / FAILURE_ARTIFACTS_DIRECTORY
+    files: list[dict[str, Any]] = []
+    summary: dict[str, Any] = {}
+    for path in mztab:
+        files.append({**_artifact_inventory(path), "kind": "mztab"})
+    if mztab:
+        validation = validate_mztab_files(mztab, output)
+        summary = dict(validation.get("summary") or {})
+        head = {"schema": "msdial-failed-run-output-validation.v1", "validated_at": at, **declared}
+        files.append(
+            {
+                **_write_failure_record(
+                    directory / FAILURE_VALIDATION_RECORD,
+                    {**head, **context.view(validation)},
+                    {**head, **_validation_minimal(validation)},
+                    context,
+                ),
+                "kind": "mztab_validation",
+            }
+        )
+    attempts = [item for item in manifest.get("run_attempts") or [] if isinstance(item, dict)][-10:]
+    head = {
+        "schema": "msdial-run-failure-record.v1",
+        "recorded_at": at,
+        **declared,
+        "analysis_unit_id": str((manifest.get("project") or {}).get("analysis_unit_id") or ""),
+        "status": manifest.get("status"),
+        "full_record": "run_failures and run_attempts in the unit's provenance manifest, which is not shared",
+    }
+    files.append(
+        {
+            **_write_failure_record(
+                directory / FAILURE_RUN_RECORD,
+                {
+                    **head,
+                    "run_failures": [_shared_run_failure(item, context) for item in failures],
+                    "run_attempts": [_shared_run_attempt(item, context) for item in attempts],
+                },
+                {
+                    **head,
+                    "run_failures": [_shared_run_failure(item, context, free_text=False) for item in failures],
+                    "run_attempts": [
+                        {key: item.get(key) for key in ("attempt_id", "attempt", "started_at", "ended_at", "exit_code")}
+                        for item in attempts
+                    ],
+                },
+                context,
+            ),
+            "kind": "run_failure_record",
+        }
+    )
+    return {
+        "schema": FAILURE_ARTIFACTS_SCHEMA,
+        "recorded_at": at,
+        "directory": str(directory),
+        "mztab_validation_status": summary.get("status") if summary else None,
+        "files": files,
+    }
+
+
+def _mztab_outputs(output: Path) -> list[str]:
+    from .mztab_validation import find_mztab_files
+
+    return [str(path) for path in find_mztab_files(output)] if str(output).strip() and output.is_dir() else []
+
+
+def plan_download_discard(manifest_path: Path, *, authorized: bool = False) -> dict[str, Any]:
+    """Describe what discarding a unit's raw data would remove and keep, and what refuses it. Changes nothing.
+
+    ``authorized`` is whether a campaign approval covers the discard. Under one a failed unit whose output holds
+    an mzTab-M - unvalidated, or invalid - may be discarded, its mzTab-M kept as a failure artifact; with
+    confirmed=true alone such a unit is refused, as it always was.
+    """
+    from .run_finalisation import describe_holds, raw_deletion_holds
+
+    manifest_path = manifest_path.resolve()
+    manifest = read_manifest(manifest_path)
+    status = str(manifest.get("status") or "")
+    raw_root = Path(str(manifest.get("raw_directory") or "")).resolve()
+    workspace = Path(str(manifest.get("workspace") or "")).resolve()
+    output = Path(str(manifest.get("output_directory") or ""))
+    mztab = _mztab_outputs(output)
+    file_count, total_bytes = _tree_size(raw_root)
+    blockers: list[str] = []
+    if status in {"mztab_validated", "completed", "cleanup_pending_confirmation", "raw_cleaned"}:
+        blockers.append("Validated/completed runs must use the normal cleanup command.")
+    if status == "downloading":
+        owner_state = lease_owner_state(manifest)
+        if owner_state["state"] != "gone":
+            blockers.append(
+                "This unit's lease is recorded as still downloading, and its owner is not provably gone "
+                f"({owner_state['reason']})."
+            )
+    attempt = _live_run_attempt_in(manifest)
+    if attempt is not None:
+        blockers.append(
+            f"Run attempt {attempt.get('attempt_id') or '?'} of job {attempt.get('job_id') or 'unrecorded'} may still "
+            "have its MS-DIAL Console reading the raw tree."
+        )
+    if mztab and not authorized:
+        blockers.append("mzTab-M output exists; finalize the run before deleting raw data.")
     if raw_root.parent != workspace or raw_root.name != "raw":
-        raise ValueError("Raw directory is outside the expected project workspace.")
+        blockers.append("Raw directory is outside the expected project workspace.")
+    kept = [str(item) for item in manifest.get("retained_artifacts") or []] + [
+        str(item.get("path") or "") for item in ((manifest.get("failure_artifacts") or {}).get("files") or [])
+        if isinstance(item, dict)
+    ] + mztab
+    under = _paths_under(kept, raw_root)
+    if under:
+        blockers.append(
+            f"{len(under)} retained or failure artifact(s) lie under the raw directory, so its deletion would "
+            f"delete them; the first is {under[0]}."
+        )
     held = raw_deletion_holds(manifest_path, manifest)
     if held:
-        raise FinalisationHeld(
-            BLOCKS_RAW_DELETION,
-            "MS-DIAL containers are still in the raw directory, and deleting it would delete them; raw cleanup "
-            "was refused", held,
+        blockers.append(
+            "finalisation_held [raw_deletion]: MS-DIAL containers a finished run could not move are still in the raw "
+            "directory: " + describe_holds(held) + "."
         )
-    shutil.rmtree(raw_root)
-    cleaned_at = datetime.now(timezone.utc).isoformat()
+    return {
+        **({"finalisation_holds": held} if held else {}),
+        "manifest_path": str(manifest_path),
+        "status": status,
+        "retention_policy": manifest.get("raw_retention_policy"),
+        "deletion_target": str(raw_root),
+        "deletion_file_count": file_count,
+        "deletion_bytes": total_bytes,
+        "mztab_files": mztab,
+        # Kept under output whatever the deletion does; under an approval written as failure artifacts first.
+        "failure_artifacts_kept": bool(authorized and (mztab or manifest.get("run_failures"))),
+        **({"raw_deletion": manifest["raw_deletion"]} if isinstance(manifest.get("raw_deletion"), dict) else {}),
+        "blockers": blockers,
+    }
 
-    def change(current: dict[str, Any]) -> None:
-        current["status"] = "raw_cleaned"
-        current["raw_cleaned_at"] = cleaned_at
 
-    update_manifest(manifest_path, change)
-    return {"deleted": True, "raw_directory": str(raw_root), "manifest_path": str(manifest_path)}
+def _discard_finished(manifest: dict[str, Any], raw_root: Path, *, authorized: bool) -> dict[str, Any] | None:
+    """The deletion record of this unit's discard when the discard was made and has finished, else None.
+
+    Finished: the unit is discarded, and its raw_deletion is of kind discard, for this tree, and deleted. Under
+    an approval, a unit discarded before deletions were recorded, which carries no record, has finished too
+    ({}). A deleting or partial record has not: that deletion is resumed. Without an approval such a legacy
+    unit is discarded again, as it always was.
+    """
+    if manifest.get("status") != "discarded":
+        return None
+    record = manifest.get("raw_deletion")
+    if isinstance(record, dict):
+        same = record.get("kind") == "discard" and _file_key(str(record.get("target") or "")) == _file_key(str(raw_root))
+        return record if same and record.get("state") == "deleted" else None
+    return {} if authorized else None
 
 
-def discard_download_lease(manifest_path: Path, confirmed: bool = False) -> dict[str, Any]:
+def _discard_made(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    raw_root: Path,
+    record: dict[str, Any],
+    crossing: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """A discard asked for again once it has finished: the record it made, with nothing deleted or rewritten.
+
+    A caller that repeats a discard - a runner that stopped after the discard and before it recorded the result -
+    must not replace the first deletion's accounting with an empty one, rewrite the failure record as the
+    discarded unit's, or record another crossing. A raw tree that holds files again, which no deletion of this
+    unit made, is a refusal: the unit's own record says its tree is gone.
+    """
+    remaining, remaining_bytes = _tree_size(raw_root)
+    if remaining:
+        when = f"at {record['deleted_at']}" if record.get("deleted_at") else "earlier"
+        message = (
+            f"This unit's raw data were discarded ({when}), yet its raw directory holds {remaining} file(s) "
+            f"({remaining_bytes} bytes) again, which no deletion of this unit made; nothing was deleted or recorded."
+        )
+        if crossing is None:
+            raise ValueError(message)
+        return {
+            "deleted": False,
+            "confirmation_required": False,
+            "manifest_path": str(manifest_path),
+            "status": manifest.get("status"),
+            "deletion_target": str(raw_root),
+            "deletion_file_count": remaining,
+            "deletion_bytes": remaining_bytes,
+            "campaign_authorization": crossing,
+            "blockers": [message],
+            "message": "Nothing was deleted: the approval covers this unit, but its discard was already made.",
+        }
+    kept = manifest.get("failure_artifacts")
+    return {
+        "deleted": True,
+        "already_discarded": True,
+        "raw_directory": str(raw_root),
+        "manifest_path": str(manifest_path),
+        **({"raw_deletion": record} if record else {}),
+        **({"failure_artifacts": kept} if isinstance(kept, dict) else {}),
+    }
+
+
+def discard_download_lease(
+    manifest_path: Path,
+    confirmed: bool = False,
+    *,
+    campaign_authorization_path: str | Path | None = None,
+    entry_point: str = "discard_download_lease",
+) -> dict[str, Any]:
+    """Delete the raw data of a unit that produced no validated output.
+
+    With confirmed=false and no approval this is a preview that deletes nothing. ``campaign_authorization_path``
+    stands in for confirmed=true when it covers boundary 5 for the unit, or the unit it was split from, and the
+    approval and the unit both state delete_after_validated_output. Under it, and only under it, a failed unit
+    whose output holds an mzTab-M - unvalidated, or invalid - is discarded too: that mzTab-M, its validation
+    and the unit's failure record are kept as failure artifacts under output (failure_artifacts), and none of
+    them is deleted. A refusal under an approval is returned as blockers, with nothing recorded or deleted;
+    with confirmed=true it is raised, as it always was.
+
+    A discard that has finished, asked for again, returns its record (already_discarded) and writes nothing;
+    one that stopped part-way is resumed, keeping the failure artifacts it wrote first (_discard_finished).
+
+    A split parent is released by cleanup_split_parent, which this calls for one. A part's raw data are its
+    parent's: under an approval its discard records that the part has ended, deleting nothing, and its parent's
+    tree goes with the parent's release.
+    """
     from .mztab_validation import find_mztab_files
 
     manifest_path = manifest_path.resolve()
     manifest = read_manifest(manifest_path)
+    if _is_split_parent(manifest):
+        return cleanup_split_parent(
+            manifest_path,
+            confirmed=confirmed,
+            campaign_authorization_path=campaign_authorization_path,
+            entry_point=entry_point,
+        )
+    crossing = _deletion_crossing(campaign_authorization_path, manifest, entry_point)
+    owner = _owner_manifest_path(manifest, manifest_path)
+    if owner is not None and crossing is not None:
+        return _discard_split_part(manifest_path, owner, crossing)
     downloading = manifest.get("status") == "downloading"
     owner_state = lease_owner_state(manifest) if downloading else None
-    if not confirmed:
-        preview = {"deleted": False, "confirmation_required": True, "manifest_path": str(manifest_path)}
+    if not confirmed and crossing is None:
+        preview = {
+            "deleted": False,
+            "confirmation_required": True,
+            "manifest_path": str(manifest_path),
+            "plan": plan_download_discard(manifest_path),
+        }
         if owner_state is not None:
             preview["lease_owner_state"] = owner_state
         return preview
-    if manifest.get("status") in {"mztab_validated", "completed", "raw_cleaned"}:
-        raise ValueError("Validated/completed runs must use the normal cleanup command.")
-    stale: dict[str, Any] | None = None
-    if downloading:
-        # Written before the first byte of a lease. A lease that is still running writes into the tree
-        # this would delete. One whose process is provably gone - killed with it by a reboot or a
-        # backend stop, so it never wrote download_failed - never will, and its bytes are released here
-        # rather than kept until someone downloads the unit again. Possibly alive is not gone.
-        if owner_state["state"] != "gone":
-            raise ValueError(
-                "This unit's lease is recorded as still downloading, and its owner is not provably gone "
-                f"({owner_state['reason']}); retry or finish the lease before discarding its raw data."
-            )
-        stale = {
-            "lease_owner": manifest.get("lease_owner"),
-            "evidence": owner_state["reason"],
-            "last_heartbeat_at": manifest.get("download_progress_at"),
-        }
-    output = Path(manifest.get("output_directory", ""))
-    if find_mztab_files(output):
-        raise ValueError("mzTab-M output exists; finalize the run before deleting raw data.")
-    raw_root = Path(manifest["raw_directory"]).resolve()
-    workspace = Path(manifest["workspace"]).resolve()
-    if raw_root.parent != workspace or raw_root.name != "raw":
-        raise ValueError("Raw directory is outside the expected project workspace.")
     from .run_finalisation import BLOCKS_RAW_DELETION, FinalisationHeld, raw_deletion_holds
 
+    raw_root = Path(str(manifest.get("raw_directory") or "")).resolve()
+    with _raw_deletion_lock(manifest_path):
+        manifest = read_manifest(manifest_path)
+        finished = _discard_finished(manifest, raw_root, authorized=crossing is not None)
+        if finished is not None:
+            return _discard_made(manifest_path, manifest, raw_root, finished, crossing)
+        downloading = manifest.get("status") == "downloading"
+        owner_state = lease_owner_state(manifest) if downloading else None
+        if crossing is not None:
+            plan = plan_download_discard(manifest_path, authorized=True)
+            if plan["blockers"]:
+                return {
+                    **plan,
+                    "deleted": False,
+                    "confirmation_required": False,
+                    "campaign_authorization": crossing,
+                    "message": "Nothing was deleted: the approval covers this unit, but the discard is refused.",
+                }
+        elif manifest.get("status") in {"mztab_validated", "completed", "raw_cleaned"}:
+            raise ValueError("Validated/completed runs must use the normal cleanup command.")
+        stale: dict[str, Any] | None = None
+        if downloading:
+            # Written before the first byte of a lease. A lease that is still running writes into the tree
+            # this would delete. One whose process is provably gone - killed with it by a reboot or a
+            # backend stop, so it never wrote download_failed - never will, and its bytes are released here
+            # rather than kept until someone downloads the unit again. Possibly alive is not gone.
+            if owner_state["state"] != "gone":
+                raise ValueError(
+                    "This unit's lease is recorded as still downloading, and its owner is not provably gone "
+                    f"({owner_state['reason']}); retry or finish the lease before discarding its raw data."
+                )
+            stale = {
+                "lease_owner": manifest.get("lease_owner"),
+                "evidence": owner_state["reason"],
+                "last_heartbeat_at": manifest.get("download_progress_at"),
+            }
+        output = Path(manifest.get("output_directory", ""))
+        if crossing is None:
+            if find_mztab_files(output):
+                raise ValueError("mzTab-M output exists; finalize the run before deleting raw data.")
+            workspace = Path(manifest["workspace"]).resolve()
+            if raw_root.parent != workspace or raw_root.name != "raw":
+                raise ValueError("Raw directory is outside the expected project workspace.")
+            held = raw_deletion_holds(manifest_path, manifest)
+            if held:
+                raise FinalisationHeld(
+                    BLOCKS_RAW_DELETION,
+                    "MS-DIAL containers a finished run could not move are still in the raw directory, and the "
+                    "cleanup command retries the move; discard was refused", held,
+                )
+            attempt = _live_run_attempt_in(manifest)
+            if attempt is not None:
+                raise ValueError(
+                    f"Run attempt {attempt.get('attempt_id') or '?'} of this unit may still have its MS-DIAL Console "
+                    "reading the raw tree; discard was refused."
+                )
+            under = _paths_under([str(item) for item in manifest.get("retained_artifacts") or []], raw_root)
+            if under:
+                raise ValueError(
+                    f"{len(under)} retained artifact(s) lie under the raw directory, and deleting it would delete "
+                    f"them (the first is {under[0]}); discard was refused."
+                )
+        discarded_at = datetime.now(timezone.utc).isoformat()
+        # A deletion an earlier call began and did not finish keeps the failure artifacts it wrote first: they
+        # were written from the failed unit, and are not written again from one half deleted.
+        kept_before = (
+            manifest.get("failure_artifacts")
+            if _resumable_deletion(manifest, "discard", raw_root) and isinstance(manifest.get("failure_artifacts"), dict)
+            else None
+        )
+        failure_artifacts = (
+            (kept_before or _failure_artifacts(manifest_path, manifest, output, discarded_at))
+            if crossing is not None
+            else None
+        )
+        if crossing is not None:
+            record_campaign_authorization(manifest_path, crossing)
+        if failure_artifacts is not None and kept_before is None:
+            # Written before the first file goes, so a deletion that stops still names what it keeps.
+            def keep(current: dict[str, Any]) -> None:
+                current["failure_artifacts"] = failure_artifacts
+
+            update_manifest(manifest_path, keep)
+        mztab_kept = [item["path"] for item in (failure_artifacts or {}).get("files") or [] if item["kind"] == "mztab"]
+
+        def same_lease(current: dict[str, Any]) -> None:
+            if stale is not None and (current.get("lease_owner") or {}).get("lease_id") != (
+                (stale["lease_owner"] or {}).get("lease_id")
+            ):
+                # Another lease took the workspace over after the check. Its record is not this discard's.
+                raise ValueError(
+                    "A new lease took this workspace over while its stale lease was being discarded; the new "
+                    "lease's record was left as it is."
+                )
+
+        def change(current: dict[str, Any]) -> None:
+            same_lease(current)
+            current["status"] = "discarded"
+            current["discarded_at"] = discarded_at
+            if stale is not None:
+                current["discard_reason"] = "The lease's process stopped before it recorded its inputs or its failure."
+                current["stale_lease_discarded"] = {**stale, "discarded_at": discarded_at}
+            elif mztab_kept:
+                current["discard_reason"] = (
+                    "The run produced no validated mzTab-M output. Its raw data were deleted under the campaign "
+                    "approval; its mzTab-M, that mzTab-M's validation and its failure record are kept as failure "
+                    "artifacts."
+                )
+            else:
+                current["discard_reason"] = (
+                    "Preflight/download was rejected before a retained mzTab-M result was produced."
+                )
+
+        kept: dict[str, Any] = {
+            "retained_artifact_count": len(manifest.get("retained_artifacts") or []),
+            "failure_artifact_count": len((failure_artifacts or {}).get("files") or []),
+            "mztab_kept": mztab_kept,
+        }
+        result = _delete_raw_tree(
+            manifest_path,
+            raw_root,
+            kind="discard",
+            authorized_by=_authorized_by(crossing),
+            kept=kept,
+            finish=change,
+            # Checked again before the first file goes, not only after the last.
+            guard=same_lease,
+        )
+    if stale is not None and result.get("deleted"):
+        result["stale_lease_discarded"] = True
+    if failure_artifacts is not None:
+        result["failure_artifacts"] = failure_artifacts
+    if crossing is not None:
+        result["campaign_authorization"] = crossing
+    return result
+
+
+def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[str, Any]) -> dict[str, Any]:
+    """Record under an approval that a split part has ended without validated output. Deletes nothing.
+
+    The part's raw tree is its parent's, read by every other part, and goes only with the parent's release
+    (cleanup_split_parent). What a part's discard can do is say that this part no longer needs it - a run
+    failed after its retries, a refusal before production - which is what lets the parent's release count it
+    as ended. Its output is kept, an mzTab-M and its failure record among the failure artifacts.
+    """
+    with _raw_deletion_lock(manifest_path):
+        manifest = read_manifest(manifest_path)
+        status = str(manifest.get("status") or "")
+        blockers: list[str] = []
+        if status in {"mztab_validated", "completed", "cleanup_pending_confirmation", "raw_cleaned"}:
+            blockers.append("Validated/completed runs must use the normal cleanup command.")
+        attempt = _live_run_attempt_in(manifest)
+        if attempt is not None:
+            blockers.append(
+                f"Run attempt {attempt.get('attempt_id') or '?'} of job {attempt.get('job_id') or 'unrecorded'} may "
+                "still have its MS-DIAL Console reading the raw tree."
+            )
+        if blockers:
+            return {
+                "deleted": False,
+                "confirmation_required": False,
+                "manifest_path": str(manifest_path),
+                "status": status,
+                "campaign_authorization": crossing,
+                "blockers": blockers,
+                "message": "Nothing was recorded: the approval covers this part, but its discard is refused.",
+            }
+        if status == "discarded":
+            ended = {"already_discarded": True}
+        else:
+            at = datetime.now(timezone.utc).isoformat()
+            output = Path(str(manifest.get("output_directory") or ""))
+            failure_artifacts = _failure_artifacts(manifest_path, manifest, output, at)
+            record_campaign_authorization(manifest_path, crossing)
+
+            def change(current: dict[str, Any]) -> None:
+                current["status"] = "discarded"
+                current["discarded_at"] = at
+                current["discard_reason"] = (
+                    "The part ended without validated output. Its raw data are its parent's, and are released "
+                    "with the parent's once every part has ended."
+                )
+                current["raw_release_deferred_to"] = str(parent_path)
+                if failure_artifacts is not None:
+                    current["failure_artifacts"] = failure_artifacts
+
+            update_manifest(manifest_path, change)
+            ended = {**({"failure_artifacts": failure_artifacts} if failure_artifacts else {})}
+    try:
+        parent_plan = plan_split_parent_cleanup(parent_path)
+    except (OSError, ValueError) as error:
+        parent_plan = {"error": str(error)}
+    return {
+        "deleted": False,
+        "part_ended": True,
+        "manifest_path": str(manifest_path),
+        "raw_release_deferred_to": str(parent_path),
+        "split_parent_plan": parent_plan,
+        "campaign_authorization": crossing,
+        **ended,
+    }
+
+
+# ---- releasing a split parent's raw tree -----------------------------------------------------------------
+
+
+def _part_end(part: dict[str, Any], parent_raw: Path) -> dict[str, Any]:
+    """How one split part stands for its parent's raw release: its state, whether it has ended, what blocks.
+
+    Ended means one of: validated (a cleanup-ready status, cleanup_allowed, no mzTab-M that failed, every
+    retained artifact present and none under the parent's raw tree); released (raw_cleaned, by an earlier pass
+    of this release); failed after its retries (CAMPAIGN_RUN_ATTEMPTS recorded run failures, which the post-run
+    hook records for a Console that exits non-zero and for one that exits 0 without a validated mzTab-M alike);
+    skipped or excluded (by its campaign disposition, or at the split); or discarded (its own discard under an
+    approval). Anything else - not yet preflighted, prepared, running, failed with retries left - has not.
+    """
+    status = str(part.get("status") or "")
+    blockers: list[str] = []
+    failures = len([item for item in part.get("run_failures") or [] if isinstance(item, dict)])
+    retained = [str(item) for item in part.get("retained_artifacts") or []]
+    if status in CLEANUP_READY_STATUSES or status == "raw_cleaned":
+        state = "released" if status == "raw_cleaned" else "validated"
+        if state == "validated" and not part.get("cleanup_allowed"):
+            blockers.append("cleanup_allowed is not true")
+        failed = ((part.get("mztab_validation") or {}).get("summary") or {}).get("failed")
+        if failed:
+            blockers.append(f"{failed} of its mzTab-M file(s) failed validation")
+        if not retained:
+            blockers.append("no retained artifacts are recorded")
+        missing = [item for item in retained if not os.path.exists(extended_path(item))]
+        if missing:
+            blockers.append(f"{len(missing)} of its retained artifacts are missing")
+    elif status == SKIPPED_BY_PREFLIGHT_STATUS:
+        state = "skipped"
+    elif status == EXCLUDED_BY_PREFLIGHT_STATUS:
+        state = "excluded"
+    elif status == "discarded":
+        state = "discarded"
+    elif status in {"run_failed", "validation_failed"} and failures >= CAMPAIGN_RUN_ATTEMPTS:
+        state = "failed"
+    else:
+        state = "pending"
+        blockers.append(
+            f"it is {status or 'unrecorded'!r}"
+            + (
+                f", with {failures} of {CAMPAIGN_RUN_ATTEMPTS} runs failed"
+                if status in {"run_failed", "validation_failed"}
+                else ""
+            )
+            + ", and has not ended"
+        )
+    kept = retained + [
+        str(item.get("path") or "") for item in ((part.get("failure_artifacts") or {}).get("files") or [])
+        if isinstance(item, dict)
+    ]
+    under = _paths_under(kept, parent_raw)
+    if under:
+        blockers.append(f"{len(under)} of its retained or failure artifacts lie under the parent's raw tree")
+    attempt = _live_run_attempt_in(part)
+    if attempt is not None:
+        blockers.append(f"run attempt {attempt.get('attempt_id') or '?'} may still have its MS-DIAL Console running")
+    mztab = [
+        {"path": str(item.get("path") or ""), "sha256": str(item.get("sha256") or "")}
+        for item in part.get("retained_artifact_inventory") or []
+        if isinstance(item, dict) and str(item.get("path") or "").casefold().endswith(".mztab")
+    ]
+    return {
+        "state": state,
+        "ended": state != "pending",
+        "blockers": blockers,
+        "status": status,
+        "run_failures": failures,
+        "retained_artifact_count": len(retained),
+        "mztab_files": mztab,
+    }
+
+
+def plan_split_parent_cleanup(manifest_path: Path) -> dict[str, Any]:
+    """Describe the release of a split parent's raw tree, and what still refuses it. Changes nothing.
+
+    WHAT A SPLIT PARENT IS. The unit that downloaded the data and owns <workspace>\\raw, which every part split
+    from it reads in place. It never runs, and its tree can go only once no part will read it again. Released
+    when every condition holds:
+
+    1. The parent is split_by_acquisition, names its parts, and its raw directory is <workspace>\\raw.
+    2. Its raw_retention_policy is delete_after_validated_output: a unit kept under keep (MTBLS2207) is never
+       released.
+    3. Every part's manifest is readable and names this parent, its manifest and its raw directory, as SPL-1
+       reads them.
+    4. The parts' inputs, with the inputs a campaign disposition excluded, are the parent's inputs, each once.
+    5. Every part has ended (_part_end): validated, released, failed after its retries, skipped, excluded or
+       discarded; none has a Console that may still be running, and none keeps an artifact under the tree.
+    6. No finalisation hold stands on the parent or a part (run_finalisation.raw_deletion_holds).
+
+    The release is ``released`` when some part's outputs validated, else ``discarded``. The authorization - a
+    person's confirmed=true or a campaign approval covering boundary 5 for the parent - is cleanup_split_parent's
+    to check; this reports what the deletion would remove and each part's state.
+    """
+    from .run_finalisation import describe_holds, raw_deletion_holds
+
+    manifest_path = Path(manifest_path).resolve()
+    manifest = read_manifest(manifest_path)
+    project = manifest.get("project") or {}
+    raw_root = Path(str(manifest.get("raw_directory") or "")).resolve()
+    workspace = Path(str(manifest.get("workspace") or "")).resolve()
+    blockers: list[str] = []
+    if manifest.get("status") != SPLIT_PARENT_STATUS:
+        blockers.append(
+            f"The unit is {manifest.get('status') or 'unrecorded'!r}, not {SPLIT_PARENT_STATUS!r}; only a split "
+            "parent's raw tree is released here."
+        )
+    listed = [item for item in manifest.get("split_into") or [] if isinstance(item, dict)]
+    if not listed:
+        blockers.append("The parent names no parts.")
+    if not str(manifest.get("raw_directory") or "").strip() or raw_root.parent != workspace or raw_root.name != "raw":
+        blockers.append("The raw directory is not the expected 'raw' folder inside the parent's workspace.")
+    policy = str(manifest.get("raw_retention_policy") or "keep")
+    if policy != "delete_after_validated_output":
+        blockers.append(f"The parent's raw retention policy is {policy!r}; its raw data are kept.")
+
+    parts: list[dict[str, Any]] = []
+    claimed: list[str] = []
+    for item in listed:
+        part_path = Path(str(item.get("manifest_path") or "")).expanduser()
+        unit_id = str(item.get("analysis_unit_id") or "")
+        try:
+            part = read_manifest(part_path)
+        except (OSError, ValueError) as error:
+            blockers.append(f"The manifest of part {unit_id or part_path} could not be read: {error}.")
+            parts.append({"analysis_unit_id": unit_id, "manifest_path": str(part_path), "state": "unreadable", "ended": False})
+            continue
+        problems = []
+        if _file_key(str((part.get("split_from") or {}).get("manifest_path") or "")) != _file_key(str(manifest_path)):
+            problems.append("its split_from names another parent")
+        if _file_key(str(part.get("raw_owned_by") or "")) != _file_key(str(manifest_path)):
+            problems.append("its raw_owned_by names another unit")
+        if _file_key(str(part.get("raw_directory") or "")) != _file_key(str(raw_root)):
+            problems.append("its raw_directory is not the parent's")
+        end = _part_end(part, raw_root)
+        for problem in problems + end["blockers"]:
+            blockers.append(f"Part {unit_id or part_path}: {problem}.")
+        claimed.extend(str(path) for path in part.get("input_candidates") or [] if str(path).strip())
+        parts.append({"analysis_unit_id": unit_id, "manifest_path": str(part_path), **end})
+
+    excluded = {
+        *(_file_key(str(item.get("path"))) for item in manifest.get("split_excluded_inputs") or []
+          if isinstance(item, dict) and str(item.get("path") or "").strip()),
+        *_campaign_excluded_inputs(manifest),
+    }
+    candidates = sorted(_file_key(str(item)) for item in manifest.get("input_candidates") or [] if str(item).strip())
+    accounted = sorted([_file_key(item) for item in claimed] + [key for key in excluded if key in set(candidates)])
+    if listed and accounted != candidates:
+        blockers.append(
+            f"The parts hold {len(claimed)} inputs and the excluded ones {len(accounted) - len(claimed)}, against the "
+            f"parent's {len(candidates)} input candidates: they are not the parent's inputs, each once."
+        )
     held = raw_deletion_holds(manifest_path, manifest)
     if held:
-        raise FinalisationHeld(
-            BLOCKS_RAW_DELETION,
-            "MS-DIAL containers a finished run could not move are still in the raw directory, and the cleanup "
-            "command retries the move; discard was refused", held,
+        blockers.append(
+            "MS-DIAL containers are still in the raw directory, and its deletion would delete them: "
+            + describe_holds(held) + "."
         )
-    if raw_root.exists():
-        shutil.rmtree(raw_root)
-    discarded_at = datetime.now(timezone.utc).isoformat()
+    file_count, total_bytes = _tree_size(raw_root)
+    release = manifest.get("raw_release") if isinstance(manifest.get("raw_release"), dict) else {}
+    already = release.get("state") == "deleted" and not raw_root.exists()
+    return {
+        "manifest_path": str(manifest_path),
+        "analysis_unit_id": str(project.get("analysis_unit_id") or ""),
+        "status": manifest.get("status"),
+        "retention_policy": policy,
+        "deletion_target": str(raw_root),
+        "deletion_file_count": file_count,
+        "deletion_bytes": total_bytes,
+        "kind": "released" if any(part.get("state") in {"validated", "released"} for part in parts) else "discarded",
+        "parts": parts,
+        **({"raw_release": release} if release else {}),
+        "already_released": already,
+        "resumable": release.get("state") in DELETION_RESUMABLE_STATES,
+        "blockers": blockers,
+        "ready": not blockers and not already,
+    }
+
+
+def record_split_parent_pending(part_manifest_path: Path) -> dict[str, Any] | None:
+    """Record on a part's parent the release plan as it stands now; delete nothing. None for an unsplit unit.
+
+    What the backend's post-run hook does once a part's run is finalised. The release itself is the caller's
+    to make - in a campaign, the runner's, under its approval - so a run job never deletes raw data, and two
+    processes never race to release one tree.
+    """
+    part_manifest_path = Path(part_manifest_path).resolve()
+    part = read_manifest(part_manifest_path)
+    parent_text = str((part.get("split_from") or {}).get("manifest_path") or "").strip()
+    if not parent_text or not Path(parent_text).is_file():
+        return None
+    parent_path = Path(parent_text).resolve()
+    plan = plan_split_parent_cleanup(parent_path)
+    pending = {
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "requested_by": str((part.get("project") or {}).get("analysis_unit_id") or ""),
+        "ready": plan["ready"],
+        "kind": plan["kind"],
+        "parts": [
+            {"analysis_unit_id": item.get("analysis_unit_id"), "state": item.get("state")} for item in plan["parts"]
+        ],
+        "blockers": plan["blockers"][:_REPORTED_DELETION_ITEMS],
+        "deleted": False,
+    }
 
     def change(current: dict[str, Any]) -> None:
-        if stale is not None and (current.get("lease_owner") or {}).get("lease_id") != (
-            (stale["lease_owner"] or {}).get("lease_id")
-        ):
-            # Another lease took the workspace over after the check. Its record is not this discard's.
-            raise ValueError(
-                "A new lease took this workspace over while its stale lease was being discarded; the new "
-                "lease's record was left as it is."
-            )
-        current["status"] = "discarded"
-        current["discarded_at"] = discarded_at
-        current["discard_reason"] = (
-            "Preflight/download was rejected before a retained mzTab-M result was produced."
-            if stale is None
-            else "The lease's process stopped before it recorded its inputs or its failure."
-        )
-        if stale is not None:
-            current["stale_lease_discarded"] = {**stale, "discarded_at": discarded_at}
+        current["raw_release_pending"] = pending
 
-    update_manifest(manifest_path, change)
-    result = {"deleted": True, "raw_directory": str(raw_root), "manifest_path": str(manifest_path)}
-    if stale is not None:
-        result["stale_lease_discarded"] = True
+    update_manifest(parent_path, change)
+    return {**plan, "pending_recorded": True}
+
+
+def cleanup_split_parent(
+    manifest_path: Path,
+    confirmed: bool = False,
+    *,
+    campaign_authorization_path: str | Path | None = None,
+    entry_point: str = "cleanup_split_parent",
+) -> dict[str, Any]:
+    """Release a split parent's raw tree once every part has ended (plan_split_parent_cleanup).
+
+    With neither confirmed=true nor ``campaign_authorization_path`` this is the plan, deleting nothing. An
+    approval must cover boundary 5 for the parent and state delete_after_validated_output, as the parent does.
+    Under the deletion lock the plan is drawn again, and any blocker stops it with nothing recorded. Then:
+
+    1. the crossing, if any, is recorded on the parent, and raw_release (msdial-split-parent-raw-release.v1) is
+       written with state deleting: the kind, the target, its files and bytes, and each part as it ended;
+    2. the tree is removed (download_store.unlink_tree), and raw_release becomes state removed. A tree that
+       could not be removed whole is state partial with what remains, and a later call resumes it;
+    3. each validated part becomes raw_cleaned with raw_released_by naming the parent; every other part keeps
+       its status and gains raw_released_at and raw_released_by;
+    4. raw_release becomes state deleted. The parent stays split_by_acquisition, as SPL-1 requires.
+
+    Idempotent: a release already recorded deleted returns it again, deleting nothing.
+    """
+    from .run_finalisation import raw_deletion_holds, resolve_finalisation_holds
+
+    manifest_path = Path(manifest_path).resolve()
+    manifest = read_manifest(manifest_path)
+    if not _is_split_parent(manifest):
+        raise ValueError(
+            "This unit was not split; its raw data are deleted by cleanup_download_lease or discard_download_lease."
+        )
+    if raw_deletion_holds(manifest_path):
+        # A part's containers that could not be moved out of the tree are moved now, if they can be; what moves
+        # joins that part's retained inventory.
+        resolve_finalisation_holds(manifest_path)
+        for item in manifest.get("split_into") or []:
+            if isinstance(item, dict) and Path(str(item.get("manifest_path") or "")).is_file():
+                refresh_retained_artifacts(Path(str(item["manifest_path"])))
+    crossing = _deletion_crossing(campaign_authorization_path, manifest, entry_point)
+    plan = plan_split_parent_cleanup(manifest_path)
+    if plan["already_released"]:
+        return {**plan, "deleted": True, "already_released": True}
+    if not confirmed and crossing is None:
+        return {**plan, "deleted": False, "confirmation_required": True}
+    raw_root = Path(plan["deletion_target"])
+    with _raw_deletion_lock(manifest_path):
+        plan = plan_split_parent_cleanup(manifest_path)
+        if plan["already_released"]:
+            return {**plan, "deleted": True, "already_released": True}
+        if plan["blockers"]:
+            return {
+                **plan,
+                "deleted": False,
+                "confirmation_required": False,
+                **({"campaign_authorization": crossing} if crossing else {}),
+                "message": "Nothing was deleted: the split parent's raw tree is not ready to be released.",
+            }
+        if crossing is not None:
+            record_campaign_authorization(manifest_path, crossing)
+        parts = [
+            {
+                "analysis_unit_id": part.get("analysis_unit_id"),
+                "manifest_path": part.get("manifest_path"),
+                "state": part.get("state"),
+                "status_at_release": part.get("status"),
+                "mztab_files": part.get("mztab_files") or [],
+                "retained_artifact_count": part.get("retained_artifact_count", 0),
+            }
+            for part in plan["parts"]
+        ]
+        removal = _delete_raw_tree(
+            manifest_path,
+            raw_root,
+            kind=plan["kind"],
+            authorized_by=_authorized_by(crossing),
+            kept={"parts": len(parts), "retained_artifact_count": sum(item["retained_artifact_count"] for item in parts)},
+            finish=lambda current: None,
+            record_key="raw_release",
+            extra={"parts": parts},
+            final_state="removed",
+        )
+        if not removal["deleted"]:
+            return {**plan, **removal, **({"campaign_authorization": crossing} if crossing else {})}
+        released_at = str(removal["raw_release"].get("removed_at") or datetime.now(timezone.utc).isoformat())
+        for part in plan["parts"]:
+
+            def change(current: dict[str, Any], state: str = str(part.get("state") or "")) -> None:
+                if state == "validated" and current.get("status") in CLEANUP_READY_STATUSES:
+                    current["status"] = "raw_cleaned"
+                    current["raw_cleaned_at"] = released_at
+                elif current.get("status") != "raw_cleaned":
+                    current.setdefault("raw_released_at", released_at)
+                current.setdefault("raw_released_by", str(manifest_path))
+
+            update_manifest(Path(str(part["manifest_path"])), change)
+
+        def finish(current: dict[str, Any]) -> None:
+            # Only now, with every part told: a release stopped between the two is resumed as removed.
+            release = dict(current.get("raw_release") or {})
+            release["state"] = "deleted"
+            release["deleted_at"] = datetime.now(timezone.utc).isoformat()
+            current["raw_release"] = release
+            current["raw_cleaned_at"] = released_at
+            current.pop("raw_release_pending", None)
+
+        update_manifest(manifest_path, finish)
+    result = {
+        **plan_split_parent_cleanup(manifest_path),
+        "deleted": True,
+        "kind": removal["raw_release"].get("kind"),
+        "raw_directory": str(raw_root),
+        "raw_release": read_manifest(manifest_path).get("raw_release"),
+    }
+    if crossing is not None:
+        result["campaign_authorization"] = crossing
     return result
 
 

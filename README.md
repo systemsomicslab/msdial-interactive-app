@@ -491,7 +491,8 @@ Core MCP tools:
 - `msdial_split_repository_unit`: split a Mixed acquisition unit after explicit confirmation
 - `msdial_prepare_repository_reanalysis`: review Class matching and prepare `analysis_files.csv`
 - `msdial_repository_qa_evidence`: expose internal-standard declarations for agent-reviewed QA targets
-- `msdial_cleanup_repository_raw`: preview and explicitly confirm post-validation raw-data deletion
+- `msdial_cleanup_repository_raw`: preview and explicitly confirm post-validation raw-data deletion, a split parent's release included
+- `msdial_discard_repository_raw`: preview and explicitly confirm deletion of raw data that produced no validated output
 
 Agent API 0.5 binds mzTab-M, QA, publication, and handoff operations to the
 production `job_id`. Files left by earlier runs in the same output directory are

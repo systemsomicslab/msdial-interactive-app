@@ -67,6 +67,7 @@ from .repository_reanalysis import (
     record_run_end,
     record_run_process,
     record_run_start,
+    record_split_parent_pending,
     refresh_retained_artifacts,
     resolve_required_download_bytes,
     split_unit_by_acquisition,
@@ -2515,6 +2516,8 @@ def _record_repository_run_failure(
     reason: str,
     exit_code: int | None,
     logs: list[str],
+    *,
+    status: str = "run_failed",
 ) -> None:
     """Put a failed run into the analysis unit's own manifest, if it belongs to one.
 
@@ -2531,7 +2534,17 @@ def _record_repository_run_failure(
         return
     from .repository_reanalysis import record_run_failure
 
-    record_run_failure(Path(manifest_text), reason, exit_code, list(logs or []))
+    record_run_failure(Path(manifest_text), reason, exit_code, list(logs or []), status=status)
+
+
+def _unvalidated_run_reason(artifacts: dict[str, Any], summary: dict[str, Any]) -> str:
+    """Why a run whose Console exited 0 left no validated mzTab-M: it wrote none, or what it wrote failed."""
+    if not artifacts.get("mztab"):
+        return "MS-DIAL Console exited with code 0 but wrote no mzTab-M, so the run produced no validated output."
+    return (
+        f"MS-DIAL Console exited with code 0, but {summary.get('failed', 0)} of {summary.get('file_count', 0)} "
+        "mzTab-M file(s) it wrote failed validation, so the run produced no validated output."
+    )
 
 
 def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
@@ -2642,23 +2655,72 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
                             "finalization": finalized,
                             "cleanup": None,
                         }
-                        if retention == "delete_after_validated_output":
+                        if finalized.get("status") == "validation_failed":
+                            # This run's own mzTab-M validated, but finalisation validates every mzTab-M in
+                            # the output, and another there fails: an earlier attempt's. The unit is not
+                            # validated, so the run counts as a failed one, and no deletion is requested.
+                            checked = (finalized.get("mztab_validation") or {}).get("summary") or {}
+                            failure = (
+                                "MS-DIAL Console exited with code 0 and its mzTab-M validated, but "
+                                f"{checked.get('failed', 0)} of {checked.get('file_count', 0)} mzTab-M file(s) "
+                                "in the output failed validation, so the unit was finalised as validation_failed."
+                            )
+                            repository_retention["reason"] = failure
+                            repository_retention["run_failure_recorded"] = True
+                            log("Recorded on the unit as a failed run: " + failure)
+                            with JOBS_LOCK:
+                                logs = list(JOBS[job_id]["logs"])
+                            _record_repository_run_failure(
+                                preparation, failure, exit_code, logs, status="validation_failed"
+                            )
+                        elif retention == "delete_after_validated_output":
                             # The retention policy records a wish, not an approval. Deleting the raw data
                             # is the only irreversible operation in this pipeline, and the confirmation
                             # for it belongs to a person who has seen the retained artifacts, the target
                             # paths and the size that would be freed. A background job supplies none of
                             # those, so it records the request and stops. The server must never generate
                             # confirmed=True on the user's behalf.
+                            #
+                            # Under a campaign too it only records: the runner is the one trigger of every
+                            # deletion, its own cleanup and a split parent's release alike, under the
+                            # approval it holds. A hook that deleted as well would race the runner for the
+                            # same manifest and the same tree.
                             pending = request_download_cleanup(Path(manifest_text))
                             repository_retention["cleanup"] = pending
-                            log(
-                                "Validated output retained. Raw-data deletion was REQUESTED by the "
-                                "retention policy and NOT performed; it needs a separate confirmation. "
-                                f"{pending['deletion_file_count']} files, "
-                                f"{pending['deletion_bytes'] / 1e9:.2f} GB under "
-                                f"{pending['deletion_target']} would be removed, and "
-                                f"{pending['retained_artifact_count']} artifacts would be retained."
-                            )
+                            try:
+                                split_parent = record_split_parent_pending(Path(manifest_text))
+                            except (OSError, ValueError) as pending_error:
+                                # The part's own finalisation stands; only the parent's record is missing.
+                                split_parent = None
+                                artifact_warnings.append(
+                                    f"The split parent's pending raw release could not be recorded: {pending_error}"
+                                )
+                                log("WARNING: " + artifact_warnings[-1])
+                            if split_parent is not None:
+                                # A part reads its parent's raw tree, released only once every part has
+                                # ended: what is recorded is the parent's plan, on the parent.
+                                repository_retention["split_parent"] = {
+                                    key: split_parent.get(key)
+                                    for key in ("manifest_path", "ready", "kind", "blockers", "deletion_target")
+                                }
+                                log(
+                                    "Validated output retained. This part's raw data are its split parent's; "
+                                    "their release was recorded on the parent as pending and NOT performed ("
+                                    + ("every part has ended" if split_parent["ready"] else
+                                       f"{len(split_parent['blockers'])} blocker(s) remain")
+                                    + f"). {split_parent['deletion_file_count']} files, "
+                                    f"{split_parent['deletion_bytes'] / 1e9:.2f} GB under "
+                                    f"{split_parent['deletion_target']} would be released."
+                                )
+                            else:
+                                log(
+                                    "Validated output retained. Raw-data deletion was REQUESTED by the "
+                                    "retention policy and NOT performed; it needs a separate confirmation. "
+                                    f"{pending['deletion_file_count']} files, "
+                                    f"{pending['deletion_bytes'] / 1e9:.2f} GB under "
+                                    f"{pending['deletion_target']} would be removed, and "
+                                    f"{pending['retained_artifact_count']} artifacts would be retained."
+                                )
                         else:
                             log("Validated output retained; downloaded repository raw data were kept.")
                     else:
@@ -2668,6 +2730,16 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
                             "reason": "Raw data were kept because this run did not produce a validated mzTab-M output.",
                         }
                         log(repository_retention["reason"])
+                        # A Console that exits 0 without a validated mzTab-M has failed, and the unit records
+                        # it as it records one that exits non-zero: its run failures are what count its
+                        # attempts, and a split part ends after CAMPAIGN_RUN_ATTEMPTS of them. The job itself
+                        # stays completed, as it always was.
+                        failure = _unvalidated_run_reason(artifacts, summary)
+                        repository_retention["run_failure_recorded"] = True
+                        log("Recorded on the unit as a failed run: " + failure)
+                        with JOBS_LOCK:
+                            logs = list(JOBS[job_id]["logs"])
+                        _record_repository_run_failure(preparation, failure, exit_code, logs)
                 except Exception as retention_error:
                     repository_retention = {
                         "policy": retention,

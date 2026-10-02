@@ -76,6 +76,12 @@ def summarize_jobs(
             "cancel_console_and_download_jobs",
             "repository_run_attempt_records",
             "one_console_per_repository_unit",
+            # A unit splits by acquisition mode, ion-mobility regime and polarity, and an ion-mobility part is
+            # written excluded. A split parent's raw tree is released once every part has ended, and the raw
+            # cleanup and discard take a campaign approval for boundary 5, each recording what it deleted.
+            "split_key_acquisition_ion_mobility_polarity",
+            "split_parent_raw_release",
+            "campaign_authorized_raw_cleanup_and_discard",
         ],
         "workflow_outline": [
             "Inspect the input path and collect the guided scientific choices.",
