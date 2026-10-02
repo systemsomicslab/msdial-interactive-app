@@ -107,7 +107,14 @@ from .workflow import (
     is_supported,
     validate_workflow,
 )
-from .user_settings import load_user_settings, save_path_settings, settings_path, user_data_directory
+from .user_settings import (
+    download_store_mode,
+    load_user_settings,
+    save_download_store_mode,
+    save_path_settings,
+    settings_path,
+    user_data_directory,
+)
 from .worksets import describe_workset_candidate, list_worksets, save_workset
 from .diagnostic_paths import diagnostic_run_directory, is_diagnostic_artifact
 
@@ -124,7 +131,10 @@ JOBS_LOCK = threading.Lock()
 PROCESSES: dict[str, dict[str, Any]] = {}
 CANCELLABLE_JOB_KINDS = frozenset({"run", "tuning", "repository_download"})
 CONSOLE_JOB_KINDS = frozenset({"run", "tuning"})
-LIVE_JOB_STATUSES = frozenset({"queued", "running"})
+# waiting_for_shared_download: a repository download whose lease waits while another lease fetches or extracts
+# an object of the accession download store that both need. It is running, and cancellable, as any other.
+WAITING_FOR_SHARED_DOWNLOAD = "waiting_for_shared_download"
+LIVE_JOB_STATUSES = frozenset({"queued", "running", WAITING_FOR_SHARED_DOWNLOAD})
 # Repository units a Console job is being set up for, by unit key, guarded by JOBS_LOCK. Held from before
 # the run's preparation writes anything until the job is registered, so that two requests for one unit
 # cannot both pass the single-flight check.
@@ -452,7 +462,7 @@ def _load_persisted_jobs() -> dict[str, dict[str, Any]]:
         return {}
     now = dt.datetime.now().astimezone().isoformat()
     for job in jobs.values():
-        if job.get("status") in {"queued", "running"}:
+        if job.get("status") in LIVE_JOB_STATUSES:
             job["status"] = "interrupted"
             job["updated_at"] = now
             job["error"] = (
@@ -1140,6 +1150,11 @@ class Handler(BaseHTTPRequestHandler):
                         "settings": saved,
                         "settings_file": str(settings_path()),
                     }
+                )
+            elif parsed.path == "/api/settings/store-mode":
+                # Whether a lease outside a campaign uses the accession download store; a campaign's always does.
+                self._json(
+                    {"store_mode": save_download_store_mode(body.get("store_mode")), "settings_file": str(settings_path())}
                 )
             elif parsed.path == "/api/agent/console/check":
                 self._json(discover_console_paths(body.get("search_roots", [])))
@@ -2344,6 +2359,28 @@ def _run_repository_download_job(
                     job["updated_at"] = dt.datetime.now().astimezone().isoformat()
                     _persist_jobs_locked()
 
+        def shared_download(event: str, detail: dict[str, Any]) -> None:
+            # The accession download store: another lease is fetching or extracting an object this one needs,
+            # and this one waits for it rather than fetch it twice. Still live, and still cancellable.
+            with JOBS_LOCK:
+                job = JOBS[job_id]
+                if event == WAITING_FOR_SHARED_DOWNLOAD:
+                    job["status"] = WAITING_FOR_SHARED_DOWNLOAD
+                    job["waiting_for"] = {
+                        key: detail.get(key)
+                        for key in ("object", "url", "object_id", "job_id", "pid", "heartbeat_age_seconds", "reason")
+                        if key in detail
+                    }
+                    job["logs"].append(
+                        f"Waiting for another download of {detail.get('object') or 'a shared object'} to finish; "
+                        "its bytes will be reused, not fetched again."
+                    )
+                elif job.get("status") == WAITING_FOR_SHARED_DOWNLOAD:
+                    job["status"] = "running"
+                    job.pop("waiting_for", None)
+                job["updated_at"] = dt.datetime.now().astimezone().isoformat()
+                _persist_jobs_locked()
+
         lease = create_download_lease(
             project,
             workspace_root,
@@ -2355,6 +2392,8 @@ def _run_repository_download_job(
                 {**campaign_authorization, "job_id": job_id} if campaign_authorization else None
             ),
             job_id=job_id,
+            store_mode=download_store_mode(),
+            shared_download_callback=shared_download,
         )
         recognized = expand_paths_report(lease.get("input_candidates", []))
         result = {
@@ -2368,6 +2407,18 @@ def _run_repository_download_job(
             "recognized": recognized,
             "raw_retention_policy": retention,
         }
+        cache = lease.get("download_cache")
+        if isinstance(cache, dict):
+            # Only where the accession download store was used: what it fetched and what it reused.
+            result["download_cache"] = {
+                key: cache.get(key)
+                for key in ("store", "activated_by", "objects_fetched", "cache_hits", "transferred_bytes")
+            }
+            result["raw_storage"] = (lease.get("raw_storage") or {}).get("materialization")
+            log(
+                f"Download store: {cache.get('objects_fetched', 0)} object(s) fetched, {cache.get('cache_hits', 0)} "
+                f"reused; the unit's raw tree is a {result['raw_storage']} of the store's files."
+            )
         log(f"Recognized {len(recognized.get('files', []))} MS-DIAL analysis file(s).")
         with JOBS_LOCK:
             JOBS[job_id]["result"] = result

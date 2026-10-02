@@ -39,7 +39,15 @@ from .diagnostic_paths import (
     path_is_file,
     plain_path,
 )
-from .download_store import unlink_tree
+from .download_store import (
+    STORE_DIRECTORY,
+    DeclaredChecksumMismatch,
+    DownloadStore,
+    MaterializationCollision,
+    StoreError,
+    StoreLockTimeout,
+    unlink_tree,
+)
 from .mzml_encoding import UNSUPPORTED_MZML_ENCODING, scan_mzml_encoding
 from .mzxml_conversion import CONVERTER_NAME, ConversionOptions, convert_mzxml_to_mzml, converter_identity
 from .process_liveness import process_created_at, process_is_alive
@@ -1380,6 +1388,219 @@ def resolve_required_download_bytes(
     }
 
 
+def unit_download_objects(project: dict[str, Any]) -> list[dict[str, Any]]:
+    """The objects one unit's lease fetches, one per URL, in the order of its files.
+
+    As the Catalog's handoff lists them (download_scope.objects, Catalog 0.6.1: name, kind, bytes,
+    size_known and every consumer unit), or, for a handoff that lists none, as the unit's own files make
+    them: each listed path counted once at its largest size, and an object holding a path of no listed size
+    of unknown size (bytes None), never 0.
+    """
+    files = [item for item in project.get("files") or [] if isinstance(item, dict) and str(item.get("url") or "")]
+    declared = {
+        str(item.get("url")): item
+        for item in (project.get("download_scope") or {}).get("objects") or []
+        if isinstance(item, dict) and str(item.get("url") or "")
+    }
+    repository = str(project.get("repository") or "")
+    objects: list[dict[str, Any]] = []
+    for url in dict.fromkeys(str(item["url"]) for item in files):
+        if url in declared:
+            item = declared[url]
+            known = int(item.get("known_bytes") or item.get("bytes") or 0)
+            size_known = bool(item.get("size_known", item.get("bytes") is not None))
+            objects.append(
+                {
+                    "url": url,
+                    "name": str(item.get("name") or _url_basename(url)),
+                    "kind": str(item.get("kind") or ""),
+                    "bytes": known if size_known else None,
+                    "known_bytes": known,
+                    "size_known": size_known,
+                    "catalog_consumer_unit_ids": [str(unit) for unit in item.get("consumer_unit_ids") or []],
+                    "declared_by": "catalog_download_objects",
+                }
+            )
+            continue
+        listed = [item for item in files if str(item["url"]) == url]
+        sizes: dict[str, int] = {}
+        for item in listed:
+            name = str(item.get("name") or "")
+            sizes[name] = max(sizes.get(name, 0), int(item.get("size_bytes") or 0))
+        unknown = any(size <= 0 for size in sizes.values())
+        known = sum(size for size in sizes.values() if size > 0)
+        roles = {str(item.get("role") or "raw") for item in listed}
+        if repository == "mb_post" or len(sizes) > 1:
+            kind = "bundle"
+        elif roles & ARCHIVE_ROLES:
+            kind = "archive"
+        else:
+            kind = "file"
+        name = f"{project.get('accession')}.tar" if repository == "mb_post" else (
+            _url_basename(url) or PurePosixPath(next(iter(sizes), "").replace("\\", "/")).name
+        )
+        objects.append(
+            {
+                "url": url,
+                "name": name,
+                "kind": kind,
+                "bytes": None if unknown else known,
+                "known_bytes": known,
+                "size_known": not unknown,
+                "catalog_consumer_unit_ids": [],
+                "declared_by": "unit_files",
+            }
+        )
+    return objects
+
+
+def plan_batch_downloads(units: list[dict[str, Any]], workspace_root: str | Path | None = None) -> dict[str, Any]:
+    """What fetching a batch of units through the download store amounts to. Changes nothing.
+
+    ``units`` are {analysis_unit_id, repository, accession, objects (unit_download_objects)} in the batch's
+    order. Returns the distinct objects, each with the batch units that consume it; per unit its objects and
+    bytes; the per-unit total (what fetching per unit would move) against the distinct total (what the store
+    moves, each object once per accession); the sharing groups - units joined, directly or through others,
+    by an object more than one of them needs - and a run order that keeps each group together, so that no
+    object waits on disk longer than its group takes. Bytes count only objects of known size, the
+    lower-bound figures add what is stated of the others, and an object of unknown size is counted, never
+    priced at 0. With ``workspace_root``, an object already ready in its accession's store transfers nothing.
+    """
+    by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    unit_keys: dict[str, list[tuple[str, str, str]]] = {}
+    order: list[str] = []
+    for unit in units:
+        unit_id = str(unit.get("analysis_unit_id") or "")
+        order.append(unit_id)
+        keys = unit_keys.setdefault(unit_id, [])
+        for item in unit.get("objects") or []:
+            key = (str(unit.get("repository") or ""), str(unit.get("accession") or ""), str(item["url"]))
+            entry = by_key.setdefault(
+                key, {**item, "repository": key[0], "accession": key[1], "consumers": []}
+            )
+            if unit_id not in entry["consumers"]:
+                entry["consumers"].append(unit_id)
+            if key not in keys:
+                keys.append(key)
+    for entry in by_key.values():
+        entry["in_store"] = False
+        if workspace_root is None:
+            continue
+        try:
+            store = DownloadStore(workspace_root, entry["repository"], entry["accession"])
+            index = store.lookup(entry["url"]) if store.root.is_dir() else None
+            stored = store.entry(index["object_id"]) if index and index.get("object_id") else None
+        except (StoreError, OSError):
+            continue
+        if stored and stored.get("state") == "ready":
+            entry.update(in_store=True, store_object_id=stored.get("object_id"))
+
+    # Sharing groups: connected components of the batch's units, joined by the objects they share.
+    parent = {unit: unit for unit in order}
+
+    def root(unit: str) -> str:
+        while parent[unit] != unit:
+            parent[unit] = parent[parent[unit]]
+            unit = parent[unit]
+        return unit
+
+    for entry in by_key.values():
+        consumers = entry["consumers"]
+        for other in consumers[1:]:
+            left, right = root(consumers[0]), root(other)
+            if left != right:
+                first, second = sorted((left, right), key=order.index)
+                parent[second] = first
+    groups: dict[str, list[str]] = {}
+    for unit in order:
+        groups.setdefault(root(unit), []).append(unit)
+
+    def totals(entries: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "distinct_bytes": sum(item["known_bytes"] for item in entries if item["size_known"]),
+            "distinct_bytes_lower_bound": sum(item["known_bytes"] for item in entries),
+            "unknown_size_objects": sum(1 for item in entries if not item["size_known"]),
+        }
+
+    group_records = []
+    group_of: dict[str, str] = {}
+    for index, members in enumerate(groups.values(), start=1):
+        group_id = f"group-{index}"
+        keys = list(dict.fromkeys(key for unit in members for key in unit_keys[unit]))
+        group_records.append(
+            {
+                "group_id": group_id,
+                "unit_ids": members,
+                "object_count": len(keys),
+                "shared_object_count": sum(1 for key in keys if len(by_key[key]["consumers"]) > 1),
+                **totals([by_key[key] for key in keys]),
+            }
+        )
+        group_of.update((unit, group_id) for unit in members)
+    run_order = [unit for record in group_records for unit in record["unit_ids"]]
+    per_unit = []
+    for unit in order:
+        entries = [by_key[key] for key in unit_keys[unit]]
+        unit_totals = totals(entries)
+        size_known = bool(entries) and not unit_totals["unknown_size_objects"]
+        per_unit.append(
+            {
+                "analysis_unit_id": unit,
+                "object_count": len(entries),
+                "bytes": unit_totals["distinct_bytes"] if size_known else None,
+                "known_bytes": unit_totals["distinct_bytes_lower_bound"],
+                "size_known": size_known,
+                "shared_object_count": sum(1 for item in entries if len(item["consumers"]) > 1),
+                "sharing_group": group_of[unit],
+                "run_position": run_order.index(unit) + 1,
+            }
+        )
+    objects = list(by_key.values())
+    distinct = totals(objects)
+    to_transfer = [item for item in objects if not item["in_store"]]
+    return {
+        "schema": "msdial-batch-download-plan.v1",
+        "object_count": len(objects),
+        "shared_objects": sum(1 for item in objects if len(item["consumers"]) > 1),
+        "per_unit_known_bytes": sum(item["known_bytes"] for item in per_unit),
+        **distinct,
+        "objects_in_store": len(objects) - len(to_transfer),
+        "distinct_bytes_to_transfer": sum(item["known_bytes"] for item in to_transfer if item["size_known"]),
+        "units_of_unknown_size": sum(1 for item in per_unit if not item["size_known"]),
+        "group_count": len(group_records),
+        "groups": group_records,
+        "run_order": run_order,
+        "units": per_unit,
+        "objects": objects,
+    }
+
+
+def pre_claim_downloads(workspace_root: str | Path, units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Record a pending store claim of each unit on each object it will fetch, before any of them is leased.
+
+    A pending claim keeps an object through the release of another unit that shares it, so a unit approved
+    in a batch but not run yet still counts when the store decides what it may delete. Idempotent: a live
+    claim is kept as it is. ``units`` are as plan_batch_downloads takes them.
+    """
+    claimed = []
+    for unit in units:
+        unit_id = str(unit.get("analysis_unit_id") or "")
+        store = DownloadStore(workspace_root, unit.get("repository"), unit.get("accession"))
+        states = [
+            store.claim(str(item["url"]), unit_id, source="batch_plan").get("state")
+            for item in unit.get("objects") or []
+        ]
+        claimed.append(
+            {
+                "analysis_unit_id": unit_id,
+                "store": str(store.root),
+                "claims": len(states),
+                "live": sum(1 for state in states if state in {"pending", "materialized"}),
+            }
+        )
+    return claimed
+
+
 # The only two retention policies that mean anything. Named once because the HTTP download
 # endpoint validated against an inline set while every other reader compared against a bare literal,
 # so a third reader could -- and did -- accept a string no writer would ever produce.
@@ -1414,6 +1635,8 @@ def create_download_lease(
     raw_retention_policy: str = "keep",
     campaign_authorization: dict[str, Any] | None = None,
     job_id: str = "",
+    store_mode: str | None = None,
+    shared_download_callback: Any = None,
 ) -> dict[str, Any]:
     """Download one unit's objects into its workspace and write the unit's run manifest.
 
@@ -1423,6 +1646,15 @@ def create_download_lease(
 
     ``job_id`` is the backend job the lease runs in. It is recorded with this process as the lease's
     owner, so a lease left "downloading" by a process that has since died can be told from a live one.
+
+    THE ACCESSION DOWNLOAD STORE (msdial_app.download_store) is used by a campaign's lease, and by any
+    other only where ``store_mode`` - by default the saved setting (user_settings.download_store_mode) -
+    is "always". Its lease fetches each object into <workspace_root>\\<repository>\\<accession>\\_dl once
+    for every unit of the accession, under a claim of this unit's, extracts each archive there once, and
+    gives this unit a raw tree of hardlinks to it (see _StoreLease). Without it, the default, every
+    object is fetched into this unit's own raw tree as it always was. ``shared_download_callback(event,
+    detail)`` hears waiting_for_shared_download while another lease holds an object this one needs, and
+    shared_download_ready once it has it.
 
     A manifest already in the workspace is never lost: unless it is itself an unfinished or discarded
     lease, it is copied byte for byte beside itself before the first write, and the copy is named in
@@ -1437,7 +1669,9 @@ def create_download_lease(
     - extract: each archive expanded by archives.extract_archive into a staging tree beside the data
       root, then moved into it without overwriting anything (archive_extractions, and the member listing
       in provenance\\archive-members-<sha12>.tsv);
-    - materialise: recorded as not_used. The accession download store is wired in here, after extraction;
+    - materialise: with the download store, this unit's raw tree of links to the store's objects and
+      extraction trees (raw_storage); without it, not_used. Links that turn out to be none of the unit's
+      inputs, members or sidecars are pruned once the attribute stage has said which those are;
     - convert: each of the unit's mzXML written as mzML under raw\\converted, every inference off, and
       recorded (input_conversions, provenance\\input-conversions.json); where extraction shows a readable
       encoding of the same sample beside an mzXML, that one is analysed instead. Only under a
@@ -1473,7 +1707,20 @@ def create_download_lease(
             f"Required repository bundle is {required_download_bytes} bytes; "
             f"the download lease limit is {maximum_bytes} bytes."
         )
+    reserved = [
+        f"{label} {value!r}"
+        for label, value in (
+            ("repository", project.repository), ("accession", project.accession), ("unit", project.analysis_unit_id)
+        )
+        if is_reserved_workspace_name(value)
+    ]
+    if reserved:
+        raise ValueError(
+            f"The {', '.join(reserved)} is a name the workspace keeps for itself "
+            f"({', '.join(sorted(RESERVED_WORKSPACE_NAMES))}); no unit is leased under it."
+        )
     client = client or RepositoryHttpClient()
+    store, store_use = _lease_store(project, workspace_root, campaign_authorization, store_mode)
     adapter_type = ADAPTERS.get(project.repository)
     if not project.analysis_unit_id and adapter_type and hasattr(adapter_type, "inspect_metadata"):
         try:
@@ -1530,6 +1777,9 @@ def create_download_lease(
     }
     if campaign_authorization:
         lease_record["campaign_authorizations"] = [dict(campaign_authorization)]
+    if store is not None:
+        # From the first write on, so a lease that stops part-way says whose store holds its claims.
+        lease_record["download_cache"] = _download_cache_record(store, project, store_use, [])
     # Held before the first write, so this process never reads its own new lease as abandoned.
     _hold_lease(owner["lease_id"])
     try:
@@ -1583,6 +1833,29 @@ def create_download_lease(
         }
         stages.start("fetch")
         stages.start("verify_declared_checksums")
+
+        def waiting_beat(name: str) -> None:
+            # While this lease waits for another's extraction of an object both need: its heartbeat, and its
+            # progress callback, which is where a cancelled job is heard.
+            beat(downloaded_bytes)
+            if progress_callback:
+                progress_callback(
+                    total_objects, total_objects, name, downloaded_bytes, required_download_bytes or downloaded_bytes
+                )
+
+        store_lease = None if store is None else _StoreLease(
+            store,
+            project,
+            store_use,
+            lease_record,
+            client=client,
+            data_root=data_root,
+            provenance=provenance,
+            stages=stages,
+            job_id=job_id,
+            heartbeat=waiting_beat,
+            shared_download_callback=shared_download_callback,
+        )
         for index, (url, item) in enumerate(unique_urls.items(), start=1):
             filename, archive_kind, placement = _route_object(project, url, item, index)
             if archive_kind:
@@ -1604,12 +1877,24 @@ def create_download_lease(
                     )
 
             stages.at("fetch")
-            result = client.download(
-                url,
-                destination,
-                maximum_bytes - downloaded_bytes,
-                progress_callback=item_progress,
-            )
+            if store_lease is None:
+                result = client.download(
+                    url,
+                    destination,
+                    maximum_bytes - downloaded_bytes,
+                    progress_callback=item_progress,
+                )
+            else:
+                # Into the store, once for every unit of the accession; a per-file object's path is where
+                # this unit's link to it will be, an archive's the store's own (see _StoreLease.fetch).
+                result = store_lease.fetch(
+                    url,
+                    item,
+                    filename,
+                    None if archive_kind else _safe_relative_name(item.name).as_posix(),
+                    maximum_bytes - downloaded_bytes,
+                    item_progress,
+                )
             downloaded_bytes += result["size_bytes"]
             result["source_url"] = url
             result["declared_checksum"] = item.checksum
@@ -1653,16 +1938,25 @@ def create_download_lease(
         for item in downloads:
             if not item.get("archive"):
                 continue
-            record, members = _extract_into_data_root(
-                Path(item["path"]),
-                item,
-                placements[_file_key(item["path"])],
-                data_root,
-                raw_root,
-                provenance,
-                len(archive_extractions) + 1,
-                earlier=archive_extractions,
-            )
+            if store_lease is None:
+                record, members = _extract_into_data_root(
+                    Path(item["path"]),
+                    item,
+                    placements[_file_key(item["path"])],
+                    data_root,
+                    raw_root,
+                    provenance,
+                    len(archive_extractions) + 1,
+                    earlier=archive_extractions,
+                )
+            else:
+                # Once in the store, for every unit; this unit's members are linked in at materialise.
+                record, members = store_lease.extract(
+                    item,
+                    placements[_file_key(item["path"])],
+                    len(archive_extractions) + 1,
+                    archive_extractions,
+                )
             archive_extractions.append(record)
             for member_path, member in members:
                 key = _file_key(member_path)
@@ -1679,11 +1973,18 @@ def create_download_lease(
                 int((record.get("merge") or {}).get("already_present_files") or 0)
                 for record in archive_extractions
             ),
+            **(store_lease.extraction_counts() if store_lease is not None else {}),
         )
-        stages.not_used(
-            "materialise",
-            "Every object was fetched into this unit's own raw tree; no accession download store is in use.",
-        )
+        if store_lease is None:
+            stages.not_used(
+                "materialise",
+                "Every object was fetched into this unit's own raw tree; no accession download store is in use."
+                if store_use.get("reason") is None
+                else store_use["reason"],
+            )
+        else:
+            stages.start("materialise")
+            stages.finish("materialise", **store_lease.materialise())
 
         # The unit's mzXML, written as mzML under raw\converted (see the notes above _find_mzxml_files). Only a
         # campaign's lease converts: without a campaign authorization, and in a unit with no mzXML of its own,
@@ -1808,6 +2109,21 @@ def create_download_lease(
         )
         if conversion_rows:
             input_lineage["conversion_sources"] = conversion_rows
+        pruned: dict[str, Any] = {}
+        if store_lease is not None:
+            # Now that the unit's own files are known: the links to anything else the store's objects
+            # carried (the other polarity's samples in a shared study archive) are removed from this
+            # unit's tree. The store keeps their bytes for the units that need them.
+            pruned = store_lease.prune(
+                [
+                    *inputs,
+                    *(str(item["path"]) for item in excluded_inputs),
+                    *conversion_sources,
+                    *selected_extracted,
+                    *(Path(key) for key in verified_checksums),
+                    *(str(item["path"]) for item in downloads if not item.get("archive")),
+                ]
+            )
         stages.finish(
             "attribute",
             input_candidates=len(inputs),
@@ -1818,6 +2134,7 @@ def create_download_lease(
             ignored_extracted_files=len(extracted) - len(selected_extracted),
             declared_files_verified=checksum_validation.get("verified", 0),
             archives_verified_at_download=checksum_validation.get("archives_verified_at_download", 0),
+            **({"pruned_links": pruned.get("removed_files", 0)} if store_lease is not None else {}),
         )
 
         stages.start("record")
@@ -1871,6 +2188,10 @@ def create_download_lease(
         warnings = _archive_warnings(archive_extractions)
         if warnings:
             manifest["archive_warnings"] = warnings
+        if store_lease is not None:
+            # Only where the store was used, so every other lease records what it always did.
+            manifest["download_cache"] = store_lease.cache_record()
+            manifest["raw_storage"] = store_lease.raw_storage
         for key in ("previous_manifest", "superseded_manifests", "campaign_authorizations", "lease_owner"):
             if key in lease_record:
                 manifest[key] = lease_record[key]
@@ -2140,6 +2461,9 @@ def _record_download_failure(
         failure = error.record()
         failure["rejected_members"] = failure["rejected_members"][:50]
         record["download_failure"]["archive_failure"] = failure
+    if isinstance(error, MaterializationCollision):
+        # The download store's: the paths two of its objects, or an object and a file already there, wanted.
+        record["download_failure"]["materialization_collisions"] = error.collisions[:20]
     try:
         _write_json(manifest_path, record)
     except (OSError, ValueError, TypeError):
@@ -2147,8 +2471,8 @@ def _record_download_failure(
 
 
 # The stages of a download lease, in the order they run. materialise (the accession download store) is
-# recorded as not_used until it is wired in, where it will run; convert (mzXML to mzML) is not_used in a
-# unit with no mzXML of its own.
+# not_used in a lease that does not use the store; convert (mzXML to mzML) is not_used in a unit with no
+# mzXML of its own.
 LEASE_STAGES = (
     "fetch", "verify_declared_checksums", "extract", "materialise", "convert", "discover", "attribute",
     "record",
@@ -2163,7 +2487,8 @@ class _LeaseStages:
     verify_declared_checksums run object by object, side by side, so the lease says which of them it
     is in (at); when it fails, that one is failed and the other interrupted.
 
-    The writes are the lease's own keys only (lease_stages, downloads, archive_extractions),
+    The writes are the lease's own keys only (lease_stages, downloads, archive_extractions, and
+    download_cache where the download store is used),
     read-modified-written under the manifest's lock like the heartbeat, and never raise: a stage that
     cannot be recorded must not stop the bytes, and the final write or the failure record says the rest.
     """
@@ -2233,9 +2558,520 @@ class _LeaseStages:
                     return
                 for key in ("lease_stages", "downloads", "archive_extractions"):
                     current[key] = self.lease_record.get(key)
+                if "download_cache" in self.lease_record:
+                    current["download_cache"] = self.lease_record["download_cache"]
                 _write_json(self.manifest_path, current)
         except (OSError, ValueError, TypeError):
             pass
+
+
+# ---- the accession download store in the lease ------------------------------------------------------------
+#
+# WHY. A Workbench study archive lists every sample of a study, and the store's design measured 489 declared
+# units touching a URL another unit lists: fetched per unit, 14.37 TB move where fetching each URL once moves
+# 8.22 TB, and ST001408.zip alone is 928 GB used by three units. The user decided on 2026-09-30 that a shared
+# object is downloaded once. download_store.py (0.5.13) holds the bytes; until now no lease used it.
+#
+# WHAT THE STORE OWNS AND WHAT THE UNIT OWNS. The store owns the downloaded objects and their extraction
+# trees, under <workspace_root>\<repository>\<accession>\_dl, kept alive by one claim per consuming unit.
+# Each unit still owns its own raw tree, <workspace>\raw, so every deletion that requires raw to be that
+# folder (cleanup_download_lease, discard_download_lease, cleanup_split_parent) works on it as before: the
+# tree holds hardlinks to the store's files, which MS-DIAL reads, and MS-DIAL's intermediates written beside
+# them stay in the unit's tree and never reach the store. A unit's release of its tree releases its claims,
+# and the store deletes an object only when no live claim holds it, under the campaign approval that covers
+# boundary 5 for every unit that released it (DownloadStore.gc). Split parts never claim: the parent's claims
+# stand for its parts until the parent's own release.
+#
+# RESERVED NAMES. _dl is the store's directory beside an accession's units, and _campaigns the campaign
+# runner's beside the repositories; neither is ever a unit, an accession or a repository.
+RESERVED_WORKSPACE_NAMES = frozenset({STORE_DIRECTORY, "_campaigns"})
+DOWNLOAD_CACHE_SCHEMA = "msdial-download-cache.v1"
+RAW_STORAGE_SCHEMA = "msdial-raw-storage.v1"
+STORE_RELEASE_SCHEMA = "msdial-download-store-release.v1"
+# How long one wait for another lease's lock lasts before the lease beats its heartbeat and hears a cancel.
+STORE_WAIT_POLL_SECONDS = 15.0
+
+
+def is_reserved_workspace_name(name: Any) -> bool:
+    return str(name or "").strip().casefold() in {item.casefold() for item in RESERVED_WORKSPACE_NAMES}
+
+
+def _lease_store(
+    project: RepositoryProject,
+    workspace_root: Path,
+    campaign_authorization: dict[str, Any] | None,
+    store_mode: str | None,
+) -> tuple[DownloadStore | None, dict[str, Any]]:
+    """The download store this lease uses, or None, and why.
+
+    A campaign's lease uses it; any other only where store_mode (the argument, else the saved setting) is
+    "always". A unit without an analysis unit id has no claim to hold, and is leased as before.
+    """
+    from .user_settings import STORE_MODES, download_store_mode
+
+    mode = str(store_mode or "").strip().casefold()
+    mode = mode if mode in STORE_MODES else download_store_mode()
+    use: dict[str, Any] = {"store_mode": mode, "reason": None}
+    if campaign_authorization:
+        use["activated_by"] = "campaign_authorization"
+    elif mode == "always":
+        use["activated_by"] = "store_mode"
+    else:
+        return None, use
+    if not project.analysis_unit_id:
+        use["reason"] = (
+            "The accession download store was asked for, but the unit has no analysis unit id to claim its "
+            "objects under; every object was fetched into this unit's own raw tree."
+        )
+        return None, use
+    try:
+        return DownloadStore(workspace_root, project.repository, project.accession), use
+    except StoreError as error:
+        use["reason"] = (
+            f"The accession download store was asked for, but cannot be placed: {error} Every object was "
+            "fetched into this unit's own raw tree."
+        )
+        return None, use
+
+
+def _download_cache_record(
+    store: DownloadStore, project: RepositoryProject, use: dict[str, Any], objects: list[dict[str, Any]]
+) -> dict[str, Any]:
+    return {
+        "schema": DOWNLOAD_CACHE_SCHEMA,
+        "store": str(store.root),
+        "workspace_root": str(store.root.parent.parent.parent),
+        "repository": store.repository,
+        "accession": store.accession,
+        "unit_id": project.analysis_unit_id,
+        "activated_by": use.get("activated_by"),
+        "store_mode": use.get("store_mode"),
+        "objects": objects,
+    }
+
+
+class _LeaseFetcher:
+    """The store's fetcher over the lease's client, so a store fetch keeps the client's idle timeouts and
+    retries (RepositoryHttpClient.download) and the attempts it records."""
+
+    def __init__(self, client: Any, maximum_bytes: int) -> None:
+        self.client = client
+        self.maximum_bytes = maximum_bytes
+        self.results: list[dict[str, Any]] = []
+
+    def fetch(self, url: str, destination: Path, progress_callback: Any = None) -> dict[str, Any]:
+        result = self.client.download(url, destination, self.maximum_bytes, progress_callback=progress_callback)
+        self.results.append(result)
+        return result
+
+    def head(self, url: str) -> int:
+        probe = getattr(self.client, "content_length", None)
+        return probe(url) if callable(probe) else 0
+
+
+class _StoreLease:
+    """The fetch, extract and materialise stages of one unit's lease through the accession download store.
+
+    fetch: each object through DownloadStore.fetch_or_reuse, which claims it for this unit, transfers it
+    only when no verified copy is in the store (one GET for every unit of the accession, with the client's
+    idle timeouts and retries), and compares its declared MD5 before anything else sees it. A per-file
+    object's downloads[] path is where this unit's link to it will be, so the lineage and the gate find it
+    as they always did; an archive's is the store's object, which keeps its name and its suffix. Each entry
+    also records cache_object_path, sha256_origin (fetched_by_this_unit or inherited_from_cache) and
+    declared_checksum_verified.
+
+    extract: each archive once, in the store (DownloadStore.ensure_extracted), with archives.extract_archive
+    and the lease's limits; a unit that finds the tree already there reuses it. The extraction record is the
+    store's, with this unit's placement, and its member listing is copied into this unit's provenance,
+    where it survives raw deletion, as the per-unit extraction wrote it.
+
+    materialise: every object and tree linked into the unit's raw\\data at the placement the per-unit lease
+    used (_route_object), planned whole first, never overwriting: a second source with the same bytes at one
+    path is not placed again, and a file already there with its source's bytes is kept, as the per-unit
+    merge allowed; anything else refuses the lease (MaterializationCollision). A failed link is a copy, and
+    raw_storage says which (hardlink, copy or mixed); so is a file a reader rewrites in place
+    (_rewritten_by_its_reader), which would otherwise change the store's record through the link.
+
+    prune: once the attribute stage has said what is the unit's, the links this materialisation made to
+    anything else are removed - never a file the unit holds itself.
+
+    While another lease holds an object's lock, this one waits in polls of STORE_WAIT_POLL_SECONDS, telling
+    shared_download_callback once (waiting_for_shared_download), beating its heartbeat and calling its
+    progress callback between polls, so a cancel is heard during the wait.
+    """
+
+    def __init__(
+        self,
+        store: DownloadStore,
+        project: RepositoryProject,
+        use: dict[str, Any],
+        lease_record: dict[str, Any],
+        *,
+        client: Any,
+        data_root: Path,
+        provenance: Path,
+        stages: _LeaseStages,
+        job_id: str,
+        heartbeat: Any,
+        shared_download_callback: Any = None,
+    ) -> None:
+        self.store = store
+        self.project = project
+        self.unit_id = project.analysis_unit_id
+        self.client = client
+        self.data_root = data_root
+        self.provenance = provenance
+        self.stages = stages
+        self.job_id = job_id
+        # Called between polls of a wait outside the fetch: the lease's heartbeat, and its progress callback,
+        # which is where a cancelled job is heard.
+        self.heartbeat = heartbeat
+        self.shared_download_callback = shared_download_callback
+        self.objects: list[dict[str, Any]] = []
+        self.placements: list[dict[str, Any]] = []
+        self.tree_records: list[tuple[int, dict[str, Any]]] = []
+        self.placed: dict[str, dict[str, Any]] = {}
+        self.raw_storage: dict[str, Any] = {}
+        self.record = _download_cache_record(store, project, use, self.objects)
+        # The record a stage write persists while the lease runs (_LeaseStages.persist).
+        lease_record["download_cache"] = self.record
+
+    def _wait(self, call: Any, between: Any, label: str) -> Any:
+        told: list[dict[str, Any]] = []
+
+        def on_wait(holder: dict[str, Any]) -> None:
+            if told:
+                return
+            detail = {**holder, "unit_id": self.unit_id, "object": label}
+            told.append(detail)
+            if self.shared_download_callback is not None:
+                self.shared_download_callback("waiting_for_shared_download", detail)
+
+        while True:
+            try:
+                result = call(STORE_WAIT_POLL_SECONDS, on_wait)
+                break
+            except StoreLockTimeout:
+                # Another lease is still fetching or extracting it. Its bytes are this lease's too, so it
+                # waits; between polls it beats and hears a cancel through the progress callback.
+                between()
+        if told and self.shared_download_callback is not None:
+            self.shared_download_callback("shared_download_ready", {"unit_id": self.unit_id, "object": label})
+        return result
+
+    def fetch(
+        self,
+        url: str,
+        item: RepositoryFile,
+        filename: str,
+        link_target: str | None,
+        maximum_bytes: int,
+        progress: Any,
+    ) -> dict[str, Any]:
+        """One object, as the download record the per-unit fetch would have returned, plus the store's own."""
+        declared = str(item.checksum or "").strip()
+        if self.project.repository == "mb_post" or not re.fullmatch(r"[0-9a-fA-F]{32}", declared):
+            # As _verify_object_checksum: only an object's own MD5 is compared as it arrives.
+            declared = ""
+        fetcher = _LeaseFetcher(self.client, maximum_bytes)
+        try:
+            fetched = self._wait(
+                lambda timeout, on_wait: self.store.fetch_or_reuse(
+                    url,
+                    filename,
+                    unit_id=self.unit_id,
+                    fetcher=fetcher,
+                    declared_md5=declared,
+                    job_id=self.job_id,
+                    progress_callback=progress,
+                    on_wait=on_wait,
+                    lock_timeout=timeout,
+                ),
+                lambda: progress(0, 0),
+                item.name,
+            )
+        except DeclaredChecksumMismatch:
+            self.stages.at("verify_declared_checksums")
+            raise
+        result: dict[str, Any] = {
+            "path": fetched["object_path"] if link_target is None else str(self.data_root / link_target),
+            "size_bytes": int(fetched["size_bytes"]),
+            "sha256": fetched["sha256"],
+            "md5": fetched["md5"],
+            "resumed_from_bytes": int(fetched.get("resumed_from_bytes") or 0),
+        }
+        if fetcher.results:
+            for key in ("etag", "last_modified", "attempts"):
+                if fetcher.results[-1].get(key):
+                    result[key] = fetcher.results[-1][key]
+        result.update(
+            cache_object_path=fetched["object_path"],
+            cache_object_id=fetched["object_id"],
+            sha256_origin=fetched["sha256_origin"],
+            declared_checksum_verified=fetched["declared_checksum_verified"],
+        )
+        self.objects.append(
+            {
+                key: fetched.get(key)
+                for key in (
+                    "url", "url_key", "object_id", "name", "size_bytes", "cache_hit", "action", "reuse_reason",
+                    "sha256_origin", "fetched_by", "transferred_bytes", "reuse_check", "waited_for_lock",
+                    "lock_holder", "recovered_stale_locks", "claim_path", "claim_state",
+                )
+            }
+        )
+        if link_target is not None:
+            self.placements.append({"url": url, "source": "object", "target": link_target})
+        return result
+
+    def extract(
+        self,
+        download: dict[str, Any],
+        placement: str,
+        number: int,
+        earlier: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]]]:
+        """One archive's extraction, made once in the store, as this unit's record and members.
+
+        The same (record, members) _extract_into_data_root returns, with the members where materialise will
+        link them: under the data root at ``placement``.
+        """
+        sha256 = str(download.get("sha256") or "")
+        object_id = str(download["cache_object_id"])
+
+        def extract(obj: Path, staging: Path) -> dict[str, Any]:
+            # extract_archive builds its own staging beside a destination that must not exist yet, and holds
+            # every member path to MAX_PATH under that staging: so it extracts to the shortest name the
+            # object's directory can give, x, whose staging is x.partial, and the tree is then moved to where
+            # the store expects it. The member listing is left beside the tree, in the object's directory.
+            short = staging.parent / "x"
+            if os.path.lexists(short):
+                unlink_tree(short)  # verified and not moved when an earlier extraction stopped
+            staging.rmdir()
+            record = archives.extract_archive(
+                obj,
+                short,
+                archive_sha256=sha256,
+                listing_directory=staging.parent,
+                limits=LEASE_EXTRACTION_LIMITS,
+            )
+            os.replace(short, staging)
+            return record
+
+        name = Path(str(download.get("cache_object_path") or download.get("path") or "")).name
+        entry = self._wait(
+            lambda timeout, on_wait: self.store.ensure_extracted(
+                object_id, extract, unit_id=self.unit_id, job_id=self.job_id, lock_timeout=timeout, on_wait=on_wait
+            ),
+            lambda: self.heartbeat(name),
+            name,
+        )
+        extraction = dict(entry.get("extraction") or {})
+        listing = dict(extraction.get("members_tsv") or {})
+        if not listing.get("path"):
+            raise StoreError(f"The store's extraction of {name} recorded no member listing.")
+        listing_directory = self.provenance
+        if sha256 and any(str(record.get("archive_sha256") or "") == sha256 for record in earlier):
+            listing_directory = self.provenance / "archive-members" / str(number)
+        copy_path = listing_directory / Path(str(listing["path"])).name
+        _copy_store_listing(Path(str(listing["path"])), copy_path, str(listing.get("sha256") or ""))
+        rows = [row for row in _read_members_listing(copy_path) if row.get("disposition") == "extracted"]
+        target = self.data_root.joinpath(*placement.split("/")) if placement else self.data_root
+        _refuse_long_final_paths(rows, target, LEASE_EXTRACTION_LIMITS, name)
+        members: list[tuple[str, dict[str, Any]]] = [
+            (str(target.joinpath(*row["path"].split("/"))), {"member": row["path"], "archive": row["archive"]})
+            for row in rows
+            if row.get("type") == "file"
+        ]
+        tree = self.store.object_directory(object_id) / "t"
+        container_root = str(extraction.get("container_root") or "")
+        record = {
+            **extraction,
+            "members_tsv": {**listing, "path": str(copy_path)},
+            "staging_destination": str(tree),
+            "destination": str(target),
+            "placement": placement,
+            "container_path": "/".join(part for part in (placement, container_root) if part),
+            "source_url": str(download.get("source_url") or ""),
+            "download_path": str(download.get("path") or ""),
+            "extracted_file_count": len(members),
+            "store_extraction": {
+                "object_id": object_id,
+                "tree": str(tree),
+                "action": entry.get("extraction_action"),
+                "extracted_by": (entry.get("tree") or {}).get("extracted_by"),
+                "extracted_at": (entry.get("tree") or {}).get("extracted_at"),
+            },
+        }
+        self.tree_records.append((len(self.placements), record))
+        self.placements.append({"url": str(download.get("source_url") or ""), "source": "tree", "target": placement})
+        return record, members
+
+    def extraction_counts(self) -> dict[str, Any]:
+        actions = [str((record.get("store_extraction") or {}).get("action") or "") for _index, record in self.tree_records]
+        return {
+            "extracted_in_store": sum(1 for action in actions if action in {"extracted", "re-extracted"}),
+            "store_extractions_reused": actions.count("reused"),
+        }
+
+    def materialise(self) -> dict[str, Any]:
+        """Link every object and tree into the unit's tree; returns the stage's summary."""
+        placed: dict[str, dict[str, Any]] = {}
+        record = self.store.materialize(
+            self.unit_id,
+            self.data_root,
+            self.placements,
+            same_content=_same_bytes,
+            placed=placed,
+            copy_instead=_rewritten_by_its_reader,
+        )
+        self.placed = placed
+        for index, extraction in self.tree_records:
+            mine = [(relative, info) for relative, info in placed.items() if info["pair"] == index]
+            already = [relative for relative, info in mine if info["how"] in {"present", "kept_existing"}]
+            # Members a placement before this one already put at the same path, with the same bytes.
+            already += [
+                relative for relative, info in placed.items()
+                for duplicate in info.get("duplicates") or [] if duplicate["pair"] == index
+            ]
+            extraction["merge"] = {
+                "materialized_from_store": True,
+                "linked_files": sum(1 for _relative, info in mine if info["how"] == "linked"),
+                "copied_files": sum(1 for _relative, info in mine if info["how"] == "copied"),
+                "moved_entries": 0,
+                "already_present_files": len(already),
+                "already_present": sorted(already)[:50],
+            }
+        self.raw_storage = {
+            "schema": RAW_STORAGE_SCHEMA,
+            "materialization": record["materialization"],
+            "store": str(self.store.root),
+            "data_root": record["data_root"],
+            "files": record["files"],
+            "directories": record["directories"],
+            "linked_files": record["linked_files"],
+            "copied_files": record["copied_files"],
+            "already_present_files": record["already_present_files"],
+            "duplicate_source_files": record.get("duplicate_source_files", 0),
+            "kept_existing_files": record.get("kept_existing_files", 0),
+            "logical_bytes": record["logical_bytes"],
+            "bytes_linked_from_store": record["bytes_linked_from_store"],
+            # What this unit holds that the store does not: copies made where a link failed, and files an
+            # earlier lease left in the tree with the same bytes.
+            "bytes_held_by_unit": int(record["bytes_copied"]) + int(record.get("bytes_kept_existing") or 0),
+            "copy_fallback_count": record["copy_fallback_count"],
+            "copy_fallbacks": record["copy_fallbacks"],
+            "protected_copies": record.get("protected_copies", 0),
+            "protected_copy_paths": record.get("protected_copy_paths", []),
+        }
+        return {
+            "objects": len(self.placements),
+            "materialization": record["materialization"],
+            "files": record["files"],
+            "linked_files": record["linked_files"],
+            "copied_files": record["copied_files"],
+            "already_present_files": record["already_present_files"] + record.get("duplicate_source_files", 0)
+            + record.get("kept_existing_files", 0),
+            "bytes_linked_from_store": record["bytes_linked_from_store"],
+        }
+
+    def prune(self, keep: Iterable[Any]) -> dict[str, Any]:
+        """Remove the links this materialisation made to files that are none of the unit's.
+
+        ``keep`` is every path the lease found to be the unit's: its inputs (a folder keeps all it holds),
+        the inputs it excluded, the mzXML it converted or chose against, its members of the archives, the
+        files whose declared checksums it verified, and its own per-file objects. A .wiff.scan stays with
+        its .wiff. A name is removed only if it is the store's file (or this lease's copy of one); a file
+        the unit holds itself is never removed here, because deleting raw data is not a lease's to do.
+        """
+        files: set[str] = set()
+        folders: set[str] = set()
+        for value in keep:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            key = _file_key(text)
+            (folders if Path(text).is_dir() else files).add(key)
+        removed = removed_bytes = directories = 0
+        kept_failures: list[dict[str, Any]] = []
+        emptied: set[Path] = set()
+        for relative, info in sorted(self.placed.items()):
+            if info["how"] not in {"linked", "copied", "present"}:
+                continue
+            path = self.data_root.joinpath(*relative.split("/"))
+            key = _file_key(str(path))
+            if key in files or any(str(parent) in folders for parent in Path(key).parents):
+                continue
+            if _is_sidecar_name(path.name) and _file_key(str(path.with_name(path.name.rsplit(".", 1)[0]))) in files:
+                continue
+            try:
+                ours = info["how"] == "copied" or os.path.samefile(path, info["source"])
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if not ours:
+                continue
+            removal = unlink_tree(path)
+            if removal["complete"]:
+                removed += 1
+                removed_bytes += size
+                emptied.add(path.parent)
+            else:
+                kept_failures.extend(removal["kept"])
+        root = self.data_root.resolve()
+        for directory in sorted(emptied, key=lambda item: len(item.parts), reverse=True):
+            current = directory
+            while current != root and root in current.parents:
+                try:
+                    current.rmdir()
+                except OSError:
+                    break
+                directories += 1
+                current = current.parent
+        result = {
+            "removed_files": removed,
+            "removed_logical_bytes": removed_bytes,
+            "removed_directories": directories,
+            "kept_count": len(kept_failures),
+            "kept": kept_failures[:_REPORTED_DELETION_ITEMS],
+        }
+        self.raw_storage["pruned"] = result
+        self.raw_storage["files_after_prune"] = int(self.raw_storage.get("files") or 0) - removed
+        return result
+
+    def cache_record(self) -> dict[str, Any]:
+        record = dict(self.record)
+        record["objects_fetched"] = sum(1 for item in self.objects if not item.get("cache_hit"))
+        record["cache_hits"] = sum(1 for item in self.objects if item.get("cache_hit"))
+        record["transferred_bytes"] = sum(int(item.get("transferred_bytes") or 0) for item in self.objects)
+        record["waited_for_shared_download"] = sum(1 for item in self.objects if item.get("waited_for_lock"))
+        return record
+
+
+def _rewritten_by_its_reader(source: Path) -> bool:
+    """Whether a store file is one a reader may rewrite in place, and so is copied into a unit, not linked.
+
+    Bruker's baf2sql writes analysis.sqlite into the BAF .d it opens (msdial_app.reader_created). A .d that
+    arrived with one would have it rewritten through the unit's link, which is the store's file record and
+    every other unit's: the store would find it tainted only afterwards. A copy keeps the store's own.
+    """
+    return source.name.casefold() in reader_created_names(source.parent)
+
+
+def _copy_store_listing(source: Path, destination: Path, sha256: str) -> None:
+    """Copy the store's member listing into the unit's provenance, refusing one that is not the recorded one."""
+    data = source.read_bytes()
+    if sha256 and hashlib.sha256(data).hexdigest() != sha256:
+        raise StoreError(
+            f"The store's member listing {source.name} is not the one its extraction recorded; the object has to "
+            "be extracted again before a unit can use it."
+        )
+    if destination.is_file() and destination.read_bytes() == data:
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    temporary.write_bytes(data)
+    os.replace(temporary, destination)
 
 
 def _route_object(
@@ -5995,8 +6831,10 @@ def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
             "MS-DIAL containers are still in the raw directory, and its deletion would delete them: "
             + describe_holds(held) + "."
         )
+    store = _store_release_preview(manifest)
     return {
         **({"finalisation_holds": held} if held else {}),
+        **({"download_store": store} if store else {}),
         "manifest_path": str(manifest_path),
         "status": manifest.get("status"),
         "retention_policy": manifest.get("raw_retention_policy"),
@@ -6374,9 +7212,266 @@ def cleanup_download_lease(
             kept=_retained_kept(manifest),
             finish=change,
         )
+        if result.get("deleted"):
+            # The tree's links are gone, so its claims go too, and the store collects what no unit holds.
+            released = release_store_claims(manifest_path, "raw_cleaned", crossing)
+            if released is not None:
+                result["download_store"] = released
     if crossing is not None:
         result["campaign_authorization"] = crossing
     return result
+
+
+def _unit_store(manifest: dict[str, Any]) -> DownloadStore | None:
+    """The accession download store that may hold claims of this unit's; None when there is none.
+
+    The one its lease recorded (download_cache), else - a lease from before the store, or one that stopped
+    before it recorded one - the store beside the unit's workspace, where a batch pre-claim may have put a
+    claim of this unit's.
+    """
+    project = manifest.get("project") or {}
+    cache = manifest.get("download_cache")
+    try:
+        if isinstance(cache, dict) and str(cache.get("workspace_root") or "").strip():
+            return DownloadStore(cache["workspace_root"], cache.get("repository"), cache.get("accession"))
+        unit = str(project.get("analysis_unit_id") or "")
+        workspace = Path(str(manifest.get("workspace") or ""))
+        accession_root = workspace.parent
+        if (
+            not unit
+            or workspace.name != unit
+            or accession_root.name != str(project.get("accession") or "")
+            or accession_root.parent.name != str(project.get("repository") or "")
+            or not (accession_root / STORE_DIRECTORY).is_dir()
+        ):
+            return None
+        return DownloadStore(accession_root.parent.parent, project.get("repository"), project.get("accession"))
+    except StoreError:
+        return None
+
+
+def release_store_claims(
+    manifest_path: Path, reason: str, crossing: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """Release every download-store claim this unit holds, now that its raw tree is gone. Never raises.
+
+    Called by cleanup_download_lease, discard_download_lease and cleanup_split_parent once the tree they
+    delete is gone, under the deletion they made: with the campaign approval that covered it (``crossing``,
+    boundary 5), the store's GC then deletes each released object no live claim still holds
+    (DownloadStore.gc: a pending pre-claim of a unit that has not run yet keeps it, as does a materialized
+    claim of a unit still reading it); with a person's confirmation alone the claims are released and the
+    store deletes nothing, because its objects are deleted only under a campaign approval. A release asked
+    for again releases nothing more. The record is written into the manifest as download_store_release.
+    None when no store holds claims of this unit's.
+    """
+    try:
+        manifest = read_manifest(manifest_path)
+    except (OSError, ValueError):
+        return None
+    store = _unit_store(manifest)
+    unit = str((manifest.get("project") or {}).get("analysis_unit_id") or "")
+    if store is None or not unit:
+        return None
+    at = datetime.now(timezone.utc).isoformat()
+    authorization = str((crossing or {}).get("authorization_path") or "").strip() or None
+    record: dict[str, Any] = {"schema": STORE_RELEASE_SCHEMA, "released_at": at, "reason": reason, "store": str(store.root)}
+    try:
+        if not store.claims_for_unit(unit):
+            return None
+        released = store.release_unit(unit, reason, authorization=authorization)
+    except (StoreError, OSError) as error:
+        record["error"] = f"{type(error).__name__}: {error}"
+    else:
+        record["claims"] = [
+            {key: claim.get(key) for key in ("url", "object_id", "state", "release_reason", "released_at")}
+            for claim in released["released"]
+        ]
+        gc = released.get("gc")
+        if gc is None:
+            record["gc"] = {
+                "authorized": False,
+                "reason": (
+                    "No campaign approval covered this deletion, and the store deletes nothing without one; "
+                    "its objects stay for a collection under one."
+                ),
+            }
+        else:
+            record["gc"] = {
+                key: gc.get(key)
+                for key in ("authorized", "approval_id", "raw_retention_policy", "reason", "refusal_codes")
+                if key in gc
+            }
+            record["gc"].update(
+                collected=[
+                    {key: item.get(key) for key in ("object_id", "state", "removed_bytes")}
+                    for item in gc.get("collected") or []
+                ],
+                kept=list(gc.get("kept") or []),
+                refused=list(gc.get("refused") or []),
+                busy=list(gc.get("busy") or []),
+                partials_removed=len(gc.get("partials_removed") or []),
+            )
+
+    def change(current: dict[str, Any]) -> None:
+        current["download_store_release"] = record
+
+    try:
+        update_manifest(manifest_path, change)
+    except (OSError, ValueError):
+        pass
+    return record
+
+
+def _store_release_preview(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """What releasing this unit's store claims would free, and what the store keeps, for which units.
+
+    For a deletion's preview: the bytes of an object freed only when it is collected, which happens under a
+    campaign approval and only once no other live claim holds it. Changes nothing. None without claims.
+    """
+    store = _unit_store(manifest)
+    unit = str((manifest.get("project") or {}).get("analysis_unit_id") or "")
+    if store is None or not unit:
+        return None
+    try:
+        claims = store.claims_for_unit(unit)
+        if not claims:
+            return None
+        objects = []
+        for claim in claims:
+            object_id = claim.get("object_id") or (store.lookup(str(claim.get("url") or "")) or {}).get("object_id")
+            entry = store.entry(object_id) if object_id else None
+            others = sorted(
+                {item["unit_id"] for item in store.live_claims(object_id) if item.get("unit_id") != unit}
+            ) if object_id else []
+            objects.append(
+                {
+                    "url": claim.get("url"),
+                    "object_id": object_id,
+                    "claim_state": claim.get("state"),
+                    "object_state": (entry or {}).get("state"),
+                    "size_bytes": (entry or {}).get("size_bytes"),
+                    "kept_for_units": others,
+                }
+            )
+    except (StoreError, OSError) as error:
+        return {"store": str(store.root), "error": f"{type(error).__name__}: {error}"}
+    return {
+        "store": str(store.root),
+        "claims": len(claims),
+        "objects": objects,
+        "bytes_collectable_after_release": sum(
+            int(item.get("size_bytes") or 0)
+            for item in objects
+            if not item["kept_for_units"] and item.get("object_state") == "ready"
+        ),
+        "collection": (
+            "An object is deleted only under a campaign approval that covers boundary 5 for every unit that "
+            "released it, and only once no live claim holds it; a person's confirmation releases the claims "
+            "and deletes no store object."
+        ),
+    }
+
+
+def unit_workspaces(accession_root: Path) -> list[Path]:
+    """The unit workspaces under one accession's directory: those with a run manifest, never _dl or _campaigns."""
+    try:
+        children = sorted(Path(accession_root).iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    return [
+        child for child in children
+        if child.is_dir()
+        and not is_reserved_workspace_name(child.name)
+        and (child / "provenance" / "run-manifest.json").is_file()
+    ]
+
+
+def download_store_status(
+    workspace_root: str | Path, repository: str = "", accession: str = "", unit_id: str = ""
+) -> dict[str, Any]:
+    """A read-only picture of the accession download stores under a workspace root. Changes nothing.
+
+    Per store: its objects (state, size, the units whose live claims keep each), its claims by state, its
+    partial transfers and its lock holders (DownloadStore.summary), and, read from each unit's own manifest,
+    the claims of units whose raw data are already released (raw_cleaned, discarded) yet still live, and
+    the objects no live claim holds, which the next collection under a campaign approval deletes.
+    ``repository`` and ``accession`` narrow it to one store, ``unit_id`` to the claims of one unit. Only the
+    _dl directory of each accession is read; _dl and _campaigns are never taken for units.
+    """
+    from .user_settings import download_store_mode
+
+    root = Path(workspace_root).expanduser().resolve()
+    stores: list[dict[str, Any]] = []
+    repositories = [root / repository] if repository else (
+        sorted(path for path in root.iterdir() if path.is_dir()) if root.is_dir() else []
+    )
+    for repository_root in repositories:
+        if is_reserved_workspace_name(repository_root.name) or not repository_root.is_dir():
+            continue
+        accessions = [repository_root / accession] if accession else sorted(
+            path for path in repository_root.iterdir() if path.is_dir()
+        )
+        for accession_root in accessions:
+            if is_reserved_workspace_name(accession_root.name) or not (accession_root / STORE_DIRECTORY).is_dir():
+                continue
+            try:
+                store = DownloadStore(root, repository_root.name, accession_root.name)
+                summary = store.summary()
+                claims = store.all_claims()
+            except (StoreError, OSError) as error:
+                stores.append({"store": str(accession_root / STORE_DIRECTORY), "error": f"{type(error).__name__}: {error}"})
+                continue
+            statuses: dict[str, str] = {}
+            for workspace in unit_workspaces(accession_root):
+                try:
+                    recorded = read_manifest(workspace / "provenance" / "run-manifest.json")
+                except (OSError, ValueError):
+                    continue
+                unit = str((recorded.get("project") or {}).get("analysis_unit_id") or workspace.name)
+                statuses[unit] = str(recorded.get("status") or "")
+            if unit_id:
+                claims = [claim for claim in claims if claim.get("unit_id") == unit_id]
+            by_unit: dict[str, list[dict[str, Any]]] = {}
+            for claim in claims:
+                by_unit.setdefault(str(claim.get("unit_id") or ""), []).append(
+                    {key: claim.get(key) for key in ("url", "object_id", "state", "release_reason", "claimed_at", "released_at")}
+                )
+            stale = sorted(
+                unit for unit, items in by_unit.items()
+                if statuses.get(unit) in RAW_RELEASED_STATUSES and any(item["state"] in {"pending", "materialized"} for item in items)
+            )
+            stores.append(
+                {
+                    **summary,
+                    "repository": repository_root.name,
+                    "accession": accession_root.name,
+                    "units": {
+                        unit: {"status": statuses.get(unit) or "no_manifest", "claims": items}
+                        for unit, items in sorted(by_unit.items())
+                    },
+                    "live_claims_of_released_units": stale,
+                    "unclaimed_objects": [
+                        item["object_id"] for item in summary["objects"]
+                        if item.get("state") == "ready" and not item.get("live_claims")
+                    ],
+                }
+            )
+    return {
+        "schema": "msdial-download-store-status.v1",
+        "workspace_root": str(root),
+        "store_mode": download_store_mode(),
+        "store_count": len(stores),
+        "stores": stores,
+    }
+
+
+def _store_release_reason(status: str) -> str:
+    """The reason a discarded unit's claims are released with, by the status it was discarded from."""
+    if status in {SKIPPED_BY_PREFLIGHT_STATUS, EXCLUDED_BY_PREFLIGHT_STATUS}:
+        return "excluded"
+    if status in {"run_failed", "validation_failed"}:
+        return "failed_terminal"
+    return "discarded"
 
 
 def _authorized_by(crossing: dict[str, Any] | None) -> dict[str, Any]:
@@ -6608,8 +7703,10 @@ def plan_download_discard(manifest_path: Path, *, authorized: bool = False) -> d
             "finalisation_held [raw_deletion]: MS-DIAL containers a finished run could not move are still in the raw "
             "directory: " + describe_holds(held) + "."
         )
+    store = _store_release_preview(manifest)
     return {
         **({"finalisation_holds": held} if held else {}),
+        **({"download_store": store} if store else {}),
         "manifest_path": str(manifest_path),
         "status": status,
         "retention_policy": manifest.get("raw_retention_policy"),
@@ -6745,7 +7842,18 @@ def discard_download_lease(
         manifest = read_manifest(manifest_path)
         finished = _discard_finished(manifest, raw_root, authorized=crossing is not None)
         if finished is not None:
-            return _discard_made(manifest_path, manifest, raw_root, finished, crossing)
+            made = _discard_made(manifest_path, manifest, raw_root, finished, crossing)
+            if made.get("deleted"):
+                # A discard stopped between its deletion and its release finishes the release; a repeated
+                # one releases nothing more.
+                previous = manifest.get("download_store_release") or {}
+                released = release_store_claims(
+                    manifest_path, str(previous.get("reason") or "discarded"), crossing
+                )
+                if released is not None:
+                    made["download_store"] = released
+            return made
+        released_from = str(manifest.get("status") or "")
         downloading = manifest.get("status") == "downloading"
         owner_state = lease_owner_state(manifest) if downloading else None
         if crossing is not None:
@@ -6868,6 +7976,10 @@ def discard_download_lease(
             # Checked again before the first file goes, not only after the last.
             guard=same_lease,
         )
+        if result.get("deleted"):
+            released = release_store_claims(manifest_path, _store_release_reason(released_from), crossing)
+            if released is not None:
+                result["download_store"] = released
     if stale is not None and result.get("deleted"):
         result["stale_lease_discarded"] = True
     if failure_artifacts is not None:
@@ -7105,7 +8217,10 @@ def plan_split_parent_cleanup(manifest_path: Path) -> dict[str, Any]:
     file_count, total_bytes = _tree_size(raw_root)
     release = manifest.get("raw_release") if isinstance(manifest.get("raw_release"), dict) else {}
     already = release.get("state") == "deleted" and not raw_root.exists()
+    # The parent's claims stand for every part (parts never claim), and are released with its tree.
+    store = _store_release_preview(manifest)
     return {
+        **({"download_store": store} if store else {}),
         "manifest_path": str(manifest_path),
         "analysis_unit_id": str(project.get("analysis_unit_id") or ""),
         "status": manifest.get("status"),
@@ -7196,7 +8311,7 @@ def cleanup_split_parent(
                 refresh_retained_artifacts(Path(str(item["manifest_path"])))
     crossing = _deletion_crossing(campaign_authorization_path, manifest, entry_point)
     plan = plan_split_parent_cleanup(manifest_path)
-    if plan["already_released"]:
+    if plan["already_released"] and not confirmed and crossing is None:
         return {**plan, "deleted": True, "already_released": True}
     if not confirmed and crossing is None:
         return {**plan, "deleted": False, "confirmation_required": True}
@@ -7204,7 +8319,7 @@ def cleanup_split_parent(
     with _raw_deletion_lock(manifest_path):
         plan = plan_split_parent_cleanup(manifest_path)
         if plan["already_released"]:
-            return {**plan, "deleted": True, "already_released": True}
+            return _split_parent_released_again(manifest_path, plan, crossing)
         if plan["blockers"]:
             return {
                 **plan,
@@ -7262,6 +8377,11 @@ def cleanup_split_parent(
             current.pop("raw_release_pending", None)
 
         update_manifest(manifest_path, finish)
+        # The parent's claims stood for every part; with the tree gone they go, and the store collects what
+        # no other unit holds.
+        released = release_store_claims(
+            manifest_path, "raw_cleaned" if removal["raw_release"].get("kind") == "released" else "discarded", crossing
+        )
     result = {
         **plan_split_parent_cleanup(manifest_path),
         "deleted": True,
@@ -7269,8 +8389,23 @@ def cleanup_split_parent(
         "raw_directory": str(raw_root),
         "raw_release": read_manifest(manifest_path).get("raw_release"),
     }
+    if released is not None:
+        result["download_store"] = released
     if crossing is not None:
         result["campaign_authorization"] = crossing
+    return result
+
+
+def _split_parent_released_again(
+    manifest_path: Path, plan: dict[str, Any], crossing: dict[str, Any] | None
+) -> dict[str, Any]:
+    """A release asked for again: nothing is deleted, and a claim release a stop left unmade is made now."""
+    result = {**plan, "deleted": True, "already_released": True}
+    recorded = read_manifest(manifest_path)
+    reason = "raw_cleaned" if (recorded.get("raw_release") or {}).get("kind") == "released" else "discarded"
+    released = release_store_claims(manifest_path, reason, crossing)
+    if released is not None:
+        result["download_store"] = released
     return result
 
 
