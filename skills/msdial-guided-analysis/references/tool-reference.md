@@ -206,7 +206,15 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   expand mixed accessions into independent analysis-unit workspaces. Prefer
   `analysis_unit_handoff_paths` over inlining file/sample manifests. It never
   downloads or executes data. Pass the reviewed `analysis_purpose`; omission is
-  reported as a pending decision.
+  reported as a pending decision. Its `download_plan` lists the distinct
+  objects with the units that consume each, per-unit against distinct bytes,
+  and a `run_order` that keeps units sharing an object together; with a
+  campaign approval, `pre_claim=true` records a store claim for each covered
+  unit so a shared object is kept until it has run.
+- `msdial_download_store_status`: read-only view of the accession download
+  stores (`<workspace_root>\<repository>\<accession>\_dl`): each object and the
+  units whose claims keep it, partial transfers, lock holders, unclaimed
+  objects, and live claims of units whose raw data are already released.
 - `msdial_repository_reanalysis_plan`: inspect metadata, eligibility, the
   default Class hierarchy, and internal-standard declarations without
   downloading raw data. Pass `analysis_unit_handoff_path` for Catalog-driven

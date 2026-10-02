@@ -493,6 +493,7 @@ Core MCP tools:
 - `msdial_repository_qa_evidence`: expose internal-standard declarations for agent-reviewed QA targets
 - `msdial_cleanup_repository_raw`: preview and explicitly confirm post-validation raw-data deletion, a split parent's release included
 - `msdial_discard_repository_raw`: preview and explicitly confirm deletion of raw data that produced no validated output
+- `msdial_download_store_status`: show the accession download stores (objects, claims, partial transfers), read-only
 
 Agent API 0.5 binds mzTab-M, QA, publication, and handoff operations to the
 production `job_id`. Files left by earlier runs in the same output directory are
