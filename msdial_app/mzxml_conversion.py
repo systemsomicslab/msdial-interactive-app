@@ -186,6 +186,11 @@ class ConversionOptions:
 
     impute_polarity: "positive" or "negative", the unit's declared ion mode, written for scans whose
         polarity is absent or "any". The file fails when any scan records the other polarity.
+    declared_ion_mode, declared_ion_mode_field: the ion mode the caller read for the unit, as it was
+        declared ("Negative", "Both"), and where it was read. Recorded only: the converter acts on
+        impute_polarity alone, which must be the declared polarity where both are given. They are kept
+        with the options, so that a conversion made under another declaration is never reused for this
+        one, and an imputation's inference names them.
     infer_dia_windows: give MS2 precursors without windowWideness a symmetric window of the spacing
         of a uniform, repeated precursor ladder (SWATH). Not applied when the ladder is irregular.
     synthesize_all_ion_windows: give MS2 scans without precursorMz a window spanning the scan range,
@@ -201,6 +206,8 @@ class ConversionOptions:
     synthesize_all_ion_windows: bool = False
     spectrum_level_collision_energy: bool = False
     fail_on_sha1_mismatch: bool = True
+    declared_ion_mode: str | None = None
+    declared_ion_mode_field: str | None = None
 
 
 def converter_identity() -> dict[str, Any]:
@@ -393,6 +400,10 @@ def _options(options: ConversionOptions | dict[str, Any] | None) -> ConversionOp
     ):
         if not isinstance(getattr(opts, name), bool):
             raise ConversionError(f"option {name} must be true or false")
+    for name in ("declared_ion_mode", "declared_ion_mode_field"):
+        value = getattr(opts, name)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ConversionError(f"option {name} must be text or null")
     if opts.impute_polarity is not None:
         polarity = {
             "positive": "positive", "pos": "positive", "+": "positive",
@@ -403,6 +414,10 @@ def _options(options: ConversionOptions | dict[str, Any] | None) -> ConversionOp
                 f"impute_polarity must be positive or negative, not {opts.impute_polarity!r}"
             )
         opts = replace(opts, impute_polarity=polarity)
+        declared = opts.declared_ion_mode
+        if declared is not None and declared.strip().casefold() != polarity:
+            # An imputation stands for the declaration it is recorded with, or for nothing.
+            raise ConversionError(f"impute_polarity {polarity} is not the declared ion mode {declared!r}")
     return opts
 
 
@@ -1522,6 +1537,11 @@ def _applied(
                 "basis": "the analysis unit's declared ion mode, supplied by the caller",
                 "source": "repository_declared",
                 "spectra": builder.imputed,
+                **(
+                    {"declared_ion_mode": options.declared_ion_mode, "declared_in": options.declared_ion_mode_field}
+                    if options.declared_ion_mode is not None
+                    else {}
+                ),
                 "summary": f"{options.impute_polarity} polarity imputed from the declared ion mode"
                 f" for {builder.imputed} spectra",
             }
