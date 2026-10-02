@@ -6318,15 +6318,81 @@ def _authorized_by(crossing: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def _write_failure_record(path: Path, value: Any) -> dict[str, Any]:
-    """Write one failure artifact, atomically and with no lock file beside it, and describe it."""
+def _write_failure_record(path: Path, value: Any, minimal: Any, context: Any) -> dict[str, Any]:
+    """Write one failure artifact, atomically and with no lock file beside it, and describe it.
+
+    It lies under output, which is shared, so it is written as a shared artifact: ``value`` has been through
+    ``context`` (sharing.SharingContext), and its bytes are scanned with the gate's patterns before they are
+    written. Should anything still match, ``minimal`` - identifiers, codes and times, no free text - is written
+    instead; should that match too, SharingError is raised and nothing is written.
+    """
+    from .sharing import SharingError
+
     path.parent.mkdir(parents=True, exist_ok=True)
     data = (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    reduced = bool(context.scan(path.name, data))
+    if reduced:
+        data = (json.dumps(minimal, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        findings = context.scan(path.name, data)
+        if findings:
+            raise SharingError(path.name, findings)
     _replace_atomically(path, data)
-    return {"path": str(path), "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    return {
+        "path": str(path),
+        "size_bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        **({"free_text_withheld": True} if reduced else {}),
+    }
 
 
-def _failure_artifacts(manifest: dict[str, Any], output: Path, at: str) -> dict[str, Any] | None:
+# A run attempt's fields a shared failure record carries: no output directory, backend host or process, and
+# no stop detail, all of which are this machine's.
+_SHARED_ATTEMPT_FIELDS = (
+    "attempt_id", "attempt", "job_id", "kind", "started_at", "ended_at", "exit_code", "reason", "command_sha256",
+    "timeout_seconds", "idle_timeout_seconds", "start_unrecorded",
+)
+_SHARED_CONSOLE_FIELDS = ("version", "binary_sha256", "assembly_sha256", "inventory_sha256", "provenance_status")
+
+
+def _shared_run_failure(item: dict[str, Any], context: Any, *, free_text: bool = True) -> dict[str, Any]:
+    """One run failure as a shared record carries it: its reason redacted, and no log lines.
+
+    The log tail stays in the provenance manifest only. It is the Console's own output, and the Console prints a
+    library's full location when it cannot open it ("MSP file was not found: <location>").
+    """
+    tail = item.get("log_tail") if isinstance(item.get("log_tail"), list) else []
+    return {
+        **({"reason": context.text(str(item.get("reason") or ""))} if free_text else {}),
+        "exit_code": item.get("exit_code"),
+        "recorded_at": item.get("recorded_at"),
+        "log_tail_line_count": len(tail),
+    }
+
+
+def _shared_run_attempt(item: dict[str, Any], context: Any) -> dict[str, Any]:
+    console = item.get("console") if isinstance(item.get("console"), dict) else {}
+    shared = {key: item[key] for key in _SHARED_ATTEMPT_FIELDS if key in item}
+    shared["console"] = {key: console[key] for key in _SHARED_CONSOLE_FIELDS if key in console}
+    return context.view(shared)
+
+
+def _validation_minimal(validation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "summary": validation.get("summary") or {},
+        "files": [
+            {
+                "file_name": str(item.get("file_name") or ""),
+                "status": item.get("status"),
+                "error_count": len(item.get("errors") or []),
+                "warning_count": len(item.get("warnings") or []),
+            }
+            for item in validation.get("files") or []
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _failure_artifacts(manifest_path: Path, manifest: dict[str, Any], output: Path, at: str) -> dict[str, Any] | None:
     """Keep what a failed run left as failure artifacts under its output: its mzTab-M, validated now, and its
     failure record. None when there is neither an mzTab-M nor a recorded failure.
 
@@ -6334,13 +6400,22 @@ def _failure_artifacts(manifest: dict[str, Any], output: Path, at: str) -> dict[
     validation and the unit's failure record are written beside the outputs, in failure-artifacts/, because
     the manifest that also holds them is no file anyone shares. Neither name holds "mztab", which is how
     find_mztab_files recognises an mzTab-M by name.
+
+    Output is what is shared, so both are written as the unit's other shared artifacts are
+    (sharing.SharingContext for its manifest; shared_path_policy declared): the raw directory becomes raw/,
+    the workspace the root of a relative path, and any other location is withheld. The failure record carries
+    each failure's reason, exit code and time and each attempt's identifiers, never a log line, a backend's
+    host or an output directory: the full record stays in the provenance manifest.
     """
     from .mztab_validation import validate_mztab_files
+    from .sharing import PATH_POLICY, SharingContext
 
     mztab = [Path(item) for item in _mztab_outputs(output)]
     failures = [item for item in manifest.get("run_failures") or [] if isinstance(item, dict)]
     if not mztab and not failures:
         return None
+    context = SharingContext.for_state({"repository_run_manifest": str(manifest_path)}, run_directory=output)
+    declared = {"shared_path_policy": PATH_POLICY, "shared_paths": context.describe()}
     directory = output / FAILURE_ARTIFACTS_DIRECTORY
     files: list[dict[str, Any]] = []
     summary: dict[str, Any] = {}
@@ -6349,27 +6424,45 @@ def _failure_artifacts(manifest: dict[str, Any], output: Path, at: str) -> dict[
     if mztab:
         validation = validate_mztab_files(mztab, output)
         summary = dict(validation.get("summary") or {})
+        head = {"schema": "msdial-failed-run-output-validation.v1", "validated_at": at, **declared}
         files.append(
             {
                 **_write_failure_record(
                     directory / FAILURE_VALIDATION_RECORD,
-                    {"schema": "msdial-failed-run-output-validation.v1", "validated_at": at, **validation},
+                    {**head, **context.view(validation)},
+                    {**head, **_validation_minimal(validation)},
+                    context,
                 ),
                 "kind": "mztab_validation",
             }
         )
+    attempts = [item for item in manifest.get("run_attempts") or [] if isinstance(item, dict)][-10:]
+    head = {
+        "schema": "msdial-run-failure-record.v1",
+        "recorded_at": at,
+        **declared,
+        "analysis_unit_id": str((manifest.get("project") or {}).get("analysis_unit_id") or ""),
+        "status": manifest.get("status"),
+        "full_record": "run_failures and run_attempts in the unit's provenance manifest, which is not shared",
+    }
     files.append(
         {
             **_write_failure_record(
                 directory / FAILURE_RUN_RECORD,
                 {
-                    "schema": "msdial-run-failure-record.v1",
-                    "recorded_at": at,
-                    "analysis_unit_id": str((manifest.get("project") or {}).get("analysis_unit_id") or ""),
-                    "status": manifest.get("status"),
-                    "run_failures": failures,
-                    "run_attempts": [item for item in manifest.get("run_attempts") or [] if isinstance(item, dict)][-10:],
+                    **head,
+                    "run_failures": [_shared_run_failure(item, context) for item in failures],
+                    "run_attempts": [_shared_run_attempt(item, context) for item in attempts],
                 },
+                {
+                    **head,
+                    "run_failures": [_shared_run_failure(item, context, free_text=False) for item in failures],
+                    "run_attempts": [
+                        {key: item.get(key) for key in ("attempt_id", "attempt", "started_at", "ended_at", "exit_code")}
+                        for item in attempts
+                    ],
+                },
+                context,
             ),
             "kind": "run_failure_record",
         }
@@ -6458,6 +6551,69 @@ def plan_download_discard(manifest_path: Path, *, authorized: bool = False) -> d
     }
 
 
+def _discard_finished(manifest: dict[str, Any], raw_root: Path, *, authorized: bool) -> dict[str, Any] | None:
+    """The deletion record of this unit's discard when the discard was made and has finished, else None.
+
+    Finished: the unit is discarded, and its raw_deletion is of kind discard, for this tree, and deleted. Under
+    an approval, a unit discarded before deletions were recorded, which carries no record, has finished too
+    ({}). A deleting or partial record has not: that deletion is resumed. Without an approval such a legacy
+    unit is discarded again, as it always was.
+    """
+    if manifest.get("status") != "discarded":
+        return None
+    record = manifest.get("raw_deletion")
+    if isinstance(record, dict):
+        same = record.get("kind") == "discard" and _file_key(str(record.get("target") or "")) == _file_key(str(raw_root))
+        return record if same and record.get("state") == "deleted" else None
+    return {} if authorized else None
+
+
+def _discard_made(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    raw_root: Path,
+    record: dict[str, Any],
+    crossing: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """A discard asked for again once it has finished: the record it made, with nothing deleted or rewritten.
+
+    A caller that repeats a discard - a runner that stopped after the discard and before it recorded the result -
+    must not replace the first deletion's accounting with an empty one, rewrite the failure record as the
+    discarded unit's, or record another crossing. A raw tree that holds files again, which no deletion of this
+    unit made, is a refusal: the unit's own record says its tree is gone.
+    """
+    remaining, remaining_bytes = _tree_size(raw_root)
+    if remaining:
+        when = f"at {record['deleted_at']}" if record.get("deleted_at") else "earlier"
+        message = (
+            f"This unit's raw data were discarded ({when}), yet its raw directory holds {remaining} file(s) "
+            f"({remaining_bytes} bytes) again, which no deletion of this unit made; nothing was deleted or recorded."
+        )
+        if crossing is None:
+            raise ValueError(message)
+        return {
+            "deleted": False,
+            "confirmation_required": False,
+            "manifest_path": str(manifest_path),
+            "status": manifest.get("status"),
+            "deletion_target": str(raw_root),
+            "deletion_file_count": remaining,
+            "deletion_bytes": remaining_bytes,
+            "campaign_authorization": crossing,
+            "blockers": [message],
+            "message": "Nothing was deleted: the approval covers this unit, but its discard was already made.",
+        }
+    kept = manifest.get("failure_artifacts")
+    return {
+        "deleted": True,
+        "already_discarded": True,
+        "raw_directory": str(raw_root),
+        "manifest_path": str(manifest_path),
+        **({"raw_deletion": record} if record else {}),
+        **({"failure_artifacts": kept} if isinstance(kept, dict) else {}),
+    }
+
+
 def discard_download_lease(
     manifest_path: Path,
     confirmed: bool = False,
@@ -6474,6 +6630,9 @@ def discard_download_lease(
     and the unit's failure record are kept as failure artifacts under output (failure_artifacts), and none of
     them is deleted. A refusal under an approval is returned as blockers, with nothing recorded or deleted;
     with confirmed=true it is raised, as it always was.
+
+    A discard that has finished, asked for again, returns its record (already_discarded) and writes nothing;
+    one that stopped part-way is resumed, keeping the failure artifacts it wrote first (_discard_finished).
 
     A split parent is released by cleanup_split_parent, which this calls for one. A part's raw data are its
     parent's: under an approval its discard records that the part has ended, deleting nothing, and its parent's
@@ -6511,6 +6670,9 @@ def discard_download_lease(
     raw_root = Path(str(manifest.get("raw_directory") or "")).resolve()
     with _raw_deletion_lock(manifest_path):
         manifest = read_manifest(manifest_path)
+        finished = _discard_finished(manifest, raw_root, authorized=crossing is not None)
+        if finished is not None:
+            return _discard_made(manifest_path, manifest, raw_root, finished, crossing)
         downloading = manifest.get("status") == "downloading"
         owner_state = lease_owner_state(manifest) if downloading else None
         if crossing is not None:
@@ -6568,12 +6730,21 @@ def discard_download_lease(
                     f"them (the first is {under[0]}); discard was refused."
                 )
         discarded_at = datetime.now(timezone.utc).isoformat()
+        # A deletion an earlier call began and did not finish keeps the failure artifacts it wrote first: they
+        # were written from the failed unit, and are not written again from one half deleted.
+        kept_before = (
+            manifest.get("failure_artifacts")
+            if _resumable_deletion(manifest, "discard", raw_root) and isinstance(manifest.get("failure_artifacts"), dict)
+            else None
+        )
         failure_artifacts = (
-            _failure_artifacts(manifest, output, discarded_at) if crossing is not None else None
+            (kept_before or _failure_artifacts(manifest_path, manifest, output, discarded_at))
+            if crossing is not None
+            else None
         )
         if crossing is not None:
             record_campaign_authorization(manifest_path, crossing)
-        if failure_artifacts is not None:
+        if failure_artifacts is not None and kept_before is None:
             # Written before the first file goes, so a deletion that stops still names what it keeps.
             def keep(current: dict[str, Any]) -> None:
                 current["failure_artifacts"] = failure_artifacts
@@ -6668,7 +6839,7 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
         else:
             at = datetime.now(timezone.utc).isoformat()
             output = Path(str(manifest.get("output_directory") or ""))
-            failure_artifacts = _failure_artifacts(manifest, output, at)
+            failure_artifacts = _failure_artifacts(manifest_path, manifest, output, at)
             record_campaign_authorization(manifest_path, crossing)
 
             def change(current: dict[str, Any]) -> None:

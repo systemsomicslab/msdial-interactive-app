@@ -349,10 +349,17 @@ state `delete_after_validated_output`. Under it a failed unit whose output
 holds an unvalidated or invalid mzTab-M may be discarded: that mzTab-M, its
 validation (`failure-artifacts/output-validation.json`) and the failure record
 (`failure-artifacts/run-failure-record.json`) are kept under output and listed
-in `failure_artifacts`. Every deletion refuses while a retained artifact lies
+in `failure_artifacts`. Both are written as shared artifacts: they declare
+`shared_path_policy`, the raw directory reads `raw/`, a workspace path is
+relative, any other location is withheld, and the failure record carries each
+failure's reason, exit code and time and each attempt's identifiers, never a
+log line, a host or an output directory; the full record stays in the
+provenance manifest. Every deletion refuses while a retained artifact lies
 under its target, unlinks a multiply-linked file without touching its
 attributes, and records what it removed and kept (`raw_deletion`); one that a
-held file or a crash stopped is resumed by the next call.
+held file or a crash stopped is resumed by the next call, keeping the failure
+artifacts it wrote first. A discard that has finished, asked for again, returns
+its record (`already_discarded`) and writes nothing.
 
 A split parent's raw tree, which every part reads, is released by
 `cleanup_split_parent` (also reached through either tool on the parent's

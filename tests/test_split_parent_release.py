@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import tempfile
 import unittest
@@ -30,7 +31,7 @@ from unittest.mock import patch
 
 _CONFIG = tempfile.TemporaryDirectory()
 with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
-    from msdial_app import mcp_server, repository_reanalysis, run_finalisation, server
+    from msdial_app import mcp_server, repository_reanalysis, run_finalisation, server, sharing
     from msdial_app.campaign_authorization import CampaignAuthorizationError
     from msdial_app.process_liveness import process_created_at
     from msdial_app.repository_reanalysis import (
@@ -744,6 +745,148 @@ class TheAuthorizedCleanupAndDiscard(_Unit, unittest.TestCase):
             self.assertEqual(1, read_manifest(manifest)["raw_deletion"]["passes"][0]["removed_links"])
         finally:
             os.chmod(store, stat.S_IWRITE | stat.S_IREAD)
+
+    def test_a_finished_discard_asked_for_again_rewrites_nothing(self) -> None:
+        # A runner that stopped after the discard and before it recorded the result asks for it again.
+        manifest, raw = self.unit(status="run_failed", mztab=INVALID_MZTAB, run_failures=self.FAILURES)
+        first = discard_download_lease(manifest, campaign_authorization_path=self.approval())
+        before = read_manifest(manifest)
+        record = Path(before["output_directory"]) / FAILURE_ARTIFACTS_DIRECTORY / FAILURE_RUN_RECORD
+        written = record.read_bytes()
+
+        again = discard_download_lease(manifest, campaign_authorization_path=self.approval())
+        confirmed = discard_download_lease(manifest, confirmed=True)
+
+        self.assertTrue(first["deleted"], first.get("blockers"))
+        for result in (again, confirmed):
+            self.assertTrue(result["deleted"])
+            self.assertTrue(result["already_discarded"])
+            self.assertEqual(before["raw_deletion"], result["raw_deletion"])
+        self.assertEqual(before, read_manifest(manifest), "the deletion's accounting, discarded_at and crossings stand")
+        self.assertEqual((2, 80), (before["raw_deletion"]["file_count"], before["raw_deletion"]["bytes"]))
+        self.assertEqual(written, record.read_bytes())
+        self.assertEqual("run_failed", json.loads(written)["status"])
+        self.assertEqual([5], [item["boundary"] for item in before["campaign_authorizations"]])
+
+    def test_files_back_under_a_discarded_tree_are_refused_and_the_record_kept(self) -> None:
+        manifest, raw = self.unit(status="skipped_by_preflight")
+        discard_download_lease(manifest, campaign_authorization_path=self.approval())
+        before = read_manifest(manifest)
+        (raw / "data").mkdir(parents=True)
+        (raw / "data" / "late.mzML").write_bytes(b"z")
+
+        refused = discard_download_lease(manifest, campaign_authorization_path=self.approval())
+        with self.assertRaisesRegex(ValueError, "holds 1 file"):
+            discard_download_lease(manifest, confirmed=True)
+
+        self.assertFalse(refused["deleted"])
+        self.assertTrue(any("which no deletion of this unit made" in item for item in refused["blockers"]))
+        self.assertEqual(before, read_manifest(manifest))
+        self.assertTrue((raw / "data" / "late.mzML").is_file())
+
+    def test_a_unit_discarded_before_deletions_were_recorded(self) -> None:
+        manifest, raw = self.unit(status="discarded", discarded_at="2026-09-01T00:00:00+00:00")
+        shutil.rmtree(raw)
+
+        authorized = discard_download_lease(manifest, campaign_authorization_path=self.approval())
+        self.assertTrue(authorized["already_discarded"])
+        self.assertNotIn("raw_deletion", read_manifest(manifest))
+        self.assertNotIn("campaign_authorizations", read_manifest(manifest))
+        # Without an approval it is discarded again, as it always was.
+        confirmed = discard_download_lease(manifest, confirmed=True)
+        self.assertTrue(confirmed["deleted"])
+        self.assertNotIn("already_discarded", confirmed)
+
+    def test_a_discard_stopped_part_way_resumes_with_the_failure_artifacts_it_wrote_first(self) -> None:
+        manifest, raw = self.unit(status="run_failed", mztab=INVALID_MZTAB, run_failures=self.FAILURES)
+
+        with patch.object(repository_reanalysis, "unlink_tree", side_effect=RuntimeError("the backend stopped")):
+            with self.assertRaises(RuntimeError):
+                discard_download_lease(manifest, campaign_authorization_path=self.approval())
+        stopped = read_manifest(manifest)
+        record = Path(stopped["output_directory"]) / FAILURE_ARTIFACTS_DIRECTORY / FAILURE_RUN_RECORD
+        written = record.read_bytes()
+        resumed = discard_download_lease(manifest, campaign_authorization_path=self.approval())
+        after = read_manifest(manifest)
+
+        self.assertEqual(("deleting", "run_failed"), (stopped["raw_deletion"]["state"], stopped["status"]))
+        self.assertTrue(resumed["deleted"], resumed.get("blockers"))
+        self.assertFalse(raw.exists())
+        self.assertEqual("discarded", after["status"])
+        self.assertEqual(stopped["failure_artifacts"], after["failure_artifacts"])
+        self.assertEqual(written, record.read_bytes(), "written from the failed unit, and not again")
+        self.assertEqual(stopped["raw_deletion"]["planned_at"], after["raw_deletion"]["planned_at"])
+        self.assertEqual((2, 80), (after["raw_deletion"]["file_count"], after["raw_deletion"]["bytes"]))
+        self.assertEqual(1, len(after["raw_deletion"]["resumed_at"]))
+
+    def test_the_failure_artifacts_carry_no_local_path(self) -> None:
+        # The pinned Console prints a library's location when it cannot open it (CommonProcess.cs, ParseLibraries).
+        location = r"\\synthetic-nas\private-libs\Synthetic_Private_Pos.msp"
+        missing = r"D:\synthetic-elsewhere\out\sample_neg.mdpeak"
+        failures = [
+            {
+                "reason": f"MS-DIAL returned success but produced 0 of 1 expected analysis exports. Missing: {missing}.",
+                "exit_code": None,
+                "recorded_at": "2026-10-01T10:00:00+09:00",
+                "log_tail": [f"MSP file was not found: {location}", "Loading libraries"],
+            }
+        ]
+        attempts = [
+            {
+                "attempt_id": "a1", "attempt": 1, "job_id": "run1", "kind": "run",
+                "started_at": "2026-10-01T00:00:00+00:00", "ended_at": "2026-10-01T00:10:00+00:00",
+                "exit_code": 0, "reason": "exited", "output_directory": r"D:\synthetic-elsewhere\out",
+                "backend": {"pid": 4242, "host": "SYNTHETIC-HOST"},
+                "console": {"version": "5.5.0", "binary_sha256": "ab" * 32},
+                "detail": {"stopped_by": r"D:\synthetic-elsewhere\stop.flag"},
+            }
+        ]
+        manifest, raw = self.unit(status="run_failed", mztab=INVALID_MZTAB, run_failures=failures, run_attempts=attempts)
+
+        result = discard_download_lease(manifest, campaign_authorization_path=self.approval())
+        recorded = read_manifest(manifest)
+        directory = Path(recorded["output_directory"]) / FAILURE_ARTIFACTS_DIRECTORY
+
+        self.assertTrue(result["deleted"], result.get("blockers"))
+        for name in (FAILURE_RUN_RECORD, FAILURE_VALIDATION_RECORD):
+            text = (directory / name).read_text(encoding="utf-8")
+            with self.subTest(record=name):
+                self.assertEqual([], [kind for kind, pattern in sharing._DETECTORS if pattern.search(text)])
+                for local in ("synthetic-nas", "synthetic-elsewhere", "SYNTHETIC-HOST", "stop.flag"):
+                    self.assertNotIn(local, text)
+                self.assertNotIn(sharing.fold(str(self.root.resolve())), sharing.fold(text))
+                self.assertEqual(sharing.PATH_POLICY, json.loads(text)["shared_path_policy"])
+        failure = json.loads((directory / FAILURE_RUN_RECORD).read_text(encoding="utf-8"))
+        self.assertIn("Missing: <local path withheld", failure["run_failures"][0]["reason"])
+        self.assertEqual(2, failure["run_failures"][0]["log_tail_line_count"])
+        self.assertNotIn("log_tail", failure["run_failures"][0])
+        self.assertFalse({"output_directory", "backend", "detail", "console_pid"} & set(failure["run_attempts"][0]))
+        self.assertEqual({"version": "5.5.0", "binary_sha256": "ab" * 32}, failure["run_attempts"][0]["console"])
+        validation = json.loads((directory / FAILURE_VALIDATION_RECORD).read_text(encoding="utf-8"))
+        self.assertEqual("output", validation["run_directory"])
+        self.assertEqual(["output/AlignResult-2026101012.mzTab"], [item["file"] for item in validation["files"]])
+        # The full record stays where it was, in the provenance manifest.
+        self.assertEqual(failures[0]["log_tail"], recorded["run_failures"][0]["log_tail"])
+        self.assertEqual("SYNTHETIC-HOST", recorded["run_attempts"][0]["backend"]["host"])
+
+    def test_a_record_the_redaction_misses_is_written_without_its_free_text(self) -> None:
+        missing = r"D:\synthetic-elsewhere\out\sample_neg.mdpeak"
+        failures = [{"reason": f"Missing: {missing}.", "exit_code": 1, "log_tail": []}]
+        manifest, raw = self.unit(status="run_failed", mztab=INVALID_MZTAB, run_failures=failures)
+
+        with patch.object(sharing.SharingContext, "text", lambda _self, value: value), \
+                patch.object(sharing.SharingContext, "view", lambda _self, value: value):
+            result = discard_download_lease(manifest, campaign_authorization_path=self.approval())
+        kept = {item["kind"]: item for item in read_manifest(manifest)["failure_artifacts"]["files"]}
+
+        self.assertTrue(result["deleted"], result.get("blockers"))
+        for kind in ("run_failure_record", "mztab_validation"):
+            with self.subTest(kind=kind):
+                text = Path(kept[kind]["path"]).read_text(encoding="utf-8")
+                self.assertTrue(kept[kind]["free_text_withheld"])
+                self.assertEqual([], [name for name, pattern in sharing._DETECTORS if pattern.search(text)])
+        failure = json.loads(Path(kept["run_failure_record"]["path"]).read_text(encoding="utf-8"))
+        self.assertEqual({"exit_code", "recorded_at", "log_tail_line_count"}, set(failure["run_failures"][0]))
 
     def test_the_discard_tool_previews_and_takes_an_approval(self) -> None:
         manifest, raw = self.unit(status="skipped_by_preflight")
