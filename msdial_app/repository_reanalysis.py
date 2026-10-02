@@ -3496,6 +3496,8 @@ def record_run_failure(
     reason: str,
     exit_code: int | None = None,
     log_tail: list[str] | None = None,
+    *,
+    status: str = "run_failed",
 ) -> dict[str, Any]:
     """Write a failed MS-DIAL run into the analysis unit's own manifest.
 
@@ -3514,6 +3516,11 @@ def record_run_failure(
     reclaim the disk. The campaign's retention policy is now "delete after a successful run"; this
     is the clause that keeps "successful" in it.
 
+    A Console that exits 0 and leaves the unit without a validated mzTab-M has failed too, and is
+    recorded here like one that exits non-zero, so the run failures count every run that did not
+    validate. ``status`` is validation_failed for such a run that finalize_download_lease has
+    already finalised as validation_failed, which it keeps; anything else is run_failed.
+
     Never raises. A failure while recording a failure would lose both, so any problem writing the
     manifest is returned rather than thrown -- the caller is already on its error path.
     """
@@ -3527,7 +3534,7 @@ def record_run_failure(
         "log_tail": [str(line) for line in (log_tail or [])][-40:],
     }
     def change(manifest: dict[str, Any]) -> None:
-        manifest["status"] = "run_failed"
+        manifest["status"] = status
         manifest["cleanup_allowed"] = False
         failures = list(manifest.get("run_failures") or [])
         failures.append(record)
@@ -3540,7 +3547,7 @@ def record_run_failure(
         manifest = update_manifest(manifest_path, change)
         return {**manifest, "manifest_path": str(manifest_path)}
     except (OSError, ValueError) as error:
-        return {"status": "run_failed", "manifest_error": str(error), "run_failure": record}
+        return {"status": status, "manifest_error": str(error), "run_failure": record}
 
 
 def record_run_start(
@@ -6700,9 +6707,10 @@ def _part_end(part: dict[str, Any], parent_raw: Path) -> dict[str, Any]:
 
     Ended means one of: validated (a cleanup-ready status, cleanup_allowed, no mzTab-M that failed, every
     retained artifact present and none under the parent's raw tree); released (raw_cleaned, by an earlier pass
-    of this release); failed after its retries (CAMPAIGN_RUN_ATTEMPTS recorded run failures); skipped or
-    excluded (by its campaign disposition, or at the split); or discarded (its own discard under an approval).
-    Anything else - not yet preflighted, prepared, running, failed with retries left - has not.
+    of this release); failed after its retries (CAMPAIGN_RUN_ATTEMPTS recorded run failures, which the post-run
+    hook records for a Console that exits non-zero and for one that exits 0 without a validated mzTab-M alike);
+    skipped or excluded (by its campaign disposition, or at the split); or discarded (its own discard under an
+    approval). Anything else - not yet preflighted, prepared, running, failed with retries left - has not.
     """
     status = str(part.get("status") or "")
     blockers: list[str] = []

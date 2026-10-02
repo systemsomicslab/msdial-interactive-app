@@ -2516,6 +2516,8 @@ def _record_repository_run_failure(
     reason: str,
     exit_code: int | None,
     logs: list[str],
+    *,
+    status: str = "run_failed",
 ) -> None:
     """Put a failed run into the analysis unit's own manifest, if it belongs to one.
 
@@ -2532,7 +2534,17 @@ def _record_repository_run_failure(
         return
     from .repository_reanalysis import record_run_failure
 
-    record_run_failure(Path(manifest_text), reason, exit_code, list(logs or []))
+    record_run_failure(Path(manifest_text), reason, exit_code, list(logs or []), status=status)
+
+
+def _unvalidated_run_reason(artifacts: dict[str, Any], summary: dict[str, Any]) -> str:
+    """Why a run whose Console exited 0 left no validated mzTab-M: it wrote none, or what it wrote failed."""
+    if not artifacts.get("mztab"):
+        return "MS-DIAL Console exited with code 0 but wrote no mzTab-M, so the run produced no validated output."
+    return (
+        f"MS-DIAL Console exited with code 0, but {summary.get('failed', 0)} of {summary.get('file_count', 0)} "
+        "mzTab-M file(s) it wrote failed validation, so the run produced no validated output."
+    )
 
 
 def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
@@ -2643,7 +2655,25 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
                             "finalization": finalized,
                             "cleanup": None,
                         }
-                        if retention == "delete_after_validated_output":
+                        if finalized.get("status") == "validation_failed":
+                            # This run's own mzTab-M validated, but finalisation validates every mzTab-M in
+                            # the output, and another there fails: an earlier attempt's. The unit is not
+                            # validated, so the run counts as a failed one, and no deletion is requested.
+                            checked = (finalized.get("mztab_validation") or {}).get("summary") or {}
+                            failure = (
+                                "MS-DIAL Console exited with code 0 and its mzTab-M validated, but "
+                                f"{checked.get('failed', 0)} of {checked.get('file_count', 0)} mzTab-M file(s) "
+                                "in the output failed validation, so the unit was finalised as validation_failed."
+                            )
+                            repository_retention["reason"] = failure
+                            repository_retention["run_failure_recorded"] = True
+                            log("Recorded on the unit as a failed run: " + failure)
+                            with JOBS_LOCK:
+                                logs = list(JOBS[job_id]["logs"])
+                            _record_repository_run_failure(
+                                preparation, failure, exit_code, logs, status="validation_failed"
+                            )
+                        elif retention == "delete_after_validated_output":
                             # The retention policy records a wish, not an approval. Deleting the raw data
                             # is the only irreversible operation in this pipeline, and the confirmation
                             # for it belongs to a person who has seen the retained artifacts, the target
@@ -2700,6 +2730,16 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
                             "reason": "Raw data were kept because this run did not produce a validated mzTab-M output.",
                         }
                         log(repository_retention["reason"])
+                        # A Console that exits 0 without a validated mzTab-M has failed, and the unit records
+                        # it as it records one that exits non-zero: its run failures are what count its
+                        # attempts, and a split part ends after CAMPAIGN_RUN_ATTEMPTS of them. The job itself
+                        # stays completed, as it always was.
+                        failure = _unvalidated_run_reason(artifacts, summary)
+                        repository_retention["run_failure_recorded"] = True
+                        log("Recorded on the unit as a failed run: " + failure)
+                        with JOBS_LOCK:
+                            logs = list(JOBS[job_id]["logs"])
+                        _record_repository_run_failure(preparation, failure, exit_code, logs)
                 except Exception as retention_error:
                     repository_retention = {
                         "policy": retention,

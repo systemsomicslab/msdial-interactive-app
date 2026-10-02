@@ -358,13 +358,17 @@ A split parent's raw tree, which every part reads, is released by
 `cleanup_split_parent` (also reached through either tool on the parent's
 manifest) once every part has ended: validated, failed after its retries
 (three recorded run failures), skipped, excluded, or discarded by its own
-authorized discard. The release takes a lock, writes `raw_release` before the
-first file goes, marks validated parts `raw_cleaned` with `raw_released_by`,
-and leaves the parent `split_by_acquisition`. A finished run's post-run hook
-only records the parent's pending plan (`raw_release_pending`); in a campaign
-the runner is the one trigger of every deletion. A unit whose raw data were
-released (`raw_cleaned`, `discarded`, or a part of a released parent) never
-passes the execution gate again.
+authorized discard. A run is recorded as failed (`run_failures`) when its
+Console exits non-zero, and also when it exits 0 without a validated mzTab-M:
+it wrote none, what it wrote failed validation, or finalisation found another
+mzTab-M in the output that fails (the status `validation_failed` is kept). The
+job itself stays `completed`. The release takes a lock, writes `raw_release`
+before the first file goes, marks validated parts `raw_cleaned` with
+`raw_released_by`, and leaves the parent `split_by_acquisition`. A finished
+run's post-run hook only records the parent's pending plan
+(`raw_release_pending`); in a campaign the runner is the one trigger of every
+deletion. A unit whose raw data were released (`raw_cleaned`, `discarded`, or a
+part of a released parent) never passes the execution gate again.
 
 ## Pilot record
 

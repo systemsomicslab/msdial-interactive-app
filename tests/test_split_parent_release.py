@@ -121,6 +121,56 @@ class _SplitParent(_Approvals, _MixedUnitFixture):
         finalized = finalize_download_lease(part)
         self.assertEqual("mztab_validated", finalized["status"])
 
+    def run_job(self, part: Path, job_id: str, mztab: str | None, name: str = "AlignResult-2026101013.mzTab") -> dict:
+        """One production job on a part through the backend's _run_job, its Console a stand-in that exits 0.
+
+        It writes every expected export, and ``mztab`` as the run's mzTab-M under ``name`` (none when None).
+        Returns the job's record.
+        """
+        recorded = read_manifest(part)
+        output = Path(recorded["output_directory"])
+        inputs = [Path(item) for item in recorded["input_candidates"]]
+        csv_path = output / "analysis_files.csv"
+        csv_path.write_text(
+            "file_path,file_name,file_type,class_id,acquisition_type\n"
+            + "".join(f"{path},{path.stem},Sample,All,DDA\n" for path in inputs),
+            encoding="ascii",
+        )
+        (output / "workflow-settings.json").write_text(
+            json.dumps({"project_type": "lcms", "repository_run_manifest": str(part), "output_root": str(output),
+                        "files": [{"file_path": str(path), "file_name": path.stem} for path in inputs]}),
+            encoding="utf-8",
+        )
+        (output / "run-manifest.json").write_text(json.dumps({"libraries": []}), encoding="utf-8")
+        preparation = {
+            "command": ["MSDIALCUI.exe"],
+            "run_directory": str(output),
+            "export_folder_path": str(output),
+            "repository_run_manifest": str(part),
+            "repository_raw_retention_policy": DELETE,
+            "expected_analysis_exports": [str(output / f"{path.stem}.mdpeak") for path in inputs],
+            "qa_matrix_expected": False,
+            "input_csv": str(csv_path),
+            "settings_file": str(output / "workflow-settings.json"),
+            "manifest": str(output / "run-manifest.json"),
+        }
+
+        def console(_preparation, _log, **_watch):
+            for path in inputs:
+                (output / f"{path.stem}.mdpeak").write_bytes(b"Height\n")
+            if mztab is not None:
+                (output / name).write_text(mztab, encoding="ascii")
+            return 0
+
+        # As the run route takes it, so an earlier attempt's outputs are not this job's.
+        baseline = server._snapshot_run_artifacts(preparation)
+        jobs = {job_id: {"id": job_id, "status": "queued", "kind": "run", "logs": [], "preparation": preparation,
+                         "artifact_baseline": baseline}}
+        with patch.object(server, "JOBS", jobs), patch.object(server, "_persist_jobs_locked", lambda: None), \
+                patch.object(server, "run_console", console):
+            server._run_job(job_id, preparation)
+        return jobs[job_id]
+
     def set_status(self, part: Path, status: str, **fields) -> None:
         def change(current: dict) -> None:
             current["status"] = status
@@ -425,61 +475,79 @@ class ThePostRunHook(_SplitParent, unittest.TestCase):
         parent, parts = self.split()
         record_campaign_authorization(parent, {"approval_id": "approval-release", "boundary": "split", "unit_id": "unit-mixed"})
         self.set_status(parts["DIA"], "skipped_by_preflight")
-        part = read_manifest(parts["DDA"])
-        output = Path(part["output_directory"])
-        inputs = [Path(item) for item in part["input_candidates"]]
-        csv_path = output / "analysis_files.csv"
-        csv_path.write_text(
-            "file_path,file_name,file_type,class_id,acquisition_type\n"
-            + "".join(f"{path},{path.stem},Sample,All,DDA\n" for path in inputs),
-            encoding="ascii",
-        )
-        (output / "workflow-settings.json").write_text(
-            json.dumps({"project_type": "lcms", "repository_run_manifest": str(parts["DDA"]), "output_root": str(output),
-                        "files": [{"file_path": str(path), "file_name": path.stem} for path in inputs]}),
-            encoding="utf-8",
-        )
-        (output / "run-manifest.json").write_text(json.dumps({"libraries": []}), encoding="utf-8")
-        preparation = {
-            "command": ["MSDIALCUI.exe"],
-            "run_directory": str(output),
-            "export_folder_path": str(output),
-            "repository_run_manifest": str(parts["DDA"]),
-            "repository_raw_retention_policy": DELETE,
-            "expected_analysis_exports": [str(output / f"{path.stem}.mdpeak") for path in inputs],
-            "qa_matrix_expected": False,
-            "input_csv": str(csv_path),
-            "settings_file": str(output / "workflow-settings.json"),
-            "manifest": str(output / "run-manifest.json"),
-        }
 
-        def console(_preparation, _log, **_watch):
-            for path in inputs:
-                (output / f"{path.stem}.mdpeak").write_bytes(b"Height\n")
-            (output / "AlignResult-2026101013.mzTab").write_text(VALID_MZTAB, encoding="ascii")
-            return 0
-
-        jobs = {"run1": {"id": "run1", "status": "queued", "kind": "run", "logs": [], "preparation": preparation,
-                         "artifact_baseline": {}}}
-        with patch.object(server, "JOBS", jobs), patch.object(server, "_persist_jobs_locked", lambda: None), \
-                patch.object(server, "run_console", console):
-            server._run_job("run1", preparation)
+        job = self.run_job(parts["DDA"], "run1", VALID_MZTAB)
 
         recorded = read_manifest(parent)
-        self.assertEqual("completed", jobs["run1"]["status"], jobs["run1"].get("error"))
+        self.assertEqual("completed", job["status"], job.get("error"))
         self.assertEqual("cleanup_pending_confirmation", read_manifest(parts["DDA"])["status"])
         self.assertTrue(self.raw.is_dir(), "a run job never deletes raw data")
         self.assertTrue(recorded["raw_release_pending"]["ready"], recorded["raw_release_pending"]["blockers"])
         self.assertFalse(recorded["raw_release_pending"]["deleted"])
         self.assertNotIn("raw_release", recorded)
-        self.assertTrue(jobs["run1"]["repository_retention"]["split_parent"]["ready"])
-        self.assertTrue(any("NOT performed" in line for line in jobs["run1"]["logs"]))
+        self.assertTrue(job["repository_retention"]["split_parent"]["ready"])
+        self.assertTrue(any("NOT performed" in line for line in job["logs"]))
 
         unauthorized = cleanup_split_parent(parent)
         self.assertFalse(unauthorized["deleted"])
         self.assertTrue(self.raw.is_dir())
         authorized = cleanup_split_parent(parent, campaign_authorization_path=self.approval())
         self.assertTrue(authorized["deleted"], authorized.get("blockers"))
+        self.assertNotIn("raw_release_pending", read_manifest(parent))
+
+
+class AnUnvalidatedRunIsAFailedRun(_SplitParent, unittest.TestCase):
+    """A Console that exits 0 without a validated mzTab-M is recorded as a failed run, so its part can end.
+
+    The hook recorded nothing for it: the job completed, the part stayed split_from_parent with no run failure,
+    and its parent's raw tree was held for good however often it was retried.
+    """
+
+    def test_a_part_whose_mztab_fails_validation_three_times_has_ended(self) -> None:
+        parent, parts = self.split()
+        self.validate(parts["DIA"])
+
+        for attempt in (1, 2, 3):
+            job = self.run_job(parts["DDA"], f"run{attempt}", INVALID_MZTAB, name=f"AlignResult-20261010{attempt:02d}.mzTab")
+            recorded = read_manifest(parts["DDA"])
+            with self.subTest(attempt=attempt):
+                self.assertEqual("completed", job["status"], "the job itself stays as it was")
+                self.assertTrue(job["repository_retention"]["run_failure_recorded"])
+                self.assertEqual(("run_failed", attempt), (recorded["status"], len(recorded["run_failures"])))
+                self.assertFalse(recorded["cleanup_allowed"])
+                self.assertEqual(0, recorded["run_failures"][-1]["exit_code"])
+                self.assertIn("failed validation", recorded["run_failures"][-1]["reason"])
+            if attempt < 3:
+                self.assertFalse(plan_split_parent_cleanup(parent)["ready"])
+        plan = plan_split_parent_cleanup(parent)
+
+        self.assertTrue(plan["ready"], plan["blockers"])
+        self.assertEqual("failed", {item["analysis_unit_id"]: item["state"] for item in plan["parts"]}["unit-mixed-dda"])
+        self.assertTrue(self.raw.is_dir(), "a run job never deletes raw data")
+
+    def test_a_run_that_wrote_no_mztab_is_a_failed_run(self) -> None:
+        parent, parts = self.split()
+
+        job = self.run_job(parts["DDA"], "run1", None)
+        recorded = read_manifest(parts["DDA"])
+
+        self.assertEqual("completed", job["status"])
+        self.assertEqual(("run_failed", 1), (recorded["status"], len(recorded["run_failures"])))
+        self.assertIn("wrote no mzTab-M", recorded["run_failures"][0]["reason"])
+
+    def test_a_valid_run_beside_an_earlier_attempts_invalid_mztab_is_counted_as_validation_failed(self) -> None:
+        # Finalisation validates every mzTab-M in the output, the failed attempt's too.
+        parent, parts = self.split()
+        self.run_job(parts["DDA"], "run1", INVALID_MZTAB, name="AlignResult-2026101001.mzTab")
+
+        job = self.run_job(parts["DDA"], "run2", VALID_MZTAB, name="AlignResult-2026101002.mzTab")
+        recorded = read_manifest(parts["DDA"])
+
+        self.assertEqual("completed", job["status"])
+        self.assertEqual(("validation_failed", 2), (recorded["status"], len(recorded["run_failures"])))
+        self.assertTrue(recorded["finalized_at"], "the finalisation stands")
+        self.assertIn("finalised as validation_failed", recorded["run_failures"][-1]["reason"])
+        self.assertIsNone(job["repository_retention"]["cleanup"], "no deletion is requested")
         self.assertNotIn("raw_release_pending", read_manifest(parent))
 
 
