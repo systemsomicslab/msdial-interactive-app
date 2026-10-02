@@ -67,6 +67,7 @@ from .repository_reanalysis import (
     record_run_end,
     record_run_process,
     record_run_start,
+    record_split_parent_pending,
     refresh_retained_artifacts,
     resolve_required_download_bytes,
     split_unit_by_acquisition,
@@ -2649,16 +2650,47 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
                             # paths and the size that would be freed. A background job supplies none of
                             # those, so it records the request and stops. The server must never generate
                             # confirmed=True on the user's behalf.
+                            #
+                            # Under a campaign too it only records: the runner is the one trigger of every
+                            # deletion, its own cleanup and a split parent's release alike, under the
+                            # approval it holds. A hook that deleted as well would race the runner for the
+                            # same manifest and the same tree.
                             pending = request_download_cleanup(Path(manifest_text))
                             repository_retention["cleanup"] = pending
-                            log(
-                                "Validated output retained. Raw-data deletion was REQUESTED by the "
-                                "retention policy and NOT performed; it needs a separate confirmation. "
-                                f"{pending['deletion_file_count']} files, "
-                                f"{pending['deletion_bytes'] / 1e9:.2f} GB under "
-                                f"{pending['deletion_target']} would be removed, and "
-                                f"{pending['retained_artifact_count']} artifacts would be retained."
-                            )
+                            try:
+                                split_parent = record_split_parent_pending(Path(manifest_text))
+                            except (OSError, ValueError) as pending_error:
+                                # The part's own finalisation stands; only the parent's record is missing.
+                                split_parent = None
+                                artifact_warnings.append(
+                                    f"The split parent's pending raw release could not be recorded: {pending_error}"
+                                )
+                                log("WARNING: " + artifact_warnings[-1])
+                            if split_parent is not None:
+                                # A part reads its parent's raw tree, released only once every part has
+                                # ended: what is recorded is the parent's plan, on the parent.
+                                repository_retention["split_parent"] = {
+                                    key: split_parent.get(key)
+                                    for key in ("manifest_path", "ready", "kind", "blockers", "deletion_target")
+                                }
+                                log(
+                                    "Validated output retained. This part's raw data are its split parent's; "
+                                    "their release was recorded on the parent as pending and NOT performed ("
+                                    + ("every part has ended" if split_parent["ready"] else
+                                       f"{len(split_parent['blockers'])} blocker(s) remain")
+                                    + f"). {split_parent['deletion_file_count']} files, "
+                                    f"{split_parent['deletion_bytes'] / 1e9:.2f} GB under "
+                                    f"{split_parent['deletion_target']} would be released."
+                                )
+                            else:
+                                log(
+                                    "Validated output retained. Raw-data deletion was REQUESTED by the "
+                                    "retention policy and NOT performed; it needs a separate confirmation. "
+                                    f"{pending['deletion_file_count']} files, "
+                                    f"{pending['deletion_bytes'] / 1e9:.2f} GB under "
+                                    f"{pending['deletion_target']} would be removed, and "
+                                    f"{pending['retained_artifact_count']} artifacts would be retained."
+                                )
                         else:
                             log("Validated output retained; downloaded repository raw data were kept.")
                     else:

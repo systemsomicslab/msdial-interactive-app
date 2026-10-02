@@ -1888,6 +1888,17 @@ def msdial_split_repository_unit(
     }
 
 
+def _unit_manifest_path(download_job_id: str, manifest_path: str, host: str, port: int) -> Path:
+    """The unit manifest a raw-data tool acts on: manifest_path when it exists, else its download job's."""
+    resolved = Path(str(manifest_path or "")).expanduser()
+    if not resolved.is_file():
+        if not download_job_id:
+            raise ValueError("Provide either download_job_id or a manifest_path that exists.")
+        _, manifest = _repository_download_job(download_job_id, host, port)
+        resolved = Path(manifest["manifest_path"])
+    return resolved
+
+
 @mcp.tool()
 @_structured_validation_errors
 def msdial_cleanup_repository_raw(
@@ -1915,47 +1926,79 @@ def msdial_cleanup_repository_raw(
     unit's own manifest recorded that same policy at download, and the preview is ready - every guard of
     the preview still applies. The crossing is recorded in the manifest before anything is deleted.
 
+    A split parent's manifest is released here too: its raw tree, which every part reads, goes only once
+    every part has ended (validated, failed after its retries, skipped or excluded), and the parent stays
+    split_by_acquisition. A part's own preview carries its parent's plan (split_parent_plan).
+
+    Every deletion is recorded in the manifest (raw_deletion, or raw_release for a split parent): the files
+    and bytes removed, what was kept, and who authorised it. One a held file stopped is recorded as partial
+    and resumes when called again. A multiply-linked file loses only this name; its attributes are untouched.
+
     A finished run whose MS-DIAL containers could not be moved out of the raw tree holds the deletion
     (finalisation_holds in the manifest). Both calls retry that move first; while it still fails the preview
     lists it as a blocker and the deletion is refused.
     """
-    from .repository_reanalysis import (
-        cleanup_download_lease,
-        read_manifest,
-        record_campaign_authorization,
-    )
+    from .repository_reanalysis import cleanup_download_lease
 
-    resolved = Path(str(manifest_path or "")).expanduser()
-    if not resolved.is_file():
-        if not download_job_id:
-            raise ValueError("Provide either download_job_id or a manifest_path that exists.")
-        _, manifest = _repository_download_job(download_job_id, host, port)
-        resolved = Path(manifest["manifest_path"])
-    if str(campaign_authorization_path or "").strip():
-        manifest = read_manifest(resolved)
-        crossing = _campaign_authorization(
-            campaign_authorization_path,
-            manifest,
-            5,
-            "msdial_cleanup_repository_raw",
-            raw_retention_policy=str(manifest.get("raw_retention_policy") or "keep"),
-        )
-        preview = cleanup_download_lease(resolved, confirmed=False)
-        if not preview.get("ready_for_confirmation"):
-            return {
-                **preview,
-                "campaign_authorization": crossing,
-                "message": (
-                    "Nothing was deleted: the approval covers this unit, but the preview is not ready."
-                ),
-            }
-        record_campaign_authorization(resolved, crossing or {})
-        return {**cleanup_download_lease(resolved, confirmed=True), "campaign_authorization": crossing}
-    result = cleanup_download_lease(resolved, confirmed=confirmed)
-    if not confirmed:
+    resolved = _unit_manifest_path(download_job_id, manifest_path, host, port)
+    authorized = bool(str(campaign_authorization_path or "").strip())
+    result = cleanup_download_lease(
+        resolved,
+        confirmed=confirmed,
+        campaign_authorization_path=campaign_authorization_path or None,
+        entry_point="msdial_cleanup_repository_raw",
+    )
+    if authorized and not result.get("deleted"):
+        result.setdefault("message", "Nothing was deleted: the approval covers this unit, but the deletion is not ready.")
+    elif not confirmed and not authorized and not result.get("deleted"):
         result["message"] = (
             "Nothing was deleted. Show the deletion target, the size and the retained artifacts to the "
             "user, and call again with confirmed=true only after an explicit answer."
+        )
+    return result
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_discard_repository_raw(
+    download_job_id: str = "",
+    manifest_path: str = "",
+    confirmed: bool = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    campaign_authorization_path: str = "",
+) -> dict[str, Any]:
+    """Preview, and only on explicit confirmation perform, deletion of the raw data of a unit with no validated output.
+
+    For a unit skipped or excluded after its download, one whose download failed, or one whose run failed.
+    With confirmed=false and no approval nothing is deleted and the result carries the plan: the target, its
+    files and bytes, any mzTab-M in the output, and what refuses the discard. A validated unit is refused here;
+    its raw data are deleted by msdial_cleanup_repository_raw.
+
+    campaign_authorization_path names a recorded campaign approval. It stands in for confirmed=true only when
+    it covers boundary 5 for this unit (or the unit it was split from) and the approval and the unit both state
+    delete_after_validated_output. Under it, and only under it, a failed unit whose output holds an
+    unvalidated or invalid mzTab-M is discarded too: the mzTab-M, its validation and the failure record are
+    kept under output as failure artifacts and never deleted. A refusal under an approval returns blockers, with
+    nothing recorded or deleted.
+
+    A split parent is released as msdial_cleanup_repository_raw releases one. For a split part, an approval
+    records that the part has ended, deleting nothing: its raw data are its parent's, released with them.
+    """
+    from .repository_reanalysis import discard_download_lease
+
+    resolved = _unit_manifest_path(download_job_id, manifest_path, host, port)
+    authorized = bool(str(campaign_authorization_path or "").strip())
+    result = discard_download_lease(
+        resolved,
+        confirmed=confirmed,
+        campaign_authorization_path=campaign_authorization_path or None,
+        entry_point="msdial_discard_repository_raw",
+    )
+    if not confirmed and not authorized and not result.get("deleted"):
+        result["message"] = (
+            "Nothing was deleted. Show the deletion target, the size and what refuses it to the user, and call "
+            "again with confirmed=true only after an explicit answer."
         )
     return result
 

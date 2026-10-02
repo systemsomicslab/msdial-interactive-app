@@ -240,7 +240,13 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
 - `msdial_cleanup_repository_raw`: preview the exact deletion and retained
   artifacts first, then delete leased raw data only after mzTab-M validation,
   artifact inventory, and a separate explicit confirmation. A retention policy
-  is not deletion approval.
+  is not deletion approval. On a split parent's manifest it releases the raw
+  tree its parts read, only once every part has ended.
+- `msdial_discard_repository_raw`: preview, then on a separate explicit
+  confirmation delete the raw data of a unit that produced no validated output
+  (skipped, excluded, download or run failed). In a campaign only, a recorded
+  approval covering boundary 5 stands in for the confirmation, and a failed
+  unit's unvalidated mzTab-M is then kept as a failure artifact.
 
 MS-DIAL accepts mzML, not mzXML or mzData. Files reported as
 `requires_conversion` must be converted to mzML outside the run and entered
@@ -276,5 +282,6 @@ These tools return a preview when `confirmed=false`:
 - `msdial_prepare_repository_reanalysis`
 - `msdial_split_repository_unit`
 - `msdial_cleanup_repository_raw`
+- `msdial_discard_repository_raw`
 
 Do not set `confirmed=true` until the user approves the corresponding action in the current conversation.

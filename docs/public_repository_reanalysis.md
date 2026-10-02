@@ -338,7 +338,33 @@ For agents, cleanup is a separate confirmation boundary: first preview
 `msdial_cleanup_repository_raw`, report the exact raw directory and retained
 artifact inventory, and call it with `confirmed=true` only after the user
 approves that deletion. Selecting a retention policy earlier in the workflow
-does not authorize deletion.
+does not authorize deletion. `msdial_discard_repository_raw` previews and
+performs the discard of a unit that produced no validated output.
+
+In a campaign, `campaign_authorization_path` stands in for `confirmed=true` on
+both tools (and on `cleanup_download_lease`, `discard_download_lease` and
+`cleanup_split_parent` called in-process) when the approval covers boundary 5
+for the unit, or the unit it was split from, and the approval and the unit both
+state `delete_after_validated_output`. Under it a failed unit whose output
+holds an unvalidated or invalid mzTab-M may be discarded: that mzTab-M, its
+validation (`failure-artifacts/output-validation.json`) and the failure record
+(`failure-artifacts/run-failure-record.json`) are kept under output and listed
+in `failure_artifacts`. Every deletion refuses while a retained artifact lies
+under its target, unlinks a multiply-linked file without touching its
+attributes, and records what it removed and kept (`raw_deletion`); one that a
+held file or a crash stopped is resumed by the next call.
+
+A split parent's raw tree, which every part reads, is released by
+`cleanup_split_parent` (also reached through either tool on the parent's
+manifest) once every part has ended: validated, failed after its retries
+(three recorded run failures), skipped, excluded, or discarded by its own
+authorized discard. The release takes a lock, writes `raw_release` before the
+first file goes, marks validated parts `raw_cleaned` with `raw_released_by`,
+and leaves the parent `split_by_acquisition`. A finished run's post-run hook
+only records the parent's pending plan (`raw_release_pending`); in a campaign
+the runner is the one trigger of every deletion. A unit whose raw data were
+released (`raw_cleaned`, `discarded`, or a part of a released parent) never
+passes the execution gate again.
 
 ## Pilot record
 

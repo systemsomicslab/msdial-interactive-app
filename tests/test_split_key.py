@@ -23,6 +23,7 @@ from unittest.mock import patch
 from msdial_app.repository_reanalysis import (
     ION_MOBILITY_EXCLUSION,
     plan_acquisition_split,
+    plan_split_parent_cleanup,
     read_manifest,
     run_raw_metadata_preflight,
     split_unit_by_acquisition,
@@ -199,6 +200,16 @@ class BrukerBafAndTdf(_Unit, unittest.TestCase):
         self.assertEqual("excluded", after["project"]["selection_status"])
         self.assertEqual("exclude", after["campaign_disposition"]["disposition"])
         self.assertTrue(after["raw_metadata_preflight"]["summary"]["per_file"], "the reads are still recorded")
+
+    def test_the_excluded_part_has_ended_for_its_parents_raw_release(self) -> None:
+        manifest = self.unit(self.INPUTS)
+        self.preflight(manifest, self.VERDICTS)
+        split_unit_by_acquisition(manifest, confirmed=True)
+
+        plan = plan_split_parent_cleanup(manifest)
+
+        states = {part["analysis_unit_id"]: part["state"] for part in plan["parts"]}
+        self.assertEqual({"unit-x-dda": "pending", "unit-x-dda-im": "excluded"}, states)
 
     def test_a_header_that_records_ion_mobility_decides_for_any_container(self) -> None:
         inputs = {"d/a.mzML": "mzml", "d/b.mzML": "mzml"}
