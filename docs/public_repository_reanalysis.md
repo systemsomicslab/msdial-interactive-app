@@ -314,7 +314,10 @@ is written excluded (`excluded_by_preflight`, `split_exclusion`
 `ion_mobility_out_of_scope`): LC-IM-MS is outside this campaign's scope. A
 part split by polarity carries its polarity as its ion mode, and each part
 lists only its own entries of the parent's file list, its folders' members
-matched by path, and the samples its declared inputs name.
+matched by path, and its own samples: those its declared inputs or its lineage
+name, and otherwise those whose `raw_file` matches its inputs' paths, a sample's
+name being used only where no path accounts for it. An input two samples match
+equally well is neither one's, and those samples are reported unclaimed.
 
 ## Finalize and clean up
 

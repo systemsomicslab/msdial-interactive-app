@@ -4887,6 +4887,79 @@ def _input_samples(manifest: dict[str, Any], candidates: list[str]) -> dict[str,
     return result
 
 
+def _sample_parts_by_path(
+    samples: list[dict[str, Any]],
+    groups: dict[tuple[str, bool, str], list[str]],
+    sample_of: dict[str, str],
+    stands_for: dict[str, str],
+    data_root: Path | None,
+) -> dict[int, set[tuple[str, bool, str]]]:
+    """The parts (group keys) of each sample no input names (sample_of), by the sample's index.
+
+    A sample's raw_file is matched against the paths of the parts' unnamed inputs under the data root, in the
+    forms a listed file may carry for them (_allowlist_forms), as _files_of_parts matches the file list: the
+    full path before any shorter form. Only a raw_file no input's path accounts for is matched by its name
+    (or its stem, when it records no extension), as every sample used to be. An input is then the sample's
+    that matched it best; where two samples match it equally well, neither has it. By name alone pos/S1.raw and
+    neg/S1.raw are one file, and each polarity part held the samples of both.
+    """
+    forms: dict[str, list[tuple[int, tuple[str, bool, str], str]]] = {}
+    bare_forms: dict[str, list[tuple[int, tuple[str, bool, str], str]]] = {}
+    names: dict[str, list[tuple[tuple[str, bool, str], str]]] = {}
+    stems: dict[str, list[tuple[tuple[str, bool, str], str]]] = {}
+    for key, files in groups.items():
+        for item in files:
+            item_key = _file_key(item)
+            if sample_of.get(item_key):
+                continue
+            for source in (item, stands_for.get(item_key, "")):
+                if not source:
+                    continue
+                name = Path(source).name.casefold()
+                names.setdefault(name, []).append((key, item_key))
+                stems.setdefault(PurePosixPath(name).stem, []).append((key, item_key))
+                relative = _relative_to_data_root(Path(source), data_root) if data_root is not None else None
+                if relative is None:
+                    continue
+                exact = {relative, relative[6:] if relative.startswith("files/") else relative}
+                for form in _allowlist_forms(relative):
+                    entry = (2 if form in exact else 1, key, item_key)
+                    forms.setdefault(form, []).append(entry)
+                    bare = PurePosixPath(form)
+                    bare_forms.setdefault(str(bare.with_name(bare.stem)) if bare.suffix else form, []).append(entry)
+    # input -> {sample index: how well it matched}: 3 and 2 by path, the full path or a shorter form; 1 by name.
+    claims: dict[str, dict[int, int]] = {}
+    for index, sample in enumerate(samples):
+        text = str((sample or {}).get("raw_file") or "").strip()
+        raw = PurePosixPath(text.replace("\\", "/")).name.casefold()
+        if not raw:
+            continue
+        no_extension = not PurePosixPath(raw).suffix
+        listed = _listed_key(text)
+        alias = _container_alias_path(listed) if listed else ""
+        table = bare_forms if no_extension else forms
+        found = [*(table.get(listed) or []), *(forms.get(alias) or [] if alias else [])] if listed else []
+        if found:
+            best = max(rank for rank, _key, _item in found)
+            matched = [(rank + 1, item) for rank, _key, item in found if rank == best]
+        else:
+            alias_name = archives.container_alias(raw).casefold()
+            by_name = [*(names.get(raw) or []), *(names.get(alias_name) or [] if alias_name else [])]
+            if no_extension:
+                by_name.extend(stems.get(raw) or [])
+            matched = [(1, item) for _key, item in by_name]
+        for level, item in matched:
+            claims.setdefault(item, {})[index] = max(level, claims.get(item, {}).get(index, 0))
+    part_of = {_file_key(item): key for key, files in groups.items() for item in files}
+    result: dict[int, set[tuple[str, bool, str]]] = {}
+    for item, by_sample in claims.items():
+        best = max(by_sample.values())
+        owners = [index for index, level in by_sample.items() if level == best]
+        if len(owners) == 1:
+            result.setdefault(owners[0], set()).add(part_of[item])
+    return result
+
+
 def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     """Describe how a unit would be split by its split key. Changes nothing.
 
@@ -5012,26 +5085,26 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     stands_for = lineage_stands_for(manifest)
     sample_of = _input_samples(manifest, candidates)
     named_anywhere = set(sample_of.values())
+    data_root_text = str(manifest.get("input_directory") or "").strip()
+    # The rest are matched by their raw_file's path, and only where no path accounts for it by name.
+    by_path = _sample_parts_by_path(
+        samples, groups, sample_of, stands_for, Path(data_root_text) if data_root_text else None
+    )
     parts = []
     claimed_samples: set[int] = set()
-    for (mode, mobility, polarity), files in sorted(groups.items()):
-        # A sample the declared inputs or the lineage attribute is matched by that; only the rest by name.
+    for group_key, files in sorted(groups.items()):
+        mode, mobility, polarity = group_key
+        # A sample the declared inputs or the lineage attribute is matched by that; only the rest by path.
         named = {sample_of[_file_key(item)] for item in files if sample_of.get(_file_key(item))}
-        unnamed = [item for item in files if not sample_of.get(_file_key(item))]
-        names = {Path(item).name.casefold() for item in unnamed} | {
-            Path(stands_for[_file_key(item)]).name.casefold() for item in unnamed if _file_key(item) in stands_for
-        }
-        stems = {PurePosixPath(name).stem for name in names}
         part_samples = []
         for index, sample in enumerate(samples):
             sample_id = str((sample or {}).get("sample_id") or "").strip()
-            raw = PurePosixPath(str((sample or {}).get("raw_file") or "").replace("\\", "/")).name.casefold()
             if sample_id and sample_id in named:
                 matched = True
             elif sample_id and sample_id in named_anywhere:
                 matched = False
             else:
-                matched = bool(raw) and (raw in names or (not PurePosixPath(raw).suffix and raw in stems))
+                matched = group_key in by_path.get(index, set())
             if matched:
                 part_samples.append(sample)
                 claimed_samples.add(index)

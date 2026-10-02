@@ -8,7 +8,8 @@ polarity was refused ("Only a unit whose raw headers disagree about acquisition 
 Now the key has three parts. A part whose inputs carry ion mobility is written excluded, since LC-IM-MS is
 outside the campaign's scope; a part split by polarity carries that polarity as its ion mode. And a part's
 file list is its own folders' members, matched by path: by name alone, pos/S1.raw and neg/S1.raw are one
-folder, and each polarity part listed the members of both.
+folder, and each polarity part listed the members of both. Its samples, where no declared input names them,
+are matched by their raw_file's path the same way, and a name two samples give is neither one's.
 """
 
 from __future__ import annotations
@@ -276,6 +277,45 @@ class Polarity(_Unit, unittest.TestCase):
             {"pos_S1", "pos_S2"}, {item["sample_id"] for item in project["class_proposal"]["assignments"]}
         )
         self.assertEqual([], result["unclaimed_samples"])
+
+    def test_undeclared_same_named_folders_give_each_part_its_own_samples(self) -> None:
+        # An archive unit declares no inputs, so nothing names a folder's sample but the sample's own raw_file.
+        manifest = self.unit(self.INPUTS, ion_mode="Unknown", declared_inputs=False)
+        self.preflight(manifest, self.verdicts())
+
+        result = split_unit_by_acquisition(manifest, confirmed=True)
+        parts = {part["polarity"]: read_manifest(part["manifest_path"])["project"] for part in result["parts"]}
+
+        self.assertTrue(result["written"], result["blockers"])
+        for polarity, prefix in (("Positive", "pos"), ("Negative", "neg")):
+            with self.subTest(polarity=polarity):
+                project = parts[polarity]
+                expected = {f"{prefix}_S1", f"{prefix}_S2"}
+                self.assertEqual(expected, {item["sample_id"] for item in project["sample_metadata"]})
+                self.assertEqual(expected, {item["sample_id"] for item in project["class_proposal"]["assignments"]})
+                self.assertEqual(2, project["sample_count"])
+        self.assertEqual([], result["unclaimed_samples"])
+
+    def test_a_name_two_samples_give_is_neither_ones_and_a_name_one_gives_is_matched_in_every_part(self) -> None:
+        manifest = self.unit(self.INPUTS, ion_mode="Unknown", declared_inputs=False)
+        self.preflight(manifest, self.verdicts())
+
+        def by_name(current: dict) -> None:
+            # S1.raw names two samples and no folder; S2.raw names one sample, and both polarities hold an S2.raw.
+            samples = {item["sample_id"]: item for item in current["project"]["sample_metadata"]}
+            samples["pos_S1"]["raw_file"] = samples["neg_S1"]["raw_file"] = "S1.raw"
+            samples["pos_S2"]["raw_file"] = "S2.raw"
+            current["project"]["sample_metadata"] = [item for key, item in samples.items() if key != "neg_S2"]
+
+        update_manifest(manifest, by_name)
+        plan = plan_acquisition_split(manifest)
+
+        self.assertEqual([], plan["blockers"])
+        self.assertEqual({"neg_S1", "pos_S1"}, set(plan["unclaimed_samples"]))
+        self.assertEqual(
+            {"unit-x-dda-neg": ["pos_S2"], "unit-x-dda-pos": ["pos_S2"]},
+            {part["analysis_unit_id"]: part["sample_ids"] for part in plan["parts"]},
+        )
 
     def test_mixed_acquisition_and_polarity_name_both(self) -> None:
         manifest = self.unit(self.INPUTS, ion_mode="Unknown", declared_inputs=True)
