@@ -303,6 +303,19 @@ Preview `msdial_split_repository_unit`, confirm the proposed DDA and
 DIA/AIF/SWATH child units, then preflight each child independently. The Mixed
 parent must never be passed to an MS-DIAL production run.
 
+The split key has three parts: the acquisition mode, the ion-mobility regime
+(the header's `has_ion_mobility`, or an ion-mobility container such as a Bruker
+TDF folder) and the polarity. A unit whose inputs differ in any of them is
+split along every part in which they differ, and the part id names each of
+those parts after the acquisition mode: `<unit>-dda` and `<unit>-dia` as
+before, `<unit>-dda-im` for the ion-mobility part of a BAF/TDF unit, and
+`<unit>-dda-neg` / `<unit>-dda-pos` for a polarity split. An ion-mobility part
+is written excluded (`excluded_by_preflight`, `split_exclusion`
+`ion_mobility_out_of_scope`): LC-IM-MS is outside this campaign's scope. A
+part split by polarity carries its polarity as its ion mode, and each part
+lists only its own entries of the parent's file list, its folders' members
+matched by path, and the samples its declared inputs name.
+
 ## Finalize and clean up
 
 After MS-DIAL Interactive has produced mzTab-M, QA, and publication artifacts,

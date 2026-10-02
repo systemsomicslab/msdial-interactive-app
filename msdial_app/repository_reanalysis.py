@@ -4064,10 +4064,11 @@ def disposition_hold(manifest: dict[str, Any]) -> dict[str, Any] | None:
 
     split_parent: the unit was split. A parent owns its parts' raw data and never runs, so a disposition
     that made it runnable, or skipped it - and a campaign deletes a skipped unit's raw data - would reach
-    the parts. past_preflight: its run finished (mztab_validated, cleanup_pending_confirmation, raw_cleaned
-    and the like) or its raw data were discarded; applied again, a disposition would move a finished unit
-    out of the cleanup-ready states and make it look as if it were waiting to run. run_in_progress: a
-    Console of its own may still be running.
+    the parts. excluded_at_split: a part of ion-mobility inputs, excluded when its parent was split
+    (split_exclusion). past_preflight: its run finished (mztab_validated, cleanup_pending_confirmation,
+    raw_cleaned and the like) or its raw data were discarded; applied again, a disposition would move a
+    finished unit out of the cleanup-ready states and make it look as if it were waiting to run.
+    run_in_progress: a Console of its own may still be running.
     """
     status = str(manifest.get("status") or "")
     if status == SPLIT_PARENT_STATUS or manifest.get("split_into"):
@@ -4075,6 +4076,16 @@ def disposition_hold(manifest: dict[str, Any]) -> dict[str, Any] | None:
             "reason": "split_parent",
             "status": status,
             "detail": "The unit was split; its parts are preflighted and run, and it never is.",
+        }
+    if manifest.get("split_exclusion"):
+        # A part of ion-mobility inputs ended at its split: a disposition decided from its own headers would
+        # say the same, and one that made it runnable would run LC-IM-MS data as LC-MS.
+        return {
+            "reason": "excluded_at_split",
+            "status": status,
+            "detail": "The part was excluded when its parent was split: "
+            + str((manifest.get("split_exclusion") or {}).get("reason") or "excluded")
+            + ".",
         }
     if status in PAST_PREFLIGHT_STATUSES:
         return {
@@ -4414,7 +4425,11 @@ def _record_preflight(
     # recorded, for its parts to reuse; the verdicts change nothing, and the disposition it carries stands.
     hold = disposition_hold(current)
     split_parent = hold is not None and hold["reason"] == "split_parent"
+    # A part excluded at its split is read like any unit, and stays excluded: outside a campaign nothing
+    # else here knows that ion mobility is out of scope.
+    excluded_part = hold is not None and hold["reason"] == "excluded_at_split"
     status_before = current.get("status")
+    project_before = copy.deepcopy(current.get("project") or {})
     previously_allowed = bool(
         current.get("execution_allowed") or (current.get("project") or {}).get("eligible")
     )
@@ -4594,12 +4609,14 @@ def _record_preflight(
             else:
                 current["status"] = "preflight_review_required"
 
-    if split_parent:
+    if split_parent or excluded_part:
         # Its status as it was, and the disposition it carries as it was: a campaign acts on whatever
         # disposition a unit carries, and one decided from a split parent's own headers - skip, say - would
-        # reach the raw data its parts read.
+        # reach the raw data its parts read. A part excluded at its split keeps its exclusion the same way.
         current["status"] = status_before
         current["execution_allowed"] = False
+        if excluded_part:
+            current["project"] = project_before
         return
     disposition = decide_disposition(current, declared=declared, extractor=extractor)
     assignments = disposition.pop("assignments")
@@ -4772,13 +4789,99 @@ SPLIT_PART_STATUS = "split_from_parent"
 
 DECIDED_TYPE_PART_MODE = {"DDA": "DDA", "SWATH": "DIA", "AIF": "AIF"}
 
+# ONE SPLIT KEY. A part is one acquisition mode, one ion-mobility regime and one polarity: MS-DIAL runs one
+# acquisition type and one ion mode per analysis, and the campaign runs LC-MS only. The key was the
+# acquisition mode alone, so a BAF and a TDF folder of one DDA unit landed in one part (or, keyed by
+# container as well, under one id twice), and a unit whose files differed only in polarity could not be
+# split at all. A part whose files carry ion mobility is written excluded: LC-IM-MS is outside the campaign's
+# scope, and Interactive runs no ion-mobility project. The part id names every key part in which the parts
+# differ, after the acquisition mode it always named, so a DDA/DIA split keeps <unit>-dda and <unit>-dia.
+SPLIT_KEY_SCHEMA = "msdial-split-key.v1"
+SPLIT_KEY_PARTS = ("acquisition", "ion_mobility", "polarity")
+ION_MOBILITY_PART_TOKEN = "im"
+POLARITY_PART_TOKENS = {"Positive": "pos", "Negative": "neg"}
+ION_MOBILITY_EXCLUSION = "ion_mobility_out_of_scope"
+ION_MOBILITY_EXCLUSION_REASON = (
+    "LC-IM-MS is outside this campaign's LC-MS/MS scope: these inputs carry an ion-mobility dimension, by their "
+    "raw header (has_ion_mobility) or their container format, and Interactive runs no ion-mobility project."
+)
 
-def _split_part_id(parent_unit_id: str, mode: str) -> str:
-    return f"{parent_unit_id}-{mode.casefold()}"
+
+def _split_part_id(parent_unit_id: str, mode: str, ion_mobility: bool = False, polarity: str = "") -> str:
+    tokens = [mode.casefold()]
+    if ion_mobility:
+        tokens.append(ION_MOBILITY_PART_TOKEN)
+    if polarity:
+        tokens.append(POLARITY_PART_TOKENS[polarity])
+    return f"{parent_unit_id}-{'-'.join(tokens)}"
+
+
+def _input_ion_mobility(verdict: dict[str, Any] | None, path: str) -> bool:
+    """Whether an input carries ion mobility: its header says so, or its container format is a mobility one.
+
+    Either is enough, as for the campaign disposition (decide_disposition), which excludes such an input by
+    the same reading: a TDF folder whose header read no mobility is still a timsTOF acquisition.
+    """
+    from .raw_metadata_preflight import ION_MOBILITY_FORMATS, input_format
+
+    entry = verdict or {}
+    if entry.get("has_ion_mobility") is True:
+        return True
+    return (str(entry.get("format") or "") or input_format(path)) in ION_MOBILITY_FORMATS
+
+
+def _disposition_polarities(disposition: dict[str, Any]) -> dict[str, str]:
+    """The polarity an applied split disposition gave each input, by _file_key."""
+    result: dict[str, str] = {}
+    for group in ((disposition.get("split_key") or {}).get("groups") or []) if disposition else []:
+        polarity = str((group or {}).get("polarity") or "") if isinstance(group, dict) else ""
+        if polarity in POLARITY_PART_TOKENS:
+            for item in group.get("inputs") or []:
+                result[_file_key(str(item))] = polarity
+    return result
+
+
+def _input_samples(manifest: dict[str, Any], candidates: list[str]) -> dict[str, str]:
+    """The sample each input is, by _file_key: the Catalog's declared input it is, else its lineage row's.
+
+    Asked as the analysis-CSV builder asks it (match_declared_inputs), so a part holds the samples its CSV
+    will. A name alone cannot say it where two folders share one, as pos/S1.raw and neg/S1.raw do.
+    """
+    lineage = manifest.get("input_lineage") if isinstance(manifest.get("input_lineage"), dict) else {}
+    lineage_samples = {
+        _file_key(str(row.get("path") or "")): str(row.get("sample_id") or "").strip()
+        for row in lineage.get("rows") or []
+        if isinstance(row, dict) and str(row.get("path") or "").strip()
+    }
+    result = {key: value for key, value in lineage_samples.items() if value}
+    project_record = manifest.get("project") or {}
+    data_root = str(manifest.get("input_directory") or "").strip()
+    if not project_record.get("analysis_inputs") or not data_root:
+        return result
+    try:
+        project = project_from_dict(project_record)
+    except (TypeError, ValueError):
+        return result
+    declared = declared_analysis_inputs(project)
+    if not declared:
+        return result
+    matched = match_declared_inputs(
+        candidates,
+        Path(data_root),
+        declared,
+        containers=declared_archive_containers(project, declared, manifest.get("archive_extractions")),
+        samples=lineage_samples,
+        stands_for=lineage_stands_for(manifest),
+    )
+    for form, found in matched.items():
+        sample = str(declared[form].get("sample_id") or "").strip()
+        for item in found if sample else []:
+            result[_file_key(item)] = sample
+    return result
 
 
 def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
-    """Describe how a Mixed unit would be split by per-file acquisition mode. Changes nothing.
+    """Describe how a unit would be split by its split key. Changes nothing.
 
     WHY A SPLIT AND NOT A RELABEL. MS-DIAL deconvolutes each file by the acquisition type written
     against it, and a DDA file deconvoluted as SWATH, or a DIA file read as DDA, gives a result that
@@ -4786,6 +4889,13 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     and the only evidence for how to divide it is what each file's own header said. The parts are
     made from that evidence and nothing else: a file whose header gave no usable mode blocks the
     split rather than being guessed into a part.
+
+    THE KEY is the acquisition mode, the ion-mobility regime and the polarity (SPLIT_KEY_PARTS). A unit
+    is split when its headers disagree about acquisition mode, when an applied campaign disposition
+    splits it, or when its inputs differ in any part of the key. Polarity is the header's, or the one an
+    applied disposition gave the input; it is part of the key only where the inputs differ in it, and
+    then an input with no single polarity blocks the split. A part of ion-mobility inputs is planned
+    excluded (ION_MOBILITY_EXCLUSION), so its inputs are accounted for and none of them runs.
 
     The parts share the parent's raw data and do not copy it. Their input files are disjoint, and
     MS-DIAL's per-file intermediates carry a run timestamp, so parts run one after another do not
@@ -4814,15 +4924,11 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     if not parent_id:
         blockers.append("The manifest names no analysis_unit_id to derive part identifiers from.")
     disposition = _applied_disposition(manifest)
-    # A campaign disposition splits SWATH from AIF too, and both of those read "DIA" in the header.
-    split_by_acquisition = disposition.get("disposition") == "split" and "acquisition" in (
-        (disposition.get("split_key") or {}).get("by") or []
+    # A campaign disposition splits SWATH from AIF too, and both of those read "DIA" in the header; and it
+    # splits by polarity where the inputs' headers differ in it.
+    split_by_disposition = disposition.get("disposition") == "split" and bool(
+        set((disposition.get("split_key") or {}).get("by") or []) & {"acquisition", "polarity"}
     )
-    if summary.get("acquisition_mode") != "Mixed" and not split_by_acquisition:
-        blockers.append(
-            "Only a unit whose raw headers disagree about acquisition mode is split here; this one "
-            f"is {summary.get('acquisition_mode') or project.get('acquisition_mode') or 'unknown'!r}."
-        )
     if not coverage.get("complete"):
         blockers.append(
             "The raw-header preflight did not read every input file, so the files it did not read "
@@ -4833,7 +4939,8 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     candidates = [str(item) for item in manifest.get("input_candidates") or [] if str(item).strip()]
     decided = _decided_acquisition_by_file(manifest)
     excluded = _campaign_excluded_inputs(manifest)
-    groups: dict[str, list[str]] = {}
+    decided_polarity = _disposition_polarities(disposition)
+    keyed: list[tuple[str, str, bool, str]] = []
     unassigned: list[str] = []
     left_out: list[dict[str, str]] = []
     for candidate in candidates:
@@ -4848,14 +4955,46 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
             # The type an applied campaign disposition decided, named as the header names it (a SWATH file
             # is in the DIA part), so a DDA/DIA split keeps the part identifiers it always had.
             mode = DECIDED_TYPE_PART_MODE[console]
-        if mode in HEADER_ACQUISITION_TO_MSDIAL:
-            groups.setdefault(mode, []).append(candidate)
-        else:
+        if mode not in HEADER_ACQUISITION_TO_MSDIAL:
             unassigned.append(f"{Path(candidate).name} ({mode or 'no header verdict'})")
+            continue
+        polarity = decided_polarity.get(_file_key(candidate)) or str((verdict or {}).get("polarity") or "").strip()
+        keyed.append(
+            (
+                candidate,
+                mode,
+                _input_ion_mobility(verdict, candidate),
+                polarity if polarity in POLARITY_PART_TOKENS else "",
+            )
+        )
     if unassigned:
         blockers.append(
             f"{len(unassigned)} input files have no DDA, DIA or AIF header verdict and cannot be put "
             f"into a part: {', '.join(unassigned[:5])}. Decide whether to exclude them."
+        )
+    by_polarity = len({polarity for *_, polarity in keyed if polarity}) > 1
+    if by_polarity:
+        unpolarised = [Path(candidate).name for candidate, *_, polarity in keyed if not polarity]
+        if unpolarised:
+            blockers.append(
+                f"The inputs differ in polarity, and {len(unpolarised)} of them record no single polarity, so "
+                f"they cannot be put into a part: {', '.join(unpolarised[:5])}. Decide whether to exclude them."
+            )
+    groups: dict[tuple[str, bool, str], list[str]] = {}
+    for candidate, mode, mobility, polarity in keyed:
+        if by_polarity and not polarity:
+            continue
+        groups.setdefault((mode, mobility, polarity if by_polarity else ""), []).append(candidate)
+    varying = [
+        name
+        for name, index in (("acquisition", 0), ("ion_mobility", 1), ("polarity", 2))
+        if len({key[index] for key in groups}) > 1
+    ]
+    if summary.get("acquisition_mode") != "Mixed" and not split_by_disposition and not varying:
+        described = summary.get("acquisition_mode") or project.get("acquisition_mode") or "unknown"
+        blockers.append(
+            "Only a unit whose raw headers disagree about acquisition mode, ion-mobility regime or polarity is "
+            f"split here; this one is {described!r} in one regime and one polarity."
         )
 
     samples = list(project.get("sample_metadata") or [])
@@ -4863,17 +5002,29 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     # An mzML converted from an mzXML, or chosen over one, is that mzXML's sample's: the sample names the
     # repository's file, not what the lease wrote from it.
     stands_for = lineage_stands_for(manifest)
+    sample_of = _input_samples(manifest, candidates)
+    named_anywhere = set(sample_of.values())
     parts = []
     claimed_samples: set[int] = set()
-    for mode, files in sorted(groups.items()):
-        names = {Path(item).name.casefold() for item in files} | {
-            Path(stands_for[_file_key(item)]).name.casefold() for item in files if _file_key(item) in stands_for
+    for (mode, mobility, polarity), files in sorted(groups.items()):
+        # A sample the declared inputs or the lineage attribute is matched by that; only the rest by name.
+        named = {sample_of[_file_key(item)] for item in files if sample_of.get(_file_key(item))}
+        unnamed = [item for item in files if not sample_of.get(_file_key(item))]
+        names = {Path(item).name.casefold() for item in unnamed} | {
+            Path(stands_for[_file_key(item)]).name.casefold() for item in unnamed if _file_key(item) in stands_for
         }
         stems = {PurePosixPath(name).stem for name in names}
         part_samples = []
         for index, sample in enumerate(samples):
+            sample_id = str((sample or {}).get("sample_id") or "").strip()
             raw = PurePosixPath(str((sample or {}).get("raw_file") or "").replace("\\", "/")).name.casefold()
-            if raw and (raw in names or (not PurePosixPath(raw).suffix and raw in stems)):
+            if sample_id and sample_id in named:
+                matched = True
+            elif sample_id and sample_id in named_anywhere:
+                matched = False
+            else:
+                matched = bool(raw) and (raw in names or (not PurePosixPath(raw).suffix and raw in stems))
+            if matched:
                 part_samples.append(sample)
                 claimed_samples.add(index)
         sample_ids = {str(item.get("sample_id") or "") for item in part_samples}
@@ -4890,19 +5041,23 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
                 if str(level).isdigit() and int(level) > 2
             }
         )
-        part_id = _split_part_id(parent_id, mode)
-        parts.append(
-            {
-                "analysis_unit_id": part_id,
-                "acquisition_mode": mode,
-                "workspace": str(workspace.parent / part_id),
-                "input_candidates": sorted(files),
-                "file_count": len(files),
-                "sample_ids": sorted(sample_ids),
-                "class_levels": levels,
-                "higher_ms_levels": higher_levels,
-            }
-        )
+        part_id = _split_part_id(parent_id, mode, ion_mobility=mobility, polarity=polarity)
+        part = {
+            "analysis_unit_id": part_id,
+            "acquisition_mode": mode,
+            "ion_mobility": mobility,
+            "polarity": polarity,
+            "split_key": {"acquisition": mode, "ion_mobility": mobility, "polarity": polarity},
+            "workspace": str(workspace.parent / part_id),
+            "input_candidates": sorted(files),
+            "file_count": len(files),
+            "sample_ids": sorted(sample_ids),
+            "class_levels": levels,
+            "higher_ms_levels": higher_levels,
+        }
+        if mobility:
+            part["excluded"] = {"reason": ION_MOBILITY_EXCLUSION, "detail": ION_MOBILITY_EXCLUSION_REASON}
+        parts.append(part)
     unclaimed = [
         str((sample or {}).get("sample_id") or index)
         for index, sample in enumerate(samples)
@@ -4912,6 +5067,7 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
         "manifest_path": str(manifest_path),
         "analysis_unit_id": parent_id,
         "already_split": False,
+        "split_key": {"schema": SPLIT_KEY_SCHEMA, "parts": list(SPLIT_KEY_PARTS), "by": varying},
         "parts": parts,
         "unclaimed_samples": unclaimed,
         "excluded_inputs": left_out,
@@ -4919,8 +5075,19 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     }
 
 
+def _part_label(part: dict[str, Any]) -> str:
+    """'DDA', or 'DDA ion-mobility Negative': the part's key as words, for evidence and warnings."""
+    return " ".join(
+        [
+            str(part.get("acquisition_mode") or ""),
+            *(["ion-mobility"] if part.get("ion_mobility") else []),
+            *([str(part["polarity"])] if part.get("polarity") else []),
+        ]
+    )
+
+
 def _part_class_proposal(
-    parent_proposal: dict[str, Any], sample_ids: set[str], parent_unit_id: str, mode: str
+    parent_proposal: dict[str, Any], sample_ids: set[str], parent_unit_id: str, mode: str, label: str = ""
 ) -> dict[str, Any]:
     """The parent's accepted Class proposal, restricted to one part's samples, saying so.
 
@@ -4931,6 +5098,7 @@ def _part_class_proposal(
     """
     if not parent_proposal:
         return {}
+    label = label or mode
     proposal = copy.deepcopy(parent_proposal)
     every = list(proposal.get("assignments") or [])
     kept = [item for item in every if str(item.get("sample_id") or "") in sample_ids]
@@ -4938,7 +5106,7 @@ def _part_class_proposal(
     proposal["assignments"] = kept
     proposal["split_from"] = {
         "parent_analysis_unit_id": parent_unit_id,
-        "split_by": "raw_header_acquisition_mode",
+        "split_by": "raw_header_acquisition_mode" if label == mode else "raw_header_split_key",
         "acquisition_mode": mode,
         "assignments_kept": len(kept),
         "assignments_in_parent": len(every),
@@ -4947,8 +5115,9 @@ def _part_class_proposal(
     warnings = list(proposal.get("warnings") or [])
     warnings.append(
         f"This run holds {len(kept)} of the {len(every)} samples the proposal assigned: analysis unit "
-        f"{parent_unit_id} was split by raw-header acquisition mode and this is its {mode} part. The "
-        "rationale describes the whole unit."
+        f"{parent_unit_id} was split by raw-header "
+        + ("acquisition mode" if label == mode else "acquisition mode, ion-mobility regime and polarity")
+        + f" and this is its {label} part. The rationale describes the whole unit."
     )
     if len(levels) < 2:
         warnings.append(
@@ -4959,18 +5128,128 @@ def _part_class_proposal(
     return proposal
 
 
+def _listed_key(name: str) -> str:
+    """A listed file's path as the lease places it (_safe_relative_name), casefolded; '' when unsafe."""
+    try:
+        return _safe_relative_name(str(name or "")).as_posix().casefold()
+    except ValueError:
+        return ""
+
+
+def _files_of_parts(
+    listed: list[dict[str, Any]],
+    parts: list[dict[str, Any]],
+    data_root: Path | None,
+    stands_for: dict[str, str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Each part's entries of its parent's file list: its inputs' own, and its folders' members.
+
+    A member belongs to the part whose input its container is, matched by the container's path under the
+    data root (as the lease's allow-list matches it, _allowlist_forms), the full path before any shorter
+    form; only an entry no input's path accounts for is matched by name, as every entry used to be. By name
+    alone, pos/S1.raw and neg/S1.raw are one folder, and each polarity part listed both folders' members.
+    A converted input is listed as the mzXML it was converted from.
+    """
+    forms: dict[str, dict[str, int]] = {}
+    names: dict[str, set[str]] = {}
+    for part in parts:
+        part_id = part["analysis_unit_id"]
+        for item in part["input_candidates"]:
+            for source in (item, stands_for.get(_file_key(item), "")):
+                if not source:
+                    continue
+                names.setdefault(Path(source).name.casefold(), set()).add(part_id)
+                relative = _relative_to_data_root(Path(source), data_root) if data_root is not None else None
+                if relative is None:
+                    continue
+                exact = {relative, relative[6:] if relative.startswith("files/") else relative}
+                for form in _allowlist_forms(relative):
+                    rank = 2 if form in exact else 1
+                    owners = forms.setdefault(form, {})
+                    owners[part_id] = max(owners.get(part_id, 0), rank)
+    result: dict[str, list[dict[str, Any]]] = {part["analysis_unit_id"]: [] for part in parts}
+    for entry in listed:
+        if not isinstance(entry, dict):
+            continue
+        member = str(entry.get("role") or "") == VENDOR_FOLDER_MEMBER_ROLE
+        name = str((entry.get("container") if member else entry.get("name") or entry.get("path")) or "")
+        key = _listed_key(name)
+        owners = (forms.get(key) or forms.get(_container_alias_path(key)) or {}) if key else {}
+        if owners:
+            best = max(owners.values())
+            chosen = {part_id for part_id, rank in owners.items() if rank == best}
+        else:
+            chosen = names.get(PurePosixPath(name.replace("\\", "/")).name.casefold(), set())
+        for part_id in chosen:
+            result[part_id].append(entry)
+    return result
+
+
+def _excluded_part_disposition(
+    parent: dict[str, Any], part_manifest: dict[str, Any], decided_at: str
+) -> dict[str, Any]:
+    """The campaign disposition of a part planned excluded, decided by the one mapping (decide_disposition).
+
+    Decided from the parent's header verdicts for the part's inputs, which is all a part has before its own
+    preflight; it excludes every ion-mobility input, so the part is excluded whole. It is applied when the
+    parent is a campaign unit, so a campaign acts on it as on any excluded unit's.
+    """
+    from .raw_metadata_preflight import decide_disposition
+
+    preflight = parent.get("raw_metadata_preflight") or {}
+    summary = preflight.get("summary") or {}
+    view = {
+        "raw_metadata_preflight": {
+            "summary": {
+                **{key: value for key, value in summary.items() if key not in ("per_file", "coverage")},
+                "per_file": list(part_manifest.get("header_verdicts_from_parent") or []),
+                "coverage": {**(summary.get("coverage") or {}), "complete": True, "capped": False},
+            },
+            "declared": preflight.get("declared"),
+            "extractor": preflight.get("extractor"),
+        },
+        "input_candidates": list(part_manifest.get("input_candidates") or []),
+        "project": part_manifest.get("project") or {},
+    }
+    declared = preflight.get("declared") if isinstance(preflight.get("declared"), dict) else None
+    disposition = decide_disposition(view, declared=declared, extractor=preflight.get("extractor"), decided_at=decided_at)
+    disposition.pop("assignments", None)
+    if disposition.get("disposition") not in {"exclude", "skip"}:
+        # Not reachable while decide_disposition excludes ion mobility; a part of mobility data never runs.
+        disposition.update(
+            disposition="exclude",
+            reasons=[ION_MOBILITY_EXCLUSION],
+            excluded_inputs=[
+                {"path": item, "reason": ION_MOBILITY_EXCLUSION} for item in part_manifest.get("input_candidates") or []
+            ],
+            split_key=None,
+        )
+    disposition["decided_from"] = "split_parent_preflight"
+    campaign = preflight_campaign(parent)
+    disposition["applied"] = campaign is not None
+    if campaign is not None:
+        disposition["campaign"] = dict(campaign)
+    return disposition
+
+
 def split_unit_by_acquisition(manifest_path: Path, confirmed: bool = False) -> dict[str, Any]:
-    """Split a Mixed unit into one part per acquisition mode, each with its own manifest.
+    """Split a unit into one part per value of its split key, each with its own manifest.
 
     With confirmed false this is plan_acquisition_split. With confirmed true it writes, for each part,
     a workspace holding provenance and output directories and a run manifest that:
 
     - admits only that part's input files, so the execution gate refuses the others;
     - carries the part's acquisition mode as read from its files' headers, and those headers' own
-      verdicts, so the gate can check each file against its header;
+      verdicts, so the gate can check each file against its header; and, for a part split by polarity,
+      that polarity as its ion mode;
     - keeps only the samples, and the accepted Class assignments, that belong to its files. The
       Class decision is the parent's, filtered; it is not a new grouping;
+    - lists only its own entries of the parent's file list, its folders' members among them;
     - starts with execution_allowed false. Each part is preflighted on its own before it can run.
+
+    A part of ion-mobility inputs is written excluded (status excluded_by_preflight, split_exclusion, and
+    the campaign disposition the one mapping gives it), so it never runs and it counts as ended for the
+    release of its parent's raw data.
 
     The parent is marked split and names its parts. Nothing is copied or deleted.
 
@@ -5013,6 +5292,13 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         _file_key(str(item.get("file") or "")): item
         for item in (parent.get("raw_metadata_preflight") or {}).get("summary", {}).get("per_file") or []
     }
+    data_root = str(parent.get("input_directory") or "").strip()
+    files_of = _files_of_parts(
+        list(parent_project.get("files") or []),
+        plan["parts"],
+        Path(data_root) if data_root else None,
+        stands_for,
+    )
     from .repository_metadata import metadata_workspace
 
     now = datetime.now(timezone.utc).isoformat()
@@ -5023,17 +5309,14 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         output = root / "output"
         provenance.mkdir(parents=True, exist_ok=True)
         output.mkdir(parents=True, exist_ok=True)
-        # A converted input's listed file is the mzXML it was converted from.
-        names = {Path(item).name.casefold() for item in part["input_candidates"]} | {
-            Path(stands_for[_file_key(item)]).name.casefold()
-            for item in part["input_candidates"]
-            if _file_key(item) in stands_for
-        }
         sample_ids = set(part["sample_ids"])
+        label = _part_label(part)
 
         project = copy.deepcopy(parent_project)
         project["analysis_unit_id"] = part["analysis_unit_id"]
         project["acquisition_mode"] = part["acquisition_mode"]
+        if part.get("polarity"):
+            project["ion_mode"] = part["polarity"]
         project["sample_metadata"] = [
             sample for sample in parent_project.get("sample_metadata") or []
             if str((sample or {}).get("sample_id") or "") in sample_ids
@@ -5047,30 +5330,30 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 if isinstance(entry, dict) and str(entry.get("sample_id") or "") in sample_ids
             ]
         # A folder's files are listed one by one, as its members (Catalog 0.6.0): they go with the part
-        # whose input their folder is, so a part's download description is its own folders'.
-        matched_files = [
-            item for item in parent_project.get("files") or []
-            if PurePosixPath(str(item.get("name") or "").replace("\\", "/")).name.casefold() in names
-            or (
-                str(item.get("role") or "") == VENDOR_FOLDER_MEMBER_ROLE
-                and PurePosixPath(str(item.get("container") or "").replace("\\", "/")).name.casefold() in names
-            )
-        ]
-        # An archive unit's file list names the archive, not the files inside it; the part then
-        # shares the parent's download description rather than being given an empty one.
-        project["files"] = matched_files or list(parent_project.get("files") or [])
+        # whose input their folder is, so a part's download description is its own folders'. An archive
+        # unit's file list names the archive, not the files inside it; the part then shares the parent's
+        # download description rather than being given an empty one.
+        project["files"] = files_of[part["analysis_unit_id"]] or list(parent_project.get("files") or [])
         project["total_download_bytes"] = sum(int(item.get("size_bytes") or 0) for item in project["files"])
         proposal = _part_class_proposal(
             parent_project.get("class_proposal") or {},
             sample_ids,
             plan["analysis_unit_id"],
             part["acquisition_mode"],
+            label,
         )
         if proposal:
             project["class_proposal"] = proposal
         project["evidence"] = list(project.get("evidence") or []) + [
-            f"Split from analysis unit {plan['analysis_unit_id']} by raw-header acquisition mode: "
-            f"{part['file_count']} file(s) whose headers read {part['acquisition_mode']}."
+            (
+                f"Split from analysis unit {plan['analysis_unit_id']} by raw-header acquisition mode: "
+                f"{part['file_count']} file(s) whose headers read {part['acquisition_mode']}."
+            )
+            if label == part["acquisition_mode"]
+            else (
+                f"Split from analysis unit {plan['analysis_unit_id']} by raw-header acquisition mode, ion-mobility "
+                f"regime and polarity: {part['file_count']} file(s) read as {label}."
+            )
         ]
         warnings = list(project.get("warnings") or [])
         if part["higher_ms_levels"]:
@@ -5092,8 +5375,15 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 convert_mzxml=converts,
             ),
         )
+        excluded_part = part.get("excluded")
         project["exclusion_reasons"] = list(
-            dict.fromkeys([*evaluated.exclusion_reasons, *parent_conversion_reasons])
+            dict.fromkeys(
+                [
+                    *evaluated.exclusion_reasons,
+                    *parent_conversion_reasons,
+                    *([excluded_part["detail"]] if excluded_part else []),
+                ]
+            )
         )
         project["review_reasons"] = list(evaluated.review_reasons) + (
             []
@@ -5113,8 +5403,9 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
             "split_from": {
                 "manifest_path": str(manifest_path),
                 "analysis_unit_id": plan["analysis_unit_id"],
-                "split_by": "raw_header_acquisition_mode",
+                "split_by": "raw_header_acquisition_mode" if label == part["acquisition_mode"] else "raw_header_split_key",
                 "acquisition_mode": part["acquisition_mode"],
+                **({"split_key": part["split_key"]} if label != part["acquisition_mode"] else {}),
             },
             "workspace": str(root),
             # Shared with the parent and owned by it. A part's cleanup plan refuses this directory
@@ -5132,6 +5423,14 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 per_file[_file_key(item)] for item in part["input_candidates"] if _file_key(item) in per_file
             ],
         }
+        if excluded_part:
+            # Ended at the split: it never runs, and its parent's raw data are released once the others end.
+            disposition = _excluded_part_disposition(parent, part_manifest, now)
+            part_manifest["status"] = (
+                SKIPPED_BY_PREFLIGHT_STATUS if disposition["disposition"] == "skip" else EXCLUDED_BY_PREFLIGHT_STATUS
+            )
+            part_manifest["split_exclusion"] = {**excluded_part, "decided_at": now}
+            part_manifest["campaign_disposition"] = disposition
         lineage = parent.get("input_lineage")
         if isinstance(lineage, dict):
             # The part reads the parent's files, so their lineage is the parent's, row for row. Without
@@ -5165,6 +5464,7 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         current["execution_allowed"] = False
         current["split_at"] = now
         current["split_into"] = written
+        current["split_key"] = plan["split_key"]
         if plan.get("excluded_inputs"):
             # The parent's inputs are its parts' plus these, each exactly once.
             current["split_excluded_inputs"] = plan["excluded_inputs"]
@@ -5234,7 +5534,6 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             f"{project.get('selection_status', 'unknown')!r}). Resolve the unit's technical conditions "
             "with a raw-header preflight before running MS-DIAL."
         )
-
     # The manifest and the workflow must be describing the same unit. A workflow that has drifted to
     # another directory or another file set is no longer covered by this manifest's verdict, whatever
     # that verdict says.
