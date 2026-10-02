@@ -1417,6 +1417,101 @@ class ClaimLockTests(StoreTestCase):
         self.assertEqual("pending", self.store.read_claim(URL, "unit-b")["state"])
 
 
+class LeaseMaterializationTests(StoreTestCase):
+    """What the lease asks of materialization beyond links: the per-unit merge's rules, and a protected copy."""
+
+    def sources(self, **files: bytes) -> dict[str, Path]:
+        root = Path(self.directory.name) / "sources"
+        paths = {}
+        for name, data in files.items():
+            path = root / name / "README.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            paths[name] = path.parent
+        return paths
+
+    def test_a_second_source_with_the_same_bytes_is_not_placed_again(self) -> None:
+        sources = self.sources(first=b"same notes", second=b"same notes")
+        placed: dict = {}
+
+        record = materialize_unit_tree(
+            self.unit_data("unit-a"), [(sources["first"], ""), (sources["second"], "")],
+            same_content=lambda left, right: left.read_bytes() == right.read_bytes(), placed=placed,
+        )
+
+        self.assertEqual((1, 1), (record["linked_files"], record["duplicate_source_files"]))
+        self.assertTrue(os.path.samefile(self.unit_data("unit-a") / "README.txt", sources["first"] / "README.txt"))
+        self.assertEqual([{"source": str(sources["second"] / "README.txt"), "pair": 1}], placed["README.txt"]["duplicates"])
+        with self.assertRaises(MaterializationCollision):
+            materialize_unit_tree(self.unit_data("unit-b"), [(sources["first"], ""), (sources["second"], "")])
+
+    def test_a_file_already_there_with_its_sources_bytes_is_kept_not_refused(self) -> None:
+        sources = self.sources(first=b"notes")
+        own = self.unit_data("unit-a") / "README.txt"
+        own.parent.mkdir(parents=True)
+        own.write_bytes(b"notes")
+        placed: dict = {}
+
+        record = materialize_unit_tree(
+            self.unit_data("unit-a"), [(sources["first"], "")],
+            same_content=lambda left, right: left.read_bytes() == right.read_bytes(), placed=placed,
+        )
+
+        self.assertEqual((1, len(b"notes"), "kept_existing"), (record["kept_existing_files"],
+                                                               record["bytes_kept_existing"], record["materialization"]))
+        self.assertEqual("kept_existing", placed["README.txt"]["how"])
+        self.assertEqual(1, os.stat(own).st_nlink, "the unit's own file is left as it is")
+
+    def test_copy_instead_keeps_a_file_a_reader_rewrites_off_the_stores_record(self) -> None:
+        sources = self.sources(first=b"sqlite")
+
+        record = materialize_unit_tree(
+            self.unit_data("unit-a"), [(sources["first"], "S1.d")], copy_instead=lambda source: True,
+        )
+
+        copied = self.unit_data("unit-a") / "S1.d" / "README.txt"
+        self.assertFalse(os.path.samefile(copied, sources["first"] / "README.txt"))
+        self.assertEqual((1, ["S1.d/README.txt"], "copy"), (record["protected_copies"],
+                                                             record["protected_copy_paths"], record["materialization"]))
+        self.assertEqual(0, record["copy_fallback_count"], "a protected copy is no failed link")
+
+
+class EnsureExtractedTests(StoreTestCase):
+    def test_a_fetched_archive_is_extracted_once_and_its_tree_reused(self) -> None:
+        extractor = ZipExtractor()
+        result = self.fetch("unit-a", FakeFetcher({ARCHIVE_URL: ARCHIVE}), url=ARCHIVE_URL, name="ST000001.zip")
+
+        first = self.store.ensure_extracted(result["object_id"], extractor, unit_id="unit-a")
+        second = self.store.ensure_extracted(result["object_id"], extractor, unit_id="unit-b")
+
+        self.assertEqual(("extracted", "reused", 1), (first["extraction_action"], second["extraction_action"], extractor.calls))
+        self.assertEqual("unit-a", second["tree"]["extracted_by"]["unit_id"])
+
+    def test_a_tree_a_reader_modified_is_extracted_again(self) -> None:
+        extractor = ZipExtractor()
+        result = self.fetch("unit-a", FakeFetcher({ARCHIVE_URL: ARCHIVE}), url=ARCHIVE_URL, name="ST000001.zip")
+        self.store.ensure_extracted(result["object_id"], extractor, unit_id="unit-a")
+        member = self.store.object_directory(result["object_id"]) / "t" / "run1.mzML"
+        member.write_bytes(b"rewritten in place")
+
+        again = self.store.ensure_extracted(result["object_id"], extractor, unit_id="unit-b")
+
+        self.assertEqual(("re-extracted", 2), (again["extraction_action"], extractor.calls))
+        self.assertEqual(_payload("run-one|"), member.read_bytes())
+        self.assertTrue(self.store.verify_members(result["object_id"])["intact"])
+
+    def test_an_object_that_is_not_ready_is_refused(self) -> None:
+        with self.assertRaises(StoreError):
+            self.store.ensure_extracted("0" * 16, ZipExtractor(), unit_id="unit-a")
+
+    def test_all_claims_lists_every_unit_and_url(self) -> None:
+        self.store.claim(URL, "unit-a")
+        self.store.claim(ARCHIVE_URL, "unit-b", source="batch_plan")
+
+        claims = self.store.all_claims()
+        self.assertEqual({("unit-a", URL), ("unit-b", ARCHIVE_URL)}, {(item["unit_id"], item["url"]) for item in claims})
+
+
 class StorePathTests(unittest.TestCase):
     def test_the_store_is_scoped_to_one_accession_beside_its_units(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

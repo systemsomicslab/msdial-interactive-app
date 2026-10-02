@@ -574,6 +574,14 @@ class DownloadStore:
     def read_claim(self, url: str, unit_id: str) -> dict[str, Any] | None:
         return _read_json(self.claim_path(self.url_key(url), _unit_id(unit_id)))
 
+    def all_claims(self) -> list[dict[str, Any]]:
+        """Every claim record in the store, of every URL and unit, in a stable order."""
+        claims = []
+        for directory in _sorted_children(self.root / "claims"):
+            if directory.is_dir():
+                claims.extend(record for path in _claim_files(directory) for record in [_read_json(path)] if record)
+        return claims
+
     def claims_for_unit(self, unit_id: str) -> list[dict[str, Any]]:
         unit_id = _unit_id(unit_id)
         file_name = _unit_file_name(unit_id)
@@ -1265,6 +1273,9 @@ class DownloadStore:
         copy: Callable[[Path, Path], Any] = shutil.copy2,
         max_path_length: int | None = MAX_WINDOWS_PATH if os.name == "nt" else None,
         max_directory_length: int | None = MAX_WINDOWS_DIRECTORY_PATH if os.name == "nt" else None,
+        same_content: Callable[[Path, Path], bool] | None = None,
+        placed: dict[str, dict[str, Any]] | None = None,
+        copy_instead: Callable[[Path], bool] | None = None,
     ) -> dict[str, Any]:
         """Link claimed objects into a unit's own tree and mark its claims materialized.
 
@@ -1272,6 +1283,8 @@ class DownloadStore:
         "object" placement puts the object file at `target`, a per-file object's declared name. A
         "tree" placement puts the extraction tree's files under `target` ("" for the data root), so
         a bundle archive keeps its internal relative paths, as the per-unit extraction did.
+        ``same_content``, ``placed`` and ``copy_instead`` are materialize_unit_tree's; each ``placed``
+        entry also names the index of the placement its file came from.
         """
         unit_id = _unit_id(unit_id)
         data_root = Path(data_root).resolve()
@@ -1314,6 +1327,9 @@ class DownloadStore:
                 copy=copy,
                 max_path_length=max_path_length,
                 max_directory_length=max_directory_length,
+                same_content=same_content,
+                placed=placed,
+                copy_instead=copy_instead,
             )
         except MaterializationCollision as error:
             for url, _object_id in objects:
@@ -1324,6 +1340,52 @@ class DownloadStore:
             self.mark_materialized(url, unit_id, object_id=object_id, record=summary)
         record["objects"] = [{"url": url, "object_id": object_id} for url, object_id in objects]
         return record
+
+    def ensure_extracted(
+        self,
+        object_id: str,
+        extract: Callable[[Path, Path], Mapping[str, Any] | None],
+        *,
+        unit_id: str,
+        job_id: str = "",
+        lock_timeout: float | None = None,
+        on_wait: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Give a fetched object its extraction tree, extracting it only when it has none intact.
+
+        fetch_or_reuse without `extract` takes the object and not its tree, so a lease that fetches
+        every object before it extracts any (its fetch stage, then its extract stage) asks for the tree
+        here. Under the object's lock: a tree that exists with every member as recorded is reused, one
+        a reader modified is extracted again from the kept object, and a missing one is extracted once.
+        Another consumer extracting the same object is waited for and its tree reused. Returns the
+        entry, with `extraction_action` extracted, re-extracted or reused.
+        """
+        unit_id = _unit_id(unit_id)
+
+        def waiting(holder: dict[str, Any]) -> None:
+            if on_wait is not None:
+                on_wait({"status": "waiting_for_shared_download", "object_id": object_id, **holder})
+
+        with self._locked(f"o-{object_id}", job_id=job_id, timeout=lock_timeout, on_wait=waiting):
+            entry = self._ready_entry(object_id)
+            if entry is None:
+                raise StoreError(f"Object {object_id} is not ready; fetch_or_reuse it before extracting.")
+            check = self.verify_members(object_id)
+            if not check["object_intact"]:
+                self._note_taint(entry, check)
+                raise StoreError(
+                    f"Object {object_id} was modified in place ({check['mismatch_count']} member(s)); "
+                    "fetch_or_reuse it again before extracting."
+                )
+            if entry.get("tree") and (self.object_directory(object_id) / "t").is_dir() and check["tree_intact"]:
+                action = "reused"
+            else:
+                reason = "tree_tainted" if entry.get("tree") else ""
+                if reason:
+                    self._note_taint(entry, check)
+                entry = self._extract_locked(entry, extract, unit_id, job_id, reason)
+                action = "re-extracted" if reason else "extracted"
+        return {**entry, "extraction_action": action}
 
     # ---- garbage collection ----------------------------------------------------------------------
 
@@ -1428,7 +1490,9 @@ class DownloadStore:
         directory = self.object_directory(object_id)
         kept = []
         removed_bytes = 0
-        for part in ("obj", "t", "t.partial"):
+        # x and x.partial: what the lease's extractor builds before the tree becomes t (it extracts to the
+        # shortest name, since every member's path is held to MAX_PATH), left there by a stopped extraction.
+        for part in ("obj", "t", "t.partial", "x", "x.partial"):
             target = directory / part
             if target.exists():
                 removal = unlink_tree(target)
@@ -1577,6 +1641,9 @@ def materialize_unit_tree(
     copy: Callable[[Path, Path], Any] = shutil.copy2,
     max_path_length: int | None = MAX_WINDOWS_PATH if os.name == "nt" else None,
     max_directory_length: int | None = MAX_WINDOWS_DIRECTORY_PATH if os.name == "nt" else None,
+    same_content: Callable[[Path, Path], bool] | None = None,
+    placed: dict[str, dict[str, Any]] | None = None,
+    copy_instead: Callable[[Path], bool] | None = None,
 ) -> dict[str, Any]:
     """Build real directories under `data_root` with one hardlink per source file.
 
@@ -1589,13 +1656,35 @@ def materialize_unit_tree(
     overwritten. A file already linked to the same source is left as it is, so a retry is a no-op.
     A link that fails (another volume, the 1023-link NTFS limit, a filesystem without links) falls
     back to a copy, and the record says so.
+
+    ``same_content(a, b)``, when given, is what the per-unit lease's merge allowed and a collision
+    otherwise refuses: a second source wanting a path the first has, with the same bytes (two study
+    archives carrying one identical file), is not placed again (duplicate), and a file already in place
+    with the bytes of its source, but not linked to it (a tree an earlier lease filled with its own
+    copies), is kept as it is (kept_existing) rather than refused. Nothing is overwritten either way.
+    ``placed``, when given, is filled with one entry per planned file, by its relative path: its
+    source, the index of its pair, how it got there (linked, copied, present or kept_existing), and
+    the duplicates that were not placed again, so a caller can later remove exactly the names this
+    placement made. ``copy_instead(source)``, when it is true, copies that file rather than linking
+    it: a file some reader rewrites in place would otherwise change the store's record, and every other
+    unit's view of it, through the link (protected_copies).
     """
     if os.path.lexists(data_root) and _is_link_like(os.lstat(data_root)):
         raise StoreError(f"A unit tree root must be a real directory, not a link: {data_root}")
     root = Path(data_root).resolve()
-    files: dict[str, tuple[Path, PurePosixPath]] = {}
+    files: dict[str, tuple[Path, PurePosixPath, int]] = {}
     directories: dict[str, PurePosixPath] = {}
     collisions: list[dict[str, Any]] = []
+    duplicates: list[tuple[PurePosixPath, Path, int]] = []
+    kept_existing: set[str] = set()
+
+    def same(left: Path, right: Path) -> bool:
+        if same_content is None:
+            return False
+        try:
+            return os.path.samefile(left, right) or bool(same_content(left, right))
+        except OSError:
+            return False
 
     def claim_directory(relative: PurePosixPath, source: Path) -> None:
         for depth in range(1, len(relative.parts) + 1):
@@ -1607,9 +1696,12 @@ def materialize_unit_tree(
                 return
             directories.setdefault(folded, prefix)
 
-    def claim_file(relative: PurePosixPath, source: Path) -> None:
+    def claim_file(relative: PurePosixPath, source: Path, index: int) -> None:
         folded = relative.as_posix().casefold()
         if folded in files:
+            if same(files[folded][0], source):
+                duplicates.append((relative, source, index))
+                return
             collisions.append(
                 {"path": relative.as_posix(), "kind": "same_path", "sources": [str(files[folded][0]), str(source)]}
             )
@@ -1619,9 +1711,9 @@ def materialize_unit_tree(
             return
         if relative.parent.parts:
             claim_directory(relative.parent, source)
-        files[folded] = (source, relative)
+        files[folded] = (source, relative, index)
 
-    for source_value, target_value in pairs:
+    for index, (source_value, target_value) in enumerate(pairs):
         source = Path(source_value)
         target = _relative_target(target_value)
         details = os.lstat(source)
@@ -1635,13 +1727,13 @@ def materialize_unit_tree(
                 if directory is not None:
                     claim_directory(relative, source)
                 else:
-                    claim_file(relative, file_path)
+                    claim_file(relative, file_path, index)
         else:
             if not target.parts:
                 raise StoreError(f"A file placement needs a target name: {source}")
-            claim_file(target, source)
+            claim_file(target, source, index)
 
-    for folded, (source, relative) in files.items():
+    for folded, (source, relative, _index) in files.items():
         destination = root.joinpath(*relative.parts)
         if max_path_length is not None and len(str(destination)) > max_path_length:
             collisions.append({"path": relative.as_posix(), "kind": "path_too_long", "length": len(str(destination))})
@@ -1650,7 +1742,10 @@ def materialize_unit_tree(
             if destination.is_dir() or _is_link_like(os.lstat(destination)):
                 collisions.append({"path": relative.as_posix(), "kind": "exists_as_other_type"})
             elif not os.path.samefile(source, destination):
-                collisions.append({"path": relative.as_posix(), "kind": "exists_different"})
+                if same(source, destination):
+                    kept_existing.add(folded)
+                else:
+                    collisions.append({"path": relative.as_posix(), "kind": "exists_different"})
         parent = destination.parent
         while parent != root and root in parent.parents:
             if os.path.lexists(parent) and not parent.is_dir():
@@ -1682,15 +1777,33 @@ def materialize_unit_tree(
     for relative in sorted(directories.values(), key=lambda value: len(value.parts)):
         root.joinpath(*relative.parts).mkdir(exist_ok=True)
     linked = copied = present = 0
-    logical = linked_bytes = copied_bytes = 0
+    logical = linked_bytes = copied_bytes = kept_bytes = 0
     fallbacks: list[dict[str, Any]] = []
-    for source, relative in sorted(files.values(), key=lambda item: item[1].as_posix()):
+    protected: list[str] = []
+
+    def note(relative: PurePosixPath, source: Path, index: int, how: str) -> None:
+        if placed is not None:
+            placed[relative.as_posix()] = {"source": str(source), "pair": index, "how": how}
+
+    for source, relative, index in sorted(files.values(), key=lambda item: item[1].as_posix()):
         destination = root.joinpath(*relative.parts)
         size = source.stat().st_size
         logical += size
+        if relative.as_posix().casefold() in kept_existing:
+            kept_bytes += size
+            note(relative, source, index, "kept_existing")
+            continue
         if os.path.lexists(destination):
             present += 1
             linked_bytes += size
+            note(relative, source, index, "present")
+            continue
+        if copy_instead is not None and copy_instead(source):
+            copy(source, destination)
+            copied += 1
+            copied_bytes += size
+            protected.append(relative.as_posix())
+            note(relative, source, index, "copied")
             continue
         try:
             link(source, destination)
@@ -1708,15 +1821,23 @@ def materialize_unit_tree(
                     "winerror": getattr(error, "winerror", None),
                 }
             )
+            note(relative, source, index, "copied")
             continue
         linked += 1
         linked_bytes += size
+        note(relative, source, index, "linked")
+    for relative, source, index in duplicates:
+        primary = placed.get(files[relative.as_posix().casefold()][1].as_posix()) if placed is not None else None
+        if primary is not None:
+            primary.setdefault("duplicates", []).append({"source": str(source), "pair": index})
     if copied and (linked or present):
         method = "mixed"
     elif copied:
         method = "copy"
     elif linked or present:
         method = "hardlink"
+    elif kept_existing:
+        method = "kept_existing"
     else:
         method = "none"
     return {
@@ -1732,6 +1853,24 @@ def materialize_unit_tree(
         "bytes_copied": copied_bytes,
         "copy_fallback_count": len(fallbacks),
         "copy_fallbacks": fallbacks[:_REPORTED_ITEMS],
+        # Only where same_content let them through, so every other placement records what it always did.
+        **(
+            {
+                "duplicate_source_files": len(duplicates),
+                "duplicate_sources": [
+                    {"path": relative.as_posix(), "source": str(source)} for relative, source, _index in duplicates
+                ][:_REPORTED_ITEMS],
+                "kept_existing_files": len(kept_existing),
+                "bytes_kept_existing": kept_bytes,
+            }
+            if same_content is not None
+            else {}
+        ),
+        **(
+            {"protected_copies": len(protected), "protected_copy_paths": protected[:_REPORTED_ITEMS]}
+            if copy_instead is not None
+            else {}
+        ),
     }
 
 
