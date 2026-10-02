@@ -72,6 +72,12 @@ const DEFAULT_LBM_SETTINGS = {
   use_rt_filtering: false,
 };
 const RT_WORKSPACE_STORAGE_KEY = "msdialInteractive.rtCorrectionWorkspace.v1";
+// The states in which a backend job is still live, and polled on: server.LIVE_JOB_STATUSES. A repository
+// download that waits while another lease fetches or extracts an object of the accession download store
+// both need is waiting_for_shared_download; it is still running, and finishes on its own.
+const WAITING_FOR_SHARED_DOWNLOAD = "waiting_for_shared_download";
+const LIVE_JOB_STATUSES = ["queued", "running", WAITING_FOR_SHARED_DOWNLOAD];
+const jobIsLive = (job) => LIVE_JOB_STATUSES.includes(job?.status);
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -1097,7 +1103,7 @@ async function pollLibraryDownload(catalogId, jobId) {
   const job = await api(`/api/jobs/${jobId}`);
   state.libraryJobs[catalogId] = job;
   renderLibraryCatalog();
-  if (["queued", "running"].includes(job.status)) {
+  if (jobIsLive(job)) {
     window.setTimeout(() => pollLibraryDownload(catalogId, jobId).catch((error) => {
       state.libraryJobs[catalogId] = { status: "failed", error: error.message };
       renderLibraryCatalog();
@@ -2317,7 +2323,7 @@ async function pollTuningJob() {
     $("#tuningLog").textContent = (job.log_tail || job.logs || []).join("\n") || job.status;
     $("#tuningLog").scrollTop = $("#tuningLog").scrollHeight;
     setStatus(`Tuning job ${job.status}`);
-    if (["queued", "running"].includes(job.status)) {
+    if (jobIsLive(job)) {
       setTimeout(pollTuningJob, 1000);
     } else if (job.status === "completed") {
       const completed = await api(`/api/jobs/${state.tuningJobId}?detail=full`);
@@ -2828,7 +2834,7 @@ async function pollRtCorrectionJob() {
     $("#rtCorrectionLog").textContent = (job.log_tail || job.logs || []).join("\n") || job.status;
     $("#rtCorrectionLog").scrollTop = $("#rtCorrectionLog").scrollHeight;
     setStatus(`RT correction audit ${job.status}`);
-    if (["queued", "running"].includes(job.status)) {
+    if (jobIsLive(job)) {
       setTimeout(pollRtCorrectionJob, 1000);
     } else if (job.status === "completed") {
       const completed = await api(`/api/jobs/${state.rtCorrectionJobId}?detail=full`);
@@ -2993,7 +2999,7 @@ async function pollConsoleBuild() {
   log.textContent = (job.logs || []).join("\n") || job.status;
   log.scrollTop = log.scrollHeight;
   setStatus(`Console build ${job.status}`);
-  if (["queued", "running"].includes(job.status)) {
+  if (jobIsLive(job)) {
     setTimeout(() => pollConsoleBuild().catch((error) => setStatus(error.message)), 1000);
     return;
   }
@@ -3116,7 +3122,7 @@ async function pollJob() {
   $("#log").textContent = (job.log_tail || []).join("\n") || job.status;
   $("#log").scrollTop = $("#log").scrollHeight;
   setStatus(`Job ${job.status}`);
-  if (["queued", "running"].includes(job.status)) {
+  if (jobIsLive(job)) {
     setTimeout(pollJob, 1000);
   } else {
     await selectAnalysisJob(job.id, job);
@@ -3356,9 +3362,11 @@ async function pollRepositoryDownload() {
     const eta = job.eta_seconds !== null && job.eta_seconds !== undefined
       ? `ETA ${formatDuration(job.eta_seconds)}`
       : "ETA unavailable";
-    $("#repositoryDownloadProgressText").textContent =
-      `${progress.toFixed(1)}% | ${transfer} | ${speed} | ${eta}`;
-    if (["queued", "running"].includes(job.status)) {
+    $("#repositoryDownloadProgressText").textContent = job.status === WAITING_FOR_SHARED_DOWNLOAD
+      ? `${progress.toFixed(1)}% | waiting for another download of ${job.waiting_for?.object || "a shared object"}; `
+        + "its bytes will be reused, not fetched again"
+      : `${progress.toFixed(1)}% | ${transfer} | ${speed} | ${eta}`;
+    if (jobIsLive(job)) {
       setTimeout(pollRepositoryDownload, 1500);
       return;
     }
