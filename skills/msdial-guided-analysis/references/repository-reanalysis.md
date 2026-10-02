@@ -16,7 +16,10 @@ ProteoWizard `msconvert` workflow, then create a new auditable input manifest.
 Only in a campaign, where a campaign authorization covers the unit, is an mzXML
 converted in the download lease: its `convert` stage writes each of the unit's
 mzXML as mzML under `raw\converted` with Interactive's converter, every
-inference flag off, records each conversion (`input_conversions`,
+inference flag off but the polarity of scans that record none, which is the
+unit's declared ion mode where its Catalog handoff declares exactly one
+polarity (Positive or Negative; never `project.ion_mode`, and nothing for Both
+or Unknown), records each conversion (`input_conversions`,
 `provenance\input-conversions.json`, and `input_lineage` rows of kind
 `converted`), and the converted mzML are the unit's inputs. A file whose
 conversion fails is excluded with reason `conversion_failed`, listed in the

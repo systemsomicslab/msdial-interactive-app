@@ -68,9 +68,12 @@ def summarize_jobs(
             "isolated_job_registry",
             # Outside a campaign an mzXML or mzData still excludes its unit before download. A campaign's lease
             # converts its unit's mzXML to mzML in its convert stage (mzxml_conversion, every inference off),
-            # records input_conversions, and runs what converted; mzData is excluded there too.
+            # records input_conversions, and runs what converted; mzData is excluded there too. The one
+            # inference: a scan recording no polarity is given the unit's declared ion mode, where its Catalog
+            # handoff declares exactly one polarity, and the declaration is recorded with the options.
             "mzxml_requires_conversion_to_mzml",
             "campaign_mzxml_converted_to_mzml",
+            "campaign_mzxml_polarity_from_declared_ion_mode",
             "automatic_alignment_rt_correction",
             "console_time_limits",
             "cancel_console_and_download_jobs",

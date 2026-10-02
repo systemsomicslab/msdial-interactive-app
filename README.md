@@ -189,9 +189,16 @@ must be converted to mzML through a separately reviewed conversion workflow.
 Only in a campaign, where a campaign authorization covers the unit, is an
 mzXML converted by the download lease itself: its `convert` stage writes each
 of the unit's mzXML as mzML under `raw\converted` with Interactive's own
-converter (`msdial_app.mzxml_conversion`, every inference flag off), records
-each conversion in `input_conversions` and `provenance\input-conversions.json`,
-and runs what converted. A file whose conversion fails is excluded with reason
+converter (`msdial_app.mzxml_conversion`, every inference flag off but one),
+records each conversion in `input_conversions` and
+`provenance\input-conversions.json`, and runs what converted. The one
+inference: a scan whose mzXML records no polarity is given the unit's declared
+ion mode, and only where the unit's Catalog handoff declares exactly one
+polarity (`technical_settings.ion_mode` Positive or Negative); the declaration
+and the field it was read from are recorded with the options, and each
+imputation as an inference with its count. A unit declaring Both or Unknown
+imputes nothing, and a file any of whose scans records the other polarity is
+refused. A file whose conversion fails is excluded with reason
 `conversion_failed`, listed in the unit's `campaign_disposition`, and the rest
 of the unit runs; a full disk, or a file another process holds, instead stops
 the lease, so that the unit is retried. Where the unit holds a readable

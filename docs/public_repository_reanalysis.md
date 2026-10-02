@@ -33,7 +33,21 @@ judged with `EligibilityPolicy.convert_mzxml`: an mzXML (packed or not) only
 plans a conversion (`project.conversion_plan`), and the download lease's
 `convert` stage, after extraction and before input discovery, writes each of the
 unit's mzXML as mzML under `raw\converted\<relative path>.mzML` with
-`msdial_app.mzxml_conversion`, with every inference flag off. The converted mzML
+`msdial_app.mzxml_conversion`, with every inference flag off but one: a scan
+whose mzXML records no polarity is given the unit's declared ion mode, read from
+its Catalog handoff (`project.repository_metadata.catalog_handoff.technical_settings.ion_mode`,
+the field the gate's CONV-1 holds an imputation to), and only where that declares
+exactly one polarity, Positive or Negative. `project.ion_mode` is never read for
+it: the raw-header preflight rewrites it from headers that carry what was
+imputed, and a split part's is its part's polarity, while the handoff a part
+copies from its parent is the parent's declaration. Both, Unknown or no
+declaration imputes nothing, and CONV-1 fails the spectra left without a
+polarity. The converter refuses a file any of whose scans records the other
+polarity (`conversion_failed`). The declaration and its field are recorded in
+the options of every conversion record and of `input_conversions`, and in its
+`polarity_declaration`; each imputation is an inference with its count
+(`counts.imputed_polarity_spectra` sums them). A record made under another
+declaration is not reused by a later lease. The converted mzML
 are the unit's input candidates. A project with no `analysis_unit_id` converts
 nothing. Each conversion is recorded in the manifest's `input_conversions` and
 in `provenance\input-conversions.json`; each converted input has an

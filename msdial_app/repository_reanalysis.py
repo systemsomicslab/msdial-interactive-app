@@ -70,9 +70,10 @@ RAW_SUFFIXES = {
 # was: it needs a reviewed ProteoWizard-to-mzML conversion with new provenance. The user decided on
 # 2026-09-30 that a campaign's mzXML-only data are converted to mzML and run: the lease's convert stage,
 # given a campaign authorization, writes each of the unit's mzXML as mzML under raw\converted
-# (msdial_app.mzxml_conversion, every inference off). Nothing converts mzData, so a unit that needs it is
-# excluded in a campaign too. A packed mzXML (x.mzXML.lzma, x.mzXML.gz) is the mzXML it unpacks to, and is
-# converted once the extract stage has unpacked it.
+# (msdial_app.mzxml_conversion, every inference off but the polarity a unit's declaration gives, below).
+# Nothing converts mzData, so a unit that needs it is excluded in a campaign too. A packed mzXML
+# (x.mzXML.lzma, x.mzXML.gz) is the mzXML it unpacks to, and is converted once the extract stage has
+# unpacked it.
 CONVERTIBLE_SUFFIXES = (".mzxml",)
 UNSUPPORTED_ENCODING_SUFFIXES = (".mzdata", ".mzdata.xml")
 CONVERSION_REQUIRED_SUFFIXES = CONVERTIBLE_SUFFIXES + UNSUPPORTED_ENCODING_SUFFIXES
@@ -91,6 +92,16 @@ LEASE_STOPPING_ERRNOS = FULL_DISK_ERRNOS | HELD_FILE_ERRNOS
 INPUT_CONVERSIONS_SCHEMA = "msdial-input-conversions.v1"
 INPUT_CONVERSIONS_NAME = "input-conversions.json"
 CONVERSION_PLAN_SCHEMA = "msdial-mzxml-conversion-plan.v1"
+# THE ONE INFERENCE A CAMPAIGN'S CONVERSION MAKES. MS-DIAL skips a spectrum whose polarity is not the method's
+# ion mode, and RawDataHandler reads polarity only as a spectrum cvParam, so an mzXML whose scans record none
+# runs to nothing. The user decided on 2026-10-02 that the convert stage then imputes the unit's declared ion
+# mode, and only where its Catalog handoff's technical settings declare exactly one polarity, Positive or
+# Negative (DECLARED_POLARITIES). That field is read because nothing rewrites it, and the gate's CONV-1 holds
+# an imputation to it (_declared_ion_mode); project.ion_mode is never read, since the raw-header preflight
+# rewrites it from headers that carry what was imputed, and a split part's is its part's polarity. Both,
+# Unknown or no declaration imputes nothing, and CONV-1 fails the spectra left without a polarity.
+DECLARED_ION_MODE_FIELD = "project.repository_metadata.catalog_handoff.technical_settings.ion_mode"
+DECLARED_POLARITIES = {"positive": "positive", "negative": "negative"}
 # The exclusion reasons evaluate_eligibility gives for these, which a split part inherits from its parent:
 # outside a campaign, for an mzXML or mzData; in one, for what nothing converts, and for a unit whose lease
 # converted and was left with no input.
@@ -1143,21 +1154,67 @@ ADAPTERS = {
 }
 
 
-def _conversion_plan(names: list[str], outcome: dict[str, Any] | None = None) -> dict[str, Any]:
+def conversion_polarity_declaration(project: RepositoryProject | dict[str, Any]) -> dict[str, Any]:
+    """The ion mode a campaign's convert stage reads for a unit, and the polarity it imputes from it.
+
+    Read from the Catalog handoff the project carries (DECLARED_ION_MODE_FIELD), never from project.ion_mode.
+    A split part carries its parent's handoff, copied with the rest of its project, so a part reads the
+    declaration of the unit whose lease converted its files, its raw owner's, as CONV-1 does.
+
+    Returns the field read; the value declared there, as the handoff gives it (None where nothing is); the
+    analysis unit whose handoff it is (declared_by); the polarity imputed, None unless exactly one polarity,
+    Positive or Negative, is declared; and, where none is imputed, why.
+    """
+    metadata = project.repository_metadata if isinstance(project, RepositoryProject) else (project or {}).get(
+        "repository_metadata"
+    )
+    handoff = metadata.get("catalog_handoff") if isinstance(metadata, dict) else None
+    settings = handoff.get("technical_settings") if isinstance(handoff, dict) else None
+    declared = str(settings.get("ion_mode") or "").strip() if isinstance(settings, dict) else ""
+    declaration: dict[str, Any] = {
+        "field": DECLARED_ION_MODE_FIELD,
+        "declared": declared or None,
+        "declared_by": (str(handoff.get("analysis_unit_id") or "").strip() or None) if isinstance(handoff, dict) else None,
+        "impute_polarity": DECLARED_POLARITIES.get(declared.casefold()),
+    }
+    if declaration["impute_polarity"] is None:
+        declaration["reason"] = (
+            "The unit carries no Catalog handoff, so no ion mode is declared for it." if not isinstance(handoff, dict)
+            else "The unit's Catalog handoff declares no ion mode." if not declared
+            else f"The unit's Catalog handoff declares {declared}, not one polarity."
+        )
+    return declaration
+
+
+def campaign_conversion_options(declaration: dict[str, Any]) -> ConversionOptions:
+    """The converter's options under a declaration (conversion_polarity_declaration): every inference off but
+    the polarity it gives, recorded with the declaration and the field it was read from."""
+    declared = declaration.get("declared")
+    return ConversionOptions(
+        impute_polarity=declaration.get("impute_polarity"),
+        declared_ion_mode=declared,
+        declared_ion_mode_field=declaration["field"] if declared else None,
+    )
+
+
+def _conversion_plan(
+    names: list[str], outcome: dict[str, Any] | None = None, options: ConversionOptions | None = None
+) -> dict[str, Any]:
     """What a unit will convert from mzXML, as evaluate_eligibility records it before any byte is fetched.
 
     ``names`` are the listed files and the sample rows' raw files that are mzXML; for a unit that lists only
     a study archive, the samples' names are all there is until the archive is extracted, and the convert
     stage decides there which files are converted (an mzXML a readable encoding of the same sample came
-    out beside is not). ``outcome`` is what an earlier lease's convert stage recorded, kept.
+    out beside is not). ``outcome`` is what an earlier lease's convert stage recorded, kept. ``options`` are
+    those the convert stage will use (campaign_conversion_options), every inference off where none is given.
     """
     plan: dict[str, Any] = {
         "schema": CONVERSION_PLAN_SCHEMA,
         "target": "mzML",
         "converter": CONVERTER_NAME,
-        # Every inference flag off, as the user decided on 2026-09-30: nothing the mzXML does not record
-        # is supplied.
-        "options": asdict(ConversionOptions()),
+        # Every inference flag off, as the user decided on 2026-09-30, but the polarity a unit's declaration
+        # gives, as the user decided on 2026-10-02: nothing else the mzXML does not record is supplied.
+        "options": asdict(options or ConversionOptions()),
         "stage": "the download lease's convert stage, after extraction and before input discovery",
         "named_inputs": len(names),
         "names": names[:50],
@@ -1245,7 +1302,11 @@ def _campaign_conversion_reasons(project: RepositoryProject) -> list[str]:
         reasons.append(f"{UNCONVERTIBLE_INPUT_REASON} (mzData or another format; only mzXML is converted): {preview}.")
     outcome = (project.conversion_plan or {}).get("outcome")
     if convertible:
-        project.conversion_plan = _conversion_plan(sorted(convertible, key=str.casefold), outcome)
+        project.conversion_plan = _conversion_plan(
+            sorted(convertible, key=str.casefold),
+            outcome,
+            campaign_conversion_options(conversion_polarity_declaration(project)),
+        )
     elif not outcome:
         project.conversion_plan = {}
     survivor = _no_converted_input_reason(outcome)
@@ -1673,9 +1734,11 @@ def create_download_lease(
     - materialise: with the download store, this unit's raw tree of links to the store's objects and
       extraction trees (raw_storage); without it, not_used. Links that turn out to be none of the unit's
       inputs, members or sidecars are pruned once the attribute stage has said which those are;
-    - convert: each of the unit's mzXML written as mzML under raw\\converted, every inference off, and
-      recorded (input_conversions, provenance\\input-conversions.json); where extraction shows a readable
-      encoding of the same sample beside an mzXML, that one is analysed instead. Only under a
+    - convert: each of the unit's mzXML written as mzML under raw\\converted, every inference off but the
+      polarity the unit's Catalog handoff declares, given to scans that record none where it declares
+      exactly one (conversion_polarity_declaration), and recorded (input_conversions,
+      provenance\\input-conversions.json, the declaration and its field among them); where extraction
+      shows a readable encoding of the same sample beside an mzXML, that one is analysed instead. Only under a
       ``campaign_authorization``: not used outside a campaign, where an mzXML is no input, nor where the
       unit has no mzXML. See the notes above _find_mzxml_files;
     - discover: every vendor folder listed member by member checked whole (container_completeness),
@@ -2020,16 +2083,25 @@ def create_download_lease(
                         required_download_bytes or downloaded_bytes,
                     )
 
+            # The polarity a scan recording none is given: the unit's Catalog handoff's, where it declares
+            # exactly one, and never project.ion_mode, which a preflight rewrites from what was imputed.
+            declaration = conversion_polarity_declaration(project)
             conversion = _run_lease_conversions(
                 [item for item in conversion_sources if _file_key(item) not in chosen_over],
                 data_root,
                 raw_root,
                 provenance,
                 choices,
+                declaration=declaration,
                 between=between,
             )
             stands_for = {**stands_for, **conversion["outputs"]}
-            stages.finish("convert", mzxml_found=len(mzxml_found), **conversion["block"]["counts"])
+            stages.finish(
+                "convert",
+                mzxml_found=len(mzxml_found),
+                impute_polarity=declaration["impute_polarity"],
+                **conversion["block"]["counts"],
+            )
         else:
             stages.not_used(
                 "convert",
@@ -3595,8 +3667,14 @@ def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict
 # is the Catalog's, applied here only to what an archive showed: a listing the Catalog saw it already
 # decided. It is given the files of one sample's place, never another folder's file of the same name
 # (_sample_locus), and wherever they are the readable files the unit admits by itself, which are its inputs
-# in any case (_readable_inputs_admitted). Every inference the converter offers stays off
-# (ConversionOptions()).
+# in any case (_readable_inputs_admitted).
+#
+# WHAT IS INFERRED. Every inference the converter offers stays off but one: a scan whose mzXML records no
+# polarity is given the unit's declared ion mode, where its Catalog handoff declares exactly one polarity
+# (conversion_polarity_declaration, DECLARED_ION_MODE_FIELD). The converter still refuses a file any of whose
+# scans records the other polarity, and records each imputation as an inference with its count; the
+# declaration and its field go into the options of every record and of input_conversions, and into the
+# block's polarity_declaration. A unit declaring Both or Unknown, or nothing, imputes nothing.
 #
 # A FILE WHOSE CONVERSION FAILS is no input: it is kept out of the candidates with reason conversion_failed,
 # like an mzML RawDataHandler cannot decode, and the rest of the unit runs. A unit left with no input is
@@ -3608,6 +3686,8 @@ def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict
 # RESUMABLE. Each conversion's record is written to provenance\input-conversions.json as it completes, and a
 # lease that finds one for the same output passes it to the converter, which reuses the output when the
 # mzXML, the options and the converter are what the record says and the mzML still has its recorded sha256.
+# The options carry the declaration, so a record made under another one - before the Catalog corrected a
+# unit's ion mode, say - is converted again rather than reused.
 
 
 def _find_mzxml_files(root: Path) -> list[str]:
@@ -3834,9 +3914,13 @@ def _run_lease_conversions(
     provenance: Path,
     choices: list[dict[str, Any]],
     *,
+    declaration: dict[str, Any],
     between: Any = None,
 ) -> dict[str, Any]:
     """Convert each mzXML, recording as it goes; raises only for a full disk or an unwritable record.
+
+    ``declaration`` is the unit's (conversion_polarity_declaration): every conversion runs under the options
+    it gives (campaign_conversion_options), and the block records it as polarity_declaration.
 
     Returns the input_conversions block (INPUT_CONVERSIONS_SCHEMA, with the converter's records), the mzML
     written by _file_key with the mzXML each was written from, and the exclusion entry of each mzXML whose
@@ -3849,12 +3933,13 @@ def _run_lease_conversions(
     the lease at its convert stage. A retry reuses what was converted and converts the rest.
     """
     previous = _previous_conversion_records(provenance)
-    options = ConversionOptions()
+    options = campaign_conversion_options(declaration)
     block: dict[str, Any] = {
         "schema": INPUT_CONVERSIONS_SCHEMA,
         "status": "running",
         "converter": converter_identity(),
         "options": asdict(options),
+        "polarity_declaration": dict(declaration),
         "started_at": datetime.now(timezone.utc).isoformat(),
         "records": [],
         "encoding_choices": choices,
@@ -3906,6 +3991,14 @@ def _run_lease_conversions(
         "reused": sum(1 for item in records if item.get("reused_previous_record")),
         "failed": len(failed),
         "not_converted_readable_encoding": len(choices),
+        # The spectra given the declared polarity, which each record's polarity_imputation inference counts.
+        "imputed_polarity_spectra": sum(
+            int(item.get("spectra") or 0)
+            for record in records
+            if record.get("status") == "converted"
+            for item in record.get("inferences") or []
+            if isinstance(item, dict) and item.get("kind") == "polarity_imputation"
+        ),
     }
     block["status"] = "completed"
     block["completed_at"] = datetime.now(timezone.utc).isoformat()
@@ -4035,6 +4128,8 @@ def _record_conversion_outcome(project: RepositoryProject, conversion: dict[str,
     plan = dict(project.conversion_plan or {}) or _conversion_plan(
         sorted({Path(str(record["source"]["path"])).name for record in conversion["block"]["records"]}, key=str.casefold)
     )
+    # The options the stage converted with, which a plan made before the declaration was read may not give.
+    plan["options"] = dict(conversion["block"]["options"])
     plan["outcome"] = outcome
     project.conversion_plan = plan
     reason = _no_converted_input_reason(outcome)
