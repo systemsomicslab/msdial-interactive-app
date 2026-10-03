@@ -428,6 +428,11 @@ class EachEndpointAsksForWhatItReads(_Unit, unittest.TestCase):
         self.assertIn("stopped before the Console", response.get("error", ""))
         self.assertEqual([{"annotate": True}], self.calls)
 
+    def test_an_agent_can_tell_the_diagnostic_skips_annotation(self) -> None:
+        from msdial_app.agent_bridge import summarize_jobs
+
+        self.assertIn("peak_count_diagnostic_without_annotation", summarize_jobs({})["capabilities"])
+
 
 if __name__ == "__main__":
     unittest.main()
