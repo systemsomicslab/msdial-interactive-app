@@ -4,6 +4,62 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.25] - Unreleased
+
+### Fixed
+- Replicate injections. A repository lists each injection as a sample row of its
+  own, and the rows of one sample share its id: MetaboLights MTBLS291 names `Cel`
+  in five rows, one mzML each, and MetaboBank MTBKS64 names `S01` in two, one .RAW
+  each. Both were refused as "two inputs on one sample". The unit of mapping is
+  now the sample row:
+  - `msdial_download_repository_raw` and every handoff mapping: the analysis-input
+    check (`_inputs_unpaired_with_rows`) pairs each declared input with the row of
+    its sample whose `raw_file` is the input's path (or its archive's), else the
+    one with its file name. Catalog 0.6.x already lists one input per row and
+    counts them alike, so MTBKS64 is consistent and is no longer excluded as
+    `analysis_input:count_mismatch`. Two inputs on one row, more inputs than a
+    sample has rows, or an input none of its sample's rows names, still are.
+  - `msdial_prepare_repository_reanalysis`: the analysis-CSV builder maps each
+    input to the row of its sample that names it (by its own name, its lineage
+    row's declared names, its declared path, or its `name_pairing`), and every
+    replicate is a CSV row of its own with its sample's Class. Nothing is merged,
+    averaged or dropped. `sample_with_two_inputs` is renamed
+    `sample_row_with_two_inputs` and fires only for one row two inputs name; an
+    input two rows name is `input_with_two_sample_rows` (it was reported as
+    `input_without_sample`), and an input of a sample several rows describe that
+    none of them names is `sample_row_not_identified`. All three are mapping
+    failures `allow_partial_mapping` may accept. `sample_without_input` and the
+    exclusions are counted by row, and a replicate is named with its raw file.
+  - Each CSV row records `sample_row_index` and `sample_raw_file`; each lineage
+    row the CSV was written from records `sample_row` (`index`, `sample_id`,
+    `raw_file`) beside the lease's own `sample_id`; the excluded inputs carry
+    `sample_raw_file`; the CSV record adds `sample_rows_without_input`.
+  - A handoff that counts no inputs gives `sample_count` as its rows that name a
+    sample, not its distinct sample ids.
+- Declared raw file names an archive member carries behind a prefix. Metabolomics
+  Workbench ST001264 declares `BioRec1.raw`, and its study archive holds
+  `021518_387057_CSHp_BioRec1.raw`; the lease admitted nothing and failed at its
+  attribute stage. For a unit whose Catalog declared no analysis inputs, an archive
+  member (an analysable file, or the outermost .d/.raw folder) whose name - or
+  stem, for a name a row records without an extension - ends in `_`, `-`, `.` or a
+  space and then a declared name, compared without case, is that declared file's
+  (`_prefixed_member_pairing`), where no member carries the name exactly, the
+  member carries no declared name exactly, and the pairing is one to one: a member
+  ending in two declared names, or a name two members end in, pairs neither, so
+  `Youn_sa1.raw` never takes `..._Youn_sa11.raw`. Every stage that admits a member
+  by a sample's name admits a paired one (conversion sources, the encoding choice,
+  the attribute stage, the extracted files kept), and its lineage row records
+  `name_pairing` (`declared_raw_file`, `member_name`, `paired_by`
+  `prefixed_member_name`) and takes that file's sample; the attribute stage counts
+  `prefixed_member_pairings`. The analysis-CSV builder finds the sample row by the
+  same pairing. A declared name nothing carries still admits nothing: its row is
+  left in `samples_without_input`, and a unit left with no input still refuses to
+  fall back to accession-level inputs.
+
+### Added
+- Agent capabilities `repository_replicate_rows_as_inputs` and
+  `repository_prefixed_member_names`.
+
 ## [0.5.24] - Unreleased
 
 ### Added
