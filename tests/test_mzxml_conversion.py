@@ -624,6 +624,23 @@ class InferenceFlagTests(_Workspace):
     def test_polarity_imputation_is_refused_when_the_file_records_the_other_polarity(self) -> None:
         record, destination = self.convert(polarity_32(["any", "+"]), options={"impute_polarity": "negative"})
         self.assertFailedCleanly(record, destination, "polarity imputation refused")
+        # Named, so that a caller can tell a file that contradicts the declared polarity from one that will never
+        # convert.
+        self.assertEqual("polarity_imputation", record["refused_inference"])
+
+    def test_the_same_file_converts_without_the_imputation_its_polarity_less_scans_unrecorded(self) -> None:
+        record, destination = self.convert(polarity_32(["any", "+"]))
+        self.assertConverted(record)
+        self.assertNotIn("refused_inference", record)
+        self.assertEqual({"positive": 1, "unrecorded": 1}, record["counts"]["polarity"])
+
+    def test_a_file_whose_every_scan_records_the_other_polarity_is_not_refused(self) -> None:
+        """No scan records none, so nothing is imputed and nothing contradicts the polarity asked for: the file is
+        written with the polarity each scan records, and a caller splits it from the declared polarity's files."""
+        record, destination = self.convert(polarity_32(["+", "+"]), options={"impute_polarity": "negative"})
+        self.assertConverted(record)
+        self.assertNotIn("refused_inference", record)
+        self.assertEqual(([], {"positive": 2}), (record["inferences"], record["counts"]["polarity"]))
 
     DECLARED = {"declared_ion_mode": "Negative", "declared_ion_mode_field": "catalog_handoff.technical_settings.ion_mode"}
 
@@ -745,6 +762,7 @@ class IntegrityTests(_Workspace):
         record, destination = self.convert(data[: len(data) // 2])
         self.assertFailedCleanly(record, destination, "ParseError")
         self.assertNotIn("error_errno", record, "a file that will never convert names no system error")
+        self.assertNotIn("refused_inference", record, "nor an inference it refused")
 
     def test_a_full_disk_is_recorded_with_its_system_error(self) -> None:
         """So that a caller can tell a disk a retry may get past from a file that will never convert."""

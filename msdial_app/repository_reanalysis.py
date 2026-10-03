@@ -50,7 +50,13 @@ from .download_store import (
     unlink_tree,
 )
 from .mzml_encoding import UNSUPPORTED_MZML_ENCODING, scan_mzml_encoding
-from .mzxml_conversion import CONVERTER_NAME, ConversionOptions, convert_mzxml_to_mzml, converter_identity
+from .mzxml_conversion import (
+    CONVERTER_NAME,
+    POLARITY_IMPUTATION,
+    ConversionOptions,
+    convert_mzxml_to_mzml,
+    converter_identity,
+)
 from .process_liveness import process_created_at, process_is_alive
 from .reader_created import container_members, reader_created_files, reader_created_names
 
@@ -83,6 +89,11 @@ CONVERTED_DIRECTORY = "converted"
 # The reason a file whose conversion failed is kept out of the input candidates, and the provenance record
 # every conversion of a lease is written to (also the manifest's input_conversions).
 CONVERSION_FAILED = "conversion_failed"
+# The reason an mzXML is kept out of them where its unit declares one polarity and some of its scans record the
+# other beside scans that record none: the declaration cannot be imputed to those, and the user decided on
+# 2026-10-03 that such a file is excluded and the rest of the unit runs (A FILE WHOSE SCANS CONTRADICT THE
+# DECLARATION, at the convert stage).
+POLARITY_CONTRADICTS_DECLARATION = "polarity_contradicts_declaration"
 # The system errors that fail a conversion through no fault of its file - the disk or the quota is full, or
 # another process (a virus scanner, an indexer) still held the file after the converter waited for it - and
 # stop the lease instead, so that the unit is retried rather than run without that sample.
@@ -99,7 +110,8 @@ CONVERSION_PLAN_SCHEMA = "msdial-mzxml-conversion-plan.v1"
 # Negative (DECLARED_POLARITIES). That field is read because nothing rewrites it, and the gate's CONV-1 holds
 # an imputation to it (_declared_ion_mode); project.ion_mode is never read, since the raw-header preflight
 # rewrites it from headers that carry what was imputed, and a split part's is its part's polarity. Both,
-# Unknown or no declaration imputes nothing, and CONV-1 fails the spectra left without a polarity.
+# Unknown or no declaration imputes nothing, and CONV-1 fails the spectra left without a polarity. A file some
+# of whose scans record the other polarity and some none is excluded (POLARITY_CONTRADICTS_DECLARATION).
 DECLARED_ION_MODE_FIELD = "project.repository_metadata.catalog_handoff.technical_settings.ion_mode"
 DECLARED_POLARITIES = {"positive": "positive", "negative": "negative"}
 # The exclusion reasons evaluate_eligibility gives for these, which a split part inherits from its parent:
@@ -1225,13 +1237,29 @@ def _conversion_plan(
 
 
 def _no_converted_input_reason(outcome: Any) -> str:
-    """The exclusion reason of a unit whose lease converted mzXML and was left with no input, else ''."""
-    if not isinstance(outcome, dict) or outcome.get("analysis_inputs") != 0 or not outcome.get("failed"):
+    """The exclusion reason of a unit whose lease converted mzXML and was left with no input, else ''.
+
+    Its mzXML failed their conversion, or contradicted the polarity the unit declares and were excluded
+    (POLARITY_CONTRADICTS_DECLARATION), or both.
+    """
+    if not isinstance(outcome, dict) or outcome.get("analysis_inputs") != 0:
         return ""
-    return (
-        f"{NO_CONVERTED_INPUT_REASON}: {outcome['failed']} of the unit's mzXML file(s) failed their "
-        f"conversion ({CONVERSION_FAILED}), and no other input of the unit remains."
-    )
+    failed = outcome.get("failed") or 0
+    contradicting = outcome.get(POLARITY_CONTRADICTS_DECLARATION) or 0
+    lost = [
+        *([f"{failed} of the unit's mzXML file(s) failed their conversion ({CONVERSION_FAILED})"] if failed else []),
+        *(
+            [
+                f"{contradicting} of its mzXML file(s) record the polarity opposite to its declared ion mode in some "
+                f"scans and none in others ({POLARITY_CONTRADICTS_DECLARATION})"
+            ]
+            if contradicting
+            else []
+        ),
+    ]
+    if not lost:
+        return ""
+    return f"{NO_CONVERTED_INPUT_REASON}: {'; '.join(lost)}, and no other input of the unit remains."
 
 
 def _conversion_required_reasons(project: RepositoryProject) -> list[str]:
@@ -1737,10 +1765,11 @@ def create_download_lease(
     - convert: each of the unit's mzXML written as mzML under raw\\converted, every inference off but the
       polarity the unit's Catalog handoff declares, given to scans that record none where it declares
       exactly one (conversion_polarity_declaration), and recorded (input_conversions,
-      provenance\\input-conversions.json, the declaration and its field among them); where extraction
-      shows a readable encoding of the same sample beside an mzXML, that one is analysed instead. Only under a
-      ``campaign_authorization``: not used outside a campaign, where an mzXML is no input, nor where the
-      unit has no mzXML. See the notes above _find_mzxml_files;
+      provenance\\input-conversions.json, the declaration and its field among them); a file some of whose
+      scans record the other polarity and some none is not converted (polarity_contradictions); where
+      extraction shows a readable encoding of the same sample beside an mzXML, that one is analysed instead.
+      Only under a ``campaign_authorization``: not used outside a campaign, where an mzXML is no input,
+      nor where the unit has no mzXML. See the notes above _find_mzxml_files;
     - discover: every vendor folder listed member by member checked whole (container_completeness),
       then the MS-DIAL inputs under the data root, outermost folders only, and the mzML converted;
     - attribute: the unit's own inputs - by path, every one, when the Catalog declared them
@@ -1749,8 +1778,8 @@ def create_download_lease(
       whose binary arrays RawDataHandler cannot decode is not an input: it is listed in
       excluded_input_candidates and in input_lineage's excluded rows, with reason
       unsupported_mzml_encoding and the accessions found (_exclude_undecodable_inputs). Nor is an mzXML
-      whose conversion failed (conversion_failed); a unit left with no input is recorded, excluded, and
-      not raised;
+      whose conversion failed (conversion_failed), or whose scans contradict the polarity the unit declares
+      (polarity_contradicts_declaration); a unit left with no input is recorded, excluded, and not raised;
     - record: the manifest.
 
     The stages are written into the manifest as they finish, so a lease that stops says where
@@ -2145,13 +2174,14 @@ def create_download_lease(
             archive_samples=archive_samples,
             archive_extractions=archive_extractions,
             stands_for=stands_for,
-            set_aside=[item["path"] for item in (conversion or {}).get("failed") or []],
+            set_aside=[item["path"] for item in (conversion or {}).get("excluded") or []],
         )
         inputs, excluded_inputs, mzml_scanned = _exclude_undecodable_inputs(inputs)
         ignored_inputs = len(all_inputs) - len(inputs) - len(excluded_inputs)
         if conversion is not None:
-            # An mzXML whose conversion failed is no candidate, as an undecodable mzML is none.
-            excluded_inputs = [*conversion["failed"], *excluded_inputs]
+            # An mzXML whose conversion failed, or whose scans contradict the declared polarity, is no
+            # candidate, as an undecodable mzML is none.
+            excluded_inputs = [*conversion["excluded"], *excluded_inputs]
         analysis_input = _common_input_path(inputs, data_root)
         kept = {_file_key(item) for item in inputs}
         conversions, conversion_rows = _conversion_lineage(
@@ -3323,7 +3353,8 @@ def build_input_lineage(
 
     A FILE THE LEASE EXCLUDED is no input, so it has no row: rows stay one per analysis input, which is
     what the gate resolves inputs against. ``excluded_inputs`` ({path, reason, problems}, from
-    _exclude_undecodable_inputs, or an mzXML whose conversion failed) are described the same way under
+    _exclude_undecodable_inputs, or an mzXML whose conversion failed or whose scans contradict the
+    polarity the unit declares) are described the same way under
     ``excluded``, each with its ``exclusion``, so where the bytes of a file that was not analysed came from
     is still recorded.
 
@@ -3671,10 +3702,23 @@ def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict
 #
 # WHAT IS INFERRED. Every inference the converter offers stays off but one: a scan whose mzXML records no
 # polarity is given the unit's declared ion mode, where its Catalog handoff declares exactly one polarity
-# (conversion_polarity_declaration, DECLARED_ION_MODE_FIELD). The converter still refuses a file any of whose
-# scans records the other polarity, and records each imputation as an inference with its count; the
-# declaration and its field go into the options of every record and of input_conversions, and into the
-# block's polarity_declaration. A unit declaring Both or Unknown, or nothing, imputes nothing.
+# (conversion_polarity_declaration, DECLARED_ION_MODE_FIELD). The converter records each imputation as an
+# inference with its count; the declaration and its field go into the options of every record and of
+# input_conversions, and into the block's polarity_declaration. A unit declaring Both or Unknown, or nothing,
+# imputes nothing.
+#
+# A FILE WHOSE SCANS CONTRADICT THE DECLARATION. The converter refuses to impute where a scan of the file
+# records the other polarity (refused_inference POLARITY_IMPUTATION): the declaration cannot stand for the
+# scans that record none. The user decided on 2026-10-03 that such a file is excluded with a reason, and the
+# rest of the unit runs: it is kept out of the candidates with reason polarity_contradicts_declaration, and
+# listed, as a file whose conversion failed is, in excluded_input_candidates and input_lineage's excluded
+# rows, and through them in the campaign disposition's excluded_inputs and the analysis-CSV record, where
+# the gate's INP-1 accounts for it. It is not a conversion that failed: nothing was written for it, and the
+# converter's record of the refusal is kept in the block's polarity_contradictions, with the mzXML and the
+# declaration it contradicts, not among its records, which are the conversions CONV-1 holds to their mzML.
+# A later lease asks again, and the same bytes are refused again. A file every scan of which records the
+# other polarity asks for no imputation and is no such file: it converts with the polarity it records, and
+# the raw-header preflight's polarity rule splits the unit by polarity, as it would for a vendor file.
 #
 # A FILE WHOSE CONVERSION FAILS is no input: it is kept out of the candidates with reason conversion_failed,
 # like an mzML RawDataHandler cannot decode, and the rest of the unit runs. A unit left with no input is
@@ -3920,12 +3964,16 @@ def _run_lease_conversions(
     """Convert each mzXML, recording as it goes; raises only for a full disk or an unwritable record.
 
     ``declaration`` is the unit's (conversion_polarity_declaration): every conversion runs under the options
-    it gives (campaign_conversion_options), and the block records it as polarity_declaration.
+    it gives (campaign_conversion_options), and the block records it as polarity_declaration. A file that
+    refuses the imputation they ask for is not converted (A FILE WHOSE SCANS CONTRADICT THE DECLARATION,
+    above): the converter's record of the refusal goes into the block's polarity_contradictions, not its
+    records.
 
     Returns the input_conversions block (INPUT_CONVERSIONS_SCHEMA, with the converter's records), the mzML
     written by _file_key with the mzXML each was written from, and the exclusion entry of each mzXML whose
-    conversion failed. ``between(name)`` is called before each file, where the lease beats its heartbeat
-    and hears a cancel.
+    conversion failed (conversion_failed) or that contradicts the declaration
+    (polarity_contradicts_declaration), in source order. ``between(name)`` is called before each file, where
+    the lease beats its heartbeat and hears a cancel.
 
     A conversion the disk filled under (FULL_DISK_ERRNOS), or one stopped by a file another process held
     after the converter waited for it (HELD_FILE_ERRNOS), says nothing about its mzXML, so it excludes no
@@ -3943,10 +3991,11 @@ def _run_lease_conversions(
         "started_at": datetime.now(timezone.utc).isoformat(),
         "records": [],
         "encoding_choices": choices,
+        "polarity_contradictions": [],
     }
     record_path = provenance / INPUT_CONVERSIONS_NAME
     outputs: dict[str, str] = {}
-    failed: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
     for source in sources:
         if between is not None:
             between(Path(source).name)
@@ -3958,6 +4007,26 @@ def _run_lease_conversions(
             source_relative_path=relative,
             previous=previous.get(_file_key(str(destination))),
         )
+        if record.get("refused_inference") == POLARITY_IMPUTATION:
+            # A scan of the file records the other polarity, so the declaration cannot stand for those that
+            # record none: the file is excluded, and the rest of the unit runs (the user, 2026-10-03).
+            block["polarity_contradictions"].append({
+                "mzxml": source,
+                "reason": POLARITY_CONTRADICTS_DECLARATION,
+                "declared_polarity": options.impute_polarity,
+                "record": record,
+            })
+            excluded.append({
+                "path": source,
+                "reason": POLARITY_CONTRADICTS_DECLARATION,
+                "problems": [str(record.get("error") or "the polarity imputation was refused")],
+                "conversion": {
+                    "output": str(destination),
+                    "polarity_contradiction": len(block["polarity_contradictions"]) - 1,
+                },
+            })
+            _write_json(record_path, block)
+            continue
         block["records"].append(record)
         if record.get("status") == "converted":
             outputs[_file_key(str(destination))] = source
@@ -3976,7 +4045,7 @@ def _run_lease_conversions(
                 "retry converts it and the rest.",
             )
         else:
-            failed.append({
+            excluded.append({
                 "path": source,
                 "reason": CONVERSION_FAILED,
                 "problems": [str(record.get("error") or "the conversion did not complete")],
@@ -3989,7 +4058,9 @@ def _run_lease_conversions(
         "sources": len(sources),
         "converted": sum(1 for item in records if item.get("status") == "converted"),
         "reused": sum(1 for item in records if item.get("reused_previous_record")),
-        "failed": len(failed),
+        "failed": sum(1 for item in excluded if item["reason"] == CONVERSION_FAILED),
+        # The files excluded because their scans contradict the declared polarity, none of them converted.
+        POLARITY_CONTRADICTS_DECLARATION: len(block["polarity_contradictions"]),
         "not_converted_readable_encoding": len(choices),
         # The spectra given the declared polarity, which each record's polarity_imputation inference counts.
         "imputed_polarity_spectra": sum(
@@ -3997,14 +4068,14 @@ def _run_lease_conversions(
             for record in records
             if record.get("status") == "converted"
             for item in record.get("inferences") or []
-            if isinstance(item, dict) and item.get("kind") == "polarity_imputation"
+            if isinstance(item, dict) and item.get("kind") == POLARITY_IMPUTATION
         ),
     }
     block["status"] = "completed"
     block["completed_at"] = datetime.now(timezone.utc).isoformat()
     block["record_path"] = str(record_path)
     _write_json(record_path, block)
-    return {"block": block, "outputs": outputs, "failed": failed}
+    return {"block": block, "outputs": outputs, "excluded": excluded}
 
 
 def lineage_stands_for(manifest: dict[str, Any]) -> dict[str, str]:
@@ -4117,7 +4188,8 @@ def _record_conversion_outcome(project: RepositoryProject, conversion: dict[str,
     judges again - a preflight, a campaign disposition, a split - stays what the lease found it to be:
     eligible where an input survived the conversion, excluded where none did.
     """
-    counts = conversion["block"]["counts"]
+    block = conversion["block"]
+    counts = block["counts"]
     outcome = {
         "converted": counts["converted"],
         "reused": counts["reused"],
@@ -4125,11 +4197,20 @@ def _record_conversion_outcome(project: RepositoryProject, conversion: dict[str,
         "not_converted_readable_encoding": counts["not_converted_readable_encoding"],
         "analysis_inputs": len(inputs),
     }
+    if counts[POLARITY_CONTRADICTS_DECLARATION]:
+        # Only where one was, so the outcome of a unit with none records what it always did.
+        outcome[POLARITY_CONTRADICTS_DECLARATION] = counts[POLARITY_CONTRADICTS_DECLARATION]
     plan = dict(project.conversion_plan or {}) or _conversion_plan(
-        sorted({Path(str(record["source"]["path"])).name for record in conversion["block"]["records"]}, key=str.casefold)
+        sorted(
+            {
+                *(Path(str(record["source"]["path"])).name for record in block["records"]),
+                *(Path(str(item["mzxml"])).name for item in block["polarity_contradictions"]),
+            },
+            key=str.casefold,
+        )
     )
     # The options the stage converted with, which a plan made before the declaration was read may not give.
-    plan["options"] = dict(conversion["block"]["options"])
+    plan["options"] = dict(block["options"])
     plan["outcome"] = outcome
     project.conversion_plan = plan
     reason = _no_converted_input_reason(outcome)
@@ -8832,9 +8913,10 @@ def _filter_inputs_by_project_allowlist(
 
     stands_for maps an input, by _file_key, to the mzXML it stands for (the convert stage's
     stands_for): an mzML converted from it, or a readable encoding of its sample chosen over it. Such an
-    input is this unit's when it, or the mzXML, is. set_aside is the mzXML of this unit whose conversion
-    failed: a declared input they are is not missing, and a unit left with nothing else selects nothing
-    rather than raising, so the lease can record why.
+    input is this unit's when it, or the mzXML, is. set_aside is the mzXML of this unit the convert stage
+    excluded, whose conversion failed or whose scans contradict the declared polarity: a declared input
+    they are is not missing, and a unit left with nothing else selects nothing rather than raising, so the
+    lease can record why.
     """
     if not project.analysis_unit_id:
         return inputs
@@ -9046,8 +9128,9 @@ def _select_declared_inputs(
 ) -> list[str]:
     """The inputs that are this unit's declared analysis inputs, matched by path, every one of them.
 
-    An input converted from a declared mzXML is matched through it (``stands_for``); a declared mzXML whose
-    conversion failed (``set_aside``) is accounted for by that failure, recorded with it, not missing.
+    An input converted from a declared mzXML is matched through it (``stands_for``); a declared mzXML the
+    convert stage excluded (``set_aside``: its conversion failed, or its scans contradict the declared
+    polarity) is accounted for by that exclusion, recorded with it, not missing.
 
     WHY BY PATH, AND WHY EVERY ONE. Before the Catalog declared its inputs, an input was admitted when a
     listed name or a sample's file name matched its basename. A Waters folder matched neither - its

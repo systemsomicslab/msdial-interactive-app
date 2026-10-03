@@ -680,11 +680,12 @@ def decide_disposition(
     caller strips ``assignments`` before persisting and applies them to the per-file records.
 
     WHAT THE LEASE ITSELF KEPT OUT of the input candidates (excluded_input_candidates: an mzXML whose
-    conversion failed, an mzML whose arrays RawDataHandler cannot decode) is listed first among the
-    excluded inputs of every disposition, with the lease's reason. The Catalog declared it, and a declared
-    input that is no candidate is accounted for only through the binding disposition's excluded_inputs
-    (the gate's INP-1): without it, one file that failed its conversion would stop the rest of a declared
-    unit. It decides nothing about the unit; what remains is decided below as before.
+    conversion failed, or whose scans contradict the polarity the unit declares, an mzML whose arrays
+    RawDataHandler cannot decode) is listed first among the excluded inputs of every disposition, with the
+    lease's reason. The Catalog declared it, and a declared input that is no candidate is accounted for only
+    through the binding disposition's excluded_inputs (the gate's INP-1): without it, one file that failed
+    its conversion would stop the rest of a declared unit. It decides nothing about the unit; what remains
+    is decided below as before.
     """
     def mapping(value: Any) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
@@ -740,14 +741,23 @@ def decide_disposition(
     if not candidates:
         reasons.append("no_inputs")
         failed = [item for item in lease_excluded if item["reason"] == "conversion_failed"]
-        if failed:
-            # The lease's convert stage wrote the unit's mzXML as mzML and every conversion failed; each failure
-            # is recorded with its error in input_conversions.
-            reasons.append("conversion_failed")
-            detail.append(
-                f"The unit has no input files: the conversion of its {len(failed)} mzXML file(s) to mzML failed, "
-                "and no other input remains."
-            )
+        contradicting = [item for item in lease_excluded if item["reason"] == "polarity_contradicts_declaration"]
+        if failed or contradicting:
+            # The lease's convert stage was to write the unit's mzXML as mzML, and none is left: each conversion
+            # failed, or the file's scans record the polarity opposite to the unit's declared ion mode beside
+            # scans that record none, and it was excluded unconverted. Each is recorded with its error in
+            # input_conversions.
+            lost = []
+            if failed:
+                reasons.append("conversion_failed")
+                lost.append(f"the conversion of its {len(failed)} mzXML file(s) to mzML failed")
+            if contradicting:
+                reasons.append("polarity_contradicts_declaration")
+                lost.append(
+                    f"{len(contradicting)} of its mzXML file(s) record the polarity opposite to its declared ion "
+                    "mode in some scans and none in others, and were excluded"
+                )
+            detail.append(f"The unit has no input files: {'; '.join(lost)}, and no other input remains.")
         else:
             detail.append("The unit has no input files.")
         return result("skip")

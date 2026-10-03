@@ -177,7 +177,20 @@ _WHITESPACE = re.compile(r"\s")
 
 
 class ConversionError(Exception):
-    """A file the converter will not write, with the reason that goes into the record."""
+    """A file the converter will not write, with the reason that goes into the record.
+
+    ``refused_inference`` names the inference the options asked for that the file refuses, where that is the
+    reason (POLARITY_IMPUTATION): the record keeps it, so a caller can tell a file that contradicts what it
+    was asked to infer from one that will never convert.
+    """
+
+    def __init__(self, message: str, *, refused_inference: str | None = None) -> None:
+        super().__init__(message)
+        self.refused_inference = refused_inference
+
+
+# The inference kind of an imputed polarity, as its record's inferences and a refused_inference name it.
+POLARITY_IMPUTATION = "polarity_imputation"
 
 
 @dataclass(frozen=True)
@@ -185,7 +198,8 @@ class ConversionOptions:
     """What the converter may do beyond copying what the mzXML records. Every inference is off.
 
     impute_polarity: "positive" or "negative", the unit's declared ion mode, written for scans whose
-        polarity is absent or "any". The file fails when any scan records the other polarity.
+        polarity is absent or "any". The file fails, its record's refused_inference POLARITY_IMPUTATION,
+        when it has such a scan and any scan records the other polarity.
     declared_ion_mode, declared_ion_mode_field: the ion mode the caller read for the unit, as it was
         declared ("Negative", "Both"), and where it was read. Recorded only: the converter acts on
         impute_polarity alone, which must be the declared polarity where both are given. They are kept
@@ -242,7 +256,8 @@ def convert_mzxml_to_mzml(
     have been another unit's or the same files under another spelling of their path.
 
     Never raises. The record's status is "converted" or "failed"; on failure the error says why (with
-    "error_errno" where a system error stopped it) and none of this converter's output is left at the
+    "error_errno" where a system error stopped it, and "refused_inference" where the file refused an
+    inference the options asked for, POLARITY_IMPUTATION) and none of this converter's output is left at the
     destination. Nothing at the destination is touched for an argument error (options, destination,
     missing source), and a file there that this converter did not write is never replaced or removed.
     The written mzML is renamed into place once another process lets go of it, for a few seconds
@@ -337,6 +352,10 @@ def convert_mzxml_to_mzml(
             # Which system error stopped it, so that a caller can tell a full disk, which a retry may get
             # past, from a file that will never convert.
             record["error_errno"] = exc.errno
+        if getattr(exc, "refused_inference", None):
+            # Which inference the file refused, so that a caller can tell a file that contradicts it from
+            # one that will never convert.
+            record["refused_inference"] = exc.refused_inference
         if owned and destination.is_file() and _written_by_converter(destination, previous):
             # A stale output of this converter; leaving it would let input discovery pick up an mzML
             # this record says is not a valid conversion.
@@ -1080,7 +1099,8 @@ class _SpectrumBuilder:
                 raise ConversionError(
                     f"polarity imputation refused: {self.recorded_polarity[opposite]} scans record"
                     f" {opposite} polarity, so the declared {self.options.impute_polarity} ion mode"
-                    " cannot stand for the scans that record none"
+                    " cannot stand for the scans that record none",
+                    refused_inference=POLARITY_IMPUTATION,
                 )
 
     def _build(self, scan: _MzxmlScan) -> _Spectrum:
@@ -1532,7 +1552,7 @@ def _applied(
     if builder.imputed:
         inferences.append(
             {
-                "kind": "polarity_imputation",
+                "kind": POLARITY_IMPUTATION,
                 "value": options.impute_polarity,
                 "basis": "the analysis unit's declared ion mode, supplied by the caller",
                 "source": "repository_declared",

@@ -70,7 +70,9 @@ def summarize_jobs(
             # converts its unit's mzXML to mzML in its convert stage (mzxml_conversion, every inference off),
             # records input_conversions, and runs what converted; mzData is excluded there too. The one
             # inference: a scan recording no polarity is given the unit's declared ion mode, where its Catalog
-            # handoff declares exactly one polarity, and the declaration is recorded with the options.
+            # handoff declares exactly one polarity, and the declaration is recorded with the options. A file
+            # some of whose scans record the other polarity and some none is excluded unconverted (reason
+            # polarity_contradicts_declaration), and the rest of the unit runs.
             "mzxml_requires_conversion_to_mzml",
             "campaign_mzxml_converted_to_mzml",
             "campaign_mzxml_polarity_from_declared_ion_mode",

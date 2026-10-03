@@ -42,8 +42,19 @@ it: the raw-header preflight rewrites it from headers that carry what was
 imputed, and a split part's is its part's polarity, while the handoff a part
 copies from its parent is the parent's declaration. Both, Unknown or no
 declaration imputes nothing, and CONV-1 fails the spectra left without a
-polarity. The converter refuses a file any of whose scans records the other
-polarity (`conversion_failed`). The declaration and its field are recorded in
+polarity. A file some of whose scans record the other polarity and some none
+contradicts the declaration: the converter refuses the imputation (its record's
+`refused_inference` is `polarity_imputation`), and, as the user decided on
+2026-10-03, the lease excludes that file unconverted with reason
+`polarity_contradicts_declaration` and the rest of the unit runs. The refusal
+is not a conversion record: it is kept in `input_conversions`'
+`polarity_contradictions` (the mzXML, the declared polarity and the converter's
+record), counted in `counts.polarity_contradicts_declaration`, and the file is
+listed as a failed conversion is (below), so the gate's INP-1 accounts for it
+and CONV-1 has no conversion of it to hold. A file whose every scan records
+the other polarity asks for no imputation: it is converted with the polarity it
+records, and the raw-header preflight splits the unit by polarity. The
+declaration and its field are recorded in
 the options of every conversion record and of `input_conversions`, and in its
 `polarity_declaration`; each imputation is an inference with its count
 (`counts.imputed_polarity_spectra` sums them). A record made under another
@@ -55,9 +66,11 @@ in `provenance\input-conversions.json`; each converted input has an
 mzXML it was read from (path, sha256, md5), the output's sha256, the converter
 and the validation, and carries the mzXML's own row (`source_row`). A file whose
 conversion fails is kept out with reason `conversion_failed` and the rest run:
-the unit's `campaign_disposition` lists it in `excluded_inputs`, as it lists an
-mzML excluded as `unsupported_mzml_encoding`, so the gate's INP-1 accounts for
-the declared input. A unit left with no input is excluded with the reason, and
+the unit's `excluded_input_candidates`, `input_lineage.excluded` and analysis-CSV
+record name it, and its `campaign_disposition` lists it in `excluded_inputs`,
+as it lists an mzML excluded as `unsupported_mzml_encoding` or an mzXML as
+`polarity_contradicts_declaration`, so the gate's INP-1 accounts for the
+declared input. A unit left with no input is excluded with the reasons, and
 its preflight skips it. A full disk, or a file another process holds
 (`EACCES`/`EPERM`, after the converter has waited for it), is not a failed
 conversion: the lease stops at its `convert` stage (`download_failed`), keeping

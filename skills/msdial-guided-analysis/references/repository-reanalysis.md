@@ -22,10 +22,13 @@ polarity (Positive or Negative; never `project.ion_mode`, and nothing for Both
 or Unknown), records each conversion (`input_conversions`,
 `provenance\input-conversions.json`, and `input_lineage` rows of kind
 `converted`), and the converted mzML are the unit's inputs. A file whose
-conversion fails is excluded with reason `conversion_failed`, listed in the
-unit's `campaign_disposition`, and the rest run. Do not convert mzXML by hand
-or relabel it as `converted`. mzData, which nothing converts, still excludes
-its unit.
+conversion fails is excluded with reason `conversion_failed`, and a file some
+of whose scans record the other polarity and some none, unconverted, with
+reason `polarity_contradicts_declaration`; each is listed in the unit's
+`campaign_disposition`, and the rest run. A file whose every scan records the
+other polarity is converted as recorded, and the unit splits by polarity. Do
+not convert mzXML by hand or relabel it as `converted`. mzData, which nothing
+converts, still excludes its unit.
 
 Before selecting an analysis unit, ask what the user wants to learn. Capture the
 scientific question and comparison, whether annotation or comparative profiling
