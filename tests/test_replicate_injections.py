@@ -353,10 +353,13 @@ class ReplicatesNamedByTheirFilesAreRowsOfTheirOwn(unittest.TestCase):
             manifest = read_manifest(manifest_path)
             built = build_repository_analysis_rows(manifest)
 
-        self.assertEqual(["Cel", "Cel", "Cel", "PC", "PC"], [row["sample_id"] for row in manifest["input_lineage"]["rows"]])
+        self.assertEqual(
+            ["Cel", "Cel", "Cel", "PC", "PC"], [row["sample_id"] for row in manifest["input_lineage"]["rows"]]
+        )
         self.assertEqual([], built["failures"])
         self.assertEqual(
-            [f"FILES/{name}" for _sample, name, _replicate in MTBLS291], [row["sample_raw_file"] for row in built["rows"]]
+            [f"FILES/{name}" for _sample, name, _replicate in MTBLS291],
+            [row["sample_raw_file"] for row in built["rows"]],
         )
         self.assertEqual({"All"}, {row["class_id"] for row in built["rows"]})
         # A comma is no character the Console's parser reads back: each replicate gets an alias of its own.
@@ -558,7 +561,9 @@ class ADeclaredNameBehindAPrefixIsPairedOneToOne(_Workspace):
         self.assertEqual({}, self.pairing(["x_A_B.raw"], [("a", "A_B.raw"), ("b", "B.raw")]))
 
     def test_only_a_separator_may_precede_the_declared_name(self) -> None:
-        self.assertEqual({"run-S1.raw": "S1.raw"}, self.pairing(["run-S1.raw", "runS2.raw"], [("1", "S1.raw"), ("2", "S2.raw")]))
+        self.assertEqual(
+            {"run-S1.raw": "S1.raw"}, self.pairing(["run-S1.raw", "runS2.raw"], [("1", "S1.raw"), ("2", "S2.raw")])
+        )
 
     def test_a_unit_whose_catalog_declared_its_inputs_is_matched_by_path_and_never_by_prefix(self) -> None:
         declared = [{"path": "S1.raw", "kind": "file", "sample_id": "s"}]

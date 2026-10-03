@@ -637,8 +637,9 @@ def _handoff_analysis_inputs(
     The check compares the counts the handoff states with the lists it carries: analysis_input_count,
     analytical_sample_count and download_scope.analysis_file_count against the inputs; each vendor folder
     against the members listed for it; and, where no Catalog issue already blocks the unit, the sample rows
-    against the inputs, one input per row (_inputs_unpaired_with_rows: rows may share a sample id). A disagreement is returned as {"status": "failed", "problems": [...]},
-    for the caller to record against this unit, never raised.
+    against the inputs, one input per row (_inputs_unpaired_with_rows: rows may share a sample id). A
+    disagreement is returned as {"status": "failed", "problems": [...]}, for the caller to record against
+    this unit, never raised.
     """
     if "analysis_input_model" not in handoff:
         return [], {}
