@@ -4,6 +4,40 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.26] - Unreleased
+
+### Changed
+- The LC-MS peak-count diagnostic behind `msdial_start_peak_count_diagnostic`
+  (`POST /api/agent/tuning/run`, the campaign runner's diagnose step) no longer
+  annotates. Only its `.mdpeak` rows and their Height column are read, and the
+  Console writes one row per peak spotted after peak spotting, isotope estimation
+  and deconvolution; annotation neither adds nor removes a peak nor changes its
+  height (`MsdialLcMsApi` `FileProcess.RunAsync`, `LcmsProcess.ExecuteAsync`). On a
+  campaign unit the diagnostic searched the tiered LBM, strict MSP and broad MSP
+  annotators at Minimum peak height 0, and one Waters AIF file took more than 40
+  minutes, most of it in annotation. Its method now writes every library line
+  blank (Msp, MSP annotator settings, Lbm, Text DB, Text annotator settings,
+  Isotope text DB), writes no annotator settings file and no annotation pipeline
+  profile, and its run manifest lists no library. Every peak-spotting and
+  deconvolution setting is still the production method's; only Minimum peak
+  height (0) and the alignment switches differ, as before. The production run is
+  unchanged.
+- The diagnostic records `diagnostic_annotation` (`status`
+  `skipped_for_peak_count`, the reason, the production annotation profile and the
+  library roles it did not load, never their paths) in its
+  `workflow-settings.json` and `run-manifest.json`, as `annotation` in its
+  `diagnostic-job.json`, and as `annotation` on the unit manifest's
+  `peak_height_diagnostics` entry, including an estimate made from disk.
+- The GUI's diagnostic panel (`POST /api/tuning/run`) still annotates, because
+  its MSP sliders read the match scores of the same run; it records `status`
+  `performed`. A GC-MS diagnostic is unchanged.
+- Agent capability `peak_count_diagnostic_without_annotation`.
+
+### Known limitations
+- That the count is the same with and without annotation is established from
+  the Console source, not yet measured: it is to be confirmed on a real file with
+  the Console once the running pilot has finished.
+
 ## [0.5.24] - Unreleased
 
 ### Added
