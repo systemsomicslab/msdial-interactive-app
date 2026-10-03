@@ -40,6 +40,7 @@ from msdial_app.repository_analysis_rows import build_repository_analysis_rows, 
 from msdial_app.repository_reanalysis import (
     CONVERSION_FAILED,
     CONVERSION_PLAN_SCHEMA,
+    DECLARED_ION_MODE_FIELD,
     INPUT_CONVERSIONS_SCHEMA,
     LEASE_STAGES,
     NO_CONVERTED_INPUT_REASON,
@@ -67,6 +68,12 @@ GATE = Path(
     or "D:\\13_MSDIAL_Public_Reanalysis\\code\\scripts\\verify-run-invariants.py"
 )
 OFF = asdict(ConversionOptions())
+
+
+def _declared(mode: str, polarity: str | None) -> dict:
+    """The options a campaign converts with where the unit's Catalog handoff declares ``mode``: every inference
+    flag off but the ``polarity`` it gives, recorded with the declaration and the field it was read from."""
+    return {**OFF, "impute_polarity": polarity, "declared_ion_mode": mode, "declared_ion_mode_field": DECLARED_ION_MODE_FIELD}
 
 
 class _Cancelled(Exception):
@@ -209,8 +216,8 @@ class AnMzxmlUnitIsEligibleWithAConversionPlan(unittest.TestCase):
         self.assertEqual(CONVERSION_PLAN_SCHEMA, plan["schema"])
         self.assertEqual("mzML", plan["target"])
         self.assertEqual((4, paths), (plan["named_inputs"], plan["names"]))
-        self.assertEqual(OFF, plan["options"])
-        self.assertIsNone(plan["options"]["impute_polarity"])
+        # Every inference flag off but the polarity the handoff declares (2026-10-02), recorded with its field.
+        self.assertEqual(_declared("Positive", "positive"), plan["options"])
         self.assertFalse(any(plan["options"][name] for name in (
             "infer_dia_windows", "synthesize_all_ion_windows", "spectrum_level_collision_energy")))
         # The declared mzXML stay the unit's declared inputs: what is converted from them stands for them.

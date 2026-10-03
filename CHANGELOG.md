@@ -4,6 +4,31 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.24] - Unreleased
+
+### Added
+- In a campaign, the lease's `convert` stage gives an mzXML scan that records no
+  polarity (absent, or `any`) the unit's declared ion mode, as the user decided on
+  2026-10-02. It does so only where the unit's Catalog handoff declares exactly one
+  polarity (`technical_settings.ion_mode` Positive or Negative), the field the gate's
+  CONV-1 checks an imputation against. `project.ion_mode` is never read for it,
+  since a raw-header preflight rewrites it, and a split part's conversions stand for
+  its parent's declaration. Each imputation is recorded as a `polarity_imputation`
+  inference with its count. `ConversionOptions` gains `declared_ion_mode` and
+  `declared_ion_mode_field`, kept with every record's options, so a re-lease never
+  reuses a conversion made under another declaration. A declaration of Both or
+  Unknown, or none, imputes nothing, and CONV-1 then fails the spectra left without
+  a polarity.
+- An mzXML some of whose scans record the polarity opposite to the declaration
+  while others record none refuses the imputation, and is excluded as
+  `polarity_contradicts_declaration` (the user's default of 2026-10-03, as a failed
+  conversion is excluded): it is listed in `excluded_input_candidates`,
+  `input_lineage.excluded`, the campaign disposition's `excluded_inputs` and the
+  analysis CSV record, and the rest of the unit runs. A file whose scans all record
+  the opposite polarity converts with its recorded polarity, and the preflight's
+  per-file polarity rule decides what happens to it.
+- Agent capability `campaign_mzxml_polarity_from_declared_ion_mode`.
+
 ## [0.5.23] - Unreleased
 
 ### Added

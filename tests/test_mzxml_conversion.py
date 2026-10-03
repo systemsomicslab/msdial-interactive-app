@@ -590,6 +590,8 @@ class InferenceFlagTests(_Workspace):
         self.assertFalse(options.synthesize_all_ion_windows)
         self.assertFalse(options.spectrum_level_collision_energy)
         self.assertTrue(options.fail_on_sha1_mismatch)
+        self.assertIsNone(options.declared_ion_mode)
+        self.assertIsNone(options.declared_ion_mode_field)
 
     def test_spectrum_level_collision_energy_is_a_recorded_deviation(self) -> None:
         record, destination = self.convert(dda_32(), options={"spectrum_level_collision_energy": True})
@@ -622,6 +624,80 @@ class InferenceFlagTests(_Workspace):
     def test_polarity_imputation_is_refused_when_the_file_records_the_other_polarity(self) -> None:
         record, destination = self.convert(polarity_32(["any", "+"]), options={"impute_polarity": "negative"})
         self.assertFailedCleanly(record, destination, "polarity imputation refused")
+        # Named, so that a caller can tell a file that contradicts the declared polarity from one that will never
+        # convert.
+        self.assertEqual("polarity_imputation", record["refused_inference"])
+
+    def test_the_same_file_converts_without_the_imputation_its_polarity_less_scans_unrecorded(self) -> None:
+        record, destination = self.convert(polarity_32(["any", "+"]))
+        self.assertConverted(record)
+        self.assertNotIn("refused_inference", record)
+        self.assertEqual({"positive": 1, "unrecorded": 1}, record["counts"]["polarity"])
+
+    def test_a_file_whose_every_scan_records_the_other_polarity_is_not_refused(self) -> None:
+        """No scan records none, so nothing is imputed and nothing contradicts the polarity asked for: the file is
+        written with the polarity each scan records, and a caller splits it from the declared polarity's files."""
+        record, destination = self.convert(polarity_32(["+", "+"]), options={"impute_polarity": "negative"})
+        self.assertConverted(record)
+        self.assertNotIn("refused_inference", record)
+        self.assertEqual(([], {"positive": 2}), (record["inferences"], record["counts"]["polarity"]))
+
+    DECLARED = {"declared_ion_mode": "Negative", "declared_ion_mode_field": "catalog_handoff.technical_settings.ion_mode"}
+
+    def test_the_declaration_an_imputation_stands_for_is_recorded_with_the_options_and_the_inference(self) -> None:
+        record, destination = self.convert(polarity_32(["any", None]), options={"impute_polarity": "negative", **self.DECLARED})
+        self.assertConverted(record)
+        self.assertEqual(
+            ("negative", "Negative", "catalog_handoff.technical_settings.ion_mode"),
+            tuple(record["options"][key] for key in ("impute_polarity", *self.DECLARED)),
+        )
+        inference = record["inferences"][0]
+        self.assertEqual(
+            ("polarity_imputation", 2, "Negative", "catalog_handoff.technical_settings.ion_mode"),
+            (inference["kind"], inference["spectra"], inference["declared_ion_mode"], inference["declared_in"]),
+        )
+        # Recorded only: the mzML is the one an imputation without its declaration writes.
+        bare, bare_destination = self.convert(polarity_32(["any", None]), name="bare.mzXML", options={"impute_polarity": "negative"})
+        self.assertNotIn("declared_in", bare["inferences"][0])
+        self.assertEqual(
+            destination.read_bytes().replace(b"sample", b"bare"), bare_destination.read_bytes().replace(b"sample", b"bare")
+        )
+
+    def test_a_declaration_with_no_imputation_is_recorded_and_imputes_nothing(self) -> None:
+        record, _ = self.convert(polarity_32(["any", None]), options={**self.DECLARED, "declared_ion_mode": "Both"})
+        self.assertConverted(record)
+        self.assertEqual((None, "Both"), (record["options"]["impute_polarity"], record["options"]["declared_ion_mode"]))
+        self.assertEqual([], record["inferences"])
+        self.assertEqual({"unrecorded": 2}, record["counts"]["polarity"])
+
+    def test_an_imputation_its_declaration_does_not_give_is_refused(self) -> None:
+        for declared in ("Positive", "Both", "Unknown"):
+            with self.subTest(declared=declared):
+                record, destination = self.convert(
+                    polarity_32(["any", None]), options={"impute_polarity": "negative", **self.DECLARED, "declared_ion_mode": declared}
+                )
+                self.assertFailedCleanly(record, destination, f"is not the declared ion mode '{declared}'")
+        for name in self.DECLARED:
+            with self.subTest(option=name):
+                record, destination = self.convert(polarity_32(["any"]), options={name: "  "})
+                self.assertFailedCleanly(record, destination, f"option {name} must be text or null")
+
+    def test_a_conversion_made_under_another_declaration_is_not_reused(self) -> None:
+        both, destination = self.convert(polarity_32(["any", None]), options={**self.DECLARED, "declared_ion_mode": "Both"})
+        source = self.root / "data" / "sample.mzXML"
+        negative = {"impute_polarity": "negative", **self.DECLARED}
+        corrected = convert_mzxml_to_mzml(source, destination, negative, previous=both)
+        self.assertConverted(corrected)
+        self.assertFalse(corrected["reused_previous_record"])
+        self.assertEqual(2, corrected["inferences"][0]["spectra"])
+        # The same declaration read from another field is another option, both ways.
+        moved = convert_mzxml_to_mzml(
+            source, destination, {**negative, "declared_ion_mode_field": "project.ion_mode"}, previous=corrected
+        )
+        self.assertFalse(moved["reused_previous_record"])
+        again = convert_mzxml_to_mzml(source, destination, negative, previous=moved)
+        self.assertFalse(again["reused_previous_record"])
+        self.assertTrue(convert_mzxml_to_mzml(source, destination, negative, previous=again)["reused_previous_record"])
 
     def test_all_ion_scans_get_no_precursor_unless_synthesis_is_asked_for(self) -> None:
         record, destination = self.convert(all_ion_32())
@@ -686,6 +762,7 @@ class IntegrityTests(_Workspace):
         record, destination = self.convert(data[: len(data) // 2])
         self.assertFailedCleanly(record, destination, "ParseError")
         self.assertNotIn("error_errno", record, "a file that will never convert names no system error")
+        self.assertNotIn("refused_inference", record, "nor an inference it refused")
 
     def test_a_full_disk_is_recorded_with_its_system_error(self) -> None:
         """So that a caller can tell a disk a retry may get past from a file that will never convert."""

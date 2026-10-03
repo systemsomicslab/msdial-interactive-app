@@ -189,12 +189,25 @@ must be converted to mzML through a separately reviewed conversion workflow.
 Only in a campaign, where a campaign authorization covers the unit, is an
 mzXML converted by the download lease itself: its `convert` stage writes each
 of the unit's mzXML as mzML under `raw\converted` with Interactive's own
-converter (`msdial_app.mzxml_conversion`, every inference flag off), records
-each conversion in `input_conversions` and `provenance\input-conversions.json`,
-and runs what converted. A file whose conversion fails is excluded with reason
-`conversion_failed`, listed in the unit's `campaign_disposition`, and the rest
-of the unit runs; a full disk, or a file another process holds, instead stops
-the lease, so that the unit is retried. Where the unit holds a readable
+converter (`msdial_app.mzxml_conversion`, every inference flag off but one),
+records each conversion in `input_conversions` and
+`provenance\input-conversions.json`, and runs what converted. The one
+inference: a scan whose mzXML records no polarity is given the unit's declared
+ion mode, and only where the unit's Catalog handoff declares exactly one
+polarity (`technical_settings.ion_mode` Positive or Negative); the declaration
+and the field it was read from are recorded with the options, and each
+imputation as an inference with its count. A unit declaring Both or Unknown
+imputes nothing. A file some of whose scans record the other polarity and some
+none contradicts the declaration: the converter refuses the imputation for it,
+and the file is excluded unconverted with reason
+`polarity_contradicts_declaration`, the refusal kept in `input_conversions`'
+`polarity_contradictions`, and the rest of the unit runs. A file whose every
+scan records the other polarity is converted as it records it, and the
+raw-header preflight splits the unit by polarity. A file whose conversion
+fails is excluded with reason `conversion_failed`. Either exclusion is listed
+in the unit's `excluded_input_candidates` and `campaign_disposition`, and the
+rest of the unit runs; a full disk, or a file another process holds, instead
+stops the lease, so that the unit is retried. Where the unit holds a readable
 encoding of the same sample beside the mzXML, in the same place or anywhere it
 admits that file by itself, the Catalog's encoding rule analyses that one
 instead. mzData, which nothing converts, excludes its unit there too.
