@@ -4768,8 +4768,13 @@ def record_peak_height_diagnostic(
     representative: dict[str, Any] | None = None,
     job_id: str = "",
     diagnostic_directory: str = "",
+    annotation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write a peak-count diagnostic into the analysis unit's own manifest.
+
+    ``annotation`` is the diagnostic's own record of whether it annotated
+    (workflow.DIAGNOSTIC_ANNOTATION_SKIPPED for a campaign diagnostic), kept beside the count it
+    qualifies. A diagnostic from a version that kept no such record leaves the field out.
 
     WHAT THIS ENDS. The project contract requires the zero-threshold diagnostic before every
     production repository run, and requires "the method, representative sample, diagnostic count,
@@ -4807,6 +4812,7 @@ def record_peak_height_diagnostic(
         "estimated_peak_count": estimate.get("estimated_peak_count"),
         "threshold_step": estimate.get("threshold_step"),
         "method": estimate.get("method", ""),
+        **({"annotation": dict(annotation)} if isinstance(annotation, dict) else {}),
     }
 
     def change(manifest: dict[str, Any]) -> None:
