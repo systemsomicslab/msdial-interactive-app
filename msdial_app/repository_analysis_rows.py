@@ -111,7 +111,7 @@ ORDER_FIELDS = ("analytical order", "injection order", "run order", "acquisition
 BATCH_FIELDS = ("batch order", "batch number", "batch id")
 
 # Failures a caller may accept with allow_partial_mapping: an input no sample row claims, a row two inputs
-# claim, an input two rows claim, or an input of a sample whose rows do not say which is it, keeps the
+# claim, an input two rows claim, or an input of a sample whose rows do not say which it is, keeps the
 # default Class, as the name-matching path always allowed. Every other failure - counts that disagree, an
 # acquisition type that cannot be written, an alias that cannot be made - is structural.
 MAPPING_FAILURES = frozenset(
