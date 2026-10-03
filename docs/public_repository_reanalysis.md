@@ -87,6 +87,20 @@ archive's `POS/QC_01.mzML` is no encoding of `NEG/QC_01.mzXML` for a unit whose
 samples name `QC_01.mzXML`. mzData, which nothing converts, excludes its unit in
 a campaign too.
 
+A unit whose Catalog declared no analysis inputs admits a file by its listing,
+by the file names its samples declare, or through an archive one sample names.
+An archive member that carries a declared name only behind a prefix is admitted
+too (0.5.25): Metabolomics Workbench ST001264 declares `BioRec1.raw` and its
+study archive holds `021518_387057_CSHp_BioRec1.raw`. The member's name (or its
+stem, for a name declared without an extension) must end in `_`, `-`, `.` or a
+space and then the declared name, compared without case; exact matches are
+decided first; and the pairing must be one to one, so `Youn_sa1.raw` never
+takes `..._Youn_sa11.raw` and a name two members carry is given to neither. The
+input's `input_lineage` row records `name_pairing` (`declared_raw_file`,
+`member_name`, `paired_by` `prefixed_member_name`), and the analysis CSV finds
+its sample row by it. A declared name no member carries leaves its sample row
+in the CSV record's `samples_without_input`, and the rest run.
+
 Agent-driven reanalysis also requires a user-reviewed `analysis_purpose` before
 download. That purpose anchors Class/contrast selection, annotation strategy,
 QA, and requested outputs; it is retained with repository provenance.
@@ -265,6 +279,17 @@ The Data tab contains a **Repository metadata handler**. It can inspect an
 accession directly or reopen `run-manifest.json`, `repository-metadata.json`,
 or a reviewed metadata JSON. Each repository is normalized to one row per
 analysis file while all source values remain available for audit and editing.
+
+Rows may share a sample id: a repository lists each injection of a sample as a
+row of its own (MetaboLights MTBLS291's five replicates of `Cel`, MetaboBank
+MTBKS64's `S01_M01` and `S01_M02` of `S01`). Each such row is its own analysis
+input and analysis-CSV row, with its own raw file and its sample's Class;
+nothing is merged, averaged or dropped. A repository unit's CSV row records the
+sample row it came from (`sample_row_index`, `sample_raw_file`, and `sample_row`
+on its `input_lineage` row). What stays refused is what is ambiguous: one row
+two inputs name (`sample_row_with_two_inputs`), one input two rows name
+(`input_with_two_sample_rows`), and an input of a sample several rows describe
+that none of them names (`sample_row_not_identified`).
 
 Select metadata fields in the intended hierarchy, for example `Genotype`,
 `Region`, then `Sex`. MS-DIAL Interactive projects these fields into its single

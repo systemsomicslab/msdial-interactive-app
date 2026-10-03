@@ -2085,9 +2085,12 @@ def create_download_lease(
         archive_samples = _archive_sample_attribution(
             project, archive_extractions, extracted_members, data_root
         )
+        # The archive members a sample names behind a prefix (ST001264's 021518_387057_CSHp_BioRec1.raw for
+        # BioRec1.raw), decided once, one to one, for every stage below and for the lineage.
+        prefixed_members = _prefixed_member_pairing(project, extracted_members, data_root)
         mzxml_found = _find_mzxml_files(data_root) if campaign_authorization else []
         conversion_sources = _select_conversion_sources(
-            mzxml_found, data_root, project, archive_samples, archive_extractions
+            mzxml_found, data_root, project, archive_samples, archive_extractions, prefixed_members
         ) if mzxml_found else []
         conversion: dict[str, Any] | None = None
         stands_for: dict[str, str] = {}
@@ -2099,7 +2102,7 @@ def create_download_lease(
                 data_root,
                 readable,
                 _extracted_keys(extracted_members, data_root),
-                _readable_inputs_admitted(readable, data_root, project, archive_samples),
+                _readable_inputs_admitted(readable, data_root, project, archive_samples, prefixed_members),
             )
             chosen_over = {_file_key(item["mzxml"]) for item in choices}
 
@@ -2161,7 +2164,7 @@ def create_download_lease(
 
         stages.start("attribute")
         selected_extracted = _filter_project_allowlist_paths(
-            extracted, data_root, project, archive_samples=archive_samples
+            extracted, data_root, project, archive_samples=archive_samples, prefixed_members=prefixed_members
         )
         verified_checksums: dict[str, dict[str, Any]] = {}
         checksum_validation = _verify_project_allowlist_checksums(
@@ -2175,6 +2178,7 @@ def create_download_lease(
             archive_extractions=archive_extractions,
             stands_for=stands_for,
             set_aside=[item["path"] for item in (conversion or {}).get("excluded") or []],
+            prefixed_members=prefixed_members,
         )
         inputs, excluded_inputs, mzml_scanned = _exclude_undecodable_inputs(inputs)
         ignored_inputs = len(all_inputs) - len(inputs) - len(excluded_inputs)
@@ -2209,9 +2213,13 @@ def create_download_lease(
             excluded_inputs=excluded_inputs,
             conversions=conversions,
             stands_for={key: value for key, value in stands_for.items() if key in kept},
+            prefixed_members=prefixed_members,
         )
         if conversion_rows:
             input_lineage["conversion_sources"] = conversion_rows
+        # The inputs admitted only because their name carries a declared one behind a prefix; each lineage row
+        # says so (name_pairing).
+        paired = sum(1 for item in inputs if _file_key(item) in prefixed_members)
         pruned: dict[str, Any] = {}
         if store_lease is not None:
             # Now that the unit's own files are known: the links to anything else the store's objects
@@ -2238,6 +2246,7 @@ def create_download_lease(
             declared_files_verified=checksum_validation.get("verified", 0),
             archives_verified_at_download=checksum_validation.get("archives_verified_at_download", 0),
             **({"pruned_links": pruned.get("removed_files", 0)} if store_lease is not None else {}),
+            **({"prefixed_member_pairings": paired} if paired else {}),
         )
 
         stages.start("record")
@@ -3306,6 +3315,7 @@ def build_input_lineage(
     excluded_inputs: list[dict[str, Any]] | None = None,
     conversions: dict[str, dict[str, Any]] | None = None,
     stands_for: dict[str, str] | None = None,
+    prefixed_members: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """One row per analysis input: what it is, where its bytes came from, and what vouches for them.
 
@@ -3361,6 +3371,11 @@ def build_input_lineage(
     AN INPUT THAT STANDS FOR AN MZXML - one converted from it, or a readable encoding of its sample the lease
     chose over it (``stands_for``, by _file_key; the latter's row carries encoding_choice) - is given the
     sample and the declared names of that mzXML wherever its own name gives none.
+
+    AN ARCHIVE MEMBER THAT CARRIES A DECLARED NAME BEHIND A PREFIX (``prefixed_members``, by _file_key, the
+    lease's _prefixed_member_pairing; worked out here from ``extracted_members`` when not given) is the
+    sample's that declares that name, and its row says how it was paired (name_pairing: the declared raw
+    file, paired_by prefixed_member_name), so the analysis-CSV builder finds the same sample row by it.
     """
     verified_checksums = verified_checksums or {}
     excluded_inputs = excluded_inputs or []
@@ -3373,6 +3388,8 @@ def build_input_lineage(
     # An input that came out of an archive one sample names (X.zip) is that sample's, although its own
     # name (X.d) is no sample's.
     archive_samples = _archive_sample_attribution(project, archive_extractions, extracted_members, data_root)
+    if prefixed_members is None:
+        prefixed_members = _prefixed_member_pairing(project, extracted_members, data_root)
     # Each extraction's nested archives by label, built once (_nesting_index), so tracing a file to
     # the archives that held it does not walk the whole lineage once per file.
     nesting: dict[int, dict[str, list[dict[str, Any]]]] = {}
@@ -3419,8 +3436,9 @@ def build_input_lineage(
                     if parent_key == data_key or len(parent_key) < len(data_key):
                         break
 
-    def naming(path: Path, key: str) -> tuple[set[str], set[str]]:
-        """(the declared-name forms of a path relative to the data root, the samples its name gives)."""
+    def naming(path: Path, key: str) -> tuple[set[str], set[str], dict[str, str] | None]:
+        """(the declared-name forms of a path relative to the data root, the samples its name gives, and the
+        prefixed-member pairing that gave them, where that is what did)."""
         try:
             relative = path.resolve().relative_to(data_root.resolve()).as_posix()
         except ValueError:
@@ -3435,20 +3453,24 @@ def build_input_lineage(
         matched = sample_names.get(base) or sample_names.get(PurePosixPath(base).stem) or set()
         if not matched and key in archive_samples:
             matched = {archive_samples[key]}
-        return candidates, matched
+        if not matched and key in prefixed_members:
+            pairing = prefixed_members[key]
+            return candidates, sample_names.get(pairing["declared_raw_file"].casefold()) or set(), pairing
+        return candidates, matched, None
 
     rows = []
     for text in inputs:
         path = Path(text)
         key = _file_key(text)
-        candidates, matched_samples = naming(path, key)
+        candidates, matched_samples, pairing = naming(path, key)
+        paired_name = path.name
         stand = stands_for.get(key, "")
         if stand:
-            stand_candidates, stand_samples = naming(Path(stand), _file_key(stand))
+            stand_candidates, stand_samples, stand_pairing = naming(Path(stand), _file_key(stand))
             if not {item for item in candidates if item in declared}:
                 candidates = stand_candidates
-            if not matched_samples:
-                matched_samples = stand_samples
+            if not matched_samples and not pairing:
+                matched_samples, pairing, paired_name = stand_samples, stand_pairing, Path(stand).name
         row: dict[str, Any] = {
             "path": str(path),
             "kind": "",
@@ -3458,6 +3480,14 @@ def build_input_lineage(
             "source": {},
             "checksums": {},
         }
+        if pairing:
+            # Which declared raw file the input is, and by which rule: its own name carries that name only
+            # behind a prefix. The analysis-CSV builder finds the sample row by it.
+            row["name_pairing"] = {
+                "declared_raw_file": pairing["declared_raw_file"],
+                "member_name": paired_name,
+                "paired_by": pairing["paired_by"],
+            }
         if key in conversions:
             conversion = conversions[key]
             record = conversion["record"]
@@ -3751,13 +3781,15 @@ def _select_conversion_sources(
     project: RepositoryProject,
     archive_samples: dict[str, str],
     archive_extractions: list[dict[str, Any]],
+    prefixed_members: dict[str, dict[str, str]] | None = None,
 ) -> list[str]:
     """The mzXML that are this unit's to analyse, as the attribute stage will admit what is written from them.
 
     The Catalog's declared inputs, matched by path, where it declared them. Otherwise a file the listing
     names is converted only when the listing gives it for analysis (requires_conversion; an mzXML the
     Catalog demoted to raw_alternate beside a vendor file is not), and a file only an archive held when one
-    of the unit's samples names it, or it came out of the archive one sample names. A project with no
+    of the unit's samples names it (exactly, or behind a prefix: prefixed_members), or it came out of the
+    archive one sample names. A project with no
     analysis unit has no Catalog decision of which files are its inputs, and converts none: every mzXML of
     an accession would be converted beside the vendor files of the same samples.
     """
@@ -3800,7 +3832,11 @@ def _select_conversion_sources(
         if forms & listed:
             if forms & sources:
                 selected.append(item)
-        elif _matches_sample_file_names(Path(item), sample_names) or _file_key(item) in archive_samples:
+        elif (
+            _matches_sample_file_names(Path(item), sample_names)
+            or _file_key(item) in archive_samples
+            or _file_key(item) in (prefixed_members or {})
+        ):
             selected.append(item)
     return selected
 
@@ -8857,24 +8893,149 @@ def _matches_sample_file_names(
     return bool(stems) and PurePosixPath(base).stem in stems
 
 
+# A DECLARED FILE NAME AN ARCHIVE MEMBER CARRIES BEHIND A PREFIX. Metabolomics Workbench ST001264 declares
+# BioRec1.raw in its sample rows, and its study archive holds 021518_387057_CSHp_BioRec1.raw: the run's date
+# and sequence prefix, which no row records. No exact rule (the name, the extensionless stem, the container
+# alias) matched it, the attribute stage admitted nothing, and the unit failed after its whole download. A
+# member whose name ends in one of these separators and then a declared name is that declared file's, when
+# the pairing is one to one (_prefixed_member_pairing), and the pairing is recorded as made by this rule.
+PREFIX_SEPARATORS = frozenset("_-. ")
+PREFIXED_MEMBER_PAIRING = "prefixed_member_name"
+
+
+def _prefixed_member_pairing(
+    project: RepositoryProject,
+    extracted_members: dict[str, dict[str, Any]] | None,
+    data_root: Path,
+) -> dict[str, dict[str, str]]:
+    """The archive members an undeclared unit's samples name behind a prefix, by _file_key.
+
+    Each value says which declared raw file the member is ({"declared_raw_file", "paired_by"}). A member is
+    paired with a declared name when it carries no declared name exactly and its name - or its stem, for a
+    name a row records without an extension, as _sample_file_names reads those - ends in a separator
+    (PREFIX_SEPARATORS) and then the declared name, compared without case. EXACT MATCHES ARE DECIDED FIRST: a
+    declared name some member, or the unit's file listing, carries exactly is never paired by prefix, and a
+    member a declared name names exactly is never given another. THE PAIRING IS ONE TO ONE: a member that
+    ends in two declared names, or a declared name two members end in, pairs neither - which is why
+    Youn_sa1.raw never takes 021518_Youn_sa11.raw, whose name ends in _Youn_sa11.raw and not _Youn_sa1.raw,
+    and why a shared study archive holding POS/x_S1.raw and NEG/x_S1.raw gives S1.raw to neither.
+
+    Only what came out of an archive is paired (``extracted_members``: an analysable file outside a vendor
+    folder, or the outermost .d/.raw folder holding members): a file the repository lists on its own is
+    attributed by its listing. A unit whose Catalog declared its analysis inputs is matched by path and never
+    by a name (_select_declared_inputs), so it has none.
+    """
+    if not project.analysis_unit_id or not extracted_members or declared_analysis_inputs(project):
+        return {}
+    named: dict[str, set[str]] = {}
+    stemmed: dict[str, set[str]] = {}
+    for sample in project.sample_metadata or []:
+        raw = PurePosixPath(str((sample or {}).get("raw_file") or "").strip().replace("\\", "/")).name
+        if not raw:
+            continue
+        folded = raw.casefold()
+        if PurePosixPath(folded).suffix:
+            named.setdefault(folded, set()).add(raw)
+        else:
+            stemmed.setdefault(folded, set()).add(raw)
+        alias = archives.container_alias(folded)
+        if alias:
+            named.setdefault(alias.casefold(), set()).add(raw)
+    if not named and not stemmed:
+        return {}
+    data_key = _file_key(str(data_root))
+    pool: dict[str, str] = {}
+    for key in extracted_members:
+        path = Path(key)
+        outermost = ""
+        for parent in path.parents:
+            parent_key = str(parent)
+            if parent_key == data_key or len(parent_key) <= len(data_key):
+                break
+            if parent.suffix.casefold() in FOLDER_INPUT_SUFFIXES:
+                outermost = parent_key
+        if outermost:
+            pool[outermost] = Path(outermost).name.casefold()
+        elif not _is_sidecar_name(path.name) and (
+            path.suffix.casefold() in RAW_SUFFIXES or is_convertible_input(path.name)
+        ):
+            pool[key] = path.name.casefold()
+
+    def exactly(name: str) -> set[str]:
+        """The declared names a name carries exactly: itself, or its stem where a row records no extension."""
+        return {form for form in (name, PurePosixPath(name).stem) if form in stemmed} | (
+            {name} if name in named else set()
+        )
+
+    taken: set[str] = set()
+    for item in project.files:
+        base = PurePosixPath(str(item.name or "").replace("\\", "/")).name.casefold()
+        for name in filter(None, (base, archives.container_alias(base).casefold())):
+            taken |= exactly(name)
+    for name in pool.values():
+        taken |= exactly(name)
+    claims: dict[str, set[str]] = {}
+    claimed_by: dict[str, set[str]] = {}
+    for key, name in pool.items():
+        if exactly(name):
+            continue
+        found = {
+            text[index + 1:]
+            for text, table in ((name, named), (PurePosixPath(name).stem, stemmed))
+            for index, character in enumerate(text)
+            if character in PREFIX_SEPARATORS and text[index + 1:] in table and text[index + 1:] not in taken
+        }
+        if found:
+            claims[key] = found
+            for declared_name in found:
+                claimed_by.setdefault(declared_name, set()).add(key)
+    paired: dict[str, dict[str, str]] = {}
+    for key, found in claims.items():
+        declared_name = next(iter(found))
+        if len(found) != 1 or len(claimed_by[declared_name]) != 1:
+            continue
+        written = sorted(named.get(declared_name) or stemmed.get(declared_name) or {declared_name})
+        paired[key] = {"declared_raw_file": written[0], "paired_by": PREFIXED_MEMBER_PAIRING}
+    return paired
+
+
+def _paired_member_of(path: Path, prefixed: dict[str, dict[str, str]] | None) -> bool:
+    """Whether an extracted file is a prefixed member's: the member, its .wiff.scan, or inside its folder."""
+    if not prefixed:
+        return False
+    key = _file_key(str(path))
+    if key in prefixed:
+        return True
+    if _is_sidecar_name(path.name) and _file_key(str(path.with_name(path.name[:-5]))) in prefixed:
+        return True
+    return any(str(parent) in prefixed for parent in Path(key).parents)
+
+
 def _admitted_by_unit(
     path: Path,
     data_root: Path,
     listed: Iterable[str],
     sample_names: tuple[set[str], set[str]],
     archive_samples: dict[str, str],
+    prefixed: dict[str, dict[str, str]] | None = None,
 ) -> bool:
-    """Whether an undeclared unit admits a file by itself: listed, named by its samples, or out of an archive
-    one of its samples names (archive_samples, by _file_key)."""
+    """Whether an undeclared unit admits a file by itself: listed, named by its samples, out of an archive
+    one of its samples names (archive_samples, by _file_key), or an archive member one of its samples names
+    behind a prefix (prefixed, _prefixed_member_pairing)."""
     return (
         _path_matches_allowlist(path, data_root, listed)
         or _matches_sample_file_names(path, sample_names)
         or (bool(archive_samples) and _file_key(str(path)) in archive_samples)
+        or (bool(prefixed) and _file_key(str(path)) in prefixed)
     )
 
 
 def _readable_inputs_admitted(
-    readable: list[str], data_root: Path, project: RepositoryProject, archive_samples: dict[str, str]
+    readable: list[str],
+    data_root: Path,
+    project: RepositoryProject,
+    archive_samples: dict[str, str],
+    prefixed: dict[str, dict[str, str]] | None = None,
 ) -> set[str]:
     """The readable inputs an undeclared unit admits by itself, by _file_key, as its attribute stage will.
 
@@ -8890,7 +9051,7 @@ def _readable_inputs_admitted(
         _file_key(item)
         for item in readable
         if not requires_msdial_conversion(Path(item).name)
-        and _admitted_by_unit(Path(item), data_root, listed, sample_names, archive_samples)
+        and _admitted_by_unit(Path(item), data_root, listed, sample_names, archive_samples, prefixed)
     }
 
 
@@ -8903,13 +9064,17 @@ def _filter_inputs_by_project_allowlist(
     archive_extractions: list[dict[str, Any]] | None = None,
     stands_for: dict[str, str] | None = None,
     set_aside: list[str] | None = None,
+    prefixed_members: dict[str, dict[str, str]] | None = None,
 ) -> list[str]:
     """The inputs that are this unit's: listed, named by its samples, or out of an archive one names.
 
     archive_samples is _archive_sample_attribution's: the files, and outermost .d/.raw folders, that
     came out of an archive exactly one of this unit's samples names (X.zip). Without it, only names
     are matched, as they always were. archive_extractions is the lease's extraction records, which say
-    where a declared archived container really is (declared_archive_containers).
+    where a declared archived container really is (declared_archive_containers). prefixed_members is
+    _prefixed_member_pairing's: the archive members that carry a declared name behind a prefix, one to one
+    (021518_387057_CSHp_BioRec1.raw for BioRec1.raw). A declared name nothing carries, exactly or so, admits
+    nothing, and its sample row is left without an input (samples_without_input) as before.
 
     stands_for maps an input, by _file_key, to the mzXML it stands for (the convert stage's
     stands_for): an mzML converted from it, or a readable encoding of its sample chosen over it. Such an
@@ -8945,7 +9110,7 @@ def _filter_inputs_by_project_allowlist(
         )
 
     def admitted(path: Path, listed: Iterable[str]) -> bool:
-        return _admitted_by_unit(path, data_root, listed, sample_names, archive_samples)
+        return _admitted_by_unit(path, data_root, listed, sample_names, archive_samples, prefixed_members)
 
     # Either source is sufficient on its own, and both are scoped to THIS unit: the declared
     # analysis-input files, and the file names this unit's samples claim. An archive shared with
@@ -9277,12 +9442,14 @@ def _filter_project_allowlist_paths(
     project: RepositoryProject,
     *,
     archive_samples: dict[str, str] | None = None,
+    prefixed_members: dict[str, dict[str, str]] | None = None,
 ) -> list[str]:
     """The extracted files that are this unit's: listed, inside a listed folder, or its samples'.
 
     Matching the listed names alone gave [] for every Workbench unit, whose only listed file is the
     study archive: extracted_files said nothing came out for the unit although its inputs had. A file
-    that came out of an archive one of its samples names (archive_samples) is that sample's.
+    that came out of an archive one of its samples names (archive_samples) is that sample's, and so is a
+    member a sample names behind a prefix (prefixed_members), with its .wiff.scan and its folder's files.
     """
     if not project.analysis_unit_id:
         return paths
@@ -9295,6 +9462,7 @@ def _filter_project_allowlist_paths(
         if _path_matches_allowlist(Path(item), data_root, allowed, allow_directory_descendants=True)
         or _is_sample_member(Path(item), data_root, sample_names)
         or (bool(archive_samples) and _file_key(item) in archive_samples)
+        or _paired_member_of(Path(item), prefixed_members)
     ]
 
 
