@@ -360,8 +360,15 @@ applied: it sets `execution_allowed`, the status (`preflight_passed`,
 `skipped_by_preflight`, `excluded_by_preflight`) and each input's
 `console_acquisition_type` (DDA, SWATH or AIF; none for an input that does not
 run), and the execution gate then admits each file only as that type, and never
-as one that contradicts the Console type its header gives
-(`header_console_acquisition_type`).
+as one that contradicts the Console type its header settles
+(`header_console_acquisition_type`: a DDA or AIF header, or a DIA header whose
+isolation targets recur at two or more m/z, which is SWATH). A DIA header with one
+recorded isolation target or none binds no type: the extractor records targets
+only from MS2 headers that carry a precursor m/z. A disposition applied before
+Interactive 0.5.29 (it records no `declared_acquisition_source`) is decided again
+at the gate from the same records, and the run is refused where the new decision
+would not run the unit, would exclude a row's file, or would give it another type
+on its header's word, until `classify_preflight` or a new preflight records it.
 
 Each file's acquisition is its raw header's wherever the header was read (user
 decision, 2026-10-06). A file with MS2 whose header gives DDA, DIA, AIF or SWATH
@@ -370,14 +377,19 @@ gave: that confidence is a constant per branch of its classifier, and a
 declaration is the Catalog's keyword match over the assay's text. Each
 declaration a header overrode is listed in `declared_vs_header` with its
 `declaration_source` (`catalog_keyword_inference`, `split_part` or
-`unattributed`; the record's `declared_acquisition_source`). A file whose header
+`unattributed`; the record's `declared_acquisition_source`); an override is
+reported only for a file that reaches the run, and one excluded afterwards is
+listed with `decided: excluded` and its `excluded_reason`. A file whose header
 gives Unknown is excluded as `acquisition_unresolved`, declared unit or not, and
-one whose header gives PRM, SRM, MRM or SIM as out of scope. The declaration
+one whose header gives PRM, SRM, MRM or SIM as out of scope. A unit left with only
+Unknown-header and MS1-only files is skipped as `acquisition_unresolved`, not
+excluded. The declaration
 decides only a unit none of whose headers could be read
 (`acquisition_declared_only`), and SWATH or AIF for a DIA header whose isolation
 settles neither. MS1-only files are folded into a DDA run, except in a unit
 declared DIA or AIF, where they may be all-ion data exported as MS1 scans and are
-excluded as `ms1_only_in_declared_dia_unit`.
+excluded as `ms1_only_in_declared_dia_unit`. A split part is held to its parent's
+declaration there (`split_from.parent_declared_acquisition_mode`).
 
 A repository declaration of PRM, SRM, MRM, SIM or full scan is a declaration like
 any other, and untargeted status is never inferred over a declared targeted

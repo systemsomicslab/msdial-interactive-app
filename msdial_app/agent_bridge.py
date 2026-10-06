@@ -90,7 +90,8 @@ def summarize_jobs(
             # A campaign disposition takes each file's acquisition from its read raw header first (2026-10-06):
             # declared_vs_header records each declaration a header overrode, with its declaration_source; an
             # Unknown header is excluded; MS1-only files are not folded into DDA in a unit declared DIA or AIF;
-            # and the execution gate refuses a row that contradicts the Console type its header gives.
+            # and the execution gate refuses a row that contradicts the Console type its header gives, and decides
+            # an applied disposition from before 0.5.29 again, refusing the rows that decision would not run.
             "campaign_header_first_acquisition",
             # A campaign's lease (and any other under store_mode "always") fetches each object once per
             # accession into its download store and gives the unit a tree of links; a unit's release releases its

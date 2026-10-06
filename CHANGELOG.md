@@ -23,25 +23,63 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     `technical_settings.acquisition_mode`, which the Catalog writes only by keyword
     matching and with no source of its own), `split_part` or `unattributed`.
     `acquisition_header_disagrees_low_confidence` is no longer written.
+  - The override is reported (the warning `acquisition_header_overrides_declaration`
+    and the "run as their raw headers give" detail) only for files that reach the
+    run. A file whose header contradicted the declaration and that was then
+    excluded (`dia_scheme_unresolved`, `product_ion_only`, an out-of-scope method,
+    polarity) is listed in `declared_vs_header` with `decided: excluded`,
+    `basis: excluded` and its `excluded_reason`, and counted in a detail of its own.
   - A file whose header gives Unknown is excluded as `acquisition_unresolved` in a
     declared unit too, as it already was in an undeclared one. A header that gives
     PRM, SRM, MRM or SIM is excluded as `acquisition_out_of_scope:<method>`,
     whatever the declaration.
+  - A unit nothing of which runs, whose inputs are Unknown-header files and MS1-only
+    files only, is skipped as `acquisition_unresolved` instead of being excluded as
+    `acquisition_out_of_scope:FullScan`: the MS1-only files are out of scope only for
+    want of an MS2 file beside them, which a header that settles the others may give.
+    This holds for undeclared units too, which were excluded before. A unit with an
+    intrinsically out-of-scope input beside the Unknown ones (a targeted method, ion
+    mobility, polarity switching, an mzXML) is still excluded.
   - In a unit declared DIA, AIF or SWATH, MS1-only files are not folded into the DDA
     run its headers make. They are excluded as `ms1_only_in_declared_dia_unit`,
     since they may be all-ion data exported as MS1 scans (MTBLS1572's bbCID files).
     Elsewhere the fold is unchanged, and `ms1_only_beside_dia` still applies beside
     SWATH or AIF files. An MS1-only file whose header gives SWATH or AIF is never
     folded into DDA (`ms1_only_header_contradicts_dda`).
+  - A split part is held to its parent's declaration for that rule, since its own is
+    the mode its split wrote. A split records the parent's declared mode in
+    `split_from.parent_declared_acquisition_mode`; for a part split before 0.5.29
+    it is read from the parent manifest. The disposition records it as
+    `split_parent_declared_acquisition_mode`. A part split under the old rule could
+    carry MS1-only files its DDA part folded in; decided again, they are excluded.
   - Unchanged: a unit none of whose headers could be read is taken at its
     declaration (`acquisition_declared_only`); a DIA header whose isolation settles
     neither SWATH nor AIF takes the declared one; mixed acquisitions still split;
     untargeted status is never inferred over a declared targeted acquisition.
 - The execution gate refuses a row whose acquisition type contradicts the Console
-  type its file's header gives (`header_console_acquisition_type`), whatever an
-  applied disposition decided. A manifest decided under the old rule can no longer
-  run DDA-header files as SWATH. Outside a campaign this also refuses AIF for a DIA
-  header whose recurring isolation windows make it SWATH.
+  type its file's header settles (`header_console_acquisition_type`), whatever an
+  applied disposition decided: DDA or AIF for a DDA or AIF header, and SWATH for a
+  DIA header whose isolation targets recur at two or more m/z. A manifest decided
+  under the old rule can no longer run DDA-header files as SWATH. Outside a
+  campaign this is stricter than before in one case: AIF is refused for a DIA header
+  whose isolation targets make it SWATH, where the header's DIA used to admit SWATH
+  or AIF.
+  - A DIA header with one recorded isolation target or none binds no type. The
+    extractor records targets only from MS2 headers that carry a precursor m/z, so
+    none recorded is no evidence of all-ion acquisition. Such a row is held, as
+    before, to SWATH or AIF, and under an applied disposition to the type it
+    decided; a SWATH row the disposition decided is not refused.
+- The execution gate decides an applied disposition from before 0.5.29 again (one
+  with no `declared_acquisition_source`), in memory and from the same records, as
+  `classify_preflight` would. It refuses the run where that decision would not run
+  the unit, would exclude a row's file, or would give it another type on its
+  header's word, and says to decide the unit again (`classify_preflight`, or the
+  preflight run again). This refuses MTBKS217's `z_014nn` (an MS1-only file folded
+  into the DDA run of a unit declared DIA) and MTBLS1572's blank (an Unknown header
+  run as SWATH by the declaration). In a read-only simulation over the 10 recorded
+  runs that have an analysis CSV, every other run still passes.
+  A legacy row's type is not refused where the new decision rests on the
+  declaration or on a DIA header with no recorded isolation target.
 
 ### Added
 - Agent capability `campaign_header_first_acquisition`.
