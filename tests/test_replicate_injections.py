@@ -38,23 +38,31 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
     from msdial_app.archives import ExtractionLimits
     from msdial_app.repository_analysis_rows import (
         MAPPING_FAILURES,
+        PARTIAL_SAMPLE_COVERAGE_WARNING,
         blocking_failures,
         build_repository_analysis_rows,
     )
     from msdial_app.repository_reanalysis import (
+        INFERRED_PAIRING_WARNING,
+        LEADING_IDENTIFIER_TOKEN_PAIRING,
         PREFIXED_MEMBER_PAIRING,
         RepositoryFile,
         RepositoryProject,
         _file_key,
+        _member_name_pairings,
         _prefixed_member_pairing,
         create_download_lease,
         evaluate_repository_execution_gate,
+        leading_identifier_key,
+        plan_acquisition_split,
         project_from_dict,
         read_manifest,
+        split_unit_by_acquisition,
         update_manifest,
     )
 
 from test_folder_inputs import _Client, _exclude, _hand_made_unit, _no_backend
+from test_split_key import _Unit
 from test_mzml_encoding import dda_spectra, mzml
 
 # The default reserve is 20 GB of free space; these trees are a few kilobytes.
@@ -620,6 +628,325 @@ class TheLeaseAttributesAPrefixedMember(_Workspace):
 
         with self.assertRaisesRegex(ValueError, "Refusing to fall back to accession-level inputs"):
             self.lease(project, payloads)
+
+
+# ---- the handoff check and the CSV builder pair a declared input with a row alike --------------------------
+
+
+def _mtbks64_in_folders() -> tuple[dict, dict[str, bytes]]:
+    """MTBKS64 with S01's two rows naming one file name in two folders, as MTBLS3317's rows name
+    'FILES/Method 1/X.mzML' beside 'FILES/X.mzML'."""
+    handoff, _payloads = _mtbks64()
+    moved = {"raw/MDLC1_17050.RAW": "raw/batch1/QC.RAW", "raw/MDLC1_17051.RAW": "raw/batch2/QC.RAW"}
+    payloads = {}
+    for item in handoff["files"]:
+        item["path"] = moved.get(item["path"], item["path"])
+        item["download_url"] = MTBKS64_BASE + item["path"]
+        data = f"thermo raw bytes of {item['path']}".encode()
+        payloads[item["download_url"]] = data
+        item["size_bytes"], item["checksum"] = len(data), hashlib.md5(data).hexdigest()
+    for item in handoff["analysis_inputs"]:
+        item["path"] = moved.get(item["path"], item["path"])
+    for item in handoff["sample_metadata"]:
+        item["raw_file"] = moved.get(item["raw_file"], item["raw_file"])
+    handoff["download_scope"]["bundle_bytes"] = sum(item["size_bytes"] for item in handoff["files"])
+    return handoff, payloads
+
+
+class TheHandoffAndTheCsvPairRowsAlike(unittest.TestCase):
+    def test_rows_that_share_a_file_name_in_two_folders_are_paired_by_path_before_and_after_download(self) -> None:
+        handoff, payloads = _mtbks64_in_folders()
+        project, _workspace = mcp_server._project_from_analysis_unit_handoff(handoff)
+        self.assertEqual("passed", project["repository_metadata"]["analysis_input_check"]["status"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = _lease(Path(temporary), handoff, payloads)
+            _set_types(manifest_path, "DDA")
+            built = build_repository_analysis_rows(read_manifest(manifest_path))
+
+        self.assertEqual([], built["failures"])
+        self.assertEqual(
+            [("S01", "raw/batch1/QC.RAW", 0), ("S01", "raw/batch2/QC.RAW", 1)],
+            sorted(
+                (row["sample_id"], row["sample_raw_file"], row["sample_row_index"])
+                for row in built["rows"]
+                if row["sample_id"] == "S01"
+            ),
+        )
+        for row in built["rows"]:
+            self.assertEqual(Path(row["input_path"]).parent.name, Path(row["sample_raw_file"]).parent.name)
+
+    def test_an_input_neither_path_nor_name_pairs_is_refused_before_the_download(self) -> None:
+        handoff, _payloads = _mtbks64_in_folders()
+        handoff["analysis_inputs"][1]["path"] = "raw/batch3/QC2.RAW"
+        project, _workspace = mcp_server._project_from_analysis_unit_handoff(handoff)
+
+        self.assertEqual("failed", project["repository_metadata"]["analysis_input_check"]["status"])
+
+
+# ---- a split divides a sample's replicate rows by the part their inputs go to (MTBKS220) ------------------------
+
+
+class ASplitDividesReplicateRowsByTheirInputs(_Unit, unittest.TestCase):
+    """MetaboBank MTBKS220 gives each sample a timsOFF BAF row and a timsON TDF row under one sample id."""
+
+    INPUTS = {"d/S1.d": "baf", "d/S2.d": "baf", "d/T1.d": "tdf", "d/T2.d": "tdf"}
+    SAMPLE_OF = {"S1": "X1", "T1": "X1", "S2": "X2", "T2": "X2"}
+
+    def replicated_unit(self, declared_inputs: bool) -> Path:
+        manifest_path = self.unit(self.INPUTS, ion_mode="Positive", declared_inputs=declared_inputs)
+
+        def change(manifest: dict) -> None:
+            project = manifest["project"]
+            for row in project["sample_metadata"]:
+                row["sample_id"] = self.SAMPLE_OF[Path(row["raw_file"]).stem]
+            for entry in project.get("analysis_inputs") or []:
+                entry["sample_id"] = self.SAMPLE_OF[Path(entry["path"]).stem]
+            for item in project["files"]:
+                if item.get("sample_id"):
+                    item["sample_id"] = self.SAMPLE_OF[Path(item["container"]).stem]
+            project["class_proposal"]["assignments"] = [
+                {"sample_id": "X1", "class_label": "A"}, {"sample_id": "X2", "class_label": "B"}
+            ]
+
+        update_manifest(manifest_path, change)
+        self.preflight(manifest_path, {name: {"mode": "DDA", "polarity": "Positive"} for name in self.INPUTS})
+        return manifest_path
+
+    def check(self, declared_inputs: bool) -> None:
+        manifest_path = self.replicated_unit(declared_inputs)
+
+        plan = plan_acquisition_split(manifest_path)
+        result = split_unit_by_acquisition(manifest_path, confirmed=True)
+        parts = {part["analysis_unit_id"]: read_manifest(part["manifest_path"]) for part in result["parts"]}
+
+        self.assertEqual([], plan["blockers"])
+        self.assertEqual({"unit-x-dda": [0, 1], "unit-x-dda-im": [2, 3]},
+                         {part["analysis_unit_id"]: part["sample_row_indexes"] for part in plan["parts"]})
+        lc = parts["unit-x-dda"]
+        self.assertEqual(["FILES/d/S1.d", "FILES/d/S2.d"], [row["raw_file"] for row in lc["project"]["sample_metadata"]])
+        self.assertEqual(["X1", "X2"], sorted(item["sample_id"] for item in lc["project"]["class_proposal"]["assignments"]))
+        if declared_inputs:
+            self.assertEqual(["FILES/d/S1.d", "FILES/d/S2.d"],
+                             sorted(entry["path"] for entry in lc["project"]["analysis_inputs"]))
+            self.assertEqual(["FILES/d/T1.d", "FILES/d/T2.d"],
+                             sorted(entry["path"] for entry in parts["unit-x-dda-im"]["project"]["analysis_inputs"]))
+        built = build_repository_analysis_rows(lc)
+        # The fixture is a hand-made manifest with no lease lineage; nothing else may fail, and before the rows
+        # were divided this part failed with analysis_input_not_found and sample_without_input.
+        self.assertEqual(["input_without_lineage"], [item["code"] for item in built["failures"]])
+        self.assertEqual([("X1", "FILES/d/S1.d"), ("X2", "FILES/d/S2.d")],
+                         [(row["sample_id"], row["sample_raw_file"]) for row in built["rows"]])
+
+    def test_each_part_holds_only_the_rows_and_declared_inputs_of_its_own_inputs(self) -> None:
+        self.check(declared_inputs=True)
+
+    def test_an_undeclared_unit_divides_its_rows_alike(self) -> None:
+        self.check(declared_inputs=False)
+
+
+# ---- polarity tokens: a member of the other polarity is never paired ------------------------------------------
+
+
+class APairingNeverCrossesAPolarityToken(_Workspace):
+    def pairings(self, members: list[str], samples: list[tuple[str, str]], **project_changes) -> dict:
+        data_root = self.root / "raw" / "data"
+        project, _ = _st001264(members, samples)
+        for key, value in project_changes.items():
+            setattr(project, key, value)
+        extracted = {_file_key(str(data_root / name)): {"path": name} for name in members}
+        return _member_name_pairings(project, extracted, data_root)
+
+    def test_a_prefixed_member_of_the_other_polarity_is_refused_and_recorded(self) -> None:
+        result = self.pairings(["NEG_S1.raw", "NEG_S2.raw", "POS_S2.raw"], [("1", "S1.raw"), ("2", "S2.raw")])
+
+        self.assertEqual({}, result["paired"])
+        refused = {(item["member_name"].casefold(), item["reason"]) for item in result["refused"]}
+        self.assertIn(("neg_s1.raw", "polarity_token_contradicts_ion_mode"), refused)
+        self.assertIn(("neg_s2.raw", "not_one_to_one"), refused)
+
+    def test_a_polarity_folder_counts_as_a_token_of_the_members_path(self) -> None:
+        result = self.pairings(["NEG/x_S1.raw"], [("1", "S1.raw")])
+
+        self.assertEqual({}, result["paired"])
+        self.assertEqual(["polarity_token_contradicts_ion_mode"], [item["reason"] for item in result["refused"]])
+
+    def test_only_a_whole_token_states_a_polarity(self) -> None:
+        """'position' and 'negx' are no polarity tokens; 'Pos' in any case is one, and agrees here."""
+        result = self.pairings(
+            ["position_S1.raw", "negx_S2.raw", "run_Pos_S3.raw"], [("1", "S1.raw"), ("2", "S2.raw"), ("3", "S3.raw")]
+        )
+
+        self.assertEqual({"S1.raw", "S2.raw", "S3.raw"}, {item["declared_raw_file"] for item in result["paired"].values()})
+
+    def test_a_token_pairing_across_the_declared_names_polarity_is_refused(self) -> None:
+        result = self.pairings(["VV_1_b_neg.raw"], [("1", "VV_1_a_pos.raw")], ion_mode="Unknown")
+
+        self.assertEqual({}, result["paired"])
+        self.assertEqual(
+            [("leading_identifier_token", "polarity_token_contradicts_declared_name")],
+            [(item["rule"], item["reason"]) for item in result["refused"]],
+        )
+
+
+# ---- leading identifier tokens (the user's decision of 2026-10-06) ---------------------------------------------
+
+ST001359_SAMPLES = [
+    ("VV_13_HEpG2_C1", "VV_13_HEpG2_C1_pos.raw"), ("VV_14_HEpG2_C2", "VV_14_HEepG2_C2_pos.raw"),
+    ("VV_15_HEpG2_C3", "VV_15_HEpG2_C3_pos.raw"), ("VV_16_HEpG2_SDC1", "VV_16_HEpG2_SDC1_pos.raw"),
+    ("VV_17_HEpG2_SDC2", "VV_17_HEpG2_SDC2_pos.raw"), ("VV_18_HEpG2_SDC3", "VV_18_HEpG2_SDC3_pos.raw"),
+]
+ST001359_MEMBERS = [
+    "VV_13_HEpG2_C1_exp344_pos.raw", "VV_14_HEpG2_C2_exp344_pos.raw", "VV_15_HEpG2_C3_exp344_pos.raw",
+    "VV_16_HEpG2_SDC1_exp344_pos.raw", "VV_17_HEpG2_SDC2_exp344_pos.raw", "VV_18_HEpG2_SDC3_exp344_pos.raw",
+]
+
+
+class ADeclaredNameIsPairedByItsLeadingIdentifier(_Workspace):
+    def pairings(self, members: list[str], samples: list[tuple[str, str]], **project_changes) -> dict:
+        return APairingNeverCrossesAPolarityToken.pairings(self, members, samples, **project_changes)
+
+    def test_the_key_is_the_stem_up_to_its_first_token_with_a_digit(self) -> None:
+        self.assertEqual("vv_13", leading_identifier_key("VV_13_HEpG2_C1_pos.raw"))
+        self.assertEqual("vv_14", leading_identifier_key("VV_14_HEepG2_C2_pos.raw"))
+        self.assertEqual("biorec1", leading_identifier_key("BioRec1.raw"))
+        self.assertEqual("sample1", leading_identifier_key("Sample1"))
+        self.assertEqual("qc_pool_2", leading_identifier_key("QC pool-2.mzML"))
+        # A run date is no identifier: a key of digits only, or a name without a digit, gives none.
+        self.assertEqual("", leading_identifier_key("021518_387057_CSHp_BioRec1.raw"))
+        self.assertEqual("", leading_identifier_key("blank.raw"))
+
+    def test_st001359s_six_declared_names_pair_with_their_members_the_misspelt_one_included(self) -> None:
+        result = self.pairings(ST001359_MEMBERS, ST001359_SAMPLES)
+
+        paired = {Path(key).name.casefold(): item for key, item in result["paired"].items()}
+        self.assertEqual(6, len(paired))
+        self.assertEqual(
+            {"declared_raw_file": "VV_14_HEepG2_C2_pos.raw", "paired_by": LEADING_IDENTIFIER_TOKEN_PAIRING,
+             "key": "vv_14"},
+            paired["vv_14_hepg2_c2_exp344_pos.raw"],
+        )
+        self.assertEqual([], result["refused"])
+
+    def test_st001264s_rows_named_sample1_are_never_paired_with_its_youn_sa_members(self) -> None:
+        result = self.pairings(ST001264_MEMBERS, ST001264_SAMPLES)
+
+        self.assertEqual(
+            {"BioRec1.raw", "BioRec2.raw", "BioRec3.raw"},
+            {item["declared_raw_file"] for item in result["paired"].values()},
+        )
+        self.assertEqual({PREFIXED_MEMBER_PAIRING}, {item["paired_by"] for item in result["paired"].values()})
+
+    def test_a_key_two_declared_names_share_pairs_neither_and_says_so(self) -> None:
+        result = self.pairings(["VV_1_x_pos.raw"], [("a", "VV_1_a_pos.raw"), ("b", "VV_1_b_pos.raw")])
+
+        self.assertEqual({}, result["paired"])
+        self.assertEqual({"leading_identifier_not_unique"}, {item["reason"] for item in result["refused"]})
+
+    def test_a_key_two_members_share_pairs_neither(self) -> None:
+        result = self.pairings(["VV_1_x_pos.raw", "VV_1_y_pos.raw"], [("a", "VV_1_a_pos.raw")])
+
+        self.assertEqual({}, result["paired"])
+        self.assertEqual(2, len(result["refused"]))
+
+    def test_exact_and_prefixed_pairings_come_first(self) -> None:
+        # S_1.raw is carried exactly; R_2.raw behind a prefix; only T_3 is left for its token.
+        result = self.pairings(
+            ["S_1.raw", "x_R_2.raw", "T_3_extra.raw"], [("s", "S_1.raw"), ("r", "R_2.raw"), ("t", "T_3_pos.raw")]
+        )
+
+        self.assertEqual(
+            {"R_2.raw": PREFIXED_MEMBER_PAIRING, "T_3_pos.raw": LEADING_IDENTIFIER_TOKEN_PAIRING},
+            {item["declared_raw_file"]: item["paired_by"] for item in result["paired"].values()},
+        )
+
+    def test_a_unit_whose_catalog_declared_its_inputs_is_never_paired_by_token(self) -> None:
+        declared = [{"path": "VV_13_HEpG2_C1_pos.raw", "kind": "file", "sample_id": "VV_13_HEpG2_C1"}]
+        result = self.pairings(ST001359_MEMBERS, ST001359_SAMPLES, analysis_inputs=declared)
+
+        self.assertEqual({"paired": {}, "refused": []}, result)
+
+
+def _st001359_handoff() -> tuple[dict, dict[str, bytes]]:
+    data = _zip({name: f"thermo raw bytes of {name}".encode() for name in ST001359_MEMBERS})
+    url = "https://example.org/studydownload/ST001359_rawdata.zip"
+    files = [{
+        "path": "ST001359_rawdata.zip", "download_url": url, "size_bytes": len(data),
+        "checksum": hashlib.md5(data).hexdigest(), "role": "raw_archive", "sample_id": "", "sample_id_resolved": False,
+    }]
+    samples = [{"sample_id": sample, "raw_file": raw, "attributes": {}} for sample, raw in ST001359_SAMPLES]
+    proposal = {
+        "proposal_id": "p-st001359", "unit_id": "3c19ade8159ca01ad428", "status": "accepted",
+        "selected_fields": [], "rationale": "abstention",
+        "contrast_definition": {"kind": "abstention", "class_label": "All", "reason": "no_usable_declared_factor"},
+        "assignments": [{"sample_id": sample, "class_label": "All", "values": {}} for sample, _raw in ST001359_SAMPLES],
+    }
+    handoff = _handoff("ST001359", "3c19ade8159ca01ad428", files, [], samples, proposal)
+    handoff["repository"] = "metabolomics_workbench"
+    return handoff, {url: data}
+
+
+class AnInferredPairingIsAlwaysLeftOnRecord(_Workspace):
+    def test_the_lease_the_disposition_the_csv_and_the_reviewed_table_say_how_each_file_was_paired(self) -> None:
+        from msdial_app.raw_metadata_preflight import decide_disposition
+
+        handoff, payloads = _st001359_handoff()
+        manifest_path = _lease(self.root, handoff, payloads)
+        _set_types(manifest_path, "DDA")
+        manifest = read_manifest(manifest_path)
+
+        # The lineage row of each input names the declared raw file, the rule and the key.
+        rows = {Path(row["path"]).name: row for row in manifest["input_lineage"]["rows"]}
+        self.assertEqual(
+            {"declared_raw_file": "VV_14_HEepG2_C2_pos.raw", "member_name": "VV_14_HEpG2_C2_exp344_pos.raw",
+             "paired_by": LEADING_IDENTIFIER_TOKEN_PAIRING, "key": "vv_14"},
+            rows["VV_14_HEpG2_C2_exp344_pos.raw"]["name_pairing"],
+        )
+        self.assertEqual("VV_14_HEpG2_C2", rows["VV_14_HEpG2_C2_exp344_pos.raw"]["sample_id"])
+        # The attribute stage counts and lists every inferred pairing, and the unit carries the warning.
+        attribute = next(entry for entry in manifest["lease_stages"] if entry["stage"] == "attribute")
+        self.assertEqual(6, attribute["leading_identifier_token_pairings"])
+        self.assertEqual(6, len(attribute["inferred_name_pairings"]))
+        self.assertEqual([INFERRED_PAIRING_WARNING], attribute["warnings"])
+        self.assertEqual([INFERRED_PAIRING_WARNING], manifest["warnings"])
+        self.assertEqual(6, len(manifest["input_name_pairings"]["paired"]))
+        self.assertIn(INFERRED_PAIRING_WARNING, decide_disposition(manifest)["warnings"])
+
+        with patch.object(mcp_server, "_request_json", side_effect=_no_backend):
+            prepared = mcp_server.msdial_prepare_repository_reanalysis(confirmed=True, manifest_path=str(manifest_path))
+        with open(prepared["files"]["metadata_tsv"], encoding="utf-8-sig", newline="") as handle:
+            reviewed = list(csv.DictReader(handle, delimiter="\t"))
+        recorded = read_manifest(manifest_path)["analysis_csv"]
+
+        self.assertTrue(prepared["prepared"], prepared)
+        self.assertEqual([LEADING_IDENTIFIER_TOKEN_PAIRING] * 6, [row["raw_file_paired_by"] for row in reviewed])
+        self.assertEqual([INFERRED_PAIRING_WARNING], recorded["warnings"])
+        self.assertEqual(6, len(recorded["inferred_name_pairings"]))
+        self.assertEqual([INFERRED_PAIRING_WARNING], prepared["preview"]["warnings"])
+
+    def test_a_unit_whose_rows_are_not_all_delivered_says_so_beside_its_csv(self) -> None:
+        """ST001264 runs its 3 BioRec rows; the rows named Sample1.. have no input, and that is recorded."""
+        project, payloads = _st001264(ST001264_MEMBERS, ST001264_SAMPLES)
+        manifest = self.lease(project, payloads)
+        built = build_repository_analysis_rows(manifest)
+
+        self.assertEqual([], built["failures"])
+        self.assertEqual({"sample_rows": 5, "with_input": 3, "without_input": 2}, built["sample_row_coverage"])
+        self.assertEqual([PARTIAL_SAMPLE_COVERAGE_WARNING, INFERRED_PAIRING_WARNING], built["warnings"])
+        self.assertEqual(
+            [PREFIXED_MEMBER_PAIRING] * 3, [row["raw_file_paired_by"] for row in built["rows"]]
+        )
+
+    def test_a_unit_paired_exactly_records_what_it_always_did(self) -> None:
+        handoff, payloads = _mtbks64()
+        manifest_path = _lease(self.root, handoff, payloads)
+        manifest = read_manifest(manifest_path)
+        built = build_repository_analysis_rows(manifest)
+
+        self.assertNotIn("warnings", manifest)
+        self.assertNotIn("input_name_pairings", manifest)
+        self.assertEqual([], built["warnings"])
+        self.assertEqual({"exact"}, {row["raw_file_paired_by"] for row in built["rows"]})
 
 
 if __name__ == "__main__":

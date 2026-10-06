@@ -9174,10 +9174,10 @@ def _member_name_pairings(
     def written(declared_name: str) -> str:
         return sorted(named.get(declared_name) or stemmed.get(declared_name) or {declared_name})[0]
 
-    def refuse(key: str, declared_raw_file: str, rule: str, reason: str, **extra: Any) -> None:
+    def refuse(member: str, declared_raw_file: str, rule: str, reason: str, **extra: Any) -> None:
         result["refused"].append(
             {
-                "member_name": relative(key),
+                "member_name": relative(member),
                 "declared_raw_file": declared_raw_file,
                 "rule": rule,
                 "reason": reason,
