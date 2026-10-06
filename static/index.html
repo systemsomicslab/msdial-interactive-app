@@ -672,7 +672,7 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
       </div>
       <div class="panel">
         <h2>Peak-picking threshold</h2>
-        <p class="muted">After the zero-threshold diagnostic, the automatic selector targets 3,000-6,000 peaks. It uses 100-unit steps for QTOF-type data and 1,000-unit steps for Fourier-transform data. If no more than 6,000 peaks are found at zero, the threshold remains 0.</p>
+        <p class="muted">After the zero-threshold diagnostic, the automatic selector targets 3,000-6,000 peaks. It uses 100-unit steps for QTOF-type data and 1,000-unit steps for Fourier-transform data, and falls back to 10-unit (QTOF-type) or 100-unit (Fourier-transform) steps only when no coarse step lands in range; it never goes finer. If no more than 6,000 peaks are found at zero, the threshold remains 0.</p>
         <div class="slider-row">
           <label>Minimum peak height<input id="tuningHeightNumber" type="number" min="0" value="100"></label>
           <input id="tuningHeight" type="range" min="0" max="10000" step="1" value="100">

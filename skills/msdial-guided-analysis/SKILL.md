@@ -79,8 +79,11 @@ When `parameter_strategy` is `auto_peak_range` or `target_peak_count`:
    target. The diagnostic automatically selects a mid-run QC, or a mid-run
    non-blank sample when no QC exists. It targets 3,000-6,000 retained peaks in
    100-unit threshold steps for QTOF-type data and 1,000-unit steps for
-   Fourier-transform data. A diagnostic count at or below 6,000 keeps the
-   threshold at 0. For an exact target, pass `target_peak_count`.
+   Fourier-transform data. Only when no such step lands in range does it fall
+   back to 10-unit (QTOF-type) or 100-unit (Fourier-transform) steps, never
+   finer; the estimate then says `step_fallback: true`. When
+   `within_target_range` is false, show its `warnings` to the user. A diagnostic
+   count at or below 6,000 keeps the threshold at 0. For an exact target, pass `target_peak_count`.
 6. Present the proposed `minimum_peak_height`, diagnostic peak count, and estimated retained count.
 7. Add the threshold to `answers` only after the user accepts it or supplies a replacement.
 

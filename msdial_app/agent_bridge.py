@@ -31,6 +31,11 @@ def summarize_jobs(
             "guided_analysis_planning",
             "reusable_worksets",
             "single_file_peak_count_tuning",
+            # The stepped threshold falls back from the instrument-family step to its tenth (10 for QTOF-type,
+            # 100 for FT), and no finer, only when no family-step threshold lands in the target range; the
+            # estimate and the unit's peak_height_diagnostics record threshold_step (the step used),
+            # coarse_threshold_step, step_fallback, fallback_reason and within_target_range.
+            "peak_height_fine_step_fallback",
             "console_path_discovery_and_persistence",
             "console_release_channel_inspection",
             "local_source_console_build_with_provenance",

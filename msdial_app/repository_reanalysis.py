@@ -4806,6 +4806,13 @@ def record_peak_height_diagnostic(
         "diagnostic_peak_count": estimate.get("diagnostic_peak_count"),
         "estimated_peak_count": estimate.get("estimated_peak_count"),
         "threshold_step": estimate.get("threshold_step"),
+        # The user's rule of 2026-10-06: the family step first, and its tenth only when no multiple of
+        # the family step lands in the target range. Whether the fine step was used, and whether even
+        # it missed, must be on record beside the threshold it produced.
+        "coarse_threshold_step": estimate.get("coarse_threshold_step", estimate.get("threshold_step")),
+        "step_fallback": bool(estimate.get("step_fallback", False)),
+        "fallback_reason": estimate.get("fallback_reason"),
+        "within_target_range": estimate.get("within_target_range"),
         "method": estimate.get("method", ""),
     }
 

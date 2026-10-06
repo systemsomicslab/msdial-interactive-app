@@ -124,8 +124,12 @@ The repository answer seed uses `auto_peak_range`. Run the zero-threshold
 single-file diagnostic on a QC nearest the run midpoint, or a non-blank sample
 nearest the midpoint when no QC is available. Estimate a threshold retaining
 3,000-6,000 peaks, constrained to 100-unit steps for QTOF-type data or
-1,000-unit steps for Fourier-transform data. Keep 0 when the diagnostic finds
-no more than 6,000 peaks. Add the accepted threshold to `answer_seed` before
+1,000-unit steps for Fourier-transform data. Only when no such step lands in
+range, fall back to 10-unit (QTOF-type) or 100-unit (Fourier-transform) steps,
+and never finer (the user's decision of 2026-10-06). The fallback is recorded as
+`step_fallback` and `fallback_reason`, and a threshold that misses the range even
+at the fine step as `within_target_range: false` with a warning. Keep 0 when the
+diagnostic finds no more than 6,000 peaks. Add the accepted threshold to `answer_seed` before
 production. Repository runs use `TimeBasedLinearWeightedMovingAverage` and must
 record it in the generated method and provenance.
 

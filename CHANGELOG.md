@@ -4,6 +4,49 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.28] - Unreleased
+
+Version order: 0.5.25 (#58), 0.5.26 (#59) and 0.5.27 (#60) are open beside this
+one, and all four branch from 0.5.24.
+
+### Changed
+- The stepped Minimum peak height (`estimate_peak_height_range`, the "quantized
+  height-range search" behind `msdial_estimate_peak_height` and
+  `POST /api/agent/tuning/estimate` without an exact target) follows the user's
+  decision of 2026-10-06. It searches the instrument-family step first (100 for
+  QTOF-type data, 1,000 for Fourier-transform data). Only when the zero-threshold
+  count is above 6,000 and no multiple of that step gives a count in range does
+  it search again in a tenth of the step (10 for QTOF-type, 100 for FT,
+  `fine_threshold_step`), and it never goes finer: on the Waters MSe demo a count
+  in range is reached only at a threshold of 2, where the median S/N is 2.6. A
+  zero-threshold count of 6,000 or fewer still keeps 0, and the 3,000-6,000
+  target is unchanged.
+- Of the fourteen diagnostics on disk, this changes four, and no completed pilot
+  unit: the Bruker compact DDA demo goes from 100 (an estimated 1,932 peaks) to 30
+  (4,722); the Waters Premier DDA demo from 100 (754) to 20 (3,627); MetaboBank
+  MTBKS281 from 100 (338) to 10 (2,484), still out of range; and the Waters MSe
+  demo from 100 (26) to 10 (522), still out of range.
+- When even the fine step misses the range, the threshold is the candidate
+  nearest it, `within_target_range` is false, and the estimate carries a
+  `warnings` entry, which the Tune parameters view shows. Before, an
+  out-of-range threshold said so only in `within_target_range`.
+
+### Added
+- The estimate records `threshold_step` (now the step actually used),
+  `coarse_threshold_step` (the family step), `fine_threshold_step`,
+  `step_fallback`, `fallback_reason` (`no_coarse_step_in_range` or null),
+  `coarse_minimum_peak_height` and `coarse_estimated_peak_count` (what the family
+  step alone chose), beside `within_target_range` and `warnings`. Each
+  `peak_height_diagnostics` record in the unit's manifest keeps the whole
+  estimate, as before, and now also names `coarse_threshold_step`,
+  `step_fallback`, `fallback_reason` and `within_target_range` beside
+  `threshold_step`; a record of an estimate from before this reads as its own
+  step with no fallback.
+- Agent capability `peak_height_fine_step_fallback`.
+- `tests/vectors/peak_height_diagnostics.v1.json`: the height histograms of the
+  fourteen diagnostics, each height rounded down to a multiple of the step the
+  estimate uses, which leaves every count the search reads unchanged.
+
 ## [0.5.24] - Unreleased
 
 ### Added

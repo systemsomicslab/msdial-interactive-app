@@ -344,7 +344,12 @@ Each MSP slider is paired with a numeric input for exact threshold entry.
 After a diagnostic run, **Auto-select for 3,000-6,000 peaks** chooses a stepped
 threshold from the observed height distribution. It uses 100-unit steps for
 QTOF-type data and 1,000-unit steps for Fourier-transform data; a zero-threshold
-count at or below 6,000 keeps the threshold at zero. Agent-driven repository
+count at or below 6,000 keeps the threshold at zero. Only when no such step
+lands in 3,000-6,000 does it fall back to 10-unit (QTOF-type) or 100-unit
+(Fourier-transform) steps, and it never goes finer. The estimate records the step
+used (`threshold_step`), the family step (`coarse_threshold_step`),
+`step_fallback`, `fallback_reason` and `within_target_range`; a threshold that
+misses the range even at the fine step is the nearest one, with a warning. Agent-driven repository
 analysis selects a QC nearest the run midpoint, or a mid-run non-blank sample
 when no QC is available.
 Suggested starting values are:

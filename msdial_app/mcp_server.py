@@ -2667,6 +2667,12 @@ def msdial_estimate_peak_height(
 ) -> dict[str, Any]:
     """Estimate a stepped Minimum peak height from a completed zero-threshold diagnostic.
 
+    The step is the instrument family's (100 QTOF-type, 1,000 FT, or threshold_step). Only when no
+    multiple of it gives a count in range does the search fall back to a tenth of it, and no finer; the
+    estimate then says step_fallback true, fallback_reason "no_coarse_step_in_range", and threshold_step
+    the step used, with the family step as coarse_threshold_step. When within_target_range is false,
+    show the user the estimate's warnings.
+
     With manifest_path, a diagnostic the backend no longer holds is found in the unit's diagnostics
     directory by its job_id and its result file is read again, instead of running the Console again.
     """

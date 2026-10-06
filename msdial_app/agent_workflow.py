@@ -308,35 +308,23 @@ def estimate_peak_height(heights: list[float], target_peak_count: int) -> dict[s
     }
 
 
-def estimate_peak_height_range(
-    heights: list[float],
-    minimum_peak_count: int = 3000,
-    maximum_peak_count: int = 6000,
-    threshold_step: int = 100,
-) -> dict[str, Any]:
-    values = sorted(float(value) for value in heights if float(value) >= 0)
-    minimum = max(0, int(minimum_peak_count))
-    maximum = max(minimum, int(maximum_peak_count))
-    step = max(1, int(threshold_step))
-    if not values:
-        raise ValueError("The diagnostic result contains no peak heights.")
+def fine_threshold_step(coarse_step: int) -> int:
+    """The step the range search may fall back to: a tenth of the instrument-family step.
 
-    if len(values) <= maximum:
-        return {
-            "minimum_peak_height": 0,
-            "target_peak_count_min": minimum,
-            "target_peak_count_max": maximum,
-            "estimated_peak_count": len(values),
-            "diagnostic_peak_count": len(values),
-            "threshold_step": step,
-            "within_target_range": minimum <= len(values) <= maximum,
-            "method": "quantized height-range search",
-            "note": (
-                "The zero-threshold diagnostic did not exceed the upper peak-count bound; "
-                "Minimum peak height remains 0."
-            ),
-        }
+    10 for QTOF-type data (step 100) and 100 for Fourier-transform data (step 1,000), the user's
+    decision of 2026-10-06. It is a floor: the search never goes finer, because on Waters MSe data a
+    count in range is reached only near the noise floor (threshold 2, median S/N 2.6). A step that is
+    not a multiple of 10 has no finer step and is its own floor.
+    """
+    step = max(1, int(coarse_step))
+    return step // 10 if step >= 10 and step % 10 == 0 else step
 
+
+def _stepped_threshold(
+    values: list[float], step: int, minimum: int, maximum: int
+) -> tuple[int, int]:
+    """The multiple of step whose count is in [minimum, maximum] and nearest its midpoint, or, when
+    none is in range, the one nearest the range. Returns (threshold, count at or above it)."""
     candidates = {0}
     for value in values:
         lower = max(0, math.floor(value / step) * step)
@@ -350,20 +338,109 @@ def estimate_peak_height_range(
         return distance, abs(count - midpoint), threshold
 
     threshold = min(candidates, key=candidate_score)
-    detected = len(values) - bisect_left(values, threshold)
+    return threshold, len(values) - bisect_left(values, threshold)
+
+
+def estimate_peak_height_range(
+    heights: list[float],
+    minimum_peak_count: int = 3000,
+    maximum_peak_count: int = 6000,
+    threshold_step: int = 100,
+) -> dict[str, Any]:
+    """A Minimum peak height on the instrument-family step that keeps minimum-maximum peaks.
+
+    The user's rule of 2026-10-06:
+    - 0 when the zero-threshold count is at most the upper bound;
+    - otherwise the family step (threshold_step: 100 for QTOF-type, 1,000 for FT);
+    - only when no multiple of the family step gives a count in range, the fine step (a tenth of it,
+      fine_threshold_step), and never finer;
+    - when even the fine step misses, the candidate nearest the range, marked out of range with a
+      warning.
+
+    threshold_step in the result is the step actually used, coarse_threshold_step the family step,
+    step_fallback and fallback_reason ("no_coarse_step_in_range" or None) say whether and why the fine
+    step was used. coarse_minimum_peak_height and coarse_estimated_peak_count keep what the family
+    step alone would have chosen, so a fallback can be read against it.
+    """
+    values = sorted(float(value) for value in heights if float(value) >= 0)
+    minimum = max(0, int(minimum_peak_count))
+    maximum = max(minimum, int(maximum_peak_count))
+    step = max(1, int(threshold_step))
+    fine_step = fine_threshold_step(step)
+    if not values:
+        raise ValueError("The diagnostic result contains no peak heights.")
+
+    if len(values) <= maximum:
+        return {
+            "minimum_peak_height": 0,
+            "target_peak_count_min": minimum,
+            "target_peak_count_max": maximum,
+            "estimated_peak_count": len(values),
+            "diagnostic_peak_count": len(values),
+            "threshold_step": step,
+            "coarse_threshold_step": step,
+            "fine_threshold_step": fine_step,
+            "step_fallback": False,
+            "fallback_reason": None,
+            "coarse_minimum_peak_height": 0,
+            "coarse_estimated_peak_count": len(values),
+            "within_target_range": minimum <= len(values) <= maximum,
+            "warnings": [],
+            "method": "quantized height-range search",
+            "note": (
+                "The zero-threshold diagnostic did not exceed the upper peak-count bound; "
+                "Minimum peak height remains 0."
+            ),
+        }
+
+    coarse_threshold, coarse_detected = _stepped_threshold(values, step, minimum, maximum)
+    threshold, detected, used_step = coarse_threshold, coarse_detected, step
+    fallback = not (minimum <= coarse_detected <= maximum) and fine_step < step
+    if fallback:
+        threshold, detected = _stepped_threshold(values, fine_step, minimum, maximum)
+        used_step = fine_step
+    within = minimum <= detected <= maximum
+    warnings: list[str] = []
+    if not within:
+        warnings.append(
+            f"No Minimum peak height in steps of {used_step} gives {minimum}-{maximum} peaks: the "
+            f"nearest, {threshold}, keeps {detected} of the {len(values)} found at zero threshold. "
+            + (
+                f"The family step {step} was tried first and a step of {fine_step} is the finest the "
+                "search uses. "
+                if fallback
+                else ""
+            )
+            + "The threshold is out of the target range; review it before a production run."
+        )
+    if fallback:
+        note = (
+            f"No multiple of the instrument-family step {step} gave {minimum}-{maximum} peaks "
+            f"(nearest {coarse_threshold}, {coarse_detected} peaks), so the search fell back to "
+            f"steps of {fine_step}, the finest it uses."
+        )
+    else:
+        note = (
+            "The threshold is constrained to the instrument-family step. Review the "
+            "diagnostic count when no stepped threshold can enter the requested range."
+        )
     return {
         "minimum_peak_height": threshold,
         "target_peak_count_min": minimum,
         "target_peak_count_max": maximum,
         "estimated_peak_count": detected,
         "diagnostic_peak_count": len(values),
-        "threshold_step": step,
-        "within_target_range": minimum <= detected <= maximum,
+        "threshold_step": used_step,
+        "coarse_threshold_step": step,
+        "fine_threshold_step": fine_step,
+        "step_fallback": fallback,
+        "fallback_reason": "no_coarse_step_in_range" if fallback else None,
+        "coarse_minimum_peak_height": coarse_threshold,
+        "coarse_estimated_peak_count": coarse_detected,
+        "within_target_range": within,
+        "warnings": warnings,
         "method": "quantized height-range search",
-        "note": (
-            "The threshold is constrained to the instrument-family step. Review the "
-            "diagnostic count when no stepped threshold can enter the requested range."
-        ),
+        "note": note,
     }
 
 

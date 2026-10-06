@@ -73,7 +73,9 @@ the same Agent Skills package.
 3. For LC-MS, ask positive/negative and metabolomics/lipidomics.
 4. Use template defaults, an exact peak-count target, or run the automatic
    3,000-6,000 peak diagnostic. Automatic selection prefers a mid-run QC and
-   uses instrument-specific threshold steps.
+   uses instrument-specific threshold steps (100 for QTOF-type data, 1,000 for
+   Fourier-transform data), falling back to a tenth of the step, and no finer,
+   only when no coarse step lands in range.
 5. Optionally choose reviewed user-defined RT correction or automatic
    alignment-only correction learned from detected features. Never enable both.
 6. Use official versioned, existing, tiered lipid/MSP, or no annotation libraries.
