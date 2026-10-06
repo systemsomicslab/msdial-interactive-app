@@ -31,11 +31,17 @@ def summarize_jobs(
             "guided_analysis_planning",
             "reusable_worksets",
             "single_file_peak_count_tuning",
-            # The stepped threshold falls back from the instrument-family step to its tenth (10 for QTOF-type,
-            # 100 for FT), and no finer, only when no family-step threshold lands in the target range; the
-            # estimate and the unit's peak_height_diagnostics record threshold_step (the step used),
-            # coarse_threshold_step, step_fallback, fallback_reason and within_target_range.
+            # The stepped threshold falls back from the instrument-family step to the fine step (10 for
+            # QTOF-type, 100 for FT, an absolute floor), only when no family-step threshold lands in the target
+            # range; the estimate and the unit's peak_height_diagnostics record threshold_step (the step used),
+            # coarse_threshold_step, fine_threshold_step, step_fallback, fallback_reason and within_target_range.
             "peak_height_fine_step_fallback",
+            # Within the range, the highest threshold keeping at least the lower bound (selection_rule).
+            "peak_height_lower_end_selection",
+            # An mzML's header names its instrument family: Orbitrap-class and FT-ICR are Fourier-transform.
+            "mzml_header_instrument_family",
+            # A production run's actual per-file peak counts beside the estimate (production_peak_counts).
+            "production_peak_counts",
             "console_path_discovery_and_persistence",
             "console_release_channel_inspection",
             "local_source_console_build_with_provenance",

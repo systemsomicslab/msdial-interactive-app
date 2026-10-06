@@ -307,7 +307,10 @@ class TheFallbackIsOnRecord(unittest.TestCase):
         self.assertIsNone(recorded["selection_rule"], "it chose the midpoint, and says nothing else")
 
     def test_the_capability_is_advertised(self) -> None:
-        self.assertIn("peak_height_fine_step_fallback", summarize_jobs({})["capabilities"])
+        capabilities = summarize_jobs({})["capabilities"]
+        for name in ("peak_height_fine_step_fallback", "peak_height_lower_end_selection",
+                     "mzml_header_instrument_family", "production_peak_counts"):
+            self.assertIn(name, capabilities)
 
 
 class TheEstimateEndpointRecordsTheFallback(_Unit, _Backend, unittest.TestCase):
