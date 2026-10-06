@@ -1804,6 +1804,23 @@ def _stage_input(source: Path, destination_folder: Path) -> Path:
     return staged
 
 
+def data_type_record(state: dict[str, Any]) -> dict[str, Any]:
+    """The MS1 and MS2 data type a run's method file asks for, the basis of each, and the decision behind them.
+
+    A run without a decision (a laboratory analysis, or a repository state built before 0.5.27) has basis
+    "unrecorded": the values are what the state carried, and nothing says where they came from.
+    """
+    decision = state.get("data_type_provenance") if isinstance(state.get("data_type_provenance"), dict) else None
+    record: dict[str, Any] = {}
+    for key in ("ms1_data_type", "ms2_data_type"):
+        record[key] = str(state.get(key, "Centroid"))
+        record[f"{key}_basis"] = str((decision or {}).get(f"{key}_basis") or "unrecorded")
+    if decision is not None:
+        record["warnings"] = list(decision.get("warnings") or [])
+        record["decision"] = decision
+    return record
+
+
 def prepare_run(
     state: dict[str, Any],
     progress: Callable[[str], None] | None = None,
@@ -1879,6 +1896,10 @@ def prepare_run(
         ]
         expected_analysis_exports.extend(expected_automatic_rt_correction_exports)
     manifest_path = run_directory / "run-manifest.json"
+    # The MS1 and MS2 data type method.txt asks for, and on what basis: raw_header where every input of a
+    # repository unit recorded one representation, default otherwise, with the decision that said so
+    # (data_type_provenance, set by repository_reanalysis.apply_header_data_types).
+    data_types = data_type_record(method_state)
     # A version string and a path cannot identify a binary: the string is whatever the
     # assembly claims, the path can be rebuilt under. inspect_console_path already
     # computes the checksum, the build record and the git state of the working tree it
@@ -1937,6 +1958,7 @@ def prepare_run(
         "qa_matrix_expected": bool(
             project_type == "lcms" and method_state.get("height_matrix_export")
         ),
+        "data_types": data_types,
     }
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -1986,6 +2008,7 @@ def prepare_run(
         "qa_matrix_expected": bool(
             project_type == "lcms" and method_state.get("height_matrix_export")
         ),
+        "data_types": data_types,
         "diagnostic_result_file": expected_analysis_exports[0] if len(files) == 1 else "",
         "input_csv": str(csv_path),
         "console_input": str(csv_path),

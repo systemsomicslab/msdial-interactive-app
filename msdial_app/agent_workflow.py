@@ -726,7 +726,14 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
                 "gcms_ri_dictionary_path": str(answers.get("gcms_ri_dictionary_path", "")),
             }
         )
-    state.update(dict(answers.get("workflow_overrides") or {}))
+    overrides = dict(answers.get("workflow_overrides") or {})
+    state.update(overrides)
+    if str(state.get("repository_run_manifest") or "").strip():
+        # A repository unit's MS1 and MS2 data type come from its inputs' raw headers where they all agree,
+        # not from the template; the decision and its basis are kept as data_type_provenance.
+        from .repository_reanalysis import DATA_TYPE_KEYS, apply_header_data_types
+
+        apply_header_data_types(state, explicit=[key for key in DATA_TYPE_KEYS if key in overrides])
     _adopt_recorded_analytical_order(state)
     repository_metadata_path = str(answers.get("repository_metadata_path") or "").strip()
     if repository_metadata_path:

@@ -595,6 +595,161 @@ def _declared_agrees(declared: str, header: str, header_console: str | None) -> 
 
 
 # ------------------------------------------------------------------------------------------------------
+# What a header says about how the spectra are stored: MS-DIAL's "MS1 data type" and "MS2 data type"
+# ------------------------------------------------------------------------------------------------------
+
+DATA_TYPE_SCHEMA = "msdial-interactive.header-data-types.v1"
+# The values the pinned Console reads for "MS1 data type" and "MS2 data type" (ConfigParser: centroid or
+# profile, any case); anything else leaves its built-in default in place.
+DATA_TYPES = ("Centroid", "Profile")
+DATA_TYPE_DEFAULT = "Centroid"
+DATA_TYPE_LEVELS = (("ms1", 1), ("ms2", 2))
+# How many file names a decision lists under each value. The counts are always complete.
+DATA_TYPE_EXAMPLE_FILES = 5
+
+
+def spectrum_representation_fields(record: Mapping[str, Any]) -> dict[str, Any]:
+    """What one extractor record says about centroid or profile spectra, as a per-file summary records it.
+
+    acquisition.spectrumRepresentation is the extractor's verdict over the scan headers it sampled
+    (RawMetadataInference.SetRepresentation): Centroid or Profile when they all agree, Mixed when they do
+    not, and null when no header said. It is one value for the file and does not say which MS level is
+    which. The one place a record does say so is a Waters MassLynx function: the extractor lists each
+    function as an experiment whose vendorFields carry its ms_level and continuum, and the functions with
+    an MS level are the ones its file-level value was read from. Those give spectrum_representation_by_level;
+    every other reader leaves it empty.
+    """
+    acquisition = record.get("acquisition") if isinstance(record.get("acquisition"), Mapping) else {}
+    item = acquisition.get("spectrumRepresentation")
+    value = item.get("value") if isinstance(item, Mapping) else item
+    source = str(item.get("source") or "") if isinstance(item, Mapping) else ""
+    levels: dict[str, set[str]] = {}
+    for experiment in record.get("experiments") or []:
+        fields = experiment.get("vendorFields") if isinstance(experiment, Mapping) else None
+        if not isinstance(fields, Mapping):
+            continue
+        level = str(fields.get("ms_level") or "").strip()
+        continuum = str(fields.get("continuum") or "").strip().casefold()
+        if level.isdigit() and continuum in {"true", "false"}:
+            levels.setdefault(level, set()).add("Profile" if continuum == "true" else "Centroid")
+    return {
+        "spectrum_representation": str(value or ""),
+        "spectrum_representation_source": source,
+        "spectrum_representation_by_level": {
+            level: next(iter(found)) if len(found) == 1 else "Mixed" for level, found in sorted(levels.items())
+        },
+    }
+
+
+def _level_representation(entry: Mapping[str, Any], level: int) -> tuple[str, str]:
+    """(state, value) of one input at one MS level: recorded, unresolved, unrecorded or not_applicable."""
+    if _entry_flag(entry, "has_ms1" if level == 1 else "has_ms2", level) is False:
+        return "not_applicable", ""
+    whole = str(entry.get("spectrum_representation") or "")
+    by_level = entry.get("spectrum_representation_by_level")
+    own = str((by_level if isinstance(by_level, Mapping) else {}).get(str(level)) or "")
+    if own in DATA_TYPES:
+        # A function's own flag and the file's verdict are read from the same functions; were they ever to
+        # contradict each other, neither is believed.
+        return ("unresolved", "") if whole in DATA_TYPES and whole != own else ("recorded", own)
+    if own == "Mixed":
+        return "unresolved", ""
+    if whole in DATA_TYPES:
+        return "recorded", whole
+    if whole:
+        # Mixed (or a value this reader does not know): the file holds both, and nothing says which MS
+        # level is which.
+        return "unresolved", ""
+    return "unrecorded", ""
+
+
+def header_data_types(
+    entries: Iterable[Mapping[str, Any]], defaults: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """MS-DIAL's MS1 and MS2 data type as the raw headers of the given inputs support them. Never raises.
+
+    ``entries`` are per-file preflight records, one per input the decision covers; an input with no header
+    record is passed as {"file": path}. For each MS level, the header's value is taken only when every
+    input that has the level recorded one value and all of them agree. Otherwise the level keeps its
+    default (``defaults``, the template's Centroid unless given) and says why:
+
+    - inputs_disagree: the inputs recorded both values. The counts and example file names are kept, and a
+      warning says so. No input is dropped to make the rest agree;
+    - unresolved: an input recorded both centroid and profile spectra without saying which level is which;
+    - unrecorded: an input's header did not record its representation at all;
+    - no_input_at_level: no input has the level (an MS1-only unit's MS2).
+
+    The basis of each level is raw_header or default. File names only, never paths: the record is copied
+    into workflow-settings.json and the run manifest, which travel with the results.
+    """
+    rows = [entry for entry in entries if isinstance(entry, Mapping)]
+    result: dict[str, Any] = {"schema": DATA_TYPE_SCHEMA, "inputs": len(rows), "levels": {}, "warnings": []}
+    for name, level in DATA_TYPE_LEVELS:
+        default = str((defaults or {}).get(name) or DATA_TYPE_DEFAULT)
+        counts = {"recorded": 0, "unresolved": 0, "unrecorded": 0, "not_applicable": 0}
+        by_value: dict[str, list[str]] = {}
+        listed: dict[str, list[str]] = {"unresolved": [], "unrecorded": []}
+        for entry in rows:
+            state, value = _level_representation(entry, level)
+            counts[state] += 1
+            label = Path(str(entry.get("file") or "")).name
+            if state == "recorded":
+                by_value.setdefault(value, []).append(label)
+            elif state in listed:
+                listed[state].append(label)
+        applicable = counts["recorded"] + counts["unresolved"] + counts["unrecorded"]
+        if len(by_value) > 1:
+            reason = "inputs_disagree"
+        elif counts["unresolved"]:
+            reason = "unresolved"
+        elif counts["unrecorded"]:
+            reason = "unrecorded"
+        elif not applicable:
+            reason = "no_input_at_level"
+        else:
+            reason = "all_inputs_agree"
+        header = next(iter(by_value)) if reason == "all_inputs_agree" else None
+        result["levels"][name] = {
+            "header_data_type": header,
+            "data_type": header or default,
+            "basis": "raw_header" if header else "default",
+            "reason": reason,
+            "default": default,
+            "inputs_with_level": applicable,
+            "recorded": {value: len(files) for value, files in sorted(by_value.items())},
+            "unresolved": counts["unresolved"],
+            "unrecorded": counts["unrecorded"],
+            "not_applicable": counts["not_applicable"],
+            "example_files": {
+                **{value: sorted(files)[:DATA_TYPE_EXAMPLE_FILES] for value, files in sorted(by_value.items())},
+                **{state: sorted(files)[:DATA_TYPE_EXAMPLE_FILES] for state, files in listed.items() if files},
+            },
+        }
+        label = name.upper()
+        if reason == "inputs_disagree":
+            split = ", ".join(f"{value} {len(files)}" for value, files in sorted(by_value.items()))
+            result["warnings"].append(
+                f"{label} data type: the raw headers of the inputs disagree ({split} of {applicable}); the run "
+                f"keeps the default {default}. Which inputs recorded which is listed under levels.{name}."
+            )
+        elif reason == "unresolved":
+            result["warnings"].append(
+                f"{label} data type: {counts['unresolved']} of {applicable} inputs record both centroid and "
+                f"profile spectra without saying which MS level is which; the run keeps the default {default}."
+            )
+        elif reason == "unrecorded":
+            result["warnings"].append(
+                f"{label} data type: the raw headers of {counts['unrecorded']} of {applicable} inputs do not "
+                f"record whether the spectra are centroid or profile; the run keeps the default {default}."
+            )
+    for name, _level in DATA_TYPE_LEVELS:
+        result[f"{name}_data_type"] = result["levels"][name]["data_type"]
+        result[f"{name}_data_type_basis"] = result["levels"][name]["basis"]
+    result["disagreement"] = any(item["reason"] == "inputs_disagree" for item in result["levels"].values())
+    return result
+
+
+# ------------------------------------------------------------------------------------------------------
 # The disposition
 # ------------------------------------------------------------------------------------------------------
 

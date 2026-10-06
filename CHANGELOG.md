@@ -4,6 +4,54 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.27] - Unreleased
+
+Version order: 0.5.25 (#58) and 0.5.26 (#59) are open beside this one, and all
+three branch from 0.5.24.
+
+### Fixed
+- A repository unit's MS1 and MS2 data type come from its inputs' raw headers.
+  The preflight already read the extractor's `acquisition.spectrumRepresentation`
+  (Centroid, Profile, or Mixed when the sampled scan headers disagree), and no
+  run used it, so every unit ran with the template's Centroid. In the
+  2026-10-03 pilot, Metabolomics Workbench ST001337, whose two Thermo files both
+  record Profile, ran as Centroid.
+  - Each per-file preflight record now carries `spectrum_representation`, its
+    `spectrum_representation_source`, and `spectrum_representation_by_level`,
+    which only a Waters record fills: each MassLynx function with an MS level
+    carries `continuum`. Every other reader records one value per file. The
+    preflight summary gains `data_types`
+    (`msdial-interactive.header-data-types.v1`, scope `inspected_inputs`), so a
+    unit whose files disagree shows it there.
+  - `build_guided_plan`, which campaign and MCP repository runs both go through,
+    sets `ms1_data_type` and `ms2_data_type` from the headers of the run's inputs
+    (less those a campaign disposition excluded, each Console alias read as the
+    input it stands for). A level takes the header's value only when every input
+    with that level recorded the same one. Otherwise the default stays, with the
+    reason (`inputs_disagree`, `unresolved`, `unrecorded`,
+    `no_input_at_level`), per-value counts, example file names and a warning. No
+    input is dropped to make the rest agree. A Mixed file with no per-level
+    record is `unresolved`.
+  - The decision is kept as `data_type_provenance` in the workflow and in
+    `workflow-settings.json`. The run's `run-manifest.json` gains `data_types`
+    (each value with its basis, `raw_header` or `default`, plus the decision),
+    and so does the preparation. Each unit `run_attempts` entry records the values,
+    bases and warnings. A laboratory analysis records basis `unrecorded` and is
+    otherwise unchanged.
+  - A data type set explicitly in `workflow_overrides` stands, with basis
+    `workflow_override`. The execution gate refuses a run whose data type
+    contradicts headers that agree, from any path, the GUI's included.
+  - For a preflight recorded before this version, the representation is read
+    from the extractor records kept in `provenance\raw-metadata-preflight.json`
+    (`read_from_preflight_output`). The pilot's units therefore need no new
+    preflight.
+- Converted mzXML units take the representation the converted mzML records
+  (MS:1000127/MS:1000128, from the mzXML's `centroided`). Where the mzXML
+  recorded none, the level stays at the default as `unrecorded`. This replaces
+  the data-type half of 0.5.21's known limitation; the threshold step is
+  unchanged.
+- Agent capability `repository_data_type_from_raw_header`.
+
 ## [0.5.24] - Unreleased
 
 ### Added

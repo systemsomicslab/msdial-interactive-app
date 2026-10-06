@@ -4581,6 +4581,7 @@ def record_run_start(
     command: list[str] | None = None,
     timeout_seconds: float | None = None,
     idle_timeout_seconds: float | None = None,
+    data_types: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Open one run attempt in the unit's manifest, before its Console starts. Never raises.
 
@@ -4625,6 +4626,11 @@ def record_run_start(
         "output_directory": str(output_directory or ""),
         "timeout_seconds": timeout_seconds,
         "idle_timeout_seconds": idle_timeout_seconds,
+        # The MS1 and MS2 data type this attempt's method file asks for, each with its basis (raw_header or
+        # default), and the warnings of the decision; the decision itself is in the run's run-manifest.json.
+        "data_types": {
+            key: value for key, value in (data_types or {}).items() if key != "decision"
+        },
         # The process that starts the Console, identified the way a download lease's owner is.
         "backend": {
             "pid": os.getpid(),
@@ -5418,6 +5424,9 @@ def _per_input_entries(
                 "header_console_acquisition_basis": "",
                 "console_acquisition_type": None,
                 "console_acquisition_basis": "",
+                "spectrum_representation": "",
+                "spectrum_representation_source": "",
+                "spectrum_representation_by_level": {},
                 "acquisition_start_time": "",
                 "acquisition_start_time_evidence": "",
             }
@@ -5446,6 +5455,7 @@ def _record_preflight(
         READ_OUTCOMES,
         decide_disposition,
         file_key,
+        header_data_types,
     )
 
     # A split unit - split before this preflight, or while its headers were being read - stays split: a
@@ -5497,6 +5507,9 @@ def _record_preflight(
     summary = _summarize_raw_metadata(records)
     summary["per_file"] = _per_input_entries(summary["per_file"], outcomes, inputs)
     summary["coverage"] = coverage
+    # Over every inspected input, before any is excluded: where the files disagree about centroid or profile
+    # spectra, this is where it shows. The run decides again over the inputs it runs (run_data_types).
+    summary["data_types"] = {**header_data_types(summary["per_file"]), "scope": "inspected_inputs"}
     block["summary"] = summary
 
     if not records:
@@ -6770,6 +6783,19 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
                 f"unit's campaign disposition decided; the first is {undecided_as[0]}."
             )
 
+    # MS-DIAL reads every input with one MS1 and one MS2 data type. Where the raw headers of the inputs that
+    # run all record one representation at a level, a run set to the other would treat profile points as
+    # centroids, or centroid each centroid again; the template's Centroid is only a default.
+    data_types = run_data_types(state, manifest)
+    for key in DATA_TYPE_KEYS:
+        level = ((data_types or {}).get("levels") or {}).get(key.split("_", 1)[0]) or {}
+        requested = str(state.get(key) or "Centroid")
+        if level.get("basis") == "raw_header" and requested.casefold() != str(level.get("data_type")).casefold():
+            blockers.append(
+                f"The workflow sets the {key.split('_', 1)[0].upper()} data type to {requested}, but the raw "
+                f"header of every input that runs records {level.get('data_type')} spectra."
+            )
+
     # An input a campaign disposition excluded - unreadable, ion mobility, out of scope - is not part of
     # the run that disposition allowed, whatever the input list still names, and whatever alias names it.
     excluded = _campaign_excluded_inputs(manifest)
@@ -6846,6 +6872,127 @@ def _decided_acquisition_by_file(manifest: dict[str, Any]) -> dict[str, str]:
         if path_text and decided:
             result[_file_key(path_text)] = decided
     return result
+
+
+def _representation_by_input(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Each inspected input's per-file record with its spectrum representation, keyed by _file_key.
+
+    A preflight recorded since Interactive 0.5.27 carries spectrum_representation on each per-file record.
+    One recorded before did not, though the extractor read it: for such a record the representation is
+    read from the extractor records the preflight kept in its output file, and the record says so
+    (spectrum_representation_read_from). An input found in neither has no entry.
+    """
+    from .raw_metadata_preflight import spectrum_representation_fields
+
+    preflight = manifest.get("raw_metadata_preflight") or {}
+    entries = [item for item in (preflight.get("summary") or {}).get("per_file") or [] if isinstance(item, dict)]
+    result: dict[str, dict[str, Any]] = {}
+    earlier: list[dict[str, Any]] = []
+    for item in entries:
+        path_text = str(item.get("file") or "").strip()
+        if not path_text:
+            continue
+        if "spectrum_representation" in item:
+            result[_file_key(path_text)] = item
+        else:
+            earlier.append(item)
+    if not earlier:
+        return result
+    records: dict[str, dict[str, Any]] = {}
+    try:
+        raw = json.loads(Path(str(preflight.get("output") or "")).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        raw = []
+    for record in [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []:
+        source = record.get("source") if isinstance(record, dict) else None
+        path_text = str(source.get("filePath") or "") if isinstance(source, dict) else ""
+        if path_text:
+            records.setdefault(_file_key(path_text), record)
+    for item in earlier:
+        key = _file_key(str(item.get("file") or ""))
+        record = records.get(key)
+        if record is not None:
+            result[key] = {
+                **item,
+                **spectrum_representation_fields(record),
+                "spectrum_representation_read_from": "preflight_output",
+            }
+    return result
+
+
+DATA_TYPE_KEYS = ("ms1_data_type", "ms2_data_type")
+
+
+def run_data_types(state: dict[str, Any], manifest: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """The MS1 and MS2 data type the raw headers of this run's inputs support, or None outside a unit.
+
+    The inputs are the state's files, each read as the unit input it stands for (a Console alias is its
+    input), less any the unit's campaign disposition excluded. An input the preflight did not read counts
+    as unrecorded. The defaults are the state's own values, which is what the run keeps for a level the
+    headers do not settle (raw_metadata_preflight.header_data_types).
+    """
+    from .raw_metadata_preflight import header_data_types
+
+    if manifest is None:
+        manifest_text = str(state.get("repository_run_manifest") or "").strip()
+        if not manifest_text:
+            return None
+        try:
+            manifest = read_manifest(Path(manifest_text).expanduser())
+        except (OSError, ValueError):
+            return None
+    aliases = console_alias_inputs(manifest)
+    excluded = _campaign_excluded_inputs(manifest)
+    known = _representation_by_input(manifest)
+    entries = []
+    for item in state.get("files") or []:
+        path_text = str(item.get("file_path") or "").strip()
+        if not path_text:
+            continue
+        key = _file_key(_unit_input_of(path_text, aliases))
+        if key in excluded:
+            continue
+        entries.append(known.get(key) or {"file": path_text})
+    decision = header_data_types(
+        entries, {key.split("_", 1)[0]: str(state.get(key) or "Centroid") for key in DATA_TYPE_KEYS}
+    )
+    decision["scope"] = "run_inputs"
+    if any("spectrum_representation_read_from" in entry for entry in entries):
+        decision["read_from_preflight_output"] = True
+    return decision
+
+
+def apply_header_data_types(state: dict[str, Any], explicit: Iterable[str] = ()) -> dict[str, Any] | None:
+    """Set a repository run's MS1 and MS2 data type from its inputs' raw headers, and record the basis.
+
+    Where every included input's header agrees at a level, the run takes that value; otherwise the state
+    keeps what it had (the template's Centroid) and the decision's warning says why. A key named in
+    ``explicit`` - set by the caller's workflow_overrides - is left as the caller set it, with basis
+    workflow_override; if it contradicts headers that agree, the execution gate refuses the run. The
+    decision is kept as state["data_type_provenance"], which reaches workflow-settings.json and the run
+    manifest. Returns it, or None for a state that names no readable unit manifest (nothing changes).
+    """
+    decision = run_data_types(state)
+    if decision is None:
+        return None
+    named = set(explicit)
+    for key in DATA_TYPE_KEYS:
+        level = decision["levels"][key.split("_", 1)[0]]
+        current = str(state.get(key) or "Centroid")
+        if key in named:
+            value = current
+            basis = (
+                "raw_header"
+                if level["basis"] == "raw_header" and current.casefold() == str(level["data_type"]).casefold()
+                else "workflow_override"
+            )
+        else:
+            value, basis = str(level["data_type"]), str(level["basis"])
+        state[key] = value
+        decision[key] = value
+        decision[f"{key}_basis"] = basis
+    state["data_type_provenance"] = decision
+    return decision
 
 
 def _campaign_excluded_inputs(manifest: dict[str, Any]) -> dict[str, str]:
@@ -10093,7 +10240,7 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
         acquisition_mode = "Mixed"
     else:
         acquisition_mode = next(iter(acquisition_values), "Unknown")
-    from .raw_metadata_preflight import header_console_acquisition_type
+    from .raw_metadata_preflight import header_console_acquisition_type, spectrum_representation_fields
 
     per_file = []
     for item in records:
@@ -10133,6 +10280,9 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
                 "console_acquisition_type": console,
                 "console_acquisition_basis": console_basis if console else "",
                 "reader": str(source.get("readerName") or ""),
+                # Centroid, Profile or Mixed as the sampled scan headers recorded them, and per MS level where
+                # the record says (header_data_types turns these into the run's MS1 and MS2 data type).
+                **spectrum_representation_fields(item),
                 "extractor_warnings": sorted(
                     {
                         str(warning.get("code") or "")

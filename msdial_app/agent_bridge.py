@@ -76,6 +76,10 @@ def summarize_jobs(
             "mzxml_requires_conversion_to_mzml",
             "campaign_mzxml_converted_to_mzml",
             "campaign_mzxml_polarity_from_declared_ion_mode",
+            # A repository unit's MS1 and MS2 data type are taken from its inputs' raw headers where every
+            # input that runs agrees (data_type_provenance, basis raw_header or default), and the gate refuses
+            # a run set against such agreement.
+            "repository_data_type_from_raw_header",
             "automatic_alignment_rt_correction",
             "console_time_limits",
             "cancel_console_and_download_jobs",

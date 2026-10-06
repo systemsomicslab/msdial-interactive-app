@@ -707,6 +707,7 @@ def _run_console_for_job(
             command=preparation.get("command"),
             timeout_seconds=entry["timeout_seconds"],
             idle_timeout_seconds=entry["idle_timeout_seconds"],
+            data_types=preparation.get("data_types") or {},
         )
         if not attempt.get("recorded"):
             log(
