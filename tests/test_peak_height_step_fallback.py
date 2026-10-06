@@ -316,6 +316,12 @@ class TheFallbackIsOnRecord(unittest.TestCase):
 class TheEstimateEndpointRecordsTheFallback(_Unit, _Backend, unittest.TestCase):
     """End to end through POST /api/agent/tuning/estimate, on the Bruker compact demo's heights."""
 
+    FAMILY = "QTOF"
+
+    @staticmethod
+    def diagnostic_heights() -> list[float]:
+        return heights("demo bruker-compact_dda")
+
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name) / "unit"
@@ -324,7 +330,7 @@ class TheEstimateEndpointRecordsTheFallback(_Unit, _Backend, unittest.TestCase):
         self.diagnostic = self.root / "diagnostics" / self.job_id
         self.diagnostic.mkdir(parents=True)
         result_file = self.diagnostic / "a_DDA_1.mdpeak"
-        rows = "".join(f"{height:g}\t0\t0\t0\n" for height in heights("demo bruker-compact_dda"))
+        rows = "".join(f"{height:g}\t0\t0\t0\n" for height in self.diagnostic_heights())
         result_file.write_text(
             "Height\tSimple dot product\tWeighted dot product\tReverse dot product\n" + rows,
             encoding="utf-8",
@@ -336,7 +342,7 @@ class TheEstimateEndpointRecordsTheFallback(_Unit, _Backend, unittest.TestCase):
             "diagnostic_result_file": str(result_file),
             "peak_tuning_profile": {
                 "file_name": "a_DDA_1", "threshold_step": 100, "reason": "QC nearest",
-                "instrument_family": "QTOF", "instrument_family_source": "format_default",
+                "instrument_family": self.FAMILY, "instrument_family_source": "format_default",
             },
         }
         self.start()
@@ -380,6 +386,34 @@ class TheEstimateEndpointRecordsTheFallback(_Unit, _Backend, unittest.TestCase):
 
         self.assertEqual((1, 10), (found["requested_threshold_step"], found["threshold_step"]))
         self.assertEqual(50, found["minimum_peak_height"])
+
+
+class TheEstimateEndpointHoldsAnFtDiagnosticAtItsFloor(TheEstimateEndpointRecordsTheFallback):
+    """The endpoint passes the diagnostic's family to the estimator, so an FT diagnostic asked for steps of
+    100 (an FT fallback's step, echoed back) cannot fall back to 10. Constructed: 3,500 peaks at 105 and 3,500
+    at 155 put no multiple of 100 in range; a step of 10 would choose 150."""
+
+    FAMILY = "Fourier-transform MS"
+
+    @staticmethod
+    def diagnostic_heights() -> list[float]:
+        return [105.0] * 3500 + [155.0] * 3500 + [5.0] * 100
+
+    def test_the_response_and_the_manifest_both_carry_the_fallback(self) -> None:
+        found = self._estimate(threshold_step=100)["estimate"]
+
+        self.assertEqual("Fourier-transform MS", found["instrument_family"])
+        self.assertEqual((100, 100, 100), (found["coarse_threshold_step"], found["fine_threshold_step"], found["threshold_step"]))
+        self.assertFalse(found["step_fallback"])
+        self.assertEqual((100, 7000), (found["minimum_peak_height"], found["estimated_peak_count"]))
+        self.assertFalse(found["within_target_range"])
+        self.assertTrue(found["warnings"])
+
+    def test_a_request_echoing_the_fallback_step_is_held_at_the_floor(self) -> None:
+        found = self._estimate(threshold_step=10)["estimate"]
+
+        self.assertEqual((10, 100), (found["requested_threshold_step"], found["threshold_step"]))
+        self.assertEqual(0, found["minimum_peak_height"] % 100)
 
 
 if __name__ == "__main__":
