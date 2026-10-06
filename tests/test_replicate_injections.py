@@ -54,15 +54,17 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
         create_download_lease,
         evaluate_repository_execution_gate,
         leading_identifier_key,
+        name_polarities,
         plan_acquisition_split,
         project_from_dict,
         read_manifest,
+        run_raw_metadata_preflight,
         split_unit_by_acquisition,
         update_manifest,
     )
 
 from test_folder_inputs import _Client, _exclude, _hand_made_unit, _no_backend
-from test_split_key import _Unit
+from test_split_key import _Unit, _extractor
 from test_mzml_encoding import dda_spectra, mzml
 
 # The default reserve is 20 GB of free space; these trees are a few kilobytes.
@@ -793,6 +795,57 @@ class APairingNeverCrossesAPolarityToken(_Workspace):
             [(item["rule"], item["reason"]) for item in result["refused"]],
         )
 
+    def test_a_polarity_token_beside_a_control_blank_or_qc_token_states_no_polarity(self) -> None:
+        """Neg_Ctrl_1.raw is a negative control, not a negative-mode file (review of PR #58, 2026-10-06)."""
+        for name in (
+            "Neg_Ctrl_1.raw", "021518_Neg_Ctrl_1.raw", "pos_ctrl.raw", "Positive_control_3.raw", "neg_control.raw",
+            "neg_blank.raw", "S1-control-neg.raw", "QC_pos_01.raw", "Pos QC 2.raw",
+        ):
+            self.assertEqual(set(), name_polarities(name), name)
+
+    def test_a_polarity_token_not_beside_one_still_states_its_polarity(self) -> None:
+        self.assertEqual({"Negative"}, name_polarities("S1_neg.raw"))
+        self.assertEqual({"Negative"}, name_polarities("neg_S1_ctrl.raw"))
+        # A control sample's file still states the polarity it ran in by a token of its own,
+        self.assertEqual({"Negative"}, name_polarities("Pos_Ctrl_1_neg.raw"))
+        # and a polarity folder states its polarity whatever the file in it is called.
+        self.assertEqual({"Negative"}, name_polarities("NEG/021518_Pos_Ctrl_1.raw"))
+
+    def test_a_control_sample_named_by_its_polarity_is_paired_in_either_polarity_unit(self) -> None:
+        positive = self.pairings(
+            ["021518_Neg_Ctrl_1.raw", "021518_S_1.raw"], [("c", "Neg_Ctrl_1.raw"), ("s", "S_1.raw")]
+        )
+        negative = self.pairings(["run_pos_ctrl.raw"], [("c", "pos_ctrl.raw")], ion_mode="Negative")
+        by_token = self.pairings(["C_7_exp2_neg_control.raw"], [("c", "C_7_neg_control.raw")])
+
+        self.assertEqual(
+            {"Neg_Ctrl_1.raw": PREFIXED_MEMBER_PAIRING, "S_1.raw": PREFIXED_MEMBER_PAIRING},
+            {item["declared_raw_file"]: item["paired_by"] for item in positive["paired"].values()},
+        )
+        self.assertEqual([], positive["refused"])
+        self.assertEqual(["pos_ctrl.raw"], [item["declared_raw_file"] for item in negative["paired"].values()])
+        self.assertEqual([], negative["refused"])
+        self.assertEqual(
+            [("C_7_neg_control.raw", LEADING_IDENTIFIER_TOKEN_PAIRING)],
+            [(item["declared_raw_file"], item["paired_by"]) for item in by_token["paired"].values()],
+        )
+
+    def test_a_control_sample_of_the_other_polarity_is_still_refused(self) -> None:
+        in_folder = self.pairings(["NEG/021518_Neg_Ctrl_1.raw"], [("c", "Neg_Ctrl_1.raw")])
+        by_name = self.pairings(["Pos_Ctrl_1_neg.raw"], [("c", "Pos_Ctrl_1_pos.raw")])
+        against_declared = self.pairings(
+            ["Neg_Ctrl_1_run2_neg.raw"], [("c", "Neg_Ctrl_1_pos.raw")], ion_mode="Unknown"
+        )
+
+        self.assertEqual({}, in_folder["paired"])
+        self.assertEqual(["polarity_token_contradicts_ion_mode"], [item["reason"] for item in in_folder["refused"]])
+        self.assertEqual({}, by_name["paired"])
+        self.assertEqual(["polarity_token_contradicts_ion_mode"], [item["reason"] for item in by_name["refused"]])
+        self.assertEqual({}, against_declared["paired"])
+        self.assertEqual(
+            ["polarity_token_contradicts_declared_name"], [item["reason"] for item in against_declared["refused"]]
+        )
+
 
 # ---- leading identifier tokens (the user's decision of 2026-10-06) ---------------------------------------------
 
@@ -952,6 +1005,121 @@ class AnInferredPairingIsAlwaysLeftOnRecord(_Workspace):
         self.assertNotIn("input_name_pairings", manifest)
         self.assertEqual([], built["warnings"])
         self.assertEqual({"exact"}, {row["raw_file_paired_by"] for row in built["rows"]})
+
+
+# ---- a split part carries the inferred-pairing record of its own inputs and rows ------------------------------
+
+
+def _paired_archive_handoff(members: dict[str, bytes], rows: list[tuple[str, str]]) -> tuple[dict, dict[str, bytes]]:
+    """A Workbench unit whose study archive holds ``members`` and whose rows declare (sample_id, raw_file)."""
+    data = _zip(members)
+    url = "https://example.org/studydownload/ST000001_rawdata.zip"
+    files = [{
+        "path": "ST000001_rawdata.zip", "download_url": url, "size_bytes": len(data),
+        "checksum": hashlib.md5(data).hexdigest(), "role": "raw_archive", "sample_id": "", "sample_id_resolved": False,
+    }]
+    samples = [{"sample_id": sample, "raw_file": raw, "attributes": {}} for sample, raw in rows]
+    proposal = {
+        "proposal_id": "p-split", "unit_id": "u-split", "status": "accepted", "selected_fields": [],
+        "rationale": "abstention",
+        "contrast_definition": {"kind": "abstention", "class_label": "All", "reason": "no_usable_declared_factor"},
+        "assignments": [
+            {"sample_id": sample, "class_label": "All", "values": {}}
+            for sample in dict.fromkeys(sample for sample, _raw in rows)
+        ],
+    }
+    handoff = _handoff("ST000001", "u-split", files, [], samples, proposal)
+    handoff["repository"] = "metabolomics_workbench"
+    return handoff, {url: data}
+
+
+class ASplitPartCarriesItsOwnPairingRecord(_Workspace):
+    """The lease's manifest-level record (warnings, input_name_pairings) went to no part (review of PR #58)."""
+
+    def split(self, members: dict[str, bytes], rows: list[tuple[str, str]], modes: dict[str, str]) -> tuple:
+        handoff, payloads = _paired_archive_handoff(members, rows)
+        manifest_path = _lease(self.root, handoff, payloads)
+        extractor = self.root / "RawMetadataConsoleApp.exe"
+        extractor.write_bytes(b"stub")
+        verdicts = {
+            f"data/{Path(path).name}": {"mode": modes.get(Path(path).name, "DDA"), "polarity": "Positive"}
+            for path in read_manifest(manifest_path)["input_candidates"]
+        }
+        with patch("msdial_app.repository_reanalysis.subprocess.run", side_effect=_extractor(verdicts)):
+            run_raw_metadata_preflight(manifest_path, extractor)
+        result = split_unit_by_acquisition(manifest_path, confirmed=True)
+        self.assertTrue(result["written"], result["blockers"])
+        parts = {part["analysis_unit_id"]: read_manifest(part["manifest_path"]) for part in result["parts"]}
+        return read_manifest(manifest_path), parts
+
+    def test_each_part_carries_the_pairings_and_refusals_of_its_own_inputs_and_rows(self) -> None:
+        from msdial_app.raw_metadata_preflight import decide_disposition
+
+        members = ["A_1_exp_pos.raw", "B_2_exp_neg.raw", "run_C_3_pos.raw", "run_D_4_pos.raw"]
+        parent, parts = self.split(
+            {name: f"thermo raw bytes of {name}".encode() for name in members},
+            # Sample X has two rows; B_2's only member is of the other polarity and is refused.
+            [("X", "A_1_pos.raw"), ("X", "B_2_pos.raw"), ("Y", "C_3_pos.raw"), ("Z", "D_4_pos.raw")],
+            {"run_D_4_pos.raw": "DIA"},
+        )
+        dda, dia = parts["u-split-dda"], parts["u-split-dia"]
+
+        self.assertEqual(3, len(parent["input_name_pairings"]["paired"]))
+        self.assertEqual(
+            {"A_1_exp_pos.raw": LEADING_IDENTIFIER_TOKEN_PAIRING, "run_C_3_pos.raw": PREFIXED_MEMBER_PAIRING},
+            {item["member_name"]: item["paired_by"] for item in dda["input_name_pairings"]["paired"]},
+        )
+        # The refusal goes with the part that holds the row it was refused for.
+        self.assertEqual(
+            [("B_2_exp_neg.raw", "B_2_pos.raw", "polarity_token_contradicts_ion_mode")],
+            [
+                (item["member_name"], item["declared_raw_file"], item["reason"])
+                for item in dda["input_name_pairings"]["refused"]
+            ],
+        )
+        self.assertEqual(
+            {"paired": [{"member_name": "run_D_4_pos.raw", "declared_raw_file": "D_4_pos.raw",
+                         "paired_by": PREFIXED_MEMBER_PAIRING}], "refused": []},
+            dia["input_name_pairings"],
+        )
+        for part in (dda, dia):
+            self.assertEqual([INFERRED_PAIRING_WARNING], part["warnings"])
+            self.assertIn(INFERRED_PAIRING_WARNING, decide_disposition(part)["warnings"])
+
+    def test_a_part_whose_inputs_were_named_exactly_carries_no_pairing_record(self) -> None:
+        from msdial_app.raw_metadata_preflight import decide_disposition
+
+        members = ["A_1_exp_pos.raw", "D_4_pos.raw"]
+        _parent, parts = self.split(
+            {name: f"thermo raw bytes of {name}".encode() for name in members},
+            [("X", "A_1_pos.raw"), ("Z", "D_4_pos.raw")],
+            {"D_4_pos.raw": "DIA"},
+        )
+        dda, dia = parts["u-split-dda"], parts["u-split-dia"]
+
+        self.assertEqual([INFERRED_PAIRING_WARNING], dda["warnings"])
+        self.assertEqual(1, len(dda["input_name_pairings"]["paired"]))
+        self.assertNotIn("warnings", dia)
+        self.assertNotIn("input_name_pairings", dia)
+        self.assertNotIn(INFERRED_PAIRING_WARNING, decide_disposition(dia)["warnings"])
+
+    def test_an_excluded_ion_mobility_part_records_its_pairing_and_its_disposition_says_so(self) -> None:
+        _parent, parts = self.split(
+            {
+                "A_1_exp_pos.d/analysis.baf": b"baf of A_1",
+                "run_C_3_pos.d/analysis.tdf": b"tdf of C_3",
+                "run_C_3_pos.d/analysis.tdf_bin": b"tdf_bin of C_3",
+            },
+            [("X", "A_1_pos.d"), ("Y", "C_3_pos.d")],
+            {},
+        )
+        lc, im = parts["u-split-dda"], parts["u-split-dda-im"]
+
+        self.assertEqual(["A_1_exp_pos.d"], [item["member_name"] for item in lc["input_name_pairings"]["paired"]])
+        self.assertEqual(["run_C_3_pos.d"], [item["member_name"] for item in im["input_name_pairings"]["paired"]])
+        self.assertEqual("excluded_by_preflight", im["status"])
+        self.assertEqual([INFERRED_PAIRING_WARNING], im["warnings"])
+        self.assertIn(INFERRED_PAIRING_WARNING, im["campaign_disposition"]["warnings"])
 
 
 if __name__ == "__main__":

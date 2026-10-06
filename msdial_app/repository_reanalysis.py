@@ -6096,6 +6096,53 @@ def _declared_input_in_part(
     return sample_id in sample_ids
 
 
+def _part_name_pairings(
+    parent: dict[str, Any], inputs: list[str], samples: list[dict[str, Any]], stands_for: dict[str, str]
+) -> dict[str, list[dict[str, Any]]]:
+    """The parent's input_name_pairings that are one split part's own: {"paired": [...], "refused": [...]}.
+
+    A pairing is the part's when its member is one of the part's inputs, or the mzXML one of them stands for
+    (stands_for), compared as the lease named it: its path under the data root (_member_under_root), without
+    case. A refusal is the part's when its member is, or when the declared raw file it was refused for is the
+    raw_file of one of the part's sample rows: a refused member is no input, and the row it was refused for is
+    what the part holds. A pairing of an input the lease or the campaign disposition excluded, and a refusal for
+    a row no part holds, are in no part's record and stay in the parent's.
+    """
+    record = parent.get("input_name_pairings")
+    if not isinstance(record, dict):
+        return {"paired": [], "refused": []}
+    data_root = str(parent.get("input_directory") or "").strip()
+    data_key = _file_key(data_root) if data_root else ""
+
+    def named(path_text: str) -> str:
+        key = _file_key(path_text)
+        return (_member_under_root(key, data_key) if data_key else Path(key).name).casefold()
+
+    members = {
+        named(source)
+        for item in inputs
+        for source in (item, stands_for.get(_file_key(item), ""))
+        if source
+    }
+    row_names = {
+        PurePosixPath(str((sample or {}).get("raw_file") or "").strip().replace("\\", "/")).name.casefold()
+        for sample in samples
+    } - {""}
+
+    def entries(name: str) -> list[dict[str, Any]]:
+        return [dict(item) for item in record.get(name) or [] if isinstance(item, dict)]
+
+    return {
+        "paired": [item for item in entries("paired") if str(item.get("member_name") or "").casefold() in members],
+        "refused": [
+            item
+            for item in entries("refused")
+            if str(item.get("member_name") or "").casefold() in members
+            or str(item.get("declared_raw_file") or "").casefold() in row_names
+        ],
+    }
+
+
 def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     """Describe how a unit would be split by its split key. Changes nothing.
 
@@ -6450,6 +6497,9 @@ def _excluded_part_disposition(
         },
         "input_candidates": list(part_manifest.get("input_candidates") or []),
         "project": part_manifest.get("project") or {},
+        # Read only for the inferred-pairing warning: the part's own lineage rows and manifest warnings.
+        "input_lineage": part_manifest.get("input_lineage") or {},
+        "warnings": list(part_manifest.get("warnings") or []),
     }
     declared = preflight.get("declared") if isinstance(preflight.get("declared"), dict) else None
     disposition = decide_disposition(view, declared=declared, extractor=preflight.get("extractor"), decided_at=decided_at)
@@ -6665,14 +6715,6 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 per_file[_file_key(item)] for item in part["input_candidates"] if _file_key(item) in per_file
             ],
         }
-        if excluded_part:
-            # Ended at the split: it never runs, and its parent's raw data are released once the others end.
-            disposition = _excluded_part_disposition(parent, part_manifest, now)
-            part_manifest["status"] = (
-                SKIPPED_BY_PREFLIGHT_STATUS if disposition["disposition"] == "skip" else EXCLUDED_BY_PREFLIGHT_STATUS
-            )
-            part_manifest["split_exclusion"] = {**excluded_part, "decided_at": now}
-            part_manifest["campaign_disposition"] = disposition
         lineage = parent.get("input_lineage")
         if isinstance(lineage, dict):
             # The part reads the parent's files, so their lineage is the parent's, row for row. Without
@@ -6691,6 +6733,27 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 ],
                 "inherited_from": str(manifest_path),
             }
+        # Which declared raw file an input is, where the lease inferred it (the user's decision of 2026-10-06:
+        # always left on record), as the lease's own manifest says it, for this part's inputs and rows only
+        # (_part_name_pairings): a part with no inferred pairing of its own carries no warning for it.
+        pairings = _part_name_pairings(parent, part["input_candidates"], project["sample_metadata"], stands_for)
+        if pairings["paired"] or pairings["refused"]:
+            part_manifest["input_name_pairings"] = pairings
+        part_warnings = [item for item in parent.get("warnings") or [] if item != INFERRED_PAIRING_WARNING]
+        if pairings["paired"]:
+            part_warnings.append(INFERRED_PAIRING_WARNING)
+        if part_warnings:
+            part_manifest["warnings"] = part_warnings
+        if excluded_part:
+            # Ended at the split: it never runs, and its parent's raw data are released once the others end.
+            # Decided after its lineage and pairing record are in place, so its disposition carries the
+            # inferred-pairing warning as any other disposition of such inputs does.
+            disposition = _excluded_part_disposition(parent, part_manifest, now)
+            part_manifest["status"] = (
+                SKIPPED_BY_PREFLIGHT_STATUS if disposition["disposition"] == "skip" else EXCLUDED_BY_PREFLIGHT_STATUS
+            )
+            part_manifest["split_exclusion"] = {**excluded_part, "decided_at": now}
+            part_manifest["campaign_disposition"] = disposition
         repository_metadata_path = provenance / "repository-metadata.json"
         sample_metadata_path = provenance / "sample-metadata-extracted.json"
         part_manifest_path = provenance / "run-manifest.json"
@@ -9018,6 +9081,11 @@ LEADING_IDENTIFIER_TOKEN_PAIRING = "leading_identifier_token"
 _NAME_TOKEN_SPLIT = re.compile(r"[_\-. ]+")
 # The polarity a name's token states, as a token of its own (x_pos.raw, NEG/x.raw; not "position").
 POLARITY_NAME_TOKENS = {"pos": "Positive", "positive": "Positive", "neg": "Negative", "negative": "Negative"}
+# Tokens beside which a pos/neg token names a sample rather than a polarity: Neg_Ctrl_1.raw is a negative
+# control, and pos_ctrl, Positive_control and neg_blank are such samples too, whatever polarity they ran in. A
+# polarity token next to one of these (before or after it, in the same folder or file name) states no polarity.
+# Read as polarities, they refused a positive unit's own Neg_Ctrl_1.raw (review of PR #58, 2026-10-06).
+POLARITY_EXEMPTING_TOKENS = frozenset({"control", "ctrl", "blank", "qc"})
 # The suffixes a name's stem is read without, as metadata_match_keys reads them.
 _PAIRING_NAME_SUFFIXES = (".wiff2", ".wiff", ".mzml", ".mzxml", ".raw", ".cdf", ".lcd", ".qgd", ".abf", ".d")
 
@@ -9027,13 +9095,23 @@ def _name_tokens(text: str) -> list[str]:
 
 
 def name_polarities(text: str) -> set[str]:
-    """The polarities a name, or a path's folders and name, state by a token of their own (POLARITY_NAME_TOKENS)."""
-    return {
-        POLARITY_NAME_TOKENS[token]
-        for part in str(text or "").replace("\\", "/").split("/")
-        for token in _name_tokens(part)
-        if token in POLARITY_NAME_TOKENS
-    }
+    """The polarities a name, or a path's folders and name, state by a token of their own (POLARITY_NAME_TOKENS).
+
+    A polarity token beside a control, ctrl, blank or QC token in the same folder or file name
+    (POLARITY_EXEMPTING_TOKENS) names a sample, not a polarity, and states none: Neg_Ctrl_1.raw states no
+    polarity, and x_Neg_Ctrl_1_neg.raw still states Negative by its last token.
+    """
+    found: set[str] = set()
+    for part in str(text or "").replace("\\", "/").split("/"):
+        tokens = _name_tokens(part)
+        for index, token in enumerate(tokens):
+            if token not in POLARITY_NAME_TOKENS:
+                continue
+            beside = tokens[max(index - 1, 0):index] + tokens[index + 1:index + 2]
+            if any(neighbour in POLARITY_EXEMPTING_TOKENS for neighbour in beside):
+                continue
+            found.add(POLARITY_NAME_TOKENS[token])
+    return found
 
 
 def leading_identifier_key(name: str) -> str:
@@ -9103,7 +9181,9 @@ def _member_name_pairings(
     _Youn_sa11.raw and not _Youn_sa1.raw, and why a shared study archive holding POS/x_S1.raw and NEG/x_S1.raw
     gives S1.raw to neither. AND NEVER ACROSS POLARITIES: where the member's path (its folders under the data
     root and its name) or the declared name states a polarity by a token of its own (name_polarities) that is
-    not the unit's ion mode, or the two state different ones, the pairing is refused and recorded as such.
+    not the unit's ion mode, or the two state different ones, the pairing is refused and recorded as such. A
+    pos/neg token beside a control, ctrl, blank or QC token names a sample (Neg_Ctrl_1.raw) and states no
+    polarity, so it refuses nothing.
 
     Only what came out of an archive is paired (``extracted_members``: an analysable file outside a vendor
     folder, or the outermost .d/.raw folder holding members): a file the repository lists on its own is
