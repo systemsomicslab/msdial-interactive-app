@@ -1,15 +1,19 @@
 """The peak-count diagnostic measures peaks, so an LC-MS diagnostic loads no annotation library.
 
 Only the .mdpeak rows and their Height column are read from a diagnostic (workflow.parse_mdpeak, then
-estimate_peak_height_range). The LC-MS Console writes one row per peak spotted, after peak spotting,
-isotope estimation and deconvolution, and annotation neither adds nor removes a peak nor changes its
-height. A diagnostic that annotated as the production run does searched the tiered LBM -> strict MSP ->
-broad MSP cascade at Minimum peak height 0, where every peak above the noise is a query, and a
-diagnostic of one Waters AIF file ran for more than forty minutes for a number annotation cannot change.
+estimate_peak_height_range). The LC-MS Console fixes the peaks and their heights in peak spotting,
+isotope estimation and deconvolution. It writes the .mdpeak after annotation and the characterisation
+that follows it, and neither adds or removes a peak or changes its height; without reference matches
+the characterisation can change a row's Adduct, Isotope and MS1 isotopes columns, which nothing reads
+from a diagnostic. A diagnostic that annotated as the production run does searched the tiered LBM ->
+strict MSP -> broad MSP cascade at Minimum peak height 0, where every peak above the noise is a query.
+On the pilot's Waters MSE (AIF) file MTBKS281 Lm1 that took 2,650.5 s; without annotation the Console
+took 927.9 s and gave the same 20,057 peaks with the same heights.
 
-What is held here: the diagnostic's method and settings name no library; the production method still
-names every one; every setting that decides which peaks are spotted is the same in both; and the
-diagnostic says, wherever it is recorded, that annotation was skipped and why.
+What is held here: the diagnostic's method and settings name no library and no annotation profile, even
+when the template does; the production method still names every one; every setting that decides which
+peaks are spotted is the same in both; and the diagnostic says, wherever it is recorded, that annotation
+was skipped and why.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from msdial_app.annotation_pipeline import TIERED_LCMS_PROFILE_ID, apply_tiered_
 from msdial_app.repository_reanalysis import _write_json, read_manifest, record_peak_height_diagnostic
 from msdial_app.workflow import (
     ANNOTATION_LIBRARY_METHOD_KEYS,
+    ANNOTATION_PROFILE_METHOD_KEY,
     DIAGNOSTIC_ANNOTATION_PERFORMED,
     DIAGNOSTIC_ANNOTATION_SKIPPED,
     console_method_key,
@@ -97,7 +102,7 @@ ALLOWED_DIFFERENCES = frozenset(
         "together with alignment",
         "alignment light mode",
         "execute rt correction",
-        "annotation pipeline profile",
+        ANNOTATION_PROFILE_METHOD_KEY,
         "export folder path",
         *ANNOTATION_LIBRARY_METHOD_KEYS,
     }
@@ -183,7 +188,39 @@ class TheDiagnosticLoadsNoLibrary(_Unit, unittest.TestCase):
 
         for key in ANNOTATION_LIBRARY_METHOD_KEYS:
             self.assertEqual([""], method.get(key), key)
-        self.assertNotIn("annotation pipeline profile", method)
+        self.assertEqual([""], method.get(ANNOTATION_PROFILE_METHOD_KEY))
+
+    def test_a_template_annotation_profile_line_is_written_blank(self) -> None:
+        # The state's profile is gone before the method is written, so a template line naming one would
+        # otherwise be copied through, and the diagnostic's method would name a production annotation
+        # profile while its records say annotation was skipped.
+        template = self.root / "template-with-profile.txt"
+        template.write_text(
+            f"Annotation pipeline profile: {TIERED_LCMS_PROFILE_ID}\n"
+            + TEMPLATE.read_text(encoding="utf-8-sig"),
+            encoding="utf-8",
+        )
+        self.state["template_path"] = str(template)
+
+        diagnostic = self.diagnostic()
+        method_text = Path(diagnostic["method_file"]).read_text(encoding="utf-8")
+
+        self.assertEqual([""], _method(diagnostic["method_file"])[ANNOTATION_PROFILE_METHOD_KEY])
+        self.assertNotIn(TIERED_LCMS_PROFILE_ID, method_text)
+        record = diagnostic["diagnostic_annotation"]
+        self.assertEqual(TIERED_LCMS_PROFILE_ID, record["production_annotation_pipeline_profile"])
+        # The same template still gives the production run its one profile line, not two.
+        production = _method(self.production()["method_file"])
+        self.assertEqual([TIERED_LCMS_PROFILE_ID], production[ANNOTATION_PROFILE_METHOD_KEY])
+
+    def test_its_reason_says_which_columns_are_not_the_production_runs(self) -> None:
+        # The .mdpeak is written after annotation, and characterisation without reference matches can
+        # assign another adduct, charge or isotope: only the rows and the Height column are the same.
+        reason = self.diagnostic()["diagnostic_annotation"]["reason"]
+
+        self.assertIn("after annotation", reason)
+        for column in ("Height", "Adduct", "Isotope", "MS1 isotopes"):
+            self.assertIn(column, reason)
 
     def test_it_writes_no_annotator_settings_file(self) -> None:
         directory = Path(self.diagnostic()["run_directory"])

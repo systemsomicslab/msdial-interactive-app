@@ -2059,10 +2059,14 @@ DIAGNOSTIC_ANNOTATION_SKIPPED = "skipped_for_peak_count"
 DIAGNOSTIC_ANNOTATION_PERFORMED = "performed"
 DIAGNOSTIC_ANNOTATION_SKIPPED_REASON = (
     "Only the peaks are read from a diagnostic: one row of the Console's .mdpeak per detected peak, and "
-    "its Height column. The LC-MS Console spots the peaks, estimates their isotopes and deconvolutes "
-    "their spectra before it annotates (MsdialLcMsApi FileProcess.RunAsync), and annotation neither "
-    "adds nor removes a peak nor changes its height, so the MSP, LBM and text libraries are not loaded. "
-    "Every peak-spotting and deconvolution setting is the production method's; Minimum peak height is 0."
+    "its Height column. The LC-MS Console fixes which peaks there are, and their heights, in peak "
+    "spotting, isotope estimation and deconvolution (MsdialLcMsApi FileProcess.RunAsync). It writes the "
+    ".mdpeak after annotation and the characterisation that follows it (LcmsProcess.ExecuteAsync), but "
+    "neither of those adds or removes a peak or changes its height, so the MSP, LBM and text libraries "
+    "are not loaded. Without reference matches the characterisation can give a peak another adduct, "
+    "charge or isotope assignment, so the Adduct, Isotope and MS1 isotopes columns of a diagnostic "
+    ".mdpeak are not the production run's, and nothing reads them. Every peak-spotting and deconvolution "
+    "setting is the production method's; Minimum peak height is 0."
 )
 
 # Every method-file line that names a library the LC-MS Console loads. A diagnostic that skips annotation
@@ -2076,6 +2080,11 @@ ANNOTATION_LIBRARY_METHOD_KEYS = (
     "text annotator settings file path",
     "isotope text db file path",
 )
+
+# The method-file line naming the production annotation pipeline profile. No Console reads it; it says
+# which annotation the run performs, so a diagnostic that skips annotation writes it blank as well, whatever
+# the template carries.
+ANNOTATION_PROFILE_METHOD_KEY = "annotation pipeline profile"
 
 
 def diagnostic_skips_annotation(state: dict[str, Any]) -> bool:
@@ -2110,8 +2119,11 @@ def _skip_diagnostic_annotation(tuning: dict[str, Any]) -> None:
 
     THE DIAGNOSTIC USED TO ANNOTATE AS THE PRODUCTION RUN DOES. On a campaign unit that meant the tiered
     LBM -> strict MSP -> broad MSP cascade against the VS21-size MSP twice over, at Minimum peak height 0,
-    where every peak above the noise is a query: a diagnostic of one Waters AIF file ran for more than 40
-    minutes, most of it in annotation, for a number annotation cannot change.
+    where every peak above the noise is a query. In the pilot, the diagnostic of one Waters MSE (AIF) file,
+    MTBKS281 Lm1, took 2,650.5 s with annotation. Run again without it, the same file took 927.9 s and gave
+    the same 20,057 peaks with the same heights. A Thermo DDA file, ST001337 Human feces_ALA007, took
+    267.0 s with annotation and 12.1 s without, with the same 13,599 peaks and heights. Each figure is
+    one Console run, and the two runs of a file were on different days.
 
     Library provenance goes too, because a repository run manifest lists every library its state names;
     left in place, the diagnostic's manifest would list libraries it never loaded.
@@ -3696,10 +3708,13 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
     if text_annotator_settings_path is not None:
         replacements["text annotator settings file path"] = str(text_annotator_settings_path)
     if project_type == "lcms" and diagnostic_skips_annotation(state):
-        # Written blank rather than left to the template: an isotope text DB or a settings-file line in a
-        # template is not Interactive's state, and a diagnostic that says it loads no library must not.
-        replacements.pop("annotation pipeline profile", None)
-        replacements.update({key: "" for key in ANNOTATION_LIBRARY_METHOD_KEYS})
+        # Written blank rather than left to the template: an isotope text DB, a settings-file line or an
+        # annotation pipeline profile in a template is not Interactive's state, and a diagnostic that says it
+        # loads no library must not name one. Leaving the profile out of the replacements is not enough:
+        # _skip_diagnostic_annotation has already taken it out of the state, and a template line with no
+        # replacement is copied through as it stands.
+        blanked = (*ANNOTATION_LIBRARY_METHOD_KEYS, ANNOTATION_PROFILE_METHOD_KEY)
+        replacements.update({key: "" for key in blanked})
     if project_type == "gcms":
         replacements.update(
             {
