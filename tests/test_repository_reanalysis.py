@@ -942,7 +942,7 @@ class MixedAcquisitionPreflightTests(_MixedUnitFixture, unittest.TestCase):
         self.assertFalse(gate["allowed"])
         self.assertTrue(any("more than one acquisition mode" in item for item in gate["blockers"]))
         self.assertTrue(
-            any("header DDA, run as SWATH" in item for item in gate["blockers"]), gate["blockers"]
+            any("header gives DDA, run as SWATH" in item for item in gate["blockers"]), gate["blockers"]
         )
 
     def test_the_gate_refuses_a_file_run_against_its_own_header(self) -> None:
