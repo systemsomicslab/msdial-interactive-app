@@ -432,6 +432,40 @@ class RunDecisionTests(_UnitCase):
         self.assertEqual({"thermo_ftms_centroid_stream": 2}, decision["levels"]["ms2"]["delivery"])
         self.assertTrue(decision["read_from_preflight_output"])
 
+    def summary_less_unit(self, output: Path) -> Path:
+        # The shape a preflight keeps when it recorded no summary: command, exit code, streams and output.
+        manifest = _write_unit(self.root, [{"file": str(path)} for path in self.files])
+        content = json.loads(manifest.read_text(encoding="utf-8"))
+        content["raw_metadata_preflight"] = {"command": ["extractor"], "exit_code": 1, "stdout": "", "stderr": "", "output": str(output)}
+        manifest.write_text(json.dumps(content), encoding="utf-8")
+        return manifest
+
+    def test_a_preflight_without_a_summary_is_read_from_its_output(self) -> None:
+        output = self.root / "provenance" / "raw-metadata-preflight.json"
+        records = []
+        for path in self.files:
+            record = fx._header(str(path))
+            record["source"].update({"readerName": "ShimadzuLcdMetadataReader", "nativeFormat": "Shimadzu LCD"})
+            record["acquisition"]["spectrumRepresentation"] = {"value": "Profile", "source": "SpectrumHeader", "confidence": 1.0}
+            records.append(record)
+        manifest = self.summary_less_unit(output)
+        output.write_text(json.dumps(records), encoding="utf-8")
+
+        decision = run_data_types(self.state(manifest))
+
+        self.assertEqual(("Centroid", "delivered_centroid", 2), (decision["ms1_data_type"], decision["ms1_data_type_basis"], decision["inputs"]))
+        self.assertEqual({"shimadzu_centroid_list": 2}, decision["levels"]["ms2"]["delivery"])
+        self.assertTrue(decision["read_from_preflight_output"])
+
+    def test_a_preflight_without_a_summary_or_an_output_stays_unrecorded(self) -> None:
+        manifest = self.summary_less_unit(self.root / "provenance" / "raw-metadata-preflight.json")
+
+        decision = run_data_types(self.state(manifest))
+
+        self.assertEqual(("Centroid", "default", "unrecorded"), _level(decision, "ms1"))
+        self.assertEqual(("Centroid", "default", "unrecorded"), _level(decision, "ms2"))
+        self.assertNotIn("read_from_preflight_output", decision)
+
     def test_outside_a_unit_there_is_nothing_to_decide(self) -> None:
         self.assertIsNone(run_data_types({"files": [{"file_path": str(self.files[0])}]}))
 

@@ -6886,7 +6886,10 @@ def _representation_by_input(manifest: dict[str, Any]) -> dict[str, dict[str, An
     format and instrument model that say what MS-DIAL receives, on each per-file record. One recorded
     before did not, though the extractor read them: for such a record they are read from the extractor
     records the preflight kept in its output file, and the record says so
-    (spectrum_representation_read_from). An input found in neither has no entry.
+    (spectrum_representation_read_from). A preflight that kept no per-file summary at all (one recorded
+    without a summary, or one whose extractor failed before it was summarised) is read the same way: every
+    extractor record its output file holds gives an entry for the file it names. An input found in neither
+    has no entry.
     """
     from .raw_metadata_preflight import spectrum_representation_fields
 
@@ -6904,11 +6907,12 @@ def _representation_by_input(manifest: dict[str, Any]) -> dict[str, dict[str, An
             result[_file_key(path_text)] = item
         else:
             earlier.append(item)
-    if not earlier:
+    if entries and not earlier:
         return result
     records: dict[str, dict[str, Any]] = {}
+    output_text = str(preflight.get("output") or "").strip()
     try:
-        raw = json.loads(Path(str(preflight.get("output") or "")).read_text(encoding="utf-8-sig"))
+        raw = json.loads(Path(output_text).read_text(encoding="utf-8-sig")) if output_text else []
     except (OSError, ValueError):
         raw = []
     for record in [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []:
@@ -6916,6 +6920,15 @@ def _representation_by_input(manifest: dict[str, Any]) -> dict[str, dict[str, An
         path_text = str(source.get("filePath") or "") if isinstance(source, dict) else ""
         if path_text:
             records.setdefault(_file_key(path_text), record)
+    if not entries:
+        # No per-file summary to complete: the extractor records themselves are the per-file entries.
+        for key, record in records.items():
+            result[key] = {
+                "file": str(record["source"]["filePath"]),
+                **spectrum_representation_fields(record),
+                "spectrum_representation_read_from": "preflight_output",
+            }
+        return result
     for item in earlier:
         key = _file_key(str(item.get("file") or ""))
         record = records.get(key)
