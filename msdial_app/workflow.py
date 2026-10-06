@@ -1896,9 +1896,10 @@ def prepare_run(
         ]
         expected_analysis_exports.extend(expected_automatic_rt_correction_exports)
     manifest_path = run_directory / "run-manifest.json"
-    # The MS1 and MS2 data type method.txt asks for, and on what basis: raw_header where every input of a
-    # repository unit recorded one representation, default otherwise, with the decision that said so
-    # (data_type_provenance, set by repository_reanalysis.apply_header_data_types).
+    # The MS1 and MS2 data type method.txt asks for, and on what basis: raw_header or delivered_centroid
+    # where every input of a repository unit delivers one representation to MS-DIAL, default otherwise,
+    # with the decision that said so (data_type_provenance, set by
+    # repository_reanalysis.apply_delivered_data_types).
     data_types = data_type_record(method_state)
     # A version string and a path cannot identify a binary: the string is whatever the
     # assembly claims, the path can be rebuilt under. inspect_console_path already
@@ -2108,6 +2109,12 @@ def prepare_tuning_run(
         annotator["reverse_dot_product_cutoff"] = 0
         annotator["matched_peaks_percentage_cutoff"] = 0
         annotator["minimum_spectrum_match"] = 0
+    if isinstance(state.get("data_type_provenance"), dict):
+        # The copied decision describes every input of the unit; the diagnostic runs one, with the unit's
+        # values, and its record must describe that one.
+        from .repository_reanalysis import diagnostic_data_types
+
+        diagnostic_data_types(tuning, state["data_type_provenance"])
     prepared = prepare_run(tuning)
     if prepared.get("temporary_input_folder"):
         prepared["diagnostic_input_folder"] = prepared["temporary_input_folder"]
