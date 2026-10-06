@@ -9084,8 +9084,8 @@ POLARITY_NAME_TOKENS = {"pos": "Positive", "positive": "Positive", "neg": "Negat
 # Tokens beside which a pos/neg token (before or after it, in the same folder or file name) may name a sample
 # rather than a polarity: Neg_Ctrl_1.raw is a negative control, whatever polarity it ran in. Read as polarities,
 # they refused a positive unit's own Neg_Ctrl_1.raw (review of PR #58, 2026-10-06). But in the Catalog such a
-# token is as often the file's polarity: in all 19 LC-MS units whose sample rows name a file by one that
-# contradicts the unit's ion mode, the unit's other rows name files by polarity (ST002251's
+# token is also a file's polarity: in all 19 LC-MS units whose sample rows state a polarity by one that
+# contradicts the unit's ion mode (157 rows), the unit's other rows name files by polarity (ST002251's
 # 20200715_004_QC-neg.mzML beside its _pos and _neg samples, ST002510's GL_NEG_Ctrl_B3_1.raw, ST003858's
 # Blank_POS_001.mzML). name_polarities therefore reads such a token as a polarity only in a listing that names
 # its files by polarity, and only in a name that states no polarity by a token of its own.
