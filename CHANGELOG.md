@@ -4,6 +4,48 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.29] - Unreleased
+
+### Changed
+- A campaign disposition takes each file's acquisition from its raw header first,
+  as the user decided on 2026-10-06. A file whose header was read, that has MS2,
+  and whose header gives DDA, DIA, AIF or SWATH runs as its header says, whatever
+  the unit declares and whatever confidence the extractor gave.
+  `HEADER_OVERRIDE_CONFIDENCE` (0.8) is gone. The extractor's confidence is a
+  constant per branch of its classifier: every DDA read without an isolation width
+  is 0.75. The declaration is the Catalog's keyword match over the assay's text
+  (`infer_acquisition`), not a structured repository field. Under the old rule
+  MTBLS1572 ran its six DDA files, and a blank whose header is Unknown, as SWATH.
+  - Each declaration a header overrode is listed in `declared_vs_header` with
+    `decided` (the header's mode), `basis: header` and `declaration_source`. The
+    record also carries `declared_acquisition_source`, one of
+    `catalog_keyword_inference` (the Catalog handoff's
+    `technical_settings.acquisition_mode`, which the Catalog writes only by keyword
+    matching and with no source of its own), `split_part` or `unattributed`.
+    `acquisition_header_disagrees_low_confidence` is no longer written.
+  - A file whose header gives Unknown is excluded as `acquisition_unresolved` in a
+    declared unit too, as it already was in an undeclared one. A header that gives
+    PRM, SRM, MRM or SIM is excluded as `acquisition_out_of_scope:<method>`,
+    whatever the declaration.
+  - In a unit declared DIA, AIF or SWATH, MS1-only files are not folded into the DDA
+    run its headers make. They are excluded as `ms1_only_in_declared_dia_unit`,
+    since they may be all-ion data exported as MS1 scans (MTBLS1572's bbCID files).
+    Elsewhere the fold is unchanged, and `ms1_only_beside_dia` still applies beside
+    SWATH or AIF files. An MS1-only file whose header gives SWATH or AIF is never
+    folded into DDA (`ms1_only_header_contradicts_dda`).
+  - Unchanged: a unit none of whose headers could be read is taken at its
+    declaration (`acquisition_declared_only`); a DIA header whose isolation settles
+    neither SWATH nor AIF takes the declared one; mixed acquisitions still split;
+    untargeted status is never inferred over a declared targeted acquisition.
+- The execution gate refuses a row whose acquisition type contradicts the Console
+  type its file's header gives (`header_console_acquisition_type`), whatever an
+  applied disposition decided. A manifest decided under the old rule can no longer
+  run DDA-header files as SWATH. Outside a campaign this also refuses AIF for a DIA
+  header whose recurring isolation windows make it SWATH.
+
+### Added
+- Agent capability `campaign_header_first_acquisition`.
+
 ## [0.5.24] - Unreleased
 
 ### Added

@@ -733,11 +733,23 @@ class DispositionMatrixTests(unittest.TestCase):
                 self.assertIn("acquisition_declared_only", disposition["warnings"])
                 self.assertEqual({"declaration"}, {item["basis"] for item in disposition["assignments"].values()})
 
-    def test_a_declaration_with_an_unknown_header_runs_on_the_declaration(self) -> None:
-        disposition = self.decide([_header("w.raw", "Unknown", confidence=0.3)], declared={"acquisition_mode": "DDA"})
+    def test_an_unknown_header_is_excluded_whatever_the_unit_declares(self) -> None:
+        # Rule 2 of 2026-10-06: the declaration is not taken for a file whose header was read and says Unknown.
+        for declared in ({"acquisition_mode": "DDA"}, {"acquisition_mode": "DIA"}, {}):
+            with self.subTest(declared=declared):
+                alone = self.decide([_header("w.raw", "Unknown", confidence=0.3)], declared=declared)
+                beside = self.decide(
+                    [_header("a.mzML", "DDA"), _header("blank.mzML", "Unknown", confidence=0.3)], declared=declared
+                )
 
-        self.assertEqual("run", disposition["disposition"])
-        self.assertIn("acquisition_declared_only", disposition["warnings"])
+                self.assertEqual(("skip", ["acquisition_unresolved"]), (alone["disposition"], alone["reasons"]))
+                self.assertNotIn("acquisition_declared_only", alone["warnings"])
+                self.assertEqual("run", beside["disposition"])
+                self.assertEqual({file_key("a.mzML")}, set(beside["assignments"]))
+                self.assertEqual(
+                    [("blank.mzML", "acquisition_unresolved")],
+                    [(item["path"], item["reason"]) for item in beside["excluded_inputs"]],
+                )
 
     def test_a_confident_header_overrides_the_declaration(self) -> None:
         disposition = self.decide([_header("a.mzML", "DIA", confidence=0.82)], declared={"acquisition_mode": "DDA"})
@@ -747,13 +759,71 @@ class DispositionMatrixTests(unittest.TestCase):
         self.assertIn("acquisition_header_overrides_declaration", disposition["warnings"])
         self.assertEqual("DIA", disposition["declared_vs_header"][0]["decided"])
 
-    def test_an_unconfident_header_leaves_the_declaration_in_force(self) -> None:
+    def test_a_header_with_ms2_decides_over_the_declaration_at_any_confidence(self) -> None:
+        # Rule 1 of 2026-10-06. The extractor's confidence is a constant per branch: 0.75 for every DDA read
+        # without an isolation width (MTBLS1572's DDA files under the Catalog's keyword "DIA"), 0.6 here for DIA.
+        cases = [
+            ("DIA", "DDA", 0.75, {}, "DDA"),
+            ("DDA", "DIA", 0.6, {}, "SWATH"),
+            ("DDA", "DIA", 0.5, {"targets": []}, "AIF"),
+            ("SWATH", "AIF", 0.3, {"targets": []}, "AIF"),
+        ]
+        for declared, header, confidence, options, console in cases:
+            with self.subTest(declared=declared, header=header):
+                disposition = self.decide(
+                    [_header("a.mzML", header, confidence=confidence, **options),
+                     _header("b.mzML", header, confidence=confidence, **options)],
+                    declared={"acquisition_mode": declared},
+                )
+
+                self.assertEqual(("run", console), (disposition["disposition"], disposition["console_acquisition_type"]))
+                self.assertTrue(all(item["basis"].startswith("header") for item in disposition["assignments"].values()))
+                self.assertIn("acquisition_header_overrides_declaration", disposition["warnings"])
+                self.assertNotIn("acquisition_header_disagrees_low_confidence", disposition["warnings"])
+                self.assertEqual(2, len(disposition["declared_vs_header"]))
+                entry = disposition["declared_vs_header"][0]
+                self.assertEqual(
+                    (declared, header, confidence, header, "header", "unattributed"),
+                    (entry["declared"], entry["header"], entry["confidence"], entry["decided"], entry["basis"],
+                     entry["declaration_source"]),
+                )
+
+    def test_a_targeted_header_is_out_of_scope_whatever_the_unit_declares(self) -> None:
         disposition = self.decide([_header("a.mzML", "PRM", confidence=0.65)], declared={"acquisition_mode": "DDA"})
 
-        self.assertEqual("run", disposition["disposition"])
-        self.assertEqual("DDA", disposition["console_acquisition_type"])
-        self.assertIn("acquisition_header_disagrees_low_confidence", disposition["warnings"])
-        self.assertEqual("DDA", disposition["declared_vs_header"][0]["decided"])
+        self.assertEqual(("exclude", ["acquisition_out_of_scope:PRM"]), (disposition["disposition"], disposition["reasons"]))
+        self.assertNotIn("acquisition_header_overrides_declaration", disposition["warnings"])
+        entry = disposition["declared_vs_header"][0]
+        self.assertEqual(("PRM", "PRM"), (entry["header"], entry["decided"]))
+
+    def test_the_declarations_source_is_recorded_beside_the_header_that_overrode_it(self) -> None:
+        handoff = {"catalog_handoff": {"technical_settings": {"acquisition_mode": "DIA"}}}
+        catalog = _manifest([_header("a.mzML", "DDA", confidence=0.75)], declared={"acquisition_mode": "DIA"})
+        catalog["project"]["repository_metadata"] = handoff
+        part = _manifest([_header("a.mzML", "DIA", confidence=0.75)], declared={"acquisition_mode": "DDA"})
+        part["project"]["repository_metadata"] = handoff
+        part["split_from"] = {"analysis_unit_id": "u", "acquisition_mode": "DDA"}
+        elsewhere = _manifest([_header("a.mzML", "DDA", confidence=0.75)], declared={"acquisition_mode": "AIF"})
+        elsewhere["project"]["repository_metadata"] = handoff
+        undeclared = _manifest([_header("a.mzML", "DDA", confidence=0.75)])
+
+        for manifest, source in (
+            (catalog, "catalog_keyword_inference"), (part, "split_part"), (elsewhere, "unattributed"), (undeclared, ""),
+        ):
+            with self.subTest(source=source):
+                disposition = decide_disposition(manifest)
+
+                self.assertEqual("run", disposition["disposition"])
+                self.assertEqual(source, disposition["declared_acquisition_source"])
+                self.assertEqual(
+                    [source] if source else [], [item["declaration_source"] for item in disposition["declared_vs_header"]]
+                )
+        self.assertIn("(catalog_keyword_inference)", " ".join(decide_disposition(catalog)["detail"]))
+
+    def test_a_campaign_runner_can_tell_the_header_first_rule_is_in_force(self) -> None:
+        from msdial_app.agent_bridge import summarize_jobs
+
+        self.assertIn("campaign_header_first_acquisition", summarize_jobs({})["capabilities"])
 
     def test_ion_mobility_is_excluded_from_the_header_or_the_folder(self) -> None:
         by_header = self.decide([_header("im.d", "AIF", mobility=True, confidence=1.0)])
@@ -783,6 +853,74 @@ class DispositionMatrixTests(unittest.TestCase):
         folded = disposition["assignments"][file_key("pool.mzML")]
         self.assertEqual(("DDA", "folded_ms1_only"), (folded["console_acquisition_type"], folded["basis"]))
         self.assertNotIn("acquisition_header_overrides_declaration", disposition["warnings"])
+
+    def test_ms1_only_files_are_not_folded_into_dda_where_the_unit_is_declared_dia_or_aif(self) -> None:
+        # Rule 3 of 2026-10-06: MTBLS1572's bbCID files carry no MS2 scans, and MTBKS217's z_014nn goes with them.
+        records = [
+            _header("a.mzML", "DDA", confidence=0.75),
+            _header("bbcid.mzML", "FullScan", levels=[1], confidence=0.95),
+            _header("full.mzML", "FullScan", levels=[1], confidence=0.95),
+        ]
+        for declared in ("DIA", "AIF", "SWATH"):
+            with self.subTest(declared=declared):
+                disposition = self.decide(records, declared={"acquisition_mode": declared})
+
+                self.assertEqual(("run", "DDA"), (disposition["disposition"], disposition["console_acquisition_type"]))
+                self.assertEqual({file_key("a.mzML")}, set(disposition["assignments"]))
+                self.assertEqual(
+                    [("bbcid.mzML", "ms1_only_in_declared_dia_unit"), ("full.mzML", "ms1_only_in_declared_dia_unit")],
+                    [(item["path"], item["reason"]) for item in disposition["excluded_inputs"]],
+                )
+                self.assertNotIn("ms1_only_files_folded", disposition["warnings"])
+                self.assertIn("ms1_only_in_declared_dia_unit", " ".join(disposition["detail"]))
+        for declared in ("DDA", "Unknown"):
+            with self.subTest(declared=declared):
+                disposition = self.decide(records, declared={"acquisition_mode": declared})
+
+                self.assertEqual(3, len(disposition["assignments"]))
+                self.assertEqual([], disposition["excluded_inputs"])
+                self.assertIn("ms1_only_files_folded", disposition["warnings"])
+
+    def test_ms1_only_files_beside_dia_or_alone_keep_their_reasons_in_a_declared_dia_unit(self) -> None:
+        full = _header("full.mzML", "FullScan", levels=[1], confidence=0.95)
+        beside = self.decide([_header("b.mzML", "DIA", confidence=0.82), full], declared={"acquisition_mode": "DIA"})
+        alone = self.decide([full], declared={"acquisition_mode": "DIA"})
+
+        self.assertEqual(("run", "SWATH"), (beside["disposition"], beside["console_acquisition_type"]))
+        self.assertEqual([("full.mzML", "ms1_only_beside_dia")], [(item["path"], item["reason"]) for item in beside["excluded_inputs"]])
+        self.assertEqual(("exclude", ["acquisition_out_of_scope:FullScan"]), (alone["disposition"], alone["reasons"]))
+
+    def test_a_declared_dia_unit_of_dda_and_swath_headers_splits_without_its_ms1_only_files(self) -> None:
+        # Rule 5: mixed modes still go to the split; the MS1-only file is in neither part.
+        disposition = self.decide(
+            [
+                _header("a.mzML", "DDA", confidence=0.75),
+                _header("b.mzML", "DIA", confidence=0.82),
+                _header("full.mzML", "FullScan", levels=[1], confidence=0.95),
+            ],
+            declared={"acquisition_mode": "DIA"},
+        )
+
+        self.assertEqual("split", disposition["disposition"])
+        self.assertEqual(
+            [("DDA", ["a.mzML"]), ("SWATH", ["b.mzML"])],
+            [(group["console_acquisition_type"], group["inputs"]) for group in disposition["split_key"]["groups"]],
+        )
+        self.assertEqual([("full.mzML", "ms1_only_in_declared_dia_unit")], [(item["path"], item["reason"]) for item in disposition["excluded_inputs"]])
+
+    def test_an_ms1_only_file_whose_header_gives_aif_is_never_folded_into_dda(self) -> None:
+        # No MS2 recorded, yet the header gives AIF: folding it into DDA would contradict its header, which the
+        # execution gate refuses. None of the per-file records on disk is one; the rule keeps the two consistent.
+        disposition = self.decide(
+            [_header("a.mzML", "DDA"), _header("mse.raw", "AIF", levels=[1], targets=[], confidence=0.95)]
+        )
+
+        self.assertEqual(("run", "DDA"), (disposition["disposition"], disposition["console_acquisition_type"]))
+        self.assertEqual(
+            [("mse.raw", "ms1_only_header_contradicts_dda")],
+            [(item["path"], item["reason"]) for item in disposition["excluded_inputs"]],
+        )
+        self.assertNotIn("ms1_only_files_folded", disposition["warnings"])
 
     def test_dda_beside_dia_splits_by_acquisition(self) -> None:
         disposition = self.decide([_header("a.mzML", "DDA"), _header("b.mzML", "DIA", confidence=0.82)])
@@ -909,18 +1047,21 @@ class DispositionMatrixTests(unittest.TestCase):
         self.assertEqual(["inputs_missing", "raw_metadata_incomplete"], disposition["reasons"])
         self.assertEqual([], disposition["excluded_inputs"])
 
-    def test_a_declared_targeted_acquisition_is_excluded_unless_a_confident_header_contradicts_it(self) -> None:
+    def test_a_declared_targeted_acquisition_yields_to_a_read_header_and_decides_an_unreadable_unit(self) -> None:
+        # Header first (2026-10-06): a targeted declaration is a declaration like any other. Untargeted status is
+        # still never inferred over one (test_untargeted_is_never_inferred_over_a_declared_targeted_acquisition).
         for method in ("MRM", "SRM", "PRM", "SIM"):
             with self.subTest(method=method):
                 weak = self.decide([_header("a.mzML", "DDA", confidence=0.5)], declared={"acquisition_mode": method})
                 unreadable = self.decide([], declared={"acquisition_mode": method}, failures={"a.wiff2": "failed"})
                 confident = self.decide([_header("a.mzML", "DDA", confidence=0.9)], declared={"acquisition_mode": method})
 
-                self.assertEqual(("exclude", [f"acquisition_out_of_scope:{method}"]), (weak["disposition"], weak["reasons"]))
-                self.assertIn("acquisition_header_disagrees_low_confidence", weak["warnings"])
+                self.assertEqual(("run", "DDA"), (weak["disposition"], weak["console_acquisition_type"]))
+                self.assertIn("acquisition_header_overrides_declaration", weak["warnings"])
                 self.assertEqual(
                     ("exclude", [f"acquisition_out_of_scope:{method}"]), (unreadable["disposition"], unreadable["reasons"])
                 )
+                self.assertIn("acquisition_declared_only", unreadable["warnings"])
                 self.assertEqual(("run", "DDA"), (confident["disposition"], confident["console_acquisition_type"]))
                 self.assertIn("acquisition_header_overrides_declaration", confident["warnings"])
 
@@ -935,9 +1076,12 @@ class DispositionMatrixTests(unittest.TestCase):
         unknown = self.decide([_header("w.raw", "Unknown", confidence=0.3)], declared={"acquisition_mode": "FullScan"})
         confident = self.decide([_header("a.mzML", "DDA", confidence=0.9)], declared={"acquisition_mode": "FullScan"})
 
-        self.assertEqual(("exclude", ["acquisition_out_of_scope:FullScan"]), (weak["disposition"], weak["reasons"]))
-        self.assertEqual(("exclude", ["acquisition_out_of_scope:FullScan"]), (unknown["disposition"], unknown["reasons"]))
+        unreadable = self.decide([], declared={"acquisition_mode": "FullScan"}, failures={"a.wiff2": "failed"})
+
+        self.assertEqual(("run", "DDA"), (weak["disposition"], weak["console_acquisition_type"]))
+        self.assertEqual(("skip", ["acquisition_unresolved"]), (unknown["disposition"], unknown["reasons"]))
         self.assertEqual("run", confident["disposition"])
+        self.assertEqual(("exclude", ["acquisition_out_of_scope:FullScan"]), (unreadable["disposition"], unreadable["reasons"]))
 
     def test_untargeted_is_never_inferred_over_a_declared_targeted_acquisition(self) -> None:
         targeted = self.decide(
@@ -1158,23 +1302,46 @@ class CampaignPreflightTests(_Scratch):
         self.assertFalse(result["execution_allowed"])
         self.assertEqual(["acquisition_out_of_scope:MRM"], result["campaign_disposition"]["reasons"])
 
-    def test_a_low_confidence_header_the_declaration_overrules_does_not_block_the_run(self) -> None:
-        manifest, _stub, files = self.campaign_unit(["a.mzML", "b.mzML"], acquisition="DDA")
+    def test_a_weak_header_runs_over_the_declaration_and_an_unknown_one_is_left_out(self) -> None:
+        # MTBLS1572 as 2026-10-06 decided it: DDA headers at the extractor's constant 0.75 run as DDA in a unit the
+        # Catalog's keyword match declares DIA, and the blank whose header is Unknown is not run on the declaration.
+        manifest, _stub, files = self.campaign_unit(["a.mzML", "b.mzML", "blank.mzML"], acquisition="DIA")
         extractor = _PinnedExtractor.make(self.root / "build")
+        verdicts = {
+            "a.mzML": {"method": "DDA", "confidence": 0.75},
+            "b.mzML": {"method": "DDA", "confidence": 0.75},
+            "blank.mzML": {"method": "Unknown", "confidence": 0.3},
+        }
 
-        result = self.preflight(manifest, extractor, _Extractor({"b.mzML": {"method": "DIA", "confidence": 0.6}}))
+        result = self.preflight(manifest, extractor, _Extractor(verdicts))
 
+        disposition = result["campaign_disposition"]
         self.assertTrue(result["execution_allowed"])
         self.assertEqual("DDA", result["project"]["acquisition_mode"])
-        gate = evaluate_repository_execution_gate(
-            {
-                "repository_run_manifest": str(manifest),
-                "output_root": str(self.root / "unit" / "output"),
-                "ion_mode": "Negative",
-                "files": [{"file_path": str(path), "acquisition_type": "DDA"} for path in files],
-            }
+        self.assertEqual([("blank.mzML", "acquisition_unresolved")], [
+            (Path(item["path"]).name, item["reason"]) for item in disposition["excluded_inputs"]
+        ])
+        self.assertEqual(["DIA", "DIA"], [item["declared"] for item in disposition["declared_vs_header"]])
+        entries = {Path(item["file"]).name: item for item in result["raw_metadata_preflight"]["summary"]["per_file"]}
+        self.assertEqual(("DDA", "header"), (entries["a.mzML"]["console_acquisition_type"], entries["a.mzML"]["console_acquisition_basis"]))
+        self.assertEqual((None, ""), (entries["blank.mzML"]["console_acquisition_type"], entries["blank.mzML"]["console_acquisition_basis"]))
+        state = {
+            "repository_run_manifest": str(manifest),
+            "output_root": str(self.root / "unit" / "output"),
+            "ion_mode": "Negative",
+            "files": [{"file_path": str(path), "acquisition_type": "DDA"} for path in files[:2]],
+        }
+        self.assertTrue(evaluate_repository_execution_gate(state)["allowed"])
+        as_swath = evaluate_repository_execution_gate(
+            {**state, "files": [{**item, "acquisition_type": "SWATH"} for item in state["files"]]}
         )
-        self.assertTrue(gate["allowed"], gate["blockers"])
+        self.assertFalse(as_swath["allowed"])
+        self.assertTrue(any("raw header contradicts" in item for item in as_swath["blockers"]), as_swath["blockers"])
+        with_blank = evaluate_repository_execution_gate(
+            {**state, "files": [*state["files"], {"file_path": str(files[2]), "acquisition_type": "SWATH"}]}
+        )
+        self.assertFalse(with_blank["allowed"])
+        self.assertTrue(any("blank.mzML (acquisition_unresolved)" in item for item in with_blank["blockers"]))
 
     def test_a_header_that_guesses_another_separation_does_not_reach_a_run_of_a_repository_lc_unit(self) -> None:
         manifest, _stub, _ = self.campaign_unit(["a.mzML"], acquisition="DDA")
@@ -1235,16 +1402,19 @@ class CampaignPreflightTests(_Scratch):
             (Path(item["path"]).name, item["reason"]) for item in recorded["campaign_disposition"]["excluded_inputs"]
         ])
 
-    def test_a_declared_mrm_unit_with_weak_dda_headers_is_excluded_not_run_as_dda(self) -> None:
+    def test_a_declared_mrm_unit_with_weak_dda_headers_is_held_back_not_run_as_dda(self) -> None:
+        # The DDA headers decide the acquisition (2026-10-06), but untargeted status is never inferred over a
+        # declared targeted acquisition, so a unit that does not declare it untargeted does not run.
         manifest, _stub, _ = self.campaign_unit(["a.wiff", "b.wiff"], acquisition="MRM", untargeted=None)
         extractor = _PinnedExtractor.make(self.root / "build")
         weak = {name: {"method": "DDA", "confidence": 0.55} for name in ("a.wiff", "b.wiff")}
 
         result = self.preflight(manifest, extractor, _Extractor(weak))
 
-        self.assertEqual("excluded_by_preflight", result["status"])
+        self.assertEqual("skipped_by_preflight", result["status"])
         self.assertFalse(result["execution_allowed"])
-        self.assertEqual(["acquisition_out_of_scope:MRM"], result["campaign_disposition"]["reasons"])
+        self.assertEqual(["untargeted_unresolved"], result["campaign_disposition"]["reasons"])
+        self.assertIn("declares MRM acquisition", " ".join(result["campaign_disposition"]["detail"]))
         self.assertIsNot(True, result["project"]["untargeted"])
 
     def test_an_input_the_disposition_excludes_runs_as_no_type(self) -> None:
@@ -1447,21 +1617,85 @@ class DecidedTypeGateTests(_Scratch):
         self.assertTrue(self.gate(manifest, files, "SWATH")["allowed"])
         self.assertFalse(self.gate(manifest, files, "AIF")["allowed"])
 
-    def test_a_file_the_declaration_decided_does_not_run_as_its_weak_header_says(self) -> None:
-        manifest, files, result = self.campaign(["a.mzML", "b.mzML"], {"b.mzML": {"method": "DIA", "confidence": 0.6}}, acquisition="DDA")
-        self.assertEqual("DDA", result["campaign_disposition"]["console_acquisition_type"])
+    def test_a_file_a_weak_header_decided_runs_only_as_its_header_gives(self) -> None:
+        manifest, files, result = self.campaign(
+            ["a.mzML", "b.mzML"], {name: {"method": "DIA", "confidence": 0.6} for name in ("a.mzML", "b.mzML")},
+            acquisition="DDA",
+        )
+        self.assertEqual("SWATH", result["campaign_disposition"]["console_acquisition_type"])
 
-        self.assertTrue(self.gate(manifest, files, "DDA")["allowed"])
-        self.assertFalse(self.gate(manifest, files[1:], "SWATH")["allowed"])
+        self.assertTrue(self.gate(manifest, files, "SWATH")["allowed"])
+        for kind in ("DDA", "AIF", ""):
+            with self.subTest(kind=kind):
+                refused = self.gate(manifest, files, kind)
+                self.assertFalse(refused["allowed"])
+                self.assertTrue(any("raw header contradicts" in item for item in refused["blockers"]), refused["blockers"])
+
+    def test_a_row_that_contradicts_the_console_type_its_header_gives_is_refused_whatever_was_decided(self) -> None:
+        # Rule 6 of 2026-10-06. A disposition recorded under the earlier rule kept a declared DIA over DDA headers
+        # below 0.8 and decided SWATH (MTBLS1572); the gate no longer lets such a row through.
+        manifest, files, _result = self.campaign(
+            ["a.mzML", "b.mzML"], {name: {"method": "DDA", "confidence": 0.75} for name in ("a.mzML", "b.mzML")},
+            acquisition="DIA",
+        )
+
+        def as_recorded_under_the_earlier_rule(current: dict) -> None:
+            for entry in current["raw_metadata_preflight"]["summary"]["per_file"]:
+                entry.update(console_acquisition_type="SWATH", console_acquisition_basis="declaration")
+
+        update_manifest(manifest, as_recorded_under_the_earlier_rule)
+        refused = self.gate(manifest, files, "SWATH")
+
+        self.assertFalse(refused["allowed"])
+        self.assertTrue(
+            any("raw header contradicts" in item and "(header gives DDA, run as SWATH)" in item for item in refused["blockers"]),
+            refused["blockers"],
+        )
+        self.assertFalse(any("campaign disposition decided" in item for item in refused["blockers"]), refused["blockers"])
+
+    def test_a_split_reads_the_header_first_decision_and_leaves_the_ms1_only_file_out(self) -> None:
+        # Rule 5: the split machinery splits what the disposition decided, and an input it excluded is in no part.
+        verdicts = {
+            "a.mzML": {"method": "DDA", "confidence": 0.75},
+            "b.mzML": {"method": "DIA", "confidence": 0.82},
+            "full.mzML": {"method": "FullScan", "levels": [1], "confidence": 0.95},
+        }
+        manifest, _files, result = self.campaign(list(verdicts), verdicts, acquisition="DIA")
+        self.assertEqual("split", result["campaign_disposition"]["disposition"])
+
+        plan = split_unit_by_acquisition(manifest, confirmed=False)
+
+        self.assertEqual([], plan["blockers"])
+        self.assertEqual(
+            [("DDA", ["a.mzML"]), ("DIA", ["b.mzML"])],
+            [(part["acquisition_mode"], [Path(item).name for item in part["input_candidates"]]) for part in plan["parts"]],
+        )
+        self.assertEqual(
+            [("full.mzML", "ms1_only_in_declared_dia_unit")],
+            [(Path(item["path"]).name, item["reason"]) for item in plan["excluded_inputs"]],
+        )
 
     def test_outside_a_campaign_a_file_is_held_to_its_header_as_before(self) -> None:
+        manifest, stub, files = _unit(self.root / "unit", ["a.mzML"], acquisition="DIA")
+        self.preflight(manifest, stub, _Extractor({"a.mzML": {"method": "DIA", "confidence": 0.82, "targets": [500.0]}}))
+        update_manifest(manifest, lambda current: current.update(execution_allowed=True))
+
+        # One recurring target settles neither SWATH nor AIF, so the header admits both.
+        self.assertTrue(self.gate(manifest, files, "AIF")["allowed"])
+        self.assertTrue(self.gate(manifest, files, "SWATH")["allowed"])
+        self.assertFalse(self.gate(manifest, files, "DDA")["allowed"])
+        self.assertFalse(self.gate(manifest, files, "")["allowed"], "a blank type is DDA to the Console")
+
+    def test_outside_a_campaign_a_header_that_gives_a_console_type_binds_the_row(self) -> None:
+        # Recurring isolation windows make the header's DIA SWATH; AIF would ignore the windows.
         manifest, stub, files = _unit(self.root / "unit", ["a.mzML"], acquisition="DIA")
         self.preflight(manifest, stub, _Extractor({"a.mzML": {"method": "DIA", "confidence": 0.82}}))
         update_manifest(manifest, lambda current: current.update(execution_allowed=True))
 
-        self.assertTrue(self.gate(manifest, files, "AIF")["allowed"])
-        self.assertFalse(self.gate(manifest, files, "DDA")["allowed"])
-        self.assertFalse(self.gate(manifest, files, "")["allowed"], "a blank type is DDA to the Console")
+        self.assertTrue(self.gate(manifest, files, "SWATH")["allowed"])
+        refused = self.gate(manifest, files, "AIF")
+        self.assertFalse(refused["allowed"])
+        self.assertTrue(any("(header gives SWATH, run as AIF)" in item for item in refused["blockers"]), refused["blockers"])
 
 
 class UntargetedWordingTests(_Scratch):

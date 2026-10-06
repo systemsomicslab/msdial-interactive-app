@@ -359,11 +359,28 @@ campaign it is advice and changes nothing else. Under a campaign approval it is
 applied: it sets `execution_allowed`, the status (`preflight_passed`,
 `skipped_by_preflight`, `excluded_by_preflight`) and each input's
 `console_acquisition_type` (DDA, SWATH or AIF; none for an input that does not
-run), and the execution gate then admits each file only as that type.
+run), and the execution gate then admits each file only as that type, and never
+as one that contradicts the Console type its header gives
+(`header_console_acquisition_type`).
+
+Each file's acquisition is its raw header's wherever the header was read (user
+decision, 2026-10-06). A file with MS2 whose header gives DDA, DIA, AIF or SWATH
+runs as that, whatever the unit declares and whatever confidence the extractor
+gave: that confidence is a constant per branch of its classifier, and a
+declaration is the Catalog's keyword match over the assay's text. Each
+declaration a header overrode is listed in `declared_vs_header` with its
+`declaration_source` (`catalog_keyword_inference`, `split_part` or
+`unattributed`; the record's `declared_acquisition_source`). A file whose header
+gives Unknown is excluded as `acquisition_unresolved`, declared unit or not, and
+one whose header gives PRM, SRM, MRM or SIM as out of scope. The declaration
+decides only a unit none of whose headers could be read
+(`acquisition_declared_only`), and SWATH or AIF for a DIA header whose isolation
+settles neither. MS1-only files are folded into a DDA run, except in a unit
+declared DIA or AIF, where they may be all-ion data exported as MS1 scans and are
+excluded as `ms1_only_in_declared_dia_unit`.
 
 A repository declaration of PRM, SRM, MRM, SIM or full scan is a declaration like
-any other: the unit is excluded unless a header of confidence 0.8 or more says
-otherwise, and untargeted status is never inferred over a declared targeted
+any other, and untargeted status is never inferred over a declared targeted
 acquisition. An input that is missing, or that the recorded preflight never read,
 skips the unit (`inputs_missing`, `raw_metadata_incomplete`) instead of shrinking
 the run; only an input that was read and failed is excluded on its own. Outside a
