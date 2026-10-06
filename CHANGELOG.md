@@ -67,7 +67,13 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   declared name carries `pos`, `neg`, `positive` or `negative` as a token of its
   own, in any case, and that is not the unit's ion mode, or the two disagree, the
   pairing is refused (`polarity_token_contradicts_ion_mode`,
-  `polarity_token_contradicts_declared_name`). Every stage that admits a member
+  `polarity_token_contradicts_declared_name`). A polarity token beside a `control`,
+  `ctrl`, `blank` or `qc` token in the same folder or file name names a sample, not
+  a polarity, and refuses nothing: a positive unit's `Neg_Ctrl_1.raw` (a negative
+  control) pairs with `021518_Neg_Ctrl_1.raw`, as do `pos_ctrl`,
+  `Positive_control` and `neg_blank`. A polarity folder, or a polarity token of its
+  own elsewhere in the name (`Pos_Ctrl_1_neg.raw`), still refuses. Every stage that
+  admits a member
   by a sample's name admits a paired one (conversion sources, the encoding choice,
   the attribute stage, the extracted files kept), and its lineage row records
   `name_pairing` (`declared_raw_file`, `member_name`, `paired_by`
@@ -104,6 +110,12 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - the run manifest carries `warnings: ["input_names_paired_by_inference"]` and
     `input_name_pairings` (`paired`, `refused`); every campaign disposition of such
     a unit lists the same warning;
+  - a split part's run manifest carries the same record for itself: the pairings
+    of its own inputs (or of the mzXML they stand for), the refusals for its own
+    sample rows, and the warning only where it has a pairing of its own. A pairing
+    of an excluded input, or a refusal for a row no part holds, stays in the
+    parent's record only. An excluded ion-mobility part's disposition carries the
+    warning too;
   - the analysis-CSV build, its preview and the manifest's `analysis_csv` record
     carry the warning and `inferred_name_pairings`;
   - the reviewed sample TSV (and JSON) of a repository unit gains the column

@@ -112,12 +112,15 @@ be unique among the declared names and among the candidate members. Exact
 matches come first, then prefixed ones, then these. No inferred pairing crosses
 a polarity: a member whose path, or a declared name, carries `pos`, `neg`,
 `positive` or `negative` as a token of its own that is not the unit's ion mode
-(or the two disagree) is refused, and the refusal is recorded. Each inferred
-pairing is left on record: `name_pairing` on the lineage row (`paired_by`
-`leading_identifier_token` and its `key`), `inferred_name_pairings` and
-`refused_name_pairings` on the attribute stage, `input_name_pairings` and the
+(or the two disagree) is refused, and the refusal is recorded. A polarity token
+beside a `control`, `ctrl`, `blank` or `qc` token in the same folder or file name
+names a sample (`Neg_Ctrl_1.raw` is a negative control) and refuses nothing. Each
+inferred pairing is left on record: `name_pairing` on the lineage row
+(`paired_by` `leading_identifier_token` and its `key`), `inferred_name_pairings`
+and `refused_name_pairings` on the attribute stage, `input_name_pairings` and the
 warning `input_names_paired_by_inference` in the run manifest and in every
-campaign disposition, the same warning on the CSV record, and the column
+campaign disposition (a split part's manifest carries them for its own inputs
+and sample rows), the same warning on the CSV record, and the column
 `raw_file_paired_by` (`exact`, `prefixed_member_name`,
 `leading_identifier_token`) in the reviewed sample TSV.
 
