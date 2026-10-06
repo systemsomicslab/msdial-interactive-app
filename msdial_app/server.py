@@ -26,6 +26,7 @@ from .automatic_rt_review import extract_anchor_eic, read_automatic_rt_review
 from .agent_workflow import (
     build_guided_plan,
     estimate_peak_height,
+    current_peak_tuning_profile,
     estimate_peak_height_range,
     select_peak_tuning_representative,
 )
@@ -1754,23 +1755,25 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
                 target = int(body.get("target_peak_count", 0) or 0)
-                profile = (job.get("preparation") or {}).get("peak_tuning_profile") or {}
+                # The family is read again with this version's classifier: a diagnostic started before
+                # 0.5.28 stored every mzML as QTOF, and re-estimating it from its manifest kept that family.
+                preparation_record = job.get("preparation") or {}
+                profile = current_peak_tuning_profile(
+                    preparation_record.get("peak_tuning_profile") or {},
+                    declared_instrument(preparation_record.get("repository_run_manifest")),
+                )
                 if target > 0:
                     estimate = estimate_peak_height(
                         job["result"].get("heights", []), target
                     )
                 else:
-                    requested_step = int(body.get("threshold_step", 0) or 0)
-                    threshold_step = requested_step or int(
-                        profile.get("threshold_step", 100) or 100
-                    )
-                    # The family decides the fine step's floor (10 QTOF-type, 100 FT); a requested step is
-                    # only the coarse step, and one finer than the floor is raised to it.
+                    # The family decides the coarse step (100 QTOF-type, 1,000 FT) and the fine step (10,
+                    # 100). A requested step is recorded, never searched in the family step's place.
                     estimate = estimate_peak_height_range(
                         job["result"].get("heights", []),
                         int(body.get("target_peak_count_min", 3000) or 3000),
                         int(body.get("target_peak_count_max", 6000) or 6000),
-                        threshold_step,
+                        int(body.get("threshold_step", 0) or 0),
                         str(profile.get("instrument_family") or ""),
                     )
                 # The contract requires the diagnostic's method, representative sample, count,
