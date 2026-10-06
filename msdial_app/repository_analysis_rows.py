@@ -82,7 +82,9 @@ from .repository_metadata import (
     metadata_integer,
     metadata_match_keys,
     metadata_workspace,
+    rows_naming_input,
 )
+from .raw_metadata_preflight import INFERRED_PAIRING_WARNING
 from .repository_reanalysis import (
     SCIEX_SUFFIXES,
     _applied_disposition,
@@ -117,6 +119,13 @@ BATCH_FIELDS = ("batch order", "batch number", "batch id")
 MAPPING_FAILURES = frozenset(
     {"input_without_sample", "sample_row_with_two_inputs", "input_with_two_sample_rows", "sample_row_not_identified"}
 )
+# How a sample row's raw file was paired with its input where no rule had to infer it: by its own name, the
+# declared input's path, or the archive one sample names. The inferred rules are the lease's name_pairing.
+PAIRED_EXACTLY = "exact"
+# The warnings a build carries, which stop nothing and are recorded with the CSV: an undeclared unit whose
+# sample rows the download did not all deliver (ST001264 runs 3 of its 31 rows), and an input whose raw file
+# was paired by inference (the user's decision of 2026-10-06: always left on record).
+PARTIAL_SAMPLE_COVERAGE_WARNING = "sample_rows_without_input"
 
 
 def _failure(code: str, message: str, inputs: list[str] | None = None) -> dict[str, Any]:
@@ -334,6 +343,15 @@ def build_repository_analysis_rows(
         indexes = rows_of_id.get(sample_id, []) if sample_id else []
         if len(indexes) == 1:
             return indexes[0], ""
+        if indexes and entry:
+            # A declared input is paired with a row as the handoff check paired it before the download: the
+            # row whose raw_file is its path (or its archive's), else the one with its file name. Only an input
+            # neither names is looked for by every name it has, below.
+            found = rows_naming_input((entry.get("path"), entry.get("archive")), samples, indexes)
+            if len(found) == 1:
+                return found[0], ""
+            if found:
+                return None, "input_with_two_sample_rows"
         names = input_names(candidate, entry, lineage_row)
         if indexes:
             named = [index for index in indexes if file_keys[index] & names]
@@ -382,6 +400,7 @@ def build_repository_analysis_rows(
         record = {"path": candidate, "reason": excluded[key], "sample_id": sample_id}
         if index is not None:
             record["sample_raw_file"] = str(samples[index].get("raw_file") or "")
+            record["sample_row_index"] = index
             excluded_rows.add(index)
         elif sample_id:
             # The row is not known, so every row of the sample is spared, as every one always was.
@@ -441,6 +460,13 @@ def build_repository_analysis_rows(
             # raw file: replicate rows share the id.
             "sample_row_index": index,
             "sample_raw_file": str((sample or {}).get("raw_file") or ""),
+            # How the input was paired with that row's raw file: exactly (by its name or its declared path), or
+            # by a rule the lease inferred it by (its lineage row's name_pairing). The reviewed sample TSV says it.
+            "raw_file_paired_by": (
+                str(((lineage_row or {}).get("name_pairing") or {}).get("paired_by") or "") or PAIRED_EXACTLY
+            )
+            if index is not None
+            else "",
             "input_path": candidate,
             "listing_order": listed,
             "acquisition_type_source": source,
@@ -601,6 +627,26 @@ def build_repository_analysis_rows(
         ))
     unused_rows = [] if declared else rows_without_input
     unused_samples = sorted(str(samples[index].get("sample_id") or "") for index in unused_rows)
+    # What runs is said beside what does not: how many of the unit's sample rows have an input, and every
+    # input whose raw file a rule of the lease inferred. Neither stops the CSV; both travel with it.
+    inferred = []
+    for row in rows:
+        if row["raw_file_paired_by"] in ("", PAIRED_EXACTLY):
+            continue
+        pairing = (lineage_by_key.get(_file_key(row["input_path"])) or {}).get("name_pairing") or {}
+        inferred.append(
+            {
+                "input": Path(row["input_path"]).name,
+                "sample_id": row["sample_id"],
+                "sample_raw_file": row["sample_raw_file"],
+                **{key: pairing[key] for key in ("declared_raw_file", "paired_by", "key") if key in pairing},
+            }
+        )
+    warnings = []
+    if unused_rows:
+        warnings.append(PARTIAL_SAMPLE_COVERAGE_WARNING)
+    if inferred:
+        warnings.append(INFERRED_PAIRING_WARNING)
     return {
         "schema": SCHEMA,
         "built_from": "input_lineage",
@@ -631,6 +677,14 @@ def build_repository_analysis_rows(
         "excluded_inputs": excluded_inputs,
         "aliases": [row["console_alias"] for row in rows if row["console_alias"]],
         "acquisition_types": sorted({row["acquisition_type"] for row in rows if row["acquisition_type"]}),
+        # The sample rows with an input in this CSV, of all the unit's rows: ST001264's 3 of 31.
+        "sample_row_coverage": {
+            "sample_rows": len(samples),
+            "with_input": len({row["sample_row_index"] for row in rows if row["sample_row_index"] is not None}),
+            "without_input": len(rows_without_input),
+        },
+        "inferred_name_pairings": inferred,
+        "warnings": warnings,
     }
 
 
@@ -814,6 +868,14 @@ def record_analysis_csv(
         "excluded_inputs": [dict(item) for item in built.get("excluded_inputs") or []],
         "recorded_at": datetime.now(timezone.utc).isoformat(),
     }
+    # Only where there is something to say, so a unit whose every row has an exactly paired input records
+    # what it always did.
+    if built.get("warnings"):
+        summary["warnings"] = list(built["warnings"])
+    if built.get("sample_rows_without_input"):
+        summary["sample_row_coverage"] = dict(built.get("sample_row_coverage") or {})
+    if built.get("inferred_name_pairings"):
+        summary["inferred_name_pairings"] = [dict(item) for item in built["inferred_name_pairings"]]
 
     def change(manifest: dict[str, Any]) -> None:
         lineage = manifest.get("input_lineage")

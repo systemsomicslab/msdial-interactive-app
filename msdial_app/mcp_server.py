@@ -550,11 +550,6 @@ _CATALOG_BLOCKING_INPUT_ISSUES = frozenset(
 )
 
 
-def _row_path_key(value: Any) -> str:
-    """A listed path as the Catalog writes it into an input and a sample row: '/'-separated, casefolded."""
-    return str(value or "").replace("\\", "/").strip().strip("/").casefold()
-
-
 def _inputs_unpaired_with_rows(inputs: list[dict[str, Any]], samples: list[dict[str, Any]]) -> list[str]:
     """Where the Catalog's declared inputs and its sample rows do not pair one to one; [] where they do.
 
@@ -569,6 +564,8 @@ def _inputs_unpaired_with_rows(inputs: list[dict[str, Any]], samples: list[dict[
     the input to - else the one of them with the input's file name. Two inputs on one row, or an input none
     of its sample's rows names, is still a disagreement.
     """
+    from .repository_metadata import rows_naming_input
+
     problems: list[str] = []
     claimed = [str(item.get("sample_id") or "") for item in inputs]
     rows_of: dict[str, list[dict[str, Any]]] = {}
@@ -590,21 +587,12 @@ def _inputs_unpaired_with_rows(inputs: list[dict[str, Any]], samples: list[dict[
         if count > len(rows):
             problems.append(f"{count} analysis inputs name the {len(rows)} sample rows of sample {sample_id!r}")
             continue
-        exact: dict[str, list[int]] = {}
-        names: dict[str, list[int]] = {}
-        for index, row in enumerate(rows):
-            key = _row_path_key(row.get("raw_file"))
-            if key:
-                exact.setdefault(key, []).append(index)
-                names.setdefault(key.rsplit("/", 1)[-1], []).append(index)
         taken: set[int] = set()
         for item in inputs:
             if str(item.get("sample_id") or "") != sample_id:
                 continue
-            keys = [key for key in (_row_path_key(item.get("path")), _row_path_key(item.get("archive"))) if key]
-            found = sorted({index for key in keys for index in exact.get(key, ())})
-            if not found:
-                found = sorted({index for key in keys for index in names.get(key.rsplit("/", 1)[-1], ())})
+            # As the analysis-CSV builder pairs it after the download (rows_naming_input): by path, else name.
+            found = rows_naming_input((item.get("path"), item.get("archive")), rows, range(len(rows)))
             if len(found) != 1:
                 unnamed.append(str(item.get("path") or ""))
             elif found[0] in taken:
@@ -2459,6 +2447,11 @@ def _prepare_repository_rows_from_lineage(
         "excluded_inputs": built["excluded_inputs"],
         "failures": failures,
         "blocking_failures": [item["code"] for item in blocking],
+        # What stops nothing and is recorded with the CSV: sample rows without an input (ST001264 runs 3 of its
+        # 31), and inputs whose raw file the lease paired by an inferred rule.
+        "warnings": list(built.get("warnings") or []),
+        "sample_row_coverage": dict(built.get("sample_row_coverage") or {}),
+        "inferred_name_pairings": list(built.get("inferred_name_pairings") or []),
         "answer_seed": answer_seed,
         "qa_internal_standard_evidence": repository_internal_standard_evidence(projected),
         "analytical_order": {
@@ -2496,6 +2489,20 @@ def _prepare_repository_rows_from_lineage(
             "analysis_csv": record,
             "preview": preview,
         }
+    # The reviewed sample TSV says how each row's raw file was paired with its input: exact, or the inferred
+    # rule (prefixed_member_name, leading_identifier_token); a row without an input says nothing.
+    paired_by = {
+        row["sample_row_index"]: row["raw_file_paired_by"]
+        for row in built["rows"]
+        if row["sample_row_index"] is not None
+    }
+    projected = {
+        **projected,
+        "rows": [
+            {**row, "raw_file_paired_by": paired_by.get(index, "")}
+            for index, row in enumerate(projected.get("rows") or [])
+        ],
+    }
     saved = save_metadata_review(projected, output_root)
     input_path = write_analysis_csv(built, Path(output_root) / "analysis_files.csv")
     saved["analysis_files_csv"] = str(input_path)

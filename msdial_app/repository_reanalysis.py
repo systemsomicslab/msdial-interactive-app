@@ -6050,6 +6050,52 @@ def _sample_parts_by_path(
     return result
 
 
+def _input_sample_rows(manifest: dict[str, Any]) -> dict[str, int]:
+    """The sample row each input is, by _file_key: its position in the unit's sample_metadata.
+
+    Answered by the analysis-CSV builder (build_repository_analysis_rows), so a split part holds the rows its
+    CSV will find: the inputs it keeps, and the ones the lease or the campaign disposition excluded. An input
+    the builder finds no single row for is left out, and its row is matched by its sample as before.
+    """
+    from .repository_analysis_rows import build_repository_analysis_rows
+
+    try:
+        built = build_repository_analysis_rows(manifest)
+    except (KeyError, TypeError, ValueError, OSError):
+        return {}
+    result: dict[str, int] = {}
+    for row in built.get("rows") or []:
+        if row.get("sample_row_index") is not None:
+            result[_file_key(str(row["input_path"]))] = int(row["sample_row_index"])
+    for item in built.get("excluded_inputs") or []:
+        if item.get("sample_row_index") is not None:
+            result[_file_key(str(item["path"]))] = int(item["sample_row_index"])
+    return result
+
+
+def _declared_input_in_part(
+    entry: dict[str, Any], samples: list[dict[str, Any]], part_rows: set[int], sample_ids: set[str]
+) -> bool:
+    """Whether a declared input belongs to a split part: the row it is (rows_naming_input among its sample's
+    rows) is one of the part's; where no one row is it, its sample is one of the part's, as before."""
+    from .repository_metadata import rows_naming_input
+
+    sample_id = str(entry.get("sample_id") or "").strip()
+    indexes = [
+        index
+        for index, sample in enumerate(samples)
+        if str((sample or {}).get("sample_id") or "").strip() == sample_id
+    ]
+    found = (
+        indexes
+        if len(indexes) == 1
+        else rows_naming_input((entry.get("path"), entry.get("archive")), samples, indexes)
+    )
+    if len(found) == 1:
+        return found[0] in part_rows
+    return sample_id in sample_ids
+
+
 def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     """Describe how a unit would be split by its split key. Changes nothing.
 
@@ -6180,6 +6226,21 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     by_path = _sample_parts_by_path(
         samples, groups, sample_of, stands_for, Path(data_root_text) if data_root_text else None
     )
+    # THE SAMPLE ROW EACH INPUT IS, not only its sample. Replicate rows share their sample's id, and MetaboBank
+    # MTBKS220 gives each of its 6 samples 7 rows: 3 timsOFF BAF folders and 4 timsON TDF folders. Picked by
+    # sample id, each part held all 7 rows and every declared input of them, and its analysis CSV was refused
+    # after the 14 GB download (analysis_input_not_found, sample_without_input). A row an input of a part is
+    # (as the analysis-CSV builder finds it, _input_sample_rows) is that part's alone; a row of an excluded
+    # input is no part's; only a row no input is found to be is matched by its sample, as every row was.
+    row_of = _input_sample_rows(manifest)
+    rows_of_part = {
+        group_key: {row_of[_file_key(item)] for item in files if _file_key(item) in row_of}
+        for group_key, files in groups.items()
+    }
+    placed_rows = {
+        *(index for indexes in rows_of_part.values() for index in indexes),
+        *(row_of[_file_key(item["path"])] for item in left_out if _file_key(item["path"]) in row_of),
+    }
     parts = []
     claimed_samples: set[int] = set()
     for group_key, files in sorted(groups.items()):
@@ -6187,9 +6248,14 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
         # A sample the declared inputs or the lineage attribute is matched by that; only the rest by path.
         named = {sample_of[_file_key(item)] for item in files if sample_of.get(_file_key(item))}
         part_samples = []
+        part_rows = []
         for index, sample in enumerate(samples):
             sample_id = str((sample or {}).get("sample_id") or "").strip()
-            if sample_id and sample_id in named:
+            if index in rows_of_part[group_key]:
+                matched = True
+            elif index in placed_rows:
+                matched = False
+            elif sample_id and sample_id in named:
                 matched = True
             elif sample_id and sample_id in named_anywhere:
                 matched = False
@@ -6197,6 +6263,7 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
                 matched = group_key in by_path.get(index, set())
             if matched:
                 part_samples.append(sample)
+                part_rows.append(index)
                 claimed_samples.add(index)
         sample_ids = {str(item.get("sample_id") or "") for item in part_samples}
         part_assignments = [item for item in assignments if str(item.get("sample_id") or "") in sample_ids]
@@ -6223,6 +6290,8 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
             "input_candidates": sorted(files),
             "file_count": len(files),
             "sample_ids": sorted(sample_ids),
+            # The positions of the part's rows in the parent's sample_metadata: replicate rows share an id.
+            "sample_row_indexes": part_rows,
             "class_levels": levels,
             "higher_ms_levels": higher_levels,
         }
@@ -6488,17 +6557,19 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         project["acquisition_mode"] = part["acquisition_mode"]
         if part.get("polarity"):
             project["ion_mode"] = part["polarity"]
-        project["sample_metadata"] = [
-            sample for sample in parent_project.get("sample_metadata") or []
-            if str((sample or {}).get("sample_id") or "") in sample_ids
-        ]
+        # The part's own sample rows, by position: a sample whose replicates the split divided is in each part
+        # with the rows of that part's inputs only (plan_acquisition_split).
+        part_rows = set(part.get("sample_row_indexes") or [])
+        parent_samples = list(parent_project.get("sample_metadata") or [])
+        project["sample_metadata"] = [sample for index, sample in enumerate(parent_samples) if index in part_rows]
         project["sample_count"] = len(project["sample_metadata"]) or part["file_count"]
         if project.get("analysis_inputs"):
-            # The Catalog's inputs of this part's samples only, so a part's analysis CSV is held to its own
-            # inputs and not to the parent's.
+            # The Catalog's inputs of this part's rows only, so a part's analysis CSV is held to its own inputs
+            # and not to the parent's: each input of a sample several rows describe goes with the row it is
+            # (_declared_input_in_part, as the handoff check and the analysis-CSV builder pair them).
             project["analysis_inputs"] = [
                 entry for entry in parent_project.get("analysis_inputs") or []
-                if isinstance(entry, dict) and str(entry.get("sample_id") or "") in sample_ids
+                if isinstance(entry, dict) and _declared_input_in_part(entry, parent_samples, part_rows, sample_ids)
             ]
         # A folder's files are listed one by one, as its members (Catalog 0.6.0): they go with the part
         # whose input their folder is, so a part's download description is its own folders'. An archive
