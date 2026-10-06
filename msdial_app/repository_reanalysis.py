@@ -9081,10 +9081,14 @@ LEADING_IDENTIFIER_TOKEN_PAIRING = "leading_identifier_token"
 _NAME_TOKEN_SPLIT = re.compile(r"[_\-. ]+")
 # The polarity a name's token states, as a token of its own (x_pos.raw, NEG/x.raw; not "position").
 POLARITY_NAME_TOKENS = {"pos": "Positive", "positive": "Positive", "neg": "Negative", "negative": "Negative"}
-# Tokens beside which a pos/neg token names a sample rather than a polarity: Neg_Ctrl_1.raw is a negative
-# control, and pos_ctrl, Positive_control and neg_blank are such samples too, whatever polarity they ran in. A
-# polarity token next to one of these (before or after it, in the same folder or file name) states no polarity.
-# Read as polarities, they refused a positive unit's own Neg_Ctrl_1.raw (review of PR #58, 2026-10-06).
+# Tokens beside which a pos/neg token (before or after it, in the same folder or file name) may name a sample
+# rather than a polarity: Neg_Ctrl_1.raw is a negative control, whatever polarity it ran in. Read as polarities,
+# they refused a positive unit's own Neg_Ctrl_1.raw (review of PR #58, 2026-10-06). But in the Catalog such a
+# token is as often the file's polarity: in all 19 LC-MS units whose sample rows name a file by one that
+# contradicts the unit's ion mode, the unit's other rows name files by polarity (ST002251's
+# 20200715_004_QC-neg.mzML beside its _pos and _neg samples, ST002510's GL_NEG_Ctrl_B3_1.raw, ST003858's
+# Blank_POS_001.mzML). name_polarities therefore reads such a token as a polarity only in a listing that names
+# its files by polarity, and only in a name that states no polarity by a token of its own.
 POLARITY_EXEMPTING_TOKENS = frozenset({"control", "ctrl", "blank", "qc"})
 # The suffixes a name's stem is read without, as metadata_match_keys reads them.
 _PAIRING_NAME_SUFFIXES = (".wiff2", ".wiff", ".mzml", ".mzxml", ".raw", ".cdf", ".lcd", ".qgd", ".abf", ".d")
@@ -9094,24 +9098,42 @@ def _name_tokens(text: str) -> list[str]:
     return [token for token in _NAME_TOKEN_SPLIT.split(str(text or "").casefold()) if token]
 
 
-def name_polarities(text: str) -> set[str]:
-    """The polarities a name, or a path's folders and name, state by a token of their own (POLARITY_NAME_TOKENS).
-
-    A polarity token beside a control, ctrl, blank or QC token in the same folder or file name
-    (POLARITY_EXEMPTING_TOKENS) names a sample, not a polarity, and states none: Neg_Ctrl_1.raw states no
-    polarity, and x_Neg_Ctrl_1_neg.raw still states Negative by its last token.
-    """
-    found: set[str] = set()
+def _polarity_token_reading(text: str) -> tuple[set[str], set[str]]:
+    """(the polarities a name - or a path's folders and name - states by a pos/neg token of its own, those it
+    states only by a token beside a control, ctrl, blank or QC token: POLARITY_EXEMPTING_TOKENS)."""
+    plain: set[str] = set()
+    beside_exempting: set[str] = set()
     for part in str(text or "").replace("\\", "/").split("/"):
         tokens = _name_tokens(part)
         for index, token in enumerate(tokens):
             if token not in POLARITY_NAME_TOKENS:
                 continue
             beside = tokens[max(index - 1, 0):index] + tokens[index + 1:index + 2]
-            if any(neighbour in POLARITY_EXEMPTING_TOKENS for neighbour in beside):
-                continue
-            found.add(POLARITY_NAME_TOKENS[token])
-    return found
+            exempting = any(neighbour in POLARITY_EXEMPTING_TOKENS for neighbour in beside)
+            (beside_exempting if exempting else plain).add(POLARITY_NAME_TOKENS[token])
+    return plain, beside_exempting
+
+
+def names_state_polarity(texts: Iterable[str]) -> bool:
+    """Whether a listing names its files by polarity: some name states one by a pos/neg token that is beside no
+    control, ctrl, blank or QC token (x_pos.raw, NEG/x.raw)."""
+    return any(_polarity_token_reading(text)[0] for text in texts)
+
+
+def name_polarities(text: str, *, polarity_named: bool) -> set[str]:
+    """The polarities a name, or a path's folders and name, state by a token of their own (POLARITY_NAME_TOKENS).
+
+    A pos/neg token beside a control, ctrl, blank or QC token (POLARITY_EXEMPTING_TOKENS) is read as part of a
+    sample's name and states no polarity (Neg_Ctrl_1.raw, pos_ctrl, neg_blank), and a name that states a
+    polarity by a token of its own as well states that one only (x_Neg_Ctrl_1_neg.raw: Negative). Only where
+    such a token is the name's sole polarity token and the name comes from a listing that names its files by
+    polarity (``polarity_named``, names_state_polarity) is it read as the file's polarity, as the Catalog's
+    20200715_004_QC-neg.mzML is beside its _pos and _neg samples.
+    """
+    plain, beside_exempting = _polarity_token_reading(text)
+    if plain or not polarity_named:
+        return plain
+    return beside_exempting
 
 
 def leading_identifier_key(name: str) -> str:
@@ -9182,8 +9204,10 @@ def _member_name_pairings(
     gives S1.raw to neither. AND NEVER ACROSS POLARITIES: where the member's path (its folders under the data
     root and its name) or the declared name states a polarity by a token of its own (name_polarities) that is
     not the unit's ion mode, or the two state different ones, the pairing is refused and recorded as such. A
-    pos/neg token beside a control, ctrl, blank or QC token names a sample (Neg_Ctrl_1.raw) and states no
-    polarity, so it refuses nothing.
+    pos/neg token beside a control, ctrl, blank or QC token names a sample (Neg_Ctrl_1.raw) and refuses
+    nothing, unless it is the name's only polarity token and that side's names (the declared names, or the
+    candidate members' paths) name files by polarity elsewhere: then it is the file's polarity
+    (name_polarities).
 
     Only what came out of an archive is paired (``extracted_members``: an analysable file outside a vendor
     folder, or the outermost .d/.raw folder holding members): a file the repository lists on its own is
@@ -9235,10 +9259,17 @@ def _member_name_pairings(
     unit_polarity = str(project.ion_mode or "").strip().capitalize()
     unit_polarity = unit_polarity if unit_polarity in {"Positive", "Negative"} else ""
 
+    # Whether each side names its files by polarity: a pos/neg token beside a control, ctrl, blank or QC token
+    # is a polarity only in a listing that does (name_polarities). Read once, when a pairing is first checked.
+    polarity_named: dict[str, bool] = {}
+
     def polarity_conflict(key: str, declared_raw_file: str) -> str:
         """Why a member and a declared name may not be paired by their polarity tokens; '' when they may."""
-        member = name_polarities(relative(key))
-        declared = name_polarities(declared_raw_file)
+        if not polarity_named:
+            polarity_named["members"] = names_state_polarity(relative(item) for item in pool)
+            polarity_named["declared"] = names_state_polarity(written_names)
+        member = name_polarities(relative(key), polarity_named=polarity_named["members"])
+        declared = name_polarities(declared_raw_file, polarity_named=polarity_named["declared"])
         if unit_polarity and ((member | declared) - {unit_polarity}):
             return "polarity_token_contradicts_ion_mode"
         if member and declared and member != declared:

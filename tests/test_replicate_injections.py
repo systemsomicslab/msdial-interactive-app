@@ -55,6 +55,7 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
         evaluate_repository_execution_gate,
         leading_identifier_key,
         name_polarities,
+        names_state_polarity,
         plan_acquisition_split,
         project_from_dict,
         read_manifest,
@@ -801,15 +802,30 @@ class APairingNeverCrossesAPolarityToken(_Workspace):
             "Neg_Ctrl_1.raw", "021518_Neg_Ctrl_1.raw", "pos_ctrl.raw", "Positive_control_3.raw", "neg_control.raw",
             "neg_blank.raw", "S1-control-neg.raw", "QC_pos_01.raw", "Pos QC 2.raw",
         ):
-            self.assertEqual(set(), name_polarities(name), name)
+            self.assertEqual(set(), name_polarities(name, polarity_named=False), name)
+        self.assertFalse(names_state_polarity(["Neg_Ctrl_1.raw", "S_1.raw", "pos_ctrl.raw"]))
 
     def test_a_polarity_token_not_beside_one_still_states_its_polarity(self) -> None:
-        self.assertEqual({"Negative"}, name_polarities("S1_neg.raw"))
-        self.assertEqual({"Negative"}, name_polarities("neg_S1_ctrl.raw"))
-        # A control sample's file still states the polarity it ran in by a token of its own,
-        self.assertEqual({"Negative"}, name_polarities("Pos_Ctrl_1_neg.raw"))
-        # and a polarity folder states its polarity whatever the file in it is called.
-        self.assertEqual({"Negative"}, name_polarities("NEG/021518_Pos_Ctrl_1.raw"))
+        for polarity_named in (False, True):
+            self.assertEqual({"Negative"}, name_polarities("S1_neg.raw", polarity_named=polarity_named))
+            self.assertEqual({"Negative"}, name_polarities("neg_S1_ctrl.raw", polarity_named=polarity_named))
+            # A control sample's file states the polarity it ran in by a token of its own, and that one only,
+            self.assertEqual({"Negative"}, name_polarities("Pos_Ctrl_1_neg.raw", polarity_named=polarity_named))
+            self.assertEqual({"Positive"}, name_polarities("Neg_Ctrl_1_pos.raw", polarity_named=polarity_named))
+            # and a polarity folder states its polarity whatever the file in it is called.
+            self.assertEqual(
+                {"Negative"}, name_polarities("NEG/021518_Pos_Ctrl_1.raw", polarity_named=polarity_named)
+            )
+
+    def test_in_a_listing_named_by_polarity_a_token_beside_qc_blank_or_control_is_the_files_polarity(self) -> None:
+        """Every Catalog unit whose rows name a file by such a token against the unit's ion mode names its other
+        files by polarity: ST002251, ST002510, ST003858 (names as the Catalog gives them)."""
+        listing = ["20200715_003_QC-pos.mzML", "20200715_004_QC-neg.mzML", "20200715_005_S1-pos.mzML"]
+
+        self.assertTrue(names_state_polarity(listing))
+        self.assertEqual({"Negative"}, name_polarities("20200715_004_QC-neg.mzML", polarity_named=True))
+        self.assertEqual({"Negative"}, name_polarities("GL_NEG_Ctrl_B3_1.raw", polarity_named=True))
+        self.assertEqual({"Positive"}, name_polarities("2024-11-25_Wills-15-Blank_POS_001.mzML", polarity_named=True))
 
     def test_a_control_sample_named_by_its_polarity_is_paired_in_either_polarity_unit(self) -> None:
         positive = self.pairings(
@@ -830,6 +846,16 @@ class APairingNeverCrossesAPolarityToken(_Workspace):
             [(item["declared_raw_file"], item["paired_by"]) for item in by_token["paired"].values()],
         )
 
+    def test_a_control_sample_whose_name_gives_its_own_polarity_pairs_in_a_listing_named_by_polarity(self) -> None:
+        result = self.pairings(
+            ["VV_1_a_exp_pos.raw", "Neg_Ctrl_1_exp_pos.raw"], [("v", "VV_1_a_pos.raw"), ("c", "Neg_Ctrl_1_pos.raw")]
+        )
+
+        self.assertEqual(
+            {"VV_1_a_pos.raw", "Neg_Ctrl_1_pos.raw"}, {item["declared_raw_file"] for item in result["paired"].values()}
+        )
+        self.assertEqual([], result["refused"])
+
     def test_a_control_sample_of_the_other_polarity_is_still_refused(self) -> None:
         in_folder = self.pairings(["NEG/021518_Neg_Ctrl_1.raw"], [("c", "Neg_Ctrl_1.raw")])
         by_name = self.pairings(["Pos_Ctrl_1_neg.raw"], [("c", "Pos_Ctrl_1_pos.raw")])
@@ -844,6 +870,36 @@ class APairingNeverCrossesAPolarityToken(_Workspace):
         self.assertEqual({}, against_declared["paired"])
         self.assertEqual(
             ["polarity_token_contradicts_declared_name"], [item["reason"] for item in against_declared["refused"]]
+        )
+
+    def test_a_qc_or_blank_of_the_other_polarity_in_a_listing_named_by_polarity_is_still_refused(self) -> None:
+        """Catalog-shaped: ST002251's positive unit lists 20200715_004_QC-neg.mzML beside its _pos files, and
+        ST003858's negative unit lists Blank_POS_001.mzML beside its _NEG files."""
+        positive_rows = ["20200715_003_QC-pos.mzML", "20200715_004_QC-neg.mzML", "20200715_005_S1-pos.mzML"]
+        positive = self.pairings(
+            [f"run_{name}" for name in positive_rows], [(str(index), name) for index, name in enumerate(positive_rows)]
+        )
+        negative_rows = ["2024-11-25_Wills-15-Blank_POS_001.mzML", "2024-11-25_Wills-15-S1_NEG_001.mzML"]
+        negative = self.pairings(
+            [f"run_{name}" for name in negative_rows],
+            [(str(index), name) for index, name in enumerate(negative_rows)],
+            ion_mode="Negative",
+        )
+
+        self.assertEqual(
+            {"20200715_003_QC-pos.mzML", "20200715_005_S1-pos.mzML"},
+            {item["declared_raw_file"] for item in positive["paired"].values()},
+        )
+        self.assertEqual(
+            [("20200715_004_QC-neg.mzML", "polarity_token_contradicts_ion_mode")],
+            [(item["declared_raw_file"], item["reason"]) for item in positive["refused"]],
+        )
+        self.assertEqual(
+            ["2024-11-25_Wills-15-S1_NEG_001.mzML"], [item["declared_raw_file"] for item in negative["paired"].values()]
+        )
+        self.assertEqual(
+            [("2024-11-25_Wills-15-Blank_POS_001.mzML", "polarity_token_contradicts_ion_mode")],
+            [(item["declared_raw_file"], item["reason"]) for item in negative["refused"]],
         )
 
 
