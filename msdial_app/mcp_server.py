@@ -2633,9 +2633,10 @@ def msdial_start_peak_count_diagnostic(
     confirmed=true. The diagnostic records itself in its own directory, which is what lets
     msdial_estimate_peak_height find it by manifest_path later. timeout_seconds and
     idle_timeout_seconds limit the Console as they do for msdial_start_guided_analysis; 0 is no limit.
-    An LC-MS diagnostic loads no annotation library (no MSP, LBM or text library): only its peaks are
-    read, annotation does not change them, and every peak-spotting setting is the production method's.
-    Its provenance records annotation "skipped_for_peak_count".
+    An LC-MS diagnostic loads no annotation library (no MSP, LBM or text library): only its peaks and
+    their heights are read, annotation changes neither, and every peak-spotting setting is the production
+    method's. Its .mdpeak's Adduct, Isotope and MS1 isotopes columns are not the production run's. Its
+    provenance records annotation "skipped_for_peak_count".
     """
     return _request_json(
         "POST",

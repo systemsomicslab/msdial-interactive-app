@@ -9,19 +9,39 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 ### Changed
 - The LC-MS peak-count diagnostic behind `msdial_start_peak_count_diagnostic`
   (`POST /api/agent/tuning/run`, the campaign runner's diagnose step) no longer
-  annotates. Only its `.mdpeak` rows and their Height column are read, and the
-  Console writes one row per peak spotted after peak spotting, isotope estimation
-  and deconvolution; annotation neither adds nor removes a peak nor changes its
-  height (`MsdialLcMsApi` `FileProcess.RunAsync`, `LcmsProcess.ExecuteAsync`). On a
-  campaign unit the diagnostic searched the tiered LBM, strict MSP and broad MSP
-  annotators at Minimum peak height 0, and one Waters AIF file took more than 40
-  minutes, most of it in annotation. Its method now writes every library line
-  blank (Msp, MSP annotator settings, Lbm, Text DB, Text annotator settings,
-  Isotope text DB), writes no annotator settings file and no annotation pipeline
-  profile, and its run manifest lists no library. Every peak-spotting and
-  deconvolution setting is still the production method's; only Minimum peak
-  height (0) and the alignment switches differ, as before. The production run is
-  unchanged.
+  annotates. Only its `.mdpeak` rows and their Height column are read.
+  - The Console fixes which peaks there are, and their heights, in peak
+    spotting, isotope estimation and deconvolution (`MsdialLcMsApi`
+    `FileProcess.RunAsync`).
+  - It writes the `.mdpeak` after annotation and the characterisation that
+    follows it (`LcmsProcess.ExecuteAsync`). Neither adds or removes a peak or
+    changes its height.
+  - Without reference matches, the characterisation can give a peak another
+    adduct, charge or isotope assignment. So a diagnostic's Adduct, Isotope and
+    MS1 isotopes columns are not the production run's. Nothing reads them from
+    a diagnostic.
+- On a campaign unit the diagnostic searched the tiered LBM, strict MSP and
+  broad MSP annotators at Minimum peak height 0, where every peak above the
+  noise is a query. In the pilot, the diagnostic of one Waters MSE (AIF) file,
+  MTBKS281 Lm1, took 2,650.5 s (44 min).
+- Measured with the Console (`f56d4478a`) on two pilot files, each diagnostic
+  run once with annotation (in the pilot) and once without it:
+  - MTBKS281 Lm1 (Waters MSE, AIF, negative): 20,057 peaks in both, with the
+    same sorted Height list. 2,650.5 s with annotation against 927.9 s without.
+    Without annotation, deconvolution took 768.2 s of the 927.9 s.
+  - ST001337 Human feces_ALA007 (Thermo, DDA, positive): 13,599 peaks in both,
+    with the same sorted Height list. 267.0 s against 12.1 s.
+  - In both, the same Peak IDs, the same values in every peak-spotting column,
+    byte-identical deconvolution (`.dcl`) files, and the same estimated
+    threshold. Adduct differed in 8,987 and 8,378 rows and MS1 isotopes in 284
+    and 1,566 rows; Isotope differed in none.
+- The diagnostic's method writes every library line blank (Msp, MSP annotator
+  settings, Lbm, Text DB, Text annotator settings, Isotope text DB) and the
+  Annotation pipeline profile line blank, also when the template carries one of
+  them. It writes no annotator settings file, and its run manifest lists no
+  library. Every peak-spotting and deconvolution setting is still the
+  production method's; only Minimum peak height (0) and the alignment switches
+  differ, as before. The production run is unchanged.
 - The diagnostic records `diagnostic_annotation` (`status`
   `skipped_for_peak_count`, the reason, the production annotation profile and the
   library roles it did not load, never their paths) in its
@@ -34,9 +54,16 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 - Agent capability `peak_count_diagnostic_without_annotation`.
 
 ### Known limitations
-- That the count is the same with and without annotation is established from
-  the Console source, not yet measured: it is to be confirmed on a real file with
-  the Console once the running pilot has finished.
+- The count was measured the same with and without annotation on two files
+  only, a Waters MSE AIF file and a Thermo DDA file. SCIEX, Bruker and Agilent
+  raw data, mzML inputs and ion-mobility data were not measured; for them it
+  rests on the Console source.
+- Each timing is one Console run per arm. The two runs of a file were on
+  different days, under different machine load, and run-to-run variance was not
+  measured. The share of the pilot run's time spent in annotation is inferred
+  from the difference, not timed by stage.
+- The measured runs used a method built by hand to the same rule, not one
+  written by this version's `_write_method`.
 
 ## [0.5.24] - Unreleased
 

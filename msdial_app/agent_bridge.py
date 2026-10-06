@@ -94,8 +94,8 @@ def summarize_jobs(
             "waiting_for_shared_download_job_state",
             "batch_plan_distinct_objects_and_pre_claims",
             # The LC-MS peak-count diagnostic behind /api/agent/tuning/run loads no annotation library: only
-            # its peaks are read, and annotation does not change them. Its records say annotation
-            # "skipped_for_peak_count".
+            # its peaks and their heights are read, and annotation changes neither. Its records say
+            # annotation "skipped_for_peak_count".
             "peak_count_diagnostic_without_annotation",
         ],
         "workflow_outline": [

@@ -126,7 +126,8 @@ nearest the midpoint when no QC is available. Estimate a threshold retaining
 3,000-6,000 peaks, constrained to 100-unit steps for QTOF-type data or
 1,000-unit steps for Fourier-transform data. Keep 0 when the diagnostic finds
 no more than 6,000 peaks. The LC-MS diagnostic loads no annotation library, so
-it says nothing about annotation; only its peak count and heights are used. Add
+it says nothing about annotation; only its peak count and heights are used, and
+its Adduct and Isotope columns are not the production run's. Add
 the accepted threshold to `answer_seed` before
 production. Repository runs use `TimeBasedLinearWeightedMovingAverage` and must
 record it in the generated method and provenance.
