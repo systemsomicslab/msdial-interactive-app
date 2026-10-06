@@ -68,12 +68,21 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   own, in any case, and that is not the unit's ion mode, or the two disagree, the
   pairing is refused (`polarity_token_contradicts_ion_mode`,
   `polarity_token_contradicts_declared_name`). A polarity token beside a `control`,
-  `ctrl`, `blank` or `qc` token in the same folder or file name names a sample, not
-  a polarity, and refuses nothing: a positive unit's `Neg_Ctrl_1.raw` (a negative
-  control) pairs with `021518_Neg_Ctrl_1.raw`, as do `pos_ctrl`,
-  `Positive_control` and `neg_blank`. A polarity folder, or a polarity token of its
-  own elsewhere in the name (`Pos_Ctrl_1_neg.raw`), still refuses. Every stage that
-  admits a member
+  `ctrl`, `blank` or `qc` token in the same folder or file name is read as part of a
+  sample's name and refuses nothing (`name_polarities`): a positive unit's
+  `Neg_Ctrl_1.raw` (a negative control) pairs with `021518_Neg_Ctrl_1.raw`, as do
+  `pos_ctrl`, `Positive_control` and `neg_blank`. Two cases keep it a polarity. A
+  name with a polarity token of its own elsewhere states that one only
+  (`Pos_Ctrl_1_neg.raw` is Negative), and a polarity folder always states its
+  polarity. And where such a token is a name's only polarity token and that side of
+  the pairing (the declared names, or the members' paths) names its files by
+  polarity elsewhere (`names_state_polarity`), it is the file's polarity. Read-only
+  over the Catalog, an unconditional exemption would have stopped 157 sample rows in
+  19 LC-MS units from contradicting their unit's ion mode, and every one of those
+  units names its other files by polarity: ST002251's positive unit lists
+  `20200715_004_QC-neg.mzML` beside its `_pos` files, ST003858's negative unit lists
+  `Blank_POS_001.mzML`, and ST002510 lists `GL_NEG_Ctrl_B3_1.raw`. With the
+  condition, none does. Every stage that admits a member
   by a sample's name admits a paired one (conversion sources, the encoding choice,
   the attribute stage, the extracted files kept), and its lineage row records
   `name_pairing` (`declared_raw_file`, `member_name`, `paired_by`
