@@ -113,9 +113,10 @@ matches come first, then prefixed ones, then these. No inferred pairing crosses
 a polarity: a member whose path, or a declared name, carries `pos`, `neg`,
 `positive` or `negative` as a token of its own that is not the unit's ion mode
 (or the two disagree) is refused, and the refusal is recorded. A polarity token
-beside a `control`, `ctrl`, `blank` or `qc` token in the same folder or file name
-is read as part of a sample's name (`Neg_Ctrl_1.raw` is a negative control) and
-refuses nothing. It is still read as a polarity in two cases: where it is the
+beside a `control`, `ctrl`, `blank` or `qc` token in the file name is read as
+part of a sample's name (`Neg_Ctrl_1.raw` is a negative control) and refuses
+nothing. A folder's token always states its polarity (`QC_NEG/`, `Blank_POS/`,
+as `NEG/`). In a file name it is still read as a polarity in two cases: where it is the
 name's only polarity token and that side's names (declared, or members) name
 their files by polarity elsewhere, as the Catalog's `20200715_004_QC-neg.mzML` is
 beside its `_pos` and `_neg` files; and where the name has a polarity token of

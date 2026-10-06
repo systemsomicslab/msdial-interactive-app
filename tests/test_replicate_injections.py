@@ -902,6 +902,46 @@ class APairingNeverCrossesAPolarityToken(_Workspace):
             [(item["declared_raw_file"], item["reason"]) for item in negative["refused"]],
         )
 
+    def test_a_polarity_folder_named_with_qc_blank_or_control_states_its_polarity(self) -> None:
+        """Only a file name's pos/neg token can name a sample: a QC_NEG/ or Blank_POS/ folder states its polarity,
+        as NEG/ does, in any listing (review of PR #58, 2026-10-07)."""
+        for polarity_named in (False, True):
+            for path, polarity in (
+                ("QC_NEG/2020_QC_1.raw", "Negative"), ("Blank_POS/2020_B_1.raw", "Positive"),
+                ("neg_ctrl/run_S1.raw", "Negative"), (r"Data\Pos-Control\run_S1.raw", "Positive"),
+                ("QC_NEG/2020_QC_1.raw/", "Negative"),
+            ):
+                self.assertEqual({polarity}, name_polarities(path, polarity_named=polarity_named), path)
+            # The file name's own token beside QC is still a sample's name where the listing states no polarity.
+            self.assertEqual(set(), name_polarities("Samples/Neg_Ctrl_1.raw", polarity_named=False))
+            self.assertEqual({"Negative"}, name_polarities("QC_NEG/Pos_Ctrl_1.raw", polarity_named=polarity_named))
+        self.assertTrue(names_state_polarity(["QC_NEG/2020_QC_1.raw", "Samples/2020_S1.raw"]))
+        self.assertFalse(names_state_polarity(["Samples/Neg_Ctrl_1.raw", "Samples/2020_S1.raw"]))
+
+    def test_a_member_in_a_qc_or_blank_folder_of_the_other_polarity_is_refused(self) -> None:
+        """The reviewer's case: a positive unit's QC_1.raw is not paired with QC_NEG/2020_QC_1.raw, nor a negative
+        unit's B_1.raw with Blank_POS/2020_B_1.raw; a385a28 refused both, and so does this branch."""
+        positive = self.pairings(
+            ["QC_NEG/2020_QC_1.raw", "Samples/2020_S1.raw"], [("q", "QC_1.raw"), ("s", "S1.raw")]
+        )
+        negative = self.pairings(
+            ["Blank_POS/2020_B_1.raw", "Samples/2020_S1.raw"], [("b", "B_1.raw"), ("s", "S1.raw")],
+            ion_mode="Negative",
+        )
+
+        for result, refused in ((positive, "QC_1.raw"), (negative, "B_1.raw")):
+            self.assertEqual(["S1.raw"], [item["declared_raw_file"] for item in result["paired"].values()])
+            self.assertEqual(
+                [(refused, "polarity_token_contradicts_ion_mode")],
+                [(item["declared_raw_file"], item["reason"]) for item in result["refused"]],
+            )
+
+    def test_a_member_in_a_qc_folder_of_the_units_own_polarity_is_paired(self) -> None:
+        result = self.pairings(["QC_POS/2020_QC_1.raw", "Samples/2020_S1.raw"], [("q", "QC_1.raw"), ("s", "S1.raw")])
+
+        self.assertEqual({"QC_1.raw", "S1.raw"}, {item["declared_raw_file"] for item in result["paired"].values()})
+        self.assertEqual([], result["refused"])
+
 
 # ---- leading identifier tokens (the user's decision of 2026-10-06) ---------------------------------------------
 

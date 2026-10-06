@@ -9081,7 +9081,7 @@ LEADING_IDENTIFIER_TOKEN_PAIRING = "leading_identifier_token"
 _NAME_TOKEN_SPLIT = re.compile(r"[_\-. ]+")
 # The polarity a name's token states, as a token of its own (x_pos.raw, NEG/x.raw; not "position").
 POLARITY_NAME_TOKENS = {"pos": "Positive", "positive": "Positive", "neg": "Negative", "negative": "Negative"}
-# Tokens beside which a pos/neg token (before or after it, in the same folder or file name) may name a sample
+# Tokens beside which a pos/neg token (before or after it, in the file name; never in a folder) may name a sample
 # rather than a polarity: Neg_Ctrl_1.raw is a negative control, whatever polarity it ran in. Read as polarities,
 # they refused a positive unit's own Neg_Ctrl_1.raw (review of PR #58, 2026-10-06). But in the Catalog such a
 # token is also a file's polarity: in all 19 LC-MS units whose sample rows state a polarity by one that
@@ -9100,16 +9100,23 @@ def _name_tokens(text: str) -> list[str]:
 
 def _polarity_token_reading(text: str) -> tuple[set[str], set[str]]:
     """(the polarities a name - or a path's folders and name - states by a pos/neg token of its own, those it
-    states only by a token beside a control, ctrl, blank or QC token: POLARITY_EXEMPTING_TOKENS)."""
+    states only by a token beside a control, ctrl, blank or QC token: POLARITY_EXEMPTING_TOKENS).
+
+    Only the name itself (the path's last part) can hold such a token. A folder's pos/neg token always states
+    its polarity, whatever stands beside it: a shared archive sorts its runs into QC_NEG/ and Blank_POS/ as it
+    does into NEG/ and POS/, and a385a28 refused a QC_NEG/ member in a positive unit (review of PR #58,
+    2026-10-07)."""
     plain: set[str] = set()
     beside_exempting: set[str] = set()
-    for part in str(text or "").replace("\\", "/").split("/"):
+    parts = [part for part in str(text or "").replace("\\", "/").split("/") if part.strip()]
+    for position, part in enumerate(parts):
+        is_name = position == len(parts) - 1
         tokens = _name_tokens(part)
         for index, token in enumerate(tokens):
             if token not in POLARITY_NAME_TOKENS:
                 continue
             beside = tokens[max(index - 1, 0):index] + tokens[index + 1:index + 2]
-            exempting = any(neighbour in POLARITY_EXEMPTING_TOKENS for neighbour in beside)
+            exempting = is_name and any(neighbour in POLARITY_EXEMPTING_TOKENS for neighbour in beside)
             (beside_exempting if exempting else plain).add(POLARITY_NAME_TOKENS[token])
     return plain, beside_exempting
 
