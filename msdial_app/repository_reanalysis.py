@@ -22,6 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -58,6 +59,7 @@ from .mzxml_conversion import (
     converter_identity,
 )
 from .process_liveness import process_created_at, process_is_alive
+from .raw_metadata_preflight import INFERRED_PAIRING_WARNING
 from .reader_created import container_members, reader_created_files, reader_created_names
 
 try:
@@ -2086,8 +2088,11 @@ def create_download_lease(
             project, archive_extractions, extracted_members, data_root
         )
         # The archive members a sample names behind a prefix (ST001264's 021518_387057_CSHp_BioRec1.raw for
-        # BioRec1.raw), decided once, one to one, for every stage below and for the lineage.
-        prefixed_members = _prefixed_member_pairing(project, extracted_members, data_root)
+        # BioRec1.raw) or by its leading identifier (ST001359's VV_13_HEpG2_C1_exp344_pos.raw for
+        # VV_13_HEpG2_C1_pos.raw), decided once, one to one, for every stage below and for the lineage; and the
+        # pairings refused, recorded with them.
+        name_pairings = _member_name_pairings(project, extracted_members, data_root)
+        prefixed_members = name_pairings["paired"]
         mzxml_found = _find_mzxml_files(data_root) if campaign_authorization else []
         conversion_sources = _select_conversion_sources(
             mzxml_found, data_root, project, archive_samples, archive_extractions, prefixed_members
@@ -2217,9 +2222,12 @@ def create_download_lease(
         )
         if conversion_rows:
             input_lineage["conversion_sources"] = conversion_rows
-        # The inputs admitted only because their name carries a declared one behind a prefix; each lineage row
-        # says so (name_pairing).
-        paired = sum(1 for item in inputs if _file_key(item) in prefixed_members)
+        # The inputs admitted only because a rule inferred which declared raw file they are; each lineage row
+        # says so (name_pairing), and the attribute stage and the manifest list every such pairing.
+        paired_by_rule = Counter(
+            prefixed_members[_file_key(item)]["paired_by"] for item in inputs if _file_key(item) in prefixed_members
+        )
+        inferred = inferred_name_pairings(prefixed_members, data_root)
         pruned: dict[str, Any] = {}
         if store_lease is not None:
             # Now that the unit's own files are known: the links to anything else the store's objects
@@ -2246,7 +2254,18 @@ def create_download_lease(
             declared_files_verified=checksum_validation.get("verified", 0),
             archives_verified_at_download=checksum_validation.get("archives_verified_at_download", 0),
             **({"pruned_links": pruned.get("removed_files", 0)} if store_lease is not None else {}),
-            **({"prefixed_member_pairings": paired} if paired else {}),
+            **(
+                {"prefixed_member_pairings": paired_by_rule[PREFIXED_MEMBER_PAIRING]}
+                if paired_by_rule[PREFIXED_MEMBER_PAIRING]
+                else {}
+            ),
+            **(
+                {"leading_identifier_token_pairings": paired_by_rule[LEADING_IDENTIFIER_TOKEN_PAIRING]}
+                if paired_by_rule[LEADING_IDENTIFIER_TOKEN_PAIRING]
+                else {}
+            ),
+            **({"inferred_name_pairings": inferred, "warnings": [INFERRED_PAIRING_WARNING]} if inferred else {}),
+            **({"refused_name_pairings": name_pairings["refused"]} if name_pairings["refused"] else {}),
         )
 
         stages.start("record")
@@ -2297,6 +2316,16 @@ def create_download_lease(
             manifest["execution_allowed"] = project.eligible
         if container_completeness["required"]:
             manifest["container_completeness"] = container_completeness
+        if inferred or name_pairings["refused"]:
+            # Which declared raw file an archive member is, where a rule inferred it rather than an exact name:
+            # the user decided on 2026-10-06 that such a pairing is always left on record. Only where one was
+            # made or refused, so every other lease records what it always did.
+            manifest["input_name_pairings"] = {
+                "paired": inferred,
+                "refused": list(name_pairings["refused"]),
+            }
+        if inferred:
+            manifest["warnings"] = [INFERRED_PAIRING_WARNING]
         warnings = _archive_warnings(archive_extractions)
         if warnings:
             manifest["archive_warnings"] = warnings
@@ -3372,10 +3401,12 @@ def build_input_lineage(
     chose over it (``stands_for``, by _file_key; the latter's row carries encoding_choice) - is given the
     sample and the declared names of that mzXML wherever its own name gives none.
 
-    AN ARCHIVE MEMBER THAT CARRIES A DECLARED NAME BEHIND A PREFIX (``prefixed_members``, by _file_key, the
-    lease's _prefixed_member_pairing; worked out here from ``extracted_members`` when not given) is the
-    sample's that declares that name, and its row says how it was paired (name_pairing: the declared raw
-    file, paired_by prefixed_member_name), so the analysis-CSV builder finds the same sample row by it.
+    AN ARCHIVE MEMBER A RULE PAIRED WITH A DECLARED NAME - behind a prefix, or by its leading identifier
+    (``prefixed_members``, by _file_key, the lease's _member_name_pairings; worked out here from
+    ``extracted_members`` when not given) - is the sample's that declares that name, and its row says how
+    it was paired (name_pairing: the declared raw file, the member's name, paired_by prefixed_member_name or
+    leading_identifier_token, and for the latter the key), so the analysis-CSV builder finds the same
+    sample row by it.
     """
     verified_checksums = verified_checksums or {}
     excluded_inputs = excluded_inputs or []
@@ -3438,7 +3469,7 @@ def build_input_lineage(
 
     def naming(path: Path, key: str) -> tuple[set[str], set[str], dict[str, str] | None]:
         """(the declared-name forms of a path relative to the data root, the samples its name gives, and the
-        prefixed-member pairing that gave them, where that is what did)."""
+        inferred pairing that gave them, where that is what did)."""
         try:
             relative = path.resolve().relative_to(data_root.resolve()).as_posix()
         except ValueError:
@@ -3482,11 +3513,13 @@ def build_input_lineage(
         }
         if pairing:
             # Which declared raw file the input is, and by which rule: its own name carries that name only
-            # behind a prefix. The analysis-CSV builder finds the sample row by it.
+            # behind a prefix, or shares its leading identifier. The analysis-CSV builder finds the sample row by it.
             row["name_pairing"] = {
                 "declared_raw_file": pairing["declared_raw_file"],
                 "member_name": paired_name,
                 "paired_by": pairing["paired_by"],
+                # The leading identifier both names share, where that is the rule that paired them.
+                **({"key": pairing["key"]} if pairing.get("key") else {}),
             }
         if key in conversions:
             conversion = conversions[key]
@@ -3788,7 +3821,7 @@ def _select_conversion_sources(
     The Catalog's declared inputs, matched by path, where it declared them. Otherwise a file the listing
     names is converted only when the listing gives it for analysis (requires_conversion; an mzXML the
     Catalog demoted to raw_alternate beside a vendor file is not), and a file only an archive held when one
-    of the unit's samples names it (exactly, or behind a prefix: prefixed_members), or it came out of the
+    of the unit's samples names it (exactly, or by an inferred pairing: prefixed_members), or it came out of the
     archive one sample names. A project with no
     analysis unit has no Catalog decision of which files are its inputs, and converts none: every mzXML of
     an accession would be converted beside the vendor files of the same samples.
@@ -8898,9 +8931,69 @@ def _matches_sample_file_names(
 # and sequence prefix, which no row records. No exact rule (the name, the extensionless stem, the container
 # alias) matched it, the attribute stage admitted nothing, and the unit failed after its whole download. A
 # member whose name ends in one of these separators and then a declared name is that declared file's, when
-# the pairing is one to one (_prefixed_member_pairing), and the pairing is recorded as made by this rule.
+# the pairing is one to one (_member_name_pairings), and the pairing is recorded as made by this rule.
 PREFIX_SEPARATORS = frozenset("_-. ")
 PREFIXED_MEMBER_PAIRING = "prefixed_member_name"
+# A DECLARED FILE NAME AND A MEMBER THAT SHARE THEIR LEADING IDENTIFIER. Metabolomics Workbench ST001359
+# declares VV_13_HEpG2_C1_pos.raw, and its archive holds VV_13_HEpG2_C1_exp344_pos.raw: the member carries an
+# experiment number the row does not, and the row for VV_14 even misspells the cell line (HEepG2). Neither
+# name ends in the other, so no exact or prefixed rule pairs them. The user decided on 2026-10-06 that a
+# declared name and a member are one file when their leading identifier (leading_identifier_key: VV_13) is
+# unique on both sides, and that such a pairing must always be left on record (INFERRED_PAIRING_WARNING).
+LEADING_IDENTIFIER_TOKEN_PAIRING = "leading_identifier_token"
+# The unit-level warning code every inferred pairing (prefixed or by token) raises: in the attribute stage,
+# the run manifest's warnings and the campaign disposition's warnings (raw_metadata_preflight's, imported).
+# A name's tokens: what lies between these separators, compared without case.
+_NAME_TOKEN_SPLIT = re.compile(r"[_\-. ]+")
+# The polarity a name's token states, as a token of its own (x_pos.raw, NEG/x.raw; not "position").
+POLARITY_NAME_TOKENS = {"pos": "Positive", "positive": "Positive", "neg": "Negative", "negative": "Negative"}
+# The suffixes a name's stem is read without, as metadata_match_keys reads them.
+_PAIRING_NAME_SUFFIXES = (".wiff2", ".wiff", ".mzml", ".mzxml", ".raw", ".cdf", ".lcd", ".qgd", ".abf", ".d")
+
+
+def _name_tokens(text: str) -> list[str]:
+    return [token for token in _NAME_TOKEN_SPLIT.split(str(text or "").casefold()) if token]
+
+
+def name_polarities(text: str) -> set[str]:
+    """The polarities a name, or a path's folders and name, state by a token of their own (POLARITY_NAME_TOKENS)."""
+    return {
+        POLARITY_NAME_TOKENS[token]
+        for part in str(text or "").replace("\\", "/").split("/")
+        for token in _name_tokens(part)
+        if token in POLARITY_NAME_TOKENS
+    }
+
+
+def leading_identifier_key(name: str) -> str:
+    """A file name's leading identifier: its stem's tokens up to and including the first one with a digit.
+
+    The stem is the name less a raw or converted suffix (_PAIRING_NAME_SUFFIXES); its tokens are what lies
+    between _ - . and spaces, compared without case, and joined by _. VV_13_HEpG2_C1_pos.raw gives vv_13, as
+    VV_13_HEpG2_C1_exp344_pos.raw does. A name with no digit gives no key, and so does a key of digits only
+    (021518_387057_CSHp_BioRec1.raw gives none: a run date is no sample's identifier).
+    """
+    text = PurePosixPath(str(name or "").replace("\\", "/")).name.casefold()
+    for suffix in _PAIRING_NAME_SUFFIXES:
+        if text.endswith(suffix) and len(text) > len(suffix):
+            text = text[: -len(suffix)]
+            break
+    tokens = _name_tokens(text)
+    for index, token in enumerate(tokens):
+        if any(character.isdigit() for character in token):
+            key = tokens[: index + 1]
+            return "_".join(key) if any(character.isalpha() for character in "".join(key)) else ""
+    return ""
+
+
+def _member_under_root(key: str, data_key: str) -> str:
+    """A member's path under the data root, '/'-separated, in its own case where it is on disk; its name
+    alone where it is not under the root. Keys are casefolded (_file_key), so the case is read back."""
+    path = Path(key)
+    shown = str(path.resolve()) if path.exists() else key
+    if shown.casefold().startswith(data_key):
+        return shown[len(data_key):].lstrip("\\/").replace("\\", "/")
+    return path.name
 
 
 def _prefixed_member_pairing(
@@ -8908,31 +9001,55 @@ def _prefixed_member_pairing(
     extracted_members: dict[str, dict[str, Any]] | None,
     data_root: Path,
 ) -> dict[str, dict[str, str]]:
-    """The archive members an undeclared unit's samples name behind a prefix, by _file_key.
+    """The archive members an undeclared unit's samples name by an inferred rule, by _file_key.
 
-    Each value says which declared raw file the member is ({"declared_raw_file", "paired_by"}). A member is
-    paired with a declared name when it carries no declared name exactly and its name - or its stem, for a
-    name a row records without an extension, as _sample_file_names reads those - ends in a separator
-    (PREFIX_SEPARATORS) and then the declared name, compared without case. EXACT MATCHES ARE DECIDED FIRST: a
-    declared name some member, or the unit's file listing, carries exactly is never paired by prefix, and a
-    member a declared name names exactly is never given another. THE PAIRING IS ONE TO ONE: a member that
-    ends in two declared names, or a declared name two members end in, pairs neither - which is why
-    Youn_sa1.raw never takes 021518_Youn_sa11.raw, whose name ends in _Youn_sa11.raw and not _Youn_sa1.raw,
-    and why a shared study archive holding POS/x_S1.raw and NEG/x_S1.raw gives S1.raw to neither.
+    _member_name_pairings' pairings alone: by a prefixed name, or by a leading identifier token."""
+    return _member_name_pairings(project, extracted_members, data_root)["paired"]
+
+
+def _member_name_pairings(
+    project: RepositoryProject,
+    extracted_members: dict[str, dict[str, Any]] | None,
+    data_root: Path,
+) -> dict[str, Any]:
+    """The archive members an undeclared unit's samples name by an inferred rule, and the pairings refused.
+
+    Returns {"paired": {_file_key: pairing}, "refused": [...]}. Each pairing says which declared raw file the
+    member is ({"declared_raw_file", "paired_by"}, and for a token pairing its "key"). Each refusal names the
+    member, the declared raw file, the rule and the reason.
+
+    EXACT MATCHES ARE DECIDED FIRST: a declared name some member, or the unit's file listing, carries exactly
+    is never paired by inference, and a member a declared name names exactly is never given another. THEN
+    PREFIXED NAMES (PREFIXED_MEMBER_PAIRING): a member is paired with a declared name when its name - or its
+    stem, for a name a row records without an extension, as _sample_file_names reads those - ends in a
+    separator (PREFIX_SEPARATORS) and then the declared name, compared without case. THEN LEADING IDENTIFIERS
+    (LEADING_IDENTIFIER_TOKEN_PAIRING): a declared name still unpaired is paired with the member whose
+    leading_identifier_key is its own, when that key is the key of no other declared name and of no other
+    candidate member.
+
+    EACH PAIRING IS ONE TO ONE: a member that ends in two declared names, or a declared name two members end
+    in, pairs neither - which is why Youn_sa1.raw never takes 021518_Youn_sa11.raw, whose name ends in
+    _Youn_sa11.raw and not _Youn_sa1.raw, and why a shared study archive holding POS/x_S1.raw and NEG/x_S1.raw
+    gives S1.raw to neither. AND NEVER ACROSS POLARITIES: where the member's path (its folders under the data
+    root and its name) or the declared name states a polarity by a token of its own (name_polarities) that is
+    not the unit's ion mode, or the two state different ones, the pairing is refused and recorded as such.
 
     Only what came out of an archive is paired (``extracted_members``: an analysable file outside a vendor
     folder, or the outermost .d/.raw folder holding members): a file the repository lists on its own is
     attributed by its listing. A unit whose Catalog declared its analysis inputs is matched by path and never
     by a name (_select_declared_inputs), so it has none.
     """
+    result: dict[str, Any] = {"paired": {}, "refused": []}
     if not project.analysis_unit_id or not extracted_members or declared_analysis_inputs(project):
-        return {}
+        return result
     named: dict[str, set[str]] = {}
     stemmed: dict[str, set[str]] = {}
+    written_names: set[str] = set()
     for sample in project.sample_metadata or []:
         raw = PurePosixPath(str((sample or {}).get("raw_file") or "").strip().replace("\\", "/")).name
         if not raw:
             continue
+        written_names.add(raw)
         folded = raw.casefold()
         if PurePosixPath(folded).suffix:
             named.setdefault(folded, set()).add(raw)
@@ -8942,7 +9059,7 @@ def _prefixed_member_pairing(
         if alias:
             named.setdefault(alias.casefold(), set()).add(raw)
     if not named and not stemmed:
-        return {}
+        return result
     data_key = _file_key(str(data_root))
     pool: dict[str, str] = {}
     for key in extracted_members:
@@ -8961,10 +9078,40 @@ def _prefixed_member_pairing(
         ):
             pool[key] = path.name.casefold()
 
+    def relative(key: str) -> str:
+        return _member_under_root(key, data_key)
+
+    unit_polarity = str(project.ion_mode or "").strip().capitalize()
+    unit_polarity = unit_polarity if unit_polarity in {"Positive", "Negative"} else ""
+
+    def polarity_conflict(key: str, declared_raw_file: str) -> str:
+        """Why a member and a declared name may not be paired by their polarity tokens; '' when they may."""
+        member = name_polarities(relative(key))
+        declared = name_polarities(declared_raw_file)
+        if unit_polarity and ((member | declared) - {unit_polarity}):
+            return "polarity_token_contradicts_ion_mode"
+        if member and declared and member != declared:
+            return "polarity_token_contradicts_declared_name"
+        return ""
+
     def exactly(name: str) -> set[str]:
         """The declared names a name carries exactly: itself, or its stem where a row records no extension."""
         return {form for form in (name, PurePosixPath(name).stem) if form in stemmed} | (
             {name} if name in named else set()
+        )
+
+    def written(declared_name: str) -> str:
+        return sorted(named.get(declared_name) or stemmed.get(declared_name) or {declared_name})[0]
+
+    def refuse(key: str, declared_raw_file: str, rule: str, reason: str, **extra: Any) -> None:
+        result["refused"].append(
+            {
+                "member_name": relative(key),
+                "declared_raw_file": declared_raw_file,
+                "rule": rule,
+                "reason": reason,
+                **extra,
+            }
         )
 
     taken: set[str] = set()
@@ -8989,14 +9136,79 @@ def _prefixed_member_pairing(
             claims[key] = found
             for declared_name in found:
                 claimed_by.setdefault(declared_name, set()).add(key)
-    paired: dict[str, dict[str, str]] = {}
-    for key, found in claims.items():
+    paired: dict[str, dict[str, str]] = result["paired"]
+    for key, found in sorted(claims.items()):
         declared_name = next(iter(found))
         if len(found) != 1 or len(claimed_by[declared_name]) != 1:
+            for name in sorted(found):
+                refuse(key, written(name), PREFIXED_MEMBER_PAIRING, "not_one_to_one")
             continue
-        written = sorted(named.get(declared_name) or stemmed.get(declared_name) or {declared_name})
-        paired[key] = {"declared_raw_file": written[0], "paired_by": PREFIXED_MEMBER_PAIRING}
-    return paired
+        reason = polarity_conflict(key, written(declared_name))
+        if reason:
+            refuse(key, written(declared_name), PREFIXED_MEMBER_PAIRING, reason)
+            continue
+        paired[key] = {"declared_raw_file": written(declared_name), "paired_by": PREFIXED_MEMBER_PAIRING}
+
+    # The leading identifiers of every declared name and of every candidate member, for uniqueness. A
+    # declared name a prefixed member claims, paired or refused, and a member that claims one, are left to
+    # that rule: the token rule never pairs what a rule before it settled or refused.
+    declared_keys: dict[str, set[str]] = {}
+    for raw in written_names:
+        token_key = leading_identifier_key(raw)
+        if token_key:
+            declared_keys.setdefault(token_key, set()).add(raw.casefold())
+    member_keys: dict[str, set[str]] = {}
+    for key, name in pool.items():
+        token_key = leading_identifier_key(name)
+        if token_key:
+            member_keys.setdefault(token_key, set()).add(key)
+    for token_key, declared_names in sorted(declared_keys.items()):
+        members = member_keys.get(token_key) or set()
+        open_names = {name for name in declared_names if name not in taken and name not in claimed_by}
+        if not members or not open_names:
+            continue
+        if len(declared_names) != 1 or len(members) != 1:
+            for name in sorted(open_names):
+                for key in sorted(members):
+                    if key not in claims and not exactly(pool[key]):
+                        refuse(
+                            key,
+                            written(name),
+                            LEADING_IDENTIFIER_TOKEN_PAIRING,
+                            "leading_identifier_not_unique",
+                            key=token_key,
+                        )
+            continue
+        declared_name = next(iter(declared_names))
+        key = next(iter(members))
+        if key in claims or exactly(pool[key]):
+            continue
+        reason = polarity_conflict(key, written(declared_name))
+        if reason:
+            refuse(key, written(declared_name), LEADING_IDENTIFIER_TOKEN_PAIRING, reason, key=token_key)
+            continue
+        paired[key] = {
+            "declared_raw_file": written(declared_name),
+            "paired_by": LEADING_IDENTIFIER_TOKEN_PAIRING,
+            "key": token_key,
+        }
+    return result
+
+
+def inferred_name_pairings(pairings: dict[str, dict[str, str]], data_root: Path) -> list[dict[str, str]]:
+    """Every inferred pairing as the attribute stage and the run manifest list it: member, declared name, rule."""
+    data_key = _file_key(str(data_root))
+    listed = []
+    for key, pairing in sorted(pairings.items()):
+        listed.append(
+            {
+                "member_name": _member_under_root(key, data_key),
+                "declared_raw_file": pairing["declared_raw_file"],
+                "paired_by": pairing["paired_by"],
+                **({"key": pairing["key"]} if pairing.get("key") else {}),
+            }
+        )
+    return listed
 
 
 def _paired_member_of(path: Path, prefixed: dict[str, dict[str, str]] | None) -> bool:
@@ -9021,7 +9233,7 @@ def _admitted_by_unit(
 ) -> bool:
     """Whether an undeclared unit admits a file by itself: listed, named by its samples, out of an archive
     one of its samples names (archive_samples, by _file_key), or an archive member one of its samples names
-    behind a prefix (prefixed, _prefixed_member_pairing)."""
+    by an inferred pairing (prefixed, _member_name_pairings)."""
     return (
         _path_matches_allowlist(path, data_root, listed)
         or _matches_sample_file_names(path, sample_names)
@@ -9072,7 +9284,8 @@ def _filter_inputs_by_project_allowlist(
     came out of an archive exactly one of this unit's samples names (X.zip). Without it, only names
     are matched, as they always were. archive_extractions is the lease's extraction records, which say
     where a declared archived container really is (declared_archive_containers). prefixed_members is
-    _prefixed_member_pairing's: the archive members that carry a declared name behind a prefix, one to one
+    _member_name_pairings': the archive members that carry a declared name behind a prefix, or share its
+    leading identifier, one to one
     (021518_387057_CSHp_BioRec1.raw for BioRec1.raw). A declared name nothing carries, exactly or so, admits
     nothing, and its sample row is left without an input (samples_without_input) as before.
 
@@ -9449,7 +9662,7 @@ def _filter_project_allowlist_paths(
     Matching the listed names alone gave [] for every Workbench unit, whose only listed file is the
     study archive: extracted_files said nothing came out for the unit although its inputs had. A file
     that came out of an archive one of its samples names (archive_samples) is that sample's, and so is a
-    member a sample names behind a prefix (prefixed_members), with its .wiff.scan and its folder's files.
+    member a sample names by an inferred pairing (prefixed_members), with its .wiff.scan and its folder's files.
     """
     if not project.analysis_unit_id:
         return paths

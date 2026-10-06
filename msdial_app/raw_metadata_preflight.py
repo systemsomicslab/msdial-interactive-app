@@ -599,6 +599,10 @@ def _declared_agrees(declared: str, header: str, header_console: str | None) -> 
 # ------------------------------------------------------------------------------------------------------
 
 DISPOSITION_SCHEMA = "msdial-campaign-disposition.v1"
+# The warning a unit carries where the lease inferred which declared raw file an input is (an archive member
+# that carries the name behind a prefix, or shares its leading identifier; repository_reanalysis's
+# _member_name_pairings). The run manifest's warnings and the attribute stage carry it too.
+INFERRED_PAIRING_WARNING = "input_names_paired_by_inference"
 DISPOSITIONS = ("run", "skip", "exclude", "split")
 # A header verdict this confident replaces a repository declaration it contradicts.
 HEADER_OVERRIDE_CONFIDENCE = 0.8
@@ -710,6 +714,16 @@ def decide_disposition(
     def warn(code: str) -> None:
         if code and code not in warnings:
             warnings.append(code)
+
+    # Which declared raw file an input is was inferred for some input (a prefixed member name, or a leading
+    # identifier: the lease's name_pairing). The user decided on 2026-10-06 that this is always left on record,
+    # so every disposition of such a unit carries it, whatever else it decides.
+    lineage = mapping(manifest.get("input_lineage"))
+    if INFERRED_PAIRING_WARNING in (manifest.get("warnings") or []) or any(
+        isinstance(row, dict) and row.get("name_pairing")
+        for row in [*(lineage.get("rows") or []), *(lineage.get("excluded") or [])]
+    ):
+        warn(INFERRED_PAIRING_WARNING)
 
     def result(disposition: str, split_key: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
         return {
