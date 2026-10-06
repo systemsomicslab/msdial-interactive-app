@@ -5154,6 +5154,37 @@ def _declared_technical(manifest: dict[str, Any]) -> dict[str, Any]:
     return declared_technical(manifest.get("project"))
 
 
+def _split_parent_declared(manifest: dict[str, Any], depth: int = 0) -> str | None:
+    """The acquisition mode a split part's parent declared; None for a unit that is no split part.
+
+    A split from 0.5.29 records it (split_from.parent_declared_acquisition_mode). For a part split before that,
+    it is read from the parent manifest as _declared_technical gives it, and through the parent's own parent
+    where the parent is itself a part; "" where the parent cannot be read.
+    """
+    from .raw_metadata_preflight import SPLIT_PARENT_DECLARED_FIELD
+
+    split = manifest.get("split_from")
+    if not isinstance(split, dict):
+        return None
+    recorded = str(split.get(SPLIT_PARENT_DECLARED_FIELD) or "").strip()
+    if recorded:
+        return recorded
+    parent_path = str(split.get("manifest_path") or "").strip()
+    if not parent_path or depth > 8:
+        return ""
+    try:
+        parent = read_manifest(parent_path) if Path(parent_path).is_file() else None
+    except (OSError, ValueError):
+        parent = None
+    if not isinstance(parent, dict):
+        return ""
+    grandparent = _split_parent_declared(parent, depth + 1)
+    if grandparent is not None:
+        return grandparent
+    mode = str(_declared_technical(parent).get("acquisition_mode") or "").strip()
+    return "" if mode.casefold() == "unknown" else mode
+
+
 def _previous_reads(manifest: dict[str, Any], manifest_path: Path) -> dict[str, dict[str, Any]]:
     """Earlier reads that may stand for this one: the unit's own last preflight, then its split parent's.
 
@@ -5646,7 +5677,9 @@ def _record_preflight(
         if excluded_part:
             current["project"] = project_before
         return
-    disposition = decide_disposition(current, declared=declared, extractor=extractor)
+    disposition = decide_disposition(
+        current, declared=declared, extractor=extractor, parent_declared=_split_parent_declared(current)
+    )
     assignments = disposition.pop("assignments")
     disposition["applied"] = campaign is not None
     if campaign is not None:
@@ -5768,29 +5801,13 @@ def classify_preflight(
     fields is decided from the extractor records its preflight left (_rebuilt_legacy_per_file), and
     recorded as it was.
     """
-    from .raw_metadata_preflight import decide_disposition
-
     target = Path(manifest_path).resolve()
     campaign = preflight_campaign(read_manifest(target), campaign_authorization_path)
     with manifest_lock(target):
         current = read_manifest(target)
         preflight = current.get("raw_metadata_preflight") or {}
-        declared = preflight.get("declared")
-        if not isinstance(declared, dict):
-            declared = _declared_technical(current)
-        view = current
-        rebuilt = _rebuilt_legacy_per_file(current)
-        if rebuilt is not None:
-            view = copy.deepcopy(current)
-            view["raw_metadata_preflight"]["summary"]["per_file"] = rebuilt
-        disposition = decide_disposition(view, declared=declared)
+        disposition = _decide_recorded_preflight(current)
         assignments = disposition.pop("assignments")
-        if rebuilt is not None and "raw_metadata_preflight_legacy" not in disposition["warnings"]:
-            disposition["warnings"].append("raw_metadata_preflight_legacy")
-            disposition["detail"].append(
-                "The per-file records predate recorded formats, MS-level flags and isolation; the unit was "
-                "decided from the extractor records its preflight left."
-            )
         held = disposition_hold(current)
         if held is None and not (preflight.get("summary") or {}):
             held = {
@@ -5806,6 +5823,34 @@ def classify_preflight(
             _apply_disposition(current, disposition, assignments)
         current["campaign_disposition"] = disposition
         _write_json(target, current)
+    return disposition
+
+
+def _decide_recorded_preflight(current: dict[str, Any]) -> dict[str, Any]:
+    """decide_disposition over a unit's recorded preflight, as classify_preflight decides it. Changes nothing.
+
+    The declaration is the one the preflight recorded, else _declared_technical; a split part is also held to
+    its parent's declaration (_split_parent_declared); a summary written before the per-file fields is decided
+    from the extractor records its preflight left (_rebuilt_legacy_per_file). The result keeps ``assignments``.
+    """
+    from .raw_metadata_preflight import decide_disposition
+
+    preflight = current.get("raw_metadata_preflight") or {}
+    declared = preflight.get("declared")
+    if not isinstance(declared, dict):
+        declared = _declared_technical(current)
+    view = current
+    rebuilt = _rebuilt_legacy_per_file(current)
+    if rebuilt is not None:
+        view = copy.deepcopy(current)
+        view["raw_metadata_preflight"]["summary"]["per_file"] = rebuilt
+    disposition = decide_disposition(view, declared=declared, parent_declared=_split_parent_declared(current))
+    if rebuilt is not None and "raw_metadata_preflight_legacy" not in disposition["warnings"]:
+        disposition["warnings"].append("raw_metadata_preflight_legacy")
+        disposition["detail"].append(
+            "The per-file records predate recorded formats, MS-level flags and isolation; the unit was "
+            "decided from the extractor records its preflight left."
+        )
     return disposition
 
 
@@ -6394,6 +6439,18 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         _file_key(str(item.get("file") or "")): item
         for item in (parent.get("raw_metadata_preflight") or {}).get("summary", {}).get("per_file") or []
     }
+    from .raw_metadata_preflight import SPLIT_PARENT_DECLARED_FIELD
+
+    parent_declared_mode = _split_parent_declared(parent)
+    if parent_declared_mode is None:
+        parent_declared_mode = str(
+            ((parent.get("raw_metadata_preflight") or {}).get("declared") or _declared_technical(parent)).get(
+                "acquisition_mode"
+            )
+            or ""
+        ).strip()
+        if parent_declared_mode.casefold() == "unknown":
+            parent_declared_mode = ""
     data_root = str(parent.get("input_directory") or "").strip()
     files_of = _files_of_parts(
         list(parent_project.get("files") or []),
@@ -6507,6 +6564,9 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 "analysis_unit_id": plan["analysis_unit_id"],
                 "split_by": "raw_header_acquisition_mode" if label == part["acquisition_mode"] else "raw_header_split_key",
                 "acquisition_mode": part["acquisition_mode"],
+                # What the parent's repository record declared (decide_disposition holds a part to it where it
+                # keeps MS1-only inputs out of a DDA run); "" where it declared nothing.
+                SPLIT_PARENT_DECLARED_FIELD: parent_declared_mode,
                 **({"split_key": part["split_key"]} if label != part["acquisition_mode"] else {}),
             },
             "workspace": str(root),
@@ -6744,6 +6804,13 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
     # decision is held to what its header alone admits, as before dispositions existed. All are recorded
     # against the input, so a row that reads it through a Console alias is looked up as that input.
     decided_types = _decided_acquisition_by_file(manifest)
+    # An applied disposition decided before the header-first rule (Interactive 0.5.29, which records
+    # declared_acquisition_source on every disposition) may run what that rule excludes: an MS1-only file
+    # folded into the DDA run of a unit declared DIA, or a file whose header gives no acquisition mode, taken
+    # at the declaration. It is decided again here from the same records, as classify_preflight would, and
+    # changes nothing: a row that decision would not run refuses the run until the unit is decided again.
+    legacy_refusals = _legacy_disposition_refusals(manifest, state.get("files") or [], aliases)
+    blockers.extend(legacy_refusals)
     if header_modes or header_types or decided_types:
         disagreeing = []
         undecided_as = []
@@ -6850,9 +6917,90 @@ def _header_console_type_by_file(manifest: dict[str, Any]) -> dict[str, str]:
     for item in summary.get("per_file") or []:
         path_text = str(item.get("file") or "").strip() if isinstance(item, dict) else ""
         console = entry_header_console(item) if path_text else None
+        if console == "AIF" and str(item.get("acquisition_mode") or "").strip() == "DIA":
+            # A DIA header with no recorded isolation target (header_no_isolation): the extractor records
+            # targets only from MS2 headers that carry a precursor m/z, so a vendor read without one gives none
+            # for windowed DIA too. It binds nothing; the header's DIA admits SWATH or AIF, and a disposition's
+            # decided type still binds.
+            continue
         if console in {"DDA", "SWATH", "AIF"}:
             result[_file_key(path_text)] = console
     return result
+
+
+# The bases of an assignment that a header did not settle (raw_metadata_preflight.decide_disposition): the
+# declaration's SWATH or AIF, and AIF for a DIA header that recorded no isolation target, which is the extractor's
+# reading of MS2 headers with no precursor m/z and not evidence of all-ion acquisition. A legacy row of another
+# type for such a file is no contradiction of its header.
+_UNSETTLED_ASSIGNMENT_BASES = {"declaration", "header_no_isolation"}
+
+
+def _legacy_disposition_refusals(
+    manifest: dict[str, Any], files: list[dict[str, Any]], aliases: dict[str, str]
+) -> list[str]:
+    """Blockers for the rows an applied pre-0.5.29 disposition runs and the header-first rule would not.
+
+    Empty for a unit with no applied disposition, or one decided from 0.5.29 on (it records
+    declared_acquisition_source). Otherwise the unit is decided again from its recorded preflight
+    (_decide_recorded_preflight), in memory: the run is refused where that decision does not run the unit as
+    one, excludes a row's file, or gives it another type on its header's word.
+    """
+    from .raw_metadata_preflight import file_key
+
+    applied = _applied_disposition(manifest)
+    if not applied or "declared_acquisition_source" in applied:
+        return []
+    again_hint = (
+        "Decide the unit again from its recorded preflight (classify_preflight, or the raw-header preflight run "
+        "again) before it runs."
+    )
+    try:
+        again = _decide_recorded_preflight(manifest)
+    except Exception as error:  # A gate that cannot decide refuses rather than runs.
+        return [
+            "This unit's campaign disposition was decided before Interactive 0.5.29 took each file's acquisition "
+            f"from its raw header first, and could not be decided again here ({type(error).__name__}). "
+            + again_hint
+        ]
+    kind = str(again.get("disposition") or "")
+    if kind != "run":
+        return [
+            "This unit's campaign disposition was decided before Interactive 0.5.29 took each file's acquisition "
+            f"from its raw header first (user decision, 2026-10-06); decided again from the same records, the "
+            f"unit would {kind} ({', '.join(again.get('reasons') or []) or 'no reason recorded'}), not run. "
+            + again_hint
+        ]
+    assigned = again.get("assignments") or {}
+    excluded_now = {
+        file_key(str(item.get("path") or "")): str(item.get("reason") or "")
+        for item in again.get("excluded_inputs") or []
+        if isinstance(item, dict)
+    }
+    refused = []
+    for item in files:
+        path_text = str(item.get("file_path") or "").strip()
+        if not path_text:
+            continue
+        key = file_key(_unit_input_of(path_text, aliases))
+        given = str(item.get("acquisition_type") or "").strip() or "no type"
+        assignment = assigned.get(key)
+        if assignment is None:
+            refused.append(f"{Path(path_text).name} (now {excluded_now.get(key) or 'not decided'})")
+        elif (
+            assignment.get("console_acquisition_type") != given
+            and str(assignment.get("basis") or "") not in _UNSETTLED_ASSIGNMENT_BASES
+        ):
+            refused.append(
+                f"{Path(path_text).name} (now {assignment.get('console_acquisition_type')} on the basis "
+                f"{assignment.get('basis')}, run as {given})"
+            )
+    if not refused:
+        return []
+    return [
+        f"{len(refused)} input files would run as a campaign disposition decided before Interactive 0.5.29 took "
+        "each file's acquisition from its raw header first (user decision, 2026-10-06), and decided again from "
+        f"the same records they would not; the first is {refused[0]}. " + again_hint
+    ]
 
 
 def _applied_disposition(manifest: dict[str, Any]) -> dict[str, Any]:

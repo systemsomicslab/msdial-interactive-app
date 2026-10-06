@@ -628,6 +628,12 @@ MS1_ONLY_HEADER_CONTRADICTS_DDA = "ms1_only_header_contradicts_dda"
 # - split_part: the mode a split wrote for its part (split_from.acquisition_mode), from its parent's headers;
 # - unattributed: anything else; the record does not say where the mode came from.
 DECLARATION_SOURCES = ("catalog_keyword_inference", "split_part", "unattributed")
+# A split part declares the mode the split wrote for it, from its parent's headers. What its parent's repository
+# record declared is recorded beside it (split_from.parent_declared_acquisition_mode, from 0.5.29; read from the
+# parent manifest for a part split before that), and a part whose parent was declared DIA, AIF or SWATH keeps
+# its MS1-only inputs out of a DDA run as its parent would: a part split before 0.5.29 may carry such inputs,
+# folded into its DDA part by the rule of the time.
+SPLIT_PARENT_DECLARED_FIELD = "parent_declared_acquisition_mode"
 _POLARITIES = {"Positive", "Negative"}
 _SWITCHING = {"PolaritySwitching", "MixedFunctions"}
 _SEPARATION_NAMES = {
@@ -642,6 +648,15 @@ _OUT_OF_SCOPE_FILE_REASONS = (
     "acquisition_out_of_scope:",
     "polarity_switching",
     "conversion_required",
+    "ms1_only_beside_dia",
+    MS1_ONLY_IN_DECLARED_DIA_UNIT,
+    MS1_ONLY_HEADER_CONTRADICTS_DDA,
+)
+# File-level reasons that do not stand on their own while an input's acquisition is unresolved: an MS1-only
+# input is out of scope only because no runnable MS2 input is beside it, and an unresolved input may be exactly
+# that once its header is read.
+_DEPENDS_ON_THE_UNIT_FILE_REASONS = (
+    "acquisition_out_of_scope:FullScan",
     "ms1_only_beside_dia",
     MS1_ONLY_IN_DECLARED_DIA_UNIT,
     MS1_ONLY_HEADER_CONTRADICTS_DDA,
@@ -716,11 +731,20 @@ def declaration_source(manifest: Mapping[str, Any], declared: Mapping[str, Any])
     return "unattributed"
 
 
+def split_parent_declared_mode(manifest: Mapping[str, Any]) -> str:
+    """The acquisition mode a split part's parent declared, as its split recorded it; "" where none is recorded."""
+    split = manifest.get("split_from")
+    if not isinstance(split, Mapping):
+        return ""
+    return str(split.get(SPLIT_PARENT_DECLARED_FIELD) or "").strip()
+
+
 def decide_disposition(
     manifest: Mapping[str, Any],
     declared: Mapping[str, Any] | None = None,
     extractor: Mapping[str, Any] | None = None,
     decided_at: str | None = None,
+    parent_declared: str | None = None,
 ) -> dict[str, Any]:
     """What a campaign does with a unit, from its recorded preflight. Never raises; changes nothing.
 
@@ -743,7 +767,15 @@ def decide_disposition(
     unit or not. The declaration decides only a unit none of whose headers could be read
     (acquisition_declared_only), and SWATH or AIF for a DIA header whose isolation settles neither. MS1-only
     files are folded into a DDA run as before, except in a unit declared DIA or AIF, where they are
-    excluded as ms1_only_in_declared_dia_unit.
+    excluded as ms1_only_in_declared_dia_unit; a split part is held to its parent's declaration there
+    (``parent_declared``, else split_parent_declared_mode), since its own is the mode its split wrote.
+
+    A header that contradicted the declaration is reported as having overridden it (the warning
+    acquisition_header_overrides_declaration, and the detail) only for a file that reaches the run; one
+    excluded after its header was taken (dia_scheme_unresolved, product_ion_only, polarity) is recorded in
+    declared_vs_header as excluded, with its reason. A unit nothing of which runs, with an input whose
+    acquisition is unresolved, is skipped as acquisition_unresolved, not excluded, where every other input is
+    out of scope only for want of a runnable MS2 input beside it (MS1-only inputs).
     """
     def mapping(value: Any) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
@@ -753,6 +785,7 @@ def decide_disposition(
     coverage = mapping(summary.get("coverage"))
     declared = dict(declared or preflight.get("declared") or declared_technical(manifest.get("project")))
     declared_source = declaration_source(manifest, declared)
+    parent_mode = str(parent_declared if parent_declared is not None else split_parent_declared_mode(manifest)).strip()
     identity = dict(extractor or preflight.get("extractor") or {})
     reasons: list[str] = []
     warnings: list[str] = []
@@ -770,7 +803,44 @@ def decide_disposition(
         if code and code not in warnings:
             warnings.append(code)
 
+    def settle_overrides(disposition: str) -> None:
+        # A header decided each file it contradicted the declaration for, but the declaration was overridden
+        # in what runs only where that file reaches the run: one excluded after its header was taken is
+        # recorded as excluded, with its reason, and is not said to run.
+        reasons_of = {file_key(item["path"]): item["reason"] for item in excluded}
+        kept = 0
+        dropped: dict[str, int] = {}
+        for item in disagreements:
+            if item.get("basis") != "header":
+                continue
+            reason = reasons_of.get(file_key(str(item.get("file") or "")))
+            if reason is not None:
+                item.update(decided="excluded", basis="excluded", excluded_reason=reason)
+                dropped[reason] = dropped.get(reason, 0) + 1
+            elif item.get("header") in HEADER_RUN_METHODS:
+                kept += 1
+        if kept:
+            warn("acquisition_header_overrides_declaration")
+            detail.append(
+                (
+                    f"{kept} input(s) run as their raw headers give, over the declared {declared_mode} "
+                    if disposition in {"run", "split"}
+                    else f"{kept} input(s) are taken as their raw headers give, over the declared {declared_mode}, "
+                    f"though the unit does not run ({disposition}) "
+                )
+                + f"({declared_source}): a header that gives DDA, DIA, AIF or SWATH with MS2 decides whatever the "
+                "declaration and whatever the extractor's confidence (user decision, 2026-10-06)."
+            )
+        if dropped:
+            detail.append(
+                f"{sum(dropped.values())} input(s) whose raw header contradicts the declared {declared_mode} "
+                f"({declared_source}) are excluded ("
+                + ", ".join(f"{reason} {count}" for reason, count in sorted(dropped.items()))
+                + "); the declaration decides none of them."
+            )
+
     def result(disposition: str, split_key: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
+        settle_overrides(disposition)
         return {
             "schema": DISPOSITION_SCHEMA,
             "disposition": disposition,
@@ -787,6 +857,7 @@ def decide_disposition(
             },
             "declared": declared,
             "declared_acquisition_source": declared_source,
+            **({"split_parent_declared_acquisition_mode": parent_mode} if parent_mode else {}),
             "declared_vs_header": disagreements[:50],
             "detail": detail,
             **extra,
@@ -934,8 +1005,8 @@ def decide_disposition(
 
     # HEADER FIRST (HEADER_RUN_METHODS). A read header decides each file, declared unit or not: what it gives
     # runs, out of scope or not, and an Unknown is excluded below as acquisition_unresolved. A declaration it
-    # contradicts is recorded with where it came from, and decides nothing.
-    overridden = 0
+    # contradicts is recorded with where it came from, and decides nothing; whether the file then runs is
+    # settled with the rest of the unit (settle_overrides).
     unresolved_declared = 0
     for path, entry in readable:
         header = str(entry.get("acquisition_mode") or "").strip()
@@ -954,21 +1025,12 @@ def decide_disposition(
             decided.append((path, entry, "Unknown", None, "header"))
             continue
         if declared_known and not _declared_agrees(declared_mode, header, header_console):
-            if header in HEADER_RUN_METHODS:
-                warn("acquisition_header_overrides_declaration")
-                overridden += 1
             disagreements.append(
                 {"file": path, "declared": declared_mode, "header": header, "confidence": confidence,
                  "decided": header, "basis": "header", "declaration_source": declared_source}
             )
         decided.append((path, entry, header, header_console, "header"))
         header_based.add(path)
-    if overridden:
-        detail.append(
-            f"{overridden} input(s) run as their raw headers give, over the declared {declared_mode} "
-            f"({declared_source}): a header that gives DDA, DIA, AIF or SWATH with MS2 decides whatever the "
-            "declaration and whatever the extractor's confidence (user decision, 2026-10-06)."
-        )
     if unresolved_declared:
         detail.append(
             f"{unresolved_declared} input(s) whose raw header gives no acquisition mode are excluded "
@@ -1012,9 +1074,14 @@ def decide_disposition(
 
     if ms1_only:
         dda_run = any(console == "DDA" for _path, _entry, console, _basis in included)
-        if dda_run and declared_mode.upper() in _DECLARED_DIA_FAMILY:
+        dia_declared = (
+            f"declared {declared_mode}" if declared_mode.upper() in _DECLARED_DIA_FAMILY
+            else f"split from a unit declared {parent_mode}" if parent_mode.upper() in _DECLARED_DIA_FAMILY
+            else ""
+        )
+        if dda_run and dia_declared:
             detail.append(
-                f"The unit is declared {declared_mode}, so its {len(ms1_only)} MS1-only input(s) are not folded "
+                f"The unit is {dia_declared}, so its {len(ms1_only)} MS1-only input(s) are not folded "
                 "into the DDA run its headers make: they may be all-ion data exported as MS1 scans "
                 f"({MS1_ONLY_IN_DECLARED_DIA_UNIT})."
             )
@@ -1065,6 +1132,24 @@ def decide_disposition(
     if not groups:
         file_reasons = [item["reason"] for item in excluded]
         out_of_scope = [reason for reason in file_reasons if _is_out_of_scope(reason)]
+        if out_of_scope and "acquisition_unresolved" in file_reasons and all(
+            reason in _DEPENDS_ON_THE_UNIT_FILE_REASONS for reason in out_of_scope
+        ):
+            # What its MS1-only inputs are depends on the inputs whose header gave no acquisition: one of those
+            # read as DDA would take them into its run. The unit waits for headers that settle them.
+            reasons.append("acquisition_unresolved")
+            reasons.extend(
+                _UNIT_REASON_FOR_FILE_REASON.get(reason, reason) for reason in file_reasons
+                if not _is_out_of_scope(reason)
+            )
+            detail.append(
+                "No input remains that this campaign can run: "
+                f"{file_reasons.count('acquisition_unresolved')} input(s) have a raw header that gives no "
+                f"acquisition mode, and {len(out_of_scope)} MS1-only input(s) are out of scope only for want of a "
+                "runnable MS2 input beside them. The unit is skipped, not excluded: a header that settles the "
+                "unresolved inputs may make it runnable."
+            )
+            return result("skip")
         chosen = out_of_scope or file_reasons or ["acquisition_unresolved"]
         reasons.extend(_UNIT_REASON_FOR_FILE_REASON.get(reason, reason) for reason in chosen)
         detail.append("No input remains that this campaign can run.")

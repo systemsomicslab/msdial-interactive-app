@@ -794,7 +794,95 @@ class DispositionMatrixTests(unittest.TestCase):
         self.assertEqual(("exclude", ["acquisition_out_of_scope:PRM"]), (disposition["disposition"], disposition["reasons"]))
         self.assertNotIn("acquisition_header_overrides_declaration", disposition["warnings"])
         entry = disposition["declared_vs_header"][0]
-        self.assertEqual(("PRM", "PRM"), (entry["header"], entry["decided"]))
+        self.assertEqual(
+            ("PRM", "excluded", "excluded", "acquisition_out_of_scope:PRM"),
+            (entry["header"], entry["decided"], entry["basis"], entry["excluded_reason"]),
+        )
+
+    def test_a_header_that_overrode_the_declaration_and_was_then_excluded_is_not_said_to_run(self) -> None:
+        # A DIA header with one recurring target settles neither SWATH nor AIF, and a declared DDA gives no
+        # fallback: excluded as dia_scheme_unresolved. A DDA header with no MS1 is product-ion-only data.
+        beside = self.decide(
+            [_header("a.mzML", "DIA", targets=[500.0], confidence=0.82), _header("b.mzML", "DDA")],
+            declared={"acquisition_mode": "DDA"},
+        )
+        alone = self.decide([_header("p.mzML", "DDA", levels=[2], confidence=0.75)], declared={"acquisition_mode": "DIA"})
+
+        self.assertEqual(("run", "DDA"), (beside["disposition"], beside["console_acquisition_type"]))
+        self.assertEqual(("exclude", ["acquisition_out_of_scope:product_ion_only"]), (alone["disposition"], alone["reasons"]))
+        for disposition, reason in ((beside, "dia_scheme_unresolved"), (alone, "acquisition_out_of_scope:product_ion_only")):
+            with self.subTest(reason=reason):
+                self.assertNotIn("acquisition_header_overrides_declaration", disposition["warnings"])
+                self.assertNotIn("run as their raw headers give", " ".join(disposition["detail"]))
+                self.assertIn(f"are excluded ({reason} 1)", " ".join(disposition["detail"]))
+                (entry,) = disposition["declared_vs_header"]
+                self.assertEqual(
+                    ("excluded", "excluded", reason), (entry["decided"], entry["basis"], entry["excluded_reason"])
+                )
+
+    def test_an_override_is_said_to_run_only_for_the_files_that_run(self) -> None:
+        disposition = self.decide(
+            [_header("a.mzML", "DDA", confidence=0.75), _header("b.mzML", "DDA", levels=[2], confidence=0.75)],
+            declared={"acquisition_mode": "DIA"},
+        )
+
+        self.assertEqual(("run", "DDA"), (disposition["disposition"], disposition["console_acquisition_type"]))
+        self.assertIn("acquisition_header_overrides_declaration", disposition["warnings"])
+        detail = " ".join(disposition["detail"])
+        self.assertIn("1 input(s) run as their raw headers give, over the declared DIA", detail)
+        self.assertIn("1 input(s) whose raw header contradicts the declared DIA (unattributed) are excluded", detail)
+        self.assertEqual(
+            [("a.mzML", "DDA", "header"), ("b.mzML", "excluded", "excluded")],
+            [(item["file"], item["decided"], item["basis"]) for item in disposition["declared_vs_header"]],
+        )
+
+    def test_unresolved_ms2_headers_beside_ms1_only_files_skip_the_unit_as_unresolved(self) -> None:
+        # An MTBLS1842-like unit whose MS2 files all read Unknown: the MS1-only files are out of scope only for
+        # want of a runnable MS2 file beside them, which a header that settles the others may give.
+        records = [
+            _header("a.mzML", "Unknown", confidence=0.3),
+            _header("full.mzML", "FullScan", levels=[1], confidence=0.95),
+        ]
+        for declared in ({"acquisition_mode": "DIA"}, {"acquisition_mode": "DDA"}, {}):
+            with self.subTest(declared=declared):
+                disposition = self.decide(records, declared=declared)
+
+                self.assertEqual(("skip", ["acquisition_unresolved"]), (disposition["disposition"], disposition["reasons"]))
+                self.assertEqual(
+                    [("a.mzML", "acquisition_unresolved"), ("full.mzML", "acquisition_out_of_scope:FullScan")],
+                    [(item["path"], item["reason"]) for item in disposition["excluded_inputs"]],
+                )
+                self.assertIn("skipped, not excluded", " ".join(disposition["detail"]))
+
+    def test_an_unresolved_header_beside_a_targeted_one_still_excludes_the_unit(self) -> None:
+        disposition = self.decide(
+            [_header("a.mzML", "Unknown", confidence=0.3), _header("s.mzML", "SRM", confidence=0.9)],
+            declared={"acquisition_mode": "DIA"},
+        )
+
+        self.assertEqual(("exclude", ["acquisition_out_of_scope:SRM"]), (disposition["disposition"], disposition["reasons"]))
+
+    def test_a_split_part_keeps_ms1_only_files_out_of_dda_where_its_parent_was_declared_dia(self) -> None:
+        # A part split before 0.5.29 may carry MS1-only inputs its DDA part folded in; its own declaration is the
+        # DDA its split wrote, so the guard reads its parent's.
+        records = [_header("a.mzML", "DDA", confidence=0.75), _header("full.mzML", "FullScan", levels=[1], confidence=0.95)]
+        recorded = _manifest(records, declared={"acquisition_mode": "DDA"})
+        recorded["split_from"] = {"acquisition_mode": "DDA", "parent_declared_acquisition_mode": "DIA"}
+        legacy = _manifest(records, declared={"acquisition_mode": "DDA"})
+        legacy["split_from"] = {"acquisition_mode": "DDA"}
+
+        for disposition in (decide_disposition(recorded), decide_disposition(legacy, parent_declared="DIA")):
+            with self.subTest(split_from=disposition.get("split_parent_declared_acquisition_mode")):
+                self.assertEqual(("run", "DDA"), (disposition["disposition"], disposition["console_acquisition_type"]))
+                self.assertEqual(
+                    [("full.mzML", "ms1_only_in_declared_dia_unit")],
+                    [(item["path"], item["reason"]) for item in disposition["excluded_inputs"]],
+                )
+                self.assertEqual("DIA", disposition["split_parent_declared_acquisition_mode"])
+                self.assertIn("split from a unit declared DIA", " ".join(disposition["detail"]))
+        folded = decide_disposition(legacy, parent_declared="")
+        self.assertEqual(2, len(folded["assignments"]))
+        self.assertNotIn("split_parent_declared_acquisition_mode", folded)
 
     def test_the_declarations_source_is_recorded_beside_the_header_that_overrode_it(self) -> None:
         handoff = {"catalog_handoff": {"technical_settings": {"acquisition_mode": "DIA"}}}
@@ -1696,6 +1784,159 @@ class DecidedTypeGateTests(_Scratch):
         refused = self.gate(manifest, files, "AIF")
         self.assertFalse(refused["allowed"])
         self.assertTrue(any("(header gives SWATH, run as AIF)" in item for item in refused["blockers"]), refused["blockers"])
+
+
+class LegacyDispositionGateTests(_Scratch):
+    """An applied disposition decided before 0.5.29 is decided again at the gate, and refused where rule B2 differs."""
+
+    def gate(self, manifest: Path, files: list[Path], kinds: list[str] | str) -> dict:
+        kinds = [kinds] * len(files) if isinstance(kinds, str) else kinds
+        return evaluate_repository_execution_gate(
+            {
+                "repository_run_manifest": str(manifest),
+                "output_root": str(manifest.parent.parent / "output"),
+                "ion_mode": "Negative",
+                "files": [{"file_path": str(path), "acquisition_type": kind} for path, kind in zip(files, kinds)],
+            }
+        )
+
+    def campaign(self, verdicts: dict, **options) -> tuple[Path, dict[str, Path]]:
+        manifest, _stub, files = _unit(
+            self.root / "unit", list(verdicts), extra={"campaign_authorizations": [dict(_APPROVAL)]}, **options
+        )
+        self.preflight(manifest, _PinnedExtractor.make(self.root / "build"), _Extractor(verdicts))
+        return manifest, {path.name: path for path in files}
+
+    @staticmethod
+    def as_decided_before_0529(manifest: Path, decided: dict[str, tuple[str, str]]) -> None:
+        """Rewrite the applied disposition as 0.5.24-0.5.28 recorded it: these files ran as (type, basis)."""
+
+        def rewrite(current: dict) -> None:
+            disposition = current["campaign_disposition"]
+            disposition.pop("declared_acquisition_source")
+            disposition["excluded_inputs"] = [
+                item for item in disposition["excluded_inputs"] if Path(item["path"]).name not in decided
+            ]
+            for entry in current["raw_metadata_preflight"]["summary"]["per_file"]:
+                if Path(entry["file"]).name in decided:
+                    entry["console_acquisition_type"], entry["console_acquisition_basis"] = decided[Path(entry["file"]).name]
+
+        update_manifest(manifest, rewrite)
+
+    def test_a_legacy_fold_of_an_ms1_only_file_into_a_declared_dia_unit_is_refused_until_decided_again(self) -> None:
+        # MTBKS217: declared DIA, z_014nn has no MS2 and was folded into the DDA run.
+        verdicts = {
+            "a.mzML": {"method": "DDA", "confidence": 0.75},
+            "z.mzML": {"method": "FullScan", "levels": [1], "confidence": 0.95},
+        }
+        manifest, files = self.campaign(verdicts, acquisition="DIA")
+        self.as_decided_before_0529(manifest, {"z.mzML": ("DDA", "folded_ms1_only")})
+
+        refused = self.gate(manifest, [files["a.mzML"], files["z.mzML"]], "DDA")
+        self.assertFalse(refused["allowed"])
+        self.assertTrue(
+            any("before Interactive 0.5.29" in item and "z.mzML (now ms1_only_in_declared_dia_unit)" in item
+                and "classify_preflight" in item for item in refused["blockers"]),
+            refused["blockers"],
+        )
+        self.assertTrue(self.gate(manifest, [files["a.mzML"]], "DDA")["allowed"])
+
+        decided = classify_preflight(manifest)
+        self.assertIn("declared_acquisition_source", decided)
+        again = self.gate(manifest, [files["a.mzML"], files["z.mzML"]], "DDA")
+        self.assertFalse(again["allowed"])
+        self.assertFalse(any("before Interactive 0.5.29" in item for item in again["blockers"]), again["blockers"])
+        self.assertTrue(any("excluded by this unit's campaign disposition" in item for item in again["blockers"]))
+
+    def test_a_legacy_unknown_header_taken_at_the_declaration_is_refused(self) -> None:
+        # MTBLS1572's blank: an Unknown header, run as SWATH by the declared DIA.
+        verdicts = {
+            "a.mzML": {"method": "DIA", "confidence": 0.82},
+            "blank.mzML": {"method": "Unknown", "confidence": 0.3},
+        }
+        manifest, files = self.campaign(verdicts, acquisition="DIA")
+        self.as_decided_before_0529(manifest, {"blank.mzML": ("SWATH", "declaration")})
+
+        refused = self.gate(manifest, [files["blank.mzML"]], "SWATH")
+        self.assertFalse(refused["allowed"])
+        self.assertTrue(
+            any("blank.mzML (now acquisition_unresolved)" in item for item in refused["blockers"]), refused["blockers"]
+        )
+        self.assertTrue(self.gate(manifest, [files["a.mzML"]], "SWATH")["allowed"])
+
+    def test_a_legacy_disposition_whose_unit_would_no_longer_run_is_refused(self) -> None:
+        verdicts = {"blank.mzML": {"method": "Unknown", "confidence": 0.3}, "b.mzML": {"method": "Unknown", "confidence": 0.3}}
+        manifest, files = self.campaign(verdicts, acquisition="DIA")
+        self.assertEqual("skip", read_manifest(manifest)["campaign_disposition"]["disposition"])
+
+        def ran_by_declaration(current: dict) -> None:
+            disposition = current["campaign_disposition"]
+            disposition.pop("declared_acquisition_source")
+            disposition.update(disposition="run", reasons=[], excluded_inputs=[], console_acquisition_type="SWATH")
+            for entry in current["raw_metadata_preflight"]["summary"]["per_file"]:
+                entry.update(console_acquisition_type="SWATH", console_acquisition_basis="declaration")
+            current.update(execution_allowed=True, status="preflight_passed")
+
+        update_manifest(manifest, ran_by_declaration)
+        refused = self.gate(manifest, list(files.values()), "SWATH")
+
+        self.assertFalse(refused["allowed"])
+        self.assertTrue(
+            any("the unit would skip (acquisition_unresolved), not run" in item for item in refused["blockers"]),
+            refused["blockers"],
+        )
+
+    def test_a_dia_header_with_no_recorded_target_does_not_refuse_a_swath_row_its_disposition_decided(self) -> None:
+        # The extractor records isolation targets only from MS2 headers that carry a precursor m/z, so none
+        # recorded is no evidence of all-ion acquisition; the decided type binds the row, not that reading.
+        verdicts = {"a.mzML": {"method": "DIA", "confidence": 0.82, "targets": []}}
+        manifest, files = self.campaign(verdicts, acquisition="DIA")
+        self.assertEqual("AIF", read_manifest(manifest)["campaign_disposition"]["console_acquisition_type"])
+
+        refused = self.gate(manifest, [files["a.mzML"]], "SWATH")
+        self.assertFalse(refused["allowed"])
+        self.assertFalse(any("raw header contradicts" in item for item in refused["blockers"]), refused["blockers"])
+        self.assertTrue(any("campaign disposition decided" in item for item in refused["blockers"]))
+
+        self.as_decided_before_0529(manifest, {"a.mzML": ("SWATH", "declaration")})
+        self.assertTrue(self.gate(manifest, [files["a.mzML"]], "SWATH")["allowed"], "the legacy SWATH runs")
+        self.assertFalse(self.gate(manifest, [files["a.mzML"]], "DDA")["allowed"])
+
+    def test_outside_a_campaign_a_dia_header_with_no_recorded_target_admits_swath_or_aif(self) -> None:
+        manifest, stub, files = _unit(self.root / "unit", ["a.mzML"], acquisition="DIA")
+        self.preflight(manifest, stub, _Extractor({"a.mzML": {"method": "DIA", "confidence": 0.82, "targets": []}}))
+        update_manifest(manifest, lambda current: current.update(execution_allowed=True))
+
+        self.assertTrue(self.gate(manifest, files, "SWATH")["allowed"])
+        self.assertTrue(self.gate(manifest, files, "AIF")["allowed"])
+        self.assertFalse(self.gate(manifest, files, "DDA")["allowed"])
+
+    def test_a_split_records_its_parents_declaration_and_a_part_split_before_is_held_to_it(self) -> None:
+        verdicts = {"a.mzML": {"method": "DDA", "confidence": 0.75}, "b.mzML": {"method": "DIA", "confidence": 0.82}}
+        manifest, extractor, _files = _unit(self.root / "unit", list(verdicts), acquisition="DIA")
+        self.preflight(manifest, extractor, _Extractor(verdicts))
+        split = split_unit_by_acquisition(manifest, confirmed=True)
+        part = next(Path(item["manifest_path"]) for item in split["parts"] if item["acquisition_mode"] == "DDA")
+        self.assertEqual("DIA", read_manifest(part)["split_from"]["parent_declared_acquisition_mode"])
+
+        # As a part split under the earlier rule: no recorded parent declaration, and an MS1-only input folded in.
+        full = self.root / "unit" / "raw" / "data" / "full.mzML"
+        full.write_bytes(b"x")
+
+        def split_before_0529(current: dict) -> None:
+            current["split_from"].pop("parent_declared_acquisition_mode")
+            current["input_candidates"].append(str(full))
+
+        update_manifest(part, split_before_0529)
+        verdicts["full.mzML"] = {"method": "FullScan", "levels": [1], "confidence": 0.95}
+        result = self.preflight(part, extractor, _Extractor(verdicts))
+        disposition = result["campaign_disposition"]
+
+        self.assertEqual("DIA", disposition["split_parent_declared_acquisition_mode"])
+        self.assertEqual(
+            [("full.mzML", "ms1_only_in_declared_dia_unit")],
+            [(Path(item["path"]).name, item["reason"]) for item in disposition["excluded_inputs"]],
+        )
 
 
 class UntargetedWordingTests(_Scratch):
