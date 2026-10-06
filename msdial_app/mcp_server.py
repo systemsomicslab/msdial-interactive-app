@@ -2667,13 +2667,15 @@ def msdial_estimate_peak_height(
 ) -> dict[str, Any]:
     """Estimate a stepped Minimum peak height from a completed zero-threshold diagnostic.
 
-    The coarse step is the instrument family's (100 QTOF-type, 1,000 FT, or threshold_step), and of its
-    multiples the threshold is the HIGHEST whose estimated count is still at least
-    target_peak_count_min: the lower end of the range. Only when no multiple of it lands in range does
-    the search make the same choice in the fine step - 10 for QTOF-type, 100 for FT, an absolute floor
-    that a smaller threshold_step cannot lower - and the estimate then says step_fallback true,
-    fallback_reason "no_coarse_step_in_range", threshold_step the step used and coarse_threshold_step the
-    family step. When within_target_range is false, show the user the estimate's warnings.
+    The coarse step is ALWAYS the instrument family's (100 QTOF-type, 1,000 FT), read again from the
+    diagnostic's representative file, and of its multiples the threshold is the HIGHEST whose estimated
+    count is still at least target_peak_count_min: the lower end of the range. Only when no multiple of
+    it lands in range does the search make the same choice in the fine step - 10 for QTOF-type, 100 for
+    FT, an absolute floor - and the estimate then says step_fallback true, fallback_reason
+    "no_coarse_step_in_range", threshold_step the step used and coarse_threshold_step the family step.
+    Leave threshold_step at 0: a step passed, including a fallback's step echoed back, is recorded as
+    requested_threshold_step with a warning and is never searched in the family step's place. When
+    within_target_range is false, show the user the estimate's warnings.
 
     With manifest_path, a diagnostic the backend no longer holds is found in the unit's diagnostics
     directory by its job_id and its result file is read again, instead of running the Console again.

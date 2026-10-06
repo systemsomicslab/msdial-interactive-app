@@ -35,6 +35,7 @@ def summarize_jobs(
             # QTOF-type, 100 for FT, an absolute floor), only when no family-step threshold lands in the target
             # range; the estimate and the unit's peak_height_diagnostics record threshold_step (the step used),
             # coarse_threshold_step, fine_threshold_step, step_fallback, fallback_reason and within_target_range.
+            # The family step is always the coarse step; a requested step is recorded, never searched.
             "peak_height_fine_step_fallback",
             # Within the range, the highest threshold keeping at least the lower bound (selection_rule).
             "peak_height_lower_end_selection",

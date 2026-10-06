@@ -83,8 +83,10 @@ When `parameter_strategy` is `auto_peak_range` or `target_peak_count`:
    mzML header). Within the range it takes the highest threshold still keeping
    3,000, the lower end. Only when no such step lands in range does it fall
    back to 10-unit (QTOF-type) or 100-unit (Fourier-transform) steps, never
-   finer, whatever `threshold_step` you pass; the estimate then says
-   `step_fallback: true`. When
+   finer; the estimate then says `step_fallback: true`. Do not pass
+   `threshold_step`: the family step is always the coarse step, and a step you
+   pass, including a fallback's step echoed back, is only recorded
+   (`requested_threshold_step`) with a warning. When
    `within_target_range` is false, show its `warnings` to the user. A diagnostic
    count at or below 6,000 keeps the threshold at 0. For an exact target, pass `target_peak_count`.
 6. Present the proposed `minimum_peak_height`, diagnostic peak count, and estimated retained count.

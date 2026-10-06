@@ -29,10 +29,21 @@ open beside this one, and all five branch from 0.5.24.
     passes: a request with `threshold_step` 10, which is what a fallback's
     estimate reports as the step used, searched in steps of 1 in this PR's first
     draft and reached a threshold of 2 on the Waters MSe demo, where the median
-    S/N is 2.6. A requested step below the floor is raised to it, and
-    `requested_threshold_step` keeps what was asked. The diagnostic's
-    `instrument_family` decides the floor; without one, a step of 1,000 or more
-    is the FT family's.
+    S/N is 2.6.
+  - The family step is always the coarse step, whatever `threshold_step` is
+    requested. The diagnostic's `instrument_family` decides it
+    (`family_threshold_step`) and the fine step; a request below the fine step
+    is raised to it, and any other request that is not the family step is
+    recorded (`requested_threshold_step`, `requested_step_disposition`: null
+    when none was made, `family_step`, `fine_step`, `raised_to_fine_step` or
+    `recorded_only`) with a warning, and never searched in the family step's
+    place. This PR's second draft let a request between the floor and the
+    family step become the coarse step: MTBLS2207's DDA unit asked for steps of
+    100 got 19,700 instead of 19,000, and MTBLS417 asked for steps of 10 got
+    1,820 instead of 1,800, both recorded with that request as
+    `coarse_threshold_step` and no fallback. Only without a family does the
+    request name one: 1,000 or more is the FT family's step, anything else the
+    QTOF-type family's. A `threshold_step` of 0 is no request.
   - When even the fine step misses, the threshold is the candidate nearest the
     range (the one keeping more peaks on a tie), `within_target_range` is false
     and the estimate carries a `warnings` entry, which the Tune parameters view
@@ -79,10 +90,25 @@ open beside this one, and all five branch from 0.5.24.
     `instrument_evidence` and `declared_instrument`.
   - Every completed pilot unit keeps its family: ST001337 (Thermo .raw) FT; the
     Waters, SCIEX and Bruker units QTOF. ST004304 and MTBLS2207 become FT.
+- The estimate reads a stored diagnostic's family again
+  (`current_peak_tuning_profile`) instead of the one the version that started
+  it stored. A diagnostic recorded before 0.5.28 and re-estimated through
+  `manifest_path` kept the QTOF family and step 100 stored for every mzML:
+  MTBLS2207's DDA diagnostic re-estimated to 19,700 and recorded QTOF. The
+  representative file's own format and mzML header decide when it is on disk;
+  otherwise the stored family does, and for a profile recorded before 0.5.28,
+  which kept no `instrument_family_source`, an mzML or .d family is taken as a
+  format default, so the unit's declared instrument can still name an FT
+  family after the raw data are deleted. The response's `representative` and
+  the `peak_height_diagnostics` record carry the re-derived family, with
+  `instrument_family_rederived` and, when it changed, `stored_peak_tuning_profile`
+  (the stored family, source and step). The diagnostic's own
+  `diagnostic-job.json` is not rewritten.
 
 ### Added
 - The estimate records `threshold_step` (the step actually used),
-  `requested_threshold_step`, `coarse_threshold_step` (the family step),
+  `requested_threshold_step`, `requested_step_disposition`,
+  `coarse_threshold_step` (the family step),
   `fine_threshold_step`, `step_fallback`, `fallback_reason`
   (`no_coarse_step_in_range` or null), `coarse_minimum_peak_height` and
   `coarse_estimated_peak_count` (what the family step alone chose),

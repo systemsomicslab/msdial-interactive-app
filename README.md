@@ -349,7 +349,10 @@ and FT-ICR instruments, read from an mzML's header as well as from a Thermo
 Within the range it takes the highest threshold whose estimated count is still
 at least 3,000, the lower end of the range. Only when no such step lands in
 3,000-6,000 does it fall back to 10-unit (QTOF-type) or 100-unit
-(Fourier-transform) steps, and it never goes finer, whatever step is requested.
+(Fourier-transform) steps, and it never goes finer. The family step is always
+searched first, whatever step is requested; a requested step is recorded
+(`requested_threshold_step`) and never searched in its place, and a diagnostic
+recorded by an earlier version has its family read again.
 The estimate records the step used (`threshold_step`), the family step
 (`coarse_threshold_step`), `step_fallback`, `fallback_reason`,
 `within_target_range` and `selection_rule`; a threshold that misses the range

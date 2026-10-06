@@ -129,9 +129,12 @@ from a Thermo .raw, an mzML header, or, where the file names no instrument, the
 unit's declared instrument). Within the range take the highest threshold whose
 estimated count is still at least 3,000, the lower end. Only when no such step
 lands in range, fall back to 10-unit (QTOF-type) or 100-unit (Fourier-transform)
-steps, and never finer (the user's decisions of 2026-10-06). The fallback is
-recorded as `step_fallback` and `fallback_reason`, and a threshold that misses
-the range even at the fine step as `within_target_range: false` with a warning.
+steps, and never finer (the user's decisions of 2026-10-06). The family step is
+always the coarse step: a requested `threshold_step` is recorded, not searched.
+The fallback is recorded as `step_fallback` and `fallback_reason`, and a
+threshold that misses the range even at the fine step as
+`within_target_range: false` with a warning. A diagnostic recorded before 0.5.28
+has its instrument family read again when it is re-estimated.
 Keep 0 when the diagnostic finds no more than 6,000 peaks. The production run's
 actual per-file peak counts are recorded beside the estimate as
 `production_peak_counts`. Add the accepted threshold to `answer_seed` before
