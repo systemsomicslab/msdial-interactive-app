@@ -600,13 +600,34 @@ def _declared_agrees(declared: str, header: str, header_console: str | None) -> 
 
 DISPOSITION_SCHEMA = "msdial-campaign-disposition.v1"
 DISPOSITIONS = ("run", "skip", "exclude", "split")
-# A header verdict this confident replaces a repository declaration it contradicts.
-HEADER_OVERRIDE_CONFIDENCE = 0.8
+# HEADER FIRST (user decision, 2026-10-06). A file whose header was read, that has MS2, and whose header gives
+# one of these runs as its header says, whatever the unit declares and whatever confidence the extractor gave:
+# that confidence is a constant per branch of its classifier (0.75 for every DDA read without an isolation
+# width), not a measured probability, and a declaration is a keyword match over the repository's text. A header
+# that gives none of these nor a targeted method (Unknown) is excluded, declared unit or not.
+HEADER_RUN_METHODS = ("DDA", "DIA", "AIF", "SWATH")
 _DECLARED_MODES = {"DDA", "DIA", "AIF", "SWATH"}
 # Declared acquisitions this campaign does not run, by the name the header uses. They are declarations all
-# the same: the Catalog's and Interactive's own inference write them, and a header has to contradict one
-# with HEADER_OVERRIDE_CONFIDENCE to be believed over it, as for the modes the campaign runs.
+# the same: the Catalog's and Interactive's own inference write them. A header that was read decides over one
+# as over any other declaration; where no header could be read, the unit is taken at it and excluded.
 _DECLARED_OUT_OF_SCOPE = {"PRM": "PRM", "SRM": "SRM", "MRM": "MRM", "SIM": "SIM", "FULLSCAN": "FullScan"}
+# A unit declared DIA or AIF (the Catalog folds SWATH into DIA) does not fold its MS1-only inputs into a DDA run
+# its headers make of it: until the extractor recognises all-ion data exported as MS1 scans (bbCID, MSe), an
+# MS1-only file there may be exactly that, and DDA processing would take its fragments for MS1 features.
+_DECLARED_DIA_FAMILY = {"DIA", "AIF", "SWATH"}
+MS1_ONLY_IN_DECLARED_DIA_UNIT = "ms1_only_in_declared_dia_unit"
+# An MS1-only input whose header nonetheless gives SWATH or AIF is never folded into DDA, which its header
+# contradicts and the execution gate refuses. None of the per-file records on disk on 2026-10-06 is one.
+MS1_ONLY_HEADER_CONTRADICTS_DDA = "ms1_only_header_contradicts_dda"
+# Where a declared acquisition mode came from, recorded beside every header that decided over it
+# (declared_acquisition_source, and declaration_source in each declared_vs_header entry):
+# - catalog_keyword_inference: the Catalog handoff's technical_settings.acquisition_mode. The handoff names no
+#   source for it, and the Catalog writes it only by keyword matching: adapters/common.py infer_acquisition over
+#   the assay's text (the first of MRM, SRM, SIM, AIF, DIA, DDA it finds), or normalize._normalize_acquisition
+#   over a sample attribute every row shares. It is no structured repository field;
+# - split_part: the mode a split wrote for its part (split_from.acquisition_mode), from its parent's headers;
+# - unattributed: anything else; the record does not say where the mode came from.
+DECLARATION_SOURCES = ("catalog_keyword_inference", "split_part", "unattributed")
 _POLARITIES = {"Positive", "Negative"}
 _SWITCHING = {"PolaritySwitching", "MixedFunctions"}
 _SEPARATION_NAMES = {
@@ -622,6 +643,8 @@ _OUT_OF_SCOPE_FILE_REASONS = (
     "polarity_switching",
     "conversion_required",
     "ms1_only_beside_dia",
+    MS1_ONLY_IN_DECLARED_DIA_UNIT,
+    MS1_ONLY_HEADER_CONTRADICTS_DDA,
 )
 _UNIT_REASON_FOR_FILE_REASON = {
     "polarity_switching": "polarity_switching_out_of_scope",
@@ -667,6 +690,32 @@ def _is_out_of_scope(reason: str) -> bool:
     )
 
 
+def entry_header_console(entry: Mapping[str, Any]) -> str | None:
+    """The Console type one input's header alone gives, as its per-file record carries it."""
+    if _CURRENT_PER_FILE_FIELD in entry:
+        value = entry.get(_CURRENT_PER_FILE_FIELD)
+        return str(value) if value else None
+    # A record that predates it recorded no isolation either: DIA stays unresolved there.
+    return header_console_acquisition_type(str(entry.get("acquisition_mode") or "").strip(), None)[0]
+
+
+def declaration_source(manifest: Mapping[str, Any], declared: Mapping[str, Any]) -> str:
+    """Where the unit's declared acquisition mode came from (DECLARATION_SOURCES), or "" where none is declared."""
+    mode = str(declared.get("acquisition_mode") or "").strip().casefold()
+    if mode in {"", "unknown"}:
+        return ""
+    split = manifest.get("split_from")
+    if isinstance(split, Mapping) and str(split.get("acquisition_mode") or "").strip().casefold() == mode:
+        return "split_part"
+    project = manifest.get("project")
+    metadata = project.get("repository_metadata") if isinstance(project, Mapping) else None
+    handoff = metadata.get("catalog_handoff") if isinstance(metadata, Mapping) else None
+    settings = handoff.get("technical_settings") if isinstance(handoff, Mapping) else None
+    if isinstance(settings, Mapping) and str(settings.get("acquisition_mode") or "").strip().casefold() == mode:
+        return "catalog_keyword_inference"
+    return "unattributed"
+
+
 def decide_disposition(
     manifest: Mapping[str, Any],
     declared: Mapping[str, Any] | None = None,
@@ -686,6 +735,15 @@ def decide_disposition(
     through the binding disposition's excluded_inputs (the gate's INP-1): without it, one file that failed
     its conversion would stop the rest of a declared unit. It decides nothing about the unit; what remains
     is decided below as before.
+
+    THE ACQUISITION OF EACH FILE (user decision, 2026-10-06) is its header's wherever its header was read:
+    one with MS2 whose header gives DDA, DIA, AIF or SWATH runs as that, over any declaration and at any
+    extractor confidence, and declared_vs_header records each declaration it contradicted with its source
+    (declaration_source); one whose header gives Unknown is excluded as acquisition_unresolved, declared
+    unit or not. The declaration decides only a unit none of whose headers could be read
+    (acquisition_declared_only), and SWATH or AIF for a DIA header whose isolation settles neither. MS1-only
+    files are folded into a DDA run as before, except in a unit declared DIA or AIF, where they are
+    excluded as ms1_only_in_declared_dia_unit.
     """
     def mapping(value: Any) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
@@ -694,6 +752,7 @@ def decide_disposition(
     summary = mapping(preflight.get("summary"))
     coverage = mapping(summary.get("coverage"))
     declared = dict(declared or preflight.get("declared") or declared_technical(manifest.get("project")))
+    declared_source = declaration_source(manifest, declared)
     identity = dict(extractor or preflight.get("extractor") or {})
     reasons: list[str] = []
     warnings: list[str] = []
@@ -727,6 +786,7 @@ def decide_disposition(
                 "pinned": bool(identity.get("pinned")),
             },
             "declared": declared,
+            "declared_acquisition_source": declared_source,
             "declared_vs_header": disagreements[:50],
             "detail": detail,
             **extra,
@@ -872,45 +932,48 @@ def decide_disposition(
             for path, entry in unreadable:
                 decided.append((path, entry, declared_as, None, "declaration"))
 
+    # HEADER FIRST (HEADER_RUN_METHODS). A read header decides each file, declared unit or not: what it gives
+    # runs, out of scope or not, and an Unknown is excluded below as acquisition_unresolved. A declaration it
+    # contradicts is recorded with where it came from, and decides nothing.
+    overridden = 0
+    unresolved_declared = 0
     for path, entry in readable:
         header = str(entry.get("acquisition_mode") or "").strip()
         confidence = entry.get("confidence")
         confidence = float(confidence) if isinstance(confidence, (int, float)) else 0.0
-        if _CURRENT_PER_FILE_FIELD in entry:
-            header_console = entry.get(_CURRENT_PER_FILE_FIELD)
-        else:
-            # A record that predates it recorded no isolation either: DIA stays unresolved there.
-            header_console, _basis = header_console_acquisition_type(header, None)
+        header_console = entry_header_console(entry)
         if header == "FullScan" or _entry_flag(entry, "has_ms2", 2) is False:
             # MS1 only: whatever the declaration says, there is no MS2 to deconvolute.
             decided.append((path, entry, "FullScan", None, "header"))
             header_based.add(path)
             continue
-        if not declared_known:
-            decided.append((path, entry, header or "Unknown", header_console, "header"))
-            if header not in {"", "Unknown"}:
-                header_based.add(path)
+        if header not in HEADER_RUN_METHODS and header not in OUT_OF_SCOPE_METHODS:
+            # Unknown, or no verdict at all: the declaration is not taken for a file whose header was read.
+            if declared_known:
+                unresolved_declared += 1
+            decided.append((path, entry, "Unknown", None, "header"))
             continue
-        if header in {"", "Unknown"}:
-            warn("acquisition_declared_only")
-            decided.append((path, entry, declared_as, None, "declaration"))
-        elif _declared_agrees(declared_mode, header, header_console):
-            decided.append((path, entry, header, header_console, "header"))
-            header_based.add(path)
-        elif confidence >= HEADER_OVERRIDE_CONFIDENCE:
-            warn("acquisition_header_overrides_declaration")
-            disagreements.append(
-                {"file": path, "declared": declared_mode, "header": header, "confidence": confidence, "decided": header}
-            )
-            decided.append((path, entry, header, header_console, "header"))
-            header_based.add(path)
-        else:
-            warn("acquisition_header_disagrees_low_confidence")
+        if declared_known and not _declared_agrees(declared_mode, header, header_console):
+            if header in HEADER_RUN_METHODS:
+                warn("acquisition_header_overrides_declaration")
+                overridden += 1
             disagreements.append(
                 {"file": path, "declared": declared_mode, "header": header, "confidence": confidence,
-                 "decided": declared_as}
+                 "decided": header, "basis": "header", "declaration_source": declared_source}
             )
-            decided.append((path, entry, declared_as, None, "declaration"))
+        decided.append((path, entry, header, header_console, "header"))
+        header_based.add(path)
+    if overridden:
+        detail.append(
+            f"{overridden} input(s) run as their raw headers give, over the declared {declared_mode} "
+            f"({declared_source}): a header that gives DDA, DIA, AIF or SWATH with MS2 decides whatever the "
+            "declaration and whatever the extractor's confidence (user decision, 2026-10-06)."
+        )
+    if unresolved_declared:
+        detail.append(
+            f"{unresolved_declared} input(s) whose raw header gives no acquisition mode are excluded "
+            f"(acquisition_unresolved); the declared {declared_as} is not taken for a file whose header was read."
+        )
 
     included: list[tuple[str, dict[str, Any], str, str]] = []
     ms1_only: list[tuple[str, dict[str, Any]]] = []
@@ -948,11 +1011,23 @@ def decide_disposition(
         included.append((path, entry, console, console_basis))
 
     if ms1_only:
-        if any(console == "DDA" for _path, _entry, console, _basis in included):
+        dda_run = any(console == "DDA" for _path, _entry, console, _basis in included)
+        if dda_run and declared_mode.upper() in _DECLARED_DIA_FAMILY:
+            detail.append(
+                f"The unit is declared {declared_mode}, so its {len(ms1_only)} MS1-only input(s) are not folded "
+                "into the DDA run its headers make: they may be all-ion data exported as MS1 scans "
+                f"({MS1_ONLY_IN_DECLARED_DIA_UNIT})."
+            )
+            for path, _entry in ms1_only:
+                exclude(path, MS1_ONLY_IN_DECLARED_DIA_UNIT)
+        elif dda_run:
             # MS1-only survey files beside DDA files are aligned with them; DDA processing of a file with no
             # MS2 finds its MS1 features and nothing else.
-            warn("ms1_only_files_folded")
             for path, entry in ms1_only:
+                if entry_header_console(entry) not in {None, "DDA"}:
+                    exclude(path, MS1_ONLY_HEADER_CONTRADICTS_DDA)
+                    continue
+                warn("ms1_only_files_folded")
                 included.append((path, entry, "DDA", "folded_ms1_only"))
         elif included:
             for path, _entry in ms1_only:

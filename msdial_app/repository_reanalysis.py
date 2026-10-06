@@ -6733,13 +6733,18 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             "unit by per-file acquisition mode before running MS-DIAL."
         )
     header_modes = _header_acquisition_by_file(manifest)
+    # The Console type a file's header alone gives (header_console_acquisition_type: DDA, SWATH or AIF) binds
+    # every row of that file, whatever a disposition decided (user decision, 2026-10-06): a header that gives
+    # one decides the file over any declaration, so a row that contradicts it is a disposition, or a workflow,
+    # gone wrong, and the run would complete, validate and be wrong.
+    header_types = _header_console_type_by_file(manifest)
     # The type an applied campaign disposition decided a file runs as - from its header, from the
-    # repository's declaration where no header could be read or a low-confidence one disagreed, or DDA for
-    # an MS1-only file folded into a DDA run - is the one type that file may run as. A file with no decision
-    # is held to what its header alone admits, as before dispositions existed. Both are recorded against the
-    # input, so a row that reads it through a Console alias is looked up as that input.
+    # repository's declaration where no header could be read or a DIA header left SWATH and AIF open, or DDA
+    # for an MS1-only file folded into a DDA run - is the one type that file may run as. A file with no
+    # decision is held to what its header alone admits, as before dispositions existed. All are recorded
+    # against the input, so a row that reads it through a Console alias is looked up as that input.
     decided_types = _decided_acquisition_by_file(manifest)
-    if header_modes or decided_types:
+    if header_modes or header_types or decided_types:
         disagreeing = []
         undecided_as = []
         for item in state.get("files") or []:
@@ -6748,6 +6753,10 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
                 continue
             input_key = _file_key(_unit_input_of(path_text, aliases))
             given = str(item.get("acquisition_type") or "").strip()
+            requested = given or "DDA"
+            header_type = header_types.get(input_key)
+            if header_type and requested != header_type:
+                disagreeing.append(f"{Path(path_text).name} (header gives {header_type}, run as {given or 'no type'})")
             decided = decided_types.get(input_key)
             if decided:
                 if given != decided:
@@ -6756,8 +6765,7 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
                     undecided_as.append(f"{Path(path_text).name} (decided {decided}, run as {given or 'no type'})")
                 continue
             header = header_modes.get(input_key)
-            requested = given or "DDA"
-            if header and requested not in HEADER_ACQUISITION_TO_MSDIAL.get(header, {header}):
+            if not header_type and header and requested not in HEADER_ACQUISITION_TO_MSDIAL.get(header, {header}):
                 disagreeing.append(f"{Path(path_text).name} (header {header}, run as {requested})")
         if disagreeing:
             blockers.append(
@@ -6826,6 +6834,24 @@ def _header_acquisition_by_file(manifest: dict[str, Any]) -> dict[str, str]:
         mode = str(item.get("acquisition_mode") or "").strip()
         if path_text and mode in HEADER_ACQUISITION_TO_MSDIAL:
             result[_file_key(path_text)] = mode
+    return result
+
+
+def _header_console_type_by_file(manifest: dict[str, Any]) -> dict[str, str]:
+    """The Console type (DDA, SWATH or AIF) each inspected file's own header gives, keyed by resolved path.
+
+    header_console_acquisition_type, which no disposition rewrites; a record written before it existed gives
+    DDA or AIF as its acquisition_mode says, and nothing for DIA, whose scheme it did not record.
+    """
+    from .raw_metadata_preflight import entry_header_console
+
+    summary = (manifest.get("raw_metadata_preflight") or {}).get("summary") or {}
+    result = {}
+    for item in summary.get("per_file") or []:
+        path_text = str(item.get("file") or "").strip() if isinstance(item, dict) else ""
+        console = entry_header_console(item) if path_text else None
+        if console in {"DDA", "SWATH", "AIF"}:
+            result[_file_key(path_text)] = console
     return result
 
 
