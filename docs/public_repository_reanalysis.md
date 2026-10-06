@@ -99,7 +99,27 @@ takes `..._Youn_sa11.raw` and a name two members carry is given to neither. The
 input's `input_lineage` row records `name_pairing` (`declared_raw_file`,
 `member_name`, `paired_by` `prefixed_member_name`), and the analysis CSV finds
 its sample row by it. A declared name no member carries leaves its sample row
-in the CSV record's `samples_without_input`, and the rest run.
+in the CSV record's `samples_without_input`, and the rest run; the CSV record
+then carries the warning `sample_rows_without_input` and `sample_row_coverage`.
+
+A declared name still unpaired is then paired by its leading identifier
+(0.5.25, the user's decision of 2026-10-06): Metabolomics Workbench ST001359
+declares `VV_13_HEpG2_C1_pos.raw`, and its archive holds
+`VV_13_HEpG2_C1_exp344_pos.raw`. The key is the stem split on `_`, `-`, `.` and
+spaces, taken up to and including the first token that contains a digit,
+compared without case (`vv_13`); a key of digits only gives none. The key must
+be unique among the declared names and among the candidate members. Exact
+matches come first, then prefixed ones, then these. No inferred pairing crosses
+a polarity: a member whose path, or a declared name, carries `pos`, `neg`,
+`positive` or `negative` as a token of its own that is not the unit's ion mode
+(or the two disagree) is refused, and the refusal is recorded. Each inferred
+pairing is left on record: `name_pairing` on the lineage row (`paired_by`
+`leading_identifier_token` and its `key`), `inferred_name_pairings` and
+`refused_name_pairings` on the attribute stage, `input_name_pairings` and the
+warning `input_names_paired_by_inference` in the run manifest and in every
+campaign disposition, the same warning on the CSV record, and the column
+`raw_file_paired_by` (`exact`, `prefixed_member_name`,
+`leading_identifier_token`) in the reviewed sample TSV.
 
 Agent-driven reanalysis also requires a user-reviewed `analysis_purpose` before
 download. That purpose anchors Class/contrast selection, annotation strategy,
@@ -289,7 +309,12 @@ sample row it came from (`sample_row_index`, `sample_raw_file`, and `sample_row`
 on its `input_lineage` row). What stays refused is what is ambiguous: one row
 two inputs name (`sample_row_with_two_inputs`), one input two rows name
 (`input_with_two_sample_rows`), and an input of a sample several rows describe
-that none of them names (`sample_row_not_identified`).
+that none of them names (`sample_row_not_identified`). A declared input is
+paired with its row by its path first and its file name second, the same way
+before the download (the handoff check) and after it (the analysis CSV). A split
+gives each part the rows of its own inputs, so a sample whose replicates differ
+in format or acquisition is in each part with only that part's rows
+(`sample_row_indexes`).
 
 Select metadata fields in the intended hierarchy, for example `Genotype`,
 `Region`, then `Sex`. MS-DIAL Interactive projects these fields into its single

@@ -98,6 +98,10 @@ def summarize_jobs(
             # file name behind a prefix is that file's, one to one, recorded as paired_by prefixed_member_name.
             "repository_replicate_rows_as_inputs",
             "repository_prefixed_member_names",
+            # A declared raw file name and an archive member that share their leading identifier (VV_13) are one
+            # file where the key is unique on both sides, recorded as paired_by leading_identifier_token with the
+            # warning input_names_paired_by_inference; no inferred pairing crosses a polarity token.
+            "repository_leading_identifier_names",
         ],
         "workflow_outline": [
             "Inspect the input path and collect the guided scientific choices.",

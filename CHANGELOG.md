@@ -19,6 +19,10 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     counts them alike, so MTBKS64 is consistent and is no longer excluded as
     `analysis_input:count_mismatch`. Two inputs on one row, more inputs than a
     sample has rows, or an input none of its sample's rows names, still are.
+    The analysis-CSV builder pairs a declared input with a row the same way
+    (`rows_naming_input`, shared by both): before, it matched by base name only,
+    so rows naming `raw/batch1/QC.RAW` and `raw/batch2/QC.RAW` passed the check
+    before the download and were refused after it (`sample_without_input`).
   - `msdial_prepare_repository_reanalysis`: the analysis-CSV builder maps each
     input to the row of its sample that names it (by its own name, its lineage
     row's declared names, its declared path, or its `name_pairing`), and every
@@ -36,6 +40,18 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     `sample_raw_file`; the CSV record adds `sample_rows_without_input`.
   - A handoff that counts no inputs gives `sample_count` as its rows that name a
     sample, not its distinct sample ids.
+  - A split divides a sample's replicate rows by the part their inputs go to.
+    MetaboBank MTBKS220 gives its samples rows of timsOFF BAF folders and rows of
+    timsON TDF folders under one sample id; `plan_acquisition_split` and the
+    confirmed split picked rows and declared inputs by sample id, so each part
+    held both formats' rows and inputs and its CSV was refused after the 14 GB
+    download (`analysis_input_not_found`, `sample_without_input`). A row an input
+    of a part is (as the analysis-CSV builder finds it) is now that part's alone,
+    a row of an excluded input is no part's, and a declared input goes with the
+    row it is; each part records `sample_row_indexes`. Only a row no input is
+    found to be is still matched by its sample. On a synthetic unit built from
+    MTBKS220's real handoff, the parts hold 24 and 29 rows and declared inputs
+    (48 and 47 before).
 - Declared raw file names an archive member carries behind a prefix. Metabolomics
   Workbench ST001264 declares `BioRec1.raw`, and its study archive holds
   `021518_387057_CSHp_BioRec1.raw`; the lease admitted nothing and failed at its
@@ -46,7 +62,12 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   (`_prefixed_member_pairing`), where no member carries the name exactly, the
   member carries no declared name exactly, and the pairing is one to one: a member
   ending in two declared names, or a name two members end in, pairs neither, so
-  `Youn_sa1.raw` never takes `..._Youn_sa11.raw`. Every stage that admits a member
+  `Youn_sa1.raw` never takes `..._Youn_sa11.raw`. No pairing crosses a polarity:
+  where the member's path (its folders under the data root and its name) or the
+  declared name carries `pos`, `neg`, `positive` or `negative` as a token of its
+  own, in any case, and that is not the unit's ion mode, or the two disagree, the
+  pairing is refused (`polarity_token_contradicts_ion_mode`,
+  `polarity_token_contradicts_declared_name`). Every stage that admits a member
   by a sample's name admits a paired one (conversion sources, the encoding choice,
   the attribute stage, the extracted files kept), and its lineage row records
   `name_pairing` (`declared_raw_file`, `member_name`, `paired_by`
@@ -57,8 +78,44 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   fall back to accession-level inputs.
 
 ### Added
-- Agent capabilities `repository_replicate_rows_as_inputs` and
-  `repository_prefixed_member_names`.
+- Declared raw file names paired with archive members by their leading identifier
+  (the user's decision of 2026-10-06). Metabolomics Workbench ST001359 declares
+  `VV_13_HEpG2_C1_pos.raw`, and its archive holds
+  `VV_13_HEpG2_C1_exp344_pos.raw`; the row for VV_14 even reads `HEepG2`. In the
+  same pairing code and with the same scope as the prefixed rule (units whose
+  Catalog declared no inputs), after exact and then prefixed matches, a declared
+  name still unpaired is paired with the member whose `leading_identifier_key` is
+  its own: the stem (less a raw or converted suffix) split on `_`, `-`, `.` and
+  spaces, taken up to and including the first token that contains a digit,
+  compared without case and joined by `_` (`vv_13`). A key of digits only (a run
+  date such as `021518`) or a name without a digit gives none. The key must be
+  unique among the declared names and among the candidate members, and no pairing
+  crosses a polarity token. Applied to ST001359's real member listing, all six
+  declared names pair; applied to ST001264's, the rows named `Sample1`..`Sample28`
+  still pair with nothing.
+- Every inferred pairing is left on record, as the user required:
+  - the input's lineage row records `name_pairing` with `paired_by`
+    `leading_identifier_token` and the `key` (or `prefixed_member_name`), the
+    declared and the member name;
+  - the attribute stage counts `prefixed_member_pairings` and
+    `leading_identifier_token_pairings`, lists `inferred_name_pairings` and any
+    `refused_name_pairings` (with the rule and the reason), and carries the warning
+    `input_names_paired_by_inference`;
+  - the run manifest carries `warnings: ["input_names_paired_by_inference"]` and
+    `input_name_pairings` (`paired`, `refused`); every campaign disposition of such
+    a unit lists the same warning;
+  - the analysis-CSV build, its preview and the manifest's `analysis_csv` record
+    carry the warning and `inferred_name_pairings`;
+  - the reviewed sample TSV (and JSON) of a repository unit gains the column
+    `raw_file_paired_by`: `exact`, `prefixed_member_name` or
+    `leading_identifier_token`, and empty for a row without an input.
+- A unit whose sample rows the download did not all deliver says so beside its CSV:
+  the build, its preview and the `analysis_csv` record carry the warning
+  `sample_rows_without_input` and `sample_row_coverage` (`sample_rows`,
+  `with_input`, `without_input`). ST001264 runs its 3 BioRec rows of 31; this is
+  recorded and does not stop the run.
+- Agent capabilities `repository_replicate_rows_as_inputs`,
+  `repository_prefixed_member_names` and `repository_leading_identifier_names`.
 
 ## [0.5.24] - Unreleased
 

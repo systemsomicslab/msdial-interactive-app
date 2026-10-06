@@ -724,8 +724,11 @@ class ASplitDividesReplicateRowsByTheirInputs(_Unit, unittest.TestCase):
         self.assertEqual({"unit-x-dda": [0, 1], "unit-x-dda-im": [2, 3]},
                          {part["analysis_unit_id"]: part["sample_row_indexes"] for part in plan["parts"]})
         lc = parts["unit-x-dda"]
-        self.assertEqual(["FILES/d/S1.d", "FILES/d/S2.d"], [row["raw_file"] for row in lc["project"]["sample_metadata"]])
-        self.assertEqual(["X1", "X2"], sorted(item["sample_id"] for item in lc["project"]["class_proposal"]["assignments"]))
+        self.assertEqual(
+            ["FILES/d/S1.d", "FILES/d/S2.d"], [row["raw_file"] for row in lc["project"]["sample_metadata"]]
+        )
+        assignments = lc["project"]["class_proposal"]["assignments"]
+        self.assertEqual(["X1", "X2"], sorted(item["sample_id"] for item in assignments))
         if declared_inputs:
             self.assertEqual(["FILES/d/S1.d", "FILES/d/S2.d"],
                              sorted(entry["path"] for entry in lc["project"]["analysis_inputs"]))
@@ -777,7 +780,9 @@ class APairingNeverCrossesAPolarityToken(_Workspace):
             ["position_S1.raw", "negx_S2.raw", "run_Pos_S3.raw"], [("1", "S1.raw"), ("2", "S2.raw"), ("3", "S3.raw")]
         )
 
-        self.assertEqual({"S1.raw", "S2.raw", "S3.raw"}, {item["declared_raw_file"] for item in result["paired"].values()})
+        self.assertEqual(
+            {"S1.raw", "S2.raw", "S3.raw"}, {item["declared_raw_file"] for item in result["paired"].values()}
+        )
 
     def test_a_token_pairing_across_the_declared_names_polarity_is_refused(self) -> None:
         result = self.pairings(["VV_1_b_neg.raw"], [("1", "VV_1_a_pos.raw")], ion_mode="Unknown")
