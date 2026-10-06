@@ -57,6 +57,7 @@ from .repository_reanalysis import (
     evaluate_repository_execution_gate,
     request_download_cleanup,
     create_download_lease,
+    declared_instrument,
     evaluate_eligibility,
     finalize_download_lease,
     live_run_attempt,
@@ -1673,7 +1674,9 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
                 profile = select_peak_tuning_representative(
-                    workflow["files"], str(body.get("representative_file", ""))
+                    workflow["files"],
+                    str(body.get("representative_file", "")),
+                    declared_instrument(workflow.get("repository_run_manifest")),
                 )
                 representative = profile["file_path"]
                 # The job id is minted before the preparation, because the diagnostic's own directory
@@ -1761,11 +1764,14 @@ class Handler(BaseHTTPRequestHandler):
                     threshold_step = requested_step or int(
                         profile.get("threshold_step", 100) or 100
                     )
+                    # The family decides the fine step's floor (10 QTOF-type, 100 FT); a requested step is
+                    # only the coarse step, and one finer than the floor is raised to it.
                     estimate = estimate_peak_height_range(
                         job["result"].get("heights", []),
                         int(body.get("target_peak_count_min", 3000) or 3000),
                         int(body.get("target_peak_count_max", 6000) or 6000),
                         threshold_step,
+                        str(profile.get("instrument_family") or ""),
                     )
                 # The contract requires the diagnostic's method, representative sample, count,
                 # step and accepted threshold in provenance. Until this, all five lived only in
@@ -2086,7 +2092,9 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
                 profile = select_peak_tuning_representative(
-                    state.get("files", []), body.get("file_path", "")
+                    state.get("files", []),
+                    body.get("file_path", ""),
+                    declared_instrument(state.get("repository_run_manifest")),
                 )
                 job_id = uuid.uuid4().hex
                 with _single_console_per_unit(state.get("repository_run_manifest"), job_id):

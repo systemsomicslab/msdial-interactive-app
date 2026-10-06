@@ -721,6 +721,97 @@ def requires_mzml_conversion(path: Path) -> bool:
     return any(name.endswith(suffix) for suffix in CONVERSION_REQUIRED_SUFFIXES)
 
 
+FOURIER_TRANSFORM_FAMILY = "Fourier-transform MS"
+FT_ICR_FAMILY = "FT-ICR"
+QTOF_FAMILY = "QTOF"
+# Where a file's instrument family came from. Only a format default may be replaced by a repository's
+# declared instrument (agent_workflow.select_peak_tuning_representative): a vendor format or an mzML
+# header is evidence about the file itself.
+FAMILY_FROM_VENDOR_FORMAT = "vendor_format"
+FAMILY_FROM_MZML_HEADER = "mzml_instrument_configuration"
+FAMILY_FROM_FORMAT_DEFAULT = "format_default"
+
+# Fourier-transform instruments by name, as the PSI-MS CV, a vendor or a repository submitter writes them.
+# Orbitrap model names are read first: ProteoWizard gives a Thermo model it does not know (Orbitrap ID-X in
+# MTBLS2207) the FT-ICR analyzer term MS:1000079 beside a userParam naming the model. "LTQ FT" is an FT-ICR
+# hybrid. A bare "LTQ", "LTQ Velos" or "Velos Plus" is a linear ion trap and matches nothing; every Orbitrap
+# Velos/Elite name says Orbitrap. "Fusion" and "Eclipse" are also HPLC column names (Synergi Fusion-RP,
+# Zorbax Eclipse Plus), which a repository's free text can carry beside the instrument.
+_ORBITRAP_INSTRUMENT = re.compile(
+    r"orbitrap|exactive|exploris|astral|\blumos\b|\bascend\b|tribrid|\bid-x\b|"
+    r"\bfusion\b(?![\s-]*rp)|(?<!zorbax )\beclipse\b(?![\s-]*(?:plus|xdb|c18|c8))",
+    re.IGNORECASE,
+)
+_FT_ICR_INSTRUMENT = re.compile(
+    r"ft[\s-]?icr|fticr|cyclotron|solarix|scimax|mrms\b|\bapex(?![a-z])|\bltq[\s-]?ft(?![a-z])",
+    re.IGNORECASE,
+)
+# A Fourier-transform analyser named generically (a Thermo "FTMS" scan filter, "Fourier transform ...").
+_FOURIER_GENERIC = re.compile(r"\bftms\b|fourier", re.IGNORECASE)
+# Time-of-flight evidence in an mzML header: the analyzer term, or a model name of a TOF family.
+_TOF_INSTRUMENT = re.compile(
+    r"time[\s-]of[\s-]flight|tof\b|maxis|\bimpact\b|\bcompact\b|timstof|xevo|synapt|\bvion\b|"
+    r"tripletof|zenotof|\bx500|\bqstar|\blct\b|\blcms-90[35]0",
+    re.IGNORECASE,
+)
+_MZML_HEADER_LIMIT = 1 << 20
+_MZML_HEADER_BLOCKS = re.compile(
+    r"<(referenceableParamGroupList|instrumentConfigurationList)\b.*?</\1>", re.DOTALL
+)
+_MZML_CV_NAME = re.compile(r"<cvParam\b[^>]*?\bname=\"([^\"]*)\"")
+_MZML_USER_VALUE = re.compile(r"<userParam\b[^>]*?\bvalue=\"([^\"]*)\"")
+
+
+def instrument_family_from_text(texts: Iterable[str]) -> tuple[str, str] | None:
+    """The Fourier-transform family an instrument description names, and the text that named it.
+
+    ("Fourier-transform MS", text) for an Orbitrap-class instrument (Q Exactive, Exactive, Exploris,
+    Orbitrap Fusion/Lumos/Eclipse/Ascend, Astral, LTQ Orbitrap, Orbitrap Velos/Elite, ID-X, the Tribrids),
+    ("FT-ICR", text) for an FT-ICR (solariX, apex, scimaX, LTQ FT), ("Fourier-transform MS", text) for an
+    analyser named only as Fourier-transform, and None when nothing in texts names one. Both families take
+    the same threshold step (1,000).
+    """
+    items = [str(text or "") for text in texts if str(text or "").strip()]
+    for pattern, family in (
+        (_ORBITRAP_INSTRUMENT, FOURIER_TRANSFORM_FAMILY),
+        (_FT_ICR_INSTRUMENT, FT_ICR_FAMILY),
+        (_FOURIER_GENERIC, FOURIER_TRANSFORM_FAMILY),
+    ):
+        for item in items:
+            if pattern.search(item):
+                return family, item
+    return None
+
+
+def mzml_instrument_description(path: str | Path) -> list[str]:
+    """The instrument an mzML header describes: every cvParam name and userParam value in its
+    referenceableParamGroupList and instrumentConfigurationList, read from the head of the file only.
+
+    The model is a cvParam (MS:1001911 "Q Exactive") or, in Interactive's own mzXML conversion, a
+    userParam "instrument model"; the analyzer is a cvParam (MS:1000484 "orbitrap"). Nothing outside those
+    two lists is read: a source file name or a sample name can say "orbitrap" without describing the
+    instrument. Returns [] for a file that cannot be read.
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = b""
+            while len(head) < _MZML_HEADER_LIMIT:
+                chunk = handle.read(65536)
+                if not chunk:
+                    break
+                head += chunk
+                if b"</instrumentConfigurationList>" in head or b"<run " in head or b"<run>" in head:
+                    break
+    except OSError:
+        return []
+    text = head.decode("utf-8", "replace")
+    found: list[str] = []
+    for block in _MZML_HEADER_BLOCKS.finditer(text):
+        found.extend(match.group(1) for match in _MZML_CV_NAME.finditer(block.group(0)))
+        found.extend(match.group(1) for match in _MZML_USER_VALUE.finditer(block.group(0)))
+    return [item for item in found if item.strip()]
+
+
 def detect_raw_format(path: str | Path) -> dict[str, Any]:
     """What a file's format implies, before anyone has decided anything.
 
@@ -728,6 +819,12 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
     family usually want. They are named as suggestions because the run applies one
     value chosen elsewhere: reporting a per-file 100 beside an applied 300 states a
     threshold that governs nothing.
+
+    instrument_family decides the peak-count diagnostic's threshold step (1,000 for
+    Fourier-transform data, 100 otherwise), and instrument_family_source says what it
+    rests on. An mzML is read for its instrument: an Orbitrap or FT-ICR exported to mzML
+    is Fourier-transform data, and before 0.5.28 every mzML was labelled QTOF, so a Q
+    Exactive unit published as mzML (ST004304) was diagnosed in steps of 100.
     """
     target = Path(path)
     suffix = target.suffix.lower()
@@ -735,7 +832,8 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
         return {
             "vendor": "SCIEX",
             "format": "SCIEX WIFF" if suffix == ".wiff" else "SCIEX WIFF2",
-            "instrument_family": "QTOF",
+            "instrument_family": QTOF_FAMILY,
+            "instrument_family_source": FAMILY_FROM_VENDOR_FORMAT,
             "suggested_minimum_peak_height": 100,
             "suggested_mass_slice_width": 0.1,
             "sidecar_available": (
@@ -746,7 +844,8 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
         return {
             "vendor": "Waters",
             "format": "Waters .raw folder",
-            "instrument_family": "QTOF",
+            "instrument_family": QTOF_FAMILY,
+            "instrument_family_source": FAMILY_FROM_VENDOR_FORMAT,
             "suggested_minimum_peak_height": 100,
             "suggested_mass_slice_width": 0.1,
         }
@@ -754,7 +853,8 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
         return {
             "vendor": "Thermo",
             "format": "Thermo .raw file",
-            "instrument_family": "Fourier-transform MS",
+            "instrument_family": FOURIER_TRANSFORM_FAMILY,
+            "instrument_family_source": FAMILY_FROM_VENDOR_FORMAT,
             "suggested_minimum_peak_height": 10000,
             "suggested_mass_slice_width": 0.05,
         }
@@ -762,7 +862,8 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
         return {
             "vendor": "Shimadzu",
             "format": "Shimadzu LCD" if suffix == ".lcd" else "Shimadzu QGD",
-            "instrument_family": "QTOF" if suffix == ".lcd" else "GC-MS",
+            "instrument_family": QTOF_FAMILY if suffix == ".lcd" else "GC-MS",
+            "instrument_family_source": FAMILY_FROM_VENDOR_FORMAT,
             "suggested_minimum_peak_height": 100,
             "suggested_mass_slice_width": 0.1,
         }
@@ -778,14 +879,43 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
         return {
             "vendor": vendor,
             "format": label,
-            "instrument_family": "QTOF",
+            "instrument_family": QTOF_FAMILY,
+            # Bruker also writes FT-ICR (solariX, apex) data as .d, so a Bruker or unrecognised .d is
+            # QTOF only by default; an Agilent .d is a QTOF.
+            "instrument_family_source": (
+                FAMILY_FROM_VENDOR_FORMAT if vendor == "Agilent" else FAMILY_FROM_FORMAT_DEFAULT
+            ),
+            "suggested_minimum_peak_height": 100,
+            "suggested_mass_slice_width": 0.1,
+        }
+    if target.is_file() and suffix == ".mzml":
+        description = mzml_instrument_description(target)
+        fourier = instrument_family_from_text(description)
+        if fourier is not None:
+            return {
+                "vendor": "Open format",
+                "format": "MZML",
+                "instrument_family": fourier[0],
+                "instrument_family_source": FAMILY_FROM_MZML_HEADER,
+                "instrument_evidence": fourier[1],
+                "suggested_minimum_peak_height": 10000,
+                "suggested_mass_slice_width": 0.05,
+            }
+        tof = next((item for item in description if _TOF_INSTRUMENT.search(item)), None)
+        return {
+            "vendor": "Open format",
+            "format": "MZML",
+            "instrument_family": QTOF_FAMILY,
+            "instrument_family_source": FAMILY_FROM_MZML_HEADER if tof else FAMILY_FROM_FORMAT_DEFAULT,
+            **({"instrument_evidence": tof} if tof else {}),
             "suggested_minimum_peak_height": 100,
             "suggested_mass_slice_width": 0.1,
         }
     return {
         "vendor": "Open format" if suffix in {".mzml", ".cdf"} else "Other",
         "format": suffix.lstrip(".").upper() or "Unknown",
-        "instrument_family": "QTOF",
+        "instrument_family": QTOF_FAMILY,
+        "instrument_family_source": FAMILY_FROM_FORMAT_DEFAULT,
         "suggested_minimum_peak_height": 100,
         "suggested_mass_slice_width": 0.1,
     }
