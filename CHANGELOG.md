@@ -4,6 +4,179 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.29] - Unreleased
+
+### Changed
+- A campaign disposition takes each file's acquisition from its raw header first,
+  as the user decided on 2026-10-06. A file whose header was read, that has MS2,
+  and whose header gives DDA, DIA, AIF or SWATH runs as its header says, whatever
+  the unit declares and whatever confidence the extractor gave.
+  `HEADER_OVERRIDE_CONFIDENCE` (0.8) is gone. The extractor's confidence is a
+  constant per branch of its classifier: every DDA read without an isolation width
+  is 0.75. The declaration is the Catalog's keyword match over the assay's text
+  (`infer_acquisition`), not a structured repository field. Under the old rule
+  MTBLS1572 ran its six DDA files, and a blank whose header is Unknown, as SWATH.
+  - Each declaration a header overrode is listed in `declared_vs_header` with
+    `decided` (the header's mode), `basis: header` and `declaration_source`. The
+    record also carries `declared_acquisition_source`, one of
+    `catalog_keyword_inference` (the Catalog handoff's
+    `technical_settings.acquisition_mode`, which the Catalog writes only by keyword
+    matching and with no source of its own), `split_part` or `unattributed`.
+    `acquisition_header_disagrees_low_confidence` is no longer written.
+  - The override is reported (the warning `acquisition_header_overrides_declaration`
+    and the "run as their raw headers give" detail) only for files that reach the
+    run. A file whose header contradicted the declaration and that was then
+    excluded (`dia_scheme_unresolved`, `product_ion_only`, an out-of-scope method,
+    polarity) is listed in `declared_vs_header` with `decided: excluded`,
+    `basis: excluded` and its `excluded_reason`, and counted in a detail of its own.
+  - A file whose header gives Unknown is excluded as `acquisition_unresolved` in a
+    declared unit too, as it already was in an undeclared one. A header that gives
+    PRM, SRM, MRM or SIM is excluded as `acquisition_out_of_scope:<method>`,
+    whatever the declaration.
+  - A unit nothing of which runs, whose inputs are Unknown-header files and MS1-only
+    files only, is skipped as `acquisition_unresolved` instead of being excluded as
+    `acquisition_out_of_scope:FullScan`: the MS1-only files are out of scope only for
+    want of an MS2 file beside them, which a header that settles the others may give.
+    This holds for undeclared units too, which were excluded before. A unit with an
+    intrinsically out-of-scope input beside the Unknown ones (a targeted method, ion
+    mobility, polarity switching, an mzXML) is still excluded.
+  - In a unit declared DIA, AIF or SWATH, MS1-only files are not folded into the DDA
+    run its headers make. They are excluded as `ms1_only_in_declared_dia_unit`,
+    since they may be all-ion data exported as MS1 scans (MTBLS1572's bbCID files).
+    Elsewhere the fold is unchanged, and `ms1_only_beside_dia` still applies beside
+    SWATH or AIF files. An MS1-only file whose header gives SWATH or AIF is never
+    folded into DDA (`ms1_only_header_contradicts_dda`).
+  - A split part is held to its parent's declaration for that rule, since its own is
+    the mode its split wrote. A split records the parent's declared mode in
+    `split_from.parent_declared_acquisition_mode`; for a part split before 0.5.29
+    it is read from the parent manifest. The disposition records it as
+    `split_parent_declared_acquisition_mode`. A part split under the old rule could
+    carry MS1-only files its DDA part folded in; decided again, they are excluded.
+  - Unchanged: a unit none of whose headers could be read is taken at its
+    declaration (`acquisition_declared_only`); a DIA header whose isolation settles
+    neither SWATH nor AIF takes the declared one; mixed acquisitions still split;
+    untargeted status is never inferred over a declared targeted acquisition.
+- The execution gate refuses a row whose acquisition type contradicts the Console
+  type its file's header settles (`header_console_acquisition_type`), whatever an
+  applied disposition decided: DDA or AIF for a DDA or AIF header, and SWATH for a
+  DIA header whose isolation targets recur at two or more m/z. A manifest decided
+  under the old rule can no longer run DDA-header files as SWATH. Outside a
+  campaign this is stricter than before in one case: AIF is refused for a DIA header
+  whose isolation targets make it SWATH, where the header's DIA used to admit SWATH
+  or AIF.
+  - A DIA header with one recorded isolation target or none binds no type. The
+    extractor records targets only from MS2 headers that carry a precursor m/z, so
+    none recorded is no evidence of all-ion acquisition. Such a row is held, as
+    before, to SWATH or AIF, and under an applied disposition to the type it
+    decided; a SWATH row the disposition decided is not refused.
+- The execution gate decides an applied disposition from before 0.5.29 again (one
+  with no `declared_acquisition_source`), in memory and from the same records, as
+  `classify_preflight` would. It refuses the run where that decision would not run
+  the unit, would exclude a row's file, or would give it another type on its
+  header's word, and says to prepare the unit again. This refuses MTBKS217's
+  `z_014nn` (an MS1-only file folded into the DDA run of a unit declared DIA) and
+  MTBLS1572's blank (an Unknown header run as SWATH by the declaration). In a
+  read-only simulation over the 10 recorded runs that have an analysis CSV, every
+  other run still passes.
+  A legacy row's type is not refused where the new decision rests on the
+  declaration or on a DIA header with no recorded isolation target.
+- `msdial_prepare_repository_reanalysis` decides such a legacy disposition again,
+  from the unit's recorded preflight, before it builds the rows, and the analysis
+  CSV is written from the new decision. This is what clears the gate's refusal.
+  - The preview decides in memory and writes nothing. The re-decision is written
+    when the call writes (`confirmed=true`, or under a campaign approval), before
+    the CSV and whether or not the CSV then fails. The reply reports it in
+    `preview.legacy_disposition_redecision`: old and new disposition, Console
+    type, reasons, excluded inputs, and the status before and after.
+  - The new disposition keeps the old one, with each input's former type and
+    basis, under `supersedes`, and records `redecided` (by, when).
+  - A unit held for any reason is not decided again in place: split, excluded at
+    its split, past its run (`mztab_validated`, `completed`,
+    `cleanup_pending_confirmation`, `raw_cleaned`, `discarded`), a run attempt
+    open, or a production run finalised under another status
+    (`validation_failed`).
+- `msdial_prepare_repository_reanalysis` never writes over a finished run's files.
+  A unit past its run (the statuses above, or any unit with `finalized_at`) is
+  refused with `ok: false`, `reason: run_finished`, and nothing is written. Before,
+  preparing such a unit rewrote `output\analysis_files.csv`, the CSV its run read
+  and a retained artifact, while the unit stayed `mztab_validated` and
+  cleanup-allowed.
+  - New argument `new_run=true` prepares a new production run for such a unit. The
+    finished run's records are copied unchanged into a new entry of
+    `superseded_runs`, and its own records (`finalized_at`, `finalized_run`,
+    `mztab_validation`, `retained_artifacts`, `retained_artifact_inventory`,
+    `project_archive`, `console_run_finalisation`, `analysis_csv`,
+    `analytical_order` and the like) are taken off the top level.
+    `output_directory` becomes `<workspace>\output-run-<n>`, where the analysis
+    CSV and the new run's outputs go; the old output directory is left as it is.
+    `cleanup_allowed` becomes false and the status `preflight_passed` (or
+    `prepared`). A legacy disposition is decided again then, and only then. The
+    preview does this in memory and reports it in `preview.new_run`.
+  - Refused, and nothing written: a unit whose raw data were released
+    (`raw_released`, with or without `new_run`), a new run while a run attempt
+    may still be running (`run_in_progress`), one a legacy disposition decided
+    again would not run (`would_not_run`), and one whose decision fails
+    (`redecision_failed`).
+  - A confirmed new run is all or nothing. It is decided in memory, its rows
+    are built, its aliases made, and its reviewed metadata and analysis CSV
+    written into a hidden staging folder beside the new one
+    (`.output-run-<n>.<random>.staging`). Only then, under the manifest lock,
+    the staging folder is renamed to `output-run-<n>` and the manifest is
+    written once, with the superseded run, the new `output_directory`, the CSV
+    record, the analytical order and any campaign crossing together.
+  - If any step before that fails, the manifest and every file of the finished
+    run stay byte for byte as they were, and the staging folder and the aliases
+    the call made are removed. The failing steps are rows that disagree or an
+    alias that cannot be made (`analysis_csv_failed`, recorded nowhere in the
+    manifest, `analysis_csv.written_to_manifest: false`), files that do not
+    map, or an error. A manifest written by another writer meanwhile is refused
+    as `new_run_conflict`.
+  - Aliases in `raw\console-aliases` have fixed paths, so two prepares of one
+    unit share them: the second reuses what the first made. A call that is
+    abandoned now removes an alias it made only if no analysis CSV of the
+    unit's committed manifest names it (the current run's or a superseded
+    run's, read from the CSV and its lineage rows, sidecars included). Before,
+    a prepare refused as `new_run_conflict` removed the alias a concurrent
+    prepare had reused and committed, leaving that run's CSV naming a missing
+    input (review r7-62). In the other order, a commit whose CSV names an
+    alias that is gone, because the prepare that made it was abandoned, is
+    refused as `new_run_conflict`. Both checks run under the manifest lock.
+  - Before this, a CSV that failed after the new run was written left a
+    validated, cleanup-ready unit as `preflight_passed`, `cleanup_allowed:
+    false`, with an empty `output-run-<n>` and no new run prepared (review
+    r6-62).
+  - Raw-data deletion is judged by the unit's current run. While a new run
+    prepared after a validated run has not validated (prepared, running or
+    failed), `msdial_discard_repository_raw` refuses: before, it saw no mzTab-M
+    in the new folder and would have discarded the unit as one with no
+    validated output. `msdial_cleanup_repository_raw` refuses as before, since
+    the current run is not validated. Both previews name the superseded
+    validated run. The raw data are kept for the new run and are deleted by
+    the cleanup once it validates.
+  - The same holds for a split part, approved or not (review r7-62). Under a
+    campaign approval, the discard of a part with such a pending new run is
+    refused with the same blocker, and nothing is recorded. Before, it marked
+    the part `discarded`, and the parent's release then deleted the raw tree
+    the new run reads. The parent's release (`plan_split_parent_cleanup`,
+    `cleanup_split_parent`) counts such a part as not ended (`pending`),
+    whatever its status and however many runs failed, a part already marked
+    `discarded` that way included. Once the new run validates, the part ends as
+    any validated part does.
+  - The gate's legacy refusal names `new_run=true` for a unit past its run.
+  - On disk, as recorded on 2026-10-07, 11 manifests carry a legacy applied
+    disposition. Five are past their run (MTBKS217, MTBKS236, MTBLS1572,
+    MTBLS417, ST001337; all `mztab_validated`): a prepare refuses them, and they
+    are decided again only by a prepare with `new_run=true` that writes. The
+    other six (MTBKS281 `run_failed`; MTBLS291 and ST004304 `preflight_passed`;
+    MPST000015 twice and MTBLS548 `excluded_by_preflight`) have no `finalized_at`
+    and are decided again by any prepare that writes, where nothing else holds
+    them; MTBKS281 then becomes `preflight_passed` if the decision runs it, and an
+    `excluded_by_preflight` unit becomes runnable if the recorded preflight no
+    longer excludes it. A preview changes none of them.
+
+### Added
+- Agent capability `campaign_header_first_acquisition`.
+- Agent capability `repository_prepare_new_production_run`.
 ## [0.5.28] - Unreleased
 
 Version order: 0.5.25 (#58), 0.5.26 (#59), 0.5.27 (#60) and 0.5.29 (#62) are

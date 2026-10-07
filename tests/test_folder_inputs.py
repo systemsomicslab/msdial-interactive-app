@@ -1270,13 +1270,19 @@ class TheRunKeepsEachRowsAcquisitionType(unittest.TestCase):
 
 
 def _exclude(manifest_path: Path, names: list[str], reason: str = "ion_mobility_out_of_scope", applied: bool = True) -> None:
-    """Record a campaign disposition that runs the unit and excludes the inputs of these names."""
+    """Record a campaign disposition that runs the unit and excludes the inputs of these names.
+
+    It is recorded as decided from 0.5.29 on (declared_acquisition_source), as every disposition now is. One
+    without it is a legacy disposition, which preparing the unit decides again from its preflight; these
+    synthetic headers carry no ion-mobility flag, so that decision would exclude nothing.
+    """
 
     def change(manifest: dict) -> None:
         manifest["campaign_disposition"] = {
             "schema": "msdial-campaign-disposition.v1",
             "disposition": "run",
             "applied": applied,
+            "declared_acquisition_source": "unattributed",
             "reasons": [],
             "warnings": [],
             "excluded_inputs": [
@@ -1595,11 +1601,11 @@ class AnAliasedInputIsHeldToItsDisposition(unittest.TestCase):
         return built, state
 
     def test_a_decided_type_is_the_aliased_inputs_own_whatever_its_header_said(self) -> None:
-        """A low-confidence DDA header the repository's SWATH declaration overrode (basis: declaration)."""
+        """A DIA header that settles neither SWATH nor AIF, which the repository's SWATH declaration settled."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "unit"
             manifest_path = _hand_made_unit(root, self.NAMES, mode="SWATH")
-            _dispose(manifest_path, {name: "SWATH" for name in self.NAMES}, headers={self.NAMES[0]: "DDA"})
+            _dispose(manifest_path, {name: "SWATH" for name in self.NAMES})
             built, state = self._recorded(root)
             gate = evaluate_repository_execution_gate(state)
             as_aif = evaluate_repository_execution_gate(
@@ -1618,6 +1624,25 @@ class AnAliasedInputIsHeldToItsDisposition(unittest.TestCase):
             as_aif["blockers"],
         )
         self.assertFalse(any("raw header contradicts" in item for item in as_aif["blockers"]), as_aif["blockers"])
+
+    def test_the_console_type_its_header_gives_binds_an_aliased_input_whatever_was_decided(self) -> None:
+        """A disposition recorded before 2026-10-06 kept the repository's SWATH over a weak DDA header."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "unit"
+            manifest_path = _hand_made_unit(root, self.NAMES, mode="SWATH")
+            _dispose(manifest_path, {name: "SWATH" for name in self.NAMES}, headers={self.NAMES[0]: "DDA"})
+            built, state = self._recorded(root)
+            gate = evaluate_repository_execution_gate(state)
+
+        alias_name = Path(next(row for row in built["rows"] if row["console_alias"])["file_path"]).name
+        self.assertFalse(gate["allowed"])
+        self.assertTrue(
+            any(
+                "raw header contradicts" in item and f"{alias_name} (header gives DDA, run as SWATH)" in item
+                for item in gate["blockers"]
+            ),
+            gate["blockers"],
+        )
 
     def test_an_aliased_input_the_disposition_excluded_after_its_csv_is_refused_by_its_alias(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

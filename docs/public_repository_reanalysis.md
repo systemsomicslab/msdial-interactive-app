@@ -418,11 +418,106 @@ campaign it is advice and changes nothing else. Under a campaign approval it is
 applied: it sets `execution_allowed`, the status (`preflight_passed`,
 `skipped_by_preflight`, `excluded_by_preflight`) and each input's
 `console_acquisition_type` (DDA, SWATH or AIF; none for an input that does not
-run), and the execution gate then admits each file only as that type.
+run), and the execution gate then admits each file only as that type, and never
+as one that contradicts the Console type its header settles
+(`header_console_acquisition_type`: a DDA or AIF header, or a DIA header whose
+isolation targets recur at two or more m/z, which is SWATH). A DIA header with one
+recorded isolation target or none binds no type: the extractor records targets
+only from MS2 headers that carry a precursor m/z. A disposition applied before
+Interactive 0.5.29 (it records no `declared_acquisition_source`) is decided again
+at the gate from the same records, and the run is refused where the new decision
+would not run the unit, would exclude a row's file, or would give it another type
+on its header's word. Preparing the unit again
+(`msdial_prepare_repository_reanalysis`) clears it: the unit is decided again from
+its recorded preflight before its rows are built (in memory for the preview, on disk
+when the call writes), the analysis CSV follows the new decision, and the reply
+reports it as `legacy_disposition_redecision`. The old disposition is kept under the
+new one's `supersedes`.
+
+A unit past its run is never decided again in place, and a prepare never writes over
+that run's files. Past its run means a status of `mztab_validated`, `completed`,
+`cleanup_pending_confirmation`, `raw_cleaned` or `discarded`, or a production run
+that was finalised (`finalized_at`, `validation_failed` included); its output
+directory holds the analysis CSV the run read, and `retained_artifact_inventory`
+their checksums. Preparing such a unit returns `ok: false`, `reason: run_finished`,
+and writes nothing. To run it again, prepare a new production run with
+`new_run=true`:
+
+- the finished run's records are copied unchanged into a new entry of
+  `superseded_runs` (its status, `cleanup_allowed`, `output_directory`,
+  `finalized_run`, `mztab_validation`, retained artifacts and their inventory,
+  `analysis_csv`, `analytical_order`, campaign disposition and project, the
+  lineage rows' written names and types as `input_lineage_written`, and the
+  preflight's per-file Console types as `preflight_per_file`). The old output
+  directory and its files are left as they are;
+- the finished run's own records are taken off the top level, `output_directory`
+  becomes `<workspace>\output-run-<n>` (n = 2 for the second run), and the analysis
+  CSV and the new run's outputs go there;
+- `cleanup_allowed` becomes false and the status `preflight_passed` (`prepared`
+  where no raw-header preflight is recorded);
+- a disposition applied before 0.5.29 is decided again under the header-first rule,
+  which then sets the status and `execution_allowed`.
+
+The preview (`confirmed=false`) does this in memory, creates nothing and reports it
+as `preview.new_run`. A new run is refused, and nothing written, for a unit whose raw
+data were released (`raw_released`, also without `new_run`), while a run attempt of
+the unit may still be running (`run_in_progress`), where the legacy disposition
+decided again would not run the unit (`would_not_run`, with the decision in
+`new_run.legacy_disposition_redecision`), or where that decision fails
+(`redecision_failed`). The execution gate holds a workflow to the unit's current
+`output_directory`, so the new run cannot write into the finished run's folder.
+
+A confirmed new run is all or nothing. The run is decided in memory, its rows
+built, its aliases made, and its reviewed metadata and analysis CSV written into a
+hidden staging folder beside the new one. Only then, under the manifest lock, the
+staging folder becomes `output-run-<n>` and the manifest is written once, with the
+superseded run, the new `output_directory`, the CSV record, the analytical order and
+any campaign crossing. If anything before that fails, the manifest and every file of
+the finished run are left byte for byte as they were, and the staging folder and the
+aliases the call made are removed. That covers rows that disagree or an alias that
+cannot be made (`analysis_csv_failed`, with nothing recorded in the manifest), files
+that do not map, and errors. If another writer changed the manifest meanwhile, the
+call returns `new_run_conflict`. The unit stays finished, and the same call can be
+made again.
+
+An alias's path in `raw\console-aliases` is fixed by its input, so two prepares of
+one unit share it. An abandoned call removes an alias it made only if no analysis CSV
+of the unit's committed manifest names it, so a concurrent prepare that reused the
+alias and committed keeps it. A commit whose CSV names an alias that has since been
+removed is refused as `new_run_conflict`. Both checks hold the manifest lock.
+
+Raw-data deletion is judged by the unit's current run. Until a new run prepared after
+a validated run has validated itself, its raw data are kept for it:
+`msdial_cleanup_repository_raw` refuses because the current run is not validated, and
+`msdial_discard_repository_raw` refuses because the unit did produce a validated
+output. Each preview names the superseded validated run. Once the new run validates,
+the cleanup judges it as it judges any other run. A split part is held the same way,
+approved or not: its discard under a campaign approval is refused, and its parent's
+raw release counts it as not ended, whatever its status and however many runs failed.
+
+Each file's acquisition is its raw header's wherever the header was read (user
+decision, 2026-10-06). A file with MS2 whose header gives DDA, DIA, AIF or SWATH
+runs as that, whatever the unit declares and whatever confidence the extractor
+gave: that confidence is a constant per branch of its classifier, and a
+declaration is the Catalog's keyword match over the assay's text. Each
+declaration a header overrode is listed in `declared_vs_header` with its
+`declaration_source` (`catalog_keyword_inference`, `split_part` or
+`unattributed`; the record's `declared_acquisition_source`); an override is
+reported only for a file that reaches the run, and one excluded afterwards is
+listed with `decided: excluded` and its `excluded_reason`. A file whose header
+gives Unknown is excluded as `acquisition_unresolved`, declared unit or not, and
+one whose header gives PRM, SRM, MRM or SIM as out of scope. A unit left with only
+Unknown-header and MS1-only files is skipped as `acquisition_unresolved`, not
+excluded. The declaration
+decides only a unit none of whose headers could be read
+(`acquisition_declared_only`), and SWATH or AIF for a DIA header whose isolation
+settles neither. MS1-only files are folded into a DDA run, except in a unit
+declared DIA or AIF, where they may be all-ion data exported as MS1 scans and are
+excluded as `ms1_only_in_declared_dia_unit`. A split part is held to its parent's
+declaration there (`split_from.parent_declared_acquisition_mode`).
 
 A repository declaration of PRM, SRM, MRM, SIM or full scan is a declaration like
-any other: the unit is excluded unless a header of confidence 0.8 or more says
-otherwise, and untargeted status is never inferred over a declared targeted
+any other, and untargeted status is never inferred over a declared targeted
 acquisition. An input that is missing, or that the recorded preflight never read,
 skips the unit (`inputs_missing`, `raw_metadata_incomplete`) instead of shrinking
 the run; only an input that was read and failed is excluded on its own. Outside a
@@ -434,7 +529,10 @@ No disposition changes a unit that was split, whose run has finished
 (`mztab_validated`, `cleanup_pending_confirmation`, `raw_cleaned`) or whose run
 attempt is still open: a campaign preflight of such a unit reads nothing and
 reports `preflight_held`, and `classify_preflight` returns its decision with
-`held` and writes nothing. A split parent that is read all the same (outside a
+`held` and writes nothing. A finished unit whose applied disposition predates
+0.5.29 is decided again only as a new production run is prepared for it (above),
+after its finished run's records have moved to `superseded_runs`. A split parent
+that is read all the same (outside a
 campaign, or split while its headers were being read) records the reads for its
 parts and keeps its status and the disposition it carries.
 `classify_preflight` decides a summary written before the per-file fields

@@ -103,6 +103,16 @@ def summarize_jobs(
             "split_key_acquisition_ion_mobility_polarity",
             "split_parent_raw_release",
             "campaign_authorized_raw_cleanup_and_discard",
+            # A campaign disposition takes each file's acquisition from its read raw header first (2026-10-06):
+            # declared_vs_header records each declaration a header overrode, with its declaration_source; an
+            # Unknown header is excluded; MS1-only files are not folded into DDA in a unit declared DIA or AIF;
+            # and the execution gate refuses a row that contradicts the Console type its header gives, and decides
+            # an applied disposition from before 0.5.29 again, refusing the rows that decision would not run.
+            "campaign_header_first_acquisition",
+            # A prepare never writes over a finished run's files: a unit past its run is refused (run_finished)
+            # unless new_run=true, which keeps that run's records under superseded_runs and writes the analysis
+            # CSV into a new output directory; a pre-0.5.29 disposition is decided again only then.
+            "repository_prepare_new_production_run",
             # A campaign's lease (and any other under store_mode "always") fetches each object once per
             # accession into its download store and gives the unit a tree of links; a unit's release releases its
             # claims, and the store collects what no live claim holds under the approval that covered it.

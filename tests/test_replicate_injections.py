@@ -1078,6 +1078,31 @@ class AnInferredPairingIsAlwaysLeftOnRecord(_Workspace):
         self.assertEqual(6, len(recorded["inferred_name_pairings"]))
         self.assertEqual([INFERRED_PAIRING_WARNING], prepared["preview"]["warnings"])
 
+    def test_a_new_production_run_keeps_the_pairing_column_in_its_reviewed_table(self) -> None:
+        # 0.5.25's raw_file_paired_by column and 0.5.29's new_run prepare: the new run's reviewed sample table
+        # must say how each file was paired, as the first run's did.
+        handoff, payloads = _st001359_handoff()
+        manifest_path = _lease(self.root, handoff, payloads)
+        _set_types(manifest_path, "DDA")
+        with patch.object(mcp_server, "_request_json", side_effect=_no_backend):
+            first = mcp_server.msdial_prepare_repository_reanalysis(confirmed=True, manifest_path=str(manifest_path))
+        self.assertTrue(first["prepared"], first)
+
+        def finish(manifest: dict) -> None:
+            manifest["status"] = "mztab_validated"
+            manifest["finalized_at"] = "2026-10-07T00:00:00+00:00"
+
+        update_manifest(manifest_path, finish)
+        with patch.object(mcp_server, "_request_json", side_effect=_no_backend):
+            second = mcp_server.msdial_prepare_repository_reanalysis(
+                confirmed=True, manifest_path=str(manifest_path), new_run=True
+            )
+        self.assertTrue(second["prepared"], second)
+        self.assertNotEqual(first["output_root"], second["output_root"])
+        with open(second["files"]["metadata_tsv"], encoding="utf-8-sig", newline="") as handle:
+            reviewed = list(csv.DictReader(handle, delimiter="	"))
+        self.assertEqual([LEADING_IDENTIFIER_TOKEN_PAIRING] * 6, [row["raw_file_paired_by"] for row in reviewed])
+
     def test_a_unit_whose_rows_are_not_all_delivered_says_so_beside_its_csv(self) -> None:
         """ST001264 runs its 3 BioRec rows; the rows named Sample1.. have no input, and that is recorded."""
         project, payloads = _st001264(ST001264_MEMBERS, ST001264_SAMPLES)

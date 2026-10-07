@@ -2186,6 +2186,7 @@ def msdial_prepare_repository_reanalysis(
     port: int = DEFAULT_PORT,
     manifest_path: str = "",
     campaign_authorization_path: str = "",
+    new_run: bool = False,
 ) -> dict[str, Any]:
     """Project repository metadata into Class and prepare an analysis CSV after review.
 
@@ -2198,11 +2199,150 @@ def msdial_prepare_repository_reanalysis(
     declared inputs and sample rows disagree, or an acquisition type cannot be written, nothing is
     written but the failure, which is recorded in the manifest and returned with ok false, so an
     unattended caller goes on to its next unit.
+
+    A UNIT PAST ITS RUN. A prepare never writes over the files of a run that finished (mztab_validated,
+    completed, cleanup_pending_confirmation, or any unit whose production run was finalised, validation_failed
+    included): its output_directory holds the analysis CSV that run read, and retained_artifact_inventory
+    their checksums. Such a unit is refused (reason run_finished) and nothing is written, unless new_run=true
+    asks for a new production run. Then, in the preview in memory only and on disk when the call writes, the
+    finished run's records are copied unchanged into superseded_runs, output_directory becomes a new folder
+    (<workspace>\\output-run-<n>), and the analysis CSV is written there; the old output directory and its
+    files are left as they are. The reply describes it in preview.new_run. A new run is all or nothing: it is
+    decided, its rows built, its aliases made and its metadata and CSV written into a hidden staging folder
+    first, and only then, in one write under the manifest lock, the staging folder becomes output-run-<n> and
+    the manifest records the new run with its CSV (and any campaign crossing). Where anything before that
+    fails (rows that disagree, an alias that cannot be made, files that do not map, an error), or the manifest
+    was written by another writer meanwhile (reason new_run_conflict), the manifest and every file of the
+    finished run are left byte for byte as they were, the staging folder and the aliases the call made are
+    removed, no failure record is written into the manifest, and the error is returned. A unit whose raw data were released
+    (raw_cleaned, discarded) is refused with or without new_run (raw_released), and so is a new run while a run
+    attempt of the unit may still be running (run_in_progress), or one a legacy disposition decided again would
+    not run (would_not_run). Each refusal returns ok false and writes nothing.
+
+    A unit whose applied campaign disposition was decided before 0.5.29 (it records no
+    declared_acquisition_source) is decided again here under the header-first rule (B2), from its recorded
+    preflight, before its rows are built: in the preview in memory only, and on disk when the call writes
+    (confirmed=true, or a campaign approval), before the CSV and whether or not the CSV then fails. A unit past
+    its run is decided again only as a new run is prepared for it (new_run=true), never in place, and that
+    decision is written only with the new run and its CSV, never on its own. The reply
+    names what changed in legacy_disposition_redecision. The execution gate refuses such a disposition's rows
+    where the new rule would not run them, so this is the step that clears that refusal.
     """
     job, manifest = _repository_unit(download_job_id, manifest_path, host, port)
     crossing = _campaign_authorization(
         campaign_authorization_path, manifest, 3, "msdial_prepare_repository_reanalysis"
     )
+    from .repository_reanalysis import (
+        NewProductionRunConflict,
+        begin_new_production_run,
+        finished_production_run,
+        redecide_legacy_disposition,
+        start_new_production_run,
+    )
+
+    writes = confirmed or crossing is not None
+    finished = finished_production_run(manifest)
+    if finished is not None and (finished["raw_released"] or not new_run):
+        # Refused before anything is decided, built or written: the finished run's records stand as they are.
+        return {
+            "ok": False,
+            "prepared": False,
+            "confirmation_required": False,
+            "reason": "raw_released" if finished["raw_released"] else "run_finished",
+            "finished_run": finished,
+            "detail": (
+                f"This unit's raw data were released (status {finished['status']!r}); it never runs again, and "
+                "nothing was written. Download it into a new lease to analyse it again."
+                if finished["raw_released"]
+                else f"This unit's production run has finished (status {finished['status']!r}), and its output "
+                f"directory {finished['output_directory']} holds that run's files, the analysis CSV it read among "
+                "them. A prepare never writes over them, and nothing was written."
+            ),
+            **(
+                {}
+                if finished["raw_released"]
+                else {
+                    "next_step": (
+                        "To run the unit again, call again with new_run=true: the finished run's records are kept "
+                        "under superseded_runs and the analysis CSV is written into a new output directory."
+                    )
+                }
+            ),
+        }
+    new_run_record: dict[str, Any] | None = None
+    redecision: dict[str, Any] | None = None
+    pending: Any = None
+    if finished is not None:
+        if writes:
+            # Decided in memory and committed only with its CSV (PendingNewProductionRun).
+            new_run_record, manifest, pending = begin_new_production_run(manifest)
+        else:
+            new_run_record, manifest = start_new_production_run(manifest, write=False)
+        if not new_run_record["started"] and new_run_record["reason"] != "no_finished_run":
+            return {
+                "ok": False,
+                "prepared": False,
+                "confirmation_required": False,
+                "reason": new_run_record["reason"],
+                "detail": str(new_run_record.get("detail") or new_run_record.get("error") or ""),
+                "new_run": new_run_record,
+            }
+        redecision = new_run_record.pop("legacy_disposition_redecision", None)
+    if new_run_record is None or not new_run_record["started"]:
+        redecision, manifest = redecide_legacy_disposition(manifest, write=writes)
+    if new_run and new_run_record is None:
+        new_run_record = {"started": False, "reason": "no_finished_run", "written": False}
+    try:
+        result = _prepare_decided_repository_unit(
+            job,
+            manifest,
+            hierarchy=hierarchy,
+            download_job_id=download_job_id,
+            confirmed=confirmed,
+            allow_partial_mapping=allow_partial_mapping,
+            crossing=crossing,
+            redecision=redecision,
+            new_run_record=new_run_record,
+            pending=pending,
+        )
+    except NewProductionRunConflict as error:
+        return {
+            "ok": False,
+            "prepared": False,
+            "confirmation_required": False,
+            "reason": "new_run_conflict",
+            "detail": str(error),
+            "new_run": new_run_record,
+        }
+    finally:
+        if pending is not None:
+            # Whatever stopped the new run before its commit, the staging folder and its aliases go.
+            pending.abandon()
+    if pending is not None and pending.committed:
+        new_run_record["written"] = True
+        if redecision is not None:
+            redecision["written"] = True
+    return result
+
+
+def _prepare_decided_repository_unit(
+    job: dict[str, Any] | None,
+    manifest: dict[str, Any],
+    *,
+    hierarchy: list[str] | None,
+    download_job_id: str,
+    confirmed: bool,
+    allow_partial_mapping: bool,
+    crossing: dict[str, Any] | None,
+    redecision: dict[str, Any] | None,
+    new_run_record: dict[str, Any] | None,
+    pending: Any,
+) -> dict[str, Any]:
+    """msdial_prepare_repository_reanalysis once the unit, and any new run of it, has been decided.
+
+    ``pending`` is the confirmed new production run (repository_reanalysis.PendingNewProductionRun), else None.
+    With it nothing is written but into its staging folder until pending.commit, which writes the manifest once.
+    """
     from .repository_metadata import (
         apply_classes_to_analysis_files,
         metadata_workspace,
@@ -2245,6 +2385,9 @@ def msdial_prepare_repository_reanalysis(
             confirmed=confirmed,
             allow_partial_mapping=allow_partial_mapping,
             crossing=crossing,
+            redecision=redecision,
+            new_run_record=new_run_record,
+            pending=pending,
         )
     if job is not None:
         recognized = ((job.get("result") or {}).get("recognized") or {}).get("files", [])
@@ -2313,6 +2456,10 @@ def msdial_prepare_repository_reanalysis(
     }
     if crossing:
         preview["campaign_authorization"] = crossing
+    if redecision is not None:
+        preview["legacy_disposition_redecision"] = redecision
+    if new_run_record is not None:
+        preview["new_run"] = new_run_record
     if not confirmed and crossing is None:
         return {
             "prepared": False,
@@ -2328,6 +2475,34 @@ def msdial_prepare_repository_reanalysis(
             "Repository metadata did not map uniquely to every recognized raw file. "
             "Review unmatched/ambiguous paths, or explicitly set allow_partial_mapping=true."
         )
+    if pending is not None:
+        from .repository_reanalysis import analytical_order_change, campaign_authorization_change
+
+        saved = save_metadata_review(
+            projected,
+            pending.staging_directory(),
+            application["files"],
+            analytical_orders=analytical_order.get("orders"),
+        )
+        if not saved.get("analysis_files_csv"):
+            raise RuntimeError("No analysis_files.csv was generated from the repository download.")
+        saved = {key: str(pending.staged(value)) for key, value in saved.items()}
+        pending.commit(
+            ([campaign_authorization_change(crossing)] if crossing else [])
+            + [analytical_order_change(analytical_order)]
+        )
+        answer_seed["repository_metadata_path"] = saved["metadata_json"]
+        return {
+            "prepared": True,
+            "input_path": saved["analysis_files_csv"],
+            "output_root": output_root,
+            "files": saved,
+            "preview": preview,
+            "next_step": (
+                "Pass input_path and preview.answer_seed to msdial_guided_analysis_plan, then "
+                "collect any remaining scientific decisions before execution."
+            ),
+        }
     if crossing:
         from .repository_reanalysis import record_campaign_authorization
 
@@ -2367,6 +2542,9 @@ def _prepare_repository_rows_from_lineage(
     confirmed: bool,
     allow_partial_mapping: bool,
     crossing: dict[str, Any] | None,
+    redecision: dict[str, Any] | None = None,
+    new_run_record: dict[str, Any] | None = None,
+    pending: Any = None,
 ) -> dict[str, Any]:
     """msdial_prepare_repository_reanalysis for a manifest with input_lineage: one row per analysis input.
 
@@ -2460,6 +2638,12 @@ def _prepare_repository_rows_from_lineage(
     }
     if crossing:
         preview["campaign_authorization"] = crossing
+    if redecision is not None:
+        # A disposition decided before 0.5.29, decided again: the rows above are built from the new decision.
+        preview["legacy_disposition_redecision"] = redecision
+    if new_run_record is not None:
+        # A new production run of a unit past its run: output_root above is the new run's folder.
+        preview["new_run"] = new_run_record
     if not confirmed and crossing is None:
         return {
             "prepared": False,
@@ -2471,6 +2655,10 @@ def _prepare_repository_rows_from_lineage(
                 + ". Call again with confirmed=true to write reviewed metadata and analysis_files.csv."
             ),
         }
+    if pending is not None:
+        return _commit_new_run_rows(
+            pending, built, projected, analytical_order, blocking, crossing, preview, answer_seed, output_root
+        )
     if crossing:
         record_campaign_authorization(manifest["manifest_path"], crossing)
     if not blocking:
@@ -2489,21 +2677,7 @@ def _prepare_repository_rows_from_lineage(
             "analysis_csv": record,
             "preview": preview,
         }
-    # The reviewed sample TSV says how each row's raw file was paired with its input: exact, or the inferred
-    # rule (prefixed_member_name, leading_identifier_token); a row without an input says nothing.
-    paired_by = {
-        row["sample_row_index"]: row["raw_file_paired_by"]
-        for row in built["rows"]
-        if row["sample_row_index"] is not None
-    }
-    projected = {
-        **projected,
-        "rows": [
-            {**row, "raw_file_paired_by": paired_by.get(index, "")}
-            for index, row in enumerate(projected.get("rows") or [])
-        ],
-    }
-    saved = save_metadata_review(projected, output_root)
+    saved = save_metadata_review(_with_raw_file_paired_by(projected, built), output_root)
     input_path = write_analysis_csv(built, Path(output_root) / "analysis_files.csv")
     saved["analysis_files_csv"] = str(input_path)
     record_analysis_csv(manifest["manifest_path"], built, input_path)
@@ -2513,6 +2687,106 @@ def _prepare_repository_rows_from_lineage(
     return {
         "prepared": True,
         "input_path": str(input_path),
+        "output_root": output_root,
+        "files": saved,
+        "preview": preview,
+        "next_step": (
+            "Pass input_path and preview.answer_seed to msdial_guided_analysis_plan, then "
+            "collect any remaining scientific decisions before execution."
+        ),
+    }
+
+
+def _with_raw_file_paired_by(projected: dict[str, Any], built: dict[str, Any]) -> dict[str, Any]:
+    """The projected sample rows, each saying how its raw file was paired with its input.
+
+    exact, or the inferred rule (prefixed_member_name, leading_identifier_token); a row without an input says
+    nothing. Both the prepare of a unit's first run and of a new production run write it into the reviewed
+    sample TSV, so an inferred pairing is on record in every run's table.
+    """
+    paired_by = {
+        row["sample_row_index"]: row["raw_file_paired_by"]
+        for row in built["rows"]
+        if row["sample_row_index"] is not None
+    }
+    return {
+        **projected,
+        "rows": [
+            {**row, "raw_file_paired_by": paired_by.get(index, "")}
+            for index, row in enumerate(projected.get("rows") or [])
+        ],
+    }
+
+
+def _commit_new_run_rows(
+    pending: Any,
+    built: dict[str, Any],
+    projected: dict[str, Any],
+    analytical_order: dict[str, Any],
+    blocking: list[dict[str, Any]],
+    crossing: dict[str, Any] | None,
+    preview: dict[str, Any],
+    answer_seed: dict[str, Any],
+    output_root: str,
+) -> dict[str, Any]:
+    """The confirmed lineage prepare of a new production run: staged, then committed in one manifest write.
+
+    A failure returns analysis_csv_failed as any prepare does, but nothing of it is written into the manifest:
+    the unit keeps its finished run, and the caller (msdial_prepare_repository_reanalysis) removes the staging
+    folder and the aliases this call made.
+    """
+    from .repository_analysis_rows import (
+        analysis_csv_change,
+        analysis_csv_failure_record,
+        create_console_aliases,
+        write_analysis_csv,
+    )
+    from .repository_metadata import save_metadata_review
+    from .repository_reanalysis import analytical_order_change, campaign_authorization_change
+
+    if not blocking:
+        blocking = create_console_aliases(built, made=pending.aliases_made)
+    if blocking:
+        record = analysis_csv_failure_record(built, blocking)
+        return {
+            "ok": False,
+            "prepared": False,
+            "reason": "analysis_csv_failed",
+            "codes": sorted({item["code"] for item in blocking}),
+            "detail": " ".join(item["message"] for item in blocking)
+            + " No new run was prepared: the unit's finished run and its manifest are as they were.",
+            "analysis_csv": {**record, "written_to_manifest": False},
+            "preview": preview,
+        }
+    staging = pending.staging_directory()
+    saved = save_metadata_review(_with_raw_file_paired_by(projected, built), staging)
+    staged_csv = write_analysis_csv(built, staging / "analysis_files.csv")
+    saved["analysis_files_csv"] = str(staged_csv)
+    saved = {key: str(pending.staged(value)) for key, value in saved.items()}
+    input_path = saved["analysis_files_csv"]
+    # Every alias the CSV names, made here or reused: the commit refuses if a concurrent prepare that made one
+    # has since abandoned it (review r7-62).
+    required = [
+        path
+        for row in built.get("rows") or []
+        if row.get("console_alias")
+        for path in (
+            Path(row["console_alias"]["path"]),
+            *(
+                Path(row["console_alias"]["path"]).with_name(str(name))
+                for name in row["console_alias"].get("sidecars") or []
+            ),
+        )
+    ]
+    pending.commit(
+        ([campaign_authorization_change(crossing)] if crossing else [])
+        + [analysis_csv_change(built, input_path), analytical_order_change(analytical_order)],
+        required_paths=required,
+    )
+    answer_seed["repository_metadata_path"] = saved["metadata_json"]
+    return {
+        "prepared": True,
+        "input_path": input_path,
         "output_root": output_root,
         "files": saved,
         "preview": preview,

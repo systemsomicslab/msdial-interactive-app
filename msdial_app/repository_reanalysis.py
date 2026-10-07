@@ -11,6 +11,7 @@ import os
 import random
 import re
 import secrets
+import shutil
 import socket
 import ssl
 import stat
@@ -4597,12 +4598,17 @@ def record_campaign_authorization(manifest_path: str | Path, crossing: dict[str,
     Raises when it cannot write, unlike the failure recorders: the crossing is written before the step it
     authorizes, and a step whose authority cannot be recorded does not run.
     """
+    return update_manifest(Path(manifest_path), campaign_authorization_change(crossing))
+
+
+def campaign_authorization_change(crossing: dict[str, Any]) -> Any:
+    """The change record_campaign_authorization makes, for a write that carries it with the step it authorizes."""
     entry = dict(crossing)
 
     def change(manifest: dict[str, Any]) -> None:
         manifest["campaign_authorizations"] = [*(manifest.get("campaign_authorizations") or []), entry]
 
-    return update_manifest(Path(manifest_path), change)
+    return change
 
 
 def record_run_failure(
@@ -5218,6 +5224,10 @@ def disposition_hold(manifest: dict[str, Any]) -> dict[str, Any] | None:
     raw_cleaned and the like) or its raw data were discarded; applied again, a disposition would move a
     finished unit out of the cleanup-ready states and make it look as if it were waiting to run.
     run_in_progress: a Console of its own may still be running.
+
+    Nothing decides a unit past its run again in place. start_new_production_run, as a new production run is
+    prepared for it, moves the finished run's records into superseded_runs first; the unit is then no longer past
+    its run, and a pre-0.5.29 disposition is decided again for the new run only.
     """
     status = str(manifest.get("status") or "")
     if status == SPLIT_PARENT_STATUS or manifest.get("split_into"):
@@ -5273,6 +5283,37 @@ def _declared_technical(manifest: dict[str, Any]) -> dict[str, Any]:
     if isinstance(earlier, dict):
         return dict(earlier)
     return declared_technical(manifest.get("project"))
+
+
+def _split_parent_declared(manifest: dict[str, Any], depth: int = 0) -> str | None:
+    """The acquisition mode a split part's parent declared; None for a unit that is no split part.
+
+    A split from 0.5.29 records it (split_from.parent_declared_acquisition_mode). For a part split before that,
+    it is read from the parent manifest as _declared_technical gives it, and through the parent's own parent
+    where the parent is itself a part; "" where the parent cannot be read.
+    """
+    from .raw_metadata_preflight import SPLIT_PARENT_DECLARED_FIELD
+
+    split = manifest.get("split_from")
+    if not isinstance(split, dict):
+        return None
+    recorded = str(split.get(SPLIT_PARENT_DECLARED_FIELD) or "").strip()
+    if recorded:
+        return recorded
+    parent_path = str(split.get("manifest_path") or "").strip()
+    if not parent_path or depth > 8:
+        return ""
+    try:
+        parent = read_manifest(parent_path) if Path(parent_path).is_file() else None
+    except (OSError, ValueError):
+        parent = None
+    if not isinstance(parent, dict):
+        return ""
+    grandparent = _split_parent_declared(parent, depth + 1)
+    if grandparent is not None:
+        return grandparent
+    mode = str(_declared_technical(parent).get("acquisition_mode") or "").strip()
+    return "" if mode.casefold() == "unknown" else mode
 
 
 def _previous_reads(manifest: dict[str, Any], manifest_path: Path) -> dict[str, dict[str, Any]]:
@@ -5777,7 +5818,9 @@ def _record_preflight(
         if excluded_part:
             current["project"] = project_before
         return
-    disposition = decide_disposition(current, declared=declared, extractor=extractor)
+    disposition = decide_disposition(
+        current, declared=declared, extractor=extractor, parent_declared=_split_parent_declared(current)
+    )
     assignments = disposition.pop("assignments")
     disposition["applied"] = campaign is not None
     if campaign is not None:
@@ -5899,29 +5942,13 @@ def classify_preflight(
     fields is decided from the extractor records its preflight left (_rebuilt_legacy_per_file), and
     recorded as it was.
     """
-    from .raw_metadata_preflight import decide_disposition
-
     target = Path(manifest_path).resolve()
     campaign = preflight_campaign(read_manifest(target), campaign_authorization_path)
     with manifest_lock(target):
         current = read_manifest(target)
         preflight = current.get("raw_metadata_preflight") or {}
-        declared = preflight.get("declared")
-        if not isinstance(declared, dict):
-            declared = _declared_technical(current)
-        view = current
-        rebuilt = _rebuilt_legacy_per_file(current)
-        if rebuilt is not None:
-            view = copy.deepcopy(current)
-            view["raw_metadata_preflight"]["summary"]["per_file"] = rebuilt
-        disposition = decide_disposition(view, declared=declared)
+        disposition = _decide_recorded_preflight(current)
         assignments = disposition.pop("assignments")
-        if rebuilt is not None and "raw_metadata_preflight_legacy" not in disposition["warnings"]:
-            disposition["warnings"].append("raw_metadata_preflight_legacy")
-            disposition["detail"].append(
-                "The per-file records predate recorded formats, MS-level flags and isolation; the unit was "
-                "decided from the extractor records its preflight left."
-            )
         held = disposition_hold(current)
         if held is None and not (preflight.get("summary") or {}):
             held = {
@@ -5938,6 +5965,664 @@ def classify_preflight(
         current["campaign_disposition"] = disposition
         _write_json(target, current)
     return disposition
+
+
+def _decide_recorded_preflight(current: dict[str, Any]) -> dict[str, Any]:
+    """decide_disposition over a unit's recorded preflight, as classify_preflight decides it. Changes nothing.
+
+    The declaration is the one the preflight recorded, else _declared_technical; a split part is also held to
+    its parent's declaration (_split_parent_declared); a summary written before the per-file fields is decided
+    from the extractor records its preflight left (_rebuilt_legacy_per_file). The result keeps ``assignments``.
+    """
+    from .raw_metadata_preflight import decide_disposition
+
+    preflight = current.get("raw_metadata_preflight") or {}
+    declared = preflight.get("declared")
+    if not isinstance(declared, dict):
+        declared = _declared_technical(current)
+    view = current
+    rebuilt = _rebuilt_legacy_per_file(current)
+    if rebuilt is not None:
+        view = copy.deepcopy(current)
+        view["raw_metadata_preflight"]["summary"]["per_file"] = rebuilt
+    disposition = decide_disposition(view, declared=declared, parent_declared=_split_parent_declared(current))
+    if rebuilt is not None and "raw_metadata_preflight_legacy" not in disposition["warnings"]:
+        disposition["warnings"].append("raw_metadata_preflight_legacy")
+        disposition["detail"].append(
+            "The per-file records predate recorded formats, MS-level flags and isolation; the unit was "
+            "decided from the extractor records its preflight left."
+        )
+    return disposition
+
+
+def is_legacy_disposition(manifest: dict[str, Any]) -> bool:
+    """Whether the unit carries an applied disposition decided before 0.5.29 (no declared_acquisition_source)."""
+    applied = _applied_disposition(manifest)
+    return bool(applied) and "declared_acquisition_source" not in applied
+
+
+def finished_production_run(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """The run this unit is past, whose files no prepare may write over; None for a unit that is not past one.
+
+    A unit is past its run when its status is past every preflight (mztab_validated, completed,
+    cleanup_pending_confirmation, raw_cleaned, discarded) or when a production run of it was finalised
+    (finalized_at: the Console completed and its outputs were inventoried, validation_failed included). Its
+    output_directory then holds that run's files, the analysis CSV the Console read among them, and
+    retained_artifact_inventory records their checksums: a prepare that wrote its analysis CSV there would
+    leave the unit's records describing a run that never happened.
+    """
+    status = str(manifest.get("status") or "")
+    if status not in PAST_PREFLIGHT_STATUSES and not manifest.get("finalized_at"):
+        return None
+    return {
+        "status": status,
+        "output_directory": str(manifest.get("output_directory") or ""),
+        "finalized_at": manifest.get("finalized_at"),
+        "job_id": str((manifest.get("finalized_run") or {}).get("job_id") or ""),
+        "raw_released": status in RAW_RELEASED_STATUSES,
+    }
+
+
+def _redecide_legacy_in(current: dict[str, Any]) -> dict[str, Any]:
+    """Decide current's pre-0.5.29 disposition again under rule B2 and apply it to current, in place.
+
+    The caller has already found that nothing holds the unit. Raises what the decision raises; the caller then
+    drops ``current``, which may be half changed.
+    """
+    previous = copy.deepcopy(_applied_disposition(current))
+    disposition = _decide_recorded_preflight(current)
+    assignments = disposition.pop("assignments")
+    disposition["applied"] = True
+    campaign = previous.get("campaign") or preflight_campaign(current)
+    if campaign:
+        disposition["campaign"] = dict(campaign)
+    summary = (current.get("raw_metadata_preflight") or {}).get("summary") or {}
+    disposition["supersedes"] = {
+        **previous,
+        "per_file": [
+            {
+                "file": str(entry.get("file") or ""),
+                "console_acquisition_type": entry.get("console_acquisition_type"),
+                "console_acquisition_basis": entry.get("console_acquisition_basis") or "",
+            }
+            for entry in summary.get("per_file") or []
+            if isinstance(entry, dict)
+        ],
+    }
+    disposition["redecided"] = {
+        "reason": "legacy_disposition",
+        "by": "msdial_prepare_repository_reanalysis",
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _apply_disposition(current, disposition, assignments)
+    current["campaign_disposition"] = disposition
+    return {
+        "redecided": True,
+        "disposition": disposition["disposition"],
+        "reasons": list(disposition.get("reasons") or []),
+        "console_acquisition_type": disposition.get("console_acquisition_type"),
+        "excluded_inputs": [
+            {"file": Path(str(item.get("path") or "")).name, "reason": str(item.get("reason") or "")}
+            for item in disposition.get("excluded_inputs") or []
+            if isinstance(item, dict)
+        ],
+        "status_after": str(current.get("status") or ""),
+        "execution_allowed": current.get("execution_allowed") is True,
+    }
+
+
+def _redecision_base(current: dict[str, Any]) -> dict[str, Any]:
+    previous = _applied_disposition(current)
+    return {
+        "previous_disposition": str(previous.get("disposition") or ""),
+        "previous_console_acquisition_type": previous.get("console_acquisition_type"),
+        "status": str(current.get("status") or ""),
+        "redecided": False,
+        "held": None,
+    }
+
+
+def redecide_legacy_disposition(
+    manifest: dict[str, Any], *, write: bool
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Decide an applied pre-0.5.29 disposition again under the header-first rule, as the unit is prepared.
+
+    WHY HERE. The execution gate refuses the rows such a disposition runs and the header-first rule (user
+    decision, 2026-10-06; rule B2) would not (_legacy_disposition_refusals). Preparing the unit
+    (msdial_prepare_repository_reanalysis) is the step that precedes any run, and the analysis CSV it writes is
+    what the gate checks, so the unit is decided again there and the CSV is built from that decision.
+
+    Returns (record, manifest). record is None, and manifest the one given, for a unit with no applied
+    disposition or one decided from 0.5.29 on. Otherwise the unit is decided from its recorded preflight
+    (_decide_recorded_preflight) and the decision applied as classify_preflight applies it, under the campaign
+    the old disposition recorded; with ``write`` the manifest on disk (``manifest_path``) is changed under its
+    lock, otherwise only the copy returned. The old disposition, with each input's type and basis under it,
+    is kept in the new one's ``supersedes``.
+
+    NOT A UNIT PAST ITS RUN. A unit disposition_hold holds is not decided again (record ``held``): split,
+    excluded at its split, past its run (mztab_validated, completed, cleanup_pending_confirmation, raw_cleaned,
+    discarded), or a run attempt open. Nor is one whose production run was finalised under another status
+    (validation_failed): its run happened under the old disposition, and its records say so. Such a unit is
+    decided again only as a new production run is prepared for it (start_new_production_run), never in place.
+    """
+    if not is_legacy_disposition(manifest):
+        return None, manifest
+
+    def decide(current: dict[str, Any]) -> dict[str, Any]:
+        record = _redecision_base(current)
+        if not is_legacy_disposition(current):
+            # Decided again by another writer since the caller read the unit.
+            return {**record, "already_current": True}
+        held = disposition_hold(current)
+        if held is None and finished_production_run(current) is not None:
+            held = {
+                "reason": "run_finalised",
+                "status": record["status"],
+                "detail": "A production run of this unit was finalised; its records describe that run.",
+            }
+        if held is not None:
+            return {**record, "held": held}
+        return {**record, **_redecide_legacy_in(current)}
+
+    def attempt(current: dict[str, Any]) -> dict[str, Any]:
+        # A unit that cannot be decided again is prepared as it is, and the gate refuses its legacy rows.
+        try:
+            return decide(current)
+        except Exception as error:
+            return {"redecided": False, "held": None, "error": f"{type(error).__name__}: {error}"}
+
+    if not write:
+        view = copy.deepcopy(manifest)
+        record = attempt(view)
+        return {**record, "written": False}, view if record["redecided"] else manifest
+    if not str(manifest.get("manifest_path") or "").strip():
+        raise ValueError("A legacy disposition is decided again on disk only for a manifest read from its path.")
+    target = Path(str(manifest["manifest_path"])).resolve()
+    with manifest_lock(target):
+        current = read_manifest(target)
+        record = attempt(current)
+        if record["redecided"]:
+            _write_json(target, current)
+    # The unit as it is on disk now, unless a decision that failed left the copy read half changed.
+    return {**record, "written": record["redecided"]}, (
+        manifest if "error" in record else {**current, "manifest_path": str(target)}
+    )
+
+
+# What describes one production run of a unit, copied unchanged into superseded_runs when a new run is prepared.
+SUPERSEDED_RUN_FIELDS = (
+    "status",
+    "execution_allowed",
+    "cleanup_allowed",
+    "output_directory",
+    "finalized_at",
+    "finalized_run",
+    "mztab_validation",
+    "retained_artifacts",
+    "retained_artifact_inventory",
+    "retained_artifacts_refreshed_at",
+    "project_archive",
+    "console_run_finalisation",
+    "cleanup_requested_at",
+    "analysis_csv",
+    "analytical_order",
+    "campaign_disposition",
+    "project",
+)
+# Of those, what the finished run alone had and the new run does not have yet: taken off the top level, so that
+# a refresh, a cleanup plan or the gate never reads the old run's inventory as the new run's.
+_FINISHED_RUN_ONLY_FIELDS = (
+    "finalized_at",
+    "finalized_run",
+    "mztab_validation",
+    "retained_artifacts",
+    "retained_artifact_inventory",
+    "retained_artifacts_refreshed_at",
+    "project_archive",
+    "console_run_finalisation",
+    "cleanup_requested_at",
+    "analysis_csv",
+    "analytical_order",
+)
+# What record_analysis_csv wrote on each lineage row for the CSV the finished run read.
+_LINEAGE_RUN_FIELDS = ("file_name", "console_path", "console_alias", "acquisition_type", "file_name_reason")
+NEW_RUN_OUTPUT_PREFIX = "output-run-"
+
+
+def _superseded_run_record(current: dict[str, Any], at: str) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        key: copy.deepcopy(current[key]) for key in SUPERSEDED_RUN_FIELDS if key in current
+    }
+    rows = [row for row in (current.get("input_lineage") or {}).get("rows") or [] if isinstance(row, dict)]
+    if rows:
+        record["input_lineage_written"] = [
+            {"path": str(row.get("path") or ""), **{key: copy.deepcopy(row[key]) for key in _LINEAGE_RUN_FIELDS if key in row}}
+            for row in rows
+        ]
+    summary = (current.get("raw_metadata_preflight") or {}).get("summary") or {}
+    per_file = [entry for entry in summary.get("per_file") or [] if isinstance(entry, dict)]
+    if per_file:
+        record["preflight_per_file"] = [
+            {
+                "file": str(entry.get("file") or ""),
+                "console_acquisition_type": entry.get("console_acquisition_type"),
+                "console_acquisition_basis": entry.get("console_acquisition_basis") or "",
+            }
+            for entry in per_file
+        ]
+    record["superseded_at"] = at
+    record["superseded_by"] = "msdial_prepare_repository_reanalysis"
+    return record
+
+
+def _new_run_output_directory(current: dict[str, Any]) -> Path:
+    """A folder no run of the unit has used: <workspace>\\output-run-<n>, n counting the unit's runs."""
+    workspace_text = str(current.get("workspace") or "").strip()
+    old = Path(str(current.get("output_directory") or ""))
+    base = Path(workspace_text) if workspace_text else old.parent
+    used = {
+        Path(str(item.get("output_directory") or "")).resolve()
+        for item in current.get("superseded_runs") or []
+        if isinstance(item, dict) and str(item.get("output_directory") or "").strip()
+    }
+    number = 2 + len(current.get("superseded_runs") or [])
+    while True:
+        candidate = base / f"{NEW_RUN_OUTPUT_PREFIX}{number}"
+        if not os.path.lexists(candidate) and candidate.resolve() not in used and candidate.resolve() != old.resolve():
+            return candidate
+        number += 1
+
+
+def start_new_production_run(
+    manifest: dict[str, Any], *, write: bool
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Prepare a new production run for a unit past its run, without touching that run's files or records.
+
+    WHY. A unit whose run finished keeps that run's files in its output_directory, the analysis CSV the
+    Console read among them, and records their checksums in retained_artifact_inventory; cleanup and the gate's
+    run invariants read them as the description of what ran. A prepare that wrote a new analysis CSV there -
+    for a legacy disposition decided again, one input fewer - left the unit mztab_validated and cleanup-allowed
+    with a CSV that described a run that never happened (review r5-62).
+
+    What this does, in one write under the manifest lock:
+    - copies the finished run's records (SUPERSEDED_RUN_FIELDS, the lineage rows' written names and types, the
+      preflight's per-file Console types) unchanged into a new entry of ``superseded_runs``; the old output
+      directory and every file in it are left as they are;
+    - takes the finished run's own records (_FINISHED_RUN_ONLY_FIELDS) off the top level;
+    - points output_directory at a new folder, <workspace>\\output-run-<n>, created here, where the analysis
+      CSV and the new run's outputs go;
+    - sets cleanup_allowed false and the status a unit has before its run (preflight_passed where a raw-header
+      preflight is recorded, else prepared); execution_allowed is left as it was;
+    - decides a pre-0.5.29 disposition again under rule B2 (_redecide_legacy_in), which then sets the status
+      and execution_allowed as classify_preflight would.
+
+    Refused, and nothing changed (``started`` false and ``reason``): a unit whose raw data were released
+    (raw_released), one with a run attempt that may still be running (run_in_progress), one whose legacy
+    disposition, decided again, would not run it (would_not_run: skip, exclude or split; the record carries the
+    decision made in memory), and one whose disposition could not be decided again (redecision_failed). A unit
+    not past a run (no_finished_run) is left
+    alone too; the caller prepares it as any other. Without ``write`` the same is done on a copy, which is
+    returned, and nothing is created.
+
+    msdial_prepare_repository_reanalysis does not write with this: it decides the run without ``write``
+    (begin_new_production_run) and commits it only together with the analysis CSV (PendingNewProductionRun),
+    so that a CSV that fails leaves the finished run as it was.
+    """
+
+    def start(current: dict[str, Any]) -> dict[str, Any]:
+        finished = finished_production_run(current)
+        if finished is None:
+            return {"started": False, "reason": "no_finished_run", "status": str(current.get("status") or "")}
+        base = {
+            "previous_status": finished["status"],
+            "previous_output_directory": finished["output_directory"],
+            "previous_job_id": finished["job_id"],
+        }
+        if finished["raw_released"]:
+            return {
+                "started": False,
+                "reason": "raw_released",
+                **base,
+                "detail": f"This unit's raw data were released (status {finished['status']!r}); it never runs "
+                "again. Download it into a new lease to analyse it again.",
+            }
+        attempt = _live_run_attempt_in(current)
+        if attempt is not None:
+            return {
+                "started": False,
+                "reason": "run_in_progress",
+                **base,
+                "job_id": str(attempt.get("job_id") or ""),
+                "detail": "A run attempt of this unit is open and its process may still be running; a new run is "
+                "prepared only once it has ended.",
+            }
+        at = datetime.now(timezone.utc).isoformat()
+        superseded = _superseded_run_record(current, at)
+        new_output = _new_run_output_directory(current)
+        legacy = is_legacy_disposition(current)
+        for key in _FINISHED_RUN_ONLY_FIELDS:
+            current.pop(key, None)
+        current["superseded_runs"] = [*(current.get("superseded_runs") or []), superseded]
+        current["output_directory"] = str(new_output)
+        current["cleanup_allowed"] = False
+        current["status"] = "preflight_passed" if current.get("raw_metadata_preflight") else "prepared"
+        current["new_run_prepared"] = {
+            "prepared_at": at,
+            "by": "msdial_prepare_repository_reanalysis",
+            "superseded_run": len(current["superseded_runs"]) - 1,
+        }
+        redecision: dict[str, Any] | None = None
+        if legacy:
+            redecision = {
+                **_redecision_base({**current, "status": finished["status"]}),
+                **_redecide_legacy_in(current),
+                "written": False,
+            }
+            if redecision["disposition"] != "run":
+                # Decided again, the unit would not run: there is no new run to prepare, and the finished run's
+                # records stay where they are (the caller drops this copy).
+                return {
+                    "started": False,
+                    "reason": "would_not_run",
+                    **base,
+                    "legacy_disposition_redecision": redecision,
+                    "detail": f"Decided again under the header-first rule, the unit would {redecision['disposition']} "
+                    f"({', '.join(redecision['reasons']) or 'no reason recorded'}), not run; no new run was prepared "
+                    "and the finished run's records are unchanged.",
+                }
+        return {
+            "started": True,
+            **base,
+            "output_directory": str(new_output),
+            "status": str(current.get("status") or ""),
+            "execution_allowed": current.get("execution_allowed") is True,
+            "superseded_run": len(current["superseded_runs"]) - 1,
+            "legacy_disposition_redecision": redecision,
+        }
+
+    def attempt_start(current: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return start(current)
+        except Exception as error:
+            # Nothing is written: the copy that was being changed is dropped, and the run is not prepared.
+            return {"started": False, "reason": "redecision_failed", "error": f"{type(error).__name__}: {error}"}
+
+    if not write:
+        view = copy.deepcopy(manifest)
+        record = attempt_start(view)
+        return {**record, "written": False}, view if record["started"] else manifest
+    if not str(manifest.get("manifest_path") or "").strip():
+        raise ValueError("A new production run is prepared on disk only for a manifest read from its path.")
+    target = Path(str(manifest["manifest_path"])).resolve()
+    with manifest_lock(target):
+        current = read_manifest(target)
+        record = attempt_start(current)
+        if record["started"]:
+            Path(record["output_directory"]).mkdir(parents=True, exist_ok=False)
+            _write_json(target, current)
+    if not record["started"]:
+        return {**record, "written": False}, manifest
+    if record.get("legacy_disposition_redecision"):
+        record["legacy_disposition_redecision"]["written"] = True
+    return {**record, "written": True}, {**current, "manifest_path": str(target)}
+
+
+class NewProductionRunConflict(RuntimeError):
+    """The unit's manifest, or the new run's folder, changed after the new run was decided; nothing was committed."""
+
+
+class PendingNewProductionRun:
+    """A new production run decided in memory, committed only once its analysis CSV is written (review r6-62).
+
+    WHY. start_new_production_run(write=True) moved the finished run's records into superseded_runs and created
+    the new folder before the rows were built; a CSV that then failed (rows that disagree, an alias that could
+    not be made, files that did not map) left a validated, cleanup-ready unit with no validated run on its top
+    level, cleanup_allowed false, an empty output-run-<n>, and no new run prepared.
+
+    How it is used (msdial_prepare_repository_reanalysis):
+    - begin_new_production_run decides the new run against the manifest's bytes as they are on disk, in memory;
+    - the rows are built from ``view``, the aliases made (``aliases_made`` lists what this call created), and the
+      reviewed metadata and the CSV written into ``staging_directory()``, a hidden folder beside the new one;
+    - ``commit(changes)``, under the manifest lock, refuses (NewProductionRunConflict) if the manifest's bytes
+      are no longer those the run was decided from or the new folder exists, then renames the staging folder to
+      the new output_directory and writes ``view``, with ``changes`` applied, in one write;
+    - ``abandon()``, after any failure, removes the staging folder and the aliases this call made. The manifest
+      and every file of the finished run are then as they were.
+
+    ALIASES ARE SHARED (review r7-62). An alias's path in raw\\console-aliases is fixed by its input, so two
+    prepares of one unit name the same one: the second reuses what the first made. The snapshot check guards
+    the manifest, not the aliases, so both ends now hold the manifest lock for them:
+    - ``commit(changes, required_paths)`` refuses (NewProductionRunConflict) if an alias the new CSV names,
+      ``required_paths``, is gone - a concurrent prepare that made it abandoned it - rather than commit a CSV
+      whose input path does not exist;
+    - ``abandon()`` removes an alias it made only when no analysis CSV of the unit's committed manifest names
+      it (_aliases_named_by_manifest): a concurrent prepare that reused it and committed keeps it.
+    """
+
+    def __init__(
+        self, target: Path, snapshot: bytes, on_disk_keys: set[str], view: dict[str, Any], record: dict[str, Any]
+    ) -> None:
+        self.target = target
+        self.snapshot = snapshot
+        self.on_disk_keys = on_disk_keys
+        self.view = view
+        self.record = record
+        self.output_directory = Path(str(record["output_directory"]))
+        self.staging: Path | None = None
+        self.aliases_made: list[tuple[str, Path, Path]] = []
+        self.committed = False
+
+    def staging_directory(self) -> Path:
+        """A new hidden folder beside the new output directory, on its volume, so that the commit is a rename."""
+        if self.staging is None:
+            parent = self.output_directory.parent
+            parent.mkdir(parents=True, exist_ok=True)
+            self.staging = Path(
+                tempfile.mkdtemp(prefix=f".{self.output_directory.name}.", suffix=".staging", dir=str(parent))
+            )
+        return self.staging
+
+    def staged(self, path: str | Path) -> Path:
+        """Where a file written into the staging folder lies once the run is committed."""
+        staging = self.staging_directory()
+        return self.output_directory / Path(path).resolve().relative_to(staging.resolve())
+
+    def commit(self, changes: Iterable[Any] = (), required_paths: Iterable[str | Path] = ()) -> dict[str, Any]:
+        """Rename the staging folder into place and write the manifest with the new run, under the lock, at once.
+
+        ``required_paths`` are the aliases (and their sidecars) the new analysis CSV names; one that no longer
+        exists refuses the commit.
+        """
+        if self.committed:
+            raise RuntimeError("This new production run was committed already.")
+        current = copy.deepcopy(self.view)
+        if "manifest_path" not in self.on_disk_keys:
+            current.pop("manifest_path", None)
+        for change in changes:
+            change(current)
+        required = [Path(path) for path in required_paths]
+        staging = self.staging_directory()
+        with manifest_lock(self.target):
+            if _read_manifest_bytes(self.target) != self.snapshot:
+                raise NewProductionRunConflict(
+                    f"{self.target.name} was written by another writer after the new run was decided; the new run "
+                    "was not prepared, and the finished run's records are as that writer left them."
+                )
+            if os.path.lexists(self.output_directory):
+                raise NewProductionRunConflict(
+                    f"{self.output_directory} appeared after the new run was decided; the new run was not prepared."
+                )
+            gone = [path for path in required if not os.path.lexists(path)]
+            if gone:
+                raise NewProductionRunConflict(
+                    f"{len(gone)} alias(es) the new analysis CSV names no longer exist (the first is {gone[0]}): "
+                    "another prepare of this unit that made them abandoned them. The new run was not prepared; "
+                    "prepare it again."
+                )
+            os.rename(staging, self.output_directory)
+            try:
+                _write_json(self.target, current)
+            except BaseException:
+                os.rename(self.output_directory, staging)
+                raise
+            self.staging = None
+            self.committed = True
+        return {**current, "manifest_path": str(self.target)}
+
+    def abandon(self) -> dict[str, Any]:
+        """After a failure: remove the staging folder and the aliases this call made that no committed CSV names.
+
+        A no-op once committed. Under the manifest lock, so that a concurrent commit either has written its
+        manifest, whose CSV then protects the aliases it names, or finds them gone and refuses.
+        """
+        if self.committed:
+            return {"abandoned": False}
+        left: list[str] = []
+        kept: list[str] = []
+        if self.aliases_made:
+            from .repository_analysis_rows import remove_console_aliases
+
+            with manifest_lock(self.target):
+                try:
+                    committed = json.loads(_read_manifest_bytes(self.target).decode("utf-8-sig"))
+                except (OSError, ValueError):
+                    committed = None
+                if isinstance(committed, dict):
+                    named = _aliases_named_by_manifest(committed)
+                    removable = [item for item in self.aliases_made if not _alias_is_named(Path(item[1]), named)]
+                    kept = [str(item[1]) for item in self.aliases_made if _alias_is_named(Path(item[1]), named)]
+                else:
+                    # A manifest that cannot be read cannot say which aliases it names: none is removed.
+                    removable = [item for item in self.aliases_made if item[0] == "directory"]
+                    kept = [str(item[1]) for item in self.aliases_made if item[0] != "directory"]
+                left = remove_console_aliases(removable)
+            self.aliases_made = []
+        staging, self.staging = self.staging, None
+        if staging is not None and staging.exists():
+            # Only files this call wrote are in it: the reviewed metadata and the CSV.
+            shutil.rmtree(staging, ignore_errors=True)
+        return {
+            "abandoned": True,
+            "aliases_left": left,
+            "aliases_kept_for_committed_csv": kept,
+            "staging_left": bool(staging and staging.exists()),
+        }
+
+
+def _aliases_named_by_manifest(manifest: dict[str, Any]) -> set[str]:
+    """The paths (file keys) of every input an analysis CSV of this committed unit names, and their sidecars.
+
+    Read from the CSVs themselves - the current run's analysis_csv and each superseded run's - and from the
+    lineage rows record_analysis_csv wrote for them (console_path, console_alias and its sidecars), so that a
+    CSV that cannot be read still protects what its lineage recorded.
+    """
+    named: set[str] = set()
+
+    def add(path_text: Any) -> None:
+        if str(path_text or "").strip():
+            named.add(_file_key(str(path_text)))
+
+    def add_lineage(row: dict[str, Any]) -> None:
+        add(row.get("console_path"))
+        alias = row.get("console_alias")
+        if isinstance(alias, dict) and str(alias.get("path") or "").strip():
+            add(alias["path"])
+            for sidecar in alias.get("sidecars") or []:
+                add(Path(str(alias["path"])).with_name(str(sidecar)))
+
+    def add_csv(record: Any) -> None:
+        path_text = str((record or {}).get("path") or "").strip() if isinstance(record, dict) else ""
+        if not path_text:
+            return
+        try:
+            with open(extended_path(path_text), encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    add(row.get("file_path"))
+        except (OSError, ValueError, csv.Error):
+            pass
+
+    add_csv(manifest.get("analysis_csv"))
+    for row in (manifest.get("input_lineage") or {}).get("rows") or []:
+        if isinstance(row, dict):
+            add_lineage(row)
+    for run in manifest.get("superseded_runs") or []:
+        if not isinstance(run, dict):
+            continue
+        add_csv(run.get("analysis_csv"))
+        for row in run.get("input_lineage_written") or []:
+            if isinstance(row, dict):
+                add_lineage(row)
+    return named
+
+
+def _alias_is_named(link: Path, named: set[str]) -> bool:
+    """Whether a CSV names this alias, or the alias this sidecar travels with (alias-x.wiff.scan with alias-x.wiff2)."""
+    if _file_key(str(link)) in named:
+        return True
+    parent = _file_key(str(link.parent))
+    name = link.name.casefold()
+    for key in named:
+        path = Path(key)
+        if _file_key(str(path.parent)) == parent and name.startswith(path.stem.casefold() + "."):
+            return True
+    return False
+
+
+def begin_new_production_run(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], PendingNewProductionRun | None]:
+    """start_new_production_run decided in memory against the manifest on disk, to be committed with its CSV.
+
+    Returns (record, manifest, pending). record is start_new_production_run's, ``written`` false; where it did
+    not start, manifest is the one given and pending None. Otherwise manifest is the unit with the new run (the
+    view the rows are built from) and pending commits it (PendingNewProductionRun). Nothing is written or created.
+    """
+    if not str(manifest.get("manifest_path") or "").strip():
+        raise ValueError("A new production run is prepared on disk only for a manifest read from its path.")
+    target = Path(str(manifest["manifest_path"])).resolve()
+    snapshot = _read_manifest_bytes(target)
+    on_disk = json.loads(snapshot.decode("utf-8-sig"))
+    if not isinstance(on_disk, dict):
+        raise ValueError(f"{target.name} does not hold one JSON object.")
+    record, view = start_new_production_run({**on_disk, "manifest_path": str(target)}, write=False)
+    if not record["started"]:
+        return record, manifest, None
+    return record, view, PendingNewProductionRun(target, snapshot, set(on_disk), view, record)
+
+
+def superseded_validated_run(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """The newest run of this unit that validated and was superseded by a new run that has not, else None.
+
+    A raw deletion is judged by the unit's current run. While a new run prepared after a validated one has not
+    validated itself (prepared, running, failed), the raw data are kept for it: cleanup refuses, as the current
+    run is not validated, and discard refuses, as the unit did produce a validated output. Each says so with
+    this record. Once the new run validates, cleanup judges it as any other.
+    """
+    if str(manifest.get("status") or "") in PAST_PREFLIGHT_STATUSES:
+        return None
+    runs = manifest.get("superseded_runs") or []
+    for index in range(len(runs) - 1, -1, -1):
+        entry = runs[index]
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("status") or "") in CLEANUP_READY_STATUSES or entry.get("cleanup_allowed") is True:
+            return {
+                "superseded_run": index,
+                "status": str(entry.get("status") or ""),
+                "output_directory": str(entry.get("output_directory") or ""),
+                "finalized_at": entry.get("finalized_at"),
+                "superseded_at": entry.get("superseded_at"),
+            }
+    return None
+
+
+def _superseded_validated_text(found: dict[str, Any], current_status: str) -> str:
+    return (
+        f"A superseded run of this unit validated (superseded_runs[{found['superseded_run']}], status "
+        f"{found['status']!r}, output {found['output_directory']}), and the new run prepared after it (status "
+        f"{current_status!r}) has not. The raw data are kept for the new run: they are deleted by "
+        "msdial_cleanup_repository_raw once it validates, never discarded as a unit with no validated output."
+    )
 
 
 # The status a parent unit carries once it has been split. It is not in CLEANUP_READY_STATUSES and it
@@ -6644,6 +7329,18 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         _file_key(str(item.get("file") or "")): item
         for item in (parent.get("raw_metadata_preflight") or {}).get("summary", {}).get("per_file") or []
     }
+    from .raw_metadata_preflight import SPLIT_PARENT_DECLARED_FIELD
+
+    parent_declared_mode = _split_parent_declared(parent)
+    if parent_declared_mode is None:
+        parent_declared_mode = str(
+            ((parent.get("raw_metadata_preflight") or {}).get("declared") or _declared_technical(parent)).get(
+                "acquisition_mode"
+            )
+            or ""
+        ).strip()
+        if parent_declared_mode.casefold() == "unknown":
+            parent_declared_mode = ""
     data_root = str(parent.get("input_directory") or "").strip()
     files_of = _files_of_parts(
         list(parent_project.get("files") or []),
@@ -6759,6 +7456,9 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 "analysis_unit_id": plan["analysis_unit_id"],
                 "split_by": "raw_header_acquisition_mode" if label == part["acquisition_mode"] else "raw_header_split_key",
                 "acquisition_mode": part["acquisition_mode"],
+                # What the parent's repository record declared (decide_disposition holds a part to it where it
+                # keeps MS1-only inputs out of a DDA run); "" where it declared nothing.
+                SPLIT_PARENT_DECLARED_FIELD: parent_declared_mode,
                 **({"split_key": part["split_key"]} if label != part["acquisition_mode"] else {}),
             },
             "workspace": str(root),
@@ -6998,13 +7698,25 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             "unit by per-file acquisition mode before running MS-DIAL."
         )
     header_modes = _header_acquisition_by_file(manifest)
+    # The Console type a file's header alone gives (header_console_acquisition_type: DDA, SWATH or AIF) binds
+    # every row of that file, whatever a disposition decided (user decision, 2026-10-06): a header that gives
+    # one decides the file over any declaration, so a row that contradicts it is a disposition, or a workflow,
+    # gone wrong, and the run would complete, validate and be wrong.
+    header_types = _header_console_type_by_file(manifest)
     # The type an applied campaign disposition decided a file runs as - from its header, from the
-    # repository's declaration where no header could be read or a low-confidence one disagreed, or DDA for
-    # an MS1-only file folded into a DDA run - is the one type that file may run as. A file with no decision
-    # is held to what its header alone admits, as before dispositions existed. Both are recorded against the
-    # input, so a row that reads it through a Console alias is looked up as that input.
+    # repository's declaration where no header could be read or a DIA header left SWATH and AIF open, or DDA
+    # for an MS1-only file folded into a DDA run - is the one type that file may run as. A file with no
+    # decision is held to what its header alone admits, as before dispositions existed. All are recorded
+    # against the input, so a row that reads it through a Console alias is looked up as that input.
     decided_types = _decided_acquisition_by_file(manifest)
-    if header_modes or decided_types:
+    # An applied disposition decided before the header-first rule (Interactive 0.5.29, which records
+    # declared_acquisition_source on every disposition) may run what that rule excludes: an MS1-only file
+    # folded into the DDA run of a unit declared DIA, or a file whose header gives no acquisition mode, taken
+    # at the declaration. It is decided again here from the same records, as classify_preflight would, and
+    # changes nothing: a row that decision would not run refuses the run until the unit is decided again.
+    legacy_refusals = _legacy_disposition_refusals(manifest, state.get("files") or [], aliases)
+    blockers.extend(legacy_refusals)
+    if header_modes or header_types or decided_types:
         disagreeing = []
         undecided_as = []
         for item in state.get("files") or []:
@@ -7013,6 +7725,10 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
                 continue
             input_key = _file_key(_unit_input_of(path_text, aliases))
             given = str(item.get("acquisition_type") or "").strip()
+            requested = given or "DDA"
+            header_type = header_types.get(input_key)
+            if header_type and requested != header_type:
+                disagreeing.append(f"{Path(path_text).name} (header gives {header_type}, run as {given or 'no type'})")
             decided = decided_types.get(input_key)
             if decided:
                 if given != decided:
@@ -7021,8 +7737,7 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
                     undecided_as.append(f"{Path(path_text).name} (decided {decided}, run as {given or 'no type'})")
                 continue
             header = header_modes.get(input_key)
-            requested = given or "DDA"
-            if header and requested not in HEADER_ACQUISITION_TO_MSDIAL.get(header, {header}):
+            if not header_type and header and requested not in HEADER_ACQUISITION_TO_MSDIAL.get(header, {header}):
                 disagreeing.append(f"{Path(path_text).name} (header {header}, run as {requested})")
         if disagreeing:
             blockers.append(
@@ -7107,6 +7822,111 @@ def _header_acquisition_by_file(manifest: dict[str, Any]) -> dict[str, str]:
         if path_text and mode in HEADER_ACQUISITION_TO_MSDIAL:
             result[_file_key(path_text)] = mode
     return result
+
+
+def _header_console_type_by_file(manifest: dict[str, Any]) -> dict[str, str]:
+    """The Console type (DDA, SWATH or AIF) each inspected file's own header gives, keyed by resolved path.
+
+    header_console_acquisition_type, which no disposition rewrites; a record written before it existed gives
+    DDA or AIF as its acquisition_mode says, and nothing for DIA, whose scheme it did not record.
+    """
+    from .raw_metadata_preflight import entry_header_console
+
+    summary = (manifest.get("raw_metadata_preflight") or {}).get("summary") or {}
+    result = {}
+    for item in summary.get("per_file") or []:
+        path_text = str(item.get("file") or "").strip() if isinstance(item, dict) else ""
+        console = entry_header_console(item) if path_text else None
+        if console == "AIF" and str(item.get("acquisition_mode") or "").strip() == "DIA":
+            # A DIA header with no recorded isolation target (header_no_isolation): the extractor records
+            # targets only from MS2 headers that carry a precursor m/z, so a vendor read without one gives none
+            # for windowed DIA too. It binds nothing; the header's DIA admits SWATH or AIF, and a disposition's
+            # decided type still binds.
+            continue
+        if console in {"DDA", "SWATH", "AIF"}:
+            result[_file_key(path_text)] = console
+    return result
+
+
+# The bases of an assignment that a header did not settle (raw_metadata_preflight.decide_disposition): the
+# declaration's SWATH or AIF, and AIF for a DIA header that recorded no isolation target, which is the extractor's
+# reading of MS2 headers with no precursor m/z and not evidence of all-ion acquisition. A legacy row of another
+# type for such a file is no contradiction of its header.
+_UNSETTLED_ASSIGNMENT_BASES = {"declaration", "header_no_isolation"}
+
+
+def _legacy_disposition_refusals(
+    manifest: dict[str, Any], files: list[dict[str, Any]], aliases: dict[str, str]
+) -> list[str]:
+    """Blockers for the rows an applied pre-0.5.29 disposition runs and the header-first rule would not.
+
+    Empty for a unit with no applied disposition, or one decided from 0.5.29 on (it records
+    declared_acquisition_source). Otherwise the unit is decided again from its recorded preflight
+    (_decide_recorded_preflight), in memory: the run is refused where that decision does not run the unit as
+    one, excludes a row's file, or gives it another type on its header's word.
+    """
+    from .raw_metadata_preflight import file_key
+
+    applied = _applied_disposition(manifest)
+    if not applied or "declared_acquisition_source" in applied:
+        return []
+    again_hint = (
+        "Prepare the unit again (msdial_prepare_repository_reanalysis with confirmed=true, or under its campaign "
+        "approval): that decides it again from its recorded preflight and writes the analysis CSV from the new "
+        "decision."
+        if finished_production_run(manifest) is None
+        else "Its run has finished, and that run's records stand. To run it again, prepare a new production run "
+        "(msdial_prepare_repository_reanalysis with new_run=true and confirmed=true): that moves the finished "
+        "run's records into superseded_runs, decides the unit again from its recorded preflight, and writes the "
+        "analysis CSV into a new output directory."
+    )
+    try:
+        again = _decide_recorded_preflight(manifest)
+    except Exception as error:  # A gate that cannot decide refuses rather than runs.
+        return [
+            "This unit's campaign disposition was decided before Interactive 0.5.29 took each file's acquisition "
+            f"from its raw header first, and could not be decided again here ({type(error).__name__}). "
+            + again_hint
+        ]
+    kind = str(again.get("disposition") or "")
+    if kind != "run":
+        return [
+            "This unit's campaign disposition was decided before Interactive 0.5.29 took each file's acquisition "
+            f"from its raw header first (user decision, 2026-10-06); decided again from the same records, the "
+            f"unit would {kind} ({', '.join(again.get('reasons') or []) or 'no reason recorded'}), not run. "
+            + again_hint
+        ]
+    assigned = again.get("assignments") or {}
+    excluded_now = {
+        file_key(str(item.get("path") or "")): str(item.get("reason") or "")
+        for item in again.get("excluded_inputs") or []
+        if isinstance(item, dict)
+    }
+    refused = []
+    for item in files:
+        path_text = str(item.get("file_path") or "").strip()
+        if not path_text:
+            continue
+        key = file_key(_unit_input_of(path_text, aliases))
+        given = str(item.get("acquisition_type") or "").strip() or "no type"
+        assignment = assigned.get(key)
+        if assignment is None:
+            refused.append(f"{Path(path_text).name} (now {excluded_now.get(key) or 'not decided'})")
+        elif (
+            assignment.get("console_acquisition_type") != given
+            and str(assignment.get("basis") or "") not in _UNSETTLED_ASSIGNMENT_BASES
+        ):
+            refused.append(
+                f"{Path(path_text).name} (now {assignment.get('console_acquisition_type')} on the basis "
+                f"{assignment.get('basis')}, run as {given})"
+            )
+    if not refused:
+        return []
+    return [
+        f"{len(refused)} input files would run as a campaign disposition decided before Interactive 0.5.29 took "
+        "each file's acquisition from its raw header first (user decision, 2026-10-06), and decided again from "
+        f"the same records they would not; the first is {refused[0]}. " + again_hint
+    ]
 
 
 def _applied_disposition(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -7477,6 +8297,9 @@ def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
         )
     if not manifest.get("cleanup_allowed"):
         blockers.append("cleanup_allowed is not true; the run did not produce a validated mzTab-M output.")
+    validated_before = superseded_validated_run(manifest)
+    if validated_before is not None:
+        blockers.append(_superseded_validated_text(validated_before, str(manifest.get("status") or "")))
     if not retained:
         blockers.append("No retained artifacts are recorded, so nothing would survive the deletion.")
     if missing:
@@ -8457,6 +9280,9 @@ def plan_download_discard(manifest_path: Path, *, authorized: bool = False) -> d
     blockers: list[str] = []
     if status in {"mztab_validated", "completed", "cleanup_pending_confirmation", "raw_cleaned"}:
         blockers.append("Validated/completed runs must use the normal cleanup command.")
+    validated_before = superseded_validated_run(manifest)
+    if validated_before is not None:
+        blockers.append(_superseded_validated_text(validated_before, status))
     if status == "downloading":
         owner_state = lease_owner_state(manifest)
         if owner_state["state"] != "gone":
@@ -8655,6 +9481,11 @@ def discard_download_lease(
                 }
         elif manifest.get("status") in {"mztab_validated", "completed", "raw_cleaned"}:
             raise ValueError("Validated/completed runs must use the normal cleanup command.")
+        elif superseded_validated_run(manifest) is not None:
+            raise ValueError(
+                _superseded_validated_text(superseded_validated_run(manifest), str(manifest.get("status") or ""))
+                + " Discard was refused."
+            )
         stale: dict[str, Any] | None = None
         if downloading:
             # Written before the first byte of a lease. A lease that is still running writes into the tree
@@ -8783,6 +9614,9 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
     (cleanup_split_parent). What a part's discard can do is say that this part no longer needs it - a run
     failed after its retries, a refusal before production - which is what lets the parent's release count it
     as ended. Its output is kept, an mzTab-M and its failure record among the failure artifacts.
+
+    Refused, with nothing recorded, for a validated part, one whose Console may still run, and one with a new
+    run prepared after a validated run that has not validated (superseded_validated_run, review r7-62).
     """
     with _raw_deletion_lock(manifest_path):
         manifest = read_manifest(manifest_path)
@@ -8790,6 +9624,12 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
         blockers: list[str] = []
         if status in {"mztab_validated", "completed", "cleanup_pending_confirmation", "raw_cleaned"}:
             blockers.append("Validated/completed runs must use the normal cleanup command.")
+        # The rule cleanup and a unit's own discard follow holds for a part too (review r7-62): a part whose new
+        # run, prepared after a validated run, has not validated has not ended, and its discard would let the
+        # parent's release delete the raw data that new run reads.
+        validated_before = superseded_validated_run(manifest)
+        if validated_before is not None:
+            blockers.append(_superseded_validated_text(validated_before, status))
         attempt = _live_run_attempt_in(manifest)
         if attempt is not None:
             blockers.append(
@@ -8854,12 +9694,27 @@ def _part_end(part: dict[str, Any], parent_raw: Path) -> dict[str, Any]:
     hook records for a Console that exits non-zero and for one that exits 0 without a validated mzTab-M alike);
     skipped or excluded (by its campaign disposition, or at the split); or discarded (its own discard under an
     approval). Anything else - not yet preflighted, prepared, running, failed with retries left - has not.
+
+    A part with a new run prepared after a validated run, which has not validated itself, has not ended either,
+    whatever its status and however many runs failed (superseded_validated_run): its raw data are held for that
+    run, as a unit's own are (review r7-62). That includes a part discarded while such a run was pending, which
+    52b470b let an approval do.
     """
     status = str(part.get("status") or "")
     blockers: list[str] = []
     failures = len([item for item in part.get("run_failures") or [] if isinstance(item, dict)])
     retained = [str(item) for item in part.get("retained_artifacts") or []]
-    if status in CLEANUP_READY_STATUSES or status == "raw_cleaned":
+    validated_before = superseded_validated_run(part)
+    if validated_before is None and status == "discarded":
+        validated_before = superseded_validated_run({**part, "status": ""})
+    if validated_before is not None:
+        state = "pending"
+        blockers.append(
+            f"it is {status or 'unrecorded'!r}, and its run superseded_runs[{validated_before['superseded_run']}] "
+            f"validated (status {validated_before['status']!r}) before a new run was prepared that has not "
+            "validated; the raw data are held for that new run, and the part has not ended"
+        )
+    elif status in CLEANUP_READY_STATUSES or status == "raw_cleaned":
         state = "released" if status == "raw_cleaned" else "validated"
         if state == "validated" and not part.get("cleanup_allowed"):
             blockers.append("cleanup_allowed is not true")
@@ -8930,7 +9785,8 @@ def plan_split_parent_cleanup(manifest_path: Path) -> dict[str, Any]:
        reads them.
     4. The parts' inputs, with the inputs a campaign disposition excluded, are the parent's inputs, each once.
     5. Every part has ended (_part_end): validated, released, failed after its retries, skipped, excluded or
-       discarded; none has a Console that may still be running, and none keeps an artifact under the tree.
+       discarded; none has a Console that may still be running, and none keeps an artifact under the tree. A
+       part with a new run prepared after a validated run, which has not validated, has not ended.
     6. No finalisation hold stands on the parent or a part (run_finalisation.raw_deletion_holds).
 
     The release is ``released`` when some part's outputs validated, else ``discarded``. The authorization - a
@@ -11409,6 +12265,11 @@ def recorded_order_source(manifest_path: Any, files: list[dict[str, Any]]) -> st
 
 def record_analytical_order(manifest_path: str | Path, record: dict[str, Any]) -> None:
     """Keep how the analysis CSV's analytical order was decided in the unit's own manifest."""
+    update_manifest(Path(manifest_path), analytical_order_change(record))
+
+
+def analytical_order_change(record: dict[str, Any]) -> Any:
+    """The change record_analytical_order makes, for a write that carries it with the CSV it describes."""
     kept = {key: value for key, value in record.items() if key != "orders"} | {
         "recorded_at": datetime.now(timezone.utc).isoformat()
     }
@@ -11416,7 +12277,7 @@ def record_analytical_order(manifest_path: str | Path, record: dict[str, Any]) -
     def change(manifest: dict[str, Any]) -> None:
         manifest["analytical_order"] = kept
 
-    update_manifest(Path(manifest_path), change)
+    return change
 
 
 def _metadata_value(record: dict[str, Any], section: str, field_name: str) -> str:
