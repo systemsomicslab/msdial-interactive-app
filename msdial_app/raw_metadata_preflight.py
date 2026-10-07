@@ -573,12 +573,44 @@ def header_console_acquisition_type(method: str, isolation_targets: Any) -> tupl
 # deconvolutes it the same way (ST004304 gave identical results; MTBKS281 matched its 30 eV collection). An AIF
 # unit with more than one is HELD: it is not run, its raw data are kept, and the hold is no failure. An AIF unit
 # whose collision energies are not recorded is held as well, since one energy cannot be shown.
+#
+# MULTI-ENERGY AIF WITH #825 (Interactive 0.5.34). The hold was "until the patched Console", and #825 is that
+# Console: it deconvolutes a multi-energy AIF file once per energy and represents each peak by the energy of its
+# MS/MS reference-spectrum match, or else by the energy whose spectrum has the most product ions. Where the
+# configured Console carries #825 (workflow.multi_energy_aif_console, the probe recorded on the disposition as
+# multi_energy_aif_console), a unit whose AIF inputs share more than one recorded MS2 collision energy runs as AIF
+# under AIF_MULTI_CE_RULE, recorded as aif_multi_ce_run and on each assignment as basis AIF_MULTI_CE_BASIS. The
+# Console reads the energies from the raw data itself, so nothing else is written for them. Single-energy AIF still
+# runs as SWATH (validated identical), and AIF with an unrecorded energy is still held: the #825 Console stops on an
+# AIF file with no MS2 collision energy. Without #825 everything stays as above.
+#
+# #825 chooses among the energies of one file only: it writes one .dcl per energy of a file that has several, and a
+# file with one energy keeps its single .dcl, whose spectrum is taken as it is. So the unit runs as AIF only when
+# every input records the same energies, more than one (AIF_MULTI_CE_RULE's per-file condition). Inputs whose
+# energies differ from one another (one energy each but not the same one, or different sets) are held with that
+# Console under AIF_CE_DIFFERS_HOLD instead: #825 settles no representative energy across files, and aligning
+# samples acquired at different energies is a scientific decision. Without #825 such a unit is held as before
+# (AIF_MULTI_CE_HOLD).
 AIF_AS_SWATH_RULE = "single_ce_aif_as_swath_2026_10_07"
 AIF_AS_SWATH_BASIS = "aif_single_ce_as_swath"
 AIF_MULTI_CE_HOLD = "aif_multi_ce_awaiting_console"
 AIF_CE_UNRECORDED_HOLD = "aif_collision_energy_unrecorded"
+AIF_MULTI_CE_RULE = "multi_ce_aif_with_console_825"
+AIF_CE_DIFFERS_HOLD = "aif_collision_energies_differ_between_inputs"
+AIF_MULTI_CE_BASIS = "aif_multi_ce_console_825"
 # The collision energies are compared to 0.1 eV.
 COLLISION_ENERGY_DECIMALS = 1
+
+
+def multi_energy_aif_ready(console: Mapping[str, Any] | None) -> bool:
+    """Whether a multi_energy_aif_console record (workflow.multi_energy_aif_console) shows #825 in the Console."""
+    from .workflow import MULTI_ENERGY_AIF_CAPABILITY
+
+    return (
+        isinstance(console, Mapping)
+        and console.get("capability") == MULTI_ENERGY_AIF_CAPABILITY
+        and console.get("available") is True
+    )
 
 
 def collision_energy_fields(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -1120,6 +1152,7 @@ def decide_disposition(
     extractor: Mapping[str, Any] | None = None,
     decided_at: str | None = None,
     parent_declared: str | None = None,
+    multi_energy_aif_console: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """What a campaign does with a unit, from its recorded preflight. Never raises; changes nothing.
 
@@ -1158,6 +1191,15 @@ def decide_disposition(
     skip, with AIF_MULTI_CE_HOLD among the reasons and hold true, no assignment, and aif_collision_energies; so
     does an input that records none (AIF_CE_UNRECORDED_HOLD). A unit to be split is split first, and each part is
     decided by the rule on its own.
+
+    MULTI-ENERGY AIF WITH #825 (AIF_MULTI_CE_RULE). ``multi_energy_aif_console`` is the probe of the configured
+    Console (workflow.multi_energy_aif_console); every AIF unit's disposition records it as given. Where it shows
+    #825 (multi_energy_aif_ready), more than one energy runs the unit as AIF instead of holding it, recorded as
+    aif_multi_ce_run (the energies and the rule) beside the probe, and on each assignment as basis AIF_MULTI_CE_BASIS,
+    but only where every input records those same energies: #825 chooses among the energies of one file, never
+    across files. Inputs whose energies differ from one another are held with that Console (AIF_CE_DIFFERS_HOLD,
+    with aif_collision_energies_by_input). One energy runs as SWATH and an unrecorded energy holds, with that
+    Console as without it. None, or a probe without the marker, decides as before #825.
     """
     def mapping(value: Any) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
@@ -1610,37 +1652,109 @@ def decide_disposition(
         # every input that runs: one runs the unit as SWATH, more than one holds it, and none recorded holds it.
         energies: set[float] = set()
         unrecorded: list[str] = []
+        # Each recorded input's own energies: #825 chooses among the energies of one file, never across files.
+        by_input: dict[str, list[float]] = {}
+        recorded_sets: set[tuple[float, ...]] = set()
         for assignment in assignments.values():
             entry = per_file.get(file_key(assignment["path"])) or {}
             values = entry.get("ms2_collision_energies")
             if not isinstance(values, list) or not values:
                 unrecorded.append(assignment["path"])
                 continue
+            own: set[float] = set()
             for value in values:
                 try:
-                    energies.add(round(float(value), COLLISION_ENERGY_DECIMALS))
+                    own.add(round(float(value), COLLISION_ENERGY_DECIMALS))
                 except (TypeError, ValueError):
                     continue
+            energies |= own
+            by_input[Path(str(assignment["path"])).name] = sorted(own)
+            recorded_sets.add(tuple(sorted(own)))
         listed = sorted(energies)
-        if unrecorded or len(listed) > 1:
+        differ = len(recorded_sets) > 1
+        # The configured Console's #825 probe, recorded as given on every AIF unit's disposition, so the gate and
+        # the reports can see what the hold or the run was decided for.
+        probe = (
+            {"multi_energy_aif_console": dict(multi_energy_aif_console)}
+            if isinstance(multi_energy_aif_console, Mapping)
+            else {}
+        )
+        ready = multi_energy_aif_ready(multi_energy_aif_console)
+        held_for_differing = len(listed) > 1 and ready and differ
+        if unrecorded or (len(listed) > 1 and not ready) or held_for_differing:
             assignments.clear()
-            if len(listed) > 1:
+            if held_for_differing:
+                reasons.append(AIF_CE_DIFFERS_HOLD)
+                sets = sorted({tuple(own) for own in by_input.values()})
+                parts = []
+                for values in sets:
+                    names = sorted(name for name, own in by_input.items() if tuple(own) == values)
+                    parts.append(
+                        ", ".join(f"{value:g}" for value in values) + " eV in " + ", ".join(names[:3])
+                        + (f" and {len(names) - 3} more" if len(names) > 3 else "")
+                    )
+                detail.append(
+                    "The unit runs as AIF, and its inputs record different MS2 collision energies ("
+                    + "; ".join(parts) + "). "
+                    "The configured Console has multi-energy AIF processing (MsdialWorkbench#825), but it chooses a "
+                    "representative energy only among the energies of one file; a file with one energy keeps that "
+                    "energy's spectrum, so samples acquired at different energies would be aligned as one AIF run. "
+                    "The unit is held, not run, and its raw data are kept for a review of which inputs belong "
+                    f"together ({AIF_CE_DIFFERS_HOLD})."
+                )
+            if len(listed) > 1 and not ready:
                 reasons.append(AIF_MULTI_CE_HOLD)
                 detail.append(
                     f"The unit runs as AIF with {len(listed)} distinct MS2 collision energies ("
                     + ", ".join(f"{value:g} eV" for value in listed)
                     + "). Multi-energy AIF is held, not run, and its raw data are kept until a Console that settles "
-                    f"an all-ion spot's representative collision energy exists ({AIF_AS_SWATH_RULE})."
+                    f"an all-ion spot's representative collision energy exists ({AIF_AS_SWATH_RULE}); "
+                    "the configured Console has no multi-energy AIF processing (MsdialWorkbench#825; probe "
+                    f"{str((multi_energy_aif_console or {}).get('probe') or 'not_probed')}). Preflight the unit again "
+                    "with a Console that has it."
                 )
             if unrecorded:
                 reasons.append(AIF_CE_UNRECORDED_HOLD)
                 detail.append(
                     f"The unit runs as AIF, and the raw headers of {len(unrecorded)} of its inputs record no MS2 "
                     "collision energy, so one energy cannot be shown for the unit. It is held, not run, and its raw "
-                    f"data are kept until a Console that settles an all-ion spot's collision energy exists "
-                    f"({AIF_AS_SWATH_RULE})."
+                    + (
+                        "data are kept: the configured Console has multi-energy AIF processing (MsdialWorkbench#825), "
+                        "but which energies it would deconvolute is not shown, and it stops on an AIF file whose MS2 "
+                        "scans carry no collision energy."
+                        if ready
+                        else "data are kept until a Console that settles an all-ion spot's collision energy exists "
+                        f"({AIF_AS_SWATH_RULE})."
+                    )
                 )
-            return result("skip", hold=True, aif_collision_energies=listed)
+            return result(
+                "skip",
+                hold=True,
+                aif_collision_energies=listed,
+                **({"aif_collision_energies_by_input": dict(sorted(by_input.items()))} if held_for_differing else {}),
+                **probe,
+            )
+        if len(listed) > 1:
+            # MULTI-ENERGY AIF WITH #825 (AIF_MULTI_CE_RULE): every input records these same energies; run as AIF.
+            # The Console reads the energies from the data.
+            for assignment in assignments.values():
+                assignment.update(basis=AIF_MULTI_CE_BASIS)
+            detail.append(
+                f"Each of the unit's {len(assignments)} AIF input(s) records the same {len(listed)} MS2 collision "
+                "energies ("
+                + ", ".join(f"{value:g} eV" for value in listed)
+                + "), and the configured Console has multi-energy AIF processing (MsdialWorkbench#825): it "
+                "deconvolutes each energy separately and represents each peak by the energy of its MS/MS "
+                "reference-spectrum match, or else by the energy whose spectrum has the most product ions. The unit "
+                f"runs as AIF ({AIF_MULTI_CE_RULE})."
+            )
+            return result(
+                "run",
+                console_acquisition_type="AIF",
+                ion_mode=polarity,
+                aif_multi_ce_run={"collision_energies": listed, "rule": AIF_MULTI_CE_RULE},
+                **probe,
+            )
         for assignment in assignments.values():
             assignment.update(console_acquisition_type="SWATH", basis=AIF_AS_SWATH_BASIS)
         detail.append(
@@ -1653,5 +1767,6 @@ def decide_disposition(
             console_acquisition_type="SWATH",
             ion_mode=polarity,
             aif_run_as_swath={"collision_energies": listed, "rule": AIF_AS_SWATH_RULE},
+            **probe,
         )
     return result("run", console_acquisition_type=console, ion_mode=polarity)

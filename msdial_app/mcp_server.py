@@ -1864,6 +1864,7 @@ def msdial_repository_raw_metadata_preflight(
     port: int = DEFAULT_PORT,
     manifest_path: str = "",
     campaign_authorization_path: str = "",
+    console_path: str = "",
 ) -> dict[str, Any]:
     """Read every downloaded input file's header with the local raw-metadata parser.
 
@@ -1883,6 +1884,15 @@ def msdial_repository_raw_metadata_preflight(
 
     Give manifest_path instead of download_job_id to reach a unit whose download job the backend no
     longer holds.
+
+    The disposition is decided for the MS-DIAL Console that will run the unit: console_path, else the saved
+    console_path setting (msdial_set_console_path), else MSDIAL_CONSOLE_PATH. Its assembly is read, never started,
+    for MsdialWorkbench#825's multi-energy AIF processing: with it, an AIF unit every input of which records the
+    same MS2 collision energies, more than one, runs as AIF (aif_multi_ce_run) instead of being held
+    (aif_multi_ce_awaiting_console), and preflighting a held unit again with such a Console is how its hold is
+    released. #825 chooses among one file's energies, never across files, so inputs whose energies differ from one
+    another stay held (aif_collision_energies_differ_between_inputs). Single-energy AIF still runs as SWATH, and AIF
+    with an unrecorded energy is still held.
     """
     _, manifest = _repository_unit(download_job_id, manifest_path, host, port)
     from .raw_metadata_extractor import select_raw_metadata_extractor
@@ -1912,6 +1922,7 @@ def msdial_repository_raw_metadata_preflight(
         campaign_authorization_path=campaign_authorization_path or None,
         require_pinned_extractor=campaign is not None,
         extractor_source=str(selected.get("source") or ""),
+        console_path=console_path or None,
     )
     raw = result.get("raw_metadata_preflight") or {}
     # The per-file verdicts stay in the manifest; a unit of several hundred files would otherwise
@@ -1955,6 +1966,37 @@ def msdial_repository_raw_metadata_preflight(
             "split_by": (disposition.get("split_key") or {}).get("by") or [],
             "console_acquisition_type": disposition.get("console_acquisition_type"),
             "ion_mode": disposition.get("ion_mode"),
+            # AIF units only: the energies, the rule each AIF decision was taken under, and the Console probe.
+            **{
+                key: disposition[key]
+                for key in ("aif_run_as_swath", "aif_multi_ce_run", "aif_collision_energies")
+                if key in disposition
+            },
+            # A hold for energies that differ between inputs: each distinct set with its file count, not every file.
+            **(
+                {
+                    "aif_collision_energy_sets": [
+                        {"collision_energies": list(values), "file_count": count}
+                        for values, count in sorted(
+                            Counter(
+                                tuple(own) for own in disposition["aif_collision_energies_by_input"].values()
+                            ).items()
+                        )
+                    ]
+                }
+                if isinstance(disposition.get("aif_collision_energies_by_input"), dict)
+                else {}
+            ),
+            **(
+                {
+                    "multi_energy_aif_console": {
+                        key: (disposition.get("multi_energy_aif_console") or {}).get(key)
+                        for key in ("available", "probe", "console_source", "console_assembly", "assembly_sha256")
+                    }
+                }
+                if isinstance(disposition.get("multi_energy_aif_console"), dict)
+                else {}
+            ),
         },
     }
 
@@ -2642,6 +2684,7 @@ def _prepare_repository_rows_from_lineage(
         # Archive members no sample row pairs with, run as unattributed inputs (2026-10-07).
         "unattributed_inputs": list(built.get("unattributed_inputs") or []),
         **({"aif_run_as_swath": dict(built["aif_run_as_swath"])} if built.get("aif_run_as_swath") else {}),
+        **({"aif_multi_ce_run": dict(built["aif_multi_ce_run"])} if built.get("aif_multi_ce_run") else {}),
         "answer_seed": answer_seed,
         "qa_internal_standard_evidence": repository_internal_standard_evidence(projected),
         "analytical_order": {

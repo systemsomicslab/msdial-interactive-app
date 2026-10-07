@@ -210,6 +210,21 @@ def _guided_sheet(workflow: dict[str, Any]) -> dict[str, Any]:
             rows.append(_row([label, _guided_value(key, workflow.get(key)), note], "body_left"))
             represented.add(key)
 
+    multi_energy_aif = workflow.get("multi_energy_aif_evidence") or {}
+    represented.add("multi_energy_aif_evidence")
+    if multi_energy_aif:
+        rows.append(_section("Multi-energy AIF", 3))
+        rows.append(_row(["Field", "Value", "Unit or note"], "header"))
+        for key, label in (
+            ("collision_energies_ev", "MS2 collision energies (eV)"),
+            ("aif_files", "AIF analysis files"),
+            ("deconvolution", "Deconvolution"),
+            ("representative_energy", "Representative MS/MS spectrum per feature"),
+            ("rule", "Campaign rule"),
+            ("console_assembly_sha256", "Console assembly sha256"),
+        ):
+            rows.append(_row([label, _typed_value(multi_energy_aif.get(key)), "Campaign disposition"], "body_left"))
+
     automatic_rt_evidence = workflow.get("automatic_rt_correction_evidence") or {}
     represented.add("automatic_rt_correction_evidence")
     if automatic_rt_evidence.get("requested"):

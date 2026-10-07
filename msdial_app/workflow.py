@@ -172,6 +172,20 @@ AUTOMATIC_RT_CORRECTION_CONSOLE_MARKERS = (
 )
 # The lowercase key #826's ConfigParser reads; the title-case label is in MsdialCore.dll.
 AUTOMATIC_RT_LOCAL_SUPPORT_CONSOLE_MARKERS = (AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_METHOD_KEY,)
+# MsdialWorkbench#825: multi-energy AIF. The Console deconvolutes an AIF file once per collision energy (one
+# "<name>_<CE x 100>.dcl" each) and represents each peak, in the per-file export and in alignment, by the energy of
+# its MS/MS reference-spectrum match, or else by the energy whose spectrum has the most product ions. Before it, the
+# Console read one unsuffixed .dcl that a multi-energy AIF file never has. The markers are messages of #825's
+# RepresentativeDeconvolutionReader, which lives in the Console assembly (MSDIALCUI) and nowhere else: absent from the
+# Console of db6406a85 (master f0583493a), present in that of 6a0cc403d (master bb90e0e51). Every marker is required.
+# The second came earlier, with 01ac842c1 (per-energy .dcl files), and a local AIF patch build carries it alone while
+# its reader still takes an unannotated peak's spectrum from the first energy's file; only the first came with
+# ca6046f48, the commit of the most-product-ions rule and of the per-file reader (LoadPerFileResults) that applies it.
+MULTI_ENERGY_AIF_CAPABILITY = "multi_energy_aif_representative_collision_energy"
+MULTI_ENERGY_AIF_CONSOLE_MARKERS = (
+    "The collision-energy files of ",
+    " nor a collision-energy file exists.",
+)
 
 
 def console_assembly_path(console_path: str | Path) -> Path:
@@ -4740,7 +4754,76 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
     ):
         capabilities.add(AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY)
         probes.append("automatic RT local support marker")
+    if _has_every_marker(binary, MULTI_ENERGY_AIF_CONSOLE_MARKERS):
+        capabilities.add(MULTI_ENERGY_AIF_CAPABILITY)
+        probes.append("multi-energy AIF marker")
     return {
         "capability_probe": " + ".join(probes) if probes else "unsupported",
         "capabilities": sorted(capabilities),
     }
+
+
+def _has_marker(binary: bytes, marker: str) -> bool:
+    return marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary
+
+
+def _has_every_marker(binary: bytes, markers: Iterable[str]) -> bool:
+    markers = tuple(markers)
+    return bool(markers) and all(_has_marker(binary, marker) for marker in markers)
+
+
+def configured_console_path(console_path: str | Path | None = None) -> tuple[str, str]:
+    """(the Console a repository preflight decides for, where it was named): the argument, else the saved
+    console_path setting, else MSDIAL_CONSOLE_PATH; ("", "") when none is named. Nothing is searched for: a
+    Console found by guessing is not the one the operator configured."""
+    for value, source in (
+        (console_path, "argument"),
+        (load_user_settings().get("console_path"), "saved setting"),
+        (os.environ.get("MSDIAL_CONSOLE_PATH"), "MSDIAL_CONSOLE_PATH"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text, source
+    return "", ""
+
+
+def multi_energy_aif_console(console_path: str | Path | None = None) -> dict[str, Any]:
+    """Whether the configured Console has MsdialWorkbench#825's multi-energy AIF processing. Changes nothing.
+
+    Reads the Console assembly's bytes for MULTI_ENERGY_AIF_CONSOLE_MARKERS and never starts the Console (unlike
+    console_capabilities, whose rtcorrection probe does). The record is what a campaign disposition keeps for an AIF
+    unit (multi_energy_aif_console): available true only where every marker was found in the assembly named, with
+    that assembly's sha256, so the gate and the reports can see which Console a multi-energy unit was released for.
+    An assembly with some markers but not all (probe marker_incomplete) is a build from before #825's
+    representative-energy rule, and is no capability.
+    """
+    path_text, source = configured_console_path(console_path)
+    record: dict[str, Any] = {
+        "capability": MULTI_ENERGY_AIF_CAPABILITY,
+        "available": False,
+        "console_path": path_text,
+        "console_source": source,
+        "console_assembly": "",
+        "assembly_sha256": "",
+        "probe": "",
+    }
+    if not path_text:
+        record["probe"] = "no_console_configured"
+        return record
+    path = Path(path_text).expanduser()
+    if not path.is_file():
+        record["probe"] = "console_missing"
+        return record
+    assembly = console_assembly_path(path)
+    try:
+        binary = assembly.read_bytes()
+    except OSError:
+        record["probe"] = "console_unreadable"
+        return record
+    record["console_assembly"] = assembly.name
+    record["assembly_sha256"] = hashlib.sha256(binary).hexdigest()
+    present = [_has_marker(binary, marker) for marker in MULTI_ENERGY_AIF_CONSOLE_MARKERS]
+    found = all(present)
+    record["available"] = found
+    record["probe"] = "multi_energy_aif_marker" if found else ("marker_incomplete" if any(present) else "marker_absent")
+    return record

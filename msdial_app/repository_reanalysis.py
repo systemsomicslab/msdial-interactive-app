@@ -5453,6 +5453,7 @@ def run_raw_metadata_preflight(
     campaign_authorization_path: str | Path | None = None,
     require_pinned_extractor: bool = False,
     extractor_source: str = "",
+    console_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Read every input's raw header, record what was read, and decide the unit's campaign disposition.
 
@@ -5468,9 +5469,16 @@ def run_raw_metadata_preflight(
     A campaign unit that disposition_hold holds - split, finished, or with a run of its own open - is not
     read at all: the manifest is returned as it is, with preflight_held saying why. Its recorded
     disposition stands, since a campaign acts on whatever disposition the unit carries.
+
+    The disposition is decided for the configured Console (console_path, else the saved console_path setting,
+    else MSDIAL_CONSOLE_PATH): whether it has MsdialWorkbench#825's multi-energy AIF processing decides whether a
+    multi-energy AIF unit runs as AIF or is held (workflow.multi_energy_aif_console; read from the assembly, the
+    Console is not started). A unit held for multi-energy AIF is released by preflighting it again - an operator's
+    recheck - once that Console is configured.
     """
     from .raw_metadata_extractor import RawMetadataExtractorRefused, campaign_refusal
     from .raw_metadata_preflight import run_extractor
+    from .workflow import multi_energy_aif_console
 
     manifest_path = manifest_path.resolve()
     extractor_path = extractor_path.resolve()
@@ -5534,6 +5542,7 @@ def run_raw_metadata_preflight(
             progress=progress,
         )
     extractor = _extractor_record(extractor_path, identity, extractor_source)
+    aif_console = multi_energy_aif_console(console_path)
     held: dict[str, Any] = {}
 
     def change(current: dict[str, Any]) -> None:
@@ -5558,6 +5567,7 @@ def run_raw_metadata_preflight(
             capped=capped,
             campaign=campaign,
             started_at=started_at,
+            multi_energy_aif_console=aif_console,
         )
 
     written = update_manifest(manifest_path, change)
@@ -5659,6 +5669,7 @@ def _record_preflight(
     capped: bool,
     campaign: dict[str, Any] | None,
     started_at: str,
+    multi_energy_aif_console: dict[str, Any] | None = None,
 ) -> None:
     """Write one preflight's results into the manifest as it is now. The change update_manifest applies."""
     from .raw_metadata_preflight import (
@@ -5872,7 +5883,11 @@ def _record_preflight(
             current["project"] = project_before
         return
     disposition = decide_disposition(
-        current, declared=declared, extractor=extractor, parent_declared=_split_parent_declared(current)
+        current,
+        declared=declared,
+        extractor=extractor,
+        parent_declared=_split_parent_declared(current),
+        multi_energy_aif_console=multi_energy_aif_console,
     )
     assignments = disposition.pop("assignments")
     disposition["applied"] = campaign is not None
@@ -5928,6 +5943,15 @@ def _apply_disposition(
                 "The raw headers give AIF with one MS2 collision energy ("
                 + ", ".join(f"{float(value):g} eV" for value in as_swath.get("collision_energies") or [])
                 + f"), run as SWATH under the rule {as_swath.get('rule')} (user decision, 2026-10-07)."
+            )
+        multi_ce = disposition.get("aif_multi_ce_run")
+        if isinstance(multi_ce, dict):
+            energies = [float(value) for value in multi_ce.get("collision_energies") or []]
+            lines.append(
+                f"The raw headers give AIF with {len(energies)} MS2 collision energies ("
+                + ", ".join(f"{value:g} eV" for value in energies)
+                + "), run as AIF by a Console with multi-energy AIF processing (MsdialWorkbench#825) under the "
+                f"rule {multi_ce.get('rule')}."
             )
         project.evidence.extend(line for line in lines if line not in project.evidence)
         evaluated = evaluate_eligibility(
@@ -6035,7 +6059,10 @@ def _collision_energy_entries(current: dict[str, Any]) -> list[dict[str, Any]] |
 
 
 def classify_preflight(
-    manifest_path: str | Path, campaign_authorization_path: str | Path | None = None
+    manifest_path: str | Path,
+    campaign_authorization_path: str | Path | None = None,
+    *,
+    console_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Decide, record and, for a campaign unit, apply the disposition of an already preflighted unit.
 
@@ -6049,9 +6076,14 @@ def classify_preflight(
     preflight recorded: the decision is returned with applied false and ``held`` saying why, and the
     manifest, with any disposition it carries, is left as it is. A summary written before the per-file
     fields is decided from the extractor records its preflight left (_rebuilt_legacy_per_file), and
-    recorded as it was.
+    recorded as it was. As run_raw_metadata_preflight, it decides for the configured Console (console_path, else
+    the saved setting, else MSDIAL_CONSOLE_PATH), so a unit held for multi-energy AIF is decided again here, from
+    its recorded headers, as run once a Console with MsdialWorkbench#825 is configured.
     """
+    from .workflow import multi_energy_aif_console
+
     target = Path(manifest_path).resolve()
+    aif_console = multi_energy_aif_console(console_path)
     campaign = preflight_campaign(read_manifest(target), campaign_authorization_path)
     with manifest_lock(target):
         current = read_manifest(target)
@@ -6060,7 +6092,7 @@ def classify_preflight(
         if energies is not None and disposition_hold(current) is None:
             # Recorded with the disposition they decide: what each input's header gives, read from its record.
             current["raw_metadata_preflight"]["summary"]["per_file"] = energies
-        disposition = _decide_recorded_preflight(current)
+        disposition = _decide_recorded_preflight(current, multi_energy_aif_console=aif_console)
         assignments = disposition.pop("assignments")
         held = disposition_hold(current)
         if held is None and not (preflight.get("summary") or {}):
@@ -6080,12 +6112,16 @@ def classify_preflight(
     return disposition
 
 
-def _decide_recorded_preflight(current: dict[str, Any]) -> dict[str, Any]:
+def _decide_recorded_preflight(
+    current: dict[str, Any], multi_energy_aif_console: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """decide_disposition over a unit's recorded preflight, as classify_preflight decides it. Changes nothing.
 
     The declaration is the one the preflight recorded, else _declared_technical; a split part is also held to
     its parent's declaration (_split_parent_declared); a summary written before the per-file fields is decided
     from the extractor records its preflight left (_rebuilt_legacy_per_file). The result keeps ``assignments``.
+    multi_energy_aif_console is the Console's #825 probe (workflow.multi_energy_aif_console); None decides as
+    without #825.
     """
     from .raw_metadata_preflight import decide_disposition
 
@@ -6103,7 +6139,12 @@ def _decide_recorded_preflight(current: dict[str, Any]) -> dict[str, Any]:
         if energies is not None:
             view = copy.deepcopy(current)
             view["raw_metadata_preflight"]["summary"]["per_file"] = energies
-    disposition = decide_disposition(view, declared=declared, parent_declared=_split_parent_declared(current))
+    disposition = decide_disposition(
+        view,
+        declared=declared,
+        parent_declared=_split_parent_declared(current),
+        multi_energy_aif_console=multi_energy_aif_console,
+    )
     if rebuilt is not None and "raw_metadata_preflight_legacy" not in disposition["warnings"]:
         disposition["warnings"].append("raw_metadata_preflight_legacy")
         disposition["detail"].append(
@@ -6147,8 +6188,10 @@ def _redecide_legacy_in(current: dict[str, Any]) -> dict[str, Any]:
     The caller has already found that nothing holds the unit. Raises what the decision raises; the caller then
     drops ``current``, which may be half changed.
     """
+    from .workflow import multi_energy_aif_console
+
     previous = copy.deepcopy(_applied_disposition(current))
-    disposition = _decide_recorded_preflight(current)
+    disposition = _decide_recorded_preflight(current, multi_energy_aif_console=multi_energy_aif_console())
     assignments = disposition.pop("assignments")
     disposition["applied"] = True
     campaign = previous.get("campaign") or preflight_campaign(current)
@@ -7861,7 +7904,9 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
     # folded into the DDA run of a unit declared DIA, or a file whose header gives no acquisition mode, taken
     # at the declaration. It is decided again here from the same records, as classify_preflight would, and
     # changes nothing: a row that decision would not run refuses the run until the unit is decided again.
-    legacy_refusals = _legacy_disposition_refusals(manifest, state.get("files") or [], aliases)
+    legacy_refusals = _legacy_disposition_refusals(
+        manifest, state.get("files") or [], aliases, console_path=str(state.get("console_path") or "")
+    )
     blockers.extend(legacy_refusals)
     # AIF AS SWATH (user decision, 2026-10-07): an input whose header gives AIF runs as SWATH only where the
     # applied disposition records aif_run_as_swath (one MS2 collision energy over the unit's inputs) and its
@@ -7918,6 +7963,7 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
                 f"single_ce_aif_as_swath_2026_10_07); the first is {unrecorded_as_swath[0]}. Decide the unit again "
                 "(classify_preflight)."
             )
+    blockers.extend(_multi_energy_aif_blockers(manifest, str(state.get("console_path") or "")))
 
     # MS-DIAL reads every input with one MS1 and one MS2 data type, which must say what RawDataHandler hands
     # it, not what the instrument stored. Where every input that runs delivers one representation at a
@@ -8025,7 +8071,7 @@ _UNSETTLED_ASSIGNMENT_BASES = {"declaration", "header_no_isolation"}
 
 
 def _legacy_disposition_refusals(
-    manifest: dict[str, Any], files: list[dict[str, Any]], aliases: dict[str, str]
+    manifest: dict[str, Any], files: list[dict[str, Any]], aliases: dict[str, str], *, console_path: str = ""
 ) -> list[str]:
     """Blockers for the rows an applied pre-0.5.29 disposition runs and the header-first rule would not.
 
@@ -8049,8 +8095,13 @@ def _legacy_disposition_refusals(
         "run's records into superseded_runs, decides the unit again from its recorded preflight, and writes the "
         "analysis CSV into a new output directory."
     )
+    from .workflow import multi_energy_aif_console
+
     try:
-        again = _decide_recorded_preflight(manifest)
+        # For the Console this run would use: a multi-energy AIF unit runs only with MsdialWorkbench#825.
+        again = _decide_recorded_preflight(
+            manifest, multi_energy_aif_console=multi_energy_aif_console(console_path or None)
+        )
     except Exception as error:  # A gate that cannot decide refuses rather than runs.
         return [
             "This unit's campaign disposition was decided before Interactive 0.5.29 took each file's acquisition "
@@ -8131,12 +8182,95 @@ def _aif_run_as_swath_files(manifest: dict[str, Any]) -> tuple[set[str], list[st
     return accepted, claimed
 
 
+def _multi_energy_aif_blockers(manifest: dict[str, Any], console_path: str) -> list[str]:
+    """Blockers for a multi-energy AIF unit (raw_metadata_preflight.AIF_MULTI_CE_RULE) and the Console about to run it.
+
+    The applied disposition ran the unit as AIF only because the Console it was decided for had MsdialWorkbench#825
+    (multi_energy_aif_console). The Console this workflow starts is probed again, from its assembly: one without
+    #825 reads a single unsuffixed .dcl that a multi-energy AIF file never has. A per-file record that claims the
+    rule's basis under a disposition that does not record aif_multi_ce_run is refused as well, and so is one whose
+    own MS2 collision energies are not the recorded ones: #825 chooses among one file's energies, never across
+    files, so the rule holds only where every input records the same energies. Empty otherwise.
+    """
+    from .raw_metadata_preflight import (
+        AIF_MULTI_CE_BASIS,
+        AIF_MULTI_CE_RULE,
+        COLLISION_ENERGY_DECIMALS,
+        multi_energy_aif_ready,
+    )
+    from .workflow import multi_energy_aif_console
+
+    applied = _applied_disposition(manifest)
+    record = applied.get("aif_multi_ce_run") if isinstance(applied.get("aif_multi_ce_run"), dict) else {}
+    recorded = applied.get("disposition") == "run" and record.get("rule") == AIF_MULTI_CE_RULE
+    summary = (manifest.get("raw_metadata_preflight") or {}).get("summary") or {}
+    claimed = [
+        Path(str(item.get("file") or "")).name
+        for item in summary.get("per_file") or []
+        if isinstance(item, dict) and str(item.get("console_acquisition_basis") or "") == AIF_MULTI_CE_BASIS
+    ]
+    if not recorded:
+        if not claimed:
+            return []
+        return [
+            f"{len(claimed)} input files would run as multi-energy AIF (basis {AIF_MULTI_CE_BASIS}), but this unit's "
+            f"applied campaign disposition records no aif_multi_ce_run (rule {AIF_MULTI_CE_RULE}); the first is "
+            f"{claimed[0]}. Decide the unit again (preflight it again with the Console that will run it)."
+        ]
+
+    def energy_set(values: Any) -> tuple[float, ...]:
+        found = set()
+        for value in values if isinstance(values, list) else []:
+            try:
+                found.add(round(float(value), COLLISION_ENERGY_DECIMALS))
+            except (TypeError, ValueError):
+                continue
+        return tuple(sorted(found))
+
+    expected = energy_set(record.get("collision_energies"))
+    energies = ", ".join(f"{value:g} eV" for value in expected)
+    blockers: list[str] = []
+    mismatched = [
+        Path(str(item.get("file") or "")).name
+        for item in summary.get("per_file") or []
+        if isinstance(item, dict)
+        and str(item.get("console_acquisition_basis") or "") == AIF_MULTI_CE_BASIS
+        and energy_set(item.get("ms2_collision_energies")) != expected
+    ]
+    if len(expected) < 2 or mismatched:
+        blockers.append(
+            f"This unit runs as multi-energy AIF (rule {AIF_MULTI_CE_RULE}, {energies or 'no energies'}), which "
+            "holds only where every input records the same MS2 collision energies, more than one: MsdialWorkbench#825 "
+            "chooses a representative energy among one file's energies, never across files. "
+            + (
+                f"{len(mismatched)} input files record other energies; the first is {mismatched[0]}. "
+                if mismatched
+                else "The record names fewer than two energies. "
+            )
+            + "Decide the unit again (preflight it again with the Console that will run it)."
+        )
+    probe = multi_energy_aif_console(console_path or None)
+    if multi_energy_aif_ready(probe):
+        return blockers
+    return blockers + [
+        f"This unit runs as multi-energy AIF ({energies}; rule {AIF_MULTI_CE_RULE}), which only an MS-DIAL Console "
+        "with multi-energy AIF processing (MsdialWorkbench#825) processes, and the selected Console has none (probe "
+        f"{probe.get('probe')}). Select a Console that has it."
+    ]
+
+
 def held_by_disposition(manifest: dict[str, Any]) -> dict[str, Any]:
     """The applied campaign disposition when it holds the unit (hold true: skipped to run later, raw data kept).
 
+    With a #825 Console, AIF inputs whose collision energies differ from one another are held as well
+    (raw_metadata_preflight.AIF_CE_DIFFERS_HOLD): #825 settles no representative energy across files, so no Console
+    releases that hold; only an operator's decision does.
+
     Multi-energy AIF is held until a Console that settles an all-ion spot's collision energy exists (user
     decision, 2026-10-07: raw_metadata_preflight.AIF_MULTI_CE_HOLD), and so is AIF whose collision energies are
-    not recorded. A held unit is no failure, and its raw data are kept. Empty for any other unit.
+    not recorded. A held unit is no failure, and its raw data are kept. Empty for any other unit. A unit held for
+    multi-energy AIF is released by deciding it again (an operator's recheck: run_raw_metadata_preflight or
+    classify_preflight) with a Console that has MsdialWorkbench#825 configured; it then runs as AIF.
     """
     applied = _applied_disposition(manifest)
     return applied if applied.get("disposition") == "skip" and applied.get("hold") is True else {}
@@ -8163,7 +8297,11 @@ def _disposition_hold_text(hold: dict[str, Any], subject: str = "The unit") -> s
         f"{subject}'s campaign disposition holds it ("
         + ", ".join(str(item) for item in hold.get("reasons") or [])
         + "): it is to run once a Console that can exists, and a held unit's raw data are kept. It is no failure. "
-        "Only an operator's skip lifts the hold: call again with release_disposition_hold=true."
+        "A multi-energy AIF hold is released by preflighting the unit again with a Console that has "
+        "MsdialWorkbench#825 configured; one for collision energies that differ between inputs "
+        "(aif_collision_energies_differ_between_inputs) is not, since #825 chooses among one file's energies only. "
+        "Only an operator's skip lifts the hold without running the unit: call again with "
+        "release_disposition_hold=true."
     )
 
 
