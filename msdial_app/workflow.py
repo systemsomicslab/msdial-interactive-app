@@ -122,9 +122,10 @@ AUTOMATIC_RT_CORRECTION_METHOD_KEYS = {
     "automatic rt correction interpolate blanks by analytical order",
     "automatic rt correction local support rt window",
 }
-# MsdialWorkbench#826 judges each anchor against the offsets of the file's other matched reference
-# candidates within this many minutes of it (0 = the run-wide test only), and floors the robust scale
-# at the MS1 cycle time around the anchor. A Console without #826 does not know the key, so it is
+# MsdialWorkbench#826 judges each anchor against the median offsets of the other compounds matched in
+# the file within this many minutes of it (0 = the run-wide test only), co-eluting reference candidates
+# (isotope peaks, adducts) counting as one compound and the anchor's own compound left out, and floors
+# the robust scale at the MS1 cycle time around the anchor. A Console without #826 does not know the key, so it is
 # written only when the user or a profile sets it; unset, a #826 Console uses its default of 1.5 min.
 # It is kept out of AUTOMATIC_RT_CORRECTION_DEFAULTS, every key of which is always written.
 AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW = "automatic_rt_correction_local_support_rt_window"
@@ -1672,6 +1673,27 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                         "Automatic RT correction local support RT window is set, but the selected "
                         "MS-DIAL Console predates the local outlier test (MsdialWorkbench#826) and "
                         "would ignore it. Select a Console that has it, or leave the window unset."
+                    ),
+                }
+            )
+        elif (
+            found is not None
+            and str(state.get("repository_run_manifest") or "").strip()
+            and AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY not in found
+        ):
+            # A public-repository reanalysis that corrects RT does so with #826's local test, as
+            # decided on 2026-10-07. With the window left to the Console's default nothing else
+            # names #826, so a Console with #810 alone would run the older run-wide test and the
+            # run would still complete as corrected. A guided or laboratory analysis may still use
+            # an #810 Console.
+            issues.append(
+                {
+                    "level": "error",
+                    "message": (
+                        "A public-repository reanalysis runs automatic alignment RT correction with "
+                        "the local outlier test (MsdialWorkbench#826), but the selected MS-DIAL "
+                        "Console predates it and would run the older run-wide test. Select a Console "
+                        "that has it, or disable automatic alignment RT correction."
                     ),
                 }
             )

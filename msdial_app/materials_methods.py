@@ -669,9 +669,12 @@ def _automatic_rt_outlier_sentence(evidence: dict[str, Any]) -> str:
     if test == OUTLIER_TEST_LOCAL:
         window = float(evidence.get("local_support_rt_window") or 0)
         return (
-            " An anchor was rejected when its offset differed from the median offset of the file's "
-            f"other matched reference candidates within {window:g} min of it (or, where fewer than "
-            f"three were found, from the median offset of the file's anchors) {scale}; "
+            " An anchor was rejected when its offset differed from the median of the offsets of the "
+            f"other compounds matched in the file within {window:g} min of it (or, where fewer than "
+            f"three were found, from the median offset of the file's anchors) {scale}. Reference "
+            "candidates whose peak tops lay within 1.5 MS1 cycles of each other in both the reference "
+            "and the judged file (isotope peaks, adducts) counted as one compound, at their median "
+            "offset, and the anchor's own compound was not counted as support for it; "
             f"{local} anchor match(es) were rejected by the local test and {run_wide} by the "
             "file-wide test."
         )

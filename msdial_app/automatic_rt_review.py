@@ -66,9 +66,11 @@ def _method_values(path: Path) -> dict[str, str]:
 
 OUTLIER_TEST_DESCRIPTIONS = {
     OUTLIER_TEST_LOCAL: (
-        "Each anchor against the median offset of the file's other matched reference candidates "
-        "within the local support window (LocalOutlier), or of the file's anchors where it has fewer "
-        "than three such neighbours (MadOutlier); the scale is floored at the MS1 cycle around the anchor."
+        "Each anchor against the median of the offsets of the other compounds matched in the file "
+        "within the local support window (LocalOutlier), or of the file's anchors where fewer than "
+        "three such compounds are found (MadOutlier). Co-eluting reference candidates (isotope peaks, "
+        "adducts) count as one compound and the anchor's own is left out, so Neighbours counts "
+        "compounds; the scale is floored at the MS1 cycle around the anchor."
     ),
     OUTLIER_TEST_RUN_WIDE_FLOORED: (
         "Each anchor against the median offset of the file's anchors (MadOutlier); the window is 0, "

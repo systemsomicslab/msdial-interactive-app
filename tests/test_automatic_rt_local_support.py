@@ -1,9 +1,9 @@
 """MsdialWorkbench#826 in Interactive: the local anchor outlier test of automatic alignment RT correction.
 
-#826 judges each anchor against the file's other matched reference candidates within a local support
-window (status LocalOutlier), falls back to the run-wide test where fewer than three are found
-(MadOutlier), floors the scale at the MS1 cycle around the anchor, and appends audit columns. What is
-held here:
+#826 judges each anchor against the other compounds matched in the file within a local support window
+(status LocalOutlier; co-eluting reference candidates count as one compound, the anchor's own left
+out), falls back to the run-wide test where fewer than three are found (MadOutlier), floors the scale
+at the MS1 cycle around the anchor, and appends audit columns. What is held here:
 
 - the window is written to the method file only when the state sets it, so a Console without #826
   is never handed a key it does not know, and it is validated like the other automatic RT settings;
@@ -12,7 +12,9 @@ held here:
   which reads as it always did;
 - the Methods text describes the local test and the MS1-cycle floor only for a #826 audit;
 - Interactive's own defaults are unchanged, and a campaign profile's answers reach the production
-  method but never the zero-threshold diagnostic.
+  method but never the zero-threshold diagnostic;
+- a public-repository run that corrects RT is refused with a Console that predates #826 even when
+  the window is left unset, while a guided analysis may still use an #810 Console.
 """
 
 from __future__ import annotations
@@ -310,6 +312,10 @@ class TheEvidenceReadsBothAudits(unittest.TestCase):
         self.assertTrue(any("LocalOutlier (1)" in item for item in review["warnings"]), review["warnings"])
         window = next(item for item in review["outlier_settings"] if "window" in item["label"])
         self.assertEqual("1.5 (Console default; method.txt has no line)", window["value"])
+        described = next(item for item in review["outlier_settings"] if item["label"] == "Outlier test")
+        self.assertIn("other compounds matched in the file", described["value"])
+        self.assertIn("count as one compound", described["value"])
+        self.assertNotIn("reference candidates within", described["value"])
 
     def test_the_window_and_threshold_in_the_method_file_decide_the_test(self) -> None:
         cases = (
@@ -382,7 +388,14 @@ class TheMethodsTextFollowsTheAudit(unittest.TestCase):
         result = self._report(SUMMARY_826, ANCHORS_826)
         text = result["methods_text"]
         self.assertIn("learned distributed anchor features", text)
-        self.assertIn("other matched reference candidates within 1.5 min of it", text)
+        # #826's head counts compounds, not reference candidates: co-eluting candidates are one
+        # neighbour and the anchor's own compound is no support for it.
+        self.assertIn("other compounds matched in the file within 1.5 min of it", text)
+        self.assertIn("within 1.5 MS1 cycles of each other in both the reference and the judged file", text)
+        self.assertIn("counted as one compound", text)
+        self.assertIn("the anchor's own compound was not counted as support for it", text)
+        self.assertIn("fewer than three were found", text)
+        self.assertNotIn("reference candidates within", text)
         self.assertIn("no less than the MS1 cycle time around the anchor", text)
         self.assertIn("by more than 3.5 times a robust scale", text)
         self.assertIn("1 anchor match(es) were rejected by the local test and 1 by the file-wide test", text)
@@ -409,6 +422,7 @@ class TheMethodsTextFollowsTheAudit(unittest.TestCase):
         self.assertIn("learned distributed anchor features", text)
         self.assertNotIn("MS1 cycle", text)
         self.assertNotIn("reference candidates within", text)
+        self.assertNotIn("compound", text)
         self.assertNotIn("local test", text)
         self.assertIn("not applicable: Console predates MsdialWorkbench#826", result["guided"])
 
@@ -519,6 +533,71 @@ class ACampaignProfileTurnsItOn(unittest.TestCase):
         self.assertNotIn(WINDOW_KEY, workflow)
         method = Path(prepare_run(copy.deepcopy(workflow))["method_file"]).read_text(encoding="utf-8")
         self.assertNotIn("automatic rt correction", method.casefold())
+
+    def _use_an_810_console(self) -> None:
+        self.console.write_bytes("execute automatic rt correction for alignment".encode("utf-16-le"))
+        found = console_capabilities(str(self.console))["capabilities"]
+        self.assertIn(AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY, found)
+        self.assertNotIn(AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY, found)
+
+    @staticmethod
+    def _826_errors(workflow: dict) -> list[str]:
+        return [
+            item["message"]
+            for item in validate_workflow(workflow)
+            if item["level"] == "error" and "#826" in item["message"]
+        ]
+
+    def test_a_repository_run_with_an_810_console_is_refused_with_the_window_unset(self) -> None:
+        # The campaign leaves the window to the Console's default; nothing else names #826, so a
+        # Console with #810 alone would run the old run-wide test and still finish as corrected.
+        self._use_an_810_console()
+        plan = build_guided_plan(str(self.data), self._answers(self.PROFILE))
+        workflow = plan["workflow"]
+        self.assertTrue(workflow["repository_run_manifest"])
+        self.assertNotIn(WINDOW_KEY, workflow)
+        errors = self._826_errors(workflow)
+        self.assertEqual(1, len(errors), errors)
+        self.assertIn("public-repository reanalysis", errors[0])
+        self.assertFalse(plan["ready_to_prepare"])
+        with self.assertRaises(Exception):
+            prepare_run(copy.deepcopy(workflow))
+
+    def test_a_repository_run_with_an_810_console_and_the_window_set_is_refused_once(self) -> None:
+        self._use_an_810_console()
+        workflow = build_guided_plan(str(self.data), self._answers({**self.PROFILE, WINDOW_KEY: 1.5}))["workflow"]
+        errors = self._826_errors(workflow)
+        self.assertEqual(1, len(errors), errors)
+        self.assertIn("local support RT window is set", errors[0])
+
+    def test_the_diagnostic_of_a_repository_run_with_an_810_console_is_not_refused(self) -> None:
+        # The diagnostic turns the correction off, so it does not need #826.
+        self._use_an_810_console()
+        workflow = build_guided_plan(str(self.data), self._answers(self.PROFILE))["workflow"]
+        diagnostic = prepare_tuning_run(
+            workflow, workflow["files"][0]["file_path"], self.root / "diagnostics" / "job-1"
+        )
+        written = Path(diagnostic["method_file"]).read_text(encoding="utf-8").casefold()
+        self.assertNotIn("automatic rt correction", written)
+
+    def test_a_repository_run_without_the_correction_does_not_need_826(self) -> None:
+        self._use_an_810_console()
+        profile = {**self.PROFILE, "execute_automatic_rt_correction": False}
+        workflow = build_guided_plan(str(self.data), self._answers(profile))["workflow"]
+        self.assertEqual([], self._826_errors(workflow))
+
+    def test_a_guided_run_with_an_810_console_and_the_window_unset_is_not_refused(self) -> None:
+        self._use_an_810_console()
+        answers = self._answers(self.PROFILE)
+        answers["workflow_overrides"] = {
+            key: value
+            for key, value in answers["workflow_overrides"].items()
+            if not key.startswith("repository_")
+        }
+        workflow = build_guided_plan(str(self.data), answers)["workflow"]
+        self.assertFalse(str(workflow.get("repository_run_manifest") or "").strip())
+        self.assertTrue(workflow["execute_automatic_rt_correction"])
+        self.assertEqual([], self._826_errors(workflow))
 
     def test_a_blank_answer_leaves_the_window_unset(self) -> None:
         workflow = self._plan({**self.PROFILE, WINDOW_KEY: None})["workflow"]

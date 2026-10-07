@@ -8,12 +8,16 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
 ### Added
 - Support for MsdialWorkbench#826, which improves the automatic alignment RT
-  correction of #810. #826 judges each anchor against the median offset of the
-  file's other matched reference candidates within a local support window
-  (status `LocalOutlier`), falls back to the median of the file's anchors where
-  fewer than three are found (`MadOutlier`), and floors the robust scale at the
-  MS1 cycle time around the anchor. The public-repository campaign uses it, with
-  12 anchors and the default window, as the user decided on 2026-10-07.
+  correction of #810. #826 judges each anchor against the median of the offsets
+  of the other compounds matched in the file within a local support window
+  (status `LocalOutlier`): reference candidates whose peak tops lie within 1.5
+  MS1 cycles of each other in both files (isotope peaks, adducts) count as one
+  compound, and the anchor's own compound is no support for it. Where fewer
+  than three compounds are found it falls back to the median of the file's
+  anchors (`MadOutlier`). It floors the robust scale at the MS1 cycle time
+  around the anchor. The public-repository campaign is to use it, with 12
+  anchors and the default window, as the user decided on 2026-10-07; a
+  repository run is refused with a Console that predates #826 (see Changed).
   - A new answer key, `automatic_rt_correction_local_support_rt_window` (minutes,
     0 or more; 0 keeps the run-wide test only). It is written to the method file
     as `Automatic RT correction local support RT window: <v>` only when the
@@ -51,10 +55,17 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     shows the new anchor columns and each file's MS1 scan interval where the
     audit has them, and lists the outlier test's settings.
   - The Methods text says, for a #826 run, that anchors were judged against the
-    file's other matched reference candidates within the window, with the
+    other compounds matched in the file within the window, co-eluting reference
+    candidates counting as one compound and the anchor's own left out, with the
     MS1-cycle floor, and how many each test rejected. It says nothing of either
     for a Console before #826 or with the threshold at 0. Table S1 and the
     workbook carry the new evidence fields.
+- A public-repository reanalysis (a run with a repository run manifest) that
+  turns automatic RT correction on is refused when the selected Console
+  predates #826, also when the window is left to the Console's default. Were
+  only a set window checked, a Console with #810 alone would run the older
+  run-wide test and the run would still complete as corrected. A guided or
+  laboratory analysis may still use a Console with #810 alone.
 
 ### Not changed
 - Interactive's defaults for guided and laboratory analyses: automatic RT

@@ -25,7 +25,8 @@ LOCAL_SUPPORT_KEY = "automatic rt correction local support rt window"
 OUTLIER_MAD_THRESHOLD_KEY = "automatic rt correction outlier mad threshold"
 # The anchor statuses of an anchor the outlier test rejected: MadOutlier against the median of the
 # file's anchors (#810, and #826 where an anchor has too few neighbours), LocalOutlier against the
-# median of the file's other matched reference candidates within the local support window (#826).
+# median of the offsets of the other compounds matched in the file within the local support window
+# (#826; co-eluting reference candidates count as one compound, the anchor's own left out).
 OUTLIER_STATUSES = ("LocalOutlier", "MadOutlier")
 # Columns MsdialWorkbench#826 appended after the ones #810 wrote. Every reader here addresses columns
 # by name, so a pre-#826 audit, which has none of them, reads as it always did.
