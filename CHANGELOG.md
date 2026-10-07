@@ -16,9 +16,12 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   reads the energies from the raw data, so the analysis CSV says `AIF` and
   nothing more.
   - A Console capability, `multi_energy_aif_representative_collision_energy`,
-    found by a message only #825's multi-energy reader carries in the Console
+    found by two messages of #825's multi-energy reader in the Console
     assembly (present in the Console of MS-DIAL master bb90e0e51, absent from
-    that of f0583493a). `console_capabilities` reports it, and
+    that of f0583493a). Both are required: an earlier local AIF patch build has
+    only the one that came with the per-energy files, and still takes an
+    unannotated peak's spectrum from the first energy (probe
+    `marker_incomplete`, no capability). `console_capabilities` reports it, and
     `multi_energy_aif_console` reads it from the assembly without starting the
     Console.
   - The raw-header preflight (`run_raw_metadata_preflight`, the MCP tool's new

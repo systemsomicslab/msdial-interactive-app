@@ -45,13 +45,21 @@ from msdial_app.workflow import (
 )
 
 
-def _console(root: Path, *, with_825: bool, name: str = "MSDIALCUI.exe") -> Path:
-    """A stand-in Console assembly: managed strings are UTF-16LE in the user-string heap, as in the real one."""
+# The one #825 message a local AIF patch build from before #825's representative-energy rule carries (01ac842c1).
+PRE_825_MARKER = " nor a collision-energy file exists."
+
+
+def _console(
+    root: Path, *, with_825: bool, name: str = "MSDIALCUI.exe", markers: tuple[str, ...] | None = None
+) -> Path:
+    """A stand-in Console assembly: managed strings are UTF-16LE in the user-string heap, as in the real one.
+
+    with_825 writes every #825 marker; markers, when given, writes those instead."""
     root.mkdir(parents=True, exist_ok=True)
     path = root / name
     body = b"MZ\x90\x00 stand-in assembly " + "LC-MS quality-assurance matrix:".encode("utf-16-le")
-    if with_825:
-        body += MULTI_ENERGY_AIF_CONSOLE_MARKERS[0].encode("utf-16-le")
+    for marker in markers if markers is not None else (MULTI_ENERGY_AIF_CONSOLE_MARKERS if with_825 else ()):
+        body += b"\x00\x01" + marker.encode("utf-16-le")
     path.write_bytes(body)
     return path
 
@@ -73,6 +81,8 @@ class _NoConfiguredConsole(_Scratch):
             self.addCleanup(patcher.stop)
         self.with_825 = _console(self.root / "console-825", with_825=True)
         self.without_825 = _console(self.root / "console-818", with_825=False)
+        # A local AIF patch build: per-energy .dcl files, but an unannotated peak still read from the first energy.
+        self.pre_825 = _console(self.root / "console-aif-patch", with_825=False, markers=(PRE_825_MARKER,))
 
 
 class ConsoleProbeTests(_NoConfiguredConsole):
@@ -98,6 +108,27 @@ class ConsoleProbeTests(_NoConfiguredConsole):
                 self.assertFalse(multi_energy_aif_ready(found))
         self.assertFalse(multi_energy_aif_ready(None))
         self.assertFalse(multi_energy_aif_ready({"capability": "other", "available": True}))
+
+    def test_every_marker_is_required(self) -> None:
+        self.assertIn(PRE_825_MARKER, MULTI_ENERGY_AIF_CONSOLE_MARKERS)
+        self.assertGreater(len(MULTI_ENERGY_AIF_CONSOLE_MARKERS), 1)
+        for index, marker in enumerate(MULTI_ENERGY_AIF_CONSOLE_MARKERS):
+            with self.subTest(only=marker):
+                found = multi_energy_aif_console(_console(self.root / f"only-{index}", with_825=False, markers=(marker,)))
+                self.assertEqual((False, "marker_incomplete"), (found["available"], found["probe"]))
+                self.assertEqual(64, len(found["assembly_sha256"]))
+                self.assertFalse(multi_energy_aif_ready(found))
+        # Every marker in UTF-8 counts as well: the probe reads either encoding.
+        utf8 = self.root / "utf8" / "MSDIALCUI.exe"
+        utf8.parent.mkdir()
+        utf8.write_bytes(b"MZ " + b" | ".join(marker.encode("utf-8") for marker in MULTI_ENERGY_AIF_CONSOLE_MARKERS))
+        self.assertTrue(multi_energy_aif_console(utf8)["available"])
+
+    def test_a_pre_825_aif_patch_build_is_no_capability(self) -> None:
+        found = multi_energy_aif_console(self.pre_825)
+        self.assertEqual((False, "marker_incomplete"), (found["available"], found["probe"]))
+        with patch.object(workflow.subprocess, "run", side_effect=OSError("not started in a test")):
+            self.assertNotIn(MULTI_ENERGY_AIF_CAPABILITY, console_capabilities(str(self.pre_825))["capabilities"])
 
     def test_a_net8_launcher_is_probed_through_its_assembly(self) -> None:
         folder = self.root / "net8"
@@ -149,7 +180,12 @@ class DispositionTests(_NoConfiguredConsole):
         self.assertNotIn("aif_run_as_swath", ran)
         self.assertTrue(any(AIF_MULTI_CE_RULE in line for line in ran["detail"]), ran["detail"])
 
-        for console in (multi_energy_aif_console(self.without_825), multi_energy_aif_console(None), None):
+        for console in (
+            multi_energy_aif_console(self.without_825),
+            multi_energy_aif_console(self.pre_825),
+            multi_energy_aif_console(None),
+            None,
+        ):
             with self.subTest(console=(console or {}).get("probe")):
                 held = self.decide(self.MULTI, console)
                 self.assertEqual(("skip", [AIF_MULTI_CE_HOLD], True), (held["disposition"], held["reasons"], held["hold"]))
@@ -255,10 +291,14 @@ class CampaignTests(_NoConfiguredConsole):
 
         self.assertTrue(self.gate(manifest, files, "AIF", self.with_825)["allowed"])
         self.assertFalse(self.gate(manifest, files, "SWATH", self.with_825)["allowed"])
-        refused = self.gate(manifest, files, "AIF", self.without_825)
-        self.assertFalse(refused["allowed"])
-        self.assertTrue(any("multi-energy AIF" in item and "MsdialWorkbench#825" in item for item in refused["blockers"]),
-                        refused["blockers"])
+        for console in (self.without_825, self.pre_825):
+            with self.subTest(console=console.parent.name):
+                refused = self.gate(manifest, files, "AIF", console)
+                self.assertFalse(refused["allowed"])
+                self.assertTrue(
+                    any("multi-energy AIF" in item and "MsdialWorkbench#825" in item for item in refused["blockers"]),
+                    refused["blockers"],
+                )
 
     def test_classify_releases_a_held_unit_from_its_recorded_headers(self) -> None:
         manifest, _files = self.campaign_unit()
@@ -267,8 +307,11 @@ class CampaignTests(_NoConfiguredConsole):
         self.assertEqual("no_console_configured",
                          read_manifest(manifest)["campaign_disposition"]["multi_energy_aif_console"]["probe"])
 
-        again = classify_preflight(manifest, console_path=self.without_825)
-        self.assertEqual(("skip", [AIF_MULTI_CE_HOLD]), (again["disposition"], again["reasons"]))
+        for console in (self.without_825, self.pre_825):
+            with self.subTest(console=console.parent.name):
+                again = classify_preflight(manifest, console_path=console)
+                self.assertEqual(("skip", [AIF_MULTI_CE_HOLD]), (again["disposition"], again["reasons"]))
+                self.assertTrue(held_by_disposition(read_manifest(manifest)))
 
         released = classify_preflight(manifest, console_path=self.with_825)
         self.assertEqual(("run", "AIF"), (released["disposition"], released["console_acquisition_type"]))

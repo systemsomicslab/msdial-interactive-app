@@ -592,9 +592,13 @@ the most product ions (the lowest such energy on a tie); it reads the energies
 from the raw data, so the analysis CSV says `AIF` and nothing more. The
 preflight and `classify_preflight` decide for the configured Console
 (`console_path`, else the saved `console_path` setting, else
-`MSDIAL_CONSOLE_PATH`), whose assembly is read, never started, for a message only
-#825's multi-energy reader carries (capability
-`multi_energy_aif_representative_collision_energy`). Every AIF unit's disposition
+`MSDIAL_CONSOLE_PATH`), whose assembly is read, never started, for two messages
+of #825's multi-energy reader (capability
+`multi_energy_aif_representative_collision_energy`). Both are required: an
+earlier local AIF patch build carries only the one that came with the
+per-energy files, and still takes an unannotated peak's spectrum from the first
+energy; its probe is `marker_incomplete`, and it holds as a Console without #825
+does. Every AIF unit's disposition
 records that probe as `multi_energy_aif_console` (`available`, `probe`,
 `console_assembly`, `assembly_sha256`). With #825, a unit whose AIF inputs record
 more than one energy is decided `run` as AIF: `aif_multi_ce_run`

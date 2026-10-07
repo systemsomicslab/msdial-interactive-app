@@ -177,7 +177,10 @@ AUTOMATIC_RT_LOCAL_SUPPORT_CONSOLE_MARKERS = (AUTOMATIC_RT_CORRECTION_LOCAL_SUPP
 # its MS/MS reference-spectrum match, or else by the energy whose spectrum has the most product ions. Before it, the
 # Console read one unsuffixed .dcl that a multi-energy AIF file never has. The markers are messages of #825's
 # RepresentativeDeconvolutionReader, which lives in the Console assembly (MSDIALCUI) and nowhere else: absent from the
-# Console of db6406a85 (master f0583493a), present in that of 6a0cc403d (master bb90e0e51).
+# Console of db6406a85 (master f0583493a), present in that of 6a0cc403d (master bb90e0e51). Every marker is required.
+# The second came earlier, with 01ac842c1 (per-energy .dcl files), and a local AIF patch build carries it alone while
+# its reader still takes an unannotated peak's spectrum from the first energy's file; only the first came with
+# ca6046f48, the commit of the most-product-ions rule and of the per-file reader (LoadPerFileResults) that applies it.
 MULTI_ENERGY_AIF_CAPABILITY = "multi_energy_aif_representative_collision_energy"
 MULTI_ENERGY_AIF_CONSOLE_MARKERS = (
     "The collision-energy files of ",
@@ -4751,7 +4754,7 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
     ):
         capabilities.add(AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY)
         probes.append("automatic RT local support marker")
-    if _has_marker(binary, MULTI_ENERGY_AIF_CONSOLE_MARKERS):
+    if _has_every_marker(binary, MULTI_ENERGY_AIF_CONSOLE_MARKERS):
         capabilities.add(MULTI_ENERGY_AIF_CAPABILITY)
         probes.append("multi-energy AIF marker")
     return {
@@ -4760,8 +4763,13 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
     }
 
 
-def _has_marker(binary: bytes, markers: Iterable[str]) -> bool:
-    return any(marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary for marker in markers)
+def _has_marker(binary: bytes, marker: str) -> bool:
+    return marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary
+
+
+def _has_every_marker(binary: bytes, markers: Iterable[str]) -> bool:
+    markers = tuple(markers)
+    return bool(markers) and all(_has_marker(binary, marker) for marker in markers)
 
 
 def configured_console_path(console_path: str | Path | None = None) -> tuple[str, str]:
@@ -4784,8 +4792,10 @@ def multi_energy_aif_console(console_path: str | Path | None = None) -> dict[str
 
     Reads the Console assembly's bytes for MULTI_ENERGY_AIF_CONSOLE_MARKERS and never starts the Console (unlike
     console_capabilities, whose rtcorrection probe does). The record is what a campaign disposition keeps for an AIF
-    unit (multi_energy_aif_console): available true only where the marker was found in the assembly named, with that
-    assembly's sha256, so the gate and the reports can see which Console a multi-energy unit was released for.
+    unit (multi_energy_aif_console): available true only where every marker was found in the assembly named, with
+    that assembly's sha256, so the gate and the reports can see which Console a multi-energy unit was released for.
+    An assembly with some markers but not all (probe marker_incomplete) is a build from before #825's
+    representative-energy rule, and is no capability.
     """
     path_text, source = configured_console_path(console_path)
     record: dict[str, Any] = {
@@ -4812,7 +4822,8 @@ def multi_energy_aif_console(console_path: str | Path | None = None) -> dict[str
         return record
     record["console_assembly"] = assembly.name
     record["assembly_sha256"] = hashlib.sha256(binary).hexdigest()
-    found = _has_marker(binary, MULTI_ENERGY_AIF_CONSOLE_MARKERS)
+    present = [_has_marker(binary, marker) for marker in MULTI_ENERGY_AIF_CONSOLE_MARKERS]
+    found = all(present)
     record["available"] = found
-    record["probe"] = "multi_energy_aif_marker" if found else "marker_absent"
+    record["probe"] = "multi_energy_aif_marker" if found else ("marker_incomplete" if any(present) else "marker_absent")
     return record
