@@ -93,6 +93,10 @@ def summarize_jobs(
             "accession_download_store",
             "waiting_for_shared_download_job_state",
             "batch_plan_distinct_objects_and_pre_claims",
+            # The LC-MS peak-count diagnostic behind /api/agent/tuning/run loads no annotation library: only
+            # its peaks and their heights are read, and annotation changes neither. Its records say
+            # annotation "skipped_for_peak_count".
+            "peak_count_diagnostic_without_annotation",
             # Replicate rows that share a sample id are each their own input and analysis-CSV row (the sample
             # row, not the id, is mapped), and an undeclared unit's archive member that carries a declared raw
             # file name behind a prefix is that file's, one to one, recorded as paired_by prefixed_member_name.

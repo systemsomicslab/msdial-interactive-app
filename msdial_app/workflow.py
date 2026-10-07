@@ -1915,6 +1915,12 @@ def prepare_run(
         # can be identified at all.
         "software_provenance_status": console.get("provenance_status", "absent"),
         "libraries": _manifest_libraries(method_state),
+        # A peak-count diagnostic says whether it annotated; a production run carries no such record.
+        **(
+            {"diagnostic_annotation": dict(method_state["diagnostic_annotation"])}
+            if isinstance(method_state.get("diagnostic_annotation"), dict)
+            else {}
+        ),
         "project_file_requested": project_file_requested,
         "stage_inputs": stage_inputs,
         "input_csv": str(csv_path),
@@ -2047,11 +2053,115 @@ def _manifest_libraries(state: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+# What a peak-count diagnostic says about annotation, in its workflow-settings.json, its run manifest, its
+# diagnostic-job.json and the unit manifest's peak_height_diagnostics entry.
+DIAGNOSTIC_ANNOTATION_SKIPPED = "skipped_for_peak_count"
+DIAGNOSTIC_ANNOTATION_PERFORMED = "performed"
+DIAGNOSTIC_ANNOTATION_SKIPPED_REASON = (
+    "Only the peaks are read from a diagnostic: one row of the Console's .mdpeak per detected peak, and "
+    "its Height column. The LC-MS Console fixes which peaks there are, and their heights, in peak "
+    "spotting, isotope estimation and deconvolution (MsdialLcMsApi FileProcess.RunAsync). It writes the "
+    ".mdpeak after annotation and the characterisation that follows it (LcmsProcess.ExecuteAsync), but "
+    "neither of those adds or removes a peak or changes its height, so the MSP, LBM and text libraries "
+    "are not loaded. Without reference matches the characterisation can give a peak another adduct, "
+    "charge or isotope assignment, so the Adduct, Isotope and MS1 isotopes columns of a diagnostic "
+    ".mdpeak are not the production run's, and nothing reads them. Every peak-spotting and deconvolution "
+    "setting is the production method's; Minimum peak height is 0."
+)
+
+# Every method-file line that names a library the LC-MS Console loads. A diagnostic that skips annotation
+# writes each of them blank, whatever the template or the state carries; a blank path is how a method file
+# says there is no such library, and the Console skips it (CommonProcess.ParseLibraries).
+ANNOTATION_LIBRARY_METHOD_KEYS = (
+    "msp file path",
+    "msp annotator settings file path",
+    "lbm file path",
+    "text db file path",
+    "text annotator settings file path",
+    "isotope text db file path",
+)
+
+# The method-file line naming the production annotation pipeline profile. No Console reads it; it says
+# which annotation the run performs, so a diagnostic that skips annotation writes it blank as well, whatever
+# the template carries.
+ANNOTATION_PROFILE_METHOD_KEY = "annotation pipeline profile"
+
+
+def diagnostic_skips_annotation(state: dict[str, Any]) -> bool:
+    """Whether a prepared state is a peak-count diagnostic that loads no annotation library."""
+    record = state.get("diagnostic_annotation")
+    return isinstance(record, dict) and record.get("status") == DIAGNOSTIC_ANNOTATION_SKIPPED
+
+
+def _annotation_library_roles(state: dict[str, Any]) -> list[str]:
+    """The kinds of library a state annotates with, by role and never by location."""
+    roles = set()
+    if str(state.get("msp_path") or "").strip() or any(
+        str(row.get("msp_file_path") or "").strip()
+        for row in state.get("msp_annotators") or []
+        if isinstance(row, dict)
+    ):
+        roles.add("msp")
+    lbm_annotator = state.get("lbm_annotator") if isinstance(state.get("lbm_annotator"), dict) else {}
+    if str(state.get("lbm_path") or "").strip() or str(lbm_annotator.get("lbm_file_path") or "").strip():
+        roles.add("lbm")
+    if str(state.get("text_db_path") or "").strip() or any(
+        str(row.get("text_db_file_path") or "").strip()
+        for row in state.get("text_annotators") or []
+        if isinstance(row, dict)
+    ):
+        roles.add("text")
+    return sorted(roles)
+
+
+def _skip_diagnostic_annotation(tuning: dict[str, Any]) -> None:
+    """Take every annotation library out of a diagnostic's state, and say so in it.
+
+    THE DIAGNOSTIC USED TO ANNOTATE AS THE PRODUCTION RUN DOES. On a campaign unit that meant the tiered
+    LBM -> strict MSP -> broad MSP cascade against the VS21-size MSP twice over, at Minimum peak height 0,
+    where every peak above the noise is a query. In the pilot, the diagnostic of one Waters MSE (AIF) file,
+    MTBKS281 Lm1, took 2,650.5 s with annotation. Run again without it, the same file took 927.9 s and gave
+    the same 20,057 peaks with the same heights. A Thermo DDA file, ST001337 Human feces_ALA007, took
+    267.0 s with annotation and 12.1 s without, with the same 13,599 peaks and heights. Each figure is
+    one Console run, and the two runs of a file were on different days.
+
+    Library provenance goes too, because a repository run manifest lists every library its state names;
+    left in place, the diagnostic's manifest would list libraries it never loaded.
+    """
+    roles = _annotation_library_roles(tuning)
+    profile = str(tuning.get("annotation_pipeline_profile") or "")
+    tuning["msp_path"] = ""
+    tuning["msp_annotators"] = []
+    tuning["text_db_path"] = ""
+    tuning["text_annotators"] = []
+    tuning["lbm_path"] = ""
+    if isinstance(tuning.get("lbm_annotator"), dict):
+        tuning["lbm_annotator"] = {**tuning["lbm_annotator"], "lbm_file_path": ""}
+    tuning["library_provenance"] = []
+    tuning.pop("annotation_pipeline_profile", None)
+    tuning["diagnostic_annotation"] = {
+        "status": DIAGNOSTIC_ANNOTATION_SKIPPED,
+        "reason": DIAGNOSTIC_ANNOTATION_SKIPPED_REASON,
+        "production_annotation_pipeline_profile": profile,
+        "production_library_roles_not_loaded": roles,
+    }
+
+
 def prepare_tuning_run(
     state: dict[str, Any],
     file_path: str,
     output_root: str | Path,
+    *,
+    annotate: bool = False,
 ) -> dict[str, Any]:
+    """Prepare the zero-threshold diagnostic: the production method on one file, at Minimum peak height 0.
+
+    An LC-MS diagnostic does not annotate unless ``annotate`` asks for it (see
+    DIAGNOSTIC_ANNOTATION_SKIPPED_REASON). The GUI's diagnostic panel asks, because it also tunes the MSP
+    score cutoffs from the same run's match scores; the agent and campaign diagnostic reads the peaks
+    only. A GC-MS diagnostic keeps its annotation: what its .mdscan rows are has not been established
+    independently of it. ``state`` itself is never changed.
+    """
     tuning = copy.deepcopy(state)
     selected = next(
         (item for item in tuning.get("files", []) if item.get("file_path") == file_path),
@@ -2070,22 +2180,37 @@ def prepare_tuning_run(
     # state that had enabled automatic RT correction could not be tuned at all.
     tuning["execute_automatic_rt_correction"] = False
     tuning["alignment_light_mode"] = False
-    if str(tuning.get("project_type", "lcms")).lower() == "gcms":
+    project_type = str(tuning.get("project_type", "lcms")).lower()
+    if project_type == "gcms":
         tuning["minimum_peak_height"] = state.get("minimum_peak_height", 1000)
     else:
         tuning["minimum_peak_height"] = 0
-    tuning["msp_weighted_dot_product"] = 0
-    tuning["msp_simple_dot_product"] = 0
-    tuning["msp_reverse_dot_product"] = 0
-    tuning["msp_matched_peaks_percentage"] = 0
-    tuning["msp_minimum_spectrum_match"] = 0
-    for annotator in tuning.get("msp_annotators", []):
-        annotator["weighted_dot_product_cutoff"] = 0
-        annotator["simple_dot_product_cutoff"] = 0
-        annotator["reverse_dot_product_cutoff"] = 0
-        annotator["matched_peaks_percentage_cutoff"] = 0
-        annotator["minimum_spectrum_match"] = 0
+    if project_type == "lcms" and not annotate:
+        _skip_diagnostic_annotation(tuning)
+    else:
+        # The match scores are read from this run, so every candidate is kept for the cutoffs to be
+        # chosen from.
+        tuning["msp_weighted_dot_product"] = 0
+        tuning["msp_simple_dot_product"] = 0
+        tuning["msp_reverse_dot_product"] = 0
+        tuning["msp_matched_peaks_percentage"] = 0
+        tuning["msp_minimum_spectrum_match"] = 0
+        for annotator in tuning.get("msp_annotators", []):
+            annotator["weighted_dot_product_cutoff"] = 0
+            annotator["simple_dot_product_cutoff"] = 0
+            annotator["reverse_dot_product_cutoff"] = 0
+            annotator["matched_peaks_percentage_cutoff"] = 0
+            annotator["minimum_spectrum_match"] = 0
+        tuning["diagnostic_annotation"] = {
+            "status": DIAGNOSTIC_ANNOTATION_PERFORMED,
+            "reason": (
+                "requested: the diagnostic's MSP match scores are read to tune the annotation cutoffs"
+                if annotate
+                else f"a {project_type} diagnostic keeps the production annotation"
+            ),
+        }
     prepared = prepare_run(tuning)
+    prepared["diagnostic_annotation"] = dict(tuning["diagnostic_annotation"])
     if prepared.get("temporary_input_folder"):
         prepared["diagnostic_input_folder"] = prepared["temporary_input_folder"]
         prepared.setdefault("warnings", []).append(
@@ -3582,6 +3707,14 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         replacements["msp annotator settings file path"] = str(msp_annotator_settings_path)
     if text_annotator_settings_path is not None:
         replacements["text annotator settings file path"] = str(text_annotator_settings_path)
+    if project_type == "lcms" and diagnostic_skips_annotation(state):
+        # Written blank rather than left to the template: an isotope text DB, a settings-file line or an
+        # annotation pipeline profile in a template is not Interactive's state, and a diagnostic that says it
+        # loads no library must not name one. Leaving the profile out of the replacements is not enough:
+        # _skip_diagnostic_annotation has already taken it out of the state, and a template line with no
+        # replacement is copied through as it stands.
+        blanked = (*ANNOTATION_LIBRARY_METHOD_KEYS, ANNOTATION_PROFILE_METHOD_KEY)
+        replacements.update({key: "" for key in blanked})
     if project_type == "gcms":
         replacements.update(
             {
@@ -3824,6 +3957,7 @@ def _title_for_key(key: str) -> str:
         "lbm file path": "Lbm file path",
         "text db file path": "Text DB file path",
         "text annotator settings file path": "Text annotator settings file path",
+        "isotope text db file path": "Isotope text DB file path",
         "searched adduct ions": "Searched adduct ions",
         "ion mode": "Ion mode",
         "target omics": "Target omics",
