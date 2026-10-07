@@ -11,9 +11,15 @@ from pathlib import Path
 from .automatic_rt_evidence import (
     ANCHORS,
     METHOD,
+    OUTLIER_STATUSES,
+    OUTLIER_TEST_LOCAL,
+    OUTLIER_TEST_OFF,
+    OUTLIER_TEST_RUN_WIDE_FLOORED,
+    OUTLIER_TEST_RUN_WIDE_MAD,
     SUMMARY,
     automatic_rt_correction_proof,
     discarded_method_keys,
+    has_local_support_columns,
     proof_reason_phrase,
     read_method_key_record,
 )
@@ -25,8 +31,11 @@ ANCHOR_COLUMNS = {"File ID", "Anchor ID", "m/z", "Reference RT (min)", "Original
 # is interpolated from, or copied from, neighbouring injections, or it keeps its original RT;
 # its own anchors never fit it, so every anchor record in a Blank is unused by design. Missing
 # and Ambiguous records matched no single peak and so never reached the model. Only the others
-# (MadOutlier, NonMonotonic, InsufficientAnchors, and any status this viewer does not know)
-# are rejections a reviewer has to look at.
+# (MadOutlier and, from MsdialWorkbench#826, LocalOutlier - OUTLIER_STATUSES - NonMonotonic,
+# InsufficientAnchors, and any status this viewer does not know) are rejections a reviewer has to
+# look at. The columns #826 appended (automatic_rt_evidence.LOCAL_SUPPORT_ANCHOR_COLUMNS and
+# LOCAL_SUPPORT_SUMMARY_COLUMNS) are read by name where present and are None in an older audit;
+# the required column sets below are #810's and stay so.
 BLANK_ANCHOR_STATUSES = {"BlankInterpolateByOrder", "BlankNotCorrected"}
 UNMATCHED_ANCHOR_STATUSES = {"Missing", "Ambiguous"}
 SMOOTHING_METHOD_KEYS = {"smoothing method", "smoothing level"}
@@ -53,6 +62,50 @@ def _method_values(path: Path) -> dict[str, str]:
         key, value = line.split(":", 1)
         values[key.strip().casefold()] = value.strip()
     return values
+
+
+OUTLIER_TEST_DESCRIPTIONS = {
+    OUTLIER_TEST_LOCAL: (
+        "Each anchor against the median of the offsets of the other compounds matched in the file "
+        "within the local support window (LocalOutlier), or of the file's anchors where fewer than "
+        "three such compounds are found (MadOutlier). Co-eluting reference candidates (isotope peaks, "
+        "adducts) count as one compound and the anchor's own is left out, so Neighbours counts "
+        "compounds; the scale is floored at the MS1 cycle around the anchor."
+    ),
+    OUTLIER_TEST_RUN_WIDE_FLOORED: (
+        "Each anchor against the median offset of the file's anchors (MadOutlier); the window is 0, "
+        "so no local test; the scale is floored at the MS1 cycle around the anchor."
+    ),
+    OUTLIER_TEST_RUN_WIDE_MAD: (
+        "Each anchor against the median offset of the file's anchors (MadOutlier), skipped where that "
+        "MAD is 0. This Console predates the local outlier test (MsdialWorkbench#826)."
+    ),
+    OUTLIER_TEST_OFF: "No outlier test: the outlier MAD threshold is 0.",
+}
+
+
+def _outlier_settings(proof: dict, anchor_rows: list[dict[str, str]], method_values: dict[str, str]) -> list[dict]:
+    """The outlier test's settings as this run's audit and method file show them, for the viewer.
+
+    Read from the rows even when the proof stopped early, so that a run whose evidence is refused
+    still shows what its audit says.
+    """
+    from .automatic_rt_evidence import outlier_test_of
+
+    found = proof if proof.get("outlier_test") else outlier_test_of(anchor_rows, method_values)
+    window = found.get("local_support_rt_window")
+    if not found.get("local_support_columns"):
+        window_text = "not applicable: this Console predates MsdialWorkbench#826"
+    elif found.get("local_support_rt_window_source") == "console_default":
+        window_text = f"{window:g} (Console default; method.txt has no line)"
+    else:
+        window_text = f"{window:g}" + (" (run-wide test only)" if not window else "")
+    return [
+        {"label": "Outlier test", "value": OUTLIER_TEST_DESCRIPTIONS.get(found.get("outlier_test"), "")},
+        {"label": "Outlier MAD threshold", "value": method_values.get("automatic rt correction outlier mad threshold")
+         or f"{found.get('outlier_mad_threshold'):g} (Console default; method.txt has no line)"},
+        {"label": "Local support RT window (min)", "value": window_text},
+    ]
 
 
 def _smooth_eic(points: list[dict], method: str, level: int) -> list[float]:
@@ -150,6 +203,12 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
             "median_absolute_offset": _number(row, "Median absolute offset (min)"),
             "maximum_absolute_offset": _number(row, "Maximum absolute offset (min)"),
             "note": row.get("Note", ""),
+            # MsdialWorkbench#826; None in an audit written before it.
+            "estimated_scan_interval": _number(row, "Estimated scan interval (min)"),
+            "first_used_anchor_rt": _number(row, "First used anchor RT (min)"),
+            "last_used_anchor_rt": _number(row, "Last used anchor RT (min)"),
+            "peaks_before_first_used_anchor": _number(row, "Peaks before first used anchor"),
+            "peaks_after_last_used_anchor": _number(row, "Peaks after last used anchor"),
         })
 
     anchors = []
@@ -187,6 +246,14 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
             "used": used,
             "status": status,
             "category": category,
+            # MsdialWorkbench#826: which test judged the anchor (Local, Global, or empty when it was
+            # not judged), its neighbour count, the offset it was compared with, the scale, and the
+            # MS1 cycle floor. None (or "") in an audit written before it.
+            "outlier_test": str(row.get("Outlier test") or "").strip(),
+            "local_support_count": _number(row, "Local support count"),
+            "expected_offset": _number(row, "Expected offset (min)"),
+            "outlier_scale": _number(row, "Outlier scale (min)"),
+            "ms1_cycle_time": _number(row, "MS1 cycle at anchor (min)"),
         }
         anchors.append(anchor)
         anchors_by_file[file_id].append(anchor)
@@ -259,6 +326,7 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
         warnings.append(f"{len(method_audit['unusable'])} method parameter value(s) were rejected by the Console.")
 
     method_values = _method_values(root / METHOD)
+    outlier_settings = _outlier_settings(proof, anchor_rows, method_values)
     return {
         "run_directory": str(root),
         "summary_file": str(summary_path),
@@ -273,6 +341,11 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
         "method_audit": method_audit,
         "selection_settings": [{"label": label, "value": method_values.get(key.casefold()) or None}
                                for key, label in SELECTION_FIELDS],
+        "outlier_settings": outlier_settings,
+        "local_support_columns": has_local_support_columns(anchor_rows),
+        "outlier_status_counts": {
+            status: count for status, count in dict(rejected).items() if status in OUTLIER_STATUSES
+        },
         "smoothing_settings": {
             "method": method_values.get("smoothing method") or None,
             "level": method_values.get("smoothing level") or None,

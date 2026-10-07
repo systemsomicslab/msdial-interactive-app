@@ -65,6 +65,23 @@ selects the reference file automatically. The Console retains
 `automatic_alignment_rt_correction_summary.tsv` and
 `automatic_alignment_rt_correction_anchors.tsv` as audit evidence.
 
+`automatic_rt_correction_local_support_rt_window` (minutes, 0 or more) is the
+window of the local anchor outlier test of MsdialWorkbench#826: each anchor is
+judged against the median offsets of the other compounds matched in the file
+within that window, co-eluting reference candidates (isotope peaks, adducts)
+counting as one compound and the anchor's own compound left out, and falls
+back to the run-wide test where fewer than three compounds are found. The
+scale is floored at the MS1 cycle around the anchor. 0 keeps the run-wide test
+only. It is written to the method file only when given; left
+out, a Console with #826 uses its default of 1.5 min and an older Console is
+never handed the key. Setting it with a Console that predates #826 is refused.
+Interactive's defaults do not turn automatic RT correction on and keep 6
+anchors; a campaign profile enables it with `execute_automatic_rt_correction`
+and `automatic_rt_correction_maximum_anchors`. A public-repository reanalysis
+that turns it on is refused with a Console that predates #826, also when the
+window is left unset. The zero-threshold diagnostic
+never runs it.
+
 `console_path` accepts an absolute path to `MSDIALCUI.exe` or `MSDIALCUI.dll`.
 Use `msdial_check_console_path` before asking the user to locate it manually, and
 `msdial_set_console_path` to persist an accepted path. Unknown answer keys are

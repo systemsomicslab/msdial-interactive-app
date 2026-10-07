@@ -4,6 +4,78 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.32] - Unreleased
+
+### Added
+- Support for MsdialWorkbench#826, which improves the automatic alignment RT
+  correction of #810. #826 judges each anchor against the median of the offsets
+  of the other compounds matched in the file within a local support window
+  (status `LocalOutlier`): reference candidates whose peak tops lie within two
+  MS1 scans of each other in both files (isotope peaks, adducts; only identical
+  RTs where a file's scans are unknown) count as one compound, and the anchor's
+  own compound is no support for it. Where fewer
+  than three compounds are found it falls back to the median of the file's
+  anchors (`MadOutlier`). It floors the robust scale at the MS1 cycle time
+  around the anchor. The public-repository campaign is to use it, with 12
+  anchors and the default window, as the user decided on 2026-10-07; a
+  repository run is refused with a Console that predates #826 (see Changed).
+  - A new answer key, `automatic_rt_correction_local_support_rt_window` (minutes,
+    0 or more; 0 keeps the run-wide test only). It is written to the method file
+    as `Automatic RT correction local support RT window: <v>` only when the
+    answers, the workflow or the template set it. Unset, nothing is written: a
+    Console with #826 uses its default of 1.5 min, and an older Console is never
+    handed a key it does not know. A template's line for it is read into the
+    state and is not copied through past it.
+  - It is validated as the other automatic RT settings are: a number the Console
+    reads, finite as a single-precision float, and not negative. Setting it with
+    a Console that predates #826 is refused: the probe looks for #826's method
+    key in the Console assembly (capability
+    `automatic_alignment_rt_correction_local_support`).
+  - The guided form has a field for it (blank leaves it to the Console), and the
+    supplementary workbook lists it under the automatic RT correction settings
+    when it is set.
+
+### Changed
+- The automatic RT correction evidence (`automatic_rt_correction_proof`), which
+  the audit viewer and the publication report share, reads #826's audits as well
+  as #810's. It records `outlier_test` (`local_support_with_ms1_cycle_floor`,
+  `run_wide_with_ms1_cycle_floor` for a window of 0, `run_wide_mad` for a
+  Console before #826, or `off` for a threshold of 0), the window and whether it
+  came from the method file or the Console default, the threshold, the
+  `Outlier test` counts and the `LocalOutlier` and `MadOutlier` counts. A run
+  whose method file set the window and whose Console listed it as unrecognised
+  is not proof (`method_key_not_recognised_by_console`).
+  - #826's appended columns are read by name: in the anchor audit `Outlier
+    test`, `Local support count`, `Expected offset (min)`, `Outlier scale (min)`
+    and `MS1 cycle at anchor (min)`; in the summary `Estimated scan interval
+    (min)`, `First used anchor RT (min)`, `Last used anchor RT (min)`, `Peaks
+    before first used anchor` and `Peaks after last used anchor`. An audit
+    without them, from a Console before #826, reads as before, and the required
+    column sets are unchanged.
+  - The audit viewer counts `LocalOutlier` as a rejection beside `MadOutlier`,
+    shows the new anchor columns and each file's MS1 scan interval where the
+    audit has them, and lists the outlier test's settings.
+  - The Methods text says, for a #826 run, that anchors were judged against the
+    other compounds matched in the file within the window, co-eluting reference
+    candidates counting as one compound and the anchor's own left out, with the
+    MS1-cycle floor, and how many each test rejected. It says nothing of either
+    for a Console before #826 or with the threshold at 0. Table S1 and the
+    workbook carry the new evidence fields.
+- A public-repository reanalysis (a run with a repository run manifest) that
+  turns automatic RT correction on is refused when the selected Console
+  predates #826, also when the window is left to the Console's default. Were
+  only a set window checked, a Console with #810 alone would run the older
+  run-wide test and the run would still complete as corrected. A guided or
+  laboratory analysis may still use a Console with #810 alone.
+
+### Not changed
+- Interactive's defaults for guided and laboratory analyses: automatic RT
+  correction stays off and the maximum anchors stay 6. A campaign profile turns
+  it on with `execute_automatic_rt_correction` and
+  `automatic_rt_correction_maximum_anchors`, which the campaign runner passes to
+  the production prepare and run. The zero-threshold diagnostic still turns it
+  off, so its method file has no automatic RT correction line.
+
 ## [0.5.31] - Unreleased
 
 ### Changed

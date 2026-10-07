@@ -8,7 +8,12 @@ import zipfile
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
-from .automatic_rt_evidence import automatic_rt_correction_proof, unproven
+from .automatic_rt_evidence import (
+    OUTLIER_TEST_LOCAL,
+    OUTLIER_TEST_RUN_WIDE_FLOORED,
+    automatic_rt_correction_proof,
+    unproven,
+)
 from .quality_assurance import with_qc_minimum, with_recorded_order
 from .sharing import PATH_POLICY, SharingContext, SharingError
 from .supplementary_excel import write_supplementary_workbook
@@ -341,6 +346,11 @@ def supplementary_rows(
             "files_audited",
             "selected_anchor_count",
             "model_sources",
+            "outlier_test",
+            "local_support_rt_window",
+            "local_support_rt_window_source",
+            "outlier_mad_threshold",
+            "outlier_status_counts",
             "reason",
             "summary_file",
             "anchors_file",
@@ -449,7 +459,8 @@ def _methods_text(
         paragraphs.append(
             "After peak detection and annotation on the original retention-time axis, "
             "MS-DIAL learned distributed anchor features and applied file-specific "
-            "piecewise-linear retention-time correction during alignment only. The retained "
+            "piecewise-linear retention-time correction during alignment only."
+            f"{_automatic_rt_outlier_sentence(automatic_rt_evidence)} The retained "
             f"Console audit records reference file {reference}, which defines the axis and "
             f"keeps its measured retention times. Of the other {others} audited file(s), "
             f"{automatic_rt_evidence.get('corrected_file_count', 0)} were corrected from their "
@@ -637,6 +648,41 @@ def _library_warnings(workflow: dict[str, Any], libraries: list[dict[str, Any]] 
                 f"No persistent identifier was recorded for {Path(path).name}. Add a database version, DOI, repository URL, or checksum before publication."
             )
     return warnings
+
+
+def _automatic_rt_outlier_sentence(evidence: dict[str, Any]) -> str:
+    """' Each anchor ...' for the outlier test of a Console with MsdialWorkbench#826, else ''.
+
+    Only a #826 audit shows which test judged each anchor and the MS1-cycle floor it used, so a run
+    by an older Console is not described as having had either.
+    """
+    test = evidence.get("outlier_test")
+    if test not in (OUTLIER_TEST_LOCAL, OUTLIER_TEST_RUN_WIDE_FLOORED):
+        return ""
+    threshold = float(evidence.get("outlier_mad_threshold") or 0)
+    counts = evidence.get("outlier_status_counts") or {}
+    local, run_wide = int(counts.get("LocalOutlier", 0)), int(counts.get("MadOutlier", 0))
+    scale = (
+        f"by more than {threshold:g} times a robust scale, 1.4826 times the median absolute "
+        "deviation but no less than the MS1 cycle time around the anchor"
+    )
+    if test == OUTLIER_TEST_LOCAL:
+        window = float(evidence.get("local_support_rt_window") or 0)
+        return (
+            " An anchor was rejected when its offset differed from the median of the offsets of the "
+            f"other compounds matched in the file within {window:g} min of it (or, where fewer than "
+            f"three were found, from the median offset of the file's anchors) {scale}. Reference "
+            "candidates whose peak tops lay within two MS1 scans of each other in both the reference "
+            "and the judged file (only at identical retention times where a file's scans were "
+            "unknown; isotope peaks, adducts) counted as one compound, at their median "
+            "offset, and the anchor's own compound was not counted as support for it; "
+            f"{local} anchor match(es) were rejected by the local test and {run_wide} by the "
+            "file-wide test."
+        )
+    return (
+        " An anchor was rejected when its offset differed from the median offset of the file's "
+        f"anchors {scale}; {run_wide} anchor match(es) were rejected."
+    )
 
 
 def _automatic_rt_correction_evidence(

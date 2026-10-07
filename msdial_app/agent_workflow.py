@@ -12,6 +12,7 @@ from .library_catalog import catalog_status
 from .user_settings import load_user_settings
 from .workflow import (
     AUTOMATIC_RT_CORRECTION_DEFAULTS,
+    AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW,
     FAMILY_FROM_FORMAT_DEFAULT,
     FAMILY_FROM_VENDOR_FORMAT,
     console_file_type,
@@ -51,6 +52,8 @@ SUPPORTED_ANSWER_KEYS = {
     "automatic_rt_correction_outlier_mad_threshold",
     "automatic_rt_correction_reference_centrality_weight",
     "automatic_rt_correction_interpolate_blanks_by_analytical_order",
+    # MsdialWorkbench#826; written to the method file only when given (Console default 1.5 min).
+    "automatic_rt_correction_local_support_rt_window",
     "library_provenance", "run_qa", "internal_standards",
     "use_retention_time_for_annotation", "retention_time_tolerance", "number_of_threads",
     "stage_inputs", "dilution_factor", "class_assignment_confirmed",
@@ -937,6 +940,15 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             ),
         }
     )
+    # Unlike the keys above it has no default here: unset, it is not written, and a Console with
+    # MsdialWorkbench#826 uses its own 1.5 min while one without it is never handed a key it does
+    # not know. A template line for it reached the state through load_parameter_template.
+    if AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW in answers:
+        window = answers[AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW]
+        if window is None or (isinstance(window, str) and not window.strip()):
+            state.pop(AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW, None)
+        else:
+            state[AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW] = window
     if answers.get("smoothing_method"):
         state["smoothing_method"] = str(answers["smoothing_method"])
     if answers.get("minimum_peak_height") is not None:
