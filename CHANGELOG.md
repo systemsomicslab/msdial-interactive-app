@@ -64,6 +64,140 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   from the difference, not timed by stage.
 - The measured runs used a method built by hand to the same rule, not one
   written by this version's `_write_method`.
+## [0.5.25] - Unreleased
+
+### Fixed
+- Replicate injections. A repository lists each injection as a sample row of its
+  own, and the rows of one sample share its id: MetaboLights MTBLS291 names `Cel`
+  in five rows, one mzML each, and MetaboBank MTBKS64 names `S01` in two, one .RAW
+  each. Both were refused as "two inputs on one sample". The unit of mapping is
+  now the sample row:
+  - `msdial_download_repository_raw` and every handoff mapping: the analysis-input
+    check (`_inputs_unpaired_with_rows`) pairs each declared input with the row of
+    its sample whose `raw_file` is the input's path (or its archive's), else the
+    one with its file name. Catalog 0.6.x already lists one input per row and
+    counts them alike, so MTBKS64 is consistent and is no longer excluded as
+    `analysis_input:count_mismatch`. Two inputs on one row, more inputs than a
+    sample has rows, or an input none of its sample's rows names, still are.
+    The analysis-CSV builder pairs a declared input with a row the same way
+    (`rows_naming_input`, shared by both): before, it matched by base name only,
+    so rows naming `raw/batch1/QC.RAW` and `raw/batch2/QC.RAW` passed the check
+    before the download and were refused after it (`sample_without_input`).
+  - `msdial_prepare_repository_reanalysis`: the analysis-CSV builder maps each
+    input to the row of its sample that names it (by its own name, its lineage
+    row's declared names, its declared path, or its `name_pairing`), and every
+    replicate is a CSV row of its own with its sample's Class. Nothing is merged,
+    averaged or dropped. `sample_with_two_inputs` is renamed
+    `sample_row_with_two_inputs` and fires only for one row two inputs name; an
+    input two rows name is `input_with_two_sample_rows` (it was reported as
+    `input_without_sample`), and an input of a sample several rows describe that
+    none of them names is `sample_row_not_identified`. All three are mapping
+    failures `allow_partial_mapping` may accept. `sample_without_input` and the
+    exclusions are counted by row, and a replicate is named with its raw file.
+  - Each CSV row records `sample_row_index` and `sample_raw_file`; each lineage
+    row the CSV was written from records `sample_row` (`index`, `sample_id`,
+    `raw_file`) beside the lease's own `sample_id`; the excluded inputs carry
+    `sample_raw_file`; the CSV record adds `sample_rows_without_input`.
+  - A handoff that counts no inputs gives `sample_count` as its rows that name a
+    sample, not its distinct sample ids.
+  - A split divides a sample's replicate rows by the part their inputs go to.
+    MetaboBank MTBKS220 gives its samples rows of timsOFF BAF folders and rows of
+    timsON TDF folders under one sample id; `plan_acquisition_split` and the
+    confirmed split picked rows and declared inputs by sample id, so each part
+    held both formats' rows and inputs and its CSV was refused after the 14 GB
+    download (`analysis_input_not_found`, `sample_without_input`). A row an input
+    of a part is (as the analysis-CSV builder finds it) is now that part's alone,
+    a row of an excluded input is no part's, and a declared input goes with the
+    row it is; each part records `sample_row_indexes`. Only a row no input is
+    found to be is still matched by its sample. On a synthetic unit built from
+    MTBKS220's real handoff, the parts hold 24 and 29 rows and declared inputs
+    (48 and 47 before).
+- Declared raw file names an archive member carries behind a prefix. Metabolomics
+  Workbench ST001264 declares `BioRec1.raw`, and its study archive holds
+  `021518_387057_CSHp_BioRec1.raw`; the lease admitted nothing and failed at its
+  attribute stage. For a unit whose Catalog declared no analysis inputs, an archive
+  member (an analysable file, or the outermost .d/.raw folder) whose name - or
+  stem, for a name a row records without an extension - ends in `_`, `-`, `.` or a
+  space and then a declared name, compared without case, is that declared file's
+  (`_prefixed_member_pairing`), where no member carries the name exactly, the
+  member carries no declared name exactly, and the pairing is one to one: a member
+  ending in two declared names, or a name two members end in, pairs neither, so
+  `Youn_sa1.raw` never takes `..._Youn_sa11.raw`. No pairing crosses a polarity:
+  where the member's path (its folders under the data root and its name) or the
+  declared name carries `pos`, `neg`, `positive` or `negative` as a token of its
+  own, in any case, and that is not the unit's ion mode, or the two disagree, the
+  pairing is refused (`polarity_token_contradicts_ion_mode`,
+  `polarity_token_contradicts_declared_name`). A polarity token beside a `control`,
+  `ctrl`, `blank` or `qc` token in the file name is read as part of a sample's name
+  and refuses nothing (`name_polarities`): a positive unit's
+  `Neg_Ctrl_1.raw` (a negative control) pairs with `021518_Neg_Ctrl_1.raw`, as do
+  `pos_ctrl`, `Positive_control` and `neg_blank`. Two cases keep it a polarity. A
+  name with a polarity token of its own elsewhere states that one only
+  (`Pos_Ctrl_1_neg.raw` is Negative), and a polarity folder always states its
+  polarity, whatever stands beside the token: `QC_NEG/2020_QC_1.raw` is Negative, as
+  `NEG/` is, so a positive unit's `QC_1.raw` is not paired with it. And where such a token is a name's only polarity token and that side of
+  the pairing (the declared names, or the members' paths) names its files by
+  polarity elsewhere (`names_state_polarity`), it is the file's polarity. Read-only
+  over the Catalog, an unconditional exemption would have stopped 157 sample rows in
+  19 LC-MS units from contradicting their unit's ion mode, and every one of those
+  units names its other files by polarity: ST002251's positive unit lists
+  `20200715_004_QC-neg.mzML` beside its `_pos` files, ST003858's negative unit lists
+  `Blank_POS_001.mzML`, and ST002510 lists `GL_NEG_Ctrl_B3_1.raw`. With the
+  condition, none does. Every stage that admits a member
+  by a sample's name admits a paired one (conversion sources, the encoding choice,
+  the attribute stage, the extracted files kept), and its lineage row records
+  `name_pairing` (`declared_raw_file`, `member_name`, `paired_by`
+  `prefixed_member_name`) and takes that file's sample; the attribute stage counts
+  `prefixed_member_pairings`. The analysis-CSV builder finds the sample row by the
+  same pairing. A declared name nothing carries still admits nothing: its row is
+  left in `samples_without_input`, and a unit left with no input still refuses to
+  fall back to accession-level inputs.
+
+### Added
+- Declared raw file names paired with archive members by their leading identifier
+  (the user's decision of 2026-10-06). Metabolomics Workbench ST001359 declares
+  `VV_13_HEpG2_C1_pos.raw`, and its archive holds
+  `VV_13_HEpG2_C1_exp344_pos.raw`; the row for VV_14 even reads `HEepG2`. In the
+  same pairing code and with the same scope as the prefixed rule (units whose
+  Catalog declared no inputs), after exact and then prefixed matches, a declared
+  name still unpaired is paired with the member whose `leading_identifier_key` is
+  its own: the stem (less a raw or converted suffix) split on `_`, `-`, `.` and
+  spaces, taken up to and including the first token that contains a digit,
+  compared without case and joined by `_` (`vv_13`). A key of digits only (a run
+  date such as `021518`) or a name without a digit gives none. The key must be
+  unique among the declared names and among the candidate members, and no pairing
+  crosses a polarity token. Applied to ST001359's real member listing, all six
+  declared names pair; applied to ST001264's, the rows named `Sample1`..`Sample28`
+  still pair with nothing.
+- Every inferred pairing is left on record, as the user required:
+  - the input's lineage row records `name_pairing` with `paired_by`
+    `leading_identifier_token` and the `key` (or `prefixed_member_name`), the
+    declared and the member name;
+  - the attribute stage counts `prefixed_member_pairings` and
+    `leading_identifier_token_pairings`, lists `inferred_name_pairings` and any
+    `refused_name_pairings` (with the rule and the reason), and carries the warning
+    `input_names_paired_by_inference`;
+  - the run manifest carries `warnings: ["input_names_paired_by_inference"]` and
+    `input_name_pairings` (`paired`, `refused`); every campaign disposition of such
+    a unit lists the same warning;
+  - a split part's run manifest carries the same record for itself: the pairings
+    of its own inputs (or of the mzXML they stand for), the refusals for its own
+    sample rows, and the warning only where it has a pairing of its own. A pairing
+    of an excluded input, or a refusal for a row no part holds, stays in the
+    parent's record only. An excluded ion-mobility part's disposition carries the
+    warning too;
+  - the analysis-CSV build, its preview and the manifest's `analysis_csv` record
+    carry the warning and `inferred_name_pairings`;
+  - the reviewed sample TSV (and JSON) of a repository unit gains the column
+    `raw_file_paired_by`: `exact`, `prefixed_member_name` or
+    `leading_identifier_token`, and empty for a row without an input.
+- A unit whose sample rows the download did not all deliver says so beside its CSV:
+  the build, its preview and the `analysis_csv` record carry the warning
+  `sample_rows_without_input` and `sample_row_coverage` (`sample_rows`,
+  `with_input`, `without_input`). ST001264 runs its 3 BioRec rows of 31; this is
+  recorded and does not stop the run.
+- Agent capabilities `repository_replicate_rows_as_inputs`,
+  `repository_prefixed_member_names` and `repository_leading_identifier_names`.
 
 ## [0.5.24] - Unreleased
 

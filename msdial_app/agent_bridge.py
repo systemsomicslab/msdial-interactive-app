@@ -97,6 +97,15 @@ def summarize_jobs(
             # its peaks and their heights are read, and annotation changes neither. Its records say
             # annotation "skipped_for_peak_count".
             "peak_count_diagnostic_without_annotation",
+            # Replicate rows that share a sample id are each their own input and analysis-CSV row (the sample
+            # row, not the id, is mapped), and an undeclared unit's archive member that carries a declared raw
+            # file name behind a prefix is that file's, one to one, recorded as paired_by prefixed_member_name.
+            "repository_replicate_rows_as_inputs",
+            "repository_prefixed_member_names",
+            # A declared raw file name and an archive member that share their leading identifier (VV_13) are one
+            # file where the key is unique on both sides, recorded as paired_by leading_identifier_token with the
+            # warning input_names_paired_by_inference; no inferred pairing crosses a polarity token.
+            "repository_leading_identifier_names",
         ],
         "workflow_outline": [
             "Inspect the input path and collect the guided scientific choices.",

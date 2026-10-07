@@ -11,6 +11,10 @@ from typing import Any, Iterable
 
 SCHEMA = "msdial-repository-metadata.v1"
 IDENTITY_FIELDS = {"sample_id", "raw_file", "source_name"}
+# How a repository unit's analysis CSV paired a sample row's raw file with its input (exact,
+# prefixed_member_name, leading_identifier_token; '' for a row without one). Written by the repository prepare
+# step into the reviewed rows and their TSV; a record of the pairing, never a field to group samples by.
+RAW_FILE_PAIRED_BY = "raw_file_paired_by"
 ANALYSIS_FIELDS = [
     "file_path",
     "file_name",
@@ -92,18 +96,19 @@ def normalize_sample_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]
         }
         for key, value in source.items():
             name = clean_field_name(key)
-            if name and name not in IDENTITY_FIELDS | {"values", "class_id"}:
+            if name and name not in IDENTITY_FIELDS | {"values", "class_id", RAW_FILE_PAIRED_BY}:
                 values.setdefault(name, scalar_text(value))
         sample_id = scalar_text(source.get("sample_id")) or f"sample_{index}"
-        result.append(
-            {
-                "sample_id": sample_id,
-                "source_name": scalar_text(source.get("source_name")) or sample_id,
-                "raw_file": scalar_text(source.get("raw_file")),
-                "values": values,
-                "class_id": scalar_text(source.get("class_id")),
-            }
-        )
+        row = {
+            "sample_id": sample_id,
+            "source_name": scalar_text(source.get("source_name")) or sample_id,
+            "raw_file": scalar_text(source.get("raw_file")),
+            "values": values,
+            "class_id": scalar_text(source.get("class_id")),
+        }
+        if RAW_FILE_PAIRED_BY in source:
+            row[RAW_FILE_PAIRED_BY] = scalar_text(source.get(RAW_FILE_PAIRED_BY))
+        result.append(row)
     return result
 
 
@@ -510,12 +515,46 @@ def metadata_match_keys(*values: Any) -> set[str]:
     return keys
 
 
+def row_path_key(value: Any) -> str:
+    """A listed path as the Catalog writes it into an input and a sample row: '/'-separated, casefolded."""
+    return str(value or "").replace("\\", "/").strip().strip("/").casefold()
+
+
+def rows_naming_input(paths: Iterable[Any], rows: list[dict[str, Any]], indexes: Iterable[int]) -> list[int]:
+    """Which of a sample's rows (``indexes`` into ``rows``) a declared input is: by its path, else its name.
+
+    ``paths`` are the declared input's path and, for an archived container, its archive's. The rows whose
+    raw_file is one of them exactly (row_path_key) are the answer where there are any; only where none is
+    are the rows whose raw file's name is one of the paths' names. The handoff check (mcp_server's
+    _inputs_unpaired_with_rows) and the analysis-CSV builder both pair a declared input with a row by this,
+    so a unit whose rows QC.RAW in raw/batch1 and raw/batch2 pass the one before the download are paired
+    alike by the other after it. Returns the positions found, sorted; one position is a pairing.
+    """
+    keys = [key for key in (row_path_key(item) for item in paths) if key]
+    exact: dict[str, list[int]] = {}
+    names: dict[str, list[int]] = {}
+    for index in indexes:
+        key = row_path_key((rows[index] or {}).get("raw_file"))
+        if key:
+            exact.setdefault(key, []).append(index)
+            names.setdefault(key.rsplit("/", 1)[-1], []).append(index)
+    found = sorted({index for key in keys for index in exact.get(key, ())})
+    if not found:
+        found = sorted({index for key in keys for index in names.get(key.rsplit("/", 1)[-1], ())})
+    return found
+
+
 def _write_metadata_tsv(path: Path, workspace: dict[str, Any]) -> None:
     fields = [item["name"] for item in workspace.get("fields", [])]
+    # Where the repository prepare step recorded how each row's raw file was paired, the TSV says it beside
+    # the raw file; every other workspace writes the columns it always did.
+    paired = any(RAW_FILE_PAIRED_BY in row for row in workspace.get("rows", []))
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["sample_id", "source_name", "raw_file", "class_id", *fields],
+            fieldnames=[
+                "sample_id", "source_name", "raw_file", *([RAW_FILE_PAIRED_BY] if paired else []), "class_id", *fields
+            ],
             delimiter="\t",
             lineterminator="\n",
         )
@@ -526,6 +565,7 @@ def _write_metadata_tsv(path: Path, workspace: dict[str, Any]) -> None:
                     "sample_id": row.get("sample_id", ""),
                     "source_name": row.get("source_name", ""),
                     "raw_file": row.get("raw_file", ""),
+                    **({RAW_FILE_PAIRED_BY: row.get(RAW_FILE_PAIRED_BY, "")} if paired else {}),
                     "class_id": row.get("class_id", ""),
                     **{name: row.get("values", {}).get(name, "") for name in fields},
                 }

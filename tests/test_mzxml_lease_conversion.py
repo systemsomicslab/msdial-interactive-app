@@ -551,7 +551,7 @@ class TheLeaseConvertsTheUnitsMzxml(_Scratch):
     def test_a_vendor_file_the_unit_admits_is_its_samples_encoding_whatever_its_folder(self) -> None:
         """Samples named without an extension, as a Workbench RAW_FILE_NAME often is, admit QC_01.raw by its stem,
         in whichever folder it lies. Converting QC_01.mzXML as well would give the sample two inputs and the unit
-        no analysis CSV (sample_with_two_inputs); the vendor file is analysed and the mzXML is not converted."""
+        no analysis CSV (sample_row_with_two_inputs); the vendor file is analysed and the mzXML is not converted."""
         for raw_folder, mzxml_folder in (("Thermo_RAW", "mzXML"), ("RAW", "converted_mzXML"), ("RAW", "mzXML")):
             with self.subTest(raw=raw_folder, mzxml=mzxml_folder), tempfile.TemporaryDirectory() as temporary:
                 self.root = Path(temporary).resolve()
