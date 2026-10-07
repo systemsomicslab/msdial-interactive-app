@@ -6887,9 +6887,10 @@ def _representation_by_input(manifest: dict[str, Any]) -> dict[str, dict[str, An
     before did not, though the extractor read them: for such a record they are read from the extractor
     records the preflight kept in its output file, and the record says so
     (spectrum_representation_read_from). A preflight that kept no per-file summary at all (one recorded
-    without a summary, or one whose extractor failed before it was summarised) is read the same way: every
-    extractor record its output file holds gives an entry for the file it names. An input found in neither
-    has no entry.
+    without a summary, or one whose extractor failed before it was summarised) is read the same way: the
+    extractor records its output file holds are summarised as a preflight summary has them
+    (_summarize_raw_metadata, MS-level flags included), and each gives an entry for the file it names. An
+    input found in neither has no entry.
     """
     from .raw_metadata_preflight import spectrum_representation_fields
 
@@ -6921,13 +6922,12 @@ def _representation_by_input(manifest: dict[str, Any]) -> dict[str, dict[str, An
         if path_text:
             records.setdefault(_file_key(path_text), record)
     if not entries:
-        # No per-file summary to complete: the extractor records themselves are the per-file entries.
-        for key, record in records.items():
-            result[key] = {
-                "file": str(record["source"]["filePath"]),
-                **spectrum_representation_fields(record),
-                "spectrum_representation_read_from": "preflight_output",
-            }
+        # No per-file summary to complete: the extractor records are summarised as a preflight summarises
+        # them, so each entry carries has_ms1, has_ms2 and ms_levels too, and an input without a level does
+        # not vote on that level's data type. The same records decide the same way with or without a summary.
+        keys = list(records)
+        for key, entry in zip(keys, _summarize_raw_metadata([records[key] for key in keys])["per_file"]):
+            result[key] = {**entry, "spectrum_representation_read_from": "preflight_output"}
         return result
     for item in earlier:
         key = _file_key(str(item.get("file") or ""))

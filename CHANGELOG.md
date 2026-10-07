@@ -69,8 +69,10 @@ three branch from 0.5.24.
   - For a preflight recorded before this version, the representation, reader,
     format and model are read from the extractor records kept in
     `provenance\raw-metadata-preflight.json` (`read_from_preflight_output`).
-    A preflight that kept no `summary.per_file` at all is read the same way,
-    one entry per extractor record. Where that file is absent, the inputs stay
+    A preflight that kept no `summary.per_file` at all is read the same way:
+    its extractor records are summarised as a preflight summary would have
+    them, MS-level flags included, so an input without MS2 does not vote on
+    the MS2 data type. Where that file is absent, the inputs stay
     `unrecorded`; that is so for all four summary-less preflights in the
     reanalysis workspace on 2026-10-07 (MPST000007 twice, MTBLS341, ST002419).
   - What the 2026-10-03 pilot units get, read from their records:

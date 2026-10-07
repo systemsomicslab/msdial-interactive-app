@@ -27,6 +27,7 @@ from msdial_app.raw_metadata_preflight import (
     spectrum_representation_fields,
 )
 from msdial_app.repository_reanalysis import (
+    _summarize_raw_metadata,
     evaluate_repository_execution_gate,
     record_run_start,
     run_data_types,
@@ -456,6 +457,46 @@ class RunDecisionTests(_UnitCase):
         self.assertEqual(("Centroid", "delivered_centroid", 2), (decision["ms1_data_type"], decision["ms1_data_type_basis"], decision["inputs"]))
         self.assertEqual({"shimadzu_centroid_list": 2}, decision["levels"]["ms2"]["delivery"])
         self.assertTrue(decision["read_from_preflight_output"])
+
+    def mzml_records(self, output: Path, *inputs: tuple[str, list[int]]) -> list[dict]:
+        """mzML extractor records for self.files, each (stored representation, MS levels), written to output."""
+        records = []
+        for path, (representation, levels) in zip(self.files, inputs):
+            record = fx._header(str(path), levels=levels)
+            record["source"].update({"readerName": "MzmlMetadataReader", "nativeFormat": "mzML"})
+            record["acquisition"]["spectrumRepresentation"] = {"value": representation, "source": "SpectrumHeader", "confidence": 1.0}
+            records.append(record)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(records), encoding="utf-8")
+        return records
+
+    def test_an_input_without_ms2_does_not_vote_on_ms2_without_a_summary_either(self) -> None:
+        # A full-scan-only input that stores centroids beside a DDA input that stores profile: only the DDA
+        # input has MS2, so MS2 is Profile. The same records give the same decision with and without a summary.
+        output = self.root / "provenance" / "raw-metadata-preflight.json"
+        records = self.mzml_records(output, ("Centroid", [1]), ("Profile", [1, 2]))
+        summarised = run_data_types(self.state(_write_unit(self.root, _summarize_raw_metadata(records)["per_file"])))
+        manifest = self.summary_less_unit(output)
+
+        decision = run_data_types(self.state(manifest))
+
+        self.assertEqual(("Profile", "raw_header", "all_inputs_agree"), _level(decision, "ms2"))
+        self.assertEqual(1, decision["levels"]["ms2"]["not_applicable"])
+        self.assertEqual(("Centroid", "default", "inputs_disagree"), _level(decision, "ms1"))
+        self.assertTrue(decision["read_from_preflight_output"])
+        for name in ("ms1", "ms2"):
+            self.assertEqual(summarised["levels"][name], decision["levels"][name])
+
+    def test_a_unit_without_ms2_has_no_ms2_input_without_a_summary_either(self) -> None:
+        output = self.root / "provenance" / "raw-metadata-preflight.json"
+        self.mzml_records(output, ("Profile", [1]), ("Profile", [1]))
+        manifest = self.summary_less_unit(output)
+
+        decision = run_data_types(self.state(manifest))
+
+        self.assertEqual(("Profile", "raw_header", "all_inputs_agree"), _level(decision, "ms1"))
+        self.assertEqual(("Centroid", "default", "no_input_at_level"), _level(decision, "ms2"))
+        self.assertEqual(2, decision["levels"]["ms2"]["not_applicable"])
 
     def test_a_preflight_without_a_summary_or_an_output_stays_unrecorded(self) -> None:
         manifest = self.summary_less_unit(self.root / "provenance" / "raw-metadata-preflight.json")
