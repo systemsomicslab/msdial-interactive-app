@@ -1254,6 +1254,10 @@ def load_parameter_template(
     template_path = Path(path).expanduser().resolve()
     if not template_path.is_file():
         raise FileNotFoundError(f"Parameter template not found: {template_path}")
+    refuse_blank_filtering_conflict(
+        template_path,
+        template_path.read_text(encoding="utf-8-sig", errors="replace").splitlines(),
+    )
     values = parse_method(template_path)
 
     def value(*keys: str, default: str = "") -> str:
@@ -2756,6 +2760,12 @@ def prepare_rt_correction_run(state: dict[str, Any]) -> dict[str, Any]:
     template_path = Path(str(state.get("template_path", ""))).expanduser().resolve()
     if not template_path.is_file():
         raise ValueError(f"Parameter template not found: {template_path}")
+    # The preview hands the Console a byte copy of the template, so a template it would refuse is
+    # refused here, with the template named, rather than by the Console under the copy's name.
+    refuse_blank_filtering_conflict(
+        template_path,
+        template_path.read_text(encoding="utf-8-sig", errors="replace").splitlines(),
+    )
 
     acquisition_types = {
         str(item.get("acquisition_type", "DDA") or "DDA")
@@ -3813,9 +3823,121 @@ def console_method_key(line: str) -> str | None:
     return line[: min(separators)].strip().casefold()
 
 
+# The blank filtering lines of a method file, as MS-DIAL's Console names them. Since
+# MsdialWorkbench #823 "Blank filtering" and "Fold change for blank filtering" are the settings, and
+# each ratio key is shorthand for its comparison with that fold change.
+BLANK_FILTERING_KEY = "Blank filtering"
+FOLD_CHANGE_FOR_BLANK_FILTERING_KEY = "Fold change for blank filtering"
+SAMPLE_MAX_OVER_BLANK_AVERAGE_KEY = "Sample max / blank average"
+SAMPLE_AVERAGE_OVER_BLANK_AVERAGE_KEY = "Sample average / blank average"
+_BLANK_FILTERING_MODES = ("SampleMaxOverBlankAve", "SampleAveOverBlankAve")
+
+
+def _blank_filtering_mode(text: str) -> str | None:
+    """The comparison a 'Blank filtering' value names, as the Console's Enum.TryParse reads it, or None."""
+    if text.isascii() and text.isdigit() and int(text) < len(_BLANK_FILTERING_MODES):
+        return _BLANK_FILTERING_MODES[int(text)]
+    return next((mode for mode in _BLANK_FILTERING_MODES if mode.casefold() == text.casefold()), None)
+
+
+def _blank_filtering_number(text: str) -> float | None:
+    """The value as the Console keeps it, a single-precision float, or None when it cannot read it."""
+    if "_" in text:
+        return None
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    if not math.isfinite(number):
+        return None
+    try:
+        return struct.unpack("<f", struct.pack("<f", number))[0]
+    except OverflowError:
+        return math.copysign(math.inf, number)
+
+
+def blank_filtering_conflict(lines: Iterable[str]) -> str | None:
+    """Why the blank filtering lines of a method file disagree, or None when they do not.
+
+    The rule of the Console's BlankFilteringConflict (MsdialWorkbench #823), which refuses such a file
+    before any processing: both ratio keys; a ratio key whose comparison is not that of 'Blank
+    filtering'; or one whose value is not that of 'Fold change for blank filtering'. As there, each key
+    counts by the last line whose value could be read; a blank or unreadable line leaves an earlier one
+    in place.
+    """
+    readers: dict[str, Callable[[str], Any]] = {
+        BLANK_FILTERING_KEY.casefold(): _blank_filtering_mode,
+        FOLD_CHANGE_FOR_BLANK_FILTERING_KEY.casefold(): _blank_filtering_number,
+        SAMPLE_MAX_OVER_BLANK_AVERAGE_KEY.casefold(): _blank_filtering_number,
+        SAMPLE_AVERAGE_OVER_BLANK_AVERAGE_KEY.casefold(): _blank_filtering_number,
+    }
+    used: dict[str, tuple[str, Any]] = {}
+    for line in lines:
+        key = console_method_key(line)
+        if key not in readers:
+            continue
+        separator = min(index for index in (line.find(":"), line.find("=")) if index >= 0)
+        text = line[separator + 1:].strip()
+        parsed = readers[key](text) if text else None
+        if parsed is not None:
+            used[key] = (text, parsed)
+    mode = used.get(BLANK_FILTERING_KEY.casefold())
+    fold_change = used.get(FOLD_CHANGE_FOR_BLANK_FILTERING_KEY.casefold())
+    sample_max = used.get(SAMPLE_MAX_OVER_BLANK_AVERAGE_KEY.casefold())
+    sample_average = used.get(SAMPLE_AVERAGE_OVER_BLANK_AVERAGE_KEY.casefold())
+    if sample_max and sample_average:
+        return (
+            f"'{SAMPLE_MAX_OVER_BLANK_AVERAGE_KEY}: {sample_max[0]}' and "
+            f"'{SAMPLE_AVERAGE_OVER_BLANK_AVERAGE_KEY}: {sample_average[0]}' choose different blank "
+            "filtering comparisons. Write only one of them; before MsdialWorkbench #823 only "
+            f"'{SAMPLE_MAX_OVER_BLANK_AVERAGE_KEY}' took effect."
+        )
+    if sample_max:
+        shorthand_key, shorthand, shorthand_mode = (
+            SAMPLE_MAX_OVER_BLANK_AVERAGE_KEY, sample_max, "SampleMaxOverBlankAve")
+    elif sample_average:
+        shorthand_key, shorthand, shorthand_mode = (
+            SAMPLE_AVERAGE_OVER_BLANK_AVERAGE_KEY, sample_average, "SampleAveOverBlankAve")
+    else:
+        return None
+    meaning = (
+        f"'{shorthand_key}: {shorthand[0]}' is shorthand for '{BLANK_FILTERING_KEY}: {shorthand_mode}' "
+        f"with '{FOLD_CHANGE_FOR_BLANK_FILTERING_KEY}: {shorthand[0]}'"
+    )
+    if mode and mode[1] != shorthand_mode:
+        return (
+            f"'{BLANK_FILTERING_KEY}: {mode[0]}' and '{shorthand_key}: {shorthand[0]}' choose different "
+            f"blank filtering comparisons; {meaning}. Remove one of them."
+        )
+    if fold_change and fold_change[1] != shorthand[1]:
+        return (
+            f"'{FOLD_CHANGE_FOR_BLANK_FILTERING_KEY}: {fold_change[0]}' and '{shorthand_key}: {shorthand[0]}' "
+            f"set different fold changes; {meaning}. Remove one of them."
+        )
+    return None
+
+
+def refuse_blank_filtering_conflict(template_path: str | Path, lines: Iterable[str]) -> None:
+    """Refuse a parameter template whose blank filtering lines disagree, before a Console does.
+
+    A Console that contains MsdialWorkbench #823 refuses such a method file at start-up; an earlier one
+    read only 'Blank filtering: SampleMaxOverBlankAve' and 'Sample max / blank average', so the same
+    file meant different things to the two. Interactive copies these lines from the template as they
+    stand and does not choose between them, because which comparison was meant is the template
+    author's decision, not Interactive's.
+    """
+    conflict = blank_filtering_conflict(lines)
+    if conflict:
+        raise ValueError(
+            f"Parameter template {template_path}: {conflict} MS-DIAL Console refuses a method file "
+            "whose blank filtering lines disagree."
+        )
+
+
 def _write_method(path: Path, state: dict[str, Any]) -> None:
     template_path = Path(state["template_path"])
     lines = template_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    refuse_blank_filtering_conflict(template_path, lines)
     project_type = str(state.get("project_type", "lcms")).lower()
     msp_annotator_settings_path = _write_msp_annotator_settings(path.parent, state)
     text_annotator_settings_path = _write_text_annotator_settings(path.parent, state)

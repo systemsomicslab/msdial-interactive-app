@@ -4,6 +4,32 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.33] - Unreleased
+
+### Fixed
+- Every method file Interactive writes now names one blank filtering
+  comparison. The shipped LC-MS and GC-MS templates wrote
+  `Blank filtering: SampleMaxOverBlankAve`, `Sample max / blank average: 5` and
+  `Sample average / blank average: 5`; since MsdialWorkbench#823 the Console
+  refuses, before any processing, a method file that has both ratio keys, so a
+  Console built from MS-DIAL master refused every run. Both templates drop the
+  `Sample average / blank average` line, which no Console before #823 read, so
+  old and new Consoles read the remaining two lines alike: sample maximum over
+  blank average, fold change 5.
+- A parameter template whose blank filtering lines disagree by #823's rule (both
+  ratio keys; a ratio key whose comparison differs from `Blank filtering`; or
+  one whose value differs from `Fold change for blank filtering`) is refused,
+  naming the template and the two lines, when it is loaded
+  (`load_parameter_template`), when a method file is written from it, and before
+  the RT correction preview copies it. Interactive does not choose between the
+  lines, because which comparison was meant is the template author's decision.
+  As in the Console, each key counts by its last readable line.
+
+### Not changed
+- No answer, workflow setting or report sets, maps or describes blank
+  filtering: the lines come from the template alone, and a template that agrees
+  with itself is copied through as before.
+
 ## [0.5.32] - Unreleased
 
 ### Added

@@ -75,7 +75,6 @@ N percent detected in one group: 0
 Remove feature based on peak height fold-change: False
 Blank filtering: SampleMaxOverBlankAve
 Sample max / blank average: 5
-Sample average / blank average: 5
 Keep reference matched metabolites: True
 Keep suggested metabolites: False
 Keep removable features and assigned tag for checking: True
