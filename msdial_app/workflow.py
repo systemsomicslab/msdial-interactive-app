@@ -721,6 +721,97 @@ def requires_mzml_conversion(path: Path) -> bool:
     return any(name.endswith(suffix) for suffix in CONVERSION_REQUIRED_SUFFIXES)
 
 
+FOURIER_TRANSFORM_FAMILY = "Fourier-transform MS"
+FT_ICR_FAMILY = "FT-ICR"
+QTOF_FAMILY = "QTOF"
+# Where a file's instrument family came from. Only a format default may be replaced by a repository's
+# declared instrument (agent_workflow.select_peak_tuning_representative): a vendor format or an mzML
+# header is evidence about the file itself.
+FAMILY_FROM_VENDOR_FORMAT = "vendor_format"
+FAMILY_FROM_MZML_HEADER = "mzml_instrument_configuration"
+FAMILY_FROM_FORMAT_DEFAULT = "format_default"
+
+# Fourier-transform instruments by name, as the PSI-MS CV, a vendor or a repository submitter writes them.
+# Orbitrap model names are read first: ProteoWizard gives a Thermo model it does not know (Orbitrap ID-X in
+# MTBLS2207) the FT-ICR analyzer term MS:1000079 beside a userParam naming the model. "LTQ FT" is an FT-ICR
+# hybrid. A bare "LTQ", "LTQ Velos" or "Velos Plus" is a linear ion trap and matches nothing; every Orbitrap
+# Velos/Elite name says Orbitrap. "Fusion" and "Eclipse" are also HPLC column names (Synergi Fusion-RP,
+# Zorbax Eclipse Plus), which a repository's free text can carry beside the instrument.
+_ORBITRAP_INSTRUMENT = re.compile(
+    r"orbitrap|exactive|exploris|astral|\blumos\b|\bascend\b|tribrid|\bid-x\b|"
+    r"\bfusion\b(?![\s-]*rp)|(?<!zorbax )\beclipse\b(?![\s-]*(?:plus|xdb|c18|c8))",
+    re.IGNORECASE,
+)
+_FT_ICR_INSTRUMENT = re.compile(
+    r"ft[\s-]?icr|fticr|cyclotron|solarix|scimax|mrms\b|\bapex(?![a-z])|\bltq[\s-]?ft(?![a-z])",
+    re.IGNORECASE,
+)
+# A Fourier-transform analyser named generically (a Thermo "FTMS" scan filter, "Fourier transform ...").
+_FOURIER_GENERIC = re.compile(r"\bftms\b|fourier", re.IGNORECASE)
+# Time-of-flight evidence in an mzML header: the analyzer term, or a model name of a TOF family.
+_TOF_INSTRUMENT = re.compile(
+    r"time[\s-]of[\s-]flight|tof\b|maxis|\bimpact\b|\bcompact\b|timstof|xevo|synapt|\bvion\b|"
+    r"tripletof|zenotof|\bx500|\bqstar|\blct\b|\blcms-90[35]0",
+    re.IGNORECASE,
+)
+_MZML_HEADER_LIMIT = 1 << 20
+_MZML_HEADER_BLOCKS = re.compile(
+    r"<(referenceableParamGroupList|instrumentConfigurationList)\b.*?</\1>", re.DOTALL
+)
+_MZML_CV_NAME = re.compile(r"<cvParam\b[^>]*?\bname=\"([^\"]*)\"")
+_MZML_USER_VALUE = re.compile(r"<userParam\b[^>]*?\bvalue=\"([^\"]*)\"")
+
+
+def instrument_family_from_text(texts: Iterable[str]) -> tuple[str, str] | None:
+    """The Fourier-transform family an instrument description names, and the text that named it.
+
+    ("Fourier-transform MS", text) for an Orbitrap-class instrument (Q Exactive, Exactive, Exploris,
+    Orbitrap Fusion/Lumos/Eclipse/Ascend, Astral, LTQ Orbitrap, Orbitrap Velos/Elite, ID-X, the Tribrids),
+    ("FT-ICR", text) for an FT-ICR (solariX, apex, scimaX, LTQ FT), ("Fourier-transform MS", text) for an
+    analyser named only as Fourier-transform, and None when nothing in texts names one. Both families take
+    the same threshold step (1,000).
+    """
+    items = [str(text or "") for text in texts if str(text or "").strip()]
+    for pattern, family in (
+        (_ORBITRAP_INSTRUMENT, FOURIER_TRANSFORM_FAMILY),
+        (_FT_ICR_INSTRUMENT, FT_ICR_FAMILY),
+        (_FOURIER_GENERIC, FOURIER_TRANSFORM_FAMILY),
+    ):
+        for item in items:
+            if pattern.search(item):
+                return family, item
+    return None
+
+
+def mzml_instrument_description(path: str | Path) -> list[str]:
+    """The instrument an mzML header describes: every cvParam name and userParam value in its
+    referenceableParamGroupList and instrumentConfigurationList, read from the head of the file only.
+
+    The model is a cvParam (MS:1001911 "Q Exactive") or, in Interactive's own mzXML conversion, a
+    userParam "instrument model"; the analyzer is a cvParam (MS:1000484 "orbitrap"). Nothing outside those
+    two lists is read: a source file name or a sample name can say "orbitrap" without describing the
+    instrument. Returns [] for a file that cannot be read.
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = b""
+            while len(head) < _MZML_HEADER_LIMIT:
+                chunk = handle.read(65536)
+                if not chunk:
+                    break
+                head += chunk
+                if b"</instrumentConfigurationList>" in head or b"<run " in head or b"<run>" in head:
+                    break
+    except OSError:
+        return []
+    text = head.decode("utf-8", "replace")
+    found: list[str] = []
+    for block in _MZML_HEADER_BLOCKS.finditer(text):
+        found.extend(match.group(1) for match in _MZML_CV_NAME.finditer(block.group(0)))
+        found.extend(match.group(1) for match in _MZML_USER_VALUE.finditer(block.group(0)))
+    return [item for item in found if item.strip()]
+
+
 def detect_raw_format(path: str | Path) -> dict[str, Any]:
     """What a file's format implies, before anyone has decided anything.
 
@@ -728,6 +819,12 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
     family usually want. They are named as suggestions because the run applies one
     value chosen elsewhere: reporting a per-file 100 beside an applied 300 states a
     threshold that governs nothing.
+
+    instrument_family decides the peak-count diagnostic's threshold step (1,000 for
+    Fourier-transform data, 100 otherwise), and instrument_family_source says what it
+    rests on. An mzML is read for its instrument: an Orbitrap or FT-ICR exported to mzML
+    is Fourier-transform data, and before 0.5.28 every mzML was labelled QTOF, so a Q
+    Exactive unit published as mzML (ST004304) was diagnosed in steps of 100.
     """
     target = Path(path)
     suffix = target.suffix.lower()
@@ -735,7 +832,8 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
         return {
             "vendor": "SCIEX",
             "format": "SCIEX WIFF" if suffix == ".wiff" else "SCIEX WIFF2",
-            "instrument_family": "QTOF",
+            "instrument_family": QTOF_FAMILY,
+            "instrument_family_source": FAMILY_FROM_VENDOR_FORMAT,
             "suggested_minimum_peak_height": 100,
             "suggested_mass_slice_width": 0.1,
             "sidecar_available": (
@@ -746,7 +844,8 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
         return {
             "vendor": "Waters",
             "format": "Waters .raw folder",
-            "instrument_family": "QTOF",
+            "instrument_family": QTOF_FAMILY,
+            "instrument_family_source": FAMILY_FROM_VENDOR_FORMAT,
             "suggested_minimum_peak_height": 100,
             "suggested_mass_slice_width": 0.1,
         }
@@ -754,7 +853,8 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
         return {
             "vendor": "Thermo",
             "format": "Thermo .raw file",
-            "instrument_family": "Fourier-transform MS",
+            "instrument_family": FOURIER_TRANSFORM_FAMILY,
+            "instrument_family_source": FAMILY_FROM_VENDOR_FORMAT,
             "suggested_minimum_peak_height": 10000,
             "suggested_mass_slice_width": 0.05,
         }
@@ -762,7 +862,8 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
         return {
             "vendor": "Shimadzu",
             "format": "Shimadzu LCD" if suffix == ".lcd" else "Shimadzu QGD",
-            "instrument_family": "QTOF" if suffix == ".lcd" else "GC-MS",
+            "instrument_family": QTOF_FAMILY if suffix == ".lcd" else "GC-MS",
+            "instrument_family_source": FAMILY_FROM_VENDOR_FORMAT,
             "suggested_minimum_peak_height": 100,
             "suggested_mass_slice_width": 0.1,
         }
@@ -778,14 +879,43 @@ def detect_raw_format(path: str | Path) -> dict[str, Any]:
         return {
             "vendor": vendor,
             "format": label,
-            "instrument_family": "QTOF",
+            "instrument_family": QTOF_FAMILY,
+            # Bruker also writes FT-ICR (solariX, apex) data as .d, so a Bruker or unrecognised .d is
+            # QTOF only by default; an Agilent .d is a QTOF.
+            "instrument_family_source": (
+                FAMILY_FROM_VENDOR_FORMAT if vendor == "Agilent" else FAMILY_FROM_FORMAT_DEFAULT
+            ),
+            "suggested_minimum_peak_height": 100,
+            "suggested_mass_slice_width": 0.1,
+        }
+    if target.is_file() and suffix == ".mzml":
+        description = mzml_instrument_description(target)
+        fourier = instrument_family_from_text(description)
+        if fourier is not None:
+            return {
+                "vendor": "Open format",
+                "format": "MZML",
+                "instrument_family": fourier[0],
+                "instrument_family_source": FAMILY_FROM_MZML_HEADER,
+                "instrument_evidence": fourier[1],
+                "suggested_minimum_peak_height": 10000,
+                "suggested_mass_slice_width": 0.05,
+            }
+        tof = next((item for item in description if _TOF_INSTRUMENT.search(item)), None)
+        return {
+            "vendor": "Open format",
+            "format": "MZML",
+            "instrument_family": QTOF_FAMILY,
+            "instrument_family_source": FAMILY_FROM_MZML_HEADER if tof else FAMILY_FROM_FORMAT_DEFAULT,
+            **({"instrument_evidence": tof} if tof else {}),
             "suggested_minimum_peak_height": 100,
             "suggested_mass_slice_width": 0.1,
         }
     return {
         "vendor": "Open format" if suffix in {".mzml", ".cdf"} else "Other",
         "format": suffix.lstrip(".").upper() or "Unknown",
-        "instrument_family": "QTOF",
+        "instrument_family": QTOF_FAMILY,
+        "instrument_family_source": FAMILY_FROM_FORMAT_DEFAULT,
         "suggested_minimum_peak_height": 100,
         "suggested_mass_slice_width": 0.1,
     }
@@ -1804,6 +1934,23 @@ def _stage_input(source: Path, destination_folder: Path) -> Path:
     return staged
 
 
+def data_type_record(state: dict[str, Any]) -> dict[str, Any]:
+    """The MS1 and MS2 data type a run's method file asks for, the basis of each, and the decision behind them.
+
+    A run without a decision (a laboratory analysis, or a repository state built before 0.5.27) has basis
+    "unrecorded": the values are what the state carried, and nothing says where they came from.
+    """
+    decision = state.get("data_type_provenance") if isinstance(state.get("data_type_provenance"), dict) else None
+    record: dict[str, Any] = {}
+    for key in ("ms1_data_type", "ms2_data_type"):
+        record[key] = str(state.get(key, "Centroid"))
+        record[f"{key}_basis"] = str((decision or {}).get(f"{key}_basis") or "unrecorded")
+    if decision is not None:
+        record["warnings"] = list(decision.get("warnings") or [])
+        record["decision"] = decision
+    return record
+
+
 def prepare_run(
     state: dict[str, Any],
     progress: Callable[[str], None] | None = None,
@@ -1879,6 +2026,11 @@ def prepare_run(
         ]
         expected_analysis_exports.extend(expected_automatic_rt_correction_exports)
     manifest_path = run_directory / "run-manifest.json"
+    # The MS1 and MS2 data type method.txt asks for, and on what basis: raw_header or delivered_centroid
+    # where every input of a repository unit delivers one representation to MS-DIAL, default otherwise,
+    # with the decision that said so (data_type_provenance, set by
+    # repository_reanalysis.apply_delivered_data_types).
+    data_types = data_type_record(method_state)
     # A version string and a path cannot identify a binary: the string is whatever the
     # assembly claims, the path can be rebuilt under. inspect_console_path already
     # computes the checksum, the build record and the git state of the working tree it
@@ -1915,6 +2067,12 @@ def prepare_run(
         # can be identified at all.
         "software_provenance_status": console.get("provenance_status", "absent"),
         "libraries": _manifest_libraries(method_state),
+        # A peak-count diagnostic says whether it annotated; a production run carries no such record.
+        **(
+            {"diagnostic_annotation": dict(method_state["diagnostic_annotation"])}
+            if isinstance(method_state.get("diagnostic_annotation"), dict)
+            else {}
+        ),
         "project_file_requested": project_file_requested,
         "stage_inputs": stage_inputs,
         "input_csv": str(csv_path),
@@ -1937,6 +2095,7 @@ def prepare_run(
         "qa_matrix_expected": bool(
             project_type == "lcms" and method_state.get("height_matrix_export")
         ),
+        "data_types": data_types,
     }
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -1986,6 +2145,7 @@ def prepare_run(
         "qa_matrix_expected": bool(
             project_type == "lcms" and method_state.get("height_matrix_export")
         ),
+        "data_types": data_types,
         "diagnostic_result_file": expected_analysis_exports[0] if len(files) == 1 else "",
         "input_csv": str(csv_path),
         "console_input": str(csv_path),
@@ -2047,11 +2207,115 @@ def _manifest_libraries(state: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+# What a peak-count diagnostic says about annotation, in its workflow-settings.json, its run manifest, its
+# diagnostic-job.json and the unit manifest's peak_height_diagnostics entry.
+DIAGNOSTIC_ANNOTATION_SKIPPED = "skipped_for_peak_count"
+DIAGNOSTIC_ANNOTATION_PERFORMED = "performed"
+DIAGNOSTIC_ANNOTATION_SKIPPED_REASON = (
+    "Only the peaks are read from a diagnostic: one row of the Console's .mdpeak per detected peak, and "
+    "its Height column. The LC-MS Console fixes which peaks there are, and their heights, in peak "
+    "spotting, isotope estimation and deconvolution (MsdialLcMsApi FileProcess.RunAsync). It writes the "
+    ".mdpeak after annotation and the characterisation that follows it (LcmsProcess.ExecuteAsync), but "
+    "neither of those adds or removes a peak or changes its height, so the MSP, LBM and text libraries "
+    "are not loaded. Without reference matches the characterisation can give a peak another adduct, "
+    "charge or isotope assignment, so the Adduct, Isotope and MS1 isotopes columns of a diagnostic "
+    ".mdpeak are not the production run's, and nothing reads them. Every peak-spotting and deconvolution "
+    "setting is the production method's; Minimum peak height is 0."
+)
+
+# Every method-file line that names a library the LC-MS Console loads. A diagnostic that skips annotation
+# writes each of them blank, whatever the template or the state carries; a blank path is how a method file
+# says there is no such library, and the Console skips it (CommonProcess.ParseLibraries).
+ANNOTATION_LIBRARY_METHOD_KEYS = (
+    "msp file path",
+    "msp annotator settings file path",
+    "lbm file path",
+    "text db file path",
+    "text annotator settings file path",
+    "isotope text db file path",
+)
+
+# The method-file line naming the production annotation pipeline profile. No Console reads it; it says
+# which annotation the run performs, so a diagnostic that skips annotation writes it blank as well, whatever
+# the template carries.
+ANNOTATION_PROFILE_METHOD_KEY = "annotation pipeline profile"
+
+
+def diagnostic_skips_annotation(state: dict[str, Any]) -> bool:
+    """Whether a prepared state is a peak-count diagnostic that loads no annotation library."""
+    record = state.get("diagnostic_annotation")
+    return isinstance(record, dict) and record.get("status") == DIAGNOSTIC_ANNOTATION_SKIPPED
+
+
+def _annotation_library_roles(state: dict[str, Any]) -> list[str]:
+    """The kinds of library a state annotates with, by role and never by location."""
+    roles = set()
+    if str(state.get("msp_path") or "").strip() or any(
+        str(row.get("msp_file_path") or "").strip()
+        for row in state.get("msp_annotators") or []
+        if isinstance(row, dict)
+    ):
+        roles.add("msp")
+    lbm_annotator = state.get("lbm_annotator") if isinstance(state.get("lbm_annotator"), dict) else {}
+    if str(state.get("lbm_path") or "").strip() or str(lbm_annotator.get("lbm_file_path") or "").strip():
+        roles.add("lbm")
+    if str(state.get("text_db_path") or "").strip() or any(
+        str(row.get("text_db_file_path") or "").strip()
+        for row in state.get("text_annotators") or []
+        if isinstance(row, dict)
+    ):
+        roles.add("text")
+    return sorted(roles)
+
+
+def _skip_diagnostic_annotation(tuning: dict[str, Any]) -> None:
+    """Take every annotation library out of a diagnostic's state, and say so in it.
+
+    THE DIAGNOSTIC USED TO ANNOTATE AS THE PRODUCTION RUN DOES. On a campaign unit that meant the tiered
+    LBM -> strict MSP -> broad MSP cascade against the VS21-size MSP twice over, at Minimum peak height 0,
+    where every peak above the noise is a query. In the pilot, the diagnostic of one Waters MSE (AIF) file,
+    MTBKS281 Lm1, took 2,650.5 s with annotation. Run again without it, the same file took 927.9 s and gave
+    the same 20,057 peaks with the same heights. A Thermo DDA file, ST001337 Human feces_ALA007, took
+    267.0 s with annotation and 12.1 s without, with the same 13,599 peaks and heights. Each figure is
+    one Console run, and the two runs of a file were on different days.
+
+    Library provenance goes too, because a repository run manifest lists every library its state names;
+    left in place, the diagnostic's manifest would list libraries it never loaded.
+    """
+    roles = _annotation_library_roles(tuning)
+    profile = str(tuning.get("annotation_pipeline_profile") or "")
+    tuning["msp_path"] = ""
+    tuning["msp_annotators"] = []
+    tuning["text_db_path"] = ""
+    tuning["text_annotators"] = []
+    tuning["lbm_path"] = ""
+    if isinstance(tuning.get("lbm_annotator"), dict):
+        tuning["lbm_annotator"] = {**tuning["lbm_annotator"], "lbm_file_path": ""}
+    tuning["library_provenance"] = []
+    tuning.pop("annotation_pipeline_profile", None)
+    tuning["diagnostic_annotation"] = {
+        "status": DIAGNOSTIC_ANNOTATION_SKIPPED,
+        "reason": DIAGNOSTIC_ANNOTATION_SKIPPED_REASON,
+        "production_annotation_pipeline_profile": profile,
+        "production_library_roles_not_loaded": roles,
+    }
+
+
 def prepare_tuning_run(
     state: dict[str, Any],
     file_path: str,
     output_root: str | Path,
+    *,
+    annotate: bool = False,
 ) -> dict[str, Any]:
+    """Prepare the zero-threshold diagnostic: the production method on one file, at Minimum peak height 0.
+
+    An LC-MS diagnostic does not annotate unless ``annotate`` asks for it (see
+    DIAGNOSTIC_ANNOTATION_SKIPPED_REASON). The GUI's diagnostic panel asks, because it also tunes the MSP
+    score cutoffs from the same run's match scores; the agent and campaign diagnostic reads the peaks
+    only. A GC-MS diagnostic keeps its annotation: what its .mdscan rows are has not been established
+    independently of it. ``state`` itself is never changed.
+    """
     tuning = copy.deepcopy(state)
     selected = next(
         (item for item in tuning.get("files", []) if item.get("file_path") == file_path),
@@ -2070,22 +2334,43 @@ def prepare_tuning_run(
     # state that had enabled automatic RT correction could not be tuned at all.
     tuning["execute_automatic_rt_correction"] = False
     tuning["alignment_light_mode"] = False
-    if str(tuning.get("project_type", "lcms")).lower() == "gcms":
+    project_type = str(tuning.get("project_type", "lcms")).lower()
+    if project_type == "gcms":
         tuning["minimum_peak_height"] = state.get("minimum_peak_height", 1000)
     else:
         tuning["minimum_peak_height"] = 0
-    tuning["msp_weighted_dot_product"] = 0
-    tuning["msp_simple_dot_product"] = 0
-    tuning["msp_reverse_dot_product"] = 0
-    tuning["msp_matched_peaks_percentage"] = 0
-    tuning["msp_minimum_spectrum_match"] = 0
-    for annotator in tuning.get("msp_annotators", []):
-        annotator["weighted_dot_product_cutoff"] = 0
-        annotator["simple_dot_product_cutoff"] = 0
-        annotator["reverse_dot_product_cutoff"] = 0
-        annotator["matched_peaks_percentage_cutoff"] = 0
-        annotator["minimum_spectrum_match"] = 0
+    if project_type == "lcms" and not annotate:
+        _skip_diagnostic_annotation(tuning)
+    else:
+        # The match scores are read from this run, so every candidate is kept for the cutoffs to be
+        # chosen from.
+        tuning["msp_weighted_dot_product"] = 0
+        tuning["msp_simple_dot_product"] = 0
+        tuning["msp_reverse_dot_product"] = 0
+        tuning["msp_matched_peaks_percentage"] = 0
+        tuning["msp_minimum_spectrum_match"] = 0
+        for annotator in tuning.get("msp_annotators", []):
+            annotator["weighted_dot_product_cutoff"] = 0
+            annotator["simple_dot_product_cutoff"] = 0
+            annotator["reverse_dot_product_cutoff"] = 0
+            annotator["matched_peaks_percentage_cutoff"] = 0
+            annotator["minimum_spectrum_match"] = 0
+        tuning["diagnostic_annotation"] = {
+            "status": DIAGNOSTIC_ANNOTATION_PERFORMED,
+            "reason": (
+                "requested: the diagnostic's MSP match scores are read to tune the annotation cutoffs"
+                if annotate
+                else f"a {project_type} diagnostic keeps the production annotation"
+            ),
+        }
+    if isinstance(state.get("data_type_provenance"), dict):
+        # The copied decision describes every input of the unit; the diagnostic runs one, with the unit's
+        # values, and its record must describe that one.
+        from .repository_reanalysis import diagnostic_data_types
+
+        diagnostic_data_types(tuning, state["data_type_provenance"])
     prepared = prepare_run(tuning)
+    prepared["diagnostic_annotation"] = dict(tuning["diagnostic_annotation"])
     if prepared.get("temporary_input_folder"):
         prepared["diagnostic_input_folder"] = prepared["temporary_input_folder"]
         prepared.setdefault("warnings", []).append(
@@ -3582,6 +3867,14 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         replacements["msp annotator settings file path"] = str(msp_annotator_settings_path)
     if text_annotator_settings_path is not None:
         replacements["text annotator settings file path"] = str(text_annotator_settings_path)
+    if project_type == "lcms" and diagnostic_skips_annotation(state):
+        # Written blank rather than left to the template: an isotope text DB, a settings-file line or an
+        # annotation pipeline profile in a template is not Interactive's state, and a diagnostic that says it
+        # loads no library must not name one. Leaving the profile out of the replacements is not enough:
+        # _skip_diagnostic_annotation has already taken it out of the state, and a template line with no
+        # replacement is copied through as it stands.
+        blanked = (*ANNOTATION_LIBRARY_METHOD_KEYS, ANNOTATION_PROFILE_METHOD_KEY)
+        replacements.update({key: "" for key in blanked})
     if project_type == "gcms":
         replacements.update(
             {
@@ -3824,6 +4117,7 @@ def _title_for_key(key: str) -> str:
         "lbm file path": "Lbm file path",
         "text db file path": "Text DB file path",
         "text annotator settings file path": "Text annotator settings file path",
+        "isotope text db file path": "Isotope text DB file path",
         "searched adduct ions": "Searched adduct ions",
         "ion mode": "Ion mode",
         "target omics": "Target omics",

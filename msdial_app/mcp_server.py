@@ -550,6 +550,65 @@ _CATALOG_BLOCKING_INPUT_ISSUES = frozenset(
 )
 
 
+def _inputs_unpaired_with_rows(inputs: list[dict[str, Any]], samples: list[dict[str, Any]]) -> list[str]:
+    """Where the Catalog's declared inputs and its sample rows do not pair one to one; [] where they do.
+
+    ONE INPUT PER SAMPLE ROW, NOT PER SAMPLE ID. A repository lists each injection as a row of its own, and
+    the rows of one sample share its id: MetaboBank MTBKS64 names S01 in two rows, Assay Names S01_M01 and
+    S01_M02, one per .RAW. The Catalog lists one input per row, each with the row's sample_id, and counts
+    them alike (analysis_input_count and analytical_sample_count are both the inputs), so this check, which
+    read a second input of S01 as a second input of one row, blocked a consistent unit before its download.
+    Each input names a sample that has rows; a sample is named by as many inputs as it has rows; and where
+    it has more than one, each of its inputs is the row whose raw_file is the input's path (or, for an
+    archived container, its archive's) - the path the Catalog's projection writes into the row it attributed
+    the input to - else the one of them with the input's file name. Two inputs on one row, or an input none
+    of its sample's rows names, is still a disagreement.
+    """
+    from .repository_metadata import rows_naming_input
+
+    problems: list[str] = []
+    claimed = [str(item.get("sample_id") or "") for item in inputs]
+    rows_of: dict[str, list[dict[str, Any]]] = {}
+    for item in samples:
+        rows_of.setdefault(str(item.get("sample_id") or ""), []).append(item)
+    if len(samples) != len(inputs):
+        problems.append(f"{len(samples)} sample rows are listed for {len(inputs)} analysis inputs")
+    if any(not value or value not in rows_of for value in claimed):
+        problems.append("an analysis input names no sample row of this unit")
+    shared_row = False
+    unnamed: list[str] = []
+    for sample_id, count in Counter(claimed).items():
+        rows = rows_of.get(sample_id) or []
+        if not sample_id or not rows:
+            continue
+        if len(rows) == 1:
+            shared_row = shared_row or count > 1
+            continue
+        if count > len(rows):
+            problems.append(f"{count} analysis inputs name the {len(rows)} sample rows of sample {sample_id!r}")
+            continue
+        taken: set[int] = set()
+        for item in inputs:
+            if str(item.get("sample_id") or "") != sample_id:
+                continue
+            # As the analysis-CSV builder pairs it after the download (rows_naming_input): by path, else name.
+            found = rows_naming_input((item.get("path"), item.get("archive")), rows, range(len(rows)))
+            if len(found) != 1:
+                unnamed.append(str(item.get("path") or ""))
+            elif found[0] in taken:
+                shared_row = True
+            else:
+                taken.add(found[0])
+    if shared_row:
+        problems.append("two analysis inputs name the same sample row")
+    if unnamed:
+        problems.append(
+            "analysis inputs of a sample that several rows describe are named by none, or by more than one, of "
+            "those rows' raw files: " + ", ".join(sorted(unnamed, key=str.casefold)[:5])
+        )
+    return problems
+
+
 def _handoff_analysis_inputs(
     handoff: dict[str, Any],
     unit_id: str,
@@ -566,8 +625,9 @@ def _handoff_analysis_inputs(
     The check compares the counts the handoff states with the lists it carries: analysis_input_count,
     analytical_sample_count and download_scope.analysis_file_count against the inputs; each vendor folder
     against the members listed for it; and, where no Catalog issue already blocks the unit, the sample rows
-    against the inputs, one each. A disagreement is returned as {"status": "failed", "problems": [...]},
-    for the caller to record against this unit, never raised.
+    against the inputs, one input per row (_inputs_unpaired_with_rows: rows may share a sample id). A
+    disagreement is returned as {"status": "failed", "problems": [...]}, for the caller to record against
+    this unit, never raised.
     """
     if "analysis_input_model" not in handoff:
         return [], {}
@@ -637,14 +697,7 @@ def _handoff_analysis_inputs(
     if inputs and not blocked:
         # One input per sample row, each naming a row that exists. Where the Catalog already blocks the
         # unit for the way rows and folders pair, the pairing is its issue to report, not a count mismatch.
-        claimed = [str(item.get("sample_id") or "") for item in inputs]
-        rows = {str(item.get("sample_id") or "") for item in samples}
-        if len(samples) != len(inputs):
-            problems.append(f"{len(samples)} sample rows are listed for {len(inputs)} analysis inputs")
-        if any(not value or value not in rows for value in claimed):
-            problems.append("an analysis input names no sample row of this unit")
-        if len(set(claimed)) != len(claimed):
-            problems.append("two analysis inputs name the same sample row")
+        problems.extend(_inputs_unpaired_with_rows(inputs, samples))
     if not problems:
         return inputs, {"status": "passed", "analysis_inputs": len(inputs), "members": sum(listed_members.values())}
     return inputs, {
@@ -777,10 +830,12 @@ def _project_from_analysis_unit_handoff(
         "acquisition_mode": str(settings.get("acquisition_mode") or "Unknown"),
         "ion_mode": str(settings.get("ion_mode") or "Unknown"),
         "untargeted": untargeted,
+        # The rows, not the distinct ids, where the Catalog counted no input: replicate rows share an id, and
+        # each is an injection (MetaboLights MTBLS291 lists 40 mzML in the rows of 8 samples).
         "sample_count": int(
             handoff.get("analytical_sample_count")
             or scope.get("analysis_file_count")
-            or len({item["sample_id"] for item in samples if item["sample_id"]})
+            or sum(1 for item in samples if item["sample_id"])
         ),
         "files": files,
         "publications": list(handoff.get("publications") or []),
@@ -2538,7 +2593,13 @@ def _prepare_repository_rows_from_lineage(
     failures = built["failures"]
     blocking = blocking_failures(built, allow_partial_mapping)
     unmatched = next((item["inputs"] for item in failures if item["code"] == "input_without_sample"), [])
-    ambiguous = next((item["inputs"] for item in failures if item["code"] == "sample_with_two_inputs"), [])
+    # A row two inputs name, an input two rows name, or an input of a sample whose rows do not say which.
+    ambiguous = [
+        name
+        for item in failures
+        if item["code"] in ("sample_row_with_two_inputs", "input_with_two_sample_rows", "sample_row_not_identified")
+        for name in item["inputs"]
+    ]
     preview = {
         "download_job_id": download_job_id,
         "manifest_path": manifest["manifest_path"],
@@ -2564,6 +2625,11 @@ def _prepare_repository_rows_from_lineage(
         "excluded_inputs": built["excluded_inputs"],
         "failures": failures,
         "blocking_failures": [item["code"] for item in blocking],
+        # What stops nothing and is recorded with the CSV: sample rows without an input (ST001264 runs 3 of its
+        # 31), and inputs whose raw file the lease paired by an inferred rule.
+        "warnings": list(built.get("warnings") or []),
+        "sample_row_coverage": dict(built.get("sample_row_coverage") or {}),
+        "inferred_name_pairings": list(built.get("inferred_name_pairings") or []),
         "answer_seed": answer_seed,
         "qa_internal_standard_evidence": repository_internal_standard_evidence(projected),
         "analytical_order": {
@@ -2611,6 +2677,20 @@ def _prepare_repository_rows_from_lineage(
             "analysis_csv": record,
             "preview": preview,
         }
+    # The reviewed sample TSV says how each row's raw file was paired with its input: exact, or the inferred
+    # rule (prefixed_member_name, leading_identifier_token); a row without an input says nothing.
+    paired_by = {
+        row["sample_row_index"]: row["raw_file_paired_by"]
+        for row in built["rows"]
+        if row["sample_row_index"] is not None
+    }
+    projected = {
+        **projected,
+        "rows": [
+            {**row, "raw_file_paired_by": paired_by.get(index, "")}
+            for index, row in enumerate(projected.get("rows") or [])
+        ],
+    }
     saved = save_metadata_review(projected, output_root)
     input_path = write_analysis_csv(built, Path(output_root) / "analysis_files.csv")
     saved["analysis_files_csv"] = str(input_path)
@@ -2900,6 +2980,10 @@ def msdial_start_peak_count_diagnostic(
     confirmed=true. The diagnostic records itself in its own directory, which is what lets
     msdial_estimate_peak_height find it by manifest_path later. timeout_seconds and
     idle_timeout_seconds limit the Console as they do for msdial_start_guided_analysis; 0 is no limit.
+    An LC-MS diagnostic loads no annotation library (no MSP, LBM or text library): only its peaks and
+    their heights are read, annotation changes neither, and every peak-spotting setting is the production
+    method's. Its .mdpeak's Adduct, Isotope and MS1 isotopes columns are not the production run's. Its
+    provenance records annotation "skipped_for_peak_count".
     """
     return _request_json(
         "POST",
@@ -2933,6 +3017,16 @@ def msdial_estimate_peak_height(
     manifest_path: str = "",
 ) -> dict[str, Any]:
     """Estimate a stepped Minimum peak height from a completed zero-threshold diagnostic.
+
+    The coarse step is ALWAYS the instrument family's (100 QTOF-type, 1,000 FT), read again from the
+    diagnostic's representative file, and of its multiples the threshold is the HIGHEST whose estimated
+    count is still at least target_peak_count_min: the lower end of the range. Only when no multiple of
+    it lands in range does the search make the same choice in the fine step - 10 for QTOF-type, 100 for
+    FT, an absolute floor - and the estimate then says step_fallback true, fallback_reason
+    "no_coarse_step_in_range", threshold_step the step used and coarse_threshold_step the family step.
+    Leave threshold_step at 0: a step passed, including a fallback's step echoed back, is recorded as
+    requested_threshold_step with a warning and is never searched in the family step's place. When
+    within_target_range is false, show the user the estimate's warnings.
 
     With manifest_path, a diagnostic the backend no longer holds is found in the unit's diagnostics
     directory by its job_id and its result file is read again, instead of running the Console again.

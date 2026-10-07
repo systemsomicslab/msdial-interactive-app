@@ -49,6 +49,18 @@ matched to its declared input and sample, and named with its reason, in the same
 A UNIT THAT DISAGREES WITH ITSELF FAILS WITH A RECORD. Rows, input candidates, lineage rows, declared
 analysis inputs and sample rows must pair one to one; the failures say where they do not, and the caller
 records them in the unit's manifest (analysis_csv) instead of raising, so a campaign goes on to the next unit.
+
+AN INPUT IS A SAMPLE ROW'S, NOT A SAMPLE ID'S. A repository lists each injection as a row of its own, and
+the rows of one sample share its id: MetaboLights MTBLS291 names its sample Cel in five rows, one per
+replicate mzML, and MetaboBank MTBKS64 names S01 in two, one per .RAW. Keyed by sample id, the second
+replicate read as a second input of the first one's row and the unit had no CSV (sample_with_two_inputs, as
+the code was then named). An input is the row of its sample whose raw_file names it - by its own name, the
+names its lineage row was listed under, the name the Catalog declared it at, or the declared raw file the
+lease paired a prefixed archive member with (name_pairing) - and each replicate is a CSV row of its own,
+carrying its sample's Class. Nothing is merged, averaged or dropped: technical replicates are inputs. What
+stays refused is what is ambiguous: one row two inputs name (sample_row_with_two_inputs), an input two rows
+name (input_with_two_sample_rows), and an input of a sample several rows describe that none of them names
+(sample_row_not_identified). Each row records the sample row it is (sample_row_index, sample_raw_file).
 """
 
 from __future__ import annotations
@@ -70,7 +82,9 @@ from .repository_metadata import (
     metadata_integer,
     metadata_match_keys,
     metadata_workspace,
+    rows_naming_input,
 )
+from .raw_metadata_preflight import INFERRED_PAIRING_WARNING
 from .repository_reanalysis import (
     SCIEX_SUFFIXES,
     _applied_disposition,
@@ -98,10 +112,20 @@ ALIAS_DIRECTORY = "console-aliases"
 ORDER_FIELDS = ("analytical order", "injection order", "run order", "acquisition order")
 BATCH_FIELDS = ("batch order", "batch number", "batch id")
 
-# Failures a caller may accept with allow_partial_mapping: an input no sample row claims, or one claimed
-# twice, keeps the default Class, as the name-matching path always allowed. Every other failure - counts
-# that disagree, an acquisition type that cannot be written, an alias that cannot be made - is structural.
-MAPPING_FAILURES = frozenset({"input_without_sample", "sample_with_two_inputs"})
+# Failures a caller may accept with allow_partial_mapping: an input no sample row claims, a row two inputs
+# claim, an input two rows claim, or an input of a sample whose rows do not say which it is, keeps the
+# default Class, as the name-matching path always allowed. Every other failure - counts that disagree, an
+# acquisition type that cannot be written, an alias that cannot be made - is structural.
+MAPPING_FAILURES = frozenset(
+    {"input_without_sample", "sample_row_with_two_inputs", "input_with_two_sample_rows", "sample_row_not_identified"}
+)
+# How a sample row's raw file was paired with its input where no rule had to infer it: by its own name, the
+# declared input's path, or the archive one sample names. The inferred rules are the lease's name_pairing.
+PAIRED_EXACTLY = "exact"
+# The warnings a build carries, which stop nothing and are recorded with the CSV: an undeclared unit whose
+# sample rows the download did not all deliver (ST001264 runs 3 of its 31 rows), and an input whose raw file
+# was paired by inference (the user's decision of 2026-10-06: always left on record).
+PARTIAL_SAMPLE_COVERAGE_WARNING = "sample_rows_without_input"
 
 
 def _failure(code: str, message: str, inputs: list[str] | None = None) -> dict[str, Any]:
@@ -275,26 +299,92 @@ def build_repository_analysis_rows(
         else {}
     )
     declared_of = {candidate: form for form, found in matched.items() for candidate in found}
+    stands_for = lineage_stands_for(manifest)
 
+    # The sample rows by position (sample_row_index), by id, and by the names they give: their raw file's
+    # and their id's, which the name-matching path has always read, and their raw file's alone, which tells
+    # the rows of one sample apart.
     samples = [row for row in workspace.get("rows") or [] if isinstance(row, dict)]
-    by_id: dict[str, dict[str, Any]] = {}
-    by_key: dict[str, list[dict[str, Any]]] = {}
-    for row in samples:
-        by_id.setdefault(str(row.get("sample_id") or ""), row)
+    rows_of_id: dict[str, list[int]] = {}
+    by_key: dict[str, list[int]] = {}
+    file_keys: list[set[str]] = []
+    for index, row in enumerate(samples):
+        rows_of_id.setdefault(str(row.get("sample_id") or ""), []).append(index)
         for key in metadata_match_keys(row.get("raw_file", ""), row.get("sample_id", "")):
-            by_key.setdefault(key, []).append(row)
+            by_key.setdefault(key, []).append(index)
+        file_keys.append(metadata_match_keys(row.get("raw_file", "")))
+
+    def input_names(candidate: str, entry: dict[str, Any] | None, lineage_row: dict[str, Any] | None) -> set[str]:
+        """Every name a sample row may give an input by: its own; the declared input's path and archive; the
+        names its lineage row was listed under; the declared raw file the lease paired it with by a prefixed
+        member name (name_pairing); and the mzXML it stands for."""
+        values: list[Any] = [candidate]
+        if entry:
+            values.extend((entry.get("path"), entry.get("archive")))
+        if lineage_row:
+            values.extend(lineage_row.get("declared_names") or [])
+            values.append((lineage_row.get("name_pairing") or {}).get("declared_raw_file"))
+        values.append(stands_for.get(_file_key(candidate)))
+        return metadata_match_keys(*(value for value in values if value))
+
+    def sample_row(
+        candidate: str, entry: dict[str, Any] | None, lineage_row: dict[str, Any] | None
+    ) -> tuple[int | None, str]:
+        """(the position of the sample row the input is, or None; the failure code where it is None).
+
+        The sample: the one the Catalog attributed the input to, else the lineage's, else the one sample row
+        whose file name is this input's. Stripped, as the sample rows' own ids are (scalar_text). Where
+        several rows carry the sample's id, the input is the one of them whose raw file names it.
+        """
+        sample_id = (
+            str((entry or {}).get("sample_id") or "").strip()
+            or str((lineage_row or {}).get("sample_id") or "").strip()
+        )
+        indexes = rows_of_id.get(sample_id, []) if sample_id else []
+        if len(indexes) == 1:
+            return indexes[0], ""
+        if indexes and entry:
+            # A declared input is paired with a row as the handoff check paired it before the download: the
+            # row whose raw_file is its path (or its archive's), else the one with its file name. Only an input
+            # neither names is looked for by every name it has, below.
+            found = rows_naming_input((entry.get("path"), entry.get("archive")), samples, indexes)
+            if len(found) == 1:
+                return found[0], ""
+            if found:
+                return None, "input_with_two_sample_rows"
+        names = input_names(candidate, entry, lineage_row)
+        if indexes:
+            named = [index for index in indexes if file_keys[index] & names]
+            if len(named) == 1:
+                return named[0], ""
+            return None, "input_with_two_sample_rows" if named else "sample_row_not_identified"
+        if declared:
+            return None, "input_without_sample"
+        found = sorted({index for key in names for index in by_key.get(key, [])})
+        if len(found) == 1:
+            return found[0], ""
+        return None, "input_with_two_sample_rows" if found else "input_without_sample"
+
+    def described(index: int) -> str:
+        """A sample row as a failure names it: its id, and its raw file where other rows share the id."""
+        row = samples[index]
+        sample_id = str(row.get("sample_id") or "")
+        if len(rows_of_id.get(sample_id, [])) > 1:
+            return f"{sample_id} ({row.get('raw_file') or 'row ' + str(index + 1)})"
+        return sample_id
 
     failures: list[dict[str, Any]] = []
     missing_lineage: list[str] = []
     undeclared: list[str] = []
-    unmatched: list[str] = []
+    unresolved: dict[str, list[str]] = {}
     doubled: list[str] = []
     acquisition_failures: dict[str, list[str]] = {}
-    used: dict[str, str] = {}
+    used: dict[int, str] = {}
     declared_order_files: list[str] = []
     rows: list[dict[str, Any]] = []
     excluded_inputs: list[dict[str, Any]] = []
     excluded_forms: set[str] = set()
+    excluded_rows: set[int] = set()
     excluded_samples: set[str] = set()
     kept: list[str] = []
     for candidate in considered:
@@ -303,15 +393,21 @@ def build_repository_analysis_rows(
             kept.append(candidate)
             continue
         form = declared_of.get(candidate, "")
+        lineage_row = lineage_by_key.get(key) or excluded_lineage.get(key)
         sample_id = str(declared[form].get("sample_id") or "").strip() if form else ""
-        sample_id = sample_id or str(
-            (lineage_by_key.get(key) or excluded_lineage.get(key) or {}).get("sample_id") or ""
-        ).strip()
-        excluded_inputs.append({"path": candidate, "reason": excluded[key], "sample_id": sample_id})
+        sample_id = sample_id or str((lineage_row or {}).get("sample_id") or "").strip()
+        index, _code = sample_row(candidate, declared.get(form) if form else None, lineage_row)
+        record = {"path": candidate, "reason": excluded[key], "sample_id": sample_id}
+        if index is not None:
+            record["sample_raw_file"] = str(samples[index].get("raw_file") or "")
+            record["sample_row_index"] = index
+            excluded_rows.add(index)
+        elif sample_id:
+            # The row is not known, so every row of the sample is spared, as every one always was.
+            excluded_samples.add(sample_id)
+        excluded_inputs.append(record)
         if form:
             excluded_forms.add(form)
-        if sample_id:
-            excluded_samples.add(sample_id)
     listing = propose_injection_order([Path(item).stem for item in kept])
 
     for position, candidate in enumerate(kept, start=1):
@@ -326,27 +422,15 @@ def build_repository_analysis_rows(
             if entry is None:
                 undeclared.append(path.name)
 
-        # The sample: the one the Catalog attributed the input to, else the lineage's, else the one sample
-        # row whose file name is this input's. Stripped, as the sample rows' own ids are (scalar_text).
-        sample_id = (
-            str((entry or {}).get("sample_id") or "").strip()
-            or str((lineage_row or {}).get("sample_id") or "").strip()
-        )
-        sample = by_id.get(sample_id) if sample_id else None
-        if sample is None and not declared:
-            named = {
-                id(row): row
-                for match_key in metadata_match_keys(candidate)
-                for row in by_key.get(match_key, [])
-            }
-            sample = next(iter(named.values())) if len(named) == 1 else None
-        if sample is None:
-            unmatched.append(path.name)
+        # The sample row: sample_row says how it is found. A row two inputs name is the first one's.
+        index, code = sample_row(candidate, entry, lineage_row)
+        sample = samples[index] if index is not None else None
+        if index is None:
+            unresolved.setdefault(code, []).append(path.name)
         else:
-            owner = str(sample.get("sample_id") or "")
-            if owner in used:
-                doubled.append(f"{path.name} and {Path(used[owner]).name} ({owner})")
-            used.setdefault(owner, candidate)
+            if index in used:
+                doubled.append(f"{path.name} and {Path(used[index]).name} ({described(index)})")
+            used.setdefault(index, candidate)
 
         acquisition, source, code = _acquisition_type(
             verdicts.get(key), unit_mode, decided_types.get(key, "" if key in decided_over else None)
@@ -372,6 +456,17 @@ def build_repository_analysis_rows(
             "analytical_order": order if order is not None else listed,
             "factor": 1,
             "sample_id": str((sample or {}).get("sample_id") or ""),
+            # Which of the sample's rows this input is, by its position in the unit's sample_metadata and its
+            # raw file: replicate rows share the id.
+            "sample_row_index": index,
+            "sample_raw_file": str((sample or {}).get("raw_file") or ""),
+            # How the input was paired with that row's raw file: exactly (by its name or its declared path), or
+            # by a rule the lease inferred it by (its lineage row's name_pairing). The reviewed sample TSV says it.
+            "raw_file_paired_by": (
+                str(((lineage_row or {}).get("name_pairing") or {}).get("paired_by") or "") or PAIRED_EXACTLY
+            )
+            if index is not None
+            else "",
             "input_path": candidate,
             "listing_order": listed,
             "acquisition_type_source": source,
@@ -457,26 +552,40 @@ def build_repository_analysis_rows(
                 f"{len(twice)} declared analysis input(s) match more than one input candidate.",
                 twice,
             ))
-        without_input = sorted(
-            str(row.get("sample_id") or "")
-            for row in samples
-            if str(row.get("sample_id") or "") not in used and str(row.get("sample_id") or "") not in excluded_samples
-        )
+    # A sample row no input is, and whose input no exclusion accounts for: by the row the excluded input was
+    # found to be, else, where that row is not known, by the sample's id.
+    rows_without_input = [
+        index
+        for index, row in enumerate(samples)
+        if index not in used
+        and index not in excluded_rows
+        and str(row.get("sample_id") or "") not in excluded_samples
+    ]
+    if declared:
+        without_input = sorted(described(index) for index in rows_without_input)
         if without_input:
             failures.append(_failure(
                 "sample_without_input",
                 f"{len(without_input)} sample row(s) of the unit have no analysis input.",
                 without_input,
             ))
-    if unmatched:
-        failures.append(_failure(
-            "input_without_sample",
-            f"{len(unmatched)} input(s) are named by no sample row of the unit.",
-            unmatched,
-        ))
+    for code, message in (
+        ("input_without_sample", "{} input(s) are named by no sample row of the unit."),
+        (
+            "input_with_two_sample_rows",
+            "{} input(s) are named by more than one sample row of the unit, so which row each is is not stated.",
+        ),
+        (
+            "sample_row_not_identified",
+            "{} input(s) belong to a sample that several rows of the unit describe, and none of those rows "
+            "names the input, so which injection it is is not stated.",
+        ),
+    ):
+        if unresolved.get(code):
+            failures.append(_failure(code, message.format(len(unresolved[code])), unresolved[code]))
     if doubled:
         failures.append(_failure(
-            "sample_with_two_inputs",
+            "sample_row_with_two_inputs",
             f"{len(doubled)} sample row(s) are named by two inputs.",
             doubled,
         ))
@@ -516,15 +625,28 @@ def build_repository_analysis_rows(
             + (f": all {len(excluded_inputs)} were excluded (excluded_inputs)." if excluded_inputs else "."),
             [Path(item["path"]).name for item in excluded_inputs],
         ))
-    unused_samples = (
-        []
-        if declared
-        else sorted(
-            str(row.get("sample_id") or "")
-            for row in samples
-            if str(row.get("sample_id") or "") not in used and str(row.get("sample_id") or "") not in excluded_samples
+    unused_rows = [] if declared else rows_without_input
+    unused_samples = sorted(str(samples[index].get("sample_id") or "") for index in unused_rows)
+    # What runs is said beside what does not: how many of the unit's sample rows have an input, and every
+    # input whose raw file a rule of the lease inferred. Neither stops the CSV; both travel with it.
+    inferred = []
+    for row in rows:
+        if row["raw_file_paired_by"] in ("", PAIRED_EXACTLY):
+            continue
+        pairing = (lineage_by_key.get(_file_key(row["input_path"])) or {}).get("name_pairing") or {}
+        inferred.append(
+            {
+                "input": Path(row["input_path"]).name,
+                "sample_id": row["sample_id"],
+                "sample_raw_file": row["sample_raw_file"],
+                **{key: pairing[key] for key in ("declared_raw_file", "paired_by", "key") if key in pairing},
+            }
         )
-    )
+    warnings = []
+    if unused_rows:
+        warnings.append(PARTIAL_SAMPLE_COVERAGE_WARNING)
+    if inferred:
+        warnings.append(INFERRED_PAIRING_WARNING)
     return {
         "schema": SCHEMA,
         "built_from": "input_lineage",
@@ -542,10 +664,27 @@ def build_repository_analysis_rows(
         # Where the Catalog declared no inputs (an archive unit), a sample row the download did not deliver
         # is said here rather than failed: its inputs are found after the download, by name.
         "samples_without_input": unused_samples,
+        # The same rows, each by its position and raw file, since replicate rows share a sample id.
+        "sample_rows_without_input": [
+            {
+                "sample_row_index": index,
+                "sample_id": str(samples[index].get("sample_id") or ""),
+                "raw_file": str(samples[index].get("raw_file") or ""),
+            }
+            for index in unused_rows
+        ],
         # The inputs the lease or the applied campaign disposition excluded, with the reasons and their samples.
         "excluded_inputs": excluded_inputs,
         "aliases": [row["console_alias"] for row in rows if row["console_alias"]],
         "acquisition_types": sorted({row["acquisition_type"] for row in rows if row["acquisition_type"]}),
+        # The sample rows with an input in this CSV, of all the unit's rows: ST001264's 3 of 31.
+        "sample_row_coverage": {
+            "sample_rows": len(samples),
+            "with_input": len({row["sample_row_index"] for row in rows if row["sample_row_index"] is not None}),
+            "without_input": len(rows_without_input),
+        },
+        "inferred_name_pairings": inferred,
+        "warnings": warnings,
     }
 
 
@@ -790,9 +929,18 @@ def analysis_csv_change(built: dict[str, Any], csv_path: str | Path) -> Any:
         "aliases": len(built["aliases"]),
         "class_id_aliases": dict(built["class_id_aliases"]),
         "samples_without_input": list(built["samples_without_input"]),
+        "sample_rows_without_input": [dict(item) for item in built.get("sample_rows_without_input") or []],
         "excluded_inputs": [dict(item) for item in built.get("excluded_inputs") or []],
         "recorded_at": datetime.now(timezone.utc).isoformat(),
     }
+    # Only where there is something to say, so a unit whose every row has an exactly paired input records
+    # what it always did.
+    if built.get("warnings"):
+        summary["warnings"] = list(built["warnings"])
+    if built.get("sample_rows_without_input"):
+        summary["sample_row_coverage"] = dict(built.get("sample_row_coverage") or {})
+    if built.get("inferred_name_pairings"):
+        summary["inferred_name_pairings"] = [dict(item) for item in built["inferred_name_pairings"]]
 
     def change(manifest: dict[str, Any]) -> None:
         lineage = manifest.get("input_lineage")
@@ -801,11 +949,21 @@ def analysis_csv_change(built: dict[str, Any], csv_path: str | Path) -> Any:
             if row is None:
                 # No row in this CSV (the disposition excluded it): nothing an earlier CSV said of it stands.
                 item["file_name"] = ""
-                for stale in ("console_path", "console_alias", "acquisition_type", "file_name_reason"):
+                for stale in ("console_path", "console_alias", "acquisition_type", "file_name_reason", "sample_row"):
                     item.pop(stale, None)
                 continue
             item["file_name"] = row["file_name"]
             item["console_path"] = row["file_path"]
+            # The sample row the CSV row was written from. sample_id stays the lease's attribution; this is the
+            # CSV writer's, and says which of a sample's rows the input is where replicate rows share the id.
+            if row.get("sample_row_index") is not None:
+                item["sample_row"] = {
+                    "index": row["sample_row_index"],
+                    "sample_id": row["sample_id"],
+                    "raw_file": row["sample_raw_file"],
+                }
+            else:
+                item.pop("sample_row", None)
             # What the execution gate holds the workflow to: the type written from this input's own header.
             item["acquisition_type"] = row["acquisition_type"]
             if row.get("file_name_reason"):

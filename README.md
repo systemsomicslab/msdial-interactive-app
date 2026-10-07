@@ -343,10 +343,29 @@ exports `-1` for matched-peak fields when no usable MS/MS comparison exists.
 Each MSP slider is paired with a numeric input for exact threshold entry.
 After a diagnostic run, **Auto-select for 3,000-6,000 peaks** chooses a stepped
 threshold from the observed height distribution. It uses 100-unit steps for
-QTOF-type data and 1,000-unit steps for Fourier-transform data; a zero-threshold
-count at or below 6,000 keeps the threshold at zero. Agent-driven repository
+QTOF-type data and 1,000-unit steps for Fourier-transform data (Orbitrap-class
+and FT-ICR instruments, read from an mzML's header as well as from a Thermo
+.raw); a zero-threshold count at or below 6,000 keeps the threshold at zero.
+Within the range it takes the highest threshold whose estimated count is still
+at least 3,000, the lower end of the range. Only when no such step lands in
+3,000-6,000 does it fall back to 10-unit (QTOF-type) or 100-unit
+(Fourier-transform) steps, and it never goes finer. The family step is always
+searched first, whatever step is requested; a requested step is recorded
+(`requested_threshold_step`) and never searched in its place, and a diagnostic
+recorded by an earlier version has its family read again.
+The estimate records the step used (`threshold_step`), the family step
+(`coarse_threshold_step`), `step_fallback`, `fallback_reason`,
+`within_target_range` and `selection_rule`; a threshold that misses the range
+even at the fine step is the nearest one, with a warning. A repository run
+records every file's actual peak count beside the estimate
+(`production_peak_counts` in the unit manifest). Agent-driven repository
 analysis selects a QC nearest the run midpoint, or a mid-run non-blank sample
-when no QC is available.
+when no QC is available. The agent-driven LC-MS diagnostic
+(`msdial_start_peak_count_diagnostic`) loads no annotation library: only its
+peaks and their heights are read, annotation changes neither, and its
+provenance records annotation `skipped_for_peak_count`. Its `.mdpeak` Adduct,
+Isotope and MS1 isotopes columns are not the production run's. The GUI
+diagnostic above still annotates, because its MSP sliders read the match scores.
 Suggested starting values are:
 
 - Thermo RAW or FT-ICR: peak height `10000`, mass slice `0.05`
