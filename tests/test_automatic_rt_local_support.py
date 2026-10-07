@@ -391,7 +391,11 @@ class TheMethodsTextFollowsTheAudit(unittest.TestCase):
         # #826's head counts compounds, not reference candidates: co-eluting candidates are one
         # neighbour and the anchor's own compound is no support for it.
         self.assertIn("other compounds matched in the file within 1.5 min of it", text)
-        self.assertIn("within 1.5 MS1 cycles of each other in both the reference and the judged file", text)
+        # The merged head groups peak tops within two MS1 scan steps (Ms1CycleProfile.NearestScanIndex),
+        # not within 1.5 median cycles; where a file's scans are unknown only identical RTs group.
+        self.assertIn("within two MS1 scans of each other in both the reference and the judged file", text)
+        self.assertIn("only at identical retention times where a file's scans were unknown", text)
+        self.assertNotIn("MS1 cycles of each other", text)
         self.assertIn("counted as one compound", text)
         self.assertIn("the anchor's own compound was not counted as support for it", text)
         self.assertIn("fewer than three were found", text)

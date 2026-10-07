@@ -10,9 +10,10 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 - Support for MsdialWorkbench#826, which improves the automatic alignment RT
   correction of #810. #826 judges each anchor against the median of the offsets
   of the other compounds matched in the file within a local support window
-  (status `LocalOutlier`): reference candidates whose peak tops lie within 1.5
-  MS1 cycles of each other in both files (isotope peaks, adducts) count as one
-  compound, and the anchor's own compound is no support for it. Where fewer
+  (status `LocalOutlier`): reference candidates whose peak tops lie within two
+  MS1 scans of each other in both files (isotope peaks, adducts; only identical
+  RTs where a file's scans are unknown) count as one compound, and the anchor's
+  own compound is no support for it. Where fewer
   than three compounds are found it falls back to the median of the file's
   anchors (`MadOutlier`). It floors the robust scale at the MS1 cycle time
   around the anchor. The public-repository campaign is to use it, with 12
