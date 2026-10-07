@@ -2677,21 +2677,7 @@ def _prepare_repository_rows_from_lineage(
             "analysis_csv": record,
             "preview": preview,
         }
-    # The reviewed sample TSV says how each row's raw file was paired with its input: exact, or the inferred
-    # rule (prefixed_member_name, leading_identifier_token); a row without an input says nothing.
-    paired_by = {
-        row["sample_row_index"]: row["raw_file_paired_by"]
-        for row in built["rows"]
-        if row["sample_row_index"] is not None
-    }
-    projected = {
-        **projected,
-        "rows": [
-            {**row, "raw_file_paired_by": paired_by.get(index, "")}
-            for index, row in enumerate(projected.get("rows") or [])
-        ],
-    }
-    saved = save_metadata_review(projected, output_root)
+    saved = save_metadata_review(_with_raw_file_paired_by(projected, built), output_root)
     input_path = write_analysis_csv(built, Path(output_root) / "analysis_files.csv")
     saved["analysis_files_csv"] = str(input_path)
     record_analysis_csv(manifest["manifest_path"], built, input_path)
@@ -2708,6 +2694,27 @@ def _prepare_repository_rows_from_lineage(
             "Pass input_path and preview.answer_seed to msdial_guided_analysis_plan, then "
             "collect any remaining scientific decisions before execution."
         ),
+    }
+
+
+def _with_raw_file_paired_by(projected: dict[str, Any], built: dict[str, Any]) -> dict[str, Any]:
+    """The projected sample rows, each saying how its raw file was paired with its input.
+
+    exact, or the inferred rule (prefixed_member_name, leading_identifier_token); a row without an input says
+    nothing. Both the prepare of a unit's first run and of a new production run write it into the reviewed
+    sample TSV, so an inferred pairing is on record in every run's table.
+    """
+    paired_by = {
+        row["sample_row_index"]: row["raw_file_paired_by"]
+        for row in built["rows"]
+        if row["sample_row_index"] is not None
+    }
+    return {
+        **projected,
+        "rows": [
+            {**row, "raw_file_paired_by": paired_by.get(index, "")}
+            for index, row in enumerate(projected.get("rows") or [])
+        ],
     }
 
 
@@ -2752,7 +2759,7 @@ def _commit_new_run_rows(
             "preview": preview,
         }
     staging = pending.staging_directory()
-    saved = save_metadata_review(projected, staging)
+    saved = save_metadata_review(_with_raw_file_paired_by(projected, built), staging)
     staged_csv = write_analysis_csv(built, staging / "analysis_files.csv")
     saved["analysis_files_csv"] = str(staged_csv)
     saved = {key: str(pending.staged(value)) for key, value in saved.items()}
