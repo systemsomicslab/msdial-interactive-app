@@ -762,11 +762,12 @@ class DispositionMatrixTests(unittest.TestCase):
     def test_a_header_with_ms2_decides_over_the_declaration_at_any_confidence(self) -> None:
         # Rule 1 of 2026-10-06. The extractor's confidence is a constant per branch: 0.75 for every DDA read
         # without an isolation width (MTBLS1572's DDA files under the Catalog's keyword "DIA"), 0.6 here for DIA.
+        # An all-ion header of one collision energy runs as SWATH (user decision, 2026-10-07).
         cases = [
             ("DIA", "DDA", 0.75, {}, "DDA"),
             ("DDA", "DIA", 0.6, {}, "SWATH"),
-            ("DDA", "DIA", 0.5, {"targets": []}, "AIF"),
-            ("SWATH", "AIF", 0.3, {"targets": []}, "AIF"),
+            ("DDA", "DIA", 0.5, {"targets": []}, "SWATH"),
+            ("SWATH", "AIF", 0.3, {"targets": []}, "SWATH"),
         ]
         for declared, header, confidence, options, console in cases:
             with self.subTest(declared=declared, header=header):
@@ -777,7 +778,12 @@ class DispositionMatrixTests(unittest.TestCase):
                 )
 
                 self.assertEqual(("run", console), (disposition["disposition"], disposition["console_acquisition_type"]))
-                self.assertTrue(all(item["basis"].startswith("header") for item in disposition["assignments"].values()))
+                self.assertTrue(
+                    all(
+                        item["basis"].startswith("header") or item["basis"] == "aif_single_ce_as_swath"
+                        for item in disposition["assignments"].values()
+                    )
+                )
                 self.assertIn("acquisition_header_overrides_declaration", disposition["warnings"])
                 self.assertNotIn("acquisition_header_disagrees_low_confidence", disposition["warnings"])
                 self.assertEqual(2, len(disposition["declared_vs_header"]))
@@ -1089,11 +1095,13 @@ class DispositionMatrixTests(unittest.TestCase):
         self.assertEqual(("skip", ["separation_unresolved"]), (neither["disposition"], neither["reasons"]))
         self.assertEqual(("exclude", ["separation_out_of_scope:GC-MS"]), (gas["disposition"], gas["reasons"]))
 
-    def test_an_aif_file_with_no_collision_energy_target_is_only_a_warning(self) -> None:
+    def test_an_aif_file_with_no_collision_energy_target_is_held(self) -> None:
+        # No energy recorded shows no single energy, so the AIF-as-SWATH rule of 2026-10-07 holds the unit.
         disposition = self.decide([_header("a.d", "AIF", confidence=1.0, targets=[], energies=[])])
 
-        self.assertEqual("run", disposition["disposition"])
-        self.assertEqual("AIF", disposition["console_acquisition_type"])
+        self.assertEqual(("skip", ["aif_collision_energy_unrecorded"]), (disposition["disposition"], disposition["reasons"]))
+        self.assertIs(True, disposition["hold"])
+        self.assertEqual({}, disposition["assignments"])
         self.assertIn("aif_collision_energy_targets_empty", disposition["warnings"])
 
     def test_a_dia_file_whose_windows_are_unrecorded_takes_the_declared_type_or_is_skipped(self) -> None:
@@ -1270,9 +1278,11 @@ class LegacySummaryTests(_Scratch):
         self.assertEqual(("exclude", ["acquisition_out_of_scope:FullScan"]), (ms1_only["disposition"], ms1_only["reasons"]))
 
     def test_a_legacy_aif_verdict_is_aif_without_a_declaration(self) -> None:
+        # It is AIF, and a legacy record names no collision energy: the AIF-as-SWATH rule holds it (2026-10-07).
         disposition = decide_disposition(_legacy_manifest([_legacy_entry("a.d", "AIF", confidence=1.0)]))
 
-        self.assertEqual(("run", "AIF"), (disposition["disposition"], disposition["console_acquisition_type"]))
+        self.assertEqual(("skip", ["aif_collision_energy_unrecorded"]), (disposition["disposition"], disposition["reasons"]))
+        self.assertIs(True, disposition["hold"])
 
     def test_classify_decides_a_legacy_dia_summary_from_the_extractor_records(self) -> None:
         manifest, _stub, files = _unit(
@@ -1891,9 +1901,14 @@ class LegacyDispositionGateTests(_Scratch):
         # recorded is no evidence of all-ion acquisition; the decided type binds the row, not that reading.
         verdicts = {"a.mzML": {"method": "DIA", "confidence": 0.82, "targets": []}}
         manifest, files = self.campaign(verdicts, acquisition="DIA")
-        self.assertEqual("AIF", read_manifest(manifest)["campaign_disposition"]["console_acquisition_type"])
+        # Read as AIF, of one collision energy: it runs as SWATH (2026-10-07).
+        disposition = read_manifest(manifest)["campaign_disposition"]
+        self.assertEqual("SWATH", disposition["console_acquisition_type"])
+        self.assertEqual({"collision_energies": [30.0], "rule": "single_ce_aif_as_swath_2026_10_07"},
+                         disposition["aif_run_as_swath"])
+        self.assertTrue(self.gate(manifest, [files["a.mzML"]], "SWATH")["allowed"])
 
-        refused = self.gate(manifest, [files["a.mzML"]], "SWATH")
+        refused = self.gate(manifest, [files["a.mzML"]], "AIF")
         self.assertFalse(refused["allowed"])
         self.assertFalse(any("raw header contradicts" in item for item in refused["blockers"]), refused["blockers"])
         self.assertTrue(any("campaign disposition decided" in item for item in refused["blockers"]))
@@ -2846,6 +2861,202 @@ class LostUpdateTests(_Scratch):
         self.assertEqual([True, False], [results["first"]["written"], results["second"]["written"]])
         self.assertTrue(results["second"]["already_split"])
         self.assertEqual(2, len(read_manifest(manifest)["split_into"]))
+
+
+
+# ---- AIF as SWATH, and multi-energy AIF held (user decision, 2026-10-07) ------------------------------------------
+
+
+def _waters_record(path: str, energies: list[float], *, reference_level: str | None = None) -> dict:
+    """A Waters MSe record as WatersMetadataReader writes it: survey, product, LockSpray reference, diode array."""
+    record = _header(path, "AIF", confidence=0.9, targets=[], energies=energies)
+    reference = {"function_type": "TOFM", "role": "reference", "ion_mode": "ES_NEG"}
+    if reference_level is not None:
+        reference["ms_level"] = reference_level
+    record["experiments"] = [
+        {"id": "1", "name": "TOFM", "vendorFields": {"role": "survey", "ms_level": "1", "continuum": "false"}},
+        {"id": "2", "name": "TOFM", "vendorFields": {"role": "product", "ms_level": "2", "continuum": "false"}},
+        {"id": "3", "name": "TOFM", "vendorFields": reference},
+        {"id": "4", "name": "DAD", "vendorFields": {"role": "non-ms"}},
+    ]
+    return record
+
+
+class AifAsSwathTests(_Scratch):
+    """One MS2 collision energy over the unit's inputs runs AIF as SWATH; more than one holds the unit."""
+
+    RULE = "single_ce_aif_as_swath_2026_10_07"
+
+    def decide(self, records, **options):
+        return decide_disposition(_manifest(records, **options))
+
+    def test_one_energy_over_every_input_runs_as_swath_and_is_recorded(self) -> None:
+        # ST004304: 59 mzML, each AIF at 35 eV. Rounded to 0.1 eV, 35.04 is 35.0.
+        disposition = self.decide(
+            [_header("a.mzML", "AIF", targets=[], energies=[35.0]), _header("b.mzML", "AIF", targets=[], energies=[35.04])]
+        )
+
+        self.assertEqual(("run", "SWATH"), (disposition["disposition"], disposition["console_acquisition_type"]))
+        self.assertEqual({"collision_energies": [35.0], "rule": self.RULE}, disposition["aif_run_as_swath"])
+        self.assertEqual(
+            {("SWATH", "aif_single_ce_as_swath")},
+            {(item["console_acquisition_type"], item["basis"]) for item in disposition["assignments"].values()},
+        )
+        self.assertNotIn("hold", disposition)
+
+    def test_more_than_one_energy_holds_the_unit(self) -> None:
+        for records in (
+            [_header("a.mzML", "AIF", targets=[], energies=[10.0, 20.0, 40.0])],
+            # One energy per file, but two over the unit.
+            [_header("a.mzML", "AIF", targets=[], energies=[20.0]), _header("b.mzML", "AIF", targets=[], energies=[40.0])],
+        ):
+            with self.subTest(files=len(records)):
+                disposition = self.decide(records)
+
+                self.assertEqual("skip", disposition["disposition"])
+                self.assertIn("aif_multi_ce_awaiting_console", disposition["reasons"])
+                self.assertIs(True, disposition["hold"])
+                self.assertEqual({}, disposition["assignments"])
+                self.assertNotIn("aif_run_as_swath", disposition)
+                self.assertGreater(len(disposition["aif_collision_energies"]), 1)
+
+    def test_dda_and_swath_units_are_untouched(self) -> None:
+        dda = self.decide([_header("a.mzML", "DDA", energies=[10.0, 20.0, 40.0])])
+        swath = self.decide([_header("a.mzML", "DIA", energies=[10.0, 20.0])])
+
+        self.assertEqual(("run", "DDA"), (dda["disposition"], dda["console_acquisition_type"]))
+        self.assertEqual(("run", "SWATH"), (swath["disposition"], swath["console_acquisition_type"]))
+        for disposition in (dda, swath):
+            self.assertNotIn("aif_run_as_swath", disposition)
+            self.assertTrue(all(item["basis"].startswith("header") for item in disposition["assignments"].values()))
+
+    def test_an_aif_split_leaves_each_part_to_be_decided_on_its_own(self) -> None:
+        disposition = self.decide(
+            [_header("a.mzML", "AIF", targets=[], energies=[30.0], polarity="Positive"),
+             _header("b.mzML", "AIF", targets=[], energies=[40.0], polarity="Negative")]
+        )
+
+        self.assertEqual("split", disposition["disposition"])
+        self.assertEqual(["AIF", "AIF"], [group["console_acquisition_type"] for group in disposition["split_key"]["groups"]])
+        self.assertNotIn("hold", disposition)
+
+    def test_the_lockspray_reference_function_contributes_no_energy(self) -> None:
+        # MTBKS281: survey, a 30 eV product function, a LockSpray reference with no MS level, and a diode array.
+        summary = _summarize_raw_metadata([_waters_record("w.raw", [30.0])])
+        entry = summary["per_file"][0]
+
+        self.assertEqual([30.0], entry["ms2_collision_energies"])
+        self.assertEqual("", entry["ms2_collision_energies_unresolved"])
+        self.assertEqual(["3"], entry["reference_functions"])
+        disposition = decide_disposition(_manifest([_waters_record("w.raw", [30.0])]))
+        self.assertEqual({"collision_energies": [30.0], "rule": self.RULE}, disposition["aif_run_as_swath"])
+
+    def test_a_reference_function_with_an_ms_level_leaves_the_energies_unresolved_and_holds(self) -> None:
+        record = _waters_record("w.raw", [6.0, 30.0], reference_level="2")
+        entry = _summarize_raw_metadata([record])["per_file"][0]
+
+        self.assertIsNone(entry["ms2_collision_energies"])
+        self.assertEqual("reference_function_with_ms_level", entry["ms2_collision_energies_unresolved"])
+        disposition = decide_disposition(_manifest([record]))
+        self.assertEqual(("skip", ["aif_collision_energy_unrecorded"]), (disposition["disposition"], disposition["reasons"]))
+        self.assertIs(True, disposition["hold"])
+
+    def gate(self, manifest: Path, files: list[Path], kind: str) -> dict:
+        return evaluate_repository_execution_gate(
+            {
+                "repository_run_manifest": str(manifest),
+                "output_root": str(manifest.parent.parent / "output"),
+                "ion_mode": "Negative",
+                "files": [{"file_path": str(path), "acquisition_type": kind} for path in files],
+            }
+        )
+
+    def campaign(self, verdicts: dict, **options) -> tuple[Path, list[Path], dict]:
+        manifest, _stub, files = _unit(
+            self.root / "unit", list(verdicts), extra={"campaign_authorizations": [dict(_APPROVAL)]}, **options
+        )
+        result = self.preflight(manifest, _PinnedExtractor.make(self.root / "build"), _Extractor(verdicts))
+        return manifest, files, result
+
+    def test_the_gate_runs_a_recorded_aif_as_swath_and_nothing_else(self) -> None:
+        verdicts = {name: {"method": "AIF", "targets": [], "energies": [30.0]} for name in ("a.mzML", "b.mzML")}
+        manifest, files, result = self.campaign(verdicts, acquisition="AIF")
+        recorded = read_manifest(manifest)
+
+        self.assertEqual("SWATH", result["campaign_disposition"]["console_acquisition_type"])
+        self.assertEqual("SWATH", recorded["project"]["acquisition_mode"])
+        entries = recorded["raw_metadata_preflight"]["summary"]["per_file"]
+        self.assertEqual(
+            {("SWATH", "aif_single_ce_as_swath", "AIF")},
+            {(entry["console_acquisition_type"], entry["console_acquisition_basis"],
+              entry["header_console_acquisition_type"]) for entry in entries},
+        )
+        self.assertTrue(self.gate(manifest, files, "SWATH")["allowed"])
+        self.assertFalse(self.gate(manifest, files, "AIF")["allowed"])
+        self.assertFalse(self.gate(manifest, files, "DDA")["allowed"])
+
+        # Without the record, the header's AIF is no SWATH.
+        update_manifest(manifest, lambda current: current["campaign_disposition"].pop("aif_run_as_swath"))
+        refused = self.gate(manifest, files, "SWATH")
+        self.assertFalse(refused["allowed"])
+        self.assertTrue(any("records no aif_run_as_swath" in item for item in refused["blockers"]), refused["blockers"])
+        self.assertTrue(any("(header gives AIF, run as SWATH)" in item for item in refused["blockers"]), refused["blockers"])
+
+    def test_outside_a_campaign_an_aif_header_still_refuses_swath(self) -> None:
+        manifest, stub, files = _unit(self.root / "unit", ["a.mzML"], acquisition="AIF")
+        self.preflight(manifest, stub, _Extractor({"a.mzML": {"method": "AIF", "targets": [], "energies": [30.0]}}))
+        update_manifest(manifest, lambda current: current.update(execution_allowed=True))
+
+        self.assertFalse(self.gate(manifest, files, "SWATH")["allowed"])
+        self.assertTrue(self.gate(manifest, files, "AIF")["allowed"])
+
+    def test_a_held_unit_is_skipped_keeps_its_raw_data_and_is_no_ended_part(self) -> None:
+        from msdial_app.repository_reanalysis import _part_end, held_by_disposition, plan_download_discard
+
+        verdicts = {"a.mzML": {"method": "AIF", "targets": [], "energies": [10.0, 20.0, 40.0]}}
+        manifest, _files, result = self.campaign(verdicts, acquisition="AIF")
+        recorded = read_manifest(manifest)
+
+        self.assertEqual("skipped_by_preflight", recorded["status"])
+        self.assertFalse(recorded["execution_allowed"])
+        self.assertEqual(["aif_multi_ce_awaiting_console"], result["campaign_disposition"]["reasons"])
+        self.assertTrue(held_by_disposition(recorded))
+        self.assertEqual([None], [entry["console_acquisition_type"]
+                                  for entry in recorded["raw_metadata_preflight"]["summary"]["per_file"]])
+        held = [item for item in plan_download_discard(manifest, authorized=True)["blockers"] if "holds it" in item]
+        self.assertEqual(1, len(held))
+        self.assertFalse(any("holds it" in item for item in plan_download_discard(manifest)["blockers"]))
+        end = _part_end(recorded, self.root / "elsewhere" / "raw")
+        self.assertEqual(("held", False), (end["state"], end["ended"]))
+
+    def test_classify_reads_a_pre_0531_summarys_energies_from_the_extractor_records(self) -> None:
+        manifest, _stub, files = _unit(
+            self.root / "unit", ["a.mzML", "b.mzML"], acquisition="AIF",
+            extra={"campaign_authorizations": [dict(_APPROVAL)]},
+        )
+        output = manifest.parent / "raw-metadata-preflight.json"
+        records = [_header(str(path), "AIF", targets=[], energies=[30.0]) for path in files]
+        output.write_text(json.dumps(records), encoding="utf-8")
+        summary = _summarize_raw_metadata(records)
+        for entry in summary["per_file"]:
+            entry["outcome"], entry["format"] = "ok", "mzml"
+            for name in ("ms2_collision_energies", "ms2_collision_energies_unresolved", "reference_functions"):
+                entry.pop(name)
+        summary["coverage"] = {"input_candidates": 2, "inspected": 2, "complete": True}
+
+        def recorded_by_0530(current: dict) -> None:
+            current["status"] = "preflight_passed"
+            current["raw_metadata_preflight"] = {"exit_code": 0, "output": str(output), "summary": summary}
+
+        update_manifest(manifest, recorded_by_0530)
+
+        disposition = classify_preflight(manifest)
+        entries = read_manifest(manifest)["raw_metadata_preflight"]["summary"]["per_file"]
+
+        self.assertEqual(("run", "SWATH"), (disposition["disposition"], disposition["console_acquisition_type"]))
+        self.assertEqual({"collision_energies": [30.0], "rule": self.RULE}, disposition["aif_run_as_swath"])
+        self.assertEqual([[30.0], [30.0]], [entry["ms2_collision_energies"] for entry in entries])
+        self.assertEqual({"preflight_output"}, {entry["ms2_collision_energies_read_from"] for entry in entries})
 
 
 if __name__ == "__main__":

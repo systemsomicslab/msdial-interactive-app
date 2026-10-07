@@ -130,6 +130,34 @@ and sample rows), the same warning on the CSV record, and the column
 `raw_file_paired_by` (`exact`, `prefixed_member_name`,
 `leading_identifier_token`) in the reviewed sample TSV.
 
+An archive member that no sample row pairs with, exactly, behind a prefix or by
+its leading identifier, is still an input where the unit's download is its own
+alone (0.5.31, the user's decision of 2026-10-07): the Catalog declared no inputs
+for the unit, and its download scope is `unit_files` or every bundle URL has
+`shared_unit_count` 1. Metabolomics Workbench ST001264 has 31 members and 31
+sample rows, and only its three BioRec rows pair; its 28
+`021518_387057_CSHp_Youn_saN.raw` members run as unattributed inputs. Each is
+preflighted like any input, so its raw header decides its polarity and
+acquisition. Its `input_lineage` row has `name_pairing`
+`{"paired_by": "unattributed_member", "member_name": ...}`, its stem as
+`sample_id`, and `sample_row` null. Its analysis-CSV row is a `Sample` of the
+unit's abstention Class (`All`) where the Class is an abstention, and of the
+Class `Unattributed` otherwise. The reviewed sample TSV gets a row per member with
+`raw_file_paired_by` `unattributed_member`. The run manifest records
+`unattributed_members` (`count`, `members`, `rule`
+`unit_scoped_archive_2026_10_07`, `scope`), and the warning
+`unattributed_members_included` is in its warnings, the attribute stage's, every
+campaign disposition's and the CSV record's (a split part carries the record and
+the warning for its own members only). A shared archive (`shared_unit_count`
+above 1 for any bundle URL) takes none: `unattributed_members` then says
+`applied` false with its `reason` (`shared_archive`, or
+`download_scope_not_unit_scoped` where the scope says nothing) and lists the
+members as `left_out`. Left out on record too: an mzXML member
+(`requires_conversion`), a member whose path names the other polarity by a token
+of its own (`polarity_token_contradicts_ion_mode`), and a member whose name
+another member carries in another encoding, admitted or not
+(`two_encodings_of_one_name`).
+
 Agent-driven reanalysis also requires a user-reviewed `analysis_purpose` before
 download. That purpose anchors Class/contrast selection, annotation strategy,
 QA, and requested outputs; it is retained with repository provenance.
@@ -515,6 +543,31 @@ settles neither. MS1-only files are folded into a DDA run, except in a unit
 declared DIA or AIF, where they may be all-ion data exported as MS1 scans and are
 excluded as `ms1_only_in_declared_dia_unit`. A split part is held to its parent's
 declaration there (`split_from.parent_declared_acquisition_mode`).
+
+AIF runs as SWATH where it has one collision energy (0.5.31, the user's decision
+of 2026-10-07). A unit that would run as AIF counts the distinct MS2 collision
+energies, to 0.1 eV, over every input that runs (`ms2_collision_energies` on each
+per-file record, from the extractor's `acquisition.collisionEnergies`). A Waters
+LockSpray reference function contributes none: the extractor marks it as
+reference and gives it no MS level, and a record whose reference function does
+carry an MS level leaves its energies unresolved. One energy runs the unit as
+SWATH, which the pinned Console deconvolutes alike (ST004304 gave identical
+results, and MTBKS281 matched its 30 eV collection): the disposition records
+`aif_run_as_swath` (`collision_energies`, `rule`
+`single_ce_aif_as_swath_2026_10_07`), and each input's per-file record has
+`console_acquisition_type` SWATH with `console_acquisition_basis`
+`aif_single_ce_as_swath`, its `header_console_acquisition_type` staying AIF. More
+than one energy holds the unit until a Console that settles an all-ion spot's
+representative energy exists: `disposition` skip, `reasons`
+`aif_multi_ce_awaiting_console`, `hold` true. A unit whose inputs record no
+energy is held the same way as `aif_collision_energy_unrecorded`. A held unit is
+no failure, a campaign approval does not discard its raw data, and a held split
+part has not ended for its parent's raw release. A unit to be split is split
+first, and each part is decided by the rule on its own. The execution gate runs a
+header's AIF as SWATH only where the applied disposition records
+`aif_run_as_swath`, and refuses it anywhere else. `classify_preflight` reads the
+energies of a preflight recorded before 0.5.31 from the extractor records it
+left.
 
 A repository declaration of PRM, SRM, MRM, SIM or full scan is a declaration like
 any other, and untargeted status is never inferred over a declared targeted

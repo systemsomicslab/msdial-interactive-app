@@ -4,6 +4,52 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.31] - Unreleased
+
+### Changed
+- AIF runs as SWATH where it has one collision energy, as the user decided on 2026-10-07. A unit that would run as
+  AIF counts the distinct MS2 collision energies, to 0.1 eV, over every input that runs. Each per-file record now
+  carries them (`ms2_collision_energies`, with `ms2_collision_energies_unresolved` and `reference_functions`), from
+  the extractor's `acquisition.collisionEnergies`; a Waters LockSpray reference function contributes none, and a
+  record whose reference function carries an MS level leaves the energies unresolved.
+  - One energy: the unit runs as SWATH. The disposition records
+    `aif_run_as_swath = {"collision_energies": [...], "rule": "single_ce_aif_as_swath_2026_10_07"}`, and each input
+    runs with `console_acquisition_type` SWATH and `console_acquisition_basis` `aif_single_ce_as_swath`; its
+    `header_console_acquisition_type` stays AIF. ST004304 gave identical results, and MTBKS281 matched its 30 eV
+    collection.
+  - More than one: the unit is held, not run (`disposition` skip, `reasons` `aif_multi_ce_awaiting_console`,
+    `hold` true), until a Console that settles an all-ion spot's representative energy exists. An AIF unit whose
+    inputs record no energy is held as `aif_collision_energy_unrecorded`.
+  - A held unit is no failure and keeps its raw data: an authorized discard refuses it, and a held split part has
+    not ended for its parent's raw release (`held_by_disposition`).
+  - A unit to be split is split first; each part is decided by the rule on its own.
+  - The execution gate runs a header's AIF as SWATH only where the applied disposition records `aif_run_as_swath`,
+    and refuses it anywhere else.
+  - `classify_preflight` reads the energies of a preflight recorded before 0.5.31 from the extractor records it left.
+  - The analysis-CSV record and the prepare preview carry `aif_run_as_swath`.
+
+### Added
+- Unattributed archive members, as the user decided on 2026-10-07. In a unit whose Catalog declared no inputs and
+  whose download is its own alone (`download_scope.kind` `unit_files`, or every bundle URL with `shared_unit_count`
+  1), each analysable archive member that no sample row pairs with (exactly, behind a prefix, or by its leading
+  identifier) is an input all the same, and is preflighted like any other. ST001264 runs 31 inputs: 3 paired and
+  28 `..._Youn_saN.raw` unattributed.
+  - Its `input_lineage` row has `name_pairing = {"paired_by": "unattributed_member", "member_name": ...}`, its stem
+    as `sample_id`, and `sample_row` null.
+  - Its analysis-CSV row is a `Sample` of the abstention's Class (`All`) where the unit's Class is an abstention, and
+    of `Unattributed` otherwise. The reviewed sample TSV gets a row per member with `raw_file_paired_by`
+    `unattributed_member`.
+  - The run manifest records `unattributed_members = {"count", "members", "rule": "unit_scoped_archive_2026_10_07",
+    "applied", "scope"}`, and the warning `unattributed_members_included` goes into the manifest's warnings, the
+    attribute stage's, every campaign disposition's and the CSV record's. A split part carries the record and the
+    warning for its own members only.
+  - Never for a shared archive (`shared_unit_count` above 1 for any bundle URL): the record then says
+    `applied: false` with its `reason` (`shared_archive`, or `download_scope_not_unit_scoped`), and lists the
+    members as `left_out`. Also left out, on record: an mzXML (`requires_conversion`), a member whose path names the
+    other polarity (`polarity_token_contradicts_ion_mode`), and a member whose name another member carries in another
+    encoding, admitted or not (`two_encodings_of_one_name`).
+- Agent capabilities `campaign_single_ce_aif_as_swath` and `repository_unattributed_archive_members`.
+
 ## [0.5.29] - Unreleased
 
 ### Changed

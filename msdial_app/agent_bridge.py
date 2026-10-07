@@ -132,6 +132,17 @@ def summarize_jobs(
             # file where the key is unique on both sides, recorded as paired_by leading_identifier_token with the
             # warning input_names_paired_by_inference; no inferred pairing crosses a polarity token.
             "repository_leading_identifier_names",
+            # AIF as SWATH (2026-10-07): an AIF unit whose included inputs share one MS2 collision energy (0.1 eV,
+            # LockSpray reference excluded) runs as SWATH, recorded as campaign_disposition.aif_run_as_swath and
+            # console_acquisition_basis aif_single_ce_as_swath; one with more energies is held (skip, hold true,
+            # aif_multi_ce_awaiting_console) with its raw data kept. The gate runs a header's AIF as SWATH only
+            # under that record.
+            "campaign_single_ce_aif_as_swath",
+            # An undeclared unit whose download is its own alone (unit_files, or every bundle URL with
+            # shared_unit_count 1) takes the archive members no sample row pairs with as unattributed inputs
+            # (name_pairing.paired_by unattributed_member, manifest.unattributed_members, the warning
+            # unattributed_members_included); a shared archive takes none and says why.
+            "repository_unattributed_archive_members",
         ],
         "workflow_outline": [
             "Inspect the input path and collect the guided scientific choices.",
