@@ -421,12 +421,20 @@ that do not map, and errors. If another writer changed the manifest meanwhile, t
 call returns `new_run_conflict`. The unit stays finished, and the same call can be
 made again.
 
+An alias's path in `raw\console-aliases` is fixed by its input, so two prepares of
+one unit share it. An abandoned call removes an alias it made only if no analysis CSV
+of the unit's committed manifest names it, so a concurrent prepare that reused the
+alias and committed keeps it. A commit whose CSV names an alias that has since been
+removed is refused as `new_run_conflict`. Both checks hold the manifest lock.
+
 Raw-data deletion is judged by the unit's current run. Until a new run prepared after
 a validated run has validated itself, its raw data are kept for it:
 `msdial_cleanup_repository_raw` refuses because the current run is not validated, and
 `msdial_discard_repository_raw` refuses because the unit did produce a validated
 output. Each preview names the superseded validated run. Once the new run validates,
-the cleanup judges it as it judges any other run.
+the cleanup judges it as it judges any other run. A split part is held the same way,
+approved or not: its discard under a campaign approval is refused, and its parent's
+raw release counts it as not ended, whatever its status and however many runs failed.
 
 Each file's acquisition is its raw header's wherever the header was read (user
 decision, 2026-10-06). A file with MS2 whose header gives DDA, DIA, AIF or SWATH

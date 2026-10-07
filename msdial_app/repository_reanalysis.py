@@ -6257,6 +6257,15 @@ class PendingNewProductionRun:
       the new output_directory and writes ``view``, with ``changes`` applied, in one write;
     - ``abandon()``, after any failure, removes the staging folder and the aliases this call made. The manifest
       and every file of the finished run are then as they were.
+
+    ALIASES ARE SHARED (review r7-62). An alias's path in raw\\console-aliases is fixed by its input, so two
+    prepares of one unit name the same one: the second reuses what the first made. The snapshot check guards
+    the manifest, not the aliases, so both ends now hold the manifest lock for them:
+    - ``commit(changes, required_paths)`` refuses (NewProductionRunConflict) if an alias the new CSV names,
+      ``required_paths``, is gone - a concurrent prepare that made it abandoned it - rather than commit a CSV
+      whose input path does not exist;
+    - ``abandon()`` removes an alias it made only when no analysis CSV of the unit's committed manifest names
+      it (_aliases_named_by_manifest): a concurrent prepare that reused it and committed keeps it.
     """
 
     def __init__(
@@ -6287,8 +6296,12 @@ class PendingNewProductionRun:
         staging = self.staging_directory()
         return self.output_directory / Path(path).resolve().relative_to(staging.resolve())
 
-    def commit(self, changes: Iterable[Any] = ()) -> dict[str, Any]:
-        """Rename the staging folder into place and write the manifest with the new run, under the lock, at once."""
+    def commit(self, changes: Iterable[Any] = (), required_paths: Iterable[str | Path] = ()) -> dict[str, Any]:
+        """Rename the staging folder into place and write the manifest with the new run, under the lock, at once.
+
+        ``required_paths`` are the aliases (and their sidecars) the new analysis CSV names; one that no longer
+        exists refuses the commit.
+        """
         if self.committed:
             raise RuntimeError("This new production run was committed already.")
         current = copy.deepcopy(self.view)
@@ -6296,6 +6309,7 @@ class PendingNewProductionRun:
             current.pop("manifest_path", None)
         for change in changes:
             change(current)
+        required = [Path(path) for path in required_paths]
         staging = self.staging_directory()
         with manifest_lock(self.target):
             if _read_manifest_bytes(self.target) != self.snapshot:
@@ -6306,6 +6320,13 @@ class PendingNewProductionRun:
             if os.path.lexists(self.output_directory):
                 raise NewProductionRunConflict(
                     f"{self.output_directory} appeared after the new run was decided; the new run was not prepared."
+                )
+            gone = [path for path in required if not os.path.lexists(path)]
+            if gone:
+                raise NewProductionRunConflict(
+                    f"{len(gone)} alias(es) the new analysis CSV names no longer exist (the first is {gone[0]}): "
+                    "another prepare of this unit that made them abandoned them. The new run was not prepared; "
+                    "prepare it again."
                 )
             os.rename(staging, self.output_directory)
             try:
@@ -6318,20 +6339,102 @@ class PendingNewProductionRun:
         return {**current, "manifest_path": str(self.target)}
 
     def abandon(self) -> dict[str, Any]:
-        """After a failure: remove the staging folder and the aliases this call made. A no-op once committed."""
+        """After a failure: remove the staging folder and the aliases this call made that no committed CSV names.
+
+        A no-op once committed. Under the manifest lock, so that a concurrent commit either has written its
+        manifest, whose CSV then protects the aliases it names, or finds them gone and refuses.
+        """
         if self.committed:
             return {"abandoned": False}
         left: list[str] = []
+        kept: list[str] = []
         if self.aliases_made:
             from .repository_analysis_rows import remove_console_aliases
 
-            left = remove_console_aliases(self.aliases_made)
+            with manifest_lock(self.target):
+                try:
+                    committed = json.loads(_read_manifest_bytes(self.target).decode("utf-8-sig"))
+                except (OSError, ValueError):
+                    committed = None
+                if isinstance(committed, dict):
+                    named = _aliases_named_by_manifest(committed)
+                    removable = [item for item in self.aliases_made if not _alias_is_named(Path(item[1]), named)]
+                    kept = [str(item[1]) for item in self.aliases_made if _alias_is_named(Path(item[1]), named)]
+                else:
+                    # A manifest that cannot be read cannot say which aliases it names: none is removed.
+                    removable = [item for item in self.aliases_made if item[0] == "directory"]
+                    kept = [str(item[1]) for item in self.aliases_made if item[0] != "directory"]
+                left = remove_console_aliases(removable)
             self.aliases_made = []
         staging, self.staging = self.staging, None
         if staging is not None and staging.exists():
             # Only files this call wrote are in it: the reviewed metadata and the CSV.
             shutil.rmtree(staging, ignore_errors=True)
-        return {"abandoned": True, "aliases_left": left, "staging_left": bool(staging and staging.exists())}
+        return {
+            "abandoned": True,
+            "aliases_left": left,
+            "aliases_kept_for_committed_csv": kept,
+            "staging_left": bool(staging and staging.exists()),
+        }
+
+
+def _aliases_named_by_manifest(manifest: dict[str, Any]) -> set[str]:
+    """The paths (file keys) of every input an analysis CSV of this committed unit names, and their sidecars.
+
+    Read from the CSVs themselves - the current run's analysis_csv and each superseded run's - and from the
+    lineage rows record_analysis_csv wrote for them (console_path, console_alias and its sidecars), so that a
+    CSV that cannot be read still protects what its lineage recorded.
+    """
+    named: set[str] = set()
+
+    def add(path_text: Any) -> None:
+        if str(path_text or "").strip():
+            named.add(_file_key(str(path_text)))
+
+    def add_lineage(row: dict[str, Any]) -> None:
+        add(row.get("console_path"))
+        alias = row.get("console_alias")
+        if isinstance(alias, dict) and str(alias.get("path") or "").strip():
+            add(alias["path"])
+            for sidecar in alias.get("sidecars") or []:
+                add(Path(str(alias["path"])).with_name(str(sidecar)))
+
+    def add_csv(record: Any) -> None:
+        path_text = str((record or {}).get("path") or "").strip() if isinstance(record, dict) else ""
+        if not path_text:
+            return
+        try:
+            with open(extended_path(path_text), encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    add(row.get("file_path"))
+        except (OSError, ValueError, csv.Error):
+            pass
+
+    add_csv(manifest.get("analysis_csv"))
+    for row in (manifest.get("input_lineage") or {}).get("rows") or []:
+        if isinstance(row, dict):
+            add_lineage(row)
+    for run in manifest.get("superseded_runs") or []:
+        if not isinstance(run, dict):
+            continue
+        add_csv(run.get("analysis_csv"))
+        for row in run.get("input_lineage_written") or []:
+            if isinstance(row, dict):
+                add_lineage(row)
+    return named
+
+
+def _alias_is_named(link: Path, named: set[str]) -> bool:
+    """Whether a CSV names this alias, or the alias this sidecar travels with (alias-x.wiff.scan with alias-x.wiff2)."""
+    if _file_key(str(link)) in named:
+        return True
+    parent = _file_key(str(link.parent))
+    name = link.name.casefold()
+    for key in named:
+        path = Path(key)
+        if _file_key(str(path.parent)) == parent and name.startswith(path.stem.casefold() + "."):
+            return True
+    return False
 
 
 def begin_new_production_run(
@@ -9045,6 +9148,9 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
     (cleanup_split_parent). What a part's discard can do is say that this part no longer needs it - a run
     failed after its retries, a refusal before production - which is what lets the parent's release count it
     as ended. Its output is kept, an mzTab-M and its failure record among the failure artifacts.
+
+    Refused, with nothing recorded, for a validated part, one whose Console may still run, and one with a new
+    run prepared after a validated run that has not validated (superseded_validated_run, review r7-62).
     """
     with _raw_deletion_lock(manifest_path):
         manifest = read_manifest(manifest_path)
@@ -9052,6 +9158,12 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
         blockers: list[str] = []
         if status in {"mztab_validated", "completed", "cleanup_pending_confirmation", "raw_cleaned"}:
             blockers.append("Validated/completed runs must use the normal cleanup command.")
+        # The rule cleanup and a unit's own discard follow holds for a part too (review r7-62): a part whose new
+        # run, prepared after a validated run, has not validated has not ended, and its discard would let the
+        # parent's release delete the raw data that new run reads.
+        validated_before = superseded_validated_run(manifest)
+        if validated_before is not None:
+            blockers.append(_superseded_validated_text(validated_before, status))
         attempt = _live_run_attempt_in(manifest)
         if attempt is not None:
             blockers.append(
@@ -9116,12 +9228,27 @@ def _part_end(part: dict[str, Any], parent_raw: Path) -> dict[str, Any]:
     hook records for a Console that exits non-zero and for one that exits 0 without a validated mzTab-M alike);
     skipped or excluded (by its campaign disposition, or at the split); or discarded (its own discard under an
     approval). Anything else - not yet preflighted, prepared, running, failed with retries left - has not.
+
+    A part with a new run prepared after a validated run, which has not validated itself, has not ended either,
+    whatever its status and however many runs failed (superseded_validated_run): its raw data are held for that
+    run, as a unit's own are (review r7-62). That includes a part discarded while such a run was pending, which
+    52b470b let an approval do.
     """
     status = str(part.get("status") or "")
     blockers: list[str] = []
     failures = len([item for item in part.get("run_failures") or [] if isinstance(item, dict)])
     retained = [str(item) for item in part.get("retained_artifacts") or []]
-    if status in CLEANUP_READY_STATUSES or status == "raw_cleaned":
+    validated_before = superseded_validated_run(part)
+    if validated_before is None and status == "discarded":
+        validated_before = superseded_validated_run({**part, "status": ""})
+    if validated_before is not None:
+        state = "pending"
+        blockers.append(
+            f"it is {status or 'unrecorded'!r}, and its run superseded_runs[{validated_before['superseded_run']}] "
+            f"validated (status {validated_before['status']!r}) before a new run was prepared that has not "
+            "validated; the raw data are held for that new run, and the part has not ended"
+        )
+    elif status in CLEANUP_READY_STATUSES or status == "raw_cleaned":
         state = "released" if status == "raw_cleaned" else "validated"
         if state == "validated" and not part.get("cleanup_allowed"):
             blockers.append("cleanup_allowed is not true")
@@ -9192,7 +9319,8 @@ def plan_split_parent_cleanup(manifest_path: Path) -> dict[str, Any]:
        reads them.
     4. The parts' inputs, with the inputs a campaign disposition excluded, are the parent's inputs, each once.
     5. Every part has ended (_part_end): validated, released, failed after its retries, skipped, excluded or
-       discarded; none has a Console that may still be running, and none keeps an artifact under the tree.
+       discarded; none has a Console that may still be running, and none keeps an artifact under the tree. A
+       part with a new run prepared after a validated run, which has not validated, has not ended.
     6. No finalisation hold stands on the parent or a part (run_finalisation.raw_deletion_holds).
 
     The release is ``released`` when some part's outputs validated, else ``discarded``. The authorization - a

@@ -2588,6 +2588,182 @@ class LegacyDispositionPrepareTests(_Scratch):
         self.assertIsNone(superseded_validated_run(read_manifest(manifest)))
         self.assertFalse(any("superseded run" in item for item in plan_download_cleanup(manifest)["blockers"]))
 
+    def aliased_rows(self, alias: Path):
+        """The real rows, with a.mzML read through ``alias`` as an input that needs an ASCII-safe alias is."""
+        from msdial_app import repository_analysis_rows
+
+        real = repository_analysis_rows.build_repository_analysis_rows
+
+        def build(manifest_view, projected=None):
+            built = real(manifest_view, projected)
+            for row in built["rows"]:
+                if Path(row["input_path"]).name == "a.mzML":
+                    row.update(file_name=alias.stem, file_path=str(alias))
+                    row["console_alias"] = {"path": str(alias), "kind": "hardlink", "target": row["input_path"],
+                                            "reasons": ["non_ascii"]}
+            return built
+
+        return patch("msdial_app.repository_analysis_rows.build_repository_analysis_rows", side_effect=build)
+
+    def test_a_conflicting_new_run_keeps_the_alias_the_committed_run_reused(self) -> None:
+        # Review r7-62's probe, with the alias named by the rows as a real one is: A makes the alias, B reuses it
+        # and commits output-run-2, A's commit is refused. A's abandon must not remove what B's CSV names.
+        from msdial_app import repository_analysis_rows
+
+        manifest, files, _run, _before = self.finished_mtbks217()
+        alias = manifest.parent.parent / "raw" / "console-aliases" / "alias-a.mzML"
+        real_alias = repository_analysis_rows.create_console_aliases
+        real_csv = repository_analysis_rows.write_analysis_csv
+        made_by: dict = {}
+        inner: dict = {}
+
+        def aliases(built, made=None):
+            failures = real_alias(built, made=made)
+            made_by.setdefault("A" if not inner else "B", list(made or []))
+            return failures
+
+        def csv_then_b(built, path):
+            written = real_csv(built, path)
+            if not inner:
+                inner["B"] = None
+                inner["B"] = self.prepare(manifest, confirmed=True, new_run=True)
+            return written
+
+        with self.aliased_rows(alias), \
+                patch("msdial_app.repository_analysis_rows.create_console_aliases", side_effect=aliases), \
+                patch("msdial_app.repository_analysis_rows.write_analysis_csv", side_effect=csv_then_b):
+            a = self.prepare(manifest, confirmed=True, new_run=True)
+
+        b = inner["B"]
+        self.assertEqual((True, str(manifest.parent.parent / "output-run-2" / "analysis_files.csv")),
+                         (b["prepared"], b["input_path"]))
+        self.assertEqual((False, "new_run_conflict"), (a["ok"], a["reason"]))
+        self.assertEqual(["directory", "hardlink"], [kind for kind, _link, _target in made_by["A"]], "A made the alias")
+        self.assertEqual([], made_by["B"], "B reused it")
+        recorded = read_manifest(manifest)
+        self.assertEqual((str(manifest.parent.parent / "output-run-2"), "preflight_passed"),
+                         (recorded["output_directory"], recorded["status"]))
+        self.assertIn(str(alias), [row["file_path"] for row in self.csv_rows(b)])
+        self.assertTrue(alias.is_file(), "the alias the committed run's CSV names stays")
+        self.assertTrue(all(Path(row["file_path"]).exists() for row in self.csv_rows(b)))
+        self.assertTrue(os.path.samefile(alias, files["a.mzML"]))
+        self.assertEqual([], [p.name for p in manifest.parent.parent.iterdir() if p.name.startswith(".output")])
+
+    def test_review_r7_62_probe_as_written(self) -> None:
+        # The reviewer's probe unchanged: both prepares make or reuse an alias that no row names. B commits; A is
+        # refused. A's abandon removes that alias, as no committed CSV names it, and every input path B's
+        # committed CSV names still exists.
+        from msdial_app import repository_analysis_rows
+
+        manifest, files, _run, _before = self.finished_mtbks217()
+        aliases = manifest.parent.parent / "raw" / "console-aliases"
+        alias = {"path": str(aliases / "alias-a.mzML"), "target": str(files["a.mzML"]), "kind": "hardlink"}
+        real_alias = repository_analysis_rows.create_console_aliases
+        real_csv = repository_analysis_rows.write_analysis_csv
+        log: list = []
+
+        def aliases_fn(built, made=None):
+            fails = real_alias({"rows": [{"console_alias": dict(alias)}]}, made=made)
+            log.append(("alias", list(made or [])))
+            return fails
+
+        state = {"inner": False}
+
+        def csv_fn(built, path):
+            written = real_csv(built, path)
+            if not state["inner"]:
+                state["inner"] = True
+                b = self.prepare(manifest, confirmed=True, new_run=True)
+                log.append(("B", b.get("prepared"), b.get("reason"), b.get("input_path")))
+            return written
+
+        with patch("msdial_app.repository_analysis_rows.create_console_aliases", side_effect=aliases_fn), \
+                patch("msdial_app.repository_analysis_rows.write_analysis_csv", side_effect=csv_fn):
+            a = self.prepare(manifest, confirmed=True, new_run=True)
+
+        [b] = [entry for entry in log if entry[0] == "B"]
+        self.assertEqual((True, None), b[1:3])
+        self.assertEqual((False, "new_run_conflict"), (a["ok"], a["reason"]))
+        rec = read_manifest(manifest)
+        self.assertEqual((str(manifest.parent.parent / "output-run-2"), "preflight_passed"), (rec["output_directory"], rec["status"]))
+        self.assertFalse((aliases / "alias-a.mzML").exists(), "no committed CSV names it")
+        self.assertTrue(all(Path(row["file_path"]).exists() for row in self.csv_rows({"input_path": b[3]})))
+
+    def test_an_abandoned_new_run_still_removes_the_alias_no_committed_csv_names(self) -> None:
+        # The same alias, made by a prepare whose CSV then failed and that no other prepare reused: it goes.
+        from msdial_app import repository_analysis_rows
+
+        manifest, files, run, before = self.finished_mtbks217()
+        alias = manifest.parent.parent / "raw" / "console-aliases" / "alias-a.mzML"
+        real_csv = repository_analysis_rows.write_analysis_csv
+
+        def failed(built, path):
+            real_csv(built, path)
+            raise OSError("the disk filled")
+
+        with self.aliased_rows(alias), patch("msdial_app.repository_analysis_rows.write_analysis_csv", side_effect=failed):
+            refused = self.prepare(manifest, confirmed=True, new_run=True)
+
+        self.assertEqual("os_error", refused["reason"])
+        self.assertFalse(alias.parent.exists(), "the alias and the folder made for it are taken back")
+        self.assertEqual(b"x", files["a.mzML"].read_bytes())
+        self.assert_untouched(manifest, before, run)
+
+    def test_a_new_run_whose_reused_alias_was_taken_back_meanwhile_is_not_committed(self) -> None:
+        # The other order: the prepare that made the alias abandons it before the one that reused it commits.
+        # The commit finds the alias gone and refuses, rather than commit a CSV that names a missing input.
+        from msdial_app import repository_analysis_rows
+
+        manifest, files, run, _before = self.finished_mtbks217()
+        alias = manifest.parent.parent / "raw" / "console-aliases" / "alias-a.mzML"
+        alias.parent.mkdir(parents=True)
+        os.link(files["a.mzML"], alias)
+        real_csv = repository_analysis_rows.write_analysis_csv
+
+        def taken_back_meanwhile(built, path):
+            written = real_csv(built, path)
+            alias.unlink()
+            return written
+
+        with self.aliased_rows(alias), \
+                patch("msdial_app.repository_analysis_rows.write_analysis_csv", side_effect=taken_back_meanwhile):
+            refused = self.prepare(manifest, confirmed=True, new_run=True)
+
+        self.assertEqual((False, False, "new_run_conflict"), (refused["ok"], refused["prepared"], refused["reason"]))
+        self.assertIn("no longer exist", refused["detail"])
+        recorded = read_manifest(manifest)
+        self.assertEqual(("mztab_validated", True), (recorded["status"], recorded["cleanup_allowed"]))
+        self.assertNotIn("superseded_runs", recorded)
+        self.assertEqual(run["bytes"], {path: path.read_bytes() for path in run["bytes"]})
+        workspace = manifest.parent.parent
+        self.assertEqual([], [p.name for p in workspace.iterdir() if p.name.startswith((".output", "output-run"))])
+
+    def test_the_aliases_a_committed_manifest_names_include_sidecars_and_superseded_runs(self) -> None:
+        from msdial_app.repository_reanalysis import _alias_is_named, _aliases_named_by_manifest
+
+        folder = self.root / "raw" / "console-aliases"
+        folder.mkdir(parents=True)
+        old_csv = self.root / "output" / "analysis_files.csv"
+        old_csv.parent.mkdir()
+        old_csv.write_text(f"file_path,file_name\n{folder / 'alias-old.mzML'},alias-old\n", encoding="utf-8-sig")
+        named = _aliases_named_by_manifest({
+            "input_lineage": {"rows": [
+                {"path": "x.wiff2", "console_path": str(folder / "alias-x.wiff2"),
+                 "console_alias": {"path": str(folder / "alias-x.wiff2"), "sidecars": ["alias-x.wiff.scan"]}},
+            ]},
+            "superseded_runs": [
+                {"analysis_csv": {"path": str(old_csv)}},
+                {"input_lineage_written": [{"path": "d.d", "console_path": str(folder / "alias-d.d")}]},
+            ],
+        })
+        for name, expected in (
+            ("alias-x.wiff2", True), ("alias-x.wiff.scan", True), ("alias-x.timeseries.data", True),
+            ("alias-old.mzML", True), ("alias-d.d", True), ("alias-xy.wiff2", False), ("alias-y.mzML", False),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(expected, _alias_is_named(folder / name, named))
+        self.assertFalse(_alias_is_named(folder, named), "the alias folder itself is no alias")
+
 class UntargetedWordingTests(_Scratch):
     def test_confirm_untargeted_is_recorded_as_an_inference_not_a_confirmation(self) -> None:
         manifest, stub, _ = _unit(self.root / "unit", ["a.mzML"], untargeted=None, acquisition="DDA")

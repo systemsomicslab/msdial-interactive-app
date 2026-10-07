@@ -131,6 +131,16 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     manifest, `analysis_csv.written_to_manifest: false`), files that do not
     map, or an error. A manifest written by another writer meanwhile is refused
     as `new_run_conflict`.
+  - Aliases in `raw\console-aliases` have fixed paths, so two prepares of one
+    unit share them: the second reuses what the first made. A call that is
+    abandoned now removes an alias it made only if no analysis CSV of the
+    unit's committed manifest names it (the current run's or a superseded
+    run's, read from the CSV and its lineage rows, sidecars included). Before,
+    a prepare refused as `new_run_conflict` removed the alias a concurrent
+    prepare had reused and committed, leaving that run's CSV naming a missing
+    input (review r7-62). In the other order, a commit whose CSV names an
+    alias that is gone, because the prepare that made it was abandoned, is
+    refused as `new_run_conflict`. Both checks run under the manifest lock.
   - Before this, a CSV that failed after the new run was written left a
     validated, cleanup-ready unit as `preflight_passed`, `cleanup_allowed:
     false`, with an empty `output-run-<n>` and no new run prepared (review
@@ -143,6 +153,15 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     the current run is not validated. Both previews name the superseded
     validated run. The raw data are kept for the new run and are deleted by
     the cleanup once it validates.
+  - The same holds for a split part, approved or not (review r7-62). Under a
+    campaign approval, the discard of a part with such a pending new run is
+    refused with the same blocker, and nothing is recorded. Before, it marked
+    the part `discarded`, and the parent's release then deleted the raw tree
+    the new run reads. The parent's release (`plan_split_parent_cleanup`,
+    `cleanup_split_parent`) counts such a part as not ended (`pending`),
+    whatever its status and however many runs failed, a part already marked
+    `discarded` that way included. Once the new run validates, the part ends as
+    any validated part does.
   - The gate's legacy refusal names `new_run=true` for a unit past its run.
   - On disk, as recorded on 2026-10-07, 11 manifests carry a legacy applied
     disposition. Five are past their run (MTBKS217, MTBKS236, MTBLS1572,

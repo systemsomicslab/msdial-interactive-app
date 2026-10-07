@@ -2677,9 +2677,24 @@ def _commit_new_run_rows(
     saved["analysis_files_csv"] = str(staged_csv)
     saved = {key: str(pending.staged(value)) for key, value in saved.items()}
     input_path = saved["analysis_files_csv"]
+    # Every alias the CSV names, made here or reused: the commit refuses if a concurrent prepare that made one
+    # has since abandoned it (review r7-62).
+    required = [
+        path
+        for row in built.get("rows") or []
+        if row.get("console_alias")
+        for path in (
+            Path(row["console_alias"]["path"]),
+            *(
+                Path(row["console_alias"]["path"]).with_name(str(name))
+                for name in row["console_alias"].get("sidecars") or []
+            ),
+        )
+    ]
     pending.commit(
         ([campaign_authorization_change(crossing)] if crossing else [])
-        + [analysis_csv_change(built, input_path), analytical_order_change(analytical_order)]
+        + [analysis_csv_change(built, input_path), analytical_order_change(analytical_order)],
+        required_paths=required,
     )
     answer_seed["repository_metadata_path"] = saved["metadata_json"]
     return {

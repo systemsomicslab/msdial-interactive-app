@@ -497,6 +497,97 @@ class ThePostRunHook(_SplitParent, unittest.TestCase):
         self.assertNotIn("raw_release_pending", read_manifest(parent))
 
 
+class APartWithAPendingNewRunIsHeld(_SplitParent, unittest.TestCase):
+    """Review r7-62: a part whose new run, prepared after a validated run, has not validated has not ended.
+
+    Its raw data are held for that run as a unit's own are: its discard under an approval is refused, and the
+    parent's release counts it as not ended, whatever its status and however many runs failed.
+    """
+
+    def new_run_on(self, part: Path) -> None:
+        """Validate the part, then prepare a new run on it as a confirmed new_run=true prepare commits one."""
+        from msdial_app.repository_reanalysis import start_new_production_run
+
+        self.validate(part)
+        record, _view = start_new_production_run({**read_manifest(part), "manifest_path": str(part)}, write=True)
+        self.assertTrue(record["started"], record)
+
+    def assert_held(self, parent: Path) -> None:
+        plan = plan_split_parent_cleanup(parent)
+        self.assertFalse(plan["ready"])
+        self.assertEqual("pending", {item["analysis_unit_id"]: item["state"] for item in plan["parts"]}["unit-mixed-dia"])
+        self.assertTrue(any("held for that new run" in item for item in plan["blockers"]), plan["blockers"])
+        released = cleanup_split_parent(parent, campaign_authorization_path=self.approval())
+        self.assertFalse(released["deleted"])
+        self.assertTrue(self.raw.is_dir())
+        self.assertNotIn("raw_release", read_manifest(parent))
+
+    def test_review_r7_62_probe_an_approved_discard_of_the_part_is_refused(self) -> None:
+        # The reviewer's probe: DDA validated, DIA left as a confirmed new_run=true prepare leaves it.
+        from msdial_app.repository_reanalysis import plan_download_discard, superseded_validated_run
+
+        parent, parts = self.split()
+        self.validate(parts["DDA"])
+
+        def superseded(current: dict) -> None:
+            current["superseded_runs"] = [{"status": "mztab_validated", "cleanup_allowed": True,
+                                           "output_directory": str(Path(current["output_directory"]))}]
+            current["status"] = "preflight_passed"
+
+        update_manifest(parts["DIA"], superseded)
+        self.assertIsNotNone(superseded_validated_run(read_manifest(parts["DIA"])))
+        self.assertTrue(any("A superseded run of this unit validated" in item
+                            for item in plan_download_discard(parts["DIA"])["blockers"]))
+
+        refused = discard_download_lease(parts["DIA"], campaign_authorization_path=self.approval())
+
+        self.assertFalse(refused["deleted"])
+        self.assertNotIn("part_ended", refused)
+        self.assertTrue(any("A superseded run of this unit validated" in item for item in refused["blockers"]), refused)
+        part = read_manifest(parts["DIA"])
+        self.assertEqual("preflight_passed", part["status"])
+        self.assertNotIn("discard_reason", part)
+        self.assertNotIn("raw_release_deferred_to", part)
+        self.assert_held(parent)
+
+    def test_a_new_run_prepared_failed_or_failed_after_its_retries_holds_the_parent(self) -> None:
+        parent, parts = self.split()
+        self.validate(parts["DDA"])
+        self.new_run_on(parts["DIA"])
+        failure = {"reason": "MS-DIAL Console exited with code 1.", "exit_code": 1}
+        for status, failures in (("preflight_passed", []), ("run_failed", [failure]),
+                                 ("run_failed", [failure] * 3), ("validation_failed", [failure] * 3)):
+            with self.subTest(status=status, failures=len(failures)):
+                self.set_status(parts["DIA"], status, run_failures=failures)
+                refused = discard_download_lease(parts["DIA"], campaign_authorization_path=self.approval())
+                self.assertFalse(refused["deleted"])
+                self.assertNotIn("part_ended", refused)
+                self.assertEqual(status, read_manifest(parts["DIA"])["status"])
+                self.assert_held(parent)
+
+    def test_a_part_discarded_while_its_new_run_was_pending_still_holds_the_parent(self) -> None:
+        # As 52b470b let an approval leave it.
+        parent, parts = self.split()
+        self.validate(parts["DDA"])
+        self.new_run_on(parts["DIA"])
+        self.set_status(parts["DIA"], "discarded", raw_release_deferred_to=str(parent.resolve()))
+
+        self.assert_held(parent)
+
+    def test_once_the_new_run_validates_the_parent_is_released(self) -> None:
+        parent, parts = self.split()
+        self.validate(parts["DDA"])
+        self.new_run_on(parts["DIA"])
+        self.assert_held(parent)
+
+        self.validate(parts["DIA"])
+        result = cleanup_split_parent(parent, campaign_authorization_path=self.approval())
+
+        self.assertTrue(result["deleted"], result.get("blockers"))
+        self.assertFalse(self.raw.exists())
+        self.assertEqual("raw_cleaned", read_manifest(parts["DIA"])["status"])
+
+
 class AnUnvalidatedRunIsAFailedRun(_SplitParent, unittest.TestCase):
     """A Console that exits 0 without a validated mzTab-M is recorded as a failed run, so its part can end.
 
