@@ -659,12 +659,16 @@ def _same_file(left: Path, right: Path) -> bool:
         return False
 
 
-def create_console_aliases(built: dict[str, Any]) -> list[dict[str, Any]]:
+def create_console_aliases(
+    built: dict[str, Any], made: list[tuple[str, Path, Path]] | None = None
+) -> list[dict[str, Any]]:
     """Make every alias the rows name. Returns the failures; an alias already in place is reused.
 
     A folder gets a directory junction, a file a hard link, and a file's sidecars (x.wiff.scan) hard links
     of their own beside it, so the vendor reader finds them. An alias path that holds something else is
-    never replaced.
+    never replaced. ``made``, when given, receives (kind, link, target) for each link this call created, and
+    for no link it reused, and ("directory", folder, folder) for each alias folder it created, so that a caller
+    whose step fails afterwards can take back exactly what it made (remove_console_aliases).
     """
     failures: list[dict[str, Any]] = []
     for row in built.get("rows") or []:
@@ -678,9 +682,13 @@ def create_console_aliases(built: dict[str, Any]) -> list[dict[str, Any]]:
                 (sidecar, link.with_name(link.stem + rest))
                 for sidecar, rest in _travelling_files(target)
             )
-        made: list[str] = []
+        created: list[str] = []
         try:
+            if made is not None:
+                missing = [folder for folder in (link.parent, *link.parent.parents) if not os.path.lexists(folder)]
             link.parent.mkdir(parents=True, exist_ok=True)
+            if made is not None:
+                made.extend(("directory", folder, folder) for folder in reversed(missing))
             for source, destination in pairs:
                 if os.path.lexists(destination):
                     if not _same_file(destination, source):
@@ -690,7 +698,9 @@ def create_console_aliases(built: dict[str, Any]) -> list[dict[str, Any]]:
                     _create_junction(source, destination)
                 else:
                     os.link(source, destination)
-                made.append(destination.name)
+                created.append(destination.name)
+                if made is not None:
+                    made.append((str(alias["kind"]), destination, source))
         except OSError as error:
             failures.append(_failure(
                 "console_alias_failed",
@@ -700,15 +710,70 @@ def create_console_aliases(built: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         alias["created_at"] = datetime.now(timezone.utc).isoformat()
         alias["sidecars"] = [destination.name for _source, destination in pairs[1:]]
-        if not made:
+        if not created:
             alias["reused"] = True
     return failures
+
+
+def _is_link(path: Path) -> bool:
+    return path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction())
+
+
+def _has_entries(folder: Path) -> bool:
+    with os.scandir(folder) as entries:
+        return any(True for _entry in entries)
+
+
+def remove_console_aliases(made: list[tuple[str, Path, Path]]) -> list[str]:
+    """Take back the links create_console_aliases reported in ``made``, newest first. Returns what stayed.
+
+    Only a link that still names its target is removed, and only the link: a hard link is one name of the raw
+    file, whose other name (the input itself) stays; a junction is removed as a reparse point, never descended
+    into. A folder it created is removed only when it is empty. A path that now holds something else is left as
+    it is and reported.
+    """
+    kept: list[str] = []
+    for kind, link, target in reversed(made):
+        link, target = Path(link), Path(target)
+        if not os.path.lexists(link):
+            continue
+        try:
+            if kind == "directory":
+                if _is_link(link) or not link.is_dir() or _has_entries(link):
+                    kept.append(str(link))
+                    continue
+                os.rmdir(link)
+            elif kind == "junction":
+                if not _is_link(link) or not _same_file(link, target):
+                    kept.append(str(link))
+                    continue
+                if os.name == "nt":
+                    os.rmdir(link)
+                else:
+                    os.unlink(link)
+            else:
+                if link.is_symlink() or not link.is_file() or not _same_file(link, target):
+                    kept.append(str(link))
+                    continue
+                os.unlink(link)
+        except OSError:
+            kept.append(str(link))
+    return kept
 
 
 def record_analysis_csv(
     manifest_path: str | Path, built: dict[str, Any], csv_path: str | Path
 ) -> dict[str, Any]:
     """Record the CSV and every input's name in it on the unit's lineage rows (file_name, console_path)."""
+    return update_manifest(Path(manifest_path), analysis_csv_change(built, csv_path))
+
+
+def analysis_csv_change(built: dict[str, Any], csv_path: str | Path) -> Any:
+    """The change record_analysis_csv makes, as a function of a manifest edited in place.
+
+    Apart from its writer so that a new production run (repository_reanalysis.PendingNewProductionRun) records
+    its CSV in the one write that commits the run.
+    """
     by_key = {_file_key(row["input_path"]): row for row in built["rows"]}
     summary = {
         "schema": SCHEMA,
@@ -753,21 +818,14 @@ def record_analysis_csv(
                 item.pop("console_alias", None)
         manifest["analysis_csv"] = summary
 
-    return update_manifest(Path(manifest_path), change)
+    return change
 
 
 def record_analysis_csv_failure(
     manifest_path: str | Path, built: dict[str, Any], failures: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """Record why a unit's analysis CSV was not written. Never raises: the caller is reporting a failure."""
-    record = {
-        "schema": SCHEMA,
-        "status": "failed",
-        "built_from": built.get("built_from", "input_lineage"),
-        "failures": [dict(item) for item in failures],
-        "counts": dict(built.get("counts") or {}),
-        "recorded_at": datetime.now(timezone.utc).isoformat(),
-    }
+    record = analysis_csv_failure_record(built, failures)
 
     def change(manifest: dict[str, Any]) -> None:
         manifest["analysis_csv"] = record
@@ -778,3 +836,15 @@ def record_analysis_csv_failure(
     except (OSError, ValueError) as error:
         return {**record, "manifest_error": str(error)}
     return record
+
+
+def analysis_csv_failure_record(built: dict[str, Any], failures: list[dict[str, Any]]) -> dict[str, Any]:
+    """What record_analysis_csv_failure writes; a new production run that fails returns it unwritten."""
+    return {
+        "schema": SCHEMA,
+        "status": "failed",
+        "built_from": built.get("built_from", "input_lineage"),
+        "failures": [dict(item) for item in failures],
+        "counts": dict(built.get("counts") or {}),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }

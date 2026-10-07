@@ -408,6 +408,26 @@ decided again would not run the unit (`would_not_run`, with the decision in
 (`redecision_failed`). The execution gate holds a workflow to the unit's current
 `output_directory`, so the new run cannot write into the finished run's folder.
 
+A confirmed new run is all or nothing. The run is decided in memory, its rows
+built, its aliases made, and its reviewed metadata and analysis CSV written into a
+hidden staging folder beside the new one. Only then, under the manifest lock, the
+staging folder becomes `output-run-<n>` and the manifest is written once, with the
+superseded run, the new `output_directory`, the CSV record, the analytical order and
+any campaign crossing. If anything before that fails, the manifest and every file of
+the finished run are left byte for byte as they were, and the staging folder and the
+aliases the call made are removed. That covers rows that disagree or an alias that
+cannot be made (`analysis_csv_failed`, with nothing recorded in the manifest), files
+that do not map, and errors. If another writer changed the manifest meanwhile, the
+call returns `new_run_conflict`. The unit stays finished, and the same call can be
+made again.
+
+Raw-data deletion is judged by the unit's current run. Until a new run prepared after
+a validated run has validated itself, its raw data are kept for it:
+`msdial_cleanup_repository_raw` refuses because the current run is not validated, and
+`msdial_discard_repository_raw` refuses because the unit did produce a validated
+output. Each preview names the superseded validated run. Once the new run validates,
+the cleanup judges it as it judges any other run.
+
 Each file's acquisition is its raw header's wherever the header was read (user
 decision, 2026-10-06). A file with MS2 whose header gives DDA, DIA, AIF or SWATH
 runs as that, whatever the unit declares and whatever confidence the extractor

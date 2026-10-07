@@ -117,6 +117,32 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     may still be running (`run_in_progress`), one a legacy disposition decided
     again would not run (`would_not_run`), and one whose decision fails
     (`redecision_failed`).
+  - A confirmed new run is all or nothing. It is decided in memory, its rows
+    are built, its aliases made, and its reviewed metadata and analysis CSV
+    written into a hidden staging folder beside the new one
+    (`.output-run-<n>.<random>.staging`). Only then, under the manifest lock,
+    the staging folder is renamed to `output-run-<n>` and the manifest is
+    written once, with the superseded run, the new `output_directory`, the CSV
+    record, the analytical order and any campaign crossing together.
+  - If any step before that fails, the manifest and every file of the finished
+    run stay byte for byte as they were, and the staging folder and the aliases
+    the call made are removed. The failing steps are rows that disagree or an
+    alias that cannot be made (`analysis_csv_failed`, recorded nowhere in the
+    manifest, `analysis_csv.written_to_manifest: false`), files that do not
+    map, or an error. A manifest written by another writer meanwhile is refused
+    as `new_run_conflict`.
+  - Before this, a CSV that failed after the new run was written left a
+    validated, cleanup-ready unit as `preflight_passed`, `cleanup_allowed:
+    false`, with an empty `output-run-<n>` and no new run prepared (review
+    r6-62).
+  - Raw-data deletion is judged by the unit's current run. While a new run
+    prepared after a validated run has not validated (prepared, running or
+    failed), `msdial_discard_repository_raw` refuses: before, it saw no mzTab-M
+    in the new folder and would have discarded the unit as one with no
+    validated output. `msdial_cleanup_repository_raw` refuses as before, since
+    the current run is not validated. Both previews name the superseded
+    validated run. The raw data are kept for the new run and are deleted by
+    the cleanup once it validates.
   - The gate's legacy refusal names `new_run=true` for a unit past its run.
   - On disk, as recorded on 2026-10-07, 11 manifests carry a legacy applied
     disposition. Five are past their run (MTBKS217, MTBKS236, MTBLS1572,

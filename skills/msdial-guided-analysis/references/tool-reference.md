@@ -242,7 +242,11 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   whose run has finished is refused (`run_finished`) and nothing is written;
   `new_run=true` prepares a new production run instead, keeping the finished
   run's records under `superseded_runs` and writing into a new output directory
-  (`preview.new_run`). Its
+  (`preview.new_run`). A confirmed new run is committed in one manifest write
+  only once its CSV is written. If it fails (`analysis_csv_failed`,
+  `new_run_conflict` or an error), the finished run and its manifest are
+  unchanged. Until the new run validates, neither raw cleanup nor discard
+  deletes the unit's raw data. Its
   `preview.answer_seed` is passed unchanged to `msdial_guided_analysis_plan`.
   The seed points to the complete reviewed metadata JSON locally rather than
   carrying every sample row through the model context.

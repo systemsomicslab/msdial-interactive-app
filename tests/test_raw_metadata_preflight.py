@@ -2000,7 +2000,7 @@ class LegacyDispositionPrepareTests(_Scratch):
                 retained_artifact_inventory=inventory,
                 analysis_csv={"status": "written", "path": str(csv_path), "rows": len(files)},
             )
-            for row in current["input_lineage"]["rows"]:
+            for row in (current.get("input_lineage") or {}).get("rows") or []:
                 row.update(file_name=Path(row["path"]).stem, console_path=row["path"], acquisition_type="DDA")
 
         update_manifest(manifest, finalised)
@@ -2334,6 +2334,259 @@ class LegacyDispositionPrepareTests(_Scratch):
         rows = self.csv_rows(prepared)
         self.assertTrue(self.gate(manifest, [Path(row["file_path"]) for row in rows], "DDA")["allowed"])
 
+
+    # Review r6-62, medium: a confirmed new_run prepare superseded the finished run before its CSV was known to be
+    # writable. Each later step that fails must leave the manifest and every file byte for byte as they were.
+
+    @staticmethod
+    def tree(root: Path) -> dict:
+        """Every folder and every file's bytes under root: what a failed new run must leave as it found."""
+        found: dict = {}
+        for path in sorted(root.rglob("*")):
+            key = str(path.relative_to(root))
+            found[key] = None if path.is_dir() else path.read_bytes()
+        return found
+
+    def assert_untouched(self, manifest: Path, before: dict, run: dict) -> None:
+        workspace = manifest.parent.parent
+        self.assertEqual(before, self.tree(workspace), "the manifest and every file are as they were")
+        self.assertEqual(run["bytes"], {path: path.read_bytes() for path in run["bytes"]})
+        self.assertEqual([], [p.name for p in workspace.iterdir() if p.name.startswith((".output", "output-run"))])
+
+    def finished_mtbks217(self) -> tuple[Path, dict, dict, dict]:
+        manifest, files = self.finished_legacy_unit(self.MTBKS217, {"z.mzML": ("DDA", "folded_ms1_only")})
+        run = self.with_finished_run_outputs(manifest, files)
+        return manifest, files, run, self.tree(manifest.parent.parent)
+
+    def assert_finished_run_still_judged(self, manifest: Path) -> None:
+        """Cleanup and discard judge the unit by its finished run, as before the prepare that failed."""
+        from msdial_app.repository_reanalysis import discard_download_lease, plan_download_cleanup, plan_download_discard
+
+        cleanup = plan_download_cleanup(manifest)
+        self.assertEqual(([], True), (cleanup["blockers"], cleanup["ready_for_confirmation"]))
+        self.assertIn("Validated/completed runs must use the normal cleanup command.", plan_download_discard(manifest)["blockers"])
+        with self.assertRaises(ValueError):
+            discard_download_lease(manifest, confirmed=True)
+
+    def test_a_new_run_whose_rows_cannot_be_built_changes_nothing(self) -> None:
+        manifest, _files, run, before = self.finished_mtbks217()
+
+        with patch("msdial_app.repository_analysis_rows.build_repository_analysis_rows", side_effect=RuntimeError("rows")):
+            with self.assertRaisesRegex(RuntimeError, "rows"):
+                self.prepare(manifest, confirmed=True, new_run=True)
+
+        self.assert_untouched(manifest, before, run)
+        self.assert_finished_run_still_judged(manifest)
+
+    def test_a_new_run_whose_rows_disagree_changes_nothing_and_records_no_failure(self) -> None:
+        from msdial_app import repository_analysis_rows
+
+        manifest, _files, run, before = self.finished_mtbks217()
+        real = repository_analysis_rows.build_repository_analysis_rows
+
+        def disagreeing(manifest_view, projected):
+            built = real(manifest_view, projected)
+            built["failures"] = [*built["failures"], {"code": "lineage_disagrees", "message": "The lineage disagrees.", "inputs": []}]
+            return built
+
+        with patch("msdial_app.repository_analysis_rows.build_repository_analysis_rows", side_effect=disagreeing):
+            failed = self.prepare(manifest, confirmed=True, new_run=True)
+
+        self.assertEqual((False, False, "analysis_csv_failed", ["lineage_disagrees"]),
+                         (failed["ok"], failed["prepared"], failed["reason"], failed["codes"]))
+        self.assertFalse(failed["analysis_csv"]["written_to_manifest"])
+        self.assertFalse(failed["preview"]["new_run"]["written"])
+        self.assert_untouched(manifest, before, run)
+        self.assert_finished_run_still_judged(manifest)
+
+    def test_a_new_run_whose_alias_fails_takes_back_the_aliases_it_made(self) -> None:
+        from msdial_app import repository_analysis_rows
+
+        real = repository_analysis_rows.create_console_aliases
+        for outcome in ("returns_a_failure", "raises"):
+            with self.subTest(outcome=outcome):
+                self.root = Path(tempfile.mkdtemp(dir=self._directory.name)).resolve()
+                manifest, files, run, before = self.finished_mtbks217()
+                aliases = manifest.parent.parent / "raw" / "console-aliases"
+                made_here: list = []
+
+                def one_made_then_failed(built, made=None):
+                    # A real alias, in a folder this call creates, before the one that fails.
+                    alias = {"path": str(aliases / "alias-a.mzML"), "target": str(files["a.mzML"]), "kind": "hardlink"}
+                    self.assertEqual([], real({"rows": [{"console_alias": alias}]}, made=made))
+                    made_here.extend(made)
+                    self.assertTrue((aliases / "alias-a.mzML").is_file())
+                    if outcome == "raises":
+                        raise OSError("the volume refused the link")
+                    return [{"code": "console_alias_failed", "message": "No ASCII-safe alias could be made for z.mzML.",
+                             "inputs": ["z.mzML"]}]
+
+                with patch("msdial_app.repository_analysis_rows.create_console_aliases", side_effect=one_made_then_failed):
+                    if outcome == "raises":
+                        # The tool returns an OSError as os_error rather than raising past the MCP boundary.
+                        failed = self.prepare(manifest, confirmed=True, new_run=True)
+                        self.assertEqual((False, "os_error"), (failed["ok"], failed["reason"]))
+                        self.assertIn("refused the link", failed["detail"])
+                    else:
+                        failed = self.prepare(manifest, confirmed=True, new_run=True)
+                        self.assertEqual(("analysis_csv_failed", ["console_alias_failed"]), (failed["reason"], failed["codes"]))
+
+                self.assertEqual(["directory", "hardlink"], [kind for kind, _link, _target in made_here])
+                self.assertFalse(aliases.exists(), "the alias and the folder made for it are taken back")
+                self.assertEqual(b"x", files["a.mzML"].read_bytes(), "the input itself stays")
+                self.assert_untouched(manifest, before, run)
+
+    def test_a_new_run_whose_csv_cannot_be_written_removes_its_staging(self) -> None:
+        from msdial_app import repository_analysis_rows
+
+        manifest, _files, run, before = self.finished_mtbks217()
+        real = repository_analysis_rows.write_analysis_csv
+        staged: list = []
+
+        def written_then_failed(built, path):
+            staged.append(real(built, path))
+            raise OSError("the disk filled")
+
+        with patch("msdial_app.repository_analysis_rows.write_analysis_csv", side_effect=written_then_failed):
+            failed = self.prepare(manifest, confirmed=True, new_run=True)
+
+        self.assertEqual((False, "os_error", "the disk filled"), (failed["ok"], failed["reason"], failed["detail"]))
+
+        [csv_path] = staged
+        self.assertTrue(csv_path.parent.name.startswith(".output-run-2.") and csv_path.parent.name.endswith(".staging"))
+        self.assertEqual(manifest.parent.parent, csv_path.parent.parent)
+        self.assertFalse(csv_path.parent.exists())
+        self.assert_untouched(manifest, before, run)
+        self.assert_finished_run_still_judged(manifest)
+
+    def test_a_new_run_is_not_committed_over_a_manifest_another_writer_changed(self) -> None:
+        from msdial_app import repository_analysis_rows
+
+        manifest, _files, run, _before = self.finished_mtbks217()
+        real = repository_analysis_rows.write_analysis_csv
+
+        def written_while_another_writer_writes(built, path):
+            written = real(built, path)
+            update_manifest(manifest, lambda current: current.update(written_meanwhile="kept"))
+            return written
+
+        with patch("msdial_app.repository_analysis_rows.write_analysis_csv", side_effect=written_while_another_writer_writes):
+            refused = self.prepare(manifest, confirmed=True, new_run=True)
+
+        self.assertEqual((False, False, "new_run_conflict"), (refused["ok"], refused["prepared"], refused["reason"]))
+        self.assertFalse(refused["new_run"]["written"])
+        recorded = read_manifest(manifest)
+        self.assertEqual(("kept", "mztab_validated", True), (recorded["written_meanwhile"], recorded["status"], recorded["cleanup_allowed"]))
+        self.assertNotIn("superseded_runs", recorded)
+        self.assertEqual(run["bytes"], {path: path.read_bytes() for path in run["bytes"]})
+        workspace = manifest.parent.parent
+        self.assertEqual([], [p.name for p in workspace.iterdir() if p.name.startswith((".output", "output-run"))])
+
+    def finished_unit_without_lineage(self) -> tuple[Path, dict, dict, dict]:
+        manifest, files = self.campaign(self.MTBKS217, acquisition="DIA")
+        update_manifest(manifest, lambda current: current.update(status="mztab_validated", execution_allowed=True))
+        run = self.with_finished_run_outputs(manifest, files)
+        self.assertNotIn("input_lineage", read_manifest(manifest))
+        return manifest, files, run, self.tree(manifest.parent.parent)
+
+    def test_a_new_run_of_a_unit_without_lineage_whose_files_do_not_map_changes_nothing(self) -> None:
+        from msdial_app import repository_metadata
+
+        manifest, _files, run, before = self.finished_unit_without_lineage()
+        real = repository_metadata.apply_classes_to_analysis_files
+        for field in ("unmatched", "ambiguous"):
+            with self.subTest(field=field):
+
+                def not_mapped(projected, recognized):
+                    return {**real(projected, recognized), field: ["FILES/a.mzML"]}
+
+                with patch("msdial_app.repository_metadata.apply_classes_to_analysis_files", side_effect=not_mapped):
+                    preview = self.prepare(manifest, confirmed=False, new_run=True)
+                    self.assertTrue(preview["preview"]["new_run"]["started"])
+                    with self.assertRaisesRegex(RuntimeError, "did not map uniquely"):
+                        self.prepare(manifest, confirmed=True, new_run=True)
+
+                self.assert_untouched(manifest, before, run)
+        self.assert_finished_run_still_judged(manifest)
+
+    def test_a_new_run_of_a_unit_without_lineage_is_committed_with_its_csv(self) -> None:
+        manifest, _files, run, _before = self.finished_unit_without_lineage()
+        finished = read_manifest(manifest)
+
+        prepared = self.prepare(manifest, confirmed=True, new_run=True)
+
+        self.assertTrue(prepared["prepared"], prepared)
+        new_output = manifest.parent.parent / "output-run-2"
+        self.assertEqual(new_output / "analysis_files.csv", Path(prepared["input_path"]))
+        self.assertTrue(Path(prepared["input_path"]).is_file())
+        self.assertTrue(Path(prepared["files"]["metadata_json"]).is_file())
+        self.assertEqual(new_output, Path(prepared["files"]["metadata_json"]).parent)
+        self.assertTrue(prepared["preview"]["new_run"]["written"])
+        recorded = read_manifest(manifest)
+        self.assertEqual((str(new_output), "preflight_passed", False), (recorded["output_directory"], recorded["status"], recorded["cleanup_allowed"]))
+        self.assertEqual(finished["analytical_order"] if "analytical_order" in finished else None,
+                         recorded["superseded_runs"][0].get("analytical_order"))
+        self.assertIn("recorded_at", recorded["analytical_order"], "the new CSV's order is written with the run")
+        self.assertEqual(run["bytes"], {path: path.read_bytes() for path in run["bytes"]})
+        self.assertEqual([], [p.name for p in manifest.parent.parent.iterdir() if p.name.startswith(".output")])
+
+    def test_a_confirmed_new_run_writes_the_manifest_once(self) -> None:
+        from msdial_app import repository_reanalysis
+
+        manifest, _files, run, _before = self.finished_mtbks217()
+        real = repository_reanalysis._write_json
+        writes: list = []
+
+        def counted(path, value):
+            if Path(path).resolve() == manifest.resolve():
+                writes.append(dict(value))
+            return real(path, value)
+
+        with patch("msdial_app.repository_reanalysis._write_json", side_effect=counted):
+            prepared = self.prepare(manifest, confirmed=True, new_run=True)
+
+        self.assertTrue(prepared["prepared"], prepared)
+        [written] = writes
+        self.assertEqual(("preflight_passed", "written"), (written["status"], written["analysis_csv"]["status"]))
+        self.assertEqual(str(manifest.parent.parent / "output-run-2" / "analysis_files.csv"), written["analysis_csv"]["path"])
+        self.assertTrue(written["superseded_runs"])
+
+    def test_raw_data_of_a_unit_whose_new_run_has_not_validated_are_neither_cleaned_nor_discarded(self) -> None:
+        # Cleanup and discard judge the unit by its current run. While a new run prepared after a validated run
+        # has not validated (prepared, or failed), the raw data are kept for it, and each refusal says why.
+        from msdial_app.repository_reanalysis import (
+            cleanup_download_lease,
+            discard_download_lease,
+            plan_download_cleanup,
+            plan_download_discard,
+            superseded_validated_run,
+        )
+
+        manifest, files, run, _before = self.finished_mtbks217()
+        self.assertIsNone(superseded_validated_run(read_manifest(manifest)))
+        self.assertTrue(self.prepare(manifest, confirmed=True, new_run=True)["prepared"])
+        for status in ("preflight_passed", "run_failed"):
+            with self.subTest(status=status):
+                update_manifest(manifest, lambda current: current.update(status=status))
+                found = superseded_validated_run(read_manifest(manifest))
+                self.assertEqual((0, "mztab_validated", str(run["output"])),
+                                 (found["superseded_run"], found["status"], found["output_directory"]))
+                discard = plan_download_discard(manifest)
+                self.assertTrue(any("A superseded run of this unit validated" in item for item in discard["blockers"]), discard)
+                with self.assertRaisesRegex(ValueError, "superseded run of this unit validated"):
+                    discard_download_lease(manifest, confirmed=True)
+                cleanup = plan_download_cleanup(manifest)
+                self.assertFalse(cleanup["ready_for_confirmation"])
+                self.assertTrue(any("A superseded run of this unit validated" in item for item in cleanup["blockers"]), cleanup)
+                with self.assertRaises(ValueError):
+                    cleanup_download_lease(manifest, confirmed=True)
+                self.assertEqual(b"x", files["a.mzML"].read_bytes(), "nothing was deleted")
+                self.assertEqual(status, read_manifest(manifest)["status"])
+
+        # Once the new run validates, cleanup judges it as any other, and the superseded run no longer holds it.
+        update_manifest(manifest, lambda current: current.update(status="mztab_validated", cleanup_allowed=True))
+        self.assertIsNone(superseded_validated_run(read_manifest(manifest)))
+        self.assertFalse(any("superseded run" in item for item in plan_download_cleanup(manifest)["blockers"]))
 
 class UntargetedWordingTests(_Scratch):
     def test_confirm_untargeted_is_recorded_as_an_inference_not_a_confirmation(self) -> None:

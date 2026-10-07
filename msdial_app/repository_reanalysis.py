@@ -11,6 +11,7 @@ import os
 import random
 import re
 import secrets
+import shutil
 import socket
 import ssl
 import stat
@@ -4504,12 +4505,17 @@ def record_campaign_authorization(manifest_path: str | Path, crossing: dict[str,
     Raises when it cannot write, unlike the failure recorders: the crossing is written before the step it
     authorizes, and a step whose authority cannot be recorded does not run.
     """
+    return update_manifest(Path(manifest_path), campaign_authorization_change(crossing))
+
+
+def campaign_authorization_change(crossing: dict[str, Any]) -> Any:
+    """The change record_campaign_authorization makes, for a write that carries it with the step it authorizes."""
     entry = dict(crossing)
 
     def change(manifest: dict[str, Any]) -> None:
         manifest["campaign_authorizations"] = [*(manifest.get("campaign_authorizations") or []), entry]
 
-    return update_manifest(Path(manifest_path), change)
+    return change
 
 
 def record_run_failure(
@@ -6126,6 +6132,10 @@ def start_new_production_run(
     not past a run (no_finished_run) is left
     alone too; the caller prepares it as any other. Without ``write`` the same is done on a copy, which is
     returned, and nothing is created.
+
+    msdial_prepare_repository_reanalysis does not write with this: it decides the run without ``write``
+    (begin_new_production_run) and commits it only together with the analysis CSV (PendingNewProductionRun),
+    so that a CSV that fails leaves the finished run as it was.
     """
 
     def start(current: dict[str, Any]) -> dict[str, Any]:
@@ -6224,6 +6234,161 @@ def start_new_production_run(
     if record.get("legacy_disposition_redecision"):
         record["legacy_disposition_redecision"]["written"] = True
     return {**record, "written": True}, {**current, "manifest_path": str(target)}
+
+
+class NewProductionRunConflict(RuntimeError):
+    """The unit's manifest, or the new run's folder, changed after the new run was decided; nothing was committed."""
+
+
+class PendingNewProductionRun:
+    """A new production run decided in memory, committed only once its analysis CSV is written (review r6-62).
+
+    WHY. start_new_production_run(write=True) moved the finished run's records into superseded_runs and created
+    the new folder before the rows were built; a CSV that then failed (rows that disagree, an alias that could
+    not be made, files that did not map) left a validated, cleanup-ready unit with no validated run on its top
+    level, cleanup_allowed false, an empty output-run-<n>, and no new run prepared.
+
+    How it is used (msdial_prepare_repository_reanalysis):
+    - begin_new_production_run decides the new run against the manifest's bytes as they are on disk, in memory;
+    - the rows are built from ``view``, the aliases made (``aliases_made`` lists what this call created), and the
+      reviewed metadata and the CSV written into ``staging_directory()``, a hidden folder beside the new one;
+    - ``commit(changes)``, under the manifest lock, refuses (NewProductionRunConflict) if the manifest's bytes
+      are no longer those the run was decided from or the new folder exists, then renames the staging folder to
+      the new output_directory and writes ``view``, with ``changes`` applied, in one write;
+    - ``abandon()``, after any failure, removes the staging folder and the aliases this call made. The manifest
+      and every file of the finished run are then as they were.
+    """
+
+    def __init__(
+        self, target: Path, snapshot: bytes, on_disk_keys: set[str], view: dict[str, Any], record: dict[str, Any]
+    ) -> None:
+        self.target = target
+        self.snapshot = snapshot
+        self.on_disk_keys = on_disk_keys
+        self.view = view
+        self.record = record
+        self.output_directory = Path(str(record["output_directory"]))
+        self.staging: Path | None = None
+        self.aliases_made: list[tuple[str, Path, Path]] = []
+        self.committed = False
+
+    def staging_directory(self) -> Path:
+        """A new hidden folder beside the new output directory, on its volume, so that the commit is a rename."""
+        if self.staging is None:
+            parent = self.output_directory.parent
+            parent.mkdir(parents=True, exist_ok=True)
+            self.staging = Path(
+                tempfile.mkdtemp(prefix=f".{self.output_directory.name}.", suffix=".staging", dir=str(parent))
+            )
+        return self.staging
+
+    def staged(self, path: str | Path) -> Path:
+        """Where a file written into the staging folder lies once the run is committed."""
+        staging = self.staging_directory()
+        return self.output_directory / Path(path).resolve().relative_to(staging.resolve())
+
+    def commit(self, changes: Iterable[Any] = ()) -> dict[str, Any]:
+        """Rename the staging folder into place and write the manifest with the new run, under the lock, at once."""
+        if self.committed:
+            raise RuntimeError("This new production run was committed already.")
+        current = copy.deepcopy(self.view)
+        if "manifest_path" not in self.on_disk_keys:
+            current.pop("manifest_path", None)
+        for change in changes:
+            change(current)
+        staging = self.staging_directory()
+        with manifest_lock(self.target):
+            if _read_manifest_bytes(self.target) != self.snapshot:
+                raise NewProductionRunConflict(
+                    f"{self.target.name} was written by another writer after the new run was decided; the new run "
+                    "was not prepared, and the finished run's records are as that writer left them."
+                )
+            if os.path.lexists(self.output_directory):
+                raise NewProductionRunConflict(
+                    f"{self.output_directory} appeared after the new run was decided; the new run was not prepared."
+                )
+            os.rename(staging, self.output_directory)
+            try:
+                _write_json(self.target, current)
+            except BaseException:
+                os.rename(self.output_directory, staging)
+                raise
+            self.staging = None
+            self.committed = True
+        return {**current, "manifest_path": str(self.target)}
+
+    def abandon(self) -> dict[str, Any]:
+        """After a failure: remove the staging folder and the aliases this call made. A no-op once committed."""
+        if self.committed:
+            return {"abandoned": False}
+        left: list[str] = []
+        if self.aliases_made:
+            from .repository_analysis_rows import remove_console_aliases
+
+            left = remove_console_aliases(self.aliases_made)
+            self.aliases_made = []
+        staging, self.staging = self.staging, None
+        if staging is not None and staging.exists():
+            # Only files this call wrote are in it: the reviewed metadata and the CSV.
+            shutil.rmtree(staging, ignore_errors=True)
+        return {"abandoned": True, "aliases_left": left, "staging_left": bool(staging and staging.exists())}
+
+
+def begin_new_production_run(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], PendingNewProductionRun | None]:
+    """start_new_production_run decided in memory against the manifest on disk, to be committed with its CSV.
+
+    Returns (record, manifest, pending). record is start_new_production_run's, ``written`` false; where it did
+    not start, manifest is the one given and pending None. Otherwise manifest is the unit with the new run (the
+    view the rows are built from) and pending commits it (PendingNewProductionRun). Nothing is written or created.
+    """
+    if not str(manifest.get("manifest_path") or "").strip():
+        raise ValueError("A new production run is prepared on disk only for a manifest read from its path.")
+    target = Path(str(manifest["manifest_path"])).resolve()
+    snapshot = _read_manifest_bytes(target)
+    on_disk = json.loads(snapshot.decode("utf-8-sig"))
+    if not isinstance(on_disk, dict):
+        raise ValueError(f"{target.name} does not hold one JSON object.")
+    record, view = start_new_production_run({**on_disk, "manifest_path": str(target)}, write=False)
+    if not record["started"]:
+        return record, manifest, None
+    return record, view, PendingNewProductionRun(target, snapshot, set(on_disk), view, record)
+
+
+def superseded_validated_run(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """The newest run of this unit that validated and was superseded by a new run that has not, else None.
+
+    A raw deletion is judged by the unit's current run. While a new run prepared after a validated one has not
+    validated itself (prepared, running, failed), the raw data are kept for it: cleanup refuses, as the current
+    run is not validated, and discard refuses, as the unit did produce a validated output. Each says so with
+    this record. Once the new run validates, cleanup judges it as any other.
+    """
+    if str(manifest.get("status") or "") in PAST_PREFLIGHT_STATUSES:
+        return None
+    runs = manifest.get("superseded_runs") or []
+    for index in range(len(runs) - 1, -1, -1):
+        entry = runs[index]
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("status") or "") in CLEANUP_READY_STATUSES or entry.get("cleanup_allowed") is True:
+            return {
+                "superseded_run": index,
+                "status": str(entry.get("status") or ""),
+                "output_directory": str(entry.get("output_directory") or ""),
+                "finalized_at": entry.get("finalized_at"),
+                "superseded_at": entry.get("superseded_at"),
+            }
+    return None
+
+
+def _superseded_validated_text(found: dict[str, Any], current_status: str) -> str:
+    return (
+        f"A superseded run of this unit validated (superseded_runs[{found['superseded_run']}], status "
+        f"{found['status']!r}, output {found['output_directory']}), and the new run prepared after it (status "
+        f"{current_status!r}) has not. The raw data are kept for the new run: they are deleted by "
+        "msdial_cleanup_repository_raw once it validates, never discarded as a unit with no validated output."
+    )
 
 
 # The status a parent unit carries once it has been split. It is not in CLEANUP_READY_STATUSES and it
@@ -7563,6 +7728,9 @@ def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
         )
     if not manifest.get("cleanup_allowed"):
         blockers.append("cleanup_allowed is not true; the run did not produce a validated mzTab-M output.")
+    validated_before = superseded_validated_run(manifest)
+    if validated_before is not None:
+        blockers.append(_superseded_validated_text(validated_before, str(manifest.get("status") or "")))
     if not retained:
         blockers.append("No retained artifacts are recorded, so nothing would survive the deletion.")
     if missing:
@@ -8543,6 +8711,9 @@ def plan_download_discard(manifest_path: Path, *, authorized: bool = False) -> d
     blockers: list[str] = []
     if status in {"mztab_validated", "completed", "cleanup_pending_confirmation", "raw_cleaned"}:
         blockers.append("Validated/completed runs must use the normal cleanup command.")
+    validated_before = superseded_validated_run(manifest)
+    if validated_before is not None:
+        blockers.append(_superseded_validated_text(validated_before, status))
     if status == "downloading":
         owner_state = lease_owner_state(manifest)
         if owner_state["state"] != "gone":
@@ -8741,6 +8912,11 @@ def discard_download_lease(
                 }
         elif manifest.get("status") in {"mztab_validated", "completed", "raw_cleaned"}:
             raise ValueError("Validated/completed runs must use the normal cleanup command.")
+        elif superseded_validated_run(manifest) is not None:
+            raise ValueError(
+                _superseded_validated_text(superseded_validated_run(manifest), str(manifest.get("status") or ""))
+                + " Discard was refused."
+            )
         stale: dict[str, Any] | None = None
         if downloading:
             # Written before the first byte of a lease. A lease that is still running writes into the tree
@@ -11124,6 +11300,11 @@ def recorded_order_source(manifest_path: Any, files: list[dict[str, Any]]) -> st
 
 def record_analytical_order(manifest_path: str | Path, record: dict[str, Any]) -> None:
     """Keep how the analysis CSV's analytical order was decided in the unit's own manifest."""
+    update_manifest(Path(manifest_path), analytical_order_change(record))
+
+
+def analytical_order_change(record: dict[str, Any]) -> Any:
+    """The change record_analytical_order makes, for a write that carries it with the CSV it describes."""
     kept = {key: value for key, value in record.items() if key != "orders"} | {
         "recorded_at": datetime.now(timezone.utc).isoformat()
     }
@@ -11131,7 +11312,7 @@ def record_analytical_order(manifest_path: str | Path, record: dict[str, Any]) -
     def change(manifest: dict[str, Any]) -> None:
         manifest["analytical_order"] = kept
 
-    update_manifest(Path(manifest_path), change)
+    return change
 
 
 def _metadata_value(record: dict[str, Any], section: str, field_name: str) -> str:
