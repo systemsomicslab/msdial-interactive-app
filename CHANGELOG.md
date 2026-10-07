@@ -28,16 +28,25 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     `console_path`) and `classify_preflight` decide for the configured Console:
     `console_path`, else the saved `console_path` setting, else
     `MSDIAL_CONSOLE_PATH`. Every AIF unit's disposition records the probe as
-    `multi_energy_aif_console`. With #825, a unit whose AIF inputs record more
-    than one MS2 collision energy runs as AIF, recorded as `aif_multi_ce_run`
-    (energies, rule `multi_ce_aif_with_console_825`) and on each per-file record
-    as basis `aif_multi_ce_console_825`.
+    `multi_energy_aif_console`. With #825, a unit every AIF input of which
+    records the same MS2 collision energies, more than one, runs as AIF,
+    recorded as `aif_multi_ce_run` (energies, rule
+    `multi_ce_aif_with_console_825`) and on each per-file record as basis
+    `aif_multi_ce_console_825`.
+  - #825 chooses a representative energy among the energies of one file, never
+    across files: a file with one energy keeps its single deconvolution result.
+    So with #825, AIF inputs whose energies differ from one another (one energy
+    each but not the same one, or different sets) are held as
+    `aif_collision_energies_differ_between_inputs`, raw data kept, with each
+    input's energies in `aif_collision_energies_by_input`; no Console releases
+    that hold. The MCP preflight reply gives the distinct sets and their file
+    counts.
   - A unit held earlier as `aif_multi_ce_awaiting_console` is released by the
     operator's recheck: preflighted again, or classified again, with the #825
     Console configured, it is decided `run`.
   - The execution gate refuses an `aif_multi_ce_run` unit when the workflow's
-    Console lacks #825, and a per-file record that claims the basis without
-    the record.
+    Console lacks #825, a per-file record that claims the basis without the
+    record, and a per-file record whose own energies are not the recorded ones.
   - The Materials and Methods text and Table S1 state the energies and the
     representative-energy rule of a multi-energy AIF run.
 

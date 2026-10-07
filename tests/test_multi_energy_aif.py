@@ -20,6 +20,7 @@ from msdial_app import workflow
 from msdial_app.materials_methods import _methods_text, multi_energy_aif_evidence, supplementary_rows
 from msdial_app.raw_metadata_preflight import (
     AIF_AS_SWATH_RULE,
+    AIF_CE_DIFFERS_HOLD,
     AIF_CE_UNRECORDED_HOLD,
     AIF_MULTI_CE_BASIS,
     AIF_MULTI_CE_HOLD,
@@ -221,6 +222,66 @@ class DispositionTests(_NoConfiguredConsole):
                 self.assertEqual({}, held["assignments"])
                 self.assertTrue(any("stops on an AIF file" in line for line in held["detail"]), held["detail"])
 
+    def test_energies_that_differ_between_inputs_are_held_with_825(self) -> None:
+        # #825 chooses among one file's energies, never across files: a file with one energy keeps that spectrum.
+        cases = {
+            "one energy each, not the same": (
+                [_header("a.mzML", "AIF", targets=[], energies=[10.0]),
+                 _header("b.mzML", "AIF", targets=[], energies=[40.0])],
+                {"a.mzML": [10.0], "b.mzML": [40.0]},
+            ),
+            "different sets": (
+                [_header("a.mzML", "AIF", targets=[], energies=[10.0, 20.0]),
+                 _header("b.mzML", "AIF", targets=[], energies=[10.0, 40.0])],
+                {"a.mzML": [10.0, 20.0], "b.mzML": [10.0, 40.0]},
+            ),
+            "a multi-energy file beside a single-energy one": (
+                [_header("a.mzML", "AIF", targets=[], energies=[10.0, 20.0]),
+                 _header("b.mzML", "AIF", targets=[], energies=[20.0])],
+                {"a.mzML": [10.0, 20.0], "b.mzML": [20.0]},
+            ),
+        }
+        for name, (records, by_input) in cases.items():
+            with self.subTest(case=name):
+                listed = sorted({value for values in by_input.values() for value in values})
+                held = self.decide(records, multi_energy_aif_console(self.with_825))
+                self.assertEqual(("skip", [AIF_CE_DIFFERS_HOLD], True), (held["disposition"], held["reasons"], held["hold"]))
+                self.assertEqual({}, held["assignments"])
+                self.assertNotIn("aif_multi_ce_run", held)
+                self.assertEqual(listed, held["aif_collision_energies"])
+                self.assertEqual(by_input, held["aif_collision_energies_by_input"])
+                self.assertTrue(held["multi_energy_aif_console"]["available"])
+                self.assertTrue(any("only among the energies of one file" in line for line in held["detail"]),
+                                held["detail"])
+                self.assertFalse(any("deconvolutes each energy separately" in line for line in held["detail"]))
+
+                # Without #825 the hold is exactly as before: awaiting the Console, nothing per input.
+                for console in (multi_energy_aif_console(self.without_825), None):
+                    before = self.decide(records, console)
+                    self.assertEqual(("skip", [AIF_MULTI_CE_HOLD], True),
+                                     (before["disposition"], before["reasons"], before["hold"]))
+                    self.assertNotIn("aif_collision_energies_by_input", before)
+                    self.assertEqual(listed, before["aif_collision_energies"])
+
+    def test_differing_and_unrecorded_energies_are_both_named(self) -> None:
+        records = [_header("a.mzML", "AIF", targets=[], energies=[10.0]),
+                   _header("b.mzML", "AIF", targets=[], energies=[40.0]),
+                   _header("c.mzML", "AIF", targets=[], energies=[])]
+        held = self.decide(records, multi_energy_aif_console(self.with_825))
+        self.assertEqual(("skip", [AIF_CE_DIFFERS_HOLD, AIF_CE_UNRECORDED_HOLD]), (held["disposition"], held["reasons"]))
+        self.assertEqual({"a.mzML": [10.0], "b.mzML": [40.0]}, held["aif_collision_energies_by_input"])
+
+    def test_the_same_energies_in_every_input_run_as_aif_whatever_their_order(self) -> None:
+        records = [_header("a.mzML", "AIF", targets=[], energies=[20.0, 10.0]),
+                   _header("b.mzML", "AIF", targets=[], energies=[10.0, 20.0, 20.0]),
+                   _header("c.mzML", "AIF", targets=[], energies=[10.04, 19.96])]
+        ran = self.decide(records, multi_energy_aif_console(self.with_825))
+        self.assertEqual(("run", "AIF"), (ran["disposition"], ran["console_acquisition_type"]))
+        self.assertEqual([10.0, 20.0], ran["aif_multi_ce_run"]["collision_energies"])
+        self.assertNotIn("aif_collision_energies_by_input", ran)
+        self.assertTrue(any("Each of the unit's 3 AIF input(s) records the same 2" in line for line in ran["detail"]),
+                        ran["detail"])
+
     def test_dda_and_swath_units_carry_no_probe(self) -> None:
         console = multi_energy_aif_console(self.with_825)
         for method in ("DDA", "DIA"):
@@ -316,6 +377,45 @@ class CampaignTests(_NoConfiguredConsole):
         released = classify_preflight(manifest, console_path=self.with_825)
         self.assertEqual(("run", "AIF"), (released["disposition"], released["console_acquisition_type"]))
         self.assert_runs_as_aif(manifest)
+
+    def test_a_unit_whose_inputs_differ_is_held_and_no_recheck_releases_it(self) -> None:
+        self.VERDICTS = {"a.mzML": {"method": "AIF", "targets": [], "energies": [10.0]},
+                         "b.mzML": {"method": "AIF", "targets": [], "energies": [40.0]}}
+        manifest, _files = self.campaign_unit()
+        first = self.preflight_unit(manifest, console_path=self.with_825)
+        self.assertEqual([AIF_CE_DIFFERS_HOLD], first["campaign_disposition"]["reasons"])
+        held = read_manifest(manifest)
+        self.assertEqual("skipped_by_preflight", held["status"])
+        self.assertTrue(held_by_disposition(held))
+        self.assertEqual({"a.mzML": [10.0], "b.mzML": [40.0]},
+                         held["campaign_disposition"]["aif_collision_energies_by_input"])
+        self.assertNotIn(AIF_MULTI_CE_BASIS, {entry.get("console_acquisition_basis")
+                                              for entry in held["raw_metadata_preflight"]["summary"]["per_file"]})
+
+        again = classify_preflight(manifest, console_path=self.with_825)
+        self.assertEqual(("skip", [AIF_CE_DIFFERS_HOLD]), (again["disposition"], again["reasons"]))
+        self.assertTrue(held_by_disposition(read_manifest(manifest)))
+        # Without #825 the same unit is held as it was before 0.5.34.
+        before = classify_preflight(manifest, console_path=self.without_825)
+        self.assertEqual(("skip", [AIF_MULTI_CE_HOLD]), (before["disposition"], before["reasons"]))
+
+    def test_a_per_file_record_whose_energies_are_not_the_recorded_ones_is_refused(self) -> None:
+        manifest, files = self.campaign_unit()
+        self.preflight_unit(manifest, console_path=self.with_825)
+        self.assertTrue(self.gate(manifest, files, "AIF", self.with_825)["allowed"])
+
+        def one_energy(current: dict) -> None:
+            current["raw_metadata_preflight"]["summary"]["per_file"][1]["ms2_collision_energies"] = [40.0]
+
+        # As a disposition from before the per-file condition would have it: pooled energies, one file at one.
+        update_manifest(manifest, one_energy)
+        refused = self.gate(manifest, files, "AIF", self.with_825)
+        self.assertFalse(refused["allowed"])
+        self.assertTrue(
+            any("never across files" in item and "1 input files record other energies" in item
+                for item in refused["blockers"]),
+            refused["blockers"],
+        )
 
     def test_a_basis_claimed_without_the_record_is_refused(self) -> None:
         manifest, files = self.campaign_unit()

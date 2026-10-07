@@ -8188,9 +8188,16 @@ def _multi_energy_aif_blockers(manifest: dict[str, Any], console_path: str) -> l
     The applied disposition ran the unit as AIF only because the Console it was decided for had MsdialWorkbench#825
     (multi_energy_aif_console). The Console this workflow starts is probed again, from its assembly: one without
     #825 reads a single unsuffixed .dcl that a multi-energy AIF file never has. A per-file record that claims the
-    rule's basis under a disposition that does not record aif_multi_ce_run is refused as well. Empty otherwise.
+    rule's basis under a disposition that does not record aif_multi_ce_run is refused as well, and so is one whose
+    own MS2 collision energies are not the recorded ones: #825 chooses among one file's energies, never across
+    files, so the rule holds only where every input records the same energies. Empty otherwise.
     """
-    from .raw_metadata_preflight import AIF_MULTI_CE_BASIS, AIF_MULTI_CE_RULE, multi_energy_aif_ready
+    from .raw_metadata_preflight import (
+        AIF_MULTI_CE_BASIS,
+        AIF_MULTI_CE_RULE,
+        COLLISION_ENERGY_DECIMALS,
+        multi_energy_aif_ready,
+    )
     from .workflow import multi_energy_aif_console
 
     applied = _applied_disposition(manifest)
@@ -8210,11 +8217,42 @@ def _multi_energy_aif_blockers(manifest: dict[str, Any], console_path: str) -> l
             f"applied campaign disposition records no aif_multi_ce_run (rule {AIF_MULTI_CE_RULE}); the first is "
             f"{claimed[0]}. Decide the unit again (preflight it again with the Console that will run it)."
         ]
+
+    def energy_set(values: Any) -> tuple[float, ...]:
+        found = set()
+        for value in values if isinstance(values, list) else []:
+            try:
+                found.add(round(float(value), COLLISION_ENERGY_DECIMALS))
+            except (TypeError, ValueError):
+                continue
+        return tuple(sorted(found))
+
+    expected = energy_set(record.get("collision_energies"))
+    energies = ", ".join(f"{value:g} eV" for value in expected)
+    blockers: list[str] = []
+    mismatched = [
+        Path(str(item.get("file") or "")).name
+        for item in summary.get("per_file") or []
+        if isinstance(item, dict)
+        and str(item.get("console_acquisition_basis") or "") == AIF_MULTI_CE_BASIS
+        and energy_set(item.get("ms2_collision_energies")) != expected
+    ]
+    if len(expected) < 2 or mismatched:
+        blockers.append(
+            f"This unit runs as multi-energy AIF (rule {AIF_MULTI_CE_RULE}, {energies or 'no energies'}), which "
+            "holds only where every input records the same MS2 collision energies, more than one: MsdialWorkbench#825 "
+            "chooses a representative energy among one file's energies, never across files. "
+            + (
+                f"{len(mismatched)} input files record other energies; the first is {mismatched[0]}. "
+                if mismatched
+                else "The record names fewer than two energies. "
+            )
+            + "Decide the unit again (preflight it again with the Console that will run it)."
+        )
     probe = multi_energy_aif_console(console_path or None)
     if multi_energy_aif_ready(probe):
-        return []
-    energies = ", ".join(f"{float(value):g} eV" for value in record.get("collision_energies") or [])
-    return [
+        return blockers
+    return blockers + [
         f"This unit runs as multi-energy AIF ({energies}; rule {AIF_MULTI_CE_RULE}), which only an MS-DIAL Console "
         "with multi-energy AIF processing (MsdialWorkbench#825) processes, and the selected Console has none (probe "
         f"{probe.get('probe')}). Select a Console that has it."
@@ -8223,6 +8261,10 @@ def _multi_energy_aif_blockers(manifest: dict[str, Any], console_path: str) -> l
 
 def held_by_disposition(manifest: dict[str, Any]) -> dict[str, Any]:
     """The applied campaign disposition when it holds the unit (hold true: skipped to run later, raw data kept).
+
+    With a #825 Console, AIF inputs whose collision energies differ from one another are held as well
+    (raw_metadata_preflight.AIF_CE_DIFFERS_HOLD): #825 settles no representative energy across files, so no Console
+    releases that hold; only an operator's decision does.
 
     Multi-energy AIF is held until a Console that settles an all-ion spot's collision energy exists (user
     decision, 2026-10-07: raw_metadata_preflight.AIF_MULTI_CE_HOLD), and so is AIF whose collision energies are
@@ -8256,8 +8298,10 @@ def _disposition_hold_text(hold: dict[str, Any], subject: str = "The unit") -> s
         + ", ".join(str(item) for item in hold.get("reasons") or [])
         + "): it is to run once a Console that can exists, and a held unit's raw data are kept. It is no failure. "
         "A multi-energy AIF hold is released by preflighting the unit again with a Console that has "
-        "MsdialWorkbench#825 configured. Only an operator's skip lifts the hold without running the unit: call "
-        "again with release_disposition_hold=true."
+        "MsdialWorkbench#825 configured; one for collision energies that differ between inputs "
+        "(aif_collision_energies_differ_between_inputs) is not, since #825 chooses among one file's energies only. "
+        "Only an operator's skip lifts the hold without running the unit: call again with "
+        "release_disposition_hold=true."
     )
 
 

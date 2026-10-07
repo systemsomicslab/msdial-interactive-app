@@ -140,11 +140,14 @@ def summarize_jobs(
             "campaign_single_ce_aif_as_swath",
             # Multi-energy AIF with MsdialWorkbench#825 (0.5.34): where the configured Console's assembly carries
             # #825's multi-energy AIF processing (capability multi_energy_aif_representative_collision_energy), an
-            # AIF unit whose inputs record more than one MS2 collision energy runs as AIF, recorded as
+            # AIF unit every input of which records the same MS2 collision energies, more than one, runs as AIF
+            # (#825 chooses among one file's energies, never across files), recorded as
             # campaign_disposition.aif_multi_ce_run (rule multi_ce_aif_with_console_825) with the probe as
             # multi_energy_aif_console, and console_acquisition_basis aif_multi_ce_console_825. Without #825 it is
-            # held as before; preflighting a held unit again with a #825 Console releases it. The gate refuses
-            # such a unit with a Console that lacks #825.
+            # held as before; preflighting a held unit again with a #825 Console releases it. With #825, inputs
+            # whose energies differ from one another are held as aif_collision_energies_differ_between_inputs
+            # (aif_collision_energies_by_input). The gate refuses such a unit with a Console that lacks #825, and
+            # a per-file record whose energies are not the recorded ones.
             "campaign_multi_ce_aif_with_console_825",
             # An undeclared unit whose download is its own alone (unit_files, or every bundle URL with
             # shared_unit_count 1) takes the archive members no sample row pairs with as unattributed inputs

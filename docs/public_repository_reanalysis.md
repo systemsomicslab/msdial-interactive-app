@@ -600,17 +600,24 @@ per-energy files, and still takes an unannotated peak's spectrum from the first
 energy; its probe is `marker_incomplete`, and it holds as a Console without #825
 does. Every AIF unit's disposition
 records that probe as `multi_energy_aif_console` (`available`, `probe`,
-`console_assembly`, `assembly_sha256`). With #825, a unit whose AIF inputs record
-more than one energy is decided `run` as AIF: `aif_multi_ce_run`
-(`collision_energies`, `rule` `multi_ce_aif_with_console_825`), each per-file
-record `console_acquisition_basis` `aif_multi_ce_console_825`. One energy still
+`console_assembly`, `assembly_sha256`). With #825, a unit every AIF input of
+which records the same energies, more than one, is decided `run` as AIF:
+`aif_multi_ce_run` (`collision_energies`, `rule` `multi_ce_aif_with_console_825`),
+each per-file record `console_acquisition_basis` `aif_multi_ce_console_825`.
+#825 chooses a representative energy among the energies of one file, never
+across files (a file with one energy keeps its single deconvolution result), so
+with #825 inputs whose energies differ from one another are held as
+`aif_collision_energies_differ_between_inputs`, raw data kept, each input's
+energies in `aif_collision_energies_by_input`; no Console releases that hold,
+only an operator's decision. One energy still
 runs as SWATH, and an unrecorded energy is still held, since the #825 Console
 stops on an AIF file whose MS2 scans carry no energy. Without #825 nothing
 changes. A unit held earlier as `aif_multi_ce_awaiting_console` is released by
 the operator's recheck: preflighting it again (or `classify_preflight`) with
 the #825 Console configured decides it `run`. The execution gate refuses an
-`aif_multi_ce_run` unit when the workflow's Console lacks #825, and a per-file
-record that claims the basis without the record. The Materials and Methods text
+`aif_multi_ce_run` unit when the workflow's Console lacks #825, a per-file
+record that claims the basis without the record, and a per-file record whose
+own energies are not the recorded ones. The Materials and Methods text
 and Table S1 state the energies and the representative-energy rule.
 
 A repository declaration of PRM, SRM, MRM, SIM or full scan is a declaration like
