@@ -1270,13 +1270,19 @@ class TheRunKeepsEachRowsAcquisitionType(unittest.TestCase):
 
 
 def _exclude(manifest_path: Path, names: list[str], reason: str = "ion_mobility_out_of_scope", applied: bool = True) -> None:
-    """Record a campaign disposition that runs the unit and excludes the inputs of these names."""
+    """Record a campaign disposition that runs the unit and excludes the inputs of these names.
+
+    It is recorded as decided from 0.5.29 on (declared_acquisition_source), as every disposition now is. One
+    without it is a legacy disposition, which preparing the unit decides again from its preflight; these
+    synthetic headers carry no ion-mobility flag, so that decision would exclude nothing.
+    """
 
     def change(manifest: dict) -> None:
         manifest["campaign_disposition"] = {
             "schema": "msdial-campaign-disposition.v1",
             "disposition": "run",
             "applied": applied,
+            "declared_acquisition_source": "unattributed",
             "reasons": [],
             "warnings": [],
             "excluded_inputs": [
