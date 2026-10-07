@@ -69,7 +69,13 @@ def _zip_bytes(entries: list[tuple[str, bytes]], compression: int = zipfile.ZIP_
         warnings.simplefilter("ignore")  # duplicate names are written on purpose
         with zipfile.ZipFile(buffer, "w", compression=compression) as handle:
             for name, data in entries:
-                handle.writestr(name, data)
+                # writestr(name, ...) stamps the current time, so the same entries built twice
+                # differed whenever a 2-second boundary fell between the builds. The date is
+                # fixed, as _tar_bytes fixes mtime; the rest is what writestr gives a name.
+                info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = compression
+                info.external_attr = (0o40775 << 16 | 0x10) if name.endswith("/") else 0o600 << 16
+                handle.writestr(info, data)
     return buffer.getvalue()
 
 
@@ -764,8 +770,9 @@ class NestedAndContainerTests(_Workspace):
 
     def test_a_study_archive_of_per_sample_archives_expands_without_collisions(self) -> None:
         inner_tar = gzip.compress(_tar_bytes([("batch", None), ("batch/run1.mzML", b"<run1/>")]))
+        sample_a = _zip_bytes([("_FUNC001.DAT", b"A-func"), ("_HEADER.TXT", b"A")])
         study = _write_zip(self.root / "ST000001.zip", [
-            ("raw/A.raw.zip", _zip_bytes([("_FUNC001.DAT", b"A-func"), ("_HEADER.TXT", b"A")])),
+            ("raw/A.raw.zip", sample_a),
             ("raw/B.raw.zip", _zip_bytes([("_FUNC001.DAT", b"B-func"), ("_HEADER.TXT", b"B")])),
             ("raw/sample.mzML.gz", gzip.compress(b"<sample/>")),
             ("raw/batch.tar.gz", inner_tar),
@@ -791,15 +798,10 @@ class NestedAndContainerTests(_Workspace):
         self.assertEqual("nested_rooted", nested["raw/batch.tar.gz"]["destination_rule"])
         self.assertEqual("stream_file", nested["raw/sample.mzML.gz"]["destination_rule"])
         self.assertTrue(all(item["depth"] == 2 for item in nested.values()))
-        self.assertEqual(
-            hashlib.sha256(_zip_bytes([("_FUNC001.DAT", b"A-func"), ("_HEADER.TXT", b"A")])).hexdigest(),
-            nested["raw/A.raw.zip"]["archive_sha256"],
-        )
+        # The digests are of the bytes that were packed, not of a second build of the same entries.
+        self.assertEqual(hashlib.sha256(sample_a).hexdigest(), nested["raw/A.raw.zip"]["archive_sha256"])
         # A nested archive is gone once expanded, so every digest a repository may publish is kept.
-        self.assertEqual(
-            hashlib.md5(_zip_bytes([("_FUNC001.DAT", b"A-func"), ("_HEADER.TXT", b"A")])).hexdigest(),
-            nested["raw/A.raw.zip"]["archive_md5"],
-        )
+        self.assertEqual(hashlib.md5(sample_a).hexdigest(), nested["raw/A.raw.zip"]["archive_md5"])
         self.assertEqual(40, len(nested["raw/A.raw.zip"]["archive_sha1"]))
         self.assertEqual([{"path": "raw/notes.gz", "reason": "not_an_archive"}], record["nested_skipped"])
         self.assertEqual(5, record["lineage"]["archives"])
@@ -830,14 +832,15 @@ class NestedAndContainerTests(_Workspace):
     def test_a_nested_archive_whose_expansion_exists_beside_it_is_left_packed(self) -> None:
         # A study that ships run.mzML and run.mzML.gz used to fail as a whole.
         packed = gzip.compress(b"<a/>")
+        s1 = _zip_bytes([("x.mzML", b"x")])
         archive = _write_zip(self.root / "both.zip", [
             ("run.mzML", b"<a/>"), ("run.mzML.gz", packed),
-            ("S1.zip", _zip_bytes([("x.mzML", b"x")])), ("S1/kept.txt", b"k"),
+            ("S1.zip", s1), ("S1/kept.txt", b"k"),
             ("other.zip", _zip_bytes([("y.mzML", b"y")])),
         ])
         record = extract_archive(archive, self.root / "out", listing_directory=self.root / "p")
         self.assertEqual(
-            {"run.mzML": b"<a/>", "run.mzML.gz": packed, "S1.zip": _zip_bytes([("x.mzML", b"x")]),
+            {"run.mzML": b"<a/>", "run.mzML.gz": packed, "S1.zip": s1,
              "S1/kept.txt": b"k", "other/y.mzML": b"y"},
             _files_under(self.root / "out"),
         )

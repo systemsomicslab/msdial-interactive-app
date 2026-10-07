@@ -4,6 +4,26 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.30] - Unreleased
+
+### Fixed
+- `test_a_study_archive_of_per_sample_archives_expands_without_collisions` no
+  longer fails intermittently. It packed a per-sample zip into the study, then
+  built the same zip a second time to compute the SHA-256 and MD5 it expected.
+  The test helper `_zip_bytes` wrote entries with `ZipFile.writestr(name, ...)`,
+  which stamps the current time at the format's 2-second resolution, so the two
+  builds differed whenever a 2-second boundary fell between them. The helper now
+  writes a fixed date (1980-01-01 00:00:00), as `_tar_bytes` already fixes
+  `mtime`, and is otherwise byte-for-byte what `writestr` produced. The test now
+  hashes the bytes it actually packed. The same race affected
+  `test_a_nested_archive_whose_expansion_exists_beside_it_is_left_packed`, which
+  compared an unexpanded `S1.zip` with a second build, and the same changes fix it.
+
+### Not changed
+- Production code. The extraction recorded the digest of the archive it
+  expanded each time; only the tests' expectations were rebuilt. Each assertion
+  still checks the same value.
+
 ## [0.5.24] - Unreleased
 
 ### Added
