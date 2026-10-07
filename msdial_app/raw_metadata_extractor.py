@@ -40,12 +40,31 @@ RAW_TREE = "msrawdataworkbench"
 COMMON_TREE = "MsdialWorkbench"
 # The approved source pairs, newest first, as data: a new build is a new entry, not an edit to the
 # code that reads them. "built" means a build of the pair was made from clean local clones, recorded
-# by record_build and verified against the demo corpus and MTBLS2207; only a built pin makes an
-# extractor "pinned", which a campaign requires. "planned" is a pair that was approved but never
-# built, kept so that a build of it later is recognised as that pair rather than as a stranger.
+# by record_build and verified against real raw data (the demo corpus and MTBLS2207, or the files its
+# comment names); only a built pin makes an extractor "pinned", which a campaign requires. A built pin
+# that a newer one replaces as current stays an entry, so its build still inspects as pinned. "planned"
+# is a pair that was approved but never built, kept so that a build of it later is recognised as that
+# pair rather than as a stranger. "build_folder" names the folder a built pin is in when it is not the one
+# extractor_build_root would name from the commits; a pin is never moved after its record is written,
+# because the record states its paths.
 PIN_BUILT = "built"
 PIN_PLANNED = "planned"
 PINNED_BUILDS: tuple[dict[str, str], ...] = (
+    {
+        RAW_TREE: "5f604462d7bd61141bf764ca04ce52bf3f6452c9",
+        COMMON_TREE: "f0583493a44e73723f53ae312e33955f62052dd7",
+        "state": PIN_BUILT,
+        "recorded": "2026-10-08",
+        "build_folder": "RawMetadataExtractor-5f60446-f0583493a",
+        # msrawdataworkbench master 5f60446: #43 (the Console's Waters spectrum reader skips the LockSpray
+        # function the SDK names or marks REFERENCE_SCAN, and reads the lower-energy MSe function as MS1
+        # whatever the function count) and #42 (an mzML scan's collision energy from the spectrum when it
+        # parses, else from the last precursor's activation, the rule the production Console's RawDataHandler
+        # 1.3.9776.346 uses). Built as RawMetadataExtractor-5f60446-f0583493a, inventory a224c0fee2385b70,
+        # provenance verified. On 21 real files (Waters MSe, Thermo AIF mzML, Agilent multi-energy AIF,
+        # Waters, mzML and SCIEX DDA) every verdict equals the a12293c61 build's.
+        "note": "Waters LockSpray and MSe MS1 (msrawdataworkbench #43) and mzML collision energy from the last precursor's activation (#42) with MsdialWorkbench master",
+    },
     {
         RAW_TREE: "a12293c612a4e29b23d1d584f1c19556d76863f6",
         COMMON_TREE: "f0583493a44e73723f53ae312e33955f62052dd7",
@@ -267,7 +286,21 @@ def extractor_build_root(
     raw_commit: str = PINNED_MSRAWDATAWORKBENCH_COMMIT,
     common_commit: str = PINNED_MSDIALWORKBENCH_COMMIT,
 ) -> Path:
-    """The folder a pinned build lives in, named by both commits."""
+    """The folder a pinned build lives in: named by both commits, or by the pin's build_folder.
+
+    A pin's build_folder is used when both commits are that pin's, in full or abbreviated, so that the
+    default build of the current pin is where it was built, and a plan for it sees it already exists.
+    """
+    raw, common = str(raw_commit or "").casefold(), str(common_commit or "").casefold()
+    for entry in PINNED_BUILDS:
+        if (
+            entry.get("build_folder")
+            and len(raw) >= 7
+            and len(common) >= 7
+            and entry[RAW_TREE].startswith(raw)
+            and entry[COMMON_TREE].startswith(common)
+        ):
+            return Path(parent_directory) / entry["build_folder"]
     return Path(parent_directory) / f"RawMetadataExtractor-{raw_commit[:9]}-{common_commit[:9]}"
 
 

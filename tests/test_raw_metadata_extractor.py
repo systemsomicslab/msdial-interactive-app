@@ -25,10 +25,13 @@ from msdial_app.raw_metadata_extractor import (
 )
 
 
-# The current built pin: msrawdataworkbench #41 (Waters DDA, WIFF2, Shimadzu .lcd) with MsdialWorkbench master.
-RAW_HEAD = "a12293c612a4e29b23d1d584f1c19556d76863f6"
-# The pin before it: msrawdataworkbench #40 (the mzML base64 last-element fix), still a built pin.
-PREVIOUS_RAW_HEAD = "592b6dbce72177fa14d3e7cd407557b1c64a3046"
+# The current built pin: msrawdataworkbench master 5f60446 (#43 Waters LockSpray, #42 mzML collision energy
+# from the last precursor's activation) with MsdialWorkbench master.
+RAW_HEAD = "5f604462d7bd61141bf764ca04ce52bf3f6452c9"
+# The pin before it: msrawdataworkbench #41 (Waters DDA, WIFF2, Shimadzu .lcd), still a built pin.
+PREVIOUS_RAW_HEAD = "a12293c612a4e29b23d1d584f1c19556d76863f6"
+# The pin before that: msrawdataworkbench #40 (the mzML base64 last-element fix), still a built pin.
+EARLIER_RAW_HEAD = "592b6dbce72177fa14d3e7cd407557b1c64a3046"
 COMMON_HEAD = "f0583493a44e73723f53ae312e33955f62052dd7"
 # The pair approved on 2026-09-29 and never built.
 PLANNED_RAW_HEAD = "b34c857a5328e8f08c1918b3d890e7dae50b7d6d"
@@ -186,16 +189,79 @@ class BuildCommandTests(unittest.TestCase):
     def test_the_pins_are_the_approved_commits_and_name_the_build_folder(self) -> None:
         self.assertEqual(RAW_HEAD, extractor.PINNED_MSRAWDATAWORKBENCH_COMMIT)
         self.assertEqual(COMMON_HEAD, extractor.PINNED_MSDIALWORKBENCH_COMMIT)
+        # The current pin was built in a folder named by the seven-character commit, and the pin says so.
         self.assertEqual(
-            "RawMetadataExtractor-a12293c61-f0583493a",
+            "RawMetadataExtractor-5f60446-f0583493a",
             extractor_build_root(Path("synthetic-parent")).name,
         )
+        self.assertIs(extractor.PINNED_BUILDS[0], extractor.CURRENT_PIN)
+        self.assertEqual(extractor.PIN_BUILT, extractor.CURRENT_PIN["state"])
+        self.assertEqual("2026-10-08", extractor.CURRENT_PIN["recorded"])
+        self.assertEqual(extractor.CURRENT_PIN, extractor.pinned_build(RAW_HEAD, COMMON_HEAD))
 
-    def test_the_previous_build_stays_a_built_pin_but_is_not_the_current_one(self) -> None:
-        previous = extractor.pinned_build(PREVIOUS_RAW_HEAD, COMMON_HEAD)
-        self.assertIsNotNone(previous)
-        self.assertEqual(extractor.PIN_BUILT, previous["state"])
-        self.assertNotEqual(PREVIOUS_RAW_HEAD, extractor.PINNED_MSRAWDATAWORKBENCH_COMMIT)
+    def test_the_previous_builds_stay_built_pins_but_are_not_the_current_one(self) -> None:
+        for head in (PREVIOUS_RAW_HEAD, EARLIER_RAW_HEAD):
+            previous = extractor.pinned_build(head, COMMON_HEAD)
+            self.assertIsNotNone(previous, head)
+            self.assertEqual(extractor.PIN_BUILT, previous["state"])
+            self.assertNotEqual(head, extractor.PINNED_MSRAWDATAWORKBENCH_COMMIT)
+
+    def test_a_pins_build_folder_is_used_for_its_commits_in_full_or_abbreviated(self) -> None:
+        parent = Path("synthetic-parent")
+        for raw, common in ((RAW_HEAD, COMMON_HEAD), (RAW_HEAD[:7], COMMON_HEAD[:9]), (RAW_HEAD.upper(), COMMON_HEAD)):
+            self.assertEqual(
+                parent / "RawMetadataExtractor-5f60446-f0583493a", extractor_build_root(parent, raw, common), raw
+            )
+        # Pins without a build_folder, and pairs that are no pin, are named by both commits.
+        self.assertEqual(
+            "RawMetadataExtractor-a12293c61-f0583493a",
+            extractor_build_root(parent, PREVIOUS_RAW_HEAD, COMMON_HEAD).name,
+        )
+        self.assertEqual(
+            "RawMetadataExtractor-592b6dbce-f0583493a",
+            extractor_build_root(parent, EARLIER_RAW_HEAD, COMMON_HEAD).name,
+        )
+        self.assertEqual(
+            "RawMetadataExtractor-5f604462d-c471463a5",
+            extractor_build_root(parent, RAW_HEAD, "c471463a576626650e0886e26bd064cca53a7ae3").name,
+        )
+        self.assertEqual(
+            "RawMetadataExtractor-111111111-f0583493a", extractor_build_root(parent, "1" * 40, COMMON_HEAD).name
+        )
+
+    def test_a_plan_for_the_current_pin_sees_its_existing_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            built = parent / "RawMetadataExtractor-5f60446-f0583493a"
+            (built / "msrawdataworkbench").mkdir(parents=True)
+            with patch.object(extractor.shutil, "which", return_value="dotnet"):
+                plan = plan_extractor_build(
+                    parent_directory=parent,
+                    raw_source=parent / "no-msrawdataworkbench",
+                    common_source=parent / "no-MsdialWorkbench",
+                )
+
+        self.assertEqual(str(built.resolve()), plan["build_root"])
+        self.assertTrue(any("already exists" in blocker for blocker in plan["blockers"]), plan["blockers"])
+
+    def test_a_plan_without_commits_targets_the_current_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            with patch.object(extractor.shutil, "which", return_value="dotnet"):
+                plan = plan_extractor_build(
+                    parent_directory=parent,
+                    raw_source=parent / "no-msrawdataworkbench",
+                    common_source=parent / "no-MsdialWorkbench",
+                )
+
+        self.assertEqual(str(parent.resolve() / "RawMetadataExtractor-5f60446-f0583493a"), plan["build_root"])
+        self.assertEqual(RAW_HEAD, plan["trees"]["msrawdataworkbench"]["requested_commit"])
+        self.assertEqual(COMMON_HEAD, plan["trees"]["MsdialWorkbench"]["requested_commit"])
+        checkouts = [step["command"] for step in plan["steps"] if "checkout" in step["command"]]
+        self.assertEqual([RAW_HEAD, COMMON_HEAD], [command[-1] for command in checkouts])
+        # The sources do not exist, so the plan is blocked rather than built from something else.
+        self.assertEqual(2, len(plan["blockers"]))
+        self.assertTrue(all("is not the top of a git working tree" in item for item in plan["blockers"]))
 
     def test_the_build_passes_solution_dir_with_a_trailing_separator(self) -> None:
         root = Path("synthetic build") / "msrawdataworkbench"
