@@ -88,6 +88,10 @@ def summarize_jobs(
             "mzxml_requires_conversion_to_mzml",
             "campaign_mzxml_converted_to_mzml",
             "campaign_mzxml_polarity_from_declared_ion_mode",
+            # A repository unit's MS1 and MS2 data type are what its inputs deliver to MS-DIAL where every
+            # input that runs agrees (data_type_provenance, basis raw_header, delivered_centroid or default),
+            # and the gate refuses a run set against a decided level.
+            "repository_data_type_as_delivered",
             "automatic_alignment_rt_correction",
             "console_time_limits",
             "cancel_console_and_download_jobs",
@@ -105,6 +109,19 @@ def summarize_jobs(
             "accession_download_store",
             "waiting_for_shared_download_job_state",
             "batch_plan_distinct_objects_and_pre_claims",
+            # The LC-MS peak-count diagnostic behind /api/agent/tuning/run loads no annotation library: only
+            # its peaks and their heights are read, and annotation changes neither. Its records say
+            # annotation "skipped_for_peak_count".
+            "peak_count_diagnostic_without_annotation",
+            # Replicate rows that share a sample id are each their own input and analysis-CSV row (the sample
+            # row, not the id, is mapped), and an undeclared unit's archive member that carries a declared raw
+            # file name behind a prefix is that file's, one to one, recorded as paired_by prefixed_member_name.
+            "repository_replicate_rows_as_inputs",
+            "repository_prefixed_member_names",
+            # A declared raw file name and an archive member that share their leading identifier (VV_13) are one
+            # file where the key is unique on both sides, recorded as paired_by leading_identifier_token with the
+            # warning input_names_paired_by_inference; no inferred pairing crosses a polarity token.
+            "repository_leading_identifier_names",
         ],
         "workflow_outline": [
             "Inspect the input path and collect the guided scientific choices.",

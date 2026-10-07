@@ -360,7 +360,12 @@ even at the fine step is the nearest one, with a warning. A repository run
 records every file's actual peak count beside the estimate
 (`production_peak_counts` in the unit manifest). Agent-driven repository
 analysis selects a QC nearest the run midpoint, or a mid-run non-blank sample
-when no QC is available.
+when no QC is available. The agent-driven LC-MS diagnostic
+(`msdial_start_peak_count_diagnostic`) loads no annotation library: only its
+peaks and their heights are read, annotation changes neither, and its
+provenance records annotation `skipped_for_peak_count`. Its `.mdpeak` Adduct,
+Isotope and MS1 isotopes columns are not the production run's. The GUI
+diagnostic above still annotates, because its MSP sliders read the match scores.
 Suggested starting values are:
 
 - Thermo RAW or FT-ICR: peak height `10000`, mass slice `0.05`

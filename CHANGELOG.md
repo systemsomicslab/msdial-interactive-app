@@ -138,6 +138,287 @@ open beside this one, and all five branch from 0.5.24.
 - `tests/vectors/peak_height_diagnostics.v1.json`: the height histograms of the
   fourteen diagnostics, each height rounded down to a multiple of the step the
   estimate uses, which leaves every count the search reads unchanged.
+## [0.5.27] - Unreleased
+
+Version order: 0.5.25 (#58) and 0.5.26 (#59) are open beside this one, and all
+three branch from 0.5.24.
+
+### Fixed
+- A repository unit's MS1 and MS2 data type are what its inputs deliver to
+  MS-DIAL. These two settings tell MS-DIAL whether the spectra it receives still
+  need centroiding, so they must describe what RawDataHandler hands it, not what
+  the instrument stored. Every unit used to run with the template's Centroid.
+  MS-DIAL 5 loads every LC-MS input with `getProfileData=false`, and the readers
+  then differ:
+  - Waters (MassLynx scans read unprocessed), mzML (a converted mzXML included)
+    and NetCDF hand MS-DIAL the stored points. There the header decides, with
+    basis `raw_header`: per MassLynx function for Waters (`continuum`), per file
+    for the others.
+  - SCIEX WIFF and WIFF2, Bruker BAF and TSF, and Shimadzu hand it centroids
+    whatever was stored, so the level is Centroid with basis
+    `delivered_centroid`.
+  - Thermo: a centroid scan arrives as centroids. An FTMS profile scan arrives as
+    its centroid stream, but an ITMS profile scan arrives as profile points. The
+    extractor records no analyzer or scan filter, so a profile file is Centroid
+    (`delivered_centroid`) only on an instrument with no ion trap (Q Exactive,
+    Exploris, Exactive). On any other model it is `unresolved`.
+  - Agilent hands over peak spectra where the file has them and profile spectra
+    otherwise, and the extractor records neither, so it is `unresolved`. So are
+    Bruker TDF and any reader not in the table.
+
+  `raw_metadata_preflight` keeps the reader table, with file and line citations
+  into RawDataHandler.
+  - Each per-file preflight record now carries what the header stored:
+    `spectrum_representation`, its `spectrum_representation_source`, and
+    `spectrum_representation_by_level`. Only a Waters record fills the last.
+    The record also carries the `reader`, `native_format` and
+    `instrument_model` that say what MS-DIAL receives. The preflight summary
+    gains `data_types` (`msdial-interactive.delivered-data-types.v1`, scope
+    `inspected_inputs`).
+  - `build_guided_plan`, which campaign and MCP repository runs both go through,
+    sets `ms1_data_type` and `ms2_data_type` from the run's inputs. Inputs a
+    campaign disposition excluded are left out, and each Console alias is read
+    as the input it stands for. A level is decided only when every input with
+    that level delivers one representation and all agree. Its basis is
+    `raw_header`, `delivered_centroid`, or both. Otherwise the default stays,
+    with the reason (`inputs_disagree`, `unresolved` with `unresolved_by`,
+    `unrecorded`, or `no_input_at_level`), per-value and per-delivery counts,
+    example file names and a warning. No input is dropped to make the rest
+    agree.
+  - The decision is kept as `data_type_provenance` in the workflow and in
+    `workflow-settings.json`. The run's `run-manifest.json` and the preparation
+    gain `data_types`: each value with its basis, plus the decision. Each unit
+    `run_attempts` entry records the values, bases and warnings. A laboratory
+    analysis records basis `unrecorded` and is otherwise unchanged.
+  - A peak-count diagnostic runs with the unit's values, so its count stands for
+    the production run. Its `data_types` describe the one input it ran (scope
+    `diagnostic_input`), and keep the unit's decision in brief under
+    `unit_decision`. Where that input itself delivers another representation, a
+    warning says so.
+  - A data type set explicitly in `workflow_overrides` stands, with basis
+    `workflow_override`, or with the decided basis where it agrees. The
+    execution gate refuses only a run that contradicts a decided level, from any
+    path, the GUI's included. An `unresolved` or `default` level refuses
+    nothing.
+  - For a preflight recorded before this version, the representation, reader,
+    format and model are read from the extractor records kept in
+    `provenance\raw-metadata-preflight.json` (`read_from_preflight_output`).
+    A preflight that kept no `summary.per_file` at all is read the same way:
+    its extractor records are summarised as a preflight summary would have
+    them, MS-level flags included, so an input without MS2 does not vote on
+    the MS2 data type. Where that file is absent, the inputs stay
+    `unrecorded`; that is so for all four summary-less preflights in the
+    reanalysis workspace on 2026-10-07 (MPST000007 twice, MTBLS341, ST002419).
+  - What the 2026-10-03 pilot units get, read from their records:
+    - ST001337 (Orbitrap Fusion Lumos, headers Profile): Centroid, `unresolved`
+      (`thermo_analyzer_unrecorded`). That is the value it ran with, and the
+      gate refuses neither value.
+    - MTBKS217 and MTBKS281 (Waters, every function `continuum=false`):
+      Centroid, `raw_header`.
+    - MTBLS1572 (converted), MTBLS291, MTBLS417, ST004304 and MTBLS2207: mzML
+      Centroid, `raw_header`.
+    - MTBKS236 (WIFF, header null): Centroid, `delivered_centroid`.
+    - MPST000015 (Exploris 120, Profile): MS2 Centroid, `delivered_centroid`.
+- Converted mzXML units take the representation the converted mzML records
+  (MS:1000127/MS:1000128, from the mzXML's `centroided`). Where the mzXML
+  recorded none, the level stays at the default as `unrecorded`. This replaces
+  the data-type half of 0.5.21's known limitation; the threshold step is
+  unchanged.
+- Agent capability `repository_data_type_as_delivered`.
+## [0.5.26] - Unreleased
+
+### Changed
+- The LC-MS peak-count diagnostic behind `msdial_start_peak_count_diagnostic`
+  (`POST /api/agent/tuning/run`, the campaign runner's diagnose step) no longer
+  annotates. Only its `.mdpeak` rows and their Height column are read.
+  - The Console fixes which peaks there are, and their heights, in peak
+    spotting, isotope estimation and deconvolution (`MsdialLcMsApi`
+    `FileProcess.RunAsync`).
+  - It writes the `.mdpeak` after annotation and the characterisation that
+    follows it (`LcmsProcess.ExecuteAsync`). Neither adds or removes a peak or
+    changes its height.
+  - Without reference matches, the characterisation can give a peak another
+    adduct, charge or isotope assignment. So a diagnostic's Adduct, Isotope and
+    MS1 isotopes columns are not the production run's. Nothing reads them from
+    a diagnostic.
+- On a campaign unit the diagnostic searched the tiered LBM, strict MSP and
+  broad MSP annotators at Minimum peak height 0, where every peak above the
+  noise is a query. In the pilot, the diagnostic of one Waters MSE (AIF) file,
+  MTBKS281 Lm1, took 2,650.5 s (44 min).
+- Measured with the Console (`f56d4478a`) on two pilot files, each diagnostic
+  run once with annotation (in the pilot) and once without it:
+  - MTBKS281 Lm1 (Waters MSE, AIF, negative): 20,057 peaks in both, with the
+    same sorted Height list. 2,650.5 s with annotation against 927.9 s without.
+    Without annotation, deconvolution took 768.2 s of the 927.9 s.
+  - ST001337 Human feces_ALA007 (Thermo, DDA, positive): 13,599 peaks in both,
+    with the same sorted Height list. 267.0 s against 12.1 s.
+  - In both, the same Peak IDs, the same values in every peak-spotting column,
+    byte-identical deconvolution (`.dcl`) files, and the same estimated
+    threshold. Adduct differed in 8,987 and 8,378 rows and MS1 isotopes in 284
+    and 1,566 rows; Isotope differed in none.
+- The diagnostic's method writes every library line blank (Msp, MSP annotator
+  settings, Lbm, Text DB, Text annotator settings, Isotope text DB) and the
+  Annotation pipeline profile line blank, also when the template carries one of
+  them. It writes no annotator settings file, and its run manifest lists no
+  library. Every peak-spotting and deconvolution setting is still the
+  production method's; only Minimum peak height (0) and the alignment switches
+  differ, as before. The production run is unchanged.
+- The diagnostic records `diagnostic_annotation` (`status`
+  `skipped_for_peak_count`, the reason, the production annotation profile and the
+  library roles it did not load, never their paths) in its
+  `workflow-settings.json` and `run-manifest.json`, as `annotation` in its
+  `diagnostic-job.json`, and as `annotation` on the unit manifest's
+  `peak_height_diagnostics` entry, including an estimate made from disk.
+- The GUI's diagnostic panel (`POST /api/tuning/run`) still annotates, because
+  its MSP sliders read the match scores of the same run; it records `status`
+  `performed`. A GC-MS diagnostic is unchanged.
+- Agent capability `peak_count_diagnostic_without_annotation`.
+
+### Known limitations
+- The count was measured the same with and without annotation on two files
+  only, a Waters MSE AIF file and a Thermo DDA file. SCIEX, Bruker and Agilent
+  raw data, mzML inputs and ion-mobility data were not measured; for them it
+  rests on the Console source.
+- Each timing is one Console run per arm. The two runs of a file were on
+  different days, under different machine load, and run-to-run variance was not
+  measured. The share of the pilot run's time spent in annotation is inferred
+  from the difference, not timed by stage.
+- The measured runs used a method built by hand to the same rule, not one
+  written by this version's `_write_method`.
+## [0.5.25] - Unreleased
+
+### Fixed
+- Replicate injections. A repository lists each injection as a sample row of its
+  own, and the rows of one sample share its id: MetaboLights MTBLS291 names `Cel`
+  in five rows, one mzML each, and MetaboBank MTBKS64 names `S01` in two, one .RAW
+  each. Both were refused as "two inputs on one sample". The unit of mapping is
+  now the sample row:
+  - `msdial_download_repository_raw` and every handoff mapping: the analysis-input
+    check (`_inputs_unpaired_with_rows`) pairs each declared input with the row of
+    its sample whose `raw_file` is the input's path (or its archive's), else the
+    one with its file name. Catalog 0.6.x already lists one input per row and
+    counts them alike, so MTBKS64 is consistent and is no longer excluded as
+    `analysis_input:count_mismatch`. Two inputs on one row, more inputs than a
+    sample has rows, or an input none of its sample's rows names, still are.
+    The analysis-CSV builder pairs a declared input with a row the same way
+    (`rows_naming_input`, shared by both): before, it matched by base name only,
+    so rows naming `raw/batch1/QC.RAW` and `raw/batch2/QC.RAW` passed the check
+    before the download and were refused after it (`sample_without_input`).
+  - `msdial_prepare_repository_reanalysis`: the analysis-CSV builder maps each
+    input to the row of its sample that names it (by its own name, its lineage
+    row's declared names, its declared path, or its `name_pairing`), and every
+    replicate is a CSV row of its own with its sample's Class. Nothing is merged,
+    averaged or dropped. `sample_with_two_inputs` is renamed
+    `sample_row_with_two_inputs` and fires only for one row two inputs name; an
+    input two rows name is `input_with_two_sample_rows` (it was reported as
+    `input_without_sample`), and an input of a sample several rows describe that
+    none of them names is `sample_row_not_identified`. All three are mapping
+    failures `allow_partial_mapping` may accept. `sample_without_input` and the
+    exclusions are counted by row, and a replicate is named with its raw file.
+  - Each CSV row records `sample_row_index` and `sample_raw_file`; each lineage
+    row the CSV was written from records `sample_row` (`index`, `sample_id`,
+    `raw_file`) beside the lease's own `sample_id`; the excluded inputs carry
+    `sample_raw_file`; the CSV record adds `sample_rows_without_input`.
+  - A handoff that counts no inputs gives `sample_count` as its rows that name a
+    sample, not its distinct sample ids.
+  - A split divides a sample's replicate rows by the part their inputs go to.
+    MetaboBank MTBKS220 gives its samples rows of timsOFF BAF folders and rows of
+    timsON TDF folders under one sample id; `plan_acquisition_split` and the
+    confirmed split picked rows and declared inputs by sample id, so each part
+    held both formats' rows and inputs and its CSV was refused after the 14 GB
+    download (`analysis_input_not_found`, `sample_without_input`). A row an input
+    of a part is (as the analysis-CSV builder finds it) is now that part's alone,
+    a row of an excluded input is no part's, and a declared input goes with the
+    row it is; each part records `sample_row_indexes`. Only a row no input is
+    found to be is still matched by its sample. On a synthetic unit built from
+    MTBKS220's real handoff, the parts hold 24 and 29 rows and declared inputs
+    (48 and 47 before).
+- Declared raw file names an archive member carries behind a prefix. Metabolomics
+  Workbench ST001264 declares `BioRec1.raw`, and its study archive holds
+  `021518_387057_CSHp_BioRec1.raw`; the lease admitted nothing and failed at its
+  attribute stage. For a unit whose Catalog declared no analysis inputs, an archive
+  member (an analysable file, or the outermost .d/.raw folder) whose name - or
+  stem, for a name a row records without an extension - ends in `_`, `-`, `.` or a
+  space and then a declared name, compared without case, is that declared file's
+  (`_prefixed_member_pairing`), where no member carries the name exactly, the
+  member carries no declared name exactly, and the pairing is one to one: a member
+  ending in two declared names, or a name two members end in, pairs neither, so
+  `Youn_sa1.raw` never takes `..._Youn_sa11.raw`. No pairing crosses a polarity:
+  where the member's path (its folders under the data root and its name) or the
+  declared name carries `pos`, `neg`, `positive` or `negative` as a token of its
+  own, in any case, and that is not the unit's ion mode, or the two disagree, the
+  pairing is refused (`polarity_token_contradicts_ion_mode`,
+  `polarity_token_contradicts_declared_name`). A polarity token beside a `control`,
+  `ctrl`, `blank` or `qc` token in the file name is read as part of a sample's name
+  and refuses nothing (`name_polarities`): a positive unit's
+  `Neg_Ctrl_1.raw` (a negative control) pairs with `021518_Neg_Ctrl_1.raw`, as do
+  `pos_ctrl`, `Positive_control` and `neg_blank`. Two cases keep it a polarity. A
+  name with a polarity token of its own elsewhere states that one only
+  (`Pos_Ctrl_1_neg.raw` is Negative), and a polarity folder always states its
+  polarity, whatever stands beside the token: `QC_NEG/2020_QC_1.raw` is Negative, as
+  `NEG/` is, so a positive unit's `QC_1.raw` is not paired with it. And where such a token is a name's only polarity token and that side of
+  the pairing (the declared names, or the members' paths) names its files by
+  polarity elsewhere (`names_state_polarity`), it is the file's polarity. Read-only
+  over the Catalog, an unconditional exemption would have stopped 157 sample rows in
+  19 LC-MS units from contradicting their unit's ion mode, and every one of those
+  units names its other files by polarity: ST002251's positive unit lists
+  `20200715_004_QC-neg.mzML` beside its `_pos` files, ST003858's negative unit lists
+  `Blank_POS_001.mzML`, and ST002510 lists `GL_NEG_Ctrl_B3_1.raw`. With the
+  condition, none does. Every stage that admits a member
+  by a sample's name admits a paired one (conversion sources, the encoding choice,
+  the attribute stage, the extracted files kept), and its lineage row records
+  `name_pairing` (`declared_raw_file`, `member_name`, `paired_by`
+  `prefixed_member_name`) and takes that file's sample; the attribute stage counts
+  `prefixed_member_pairings`. The analysis-CSV builder finds the sample row by the
+  same pairing. A declared name nothing carries still admits nothing: its row is
+  left in `samples_without_input`, and a unit left with no input still refuses to
+  fall back to accession-level inputs.
+
+### Added
+- Declared raw file names paired with archive members by their leading identifier
+  (the user's decision of 2026-10-06). Metabolomics Workbench ST001359 declares
+  `VV_13_HEpG2_C1_pos.raw`, and its archive holds
+  `VV_13_HEpG2_C1_exp344_pos.raw`; the row for VV_14 even reads `HEepG2`. In the
+  same pairing code and with the same scope as the prefixed rule (units whose
+  Catalog declared no inputs), after exact and then prefixed matches, a declared
+  name still unpaired is paired with the member whose `leading_identifier_key` is
+  its own: the stem (less a raw or converted suffix) split on `_`, `-`, `.` and
+  spaces, taken up to and including the first token that contains a digit,
+  compared without case and joined by `_` (`vv_13`). A key of digits only (a run
+  date such as `021518`) or a name without a digit gives none. The key must be
+  unique among the declared names and among the candidate members, and no pairing
+  crosses a polarity token. Applied to ST001359's real member listing, all six
+  declared names pair; applied to ST001264's, the rows named `Sample1`..`Sample28`
+  still pair with nothing.
+- Every inferred pairing is left on record, as the user required:
+  - the input's lineage row records `name_pairing` with `paired_by`
+    `leading_identifier_token` and the `key` (or `prefixed_member_name`), the
+    declared and the member name;
+  - the attribute stage counts `prefixed_member_pairings` and
+    `leading_identifier_token_pairings`, lists `inferred_name_pairings` and any
+    `refused_name_pairings` (with the rule and the reason), and carries the warning
+    `input_names_paired_by_inference`;
+  - the run manifest carries `warnings: ["input_names_paired_by_inference"]` and
+    `input_name_pairings` (`paired`, `refused`); every campaign disposition of such
+    a unit lists the same warning;
+  - a split part's run manifest carries the same record for itself: the pairings
+    of its own inputs (or of the mzXML they stand for), the refusals for its own
+    sample rows, and the warning only where it has a pairing of its own. A pairing
+    of an excluded input, or a refusal for a row no part holds, stays in the
+    parent's record only. An excluded ion-mobility part's disposition carries the
+    warning too;
+  - the analysis-CSV build, its preview and the manifest's `analysis_csv` record
+    carry the warning and `inferred_name_pairings`;
+  - the reviewed sample TSV (and JSON) of a repository unit gains the column
+    `raw_file_paired_by`: `exact`, `prefixed_member_name` or
+    `leading_identifier_token`, and empty for a row without an input.
+- A unit whose sample rows the download did not all deliver says so beside its CSV:
+  the build, its preview and the `analysis_csv` record carry the warning
+  `sample_rows_without_input` and `sample_row_coverage` (`sample_rows`,
+  `with_input`, `without_input`). ST001264 runs its 3 BioRec rows of 31; this is
+  recorded and does not stop the run.
+- Agent capabilities `repository_replicate_rows_as_inputs`,
+  `repository_prefixed_member_names` and `repository_leading_identifier_names`.
 
 ## [0.5.24] - Unreleased
 

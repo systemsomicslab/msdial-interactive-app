@@ -239,6 +239,7 @@ def _record_peak_height_diagnostic(
         representative,
         job_id=job_id,
         diagnostic_directory=str(preparation.get("diagnostic_run_directory") or ""),
+        annotation=preparation.get("diagnostic_annotation"),
     )
 
 
@@ -339,6 +340,11 @@ def _diagnostic_job_from_manifest(manifest_text: str, job_id: str) -> dict[str, 
             "peak_tuning_profile": record.get("peak_tuning_profile") or {},
             "repository_run_manifest": manifest["manifest_path"],
             "diagnostic_run_directory": str(directory),
+            **(
+                {"diagnostic_annotation": dict(record["annotation"])}
+                if isinstance(record.get("annotation"), dict)
+                else {}
+            ),
         },
         "recovered_from": str(record_path),
     }
@@ -709,6 +715,7 @@ def _run_console_for_job(
             command=preparation.get("command"),
             timeout_seconds=entry["timeout_seconds"],
             idle_timeout_seconds=entry["idle_timeout_seconds"],
+            data_types=preparation.get("data_types") or {},
         )
         if not attempt.get("recorded"):
             log(
@@ -1692,10 +1699,13 @@ class Handler(BaseHTTPRequestHandler):
                         job_id,
                         workspace=_repository_workspace(workflow),
                     )
+                    # Only the peaks are read from this diagnostic, so it loads no annotation library
+                    # (workflow.DIAGNOSTIC_ANNOTATION_SKIPPED_REASON).
                     preparation = prepare_tuning_run(
                         workflow,
                         representative,
                         diagnostic_root,
+                        annotate=False,
                     )
                     preparation["peak_tuning_profile"] = {
                         key: value for key, value in profile.items() if key != "file"
@@ -2106,10 +2116,13 @@ class Handler(BaseHTTPRequestHandler):
                         job_id,
                         workspace=_repository_workspace(state),
                     )
+                    # The GUI panel tunes the MSP score cutoffs from this run's match scores as well as
+                    # the peak height from its peaks, so this diagnostic annotates.
                     preparation = prepare_tuning_run(
                         state,
                         profile["file_path"],
                         diagnostic_root,
+                        annotate=True,
                     )
                     preparation["peak_tuning_profile"] = {
                         key: value for key, value in profile.items() if key != "file"
@@ -2886,6 +2899,13 @@ def _write_diagnostic_record(
                 record.get("diagnostic_result_file") or preparation.get("diagnostic_result_file") or ""
             ),
             "peak_tuning_profile": dict(preparation.get("peak_tuning_profile") or {}),
+            # Whether this diagnostic annotated, and why: a count measured without the libraries is
+            # a different run from one measured with them, and only the record can say which.
+            **(
+                {"annotation": dict(preparation["diagnostic_annotation"])}
+                if isinstance(preparation.get("diagnostic_annotation"), dict)
+                else {}
+            ),
             "updated_at": now,
             **details,
         }

@@ -135,7 +135,9 @@ The fallback is recorded as `step_fallback` and `fallback_reason`, and a
 threshold that misses the range even at the fine step as
 `within_target_range: false` with a warning. A diagnostic recorded before 0.5.28
 has its instrument family read again when it is re-estimated.
-Keep 0 when the diagnostic finds no more than 6,000 peaks. The production run's
+Keep 0 when the diagnostic finds no more than 6,000 peaks. The LC-MS diagnostic loads no annotation library, so it says nothing about
+annotation; only its peak count and heights are used, and its Adduct and
+Isotope columns are not the production run's. The production run's
 actual per-file peak counts are recorded beside the estimate as
 `production_peak_counts`. Add the accepted threshold to `answer_seed` before
 production. Repository runs use `TimeBasedLinearWeightedMovingAverage` and must
