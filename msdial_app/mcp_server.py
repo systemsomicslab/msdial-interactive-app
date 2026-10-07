@@ -2143,11 +2143,22 @@ def msdial_prepare_repository_reanalysis(
     declared inputs and sample rows disagree, or an acquisition type cannot be written, nothing is
     written but the failure, which is recorded in the manifest and returned with ok false, so an
     unattended caller goes on to its next unit.
+
+    A unit whose applied campaign disposition was decided before 0.5.29 (it records no
+    declared_acquisition_source) is decided again here under the header-first rule, from its recorded
+    preflight, before its rows are built: in the preview in memory only, and on disk when the call writes
+    (confirmed=true, or a campaign approval), before the CSV and whether or not the CSV then fails. A
+    finished unit is decided again too and keeps its status. The reply names what changed in
+    legacy_disposition_redecision. The execution gate refuses such a disposition's rows where the new rule
+    would not run them, so this is the step that clears that refusal.
     """
     job, manifest = _repository_unit(download_job_id, manifest_path, host, port)
     crossing = _campaign_authorization(
         campaign_authorization_path, manifest, 3, "msdial_prepare_repository_reanalysis"
     )
+    from .repository_reanalysis import redecide_legacy_disposition
+
+    redecision, manifest = redecide_legacy_disposition(manifest, write=confirmed or crossing is not None)
     from .repository_metadata import (
         apply_classes_to_analysis_files,
         metadata_workspace,
@@ -2190,6 +2201,7 @@ def msdial_prepare_repository_reanalysis(
             confirmed=confirmed,
             allow_partial_mapping=allow_partial_mapping,
             crossing=crossing,
+            redecision=redecision,
         )
     if job is not None:
         recognized = ((job.get("result") or {}).get("recognized") or {}).get("files", [])
@@ -2258,6 +2270,8 @@ def msdial_prepare_repository_reanalysis(
     }
     if crossing:
         preview["campaign_authorization"] = crossing
+    if redecision is not None:
+        preview["legacy_disposition_redecision"] = redecision
     if not confirmed and crossing is None:
         return {
             "prepared": False,
@@ -2312,6 +2326,7 @@ def _prepare_repository_rows_from_lineage(
     confirmed: bool,
     allow_partial_mapping: bool,
     crossing: dict[str, Any] | None,
+    redecision: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """msdial_prepare_repository_reanalysis for a manifest with input_lineage: one row per analysis input.
 
@@ -2394,6 +2409,9 @@ def _prepare_repository_rows_from_lineage(
     }
     if crossing:
         preview["campaign_authorization"] = crossing
+    if redecision is not None:
+        # A disposition decided before 0.5.29, decided again: the rows above are built from the new decision.
+        preview["legacy_disposition_redecision"] = redecision
     if not confirmed and crossing is None:
         return {
             "prepared": False,

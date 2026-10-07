@@ -5097,6 +5097,9 @@ def disposition_hold(manifest: dict[str, Any]) -> dict[str, Any] | None:
     raw_cleaned and the like) or its raw data were discarded; applied again, a disposition would move a
     finished unit out of the cleanup-ready states and make it look as if it were waiting to run.
     run_in_progress: a Console of its own may still be running.
+
+    One step goes past a past_preflight hold: redecide_legacy_disposition, as a finished unit is prepared again,
+    decides a pre-0.5.29 disposition again and keeps the unit's status.
     """
     status = str(manifest.get("status") or "")
     if status == SPLIT_PARENT_STATUS or manifest.get("split_into"):
@@ -5852,6 +5855,126 @@ def _decide_recorded_preflight(current: dict[str, Any]) -> dict[str, Any]:
             "decided from the extractor records its preflight left."
         )
     return disposition
+
+
+def is_legacy_disposition(manifest: dict[str, Any]) -> bool:
+    """Whether the unit carries an applied disposition decided before 0.5.29 (no declared_acquisition_source)."""
+    applied = _applied_disposition(manifest)
+    return bool(applied) and "declared_acquisition_source" not in applied
+
+
+def redecide_legacy_disposition(
+    manifest: dict[str, Any], *, write: bool
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Decide an applied pre-0.5.29 disposition again under the header-first rule, as the unit is prepared.
+
+    WHY HERE. The execution gate refuses the rows such a disposition runs and the header-first rule (user
+    decision, 2026-10-06) would not (_legacy_disposition_refusals). classify_preflight and a new preflight are
+    held for a unit whose run has finished (disposition_hold: past_preflight), so for MTBKS217 and MTBLS1572,
+    both mztab_validated, neither could clear it. Preparing the unit again (msdial_prepare_repository_reanalysis)
+    is the step that precedes any run, and the analysis CSV it writes is what the gate checks, so the unit is
+    decided again there and the CSV is built from that decision.
+
+    Returns (record, manifest). record is None, and manifest the one given, for a unit with no applied
+    disposition or one decided from 0.5.29 on. Otherwise the unit is decided from its recorded preflight
+    (_decide_recorded_preflight) and the decision applied as classify_preflight applies it, under the campaign
+    the old disposition recorded; with ``write`` the manifest on disk (``manifest_path``) is changed under its
+    lock, otherwise only the copy returned. The old disposition, with each input's type and basis under it,
+    is kept in the new one's ``supersedes``.
+
+    A finished unit (mztab_validated, completed, cleanup_pending_confirmation) keeps its status: its run
+    happened, and the outputs on disk are that run's. Its execution_allowed follows the new decision, false
+    where the unit would no longer run. A unit disposition_hold holds for any other reason - split, excluded at
+    its split, a run attempt open, raw data released - is not decided again (record ``held``); the gate refuses
+    it on its own grounds, and the legacy refusal stands.
+    """
+    if not is_legacy_disposition(manifest):
+        return None, manifest
+
+    def decide(current: dict[str, Any]) -> dict[str, Any]:
+        previous = copy.deepcopy(_applied_disposition(current))
+        status = str(current.get("status") or "")
+        record: dict[str, Any] = {
+            "previous_disposition": str(previous.get("disposition") or ""),
+            "previous_console_acquisition_type": previous.get("console_acquisition_type"),
+            "status": status,
+            "redecided": False,
+            "held": None,
+        }
+        if not is_legacy_disposition(current):
+            # Decided again by another writer since the caller read the unit.
+            return {**record, "already_current": True}
+        held = disposition_hold(current)
+        finished = held is not None and held["reason"] == "past_preflight" and status in CLEANUP_READY_STATUSES
+        if held is not None and not finished:
+            return {**record, "held": held}
+        disposition = _decide_recorded_preflight(current)
+        assignments = disposition.pop("assignments")
+        disposition["applied"] = True
+        campaign = previous.get("campaign") or preflight_campaign(current)
+        if campaign:
+            disposition["campaign"] = dict(campaign)
+        summary = (current.get("raw_metadata_preflight") or {}).get("summary") or {}
+        disposition["supersedes"] = {
+            **previous,
+            "per_file": [
+                {
+                    "file": str(entry.get("file") or ""),
+                    "console_acquisition_type": entry.get("console_acquisition_type"),
+                    "console_acquisition_basis": entry.get("console_acquisition_basis") or "",
+                }
+                for entry in summary.get("per_file") or []
+                if isinstance(entry, dict)
+            ],
+        }
+        disposition["redecided"] = {
+            "reason": "legacy_disposition",
+            "by": "msdial_prepare_repository_reanalysis",
+            "decided_at": datetime.now(timezone.utc).isoformat(),
+            "status_kept": finished,
+        }
+        _apply_disposition(current, disposition, assignments)
+        current["campaign_disposition"] = disposition
+        if finished:
+            current["status"] = status
+        return {
+            **record,
+            "redecided": True,
+            "status_kept": finished,
+            "disposition": disposition["disposition"],
+            "reasons": list(disposition.get("reasons") or []),
+            "console_acquisition_type": disposition.get("console_acquisition_type"),
+            "excluded_inputs": [
+                {"file": Path(str(item.get("path") or "")).name, "reason": str(item.get("reason") or "")}
+                for item in disposition.get("excluded_inputs") or []
+                if isinstance(item, dict)
+            ],
+            "execution_allowed": current.get("execution_allowed") is True,
+        }
+
+    def attempt(current: dict[str, Any]) -> dict[str, Any]:
+        # A unit that cannot be decided again is prepared as it is, and the gate refuses its legacy rows.
+        try:
+            return decide(current)
+        except Exception as error:
+            return {"redecided": False, "held": None, "error": f"{type(error).__name__}: {error}"}
+
+    if not write:
+        view = copy.deepcopy(manifest)
+        record = attempt(view)
+        return {**record, "written": False}, view if record["redecided"] else manifest
+    if not str(manifest.get("manifest_path") or "").strip():
+        raise ValueError("A legacy disposition is decided again on disk only for a manifest read from its path.")
+    target = Path(str(manifest["manifest_path"])).resolve()
+    with manifest_lock(target):
+        current = read_manifest(target)
+        record = attempt(current)
+        if record["redecided"]:
+            _write_json(target, current)
+    # The unit as it is on disk now, unless a decision that failed left the copy read half changed.
+    return {**record, "written": record["redecided"]}, (
+        manifest if "error" in record else {**current, "manifest_path": str(target)}
+    )
 
 
 # The status a parent unit carries once it has been split. It is not in CLEANUP_READY_STATUSES and it
@@ -6951,8 +7074,9 @@ def _legacy_disposition_refusals(
     if not applied or "declared_acquisition_source" in applied:
         return []
     again_hint = (
-        "Decide the unit again from its recorded preflight (classify_preflight, or the raw-header preflight run "
-        "again) before it runs."
+        "Prepare the unit again (msdial_prepare_repository_reanalysis with confirmed=true, or under its campaign "
+        "approval): that decides it again from its recorded preflight, a finished unit included, and writes the "
+        "analysis CSV from the new decision."
     )
     try:
         again = _decide_recorded_preflight(manifest)

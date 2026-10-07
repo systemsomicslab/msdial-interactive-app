@@ -73,13 +73,34 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   with no `declared_acquisition_source`), in memory and from the same records, as
   `classify_preflight` would. It refuses the run where that decision would not run
   the unit, would exclude a row's file, or would give it another type on its
-  header's word, and says to decide the unit again (`classify_preflight`, or the
-  preflight run again). This refuses MTBKS217's `z_014nn` (an MS1-only file folded
-  into the DDA run of a unit declared DIA) and MTBLS1572's blank (an Unknown header
-  run as SWATH by the declaration). In a read-only simulation over the 10 recorded
-  runs that have an analysis CSV, every other run still passes.
+  header's word, and says to prepare the unit again. This refuses MTBKS217's
+  `z_014nn` (an MS1-only file folded into the DDA run of a unit declared DIA) and
+  MTBLS1572's blank (an Unknown header run as SWATH by the declaration). In a
+  read-only simulation over the 10 recorded runs that have an analysis CSV, every
+  other run still passes.
   A legacy row's type is not refused where the new decision rests on the
   declaration or on a DIA header with no recorded isolation target.
+- `msdial_prepare_repository_reanalysis` decides such a legacy disposition again,
+  from the unit's recorded preflight, before it builds the rows, and the analysis
+  CSV is written from the new decision. This is what clears the gate's refusal.
+  `classify_preflight` and a new preflight cannot: both are held for a unit whose
+  run has finished (`past_preflight`), and MTBKS217 and MTBLS1572 are both
+  `mztab_validated`.
+  - The preview decides in memory and writes nothing. The re-decision is written
+    when the call writes (`confirmed=true`, or under a campaign approval), before
+    the CSV and whether or not the CSV then fails. The reply
+    reports it in `preview.legacy_disposition_redecision`: old and new
+    disposition, Console type, reasons and excluded inputs, and whether the status
+    was kept.
+  - A finished unit (`mztab_validated`, `completed`,
+    `cleanup_pending_confirmation`) keeps its status. Its `execution_allowed`
+    follows the new decision, so it becomes false where the unit would now skip or
+    be excluded, and the gate then refuses on that ground.
+  - The new disposition keeps the old one, with each input's former type and
+    basis, under `supersedes`, and records `redecided` (by, when, `status_kept`).
+  - A unit held for any other reason (split, excluded at its split, a run attempt
+    open, raw data cleaned or discarded) is not decided again, and the refusal
+    stands.
 
 ### Added
 - Agent capability `campaign_header_first_acquisition`.

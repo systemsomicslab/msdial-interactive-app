@@ -368,7 +368,13 @@ only from MS2 headers that carry a precursor m/z. A disposition applied before
 Interactive 0.5.29 (it records no `declared_acquisition_source`) is decided again
 at the gate from the same records, and the run is refused where the new decision
 would not run the unit, would exclude a row's file, or would give it another type
-on its header's word, until `classify_preflight` or a new preflight records it.
+on its header's word. Preparing the unit again
+(`msdial_prepare_repository_reanalysis`) clears it: the unit is decided again from
+its recorded preflight before its rows are built (in memory for the preview, on disk
+when the call writes), the analysis CSV follows the new decision, and the reply
+reports it as `legacy_disposition_redecision`. This reaches a finished unit, which
+keeps its status, while `classify_preflight` and a new preflight are held for it
+(below); the old disposition is kept under the new one's `supersedes`.
 
 Each file's acquisition is its raw header's wherever the header was read (user
 decision, 2026-10-06). A file with MS2 whose header gives DDA, DIA, AIF or SWATH
@@ -404,7 +410,9 @@ No disposition changes a unit that was split, whose run has finished
 (`mztab_validated`, `cleanup_pending_confirmation`, `raw_cleaned`) or whose run
 attempt is still open: a campaign preflight of such a unit reads nothing and
 reports `preflight_held`, and `classify_preflight` returns its decision with
-`held` and writes nothing. A split parent that is read all the same (outside a
+`held` and writes nothing. The one exception is a finished unit whose applied
+disposition predates 0.5.29, which preparing it again decides again and which keeps
+its status (above). A split parent that is read all the same (outside a
 campaign, or split while its headers were being read) records the reads for its
 parts and keeps its status and the disposition it carries.
 `classify_preflight` decides a summary written before the per-file fields
