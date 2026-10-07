@@ -1940,11 +1940,15 @@ class LegacyDispositionGateTests(_Scratch):
 
 
 class LegacyDispositionPrepareTests(_Scratch):
-    """Preparing a unit again decides a pre-0.5.29 disposition again, a finished unit's included."""
+    """Preparing a unit decides a pre-0.5.29 disposition again; a unit past its run only for a new production run."""
 
     gate = LegacyDispositionGateTests.gate
     campaign = LegacyDispositionGateTests.campaign
     as_decided_before_0529 = staticmethod(LegacyDispositionGateTests.as_decided_before_0529)
+    MTBKS217 = {
+        "a.mzML": {"method": "DDA", "confidence": 0.75},
+        "z.mzML": {"method": "FullScan", "levels": [1], "confidence": 0.95},
+    }
 
     def finished_legacy_unit(self, verdicts: dict, decided: dict[str, tuple[str, str]], status: str = "mztab_validated"):
         manifest, files = self.campaign(verdicts, acquisition="DIA")
@@ -1965,13 +1969,50 @@ class LegacyDispositionPrepareTests(_Scratch):
         update_manifest(manifest, finished)
         return manifest, files
 
-    def prepare(self, manifest: Path, confirmed: bool) -> dict:
+    def with_finished_run_outputs(self, manifest: Path, files: dict[str, Path]) -> dict:
+        """The finished run's files and records, as finalize_download_lease leaves them: the CSV it read, the
+        per-file containers, a validated mzTab-M, and the inventory of their checksums."""
+        import hashlib
+
+        output = Path(read_manifest(manifest)["output_directory"])
+        output.mkdir(parents=True, exist_ok=True)
+        csv_path = output / "analysis_files.csv"
+        csv_path.write_text(
+            "file_path,file_name,acquisition_type\n" + "".join(f"{path},{path.stem},DDA\n" for path in files.values()),
+            encoding="utf-8",
+        )
+        for path in files.values():
+            (output / f"{path.stem}.mdpeak").write_bytes(b"peaks")
+        (output / "result.mzTab.txt").write_text("MTD\tmzTab-version\t2.0.0-M\n", encoding="utf-8")
+        retained = [csv_path, *sorted(output.glob("*.mdpeak")), output / "result.mzTab.txt"]
+        inventory = [
+            {"path": str(path), "size_bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            for path in retained
+        ]
+
+        def finalised(current: dict) -> None:
+            current.update(
+                cleanup_allowed=True,
+                finalized_at="2026-10-01T00:00:00+00:00",
+                finalized_run={"job_id": "run-1", "run_directory": str(output), "artifacts": {"mztab": [], "qa": []}},
+                mztab_validation={"summary": {"failed": 0, "passed": 1}},
+                retained_artifacts=[str(path) for path in retained],
+                retained_artifact_inventory=inventory,
+                analysis_csv={"status": "written", "path": str(csv_path), "rows": len(files)},
+            )
+            for row in current["input_lineage"]["rows"]:
+                row.update(file_name=Path(row["path"]).stem, console_path=row["path"], acquisition_type="DDA")
+
+        update_manifest(manifest, finalised)
+        return {"output": output, "csv": csv_path, "inventory": inventory, "bytes": {p: p.read_bytes() for p in retained}}
+
+    def prepare(self, manifest: Path, confirmed: bool, **options) -> dict:
         with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root / "config"), "APPDATA": str(self.root / "config")}):
             from msdial_app import mcp_server
 
             with patch.object(mcp_server, "_request_json", side_effect=AssertionError("no backend")):
                 return mcp_server.msdial_prepare_repository_reanalysis(
-                    hierarchy=[], confirmed=confirmed, manifest_path=str(manifest)
+                    hierarchy=[], confirmed=confirmed, manifest_path=str(manifest), **options
                 )
 
     @staticmethod
@@ -1988,64 +2029,188 @@ class LegacyDispositionPrepareTests(_Scratch):
         record, _view = redecide_legacy_disposition({**read_manifest(manifest), "manifest_path": str(manifest)}, write=True)
         return record
 
-    def test_a_finished_legacy_fold_is_decided_again_when_prepared_and_its_csv_then_passes_the_gate(self) -> None:
+    def gate_at(self, manifest: Path, files: list[Path], kinds: list[str] | str, output_root: Path) -> dict:
+        kinds = [kinds] * len(files) if isinstance(kinds, str) else kinds
+        return evaluate_repository_execution_gate(
+            {
+                "repository_run_manifest": str(manifest),
+                "output_root": str(output_root),
+                "ion_mode": "Negative",
+                "files": [{"file_path": str(path), "acquisition_type": kind} for path, kind in zip(files, kinds)],
+            }
+        )
+
+    def open_run_attempt(self, manifest: Path) -> None:
+        from msdial_app.repository_reanalysis import process_created_at
+
+        def opened(current: dict) -> None:
+            # A rerun whose Console is still running: record_run_start appends this and leaves the status alone.
+            current["run_attempts"] = [
+                *(current.get("run_attempts") or []),
+                {
+                    "attempt_id": "rerun", "kind": "run", "job_id": "rerun", "started_at": "2026-10-07T00:00:00+00:00",
+                    "ended_at": None, "console_pid": None,
+                    "backend": {"pid": os.getpid(), "process_created_at": process_created_at()},
+                },
+            ]
+
+        update_manifest(manifest, opened)
+
+    def test_a_finished_unit_is_refused_without_new_run_and_nothing_of_its_run_is_written(self) -> None:
+        # Review r5-62, medium: preparing MTBKS217 rewrote output\analysis_files.csv, the CSV its run read, while
+        # the unit stayed mztab_validated and cleanup-allowed.
+        for status in ("mztab_validated", "completed", "cleanup_pending_confirmation", "validation_failed"):
+            with self.subTest(status=status):
+                self.root = Path(tempfile.mkdtemp(dir=self._directory.name)).resolve()
+                manifest, files = self.finished_legacy_unit(self.MTBKS217, {"z.mzML": ("DDA", "folded_ms1_only")}, status)
+                run = self.with_finished_run_outputs(manifest, files)
+                before = manifest.read_bytes()
+
+                for confirmed in (False, True):
+                    refused = self.prepare(manifest, confirmed=confirmed)
+                    self.assertEqual(
+                        (False, False, "run_finished"), (refused["ok"], refused["prepared"], refused["reason"]), refused
+                    )
+                    self.assertIn("new_run=true", refused["next_step"])
+                    self.assertNotIn("preview", refused)
+                self.assertEqual(before, manifest.read_bytes(), "the manifest is not changed")
+                self.assertEqual(run["bytes"], {path: path.read_bytes() for path in run["bytes"]}, "nor any file of the run")
+                self.assertEqual([run["output"]], [p for p in manifest.parent.parent.iterdir() if p.name.startswith("output")])
+                # Nothing decides it again in place either.
+                self.assertIsNotNone(self.redecide(manifest)["held"])
+                self.assertEqual(before, manifest.read_bytes())
+
+    def test_a_new_run_for_a_finished_legacy_fold_keeps_the_finished_run_and_writes_its_csv_elsewhere(self) -> None:
         # MTBKS217: mztab_validated, declared DIA, z_014nn (MS1 only) folded into the DDA run before 0.5.29.
-        verdicts = {
-            "a.mzML": {"method": "DDA", "confidence": 0.75},
-            "z.mzML": {"method": "FullScan", "levels": [1], "confidence": 0.95},
-        }
-        manifest, files = self.finished_legacy_unit(verdicts, {"z.mzML": ("DDA", "folded_ms1_only")})
+        from msdial_app.repository_reanalysis import plan_download_cleanup, refresh_retained_artifacts
+
+        manifest, files = self.finished_legacy_unit(self.MTBKS217, {"z.mzML": ("DDA", "folded_ms1_only")})
+        run = self.with_finished_run_outputs(manifest, files)
+        finished = read_manifest(manifest)
         both = [files["a.mzML"], files["z.mzML"]]
         refused = self.gate(manifest, both, "DDA")
         self.assertTrue(
-            any("before Interactive 0.5.29" in item and "msdial_prepare_repository_reanalysis" in item
-                for item in refused["blockers"]),
+            any("before Interactive 0.5.29" in item and "new_run=true" in item for item in refused["blockers"]),
             refused["blockers"],
         )
-        # What the review found: the remedy the refusal used to name does not reach a finished unit.
         self.assertEqual("past_preflight", classify_preflight(manifest)["held"]["reason"])
         before = manifest.read_bytes()
+        new_output = manifest.parent.parent / "output-run-2"
 
-        preview = self.prepare(manifest, confirmed=False)
+        preview = self.prepare(manifest, confirmed=False, new_run=True)
+        self.assertFalse(preview["prepared"])
+        new_run = preview["preview"]["new_run"]
+        self.assertEqual(
+            (True, False, str(new_output), "mztab_validated", str(run["output"])),
+            (new_run["started"], new_run["written"], new_run["output_directory"], new_run["previous_status"],
+             new_run["previous_output_directory"]),
+        )
+        self.assertEqual(str(new_output), preview["preview"]["output_root"])
         redecision = preview["preview"]["legacy_disposition_redecision"]
         self.assertEqual(
-            (True, False, "run", "DDA", True),
+            (True, False, "run", "DDA", "mztab_validated", "preflight_passed"),
             (redecision["redecided"], redecision["written"], redecision["disposition"],
-             redecision["console_acquisition_type"], redecision["status_kept"]),
+             redecision["console_acquisition_type"], redecision["status"], redecision["status_after"]),
         )
         self.assertEqual([{"file": "z.mzML", "reason": "ms1_only_in_declared_dia_unit"}], redecision["excluded_inputs"])
-        self.assertEqual(["z.mzML"], [Path(item["path"]).name for item in preview["preview"]["excluded_inputs"]])
         self.assertEqual(before, manifest.read_bytes(), "a preview writes nothing")
+        self.assertFalse(new_output.exists(), "nor creates the new run's folder")
 
-        prepared = self.prepare(manifest, confirmed=True)
+        prepared = self.prepare(manifest, confirmed=True, new_run=True)
         self.assertTrue(prepared["prepared"], prepared)
+        self.assertTrue(prepared["preview"]["new_run"]["written"])
         self.assertTrue(prepared["preview"]["legacy_disposition_redecision"]["written"])
+        self.assertEqual(new_output / "analysis_files.csv", Path(prepared["input_path"]))
+        self.assertEqual([("a", "DDA")], [(row["file_name"], row["acquisition_type"]) for row in self.csv_rows(prepared)])
+        # The finished run's files are as it left them.
+        self.assertEqual(run["bytes"], {path: path.read_bytes() for path in run["bytes"]})
+
         recorded = read_manifest(manifest)
-        disposition = recorded["campaign_disposition"]
-        self.assertIn("declared_acquisition_source", disposition)
-        self.assertEqual("mztab_validated", recorded["status"], "the finished run stays finished")
-        self.assertTrue(recorded["execution_allowed"])
-        self.assertEqual("msdial_prepare_repository_reanalysis", disposition["redecided"]["by"])
-        self.assertNotIn("declared_acquisition_source", disposition["supersedes"])
+        self.assertEqual(
+            ("preflight_passed", False, True, str(new_output)),
+            (recorded["status"], recorded["cleanup_allowed"], recorded["execution_allowed"], recorded["output_directory"]),
+        )
+        for key in ("finalized_at", "finalized_run", "mztab_validation", "retained_artifacts", "retained_artifact_inventory"):
+            self.assertNotIn(key, recorded, f"{key} was the finished run's")
+        [superseded] = recorded["superseded_runs"]
+        for key in ("status", "cleanup_allowed", "execution_allowed", "output_directory", "finalized_at", "finalized_run",
+                    "mztab_validation", "retained_artifacts", "retained_artifact_inventory", "campaign_disposition", "project"):
+            self.assertEqual(finished[key], superseded[key], key)
+        self.assertEqual(finished["analysis_csv"], superseded["analysis_csv"])
+        self.assertEqual(
+            [(row["path"], row["file_name"], row["acquisition_type"]) for row in finished["input_lineage"]["rows"]],
+            [(row["path"], row["file_name"], row["acquisition_type"]) for row in superseded["input_lineage_written"]],
+        )
         self.assertIn(
             {"file": str(files["z.mzML"]), "console_acquisition_type": "DDA", "console_acquisition_basis": "folded_ms1_only"},
-            disposition["supersedes"]["per_file"],
+            superseded["preflight_per_file"],
         )
-        rows = self.csv_rows(prepared)
-        self.assertEqual([("a", "DDA")], [(row["file_name"], row["acquisition_type"]) for row in rows])
+        disposition = recorded["campaign_disposition"]
+        self.assertIn("declared_acquisition_source", disposition)
+        self.assertEqual("msdial_prepare_repository_reanalysis", disposition["redecided"]["by"])
+        self.assertNotIn("declared_acquisition_source", disposition["supersedes"])
 
-        allowed = self.gate(manifest, [Path(row["file_path"]) for row in rows], [row["acquisition_type"] for row in rows])
+        # The new run's records describe the new run only, and the raw data are not released on the old run's word.
+        self.assertFalse(refresh_retained_artifacts(manifest)["refreshed"])
+        self.assertTrue(plan_download_cleanup(manifest)["blockers"])
+        rows = self.csv_rows(prepared)
+        paths, kinds = [Path(row["file_path"]) for row in rows], [row["acquisition_type"] for row in rows]
+        allowed = self.gate_at(manifest, paths, kinds, new_output)
         self.assertTrue(allowed["allowed"], allowed["blockers"])
-        still = self.gate(manifest, both, "DDA")
-        self.assertFalse(still["allowed"])
+        into_old = self.gate_at(manifest, paths, kinds, run["output"])
+        self.assertTrue(any("this unit's manifest owns" in item for item in into_old["blockers"]), into_old["blockers"])
+        still = self.gate_at(manifest, both, "DDA", new_output)
         self.assertFalse(any("before Interactive 0.5.29" in item for item in still["blockers"]), still["blockers"])
         self.assertTrue(any("excluded by this unit's campaign disposition" in item for item in still["blockers"]))
 
-        # Prepared again, the disposition is current and is not decided a second time.
-        self.assertNotIn("legacy_disposition_redecision", self.prepare(manifest, confirmed=True)["preview"])
-        self.assertEqual(disposition["redecided"], read_manifest(manifest)["campaign_disposition"]["redecided"])
+        # Prepared again before it runs, the unit is not past a run: the CSV is rewritten in the new folder only.
+        again = self.prepare(manifest, confirmed=True)
+        self.assertTrue(again["prepared"], again)
+        self.assertEqual(new_output / "analysis_files.csv", Path(again["input_path"]))
+        self.assertNotIn("legacy_disposition_redecision", again["preview"])
+        self.assertEqual(superseded, read_manifest(manifest)["superseded_runs"][0])
 
-    def test_a_finished_legacy_unit_that_would_no_longer_run_is_recorded_so_and_keeps_its_status(self) -> None:
+        # Once that run has finished too, another new run takes the next folder and keeps both records.
+        update_manifest(manifest, lambda current: current.update(status="mztab_validated", cleanup_allowed=True,
+                                                                 finalized_at="2026-10-08T00:00:00+00:00"))
+        third = self.prepare(manifest, confirmed=True, new_run=True)
+        self.assertTrue(third["prepared"], third)
+        self.assertEqual(manifest.parent.parent / "output-run-3" / "analysis_files.csv", Path(third["input_path"]))
+        self.assertNotIn("legacy_disposition_redecision", third["preview"])
+        recorded = read_manifest(manifest)
+        self.assertEqual(superseded, recorded["superseded_runs"][0])
+        self.assertEqual(
+            [str(run["output"]), str(new_output)], [item["output_directory"] for item in recorded["superseded_runs"]]
+        )
+        self.assertEqual(run["bytes"], {path: path.read_bytes() for path in run["bytes"]})
+
+    def test_a_finished_unit_with_an_open_run_attempt_is_not_decided_again_nor_given_a_new_run(self) -> None:
+        # Review r5-62, low: disposition_hold says past_preflight before it looks for a live attempt, and the
+        # finished unit was decided again (and its CSV rewritten) while its rerun's Console was running.
+        from msdial_app.repository_reanalysis import _live_run_attempt_in
+
+        manifest, files = self.finished_legacy_unit(self.MTBKS217, {"z.mzML": ("DDA", "folded_ms1_only")})
+        run = self.with_finished_run_outputs(manifest, files)
+        self.open_run_attempt(manifest)
+        self.assertIsNotNone(_live_run_attempt_in(read_manifest(manifest)))
+        before = manifest.read_bytes()
+
+        record = self.redecide(manifest)
+        self.assertEqual((False, False), (record["redecided"], record["written"]))
+        self.assertIsNotNone(record["held"])
+        self.assertEqual("run_finished", self.prepare(manifest, confirmed=True)["reason"])
+        for confirmed in (False, True):
+            refused = self.prepare(manifest, confirmed=confirmed, new_run=True)
+            self.assertEqual(
+                (False, False, "run_in_progress", "rerun"),
+                (refused["ok"], refused["prepared"], refused["reason"], refused["new_run"]["job_id"]),
+            )
+        self.assertEqual(before, manifest.read_bytes())
+        self.assertEqual(run["bytes"], {path: path.read_bytes() for path in run["bytes"]})
+        self.assertFalse((manifest.parent.parent / "output-run-2").exists())
+
+    def test_a_new_run_the_unit_would_no_longer_get_is_not_prepared(self) -> None:
+        # MTBLS1572's shape: every header Unknown, run as SWATH by the declaration; decided again it skips.
         verdicts = {"blank.mzML": {"method": "Unknown", "confidence": 0.3}, "b.mzML": {"method": "Unknown", "confidence": 0.3}}
         manifest, files = self.campaign(verdicts, acquisition="DIA")
 
@@ -2055,43 +2220,41 @@ class LegacyDispositionPrepareTests(_Scratch):
             disposition.update(disposition="run", reasons=[], excluded_inputs=[], console_acquisition_type="SWATH")
             for entry in current["raw_metadata_preflight"]["summary"]["per_file"]:
                 entry.update(console_acquisition_type="SWATH", console_acquisition_basis="declaration")
-            current.update(execution_allowed=True, status="cleanup_pending_confirmation")
+            current.update(execution_allowed=True, status="cleanup_pending_confirmation", cleanup_allowed=True)
 
         update_manifest(manifest, ran_by_declaration)
-
-        record = self.redecide(manifest)
-
-        self.assertEqual(
-            ("skip", ["acquisition_unresolved"], True, False),
-            (record["disposition"], record["reasons"], record["written"], record["execution_allowed"]),
-        )
-        recorded = read_manifest(manifest)
-        self.assertEqual("cleanup_pending_confirmation", recorded["status"])
-        self.assertFalse(recorded["execution_allowed"])
-        refused = self.gate(manifest, list(files.values()), "SWATH")
-        self.assertFalse(refused["allowed"])
-        self.assertFalse(any("before Interactive 0.5.29" in item for item in refused["blockers"]), refused["blockers"])
-        self.assertTrue(any("execution_allowed" in item for item in refused["blockers"]), refused["blockers"])
-
-    def test_a_legacy_unit_whose_raw_data_were_released_is_not_decided_again(self) -> None:
-        verdicts = {
-            "a.mzML": {"method": "DDA", "confidence": 0.75},
-            "z.mzML": {"method": "FullScan", "levels": [1], "confidence": 0.95},
-        }
-        manifest, _files = self.finished_legacy_unit(verdicts, {"z.mzML": ("DDA", "folded_ms1_only")}, status="raw_cleaned")
         before = manifest.read_bytes()
 
-        record = self.redecide(manifest)
+        self.assertIsNotNone(self.redecide(manifest)["held"])
+        refused = self.prepare(manifest, confirmed=True, new_run=True)
 
-        self.assertEqual((False, False, "past_preflight"), (record["redecided"], record["written"], record["held"]["reason"]))
-        self.assertEqual(before, manifest.read_bytes())
+        self.assertEqual((False, "would_not_run"), (refused["prepared"], refused["reason"]))
+        redecision = refused["new_run"]["legacy_disposition_redecision"]
+        self.assertEqual(("skip", ["acquisition_unresolved"], False), (redecision["disposition"], redecision["reasons"], redecision["written"]))
+        self.assertEqual(before, manifest.read_bytes(), "the finished run stays as it was recorded")
+        self.assertFalse((manifest.parent.parent / "output-run-2").exists())
+        gated = self.gate(manifest, list(files.values()), "SWATH")
+        self.assertTrue(
+            any("before Interactive 0.5.29" in item and "new_run=true" in item for item in gated["blockers"]), gated["blockers"]
+        )
+
+    def test_a_legacy_unit_whose_raw_data_were_released_is_never_prepared(self) -> None:
+        for status in ("raw_cleaned", "discarded"):
+            with self.subTest(status=status):
+                self.root = Path(tempfile.mkdtemp(dir=self._directory.name)).resolve()
+                manifest, _files = self.finished_legacy_unit(self.MTBKS217, {"z.mzML": ("DDA", "folded_ms1_only")}, status)
+                before = manifest.read_bytes()
+
+                record = self.redecide(manifest)
+                self.assertEqual((False, False, "past_preflight"), (record["redecided"], record["written"], record["held"]["reason"]))
+                for new_run in (False, True):
+                    refused = self.prepare(manifest, confirmed=True, new_run=new_run)
+                    self.assertEqual((False, "raw_released"), (refused["prepared"], refused["reason"]))
+                self.assertEqual(before, manifest.read_bytes())
+                self.assertFalse((manifest.parent.parent / "output-run-2").exists())
 
     def test_a_legacy_unit_that_cannot_be_decided_again_is_left_as_it_is_and_still_refused(self) -> None:
-        verdicts = {
-            "a.mzML": {"method": "DDA", "confidence": 0.75},
-            "z.mzML": {"method": "FullScan", "levels": [1], "confidence": 0.95},
-        }
-        manifest, files = self.finished_legacy_unit(verdicts, {"z.mzML": ("DDA", "folded_ms1_only")})
+        manifest, files = self.finished_legacy_unit(self.MTBKS217, {"z.mzML": ("DDA", "folded_ms1_only")}, status="preflight_passed")
         before = manifest.read_bytes()
 
         with patch("msdial_app.repository_reanalysis._decide_recorded_preflight", side_effect=KeyError("per_file")):
@@ -2103,19 +2266,67 @@ class LegacyDispositionPrepareTests(_Scratch):
         refused = self.gate(manifest, [files["a.mzML"], files["z.mzML"]], "DDA")
         self.assertTrue(any("before Interactive 0.5.29" in item for item in refused["blockers"]), refused["blockers"])
 
+    def test_a_new_run_whose_decision_fails_is_not_prepared_and_the_finished_run_stands(self) -> None:
+        manifest, files = self.finished_legacy_unit(self.MTBKS217, {"z.mzML": ("DDA", "folded_ms1_only")})
+        run = self.with_finished_run_outputs(manifest, files)
+        before = manifest.read_bytes()
+
+        with patch("msdial_app.repository_reanalysis._decide_recorded_preflight", side_effect=KeyError("per_file")):
+            refused = self.prepare(manifest, confirmed=True, new_run=True)
+
+        self.assertEqual((False, "redecision_failed"), (refused["prepared"], refused["reason"]))
+        self.assertIn("KeyError", refused["detail"])
+        self.assertEqual(before, manifest.read_bytes())
+        self.assertEqual(run["bytes"], {path: path.read_bytes() for path in run["bytes"]})
+        self.assertFalse((manifest.parent.parent / "output-run-2").exists())
+
+    def test_a_new_run_for_a_finished_unit_decided_under_rule_b2_moves_only_the_run(self) -> None:
+        manifest, files = self.campaign(self.MTBKS217, acquisition="DIA")
+        update_manifest(manifest, lambda current: current.update(
+            status="mztab_validated", execution_allowed=True,
+            input_lineage={"schema": "msdial-input-lineage.v1", "rows": [
+                {"path": str(path), "kind": "file", "sample_id": path.stem, "file_name": "", "source": {}, "checksums": {}}
+                for path in files.values()
+            ]},
+        ))
+        run = self.with_finished_run_outputs(manifest, files)
+        disposition = read_manifest(manifest)["campaign_disposition"]
+
+        prepared = self.prepare(manifest, confirmed=True, new_run=True)
+
+        self.assertTrue(prepared["prepared"], prepared)
+        self.assertNotIn("legacy_disposition_redecision", prepared["preview"])
+        recorded = read_manifest(manifest)
+        self.assertEqual(disposition, recorded["campaign_disposition"], "a current disposition is not decided again")
+        self.assertEqual(("preflight_passed", False), (recorded["status"], recorded["cleanup_allowed"]))
+        self.assertEqual(run["inventory"], recorded["superseded_runs"][0]["retained_artifact_inventory"])
+        self.assertEqual(run["bytes"], {path: path.read_bytes() for path in run["bytes"]})
+
+    def test_an_agent_can_tell_a_prepare_keeps_a_finished_run(self) -> None:
+        from msdial_app.agent_bridge import summarize_jobs
+
+        self.assertIn("repository_prepare_new_production_run", summarize_jobs({})["capabilities"])
+
+    def test_new_run_for_a_unit_not_past_a_run_prepares_it_as_any_other(self) -> None:
+        manifest, _files = self.finished_legacy_unit(self.MTBKS217, {"z.mzML": ("DDA", "folded_ms1_only")}, status="preflight_passed")
+
+        prepared = self.prepare(manifest, confirmed=True, new_run=True)
+
+        self.assertTrue(prepared["prepared"], prepared)
+        self.assertEqual({"started": False, "reason": "no_finished_run", "written": False}, prepared["preview"]["new_run"])
+        self.assertEqual(manifest.parent.parent / "output" / "analysis_files.csv", Path(prepared["input_path"]))
+        self.assertNotIn("superseded_runs", read_manifest(manifest))
+
     def test_a_legacy_unit_not_yet_run_is_decided_again_as_classify_preflight_would(self) -> None:
-        verdicts = {
-            "a.mzML": {"method": "DDA", "confidence": 0.75},
-            "z.mzML": {"method": "FullScan", "levels": [1], "confidence": 0.95},
-        }
-        manifest, _files = self.finished_legacy_unit(verdicts, {"z.mzML": ("DDA", "folded_ms1_only")}, status="preflight_passed")
+        manifest, _files = self.finished_legacy_unit(self.MTBKS217, {"z.mzML": ("DDA", "folded_ms1_only")}, status="preflight_passed")
 
         prepared = self.prepare(manifest, confirmed=True)
 
         redecision = prepared["preview"]["legacy_disposition_redecision"]
-        self.assertEqual((True, False), (redecision["redecided"], redecision["status_kept"]))
+        self.assertEqual((True, True, "preflight_passed"), (redecision["redecided"], redecision["written"], redecision["status_after"]))
         recorded = read_manifest(manifest)
         self.assertEqual("preflight_passed", recorded["status"])
+        self.assertNotIn("superseded_runs", recorded)
         self.assertEqual(
             [("z.mzML", "ms1_only_in_declared_dia_unit")],
             [(Path(item["path"]).name, item["reason"]) for item in recorded["campaign_disposition"]["excluded_inputs"]],

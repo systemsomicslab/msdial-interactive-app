@@ -93,6 +93,10 @@ def summarize_jobs(
             # and the execution gate refuses a row that contradicts the Console type its header gives, and decides
             # an applied disposition from before 0.5.29 again, refusing the rows that decision would not run.
             "campaign_header_first_acquisition",
+            # A prepare never writes over a finished run's files: a unit past its run is refused (run_finished)
+            # unless new_run=true, which keeps that run's records under superseded_runs and writes the analysis
+            # CSV into a new output directory; a pre-0.5.29 disposition is decided again only then.
+            "repository_prepare_new_production_run",
             # A campaign's lease (and any other under store_mode "always") fetches each object once per
             # accession into its download store and gives the unit a tree of links; a unit's release releases its
             # claims, and the store collects what no live claim holds under the approval that covered it.

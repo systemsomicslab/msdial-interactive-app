@@ -372,9 +372,41 @@ on its header's word. Preparing the unit again
 (`msdial_prepare_repository_reanalysis`) clears it: the unit is decided again from
 its recorded preflight before its rows are built (in memory for the preview, on disk
 when the call writes), the analysis CSV follows the new decision, and the reply
-reports it as `legacy_disposition_redecision`. This reaches a finished unit, which
-keeps its status, while `classify_preflight` and a new preflight are held for it
-(below); the old disposition is kept under the new one's `supersedes`.
+reports it as `legacy_disposition_redecision`. The old disposition is kept under the
+new one's `supersedes`.
+
+A unit past its run is never decided again in place, and a prepare never writes over
+that run's files. Past its run means a status of `mztab_validated`, `completed`,
+`cleanup_pending_confirmation`, `raw_cleaned` or `discarded`, or a production run
+that was finalised (`finalized_at`, `validation_failed` included); its output
+directory holds the analysis CSV the run read, and `retained_artifact_inventory`
+their checksums. Preparing such a unit returns `ok: false`, `reason: run_finished`,
+and writes nothing. To run it again, prepare a new production run with
+`new_run=true`:
+
+- the finished run's records are copied unchanged into a new entry of
+  `superseded_runs` (its status, `cleanup_allowed`, `output_directory`,
+  `finalized_run`, `mztab_validation`, retained artifacts and their inventory,
+  `analysis_csv`, `analytical_order`, campaign disposition and project, the
+  lineage rows' written names and types as `input_lineage_written`, and the
+  preflight's per-file Console types as `preflight_per_file`). The old output
+  directory and its files are left as they are;
+- the finished run's own records are taken off the top level, `output_directory`
+  becomes `<workspace>\output-run-<n>` (n = 2 for the second run), and the analysis
+  CSV and the new run's outputs go there;
+- `cleanup_allowed` becomes false and the status `preflight_passed` (`prepared`
+  where no raw-header preflight is recorded);
+- a disposition applied before 0.5.29 is decided again under the header-first rule,
+  which then sets the status and `execution_allowed`.
+
+The preview (`confirmed=false`) does this in memory, creates nothing and reports it
+as `preview.new_run`. A new run is refused, and nothing written, for a unit whose raw
+data were released (`raw_released`, also without `new_run`), while a run attempt of
+the unit may still be running (`run_in_progress`), where the legacy disposition
+decided again would not run the unit (`would_not_run`, with the decision in
+`new_run.legacy_disposition_redecision`), or where that decision fails
+(`redecision_failed`). The execution gate holds a workflow to the unit's current
+`output_directory`, so the new run cannot write into the finished run's folder.
 
 Each file's acquisition is its raw header's wherever the header was read (user
 decision, 2026-10-06). A file with MS2 whose header gives DDA, DIA, AIF or SWATH
@@ -410,9 +442,10 @@ No disposition changes a unit that was split, whose run has finished
 (`mztab_validated`, `cleanup_pending_confirmation`, `raw_cleaned`) or whose run
 attempt is still open: a campaign preflight of such a unit reads nothing and
 reports `preflight_held`, and `classify_preflight` returns its decision with
-`held` and writes nothing. The one exception is a finished unit whose applied
-disposition predates 0.5.29, which preparing it again decides again and which keeps
-its status (above). A split parent that is read all the same (outside a
+`held` and writes nothing. A finished unit whose applied disposition predates
+0.5.29 is decided again only as a new production run is prepared for it (above),
+after its finished run's records have moved to `superseded_runs`. A split parent
+that is read all the same (outside a
 campaign, or split while its headers were being read) records the reads for its
 parts and keeps its status and the disposition it carries.
 `classify_preflight` decides a summary written before the per-file fields

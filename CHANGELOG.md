@@ -83,27 +83,55 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 - `msdial_prepare_repository_reanalysis` decides such a legacy disposition again,
   from the unit's recorded preflight, before it builds the rows, and the analysis
   CSV is written from the new decision. This is what clears the gate's refusal.
-  `classify_preflight` and a new preflight cannot: both are held for a unit whose
-  run has finished (`past_preflight`), and MTBKS217 and MTBLS1572 are both
-  `mztab_validated`.
   - The preview decides in memory and writes nothing. The re-decision is written
     when the call writes (`confirmed=true`, or under a campaign approval), before
-    the CSV and whether or not the CSV then fails. The reply
-    reports it in `preview.legacy_disposition_redecision`: old and new
-    disposition, Console type, reasons and excluded inputs, and whether the status
-    was kept.
-  - A finished unit (`mztab_validated`, `completed`,
-    `cleanup_pending_confirmation`) keeps its status. Its `execution_allowed`
-    follows the new decision, so it becomes false where the unit would now skip or
-    be excluded, and the gate then refuses on that ground.
+    the CSV and whether or not the CSV then fails. The reply reports it in
+    `preview.legacy_disposition_redecision`: old and new disposition, Console
+    type, reasons, excluded inputs, and the status before and after.
   - The new disposition keeps the old one, with each input's former type and
-    basis, under `supersedes`, and records `redecided` (by, when, `status_kept`).
-  - A unit held for any other reason (split, excluded at its split, a run attempt
-    open, raw data cleaned or discarded) is not decided again, and the refusal
-    stands.
+    basis, under `supersedes`, and records `redecided` (by, when).
+  - A unit held for any reason is not decided again in place: split, excluded at
+    its split, past its run (`mztab_validated`, `completed`,
+    `cleanup_pending_confirmation`, `raw_cleaned`, `discarded`), a run attempt
+    open, or a production run finalised under another status
+    (`validation_failed`).
+- `msdial_prepare_repository_reanalysis` never writes over a finished run's files.
+  A unit past its run (the statuses above, or any unit with `finalized_at`) is
+  refused with `ok: false`, `reason: run_finished`, and nothing is written. Before,
+  preparing such a unit rewrote `output\analysis_files.csv`, the CSV its run read
+  and a retained artifact, while the unit stayed `mztab_validated` and
+  cleanup-allowed.
+  - New argument `new_run=true` prepares a new production run for such a unit. The
+    finished run's records are copied unchanged into a new entry of
+    `superseded_runs`, and its own records (`finalized_at`, `finalized_run`,
+    `mztab_validation`, `retained_artifacts`, `retained_artifact_inventory`,
+    `project_archive`, `console_run_finalisation`, `analysis_csv`,
+    `analytical_order` and the like) are taken off the top level.
+    `output_directory` becomes `<workspace>\output-run-<n>`, where the analysis
+    CSV and the new run's outputs go; the old output directory is left as it is.
+    `cleanup_allowed` becomes false and the status `preflight_passed` (or
+    `prepared`). A legacy disposition is decided again then, and only then. The
+    preview does this in memory and reports it in `preview.new_run`.
+  - Refused, and nothing written: a unit whose raw data were released
+    (`raw_released`, with or without `new_run`), a new run while a run attempt
+    may still be running (`run_in_progress`), one a legacy disposition decided
+    again would not run (`would_not_run`), and one whose decision fails
+    (`redecision_failed`).
+  - The gate's legacy refusal names `new_run=true` for a unit past its run.
+  - On disk, as recorded on 2026-10-07, 11 manifests carry a legacy applied
+    disposition. Five are past their run (MTBKS217, MTBKS236, MTBLS1572,
+    MTBLS417, ST001337; all `mztab_validated`): a prepare refuses them, and they
+    are decided again only by a prepare with `new_run=true` that writes. The
+    other six (MTBKS281 `run_failed`; MTBLS291 and ST004304 `preflight_passed`;
+    MPST000015 twice and MTBLS548 `excluded_by_preflight`) have no `finalized_at`
+    and are decided again by any prepare that writes, where nothing else holds
+    them; MTBKS281 then becomes `preflight_passed` if the decision runs it, and an
+    `excluded_by_preflight` unit becomes runnable if the recorded preflight no
+    longer excludes it. A preview changes none of them.
 
 ### Added
 - Agent capability `campaign_header_first_acquisition`.
+- Agent capability `repository_prepare_new_production_run`.
 
 ## [0.5.24] - Unreleased
 

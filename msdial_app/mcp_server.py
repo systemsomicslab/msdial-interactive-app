@@ -2131,6 +2131,7 @@ def msdial_prepare_repository_reanalysis(
     port: int = DEFAULT_PORT,
     manifest_path: str = "",
     campaign_authorization_path: str = "",
+    new_run: bool = False,
 ) -> dict[str, Any]:
     """Project repository metadata into Class and prepare an analysis CSV after review.
 
@@ -2144,21 +2145,83 @@ def msdial_prepare_repository_reanalysis(
     written but the failure, which is recorded in the manifest and returned with ok false, so an
     unattended caller goes on to its next unit.
 
+    A UNIT PAST ITS RUN. A prepare never writes over the files of a run that finished (mztab_validated,
+    completed, cleanup_pending_confirmation, or any unit whose production run was finalised, validation_failed
+    included): its output_directory holds the analysis CSV that run read, and retained_artifact_inventory
+    their checksums. Such a unit is refused (reason run_finished) and nothing is written, unless new_run=true
+    asks for a new production run. Then, in the preview in memory only and on disk when the call writes, the
+    finished run's records are copied unchanged into superseded_runs, output_directory becomes a new folder
+    (<workspace>\\output-run-<n>), and the analysis CSV is written there; the old output directory and its
+    files are left as they are. The reply describes it in preview.new_run. A unit whose raw data were released
+    (raw_cleaned, discarded) is refused with or without new_run (raw_released), and so is a new run while a run
+    attempt of the unit may still be running (run_in_progress), or one a legacy disposition decided again would
+    not run (would_not_run). Each refusal returns ok false and writes nothing.
+
     A unit whose applied campaign disposition was decided before 0.5.29 (it records no
-    declared_acquisition_source) is decided again here under the header-first rule, from its recorded
+    declared_acquisition_source) is decided again here under the header-first rule (B2), from its recorded
     preflight, before its rows are built: in the preview in memory only, and on disk when the call writes
-    (confirmed=true, or a campaign approval), before the CSV and whether or not the CSV then fails. A
-    finished unit is decided again too and keeps its status. The reply names what changed in
-    legacy_disposition_redecision. The execution gate refuses such a disposition's rows where the new rule
-    would not run them, so this is the step that clears that refusal.
+    (confirmed=true, or a campaign approval), before the CSV and whether or not the CSV then fails. A unit past
+    its run is decided again only as a new run is prepared for it (new_run=true), never in place. The reply
+    names what changed in legacy_disposition_redecision. The execution gate refuses such a disposition's rows
+    where the new rule would not run them, so this is the step that clears that refusal.
     """
     job, manifest = _repository_unit(download_job_id, manifest_path, host, port)
     crossing = _campaign_authorization(
         campaign_authorization_path, manifest, 3, "msdial_prepare_repository_reanalysis"
     )
-    from .repository_reanalysis import redecide_legacy_disposition
+    from .repository_reanalysis import (
+        finished_production_run,
+        redecide_legacy_disposition,
+        start_new_production_run,
+    )
 
-    redecision, manifest = redecide_legacy_disposition(manifest, write=confirmed or crossing is not None)
+    writes = confirmed or crossing is not None
+    finished = finished_production_run(manifest)
+    if finished is not None and (finished["raw_released"] or not new_run):
+        # Refused before anything is decided, built or written: the finished run's records stand as they are.
+        return {
+            "ok": False,
+            "prepared": False,
+            "confirmation_required": False,
+            "reason": "raw_released" if finished["raw_released"] else "run_finished",
+            "finished_run": finished,
+            "detail": (
+                f"This unit's raw data were released (status {finished['status']!r}); it never runs again, and "
+                "nothing was written. Download it into a new lease to analyse it again."
+                if finished["raw_released"]
+                else f"This unit's production run has finished (status {finished['status']!r}), and its output "
+                f"directory {finished['output_directory']} holds that run's files, the analysis CSV it read among "
+                "them. A prepare never writes over them, and nothing was written."
+            ),
+            **(
+                {}
+                if finished["raw_released"]
+                else {
+                    "next_step": (
+                        "To run the unit again, call again with new_run=true: the finished run's records are kept "
+                        "under superseded_runs and the analysis CSV is written into a new output directory."
+                    )
+                }
+            ),
+        }
+    new_run_record: dict[str, Any] | None = None
+    redecision: dict[str, Any] | None = None
+    if finished is not None:
+        new_run_record, manifest = start_new_production_run(manifest, write=writes)
+        if not new_run_record["started"] and new_run_record["reason"] != "no_finished_run":
+            return {
+                "ok": False,
+                "prepared": False,
+                "confirmation_required": False,
+                "reason": new_run_record["reason"],
+                "detail": str(new_run_record.get("detail") or new_run_record.get("error") or ""),
+                "new_run": new_run_record,
+            }
+        redecision = new_run_record.pop("legacy_disposition_redecision", None)
+    if new_run_record is None or not new_run_record["started"]:
+        redecision, manifest = redecide_legacy_disposition(manifest, write=writes)
+    if new_run and new_run_record is None:
+        new_run_record = {"started": False, "reason": "no_finished_run", "written": False}
     from .repository_metadata import (
         apply_classes_to_analysis_files,
         metadata_workspace,
@@ -2202,6 +2265,7 @@ def msdial_prepare_repository_reanalysis(
             allow_partial_mapping=allow_partial_mapping,
             crossing=crossing,
             redecision=redecision,
+            new_run_record=new_run_record,
         )
     if job is not None:
         recognized = ((job.get("result") or {}).get("recognized") or {}).get("files", [])
@@ -2272,6 +2336,8 @@ def msdial_prepare_repository_reanalysis(
         preview["campaign_authorization"] = crossing
     if redecision is not None:
         preview["legacy_disposition_redecision"] = redecision
+    if new_run_record is not None:
+        preview["new_run"] = new_run_record
     if not confirmed and crossing is None:
         return {
             "prepared": False,
@@ -2327,6 +2393,7 @@ def _prepare_repository_rows_from_lineage(
     allow_partial_mapping: bool,
     crossing: dict[str, Any] | None,
     redecision: dict[str, Any] | None = None,
+    new_run_record: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """msdial_prepare_repository_reanalysis for a manifest with input_lineage: one row per analysis input.
 
@@ -2412,6 +2479,9 @@ def _prepare_repository_rows_from_lineage(
     if redecision is not None:
         # A disposition decided before 0.5.29, decided again: the rows above are built from the new decision.
         preview["legacy_disposition_redecision"] = redecision
+    if new_run_record is not None:
+        # A new production run of a unit past its run: output_root above is the new run's folder.
+        preview["new_run"] = new_run_record
     if not confirmed and crossing is None:
         return {
             "prepared": False,
