@@ -84,7 +84,12 @@ from .repository_metadata import (
     metadata_workspace,
     rows_naming_input,
 )
-from .raw_metadata_preflight import INFERRED_PAIRING_WARNING
+from .raw_metadata_preflight import (
+    INFERRED_PAIRING_WARNING,
+    UNATTRIBUTED_CLASS,
+    UNATTRIBUTED_MEMBER_PAIRING,
+    UNATTRIBUTED_MEMBERS_WARNING,
+)
 from .repository_reanalysis import (
     SCIEX_SUFFIXES,
     _applied_disposition,
@@ -138,6 +143,20 @@ def _unit_workspace(manifest: dict[str, Any]) -> dict[str, Any]:
     workspace = metadata_workspace(project)
     proposal = project.get("class_proposal") or {}
     return apply_class_proposal(workspace, proposal) if proposal.get("assignments") else workspace
+
+
+def unattributed_class(manifest: dict[str, Any]) -> str:
+    """The Class an unattributed input's row takes: the abstention's one Class where the unit's Class is an
+    abstention (contrast_definition kind abstention, "All"), else UNATTRIBUTED_CLASS."""
+    proposal = (manifest.get("project") or {}).get("class_proposal") or {}
+    contrast = proposal.get("contrast_definition") if isinstance(proposal, dict) else None
+    if isinstance(contrast, dict) and str(contrast.get("kind") or "") == "abstention":
+        return str(contrast.get("class_label") or "").strip() or "All"
+    return UNATTRIBUTED_CLASS
+
+
+def _is_unattributed(lineage_row: dict[str, Any] | None) -> bool:
+    return ((lineage_row or {}).get("name_pairing") or {}).get("paired_by") == UNATTRIBUTED_MEMBER_PAIRING
 
 
 def _per_file_verdicts(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -300,6 +319,10 @@ def build_repository_analysis_rows(
     )
     declared_of = {candidate: form for form, found in matched.items() for candidate in found}
     stands_for = lineage_stands_for(manifest)
+    # An archive member no sample row pairs with, included as an unattributed input (the lease's
+    # _unattributed_members, user decision 2026-10-07): no sample row, the abstention's Class or Unattributed.
+    unattributed_label = unattributed_class(manifest)
+    unattributed: list[dict[str, Any]] = []
 
     # The sample rows by position (sample_row_index), by id, and by the names they give: their raw file's
     # and their id's, which the name-matching path has always read, and their raw file's alone, which tells
@@ -422,10 +445,21 @@ def build_repository_analysis_rows(
             if entry is None:
                 undeclared.append(path.name)
 
-        # The sample row: sample_row says how it is found. A row two inputs name is the first one's.
-        index, code = sample_row(candidate, entry, lineage_row)
+        # The sample row: sample_row says how it is found. A row two inputs name is the first one's. An
+        # unattributed member has none, and that is on record rather than a failure.
+        is_unattributed = _is_unattributed(lineage_row)
+        index, code = (None, "") if is_unattributed else sample_row(candidate, entry, lineage_row)
         sample = samples[index] if index is not None else None
-        if index is None:
+        if is_unattributed:
+            pairing = (lineage_row or {}).get("name_pairing") or {}
+            unattributed.append(
+                {
+                    "input": path.name,
+                    "member_name": str(pairing.get("member_name") or path.name),
+                    "sample_id": str((lineage_row or {}).get("sample_id") or "") or path.stem,
+                }
+            )
+        elif index is None:
             unresolved.setdefault(code, []).append(path.name)
         else:
             if index in used:
@@ -446,16 +480,21 @@ def build_repository_analysis_rows(
             declared_order_files.append(candidate)
         listed = listing["orders"].get(stem, position)
         inferred = infer_analysis_file_type(sample) if sample else ""
+        if is_unattributed:
+            file_type, class_id = "Sample", unattributed_label
+        else:
+            file_type = inferred if inferred and inferred != "Sample" else file_type_for(stem)
+            class_id = str((sample or {}).get("class_id") or "") or "Sample"
         row: dict[str, Any] = {
             "file_path": candidate,
             "file_name": stem,
-            "file_type": inferred if inferred and inferred != "Sample" else file_type_for(stem),
-            "class_id": str((sample or {}).get("class_id") or "") or "Sample",
+            "file_type": file_type,
+            "class_id": class_id,
             "acquisition_type": acquisition,
             "batch_order": batch if batch is not None else 1,
             "analytical_order": order if order is not None else listed,
             "factor": 1,
-            "sample_id": str((sample or {}).get("sample_id") or ""),
+            "sample_id": unattributed[-1]["sample_id"] if is_unattributed else str((sample or {}).get("sample_id") or ""),
             # Which of the sample's rows this input is, by its position in the unit's sample_metadata and its
             # raw file: replicate rows share the id.
             "sample_row_index": index,
@@ -465,7 +504,7 @@ def build_repository_analysis_rows(
             "raw_file_paired_by": (
                 str(((lineage_row or {}).get("name_pairing") or {}).get("paired_by") or "") or PAIRED_EXACTLY
             )
-            if index is not None
+            if index is not None or is_unattributed
             else "",
             "input_path": candidate,
             "listing_order": listed,
@@ -631,7 +670,7 @@ def build_repository_analysis_rows(
     # input whose raw file a rule of the lease inferred. Neither stops the CSV; both travel with it.
     inferred = []
     for row in rows:
-        if row["raw_file_paired_by"] in ("", PAIRED_EXACTLY):
+        if row["raw_file_paired_by"] in ("", PAIRED_EXACTLY, UNATTRIBUTED_MEMBER_PAIRING):
             continue
         pairing = (lineage_by_key.get(_file_key(row["input_path"])) or {}).get("name_pairing") or {}
         inferred.append(
@@ -647,6 +686,10 @@ def build_repository_analysis_rows(
         warnings.append(PARTIAL_SAMPLE_COVERAGE_WARNING)
     if inferred:
         warnings.append(INFERRED_PAIRING_WARNING)
+    if unattributed:
+        warnings.append(UNATTRIBUTED_MEMBERS_WARNING)
+    applied = _applied_disposition(manifest)
+    as_swath = applied.get("aif_run_as_swath") if applied.get("disposition") == "run" else None
     return {
         "schema": SCHEMA,
         "built_from": "input_lineage",
@@ -684,6 +727,12 @@ def build_repository_analysis_rows(
             "without_input": len(rows_without_input),
         },
         "inferred_name_pairings": inferred,
+        # Archive members no sample row pairs with, run as unattributed inputs (2026-10-07), and the Class their
+        # rows take.
+        "unattributed_inputs": unattributed,
+        "unattributed_class": unattributed_label if unattributed else "",
+        # The applied disposition's AIF-as-SWATH record, where the rows' SWATH is a header's AIF (2026-10-07).
+        **({"aif_run_as_swath": dict(as_swath)} if isinstance(as_swath, dict) else {}),
         "warnings": warnings,
     }
 
@@ -941,6 +990,11 @@ def analysis_csv_change(built: dict[str, Any], csv_path: str | Path) -> Any:
         summary["sample_row_coverage"] = dict(built.get("sample_row_coverage") or {})
     if built.get("inferred_name_pairings"):
         summary["inferred_name_pairings"] = [dict(item) for item in built["inferred_name_pairings"]]
+    if built.get("unattributed_inputs"):
+        summary["unattributed_inputs"] = [dict(item) for item in built["unattributed_inputs"]]
+        summary["unattributed_class"] = built.get("unattributed_class") or ""
+    if built.get("aif_run_as_swath"):
+        summary["aif_run_as_swath"] = dict(built["aif_run_as_swath"])
 
     def change(manifest: dict[str, Any]) -> None:
         lineage = manifest.get("input_lineage")
@@ -962,6 +1016,9 @@ def analysis_csv_change(built: dict[str, Any], csv_path: str | Path) -> Any:
                     "sample_id": row["sample_id"],
                     "raw_file": row["sample_raw_file"],
                 }
+            elif row.get("raw_file_paired_by") == UNATTRIBUTED_MEMBER_PAIRING:
+                # No sample row, on record as none.
+                item["sample_row"] = None
             else:
                 item.pop("sample_row", None)
             # What the execution gate holds the workflow to: the type written from this input's own header.

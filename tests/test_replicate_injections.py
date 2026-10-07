@@ -633,6 +633,203 @@ class TheLeaseAttributesAPrefixedMember(_Workspace):
             self.lease(project, payloads)
 
 
+# ---- ST001264: the members no row pairs with, taken as unattributed inputs (user decision, 2026-10-07) ---------
+
+
+UNIT_SCOPED = {
+    "kind": "unit_files",
+    "bundle_urls": [{"url": "https://example.org/studydownload/ST001264_POSITIVE.zip", "shared_unit_count": 1}],
+}
+SHARED = {
+    "kind": "accession_archive",
+    "bundle_urls": [{"url": "https://example.org/studydownload/ST001264_POSITIVE.zip", "shared_unit_count": 2}],
+}
+YOUN = [f"{PREFIX}Youn_sa1.raw", f"{PREFIX}Youn_sa10.raw", f"{PREFIX}Youn_sa11.raw"]
+ABSTENTION = {
+    "status": "accepted",
+    "assignments": [{"sample_id": sample, "class_label": "All", "values": {}} for sample, _raw in ST001264_SAMPLES],
+    "contrast_definition": {"kind": "abstention", "class_label": "All", "reason": "no_declared_factor", "considered": []},
+}
+
+
+class TheMembersNoRowPairsWithAreUnattributedInputs(_Workspace):
+    def unit(self, scope: dict, members: list[str] = ST001264_MEMBERS, samples=ST001264_SAMPLES) -> dict:
+        project, payloads = _st001264(members, samples)
+        project.download_scope = dict(scope)
+        return self.lease(project, payloads)
+
+    def test_a_unit_scoped_archive_takes_every_member_and_records_the_unattributed_ones(self) -> None:
+        from msdial_app.raw_metadata_preflight import decide_disposition
+
+        manifest = self.unit(UNIT_SCOPED)
+
+        self.assertEqual(sorted(ST001264_MEMBERS), sorted(Path(item).name for item in manifest["input_candidates"]))
+        self.assertEqual(
+            {"rule": "unit_scoped_archive_2026_10_07", "applied": True, "count": 3, "members": YOUN, "paths": YOUN,
+             "scope": "unit_files"},
+            manifest["unattributed_members"],
+        )
+        self.assertEqual([INFERRED_PAIRING_WARNING, "unattributed_members_included"], manifest["warnings"])
+        rows = {Path(row["path"]).name: row for row in manifest["input_lineage"]["rows"]}
+        youn = rows[f"{PREFIX}Youn_sa1.raw"]
+        self.assertEqual({"paired_by": "unattributed_member", "member_name": f"{PREFIX}Youn_sa1.raw"}, youn["name_pairing"])
+        self.assertEqual(f"{PREFIX}Youn_sa1", youn["sample_id"])
+        self.assertIn("sample_row", youn)
+        self.assertIsNone(youn["sample_row"])
+        # The paired members are as before.
+        self.assertEqual(PREFIXED_MEMBER_PAIRING, rows[f"{PREFIX}BioRec1.raw"]["name_pairing"]["paired_by"])
+        attribute = next(entry for entry in manifest["lease_stages"] if entry["stage"] == "attribute")
+        self.assertEqual((3, 3), (attribute["prefixed_member_pairings"], attribute["unattributed_members"]))
+        self.assertIn("unattributed_members_included", attribute["warnings"])
+        self.assertEqual(sorted(ST001264_MEMBERS), sorted(Path(item).name for item in manifest["extracted_files"]))
+        # Every disposition of the unit carries it, whatever it decides.
+        self.assertIn("unattributed_members_included", decide_disposition(manifest)["warnings"])
+
+    def test_the_csv_gives_an_unattributed_input_no_sample_row_and_the_abstentions_class(self) -> None:
+        manifest = self.unit(UNIT_SCOPED)
+        built = build_repository_analysis_rows(manifest)
+
+        self.assertEqual([], built["failures"])
+        rows = {Path(row["input_path"]).name: row for row in built["rows"]}
+        self.assertEqual(6, len(rows))
+        youn = rows[f"{PREFIX}Youn_sa1.raw"]
+        self.assertEqual(
+            ("Unattributed", "Sample", f"{PREFIX}Youn_sa1", None, "unattributed_member"),
+            (youn["class_id"], youn["file_type"], youn["sample_id"], youn["sample_row_index"], youn["raw_file_paired_by"]),
+        )
+        self.assertEqual("Biorec1", rows[f"{PREFIX}BioRec1.raw"]["sample_id"])
+        self.assertIn("unattributed_members_included", built["warnings"])
+        self.assertIn(PARTIAL_SAMPLE_COVERAGE_WARNING, built["warnings"])
+        self.assertEqual(["Sample1", "Sample2"], built["samples_without_input"])
+        self.assertEqual(3, len(built["inferred_name_pairings"]))
+        self.assertEqual(sorted(YOUN), sorted(item["member_name"] for item in built["unattributed_inputs"]))
+
+        # Under an abstention, the abstention's one Class.
+        manifest["project"]["class_proposal"] = ABSTENTION
+        self.assertEqual({"All"}, {row["class_id"] for row in build_repository_analysis_rows(manifest)["rows"]})
+
+        # The reviewed sample table gets a row per unattributed member, after the unit's own rows.
+        review = mcp_server._with_raw_file_paired_by(
+            {"rows": [{"sample_id": sample, "raw_file": raw} for sample, raw in ST001264_SAMPLES]}, built
+        )
+        self.assertEqual(
+            [("Biorec1", "prefixed_member_name"), ("Biorec2", "prefixed_member_name"), ("Biorec3", "prefixed_member_name"),
+             ("Sample1", ""), ("Sample2", ""),
+             *((Path(name).stem, "unattributed_member") for name in YOUN)],
+            [(row["sample_id"], row["raw_file_paired_by"]) for row in review["rows"]],
+        )
+        self.assertEqual({"Unattributed"}, {row["class_id"] for row in review["rows"][5:]})
+
+    def test_a_shared_archive_takes_none_and_says_why(self) -> None:
+        manifest = self.unit(SHARED)
+
+        self.assertEqual(3, len(manifest["input_candidates"]))
+        record = manifest["unattributed_members"]
+        self.assertEqual(
+            (False, "shared_archive", 0, []), (record["applied"], record["reason"], record["count"], record["members"])
+        )
+        self.assertEqual(YOUN, [item["member_name"] for item in record["left_out"]])
+        self.assertEqual({"shared_archive"}, {item["reason"] for item in record["left_out"]})
+        self.assertEqual([INFERRED_PAIRING_WARNING], manifest["warnings"])
+
+    def test_a_scope_that_says_nothing_takes_none(self) -> None:
+        manifest = self.unit({})
+
+        self.assertEqual(3, len(manifest["input_candidates"]))
+        self.assertEqual("download_scope_not_unit_scoped", manifest["unattributed_members"]["reason"])
+
+    def test_a_unit_every_member_of_which_pairs_records_nothing(self) -> None:
+        manifest = self.unit(UNIT_SCOPED, members=ST001264_MEMBERS[:3], samples=ST001264_SAMPLES[:3])
+
+        self.assertEqual(3, len(manifest["input_candidates"]))
+        self.assertNotIn("unattributed_members", manifest)
+        self.assertEqual([INFERRED_PAIRING_WARNING], manifest["warnings"])
+
+    def test_an_other_polarity_member_and_an_mzxml_are_left_out_on_record(self) -> None:
+        members = [
+            *ST001264_MEMBERS[:3], "x_S9_neg.raw", "x_S8.mzXML", "x_S7.raw", "y_S6.raw", "y_S6.mzML",
+            f"{PREFIX}BioRec1.mzML",
+        ]
+        manifest = self.unit(UNIT_SCOPED, members=members)
+
+        self.assertEqual(
+            sorted([*ST001264_MEMBERS[:3], "x_S7.raw"]), sorted(Path(item).name for item in manifest["input_candidates"])
+        )
+        record = manifest["unattributed_members"]
+        self.assertEqual(["x_S7.raw"], record["members"])
+        self.assertEqual(
+            [(f"{PREFIX}BioRec1.mzML", "two_encodings_of_one_name"), ("x_S8.mzXML", "requires_conversion"),
+             ("x_S9_neg.raw", "polarity_token_contradicts_ion_mode"), ("y_S6.mzML", "two_encodings_of_one_name"),
+             ("y_S6.raw", "two_encodings_of_one_name")],
+            [(item["member_name"], item["reason"]) for item in record["left_out"]],
+        )
+        self.assertEqual(5, record["left_out_count"])
+        self.assertEqual(
+            [item["member_name"] for item in record["left_out"]], [item["path"] for item in record["left_out"]]
+        )
+
+    def test_a_nested_archive_names_its_members_by_basename_as_the_lineage_does(self) -> None:
+        # Review ia-0531, medium: the record listed 'ST001264_POSITIVE/<name>', the lineage '<name>', so the
+        # gate found no lineage member in the record. Both now give the basename; paths keeps where each lies.
+        nested = [f"ST001264_POSITIVE/{name}" for name in ST001264_MEMBERS]
+        twins = ["ST001264_POSITIVE/a/QC_01.raw", "ST001264_POSITIVE/b/QC_01.raw"]
+        other = "ST001264_POSITIVE/neg/x_S9_neg.raw"
+        manifest = self.unit(UNIT_SCOPED, members=[*nested, *twins, other])
+        record = manifest["unattributed_members"]
+
+        self.assertEqual(5, record["count"])
+        self.assertEqual(sorted([*YOUN, "QC_01.raw", "QC_01.raw"], key=lambda item: (item.casefold(), item)),
+                         record["members"])
+        self.assertEqual(
+            sorted([f"ST001264_POSITIVE/{name}" for name in YOUN] + twins, key=lambda item: (item.casefold(), item)),
+            record["paths"],
+        )
+        lineage = sorted(
+            row["name_pairing"]["member_name"] for row in manifest["input_lineage"]["rows"]
+            if (row.get("name_pairing") or {}).get("paired_by") == "unattributed_member"
+        )
+        self.assertEqual(sorted(record["members"]), lineage)
+        self.assertEqual(
+            [("x_S9_neg.raw", other, "polarity_token_contradicts_ion_mode")],
+            [(item["member_name"], item["path"], item["reason"]) for item in record["left_out"]],
+        )
+
+    def test_a_shared_nested_archive_lists_its_left_out_members_by_basename_and_path(self) -> None:
+        nested = [f"ST001264_POSITIVE/{name}" for name in ST001264_MEMBERS]
+        record = self.unit(SHARED, members=nested)["unattributed_members"]
+
+        self.assertEqual((0, [], []), (record["count"], record["members"], record["paths"]))
+        self.assertEqual(YOUN, [item["member_name"] for item in record["left_out"]])
+        self.assertEqual([f"ST001264_POSITIVE/{name}" for name in YOUN], [item["path"] for item in record["left_out"]])
+
+    def test_a_unit_no_row_of_which_pairs_runs_on_its_unattributed_members_alone(self) -> None:
+        manifest = self.unit(UNIT_SCOPED, members=YOUN, samples=[("Sample1", "Sample1")])
+
+        self.assertEqual(sorted(YOUN), sorted(Path(item).name for item in manifest["input_candidates"]))
+        self.assertEqual(["unattributed_members_included"], manifest["warnings"])
+
+    def test_unit_scope_is_read_from_the_catalogs_download_scope(self) -> None:
+        from msdial_app.repository_reanalysis import unit_scoped_download
+
+        def scoped(scope: dict) -> tuple[bool, str]:
+            project, _payloads = _st001264(ST001264_MEMBERS[:1], ST001264_SAMPLES[:1])
+            project.download_scope = scope
+            return unit_scoped_download(project)
+
+        self.assertEqual((True, "unit_files"), scoped({"kind": "unit_files"}))
+        self.assertEqual(
+            (True, "bundle_urls_unit_scoped"),
+            scoped({"kind": "accession_archive", "bundle_urls": [{"url": "a", "shared_unit_count": 1}]}),
+        )
+        self.assertEqual(
+            (False, "shared_archive"),
+            scoped({"kind": "unit_files", "bundle_urls": [{"url": "a", "shared_unit_count": 1},
+                                                          {"url": "b", "shared_unit_count": 3}]}),
+        )
+        self.assertEqual((False, "shared_archive"), scoped({"kind": "unit_files", "bundle_shared_unit_count": 2}))
+        self.assertEqual((False, "download_scope_not_unit_scoped"), scoped({"kind": "accession_archive"}))
+
+
 # ---- the handoff check and the CSV builder pair a declared input with a row alike --------------------------
 
 
@@ -1163,7 +1360,7 @@ class ASplitPartCarriesItsOwnPairingRecord(_Workspace):
         extractor = self.root / "RawMetadataConsoleApp.exe"
         extractor.write_bytes(b"stub")
         verdicts = {
-            f"data/{Path(path).name}": {"mode": modes.get(Path(path).name, "DDA"), "polarity": "Positive"}
+            f"{Path(path).parent.name}/{Path(path).name}": {"mode": modes.get(Path(path).name, "DDA"), "polarity": "Positive"}
             for path in read_manifest(manifest_path)["input_candidates"]
         }
         with patch("msdial_app.repository_reanalysis.subprocess.run", side_effect=_extractor(verdicts)):
@@ -1206,6 +1403,50 @@ class ASplitPartCarriesItsOwnPairingRecord(_Workspace):
         for part in (dda, dia):
             self.assertEqual([INFERRED_PAIRING_WARNING], part["warnings"])
             self.assertIn(INFERRED_PAIRING_WARNING, decide_disposition(part)["warnings"])
+
+    def test_a_part_carries_only_its_own_unattributed_members(self) -> None:
+        from msdial_app.raw_metadata_preflight import decide_disposition
+
+        # The handoff's download is the unit's own (unit_files): U_8.raw and U_9.raw pair with no row.
+        members = ["A_1_pos.raw", "D_4_pos.raw", "U_8.raw", "U_9.raw"]
+        parent, parts = self.split(
+            {name: f"thermo raw bytes of {name}".encode() for name in members},
+            [("X", "A_1_pos.raw"), ("Z", "D_4_pos.raw")],
+            {"D_4_pos.raw": "DIA", "U_9.raw": "DIA"},
+        )
+        dda, dia = parts["u-split-dda"], parts["u-split-dia"]
+
+        self.assertEqual(["U_8.raw", "U_9.raw"], parent["unattributed_members"]["members"])
+        for part, member in ((dda, "U_8.raw"), (dia, "U_9.raw")):
+            self.assertEqual(
+                {"rule": "unit_scoped_archive_2026_10_07", "applied": True, "scope": "unit_files", "count": 1,
+                 "members": [member], "paths": [member]},
+                part["unattributed_members"],
+            )
+            self.assertEqual(["unattributed_members_included"], part["warnings"])
+            self.assertIn("unattributed_members_included", decide_disposition(part)["warnings"])
+
+    def test_a_part_of_a_nested_archive_names_its_members_by_basename_and_keeps_their_paths(self) -> None:
+        # Review ia-0531, medium: the record listed paths under the data root, the lineage basenames.
+        members = ["RUN/A_1_pos.raw", "RUN/D_4_pos.raw", "RUN/U_8.raw", "RUN/more/U_9.raw"]
+        parent, parts = self.split(
+            {name: f"thermo raw bytes of {name}".encode() for name in members},
+            [("X", "A_1_pos.raw"), ("Z", "D_4_pos.raw")],
+            {"D_4_pos.raw": "DIA", "U_9.raw": "DIA"},
+        )
+
+        self.assertEqual(["U_8.raw", "U_9.raw"], parent["unattributed_members"]["members"])
+        self.assertEqual(["RUN/more/U_9.raw", "RUN/U_8.raw"], parent["unattributed_members"]["paths"])
+        for part, member, path in (
+            (parts["u-split-dda"], "U_8.raw", "RUN/U_8.raw"), (parts["u-split-dia"], "U_9.raw", "RUN/more/U_9.raw")
+        ):
+            record = part["unattributed_members"]
+            self.assertEqual(([member], [path], 1), (record["members"], record["paths"], record["count"]))
+            lineage = [
+                row["name_pairing"]["member_name"] for row in part["input_lineage"]["rows"]
+                if (row.get("name_pairing") or {}).get("paired_by") == "unattributed_member"
+            ]
+            self.assertEqual(record["members"], lineage)
 
     def test_a_part_whose_inputs_were_named_exactly_carries_no_pairing_record(self) -> None:
         from msdial_app.raw_metadata_preflight import decide_disposition

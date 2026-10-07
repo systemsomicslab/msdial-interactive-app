@@ -564,6 +564,69 @@ def header_console_acquisition_type(method: str, isolation_targets: Any) -> tupl
     return None, "dia_single_isolation_target"
 
 
+# ------------------------------------------------------------------------------------------------------
+# AIF as SWATH (user decision, 2026-10-07)
+# ------------------------------------------------------------------------------------------------------
+#
+# Until a Console that settles an all-ion spot's representative collision energy exists (MsdialWorkbench #825),
+# an AIF unit with ONE distinct MS2 collision energy over its included files runs as SWATH: the pinned Console
+# deconvolutes it the same way (ST004304 gave identical results; MTBKS281 matched its 30 eV collection). An AIF
+# unit with more than one is HELD: it is not run, its raw data are kept, and the hold is no failure. An AIF unit
+# whose collision energies are not recorded is held as well, since one energy cannot be shown.
+AIF_AS_SWATH_RULE = "single_ce_aif_as_swath_2026_10_07"
+AIF_AS_SWATH_BASIS = "aif_single_ce_as_swath"
+AIF_MULTI_CE_HOLD = "aif_multi_ce_awaiting_console"
+AIF_CE_UNRECORDED_HOLD = "aif_collision_energy_unrecorded"
+# The collision energies are compared to 0.1 eV.
+COLLISION_ENERGY_DECIMALS = 1
+
+
+def collision_energy_fields(record: Mapping[str, Any]) -> dict[str, Any]:
+    """The distinct MS2 collision energies one extractor record gives, and the reference functions it names.
+
+    acquisition.collisionEnergies is the extractor's list over the MS2 scan headers it sampled
+    (RawMetadataInference: MS level above 1 and an energy above 0), rounded here to 0.1 eV. A Waters LockSpray
+    reference function is never among them: WatersMetadataReader marks it as reference (its lock-mass function,
+    a REFERENCE descriptor, or a REFERENCE_SCAN item), samples no scan of it, and gives it no MS level, so none
+    of its scans reaches the headers the energies are read from. Its function evidence (the experiment's
+    vendorFields, role reference) is checked here all the same: a reference function that carries an MS level
+    would put its energy among the others, and then the energies are not taken (None, with why).
+    """
+    acquisition = record.get("acquisition") if isinstance(record.get("acquisition"), Mapping) else {}
+    energies = acquisition.get("collisionEnergies")
+    reference: list[str] = []
+    with_level: list[str] = []
+    for experiment in record.get("experiments") or []:
+        fields = experiment.get("vendorFields") if isinstance(experiment, Mapping) else None
+        if not isinstance(fields, Mapping) or str(fields.get("role") or "").strip().casefold() != "reference":
+            continue
+        name = str(experiment.get("id") or experiment.get("name") or "")
+        reference.append(name)
+        if str(fields.get("ms_level") or "").strip():
+            with_level.append(name)
+    values: list[float] | None = None
+    unresolved = ""
+    if with_level:
+        unresolved = "reference_function_with_ms_level"
+    elif isinstance(energies, list):
+        found = set()
+        for item in energies:
+            try:
+                value = float(item)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                found.add(round(value, COLLISION_ENERGY_DECIMALS))
+        values = sorted(found)
+    else:
+        unresolved = "collision_energies_unrecorded"
+    return {
+        "ms2_collision_energies": values,
+        "ms2_collision_energies_unresolved": unresolved,
+        "reference_functions": reference,
+    }
+
+
 def _declared_console_type(mode: str) -> tuple[str | None, str]:
     value = str(mode or "").strip().upper()
     if value in {"DDA", "SWATH", "AIF"}:
@@ -900,6 +963,17 @@ DISPOSITION_SCHEMA = "msdial-campaign-disposition.v1"
 # that carries the name behind a prefix, or shares its leading identifier; repository_reanalysis's
 # _member_name_pairings). The run manifest's warnings and the attribute stage carry it too.
 INFERRED_PAIRING_WARNING = "input_names_paired_by_inference"
+# UNATTRIBUTED MEMBERS (user decision, 2026-10-07). In a unit whose Catalog declared no inputs and whose download is
+# scoped to it alone (unit_files, or every bundle URL with shared_unit_count 1), an analysable archive member that
+# no sample row pairs with, exactly or by a rule, is an input all the same: unattributed, and always on record.
+# repository_reanalysis._unattributed_members decides which; the lineage row says so (name_pairing.paired_by), the
+# manifest lists them (unattributed_members), and every disposition and CSV of the unit carries the warning.
+UNATTRIBUTED_MEMBER_PAIRING = "unattributed_member"
+UNATTRIBUTED_MEMBERS_WARNING = "unattributed_members_included"
+UNATTRIBUTED_MEMBERS_RULE = "unit_scoped_archive_2026_10_07"
+# The Class an unattributed input's CSV row takes where the unit's Class is no abstention (where it is, the
+# abstention's one Class, "All").
+UNATTRIBUTED_CLASS = "Unattributed"
 DISPOSITIONS = ("run", "skip", "exclude", "split")
 # HEADER FIRST (user decision, 2026-10-06). A file whose header was read, that has MS2, and whose header gives
 # one of these runs as its header says, whatever the unit declares and whatever confidence the extractor gave:
@@ -1077,6 +1151,13 @@ def decide_disposition(
     declared_vs_header as excluded, with its reason. A unit nothing of which runs, with an input whose
     acquisition is unresolved, is skipped as acquisition_unresolved, not excluded, where every other input is
     out of scope only for want of a runnable MS2 input beside it (MS1-only inputs).
+
+    AIF AS SWATH (user decision, 2026-10-07; AIF_AS_SWATH_RULE). A unit that would run as AIF counts the distinct
+    MS2 collision energies (ms2_collision_energies, 0.1 eV) over every input that runs. One runs it as SWATH,
+    recorded as aif_run_as_swath and on each assignment as basis aif_single_ce_as_swath. More than one holds it:
+    skip, with AIF_MULTI_CE_HOLD among the reasons and hold true, no assignment, and aif_collision_energies; so
+    does an input that records none (AIF_CE_UNRECORDED_HOLD). A unit to be split is split first, and each part is
+    decided by the rule on its own.
     """
     def mapping(value: Any) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
@@ -1108,11 +1189,19 @@ def decide_disposition(
     # identifier: the lease's name_pairing). The user decided on 2026-10-06 that this is always left on record,
     # so every disposition of such a unit carries it, whatever else it decides.
     lineage = mapping(manifest.get("input_lineage"))
+    lineage_rows = [
+        row for row in [*(lineage.get("rows") or []), *(lineage.get("excluded") or [])] if isinstance(row, dict)
+    ]
     if INFERRED_PAIRING_WARNING in (manifest.get("warnings") or []) or any(
-        isinstance(row, dict) and row.get("name_pairing")
-        for row in [*(lineage.get("rows") or []), *(lineage.get("excluded") or [])]
+        row.get("name_pairing") and mapping(row.get("name_pairing")).get("paired_by") != UNATTRIBUTED_MEMBER_PAIRING
+        for row in lineage_rows
     ):
         warn(INFERRED_PAIRING_WARNING)
+    # Archive members no sample row pairs with, included as unattributed inputs (2026-10-07): always on record.
+    if UNATTRIBUTED_MEMBERS_WARNING in (manifest.get("warnings") or []) or any(
+        mapping(row.get("name_pairing")).get("paired_by") == UNATTRIBUTED_MEMBER_PAIRING for row in lineage_rows
+    ):
+        warn(UNATTRIBUTED_MEMBERS_WARNING)
 
     def result(disposition: str, split_key: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
         settle_overrides(disposition)
@@ -1516,4 +1605,53 @@ def decide_disposition(
         )
         return result("split", split_key)
     ((console, polarity),) = groups
+    if console == "AIF":
+        # AIF AS SWATH (user decision, 2026-10-07; AIF_AS_SWATH_RULE). The distinct MS2 collision energies over
+        # every input that runs: one runs the unit as SWATH, more than one holds it, and none recorded holds it.
+        energies: set[float] = set()
+        unrecorded: list[str] = []
+        for assignment in assignments.values():
+            entry = per_file.get(file_key(assignment["path"])) or {}
+            values = entry.get("ms2_collision_energies")
+            if not isinstance(values, list) or not values:
+                unrecorded.append(assignment["path"])
+                continue
+            for value in values:
+                try:
+                    energies.add(round(float(value), COLLISION_ENERGY_DECIMALS))
+                except (TypeError, ValueError):
+                    continue
+        listed = sorted(energies)
+        if unrecorded or len(listed) > 1:
+            assignments.clear()
+            if len(listed) > 1:
+                reasons.append(AIF_MULTI_CE_HOLD)
+                detail.append(
+                    f"The unit runs as AIF with {len(listed)} distinct MS2 collision energies ("
+                    + ", ".join(f"{value:g} eV" for value in listed)
+                    + "). Multi-energy AIF is held, not run, and its raw data are kept until a Console that settles "
+                    f"an all-ion spot's representative collision energy exists ({AIF_AS_SWATH_RULE})."
+                )
+            if unrecorded:
+                reasons.append(AIF_CE_UNRECORDED_HOLD)
+                detail.append(
+                    f"The unit runs as AIF, and the raw headers of {len(unrecorded)} of its inputs record no MS2 "
+                    "collision energy, so one energy cannot be shown for the unit. It is held, not run, and its raw "
+                    f"data are kept until a Console that settles an all-ion spot's collision energy exists "
+                    f"({AIF_AS_SWATH_RULE})."
+                )
+            return result("skip", hold=True, aif_collision_energies=listed)
+        for assignment in assignments.values():
+            assignment.update(console_acquisition_type="SWATH", basis=AIF_AS_SWATH_BASIS)
+        detail.append(
+            f"The unit's {len(assignments)} AIF input(s) share one MS2 collision energy ({listed[0]:g} eV), so they "
+            f"run as SWATH, which the pinned Console deconvolutes alike ({AIF_AS_SWATH_RULE}); each input's header "
+            "type stays AIF in header_console_acquisition_type."
+        )
+        return result(
+            "run",
+            console_acquisition_type="SWATH",
+            ion_mode=polarity,
+            aif_run_as_swath={"collision_energies": listed, "rule": AIF_AS_SWATH_RULE},
+        )
     return result("run", console_acquisition_type=console, ion_mode=polarity)

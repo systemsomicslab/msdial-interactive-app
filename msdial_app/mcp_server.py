@@ -2112,6 +2112,7 @@ def msdial_discard_repository_raw(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     campaign_authorization_path: str = "",
+    release_disposition_hold: bool = False,
 ) -> dict[str, Any]:
     """Preview, and only on explicit confirmation perform, deletion of the raw data of a unit with no validated output.
 
@@ -2129,6 +2130,13 @@ def msdial_discard_repository_raw(
 
     A split parent is released as msdial_cleanup_repository_raw releases one. For a split part, an approval
     records that the part has ended, deleting nothing: its raw data are its parent's, released with them.
+
+    release_disposition_hold (default false) is the operator's explicit decision to skip a unit, or split part,
+    whose campaign disposition holds it (hold true, e.g. aif_multi_ce_awaiting_console). Without it such a
+    unit is never discarded, under an approval or with confirmed=true, and a held part keeps its parent's raw
+    data. With it and an approval covering boundary 5 (or confirmed=true) the discard proceeds and records
+    disposition_hold_released_by "operator_skip"; on a split parent it lifts its held parts' holds the same way.
+    Pass it only on that explicit decision, never because a hold blocks a discard.
     """
     from .repository_reanalysis import discard_download_lease
 
@@ -2139,6 +2147,7 @@ def msdial_discard_repository_raw(
         confirmed=confirmed,
         campaign_authorization_path=campaign_authorization_path or None,
         entry_point="msdial_discard_repository_raw",
+        release_disposition_hold=bool(release_disposition_hold),
     )
     if not confirmed and not authorized and not result.get("deleted"):
         result["message"] = (
@@ -2630,6 +2639,9 @@ def _prepare_repository_rows_from_lineage(
         "warnings": list(built.get("warnings") or []),
         "sample_row_coverage": dict(built.get("sample_row_coverage") or {}),
         "inferred_name_pairings": list(built.get("inferred_name_pairings") or []),
+        # Archive members no sample row pairs with, run as unattributed inputs (2026-10-07).
+        "unattributed_inputs": list(built.get("unattributed_inputs") or []),
+        **({"aif_run_as_swath": dict(built["aif_run_as_swath"])} if built.get("aif_run_as_swath") else {}),
         "answer_seed": answer_seed,
         "qa_internal_standard_evidence": repository_internal_standard_evidence(projected),
         "analytical_order": {
@@ -2703,17 +2715,35 @@ def _with_raw_file_paired_by(projected: dict[str, Any], built: dict[str, Any]) -
     exact, or the inferred rule (prefixed_member_name, leading_identifier_token); a row without an input says
     nothing. Both the prepare of a unit's first run and of a new production run write it into the reviewed
     sample TSV, so an inferred pairing is on record in every run's table.
+
+    An archive member no sample row pairs with, included as an unattributed input (user decision, 2026-10-07),
+    gets a row of its own after the unit's sample rows: its stem as the sample id, its member name as the raw
+    file, raw_file_paired_by unattributed_member, and the Class its CSV row takes.
     """
     paired_by = {
         row["sample_row_index"]: row["raw_file_paired_by"]
         for row in built["rows"]
         if row["sample_row_index"] is not None
     }
+    unattributed = [
+        {
+            "sample_id": str(item.get("sample_id") or ""),
+            "source_name": str(item.get("sample_id") or ""),
+            "raw_file": str(item.get("member_name") or item.get("input") or ""),
+            "values": {},
+            "class_id": str(built.get("unattributed_class") or ""),
+            "raw_file_paired_by": "unattributed_member",
+        }
+        for item in built.get("unattributed_inputs") or []
+    ]
     return {
         **projected,
         "rows": [
-            {**row, "raw_file_paired_by": paired_by.get(index, "")}
-            for index, row in enumerate(projected.get("rows") or [])
+            *(
+                {**row, "raw_file_paired_by": paired_by.get(index, "")}
+                for index, row in enumerate(projected.get("rows") or [])
+            ),
+            *unattributed,
         ],
     }
 

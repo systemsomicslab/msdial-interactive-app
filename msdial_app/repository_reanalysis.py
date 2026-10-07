@@ -60,7 +60,12 @@ from .mzxml_conversion import (
     converter_identity,
 )
 from .process_liveness import process_created_at, process_is_alive
-from .raw_metadata_preflight import INFERRED_PAIRING_WARNING
+from .raw_metadata_preflight import (
+    INFERRED_PAIRING_WARNING,
+    UNATTRIBUTED_MEMBER_PAIRING,
+    UNATTRIBUTED_MEMBERS_RULE,
+    UNATTRIBUTED_MEMBERS_WARNING,
+)
 from .reader_created import container_members, reader_created_files, reader_created_names
 
 try:
@@ -2118,6 +2123,11 @@ def create_download_lease(
         # pairings refused, recorded with them.
         name_pairings = _member_name_pairings(project, extracted_members, data_root)
         prefixed_members = name_pairings["paired"]
+        # And, where the unit's download is its own alone, the members none of those rules pairs: unattributed
+        # inputs, always on record (user decision, 2026-10-07). They are admitted wherever a paired member is.
+        unattributed = _unattributed_members(project, extracted_members, data_root, archive_samples, prefixed_members)
+        unattributed_members = unattributed["members"]
+        admitted_members = {**prefixed_members, **unattributed_members}
         mzxml_found = _find_mzxml_files(data_root) if campaign_authorization else []
         conversion_sources = _select_conversion_sources(
             mzxml_found, data_root, project, archive_samples, archive_extractions, prefixed_members
@@ -2194,7 +2204,7 @@ def create_download_lease(
 
         stages.start("attribute")
         selected_extracted = _filter_project_allowlist_paths(
-            extracted, data_root, project, archive_samples=archive_samples, prefixed_members=prefixed_members
+            extracted, data_root, project, archive_samples=archive_samples, prefixed_members=admitted_members
         )
         verified_checksums: dict[str, dict[str, Any]] = {}
         checksum_validation = _verify_project_allowlist_checksums(
@@ -2208,7 +2218,7 @@ def create_download_lease(
             archive_extractions=archive_extractions,
             stands_for=stands_for,
             set_aside=[item["path"] for item in (conversion or {}).get("excluded") or []],
-            prefixed_members=prefixed_members,
+            prefixed_members=admitted_members,
         )
         inputs, excluded_inputs, mzml_scanned = _exclude_undecodable_inputs(inputs)
         ignored_inputs = len(all_inputs) - len(inputs) - len(excluded_inputs)
@@ -2244,6 +2254,7 @@ def create_download_lease(
             conversions=conversions,
             stands_for={key: value for key, value in stands_for.items() if key in kept},
             prefixed_members=prefixed_members,
+            unattributed_members=unattributed_members,
         )
         if conversion_rows:
             input_lineage["conversion_sources"] = conversion_rows
@@ -2253,6 +2264,16 @@ def create_download_lease(
             prefixed_members[_file_key(item)]["paired_by"] for item in inputs if _file_key(item) in prefixed_members
         )
         inferred = inferred_name_pairings(prefixed_members, data_root)
+        unattributed_inputs = [item for item in inputs if _file_key(item) in unattributed_members]
+        unattributed_record = unattributed["record"]
+        if unattributed_record is not None and unattributed_record.get("applied"):
+            # What reached the inputs: a member the lease then excluded (an undecodable mzML) is no input.
+            data_key = _file_key(str(data_root))
+            unattributed_record = {
+                **unattributed_record,
+                "count": len(unattributed_inputs),
+                **unattributed_member_names(_member_under_root(_file_key(item), data_key) for item in unattributed_inputs),
+            }
         pruned: dict[str, Any] = {}
         if store_lease is not None:
             # Now that the unit's own files are known: the links to anything else the store's objects
@@ -2289,7 +2310,18 @@ def create_download_lease(
                 if paired_by_rule[LEADING_IDENTIFIER_TOKEN_PAIRING]
                 else {}
             ),
-            **({"inferred_name_pairings": inferred, "warnings": [INFERRED_PAIRING_WARNING]} if inferred else {}),
+            **({"inferred_name_pairings": inferred} if inferred else {}),
+            **({"unattributed_members": len(unattributed_inputs)} if unattributed_inputs else {}),
+            **(
+                {
+                    "warnings": [
+                        *([INFERRED_PAIRING_WARNING] if inferred else []),
+                        *([UNATTRIBUTED_MEMBERS_WARNING] if unattributed_inputs else []),
+                    ]
+                }
+                if inferred or unattributed_inputs
+                else {}
+            ),
             **({"refused_name_pairings": name_pairings["refused"]} if name_pairings["refused"] else {}),
         )
 
@@ -2349,8 +2381,16 @@ def create_download_lease(
                 "paired": inferred,
                 "refused": list(name_pairings["refused"]),
             }
-        if inferred:
-            manifest["warnings"] = [INFERRED_PAIRING_WARNING]
+        if inferred or unattributed_inputs:
+            manifest["warnings"] = [
+                *([INFERRED_PAIRING_WARNING] if inferred else []),
+                *([UNATTRIBUTED_MEMBERS_WARNING] if unattributed_inputs else []),
+            ]
+        if unattributed_record is not None:
+            # The archive members no sample row pairs with: taken as unattributed inputs where the download is the
+            # unit's own (count, members), else left out with why (applied false, reason). Only where a member was
+            # left unpaired, so every other lease records what it always did.
+            manifest["unattributed_members"] = unattributed_record
         warnings = _archive_warnings(archive_extractions)
         if warnings:
             manifest["archive_warnings"] = warnings
@@ -3370,6 +3410,7 @@ def build_input_lineage(
     conversions: dict[str, dict[str, Any]] | None = None,
     stands_for: dict[str, str] | None = None,
     prefixed_members: dict[str, dict[str, str]] | None = None,
+    unattributed_members: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """One row per analysis input: what it is, where its bytes came from, and what vouches for them.
 
@@ -3446,6 +3487,7 @@ def build_input_lineage(
     archive_samples = _archive_sample_attribution(project, archive_extractions, extracted_members, data_root)
     if prefixed_members is None:
         prefixed_members = _prefixed_member_pairing(project, extracted_members, data_root)
+    unattributed_members = unattributed_members or {}
     # Each extraction's nested archives by label, built once (_nesting_index), so tracing a file to
     # the archives that held it does not walk the whole lineage once per file.
     nesting: dict[int, dict[str, list[dict[str, Any]]]] = {}
@@ -3512,6 +3554,8 @@ def build_input_lineage(
         if not matched and key in prefixed_members:
             pairing = prefixed_members[key]
             return candidates, sample_names.get(pairing["declared_raw_file"].casefold()) or set(), pairing
+        if not matched and key in unattributed_members:
+            return candidates, set(), unattributed_members[key]
         return candidates, matched, None
 
     rows = []
@@ -3536,7 +3580,13 @@ def build_input_lineage(
             "source": {},
             "checksums": {},
         }
-        if pairing:
+        if pairing and pairing.get("paired_by") == UNATTRIBUTED_MEMBER_PAIRING:
+            # No sample row pairs with it: an unattributed input of a unit-scoped archive (2026-10-07), named by
+            # its own stem and on record as having no sample row.
+            row["name_pairing"] = {"paired_by": UNATTRIBUTED_MEMBER_PAIRING, "member_name": paired_name}
+            row["sample_id"] = Path(paired_name).stem
+            row["sample_row"] = None
+        elif pairing:
             # Which declared raw file the input is, and by which rule: its own name carries that name only
             # behind a prefix, or shares its leading identifier. The analysis-CSV builder finds the sample row by it.
             row["name_pairing"] = {
@@ -5576,6 +5626,9 @@ def _per_input_entries(
                 "separation": "",
                 "isolation_window_count": None,
                 "collision_energy_count": None,
+                "ms2_collision_energies": None,
+                "ms2_collision_energies_unresolved": "no_header_record",
+                "reference_functions": [],
                 "header_console_acquisition_type": None,
                 "header_console_acquisition_basis": "",
                 "console_acquisition_type": None,
@@ -5869,6 +5922,13 @@ def _apply_disposition(
             )
             + "."
         )
+        as_swath = disposition.get("aif_run_as_swath")
+        if isinstance(as_swath, dict):
+            lines.append(
+                "The raw headers give AIF with one MS2 collision energy ("
+                + ", ".join(f"{float(value):g} eV" for value in as_swath.get("collision_energies") or [])
+                + f"), run as SWATH under the rule {as_swath.get('rule')} (user decision, 2026-10-07)."
+            )
         project.evidence.extend(line for line in lines if line not in project.evidence)
         evaluated = evaluate_eligibility(
             project,
@@ -5925,6 +5985,55 @@ def _rebuilt_legacy_per_file(current: dict[str, Any]) -> list[dict[str, Any]] | 
     return rebuilt
 
 
+def _collision_energy_entries(current: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The per-file records with their MS2 collision energies, for a summary recorded before 0.5.31 had them.
+
+    The AIF-as-SWATH rule of 2026-10-07 counts each input's distinct MS2 collision energies
+    (raw_metadata_preflight.collision_energy_fields). A preflight recorded before Interactive 0.5.31 kept only
+    their count; the extractor records it read are in its output, and each record without the energies is
+    completed from the one there for its file (ms2_collision_energies_read_from preflight_output). A file with
+    no record there has none (ms2_collision_energies None, unresolved no_header_record). Returns None when
+    every record has them, or there are none.
+    """
+    from .raw_metadata_preflight import collision_energy_fields, file_key
+
+    preflight = current.get("raw_metadata_preflight") or {}
+    entries = [item for item in (preflight.get("summary") or {}).get("per_file") or [] if isinstance(item, dict)]
+    if not entries or all("ms2_collision_energies" in item for item in entries):
+        return None
+    records: dict[str, dict[str, Any]] = {}
+    output_text = str(preflight.get("output") or "").strip()
+    try:
+        raw = json.loads(Path(output_text).read_text(encoding="utf-8-sig")) if output_text else []
+    except (OSError, ValueError):
+        raw = []
+    for record in [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []:
+        source = record.get("source") if isinstance(record, dict) else None
+        path_text = str(source.get("filePath") or "") if isinstance(source, dict) else ""
+        if path_text:
+            records.setdefault(file_key(path_text), record)
+    completed = []
+    for item in entries:
+        if "ms2_collision_energies" in item:
+            completed.append(item)
+            continue
+        record = records.get(file_key(str(item.get("file") or "")))
+        if record is None:
+            completed.append(
+                {
+                    **item,
+                    "ms2_collision_energies": None,
+                    "ms2_collision_energies_unresolved": "no_header_record",
+                    "reference_functions": [],
+                }
+            )
+        else:
+            completed.append(
+                {**item, **collision_energy_fields(record), "ms2_collision_energies_read_from": "preflight_output"}
+            )
+    return completed
+
+
 def classify_preflight(
     manifest_path: str | Path, campaign_authorization_path: str | Path | None = None
 ) -> dict[str, Any]:
@@ -5947,6 +6056,10 @@ def classify_preflight(
     with manifest_lock(target):
         current = read_manifest(target)
         preflight = current.get("raw_metadata_preflight") or {}
+        energies = _collision_energy_entries(current)
+        if energies is not None and disposition_hold(current) is None:
+            # Recorded with the disposition they decide: what each input's header gives, read from its record.
+            current["raw_metadata_preflight"]["summary"]["per_file"] = energies
         disposition = _decide_recorded_preflight(current)
         assignments = disposition.pop("assignments")
         held = disposition_hold(current)
@@ -5985,6 +6098,11 @@ def _decide_recorded_preflight(current: dict[str, Any]) -> dict[str, Any]:
     if rebuilt is not None:
         view = copy.deepcopy(current)
         view["raw_metadata_preflight"]["summary"]["per_file"] = rebuilt
+    else:
+        energies = _collision_energy_entries(current)
+        if energies is not None:
+            view = copy.deepcopy(current)
+            view["raw_metadata_preflight"]["summary"]["per_file"] = energies
     disposition = decide_disposition(view, declared=declared, parent_declared=_split_parent_declared(current))
     if rebuilt is not None and "raw_metadata_preflight_legacy" not in disposition["warnings"]:
         disposition["warnings"].append("raw_metadata_preflight_legacy")
@@ -7501,9 +7619,38 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         pairings = _part_name_pairings(parent, part["input_candidates"], project["sample_metadata"], stands_for)
         if pairings["paired"] or pairings["refused"]:
             part_manifest["input_name_pairings"] = pairings
-        part_warnings = [item for item in parent.get("warnings") or [] if item != INFERRED_PAIRING_WARNING]
+        part_warnings = [
+            item for item in parent.get("warnings") or []
+            if item not in {INFERRED_PAIRING_WARNING, UNATTRIBUTED_MEMBERS_WARNING}
+        ]
         if pairings["paired"]:
             part_warnings.append(INFERRED_PAIRING_WARNING)
+        # The parent's unattributed members that are this part's inputs: the part carries the record and the
+        # warning only where it has one of them.
+        parent_root = _file_key(str(parent.get("input_directory") or "")) if parent.get("input_directory") else ""
+        part_unattributed = sorted(
+            (
+                _member_under_root(_file_key(str(row.get("path") or "")), parent_root)
+                if parent_root
+                else Path(str(row.get("path") or "")).name
+                for row in (part_manifest.get("input_lineage") or {}).get("rows") or []
+                if isinstance(row, dict)
+                and (row.get("name_pairing") or {}).get("paired_by") == UNATTRIBUTED_MEMBER_PAIRING
+            ),
+            key=str.casefold,
+        )
+        if part_unattributed:
+            part_warnings.append(UNATTRIBUTED_MEMBERS_WARNING)
+            part_manifest["unattributed_members"] = {
+                **{
+                    key: value
+                    for key, value in (parent.get("unattributed_members") or {}).items()
+                    if key in {"rule", "applied", "scope"}
+                },
+                "count": len(part_unattributed),
+                # Basenames, as the lineage names them; the paths under the parent's data root beside them.
+                **unattributed_member_names(part_unattributed),
+            }
         if part_warnings:
             part_manifest["warnings"] = part_warnings
         if excluded_part:
@@ -7716,9 +7863,14 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
     # changes nothing: a row that decision would not run refuses the run until the unit is decided again.
     legacy_refusals = _legacy_disposition_refusals(manifest, state.get("files") or [], aliases)
     blockers.extend(legacy_refusals)
+    # AIF AS SWATH (user decision, 2026-10-07): an input whose header gives AIF runs as SWATH only where the
+    # applied disposition records aif_run_as_swath (one MS2 collision energy over the unit's inputs) and its
+    # per-file record says it runs so. Anywhere else a SWATH row of an AIF header is refused, as before.
+    aif_as_swath, aif_claimed = _aif_run_as_swath_files(manifest)
     if header_modes or header_types or decided_types:
         disagreeing = []
         undecided_as = []
+        unrecorded_as_swath = []
         for item in state.get("files") or []:
             path_text = str(item.get("file_path") or "").strip()
             if not path_text:
@@ -7727,6 +7879,16 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             given = str(item.get("acquisition_type") or "").strip()
             requested = given or "DDA"
             header_type = header_types.get(input_key)
+            if input_key in aif_claimed and requested == "SWATH":
+                unrecorded_as_swath.append(Path(path_text).name)
+            if (
+                header_type == "AIF"
+                and requested == "SWATH"
+                and given == "SWATH"
+                and input_key in aif_as_swath
+            ):
+                # The header's AIF, run as SWATH under the recorded rule.
+                header_type = None
             if header_type and requested != header_type:
                 disagreeing.append(f"{Path(path_text).name} (header gives {header_type}, run as {given or 'no type'})")
             decided = decided_types.get(input_key)
@@ -7748,6 +7910,13 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             blockers.append(
                 f"{len(undecided_as)} input files would run with an acquisition type other than the one this "
                 f"unit's campaign disposition decided; the first is {undecided_as[0]}."
+            )
+        if unrecorded_as_swath:
+            blockers.append(
+                f"{len(unrecorded_as_swath)} input files would run their raw header's AIF as SWATH, but this unit's "
+                "applied campaign disposition records no aif_run_as_swath (one MS2 collision energy, rule "
+                f"single_ce_aif_as_swath_2026_10_07); the first is {unrecorded_as_swath[0]}. Decide the unit again "
+                "(classify_preflight)."
             )
 
     # MS-DIAL reads every input with one MS1 and one MS2 data type, which must say what RawDataHandler hands
@@ -7927,6 +8096,87 @@ def _legacy_disposition_refusals(
         "each file's acquisition from its raw header first (user decision, 2026-10-06), and decided again from "
         f"the same records they would not; the first is {refused[0]}. " + again_hint
     ]
+
+
+def _aif_run_as_swath_files(manifest: dict[str, Any]) -> tuple[set[str], list[str]]:
+    """(the inputs whose header AIF may run as SWATH, the inputs that claim it without the record), by _file_key.
+
+    An input may when the applied campaign disposition records aif_run_as_swath under the rule of 2026-10-07
+    (raw_metadata_preflight.AIF_AS_SWATH_RULE) with one collision energy, and its per-file record runs it as
+    SWATH on that basis (console_acquisition_basis aif_single_ce_as_swath). One whose record claims that basis
+    under a disposition that records no such rule is returned second, to be refused.
+    """
+    from .raw_metadata_preflight import AIF_AS_SWATH_BASIS, AIF_AS_SWATH_RULE
+
+    applied = _applied_disposition(manifest)
+    record = applied.get("aif_run_as_swath") if isinstance(applied.get("aif_run_as_swath"), dict) else {}
+    energies = record.get("collision_energies")
+    recorded = (
+        applied.get("disposition") == "run"
+        and record.get("rule") == AIF_AS_SWATH_RULE
+        and isinstance(energies, list)
+        and len(energies) == 1
+    )
+    summary = (manifest.get("raw_metadata_preflight") or {}).get("summary") or {}
+    accepted: set[str] = set()
+    claimed: list[str] = []
+    for item in summary.get("per_file") or []:
+        path_text = str(item.get("file") or "").strip() if isinstance(item, dict) else ""
+        if not path_text or str(item.get("console_acquisition_basis") or "") != AIF_AS_SWATH_BASIS:
+            continue
+        if recorded and str(item.get("console_acquisition_type") or "") == "SWATH":
+            accepted.add(_file_key(path_text))
+        else:
+            claimed.append(_file_key(path_text))
+    return accepted, claimed
+
+
+def held_by_disposition(manifest: dict[str, Any]) -> dict[str, Any]:
+    """The applied campaign disposition when it holds the unit (hold true: skipped to run later, raw data kept).
+
+    Multi-energy AIF is held until a Console that settles an all-ion spot's collision energy exists (user
+    decision, 2026-10-07: raw_metadata_preflight.AIF_MULTI_CE_HOLD), and so is AIF whose collision energies are
+    not recorded. A held unit is no failure, and its raw data are kept. Empty for any other unit.
+    """
+    applied = _applied_disposition(manifest)
+    return applied if applied.get("disposition") == "skip" and applied.get("hold") is True else {}
+
+
+# Who lifted a disposition hold, as the discard that lifted it records it (disposition_hold_released_by).
+DISPOSITION_HOLD_RELEASED_BY = "operator_skip"
+
+
+def unreleased_disposition_hold(manifest: dict[str, Any]) -> dict[str, Any]:
+    """held_by_disposition, unless an operator's skip has already lifted the hold (disposition_hold_released_by).
+
+    A hold is lifted only by an explicit operator decision: a discard called with release_disposition_hold=true
+    under a campaign approval covering boundary 5 (or a person's confirmed=true), which the runner's operator
+    "skip" of a disposition_held unit makes. Without it a held unit, or a held split part, is never discarded,
+    under an approval or not, and a held part keeps its parent's raw data (review r9-64).
+    """
+    hold = held_by_disposition(manifest)
+    return {} if not hold or manifest.get("disposition_hold_released_by") == DISPOSITION_HOLD_RELEASED_BY else hold
+
+
+def _disposition_hold_text(hold: dict[str, Any], subject: str = "The unit") -> str:
+    return (
+        f"{subject}'s campaign disposition holds it ("
+        + ", ".join(str(item) for item in hold.get("reasons") or [])
+        + "): it is to run once a Console that can exists, and a held unit's raw data are kept. It is no failure. "
+        "Only an operator's skip lifts the hold: call again with release_disposition_hold=true."
+    )
+
+
+def _disposition_hold_release(hold: dict[str, Any], at: str) -> dict[str, Any]:
+    """The fields a discard that lifts a disposition hold writes on the unit or part it discards."""
+    return {
+        "disposition_hold_released_by": DISPOSITION_HOLD_RELEASED_BY,
+        "disposition_hold_release": {
+            "released_by": DISPOSITION_HOLD_RELEASED_BY,
+            "released_at": at,
+            "reasons": [str(item) for item in hold.get("reasons") or []],
+        },
+    }
 
 
 def _applied_disposition(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -9260,12 +9510,17 @@ def _mztab_outputs(output: Path) -> list[str]:
     return [str(path) for path in find_mztab_files(output)] if str(output).strip() and output.is_dir() else []
 
 
-def plan_download_discard(manifest_path: Path, *, authorized: bool = False) -> dict[str, Any]:
+def plan_download_discard(
+    manifest_path: Path, *, authorized: bool = False, release_disposition_hold: bool = False
+) -> dict[str, Any]:
     """Describe what discarding a unit's raw data would remove and keep, and what refuses it. Changes nothing.
 
     ``authorized`` is whether a campaign approval covers the discard. Under one a failed unit whose output holds
     an mzTab-M - unvalidated, or invalid - may be discarded, its mzTab-M kept as a failure artifact; with
     confirmed=true alone such a unit is refused, as it always was.
+
+    A unit its campaign disposition holds (held_by_disposition) is refused, approved or confirmed, unless
+    ``release_disposition_hold`` is the operator's decision to lift the hold (unreleased_disposition_hold).
     """
     from .run_finalisation import describe_holds, raw_deletion_holds
 
@@ -9298,6 +9553,11 @@ def plan_download_discard(manifest_path: Path, *, authorized: bool = False) -> d
         )
     if mztab and not authorized:
         blockers.append("mzTab-M output exists; finalize the run before deleting raw data.")
+    hold = unreleased_disposition_hold(manifest)
+    if hold and not release_disposition_hold:
+        # A unit held to run later keeps its raw data (multi-energy AIF, user decision 2026-10-07). Neither a
+        # campaign approval nor a confirmation discards it; only an operator's skip lifts the hold (r9-64).
+        blockers.append(_disposition_hold_text(hold))
     if raw_root.parent != workspace or raw_root.name != "raw":
         blockers.append("Raw directory is outside the expected project workspace.")
     kept = [str(item) for item in manifest.get("retained_artifacts") or []] + [
@@ -9403,6 +9663,7 @@ def discard_download_lease(
     *,
     campaign_authorization_path: str | Path | None = None,
     entry_point: str = "discard_download_lease",
+    release_disposition_hold: bool = False,
 ) -> dict[str, Any]:
     """Delete the raw data of a unit that produced no validated output.
 
@@ -9420,6 +9681,13 @@ def discard_download_lease(
     A split parent is released by cleanup_split_parent, which this calls for one. A part's raw data are its
     parent's: under an approval its discard records that the part has ended, deleting nothing, and its parent's
     tree goes with the parent's release.
+
+    A unit its campaign disposition holds (held_by_disposition: multi-energy AIF, 2026-10-07) is never
+    discarded, under an approval or not, unless ``release_disposition_hold`` is true: the operator's explicit
+    decision to skip it, which the campaign runner's "skip" of a disposition_held unit passes. With it, and a
+    campaign approval covering boundary 5 (or confirmed=true), the discard proceeds and records
+    disposition_hold_released_by "operator_skip" before the first file goes. The same holds for a split part
+    (_discard_split_part) and a split parent's release (cleanup_split_parent).
     """
     from .mztab_validation import find_mztab_files
 
@@ -9431,11 +9699,12 @@ def discard_download_lease(
             confirmed=confirmed,
             campaign_authorization_path=campaign_authorization_path,
             entry_point=entry_point,
+            release_disposition_hold=release_disposition_hold,
         )
     crossing = _deletion_crossing(campaign_authorization_path, manifest, entry_point)
     owner = _owner_manifest_path(manifest, manifest_path)
     if owner is not None and crossing is not None:
-        return _discard_split_part(manifest_path, owner, crossing)
+        return _discard_split_part(manifest_path, owner, crossing, release_disposition_hold=release_disposition_hold)
     downloading = manifest.get("status") == "downloading"
     owner_state = lease_owner_state(manifest) if downloading else None
     if not confirmed and crossing is None:
@@ -9443,7 +9712,7 @@ def discard_download_lease(
             "deleted": False,
             "confirmation_required": True,
             "manifest_path": str(manifest_path),
-            "plan": plan_download_discard(manifest_path),
+            "plan": plan_download_discard(manifest_path, release_disposition_hold=release_disposition_hold),
         }
         if owner_state is not None:
             preview["lease_owner_state"] = owner_state
@@ -9469,8 +9738,11 @@ def discard_download_lease(
         released_from = str(manifest.get("status") or "")
         downloading = manifest.get("status") == "downloading"
         owner_state = lease_owner_state(manifest) if downloading else None
+        hold = unreleased_disposition_hold(manifest)
         if crossing is not None:
-            plan = plan_download_discard(manifest_path, authorized=True)
+            plan = plan_download_discard(
+                manifest_path, authorized=True, release_disposition_hold=release_disposition_hold
+            )
             if plan["blockers"]:
                 return {
                     **plan,
@@ -9481,6 +9753,8 @@ def discard_download_lease(
                 }
         elif manifest.get("status") in {"mztab_validated", "completed", "raw_cleaned"}:
             raise ValueError("Validated/completed runs must use the normal cleanup command.")
+        elif hold and not release_disposition_hold:
+            raise ValueError(_disposition_hold_text(hold) + " Discard was refused.")
         elif superseded_validated_run(manifest) is not None:
             raise ValueError(
                 _superseded_validated_text(superseded_validated_run(manifest), str(manifest.get("status") or ""))
@@ -9543,6 +9817,11 @@ def discard_download_lease(
         )
         if crossing is not None:
             record_campaign_authorization(manifest_path, crossing)
+        hold_release = _disposition_hold_release(hold, discarded_at) if hold else None
+        if hold_release is not None:
+            # The operator's skip lifts the hold before the first file goes, so a deletion that stops part-way
+            # is resumed without the decision being asked for again.
+            update_manifest(manifest_path, lambda current: current.update(hold_release))
         if failure_artifacts is not None and kept_before is None:
             # Written before the first file goes, so a deletion that stops still names what it keeps.
             def keep(current: dict[str, Any]) -> None:
@@ -9604,10 +9883,18 @@ def discard_download_lease(
         result["failure_artifacts"] = failure_artifacts
     if crossing is not None:
         result["campaign_authorization"] = crossing
+    if hold_release is not None:
+        result["disposition_hold_released_by"] = DISPOSITION_HOLD_RELEASED_BY
     return result
 
 
-def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[str, Any]) -> dict[str, Any]:
+def _discard_split_part(
+    manifest_path: Path,
+    parent_path: Path,
+    crossing: dict[str, Any],
+    *,
+    release_disposition_hold: bool = False,
+) -> dict[str, Any]:
     """Record under an approval that a split part has ended without validated output. Deletes nothing.
 
     The part's raw tree is its parent's, read by every other part, and goes only with the parent's release
@@ -9617,6 +9904,10 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
 
     Refused, with nothing recorded, for a validated part, one whose Console may still run, and one with a new
     run prepared after a validated run that has not validated (superseded_validated_run, review r7-62).
+
+    Refused too for a part its campaign disposition holds (multi-energy AIF), unless ``release_disposition_hold``
+    is the operator's skip: a held part keeps its parent's raw data until it is released or run (review r9-64).
+    With it, the part records disposition_hold_released_by "operator_skip" as it ends.
     """
     with _raw_deletion_lock(manifest_path):
         manifest = read_manifest(manifest_path)
@@ -9636,6 +9927,9 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
                 f"Run attempt {attempt.get('attempt_id') or '?'} of job {attempt.get('job_id') or 'unrecorded'} may "
                 "still have its MS-DIAL Console reading the raw tree."
             )
+        hold = unreleased_disposition_hold(manifest)
+        if hold and not release_disposition_hold:
+            blockers.append(_disposition_hold_text(hold, "The part") + " Its parent's raw data are kept for it.")
         if blockers:
             return {
                 "deleted": False,
@@ -9646,27 +9940,10 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
                 "blockers": blockers,
                 "message": "Nothing was recorded: the approval covers this part, but its discard is refused.",
             }
-        if status == "discarded":
+        if status == "discarded" and not hold:
             ended = {"already_discarded": True}
         else:
-            at = datetime.now(timezone.utc).isoformat()
-            output = Path(str(manifest.get("output_directory") or ""))
-            failure_artifacts = _failure_artifacts(manifest_path, manifest, output, at)
-            record_campaign_authorization(manifest_path, crossing)
-
-            def change(current: dict[str, Any]) -> None:
-                current["status"] = "discarded"
-                current["discarded_at"] = at
-                current["discard_reason"] = (
-                    "The part ended without validated output. Its raw data are its parent's, and are released "
-                    "with the parent's once every part has ended."
-                )
-                current["raw_release_deferred_to"] = str(parent_path)
-                if failure_artifacts is not None:
-                    current["failure_artifacts"] = failure_artifacts
-
-            update_manifest(manifest_path, change)
-            ended = {**({"failure_artifacts": failure_artifacts} if failure_artifacts else {})}
+            ended = _end_split_part(manifest_path, manifest, parent_path, crossing, hold)
     try:
         parent_plan = plan_split_parent_cleanup(parent_path)
     except (OSError, ValueError) as error:
@@ -9682,10 +9959,51 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
     }
 
 
+def _end_split_part(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    parent_path: Path,
+    crossing: dict[str, Any] | None,
+    hold: dict[str, Any],
+) -> dict[str, Any]:
+    """Record that a split part has ended without validated output; the caller holds the part's deletion lock.
+
+    ``hold`` is the part's unreleased disposition hold, which the caller's release_disposition_hold lifts: the
+    part then records disposition_hold_released_by. A held part an earlier discard ended (status discarded,
+    which the code before r9-64 let an approval do) keeps its discarded_at and failure artifacts and gains only
+    the hold's release.
+    """
+    at = datetime.now(timezone.utc).isoformat()
+    hold_release = _disposition_hold_release(hold, at) if hold else {}
+    if crossing is not None:
+        record_campaign_authorization(manifest_path, crossing)
+    if manifest.get("status") == "discarded":
+        update_manifest(manifest_path, lambda current: current.update(hold_release))
+        return {"already_discarded": True, **hold_release}
+    output = Path(str(manifest.get("output_directory") or ""))
+    failure_artifacts = _failure_artifacts(manifest_path, manifest, output, at)
+
+    def change(current: dict[str, Any]) -> None:
+        current["status"] = "discarded"
+        current["discarded_at"] = at
+        current["discard_reason"] = (
+            "The operator skipped the part its campaign disposition held, lifting the hold. "
+            if hold_release
+            else "The part ended without validated output. "
+        ) + "Its raw data are its parent's, and are released with the parent's once every part has ended."
+        current["raw_release_deferred_to"] = str(parent_path)
+        current.update(hold_release)
+        if failure_artifacts is not None:
+            current["failure_artifacts"] = failure_artifacts
+
+    update_manifest(manifest_path, change)
+    return {**({"failure_artifacts": failure_artifacts} if failure_artifacts else {}), **hold_release}
+
+
 # ---- releasing a split parent's raw tree -----------------------------------------------------------------
 
 
-def _part_end(part: dict[str, Any], parent_raw: Path) -> dict[str, Any]:
+def _part_end(part: dict[str, Any], parent_raw: Path, *, release_disposition_hold: bool = False) -> dict[str, Any]:
     """How one split part stands for its parent's raw release: its state, whether it has ended, what blocks.
 
     Ended means one of: validated (a cleanup-ready status, cleanup_allowed, no mzTab-M that failed, every
@@ -9693,12 +10011,18 @@ def _part_end(part: dict[str, Any], parent_raw: Path) -> dict[str, Any]:
     of this release); failed after its retries (CAMPAIGN_RUN_ATTEMPTS recorded run failures, which the post-run
     hook records for a Console that exits non-zero and for one that exits 0 without a validated mzTab-M alike);
     skipped or excluded (by its campaign disposition, or at the split); or discarded (its own discard under an
-    approval). Anything else - not yet preflighted, prepared, running, failed with retries left - has not.
+    approval). Anything else - not yet preflighted, prepared, running, failed with retries left - has not, and
+    neither has a part its disposition holds to run later (held_by_disposition: multi-energy AIF, 2026-10-07).
 
     A part with a new run prepared after a validated run, which has not validated itself, has not ended either,
     whatever its status and however many runs failed (superseded_validated_run): its raw data are held for that
     run, as a unit's own are (review r7-62). That includes a part discarded while such a run was pending, which
     52b470b let an approval do.
+
+    A part its disposition holds stays held, skipped or discarded, until an operator's skip lifts the hold
+    (unreleased_disposition_hold, review r9-64): a discard that did not record disposition_hold_released_by does
+    not end it. With ``release_disposition_hold`` - the parent's release asked to lift its parts' holds - such a
+    part is hold_released, which ends it; cleanup_split_parent records the release on it before it deletes.
     """
     status = str(part.get("status") or "")
     blockers: list[str] = []
@@ -9726,6 +10050,19 @@ def _part_end(part: dict[str, Any], parent_raw: Path) -> dict[str, Any]:
         missing = [item for item in retained if not os.path.exists(extended_path(item))]
         if missing:
             blockers.append(f"{len(missing)} of its retained artifacts are missing")
+    elif status in {SKIPPED_BY_PREFLIGHT_STATUS, "discarded"} and unreleased_disposition_hold(part):
+        # Held, not skipped (multi-energy AIF, 2026-10-07): it is to run once a Console that can exists, from the
+        # raw data this parent owns. Discarded without the hold's release, it is held all the same (r9-64).
+        if release_disposition_hold:
+            state = "hold_released"
+        else:
+            state = "held"
+            blockers.append(
+                "its campaign disposition holds it ("
+                + ", ".join(str(item) for item in unreleased_disposition_hold(part).get("reasons") or [])
+                + "): it is to run later, and its raw data are kept until an operator's skip lifts the hold "
+                "(release_disposition_hold=true)"
+            )
     elif status == SKIPPED_BY_PREFLIGHT_STATUS:
         state = "skipped"
     elif status == EXCLUDED_BY_PREFLIGHT_STATUS:
@@ -9762,7 +10099,7 @@ def _part_end(part: dict[str, Any], parent_raw: Path) -> dict[str, Any]:
     ]
     return {
         "state": state,
-        "ended": state != "pending",
+        "ended": state not in {"pending", "held"},
         "blockers": blockers,
         "status": status,
         "run_failures": failures,
@@ -9771,7 +10108,7 @@ def _part_end(part: dict[str, Any], parent_raw: Path) -> dict[str, Any]:
     }
 
 
-def plan_split_parent_cleanup(manifest_path: Path) -> dict[str, Any]:
+def plan_split_parent_cleanup(manifest_path: Path, *, release_disposition_hold: bool = False) -> dict[str, Any]:
     """Describe the release of a split parent's raw tree, and what still refuses it. Changes nothing.
 
     WHAT A SPLIT PARENT IS. The unit that downloaded the data and owns <workspace>\\raw, which every part split
@@ -9786,7 +10123,9 @@ def plan_split_parent_cleanup(manifest_path: Path) -> dict[str, Any]:
     4. The parts' inputs, with the inputs a campaign disposition excluded, are the parent's inputs, each once.
     5. Every part has ended (_part_end): validated, released, failed after its retries, skipped, excluded or
        discarded; none has a Console that may still be running, and none keeps an artifact under the tree. A
-       part with a new run prepared after a validated run, which has not validated, has not ended.
+       part with a new run prepared after a validated run, which has not validated, has not ended, and neither
+       has a part its campaign disposition holds (multi-energy AIF) until an operator's skip lifts the hold:
+       with ``release_disposition_hold`` such a part reads as hold_released, which cleanup_split_parent records.
     6. No finalisation hold stands on the parent or a part (run_finalisation.raw_deletion_holds).
 
     The release is ``released`` when some part's outputs validated, else ``discarded``. The authorization - a
@@ -9833,7 +10172,7 @@ def plan_split_parent_cleanup(manifest_path: Path) -> dict[str, Any]:
             problems.append("its raw_owned_by names another unit")
         if _file_key(str(part.get("raw_directory") or "")) != _file_key(str(raw_root)):
             problems.append("its raw_directory is not the parent's")
-        end = _part_end(part, raw_root)
+        end = _part_end(part, raw_root, release_disposition_hold=release_disposition_hold)
         for problem in problems + end["blockers"]:
             blockers.append(f"Part {unit_id or part_path}: {problem}.")
         claimed.extend(str(path) for path in part.get("input_candidates") or [] if str(path).strip())
@@ -9920,6 +10259,7 @@ def cleanup_split_parent(
     *,
     campaign_authorization_path: str | Path | None = None,
     entry_point: str = "cleanup_split_parent",
+    release_disposition_hold: bool = False,
 ) -> dict[str, Any]:
     """Release a split parent's raw tree once every part has ended (plan_split_parent_cleanup).
 
@@ -9927,6 +10267,9 @@ def cleanup_split_parent(
     approval must cover boundary 5 for the parent and state delete_after_validated_output, as the parent does.
     Under the deletion lock the plan is drawn again, and any blocker stops it with nothing recorded. Then:
 
+    0. with ``release_disposition_hold`` - the operator's skip of the parts their campaign disposition holds -
+       each such part (hold_released in the plan) is ended as its own discard would end it, recording
+       disposition_hold_released_by "operator_skip". Without it a held part blocks the release (review r9-64);
     1. the crossing, if any, is recorded on the parent, and raw_release (msdial-split-parent-raw-release.v1) is
        written with state deleting: the kind, the target, its files and bytes, and each part as it ended;
     2. the tree is removed (download_store.unlink_tree), and raw_release becomes state removed. A tree that
@@ -9953,14 +10296,14 @@ def cleanup_split_parent(
             if isinstance(item, dict) and Path(str(item.get("manifest_path") or "")).is_file():
                 refresh_retained_artifacts(Path(str(item["manifest_path"])))
     crossing = _deletion_crossing(campaign_authorization_path, manifest, entry_point)
-    plan = plan_split_parent_cleanup(manifest_path)
+    plan = plan_split_parent_cleanup(manifest_path, release_disposition_hold=release_disposition_hold)
     if plan["already_released"] and not confirmed and crossing is None:
         return {**plan, "deleted": True, "already_released": True}
     if not confirmed and crossing is None:
         return {**plan, "deleted": False, "confirmation_required": True}
     raw_root = Path(plan["deletion_target"])
     with _raw_deletion_lock(manifest_path):
-        plan = plan_split_parent_cleanup(manifest_path)
+        plan = plan_split_parent_cleanup(manifest_path, release_disposition_hold=release_disposition_hold)
         if plan["already_released"]:
             return _split_parent_released_again(manifest_path, plan, crossing)
         if plan["blockers"]:
@@ -9973,6 +10316,18 @@ def cleanup_split_parent(
             }
         if crossing is not None:
             record_campaign_authorization(manifest_path, crossing)
+        holds_released = []
+        for part in plan["parts"]:
+            if part.get("state") != "hold_released":
+                continue
+            part_path = Path(str(part["manifest_path"])).resolve()
+            with _raw_deletion_lock(part_path):
+                current_part = read_manifest(part_path)
+                hold = unreleased_disposition_hold(current_part)
+                if hold:
+                    # The approval is the parent's, recorded there and in raw_release.authorized_by.
+                    _end_split_part(part_path, current_part, manifest_path, None, hold)
+                    holds_released.append(str(part.get("analysis_unit_id") or part_path))
         parts = [
             {
                 "analysis_unit_id": part.get("analysis_unit_id"),
@@ -9996,7 +10351,12 @@ def cleanup_split_parent(
             final_state="removed",
         )
         if not removal["deleted"]:
-            return {**plan, **removal, **({"campaign_authorization": crossing} if crossing else {})}
+            return {
+                **plan,
+                **removal,
+                **({"campaign_authorization": crossing} if crossing else {}),
+                **({"disposition_holds_released": holds_released} if holds_released else {}),
+            }
         released_at = str(removal["raw_release"].get("removed_at") or datetime.now(timezone.utc).isoformat())
         for part in plan["parts"]:
 
@@ -10032,6 +10392,9 @@ def cleanup_split_parent(
         "raw_directory": str(raw_root),
         "raw_release": read_manifest(manifest_path).get("raw_release"),
     }
+    if holds_released:
+        result["disposition_holds_released"] = holds_released
+        result["disposition_hold_released_by"] = DISPOSITION_HOLD_RELEASED_BY
     if released is not None:
         result["download_store"] = released
     if crossing is not None:
@@ -10362,22 +10725,7 @@ def _member_name_pairings(
     if not named and not stemmed:
         return result
     data_key = _file_key(str(data_root))
-    pool: dict[str, str] = {}
-    for key in extracted_members:
-        path = Path(key)
-        outermost = ""
-        for parent in path.parents:
-            parent_key = str(parent)
-            if parent_key == data_key or len(parent_key) <= len(data_key):
-                break
-            if parent.suffix.casefold() in FOLDER_INPUT_SUFFIXES:
-                outermost = parent_key
-        if outermost:
-            pool[outermost] = Path(outermost).name.casefold()
-        elif not _is_sidecar_name(path.name) and (
-            path.suffix.casefold() in RAW_SUFFIXES or is_convertible_input(path.name)
-        ):
-            pool[key] = path.name.casefold()
+    pool = _member_pool(extracted_members, data_root)
 
     def relative(key: str) -> str:
         return _member_under_root(key, data_key)
@@ -10501,6 +10849,172 @@ def _member_name_pairings(
             "key": token_key,
         }
     return result
+
+
+def _member_pool(extracted_members: dict[str, dict[str, Any]], data_root: Path) -> dict[str, str]:
+    """The analysable archive members, by _file_key, with their names casefolded: each file outside a vendor
+    folder that MS-DIAL opens or that converts to mzML (no sidecar), and each outermost .d/.raw folder holding
+    members. What _member_name_pairings pairs, and what _unattributed_members takes the rest of."""
+    data_key = _file_key(str(data_root))
+    pool: dict[str, str] = {}
+    for key in extracted_members:
+        path = Path(key)
+        outermost = ""
+        for parent in path.parents:
+            parent_key = str(parent)
+            if parent_key == data_key or len(parent_key) <= len(data_key):
+                break
+            if parent.suffix.casefold() in FOLDER_INPUT_SUFFIXES:
+                outermost = parent_key
+        if outermost:
+            pool[outermost] = Path(outermost).name.casefold()
+        elif not _is_sidecar_name(path.name) and (
+            path.suffix.casefold() in RAW_SUFFIXES or is_convertible_input(path.name)
+        ):
+            pool[key] = path.name.casefold()
+    return pool
+
+
+def unit_scoped_download(project: RepositoryProject) -> tuple[bool, str]:
+    """(whether the unit's download is its own alone, the basis or why not), from the Catalog's download_scope.
+
+    Its own: no bundle URL or object is shared with another unit (shared_unit_count above 1, or
+    bundle_shared_unit_count above 1, is a shared archive), and the scope is kind unit_files or every bundle URL
+    has shared_unit_count 1. Bases: unit_files, bundle_urls_unit_scoped; reasons not: shared_archive,
+    download_scope_not_unit_scoped.
+    """
+    scope = project.download_scope if isinstance(project.download_scope, dict) else {}
+
+    def count(item: Any) -> int | None:
+        try:
+            return int(item)
+        except (TypeError, ValueError):
+            return None
+
+    urls = [item for item in scope.get("bundle_urls") or [] if isinstance(item, dict)]
+    objects = [item for item in scope.get("objects") or [] if isinstance(item, dict)]
+    counts = [count(item.get("shared_unit_count")) for item in [*urls, *objects]]
+    if any(value is not None and value > 1 for value in [*counts, count(scope.get("bundle_shared_unit_count"))]):
+        return False, "shared_archive"
+    if str(scope.get("kind") or "") == "unit_files":
+        return True, "unit_files"
+    if urls and all(count(item.get("shared_unit_count")) == 1 for item in urls):
+        return True, "bundle_urls_unit_scoped"
+    return False, "download_scope_not_unit_scoped"
+
+
+def _unattributed_members(
+    project: RepositoryProject,
+    extracted_members: dict[str, dict[str, Any]] | None,
+    data_root: Path,
+    archive_samples: dict[str, str],
+    paired: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    """The archive members an undeclared, unit-scoped unit takes as unattributed inputs (user decision, 2026-10-07).
+
+    Returns {"members": {_file_key: {"member_name", "paired_by"}}, "record": {...} or None}. A unit whose Catalog
+    declared no analysis inputs pairs archive members with its sample rows exactly, by a prefixed name and by a
+    leading identifier (_member_name_pairings); a member none of them admits used to be left out, so ST001264 ran
+    3 of its 31 members. Where the unit's download is its own alone (unit_scoped_download), every such member that
+    MS-DIAL opens is an input all the same, with no sample row: its lineage row's name_pairing says
+    unattributed_member, and the record lists them (UNATTRIBUTED_MEMBERS_RULE). Like every input it is
+    preflighted, and its raw header decides its polarity and acquisition.
+
+    Never for a shared archive (a bundle URL another unit downloads too), whose other members are the other
+    unit's: the record then says why none was taken (applied false, reason) and lists them as left out. Also left
+    out, and listed so: a member that only converts to mzML (an mzXML, whose conversion is a reviewed step of its
+    own: requires_conversion); a member whose path names the polarity opposite to the unit's ion mode by a token of
+    its own, as the pairing rules read one (name_polarities: another unit's run, never this one's by any rule:
+    polarity_token_contradicts_ion_mode); and a member whose name another member carries in another encoding, an
+    admitted one or another unpaired one (one sample's, analysed twice otherwise: two_encodings_of_one_name). The record is None where no member is left unpaired.
+    """
+    result: dict[str, Any] = {"members": {}, "record": None}
+    if not project.analysis_unit_id or not extracted_members or declared_analysis_inputs(project):
+        return result
+    data_key = _file_key(str(data_root))
+    pool = _member_pool(extracted_members, data_root)
+    listed = set(_project_allowlist(project, analysis_only=True))
+    sample_names = _sample_file_names(project)
+
+    def on_disk(key: str) -> Path:
+        # In its case on disk, so the allow-list's relative forms and names compare as for any input.
+        return data_root / _member_under_root(key, data_key) if key.startswith(data_key) else Path(key)
+
+    remaining: dict[str, str] = {}
+    for key in sorted(pool):
+        path = on_disk(key)
+        if key in paired or key in archive_samples:
+            continue
+        if _admitted_by_unit(path, data_root, listed, sample_names, archive_samples, paired):
+            continue
+        remaining[key] = _member_under_root(key, data_key)
+    if not remaining:
+        return result
+    left_out: list[dict[str, str]] = []
+    kept: dict[str, str] = {}
+    stems: dict[str, list[str]] = {}
+    unit_polarity = str(project.ion_mode or "").strip().capitalize()
+    unit_polarity = unit_polarity if unit_polarity in {"Positive", "Negative"} else ""
+    polarity_named = names_state_polarity(_member_under_root(key, data_key) for key in pool)
+    for key, name in remaining.items():
+        if requires_msdial_conversion(Path(name).name) or is_convertible_input(Path(name).name):
+            left_out.append({"member_name": name, "reason": "requires_conversion"})
+            continue
+        if unit_polarity and name_polarities(name, polarity_named=polarity_named) - {unit_polarity}:
+            # Its path names the other polarity by a token of its own, as the pairing rules read one: another
+            # unit's run, which no pairing would give this one either.
+            left_out.append({"member_name": name, "reason": "polarity_token_contradicts_ion_mode"})
+            continue
+        kept[key] = name
+        stems.setdefault(PurePosixPath(name.casefold()).with_suffix("").as_posix(), []).append(key)
+    # A name a member the unit admitted already carries, in another encoding (X.raw beside an admitted X.mzXML), is
+    # that sample's second encoding, and so is a name two unpaired members carry.
+    admitted_stems = {
+        PurePosixPath(_member_under_root(key, data_key).casefold()).with_suffix("").as_posix()
+        for key in pool
+        if key not in remaining
+    }
+    for stem, keys in stems.items():
+        if len(keys) > 1 or stem in admitted_stems:
+            for key in keys:
+                left_out.append({"member_name": kept.pop(key), "reason": "two_encodings_of_one_name"})
+    scoped, basis = unit_scoped_download(project)
+    record: dict[str, Any] = {"rule": UNATTRIBUTED_MEMBERS_RULE, "applied": scoped}
+    if scoped:
+        result["members"] = {
+            key: {"member_name": name, "paired_by": UNATTRIBUTED_MEMBER_PAIRING} for key, name in kept.items()
+        }
+        record.update(count=len(kept), **unattributed_member_names(kept.values()), scope=basis)
+    else:
+        left_out = [*({"member_name": name, "reason": basis} for name in kept.values()), *left_out]
+        record.update(count=0, members=[], paths=[], reason=basis)
+    if left_out:
+        # Each left-out member by its basename, as members names them, and its path under the data root.
+        record["left_out"] = sorted(
+            (
+                {"member_name": PurePosixPath(item["member_name"]).name, "path": item["member_name"], "reason": item["reason"]}
+                for item in left_out
+            ),
+            key=lambda item: (item["path"].casefold(), item["reason"]),
+        )
+        record["left_out_count"] = len(left_out)
+    result["record"] = record
+    return result
+
+
+def unattributed_member_names(paths: Iterable[str]) -> dict[str, list[str]]:
+    """manifest.unattributed_members' two lists, from the members' '/'-separated paths under the data root.
+
+    members: each member's basename, as its input_lineage row's name_pairing.member_name gives it (the agreed
+    contract of 2026-10-07, review r9-64: the gate compares basenames with basenames). paths: the same members'
+    paths relative to the unit's raw data root, its parent's for a split part. Both sorted case-blind, one entry
+    per member, so two members of one basename in two folders are listed twice in members and apart in paths.
+    """
+    listed = sorted((str(item).replace("\\", "/") for item in paths), key=lambda item: (item.casefold(), item))
+    return {
+        "members": sorted((PurePosixPath(item).name for item in listed), key=lambda item: (item.casefold(), item)),
+        "paths": listed,
+    }
 
 
 def inferred_name_pairings(pairings: dict[str, dict[str, str]], data_root: Path) -> list[dict[str, str]]:
@@ -11782,7 +12296,11 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
         acquisition_mode = "Mixed"
     else:
         acquisition_mode = next(iter(acquisition_values), "Unknown")
-    from .raw_metadata_preflight import header_console_acquisition_type, spectrum_representation_fields
+    from .raw_metadata_preflight import (
+        collision_energy_fields,
+        header_console_acquisition_type,
+        spectrum_representation_fields,
+    )
 
     per_file = []
     for item in records:
@@ -11815,6 +12333,9 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
                 "separation": _metadata_value(item, "acquisition", "separation"),
                 "isolation_window_count": len(targets) if isinstance(targets, list) else None,
                 "collision_energy_count": len(energies) if isinstance(energies, list) else None,
+                # The distinct MS2 collision energies to 0.1 eV, with any Waters LockSpray reference function
+                # checked to carry none of them: what the AIF-as-SWATH rule of 2026-10-07 counts.
+                **collision_energy_fields(item),
                 # What the header alone means to the Console (DDA, SWATH, AIF or None). The disposition of
                 # a campaign unit may replace console_acquisition_type with the type the file runs as.
                 "header_console_acquisition_type": console,
