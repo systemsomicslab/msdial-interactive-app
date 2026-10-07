@@ -429,7 +429,9 @@ and last the build in the sibling `msrawdataworkbench` working checkout, reporte
 as `working_checkout_default`. `msdial_check_raw_metadata_extractor` lists every
 candidate with its provenance status and whether it is a pinned build. The pinned
 builds are data (`PINNED_BUILDS` in `raw_metadata_extractor.py`); the current one is
-msrawdataworkbench `592b6dbce` with MsdialWorkbench `f0583493a`. A unit under a
+msrawdataworkbench `5f604462d` with MsdialWorkbench `f0583493a`, and the earlier
+built pins (`a12293c61` and `592b6dbce`, each with `f0583493a`) are still pinned
+builds a campaign accepts. A unit under a
 campaign approval is preflighted only by the first extractor named, and only when it
 inspects as verified and pinned; anything else is refused before a file is read.
 

@@ -82,6 +82,7 @@ class PinnedBuildTests(_Scratch):
             [
                 (fixtures.RAW_HEAD, fixtures.COMMON_HEAD, "built"),
                 (fixtures.PREVIOUS_RAW_HEAD, fixtures.COMMON_HEAD, "built"),
+                (fixtures.EARLIER_RAW_HEAD, fixtures.COMMON_HEAD, "built"),
                 (fixtures.PLANNED_RAW_HEAD, fixtures.PLANNED_COMMON_HEAD, "planned"),
             ],
             [(entry["msrawdataworkbench"], entry["MsdialWorkbench"], entry["state"]) for entry in PINNED_BUILDS],
@@ -96,6 +97,23 @@ class PinnedBuildTests(_Scratch):
 
         self.assertEqual(("verified", True, "built"), (inspection["provenance_status"], inspection["pinned"], inspection["pin_state"]))
         self.assertEqual(([], []), campaign_refusal(inspection))
+
+    def test_a_verified_build_of_an_earlier_built_pair_is_still_accepted_by_a_campaign(self) -> None:
+        for name, head in (("previous", fixtures.PREVIOUS_RAW_HEAD), ("earlier", fixtures.EARLIER_RAW_HEAD)):
+            binary = _recorded_build(self.root / name, head, fixtures.COMMON_HEAD)
+
+            inspection = require_campaign_extractor(binary)
+
+            self.assertEqual(head, inspection["msrawdataworkbench_commit"])
+            self.assertEqual(("verified", True, "built"), (inspection["provenance_status"], inspection["pinned"], inspection["pin_state"]))
+            self.assertEqual(([], []), campaign_refusal(inspection))
+
+    def test_a_refusal_names_every_built_pair_with_the_current_one_first(self) -> None:
+        binary = _recorded_build(self.root / "planned", fixtures.PLANNED_RAW_HEAD, fixtures.PLANNED_COMMON_HEAD)
+
+        _codes, reasons = campaign_refusal(inspect_raw_metadata_extractor(binary))
+
+        self.assertIn("(5f604462d-f0583493a, a12293c61-f0583493a, 592b6dbce-f0583493a)", reasons[0])
 
     def test_a_build_of_the_planned_pair_is_recognised_but_not_pinned(self) -> None:
         binary = _recorded_build(self.root / "planned", fixtures.PLANNED_RAW_HEAD, fixtures.PLANNED_COMMON_HEAD)
