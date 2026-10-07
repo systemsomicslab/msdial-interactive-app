@@ -31,6 +31,18 @@ def summarize_jobs(
             "guided_analysis_planning",
             "reusable_worksets",
             "single_file_peak_count_tuning",
+            # The stepped threshold falls back from the instrument-family step to the fine step (10 for
+            # QTOF-type, 100 for FT, an absolute floor), only when no family-step threshold lands in the target
+            # range; the estimate and the unit's peak_height_diagnostics record threshold_step (the step used),
+            # coarse_threshold_step, fine_threshold_step, step_fallback, fallback_reason and within_target_range.
+            # The family step is always the coarse step; a requested step is recorded, never searched.
+            "peak_height_fine_step_fallback",
+            # Within the range, the highest threshold keeping at least the lower bound (selection_rule).
+            "peak_height_lower_end_selection",
+            # An mzML's header names its instrument family: Orbitrap-class and FT-ICR are Fourier-transform.
+            "mzml_header_instrument_family",
+            # A production run's actual per-file peak counts beside the estimate (production_peak_counts).
+            "production_peak_counts",
             "console_path_discovery_and_persistence",
             "console_release_channel_inspection",
             "local_source_console_build_with_provenance",
@@ -76,6 +88,10 @@ def summarize_jobs(
             "mzxml_requires_conversion_to_mzml",
             "campaign_mzxml_converted_to_mzml",
             "campaign_mzxml_polarity_from_declared_ion_mode",
+            # A repository unit's MS1 and MS2 data type are what its inputs deliver to MS-DIAL where every
+            # input that runs agrees (data_type_provenance, basis raw_header, delivered_centroid or default),
+            # and the gate refuses a run set against a decided level.
+            "repository_data_type_as_delivered",
             "automatic_alignment_rt_correction",
             "console_time_limits",
             "cancel_console_and_download_jobs",
@@ -87,12 +103,35 @@ def summarize_jobs(
             "split_key_acquisition_ion_mobility_polarity",
             "split_parent_raw_release",
             "campaign_authorized_raw_cleanup_and_discard",
+            # A campaign disposition takes each file's acquisition from its read raw header first (2026-10-06):
+            # declared_vs_header records each declaration a header overrode, with its declaration_source; an
+            # Unknown header is excluded; MS1-only files are not folded into DDA in a unit declared DIA or AIF;
+            # and the execution gate refuses a row that contradicts the Console type its header gives, and decides
+            # an applied disposition from before 0.5.29 again, refusing the rows that decision would not run.
+            "campaign_header_first_acquisition",
+            # A prepare never writes over a finished run's files: a unit past its run is refused (run_finished)
+            # unless new_run=true, which keeps that run's records under superseded_runs and writes the analysis
+            # CSV into a new output directory; a pre-0.5.29 disposition is decided again only then.
+            "repository_prepare_new_production_run",
             # A campaign's lease (and any other under store_mode "always") fetches each object once per
             # accession into its download store and gives the unit a tree of links; a unit's release releases its
             # claims, and the store collects what no live claim holds under the approval that covered it.
             "accession_download_store",
             "waiting_for_shared_download_job_state",
             "batch_plan_distinct_objects_and_pre_claims",
+            # The LC-MS peak-count diagnostic behind /api/agent/tuning/run loads no annotation library: only
+            # its peaks and their heights are read, and annotation changes neither. Its records say
+            # annotation "skipped_for_peak_count".
+            "peak_count_diagnostic_without_annotation",
+            # Replicate rows that share a sample id are each their own input and analysis-CSV row (the sample
+            # row, not the id, is mapped), and an undeclared unit's archive member that carries a declared raw
+            # file name behind a prefix is that file's, one to one, recorded as paired_by prefixed_member_name.
+            "repository_replicate_rows_as_inputs",
+            "repository_prefixed_member_names",
+            # A declared raw file name and an archive member that share their leading identifier (VV_13) are one
+            # file where the key is unique on both sides, recorded as paired_by leading_identifier_token with the
+            # warning input_names_paired_by_inference; no inferred pairing crosses a polarity token.
+            "repository_leading_identifier_names",
         ],
         "workflow_outline": [
             "Inspect the input path and collect the guided scientific choices.",

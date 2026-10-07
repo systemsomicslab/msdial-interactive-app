@@ -3865,8 +3865,12 @@ $("#autoTunePeakHeight").addEventListener("click", () => runUiAction(async () =>
     Number(estimate.minimum_peak_height), Number($("#tuningHeight").max),
   );
   updateTuningCounts();
+  const fallback = estimate.step_fallback
+    ? ` The family step ${estimate.coarse_threshold_step} gave no count in range, so step ${estimate.threshold_step} was used.`
+    : "";
+  const warnings = (estimate.warnings || []).map((item) => ` Warning: ${item}`).join("");
   $("#autoTunePeakStatus").textContent =
-    `Selected ${estimate.minimum_peak_height} (${estimate.estimated_peak_count} peaks; step ${estimate.threshold_step}).`;
+    `Selected ${estimate.minimum_peak_height} (${estimate.estimated_peak_count} peaks; step ${estimate.threshold_step}).${fallback}${warnings}`;
 }));
 connectThresholdInputs("tuneWeighted", "tuneWeightedNumber");
 connectThresholdInputs("tuneSimple", "tuneSimpleNumber");

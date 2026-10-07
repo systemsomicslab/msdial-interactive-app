@@ -11,6 +11,7 @@ import os
 import random
 import re
 import secrets
+import shutil
 import socket
 import ssl
 import stat
@@ -22,6 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -58,6 +60,7 @@ from .mzxml_conversion import (
     converter_identity,
 )
 from .process_liveness import process_created_at, process_is_alive
+from .raw_metadata_preflight import INFERRED_PAIRING_WARNING
 from .reader_created import container_members, reader_created_files, reader_created_names
 
 try:
@@ -1166,6 +1169,30 @@ ADAPTERS = {
 }
 
 
+DECLARED_INSTRUMENT_FIELD = "project.repository_metadata.catalog_handoff.technical_settings.instrument"
+
+
+def declared_instrument(manifest_path: str | Path | None) -> str:
+    """The instrument a repository unit's Catalog handoff declares (DECLARED_INSTRUMENT_FIELD), or "".
+
+    The submitter's own words ("Thermo Q Exactive Orbitrap"). The peak-count diagnostic reads it only where
+    the representative file's format leaves its instrument family at a default, such as an mzML whose header
+    names no instrument (agent_workflow.representative_instrument_family). Never raises.
+    """
+    text = str(manifest_path or "").strip()
+    if not text:
+        return ""
+    try:
+        manifest = read_manifest(text)
+    except (OSError, ValueError):
+        return ""
+    project = manifest.get("project") if isinstance(manifest.get("project"), dict) else {}
+    metadata = project.get("repository_metadata") if isinstance(project.get("repository_metadata"), dict) else {}
+    handoff = metadata.get("catalog_handoff") if isinstance(metadata.get("catalog_handoff"), dict) else {}
+    settings = handoff.get("technical_settings") if isinstance(handoff.get("technical_settings"), dict) else {}
+    return str(settings.get("instrument") or "").strip()
+
+
 def conversion_polarity_declaration(project: RepositoryProject | dict[str, Any]) -> dict[str, Any]:
     """The ion mode a campaign's convert stage reads for a unit, and the polarity it imputes from it.
 
@@ -2085,9 +2112,15 @@ def create_download_lease(
         archive_samples = _archive_sample_attribution(
             project, archive_extractions, extracted_members, data_root
         )
+        # The archive members a sample names behind a prefix (ST001264's 021518_387057_CSHp_BioRec1.raw for
+        # BioRec1.raw) or by its leading identifier (ST001359's VV_13_HEpG2_C1_exp344_pos.raw for
+        # VV_13_HEpG2_C1_pos.raw), decided once, one to one, for every stage below and for the lineage; and the
+        # pairings refused, recorded with them.
+        name_pairings = _member_name_pairings(project, extracted_members, data_root)
+        prefixed_members = name_pairings["paired"]
         mzxml_found = _find_mzxml_files(data_root) if campaign_authorization else []
         conversion_sources = _select_conversion_sources(
-            mzxml_found, data_root, project, archive_samples, archive_extractions
+            mzxml_found, data_root, project, archive_samples, archive_extractions, prefixed_members
         ) if mzxml_found else []
         conversion: dict[str, Any] | None = None
         stands_for: dict[str, str] = {}
@@ -2099,7 +2132,7 @@ def create_download_lease(
                 data_root,
                 readable,
                 _extracted_keys(extracted_members, data_root),
-                _readable_inputs_admitted(readable, data_root, project, archive_samples),
+                _readable_inputs_admitted(readable, data_root, project, archive_samples, prefixed_members),
             )
             chosen_over = {_file_key(item["mzxml"]) for item in choices}
 
@@ -2161,7 +2194,7 @@ def create_download_lease(
 
         stages.start("attribute")
         selected_extracted = _filter_project_allowlist_paths(
-            extracted, data_root, project, archive_samples=archive_samples
+            extracted, data_root, project, archive_samples=archive_samples, prefixed_members=prefixed_members
         )
         verified_checksums: dict[str, dict[str, Any]] = {}
         checksum_validation = _verify_project_allowlist_checksums(
@@ -2175,6 +2208,7 @@ def create_download_lease(
             archive_extractions=archive_extractions,
             stands_for=stands_for,
             set_aside=[item["path"] for item in (conversion or {}).get("excluded") or []],
+            prefixed_members=prefixed_members,
         )
         inputs, excluded_inputs, mzml_scanned = _exclude_undecodable_inputs(inputs)
         ignored_inputs = len(all_inputs) - len(inputs) - len(excluded_inputs)
@@ -2209,9 +2243,16 @@ def create_download_lease(
             excluded_inputs=excluded_inputs,
             conversions=conversions,
             stands_for={key: value for key, value in stands_for.items() if key in kept},
+            prefixed_members=prefixed_members,
         )
         if conversion_rows:
             input_lineage["conversion_sources"] = conversion_rows
+        # The inputs admitted only because a rule inferred which declared raw file they are; each lineage row
+        # says so (name_pairing), and the attribute stage and the manifest list every such pairing.
+        paired_by_rule = Counter(
+            prefixed_members[_file_key(item)]["paired_by"] for item in inputs if _file_key(item) in prefixed_members
+        )
+        inferred = inferred_name_pairings(prefixed_members, data_root)
         pruned: dict[str, Any] = {}
         if store_lease is not None:
             # Now that the unit's own files are known: the links to anything else the store's objects
@@ -2238,6 +2279,18 @@ def create_download_lease(
             declared_files_verified=checksum_validation.get("verified", 0),
             archives_verified_at_download=checksum_validation.get("archives_verified_at_download", 0),
             **({"pruned_links": pruned.get("removed_files", 0)} if store_lease is not None else {}),
+            **(
+                {"prefixed_member_pairings": paired_by_rule[PREFIXED_MEMBER_PAIRING]}
+                if paired_by_rule[PREFIXED_MEMBER_PAIRING]
+                else {}
+            ),
+            **(
+                {"leading_identifier_token_pairings": paired_by_rule[LEADING_IDENTIFIER_TOKEN_PAIRING]}
+                if paired_by_rule[LEADING_IDENTIFIER_TOKEN_PAIRING]
+                else {}
+            ),
+            **({"inferred_name_pairings": inferred, "warnings": [INFERRED_PAIRING_WARNING]} if inferred else {}),
+            **({"refused_name_pairings": name_pairings["refused"]} if name_pairings["refused"] else {}),
         )
 
         stages.start("record")
@@ -2288,6 +2341,16 @@ def create_download_lease(
             manifest["execution_allowed"] = project.eligible
         if container_completeness["required"]:
             manifest["container_completeness"] = container_completeness
+        if inferred or name_pairings["refused"]:
+            # Which declared raw file an archive member is, where a rule inferred it rather than an exact name:
+            # the user decided on 2026-10-06 that such a pairing is always left on record. Only where one was
+            # made or refused, so every other lease records what it always did.
+            manifest["input_name_pairings"] = {
+                "paired": inferred,
+                "refused": list(name_pairings["refused"]),
+            }
+        if inferred:
+            manifest["warnings"] = [INFERRED_PAIRING_WARNING]
         warnings = _archive_warnings(archive_extractions)
         if warnings:
             manifest["archive_warnings"] = warnings
@@ -3306,6 +3369,7 @@ def build_input_lineage(
     excluded_inputs: list[dict[str, Any]] | None = None,
     conversions: dict[str, dict[str, Any]] | None = None,
     stands_for: dict[str, str] | None = None,
+    prefixed_members: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """One row per analysis input: what it is, where its bytes came from, and what vouches for them.
 
@@ -3361,6 +3425,13 @@ def build_input_lineage(
     AN INPUT THAT STANDS FOR AN MZXML - one converted from it, or a readable encoding of its sample the lease
     chose over it (``stands_for``, by _file_key; the latter's row carries encoding_choice) - is given the
     sample and the declared names of that mzXML wherever its own name gives none.
+
+    AN ARCHIVE MEMBER A RULE PAIRED WITH A DECLARED NAME - behind a prefix, or by its leading identifier
+    (``prefixed_members``, by _file_key, the lease's _member_name_pairings; worked out here from
+    ``extracted_members`` when not given) - is the sample's that declares that name, and its row says how
+    it was paired (name_pairing: the declared raw file, the member's name, paired_by prefixed_member_name or
+    leading_identifier_token, and for the latter the key), so the analysis-CSV builder finds the same
+    sample row by it.
     """
     verified_checksums = verified_checksums or {}
     excluded_inputs = excluded_inputs or []
@@ -3373,6 +3444,8 @@ def build_input_lineage(
     # An input that came out of an archive one sample names (X.zip) is that sample's, although its own
     # name (X.d) is no sample's.
     archive_samples = _archive_sample_attribution(project, archive_extractions, extracted_members, data_root)
+    if prefixed_members is None:
+        prefixed_members = _prefixed_member_pairing(project, extracted_members, data_root)
     # Each extraction's nested archives by label, built once (_nesting_index), so tracing a file to
     # the archives that held it does not walk the whole lineage once per file.
     nesting: dict[int, dict[str, list[dict[str, Any]]]] = {}
@@ -3419,8 +3492,9 @@ def build_input_lineage(
                     if parent_key == data_key or len(parent_key) < len(data_key):
                         break
 
-    def naming(path: Path, key: str) -> tuple[set[str], set[str]]:
-        """(the declared-name forms of a path relative to the data root, the samples its name gives)."""
+    def naming(path: Path, key: str) -> tuple[set[str], set[str], dict[str, str] | None]:
+        """(the declared-name forms of a path relative to the data root, the samples its name gives, and the
+        inferred pairing that gave them, where that is what did)."""
         try:
             relative = path.resolve().relative_to(data_root.resolve()).as_posix()
         except ValueError:
@@ -3435,20 +3509,24 @@ def build_input_lineage(
         matched = sample_names.get(base) or sample_names.get(PurePosixPath(base).stem) or set()
         if not matched and key in archive_samples:
             matched = {archive_samples[key]}
-        return candidates, matched
+        if not matched and key in prefixed_members:
+            pairing = prefixed_members[key]
+            return candidates, sample_names.get(pairing["declared_raw_file"].casefold()) or set(), pairing
+        return candidates, matched, None
 
     rows = []
     for text in inputs:
         path = Path(text)
         key = _file_key(text)
-        candidates, matched_samples = naming(path, key)
+        candidates, matched_samples, pairing = naming(path, key)
+        paired_name = path.name
         stand = stands_for.get(key, "")
         if stand:
-            stand_candidates, stand_samples = naming(Path(stand), _file_key(stand))
+            stand_candidates, stand_samples, stand_pairing = naming(Path(stand), _file_key(stand))
             if not {item for item in candidates if item in declared}:
                 candidates = stand_candidates
-            if not matched_samples:
-                matched_samples = stand_samples
+            if not matched_samples and not pairing:
+                matched_samples, pairing, paired_name = stand_samples, stand_pairing, Path(stand).name
         row: dict[str, Any] = {
             "path": str(path),
             "kind": "",
@@ -3458,6 +3536,16 @@ def build_input_lineage(
             "source": {},
             "checksums": {},
         }
+        if pairing:
+            # Which declared raw file the input is, and by which rule: its own name carries that name only
+            # behind a prefix, or shares its leading identifier. The analysis-CSV builder finds the sample row by it.
+            row["name_pairing"] = {
+                "declared_raw_file": pairing["declared_raw_file"],
+                "member_name": paired_name,
+                "paired_by": pairing["paired_by"],
+                # The leading identifier both names share, where that is the rule that paired them.
+                **({"key": pairing["key"]} if pairing.get("key") else {}),
+            }
         if key in conversions:
             conversion = conversions[key]
             record = conversion["record"]
@@ -3751,13 +3839,15 @@ def _select_conversion_sources(
     project: RepositoryProject,
     archive_samples: dict[str, str],
     archive_extractions: list[dict[str, Any]],
+    prefixed_members: dict[str, dict[str, str]] | None = None,
 ) -> list[str]:
     """The mzXML that are this unit's to analyse, as the attribute stage will admit what is written from them.
 
     The Catalog's declared inputs, matched by path, where it declared them. Otherwise a file the listing
     names is converted only when the listing gives it for analysis (requires_conversion; an mzXML the
     Catalog demoted to raw_alternate beside a vendor file is not), and a file only an archive held when one
-    of the unit's samples names it, or it came out of the archive one sample names. A project with no
+    of the unit's samples names it (exactly, or by an inferred pairing: prefixed_members), or it came out of the
+    archive one sample names. A project with no
     analysis unit has no Catalog decision of which files are its inputs, and converts none: every mzXML of
     an accession would be converted beside the vendor files of the same samples.
     """
@@ -3800,7 +3890,11 @@ def _select_conversion_sources(
         if forms & listed:
             if forms & sources:
                 selected.append(item)
-        elif _matches_sample_file_names(Path(item), sample_names) or _file_key(item) in archive_samples:
+        elif (
+            _matches_sample_file_names(Path(item), sample_names)
+            or _file_key(item) in archive_samples
+            or _file_key(item) in (prefixed_members or {})
+        ):
             selected.append(item)
     return selected
 
@@ -4504,12 +4598,17 @@ def record_campaign_authorization(manifest_path: str | Path, crossing: dict[str,
     Raises when it cannot write, unlike the failure recorders: the crossing is written before the step it
     authorizes, and a step whose authority cannot be recorded does not run.
     """
+    return update_manifest(Path(manifest_path), campaign_authorization_change(crossing))
+
+
+def campaign_authorization_change(crossing: dict[str, Any]) -> Any:
+    """The change record_campaign_authorization makes, for a write that carries it with the step it authorizes."""
     entry = dict(crossing)
 
     def change(manifest: dict[str, Any]) -> None:
         manifest["campaign_authorizations"] = [*(manifest.get("campaign_authorizations") or []), entry]
 
-    return update_manifest(Path(manifest_path), change)
+    return change
 
 
 def record_run_failure(
@@ -4581,6 +4680,7 @@ def record_run_start(
     command: list[str] | None = None,
     timeout_seconds: float | None = None,
     idle_timeout_seconds: float | None = None,
+    data_types: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Open one run attempt in the unit's manifest, before its Console starts. Never raises.
 
@@ -4625,6 +4725,11 @@ def record_run_start(
         "output_directory": str(output_directory or ""),
         "timeout_seconds": timeout_seconds,
         "idle_timeout_seconds": idle_timeout_seconds,
+        # The MS1 and MS2 data type this attempt's method file asks for, each with its basis (raw_header or
+        # default), and the warnings of the decision; the decision itself is in the run's run-manifest.json.
+        "data_types": {
+            key: value for key, value in (data_types or {}).items() if key != "decision"
+        },
         # The process that starts the Console, identified the way a download lease's owner is.
         "backend": {
             "pid": os.getpid(),
@@ -4768,8 +4873,13 @@ def record_peak_height_diagnostic(
     representative: dict[str, Any] | None = None,
     job_id: str = "",
     diagnostic_directory: str = "",
+    annotation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write a peak-count diagnostic into the analysis unit's own manifest.
+
+    ``annotation`` is the diagnostic's own record of whether it annotated
+    (workflow.DIAGNOSTIC_ANNOTATION_SKIPPED for a campaign diagnostic), kept beside the count it
+    qualifies. A diagnostic from a version that kept no such record leaves the field out.
 
     WHAT THIS ENDS. The project contract requires the zero-threshold diagnostic before every
     production repository run, and requires "the method, representative sample, diagnostic count,
@@ -4806,7 +4916,24 @@ def record_peak_height_diagnostic(
         "diagnostic_peak_count": estimate.get("diagnostic_peak_count"),
         "estimated_peak_count": estimate.get("estimated_peak_count"),
         "threshold_step": estimate.get("threshold_step"),
+        # The user's rules of 2026-10-06: the family step first, and the fine step (10 QTOF-type, 100
+        # FT) only when no multiple of the family step lands in the target range; within the range, the
+        # highest threshold keeping at least the lower bound. Whether the fine step was used, and
+        # whether even it missed, must be on record beside the threshold it produced.
+        "coarse_threshold_step": estimate.get("coarse_threshold_step", estimate.get("threshold_step")),
+        "fine_threshold_step": estimate.get("fine_threshold_step"),
+        "step_fallback": bool(estimate.get("step_fallback", False)),
+        "fallback_reason": estimate.get("fallback_reason"),
+        "within_target_range": estimate.get("within_target_range"),
+        # None for an estimate from before the rule was recorded: it chose the threshold nearest the
+        # range's midpoint, not the highest keeping the lower bound.
+        "selection_rule": estimate.get("selection_rule"),
+        # The family the coarse step and the fine step's floor were chosen by, and what it rests on (the
+        # file's format, its mzML header, or the repository's declared instrument).
+        "instrument_family": (representative or {}).get("instrument_family", estimate.get("instrument_family")),
+        "instrument_family_source": (representative or {}).get("instrument_family_source"),
         "method": estimate.get("method", ""),
+        **({"annotation": dict(annotation)} if isinstance(annotation, dict) else {}),
     }
 
     def change(manifest: dict[str, Any]) -> None:
@@ -5097,6 +5224,10 @@ def disposition_hold(manifest: dict[str, Any]) -> dict[str, Any] | None:
     raw_cleaned and the like) or its raw data were discarded; applied again, a disposition would move a
     finished unit out of the cleanup-ready states and make it look as if it were waiting to run.
     run_in_progress: a Console of its own may still be running.
+
+    Nothing decides a unit past its run again in place. start_new_production_run, as a new production run is
+    prepared for it, moves the finished run's records into superseded_runs first; the unit is then no longer past
+    its run, and a pre-0.5.29 disposition is decided again for the new run only.
     """
     status = str(manifest.get("status") or "")
     if status == SPLIT_PARENT_STATUS or manifest.get("split_into"):
@@ -5152,6 +5283,37 @@ def _declared_technical(manifest: dict[str, Any]) -> dict[str, Any]:
     if isinstance(earlier, dict):
         return dict(earlier)
     return declared_technical(manifest.get("project"))
+
+
+def _split_parent_declared(manifest: dict[str, Any], depth: int = 0) -> str | None:
+    """The acquisition mode a split part's parent declared; None for a unit that is no split part.
+
+    A split from 0.5.29 records it (split_from.parent_declared_acquisition_mode). For a part split before that,
+    it is read from the parent manifest as _declared_technical gives it, and through the parent's own parent
+    where the parent is itself a part; "" where the parent cannot be read.
+    """
+    from .raw_metadata_preflight import SPLIT_PARENT_DECLARED_FIELD
+
+    split = manifest.get("split_from")
+    if not isinstance(split, dict):
+        return None
+    recorded = str(split.get(SPLIT_PARENT_DECLARED_FIELD) or "").strip()
+    if recorded:
+        return recorded
+    parent_path = str(split.get("manifest_path") or "").strip()
+    if not parent_path or depth > 8:
+        return ""
+    try:
+        parent = read_manifest(parent_path) if Path(parent_path).is_file() else None
+    except (OSError, ValueError):
+        parent = None
+    if not isinstance(parent, dict):
+        return ""
+    grandparent = _split_parent_declared(parent, depth + 1)
+    if grandparent is not None:
+        return grandparent
+    mode = str(_declared_technical(parent).get("acquisition_mode") or "").strip()
+    return "" if mode.casefold() == "unknown" else mode
 
 
 def _previous_reads(manifest: dict[str, Any], manifest_path: Path) -> dict[str, dict[str, Any]]:
@@ -5418,6 +5580,11 @@ def _per_input_entries(
                 "header_console_acquisition_basis": "",
                 "console_acquisition_type": None,
                 "console_acquisition_basis": "",
+                "spectrum_representation": "",
+                "spectrum_representation_source": "",
+                "spectrum_representation_by_level": {},
+                "native_format": "",
+                "instrument_model": "",
                 "acquisition_start_time": "",
                 "acquisition_start_time_evidence": "",
             }
@@ -5446,6 +5613,7 @@ def _record_preflight(
         READ_OUTCOMES,
         decide_disposition,
         file_key,
+        delivered_data_types,
     )
 
     # A split unit - split before this preflight, or while its headers were being read - stays split: a
@@ -5497,6 +5665,10 @@ def _record_preflight(
     summary = _summarize_raw_metadata(records)
     summary["per_file"] = _per_input_entries(summary["per_file"], outcomes, inputs)
     summary["coverage"] = coverage
+    # Over every inspected input, before any is excluded: where the files would hand MS-DIAL different
+    # spectra, or the records cannot tell, this is where it shows. The run decides again over the inputs it
+    # runs (run_data_types).
+    summary["data_types"] = {**delivered_data_types(summary["per_file"]), "scope": "inspected_inputs"}
     block["summary"] = summary
 
     if not records:
@@ -5646,7 +5818,9 @@ def _record_preflight(
         if excluded_part:
             current["project"] = project_before
         return
-    disposition = decide_disposition(current, declared=declared, extractor=extractor)
+    disposition = decide_disposition(
+        current, declared=declared, extractor=extractor, parent_declared=_split_parent_declared(current)
+    )
     assignments = disposition.pop("assignments")
     disposition["applied"] = campaign is not None
     if campaign is not None:
@@ -5768,29 +5942,13 @@ def classify_preflight(
     fields is decided from the extractor records its preflight left (_rebuilt_legacy_per_file), and
     recorded as it was.
     """
-    from .raw_metadata_preflight import decide_disposition
-
     target = Path(manifest_path).resolve()
     campaign = preflight_campaign(read_manifest(target), campaign_authorization_path)
     with manifest_lock(target):
         current = read_manifest(target)
         preflight = current.get("raw_metadata_preflight") or {}
-        declared = preflight.get("declared")
-        if not isinstance(declared, dict):
-            declared = _declared_technical(current)
-        view = current
-        rebuilt = _rebuilt_legacy_per_file(current)
-        if rebuilt is not None:
-            view = copy.deepcopy(current)
-            view["raw_metadata_preflight"]["summary"]["per_file"] = rebuilt
-        disposition = decide_disposition(view, declared=declared)
+        disposition = _decide_recorded_preflight(current)
         assignments = disposition.pop("assignments")
-        if rebuilt is not None and "raw_metadata_preflight_legacy" not in disposition["warnings"]:
-            disposition["warnings"].append("raw_metadata_preflight_legacy")
-            disposition["detail"].append(
-                "The per-file records predate recorded formats, MS-level flags and isolation; the unit was "
-                "decided from the extractor records its preflight left."
-            )
         held = disposition_hold(current)
         if held is None and not (preflight.get("summary") or {}):
             held = {
@@ -5807,6 +5965,664 @@ def classify_preflight(
         current["campaign_disposition"] = disposition
         _write_json(target, current)
     return disposition
+
+
+def _decide_recorded_preflight(current: dict[str, Any]) -> dict[str, Any]:
+    """decide_disposition over a unit's recorded preflight, as classify_preflight decides it. Changes nothing.
+
+    The declaration is the one the preflight recorded, else _declared_technical; a split part is also held to
+    its parent's declaration (_split_parent_declared); a summary written before the per-file fields is decided
+    from the extractor records its preflight left (_rebuilt_legacy_per_file). The result keeps ``assignments``.
+    """
+    from .raw_metadata_preflight import decide_disposition
+
+    preflight = current.get("raw_metadata_preflight") or {}
+    declared = preflight.get("declared")
+    if not isinstance(declared, dict):
+        declared = _declared_technical(current)
+    view = current
+    rebuilt = _rebuilt_legacy_per_file(current)
+    if rebuilt is not None:
+        view = copy.deepcopy(current)
+        view["raw_metadata_preflight"]["summary"]["per_file"] = rebuilt
+    disposition = decide_disposition(view, declared=declared, parent_declared=_split_parent_declared(current))
+    if rebuilt is not None and "raw_metadata_preflight_legacy" not in disposition["warnings"]:
+        disposition["warnings"].append("raw_metadata_preflight_legacy")
+        disposition["detail"].append(
+            "The per-file records predate recorded formats, MS-level flags and isolation; the unit was "
+            "decided from the extractor records its preflight left."
+        )
+    return disposition
+
+
+def is_legacy_disposition(manifest: dict[str, Any]) -> bool:
+    """Whether the unit carries an applied disposition decided before 0.5.29 (no declared_acquisition_source)."""
+    applied = _applied_disposition(manifest)
+    return bool(applied) and "declared_acquisition_source" not in applied
+
+
+def finished_production_run(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """The run this unit is past, whose files no prepare may write over; None for a unit that is not past one.
+
+    A unit is past its run when its status is past every preflight (mztab_validated, completed,
+    cleanup_pending_confirmation, raw_cleaned, discarded) or when a production run of it was finalised
+    (finalized_at: the Console completed and its outputs were inventoried, validation_failed included). Its
+    output_directory then holds that run's files, the analysis CSV the Console read among them, and
+    retained_artifact_inventory records their checksums: a prepare that wrote its analysis CSV there would
+    leave the unit's records describing a run that never happened.
+    """
+    status = str(manifest.get("status") or "")
+    if status not in PAST_PREFLIGHT_STATUSES and not manifest.get("finalized_at"):
+        return None
+    return {
+        "status": status,
+        "output_directory": str(manifest.get("output_directory") or ""),
+        "finalized_at": manifest.get("finalized_at"),
+        "job_id": str((manifest.get("finalized_run") or {}).get("job_id") or ""),
+        "raw_released": status in RAW_RELEASED_STATUSES,
+    }
+
+
+def _redecide_legacy_in(current: dict[str, Any]) -> dict[str, Any]:
+    """Decide current's pre-0.5.29 disposition again under rule B2 and apply it to current, in place.
+
+    The caller has already found that nothing holds the unit. Raises what the decision raises; the caller then
+    drops ``current``, which may be half changed.
+    """
+    previous = copy.deepcopy(_applied_disposition(current))
+    disposition = _decide_recorded_preflight(current)
+    assignments = disposition.pop("assignments")
+    disposition["applied"] = True
+    campaign = previous.get("campaign") or preflight_campaign(current)
+    if campaign:
+        disposition["campaign"] = dict(campaign)
+    summary = (current.get("raw_metadata_preflight") or {}).get("summary") or {}
+    disposition["supersedes"] = {
+        **previous,
+        "per_file": [
+            {
+                "file": str(entry.get("file") or ""),
+                "console_acquisition_type": entry.get("console_acquisition_type"),
+                "console_acquisition_basis": entry.get("console_acquisition_basis") or "",
+            }
+            for entry in summary.get("per_file") or []
+            if isinstance(entry, dict)
+        ],
+    }
+    disposition["redecided"] = {
+        "reason": "legacy_disposition",
+        "by": "msdial_prepare_repository_reanalysis",
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _apply_disposition(current, disposition, assignments)
+    current["campaign_disposition"] = disposition
+    return {
+        "redecided": True,
+        "disposition": disposition["disposition"],
+        "reasons": list(disposition.get("reasons") or []),
+        "console_acquisition_type": disposition.get("console_acquisition_type"),
+        "excluded_inputs": [
+            {"file": Path(str(item.get("path") or "")).name, "reason": str(item.get("reason") or "")}
+            for item in disposition.get("excluded_inputs") or []
+            if isinstance(item, dict)
+        ],
+        "status_after": str(current.get("status") or ""),
+        "execution_allowed": current.get("execution_allowed") is True,
+    }
+
+
+def _redecision_base(current: dict[str, Any]) -> dict[str, Any]:
+    previous = _applied_disposition(current)
+    return {
+        "previous_disposition": str(previous.get("disposition") or ""),
+        "previous_console_acquisition_type": previous.get("console_acquisition_type"),
+        "status": str(current.get("status") or ""),
+        "redecided": False,
+        "held": None,
+    }
+
+
+def redecide_legacy_disposition(
+    manifest: dict[str, Any], *, write: bool
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Decide an applied pre-0.5.29 disposition again under the header-first rule, as the unit is prepared.
+
+    WHY HERE. The execution gate refuses the rows such a disposition runs and the header-first rule (user
+    decision, 2026-10-06; rule B2) would not (_legacy_disposition_refusals). Preparing the unit
+    (msdial_prepare_repository_reanalysis) is the step that precedes any run, and the analysis CSV it writes is
+    what the gate checks, so the unit is decided again there and the CSV is built from that decision.
+
+    Returns (record, manifest). record is None, and manifest the one given, for a unit with no applied
+    disposition or one decided from 0.5.29 on. Otherwise the unit is decided from its recorded preflight
+    (_decide_recorded_preflight) and the decision applied as classify_preflight applies it, under the campaign
+    the old disposition recorded; with ``write`` the manifest on disk (``manifest_path``) is changed under its
+    lock, otherwise only the copy returned. The old disposition, with each input's type and basis under it,
+    is kept in the new one's ``supersedes``.
+
+    NOT A UNIT PAST ITS RUN. A unit disposition_hold holds is not decided again (record ``held``): split,
+    excluded at its split, past its run (mztab_validated, completed, cleanup_pending_confirmation, raw_cleaned,
+    discarded), or a run attempt open. Nor is one whose production run was finalised under another status
+    (validation_failed): its run happened under the old disposition, and its records say so. Such a unit is
+    decided again only as a new production run is prepared for it (start_new_production_run), never in place.
+    """
+    if not is_legacy_disposition(manifest):
+        return None, manifest
+
+    def decide(current: dict[str, Any]) -> dict[str, Any]:
+        record = _redecision_base(current)
+        if not is_legacy_disposition(current):
+            # Decided again by another writer since the caller read the unit.
+            return {**record, "already_current": True}
+        held = disposition_hold(current)
+        if held is None and finished_production_run(current) is not None:
+            held = {
+                "reason": "run_finalised",
+                "status": record["status"],
+                "detail": "A production run of this unit was finalised; its records describe that run.",
+            }
+        if held is not None:
+            return {**record, "held": held}
+        return {**record, **_redecide_legacy_in(current)}
+
+    def attempt(current: dict[str, Any]) -> dict[str, Any]:
+        # A unit that cannot be decided again is prepared as it is, and the gate refuses its legacy rows.
+        try:
+            return decide(current)
+        except Exception as error:
+            return {"redecided": False, "held": None, "error": f"{type(error).__name__}: {error}"}
+
+    if not write:
+        view = copy.deepcopy(manifest)
+        record = attempt(view)
+        return {**record, "written": False}, view if record["redecided"] else manifest
+    if not str(manifest.get("manifest_path") or "").strip():
+        raise ValueError("A legacy disposition is decided again on disk only for a manifest read from its path.")
+    target = Path(str(manifest["manifest_path"])).resolve()
+    with manifest_lock(target):
+        current = read_manifest(target)
+        record = attempt(current)
+        if record["redecided"]:
+            _write_json(target, current)
+    # The unit as it is on disk now, unless a decision that failed left the copy read half changed.
+    return {**record, "written": record["redecided"]}, (
+        manifest if "error" in record else {**current, "manifest_path": str(target)}
+    )
+
+
+# What describes one production run of a unit, copied unchanged into superseded_runs when a new run is prepared.
+SUPERSEDED_RUN_FIELDS = (
+    "status",
+    "execution_allowed",
+    "cleanup_allowed",
+    "output_directory",
+    "finalized_at",
+    "finalized_run",
+    "mztab_validation",
+    "retained_artifacts",
+    "retained_artifact_inventory",
+    "retained_artifacts_refreshed_at",
+    "project_archive",
+    "console_run_finalisation",
+    "cleanup_requested_at",
+    "analysis_csv",
+    "analytical_order",
+    "campaign_disposition",
+    "project",
+)
+# Of those, what the finished run alone had and the new run does not have yet: taken off the top level, so that
+# a refresh, a cleanup plan or the gate never reads the old run's inventory as the new run's.
+_FINISHED_RUN_ONLY_FIELDS = (
+    "finalized_at",
+    "finalized_run",
+    "mztab_validation",
+    "retained_artifacts",
+    "retained_artifact_inventory",
+    "retained_artifacts_refreshed_at",
+    "project_archive",
+    "console_run_finalisation",
+    "cleanup_requested_at",
+    "analysis_csv",
+    "analytical_order",
+)
+# What record_analysis_csv wrote on each lineage row for the CSV the finished run read.
+_LINEAGE_RUN_FIELDS = ("file_name", "console_path", "console_alias", "acquisition_type", "file_name_reason")
+NEW_RUN_OUTPUT_PREFIX = "output-run-"
+
+
+def _superseded_run_record(current: dict[str, Any], at: str) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        key: copy.deepcopy(current[key]) for key in SUPERSEDED_RUN_FIELDS if key in current
+    }
+    rows = [row for row in (current.get("input_lineage") or {}).get("rows") or [] if isinstance(row, dict)]
+    if rows:
+        record["input_lineage_written"] = [
+            {"path": str(row.get("path") or ""), **{key: copy.deepcopy(row[key]) for key in _LINEAGE_RUN_FIELDS if key in row}}
+            for row in rows
+        ]
+    summary = (current.get("raw_metadata_preflight") or {}).get("summary") or {}
+    per_file = [entry for entry in summary.get("per_file") or [] if isinstance(entry, dict)]
+    if per_file:
+        record["preflight_per_file"] = [
+            {
+                "file": str(entry.get("file") or ""),
+                "console_acquisition_type": entry.get("console_acquisition_type"),
+                "console_acquisition_basis": entry.get("console_acquisition_basis") or "",
+            }
+            for entry in per_file
+        ]
+    record["superseded_at"] = at
+    record["superseded_by"] = "msdial_prepare_repository_reanalysis"
+    return record
+
+
+def _new_run_output_directory(current: dict[str, Any]) -> Path:
+    """A folder no run of the unit has used: <workspace>\\output-run-<n>, n counting the unit's runs."""
+    workspace_text = str(current.get("workspace") or "").strip()
+    old = Path(str(current.get("output_directory") or ""))
+    base = Path(workspace_text) if workspace_text else old.parent
+    used = {
+        Path(str(item.get("output_directory") or "")).resolve()
+        for item in current.get("superseded_runs") or []
+        if isinstance(item, dict) and str(item.get("output_directory") or "").strip()
+    }
+    number = 2 + len(current.get("superseded_runs") or [])
+    while True:
+        candidate = base / f"{NEW_RUN_OUTPUT_PREFIX}{number}"
+        if not os.path.lexists(candidate) and candidate.resolve() not in used and candidate.resolve() != old.resolve():
+            return candidate
+        number += 1
+
+
+def start_new_production_run(
+    manifest: dict[str, Any], *, write: bool
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Prepare a new production run for a unit past its run, without touching that run's files or records.
+
+    WHY. A unit whose run finished keeps that run's files in its output_directory, the analysis CSV the
+    Console read among them, and records their checksums in retained_artifact_inventory; cleanup and the gate's
+    run invariants read them as the description of what ran. A prepare that wrote a new analysis CSV there -
+    for a legacy disposition decided again, one input fewer - left the unit mztab_validated and cleanup-allowed
+    with a CSV that described a run that never happened (review r5-62).
+
+    What this does, in one write under the manifest lock:
+    - copies the finished run's records (SUPERSEDED_RUN_FIELDS, the lineage rows' written names and types, the
+      preflight's per-file Console types) unchanged into a new entry of ``superseded_runs``; the old output
+      directory and every file in it are left as they are;
+    - takes the finished run's own records (_FINISHED_RUN_ONLY_FIELDS) off the top level;
+    - points output_directory at a new folder, <workspace>\\output-run-<n>, created here, where the analysis
+      CSV and the new run's outputs go;
+    - sets cleanup_allowed false and the status a unit has before its run (preflight_passed where a raw-header
+      preflight is recorded, else prepared); execution_allowed is left as it was;
+    - decides a pre-0.5.29 disposition again under rule B2 (_redecide_legacy_in), which then sets the status
+      and execution_allowed as classify_preflight would.
+
+    Refused, and nothing changed (``started`` false and ``reason``): a unit whose raw data were released
+    (raw_released), one with a run attempt that may still be running (run_in_progress), one whose legacy
+    disposition, decided again, would not run it (would_not_run: skip, exclude or split; the record carries the
+    decision made in memory), and one whose disposition could not be decided again (redecision_failed). A unit
+    not past a run (no_finished_run) is left
+    alone too; the caller prepares it as any other. Without ``write`` the same is done on a copy, which is
+    returned, and nothing is created.
+
+    msdial_prepare_repository_reanalysis does not write with this: it decides the run without ``write``
+    (begin_new_production_run) and commits it only together with the analysis CSV (PendingNewProductionRun),
+    so that a CSV that fails leaves the finished run as it was.
+    """
+
+    def start(current: dict[str, Any]) -> dict[str, Any]:
+        finished = finished_production_run(current)
+        if finished is None:
+            return {"started": False, "reason": "no_finished_run", "status": str(current.get("status") or "")}
+        base = {
+            "previous_status": finished["status"],
+            "previous_output_directory": finished["output_directory"],
+            "previous_job_id": finished["job_id"],
+        }
+        if finished["raw_released"]:
+            return {
+                "started": False,
+                "reason": "raw_released",
+                **base,
+                "detail": f"This unit's raw data were released (status {finished['status']!r}); it never runs "
+                "again. Download it into a new lease to analyse it again.",
+            }
+        attempt = _live_run_attempt_in(current)
+        if attempt is not None:
+            return {
+                "started": False,
+                "reason": "run_in_progress",
+                **base,
+                "job_id": str(attempt.get("job_id") or ""),
+                "detail": "A run attempt of this unit is open and its process may still be running; a new run is "
+                "prepared only once it has ended.",
+            }
+        at = datetime.now(timezone.utc).isoformat()
+        superseded = _superseded_run_record(current, at)
+        new_output = _new_run_output_directory(current)
+        legacy = is_legacy_disposition(current)
+        for key in _FINISHED_RUN_ONLY_FIELDS:
+            current.pop(key, None)
+        current["superseded_runs"] = [*(current.get("superseded_runs") or []), superseded]
+        current["output_directory"] = str(new_output)
+        current["cleanup_allowed"] = False
+        current["status"] = "preflight_passed" if current.get("raw_metadata_preflight") else "prepared"
+        current["new_run_prepared"] = {
+            "prepared_at": at,
+            "by": "msdial_prepare_repository_reanalysis",
+            "superseded_run": len(current["superseded_runs"]) - 1,
+        }
+        redecision: dict[str, Any] | None = None
+        if legacy:
+            redecision = {
+                **_redecision_base({**current, "status": finished["status"]}),
+                **_redecide_legacy_in(current),
+                "written": False,
+            }
+            if redecision["disposition"] != "run":
+                # Decided again, the unit would not run: there is no new run to prepare, and the finished run's
+                # records stay where they are (the caller drops this copy).
+                return {
+                    "started": False,
+                    "reason": "would_not_run",
+                    **base,
+                    "legacy_disposition_redecision": redecision,
+                    "detail": f"Decided again under the header-first rule, the unit would {redecision['disposition']} "
+                    f"({', '.join(redecision['reasons']) or 'no reason recorded'}), not run; no new run was prepared "
+                    "and the finished run's records are unchanged.",
+                }
+        return {
+            "started": True,
+            **base,
+            "output_directory": str(new_output),
+            "status": str(current.get("status") or ""),
+            "execution_allowed": current.get("execution_allowed") is True,
+            "superseded_run": len(current["superseded_runs"]) - 1,
+            "legacy_disposition_redecision": redecision,
+        }
+
+    def attempt_start(current: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return start(current)
+        except Exception as error:
+            # Nothing is written: the copy that was being changed is dropped, and the run is not prepared.
+            return {"started": False, "reason": "redecision_failed", "error": f"{type(error).__name__}: {error}"}
+
+    if not write:
+        view = copy.deepcopy(manifest)
+        record = attempt_start(view)
+        return {**record, "written": False}, view if record["started"] else manifest
+    if not str(manifest.get("manifest_path") or "").strip():
+        raise ValueError("A new production run is prepared on disk only for a manifest read from its path.")
+    target = Path(str(manifest["manifest_path"])).resolve()
+    with manifest_lock(target):
+        current = read_manifest(target)
+        record = attempt_start(current)
+        if record["started"]:
+            Path(record["output_directory"]).mkdir(parents=True, exist_ok=False)
+            _write_json(target, current)
+    if not record["started"]:
+        return {**record, "written": False}, manifest
+    if record.get("legacy_disposition_redecision"):
+        record["legacy_disposition_redecision"]["written"] = True
+    return {**record, "written": True}, {**current, "manifest_path": str(target)}
+
+
+class NewProductionRunConflict(RuntimeError):
+    """The unit's manifest, or the new run's folder, changed after the new run was decided; nothing was committed."""
+
+
+class PendingNewProductionRun:
+    """A new production run decided in memory, committed only once its analysis CSV is written (review r6-62).
+
+    WHY. start_new_production_run(write=True) moved the finished run's records into superseded_runs and created
+    the new folder before the rows were built; a CSV that then failed (rows that disagree, an alias that could
+    not be made, files that did not map) left a validated, cleanup-ready unit with no validated run on its top
+    level, cleanup_allowed false, an empty output-run-<n>, and no new run prepared.
+
+    How it is used (msdial_prepare_repository_reanalysis):
+    - begin_new_production_run decides the new run against the manifest's bytes as they are on disk, in memory;
+    - the rows are built from ``view``, the aliases made (``aliases_made`` lists what this call created), and the
+      reviewed metadata and the CSV written into ``staging_directory()``, a hidden folder beside the new one;
+    - ``commit(changes)``, under the manifest lock, refuses (NewProductionRunConflict) if the manifest's bytes
+      are no longer those the run was decided from or the new folder exists, then renames the staging folder to
+      the new output_directory and writes ``view``, with ``changes`` applied, in one write;
+    - ``abandon()``, after any failure, removes the staging folder and the aliases this call made. The manifest
+      and every file of the finished run are then as they were.
+
+    ALIASES ARE SHARED (review r7-62). An alias's path in raw\\console-aliases is fixed by its input, so two
+    prepares of one unit name the same one: the second reuses what the first made. The snapshot check guards
+    the manifest, not the aliases, so both ends now hold the manifest lock for them:
+    - ``commit(changes, required_paths)`` refuses (NewProductionRunConflict) if an alias the new CSV names,
+      ``required_paths``, is gone - a concurrent prepare that made it abandoned it - rather than commit a CSV
+      whose input path does not exist;
+    - ``abandon()`` removes an alias it made only when no analysis CSV of the unit's committed manifest names
+      it (_aliases_named_by_manifest): a concurrent prepare that reused it and committed keeps it.
+    """
+
+    def __init__(
+        self, target: Path, snapshot: bytes, on_disk_keys: set[str], view: dict[str, Any], record: dict[str, Any]
+    ) -> None:
+        self.target = target
+        self.snapshot = snapshot
+        self.on_disk_keys = on_disk_keys
+        self.view = view
+        self.record = record
+        self.output_directory = Path(str(record["output_directory"]))
+        self.staging: Path | None = None
+        self.aliases_made: list[tuple[str, Path, Path]] = []
+        self.committed = False
+
+    def staging_directory(self) -> Path:
+        """A new hidden folder beside the new output directory, on its volume, so that the commit is a rename."""
+        if self.staging is None:
+            parent = self.output_directory.parent
+            parent.mkdir(parents=True, exist_ok=True)
+            self.staging = Path(
+                tempfile.mkdtemp(prefix=f".{self.output_directory.name}.", suffix=".staging", dir=str(parent))
+            )
+        return self.staging
+
+    def staged(self, path: str | Path) -> Path:
+        """Where a file written into the staging folder lies once the run is committed."""
+        staging = self.staging_directory()
+        return self.output_directory / Path(path).resolve().relative_to(staging.resolve())
+
+    def commit(self, changes: Iterable[Any] = (), required_paths: Iterable[str | Path] = ()) -> dict[str, Any]:
+        """Rename the staging folder into place and write the manifest with the new run, under the lock, at once.
+
+        ``required_paths`` are the aliases (and their sidecars) the new analysis CSV names; one that no longer
+        exists refuses the commit.
+        """
+        if self.committed:
+            raise RuntimeError("This new production run was committed already.")
+        current = copy.deepcopy(self.view)
+        if "manifest_path" not in self.on_disk_keys:
+            current.pop("manifest_path", None)
+        for change in changes:
+            change(current)
+        required = [Path(path) for path in required_paths]
+        staging = self.staging_directory()
+        with manifest_lock(self.target):
+            if _read_manifest_bytes(self.target) != self.snapshot:
+                raise NewProductionRunConflict(
+                    f"{self.target.name} was written by another writer after the new run was decided; the new run "
+                    "was not prepared, and the finished run's records are as that writer left them."
+                )
+            if os.path.lexists(self.output_directory):
+                raise NewProductionRunConflict(
+                    f"{self.output_directory} appeared after the new run was decided; the new run was not prepared."
+                )
+            gone = [path for path in required if not os.path.lexists(path)]
+            if gone:
+                raise NewProductionRunConflict(
+                    f"{len(gone)} alias(es) the new analysis CSV names no longer exist (the first is {gone[0]}): "
+                    "another prepare of this unit that made them abandoned them. The new run was not prepared; "
+                    "prepare it again."
+                )
+            os.rename(staging, self.output_directory)
+            try:
+                _write_json(self.target, current)
+            except BaseException:
+                os.rename(self.output_directory, staging)
+                raise
+            self.staging = None
+            self.committed = True
+        return {**current, "manifest_path": str(self.target)}
+
+    def abandon(self) -> dict[str, Any]:
+        """After a failure: remove the staging folder and the aliases this call made that no committed CSV names.
+
+        A no-op once committed. Under the manifest lock, so that a concurrent commit either has written its
+        manifest, whose CSV then protects the aliases it names, or finds them gone and refuses.
+        """
+        if self.committed:
+            return {"abandoned": False}
+        left: list[str] = []
+        kept: list[str] = []
+        if self.aliases_made:
+            from .repository_analysis_rows import remove_console_aliases
+
+            with manifest_lock(self.target):
+                try:
+                    committed = json.loads(_read_manifest_bytes(self.target).decode("utf-8-sig"))
+                except (OSError, ValueError):
+                    committed = None
+                if isinstance(committed, dict):
+                    named = _aliases_named_by_manifest(committed)
+                    removable = [item for item in self.aliases_made if not _alias_is_named(Path(item[1]), named)]
+                    kept = [str(item[1]) for item in self.aliases_made if _alias_is_named(Path(item[1]), named)]
+                else:
+                    # A manifest that cannot be read cannot say which aliases it names: none is removed.
+                    removable = [item for item in self.aliases_made if item[0] == "directory"]
+                    kept = [str(item[1]) for item in self.aliases_made if item[0] != "directory"]
+                left = remove_console_aliases(removable)
+            self.aliases_made = []
+        staging, self.staging = self.staging, None
+        if staging is not None and staging.exists():
+            # Only files this call wrote are in it: the reviewed metadata and the CSV.
+            shutil.rmtree(staging, ignore_errors=True)
+        return {
+            "abandoned": True,
+            "aliases_left": left,
+            "aliases_kept_for_committed_csv": kept,
+            "staging_left": bool(staging and staging.exists()),
+        }
+
+
+def _aliases_named_by_manifest(manifest: dict[str, Any]) -> set[str]:
+    """The paths (file keys) of every input an analysis CSV of this committed unit names, and their sidecars.
+
+    Read from the CSVs themselves - the current run's analysis_csv and each superseded run's - and from the
+    lineage rows record_analysis_csv wrote for them (console_path, console_alias and its sidecars), so that a
+    CSV that cannot be read still protects what its lineage recorded.
+    """
+    named: set[str] = set()
+
+    def add(path_text: Any) -> None:
+        if str(path_text or "").strip():
+            named.add(_file_key(str(path_text)))
+
+    def add_lineage(row: dict[str, Any]) -> None:
+        add(row.get("console_path"))
+        alias = row.get("console_alias")
+        if isinstance(alias, dict) and str(alias.get("path") or "").strip():
+            add(alias["path"])
+            for sidecar in alias.get("sidecars") or []:
+                add(Path(str(alias["path"])).with_name(str(sidecar)))
+
+    def add_csv(record: Any) -> None:
+        path_text = str((record or {}).get("path") or "").strip() if isinstance(record, dict) else ""
+        if not path_text:
+            return
+        try:
+            with open(extended_path(path_text), encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    add(row.get("file_path"))
+        except (OSError, ValueError, csv.Error):
+            pass
+
+    add_csv(manifest.get("analysis_csv"))
+    for row in (manifest.get("input_lineage") or {}).get("rows") or []:
+        if isinstance(row, dict):
+            add_lineage(row)
+    for run in manifest.get("superseded_runs") or []:
+        if not isinstance(run, dict):
+            continue
+        add_csv(run.get("analysis_csv"))
+        for row in run.get("input_lineage_written") or []:
+            if isinstance(row, dict):
+                add_lineage(row)
+    return named
+
+
+def _alias_is_named(link: Path, named: set[str]) -> bool:
+    """Whether a CSV names this alias, or the alias this sidecar travels with (alias-x.wiff.scan with alias-x.wiff2)."""
+    if _file_key(str(link)) in named:
+        return True
+    parent = _file_key(str(link.parent))
+    name = link.name.casefold()
+    for key in named:
+        path = Path(key)
+        if _file_key(str(path.parent)) == parent and name.startswith(path.stem.casefold() + "."):
+            return True
+    return False
+
+
+def begin_new_production_run(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], PendingNewProductionRun | None]:
+    """start_new_production_run decided in memory against the manifest on disk, to be committed with its CSV.
+
+    Returns (record, manifest, pending). record is start_new_production_run's, ``written`` false; where it did
+    not start, manifest is the one given and pending None. Otherwise manifest is the unit with the new run (the
+    view the rows are built from) and pending commits it (PendingNewProductionRun). Nothing is written or created.
+    """
+    if not str(manifest.get("manifest_path") or "").strip():
+        raise ValueError("A new production run is prepared on disk only for a manifest read from its path.")
+    target = Path(str(manifest["manifest_path"])).resolve()
+    snapshot = _read_manifest_bytes(target)
+    on_disk = json.loads(snapshot.decode("utf-8-sig"))
+    if not isinstance(on_disk, dict):
+        raise ValueError(f"{target.name} does not hold one JSON object.")
+    record, view = start_new_production_run({**on_disk, "manifest_path": str(target)}, write=False)
+    if not record["started"]:
+        return record, manifest, None
+    return record, view, PendingNewProductionRun(target, snapshot, set(on_disk), view, record)
+
+
+def superseded_validated_run(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """The newest run of this unit that validated and was superseded by a new run that has not, else None.
+
+    A raw deletion is judged by the unit's current run. While a new run prepared after a validated one has not
+    validated itself (prepared, running, failed), the raw data are kept for it: cleanup refuses, as the current
+    run is not validated, and discard refuses, as the unit did produce a validated output. Each says so with
+    this record. Once the new run validates, cleanup judges it as any other.
+    """
+    if str(manifest.get("status") or "") in PAST_PREFLIGHT_STATUSES:
+        return None
+    runs = manifest.get("superseded_runs") or []
+    for index in range(len(runs) - 1, -1, -1):
+        entry = runs[index]
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("status") or "") in CLEANUP_READY_STATUSES or entry.get("cleanup_allowed") is True:
+            return {
+                "superseded_run": index,
+                "status": str(entry.get("status") or ""),
+                "output_directory": str(entry.get("output_directory") or ""),
+                "finalized_at": entry.get("finalized_at"),
+                "superseded_at": entry.get("superseded_at"),
+            }
+    return None
+
+
+def _superseded_validated_text(found: dict[str, Any], current_status: str) -> str:
+    return (
+        f"A superseded run of this unit validated (superseded_runs[{found['superseded_run']}], status "
+        f"{found['status']!r}, output {found['output_directory']}), and the new run prepared after it (status "
+        f"{current_status!r}) has not. The raw data are kept for the new run: they are deleted by "
+        "msdial_cleanup_repository_raw once it validates, never discarded as a unit with no validated output."
+    )
 
 
 # The status a parent unit carries once it has been split. It is not in CLEANUP_READY_STATUSES and it
@@ -5981,6 +6797,99 @@ def _sample_parts_by_path(
     return result
 
 
+def _input_sample_rows(manifest: dict[str, Any]) -> dict[str, int]:
+    """The sample row each input is, by _file_key: its position in the unit's sample_metadata.
+
+    Answered by the analysis-CSV builder (build_repository_analysis_rows), so a split part holds the rows its
+    CSV will find: the inputs it keeps, and the ones the lease or the campaign disposition excluded. An input
+    the builder finds no single row for is left out, and its row is matched by its sample as before.
+    """
+    from .repository_analysis_rows import build_repository_analysis_rows
+
+    try:
+        built = build_repository_analysis_rows(manifest)
+    except (KeyError, TypeError, ValueError, OSError):
+        return {}
+    result: dict[str, int] = {}
+    for row in built.get("rows") or []:
+        if row.get("sample_row_index") is not None:
+            result[_file_key(str(row["input_path"]))] = int(row["sample_row_index"])
+    for item in built.get("excluded_inputs") or []:
+        if item.get("sample_row_index") is not None:
+            result[_file_key(str(item["path"]))] = int(item["sample_row_index"])
+    return result
+
+
+def _declared_input_in_part(
+    entry: dict[str, Any], samples: list[dict[str, Any]], part_rows: set[int], sample_ids: set[str]
+) -> bool:
+    """Whether a declared input belongs to a split part: the row it is (rows_naming_input among its sample's
+    rows) is one of the part's; where no one row is it, its sample is one of the part's, as before."""
+    from .repository_metadata import rows_naming_input
+
+    sample_id = str(entry.get("sample_id") or "").strip()
+    indexes = [
+        index
+        for index, sample in enumerate(samples)
+        if str((sample or {}).get("sample_id") or "").strip() == sample_id
+    ]
+    found = (
+        indexes
+        if len(indexes) == 1
+        else rows_naming_input((entry.get("path"), entry.get("archive")), samples, indexes)
+    )
+    if len(found) == 1:
+        return found[0] in part_rows
+    return sample_id in sample_ids
+
+
+def _part_name_pairings(
+    parent: dict[str, Any], inputs: list[str], samples: list[dict[str, Any]], stands_for: dict[str, str]
+) -> dict[str, list[dict[str, Any]]]:
+    """The parent's input_name_pairings that are one split part's own: {"paired": [...], "refused": [...]}.
+
+    A pairing is the part's when its member is one of the part's inputs, or the mzXML one of them stands for
+    (stands_for), compared as the lease named it: its path under the data root (_member_under_root), without
+    case. A refusal is the part's when its member is, or when the declared raw file it was refused for is the
+    raw_file of one of the part's sample rows: a refused member is no input, and the row it was refused for is
+    what the part holds. A pairing of an input the lease or the campaign disposition excluded, and a refusal for
+    a row no part holds, are in no part's record and stay in the parent's.
+    """
+    record = parent.get("input_name_pairings")
+    if not isinstance(record, dict):
+        return {"paired": [], "refused": []}
+    data_root = str(parent.get("input_directory") or "").strip()
+    data_key = _file_key(data_root) if data_root else ""
+
+    def named(path_text: str) -> str:
+        key = _file_key(path_text)
+        return (_member_under_root(key, data_key) if data_key else Path(key).name).casefold()
+
+    members = {
+        named(source)
+        for item in inputs
+        for source in (item, stands_for.get(_file_key(item), ""))
+        if source
+    }
+    row_names = {
+        PurePosixPath(str((sample or {}).get("raw_file") or "").strip().replace("\\", "/")).name.casefold()
+        for sample in samples
+    } - {""}
+
+    def entries(name: str) -> list[dict[str, Any]]:
+        return [dict(item) for item in record.get(name) or [] if isinstance(item, dict)]
+
+    return {
+        "paired": [item for item in entries("paired") if str(item.get("member_name") or "").casefold() in members],
+        "refused": [
+            item
+            for item in entries("refused")
+            if str(item.get("member_name") or "").casefold() in members
+            or str(item.get("declared_raw_file") or "").casefold() in row_names
+        ],
+    }
+
+
 def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     """Describe how a unit would be split by its split key. Changes nothing.
 
@@ -6111,6 +7020,21 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
     by_path = _sample_parts_by_path(
         samples, groups, sample_of, stands_for, Path(data_root_text) if data_root_text else None
     )
+    # THE SAMPLE ROW EACH INPUT IS, not only its sample. Replicate rows share their sample's id, and MetaboBank
+    # MTBKS220 gives each of its 6 samples 7 rows: 3 timsOFF BAF folders and 4 timsON TDF folders. Picked by
+    # sample id, each part held all 7 rows and every declared input of them, and its analysis CSV was refused
+    # after the 14 GB download (analysis_input_not_found, sample_without_input). A row an input of a part is
+    # (as the analysis-CSV builder finds it, _input_sample_rows) is that part's alone; a row of an excluded
+    # input is no part's; only a row no input is found to be is matched by its sample, as every row was.
+    row_of = _input_sample_rows(manifest)
+    rows_of_part = {
+        group_key: {row_of[_file_key(item)] for item in files if _file_key(item) in row_of}
+        for group_key, files in groups.items()
+    }
+    placed_rows = {
+        *(index for indexes in rows_of_part.values() for index in indexes),
+        *(row_of[_file_key(item["path"])] for item in left_out if _file_key(item["path"]) in row_of),
+    }
     parts = []
     claimed_samples: set[int] = set()
     for group_key, files in sorted(groups.items()):
@@ -6118,9 +7042,14 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
         # A sample the declared inputs or the lineage attribute is matched by that; only the rest by path.
         named = {sample_of[_file_key(item)] for item in files if sample_of.get(_file_key(item))}
         part_samples = []
+        part_rows = []
         for index, sample in enumerate(samples):
             sample_id = str((sample or {}).get("sample_id") or "").strip()
-            if sample_id and sample_id in named:
+            if index in rows_of_part[group_key]:
+                matched = True
+            elif index in placed_rows:
+                matched = False
+            elif sample_id and sample_id in named:
                 matched = True
             elif sample_id and sample_id in named_anywhere:
                 matched = False
@@ -6128,6 +7057,7 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
                 matched = group_key in by_path.get(index, set())
             if matched:
                 part_samples.append(sample)
+                part_rows.append(index)
                 claimed_samples.add(index)
         sample_ids = {str(item.get("sample_id") or "") for item in part_samples}
         part_assignments = [item for item in assignments if str(item.get("sample_id") or "") in sample_ids]
@@ -6154,6 +7084,8 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
             "input_candidates": sorted(files),
             "file_count": len(files),
             "sample_ids": sorted(sample_ids),
+            # The positions of the part's rows in the parent's sample_metadata: replicate rows share an id.
+            "sample_row_indexes": part_rows,
             "class_levels": levels,
             "higher_ms_levels": higher_levels,
         }
@@ -6312,6 +7244,9 @@ def _excluded_part_disposition(
         },
         "input_candidates": list(part_manifest.get("input_candidates") or []),
         "project": part_manifest.get("project") or {},
+        # Read only for the inferred-pairing warning: the part's own lineage rows and manifest warnings.
+        "input_lineage": part_manifest.get("input_lineage") or {},
+        "warnings": list(part_manifest.get("warnings") or []),
     }
     declared = preflight.get("declared") if isinstance(preflight.get("declared"), dict) else None
     disposition = decide_disposition(view, declared=declared, extractor=preflight.get("extractor"), decided_at=decided_at)
@@ -6394,6 +7329,18 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         _file_key(str(item.get("file") or "")): item
         for item in (parent.get("raw_metadata_preflight") or {}).get("summary", {}).get("per_file") or []
     }
+    from .raw_metadata_preflight import SPLIT_PARENT_DECLARED_FIELD
+
+    parent_declared_mode = _split_parent_declared(parent)
+    if parent_declared_mode is None:
+        parent_declared_mode = str(
+            ((parent.get("raw_metadata_preflight") or {}).get("declared") or _declared_technical(parent)).get(
+                "acquisition_mode"
+            )
+            or ""
+        ).strip()
+        if parent_declared_mode.casefold() == "unknown":
+            parent_declared_mode = ""
     data_root = str(parent.get("input_directory") or "").strip()
     files_of = _files_of_parts(
         list(parent_project.get("files") or []),
@@ -6419,17 +7366,19 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         project["acquisition_mode"] = part["acquisition_mode"]
         if part.get("polarity"):
             project["ion_mode"] = part["polarity"]
-        project["sample_metadata"] = [
-            sample for sample in parent_project.get("sample_metadata") or []
-            if str((sample or {}).get("sample_id") or "") in sample_ids
-        ]
+        # The part's own sample rows, by position: a sample whose replicates the split divided is in each part
+        # with the rows of that part's inputs only (plan_acquisition_split).
+        part_rows = set(part.get("sample_row_indexes") or [])
+        parent_samples = list(parent_project.get("sample_metadata") or [])
+        project["sample_metadata"] = [sample for index, sample in enumerate(parent_samples) if index in part_rows]
         project["sample_count"] = len(project["sample_metadata"]) or part["file_count"]
         if project.get("analysis_inputs"):
-            # The Catalog's inputs of this part's samples only, so a part's analysis CSV is held to its own
-            # inputs and not to the parent's.
+            # The Catalog's inputs of this part's rows only, so a part's analysis CSV is held to its own inputs
+            # and not to the parent's: each input of a sample several rows describe goes with the row it is
+            # (_declared_input_in_part, as the handoff check and the analysis-CSV builder pair them).
             project["analysis_inputs"] = [
                 entry for entry in parent_project.get("analysis_inputs") or []
-                if isinstance(entry, dict) and str(entry.get("sample_id") or "") in sample_ids
+                if isinstance(entry, dict) and _declared_input_in_part(entry, parent_samples, part_rows, sample_ids)
             ]
         # A folder's files are listed one by one, as its members (Catalog 0.6.0): they go with the part
         # whose input their folder is, so a part's download description is its own folders'. An archive
@@ -6507,6 +7456,9 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 "analysis_unit_id": plan["analysis_unit_id"],
                 "split_by": "raw_header_acquisition_mode" if label == part["acquisition_mode"] else "raw_header_split_key",
                 "acquisition_mode": part["acquisition_mode"],
+                # What the parent's repository record declared (decide_disposition holds a part to it where it
+                # keeps MS1-only inputs out of a DDA run); "" where it declared nothing.
+                SPLIT_PARENT_DECLARED_FIELD: parent_declared_mode,
                 **({"split_key": part["split_key"]} if label != part["acquisition_mode"] else {}),
             },
             "workspace": str(root),
@@ -6525,14 +7477,6 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 per_file[_file_key(item)] for item in part["input_candidates"] if _file_key(item) in per_file
             ],
         }
-        if excluded_part:
-            # Ended at the split: it never runs, and its parent's raw data are released once the others end.
-            disposition = _excluded_part_disposition(parent, part_manifest, now)
-            part_manifest["status"] = (
-                SKIPPED_BY_PREFLIGHT_STATUS if disposition["disposition"] == "skip" else EXCLUDED_BY_PREFLIGHT_STATUS
-            )
-            part_manifest["split_exclusion"] = {**excluded_part, "decided_at": now}
-            part_manifest["campaign_disposition"] = disposition
         lineage = parent.get("input_lineage")
         if isinstance(lineage, dict):
             # The part reads the parent's files, so their lineage is the parent's, row for row. Without
@@ -6551,6 +7495,27 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 ],
                 "inherited_from": str(manifest_path),
             }
+        # Which declared raw file an input is, where the lease inferred it (the user's decision of 2026-10-06:
+        # always left on record), as the lease's own manifest says it, for this part's inputs and rows only
+        # (_part_name_pairings): a part with no inferred pairing of its own carries no warning for it.
+        pairings = _part_name_pairings(parent, part["input_candidates"], project["sample_metadata"], stands_for)
+        if pairings["paired"] or pairings["refused"]:
+            part_manifest["input_name_pairings"] = pairings
+        part_warnings = [item for item in parent.get("warnings") or [] if item != INFERRED_PAIRING_WARNING]
+        if pairings["paired"]:
+            part_warnings.append(INFERRED_PAIRING_WARNING)
+        if part_warnings:
+            part_manifest["warnings"] = part_warnings
+        if excluded_part:
+            # Ended at the split: it never runs, and its parent's raw data are released once the others end.
+            # Decided after its lineage and pairing record are in place, so its disposition carries the
+            # inferred-pairing warning as any other disposition of such inputs does.
+            disposition = _excluded_part_disposition(parent, part_manifest, now)
+            part_manifest["status"] = (
+                SKIPPED_BY_PREFLIGHT_STATUS if disposition["disposition"] == "skip" else EXCLUDED_BY_PREFLIGHT_STATUS
+            )
+            part_manifest["split_exclusion"] = {**excluded_part, "decided_at": now}
+            part_manifest["campaign_disposition"] = disposition
         repository_metadata_path = provenance / "repository-metadata.json"
         sample_metadata_path = provenance / "sample-metadata-extracted.json"
         part_manifest_path = provenance / "run-manifest.json"
@@ -6733,13 +7698,25 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             "unit by per-file acquisition mode before running MS-DIAL."
         )
     header_modes = _header_acquisition_by_file(manifest)
+    # The Console type a file's header alone gives (header_console_acquisition_type: DDA, SWATH or AIF) binds
+    # every row of that file, whatever a disposition decided (user decision, 2026-10-06): a header that gives
+    # one decides the file over any declaration, so a row that contradicts it is a disposition, or a workflow,
+    # gone wrong, and the run would complete, validate and be wrong.
+    header_types = _header_console_type_by_file(manifest)
     # The type an applied campaign disposition decided a file runs as - from its header, from the
-    # repository's declaration where no header could be read or a low-confidence one disagreed, or DDA for
-    # an MS1-only file folded into a DDA run - is the one type that file may run as. A file with no decision
-    # is held to what its header alone admits, as before dispositions existed. Both are recorded against the
-    # input, so a row that reads it through a Console alias is looked up as that input.
+    # repository's declaration where no header could be read or a DIA header left SWATH and AIF open, or DDA
+    # for an MS1-only file folded into a DDA run - is the one type that file may run as. A file with no
+    # decision is held to what its header alone admits, as before dispositions existed. All are recorded
+    # against the input, so a row that reads it through a Console alias is looked up as that input.
     decided_types = _decided_acquisition_by_file(manifest)
-    if header_modes or decided_types:
+    # An applied disposition decided before the header-first rule (Interactive 0.5.29, which records
+    # declared_acquisition_source on every disposition) may run what that rule excludes: an MS1-only file
+    # folded into the DDA run of a unit declared DIA, or a file whose header gives no acquisition mode, taken
+    # at the declaration. It is decided again here from the same records, as classify_preflight would, and
+    # changes nothing: a row that decision would not run refuses the run until the unit is decided again.
+    legacy_refusals = _legacy_disposition_refusals(manifest, state.get("files") or [], aliases)
+    blockers.extend(legacy_refusals)
+    if header_modes or header_types or decided_types:
         disagreeing = []
         undecided_as = []
         for item in state.get("files") or []:
@@ -6748,6 +7725,10 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
                 continue
             input_key = _file_key(_unit_input_of(path_text, aliases))
             given = str(item.get("acquisition_type") or "").strip()
+            requested = given or "DDA"
+            header_type = header_types.get(input_key)
+            if header_type and requested != header_type:
+                disagreeing.append(f"{Path(path_text).name} (header gives {header_type}, run as {given or 'no type'})")
             decided = decided_types.get(input_key)
             if decided:
                 if given != decided:
@@ -6756,8 +7737,7 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
                     undecided_as.append(f"{Path(path_text).name} (decided {decided}, run as {given or 'no type'})")
                 continue
             header = header_modes.get(input_key)
-            requested = given or "DDA"
-            if header and requested not in HEADER_ACQUISITION_TO_MSDIAL.get(header, {header}):
+            if not header_type and header and requested not in HEADER_ACQUISITION_TO_MSDIAL.get(header, {header}):
                 disagreeing.append(f"{Path(path_text).name} (header {header}, run as {requested})")
         if disagreeing:
             blockers.append(
@@ -6768,6 +7748,21 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
             blockers.append(
                 f"{len(undecided_as)} input files would run with an acquisition type other than the one this "
                 f"unit's campaign disposition decided; the first is {undecided_as[0]}."
+            )
+
+    # MS-DIAL reads every input with one MS1 and one MS2 data type, which must say what RawDataHandler hands
+    # it, not what the instrument stored. Where every input that runs delivers one representation at a
+    # level, a run set to the other would treat profile points as centroids, or centroid each centroid
+    # again; a level the records do not settle refuses nothing.
+    data_types = run_data_types(state, manifest)
+    for key in DATA_TYPE_KEYS:
+        level = ((data_types or {}).get("levels") or {}).get(key.split("_", 1)[0]) or {}
+        requested = str(state.get(key) or "Centroid")
+        if level.get("decided") and requested.casefold() != str(level.get("data_type")).casefold():
+            blockers.append(
+                f"The workflow sets the {key.split('_', 1)[0].upper()} data type to {requested}, but every "
+                f"input that runs delivers {level.get('data_type')} spectra to MS-DIAL (basis "
+                f"{level.get('basis')})."
             )
 
     # An input a campaign disposition excluded - unreadable, ion mobility, out of scope - is not part of
@@ -6829,6 +7824,111 @@ def _header_acquisition_by_file(manifest: dict[str, Any]) -> dict[str, str]:
     return result
 
 
+def _header_console_type_by_file(manifest: dict[str, Any]) -> dict[str, str]:
+    """The Console type (DDA, SWATH or AIF) each inspected file's own header gives, keyed by resolved path.
+
+    header_console_acquisition_type, which no disposition rewrites; a record written before it existed gives
+    DDA or AIF as its acquisition_mode says, and nothing for DIA, whose scheme it did not record.
+    """
+    from .raw_metadata_preflight import entry_header_console
+
+    summary = (manifest.get("raw_metadata_preflight") or {}).get("summary") or {}
+    result = {}
+    for item in summary.get("per_file") or []:
+        path_text = str(item.get("file") or "").strip() if isinstance(item, dict) else ""
+        console = entry_header_console(item) if path_text else None
+        if console == "AIF" and str(item.get("acquisition_mode") or "").strip() == "DIA":
+            # A DIA header with no recorded isolation target (header_no_isolation): the extractor records
+            # targets only from MS2 headers that carry a precursor m/z, so a vendor read without one gives none
+            # for windowed DIA too. It binds nothing; the header's DIA admits SWATH or AIF, and a disposition's
+            # decided type still binds.
+            continue
+        if console in {"DDA", "SWATH", "AIF"}:
+            result[_file_key(path_text)] = console
+    return result
+
+
+# The bases of an assignment that a header did not settle (raw_metadata_preflight.decide_disposition): the
+# declaration's SWATH or AIF, and AIF for a DIA header that recorded no isolation target, which is the extractor's
+# reading of MS2 headers with no precursor m/z and not evidence of all-ion acquisition. A legacy row of another
+# type for such a file is no contradiction of its header.
+_UNSETTLED_ASSIGNMENT_BASES = {"declaration", "header_no_isolation"}
+
+
+def _legacy_disposition_refusals(
+    manifest: dict[str, Any], files: list[dict[str, Any]], aliases: dict[str, str]
+) -> list[str]:
+    """Blockers for the rows an applied pre-0.5.29 disposition runs and the header-first rule would not.
+
+    Empty for a unit with no applied disposition, or one decided from 0.5.29 on (it records
+    declared_acquisition_source). Otherwise the unit is decided again from its recorded preflight
+    (_decide_recorded_preflight), in memory: the run is refused where that decision does not run the unit as
+    one, excludes a row's file, or gives it another type on its header's word.
+    """
+    from .raw_metadata_preflight import file_key
+
+    applied = _applied_disposition(manifest)
+    if not applied or "declared_acquisition_source" in applied:
+        return []
+    again_hint = (
+        "Prepare the unit again (msdial_prepare_repository_reanalysis with confirmed=true, or under its campaign "
+        "approval): that decides it again from its recorded preflight and writes the analysis CSV from the new "
+        "decision."
+        if finished_production_run(manifest) is None
+        else "Its run has finished, and that run's records stand. To run it again, prepare a new production run "
+        "(msdial_prepare_repository_reanalysis with new_run=true and confirmed=true): that moves the finished "
+        "run's records into superseded_runs, decides the unit again from its recorded preflight, and writes the "
+        "analysis CSV into a new output directory."
+    )
+    try:
+        again = _decide_recorded_preflight(manifest)
+    except Exception as error:  # A gate that cannot decide refuses rather than runs.
+        return [
+            "This unit's campaign disposition was decided before Interactive 0.5.29 took each file's acquisition "
+            f"from its raw header first, and could not be decided again here ({type(error).__name__}). "
+            + again_hint
+        ]
+    kind = str(again.get("disposition") or "")
+    if kind != "run":
+        return [
+            "This unit's campaign disposition was decided before Interactive 0.5.29 took each file's acquisition "
+            f"from its raw header first (user decision, 2026-10-06); decided again from the same records, the "
+            f"unit would {kind} ({', '.join(again.get('reasons') or []) or 'no reason recorded'}), not run. "
+            + again_hint
+        ]
+    assigned = again.get("assignments") or {}
+    excluded_now = {
+        file_key(str(item.get("path") or "")): str(item.get("reason") or "")
+        for item in again.get("excluded_inputs") or []
+        if isinstance(item, dict)
+    }
+    refused = []
+    for item in files:
+        path_text = str(item.get("file_path") or "").strip()
+        if not path_text:
+            continue
+        key = file_key(_unit_input_of(path_text, aliases))
+        given = str(item.get("acquisition_type") or "").strip() or "no type"
+        assignment = assigned.get(key)
+        if assignment is None:
+            refused.append(f"{Path(path_text).name} (now {excluded_now.get(key) or 'not decided'})")
+        elif (
+            assignment.get("console_acquisition_type") != given
+            and str(assignment.get("basis") or "") not in _UNSETTLED_ASSIGNMENT_BASES
+        ):
+            refused.append(
+                f"{Path(path_text).name} (now {assignment.get('console_acquisition_type')} on the basis "
+                f"{assignment.get('basis')}, run as {given})"
+            )
+    if not refused:
+        return []
+    return [
+        f"{len(refused)} input files would run as a campaign disposition decided before Interactive 0.5.29 took "
+        "each file's acquisition from its raw header first (user decision, 2026-10-06), and decided again from "
+        f"the same records they would not; the first is {refused[0]}. " + again_hint
+    ]
+
+
 def _applied_disposition(manifest: dict[str, Any]) -> dict[str, Any]:
     disposition = manifest.get("campaign_disposition")
     return disposition if isinstance(disposition, dict) and disposition.get("applied") is True else {}
@@ -6847,6 +7947,192 @@ def _decided_acquisition_by_file(manifest: dict[str, Any]) -> dict[str, str]:
             result[_file_key(path_text)] = decided
     return result
 
+
+def _representation_by_input(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Each inspected input's per-file record with its spectrum representation, keyed by _file_key.
+
+    A preflight recorded since Interactive 0.5.27 carries spectrum_representation, with the reader, native
+    format and instrument model that say what MS-DIAL receives, on each per-file record. One recorded
+    before did not, though the extractor read them: for such a record they are read from the extractor
+    records the preflight kept in its output file, and the record says so
+    (spectrum_representation_read_from). A preflight that kept no per-file summary at all (one recorded
+    without a summary, or one whose extractor failed before it was summarised) is read the same way: the
+    extractor records its output file holds are summarised as a preflight summary has them
+    (_summarize_raw_metadata, MS-level flags included), and each gives an entry for the file it names. An
+    input found in neither has no entry.
+    """
+    from .raw_metadata_preflight import spectrum_representation_fields
+
+    preflight = manifest.get("raw_metadata_preflight") or {}
+    entries = [item for item in (preflight.get("summary") or {}).get("per_file") or [] if isinstance(item, dict)]
+    result: dict[str, dict[str, Any]] = {}
+    earlier: list[dict[str, Any]] = []
+    for item in entries:
+        path_text = str(item.get("file") or "").strip()
+        if not path_text:
+            continue
+        # The native format came with the representation's reader-aware reading; a per-file record without
+        # it is read again from the extractor records.
+        if "native_format" in item:
+            result[_file_key(path_text)] = item
+        else:
+            earlier.append(item)
+    if entries and not earlier:
+        return result
+    records: dict[str, dict[str, Any]] = {}
+    output_text = str(preflight.get("output") or "").strip()
+    try:
+        raw = json.loads(Path(output_text).read_text(encoding="utf-8-sig")) if output_text else []
+    except (OSError, ValueError):
+        raw = []
+    for record in [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []:
+        source = record.get("source") if isinstance(record, dict) else None
+        path_text = str(source.get("filePath") or "") if isinstance(source, dict) else ""
+        if path_text:
+            records.setdefault(_file_key(path_text), record)
+    if not entries:
+        # No per-file summary to complete: the extractor records are summarised as a preflight summarises
+        # them, so each entry carries has_ms1, has_ms2 and ms_levels too, and an input without a level does
+        # not vote on that level's data type. The same records decide the same way with or without a summary.
+        keys = list(records)
+        for key, entry in zip(keys, _summarize_raw_metadata([records[key] for key in keys])["per_file"]):
+            result[key] = {**entry, "spectrum_representation_read_from": "preflight_output"}
+        return result
+    for item in earlier:
+        key = _file_key(str(item.get("file") or ""))
+        record = records.get(key)
+        if record is not None:
+            result[key] = {
+                **item,
+                **spectrum_representation_fields(record),
+                "spectrum_representation_read_from": "preflight_output",
+            }
+    return result
+
+
+DATA_TYPE_KEYS = ("ms1_data_type", "ms2_data_type")
+
+
+def run_data_types(state: dict[str, Any], manifest: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """The MS1 and MS2 data type this run's inputs deliver to MS-DIAL, or None outside a unit.
+
+    The inputs are the state's files, each read as the unit input it stands for (a Console alias is its
+    input), less any the unit's campaign disposition excluded. An input the preflight did not read is
+    unrecorded. The defaults are the state's own values, which is what the run keeps for a level the
+    records do not settle (raw_metadata_preflight.delivered_data_types).
+    """
+    from .raw_metadata_preflight import delivered_data_types
+
+    if manifest is None:
+        manifest_text = str(state.get("repository_run_manifest") or "").strip()
+        if not manifest_text:
+            return None
+        try:
+            manifest = read_manifest(Path(manifest_text).expanduser())
+        except (OSError, ValueError):
+            return None
+    aliases = console_alias_inputs(manifest)
+    excluded = _campaign_excluded_inputs(manifest)
+    known = _representation_by_input(manifest)
+    entries = []
+    for item in state.get("files") or []:
+        path_text = str(item.get("file_path") or "").strip()
+        if not path_text:
+            continue
+        key = _file_key(_unit_input_of(path_text, aliases))
+        if key in excluded:
+            continue
+        entries.append(known.get(key) or {"file": path_text})
+    decision = delivered_data_types(
+        entries, {key.split("_", 1)[0]: str(state.get(key) or "Centroid") for key in DATA_TYPE_KEYS}
+    )
+    decision["scope"] = "run_inputs"
+    if any("spectrum_representation_read_from" in entry for entry in entries):
+        decision["read_from_preflight_output"] = True
+    return decision
+
+
+def apply_delivered_data_types(state: dict[str, Any], explicit: Iterable[str] = ()) -> dict[str, Any] | None:
+    """Set a repository run's MS1 and MS2 data type to what its inputs deliver to MS-DIAL; record the basis.
+
+    Where every included input delivers one representation at a level (raw_header for a reader that hands
+    MS-DIAL the stored points, delivered_centroid for one that hands it centroids), the run takes that
+    value; otherwise the state keeps what it had (the template's Centroid) and the decision's warning says
+    why. A key named in ``explicit`` - set by the caller's workflow_overrides - is left as the caller set it,
+    with basis workflow_override; if it contradicts a decided level, the execution gate refuses the run. The
+    decision is kept as state["data_type_provenance"], which reaches workflow-settings.json and the run
+    manifest. Returns it, or None for a state that names no readable unit manifest (nothing changes).
+    """
+    decision = run_data_types(state)
+    if decision is None:
+        return None
+    named = set(explicit)
+    for key in DATA_TYPE_KEYS:
+        level = decision["levels"][key.split("_", 1)[0]]
+        current = str(state.get(key) or "Centroid")
+        if key in named:
+            value = current
+            basis = (
+                str(level["basis"])
+                if level["decided"] and current.casefold() == str(level["data_type"]).casefold()
+                else "workflow_override"
+            )
+        else:
+            value, basis = str(level["data_type"]), str(level["basis"])
+        state[key] = value
+        decision[key] = value
+        decision[f"{key}_basis"] = basis
+    state["data_type_provenance"] = decision
+    return decision
+
+
+
+def diagnostic_data_types(tuning: dict[str, Any], unit_decision: dict[str, Any]) -> dict[str, Any]:
+    """Re-scope a unit's data-type record to the one input a peak-count diagnostic runs. Never raises.
+
+    The diagnostic runs one input with the production run's MS1 and MS2 data type, so that its peak count
+    stands for the production run; those values and their bases are the unit's, and stay. What the record
+    describes is that one input: its levels are read from that input alone (scope diagnostic_input), the
+    unit's decision is kept in brief under unit_decision, and where the input itself delivers another
+    representation than the run uses, a warning says so. ``tuning`` is the diagnostic's state (its files
+    already the one input); its data_type_provenance is replaced and returned.
+    """
+    try:
+        decision = run_data_types(tuning)
+    except Exception:  # noqa: BLE001 - provenance only; the run must not fail on it
+        decision = None
+    if decision is None:
+        decision = {
+            "schema": unit_decision.get("schema"),
+            "inputs": len(tuning.get("files") or []),
+            "levels": {},
+            "warnings": [],
+            "file_decision_unavailable": True,
+        }
+    decision["scope"] = "diagnostic_input"
+    files = tuning.get("files") or []
+    decision["diagnostic_input"] = Path(str((files[0] if files else {}).get("file_path") or "")).name
+    decision["unit_decision"] = {
+        "scope": unit_decision.get("scope"),
+        "inputs": unit_decision.get("inputs"),
+        **{key: unit_decision.get(key) for key in DATA_TYPE_KEYS},
+        **{f"{key}_basis": unit_decision.get(f"{key}_basis") for key in DATA_TYPE_KEYS},
+    }
+    warnings = list(decision.get("warnings") or [])
+    for key in DATA_TYPE_KEYS:
+        value = str(tuning.get(key) or "Centroid")
+        decision[key] = value
+        decision[f"{key}_basis"] = unit_decision.get(f"{key}_basis") or "unrecorded"
+        level = (decision.get("levels") or {}).get(key.split("_", 1)[0]) or {}
+        if level.get("decided") and str(level.get("data_type")).casefold() != value.casefold():
+            warnings.append(
+                f"{key.split('_', 1)[0].upper()} data type: the diagnostic's input delivers "
+                f"{level.get('data_type')} spectra to MS-DIAL, and the diagnostic runs with the unit's "
+                f"{value} (basis {decision[f'{key}_basis']})."
+            )
+    decision["warnings"] = warnings
+    tuning["data_type_provenance"] = decision
+    return decision
 
 def _campaign_excluded_inputs(manifest: dict[str, Any]) -> dict[str, str]:
     """The inputs an applied campaign disposition excluded, keyed by resolved path, with the reason."""
@@ -7011,6 +8297,9 @@ def plan_download_cleanup(manifest_path: Path) -> dict[str, Any]:
         )
     if not manifest.get("cleanup_allowed"):
         blockers.append("cleanup_allowed is not true; the run did not produce a validated mzTab-M output.")
+    validated_before = superseded_validated_run(manifest)
+    if validated_before is not None:
+        blockers.append(_superseded_validated_text(validated_before, str(manifest.get("status") or "")))
     if not retained:
         blockers.append("No retained artifacts are recorded, so nothing would survive the deletion.")
     if missing:
@@ -7991,6 +9280,9 @@ def plan_download_discard(manifest_path: Path, *, authorized: bool = False) -> d
     blockers: list[str] = []
     if status in {"mztab_validated", "completed", "cleanup_pending_confirmation", "raw_cleaned"}:
         blockers.append("Validated/completed runs must use the normal cleanup command.")
+    validated_before = superseded_validated_run(manifest)
+    if validated_before is not None:
+        blockers.append(_superseded_validated_text(validated_before, status))
     if status == "downloading":
         owner_state = lease_owner_state(manifest)
         if owner_state["state"] != "gone":
@@ -8189,6 +9481,11 @@ def discard_download_lease(
                 }
         elif manifest.get("status") in {"mztab_validated", "completed", "raw_cleaned"}:
             raise ValueError("Validated/completed runs must use the normal cleanup command.")
+        elif superseded_validated_run(manifest) is not None:
+            raise ValueError(
+                _superseded_validated_text(superseded_validated_run(manifest), str(manifest.get("status") or ""))
+                + " Discard was refused."
+            )
         stale: dict[str, Any] | None = None
         if downloading:
             # Written before the first byte of a lease. A lease that is still running writes into the tree
@@ -8317,6 +9614,9 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
     (cleanup_split_parent). What a part's discard can do is say that this part no longer needs it - a run
     failed after its retries, a refusal before production - which is what lets the parent's release count it
     as ended. Its output is kept, an mzTab-M and its failure record among the failure artifacts.
+
+    Refused, with nothing recorded, for a validated part, one whose Console may still run, and one with a new
+    run prepared after a validated run that has not validated (superseded_validated_run, review r7-62).
     """
     with _raw_deletion_lock(manifest_path):
         manifest = read_manifest(manifest_path)
@@ -8324,6 +9624,12 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
         blockers: list[str] = []
         if status in {"mztab_validated", "completed", "cleanup_pending_confirmation", "raw_cleaned"}:
             blockers.append("Validated/completed runs must use the normal cleanup command.")
+        # The rule cleanup and a unit's own discard follow holds for a part too (review r7-62): a part whose new
+        # run, prepared after a validated run, has not validated has not ended, and its discard would let the
+        # parent's release delete the raw data that new run reads.
+        validated_before = superseded_validated_run(manifest)
+        if validated_before is not None:
+            blockers.append(_superseded_validated_text(validated_before, status))
         attempt = _live_run_attempt_in(manifest)
         if attempt is not None:
             blockers.append(
@@ -8388,12 +9694,27 @@ def _part_end(part: dict[str, Any], parent_raw: Path) -> dict[str, Any]:
     hook records for a Console that exits non-zero and for one that exits 0 without a validated mzTab-M alike);
     skipped or excluded (by its campaign disposition, or at the split); or discarded (its own discard under an
     approval). Anything else - not yet preflighted, prepared, running, failed with retries left - has not.
+
+    A part with a new run prepared after a validated run, which has not validated itself, has not ended either,
+    whatever its status and however many runs failed (superseded_validated_run): its raw data are held for that
+    run, as a unit's own are (review r7-62). That includes a part discarded while such a run was pending, which
+    52b470b let an approval do.
     """
     status = str(part.get("status") or "")
     blockers: list[str] = []
     failures = len([item for item in part.get("run_failures") or [] if isinstance(item, dict)])
     retained = [str(item) for item in part.get("retained_artifacts") or []]
-    if status in CLEANUP_READY_STATUSES or status == "raw_cleaned":
+    validated_before = superseded_validated_run(part)
+    if validated_before is None and status == "discarded":
+        validated_before = superseded_validated_run({**part, "status": ""})
+    if validated_before is not None:
+        state = "pending"
+        blockers.append(
+            f"it is {status or 'unrecorded'!r}, and its run superseded_runs[{validated_before['superseded_run']}] "
+            f"validated (status {validated_before['status']!r}) before a new run was prepared that has not "
+            "validated; the raw data are held for that new run, and the part has not ended"
+        )
+    elif status in CLEANUP_READY_STATUSES or status == "raw_cleaned":
         state = "released" if status == "raw_cleaned" else "validated"
         if state == "validated" and not part.get("cleanup_allowed"):
             blockers.append("cleanup_allowed is not true")
@@ -8464,7 +9785,8 @@ def plan_split_parent_cleanup(manifest_path: Path) -> dict[str, Any]:
        reads them.
     4. The parts' inputs, with the inputs a campaign disposition excluded, are the parent's inputs, each once.
     5. Every part has ended (_part_end): validated, released, failed after its retries, skipped, excluded or
-       discarded; none has a Console that may still be running, and none keeps an artifact under the tree.
+       discarded; none has a Console that may still be running, and none keeps an artifact under the tree. A
+       part with a new run prepared after a validated run, which has not validated, has not ended.
     6. No finalisation hold stands on the parent or a part (run_finalisation.raw_deletion_holds).
 
     The release is ``released`` when some part's outputs validated, else ``discarded``. The authorization - a
@@ -8857,24 +10179,383 @@ def _matches_sample_file_names(
     return bool(stems) and PurePosixPath(base).stem in stems
 
 
+# A DECLARED FILE NAME AN ARCHIVE MEMBER CARRIES BEHIND A PREFIX. Metabolomics Workbench ST001264 declares
+# BioRec1.raw in its sample rows, and its study archive holds 021518_387057_CSHp_BioRec1.raw: the run's date
+# and sequence prefix, which no row records. No exact rule (the name, the extensionless stem, the container
+# alias) matched it, the attribute stage admitted nothing, and the unit failed after its whole download. A
+# member whose name ends in one of these separators and then a declared name is that declared file's, when
+# the pairing is one to one (_member_name_pairings), and the pairing is recorded as made by this rule.
+PREFIX_SEPARATORS = frozenset("_-. ")
+PREFIXED_MEMBER_PAIRING = "prefixed_member_name"
+# A DECLARED FILE NAME AND A MEMBER THAT SHARE THEIR LEADING IDENTIFIER. Metabolomics Workbench ST001359
+# declares VV_13_HEpG2_C1_pos.raw, and its archive holds VV_13_HEpG2_C1_exp344_pos.raw: the member carries an
+# experiment number the row does not, and the row for VV_14 even misspells the cell line (HEepG2). Neither
+# name ends in the other, so no exact or prefixed rule pairs them. The user decided on 2026-10-06 that a
+# declared name and a member are one file when their leading identifier (leading_identifier_key: VV_13) is
+# unique on both sides, and that such a pairing must always be left on record (INFERRED_PAIRING_WARNING).
+LEADING_IDENTIFIER_TOKEN_PAIRING = "leading_identifier_token"
+# The unit-level warning code every inferred pairing (prefixed or by token) raises: in the attribute stage,
+# the run manifest's warnings and the campaign disposition's warnings (raw_metadata_preflight's, imported).
+# A name's tokens: what lies between these separators, compared without case.
+_NAME_TOKEN_SPLIT = re.compile(r"[_\-. ]+")
+# The polarity a name's token states, as a token of its own (x_pos.raw, NEG/x.raw; not "position").
+POLARITY_NAME_TOKENS = {"pos": "Positive", "positive": "Positive", "neg": "Negative", "negative": "Negative"}
+# Tokens beside which a pos/neg token (before or after it, in the file name; never in a folder) may name a sample
+# rather than a polarity: Neg_Ctrl_1.raw is a negative control, whatever polarity it ran in. Read as polarities,
+# they refused a positive unit's own Neg_Ctrl_1.raw (review of PR #58, 2026-10-06). But in the Catalog such a
+# token is also a file's polarity: in all 19 LC-MS units whose sample rows state a polarity by one that
+# contradicts the unit's ion mode (157 rows), the unit's other rows name files by polarity (ST002251's
+# 20200715_004_QC-neg.mzML beside its _pos and _neg samples, ST002510's GL_NEG_Ctrl_B3_1.raw, ST003858's
+# Blank_POS_001.mzML). name_polarities therefore reads such a token as a polarity only in a listing that names
+# its files by polarity, and only in a name that states no polarity by a token of its own.
+POLARITY_EXEMPTING_TOKENS = frozenset({"control", "ctrl", "blank", "qc"})
+# The suffixes a name's stem is read without, as metadata_match_keys reads them.
+_PAIRING_NAME_SUFFIXES = (".wiff2", ".wiff", ".mzml", ".mzxml", ".raw", ".cdf", ".lcd", ".qgd", ".abf", ".d")
+
+
+def _name_tokens(text: str) -> list[str]:
+    return [token for token in _NAME_TOKEN_SPLIT.split(str(text or "").casefold()) if token]
+
+
+def _polarity_token_reading(text: str) -> tuple[set[str], set[str]]:
+    """(the polarities a name - or a path's folders and name - states by a pos/neg token of its own, those it
+    states only by a token beside a control, ctrl, blank or QC token: POLARITY_EXEMPTING_TOKENS).
+
+    Only the name itself (the path's last part) can hold such a token. A folder's pos/neg token always states
+    its polarity, whatever stands beside it: a shared archive sorts its runs into QC_NEG/ and Blank_POS/ as it
+    does into NEG/ and POS/, and a385a28 refused a QC_NEG/ member in a positive unit (review of PR #58,
+    2026-10-07)."""
+    plain: set[str] = set()
+    beside_exempting: set[str] = set()
+    parts = [part for part in str(text or "").replace("\\", "/").split("/") if part.strip()]
+    for position, part in enumerate(parts):
+        is_name = position == len(parts) - 1
+        tokens = _name_tokens(part)
+        for index, token in enumerate(tokens):
+            if token not in POLARITY_NAME_TOKENS:
+                continue
+            beside = tokens[max(index - 1, 0):index] + tokens[index + 1:index + 2]
+            exempting = is_name and any(neighbour in POLARITY_EXEMPTING_TOKENS for neighbour in beside)
+            (beside_exempting if exempting else plain).add(POLARITY_NAME_TOKENS[token])
+    return plain, beside_exempting
+
+
+def names_state_polarity(texts: Iterable[str]) -> bool:
+    """Whether a listing names its files by polarity: some name states one by a pos/neg token that is beside no
+    control, ctrl, blank or QC token (x_pos.raw, NEG/x.raw)."""
+    return any(_polarity_token_reading(text)[0] for text in texts)
+
+
+def name_polarities(text: str, *, polarity_named: bool) -> set[str]:
+    """The polarities a name, or a path's folders and name, state by a token of their own (POLARITY_NAME_TOKENS).
+
+    A pos/neg token beside a control, ctrl, blank or QC token (POLARITY_EXEMPTING_TOKENS) is read as part of a
+    sample's name and states no polarity (Neg_Ctrl_1.raw, pos_ctrl, neg_blank), and a name that states a
+    polarity by a token of its own as well states that one only (x_Neg_Ctrl_1_neg.raw: Negative). Only where
+    such a token is the name's sole polarity token and the name comes from a listing that names its files by
+    polarity (``polarity_named``, names_state_polarity) is it read as the file's polarity, as the Catalog's
+    20200715_004_QC-neg.mzML is beside its _pos and _neg samples.
+    """
+    plain, beside_exempting = _polarity_token_reading(text)
+    if plain or not polarity_named:
+        return plain
+    return beside_exempting
+
+
+def leading_identifier_key(name: str) -> str:
+    """A file name's leading identifier: its stem's tokens up to and including the first one with a digit.
+
+    The stem is the name less a raw or converted suffix (_PAIRING_NAME_SUFFIXES); its tokens are what lies
+    between _ - . and spaces, compared without case, and joined by _. VV_13_HEpG2_C1_pos.raw gives vv_13, as
+    VV_13_HEpG2_C1_exp344_pos.raw does. A name with no digit gives no key, and so does a key of digits only
+    (021518_387057_CSHp_BioRec1.raw gives none: a run date is no sample's identifier).
+    """
+    text = PurePosixPath(str(name or "").replace("\\", "/")).name.casefold()
+    for suffix in _PAIRING_NAME_SUFFIXES:
+        if text.endswith(suffix) and len(text) > len(suffix):
+            text = text[: -len(suffix)]
+            break
+    tokens = _name_tokens(text)
+    for index, token in enumerate(tokens):
+        if any(character.isdigit() for character in token):
+            key = tokens[: index + 1]
+            return "_".join(key) if any(character.isalpha() for character in "".join(key)) else ""
+    return ""
+
+
+def _member_under_root(key: str, data_key: str) -> str:
+    """A member's path under the data root, '/'-separated, in its own case where it is on disk; its name
+    alone where it is not under the root. Keys are casefolded (_file_key), so the case is read back."""
+    path = Path(key)
+    shown = str(path.resolve()) if path.exists() else key
+    if shown.casefold().startswith(data_key):
+        return shown[len(data_key):].lstrip("\\/").replace("\\", "/")
+    return path.name
+
+
+def _prefixed_member_pairing(
+    project: RepositoryProject,
+    extracted_members: dict[str, dict[str, Any]] | None,
+    data_root: Path,
+) -> dict[str, dict[str, str]]:
+    """The archive members an undeclared unit's samples name by an inferred rule, by _file_key.
+
+    _member_name_pairings' pairings alone: by a prefixed name, or by a leading identifier token."""
+    return _member_name_pairings(project, extracted_members, data_root)["paired"]
+
+
+def _member_name_pairings(
+    project: RepositoryProject,
+    extracted_members: dict[str, dict[str, Any]] | None,
+    data_root: Path,
+) -> dict[str, Any]:
+    """The archive members an undeclared unit's samples name by an inferred rule, and the pairings refused.
+
+    Returns {"paired": {_file_key: pairing}, "refused": [...]}. Each pairing says which declared raw file the
+    member is ({"declared_raw_file", "paired_by"}, and for a token pairing its "key"). Each refusal names the
+    member, the declared raw file, the rule and the reason.
+
+    EXACT MATCHES ARE DECIDED FIRST: a declared name some member, or the unit's file listing, carries exactly
+    is never paired by inference, and a member a declared name names exactly is never given another. THEN
+    PREFIXED NAMES (PREFIXED_MEMBER_PAIRING): a member is paired with a declared name when its name - or its
+    stem, for a name a row records without an extension, as _sample_file_names reads those - ends in a
+    separator (PREFIX_SEPARATORS) and then the declared name, compared without case. THEN LEADING IDENTIFIERS
+    (LEADING_IDENTIFIER_TOKEN_PAIRING): a declared name still unpaired is paired with the member whose
+    leading_identifier_key is its own, when that key is the key of no other declared name and of no other
+    candidate member.
+
+    EACH PAIRING IS ONE TO ONE: a member that ends in two declared names, or a declared name two members end
+    in, pairs neither - which is why Youn_sa1.raw never takes 021518_Youn_sa11.raw, whose name ends in
+    _Youn_sa11.raw and not _Youn_sa1.raw, and why a shared study archive holding POS/x_S1.raw and NEG/x_S1.raw
+    gives S1.raw to neither. AND NEVER ACROSS POLARITIES: where the member's path (its folders under the data
+    root and its name) or the declared name states a polarity by a token of its own (name_polarities) that is
+    not the unit's ion mode, or the two state different ones, the pairing is refused and recorded as such. A
+    pos/neg token beside a control, ctrl, blank or QC token names a sample (Neg_Ctrl_1.raw) and refuses
+    nothing, unless it is the name's only polarity token and that side's names (the declared names, or the
+    candidate members' paths) name files by polarity elsewhere: then it is the file's polarity
+    (name_polarities).
+
+    Only what came out of an archive is paired (``extracted_members``: an analysable file outside a vendor
+    folder, or the outermost .d/.raw folder holding members): a file the repository lists on its own is
+    attributed by its listing. A unit whose Catalog declared its analysis inputs is matched by path and never
+    by a name (_select_declared_inputs), so it has none.
+    """
+    result: dict[str, Any] = {"paired": {}, "refused": []}
+    if not project.analysis_unit_id or not extracted_members or declared_analysis_inputs(project):
+        return result
+    named: dict[str, set[str]] = {}
+    stemmed: dict[str, set[str]] = {}
+    written_names: set[str] = set()
+    for sample in project.sample_metadata or []:
+        raw = PurePosixPath(str((sample or {}).get("raw_file") or "").strip().replace("\\", "/")).name
+        if not raw:
+            continue
+        written_names.add(raw)
+        folded = raw.casefold()
+        if PurePosixPath(folded).suffix:
+            named.setdefault(folded, set()).add(raw)
+        else:
+            stemmed.setdefault(folded, set()).add(raw)
+        alias = archives.container_alias(folded)
+        if alias:
+            named.setdefault(alias.casefold(), set()).add(raw)
+    if not named and not stemmed:
+        return result
+    data_key = _file_key(str(data_root))
+    pool: dict[str, str] = {}
+    for key in extracted_members:
+        path = Path(key)
+        outermost = ""
+        for parent in path.parents:
+            parent_key = str(parent)
+            if parent_key == data_key or len(parent_key) <= len(data_key):
+                break
+            if parent.suffix.casefold() in FOLDER_INPUT_SUFFIXES:
+                outermost = parent_key
+        if outermost:
+            pool[outermost] = Path(outermost).name.casefold()
+        elif not _is_sidecar_name(path.name) and (
+            path.suffix.casefold() in RAW_SUFFIXES or is_convertible_input(path.name)
+        ):
+            pool[key] = path.name.casefold()
+
+    def relative(key: str) -> str:
+        return _member_under_root(key, data_key)
+
+    unit_polarity = str(project.ion_mode or "").strip().capitalize()
+    unit_polarity = unit_polarity if unit_polarity in {"Positive", "Negative"} else ""
+
+    # Whether each side names its files by polarity: a pos/neg token beside a control, ctrl, blank or QC token
+    # is a polarity only in a listing that does (name_polarities). Read once, when a pairing is first checked.
+    polarity_named: dict[str, bool] = {}
+
+    def polarity_conflict(key: str, declared_raw_file: str) -> str:
+        """Why a member and a declared name may not be paired by their polarity tokens; '' when they may."""
+        if not polarity_named:
+            polarity_named["members"] = names_state_polarity(relative(item) for item in pool)
+            polarity_named["declared"] = names_state_polarity(written_names)
+        member = name_polarities(relative(key), polarity_named=polarity_named["members"])
+        declared = name_polarities(declared_raw_file, polarity_named=polarity_named["declared"])
+        if unit_polarity and ((member | declared) - {unit_polarity}):
+            return "polarity_token_contradicts_ion_mode"
+        if member and declared and member != declared:
+            return "polarity_token_contradicts_declared_name"
+        return ""
+
+    def exactly(name: str) -> set[str]:
+        """The declared names a name carries exactly: itself, or its stem where a row records no extension."""
+        return {form for form in (name, PurePosixPath(name).stem) if form in stemmed} | (
+            {name} if name in named else set()
+        )
+
+    def written(declared_name: str) -> str:
+        return sorted(named.get(declared_name) or stemmed.get(declared_name) or {declared_name})[0]
+
+    def refuse(member: str, declared_raw_file: str, rule: str, reason: str, **extra: Any) -> None:
+        result["refused"].append(
+            {
+                "member_name": relative(member),
+                "declared_raw_file": declared_raw_file,
+                "rule": rule,
+                "reason": reason,
+                **extra,
+            }
+        )
+
+    taken: set[str] = set()
+    for item in project.files:
+        base = PurePosixPath(str(item.name or "").replace("\\", "/")).name.casefold()
+        for name in filter(None, (base, archives.container_alias(base).casefold())):
+            taken |= exactly(name)
+    for name in pool.values():
+        taken |= exactly(name)
+    claims: dict[str, set[str]] = {}
+    claimed_by: dict[str, set[str]] = {}
+    for key, name in pool.items():
+        if exactly(name):
+            continue
+        found = {
+            text[index + 1:]
+            for text, table in ((name, named), (PurePosixPath(name).stem, stemmed))
+            for index, character in enumerate(text)
+            if character in PREFIX_SEPARATORS and text[index + 1:] in table and text[index + 1:] not in taken
+        }
+        if found:
+            claims[key] = found
+            for declared_name in found:
+                claimed_by.setdefault(declared_name, set()).add(key)
+    paired: dict[str, dict[str, str]] = result["paired"]
+    for key, found in sorted(claims.items()):
+        declared_name = next(iter(found))
+        if len(found) != 1 or len(claimed_by[declared_name]) != 1:
+            for name in sorted(found):
+                refuse(key, written(name), PREFIXED_MEMBER_PAIRING, "not_one_to_one")
+            continue
+        reason = polarity_conflict(key, written(declared_name))
+        if reason:
+            refuse(key, written(declared_name), PREFIXED_MEMBER_PAIRING, reason)
+            continue
+        paired[key] = {"declared_raw_file": written(declared_name), "paired_by": PREFIXED_MEMBER_PAIRING}
+
+    # The leading identifiers of every declared name and of every candidate member, for uniqueness. A
+    # declared name a prefixed member claims, paired or refused, and a member that claims one, are left to
+    # that rule: the token rule never pairs what a rule before it settled or refused.
+    declared_keys: dict[str, set[str]] = {}
+    for raw in written_names:
+        token_key = leading_identifier_key(raw)
+        if token_key:
+            declared_keys.setdefault(token_key, set()).add(raw.casefold())
+    member_keys: dict[str, set[str]] = {}
+    for key, name in pool.items():
+        token_key = leading_identifier_key(name)
+        if token_key:
+            member_keys.setdefault(token_key, set()).add(key)
+    for token_key, declared_names in sorted(declared_keys.items()):
+        members = member_keys.get(token_key) or set()
+        open_names = {name for name in declared_names if name not in taken and name not in claimed_by}
+        if not members or not open_names:
+            continue
+        if len(declared_names) != 1 or len(members) != 1:
+            for name in sorted(open_names):
+                for key in sorted(members):
+                    if key not in claims and not exactly(pool[key]):
+                        refuse(
+                            key,
+                            written(name),
+                            LEADING_IDENTIFIER_TOKEN_PAIRING,
+                            "leading_identifier_not_unique",
+                            key=token_key,
+                        )
+            continue
+        declared_name = next(iter(declared_names))
+        key = next(iter(members))
+        if key in claims or exactly(pool[key]):
+            continue
+        reason = polarity_conflict(key, written(declared_name))
+        if reason:
+            refuse(key, written(declared_name), LEADING_IDENTIFIER_TOKEN_PAIRING, reason, key=token_key)
+            continue
+        paired[key] = {
+            "declared_raw_file": written(declared_name),
+            "paired_by": LEADING_IDENTIFIER_TOKEN_PAIRING,
+            "key": token_key,
+        }
+    return result
+
+
+def inferred_name_pairings(pairings: dict[str, dict[str, str]], data_root: Path) -> list[dict[str, str]]:
+    """Every inferred pairing as the attribute stage and the run manifest list it: member, declared name, rule."""
+    data_key = _file_key(str(data_root))
+    listed = []
+    for key, pairing in sorted(pairings.items()):
+        listed.append(
+            {
+                "member_name": _member_under_root(key, data_key),
+                "declared_raw_file": pairing["declared_raw_file"],
+                "paired_by": pairing["paired_by"],
+                **({"key": pairing["key"]} if pairing.get("key") else {}),
+            }
+        )
+    return listed
+
+
+def _paired_member_of(path: Path, prefixed: dict[str, dict[str, str]] | None) -> bool:
+    """Whether an extracted file is a prefixed member's: the member, its .wiff.scan, or inside its folder."""
+    if not prefixed:
+        return False
+    key = _file_key(str(path))
+    if key in prefixed:
+        return True
+    if _is_sidecar_name(path.name) and _file_key(str(path.with_name(path.name[:-5]))) in prefixed:
+        return True
+    return any(str(parent) in prefixed for parent in Path(key).parents)
+
+
 def _admitted_by_unit(
     path: Path,
     data_root: Path,
     listed: Iterable[str],
     sample_names: tuple[set[str], set[str]],
     archive_samples: dict[str, str],
+    prefixed: dict[str, dict[str, str]] | None = None,
 ) -> bool:
-    """Whether an undeclared unit admits a file by itself: listed, named by its samples, or out of an archive
-    one of its samples names (archive_samples, by _file_key)."""
+    """Whether an undeclared unit admits a file by itself: listed, named by its samples, out of an archive
+    one of its samples names (archive_samples, by _file_key), or an archive member one of its samples names
+    by an inferred pairing (prefixed, _member_name_pairings)."""
     return (
         _path_matches_allowlist(path, data_root, listed)
         or _matches_sample_file_names(path, sample_names)
         or (bool(archive_samples) and _file_key(str(path)) in archive_samples)
+        or (bool(prefixed) and _file_key(str(path)) in prefixed)
     )
 
 
 def _readable_inputs_admitted(
-    readable: list[str], data_root: Path, project: RepositoryProject, archive_samples: dict[str, str]
+    readable: list[str],
+    data_root: Path,
+    project: RepositoryProject,
+    archive_samples: dict[str, str],
+    prefixed: dict[str, dict[str, str]] | None = None,
 ) -> set[str]:
     """The readable inputs an undeclared unit admits by itself, by _file_key, as its attribute stage will.
 
@@ -8890,7 +10571,7 @@ def _readable_inputs_admitted(
         _file_key(item)
         for item in readable
         if not requires_msdial_conversion(Path(item).name)
-        and _admitted_by_unit(Path(item), data_root, listed, sample_names, archive_samples)
+        and _admitted_by_unit(Path(item), data_root, listed, sample_names, archive_samples, prefixed)
     }
 
 
@@ -8903,13 +10584,18 @@ def _filter_inputs_by_project_allowlist(
     archive_extractions: list[dict[str, Any]] | None = None,
     stands_for: dict[str, str] | None = None,
     set_aside: list[str] | None = None,
+    prefixed_members: dict[str, dict[str, str]] | None = None,
 ) -> list[str]:
     """The inputs that are this unit's: listed, named by its samples, or out of an archive one names.
 
     archive_samples is _archive_sample_attribution's: the files, and outermost .d/.raw folders, that
     came out of an archive exactly one of this unit's samples names (X.zip). Without it, only names
     are matched, as they always were. archive_extractions is the lease's extraction records, which say
-    where a declared archived container really is (declared_archive_containers).
+    where a declared archived container really is (declared_archive_containers). prefixed_members is
+    _member_name_pairings': the archive members that carry a declared name behind a prefix, or share its
+    leading identifier, one to one
+    (021518_387057_CSHp_BioRec1.raw for BioRec1.raw). A declared name nothing carries, exactly or so, admits
+    nothing, and its sample row is left without an input (samples_without_input) as before.
 
     stands_for maps an input, by _file_key, to the mzXML it stands for (the convert stage's
     stands_for): an mzML converted from it, or a readable encoding of its sample chosen over it. Such an
@@ -8945,7 +10631,7 @@ def _filter_inputs_by_project_allowlist(
         )
 
     def admitted(path: Path, listed: Iterable[str]) -> bool:
-        return _admitted_by_unit(path, data_root, listed, sample_names, archive_samples)
+        return _admitted_by_unit(path, data_root, listed, sample_names, archive_samples, prefixed_members)
 
     # Either source is sufficient on its own, and both are scoped to THIS unit: the declared
     # analysis-input files, and the file names this unit's samples claim. An archive shared with
@@ -9277,12 +10963,14 @@ def _filter_project_allowlist_paths(
     project: RepositoryProject,
     *,
     archive_samples: dict[str, str] | None = None,
+    prefixed_members: dict[str, dict[str, str]] | None = None,
 ) -> list[str]:
     """The extracted files that are this unit's: listed, inside a listed folder, or its samples'.
 
     Matching the listed names alone gave [] for every Workbench unit, whose only listed file is the
     study archive: extracted_files said nothing came out for the unit although its inputs had. A file
-    that came out of an archive one of its samples names (archive_samples) is that sample's.
+    that came out of an archive one of its samples names (archive_samples) is that sample's, and so is a
+    member a sample names by an inferred pairing (prefixed_members), with its .wiff.scan and its folder's files.
     """
     if not project.analysis_unit_id:
         return paths
@@ -9295,6 +10983,7 @@ def _filter_project_allowlist_paths(
         if _path_matches_allowlist(Path(item), data_root, allowed, allow_directory_descendants=True)
         or _is_sample_member(Path(item), data_root, sample_names)
         or (bool(archive_samples) and _file_key(item) in archive_samples)
+        or _paired_member_of(Path(item), prefixed_members)
     ]
 
 
@@ -10093,7 +11782,7 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
         acquisition_mode = "Mixed"
     else:
         acquisition_mode = next(iter(acquisition_values), "Unknown")
-    from .raw_metadata_preflight import header_console_acquisition_type
+    from .raw_metadata_preflight import header_console_acquisition_type, spectrum_representation_fields
 
     per_file = []
     for item in records:
@@ -10133,6 +11822,10 @@ def _summarize_raw_metadata(records: list[dict[str, Any]]) -> dict[str, Any]:
                 "console_acquisition_type": console,
                 "console_acquisition_basis": console_basis if console else "",
                 "reader": str(source.get("readerName") or ""),
+                # Centroid, Profile or Mixed as the sampled scan headers recorded them, per MS level where the
+                # record says, with the reader, native format and instrument model: delivered_data_types turns
+                # these into what MS-DIAL receives, the run's MS1 and MS2 data type.
+                **spectrum_representation_fields(item),
                 "extractor_warnings": sorted(
                     {
                         str(warning.get("code") or "")
@@ -10572,6 +12265,11 @@ def recorded_order_source(manifest_path: Any, files: list[dict[str, Any]]) -> st
 
 def record_analytical_order(manifest_path: str | Path, record: dict[str, Any]) -> None:
     """Keep how the analysis CSV's analytical order was decided in the unit's own manifest."""
+    update_manifest(Path(manifest_path), analytical_order_change(record))
+
+
+def analytical_order_change(record: dict[str, Any]) -> Any:
+    """The change record_analytical_order makes, for a write that carries it with the CSV it describes."""
     kept = {key: value for key, value in record.items() if key != "orders"} | {
         "recorded_at": datetime.now(timezone.utc).isoformat()
     }
@@ -10579,7 +12277,7 @@ def record_analytical_order(manifest_path: str | Path, record: dict[str, Any]) -
     def change(manifest: dict[str, Any]) -> None:
         manifest["analytical_order"] = kept
 
-    update_manifest(Path(manifest_path), change)
+    return change
 
 
 def _metadata_value(record: dict[str, Any], section: str, field_name: str) -> str:

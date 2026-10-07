@@ -87,6 +87,49 @@ archive's `POS/QC_01.mzML` is no encoding of `NEG/QC_01.mzXML` for a unit whose
 samples name `QC_01.mzXML`. mzData, which nothing converts, excludes its unit in
 a campaign too.
 
+A unit whose Catalog declared no analysis inputs admits a file by its listing,
+by the file names its samples declare, or through an archive one sample names.
+An archive member that carries a declared name only behind a prefix is admitted
+too (0.5.25): Metabolomics Workbench ST001264 declares `BioRec1.raw` and its
+study archive holds `021518_387057_CSHp_BioRec1.raw`. The member's name (or its
+stem, for a name declared without an extension) must end in `_`, `-`, `.` or a
+space and then the declared name, compared without case; exact matches are
+decided first; and the pairing must be one to one, so `Youn_sa1.raw` never
+takes `..._Youn_sa11.raw` and a name two members carry is given to neither. The
+input's `input_lineage` row records `name_pairing` (`declared_raw_file`,
+`member_name`, `paired_by` `prefixed_member_name`), and the analysis CSV finds
+its sample row by it. A declared name no member carries leaves its sample row
+in the CSV record's `samples_without_input`, and the rest run; the CSV record
+then carries the warning `sample_rows_without_input` and `sample_row_coverage`.
+
+A declared name still unpaired is then paired by its leading identifier
+(0.5.25, the user's decision of 2026-10-06): Metabolomics Workbench ST001359
+declares `VV_13_HEpG2_C1_pos.raw`, and its archive holds
+`VV_13_HEpG2_C1_exp344_pos.raw`. The key is the stem split on `_`, `-`, `.` and
+spaces, taken up to and including the first token that contains a digit,
+compared without case (`vv_13`); a key of digits only gives none. The key must
+be unique among the declared names and among the candidate members. Exact
+matches come first, then prefixed ones, then these. No inferred pairing crosses
+a polarity: a member whose path, or a declared name, carries `pos`, `neg`,
+`positive` or `negative` as a token of its own that is not the unit's ion mode
+(or the two disagree) is refused, and the refusal is recorded. A polarity token
+beside a `control`, `ctrl`, `blank` or `qc` token in the file name is read as
+part of a sample's name (`Neg_Ctrl_1.raw` is a negative control) and refuses
+nothing. A folder's token always states its polarity (`QC_NEG/`, `Blank_POS/`,
+as `NEG/`). In a file name it is still read as a polarity in two cases: where it is the
+name's only polarity token and that side's names (declared, or members) name
+their files by polarity elsewhere, as the Catalog's `20200715_004_QC-neg.mzML` is
+beside its `_pos` and `_neg` files; and where the name has a polarity token of
+its own elsewhere, which is then the one it states. Each
+inferred pairing is left on record: `name_pairing` on the lineage row
+(`paired_by` `leading_identifier_token` and its `key`), `inferred_name_pairings`
+and `refused_name_pairings` on the attribute stage, `input_name_pairings` and the
+warning `input_names_paired_by_inference` in the run manifest and in every
+campaign disposition (a split part's manifest carries them for its own inputs
+and sample rows), the same warning on the CSV record, and the column
+`raw_file_paired_by` (`exact`, `prefixed_member_name`,
+`leading_identifier_token`) in the reviewed sample TSV.
+
 Agent-driven reanalysis also requires a user-reviewed `analysis_purpose` before
 download. That purpose anchors Class/contrast selection, annotation strategy,
 QA, and requested outputs; it is retained with repository provenance.
@@ -266,6 +309,22 @@ accession directly or reopen `run-manifest.json`, `repository-metadata.json`,
 or a reviewed metadata JSON. Each repository is normalized to one row per
 analysis file while all source values remain available for audit and editing.
 
+Rows may share a sample id: a repository lists each injection of a sample as a
+row of its own (MetaboLights MTBLS291's five replicates of `Cel`, MetaboBank
+MTBKS64's `S01_M01` and `S01_M02` of `S01`). Each such row is its own analysis
+input and analysis-CSV row, with its own raw file and its sample's Class;
+nothing is merged, averaged or dropped. A repository unit's CSV row records the
+sample row it came from (`sample_row_index`, `sample_raw_file`, and `sample_row`
+on its `input_lineage` row). What stays refused is what is ambiguous: one row
+two inputs name (`sample_row_with_two_inputs`), one input two rows name
+(`input_with_two_sample_rows`), and an input of a sample several rows describe
+that none of them names (`sample_row_not_identified`). A declared input is
+paired with its row by its path first and its file name second, the same way
+before the download (the handoff check) and after it (the analysis CSV). A split
+gives each part the rows of its own inputs, so a sample whose replicates differ
+in format or acquisition is in each part with only that part's rows
+(`sample_row_indexes`).
+
 Select metadata fields in the intended hierarchy, for example `Genotype`,
 `Region`, then `Sex`. MS-DIAL Interactive projects these fields into its single
 Class value as `KO_North_F`. Spaces and underscores inside values become
@@ -359,11 +418,106 @@ campaign it is advice and changes nothing else. Under a campaign approval it is
 applied: it sets `execution_allowed`, the status (`preflight_passed`,
 `skipped_by_preflight`, `excluded_by_preflight`) and each input's
 `console_acquisition_type` (DDA, SWATH or AIF; none for an input that does not
-run), and the execution gate then admits each file only as that type.
+run), and the execution gate then admits each file only as that type, and never
+as one that contradicts the Console type its header settles
+(`header_console_acquisition_type`: a DDA or AIF header, or a DIA header whose
+isolation targets recur at two or more m/z, which is SWATH). A DIA header with one
+recorded isolation target or none binds no type: the extractor records targets
+only from MS2 headers that carry a precursor m/z. A disposition applied before
+Interactive 0.5.29 (it records no `declared_acquisition_source`) is decided again
+at the gate from the same records, and the run is refused where the new decision
+would not run the unit, would exclude a row's file, or would give it another type
+on its header's word. Preparing the unit again
+(`msdial_prepare_repository_reanalysis`) clears it: the unit is decided again from
+its recorded preflight before its rows are built (in memory for the preview, on disk
+when the call writes), the analysis CSV follows the new decision, and the reply
+reports it as `legacy_disposition_redecision`. The old disposition is kept under the
+new one's `supersedes`.
+
+A unit past its run is never decided again in place, and a prepare never writes over
+that run's files. Past its run means a status of `mztab_validated`, `completed`,
+`cleanup_pending_confirmation`, `raw_cleaned` or `discarded`, or a production run
+that was finalised (`finalized_at`, `validation_failed` included); its output
+directory holds the analysis CSV the run read, and `retained_artifact_inventory`
+their checksums. Preparing such a unit returns `ok: false`, `reason: run_finished`,
+and writes nothing. To run it again, prepare a new production run with
+`new_run=true`:
+
+- the finished run's records are copied unchanged into a new entry of
+  `superseded_runs` (its status, `cleanup_allowed`, `output_directory`,
+  `finalized_run`, `mztab_validation`, retained artifacts and their inventory,
+  `analysis_csv`, `analytical_order`, campaign disposition and project, the
+  lineage rows' written names and types as `input_lineage_written`, and the
+  preflight's per-file Console types as `preflight_per_file`). The old output
+  directory and its files are left as they are;
+- the finished run's own records are taken off the top level, `output_directory`
+  becomes `<workspace>\output-run-<n>` (n = 2 for the second run), and the analysis
+  CSV and the new run's outputs go there;
+- `cleanup_allowed` becomes false and the status `preflight_passed` (`prepared`
+  where no raw-header preflight is recorded);
+- a disposition applied before 0.5.29 is decided again under the header-first rule,
+  which then sets the status and `execution_allowed`.
+
+The preview (`confirmed=false`) does this in memory, creates nothing and reports it
+as `preview.new_run`. A new run is refused, and nothing written, for a unit whose raw
+data were released (`raw_released`, also without `new_run`), while a run attempt of
+the unit may still be running (`run_in_progress`), where the legacy disposition
+decided again would not run the unit (`would_not_run`, with the decision in
+`new_run.legacy_disposition_redecision`), or where that decision fails
+(`redecision_failed`). The execution gate holds a workflow to the unit's current
+`output_directory`, so the new run cannot write into the finished run's folder.
+
+A confirmed new run is all or nothing. The run is decided in memory, its rows
+built, its aliases made, and its reviewed metadata and analysis CSV written into a
+hidden staging folder beside the new one. Only then, under the manifest lock, the
+staging folder becomes `output-run-<n>` and the manifest is written once, with the
+superseded run, the new `output_directory`, the CSV record, the analytical order and
+any campaign crossing. If anything before that fails, the manifest and every file of
+the finished run are left byte for byte as they were, and the staging folder and the
+aliases the call made are removed. That covers rows that disagree or an alias that
+cannot be made (`analysis_csv_failed`, with nothing recorded in the manifest), files
+that do not map, and errors. If another writer changed the manifest meanwhile, the
+call returns `new_run_conflict`. The unit stays finished, and the same call can be
+made again.
+
+An alias's path in `raw\console-aliases` is fixed by its input, so two prepares of
+one unit share it. An abandoned call removes an alias it made only if no analysis CSV
+of the unit's committed manifest names it, so a concurrent prepare that reused the
+alias and committed keeps it. A commit whose CSV names an alias that has since been
+removed is refused as `new_run_conflict`. Both checks hold the manifest lock.
+
+Raw-data deletion is judged by the unit's current run. Until a new run prepared after
+a validated run has validated itself, its raw data are kept for it:
+`msdial_cleanup_repository_raw` refuses because the current run is not validated, and
+`msdial_discard_repository_raw` refuses because the unit did produce a validated
+output. Each preview names the superseded validated run. Once the new run validates,
+the cleanup judges it as it judges any other run. A split part is held the same way,
+approved or not: its discard under a campaign approval is refused, and its parent's
+raw release counts it as not ended, whatever its status and however many runs failed.
+
+Each file's acquisition is its raw header's wherever the header was read (user
+decision, 2026-10-06). A file with MS2 whose header gives DDA, DIA, AIF or SWATH
+runs as that, whatever the unit declares and whatever confidence the extractor
+gave: that confidence is a constant per branch of its classifier, and a
+declaration is the Catalog's keyword match over the assay's text. Each
+declaration a header overrode is listed in `declared_vs_header` with its
+`declaration_source` (`catalog_keyword_inference`, `split_part` or
+`unattributed`; the record's `declared_acquisition_source`); an override is
+reported only for a file that reaches the run, and one excluded afterwards is
+listed with `decided: excluded` and its `excluded_reason`. A file whose header
+gives Unknown is excluded as `acquisition_unresolved`, declared unit or not, and
+one whose header gives PRM, SRM, MRM or SIM as out of scope. A unit left with only
+Unknown-header and MS1-only files is skipped as `acquisition_unresolved`, not
+excluded. The declaration
+decides only a unit none of whose headers could be read
+(`acquisition_declared_only`), and SWATH or AIF for a DIA header whose isolation
+settles neither. MS1-only files are folded into a DDA run, except in a unit
+declared DIA or AIF, where they may be all-ion data exported as MS1 scans and are
+excluded as `ms1_only_in_declared_dia_unit`. A split part is held to its parent's
+declaration there (`split_from.parent_declared_acquisition_mode`).
 
 A repository declaration of PRM, SRM, MRM, SIM or full scan is a declaration like
-any other: the unit is excluded unless a header of confidence 0.8 or more says
-otherwise, and untargeted status is never inferred over a declared targeted
+any other, and untargeted status is never inferred over a declared targeted
 acquisition. An input that is missing, or that the recorded preflight never read,
 skips the unit (`inputs_missing`, `raw_metadata_incomplete`) instead of shrinking
 the run; only an input that was read and failed is excluded on its own. Outside a
@@ -375,7 +529,10 @@ No disposition changes a unit that was split, whose run has finished
 (`mztab_validated`, `cleanup_pending_confirmation`, `raw_cleaned`) or whose run
 attempt is still open: a campaign preflight of such a unit reads nothing and
 reports `preflight_held`, and `classify_preflight` returns its decision with
-`held` and writes nothing. A split parent that is read all the same (outside a
+`held` and writes nothing. A finished unit whose applied disposition predates
+0.5.29 is decided again only as a new production run is prepared for it (above),
+after its finished run's records have moved to `superseded_runs`. A split parent
+that is read all the same (outside a
 campaign, or split while its headers were being read) records the reads for its
 parts and keeps its status and the disposition it carries.
 `classify_preflight` decides a summary written before the per-file fields

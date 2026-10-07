@@ -595,18 +595,346 @@ def _declared_agrees(declared: str, header: str, header_console: str | None) -> 
 
 
 # ------------------------------------------------------------------------------------------------------
+# What MS-DIAL receives: its "MS1 data type" and "MS2 data type"
+# ------------------------------------------------------------------------------------------------------
+
+DATA_TYPE_SCHEMA = "msdial-interactive.delivered-data-types.v1"
+# The values the pinned Console reads for "MS1 data type" and "MS2 data type" (ConfigParser: centroid or
+# profile, any case); anything else leaves its built-in default in place.
+DATA_TYPES = ("Centroid", "Profile")
+DATA_TYPE_DEFAULT = "Centroid"
+DATA_TYPE_LEVELS = (("ms1", 1), ("ms2", 2))
+# How many file names a decision lists under each value. The counts are always complete.
+DATA_TYPE_EXAMPLE_FILES = 5
+# The bases a level can be decided on. raw_header: every input comes through a reader that hands MS-DIAL
+# its spectra as the file stores them, and the headers say how. delivered_centroid: every input comes
+# through a reader that hands MS-DIAL centroids, whatever the header says. A level whose inputs are of both
+# kinds and agree is decided on both. Anything else is the default, which decides nothing.
+DECIDED_BASES = ("raw_header", "delivered_centroid", "raw_header_and_delivered_centroid")
+
+# What RawDataHandler hands MS-DIAL, by the extractor reader that recorded the file.
+#
+# MS1 and MS2 data type tell MS-DIAL whether the spectra it receives still need centroiding. They must
+# describe what the raw-data reader delivers, not what the instrument stored: MS-DIAL 5 loads every LC-MS
+# input with getProfileData=false (MsdialCore StandardDataProvider.cs:28 and :43, BaseDataProvider.cs:54;
+# the Console's LcmsProcess.cs:146), and most vendor readers then return centroids. Read from
+# msrawdataworkbench (RawDataHandlerStandard, edcc2e6; WatersMetadataReader from the extractor's eefe5ad):
+#
+# as_stored - the reader returns the stored points unprocessed, so the header is what MS-DIAL receives:
+#   WatersMetadataReader  MasslynxDataReader.cs:396 returns ReadScan as read (its Centroid() is commented
+#                         out); the extractor records each function's continuum flag
+#                         (WatersMetadataReader.cs:313 and :399).
+#   MzmlMetadataReader    RawDataHandler.cs:111 reads mzML with no profile flag and MzmlReader does not
+#                         centroid; the header is MS:1000127/MS:1000128 (MzmlMetadataReader.cs:294-295).
+#                         A converted mzXML is an mzML by then.
+#   RawDataAccess (.cdf)  NetCdfReader.cs:46 labels the spectra from the file's ProcessMethod and returns
+#                         them as stored.
+# centroid - the reader returns centroids whatever was stored:
+#   Wiff1MetadataReader   Wiff1Reader.cs:133-140 runs SCIEX's SpectralPeakFinder unless profile is asked.
+#   Wiff2MetadataReader   Wiff2Reader.cs:76 sets ConvertToCentroid = !getProfileMode.
+#   BrukerMetadataReader  Bruker BAF: BafReader.cs:186-187 reads the Line (centroid) arrays unless profile is
+#                         asked. Bruker TSF: TimsTofDataReader.cs:1980 and :2049 read line spectra.
+#   Shimadzu*Reader       ShimadzuIoModuleDataReader.cs:77 takes the CentroidList unless profile is asked.
+# depends on the scan - ThermoMetadataReader: ThermoDataReader.cs:228 returns the centroid (label) stream
+#   of an FT centroid scan; any other scan goes through Scan.FromFile, which returns the centroid stream
+#   where there is one (:241) and the stored points where there is not (:253). A centroid scan therefore
+#   arrives as centroids; an FTMS profile scan arrives as its centroid stream; an ITMS profile scan, which
+#   has no centroid stream, arrives as profile points. The extractor records one representation per file
+#   (ThermoMetadataReader.cs:140), and no analyzer, scan filter or FTMS/ITMS string. An instrument with no
+#   ion trap records only FTMS scans, so there a profile file arrives as centroids too; on any other model
+#   a profile file is unresolved.
+# unresolved - nothing recorded settles it:
+#   AgilentMetadataReader AgilentMidacDataReader.cs:106 (and AgilentMhdacDataReader.cs:39, PeakElseProfile)
+#                         returns peak spectra where the file has them and profile spectra where it has
+#                         only those; the extractor records neither.
+#   Bruker TDF, and any reader not named here.
+_AS_STORED_READERS = {
+    "WatersMetadataReader": "waters_scans_as_stored",
+    "MzmlMetadataReader": "mzml_spectra_as_stored",
+}
+_CENTROID_READERS = {
+    "Wiff1MetadataReader": "sciex_wiff_peak_finder",
+    "Wiff2MetadataReader": "sciex_wiff2_convert_to_centroid",
+    "ShimadzuLcdMetadataReader": "shimadzu_centroid_list",
+    "ShimadzuQgdMetadataReader": "shimadzu_centroid_list",
+}
+# Thermo instruments whose only mass analyzer is an Orbitrap: every scan is FTMS. Matched on the model name
+# the file records (Thermo InstrumentData.Model), case-insensitively. Astral and the tribrids (Fusion, Lumos,
+# Eclipse, Ascend, ID-X) and LTQ hybrids are not here: they carry a second analyzer.
+_THERMO_FTMS_ONLY_MODELS = ("q exactive", "exploris", "exactive")
+_THERMO_SECOND_ANALYZER = ("astral", "fusion", "lumos", "eclipse", "ascend", "id-x", "ltq", "velos", "elite")
+
+
+def spectrum_representation_fields(record: Mapping[str, Any]) -> dict[str, Any]:
+    """What one extractor record says about its spectra and its reader, as a per-file summary records it.
+
+    acquisition.spectrumRepresentation is the extractor's verdict over the scan headers it sampled
+    (RawMetadataInference.SetRepresentation): Centroid or Profile when they all agree, Mixed when they do
+    not, and null when no header said. It is one value for the file and does not say which MS level is
+    which. The one place a record does say so is a Waters MassLynx function: the extractor lists each
+    function as an experiment whose vendorFields carry its ms_level and continuum, and the functions with
+    an MS level are the ones its file-level value was read from. Those give spectrum_representation_by_level;
+    every other reader leaves it empty.
+
+    These are what the instrument stored. What MS-DIAL receives also depends on the reader, so the native
+    format and the instrument model are kept beside them (delivered_representation reads all of it).
+    """
+    acquisition = record.get("acquisition") if isinstance(record.get("acquisition"), Mapping) else {}
+    item = acquisition.get("spectrumRepresentation")
+    value = item.get("value") if isinstance(item, Mapping) else item
+    source = str(item.get("source") or "") if isinstance(item, Mapping) else ""
+    levels: dict[str, set[str]] = {}
+    for experiment in record.get("experiments") or []:
+        fields = experiment.get("vendorFields") if isinstance(experiment, Mapping) else None
+        if not isinstance(fields, Mapping):
+            continue
+        level = str(fields.get("ms_level") or "").strip()
+        continuum = str(fields.get("continuum") or "").strip().casefold()
+        if level.isdigit() and continuum in {"true", "false"}:
+            levels.setdefault(level, set()).add("Profile" if continuum == "true" else "Centroid")
+    origin = record.get("source") if isinstance(record.get("source"), Mapping) else {}
+    instrument = record.get("instrument") if isinstance(record.get("instrument"), Mapping) else {}
+    model = instrument.get("model")
+    model = model.get("value") if isinstance(model, Mapping) else model
+    return {
+        "spectrum_representation": str(value or ""),
+        "spectrum_representation_source": source,
+        "spectrum_representation_by_level": {
+            level: next(iter(found)) if len(found) == 1 else "Mixed" for level, found in sorted(levels.items())
+        },
+        "reader": str(origin.get("readerName") or ""),
+        "native_format": str(origin.get("nativeFormat") or ""),
+        "instrument_model": str(model or ""),
+    }
+
+
+def _stored_representation(entry: Mapping[str, Any], level: int) -> tuple[str, str]:
+    """(state, value) of what one input stored at one MS level: recorded, unresolved or unrecorded."""
+    whole = str(entry.get("spectrum_representation") or "")
+    by_level = entry.get("spectrum_representation_by_level")
+    own = str((by_level if isinstance(by_level, Mapping) else {}).get(str(level)) or "")
+    if own in DATA_TYPES:
+        # A function's own flag and the file's verdict are read from the same functions; were they ever to
+        # contradict each other, neither is believed.
+        return ("unresolved", "") if whole in DATA_TYPES and whole != own else ("recorded", own)
+    if own == "Mixed":
+        return "unresolved", ""
+    if whole in DATA_TYPES:
+        return "recorded", whole
+    if whole:
+        # Mixed (or a value this reader does not know): the file holds both, and nothing says which MS
+        # level is which.
+        return "unresolved", ""
+    return "unrecorded", ""
+
+
+def _thermo_ftms_only(model: str) -> bool:
+    name = model.casefold()
+    return any(part in name for part in _THERMO_FTMS_ONLY_MODELS) and not any(
+        part in name for part in _THERMO_SECOND_ANALYZER
+    )
+
+
+def delivered_representation(entry: Mapping[str, Any], level: int) -> tuple[str, str, str, str]:
+    """(state, value, basis, delivery) of what RawDataHandler hands MS-DIAL for one input at one MS level.
+
+    state is recorded, unresolved, unrecorded or not_applicable. A recorded value has basis raw_header (the
+    reader delivers the stored points, and the header says what they are) or delivered_centroid (the reader
+    delivers centroids). delivery names the reader behaviour the answer rests on; for an unresolved or
+    unrecorded input it names what is missing. See the reader table above.
+    """
+    if _entry_flag(entry, "has_ms1" if level == 1 else "has_ms2", level) is False:
+        return "not_applicable", "", "", ""
+    reader = str(entry.get("reader") or "")
+    native = str(entry.get("native_format") or "")
+    if reader in _CENTROID_READERS:
+        return "recorded", "Centroid", "delivered_centroid", _CENTROID_READERS[reader]
+    if reader == "BrukerMetadataReader":
+        if native == "Bruker BAF":
+            return "recorded", "Centroid", "delivered_centroid", "bruker_baf_line_spectra"
+        if native == "Bruker TSF":
+            return "recorded", "Centroid", "delivered_centroid", "bruker_tsf_line_spectra"
+        return "unresolved", "", "", "bruker_delivery_unverified"
+    as_stored = _AS_STORED_READERS.get(reader)
+    if as_stored is None and reader == "RawDataAccess" and native.casefold() == ".cdf":
+        as_stored = "netcdf_spectra_as_stored"
+    if not reader and not str(entry.get("spectrum_representation") or ""):
+        # No extractor record for this input at all (unreadable, or never inspected).
+        return "unrecorded", "", "", "no_header_record"
+    if as_stored is not None:
+        state, value = _stored_representation(entry, level)
+        if state == "recorded":
+            return state, value, "raw_header", as_stored
+        return state, "", "", "header_mixed" if state == "unresolved" else "header_silent"
+    if reader == "ThermoMetadataReader":
+        state, value = _stored_representation(entry, level)
+        if state == "recorded" and value == "Centroid":
+            return "recorded", "Centroid", "delivered_centroid", "thermo_centroid_scans"
+        if _thermo_ftms_only(str(entry.get("instrument_model") or "")):
+            return "recorded", "Centroid", "delivered_centroid", "thermo_ftms_centroid_stream"
+        # Profile, Mixed or nothing on an instrument that may also record ion-trap scans: an FTMS profile
+        # scan arrives as centroids, an ITMS one as profile points, and the record does not say which.
+        return "unresolved", "", "", "thermo_analyzer_unrecorded"
+    if reader == "AgilentMetadataReader":
+        return "unresolved", "", "", "agilent_peak_spectra_unrecorded"
+    return "unresolved", "", "", "reader_delivery_unknown"
+
+
+def delivered_data_types(
+    entries: Iterable[Mapping[str, Any]], defaults: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """MS-DIAL's MS1 and MS2 data type as what the given inputs deliver supports them. Never raises.
+
+    ``entries`` are per-file preflight records, one per input the decision covers; an input with no header
+    record is passed as {"file": path}. For each MS level, an input's delivered representation is read by
+    delivered_representation, and the level takes it only when every input that has the level delivers one
+    and all of them agree. Otherwise the level keeps its default (``defaults``, the template's Centroid
+    unless given) and says why:
+
+    - inputs_disagree: the inputs deliver both. The counts and example file names are kept, and a warning
+      says so. No input is dropped to make the rest agree;
+    - unresolved: an input's delivery cannot be told from its record (a Thermo profile file from an
+      instrument that also has an ion trap, an Agilent file, a header that mixes both without saying which
+      level is which). unresolved_by counts the cause;
+    - unrecorded: an input's header did not record its representation, and its reader delivers it as stored;
+    - no_input_at_level: no input has the level (an MS1-only unit's MS2).
+
+    The basis of each level is raw_header, delivered_centroid (or both) or default, and ``decided`` says
+    whether it is one of the first. File names only, never paths: the record is copied into
+    workflow-settings.json and the run manifest, which travel with the results.
+    """
+    rows = [entry for entry in entries if isinstance(entry, Mapping)]
+    result: dict[str, Any] = {"schema": DATA_TYPE_SCHEMA, "inputs": len(rows), "levels": {}, "warnings": []}
+    for name, level in DATA_TYPE_LEVELS:
+        default = str((defaults or {}).get(name) or DATA_TYPE_DEFAULT)
+        counts = {"recorded": 0, "unresolved": 0, "unrecorded": 0, "not_applicable": 0}
+        by_value: dict[str, list[str]] = {}
+        bases: set[str] = set()
+        delivery: dict[str, int] = {}
+        unresolved_by: dict[str, int] = {}
+        listed: dict[str, list[str]] = {"unresolved": [], "unrecorded": []}
+        for entry in rows:
+            state, value, basis, how = delivered_representation(entry, level)
+            counts[state] += 1
+            label = Path(str(entry.get("file") or "")).name
+            if state == "recorded":
+                by_value.setdefault(value, []).append(label)
+                bases.add(basis)
+                delivery[how] = delivery.get(how, 0) + 1
+            elif state in listed:
+                listed[state].append(label)
+                if state == "unresolved":
+                    unresolved_by[how] = unresolved_by.get(how, 0) + 1
+        applicable = counts["recorded"] + counts["unresolved"] + counts["unrecorded"]
+        if len(by_value) > 1:
+            reason = "inputs_disagree"
+        elif counts["unresolved"]:
+            reason = "unresolved"
+        elif counts["unrecorded"]:
+            reason = "unrecorded"
+        elif not applicable:
+            reason = "no_input_at_level"
+        else:
+            reason = "all_inputs_agree"
+        decided = next(iter(by_value)) if reason == "all_inputs_agree" else None
+        if decided is None:
+            basis = "default"
+        elif bases == {"raw_header"}:
+            basis = "raw_header"
+        elif bases == {"delivered_centroid"}:
+            basis = "delivered_centroid"
+        else:
+            basis = "raw_header_and_delivered_centroid"
+        result["levels"][name] = {
+            "decided_data_type": decided,
+            "data_type": decided or default,
+            "basis": basis,
+            "decided": decided is not None,
+            "reason": reason,
+            "default": default,
+            "inputs_with_level": applicable,
+            "recorded": {value: len(files) for value, files in sorted(by_value.items())},
+            "delivery": dict(sorted(delivery.items())),
+            "unresolved": counts["unresolved"],
+            "unrecorded": counts["unrecorded"],
+            "unresolved_by": dict(sorted(unresolved_by.items())),
+            "not_applicable": counts["not_applicable"],
+            "example_files": {
+                **{value: sorted(files)[:DATA_TYPE_EXAMPLE_FILES] for value, files in sorted(by_value.items())},
+                **{state: sorted(files)[:DATA_TYPE_EXAMPLE_FILES] for state, files in listed.items() if files},
+            },
+        }
+        label = name.upper()
+        if reason == "inputs_disagree":
+            split = ", ".join(f"{value} {len(files)}" for value, files in sorted(by_value.items()))
+            result["warnings"].append(
+                f"{label} data type: the inputs deliver different spectra to MS-DIAL ({split} of "
+                f"{applicable}); the run keeps the default {default}. Which inputs deliver which is listed "
+                f"under levels.{name}."
+            )
+        elif reason == "unresolved":
+            causes = ", ".join(f"{cause} {count}" for cause, count in sorted(unresolved_by.items()))
+            result["warnings"].append(
+                f"{label} data type: for {counts['unresolved']} of {applicable} inputs the record cannot tell "
+                f"whether MS-DIAL receives centroid or profile spectra ({causes}); the run keeps the default "
+                f"{default}."
+            )
+        elif reason == "unrecorded":
+            result["warnings"].append(
+                f"{label} data type: the raw headers of {counts['unrecorded']} of {applicable} inputs do not "
+                f"record whether the spectra are centroid or profile; the run keeps the default {default}."
+            )
+    for name, _level in DATA_TYPE_LEVELS:
+        result[f"{name}_data_type"] = result["levels"][name]["data_type"]
+        result[f"{name}_data_type_basis"] = result["levels"][name]["basis"]
+    result["disagreement"] = any(item["reason"] == "inputs_disagree" for item in result["levels"].values())
+    return result
+
+
+# ------------------------------------------------------------------------------------------------------
 # The disposition
 # ------------------------------------------------------------------------------------------------------
 
 DISPOSITION_SCHEMA = "msdial-campaign-disposition.v1"
+# The warning a unit carries where the lease inferred which declared raw file an input is (an archive member
+# that carries the name behind a prefix, or shares its leading identifier; repository_reanalysis's
+# _member_name_pairings). The run manifest's warnings and the attribute stage carry it too.
+INFERRED_PAIRING_WARNING = "input_names_paired_by_inference"
 DISPOSITIONS = ("run", "skip", "exclude", "split")
-# A header verdict this confident replaces a repository declaration it contradicts.
-HEADER_OVERRIDE_CONFIDENCE = 0.8
+# HEADER FIRST (user decision, 2026-10-06). A file whose header was read, that has MS2, and whose header gives
+# one of these runs as its header says, whatever the unit declares and whatever confidence the extractor gave:
+# that confidence is a constant per branch of its classifier (0.75 for every DDA read without an isolation
+# width), not a measured probability, and a declaration is a keyword match over the repository's text. A header
+# that gives none of these nor a targeted method (Unknown) is excluded, declared unit or not.
+HEADER_RUN_METHODS = ("DDA", "DIA", "AIF", "SWATH")
 _DECLARED_MODES = {"DDA", "DIA", "AIF", "SWATH"}
 # Declared acquisitions this campaign does not run, by the name the header uses. They are declarations all
-# the same: the Catalog's and Interactive's own inference write them, and a header has to contradict one
-# with HEADER_OVERRIDE_CONFIDENCE to be believed over it, as for the modes the campaign runs.
+# the same: the Catalog's and Interactive's own inference write them. A header that was read decides over one
+# as over any other declaration; where no header could be read, the unit is taken at it and excluded.
 _DECLARED_OUT_OF_SCOPE = {"PRM": "PRM", "SRM": "SRM", "MRM": "MRM", "SIM": "SIM", "FULLSCAN": "FullScan"}
+# A unit declared DIA or AIF (the Catalog folds SWATH into DIA) does not fold its MS1-only inputs into a DDA run
+# its headers make of it: until the extractor recognises all-ion data exported as MS1 scans (bbCID, MSe), an
+# MS1-only file there may be exactly that, and DDA processing would take its fragments for MS1 features.
+_DECLARED_DIA_FAMILY = {"DIA", "AIF", "SWATH"}
+MS1_ONLY_IN_DECLARED_DIA_UNIT = "ms1_only_in_declared_dia_unit"
+# An MS1-only input whose header nonetheless gives SWATH or AIF is never folded into DDA, which its header
+# contradicts and the execution gate refuses. None of the per-file records on disk on 2026-10-06 is one.
+MS1_ONLY_HEADER_CONTRADICTS_DDA = "ms1_only_header_contradicts_dda"
+# Where a declared acquisition mode came from, recorded beside every header that decided over it
+# (declared_acquisition_source, and declaration_source in each declared_vs_header entry):
+# - catalog_keyword_inference: the Catalog handoff's technical_settings.acquisition_mode. The handoff names no
+#   source for it, and the Catalog writes it only by keyword matching: adapters/common.py infer_acquisition over
+#   the assay's text (the first of MRM, SRM, SIM, AIF, DIA, DDA it finds), or normalize._normalize_acquisition
+#   over a sample attribute every row shares. It is no structured repository field;
+# - split_part: the mode a split wrote for its part (split_from.acquisition_mode), from its parent's headers;
+# - unattributed: anything else; the record does not say where the mode came from.
+DECLARATION_SOURCES = ("catalog_keyword_inference", "split_part", "unattributed")
+# A split part declares the mode the split wrote for it, from its parent's headers. What its parent's repository
+# record declared is recorded beside it (split_from.parent_declared_acquisition_mode, from 0.5.29; read from the
+# parent manifest for a part split before that), and a part whose parent was declared DIA, AIF or SWATH keeps
+# its MS1-only inputs out of a DDA run as its parent would: a part split before 0.5.29 may carry such inputs,
+# folded into its DDA part by the rule of the time.
+SPLIT_PARENT_DECLARED_FIELD = "parent_declared_acquisition_mode"
 _POLARITIES = {"Positive", "Negative"}
 _SWITCHING = {"PolaritySwitching", "MixedFunctions"}
 _SEPARATION_NAMES = {
@@ -622,6 +950,17 @@ _OUT_OF_SCOPE_FILE_REASONS = (
     "polarity_switching",
     "conversion_required",
     "ms1_only_beside_dia",
+    MS1_ONLY_IN_DECLARED_DIA_UNIT,
+    MS1_ONLY_HEADER_CONTRADICTS_DDA,
+)
+# File-level reasons that do not stand on their own while an input's acquisition is unresolved: an MS1-only
+# input is out of scope only because no runnable MS2 input is beside it, and an unresolved input may be exactly
+# that once its header is read.
+_DEPENDS_ON_THE_UNIT_FILE_REASONS = (
+    "acquisition_out_of_scope:FullScan",
+    "ms1_only_beside_dia",
+    MS1_ONLY_IN_DECLARED_DIA_UNIT,
+    MS1_ONLY_HEADER_CONTRADICTS_DDA,
 )
 _UNIT_REASON_FOR_FILE_REASON = {
     "polarity_switching": "polarity_switching_out_of_scope",
@@ -667,11 +1006,46 @@ def _is_out_of_scope(reason: str) -> bool:
     )
 
 
+def entry_header_console(entry: Mapping[str, Any]) -> str | None:
+    """The Console type one input's header alone gives, as its per-file record carries it."""
+    if _CURRENT_PER_FILE_FIELD in entry:
+        value = entry.get(_CURRENT_PER_FILE_FIELD)
+        return str(value) if value else None
+    # A record that predates it recorded no isolation either: DIA stays unresolved there.
+    return header_console_acquisition_type(str(entry.get("acquisition_mode") or "").strip(), None)[0]
+
+
+def declaration_source(manifest: Mapping[str, Any], declared: Mapping[str, Any]) -> str:
+    """Where the unit's declared acquisition mode came from (DECLARATION_SOURCES), or "" where none is declared."""
+    mode = str(declared.get("acquisition_mode") or "").strip().casefold()
+    if mode in {"", "unknown"}:
+        return ""
+    split = manifest.get("split_from")
+    if isinstance(split, Mapping) and str(split.get("acquisition_mode") or "").strip().casefold() == mode:
+        return "split_part"
+    project = manifest.get("project")
+    metadata = project.get("repository_metadata") if isinstance(project, Mapping) else None
+    handoff = metadata.get("catalog_handoff") if isinstance(metadata, Mapping) else None
+    settings = handoff.get("technical_settings") if isinstance(handoff, Mapping) else None
+    if isinstance(settings, Mapping) and str(settings.get("acquisition_mode") or "").strip().casefold() == mode:
+        return "catalog_keyword_inference"
+    return "unattributed"
+
+
+def split_parent_declared_mode(manifest: Mapping[str, Any]) -> str:
+    """The acquisition mode a split part's parent declared, as its split recorded it; "" where none is recorded."""
+    split = manifest.get("split_from")
+    if not isinstance(split, Mapping):
+        return ""
+    return str(split.get(SPLIT_PARENT_DECLARED_FIELD) or "").strip()
+
+
 def decide_disposition(
     manifest: Mapping[str, Any],
     declared: Mapping[str, Any] | None = None,
     extractor: Mapping[str, Any] | None = None,
     decided_at: str | None = None,
+    parent_declared: str | None = None,
 ) -> dict[str, Any]:
     """What a campaign does with a unit, from its recorded preflight. Never raises; changes nothing.
 
@@ -686,6 +1060,23 @@ def decide_disposition(
     through the binding disposition's excluded_inputs (the gate's INP-1): without it, one file that failed
     its conversion would stop the rest of a declared unit. It decides nothing about the unit; what remains
     is decided below as before.
+
+    THE ACQUISITION OF EACH FILE (user decision, 2026-10-06) is its header's wherever its header was read:
+    one with MS2 whose header gives DDA, DIA, AIF or SWATH runs as that, over any declaration and at any
+    extractor confidence, and declared_vs_header records each declaration it contradicted with its source
+    (declaration_source); one whose header gives Unknown is excluded as acquisition_unresolved, declared
+    unit or not. The declaration decides only a unit none of whose headers could be read
+    (acquisition_declared_only), and SWATH or AIF for a DIA header whose isolation settles neither. MS1-only
+    files are folded into a DDA run as before, except in a unit declared DIA or AIF, where they are
+    excluded as ms1_only_in_declared_dia_unit; a split part is held to its parent's declaration there
+    (``parent_declared``, else split_parent_declared_mode), since its own is the mode its split wrote.
+
+    A header that contradicted the declaration is reported as having overridden it (the warning
+    acquisition_header_overrides_declaration, and the detail) only for a file that reaches the run; one
+    excluded after its header was taken (dia_scheme_unresolved, product_ion_only, polarity) is recorded in
+    declared_vs_header as excluded, with its reason. A unit nothing of which runs, with an input whose
+    acquisition is unresolved, is skipped as acquisition_unresolved, not excluded, where every other input is
+    out of scope only for want of a runnable MS2 input beside it (MS1-only inputs).
     """
     def mapping(value: Any) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
@@ -694,6 +1085,8 @@ def decide_disposition(
     summary = mapping(preflight.get("summary"))
     coverage = mapping(summary.get("coverage"))
     declared = dict(declared or preflight.get("declared") or declared_technical(manifest.get("project")))
+    declared_source = declaration_source(manifest, declared)
+    parent_mode = str(parent_declared if parent_declared is not None else split_parent_declared_mode(manifest)).strip()
     identity = dict(extractor or preflight.get("extractor") or {})
     reasons: list[str] = []
     warnings: list[str] = []
@@ -711,7 +1104,18 @@ def decide_disposition(
         if code and code not in warnings:
             warnings.append(code)
 
+    # Which declared raw file an input is was inferred for some input (a prefixed member name, or a leading
+    # identifier: the lease's name_pairing). The user decided on 2026-10-06 that this is always left on record,
+    # so every disposition of such a unit carries it, whatever else it decides.
+    lineage = mapping(manifest.get("input_lineage"))
+    if INFERRED_PAIRING_WARNING in (manifest.get("warnings") or []) or any(
+        isinstance(row, dict) and row.get("name_pairing")
+        for row in [*(lineage.get("rows") or []), *(lineage.get("excluded") or [])]
+    ):
+        warn(INFERRED_PAIRING_WARNING)
+
     def result(disposition: str, split_key: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
+        settle_overrides(disposition)
         return {
             "schema": DISPOSITION_SCHEMA,
             "disposition": disposition,
@@ -727,11 +1131,49 @@ def decide_disposition(
                 "pinned": bool(identity.get("pinned")),
             },
             "declared": declared,
+            "declared_acquisition_source": declared_source,
+            **({"split_parent_declared_acquisition_mode": parent_mode} if parent_mode else {}),
             "declared_vs_header": disagreements[:50],
             "detail": detail,
             **extra,
             "assignments": assignments,
         }
+
+    def settle_overrides(disposition: str) -> None:
+        # A header decided each file it contradicted the declaration for, but the declaration was overridden
+        # in what runs only where that file reaches the run: one excluded after its header was taken is
+        # recorded as excluded, with its reason, and is not said to run.
+        reasons_of = {file_key(item["path"]): item["reason"] for item in excluded}
+        kept = 0
+        dropped: dict[str, int] = {}
+        for item in disagreements:
+            if item.get("basis") != "header":
+                continue
+            reason = reasons_of.get(file_key(str(item.get("file") or "")))
+            if reason is not None:
+                item.update(decided="excluded", basis="excluded", excluded_reason=reason)
+                dropped[reason] = dropped.get(reason, 0) + 1
+            elif item.get("header") in HEADER_RUN_METHODS:
+                kept += 1
+        if kept:
+            warn("acquisition_header_overrides_declaration")
+            detail.append(
+                (
+                    f"{kept} input(s) run as their raw headers give, over the declared {declared_mode} "
+                    if disposition in {"run", "split"}
+                    else f"{kept} input(s) are taken as their raw headers give, over the declared {declared_mode}, "
+                    f"though the unit does not run ({disposition}) "
+                )
+                + f"({declared_source}): a header that gives DDA, DIA, AIF or SWATH with MS2 decides whatever the "
+                "declaration and whatever the extractor's confidence (user decision, 2026-10-06)."
+            )
+        if dropped:
+            detail.append(
+                f"{sum(dropped.values())} input(s) whose raw header contradicts the declared {declared_mode} "
+                f"({declared_source}) are excluded ("
+                + ", ".join(f"{reason} {count}" for reason, count in sorted(dropped.items()))
+                + "); the declaration decides none of them."
+            )
 
     if not preflight or not summary:
         reasons.append("raw_metadata_preflight_missing")
@@ -872,45 +1314,39 @@ def decide_disposition(
             for path, entry in unreadable:
                 decided.append((path, entry, declared_as, None, "declaration"))
 
+    # HEADER FIRST (HEADER_RUN_METHODS). A read header decides each file, declared unit or not: what it gives
+    # runs, out of scope or not, and an Unknown is excluded below as acquisition_unresolved. A declaration it
+    # contradicts is recorded with where it came from, and decides nothing; whether the file then runs is
+    # settled with the rest of the unit (settle_overrides).
+    unresolved_declared = 0
     for path, entry in readable:
         header = str(entry.get("acquisition_mode") or "").strip()
         confidence = entry.get("confidence")
         confidence = float(confidence) if isinstance(confidence, (int, float)) else 0.0
-        if _CURRENT_PER_FILE_FIELD in entry:
-            header_console = entry.get(_CURRENT_PER_FILE_FIELD)
-        else:
-            # A record that predates it recorded no isolation either: DIA stays unresolved there.
-            header_console, _basis = header_console_acquisition_type(header, None)
+        header_console = entry_header_console(entry)
         if header == "FullScan" or _entry_flag(entry, "has_ms2", 2) is False:
             # MS1 only: whatever the declaration says, there is no MS2 to deconvolute.
             decided.append((path, entry, "FullScan", None, "header"))
             header_based.add(path)
             continue
-        if not declared_known:
-            decided.append((path, entry, header or "Unknown", header_console, "header"))
-            if header not in {"", "Unknown"}:
-                header_based.add(path)
+        if header not in HEADER_RUN_METHODS and header not in OUT_OF_SCOPE_METHODS:
+            # Unknown, or no verdict at all: the declaration is not taken for a file whose header was read.
+            if declared_known:
+                unresolved_declared += 1
+            decided.append((path, entry, "Unknown", None, "header"))
             continue
-        if header in {"", "Unknown"}:
-            warn("acquisition_declared_only")
-            decided.append((path, entry, declared_as, None, "declaration"))
-        elif _declared_agrees(declared_mode, header, header_console):
-            decided.append((path, entry, header, header_console, "header"))
-            header_based.add(path)
-        elif confidence >= HEADER_OVERRIDE_CONFIDENCE:
-            warn("acquisition_header_overrides_declaration")
-            disagreements.append(
-                {"file": path, "declared": declared_mode, "header": header, "confidence": confidence, "decided": header}
-            )
-            decided.append((path, entry, header, header_console, "header"))
-            header_based.add(path)
-        else:
-            warn("acquisition_header_disagrees_low_confidence")
+        if declared_known and not _declared_agrees(declared_mode, header, header_console):
             disagreements.append(
                 {"file": path, "declared": declared_mode, "header": header, "confidence": confidence,
-                 "decided": declared_as}
+                 "decided": header, "basis": "header", "declaration_source": declared_source}
             )
-            decided.append((path, entry, declared_as, None, "declaration"))
+        decided.append((path, entry, header, header_console, "header"))
+        header_based.add(path)
+    if unresolved_declared:
+        detail.append(
+            f"{unresolved_declared} input(s) whose raw header gives no acquisition mode are excluded "
+            f"(acquisition_unresolved); the declared {declared_as} is not taken for a file whose header was read."
+        )
 
     included: list[tuple[str, dict[str, Any], str, str]] = []
     ms1_only: list[tuple[str, dict[str, Any]]] = []
@@ -948,11 +1384,28 @@ def decide_disposition(
         included.append((path, entry, console, console_basis))
 
     if ms1_only:
-        if any(console == "DDA" for _path, _entry, console, _basis in included):
+        dda_run = any(console == "DDA" for _path, _entry, console, _basis in included)
+        dia_declared = (
+            f"declared {declared_mode}" if declared_mode.upper() in _DECLARED_DIA_FAMILY
+            else f"split from a unit declared {parent_mode}" if parent_mode.upper() in _DECLARED_DIA_FAMILY
+            else ""
+        )
+        if dda_run and dia_declared:
+            detail.append(
+                f"The unit is {dia_declared}, so its {len(ms1_only)} MS1-only input(s) are not folded "
+                "into the DDA run its headers make: they may be all-ion data exported as MS1 scans "
+                f"({MS1_ONLY_IN_DECLARED_DIA_UNIT})."
+            )
+            for path, _entry in ms1_only:
+                exclude(path, MS1_ONLY_IN_DECLARED_DIA_UNIT)
+        elif dda_run:
             # MS1-only survey files beside DDA files are aligned with them; DDA processing of a file with no
             # MS2 finds its MS1 features and nothing else.
-            warn("ms1_only_files_folded")
             for path, entry in ms1_only:
+                if entry_header_console(entry) not in {None, "DDA"}:
+                    exclude(path, MS1_ONLY_HEADER_CONTRADICTS_DDA)
+                    continue
+                warn("ms1_only_files_folded")
                 included.append((path, entry, "DDA", "folded_ms1_only"))
         elif included:
             for path, _entry in ms1_only:
@@ -990,6 +1443,24 @@ def decide_disposition(
     if not groups:
         file_reasons = [item["reason"] for item in excluded]
         out_of_scope = [reason for reason in file_reasons if _is_out_of_scope(reason)]
+        if out_of_scope and "acquisition_unresolved" in file_reasons and all(
+            reason in _DEPENDS_ON_THE_UNIT_FILE_REASONS for reason in out_of_scope
+        ):
+            # What its MS1-only inputs are depends on the inputs whose header gave no acquisition: one of those
+            # read as DDA would take them into its run. The unit waits for headers that settle them.
+            reasons.append("acquisition_unresolved")
+            reasons.extend(
+                _UNIT_REASON_FOR_FILE_REASON.get(reason, reason) for reason in file_reasons
+                if not _is_out_of_scope(reason)
+            )
+            detail.append(
+                "No input remains that this campaign can run: "
+                f"{file_reasons.count('acquisition_unresolved')} input(s) have a raw header that gives no "
+                f"acquisition mode, and {len(out_of_scope)} MS1-only input(s) are out of scope only for want of a "
+                "runnable MS2 input beside them. The unit is skipped, not excluded: a header that settles the "
+                "unresolved inputs may make it runnable."
+            )
+            return result("skip")
         chosen = out_of_scope or file_reasons or ["acquisition_unresolved"]
         reasons.extend(_UNIT_REASON_FOR_FILE_REASON.get(reason, reason) for reason in chosen)
         detail.append("No input remains that this campaign can run.")

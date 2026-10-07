@@ -26,6 +26,7 @@ from .automatic_rt_review import extract_anchor_eic, read_automatic_rt_review
 from .agent_workflow import (
     build_guided_plan,
     estimate_peak_height,
+    current_peak_tuning_profile,
     estimate_peak_height_range,
     select_peak_tuning_representative,
 )
@@ -57,6 +58,7 @@ from .repository_reanalysis import (
     evaluate_repository_execution_gate,
     request_download_cleanup,
     create_download_lease,
+    declared_instrument,
     evaluate_eligibility,
     finalize_download_lease,
     live_run_attempt,
@@ -237,6 +239,7 @@ def _record_peak_height_diagnostic(
         representative,
         job_id=job_id,
         diagnostic_directory=str(preparation.get("diagnostic_run_directory") or ""),
+        annotation=preparation.get("diagnostic_annotation"),
     )
 
 
@@ -337,6 +340,11 @@ def _diagnostic_job_from_manifest(manifest_text: str, job_id: str) -> dict[str, 
             "peak_tuning_profile": record.get("peak_tuning_profile") or {},
             "repository_run_manifest": manifest["manifest_path"],
             "diagnostic_run_directory": str(directory),
+            **(
+                {"diagnostic_annotation": dict(record["annotation"])}
+                if isinstance(record.get("annotation"), dict)
+                else {}
+            ),
         },
         "recovered_from": str(record_path),
     }
@@ -707,6 +715,7 @@ def _run_console_for_job(
             command=preparation.get("command"),
             timeout_seconds=entry["timeout_seconds"],
             idle_timeout_seconds=entry["idle_timeout_seconds"],
+            data_types=preparation.get("data_types") or {},
         )
         if not attempt.get("recorded"):
             log(
@@ -1673,7 +1682,9 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
                 profile = select_peak_tuning_representative(
-                    workflow["files"], str(body.get("representative_file", ""))
+                    workflow["files"],
+                    str(body.get("representative_file", "")),
+                    declared_instrument(workflow.get("repository_run_manifest")),
                 )
                 representative = profile["file_path"]
                 # The job id is minted before the preparation, because the diagnostic's own directory
@@ -1688,10 +1699,13 @@ class Handler(BaseHTTPRequestHandler):
                         job_id,
                         workspace=_repository_workspace(workflow),
                     )
+                    # Only the peaks are read from this diagnostic, so it loads no annotation library
+                    # (workflow.DIAGNOSTIC_ANNOTATION_SKIPPED_REASON).
                     preparation = prepare_tuning_run(
                         workflow,
                         representative,
                         diagnostic_root,
+                        annotate=False,
                     )
                     preparation["peak_tuning_profile"] = {
                         key: value for key, value in profile.items() if key != "file"
@@ -1751,21 +1765,26 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
                 target = int(body.get("target_peak_count", 0) or 0)
-                profile = (job.get("preparation") or {}).get("peak_tuning_profile") or {}
+                # The family is read again with this version's classifier: a diagnostic started before
+                # 0.5.28 stored every mzML as QTOF, and re-estimating it from its manifest kept that family.
+                preparation_record = job.get("preparation") or {}
+                profile = current_peak_tuning_profile(
+                    preparation_record.get("peak_tuning_profile") or {},
+                    declared_instrument(preparation_record.get("repository_run_manifest")),
+                )
                 if target > 0:
                     estimate = estimate_peak_height(
                         job["result"].get("heights", []), target
                     )
                 else:
-                    requested_step = int(body.get("threshold_step", 0) or 0)
-                    threshold_step = requested_step or int(
-                        profile.get("threshold_step", 100) or 100
-                    )
+                    # The family decides the coarse step (100 QTOF-type, 1,000 FT) and the fine step (10,
+                    # 100). A requested step is recorded, never searched in the family step's place.
                     estimate = estimate_peak_height_range(
                         job["result"].get("heights", []),
                         int(body.get("target_peak_count_min", 3000) or 3000),
                         int(body.get("target_peak_count_max", 6000) or 6000),
-                        threshold_step,
+                        int(body.get("threshold_step", 0) or 0),
+                        str(profile.get("instrument_family") or ""),
                     )
                 # The contract requires the diagnostic's method, representative sample, count,
                 # step and accepted threshold in provenance. Until this, all five lived only in
@@ -2086,7 +2105,9 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
                 profile = select_peak_tuning_representative(
-                    state.get("files", []), body.get("file_path", "")
+                    state.get("files", []),
+                    body.get("file_path", ""),
+                    declared_instrument(state.get("repository_run_manifest")),
                 )
                 job_id = uuid.uuid4().hex
                 with _single_console_per_unit(state.get("repository_run_manifest"), job_id):
@@ -2095,10 +2116,13 @@ class Handler(BaseHTTPRequestHandler):
                         job_id,
                         workspace=_repository_workspace(state),
                     )
+                    # The GUI panel tunes the MSP score cutoffs from this run's match scores as well as
+                    # the peak height from its peaks, so this diagnostic annotates.
                     preparation = prepare_tuning_run(
                         state,
                         profile["file_path"],
                         diagnostic_root,
+                        annotate=True,
                     )
                     preparation["peak_tuning_profile"] = {
                         key: value for key, value in profile.items() if key != "file"
@@ -2875,6 +2899,13 @@ def _write_diagnostic_record(
                 record.get("diagnostic_result_file") or preparation.get("diagnostic_result_file") or ""
             ),
             "peak_tuning_profile": dict(preparation.get("peak_tuning_profile") or {}),
+            # Whether this diagnostic annotated, and why: a count measured without the libraries is
+            # a different run from one measured with them, and only the record can say which.
+            **(
+                {"annotation": dict(preparation["diagnostic_annotation"])}
+                if isinstance(preparation.get("diagnostic_annotation"), dict)
+                else {}
+            ),
             "updated_at": now,
             **details,
         }

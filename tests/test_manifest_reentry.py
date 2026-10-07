@@ -293,6 +293,21 @@ class TheDiagnosticEstimateOutlivesTheRegistry(_Unit, _Backend, unittest.TestCas
         self.assertEqual(self.job_id, recorded["job_id"])
         self.assertTrue(Path(recorded["diagnostic_run_directory"]).samefile(self.diagnostic))
 
+    def test_whether_it_annotated_reaches_the_unit_manifest_from_disk(self) -> None:
+        # The count was measured without the annotation libraries, and the record says so wherever the
+        # estimate is made from: here, a registry that has forgotten the job.
+        annotation = {"status": "skipped_for_peak_count", "reason": "only the peaks are read"}
+        preparation = {**self.preparation, "diagnostic_annotation": annotation}
+        server._write_diagnostic_record(self.job_id, preparation, "running")
+        server._write_diagnostic_record(self.job_id, preparation, "completed", exit_code=0)
+
+        status, response = self._estimate()
+
+        self.assertEqual(200, status, response)
+        self.assertEqual(annotation, response["provenance"]["diagnostic"]["annotation"])
+        recorded = read_manifest(self.manifest)["peak_height_diagnostics"][-1]
+        self.assertEqual(annotation, recorded["annotation"])
+
     def test_a_diagnostic_that_never_finished_is_not_ready(self) -> None:
         server._write_diagnostic_record(self.job_id, self.preparation, "running")
 

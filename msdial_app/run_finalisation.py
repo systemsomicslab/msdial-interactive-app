@@ -43,6 +43,11 @@ analysis.sqlite Bruker's baf2sql writes into a BAF .d that arrived without one (
 unit manifest, msdial_app.reader_created). That is no MS-DIAL container: it is neither moved nor retained, and
 it goes with the raw tree.
 
+Every repository run also records the peaks it actually kept (``production_peak_counts`` in the unit manifest,
+one record per run): every file's count from its ``.mdpeak`` export and the representative file's count beside
+the peak-count diagnostic's estimate, which a production run does not reproduce (the user's decision of
+2026-10-06).
+
 HOLDS. On Windows a file another process holds open without FILE_SHARE_DELETE - a viewer, the search indexer,
 antivirus scanning what the Console has just written - can be neither replaced nor deleted, and a container the
 Console could write can have a path too long for an ordinary move. Every file step is retried on
@@ -844,6 +849,138 @@ def _record_redactions(manifest_path: Path, job_id: str, changed: list[dict[str,
     return local
 
 
+PRODUCTION_PEAK_COUNTS = "production_peak_counts"
+PRODUCTION_PEAK_COUNTS_SCHEMA = "msdial-production-peak-counts.v1"
+_METHOD_MINIMUM_PEAK_HEIGHT = "minimum peak height:"
+
+
+def count_mdpeak_peaks(path: str | Path) -> int:
+    """The peaks a Console .mdpeak export lists: its rows with a Height, as parse_mdpeak counts them."""
+    with open(extended_path(Path(path)), encoding="utf-8-sig", errors="replace", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if not reader.fieldnames or "Height" not in reader.fieldnames:
+            raise ValueError(f"{Path(path).name} has no Height column.")
+        count = 0
+        for row in reader:
+            text = str(row.get("Height") or "").strip()
+            if text and text.casefold() not in {"null", "nan", "na"}:
+                try:
+                    float(text)
+                except ValueError:
+                    continue
+                count += 1
+        return count
+
+
+def _applied_minimum_peak_height(preparation: dict[str, Any]) -> float | None:
+    """The Minimum peak height the run's method file gave the Console."""
+    method = str(preparation.get("method_file") or "").strip()
+    if not method:
+        return None
+    try:
+        lines = Path(method).read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if line.strip().casefold().startswith(_METHOD_MINIMUM_PEAK_HEIGHT):
+            try:
+                return float(line.split(":", 1)[1].strip())
+            except ValueError:
+                return None
+    return None
+
+
+def production_peak_counts(
+    job_id: str, preparation: dict[str, Any], manifest: dict[str, Any], complete: bool
+) -> dict[str, Any] | None:
+    """What the production run actually kept, file by file, beside the diagnostic's estimate.
+
+    The user's decision of 2026-10-06: the threshold aims at the lower end of 3,000-6,000 estimated peaks,
+    and the production run's actual counts are recorded, because the estimate is read off one file's
+    zero-threshold diagnostic and a production run keeps fewer (61-88% of the estimate in 12 of 13 pilot
+    files). The record names the diagnostic it is read against: the unit's latest peak_height_diagnostics
+    record whose threshold is the one the run applied, else its latest record, said so by
+    diagnostic_matches_applied_threshold. None for a run with no .mdpeak exports (GC-MS writes .mdscan).
+    """
+    exports = [
+        Path(str(item)) for item in preparation.get("expected_analysis_exports") or []
+        if str(item).casefold().endswith(".mdpeak")
+    ]
+    if not exports:
+        return None
+    files: list[dict[str, Any]] = []
+    for path in exports:
+        entry: dict[str, Any] = {"file_name": path.stem, "peak_count": None}
+        try:
+            entry["peak_count"] = count_mdpeak_peaks(path)
+        except (OSError, ValueError) as error:
+            entry["error"] = f"{type(error).__name__}: {error}"
+        files.append(entry)
+    counts = sorted(item["peak_count"] for item in files if isinstance(item["peak_count"], int))
+    applied = _applied_minimum_peak_height(preparation)
+    diagnostics = [item for item in manifest.get("peak_height_diagnostics") or [] if isinstance(item, dict)]
+    matched = next(
+        (
+            item for item in reversed(diagnostics)
+            if applied is not None and isinstance(item.get("minimum_peak_height"), (int, float))
+            and float(item["minimum_peak_height"]) == applied
+        ),
+        None,
+    )
+    diagnostic = matched or (diagnostics[-1] if diagnostics else None)
+    estimate = dict((diagnostic or {}).get("estimate") or {})
+    target_min = estimate.get("target_peak_count_min", 3000)
+    target_max = estimate.get("target_peak_count_max", 6000)
+    representative_name = str(((diagnostic or {}).get("representative") or {}).get("file_name") or "")
+    representative = next(
+        (item for item in files if representative_name and item["file_name"].casefold() == representative_name.casefold()),
+        None,
+    )
+    representative_count = representative["peak_count"] if representative else None
+    estimated = (diagnostic or {}).get("estimated_peak_count")
+    return {
+        "schema": PRODUCTION_PEAK_COUNTS_SCHEMA,
+        "job_id": job_id,
+        "recorded_at": _now(),
+        "run_complete": bool(complete),
+        "minimum_peak_height": applied,
+        # The estimate the run is read against.
+        "diagnostic_job_id": (diagnostic or {}).get("job_id"),
+        "diagnostic_matches_applied_threshold": matched is not None,
+        "diagnostic_minimum_peak_height": (diagnostic or {}).get("minimum_peak_height"),
+        "diagnostic_peak_count": (diagnostic or {}).get("diagnostic_peak_count"),
+        "estimated_peak_count": estimated,
+        "threshold_step": (diagnostic or {}).get("threshold_step"),
+        "coarse_threshold_step": (diagnostic or {}).get("coarse_threshold_step"),
+        "step_fallback": (diagnostic or {}).get("step_fallback"),
+        "estimate_within_target_range": (diagnostic or {}).get("within_target_range"),
+        "target_peak_count_min": target_min,
+        "target_peak_count_max": target_max,
+        # The representative file's actual count in this run, against its estimate.
+        "representative_file_name": representative_name or None,
+        "representative_peak_count": representative_count,
+        "representative_to_estimate_ratio": (
+            round(representative_count / estimated, 4)
+            if isinstance(representative_count, int) and isinstance(estimated, (int, float)) and estimated > 0
+            else None
+        ),
+        "representative_within_target_range": (
+            target_min <= representative_count <= target_max if isinstance(representative_count, int) else None
+        ),
+        # Every file's count.
+        "files": files,
+        "file_count": len(files),
+        "files_counted": len(counts),
+        "peak_count_min": counts[0] if counts else None,
+        "peak_count_median": (
+            (counts[len(counts) // 2] if len(counts) % 2 else (counts[len(counts) // 2 - 1] + counts[len(counts) // 2]) / 2)
+            if counts else None
+        ),
+        "peak_count_max": counts[-1] if counts else None,
+        "peak_count_total": sum(counts) if counts else None,
+    }
+
+
 def campaign_approval_recorded(manifest: dict[str, Any]) -> bool:
     """Whether a campaign approval has been recorded for this unit, or for the unit it was split from."""
     if any(isinstance(item, dict) for item in manifest.get("campaign_authorizations") or []):
@@ -879,6 +1016,7 @@ def finalise_console_run(
     patience = _Patience()
     manifest: dict[str, Any] = {}
     reader_created: dict[str, Any] | None = None
+    peak_counts: dict[str, Any] | None = None
     try:
         # First, so that whatever fails below is held in the unit's own manifest.
         manifest_text = str(preparation.get("repository_run_manifest") or "").strip()
@@ -923,6 +1061,22 @@ def finalise_console_run(
         if manifest_path is None:
             record["holds"] = _hold_summaries(holds)
             return record
+        # Before the containers move: the counts are read from the run's own .mdpeak exports in its output.
+        try:
+            peak_counts = production_peak_counts(job_id, preparation, manifest, complete)
+        except Exception as error:  # a record, not a step anything waits on
+            record["errors"].append(f"{PRODUCTION_PEAK_COUNTS}: {type(error).__name__}: {error}")
+        if peak_counts is not None:
+            record[PRODUCTION_PEAK_COUNTS] = {
+                key: value for key, value in peak_counts.items() if key != "files"
+            }
+            log(
+                f"Production peak counts: {peak_counts['files_counted']} of {peak_counts['file_count']} file(s) "
+                f"counted (min {peak_counts['peak_count_min']}, median {peak_counts['peak_count_median']}, "
+                f"max {peak_counts['peak_count_max']}); representative {peak_counts['representative_file_name']} "
+                f"kept {peak_counts['representative_peak_count']} against an estimate of "
+                f"{peak_counts['estimated_peak_count']}."
+            )
         output = Path(str(manifest.get("output_directory") or run_directory)).expanduser()
         changed = [item for item in redactions if item["changed"]]
         if changed:
@@ -1028,6 +1182,9 @@ def finalise_console_run(
 
     def change(current: dict[str, Any]) -> None:
         current["console_run_finalisation"] = record
+        if peak_counts is not None:
+            # Appended, one per production run, as the diagnostics are: a unit run twice has two records.
+            current[PRODUCTION_PEAK_COUNTS] = [*(current.get(PRODUCTION_PEAK_COUNTS) or []), peak_counts]
         if reader_created:
             current["reader_created_files"] = reader_created
         earlier = standing_holds(current)
