@@ -12,7 +12,11 @@ from .library_catalog import catalog_status
 from .user_settings import load_user_settings
 from .workflow import (
     AUTOMATIC_RT_CORRECTION_DEFAULTS,
+    FAMILY_FROM_FORMAT_DEFAULT,
+    FAMILY_FROM_VENDOR_FORMAT,
     console_file_type,
+    detect_raw_format,
+    instrument_family_from_text,
     automatic_rt_correction_value,
     expand_paths_report,
     discover_console_paths,
@@ -308,68 +312,326 @@ def estimate_peak_height(heights: list[float], target_peak_count: int) -> dict[s
     }
 
 
+# The finest steps of the user's rule of 2026-10-06. Absolute floors: the search never goes finer.
+FINE_THRESHOLD_STEP_QTOF = 10
+FINE_THRESHOLD_STEP_FT = 100
+# Within the target range, the highest threshold whose estimated count is still at least the lower bound:
+# the lower end of 3,000-6,000 (the user's decision of 2026-10-06), for MS/MS of higher quality, since gap
+# filling recovers the peaks a threshold leaves out of a file.
+SELECTION_RULE = "highest_threshold_keeping_at_least_minimum"
+
+
+def is_fourier_transform_family(instrument_family: str) -> bool:
+    """True for the labels Interactive gives Orbitrap and FT-ICR data ("Fourier-transform MS", "FT-ICR")."""
+    family = str(instrument_family or "").casefold()
+    return "fourier" in family or "ft-icr" in family or "fticr" in family
+
+
+# The instrument-family steps of the project contract: the coarse step the range search always starts from.
+FAMILY_THRESHOLD_STEP_QTOF = 100
+FAMILY_THRESHOLD_STEP_FT = 1000
+
+
+def family_threshold_step(instrument_family: str) -> int:
+    """The coarse step: 1,000 for Fourier-transform data, 100 for every other family (QTOF-type, GC-MS, Unknown)."""
+    return FAMILY_THRESHOLD_STEP_FT if is_fourier_transform_family(instrument_family) else FAMILY_THRESHOLD_STEP_QTOF
+
+
+def fine_threshold_step(coarse_step: int, instrument_family: str = "") -> int:
+    """The finest step the range search uses: 10 for QTOF-type data, 100 for Fourier-transform data.
+
+    The user's decision of 2026-10-06. An absolute floor, not a tenth of whatever step a caller passes: a
+    caller echoing a fallback's step of 10 back must not get a search in steps of 1, which on the Waters
+    MSe demo lands at a threshold of 2, where the median S/N is 2.6. The family decides the floor; without
+    one, a step of 1,000 or more is the Fourier-transform family's step. A coarse step at or below the
+    floor is its own fine step, so it has no fallback.
+    """
+    step = max(1, int(coarse_step))
+    return min(step, _step_floor(step, instrument_family))
+
+
+def _step_floor(step: int, instrument_family: str) -> int:
+    if is_fourier_transform_family(instrument_family) or int(step) >= 1000:
+        return FINE_THRESHOLD_STEP_FT
+    return FINE_THRESHOLD_STEP_QTOF
+
+
+def _count_at_or_above(values: list[float], threshold: float) -> int:
+    return len(values) - bisect_left(values, threshold)
+
+
+def _stepped_threshold(
+    values: list[float], step: int, minimum: int, maximum: int
+) -> tuple[int, int]:
+    """The highest multiple of step whose count is still at least minimum, when its count is in range.
+
+    Counts fall as the threshold rises, so that multiple keeps the fewest peaks of all those keeping at
+    least minimum: when its count is above maximum, no multiple of step lands in range, and the result is
+    whichever of it and the next multiple is nearer the range (the one keeping more peaks on a tie).
+    values are sorted and number more than maximum. Returns (threshold, count at or above it).
+    """
+    anchor = values[len(values) - minimum]  # the minimum-th largest height
+    threshold = int(math.floor(anchor / step)) * step
+    while threshold > 0 and _count_at_or_above(values, threshold) < minimum:
+        threshold -= step  # a quotient floating point rounded up
+    count = _count_at_or_above(values, threshold)
+    if count <= maximum:
+        return threshold, count
+    above = threshold + step
+    above_count = _count_at_or_above(values, above)
+    if minimum - above_count < count - maximum:
+        return above, above_count
+    return threshold, count
+
+
 def estimate_peak_height_range(
     heights: list[float],
     minimum_peak_count: int = 3000,
     maximum_peak_count: int = 6000,
     threshold_step: int = 100,
+    instrument_family: str = "",
 ) -> dict[str, Any]:
+    """A Minimum peak height on the instrument-family step that keeps minimum-maximum peaks.
+
+    The user's rules of 2026-10-06:
+    - 0 when the zero-threshold count is at most the upper bound;
+    - otherwise, of the multiples of the family step (100 for QTOF-type, 1,000 for FT), the HIGHEST whose
+      estimated count is still at least the lower bound - the lower end of the range;
+    - only when no multiple of the family step lands in range, the same choice in the fine step (10 for
+      QTOF-type, 100 for FT: fine_threshold_step), and never finer;
+    - when even the fine step misses, the candidate nearest the range, marked out of range with a
+      warning.
+
+    The family step is ALWAYS the coarse step. instrument_family decides it (family_threshold_step), and
+    threshold_step is only a request: one below the fine step is raised to it, and any other that is not
+    the family step (one between the fine step and the family step, a fallback's step echoed back, or a
+    step of 15) is recorded as requested_threshold_step, with a warning, and never replaces the family
+    step. Until 0.5.28's review, a requested step of 100 on FT data was searched as the coarse step, so
+    MTBLS2207's DDA unit got 19,700 where the rule gives 19,000, recorded as coarse step 100 with no
+    fallback. Only without a family does the request name one: 1,000 or more is the FT family's step,
+    anything else the QTOF-type family's. A threshold_step of 0 is no request.
+
+    threshold_step in the result is the step actually used, coarse_threshold_step the family step,
+    step_fallback and fallback_reason ("no_coarse_step_in_range" or None) say whether and why the fine
+    step was used. coarse_minimum_peak_height and coarse_estimated_peak_count keep what the family step
+    alone chose, so a fallback can be read against it. requested_step_disposition says what became of a
+    request: None (none made), "family_step", "fine_step" (the fine step, used only on a fallback),
+    "raised_to_fine_step" (below it) or "recorded_only".
+    """
     values = sorted(float(value) for value in heights if float(value) >= 0)
-    minimum = max(0, int(minimum_peak_count))
+    minimum = max(1, int(minimum_peak_count))
     maximum = max(minimum, int(maximum_peak_count))
-    step = max(1, int(threshold_step))
+    requested_value = int(threshold_step or 0)
+    requested_step = requested_value if requested_value > 0 else None
+    if str(instrument_family or "").strip():
+        step = family_threshold_step(instrument_family)
+    else:
+        step = FAMILY_THRESHOLD_STEP_FT if (requested_step or 0) >= 1000 else FAMILY_THRESHOLD_STEP_QTOF
+    fine_step = fine_threshold_step(step, instrument_family)
+    if requested_step is None:
+        disposition = None
+    elif requested_step == step:
+        disposition = "family_step"
+    elif requested_step == fine_step:
+        disposition = "fine_step"
+    elif requested_step < fine_step:
+        disposition = "raised_to_fine_step"
+    else:
+        disposition = "recorded_only"
+    request_warnings: list[str] = []
+    if requested_step is not None and requested_step != step:
+        request_warnings.append(
+            f"A threshold_step of {requested_step} was requested. The instrument-family step "
+            f"({step}{', ' + str(instrument_family) if str(instrument_family or '').strip() else ''}) is always "
+            f"the coarse step and {fine_step} the finest step, used only when no multiple of {step} lands in "
+            "range"
+            + (f"; a request below {fine_step} is raised to it" if requested_step < fine_step else "")
+            + ". The request is recorded as requested_threshold_step and was not searched."
+        )
     if not values:
         raise ValueError("The diagnostic result contains no peak heights.")
+    common = {
+        "target_peak_count_min": minimum,
+        "target_peak_count_max": maximum,
+        "diagnostic_peak_count": len(values),
+        "requested_threshold_step": requested_step,
+        "requested_step_disposition": disposition,
+        "coarse_threshold_step": step,
+        "fine_threshold_step": fine_step,
+        "instrument_family": str(instrument_family or ""),
+        "selection_rule": SELECTION_RULE,
+        "method": "quantized height-range search",
+    }
 
     if len(values) <= maximum:
         return {
             "minimum_peak_height": 0,
-            "target_peak_count_min": minimum,
-            "target_peak_count_max": maximum,
             "estimated_peak_count": len(values),
-            "diagnostic_peak_count": len(values),
             "threshold_step": step,
+            **common,
+            "step_fallback": False,
+            "fallback_reason": None,
+            "coarse_minimum_peak_height": 0,
+            "coarse_estimated_peak_count": len(values),
             "within_target_range": minimum <= len(values) <= maximum,
-            "method": "quantized height-range search",
+            "warnings": list(request_warnings),
             "note": (
                 "The zero-threshold diagnostic did not exceed the upper peak-count bound; "
-                "Minimum peak height remains 0."
+                "the threshold is kept at zero."
             ),
         }
 
-    candidates = {0}
-    for value in values:
-        lower = max(0, math.floor(value / step) * step)
-        candidates.add(lower)
-        candidates.add(lower + step)
-    midpoint = (minimum + maximum) / 2
-
-    def candidate_score(threshold: int) -> tuple[float, float, int]:
-        count = len(values) - bisect_left(values, threshold)
-        distance = max(minimum - count, 0, count - maximum)
-        return distance, abs(count - midpoint), threshold
-
-    threshold = min(candidates, key=candidate_score)
-    detected = len(values) - bisect_left(values, threshold)
+    coarse_threshold, coarse_detected = _stepped_threshold(values, step, minimum, maximum)
+    threshold, detected, used_step = coarse_threshold, coarse_detected, step
+    fallback = not (minimum <= coarse_detected <= maximum) and fine_step < step
+    if fallback:
+        threshold, detected = _stepped_threshold(values, fine_step, minimum, maximum)
+        used_step = fine_step
+    within = minimum <= detected <= maximum
+    warnings: list[str] = list(request_warnings)
+    if not within:
+        warnings.append(
+            f"No Minimum peak height in steps of {used_step} gives {minimum}-{maximum} peaks: the "
+            f"nearest, {threshold}, keeps {detected} of the {len(values)} found at zero threshold. "
+            + (
+                f"The family step {step} was tried first and a step of {fine_step} is the finest the "
+                "search uses. "
+                if fallback
+                else ""
+            )
+            + "The threshold is out of the target range; review it before a production run."
+        )
+    if fallback:
+        note = (
+            f"No multiple of the instrument-family step {step} gave {minimum}-{maximum} peaks "
+            f"(nearest {coarse_threshold}, {coarse_detected} peaks), so the search fell back to "
+            f"steps of {fine_step}, the finest it uses."
+        )
+    else:
+        note = (
+            "The threshold is the highest multiple of the instrument-family step that still keeps "
+            f"at least {minimum} peaks. Review the diagnostic count when no stepped threshold can "
+            "enter the requested range."
+        )
     return {
         "minimum_peak_height": threshold,
-        "target_peak_count_min": minimum,
-        "target_peak_count_max": maximum,
         "estimated_peak_count": detected,
-        "diagnostic_peak_count": len(values),
-        "threshold_step": step,
-        "within_target_range": minimum <= detected <= maximum,
-        "method": "quantized height-range search",
-        "note": (
-            "The threshold is constrained to the instrument-family step. Review the "
-            "diagnostic count when no stepped threshold can enter the requested range."
-        ),
+        "threshold_step": used_step,
+        **common,
+        "step_fallback": fallback,
+        "fallback_reason": "no_coarse_step_in_range" if fallback else None,
+        "coarse_minimum_peak_height": coarse_threshold,
+        "coarse_estimated_peak_count": coarse_detected,
+        "within_target_range": within,
+        "warnings": warnings,
+        "note": note,
     }
 
 
-def select_peak_tuning_representative(
-    files: list[dict[str, Any]], requested_file: str = ""
+def representative_instrument_family(
+    selected: dict[str, Any], declared_instrument: str = ""
 ) -> dict[str, Any]:
+    """The instrument family the diagnostic's threshold step is chosen by, and what it rests on.
+
+    The file itself first: its format is read again when it is on disk, so a row made before an mzML's
+    header was read (every mzML was QTOF before 0.5.28) cannot keep a Q Exactive on steps of 100. Only when
+    the file's family is a format default - an mzML whose header names no instrument, a Bruker or
+    unrecognised .d - does a repository's declared instrument (the Catalog handoff's technical_settings.
+    instrument) decide, and only to name a Fourier-transform family. A vendor format or an mzML header
+    that names a TOF is evidence about the file, and a declaration does not overrule it.
+    """
+    row = dict(selected or {})
+    path_text = str(row.get("file_path") or "").strip()
+    if path_text and Path(path_text).exists():
+        row.update(detect_raw_format(path_text))
+    family = str(row.get("instrument_family") or "Unknown")
+    source = str(row.get("instrument_family_source") or "file_row")
+    result: dict[str, Any] = {"instrument_family": family, "instrument_family_source": source}
+    if row.get("instrument_evidence"):
+        result["instrument_evidence"] = str(row["instrument_evidence"])
+    declared = str(declared_instrument or "").strip()
+    if declared:
+        result["declared_instrument"] = declared
+        named = instrument_family_from_text([declared])
+        if named is not None and source == FAMILY_FROM_FORMAT_DEFAULT and not is_fourier_transform_family(family):
+            result.update(
+                instrument_family=named[0],
+                instrument_family_source="repository_declared_instrument",
+                instrument_evidence=named[1],
+            )
+    return result
+
+
+# The suffixes whose instrument family a vendor format fixed before 0.5.28 (Thermo .raw FT; Waters .raw, SCIEX
+# and Shimadzu QTOF or GC-MS). Every other family then was a format default: an mzML was QTOF unread, and a .d
+# was QTOF whatever its vendor.
+_LEGACY_VENDOR_SUFFIXES = {".raw", ".wiff", ".wiff2", ".lcd", ".qgd"}
+
+
+def _legacy_family_source(profile: dict[str, Any]) -> str:
+    """What a profile recorded before 0.5.28, which kept no instrument_family_source, rested on."""
+    if is_fourier_transform_family(str(profile.get("instrument_family") or "")):
+        return FAMILY_FROM_VENDOR_FORMAT
+    suffix = Path(str(profile.get("file_path") or "")).suffix.lower()
+    return FAMILY_FROM_VENDOR_FORMAT if suffix in _LEGACY_VENDOR_SUFFIXES else FAMILY_FROM_FORMAT_DEFAULT
+
+
+def current_peak_tuning_profile(
+    profile: dict[str, Any], declared_instrument: str = ""
+) -> dict[str, Any]:
+    """A stored diagnostic's representative, its instrument family worked out again by this version.
+
+    The estimate reads the family and the family step from the diagnostic's peak_tuning_profile, which the
+    version that STARTED the diagnostic wrote. Before 0.5.28 every mzML was QTOF, so MTBLS2207's Orbitrap
+    ID-X diagnostic, re-estimated from its manifest, kept QTOF and steps of 100 (19,700 where the rule gives
+    19,000 in steps of 1,000), and the new peak_height_diagnostics entry said QTOF. The family is read again
+    the way a new diagnostic reads it (representative_instrument_family): the representative file's own
+    format and mzML header when it is on disk, else the stored family, which for a pre-0.5.28 profile with
+    no recorded source is a format default unless a vendor format fixed it (_legacy_family_source), so a
+    repository's declared instrument can still name an FT family once the raw data are deleted.
+
+    threshold_step becomes the re-derived family's step, and instrument_family_source says what the family
+    now rests on. When the family or the step changes, instrument_family_rederived is true and
+    stored_peak_tuning_profile keeps what was stored, so the record shows both. The stored
+    diagnostic-job.json is not rewritten: it is the record of what the diagnostic was started with.
+    """
+    stored = dict(profile or {})
+    row: dict[str, Any] = {
+        "file_path": stored.get("file_path") or "",
+        "instrument_family": stored.get("instrument_family") or "Unknown",
+        "instrument_family_source": stored.get("instrument_family_source") or _legacy_family_source(stored),
+    }
+    if stored.get("instrument_evidence"):
+        row["instrument_evidence"] = stored["instrument_evidence"]
+    family = representative_instrument_family(row, declared_instrument)
+    current = {
+        key: value for key, value in stored.items()
+        if key not in {"instrument_evidence", "declared_instrument", "stored_peak_tuning_profile",
+                       "instrument_family_rederived"}
+    }
+    current.update(family)
+    current["threshold_step"] = family_threshold_step(family["instrument_family"])
+    changed = (str(stored.get("instrument_family") or ""), int(stored.get("threshold_step") or 0)) != (
+        current["instrument_family"], current["threshold_step"]
+    )
+    current["instrument_family_rederived"] = changed
+    if changed:
+        current["stored_peak_tuning_profile"] = {
+            "instrument_family": stored.get("instrument_family"),
+            "instrument_family_source": stored.get("instrument_family_source"),
+            "threshold_step": stored.get("threshold_step"),
+        }
+    return current
+
+
+def select_peak_tuning_representative(
+    files: list[dict[str, Any]], requested_file: str = "", declared_instrument: str = ""
+) -> dict[str, Any]:
+    """The diagnostic's representative file, its instrument family and the family's threshold step.
+
+    declared_instrument is a repository unit's declared instrument text, read only when the file's own
+    format leaves the family at a default (representative_instrument_family).
+    """
     if not files:
         raise ValueError("No analysis file is available for peak-count tuning.")
     requested = str(requested_file or "").strip().casefold()
@@ -405,15 +667,14 @@ def select_peak_tuning_representative(
             else "sample-nearest-run-midpoint" if samples
             else "non-blank-nearest-run-midpoint"
         )
-    instrument_family = str(selected.get("instrument_family") or "Unknown")
-    family = instrument_family.casefold()
-    threshold_step = 1000 if ("fourier" in family or "ft-icr" in family) else 100
+    family = representative_instrument_family(selected, declared_instrument)
+    threshold_step = family_threshold_step(family["instrument_family"])
     return {
         "file": selected,
         "file_path": str(selected.get("file_path") or ""),
         "file_name": str(selected.get("file_name") or ""),
         "selection_reason": reason,
-        "instrument_family": instrument_family,
+        **family,
         "threshold_step": threshold_step,
         "target_peak_count_min": 3000,
         "target_peak_count_max": 6000,

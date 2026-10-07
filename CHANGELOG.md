@@ -4,6 +4,140 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.28] - Unreleased
+
+Version order: 0.5.25 (#58), 0.5.26 (#59), 0.5.27 (#60) and 0.5.29 (#62) are
+open beside this one, and all five branch from 0.5.24.
+
+### Changed
+- The stepped Minimum peak height (`estimate_peak_height_range`, the "quantized
+  height-range search" behind `msdial_estimate_peak_height` and
+  `POST /api/agent/tuning/estimate` without an exact target) follows the user's
+  decisions of 2026-10-06:
+  - A zero-threshold count of 6,000 or fewer still keeps 0.
+  - Otherwise, of the multiples of the instrument-family step (100 for
+    QTOF-type data, 1,000 for Fourier-transform data), the threshold is the
+    HIGHEST whose estimated count is still at least 3,000: the lower end of
+    3,000-6,000, for MS/MS of higher quality, since gap filling recovers the
+    peaks a threshold leaves out of a file. Before, it was the multiple nearest
+    the range's midpoint (`selection_rule` is now
+    `highest_threshold_keeping_at_least_minimum`).
+  - Only when no multiple of the family step lands in range does it make the
+    same choice in the fine step, 10 for QTOF-type and 100 for FT
+    (`fine_threshold_step`).
+  - The fine step is an absolute floor, never a tenth of the step a caller
+    passes: a request with `threshold_step` 10, which is what a fallback's
+    estimate reports as the step used, searched in steps of 1 in this PR's first
+    draft and reached a threshold of 2 on the Waters MSe demo, where the median
+    S/N is 2.6.
+  - The family step is always the coarse step, whatever `threshold_step` is
+    requested. The diagnostic's `instrument_family` decides it
+    (`family_threshold_step`) and the fine step; a request below the fine step
+    is raised to it, and any other request that is not the family step is
+    recorded (`requested_threshold_step`, `requested_step_disposition`: null
+    when none was made, `family_step`, `fine_step`, `raised_to_fine_step` or
+    `recorded_only`) with a warning, and never searched in the family step's
+    place. This PR's second draft let a request between the floor and the
+    family step become the coarse step: MTBLS2207's DDA unit asked for steps of
+    100 got 19,700 instead of 19,000, and MTBLS417 asked for steps of 10 got
+    1,820 instead of 1,800, both recorded with that request as
+    `coarse_threshold_step` and no fallback. Only without a family does the
+    request name one: 1,000 or more is the FT family's step, anything else the
+    QTOF-type family's. A `threshold_step` of 0 is no request.
+  - When even the fine step misses, the threshold is the candidate nearest the
+    range (the one keeping more peaks on a tie), `within_target_range` is false
+    and the estimate carries a `warnings` entry, which the Tune parameters view
+    shows.
+- Of the fourteen diagnostics on disk (0.5.24 -> 0.5.28):
+  - The Thermo Fusion pilot unit ST001337 goes from 181,000 (an estimated 4,495
+    peaks) to 323,000 (3,004); MTBLS1572 from 700 (4,678) to 1,200 (3,162);
+    MTBLS417 from 1,100 (4,529) to 1,800 (3,032); MTBLS2207 DDA from 9,000
+    (4,397) to 19,000 (3,058); the Agilent DIA demo from 200 (4,661) to 300
+    (3,643).
+  - The Bruker compact DDA demo goes from 100 (1,932) to 50 (3,257) and the
+    Waters Premier DDA demo from 100 (754) to 20 (3,627), both by the fine
+    step. MetaboBank MTBKS281 goes from 100 (338) to 10 (2,484) and the Waters
+    MSe demo from 100 (26) to 10 (522), both still out of range, with a warning.
+  - MTBKS217, MTBKS236, MTBLS2207 DIA, the Waters Xevo demo and the Bruker
+    SWATH demo do not change.
+- The instrument family, which decides the diagnostic's threshold step, is read
+  from an mzML's header: before, every mzML was QTOF, so the pilot's ST004304, a
+  Thermo Q Exactive published as mzML, was diagnosed in steps of 100 (as was
+  MTBLS2207, an Orbitrap ID-X published as mzML). `detect_raw_format` reads the
+  cvParam names and userParam values of an mzML's referenceableParamGroupList
+  and instrumentConfigurationList, from the head of the file only.
+  - Orbitrap-class instruments (Q Exactive, Exactive, Exploris, Orbitrap
+    Fusion/Lumos/Eclipse/Ascend, Astral, LTQ Orbitrap, Orbitrap Velos/Elite,
+    ID-X, the Tribrids) are `Fourier-transform MS`.
+  - FT-ICRs (solariX, apex, scimaX, LTQ FT) are `FT-ICR`.
+  - A model name outranks the FT-ICR analyzer term ProteoWizard writes for a
+    Thermo model it does not know. A TOF analyzer or model name makes the mzML
+    QTOF on its own header.
+  - Each file row now says what its family rests on: `instrument_family_source`
+    is `vendor_format`, `mzml_instrument_configuration` or `format_default`,
+    with `instrument_evidence` naming the text that decided it.
+  - An Orbitrap or FT-ICR mzML now gets the Fourier-transform format
+    suggestions (Minimum peak height 10,000, mass slice width 0.05), as a
+    Thermo .raw always has.
+- The diagnostic's representative file is read again when it is on disk, so a
+  workflow state from before this cannot keep a Q Exactive on steps of 100.
+  Only where the file's family is a format default (an mzML naming no
+  instrument, a Bruker or unrecognised .d) does the repository unit's declared
+  instrument (the Catalog handoff's `technical_settings.instrument`, read by
+  the new `declared_instrument`) name a Fourier-transform family, recorded as
+  `instrument_family_source: repository_declared_instrument`.
+  - The profile records `instrument_family`, `instrument_family_source`,
+    `instrument_evidence` and `declared_instrument`.
+  - Every completed pilot unit keeps its family: ST001337 (Thermo .raw) FT; the
+    Waters, SCIEX and Bruker units QTOF. ST004304 and MTBLS2207 become FT.
+- The estimate reads a stored diagnostic's family again
+  (`current_peak_tuning_profile`) instead of the one the version that started
+  it stored. A diagnostic recorded before 0.5.28 and re-estimated through
+  `manifest_path` kept the QTOF family and step 100 stored for every mzML:
+  MTBLS2207's DDA diagnostic re-estimated to 19,700 and recorded QTOF. The
+  representative file's own format and mzML header decide when it is on disk;
+  otherwise the stored family does, and for a profile recorded before 0.5.28,
+  which kept no `instrument_family_source`, an mzML or .d family is taken as a
+  format default, so the unit's declared instrument can still name an FT
+  family after the raw data are deleted. The response's `representative` and
+  the `peak_height_diagnostics` record carry the re-derived family, with
+  `instrument_family_rederived` and, when it changed, `stored_peak_tuning_profile`
+  (the stored family, source and step). The diagnostic's own
+  `diagnostic-job.json` is not rewritten.
+
+### Added
+- The estimate records `threshold_step` (the step actually used),
+  `requested_threshold_step`, `requested_step_disposition`,
+  `coarse_threshold_step` (the family step),
+  `fine_threshold_step`, `step_fallback`, `fallback_reason`
+  (`no_coarse_step_in_range` or null), `coarse_minimum_peak_height` and
+  `coarse_estimated_peak_count` (what the family step alone chose),
+  `instrument_family` and `selection_rule`, beside `within_target_range` and
+  `warnings`.
+- Each `peak_height_diagnostics` record in the unit's manifest keeps the whole
+  estimate, as before, and now also names `coarse_threshold_step`,
+  `fine_threshold_step`, `step_fallback`, `fallback_reason`,
+  `within_target_range`, `selection_rule`, `instrument_family` and
+  `instrument_family_source` beside `threshold_step`. A record of an estimate
+  from before this reads as its own step with no fallback and a null
+  `selection_rule`.
+- `production_peak_counts` in the unit's manifest, one record per production
+  run, appended by the run's finalisation (`finalise_console_run`) before the
+  mzTab-M is validated: the applied `minimum_peak_height` (from the run's
+  method file), every file's actual count from its .mdpeak export (`files`, with
+  `peak_count_min`, `peak_count_median`, `peak_count_max` and
+  `peak_count_total`), and the representative file's `representative_peak_count`
+  against `estimated_peak_count`, with `representative_to_estimate_ratio` and
+  `representative_within_target_range`. It names the diagnostic it is read
+  against (`diagnostic_job_id`): the latest whose threshold the run applied,
+  else the latest, said by `diagnostic_matches_applied_threshold`. The
+  finalisation record carries the same summary without the per-file list.
+- Agent capabilities `peak_height_fine_step_fallback`,
+  `peak_height_lower_end_selection`, `mzml_header_instrument_family` and
+  `production_peak_counts`.
+- `tests/vectors/peak_height_diagnostics.v1.json`: the height histograms of the
+  fourteen diagnostics, each height rounded down to a multiple of the step the
+  estimate uses, which leaves every count the search reads unchanged.
 ## [0.5.27] - Unreleased
 
 Version order: 0.5.25 (#58) and 0.5.26 (#59) are open beside this one, and all

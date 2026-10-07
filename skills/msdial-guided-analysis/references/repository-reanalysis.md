@@ -124,11 +124,22 @@ The repository answer seed uses `auto_peak_range`. Run the zero-threshold
 single-file diagnostic on a QC nearest the run midpoint, or a non-blank sample
 nearest the midpoint when no QC is available. Estimate a threshold retaining
 3,000-6,000 peaks, constrained to 100-unit steps for QTOF-type data or
-1,000-unit steps for Fourier-transform data. Keep 0 when the diagnostic finds
-no more than 6,000 peaks. The LC-MS diagnostic loads no annotation library, so
-it says nothing about annotation; only its peak count and heights are used, and
-its Adduct and Isotope columns are not the production run's. Add
-the accepted threshold to `answer_seed` before
+1,000-unit steps for Fourier-transform data (Orbitrap-class and FT-ICR, read
+from a Thermo .raw, an mzML header, or, where the file names no instrument, the
+unit's declared instrument). Within the range take the highest threshold whose
+estimated count is still at least 3,000, the lower end. Only when no such step
+lands in range, fall back to 10-unit (QTOF-type) or 100-unit (Fourier-transform)
+steps, and never finer (the user's decisions of 2026-10-06). The family step is
+always the coarse step: a requested `threshold_step` is recorded, not searched.
+The fallback is recorded as `step_fallback` and `fallback_reason`, and a
+threshold that misses the range even at the fine step as
+`within_target_range: false` with a warning. A diagnostic recorded before 0.5.28
+has its instrument family read again when it is re-estimated.
+Keep 0 when the diagnostic finds no more than 6,000 peaks. The LC-MS diagnostic loads no annotation library, so it says nothing about
+annotation; only its peak count and heights are used, and its Adduct and
+Isotope columns are not the production run's. The production run's
+actual per-file peak counts are recorded beside the estimate as
+`production_peak_counts`. Add the accepted threshold to `answer_seed` before
 production. Repository runs use `TimeBasedLinearWeightedMovingAverage` and must
 record it in the generated method and provenance.
 

@@ -1168,6 +1168,30 @@ ADAPTERS = {
 }
 
 
+DECLARED_INSTRUMENT_FIELD = "project.repository_metadata.catalog_handoff.technical_settings.instrument"
+
+
+def declared_instrument(manifest_path: str | Path | None) -> str:
+    """The instrument a repository unit's Catalog handoff declares (DECLARED_INSTRUMENT_FIELD), or "".
+
+    The submitter's own words ("Thermo Q Exactive Orbitrap"). The peak-count diagnostic reads it only where
+    the representative file's format leaves its instrument family at a default, such as an mzML whose header
+    names no instrument (agent_workflow.representative_instrument_family). Never raises.
+    """
+    text = str(manifest_path or "").strip()
+    if not text:
+        return ""
+    try:
+        manifest = read_manifest(text)
+    except (OSError, ValueError):
+        return ""
+    project = manifest.get("project") if isinstance(manifest.get("project"), dict) else {}
+    metadata = project.get("repository_metadata") if isinstance(project.get("repository_metadata"), dict) else {}
+    handoff = metadata.get("catalog_handoff") if isinstance(metadata.get("catalog_handoff"), dict) else {}
+    settings = handoff.get("technical_settings") if isinstance(handoff.get("technical_settings"), dict) else {}
+    return str(settings.get("instrument") or "").strip()
+
+
 def conversion_polarity_declaration(project: RepositoryProject | dict[str, Any]) -> dict[str, Any]:
     """The ion mode a campaign's convert stage reads for a unit, and the polarity it imputes from it.
 
@@ -4886,6 +4910,22 @@ def record_peak_height_diagnostic(
         "diagnostic_peak_count": estimate.get("diagnostic_peak_count"),
         "estimated_peak_count": estimate.get("estimated_peak_count"),
         "threshold_step": estimate.get("threshold_step"),
+        # The user's rules of 2026-10-06: the family step first, and the fine step (10 QTOF-type, 100
+        # FT) only when no multiple of the family step lands in the target range; within the range, the
+        # highest threshold keeping at least the lower bound. Whether the fine step was used, and
+        # whether even it missed, must be on record beside the threshold it produced.
+        "coarse_threshold_step": estimate.get("coarse_threshold_step", estimate.get("threshold_step")),
+        "fine_threshold_step": estimate.get("fine_threshold_step"),
+        "step_fallback": bool(estimate.get("step_fallback", False)),
+        "fallback_reason": estimate.get("fallback_reason"),
+        "within_target_range": estimate.get("within_target_range"),
+        # None for an estimate from before the rule was recorded: it chose the threshold nearest the
+        # range's midpoint, not the highest keeping the lower bound.
+        "selection_rule": estimate.get("selection_rule"),
+        # The family the coarse step and the fine step's floor were chosen by, and what it rests on (the
+        # file's format, its mzML header, or the repository's declared instrument).
+        "instrument_family": (representative or {}).get("instrument_family", estimate.get("instrument_family")),
+        "instrument_family_source": (representative or {}).get("instrument_family_source"),
         "method": estimate.get("method", ""),
         **({"annotation": dict(annotation)} if isinstance(annotation, dict) else {}),
     }
