@@ -803,6 +803,31 @@ def decide_disposition(
         if code and code not in warnings:
             warnings.append(code)
 
+    def result(disposition: str, split_key: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
+        settle_overrides(disposition)
+        return {
+            "schema": DISPOSITION_SCHEMA,
+            "disposition": disposition,
+            "reasons": list(dict.fromkeys(reasons)),
+            "warnings": warnings,
+            "excluded_inputs": [*lease_excluded, *excluded],
+            "split_key": split_key,
+            "decided_at": decided_at or _now(),
+            "extractor": {
+                "sha256": str(identity.get("sha256") or identity.get("binary_sha256") or ""),
+                "inventory_sha256": str(identity.get("inventory_sha256") or ""),
+                "provenance_status": str(identity.get("provenance_status") or ""),
+                "pinned": bool(identity.get("pinned")),
+            },
+            "declared": declared,
+            "declared_acquisition_source": declared_source,
+            **({"split_parent_declared_acquisition_mode": parent_mode} if parent_mode else {}),
+            "declared_vs_header": disagreements[:50],
+            "detail": detail,
+            **extra,
+            "assignments": assignments,
+        }
+
     def settle_overrides(disposition: str) -> None:
         # A header decided each file it contradicted the declaration for, but the declaration was overridden
         # in what runs only where that file reaches the run: one excluded after its header was taken is
@@ -838,31 +863,6 @@ def decide_disposition(
                 + ", ".join(f"{reason} {count}" for reason, count in sorted(dropped.items()))
                 + "); the declaration decides none of them."
             )
-
-    def result(disposition: str, split_key: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
-        settle_overrides(disposition)
-        return {
-            "schema": DISPOSITION_SCHEMA,
-            "disposition": disposition,
-            "reasons": list(dict.fromkeys(reasons)),
-            "warnings": warnings,
-            "excluded_inputs": [*lease_excluded, *excluded],
-            "split_key": split_key,
-            "decided_at": decided_at or _now(),
-            "extractor": {
-                "sha256": str(identity.get("sha256") or identity.get("binary_sha256") or ""),
-                "inventory_sha256": str(identity.get("inventory_sha256") or ""),
-                "provenance_status": str(identity.get("provenance_status") or ""),
-                "pinned": bool(identity.get("pinned")),
-            },
-            "declared": declared,
-            "declared_acquisition_source": declared_source,
-            **({"split_parent_declared_acquisition_mode": parent_mode} if parent_mode else {}),
-            "declared_vs_header": disagreements[:50],
-            "detail": detail,
-            **extra,
-            "assignments": assignments,
-        }
 
     if not preflight or not summary:
         reasons.append("raw_metadata_preflight_missing")
