@@ -11,7 +11,7 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   (master: #43 and #42) with MsdialWorkbench `f0583493a`, built as
   `RawMetadataExtractor-5f60446-f0583493a` (inventory `a224c0fee2385b70`,
   provenance verified). `plan_extractor_build` and `extractor_build_root`
-  default to this pair. Compared with the `a12293c61` build, which stays a built
+  default to this pair and name that folder. Compared with the `a12293c61` build, which stays a built
   pin that a campaign accepts:
   - #43: the Console's Waters spectrum reader skips the LockSpray function the
     SDK names or marks as a reference scan, and reads the lower-energy MSe
@@ -23,6 +23,13 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     Waters, mzML and SCIEX DDA) every verdict is the `a12293c61` build's.
 - A campaign's `extractor_not_pinned` refusal lists the three built pins,
   current first.
+- A `PINNED_BUILDS` entry can name the folder its build is in (`build_folder`)
+  when that is not the folder the commits would name. The `5f604462d` pin does,
+  because its folder carries a seven-character commit. `extractor_build_root`
+  uses it for that pair, in full or abbreviated, so the default extractor
+  location beside the Interactive checkout is the existing build, and a plan
+  without commits reports that the build already exists rather than planning a
+  second build of the same pin into an empty folder.
 
 ## [0.5.34] - Unreleased
 

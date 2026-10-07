@@ -189,8 +189,9 @@ class BuildCommandTests(unittest.TestCase):
     def test_the_pins_are_the_approved_commits_and_name_the_build_folder(self) -> None:
         self.assertEqual(RAW_HEAD, extractor.PINNED_MSRAWDATAWORKBENCH_COMMIT)
         self.assertEqual(COMMON_HEAD, extractor.PINNED_MSDIALWORKBENCH_COMMIT)
+        # The current pin was built in a folder named by the seven-character commit, and the pin says so.
         self.assertEqual(
-            "RawMetadataExtractor-5f604462d-f0583493a",
+            "RawMetadataExtractor-5f60446-f0583493a",
             extractor_build_root(Path("synthetic-parent")).name,
         )
         self.assertIs(extractor.PINNED_BUILDS[0], extractor.CURRENT_PIN)
@@ -205,6 +206,44 @@ class BuildCommandTests(unittest.TestCase):
             self.assertEqual(extractor.PIN_BUILT, previous["state"])
             self.assertNotEqual(head, extractor.PINNED_MSRAWDATAWORKBENCH_COMMIT)
 
+    def test_a_pins_build_folder_is_used_for_its_commits_in_full_or_abbreviated(self) -> None:
+        parent = Path("synthetic-parent")
+        for raw, common in ((RAW_HEAD, COMMON_HEAD), (RAW_HEAD[:7], COMMON_HEAD[:9]), (RAW_HEAD.upper(), COMMON_HEAD)):
+            self.assertEqual(
+                parent / "RawMetadataExtractor-5f60446-f0583493a", extractor_build_root(parent, raw, common), raw
+            )
+        # Pins without a build_folder, and pairs that are no pin, are named by both commits.
+        self.assertEqual(
+            "RawMetadataExtractor-a12293c61-f0583493a",
+            extractor_build_root(parent, PREVIOUS_RAW_HEAD, COMMON_HEAD).name,
+        )
+        self.assertEqual(
+            "RawMetadataExtractor-592b6dbce-f0583493a",
+            extractor_build_root(parent, EARLIER_RAW_HEAD, COMMON_HEAD).name,
+        )
+        self.assertEqual(
+            "RawMetadataExtractor-5f604462d-c471463a5",
+            extractor_build_root(parent, RAW_HEAD, "c471463a576626650e0886e26bd064cca53a7ae3").name,
+        )
+        self.assertEqual(
+            "RawMetadataExtractor-111111111-f0583493a", extractor_build_root(parent, "1" * 40, COMMON_HEAD).name
+        )
+
+    def test_a_plan_for_the_current_pin_sees_its_existing_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            built = parent / "RawMetadataExtractor-5f60446-f0583493a"
+            (built / "msrawdataworkbench").mkdir(parents=True)
+            with patch.object(extractor.shutil, "which", return_value="dotnet"):
+                plan = plan_extractor_build(
+                    parent_directory=parent,
+                    raw_source=parent / "no-msrawdataworkbench",
+                    common_source=parent / "no-MsdialWorkbench",
+                )
+
+        self.assertEqual(str(built.resolve()), plan["build_root"])
+        self.assertTrue(any("already exists" in blocker for blocker in plan["blockers"]), plan["blockers"])
+
     def test_a_plan_without_commits_targets_the_current_pin(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             parent = Path(temporary)
@@ -215,7 +254,7 @@ class BuildCommandTests(unittest.TestCase):
                     common_source=parent / "no-MsdialWorkbench",
                 )
 
-        self.assertEqual(str(parent.resolve() / "RawMetadataExtractor-5f604462d-f0583493a"), plan["build_root"])
+        self.assertEqual(str(parent.resolve() / "RawMetadataExtractor-5f60446-f0583493a"), plan["build_root"])
         self.assertEqual(RAW_HEAD, plan["trees"]["msrawdataworkbench"]["requested_commit"])
         self.assertEqual(COMMON_HEAD, plan["trees"]["MsdialWorkbench"]["requested_commit"])
         checkouts = [step["command"] for step in plan["steps"] if "checkout" in step["command"]]

@@ -431,7 +431,10 @@ candidate with its provenance status and whether it is a pinned build. The pinne
 builds are data (`PINNED_BUILDS` in `raw_metadata_extractor.py`); the current one is
 msrawdataworkbench `5f604462d` with MsdialWorkbench `f0583493a`, and the earlier
 built pins (`a12293c61` and `592b6dbce`, each with `f0583493a`) are still pinned
-builds a campaign accepts. A unit under a
+builds a campaign accepts. A build lives beside the Interactive checkout in
+`RawMetadataExtractor-<raw>-<common>`, named by nine characters of each commit,
+unless its entry names another folder (`build_folder`): the `5f604462d` build is in
+`RawMetadataExtractor-5f60446-f0583493a`. A unit under a
 campaign approval is preflighted only by the first extractor named, and only when it
 inspects as verified and pinned; anything else is refused before a file is read.
 
