@@ -97,6 +97,13 @@ GUIDED_SECTIONS = [
             ("automatic_rt_correction_outlier_mad_threshold", "Outlier MAD threshold", ""),
             ("automatic_rt_correction_reference_centrality_weight", "Reference centrality weight", "0-1"),
             ("automatic_rt_correction_interpolate_blanks_by_analytical_order", "Interpolate Blanks by analytical order", ""),
+            # MsdialWorkbench#826. Listed only when set; unset, the Console used its default, which
+            # the evidence section below records as read from the audit.
+            (
+                "automatic_rt_correction_local_support_rt_window",
+                "Local outlier test RT window (0 = run-wide test only)",
+                "min; Console default 1.5 when not set",
+            ),
         ],
     ),
     (
@@ -217,18 +224,26 @@ def _guided_sheet(workflow: dict[str, Any]) -> dict[str, Any]:
             ("selected_anchor_count", "Distinct anchors used by corrected files"),
             ("corrected_file_count", "Files corrected from their own anchors"),
             ("model_sources", "Per-file model sources"),
+            ("outlier_test", "Anchor outlier test"),
+            ("local_support_rt_window", "Local outlier test RT window (min)"),
+            ("local_support_rt_window_source", "Window source (method file or Console default)"),
+            ("outlier_mad_threshold", "Outlier MAD threshold"),
+            ("outlier_status_counts", "Anchors rejected as outliers, by status"),
             ("reason", "Evidence verdict"),
             ("summary_file", "Summary audit file"),
             ("anchors_file", "Anchor audit file"),
             ("method_keys_file", "Method-key audit file"),
         )
         for key, label in evidence_fields:
-            rows.append(
-                _row(
-                    [label, _typed_value(automatic_rt_evidence.get(key)), "Console audit"],
-                    "body_left",
-                )
-            )
+            value = _typed_value(automatic_rt_evidence.get(key))
+            # A Console without MsdialWorkbench#826 has no window; "not recorded" would read as lost.
+            if (
+                key.startswith("local_support_rt_window")
+                and automatic_rt_evidence.get("outlier_test")
+                and not automatic_rt_evidence.get("local_support_columns")
+            ):
+                value = "not applicable: Console predates MsdialWorkbench#826"
+            rows.append(_row([label, value, "Console audit"], "body_left"))
 
     # sample_table_proposal is how the injection order and dilution factors were guessed,
     # not a setting the run used; the full workflow record keeps it.

@@ -59,6 +59,8 @@ SMOOTHING_METHODS = [
 LCMS_QA_CAPABILITY = "lcms_alignment_qa_matrix"
 RT_CORRECTION_REVIEW_CAPABILITY = "rt_correction_review"
 AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY = "automatic_alignment_rt_correction"
+# MsdialWorkbench#826: the local outlier test and its "local support RT window" method key.
+AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY = "automatic_alignment_rt_correction_local_support"
 CONSOLE_BUILD_PROVENANCE = "msdial-console-build-provenance.json"
 # THE CONSOLE IS ITS WHOLE OUTPUT FOLDER, NOT MSDIALCUI.exe ALONE.
 #
@@ -118,7 +120,16 @@ AUTOMATIC_RT_CORRECTION_METHOD_KEYS = {
     "automatic rt correction outlier mad threshold",
     "automatic rt correction reference centrality weight",
     "automatic rt correction interpolate blanks by analytical order",
+    "automatic rt correction local support rt window",
 }
+# MsdialWorkbench#826 judges each anchor against the offsets of the file's other matched reference
+# candidates within this many minutes of it (0 = the run-wide test only), and floors the robust scale
+# at the MS1 cycle time around the anchor. A Console without #826 does not know the key, so it is
+# written only when the user or a profile sets it; unset, a #826 Console uses its default of 1.5 min.
+# It is kept out of AUTOMATIC_RT_CORRECTION_DEFAULTS, every key of which is always written.
+AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW = "automatic_rt_correction_local_support_rt_window"
+AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_METHOD_KEY = "automatic rt correction local support rt window"
+AUTOMATIC_RT_CORRECTION_CONSOLE_DEFAULT_LOCAL_SUPPORT_RT_WINDOW = 1.5
 # One set of defaults for the template reader, the validator and the method writer. The
 # validator used to default an absent tolerance to 0 and refuse it, while the writer would
 # have written 0.5 for the same state.
@@ -158,6 +169,8 @@ AUTOMATIC_RT_CORRECTION_CONSOLE_MARKERS = (
     "execute automatic rt correction for alignment",
     "Automatic alignment RT correction audit:",
 )
+# The lowercase key #826's ConfigParser reads; the title-case label is in MsdialCore.dll.
+AUTOMATIC_RT_LOCAL_SUPPORT_CONSOLE_MARKERS = (AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_METHOD_KEY,)
 
 
 def console_assembly_path(console_path: str | Path) -> Path:
@@ -1408,6 +1421,7 @@ def load_parameter_template(
                 "automatic_rt_correction_interpolate_blanks_by_analytical_order"
             ],
         ),
+        **_template_local_support_rt_window(values),
         "export_folder_path": library_path("export folder path"),
         "height_matrix_export": boolean("height matrix export"),
         "solvent": value("solvent type", default="CH3COONH4"),
@@ -1628,10 +1642,12 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
             )
         issues.extend(_automatic_rt_correction_value_issues(state))
         console_path = Path(str(state.get("console_path", "")).strip()).expanduser()
-        if console_path.is_file() and (
-            AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY
-            not in console_capabilities(str(console_path))["capabilities"]
-        ):
+        found = (
+            console_capabilities(str(console_path))["capabilities"]
+            if console_path.is_file()
+            else None
+        )
+        if found is not None and AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY not in found:
             issues.append(
                 {
                     "level": "error",
@@ -1639,6 +1655,23 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                         "Automatic alignment RT correction requires an MS-DIAL Console build "
                         "that implements this feature. Select a compatible source build or "
                         "disable automatic alignment RT correction."
+                    ),
+                }
+            )
+        elif (
+            found is not None
+            and automatic_rt_local_support_rt_window(state) is not None
+            and AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY not in found
+        ):
+            # That Console would list the key as unrecognised and run without the local test,
+            # while the method file, Table S1 and the Methods text said it had run with it.
+            issues.append(
+                {
+                    "level": "error",
+                    "message": (
+                        "Automatic RT correction local support RT window is set, but the selected "
+                        "MS-DIAL Console predates the local outlier test (MsdialWorkbench#826) and "
+                        "would ignore it. Select a Console that has it, or leave the window unset."
                     ),
                 }
             )
@@ -3854,6 +3887,10 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
             automatic_rt_replacements[label] = automatic_rt_correction_value(state_key, raw)
         except (TypeError, ValueError, OverflowError):
             automatic_rt_replacements[label] = raw
+    # Written only when set: a Console without MsdialWorkbench#826 does not know the key.
+    local_window = automatic_rt_local_support_rt_window(state)
+    if local_window is not None:
+        automatic_rt_replacements[AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_METHOD_KEY] = local_window
     automatic_rt_enabled = bool(
         project_type == "lcms" and state.get("execute_automatic_rt_correction", False)
     )
@@ -3931,6 +3968,13 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         stripped = line.lstrip()
         line_key = console_method_key(line)
         if line_key in AUTOMATIC_RT_CORRECTION_METHOD_KEYS and not automatic_rt_enabled:
+            continue
+        # A template's window line is not the state's: copied through, it would hand the key to a
+        # Console the state never asked for it. load_parameter_template reads it into the state.
+        if (
+            line_key == AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_METHOD_KEY
+            and line_key not in replacements
+        ):
             continue
         if line_key in ("solvent type", "searched lipid class"):
             continue
@@ -4182,6 +4226,7 @@ def _title_for_key(key: str) -> str:
         "automatic rt correction outlier mad threshold": "Automatic RT correction outlier MAD threshold",
         "automatic rt correction reference centrality weight": "Automatic RT correction reference centrality weight",
         "automatic rt correction interpolate blanks by analytical order": "Automatic RT correction interpolate blanks by analytical order",
+        "automatic rt correction local support rt window": "Automatic RT correction local support RT window",
         "ionization": "Ionization",
         "machine category": "Machine category",
         "accuracy type": "Accuracy type",
@@ -4441,7 +4486,47 @@ def _automatic_rt_correction_value_issues(state: dict[str, Any]) -> list[dict[st
     ):
         if key in values and not 0 <= values[key] <= 1:
             error(f"{AUTOMATIC_RT_CORRECTION_LABELS[key]} must be between 0 and 1.")
+    # Checked only when set; unset, it is not written and a #826 Console uses its 1.5-min default.
+    # The Console stores a float and refuses a negative or NaN window only after peak picking.
+    window = automatic_rt_local_support_rt_window(state)
+    if window is not None:
+        label = "local support RT window"
+        if isinstance(window, bool) or not isinstance(window, float):
+            error(f"{label} must be a number, not {window!r}.")
+        elif not math.isfinite(_as_float32(window)):
+            error(f"{label} must be a finite number, not {window!r}.")
+        elif window < 0:
+            error(f"{label} must be 0 (run-wide test only) or greater, in minutes.")
     return issues
+
+
+def automatic_rt_local_support_rt_window(state: dict[str, Any]) -> Any:
+    """The local support RT window the state sets, or None when it leaves it to the Console.
+
+    None, a missing key and a blank value all mean unset. A number the Console reads as one comes
+    back as a float; anything else as given, for _automatic_rt_correction_value_issues to refuse.
+    """
+    raw = state.get(AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    # float(True) is 1.0, but the method file would then say True, which the Console refuses.
+    if isinstance(raw, bool) or (isinstance(raw, str) and not _INVARIANT_NUMBER.fullmatch(raw)):
+        return raw
+    try:
+        return float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return raw
+
+
+def _template_local_support_rt_window(values: dict[str, str]) -> dict[str, Any]:
+    """The template's local support RT window as a state entry, or nothing when it has no line."""
+    raw = values.get(AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_METHOD_KEY, "").strip()
+    if not raw:
+        return {}
+    value = automatic_rt_local_support_rt_window(
+        {AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW: raw}
+    )
+    return {AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW: value}
 
 
 def automatic_rt_correction_value(key: str, value: Any) -> Any:
@@ -4505,6 +4590,12 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
     ):
         capabilities.add(AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY)
         probes.append("automatic RT correction marker")
+    if any(
+        marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary
+        for marker in AUTOMATIC_RT_LOCAL_SUPPORT_CONSOLE_MARKERS
+    ):
+        capabilities.add(AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY)
+        probes.append("automatic RT local support marker")
     return {
         "capability_probe": " + ".join(probes) if probes else "unsupported",
         "capabilities": sorted(capabilities),

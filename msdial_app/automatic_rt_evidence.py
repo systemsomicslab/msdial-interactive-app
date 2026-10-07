@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -20,6 +21,33 @@ ANCHORS = "automatic_alignment_rt_correction_anchors.tsv"
 METHOD_KEYS = "method.keys.json"
 METHOD = "method.txt"
 AUTOMATIC_RT_KEY = "execute automatic rt correction for alignment"
+LOCAL_SUPPORT_KEY = "automatic rt correction local support rt window"
+OUTLIER_MAD_THRESHOLD_KEY = "automatic rt correction outlier mad threshold"
+# The anchor statuses of an anchor the outlier test rejected: MadOutlier against the median of the
+# file's anchors (#810, and #826 where an anchor has too few neighbours), LocalOutlier against the
+# median of the file's other matched reference candidates within the local support window (#826).
+OUTLIER_STATUSES = ("LocalOutlier", "MadOutlier")
+# Columns MsdialWorkbench#826 appended after the ones #810 wrote. Every reader here addresses columns
+# by name, so a pre-#826 audit, which has none of them, reads as it always did.
+LOCAL_SUPPORT_ANCHOR_COLUMNS = (
+    "Outlier test",
+    "Local support count",
+    "Expected offset (min)",
+    "Outlier scale (min)",
+    "MS1 cycle at anchor (min)",
+)
+LOCAL_SUPPORT_SUMMARY_COLUMNS = (
+    "Estimated scan interval (min)",
+    "First used anchor RT (min)",
+    "Last used anchor RT (min)",
+    "Peaks before first used anchor",
+    "Peaks after last used anchor",
+)
+# What the Console's outlier test was, as the audit shows it (outlier_test_of).
+OUTLIER_TEST_LOCAL = "local_support_with_ms1_cycle_floor"
+OUTLIER_TEST_RUN_WIDE_FLOORED = "run_wide_with_ms1_cycle_floor"
+OUTLIER_TEST_RUN_WIDE_MAD = "run_wide_mad"
+OUTLIER_TEST_OFF = "off"
 
 # What each reason means, for a reader who sees the code in a warning.
 PROOF_REASON_PHRASES = {
@@ -37,6 +65,10 @@ PROOF_REASON_PHRASES = {
     "method_key_value_discarded_by_console": (
         "the Console discarded the value it was given for {keys} and ran with its default, "
         "so the recorded settings are not the ones the correction used"
+    ),
+    "method_key_not_recognised_by_console": (
+        "the Console did not know {keys}, so it ran without that setting; a Console older than "
+        "the setting does not implement it"
     ),
     "audit_older_than_method_key_record": (
         "an audit TSV is older than method.keys.json, so an earlier run wrote it"
@@ -78,6 +110,99 @@ def read_method_key_record(root: Path) -> dict[str, Any] | None:
     return record if isinstance(record, dict) else None
 
 
+def _method_values(path: Path) -> dict[str, str]:
+    """method.txt's values by case-folded key; the last line wins, as the Console keeps the last."""
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        separators = [index for index in (line.find(":"), line.find("=")) if index >= 0]
+        if not separators:
+            continue
+        cut = min(separators)
+        values[line[:cut].strip().casefold()] = line[cut + 1:].strip()
+    return values
+
+
+def _finite(text: Any) -> float | None:
+    try:
+        value = float(str(text).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def has_local_support_columns(anchor_rows: list[dict[str, Any]]) -> bool:
+    """True for an anchor audit written by a Console with MsdialWorkbench#826.
+
+    A DictReader row carries every header column as a key, a short row's as None.
+    """
+    return bool(anchor_rows) and all(column in anchor_rows[0] for column in LOCAL_SUPPORT_ANCHOR_COLUMNS)
+
+
+def outlier_test_of(
+    anchor_rows: list[dict[str, Any]], method_values: dict[str, str]
+) -> dict[str, Any]:
+    """What outlier test the Console ran on the anchors, read from its audit and the method file.
+
+    A Console with MsdialWorkbench#826 writes the anchor columns in LOCAL_SUPPORT_ANCHOR_COLUMNS. Its
+    window is the method file's value, or the Console default of 1.5 min where the file has no line;
+    a window of 0 leaves the run-wide test only, still floored at the MS1 cycle. Without those
+    columns the Console predates #826: it judged every anchor against the median of the file's
+    anchors and skipped the test where that MAD was 0, and no window applies. An outlier threshold of
+    0 turns the test off in both.
+    """
+    from .workflow import (
+        AUTOMATIC_RT_CORRECTION_CONSOLE_DEFAULT_LOCAL_SUPPORT_RT_WINDOW,
+        AUTOMATIC_RT_CORRECTION_DEFAULTS,
+    )
+
+    threshold = _finite(method_values.get(OUTLIER_MAD_THRESHOLD_KEY, ""))
+    if threshold is None:
+        threshold = float(
+            AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_outlier_mad_threshold"]
+        )
+    local_support = has_local_support_columns(anchor_rows)
+    window: float | None = None
+    window_source = ""
+    if local_support:
+        window = _finite(method_values.get(LOCAL_SUPPORT_KEY, ""))
+        window_source = "method_file"
+        if window is None:
+            window = AUTOMATIC_RT_CORRECTION_CONSOLE_DEFAULT_LOCAL_SUPPORT_RT_WINDOW
+            window_source = "console_default"
+    if not threshold > 0:
+        test = OUTLIER_TEST_OFF
+    elif not local_support:
+        test = OUTLIER_TEST_RUN_WIDE_MAD
+    elif window is not None and window > 0:
+        test = OUTLIER_TEST_LOCAL
+    else:
+        test = OUTLIER_TEST_RUN_WIDE_FLOORED
+    tests: dict[str, int] = {}
+    statuses: dict[str, int] = {}
+    for row in anchor_rows:
+        judged = str(row.get("Outlier test") or "").strip()
+        if judged:
+            tests[judged] = tests.get(judged, 0) + 1
+        status = str(row.get("Status") or "").strip()
+        if status in OUTLIER_STATUSES:
+            statuses[status] = statuses.get(status, 0) + 1
+    return {
+        "outlier_test": test,
+        "local_support_columns": local_support,
+        "local_support_rt_window": window,
+        "local_support_rt_window_source": window_source,
+        "outlier_mad_threshold": threshold,
+        "outlier_tests": tests,
+        "outlier_status_counts": statuses,
+    }
+
+
 def _rows(path: Path) -> list[dict[str, str]]:
     with path.open(encoding="utf-8-sig", newline="") as handle:
         return list(csv.DictReader(handle, delimiter="\t"))
@@ -95,6 +220,13 @@ def unproven() -> dict[str, Any]:
         "corrected_file_count": 0,
         "model_sources": {},
         "reason": "retained_evidence_missing",
+        "outlier_test": "",
+        "local_support_columns": False,
+        "local_support_rt_window": None,
+        "local_support_rt_window_source": "",
+        "outlier_mad_threshold": None,
+        "outlier_tests": {},
+        "outlier_status_counts": {},
         "summary_file": SUMMARY,
         "anchors_file": ANCHORS,
         "method_keys_file": METHOD_KEYS,
@@ -154,6 +286,16 @@ def automatic_rt_correction_proof(
         proof["reason"] = "method_key_value_discarded_by_console"
         proof["discarded_keys"] = discarded
         return proof
+    # A Console without MsdialWorkbench#826 lists the local support window as unrecognised and runs
+    # without the local test, while the method file says the window was set.
+    unknown = sorted(
+        ({method_key_name(item) for item in method_keys.get("unrecognised") or []} - applied)
+        & AUTOMATIC_RT_CORRECTION_METHOD_KEYS
+    )
+    if unknown:
+        proof["reason"] = "method_key_not_recognised_by_console"
+        proof["discarded_keys"] = unknown
+        return proof
 
     try:
         record_time = method_keys_path.stat().st_mtime
@@ -191,6 +333,7 @@ def automatic_rt_correction_proof(
         and str(row.get("File ID") or "").strip() in corrected_ids
     }
     performed = reference is not None and bool(corrected_ids) and bool(selected_anchor_ids)
+    proof.update(outlier_test_of(anchor_rows, _method_values(method_path)))
     proof.update(
         {
             "performed": performed,

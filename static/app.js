@@ -153,6 +153,8 @@ function workflow() {
     automatic_rt_correction_outlier_mad_threshold: numberField("#automaticRtOutlierMadThreshold", 3.5),
     automatic_rt_correction_reference_centrality_weight: numberField("#automaticRtReferenceCentralityWeight", 0.35),
     automatic_rt_correction_interpolate_blanks_by_analytical_order: Boolean($("#automaticRtInterpolateBlanks")?.checked),
+    // Blank stays undefined, which JSON leaves out: the method file then has no line for it.
+    automatic_rt_correction_local_support_rt_window: numberField("#automaticRtLocalSupportRtWindow", undefined),
     run_qa: $("#projectType").value === "lcms" && Boolean($("#heightMatrixExport")?.checked),
     height_matrix_export: $("#projectType").value === "lcms" && Boolean($("#heightMatrixExport")?.checked),
     export_folder_path: $("#projectType").value === "lcms" && $("#heightMatrixExport")?.checked
@@ -995,6 +997,10 @@ function applyLoadedParameterTemplate(result) {
     values.automatic_rt_correction_interpolate_blanks_by_analytical_order,
     true,
   );
+  // A template without the line leaves the window to the Console, so an earlier value is cleared.
+  if ($("#automaticRtLocalSupportRtWindow")) {
+    $("#automaticRtLocalSupportRtWindow").value = values.automatic_rt_correction_local_support_rt_window ?? "";
+  }
   setTemplateControl("heightMatrixExport", values.height_matrix_export, true);
   if (result.path) $("#templatePath").value = result.path;
   if (Array.isArray(result.msp_annotators)) state.mspAnnotators = result.msp_annotators;
@@ -1444,6 +1450,7 @@ function saveRtWorkspaceState() {
     automatic_rt_correction_outlier_mad_threshold: current.automatic_rt_correction_outlier_mad_threshold,
     automatic_rt_correction_reference_centrality_weight: current.automatic_rt_correction_reference_centrality_weight,
     automatic_rt_correction_interpolate_blanks_by_analytical_order: current.automatic_rt_correction_interpolate_blanks_by_analytical_order,
+    automatic_rt_correction_local_support_rt_window: current.automatic_rt_correction_local_support_rt_window,
     execute_rt_correction: current.execute_rt_correction,
     rt_correction_anchor_path: current.rt_correction_anchor_path,
     rt_correction_anchor_source_path: current.rt_correction_anchor_source_path,
@@ -1495,6 +1502,7 @@ function restoreRtWorkspaceState() {
     automaticRtMinimumIdealSlope: saved.automatic_rt_correction_minimum_ideal_slope,
     automaticRtOutlierMadThreshold: saved.automatic_rt_correction_outlier_mad_threshold,
     automaticRtReferenceCentralityWeight: saved.automatic_rt_correction_reference_centrality_weight,
+    automaticRtLocalSupportRtWindow: saved.automatic_rt_correction_local_support_rt_window,
     rtCorrectionAnchorPath: saved.rt_correction_anchor_path,
     rtCorrectionSelectionPath: saved.rt_correction_selection_path,
     rtCorrectionDiffMethod: saved.rt_correction_diff_method,
@@ -2522,21 +2530,28 @@ function renderAutomaticRtFile() {
   const eicTolerance = recordedTolerance > 0 && recordedTolerance <= 1 ? recordedTolerance : 0.01;
   const missingCount = anchors.length - numericAnchors.length;
   const rowClass = { used: "", rejected: "rt-audit-rejected", unmatched: "rt-audit-unused", blank: "rt-audit-unused" };
-  const rows = anchors.map((item) => `<tr class="${rowClass[rtAuditCategory(item)] ?? "rt-audit-rejected"}"><td>${escapeHtml(item.anchor_id)}</td><td>${rtAuditNumber(item.mz, 5)}</td><td>${rtAuditNumber(item.original_rt)}</td><td>${rtAuditNumber(item.reference_rt)}</td><td>${rtAuditNumber(item.offset, 4)}</td><td>${rtAuditNumber(item.quality_score, 2)}</td><td>${rtAuditNumber(item.coverage, 2)}</td><td>${item.used ? "Yes" : "No"}</td><td>${escapeHtml(item.status)}</td></tr>`).join("");
+  // MsdialWorkbench#826 records which test judged each anchor, against what offset and scale, and the
+  // MS1 cycle floor; an older audit has none of it, and its table keeps its old columns.
+  const localSupport = Boolean(review.local_support_columns);
+  const outlierCells = (item) => localSupport
+    ? `<td>${escapeHtml(item.outlier_test || "")}</td><td>${escapeHtml(item.local_support_count ?? "")}</td><td>${rtAuditNumber(item.expected_offset, 4)}</td><td>${rtAuditNumber(item.outlier_scale, 4)}</td><td>${rtAuditNumber(item.ms1_cycle_time, 4)}</td>`
+    : "";
+  const outlierHeads = localSupport ? "<th>Outlier test</th><th>Neighbours</th><th>Expected offset</th><th>Scale (min)</th><th>MS1 cycle (min)</th>" : "";
+  const rows = anchors.map((item) => `<tr class="${rowClass[rtAuditCategory(item)] ?? "rt-audit-rejected"}"><td>${escapeHtml(item.anchor_id)}</td><td>${rtAuditNumber(item.mz, 5)}</td><td>${rtAuditNumber(item.original_rt)}</td><td>${rtAuditNumber(item.reference_rt)}</td><td>${rtAuditNumber(item.offset, 4)}</td><td>${rtAuditNumber(item.quality_score, 2)}</td><td>${rtAuditNumber(item.coverage, 2)}</td><td>${item.used ? "Yes" : "No"}</td><td>${escapeHtml(item.status)}</td>${outlierCells(item)}</tr>`).join("");
   panel.innerHTML = `<h3>${escapeHtml(file.name)} | ${escapeHtml(file.model_source)}</h3>
-    <p class="muted">${escapeHtml(file.type)} | Order ${escapeHtml(file.order ?? "unknown")} | ${escapeHtml(file.used_anchors ?? 0)} accepted of ${escapeHtml(file.matched_anchors ?? 0)} matched | Reference score ${rtAuditNumber(file.reference_score, 2)}. ${escapeHtml(file.note || "")}</p>
+    <p class="muted">${escapeHtml(file.type)} | Order ${escapeHtml(file.order ?? "unknown")} | ${escapeHtml(file.used_anchors ?? 0)} accepted of ${escapeHtml(file.matched_anchors ?? 0)} matched | Reference score ${rtAuditNumber(file.reference_score, 2)}${file.estimated_scan_interval !== null && file.estimated_scan_interval !== undefined ? ` | MS1 scan interval ${rtAuditNumber(file.estimated_scan_interval, 4)} min` : ""}. ${escapeHtml(file.note || "")}</p>
     ${missingCount ? `<p class="muted">${missingCount} anchor record(s) have unavailable RT values. They remain in the table as N/A, but are not plotted or offered for apex-based EIC review. No RT values are imputed.</p>` : ""}
     ${!canReconstruct ? `<p class="issue warning">This file has no reconstructable RT model in the audit. Original candidate offsets remain visible where available; no corrected curve is inferred.</p>` : ""}
     <div class="rt-audit-grid"><article><h4>File-specific RT shift</h4>${shiftPlot}<p class="muted">The Console uses linear interpolation between accepted anchors and holds the nearest anchor's offset beyond both ends. An RT shift curve is unavailable for Blank-interpolated models because their control points are not in the audit file.</p></article>
     <article><h4>Anchor RT error before / after model</h4>${residualPlot}<p class="muted">Zero residual at accepted anchors follows from the fitted model, not independent validation. Rejected anchors at a different RT can reveal inconsistent assignments; rejected anchors sharing the same RT are not independent evidence.</p></article></div>
     <details ${anchors.some((item) => item.status === "NonMonotonic") ? "open" : ""}><summary><strong>Anchor correspondence and reversed order</strong></summary>
-      ${rtAuditCorrespondence(anchors)}<p class="muted">Crossing lines mean that the sample and reference disagree on elution order. Connecting these pairs would make corrected RT decrease as original RT increases. After MAD filtering, the Console rejects the lower-quality member of each conflicting pair (NonMonotonic); equal reference RTs are also rejected. With equal scores, the earlier member on the sample RT axis is removed. Real selectivity changes can also reverse order, so rejection is a model constraint, not proof of a wrong identification.</p></details>
+      ${rtAuditCorrespondence(anchors)}<p class="muted">Crossing lines mean that the sample and reference disagree on elution order. Connecting these pairs would make corrected RT decrease as original RT increases. After outlier filtering, the Console rejects the lower-quality member of each conflicting pair (NonMonotonic); equal reference RTs are also rejected. With equal scores, the earlier member on the sample RT axis is removed. Real selectivity changes can also reverse order, so rejection is a model constraint, not proof of a wrong identification.</p></details>
     <div class="rt-audit-eic"><h4>Inspect the raw chromatographic evidence</h4><p class="muted">Extract one MS1 EIC from this run's original raw file. This may take several minutes for vendor data. The raw data stay in place; the temporary CSV is deleted after reading.</p>
       <div class="button-row"><label>Anchor <select id="rtAuditEicAnchor">${eicAnchors.map((item) => `<option value="${escapeHtml(item.anchor_id)}">${escapeHtml(item.anchor_id)} | m/z ${rtAuditNumber(item.mz, 5)} | ${escapeHtml(item.status)}</option>`).join("")}</select></label>
       <label>m/z tolerance (Da)<input id="rtAuditEicTolerance" type="number" min="0.0001" max="1" step="any" value="${eicTolerance}"></label>
       <button id="rtAuditExtractEic" type="button" class="secondary" ${!eicAnchors.length ? "disabled" : ""}>Extract selected EIC</button></div>
       <div id="rtAuditEicResult" class="format-summary" hidden></div></div>
-    <div class="table-wrap rt-audit-table"><table><thead><tr><th>Anchor</th><th>m/z</th><th>Original RT</th><th>Reference RT</th><th>Offset (min)</th><th>Quality</th><th>Coverage</th><th>Used</th><th>Status</th></tr></thead><tbody>${rows || `<tr><td colspan="9">No matched anchor candidates were recorded.</td></tr>`}</tbody></table></div>`;
+    <div class="table-wrap rt-audit-table"><table><thead><tr><th>Anchor</th><th>m/z</th><th>Original RT</th><th>Reference RT</th><th>Offset (min)</th><th>Quality</th><th>Coverage</th><th>Used</th><th>Status</th>${outlierHeads}</tr></thead><tbody>${rows || `<tr><td colspan="${localSupport ? 14 : 9}">No matched anchor candidates were recorded.</td></tr>`}</tbody></table></div>`;
   $("#rtAuditExtractEic").addEventListener("click", () => runUiAction(async () => {
     const button = $("#rtAuditExtractEic");
     const resultPanel = $("#rtAuditEicResult");
@@ -2594,6 +2609,8 @@ function renderAutomaticRtReview(review) {
       <div class="table-wrap"><table><thead><tr><th>Criterion</th><th>Value in this run's method.txt</th></tr></thead><tbody>${(review.selection_settings || []).map((item) => `<tr><td>${escapeHtml(item.label)}</td><td>${escapeHtml(item.value ?? "not recorded")}</td></tr>`).join("")}</tbody></table></div>
       <p>Current score weights: normalized log intensity 35%, S/N 20%, Gaussian similarity 15%, ideal slope 15%, symmetry 10%, width 5%. The score ranks candidates; it is not a probability of a correct anchor.</p>
       <p class="muted">Initial shape thresholds filter reference candidates, not all cross-file matches. Gaussian similarity is an area-based measure, not a fitted R². Per-component stored metrics are not present in these audit TSVs. Method values should only be treated as verified run settings when the method record above is verified.</p></details>
+    ${(review.outlier_settings || []).length ? `<details><summary><strong>Anchor outlier test</strong></summary>
+      <div class="table-wrap"><table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody>${review.outlier_settings.map((item) => `<tr><td>${escapeHtml(item.label)}</td><td>${escapeHtml(item.value ?? "not recorded")}</td></tr>`).join("")}</tbody></table></div></details>` : ""}
     <details><summary><strong>Method-file interpretation: ${escapeHtml(audit.applied_count ?? 0)} keys applied, ${(audit.unrecognised || []).length} ignored, ${(audit.unusable || []).length} invalid</strong></summary>
       <p class="muted">The Console accepts a subset of template keys for this mode. Unrecognised keys had no effect; some exports are controlled by the Console run rather than method.txt. This does not by itself mean the run failed. Invalid values are different and need correction.</p>
       <p><strong>Ignored keys:</strong> ${escapeHtml((audit.unrecognised || []).join(", ") || "none")}</p>
