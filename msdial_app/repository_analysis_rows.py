@@ -690,6 +690,7 @@ def build_repository_analysis_rows(
         warnings.append(UNATTRIBUTED_MEMBERS_WARNING)
     applied = _applied_disposition(manifest)
     as_swath = applied.get("aif_run_as_swath") if applied.get("disposition") == "run" else None
+    multi_ce = applied.get("aif_multi_ce_run") if applied.get("disposition") == "run" else None
     return {
         "schema": SCHEMA,
         "built_from": "input_lineage",
@@ -733,6 +734,10 @@ def build_repository_analysis_rows(
         "unattributed_class": unattributed_label if unattributed else "",
         # The applied disposition's AIF-as-SWATH record, where the rows' SWATH is a header's AIF (2026-10-07).
         **({"aif_run_as_swath": dict(as_swath)} if isinstance(as_swath, dict) else {}),
+        # The applied disposition's multi-energy AIF record, where the rows' AIF has more than one MS2 collision
+        # energy and the Console it was decided for has MsdialWorkbench#825. The Console reads the energies from
+        # the data; the column says AIF and nothing more.
+        **({"aif_multi_ce_run": dict(multi_ce)} if isinstance(multi_ce, dict) else {}),
         "warnings": warnings,
     }
 
@@ -995,6 +1000,8 @@ def analysis_csv_change(built: dict[str, Any], csv_path: str | Path) -> Any:
         summary["unattributed_class"] = built.get("unattributed_class") or ""
     if built.get("aif_run_as_swath"):
         summary["aif_run_as_swath"] = dict(built["aif_run_as_swath"])
+    if built.get("aif_multi_ce_run"):
+        summary["aif_multi_ce_run"] = dict(built["aif_multi_ce_run"])
 
     def change(manifest: dict[str, Any]) -> None:
         lineage = manifest.get("input_lineage")

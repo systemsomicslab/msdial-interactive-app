@@ -4,6 +4,48 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.34] - Unreleased
+
+### Added
+- Multi-energy AIF runs with a Console that has MsdialWorkbench#825. The user
+  held multi-energy AIF on 2026-10-07 "until the patched Console"; #825 is that
+  Console. It deconvolutes an AIF file separately at each collision energy and
+  represents each peak, in the per-file export and in alignment, by the energy
+  of its MS/MS reference-spectrum match, or else by the energy whose
+  deconvoluted spectrum has the most product ions (the lowest on a tie). It
+  reads the energies from the raw data, so the analysis CSV says `AIF` and
+  nothing more.
+  - A Console capability, `multi_energy_aif_representative_collision_energy`,
+    found by a message only #825's multi-energy reader carries in the Console
+    assembly (present in the Console of MS-DIAL master bb90e0e51, absent from
+    that of f0583493a). `console_capabilities` reports it, and
+    `multi_energy_aif_console` reads it from the assembly without starting the
+    Console.
+  - The raw-header preflight (`run_raw_metadata_preflight`, the MCP tool's new
+    `console_path`) and `classify_preflight` decide for the configured Console:
+    `console_path`, else the saved `console_path` setting, else
+    `MSDIAL_CONSOLE_PATH`. Every AIF unit's disposition records the probe as
+    `multi_energy_aif_console`. With #825, a unit whose AIF inputs record more
+    than one MS2 collision energy runs as AIF, recorded as `aif_multi_ce_run`
+    (energies, rule `multi_ce_aif_with_console_825`) and on each per-file record
+    as basis `aif_multi_ce_console_825`.
+  - A unit held earlier as `aif_multi_ce_awaiting_console` is released by the
+    operator's recheck: preflighted again, or classified again, with the #825
+    Console configured, it is decided `run`.
+  - The execution gate refuses an `aif_multi_ce_run` unit when the workflow's
+    Console lacks #825, and a per-file record that claims the basis without
+    the record.
+  - The Materials and Methods text and Table S1 state the energies and the
+    representative-energy rule of a multi-energy AIF run.
+
+### Not changed
+- Single-energy AIF still runs as SWATH (`single_ce_aif_as_swath_2026_10_07`),
+  whatever the Console. AIF whose collision energy is unrecorded is still held:
+  the #825 Console stops on an AIF file whose MS2 scans carry no energy.
+- Without #825 in the configured Console, multi-energy AIF is held exactly as
+  before. Operator skips, hold releases, split parents and durable manifests are
+  unchanged.
+
 ## [0.5.33] - Unreleased
 
 ### Fixed

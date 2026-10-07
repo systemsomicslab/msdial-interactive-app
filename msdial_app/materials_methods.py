@@ -77,6 +77,9 @@ def generate_publication_report(
     report_workflow["automatic_rt_correction_evidence"] = (
         _automatic_rt_correction_evidence(root, workflow)
     )
+    multi_energy_aif = multi_energy_aif_evidence(workflow)
+    if multi_energy_aif:
+        report_workflow["multi_energy_aif_evidence"] = multi_energy_aif
     criteria = _criteria(qa_criteria)
     qa_assessment = assess_qa(qa_report, criteria)
     provenance_warnings = _library_warnings(report_workflow, libraries)
@@ -305,6 +308,7 @@ def supplementary_rows(
         "template_path",
         "output_root",
         "automatic_rt_correction_evidence",
+        "multi_energy_aif_evidence",
     } | annotation_keys
     for key in sorted(workflow):
         if key not in excluded:
@@ -335,6 +339,9 @@ def supplementary_rows(
             if library.get(key) not in (None, ""):
                 add("Library identity", str(library.get("name") or ""), key, library[key],
                     "Not distributed" if key == "distribution" and library.get("private") else "")
+
+    for key, value in (workflow.get("multi_energy_aif_evidence") or {}).items():
+        add("Acquisition", "Multi-energy AIF", key, value, "Campaign disposition (raw headers)")
 
     automatic_rt_evidence = workflow.get("automatic_rt_correction_evidence") or {}
     if automatic_rt_evidence.get("requested"):
@@ -517,6 +524,70 @@ def _processing_sentence(workflow: dict[str, Any], project_type: str) -> str:
         f"{_value(workflow.get('ms2_tolerance'))} Da, respectively. Features were aligned with "
         f"retention-time and MS1 tolerances of {_value(workflow.get('alignment_rt_tolerance'))} min and "
         f"{_value(workflow.get('alignment_ms1_tolerance'))} Da."
+        + _multi_energy_aif_sentence(workflow.get("multi_energy_aif_evidence") or {})
+    )
+
+
+# What MsdialWorkbench#825 does with a multi-energy AIF file, as the Methods text and Table S1 state it.
+MULTI_ENERGY_AIF_REPRESENTATIVE_ENERGY = (
+    "the energy of the feature's MS/MS reference-spectrum match; otherwise the energy whose deconvoluted spectrum "
+    "has the most product ions (the lowest such energy on a tie)"
+)
+
+
+def multi_energy_aif_evidence(workflow: dict[str, Any]) -> dict[str, Any]:
+    """The multi-energy AIF record of a repository run, or {} for any other run.
+
+    Present only where the unit's applied campaign disposition ran it as AIF with more than one MS2 collision
+    energy (aif_multi_ce_run; raw_metadata_preflight.AIF_MULTI_CE_RULE, a Console with MsdialWorkbench#825) and
+    the workflow's files run as AIF. Nothing here is a path.
+    """
+    from .raw_metadata_preflight import AIF_MULTI_CE_RULE
+    from .repository_reanalysis import read_manifest
+
+    manifest_path = str(workflow.get("repository_run_manifest") or "").strip()
+    files = [item for item in workflow.get("files") or [] if isinstance(item, dict)]
+    aif_files = [item for item in files if str(item.get("acquisition_type") or "").strip().upper() == "AIF"]
+    if not manifest_path or not aif_files:
+        return {}
+    try:
+        manifest = read_manifest(manifest_path)
+    except (OSError, ValueError):
+        return {}
+    disposition = manifest.get("campaign_disposition") if isinstance(manifest, dict) else None
+    if not isinstance(disposition, dict) or disposition.get("applied") is not True or disposition.get("disposition") != "run":
+        return {}
+    record = disposition.get("aif_multi_ce_run")
+    if not isinstance(record, dict) or record.get("rule") != AIF_MULTI_CE_RULE:
+        return {}
+    energies = []
+    for value in record.get("collision_energies") or []:
+        try:
+            energies.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    if len(energies) < 2:
+        return {}
+    console = disposition.get("multi_energy_aif_console") if isinstance(disposition.get("multi_energy_aif_console"), dict) else {}
+    return {
+        "collision_energies_ev": ", ".join(f"{value:g}" for value in energies),
+        "aif_files": len(aif_files),
+        "deconvolution": "separately at each collision energy",
+        "representative_energy": MULTI_ENERGY_AIF_REPRESENTATIVE_ENERGY,
+        "rule": AIF_MULTI_CE_RULE,
+        "console_assembly_sha256": str(console.get("assembly_sha256") or ""),
+    }
+
+
+def _multi_energy_aif_sentence(evidence: dict[str, Any]) -> str:
+    """' The all-ion fragmentation data ...' for a multi-energy AIF run, else ''."""
+    if not evidence.get("collision_energies_ev"):
+        return ""
+    return (
+        " All-ion fragmentation (AIF) MS/MS data were acquired at collision energies of "
+        f"{evidence['collision_energies_ev']} eV. Product-ion spectra were deconvoluted separately at each "
+        "collision energy, and each feature's representative MS/MS spectrum was taken at "
+        f"{MULTI_ENERGY_AIF_REPRESENTATIVE_ENERGY}."
     )
 
 

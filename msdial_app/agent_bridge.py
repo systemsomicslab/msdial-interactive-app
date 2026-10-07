@@ -138,6 +138,14 @@ def summarize_jobs(
             # aif_multi_ce_awaiting_console) with its raw data kept. The gate runs a header's AIF as SWATH only
             # under that record.
             "campaign_single_ce_aif_as_swath",
+            # Multi-energy AIF with MsdialWorkbench#825 (0.5.34): where the configured Console's assembly carries
+            # #825's multi-energy AIF processing (capability multi_energy_aif_representative_collision_energy), an
+            # AIF unit whose inputs record more than one MS2 collision energy runs as AIF, recorded as
+            # campaign_disposition.aif_multi_ce_run (rule multi_ce_aif_with_console_825) with the probe as
+            # multi_energy_aif_console, and console_acquisition_basis aif_multi_ce_console_825. Without #825 it is
+            # held as before; preflighting a held unit again with a #825 Console releases it. The gate refuses
+            # such a unit with a Console that lacks #825.
+            "campaign_multi_ce_aif_with_console_825",
             # An undeclared unit whose download is its own alone (unit_files, or every bundle URL with
             # shared_unit_count 1) takes the archive members no sample row pairs with as unattributed inputs
             # (name_pairing.paired_by unattributed_member, manifest.unattributed_members, the warning

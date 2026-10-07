@@ -584,6 +584,31 @@ header's AIF as SWATH only where the applied disposition records
 energies of a preflight recorded before 0.5.31 from the extractor records it
 left.
 
+Multi-energy AIF runs with a Console that has MsdialWorkbench#825 (0.5.34). #825
+deconvolutes an AIF file separately at each collision energy and represents each
+peak, in the per-file export and in alignment, by the energy of its MS/MS
+reference-spectrum match, or else by the energy whose deconvoluted spectrum has
+the most product ions (the lowest such energy on a tie); it reads the energies
+from the raw data, so the analysis CSV says `AIF` and nothing more. The
+preflight and `classify_preflight` decide for the configured Console
+(`console_path`, else the saved `console_path` setting, else
+`MSDIAL_CONSOLE_PATH`), whose assembly is read, never started, for a message only
+#825's multi-energy reader carries (capability
+`multi_energy_aif_representative_collision_energy`). Every AIF unit's disposition
+records that probe as `multi_energy_aif_console` (`available`, `probe`,
+`console_assembly`, `assembly_sha256`). With #825, a unit whose AIF inputs record
+more than one energy is decided `run` as AIF: `aif_multi_ce_run`
+(`collision_energies`, `rule` `multi_ce_aif_with_console_825`), each per-file
+record `console_acquisition_basis` `aif_multi_ce_console_825`. One energy still
+runs as SWATH, and an unrecorded energy is still held, since the #825 Console
+stops on an AIF file whose MS2 scans carry no energy. Without #825 nothing
+changes. A unit held earlier as `aif_multi_ce_awaiting_console` is released by
+the operator's recheck: preflighting it again (or `classify_preflight`) with
+the #825 Console configured decides it `run`. The execution gate refuses an
+`aif_multi_ce_run` unit when the workflow's Console lacks #825, and a per-file
+record that claims the basis without the record. The Materials and Methods text
+and Table S1 state the energies and the representative-energy rule.
+
 A repository declaration of PRM, SRM, MRM, SIM or full scan is a declaration like
 any other, and untargeted status is never inferred over a declared targeted
 acquisition. An input that is missing, or that the recorded preflight never read,
