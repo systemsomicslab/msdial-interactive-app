@@ -595,6 +595,303 @@ def _declared_agrees(declared: str, header: str, header_console: str | None) -> 
 
 
 # ------------------------------------------------------------------------------------------------------
+# What MS-DIAL receives: its "MS1 data type" and "MS2 data type"
+# ------------------------------------------------------------------------------------------------------
+
+DATA_TYPE_SCHEMA = "msdial-interactive.delivered-data-types.v1"
+# The values the pinned Console reads for "MS1 data type" and "MS2 data type" (ConfigParser: centroid or
+# profile, any case); anything else leaves its built-in default in place.
+DATA_TYPES = ("Centroid", "Profile")
+DATA_TYPE_DEFAULT = "Centroid"
+DATA_TYPE_LEVELS = (("ms1", 1), ("ms2", 2))
+# How many file names a decision lists under each value. The counts are always complete.
+DATA_TYPE_EXAMPLE_FILES = 5
+# The bases a level can be decided on. raw_header: every input comes through a reader that hands MS-DIAL
+# its spectra as the file stores them, and the headers say how. delivered_centroid: every input comes
+# through a reader that hands MS-DIAL centroids, whatever the header says. A level whose inputs are of both
+# kinds and agree is decided on both. Anything else is the default, which decides nothing.
+DECIDED_BASES = ("raw_header", "delivered_centroid", "raw_header_and_delivered_centroid")
+
+# What RawDataHandler hands MS-DIAL, by the extractor reader that recorded the file.
+#
+# MS1 and MS2 data type tell MS-DIAL whether the spectra it receives still need centroiding. They must
+# describe what the raw-data reader delivers, not what the instrument stored: MS-DIAL 5 loads every LC-MS
+# input with getProfileData=false (MsdialCore StandardDataProvider.cs:28 and :43, BaseDataProvider.cs:54;
+# the Console's LcmsProcess.cs:146), and most vendor readers then return centroids. Read from
+# msrawdataworkbench (RawDataHandlerStandard, edcc2e6; WatersMetadataReader from the extractor's eefe5ad):
+#
+# as_stored - the reader returns the stored points unprocessed, so the header is what MS-DIAL receives:
+#   WatersMetadataReader  MasslynxDataReader.cs:396 returns ReadScan as read (its Centroid() is commented
+#                         out); the extractor records each function's continuum flag
+#                         (WatersMetadataReader.cs:313 and :399).
+#   MzmlMetadataReader    RawDataHandler.cs:111 reads mzML with no profile flag and MzmlReader does not
+#                         centroid; the header is MS:1000127/MS:1000128 (MzmlMetadataReader.cs:294-295).
+#                         A converted mzXML is an mzML by then.
+#   RawDataAccess (.cdf)  NetCdfReader.cs:46 labels the spectra from the file's ProcessMethod and returns
+#                         them as stored.
+# centroid - the reader returns centroids whatever was stored:
+#   Wiff1MetadataReader   Wiff1Reader.cs:133-140 runs SCIEX's SpectralPeakFinder unless profile is asked.
+#   Wiff2MetadataReader   Wiff2Reader.cs:76 sets ConvertToCentroid = !getProfileMode.
+#   BrukerMetadataReader  Bruker BAF: BafReader.cs:186-187 reads the Line (centroid) arrays unless profile is
+#                         asked. Bruker TSF: TimsTofDataReader.cs:1980 and :2049 read line spectra.
+#   Shimadzu*Reader       ShimadzuIoModuleDataReader.cs:77 takes the CentroidList unless profile is asked.
+# depends on the scan - ThermoMetadataReader: ThermoDataReader.cs:228 returns the centroid (label) stream
+#   of an FT centroid scan; any other scan goes through Scan.FromFile, which returns the centroid stream
+#   where there is one (:241) and the stored points where there is not (:253). A centroid scan therefore
+#   arrives as centroids; an FTMS profile scan arrives as its centroid stream; an ITMS profile scan, which
+#   has no centroid stream, arrives as profile points. The extractor records one representation per file
+#   (ThermoMetadataReader.cs:140), and no analyzer, scan filter or FTMS/ITMS string. An instrument with no
+#   ion trap records only FTMS scans, so there a profile file arrives as centroids too; on any other model
+#   a profile file is unresolved.
+# unresolved - nothing recorded settles it:
+#   AgilentMetadataReader AgilentMidacDataReader.cs:106 (and AgilentMhdacDataReader.cs:39, PeakElseProfile)
+#                         returns peak spectra where the file has them and profile spectra where it has
+#                         only those; the extractor records neither.
+#   Bruker TDF, and any reader not named here.
+_AS_STORED_READERS = {
+    "WatersMetadataReader": "waters_scans_as_stored",
+    "MzmlMetadataReader": "mzml_spectra_as_stored",
+}
+_CENTROID_READERS = {
+    "Wiff1MetadataReader": "sciex_wiff_peak_finder",
+    "Wiff2MetadataReader": "sciex_wiff2_convert_to_centroid",
+    "ShimadzuLcdMetadataReader": "shimadzu_centroid_list",
+    "ShimadzuQgdMetadataReader": "shimadzu_centroid_list",
+}
+# Thermo instruments whose only mass analyzer is an Orbitrap: every scan is FTMS. Matched on the model name
+# the file records (Thermo InstrumentData.Model), case-insensitively. Astral and the tribrids (Fusion, Lumos,
+# Eclipse, Ascend, ID-X) and LTQ hybrids are not here: they carry a second analyzer.
+_THERMO_FTMS_ONLY_MODELS = ("q exactive", "exploris", "exactive")
+_THERMO_SECOND_ANALYZER = ("astral", "fusion", "lumos", "eclipse", "ascend", "id-x", "ltq", "velos", "elite")
+
+
+def spectrum_representation_fields(record: Mapping[str, Any]) -> dict[str, Any]:
+    """What one extractor record says about its spectra and its reader, as a per-file summary records it.
+
+    acquisition.spectrumRepresentation is the extractor's verdict over the scan headers it sampled
+    (RawMetadataInference.SetRepresentation): Centroid or Profile when they all agree, Mixed when they do
+    not, and null when no header said. It is one value for the file and does not say which MS level is
+    which. The one place a record does say so is a Waters MassLynx function: the extractor lists each
+    function as an experiment whose vendorFields carry its ms_level and continuum, and the functions with
+    an MS level are the ones its file-level value was read from. Those give spectrum_representation_by_level;
+    every other reader leaves it empty.
+
+    These are what the instrument stored. What MS-DIAL receives also depends on the reader, so the native
+    format and the instrument model are kept beside them (delivered_representation reads all of it).
+    """
+    acquisition = record.get("acquisition") if isinstance(record.get("acquisition"), Mapping) else {}
+    item = acquisition.get("spectrumRepresentation")
+    value = item.get("value") if isinstance(item, Mapping) else item
+    source = str(item.get("source") or "") if isinstance(item, Mapping) else ""
+    levels: dict[str, set[str]] = {}
+    for experiment in record.get("experiments") or []:
+        fields = experiment.get("vendorFields") if isinstance(experiment, Mapping) else None
+        if not isinstance(fields, Mapping):
+            continue
+        level = str(fields.get("ms_level") or "").strip()
+        continuum = str(fields.get("continuum") or "").strip().casefold()
+        if level.isdigit() and continuum in {"true", "false"}:
+            levels.setdefault(level, set()).add("Profile" if continuum == "true" else "Centroid")
+    origin = record.get("source") if isinstance(record.get("source"), Mapping) else {}
+    instrument = record.get("instrument") if isinstance(record.get("instrument"), Mapping) else {}
+    model = instrument.get("model")
+    model = model.get("value") if isinstance(model, Mapping) else model
+    return {
+        "spectrum_representation": str(value or ""),
+        "spectrum_representation_source": source,
+        "spectrum_representation_by_level": {
+            level: next(iter(found)) if len(found) == 1 else "Mixed" for level, found in sorted(levels.items())
+        },
+        "reader": str(origin.get("readerName") or ""),
+        "native_format": str(origin.get("nativeFormat") or ""),
+        "instrument_model": str(model or ""),
+    }
+
+
+def _stored_representation(entry: Mapping[str, Any], level: int) -> tuple[str, str]:
+    """(state, value) of what one input stored at one MS level: recorded, unresolved or unrecorded."""
+    whole = str(entry.get("spectrum_representation") or "")
+    by_level = entry.get("spectrum_representation_by_level")
+    own = str((by_level if isinstance(by_level, Mapping) else {}).get(str(level)) or "")
+    if own in DATA_TYPES:
+        # A function's own flag and the file's verdict are read from the same functions; were they ever to
+        # contradict each other, neither is believed.
+        return ("unresolved", "") if whole in DATA_TYPES and whole != own else ("recorded", own)
+    if own == "Mixed":
+        return "unresolved", ""
+    if whole in DATA_TYPES:
+        return "recorded", whole
+    if whole:
+        # Mixed (or a value this reader does not know): the file holds both, and nothing says which MS
+        # level is which.
+        return "unresolved", ""
+    return "unrecorded", ""
+
+
+def _thermo_ftms_only(model: str) -> bool:
+    name = model.casefold()
+    return any(part in name for part in _THERMO_FTMS_ONLY_MODELS) and not any(
+        part in name for part in _THERMO_SECOND_ANALYZER
+    )
+
+
+def delivered_representation(entry: Mapping[str, Any], level: int) -> tuple[str, str, str, str]:
+    """(state, value, basis, delivery) of what RawDataHandler hands MS-DIAL for one input at one MS level.
+
+    state is recorded, unresolved, unrecorded or not_applicable. A recorded value has basis raw_header (the
+    reader delivers the stored points, and the header says what they are) or delivered_centroid (the reader
+    delivers centroids). delivery names the reader behaviour the answer rests on; for an unresolved or
+    unrecorded input it names what is missing. See the reader table above.
+    """
+    if _entry_flag(entry, "has_ms1" if level == 1 else "has_ms2", level) is False:
+        return "not_applicable", "", "", ""
+    reader = str(entry.get("reader") or "")
+    native = str(entry.get("native_format") or "")
+    if reader in _CENTROID_READERS:
+        return "recorded", "Centroid", "delivered_centroid", _CENTROID_READERS[reader]
+    if reader == "BrukerMetadataReader":
+        if native == "Bruker BAF":
+            return "recorded", "Centroid", "delivered_centroid", "bruker_baf_line_spectra"
+        if native == "Bruker TSF":
+            return "recorded", "Centroid", "delivered_centroid", "bruker_tsf_line_spectra"
+        return "unresolved", "", "", "bruker_delivery_unverified"
+    as_stored = _AS_STORED_READERS.get(reader)
+    if as_stored is None and reader == "RawDataAccess" and native.casefold() == ".cdf":
+        as_stored = "netcdf_spectra_as_stored"
+    if not reader and not str(entry.get("spectrum_representation") or ""):
+        # No extractor record for this input at all (unreadable, or never inspected).
+        return "unrecorded", "", "", "no_header_record"
+    if as_stored is not None:
+        state, value = _stored_representation(entry, level)
+        if state == "recorded":
+            return state, value, "raw_header", as_stored
+        return state, "", "", "header_mixed" if state == "unresolved" else "header_silent"
+    if reader == "ThermoMetadataReader":
+        state, value = _stored_representation(entry, level)
+        if state == "recorded" and value == "Centroid":
+            return "recorded", "Centroid", "delivered_centroid", "thermo_centroid_scans"
+        if _thermo_ftms_only(str(entry.get("instrument_model") or "")):
+            return "recorded", "Centroid", "delivered_centroid", "thermo_ftms_centroid_stream"
+        # Profile, Mixed or nothing on an instrument that may also record ion-trap scans: an FTMS profile
+        # scan arrives as centroids, an ITMS one as profile points, and the record does not say which.
+        return "unresolved", "", "", "thermo_analyzer_unrecorded"
+    if reader == "AgilentMetadataReader":
+        return "unresolved", "", "", "agilent_peak_spectra_unrecorded"
+    return "unresolved", "", "", "reader_delivery_unknown"
+
+
+def delivered_data_types(
+    entries: Iterable[Mapping[str, Any]], defaults: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """MS-DIAL's MS1 and MS2 data type as what the given inputs deliver supports them. Never raises.
+
+    ``entries`` are per-file preflight records, one per input the decision covers; an input with no header
+    record is passed as {"file": path}. For each MS level, an input's delivered representation is read by
+    delivered_representation, and the level takes it only when every input that has the level delivers one
+    and all of them agree. Otherwise the level keeps its default (``defaults``, the template's Centroid
+    unless given) and says why:
+
+    - inputs_disagree: the inputs deliver both. The counts and example file names are kept, and a warning
+      says so. No input is dropped to make the rest agree;
+    - unresolved: an input's delivery cannot be told from its record (a Thermo profile file from an
+      instrument that also has an ion trap, an Agilent file, a header that mixes both without saying which
+      level is which). unresolved_by counts the cause;
+    - unrecorded: an input's header did not record its representation, and its reader delivers it as stored;
+    - no_input_at_level: no input has the level (an MS1-only unit's MS2).
+
+    The basis of each level is raw_header, delivered_centroid (or both) or default, and ``decided`` says
+    whether it is one of the first. File names only, never paths: the record is copied into
+    workflow-settings.json and the run manifest, which travel with the results.
+    """
+    rows = [entry for entry in entries if isinstance(entry, Mapping)]
+    result: dict[str, Any] = {"schema": DATA_TYPE_SCHEMA, "inputs": len(rows), "levels": {}, "warnings": []}
+    for name, level in DATA_TYPE_LEVELS:
+        default = str((defaults or {}).get(name) or DATA_TYPE_DEFAULT)
+        counts = {"recorded": 0, "unresolved": 0, "unrecorded": 0, "not_applicable": 0}
+        by_value: dict[str, list[str]] = {}
+        bases: set[str] = set()
+        delivery: dict[str, int] = {}
+        unresolved_by: dict[str, int] = {}
+        listed: dict[str, list[str]] = {"unresolved": [], "unrecorded": []}
+        for entry in rows:
+            state, value, basis, how = delivered_representation(entry, level)
+            counts[state] += 1
+            label = Path(str(entry.get("file") or "")).name
+            if state == "recorded":
+                by_value.setdefault(value, []).append(label)
+                bases.add(basis)
+                delivery[how] = delivery.get(how, 0) + 1
+            elif state in listed:
+                listed[state].append(label)
+                if state == "unresolved":
+                    unresolved_by[how] = unresolved_by.get(how, 0) + 1
+        applicable = counts["recorded"] + counts["unresolved"] + counts["unrecorded"]
+        if len(by_value) > 1:
+            reason = "inputs_disagree"
+        elif counts["unresolved"]:
+            reason = "unresolved"
+        elif counts["unrecorded"]:
+            reason = "unrecorded"
+        elif not applicable:
+            reason = "no_input_at_level"
+        else:
+            reason = "all_inputs_agree"
+        decided = next(iter(by_value)) if reason == "all_inputs_agree" else None
+        if decided is None:
+            basis = "default"
+        elif bases == {"raw_header"}:
+            basis = "raw_header"
+        elif bases == {"delivered_centroid"}:
+            basis = "delivered_centroid"
+        else:
+            basis = "raw_header_and_delivered_centroid"
+        result["levels"][name] = {
+            "decided_data_type": decided,
+            "data_type": decided or default,
+            "basis": basis,
+            "decided": decided is not None,
+            "reason": reason,
+            "default": default,
+            "inputs_with_level": applicable,
+            "recorded": {value: len(files) for value, files in sorted(by_value.items())},
+            "delivery": dict(sorted(delivery.items())),
+            "unresolved": counts["unresolved"],
+            "unrecorded": counts["unrecorded"],
+            "unresolved_by": dict(sorted(unresolved_by.items())),
+            "not_applicable": counts["not_applicable"],
+            "example_files": {
+                **{value: sorted(files)[:DATA_TYPE_EXAMPLE_FILES] for value, files in sorted(by_value.items())},
+                **{state: sorted(files)[:DATA_TYPE_EXAMPLE_FILES] for state, files in listed.items() if files},
+            },
+        }
+        label = name.upper()
+        if reason == "inputs_disagree":
+            split = ", ".join(f"{value} {len(files)}" for value, files in sorted(by_value.items()))
+            result["warnings"].append(
+                f"{label} data type: the inputs deliver different spectra to MS-DIAL ({split} of "
+                f"{applicable}); the run keeps the default {default}. Which inputs deliver which is listed "
+                f"under levels.{name}."
+            )
+        elif reason == "unresolved":
+            causes = ", ".join(f"{cause} {count}" for cause, count in sorted(unresolved_by.items()))
+            result["warnings"].append(
+                f"{label} data type: for {counts['unresolved']} of {applicable} inputs the record cannot tell "
+                f"whether MS-DIAL receives centroid or profile spectra ({causes}); the run keeps the default "
+                f"{default}."
+            )
+        elif reason == "unrecorded":
+            result["warnings"].append(
+                f"{label} data type: the raw headers of {counts['unrecorded']} of {applicable} inputs do not "
+                f"record whether the spectra are centroid or profile; the run keeps the default {default}."
+            )
+    for name, _level in DATA_TYPE_LEVELS:
+        result[f"{name}_data_type"] = result["levels"][name]["data_type"]
+        result[f"{name}_data_type_basis"] = result["levels"][name]["basis"]
+    result["disagreement"] = any(item["reason"] == "inputs_disagree" for item in result["levels"].values())
+    return result
+
+
+# ------------------------------------------------------------------------------------------------------
 # The disposition
 # ------------------------------------------------------------------------------------------------------
 

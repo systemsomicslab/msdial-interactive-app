@@ -4,6 +4,93 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.27] - Unreleased
+
+Version order: 0.5.25 (#58) and 0.5.26 (#59) are open beside this one, and all
+three branch from 0.5.24.
+
+### Fixed
+- A repository unit's MS1 and MS2 data type are what its inputs deliver to
+  MS-DIAL. These two settings tell MS-DIAL whether the spectra it receives still
+  need centroiding, so they must describe what RawDataHandler hands it, not what
+  the instrument stored. Every unit used to run with the template's Centroid.
+  MS-DIAL 5 loads every LC-MS input with `getProfileData=false`, and the readers
+  then differ:
+  - Waters (MassLynx scans read unprocessed), mzML (a converted mzXML included)
+    and NetCDF hand MS-DIAL the stored points. There the header decides, with
+    basis `raw_header`: per MassLynx function for Waters (`continuum`), per file
+    for the others.
+  - SCIEX WIFF and WIFF2, Bruker BAF and TSF, and Shimadzu hand it centroids
+    whatever was stored, so the level is Centroid with basis
+    `delivered_centroid`.
+  - Thermo: a centroid scan arrives as centroids. An FTMS profile scan arrives as
+    its centroid stream, but an ITMS profile scan arrives as profile points. The
+    extractor records no analyzer or scan filter, so a profile file is Centroid
+    (`delivered_centroid`) only on an instrument with no ion trap (Q Exactive,
+    Exploris, Exactive). On any other model it is `unresolved`.
+  - Agilent hands over peak spectra where the file has them and profile spectra
+    otherwise, and the extractor records neither, so it is `unresolved`. So are
+    Bruker TDF and any reader not in the table.
+
+  `raw_metadata_preflight` keeps the reader table, with file and line citations
+  into RawDataHandler.
+  - Each per-file preflight record now carries what the header stored:
+    `spectrum_representation`, its `spectrum_representation_source`, and
+    `spectrum_representation_by_level`. Only a Waters record fills the last.
+    The record also carries the `reader`, `native_format` and
+    `instrument_model` that say what MS-DIAL receives. The preflight summary
+    gains `data_types` (`msdial-interactive.delivered-data-types.v1`, scope
+    `inspected_inputs`).
+  - `build_guided_plan`, which campaign and MCP repository runs both go through,
+    sets `ms1_data_type` and `ms2_data_type` from the run's inputs. Inputs a
+    campaign disposition excluded are left out, and each Console alias is read
+    as the input it stands for. A level is decided only when every input with
+    that level delivers one representation and all agree. Its basis is
+    `raw_header`, `delivered_centroid`, or both. Otherwise the default stays,
+    with the reason (`inputs_disagree`, `unresolved` with `unresolved_by`,
+    `unrecorded`, or `no_input_at_level`), per-value and per-delivery counts,
+    example file names and a warning. No input is dropped to make the rest
+    agree.
+  - The decision is kept as `data_type_provenance` in the workflow and in
+    `workflow-settings.json`. The run's `run-manifest.json` and the preparation
+    gain `data_types`: each value with its basis, plus the decision. Each unit
+    `run_attempts` entry records the values, bases and warnings. A laboratory
+    analysis records basis `unrecorded` and is otherwise unchanged.
+  - A peak-count diagnostic runs with the unit's values, so its count stands for
+    the production run. Its `data_types` describe the one input it ran (scope
+    `diagnostic_input`), and keep the unit's decision in brief under
+    `unit_decision`. Where that input itself delivers another representation, a
+    warning says so.
+  - A data type set explicitly in `workflow_overrides` stands, with basis
+    `workflow_override`, or with the decided basis where it agrees. The
+    execution gate refuses only a run that contradicts a decided level, from any
+    path, the GUI's included. An `unresolved` or `default` level refuses
+    nothing.
+  - For a preflight recorded before this version, the representation, reader,
+    format and model are read from the extractor records kept in
+    `provenance\raw-metadata-preflight.json` (`read_from_preflight_output`).
+    A preflight that kept no `summary.per_file` at all is read the same way:
+    its extractor records are summarised as a preflight summary would have
+    them, MS-level flags included, so an input without MS2 does not vote on
+    the MS2 data type. Where that file is absent, the inputs stay
+    `unrecorded`; that is so for all four summary-less preflights in the
+    reanalysis workspace on 2026-10-07 (MPST000007 twice, MTBLS341, ST002419).
+  - What the 2026-10-03 pilot units get, read from their records:
+    - ST001337 (Orbitrap Fusion Lumos, headers Profile): Centroid, `unresolved`
+      (`thermo_analyzer_unrecorded`). That is the value it ran with, and the
+      gate refuses neither value.
+    - MTBKS217 and MTBKS281 (Waters, every function `continuum=false`):
+      Centroid, `raw_header`.
+    - MTBLS1572 (converted), MTBLS291, MTBLS417, ST004304 and MTBLS2207: mzML
+      Centroid, `raw_header`.
+    - MTBKS236 (WIFF, header null): Centroid, `delivered_centroid`.
+    - MPST000015 (Exploris 120, Profile): MS2 Centroid, `delivered_centroid`.
+- Converted mzXML units take the representation the converted mzML records
+  (MS:1000127/MS:1000128, from the mzXML's `centroided`). Where the mzXML
+  recorded none, the level stays at the default as `unrecorded`. This replaces
+  the data-type half of 0.5.21's known limitation; the threshold step is
+  unchanged.
+- Agent capability `repository_data_type_as_delivered`.
 ## [0.5.26] - Unreleased
 
 ### Changed
