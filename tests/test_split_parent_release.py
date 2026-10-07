@@ -1000,5 +1000,221 @@ class TheAuthorizedCleanupAndDiscard(_Unit, unittest.TestCase):
         self.assertEqual("discarded", read_manifest(manifest)["status"])
 
 
+# ---- a disposition hold is lifted only by an operator's skip (review r9-64) --------------------------------------
+
+
+HELD_DISPOSITION = {
+    "applied": True,
+    "disposition": "skip",
+    "hold": True,
+    "reasons": ["aif_multi_ce_awaiting_console"],
+    "warnings": [],
+}
+
+
+class AHeldUnitIsDiscardedOnlyByAnOperatorsSkip(_Unit, unittest.TestCase):
+    """Multi-energy AIF is held (2026-10-07); a held unit keeps its raw data until the operator skips it."""
+
+    def held(self) -> tuple[Path, Path]:
+        return self.unit(status="skipped_by_preflight", campaign_disposition=dict(HELD_DISPOSITION))
+
+    def test_neither_an_approval_nor_a_confirmation_discards_a_held_unit(self) -> None:
+        manifest, raw = self.held()
+
+        preview = discard_download_lease(manifest)
+        approved = discard_download_lease(manifest, campaign_authorization_path=self.approval())
+        with self.assertRaisesRegex(ValueError, "campaign disposition holds it"):
+            discard_download_lease(manifest, confirmed=True)
+
+        self.assertTrue(any("holds it" in item for item in preview["plan"]["blockers"]), preview["plan"]["blockers"])
+        self.assertFalse(approved["deleted"])
+        self.assertTrue(any("release_disposition_hold=true" in item for item in approved["blockers"]))
+        self.assertTrue(raw.is_dir())
+        recorded = read_manifest(manifest)
+        self.assertEqual("skipped_by_preflight", recorded["status"])
+        self.assertNotIn("disposition_hold_released_by", recorded)
+        self.assertNotIn("campaign_authorizations", recorded)
+
+    def test_the_operators_skip_under_an_approval_discards_it_and_records_the_release(self) -> None:
+        manifest, raw = self.held()
+
+        preview = discard_download_lease(manifest, release_disposition_hold=True)
+        result = discard_download_lease(
+            manifest, campaign_authorization_path=self.approval(), release_disposition_hold=True
+        )
+        recorded = read_manifest(manifest)
+
+        self.assertEqual([], preview["plan"]["blockers"])
+        self.assertTrue(result["deleted"], result.get("blockers"))
+        self.assertEqual("operator_skip", result["disposition_hold_released_by"])
+        self.assertFalse(raw.exists())
+        self.assertEqual("discarded", recorded["status"])
+        self.assertEqual("operator_skip", recorded["disposition_hold_released_by"])
+        self.assertEqual(
+            ("operator_skip", ["aif_multi_ce_awaiting_console"]),
+            (recorded["disposition_hold_release"]["released_by"], recorded["disposition_hold_release"]["reasons"]),
+        )
+        # The disposition itself is unchanged: it still says what the unit was held for.
+        self.assertIs(True, recorded["campaign_disposition"]["hold"])
+        # Asked again, the finished discard is returned as it was.
+        again = discard_download_lease(manifest, campaign_authorization_path=self.approval())
+        self.assertTrue(again["already_discarded"])
+
+    def test_a_persons_confirmation_with_the_release_discards_it_too(self) -> None:
+        manifest, raw = self.held()
+
+        result = discard_download_lease(manifest, confirmed=True, release_disposition_hold=True)
+
+        self.assertTrue(result["deleted"])
+        self.assertFalse(raw.exists())
+        self.assertEqual("operator_skip", read_manifest(manifest)["disposition_hold_released_by"])
+
+    def test_the_release_flag_changes_nothing_for_a_unit_no_disposition_holds(self) -> None:
+        manifest, raw = self.unit(status="skipped_by_preflight")
+
+        result = discard_download_lease(
+            manifest, campaign_authorization_path=self.approval(), release_disposition_hold=True
+        )
+
+        self.assertTrue(result["deleted"])
+        self.assertNotIn("disposition_hold_released_by", result)
+        self.assertNotIn("disposition_hold_released_by", read_manifest(manifest))
+
+    def test_the_discard_tool_takes_the_release_and_defaults_it_to_false(self) -> None:
+        import inspect
+
+        manifest, raw = self.held()
+
+        self.assertIs(
+            False,
+            inspect.signature(mcp_server.msdial_discard_repository_raw).parameters["release_disposition_hold"].default,
+        )
+        refused = mcp_server.msdial_discard_repository_raw(
+            manifest_path=str(manifest), campaign_authorization_path=str(self.approval())
+        )
+        self.assertFalse(refused["deleted"])
+        self.assertTrue(raw.is_dir())
+        result = mcp_server.msdial_discard_repository_raw(
+            manifest_path=str(manifest), campaign_authorization_path=str(self.approval()), release_disposition_hold=True
+        )
+        self.assertTrue(result["deleted"], result.get("blockers"))
+        self.assertEqual("operator_skip", read_manifest(manifest)["disposition_hold_released_by"])
+
+    def test_the_cli_discard_takes_the_release(self) -> None:
+        import contextlib
+        import importlib.util
+        import io
+        import sys
+
+        manifest, raw = self.held()
+        script = Path(__file__).resolve().parents[1] / "scripts" / "repository-reanalysis.py"
+        spec = importlib.util.spec_from_file_location("repository_reanalysis_cli_r964", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        def run(*arguments: str) -> None:
+            with patch.object(sys, "argv", ["repository-reanalysis.py", "discard", str(manifest), *arguments]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                module.main()
+
+        with self.assertRaisesRegex(ValueError, "campaign disposition holds it"):
+            run("--confirmed")
+        self.assertTrue(raw.is_dir())
+        run("--confirmed", "--release-disposition-hold")
+        self.assertFalse(raw.exists())
+        self.assertEqual("operator_skip", read_manifest(manifest)["disposition_hold_released_by"])
+
+
+class AHeldSplitPartKeepsItsParentsRawData(_SplitParent, unittest.TestCase):
+    """Review ia-0531, medium: an approved discard of a held part ended it, and the parent's tree could go."""
+
+    def hold(self, part: Path, status: str = "skipped_by_preflight") -> None:
+        self.set_status(part, status, campaign_disposition=dict(HELD_DISPOSITION))
+
+    def test_an_approved_discard_of_a_held_part_is_refused_and_the_parent_waits(self) -> None:
+        parent, parts = self.split()
+        self.validate(parts["DDA"])
+        self.hold(parts["DIA"])
+
+        refused = discard_download_lease(parts["DIA"], campaign_authorization_path=self.approval())
+        plan = plan_split_parent_cleanup(parent)
+        release = cleanup_split_parent(parent, campaign_authorization_path=self.approval())
+
+        self.assertFalse(refused["deleted"])
+        self.assertNotIn("part_ended", refused)
+        self.assertTrue(any("holds it" in item for item in refused["blockers"]), refused["blockers"])
+        self.assertEqual("skipped_by_preflight", read_manifest(parts["DIA"])["status"])
+        self.assertNotIn("campaign_authorizations", read_manifest(parts["DIA"]))
+        self.assertFalse(plan["ready"])
+        self.assertEqual("held", {item["analysis_unit_id"]: item["state"] for item in plan["parts"]}["unit-mixed-dia"])
+        self.assertFalse(release["deleted"])
+        self.assertTrue(self.raw.is_dir())
+
+    def test_the_operators_skip_of_a_held_part_ends_it_and_frees_the_parent(self) -> None:
+        parent, parts = self.split()
+        self.validate(parts["DDA"])
+        self.hold(parts["DIA"])
+
+        ended = discard_download_lease(
+            parts["DIA"], campaign_authorization_path=self.approval(), release_disposition_hold=True
+        )
+        part = read_manifest(parts["DIA"])
+
+        self.assertTrue(ended["part_ended"])
+        self.assertEqual("operator_skip", ended["disposition_hold_released_by"])
+        self.assertEqual(("discarded", "operator_skip"), (part["status"], part["disposition_hold_released_by"]))
+        self.assertTrue(self.raw.is_dir(), "a part never deletes the tree its siblings read")
+        self.assertTrue(ended["split_parent_plan"]["ready"], ended["split_parent_plan"]["blockers"])
+        self.assertTrue(cleanup_split_parent(parent, campaign_authorization_path=self.approval())["deleted"])
+        self.assertFalse(self.raw.exists())
+
+    def test_a_held_part_discarded_without_the_release_still_holds_the_parent(self) -> None:
+        # What 68f1cc0 let an approval write: discarded, the hold not lifted.
+        parent, parts = self.split()
+        self.validate(parts["DDA"])
+        self.hold(parts["DIA"], status="discarded")
+
+        plan = plan_split_parent_cleanup(parent)
+        self.assertFalse(plan["ready"])
+        self.assertEqual("held", {item["analysis_unit_id"]: item["state"] for item in plan["parts"]}["unit-mixed-dia"])
+
+        # The operator's skip, asked of the part, lifts the hold on the part it already ended.
+        ended = discard_download_lease(
+            parts["DIA"], campaign_authorization_path=self.approval(), release_disposition_hold=True
+        )
+        self.assertTrue(ended["already_discarded"])
+        self.assertEqual("operator_skip", read_manifest(parts["DIA"])["disposition_hold_released_by"])
+        self.assertTrue(plan_split_parent_cleanup(parent)["ready"])
+
+    def test_the_parents_release_lifts_its_parts_holds_only_when_asked(self) -> None:
+        parent, parts = self.split()
+        self.validate(parts["DDA"])
+        self.hold(parts["DIA"])
+
+        waiting = discard_download_lease(parent, campaign_authorization_path=self.approval())
+        self.assertFalse(waiting["deleted"])
+        self.assertTrue(self.raw.is_dir())
+        self.assertEqual("skipped_by_preflight", read_manifest(parts["DIA"])["status"])
+
+        preview = cleanup_split_parent(parent, release_disposition_hold=True)
+        self.assertTrue(preview["ready"], preview["blockers"])
+        self.assertEqual("skipped_by_preflight", read_manifest(parts["DIA"])["status"], "a preview records nothing")
+
+        released = discard_download_lease(
+            parent, campaign_authorization_path=self.approval(), release_disposition_hold=True
+        )
+        part = read_manifest(parts["DIA"])
+        recorded = read_manifest(parent)["raw_release"]
+
+        self.assertTrue(released["deleted"], released.get("blockers"))
+        self.assertEqual(["unit-mixed-dia"], released["disposition_holds_released"])
+        self.assertFalse(self.raw.exists())
+        self.assertEqual(("discarded", "operator_skip"), (part["status"], part["disposition_hold_released_by"]))
+        self.assertEqual(str(parent.resolve()), part["raw_released_by"])
+        self.assertEqual(
+            "hold_released", {item["analysis_unit_id"]: item["state"] for item in recorded["parts"]}["unit-mixed-dia"]
+        )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

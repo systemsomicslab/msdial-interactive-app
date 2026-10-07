@@ -3025,7 +3025,12 @@ class AifAsSwathTests(_Scratch):
                                   for entry in recorded["raw_metadata_preflight"]["summary"]["per_file"]])
         held = [item for item in plan_download_discard(manifest, authorized=True)["blockers"] if "holds it" in item]
         self.assertEqual(1, len(held))
-        self.assertFalse(any("holds it" in item for item in plan_download_discard(manifest)["blockers"]))
+        # Approved or not, only an operator's skip lifts the hold (review r9-64).
+        self.assertEqual(1, len([item for item in plan_download_discard(manifest)["blockers"] if "holds it" in item]))
+        self.assertFalse(any(
+            "holds it" in item
+            for item in plan_download_discard(manifest, authorized=True, release_disposition_hold=True)["blockers"]
+        ))
         end = _part_end(recorded, self.root / "elsewhere" / "raw")
         self.assertEqual(("held", False), (end["state"], end["ended"]))
 

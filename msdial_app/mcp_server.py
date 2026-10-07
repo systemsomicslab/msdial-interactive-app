@@ -2112,6 +2112,7 @@ def msdial_discard_repository_raw(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     campaign_authorization_path: str = "",
+    release_disposition_hold: bool = False,
 ) -> dict[str, Any]:
     """Preview, and only on explicit confirmation perform, deletion of the raw data of a unit with no validated output.
 
@@ -2129,6 +2130,13 @@ def msdial_discard_repository_raw(
 
     A split parent is released as msdial_cleanup_repository_raw releases one. For a split part, an approval
     records that the part has ended, deleting nothing: its raw data are its parent's, released with them.
+
+    release_disposition_hold (default false) is the operator's explicit decision to skip a unit, or split part,
+    whose campaign disposition holds it (hold true, e.g. aif_multi_ce_awaiting_console). Without it such a
+    unit is never discarded, under an approval or with confirmed=true, and a held part keeps its parent's raw
+    data. With it and an approval covering boundary 5 (or confirmed=true) the discard proceeds and records
+    disposition_hold_released_by "operator_skip"; on a split parent it lifts its held parts' holds the same way.
+    Pass it only on that explicit decision, never because a hold blocks a discard.
     """
     from .repository_reanalysis import discard_download_lease
 
@@ -2139,6 +2147,7 @@ def msdial_discard_repository_raw(
         confirmed=confirmed,
         campaign_authorization_path=campaign_authorization_path or None,
         entry_point="msdial_discard_repository_raw",
+        release_disposition_hold=bool(release_disposition_hold),
     )
     if not confirmed and not authorized and not result.get("deleted"):
         result["message"] = (

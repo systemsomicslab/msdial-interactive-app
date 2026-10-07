@@ -2272,9 +2272,7 @@ def create_download_lease(
             unattributed_record = {
                 **unattributed_record,
                 "count": len(unattributed_inputs),
-                "members": sorted(
-                    (_member_under_root(_file_key(item), data_key) for item in unattributed_inputs), key=str.casefold
-                ),
+                **unattributed_member_names(_member_under_root(_file_key(item), data_key) for item in unattributed_inputs),
             }
         pruned: dict[str, Any] = {}
         if store_lease is not None:
@@ -7650,7 +7648,8 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                     if key in {"rule", "applied", "scope"}
                 },
                 "count": len(part_unattributed),
-                "members": part_unattributed,
+                # Basenames, as the lineage names them; the paths under the parent's data root beside them.
+                **unattributed_member_names(part_unattributed),
             }
         if part_warnings:
             part_manifest["warnings"] = part_warnings
@@ -8141,6 +8140,43 @@ def held_by_disposition(manifest: dict[str, Any]) -> dict[str, Any]:
     """
     applied = _applied_disposition(manifest)
     return applied if applied.get("disposition") == "skip" and applied.get("hold") is True else {}
+
+
+# Who lifted a disposition hold, as the discard that lifted it records it (disposition_hold_released_by).
+DISPOSITION_HOLD_RELEASED_BY = "operator_skip"
+
+
+def unreleased_disposition_hold(manifest: dict[str, Any]) -> dict[str, Any]:
+    """held_by_disposition, unless an operator's skip has already lifted the hold (disposition_hold_released_by).
+
+    A hold is lifted only by an explicit operator decision: a discard called with release_disposition_hold=true
+    under a campaign approval covering boundary 5 (or a person's confirmed=true), which the runner's operator
+    "skip" of a disposition_held unit makes. Without it a held unit, or a held split part, is never discarded,
+    under an approval or not, and a held part keeps its parent's raw data (review r9-64).
+    """
+    hold = held_by_disposition(manifest)
+    return {} if not hold or manifest.get("disposition_hold_released_by") == DISPOSITION_HOLD_RELEASED_BY else hold
+
+
+def _disposition_hold_text(hold: dict[str, Any], subject: str = "The unit") -> str:
+    return (
+        f"{subject}'s campaign disposition holds it ("
+        + ", ".join(str(item) for item in hold.get("reasons") or [])
+        + "): it is to run once a Console that can exists, and a held unit's raw data are kept. It is no failure. "
+        "Only an operator's skip lifts the hold: call again with release_disposition_hold=true."
+    )
+
+
+def _disposition_hold_release(hold: dict[str, Any], at: str) -> dict[str, Any]:
+    """The fields a discard that lifts a disposition hold writes on the unit or part it discards."""
+    return {
+        "disposition_hold_released_by": DISPOSITION_HOLD_RELEASED_BY,
+        "disposition_hold_release": {
+            "released_by": DISPOSITION_HOLD_RELEASED_BY,
+            "released_at": at,
+            "reasons": [str(item) for item in hold.get("reasons") or []],
+        },
+    }
 
 
 def _applied_disposition(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -9474,12 +9510,17 @@ def _mztab_outputs(output: Path) -> list[str]:
     return [str(path) for path in find_mztab_files(output)] if str(output).strip() and output.is_dir() else []
 
 
-def plan_download_discard(manifest_path: Path, *, authorized: bool = False) -> dict[str, Any]:
+def plan_download_discard(
+    manifest_path: Path, *, authorized: bool = False, release_disposition_hold: bool = False
+) -> dict[str, Any]:
     """Describe what discarding a unit's raw data would remove and keep, and what refuses it. Changes nothing.
 
     ``authorized`` is whether a campaign approval covers the discard. Under one a failed unit whose output holds
     an mzTab-M - unvalidated, or invalid - may be discarded, its mzTab-M kept as a failure artifact; with
     confirmed=true alone such a unit is refused, as it always was.
+
+    A unit its campaign disposition holds (held_by_disposition) is refused, approved or confirmed, unless
+    ``release_disposition_hold`` is the operator's decision to lift the hold (unreleased_disposition_hold).
     """
     from .run_finalisation import describe_holds, raw_deletion_holds
 
@@ -9512,16 +9553,11 @@ def plan_download_discard(manifest_path: Path, *, authorized: bool = False) -> d
         )
     if mztab and not authorized:
         blockers.append("mzTab-M output exists; finalize the run before deleting raw data.")
-    hold = held_by_disposition(manifest)
-    if hold and authorized:
-        # A unit held to run later keeps its raw data (multi-energy AIF, user decision 2026-10-07): a campaign
-        # approval does not discard it. A person who confirms this unit's discard explicitly still may.
-        blockers.append(
-            "The unit's campaign disposition holds it ("
-            + ", ".join(hold.get("reasons") or [])
-            + "): it is to run once a Console that can exists, and a held unit's raw data are kept. It is no "
-            "failure, and a campaign approval does not discard it."
-        )
+    hold = unreleased_disposition_hold(manifest)
+    if hold and not release_disposition_hold:
+        # A unit held to run later keeps its raw data (multi-energy AIF, user decision 2026-10-07). Neither a
+        # campaign approval nor a confirmation discards it; only an operator's skip lifts the hold (r9-64).
+        blockers.append(_disposition_hold_text(hold))
     if raw_root.parent != workspace or raw_root.name != "raw":
         blockers.append("Raw directory is outside the expected project workspace.")
     kept = [str(item) for item in manifest.get("retained_artifacts") or []] + [
@@ -9627,6 +9663,7 @@ def discard_download_lease(
     *,
     campaign_authorization_path: str | Path | None = None,
     entry_point: str = "discard_download_lease",
+    release_disposition_hold: bool = False,
 ) -> dict[str, Any]:
     """Delete the raw data of a unit that produced no validated output.
 
@@ -9644,6 +9681,13 @@ def discard_download_lease(
     A split parent is released by cleanup_split_parent, which this calls for one. A part's raw data are its
     parent's: under an approval its discard records that the part has ended, deleting nothing, and its parent's
     tree goes with the parent's release.
+
+    A unit its campaign disposition holds (held_by_disposition: multi-energy AIF, 2026-10-07) is never
+    discarded, under an approval or not, unless ``release_disposition_hold`` is true: the operator's explicit
+    decision to skip it, which the campaign runner's "skip" of a disposition_held unit passes. With it, and a
+    campaign approval covering boundary 5 (or confirmed=true), the discard proceeds and records
+    disposition_hold_released_by "operator_skip" before the first file goes. The same holds for a split part
+    (_discard_split_part) and a split parent's release (cleanup_split_parent).
     """
     from .mztab_validation import find_mztab_files
 
@@ -9655,11 +9699,12 @@ def discard_download_lease(
             confirmed=confirmed,
             campaign_authorization_path=campaign_authorization_path,
             entry_point=entry_point,
+            release_disposition_hold=release_disposition_hold,
         )
     crossing = _deletion_crossing(campaign_authorization_path, manifest, entry_point)
     owner = _owner_manifest_path(manifest, manifest_path)
     if owner is not None and crossing is not None:
-        return _discard_split_part(manifest_path, owner, crossing)
+        return _discard_split_part(manifest_path, owner, crossing, release_disposition_hold=release_disposition_hold)
     downloading = manifest.get("status") == "downloading"
     owner_state = lease_owner_state(manifest) if downloading else None
     if not confirmed and crossing is None:
@@ -9667,7 +9712,7 @@ def discard_download_lease(
             "deleted": False,
             "confirmation_required": True,
             "manifest_path": str(manifest_path),
-            "plan": plan_download_discard(manifest_path),
+            "plan": plan_download_discard(manifest_path, release_disposition_hold=release_disposition_hold),
         }
         if owner_state is not None:
             preview["lease_owner_state"] = owner_state
@@ -9693,8 +9738,11 @@ def discard_download_lease(
         released_from = str(manifest.get("status") or "")
         downloading = manifest.get("status") == "downloading"
         owner_state = lease_owner_state(manifest) if downloading else None
+        hold = unreleased_disposition_hold(manifest)
         if crossing is not None:
-            plan = plan_download_discard(manifest_path, authorized=True)
+            plan = plan_download_discard(
+                manifest_path, authorized=True, release_disposition_hold=release_disposition_hold
+            )
             if plan["blockers"]:
                 return {
                     **plan,
@@ -9705,6 +9753,8 @@ def discard_download_lease(
                 }
         elif manifest.get("status") in {"mztab_validated", "completed", "raw_cleaned"}:
             raise ValueError("Validated/completed runs must use the normal cleanup command.")
+        elif hold and not release_disposition_hold:
+            raise ValueError(_disposition_hold_text(hold) + " Discard was refused.")
         elif superseded_validated_run(manifest) is not None:
             raise ValueError(
                 _superseded_validated_text(superseded_validated_run(manifest), str(manifest.get("status") or ""))
@@ -9767,6 +9817,11 @@ def discard_download_lease(
         )
         if crossing is not None:
             record_campaign_authorization(manifest_path, crossing)
+        hold_release = _disposition_hold_release(hold, discarded_at) if hold else None
+        if hold_release is not None:
+            # The operator's skip lifts the hold before the first file goes, so a deletion that stops part-way
+            # is resumed without the decision being asked for again.
+            update_manifest(manifest_path, lambda current: current.update(hold_release))
         if failure_artifacts is not None and kept_before is None:
             # Written before the first file goes, so a deletion that stops still names what it keeps.
             def keep(current: dict[str, Any]) -> None:
@@ -9828,10 +9883,18 @@ def discard_download_lease(
         result["failure_artifacts"] = failure_artifacts
     if crossing is not None:
         result["campaign_authorization"] = crossing
+    if hold_release is not None:
+        result["disposition_hold_released_by"] = DISPOSITION_HOLD_RELEASED_BY
     return result
 
 
-def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[str, Any]) -> dict[str, Any]:
+def _discard_split_part(
+    manifest_path: Path,
+    parent_path: Path,
+    crossing: dict[str, Any],
+    *,
+    release_disposition_hold: bool = False,
+) -> dict[str, Any]:
     """Record under an approval that a split part has ended without validated output. Deletes nothing.
 
     The part's raw tree is its parent's, read by every other part, and goes only with the parent's release
@@ -9841,6 +9904,10 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
 
     Refused, with nothing recorded, for a validated part, one whose Console may still run, and one with a new
     run prepared after a validated run that has not validated (superseded_validated_run, review r7-62).
+
+    Refused too for a part its campaign disposition holds (multi-energy AIF), unless ``release_disposition_hold``
+    is the operator's skip: a held part keeps its parent's raw data until it is released or run (review r9-64).
+    With it, the part records disposition_hold_released_by "operator_skip" as it ends.
     """
     with _raw_deletion_lock(manifest_path):
         manifest = read_manifest(manifest_path)
@@ -9860,6 +9927,9 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
                 f"Run attempt {attempt.get('attempt_id') or '?'} of job {attempt.get('job_id') or 'unrecorded'} may "
                 "still have its MS-DIAL Console reading the raw tree."
             )
+        hold = unreleased_disposition_hold(manifest)
+        if hold and not release_disposition_hold:
+            blockers.append(_disposition_hold_text(hold, "The part") + " Its parent's raw data are kept for it.")
         if blockers:
             return {
                 "deleted": False,
@@ -9870,27 +9940,10 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
                 "blockers": blockers,
                 "message": "Nothing was recorded: the approval covers this part, but its discard is refused.",
             }
-        if status == "discarded":
+        if status == "discarded" and not hold:
             ended = {"already_discarded": True}
         else:
-            at = datetime.now(timezone.utc).isoformat()
-            output = Path(str(manifest.get("output_directory") or ""))
-            failure_artifacts = _failure_artifacts(manifest_path, manifest, output, at)
-            record_campaign_authorization(manifest_path, crossing)
-
-            def change(current: dict[str, Any]) -> None:
-                current["status"] = "discarded"
-                current["discarded_at"] = at
-                current["discard_reason"] = (
-                    "The part ended without validated output. Its raw data are its parent's, and are released "
-                    "with the parent's once every part has ended."
-                )
-                current["raw_release_deferred_to"] = str(parent_path)
-                if failure_artifacts is not None:
-                    current["failure_artifacts"] = failure_artifacts
-
-            update_manifest(manifest_path, change)
-            ended = {**({"failure_artifacts": failure_artifacts} if failure_artifacts else {})}
+            ended = _end_split_part(manifest_path, manifest, parent_path, crossing, hold)
     try:
         parent_plan = plan_split_parent_cleanup(parent_path)
     except (OSError, ValueError) as error:
@@ -9906,10 +9959,51 @@ def _discard_split_part(manifest_path: Path, parent_path: Path, crossing: dict[s
     }
 
 
+def _end_split_part(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    parent_path: Path,
+    crossing: dict[str, Any] | None,
+    hold: dict[str, Any],
+) -> dict[str, Any]:
+    """Record that a split part has ended without validated output; the caller holds the part's deletion lock.
+
+    ``hold`` is the part's unreleased disposition hold, which the caller's release_disposition_hold lifts: the
+    part then records disposition_hold_released_by. A held part an earlier discard ended (status discarded,
+    which the code before r9-64 let an approval do) keeps its discarded_at and failure artifacts and gains only
+    the hold's release.
+    """
+    at = datetime.now(timezone.utc).isoformat()
+    hold_release = _disposition_hold_release(hold, at) if hold else {}
+    if crossing is not None:
+        record_campaign_authorization(manifest_path, crossing)
+    if manifest.get("status") == "discarded":
+        update_manifest(manifest_path, lambda current: current.update(hold_release))
+        return {"already_discarded": True, **hold_release}
+    output = Path(str(manifest.get("output_directory") or ""))
+    failure_artifacts = _failure_artifacts(manifest_path, manifest, output, at)
+
+    def change(current: dict[str, Any]) -> None:
+        current["status"] = "discarded"
+        current["discarded_at"] = at
+        current["discard_reason"] = (
+            "The operator skipped the part its campaign disposition held, lifting the hold. "
+            if hold_release
+            else "The part ended without validated output. "
+        ) + "Its raw data are its parent's, and are released with the parent's once every part has ended."
+        current["raw_release_deferred_to"] = str(parent_path)
+        current.update(hold_release)
+        if failure_artifacts is not None:
+            current["failure_artifacts"] = failure_artifacts
+
+    update_manifest(manifest_path, change)
+    return {**({"failure_artifacts": failure_artifacts} if failure_artifacts else {}), **hold_release}
+
+
 # ---- releasing a split parent's raw tree -----------------------------------------------------------------
 
 
-def _part_end(part: dict[str, Any], parent_raw: Path) -> dict[str, Any]:
+def _part_end(part: dict[str, Any], parent_raw: Path, *, release_disposition_hold: bool = False) -> dict[str, Any]:
     """How one split part stands for its parent's raw release: its state, whether it has ended, what blocks.
 
     Ended means one of: validated (a cleanup-ready status, cleanup_allowed, no mzTab-M that failed, every
@@ -9924,6 +10018,11 @@ def _part_end(part: dict[str, Any], parent_raw: Path) -> dict[str, Any]:
     whatever its status and however many runs failed (superseded_validated_run): its raw data are held for that
     run, as a unit's own are (review r7-62). That includes a part discarded while such a run was pending, which
     52b470b let an approval do.
+
+    A part its disposition holds stays held, skipped or discarded, until an operator's skip lifts the hold
+    (unreleased_disposition_hold, review r9-64): a discard that did not record disposition_hold_released_by does
+    not end it. With ``release_disposition_hold`` - the parent's release asked to lift its parts' holds - such a
+    part is hold_released, which ends it; cleanup_split_parent records the release on it before it deletes.
     """
     status = str(part.get("status") or "")
     blockers: list[str] = []
@@ -9951,15 +10050,19 @@ def _part_end(part: dict[str, Any], parent_raw: Path) -> dict[str, Any]:
         missing = [item for item in retained if not os.path.exists(extended_path(item))]
         if missing:
             blockers.append(f"{len(missing)} of its retained artifacts are missing")
-    elif status == SKIPPED_BY_PREFLIGHT_STATUS and held_by_disposition(part):
+    elif status in {SKIPPED_BY_PREFLIGHT_STATUS, "discarded"} and unreleased_disposition_hold(part):
         # Held, not skipped (multi-energy AIF, 2026-10-07): it is to run once a Console that can exists, from the
-        # raw data this parent owns.
-        state = "held"
-        blockers.append(
-            "its campaign disposition holds it ("
-            + ", ".join(held_by_disposition(part).get("reasons") or [])
-            + "): it is to run later, and its raw data are kept"
-        )
+        # raw data this parent owns. Discarded without the hold's release, it is held all the same (r9-64).
+        if release_disposition_hold:
+            state = "hold_released"
+        else:
+            state = "held"
+            blockers.append(
+                "its campaign disposition holds it ("
+                + ", ".join(str(item) for item in unreleased_disposition_hold(part).get("reasons") or [])
+                + "): it is to run later, and its raw data are kept until an operator's skip lifts the hold "
+                "(release_disposition_hold=true)"
+            )
     elif status == SKIPPED_BY_PREFLIGHT_STATUS:
         state = "skipped"
     elif status == EXCLUDED_BY_PREFLIGHT_STATUS:
@@ -10005,7 +10108,7 @@ def _part_end(part: dict[str, Any], parent_raw: Path) -> dict[str, Any]:
     }
 
 
-def plan_split_parent_cleanup(manifest_path: Path) -> dict[str, Any]:
+def plan_split_parent_cleanup(manifest_path: Path, *, release_disposition_hold: bool = False) -> dict[str, Any]:
     """Describe the release of a split parent's raw tree, and what still refuses it. Changes nothing.
 
     WHAT A SPLIT PARENT IS. The unit that downloaded the data and owns <workspace>\\raw, which every part split
@@ -10020,7 +10123,9 @@ def plan_split_parent_cleanup(manifest_path: Path) -> dict[str, Any]:
     4. The parts' inputs, with the inputs a campaign disposition excluded, are the parent's inputs, each once.
     5. Every part has ended (_part_end): validated, released, failed after its retries, skipped, excluded or
        discarded; none has a Console that may still be running, and none keeps an artifact under the tree. A
-       part with a new run prepared after a validated run, which has not validated, has not ended.
+       part with a new run prepared after a validated run, which has not validated, has not ended, and neither
+       has a part its campaign disposition holds (multi-energy AIF) until an operator's skip lifts the hold:
+       with ``release_disposition_hold`` such a part reads as hold_released, which cleanup_split_parent records.
     6. No finalisation hold stands on the parent or a part (run_finalisation.raw_deletion_holds).
 
     The release is ``released`` when some part's outputs validated, else ``discarded``. The authorization - a
@@ -10067,7 +10172,7 @@ def plan_split_parent_cleanup(manifest_path: Path) -> dict[str, Any]:
             problems.append("its raw_owned_by names another unit")
         if _file_key(str(part.get("raw_directory") or "")) != _file_key(str(raw_root)):
             problems.append("its raw_directory is not the parent's")
-        end = _part_end(part, raw_root)
+        end = _part_end(part, raw_root, release_disposition_hold=release_disposition_hold)
         for problem in problems + end["blockers"]:
             blockers.append(f"Part {unit_id or part_path}: {problem}.")
         claimed.extend(str(path) for path in part.get("input_candidates") or [] if str(path).strip())
@@ -10154,6 +10259,7 @@ def cleanup_split_parent(
     *,
     campaign_authorization_path: str | Path | None = None,
     entry_point: str = "cleanup_split_parent",
+    release_disposition_hold: bool = False,
 ) -> dict[str, Any]:
     """Release a split parent's raw tree once every part has ended (plan_split_parent_cleanup).
 
@@ -10161,6 +10267,9 @@ def cleanup_split_parent(
     approval must cover boundary 5 for the parent and state delete_after_validated_output, as the parent does.
     Under the deletion lock the plan is drawn again, and any blocker stops it with nothing recorded. Then:
 
+    0. with ``release_disposition_hold`` - the operator's skip of the parts their campaign disposition holds -
+       each such part (hold_released in the plan) is ended as its own discard would end it, recording
+       disposition_hold_released_by "operator_skip". Without it a held part blocks the release (review r9-64);
     1. the crossing, if any, is recorded on the parent, and raw_release (msdial-split-parent-raw-release.v1) is
        written with state deleting: the kind, the target, its files and bytes, and each part as it ended;
     2. the tree is removed (download_store.unlink_tree), and raw_release becomes state removed. A tree that
@@ -10187,14 +10296,14 @@ def cleanup_split_parent(
             if isinstance(item, dict) and Path(str(item.get("manifest_path") or "")).is_file():
                 refresh_retained_artifacts(Path(str(item["manifest_path"])))
     crossing = _deletion_crossing(campaign_authorization_path, manifest, entry_point)
-    plan = plan_split_parent_cleanup(manifest_path)
+    plan = plan_split_parent_cleanup(manifest_path, release_disposition_hold=release_disposition_hold)
     if plan["already_released"] and not confirmed and crossing is None:
         return {**plan, "deleted": True, "already_released": True}
     if not confirmed and crossing is None:
         return {**plan, "deleted": False, "confirmation_required": True}
     raw_root = Path(plan["deletion_target"])
     with _raw_deletion_lock(manifest_path):
-        plan = plan_split_parent_cleanup(manifest_path)
+        plan = plan_split_parent_cleanup(manifest_path, release_disposition_hold=release_disposition_hold)
         if plan["already_released"]:
             return _split_parent_released_again(manifest_path, plan, crossing)
         if plan["blockers"]:
@@ -10207,6 +10316,18 @@ def cleanup_split_parent(
             }
         if crossing is not None:
             record_campaign_authorization(manifest_path, crossing)
+        holds_released = []
+        for part in plan["parts"]:
+            if part.get("state") != "hold_released":
+                continue
+            part_path = Path(str(part["manifest_path"])).resolve()
+            with _raw_deletion_lock(part_path):
+                current_part = read_manifest(part_path)
+                hold = unreleased_disposition_hold(current_part)
+                if hold:
+                    # The approval is the parent's, recorded there and in raw_release.authorized_by.
+                    _end_split_part(part_path, current_part, manifest_path, None, hold)
+                    holds_released.append(str(part.get("analysis_unit_id") or part_path))
         parts = [
             {
                 "analysis_unit_id": part.get("analysis_unit_id"),
@@ -10230,7 +10351,12 @@ def cleanup_split_parent(
             final_state="removed",
         )
         if not removal["deleted"]:
-            return {**plan, **removal, **({"campaign_authorization": crossing} if crossing else {})}
+            return {
+                **plan,
+                **removal,
+                **({"campaign_authorization": crossing} if crossing else {}),
+                **({"disposition_holds_released": holds_released} if holds_released else {}),
+            }
         released_at = str(removal["raw_release"].get("removed_at") or datetime.now(timezone.utc).isoformat())
         for part in plan["parts"]:
 
@@ -10266,6 +10392,9 @@ def cleanup_split_parent(
         "raw_directory": str(raw_root),
         "raw_release": read_manifest(manifest_path).get("raw_release"),
     }
+    if holds_released:
+        result["disposition_holds_released"] = holds_released
+        result["disposition_hold_released_by"] = DISPOSITION_HOLD_RELEASED_BY
     if released is not None:
         result["download_store"] = released
     if crossing is not None:
@@ -10855,15 +10984,37 @@ def _unattributed_members(
         result["members"] = {
             key: {"member_name": name, "paired_by": UNATTRIBUTED_MEMBER_PAIRING} for key, name in kept.items()
         }
-        record.update(count=len(kept), members=sorted(kept.values(), key=str.casefold), scope=basis)
+        record.update(count=len(kept), **unattributed_member_names(kept.values()), scope=basis)
     else:
         left_out = [*({"member_name": name, "reason": basis} for name in kept.values()), *left_out]
-        record.update(count=0, members=[], reason=basis)
+        record.update(count=0, members=[], paths=[], reason=basis)
     if left_out:
-        record["left_out"] = sorted(left_out, key=lambda item: item["member_name"].casefold())
+        # Each left-out member by its basename, as members names them, and its path under the data root.
+        record["left_out"] = sorted(
+            (
+                {"member_name": PurePosixPath(item["member_name"]).name, "path": item["member_name"], "reason": item["reason"]}
+                for item in left_out
+            ),
+            key=lambda item: (item["path"].casefold(), item["reason"]),
+        )
         record["left_out_count"] = len(left_out)
     result["record"] = record
     return result
+
+
+def unattributed_member_names(paths: Iterable[str]) -> dict[str, list[str]]:
+    """manifest.unattributed_members' two lists, from the members' '/'-separated paths under the data root.
+
+    members: each member's basename, as its input_lineage row's name_pairing.member_name gives it (the agreed
+    contract of 2026-10-07, review r9-64: the gate compares basenames with basenames). paths: the same members'
+    paths relative to the unit's raw data root, its parent's for a split part. Both sorted case-blind, one entry
+    per member, so two members of one basename in two folders are listed twice in members and apart in paths.
+    """
+    listed = sorted((str(item).replace("\\", "/") for item in paths), key=lambda item: (item.casefold(), item))
+    return {
+        "members": sorted((PurePosixPath(item).name for item in listed), key=lambda item: (item.casefold(), item)),
+        "paths": listed,
+    }
 
 
 def inferred_name_pairings(pairings: dict[str, dict[str, str]], data_root: Path) -> list[dict[str, str]]:

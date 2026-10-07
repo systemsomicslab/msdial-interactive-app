@@ -141,8 +141,13 @@ def summarize_jobs(
             # An undeclared unit whose download is its own alone (unit_files, or every bundle URL with
             # shared_unit_count 1) takes the archive members no sample row pairs with as unattributed inputs
             # (name_pairing.paired_by unattributed_member, manifest.unattributed_members, the warning
-            # unattributed_members_included); a shared archive takes none and says why.
+            # unattributed_members_included); a shared archive takes none and says why. The record's members are
+            # basenames, as the lineage's member_name is, and its paths the members' paths under the data root.
             "repository_unattributed_archive_members",
+            # A unit or split part its disposition holds is never discarded, approved or confirmed, unless the
+            # discard passes release_disposition_hold=true (the operator's skip), which records
+            # disposition_hold_released_by "operator_skip"; a held part keeps its parent's raw data until then.
+            "discard_release_disposition_hold",
         ],
         "workflow_outline": [
             "Inspect the input path and collect the guided scientific choices.",

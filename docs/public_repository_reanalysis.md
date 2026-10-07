@@ -144,8 +144,12 @@ acquisition. Its `input_lineage` row has `name_pairing`
 unit's abstention Class (`All`) where the Class is an abstention, and of the
 Class `Unattributed` otherwise. The reviewed sample TSV gets a row per member with
 `raw_file_paired_by` `unattributed_member`. The run manifest records
-`unattributed_members` (`count`, `members`, `rule`
-`unit_scoped_archive_2026_10_07`, `scope`), and the warning
+`unattributed_members` (`count`, `members`, `paths`, `rule`
+`unit_scoped_archive_2026_10_07`, `scope`). `members` names each member by its
+basename, as its lineage row's `member_name` does, and `paths` gives the same
+members' '/'-separated paths relative to the unit's raw data root (its parent's
+for a split part); each `left_out` entry has both `member_name` and `path`. The
+warning
 `unattributed_members_included` is in its warnings, the attribute stage's, every
 campaign disposition's and the CSV record's (a split part carries the record and
 the warning for its own members only). A shared archive (`shared_unit_count`
@@ -561,8 +565,19 @@ than one energy holds the unit until a Console that settles an all-ion spot's
 representative energy exists: `disposition` skip, `reasons`
 `aif_multi_ce_awaiting_console`, `hold` true. A unit whose inputs record no
 energy is held the same way as `aif_collision_energy_unrecorded`. A held unit is
-no failure, a campaign approval does not discard its raw data, and a held split
-part has not ended for its parent's raw release. A unit to be split is split
+no failure, neither a campaign approval nor `confirmed=true` discards its raw
+data, and a held split part has not ended for its parent's raw release, even once
+discarded. Only an operator's explicit skip lifts the hold:
+`release_disposition_hold=true` (default false) on `msdial_discard_repository_raw`,
+`discard_download_lease`, a split part's discard, `cleanup_split_parent`, and the
+CLI's `discard --release-disposition-hold`. With it and an approval covering
+boundary 5 (or `confirmed=true`) the discard proceeds, and the unit or part
+records `disposition_hold_released_by` `operator_skip` (and
+`disposition_hold_release`: who, when, the hold's reasons) before anything is
+deleted. On a split parent it lifts the hold of each held part, which is then
+listed as `hold_released` in `raw_release.parts`. The campaign runner's `skip` of
+a `disposition_held` unit passes it; an agent passes it only on that explicit
+decision, never because a hold blocks a discard. A unit to be split is split
 first, and each part is decided by the rule on its own. The execution gate runs a
 header's AIF as SWATH only where the applied disposition records
 `aif_run_as_swath`, and refuses it anywhere else. `classify_preflight` reads the
@@ -661,7 +676,9 @@ A split parent's raw tree, which every part reads, is released by
 `cleanup_split_parent` (also reached through either tool on the parent's
 manifest) once every part has ended: validated, failed after its retries
 (three recorded run failures), skipped, excluded, or discarded by its own
-authorized discard. A run is recorded as failed (`run_failures`) when its
+authorized discard. A part its campaign disposition holds has not ended, skipped
+or discarded, until an operator's skip lifts the hold
+(`release_disposition_hold`, above). A run is recorded as failed (`run_failures`) when its
 Console exits non-zero, and also when it exits 0 without a validated mzTab-M:
 it wrote none, what it wrote failed validation, or finalisation found another
 mzTab-M in the output that fails (the status `validation_failed` is kept). The

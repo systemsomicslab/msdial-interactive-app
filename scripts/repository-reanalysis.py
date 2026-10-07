@@ -80,6 +80,12 @@ def main() -> int:
     discard_parser = subparsers.add_parser("discard", help="Delete a rejected preflight download while retaining provenance.")
     discard_parser.add_argument("manifest", type=Path)
     discard_parser.add_argument("--confirmed", action="store_true")
+    discard_parser.add_argument(
+        "--release-disposition-hold",
+        action="store_true",
+        help="The operator's explicit skip of a unit its campaign disposition holds (hold true): lift the hold "
+        "and discard it. Without it a held unit is never discarded.",
+    )
 
     metadata_parser = subparsers.add_parser(
         "metadata", help="Inspect, project, and save repository sample metadata."
@@ -157,7 +163,9 @@ def main() -> int:
             confirm_untargeted=args.confirm_untargeted,
         )
     elif args.command == "discard":
-        result = discard_download_lease(args.manifest, args.confirmed)
+        result = discard_download_lease(
+            args.manifest, args.confirmed, release_disposition_hold=args.release_disposition_hold
+        )
     elif args.command == "metadata" and args.metadata_command == "inspect":
         adapter = ADAPTERS[args.repository]()
         inspector = getattr(adapter, "inspect_metadata", adapter.inspect)

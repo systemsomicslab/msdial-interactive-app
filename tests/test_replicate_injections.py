@@ -665,7 +665,8 @@ class TheMembersNoRowPairsWithAreUnattributedInputs(_Workspace):
 
         self.assertEqual(sorted(ST001264_MEMBERS), sorted(Path(item).name for item in manifest["input_candidates"]))
         self.assertEqual(
-            {"rule": "unit_scoped_archive_2026_10_07", "applied": True, "count": 3, "members": YOUN, "scope": "unit_files"},
+            {"rule": "unit_scoped_archive_2026_10_07", "applied": True, "count": 3, "members": YOUN, "paths": YOUN,
+             "scope": "unit_files"},
             manifest["unattributed_members"],
         )
         self.assertEqual([INFERRED_PAIRING_WARNING, "unattributed_members_included"], manifest["warnings"])
@@ -763,6 +764,43 @@ class TheMembersNoRowPairsWithAreUnattributedInputs(_Workspace):
             [(item["member_name"], item["reason"]) for item in record["left_out"]],
         )
         self.assertEqual(5, record["left_out_count"])
+        self.assertEqual(
+            [item["member_name"] for item in record["left_out"]], [item["path"] for item in record["left_out"]]
+        )
+
+    def test_a_nested_archive_names_its_members_by_basename_as_the_lineage_does(self) -> None:
+        # Review ia-0531, medium: the record listed 'ST001264_POSITIVE/<name>', the lineage '<name>', so the
+        # gate found no lineage member in the record. Both now give the basename; paths keeps where each lies.
+        nested = [f"ST001264_POSITIVE/{name}" for name in ST001264_MEMBERS]
+        twins = ["ST001264_POSITIVE/a/QC_01.raw", "ST001264_POSITIVE/b/QC_01.raw"]
+        other = "ST001264_POSITIVE/neg/x_S9_neg.raw"
+        manifest = self.unit(UNIT_SCOPED, members=[*nested, *twins, other])
+        record = manifest["unattributed_members"]
+
+        self.assertEqual(5, record["count"])
+        self.assertEqual(sorted([*YOUN, "QC_01.raw", "QC_01.raw"], key=lambda item: (item.casefold(), item)),
+                         record["members"])
+        self.assertEqual(
+            sorted([f"ST001264_POSITIVE/{name}" for name in YOUN] + twins, key=lambda item: (item.casefold(), item)),
+            record["paths"],
+        )
+        lineage = sorted(
+            row["name_pairing"]["member_name"] for row in manifest["input_lineage"]["rows"]
+            if (row.get("name_pairing") or {}).get("paired_by") == "unattributed_member"
+        )
+        self.assertEqual(sorted(record["members"]), lineage)
+        self.assertEqual(
+            [("x_S9_neg.raw", other, "polarity_token_contradicts_ion_mode")],
+            [(item["member_name"], item["path"], item["reason"]) for item in record["left_out"]],
+        )
+
+    def test_a_shared_nested_archive_lists_its_left_out_members_by_basename_and_path(self) -> None:
+        nested = [f"ST001264_POSITIVE/{name}" for name in ST001264_MEMBERS]
+        record = self.unit(SHARED, members=nested)["unattributed_members"]
+
+        self.assertEqual((0, [], []), (record["count"], record["members"], record["paths"]))
+        self.assertEqual(YOUN, [item["member_name"] for item in record["left_out"]])
+        self.assertEqual([f"ST001264_POSITIVE/{name}" for name in YOUN], [item["path"] for item in record["left_out"]])
 
     def test_a_unit_no_row_of_which_pairs_runs_on_its_unattributed_members_alone(self) -> None:
         manifest = self.unit(UNIT_SCOPED, members=YOUN, samples=[("Sample1", "Sample1")])
@@ -1322,7 +1360,7 @@ class ASplitPartCarriesItsOwnPairingRecord(_Workspace):
         extractor = self.root / "RawMetadataConsoleApp.exe"
         extractor.write_bytes(b"stub")
         verdicts = {
-            f"data/{Path(path).name}": {"mode": modes.get(Path(path).name, "DDA"), "polarity": "Positive"}
+            f"{Path(path).parent.name}/{Path(path).name}": {"mode": modes.get(Path(path).name, "DDA"), "polarity": "Positive"}
             for path in read_manifest(manifest_path)["input_candidates"]
         }
         with patch("msdial_app.repository_reanalysis.subprocess.run", side_effect=_extractor(verdicts)):
@@ -1382,11 +1420,33 @@ class ASplitPartCarriesItsOwnPairingRecord(_Workspace):
         for part, member in ((dda, "U_8.raw"), (dia, "U_9.raw")):
             self.assertEqual(
                 {"rule": "unit_scoped_archive_2026_10_07", "applied": True, "scope": "unit_files", "count": 1,
-                 "members": [member]},
+                 "members": [member], "paths": [member]},
                 part["unattributed_members"],
             )
             self.assertEqual(["unattributed_members_included"], part["warnings"])
             self.assertIn("unattributed_members_included", decide_disposition(part)["warnings"])
+
+    def test_a_part_of_a_nested_archive_names_its_members_by_basename_and_keeps_their_paths(self) -> None:
+        # Review ia-0531, medium: the record listed paths under the data root, the lineage basenames.
+        members = ["RUN/A_1_pos.raw", "RUN/D_4_pos.raw", "RUN/U_8.raw", "RUN/more/U_9.raw"]
+        parent, parts = self.split(
+            {name: f"thermo raw bytes of {name}".encode() for name in members},
+            [("X", "A_1_pos.raw"), ("Z", "D_4_pos.raw")],
+            {"D_4_pos.raw": "DIA", "U_9.raw": "DIA"},
+        )
+
+        self.assertEqual(["U_8.raw", "U_9.raw"], parent["unattributed_members"]["members"])
+        self.assertEqual(["RUN/more/U_9.raw", "RUN/U_8.raw"], parent["unattributed_members"]["paths"])
+        for part, member, path in (
+            (parts["u-split-dda"], "U_8.raw", "RUN/U_8.raw"), (parts["u-split-dia"], "U_9.raw", "RUN/more/U_9.raw")
+        ):
+            record = part["unattributed_members"]
+            self.assertEqual(([member], [path], 1), (record["members"], record["paths"], record["count"]))
+            lineage = [
+                row["name_pairing"]["member_name"] for row in part["input_lineage"]["rows"]
+                if (row.get("name_pairing") or {}).get("paired_by") == "unattributed_member"
+            ]
+            self.assertEqual(record["members"], lineage)
 
     def test_a_part_whose_inputs_were_named_exactly_carries_no_pairing_record(self) -> None:
         from msdial_app.raw_metadata_preflight import decide_disposition
