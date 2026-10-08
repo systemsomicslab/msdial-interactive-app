@@ -29,7 +29,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 from . import archives, encoding_preference
 from .archives import ArchiveError, ExtractionLimits
 from .diagnostic_paths import (
@@ -4108,6 +4108,16 @@ def _encoding_choices(
         if roles.get(names[source]) != encoding_preference.ALTERNATE:
             continue
         chosen = [item for item in twins if roles.get(names[item]) == encoding_preference.RAW]
+        # One input stands for the mzXML, never two (review of #69 at 418766b): each would run as its sample, and the
+        # analysis CSV refuses a sample row with two inputs. Of the twins the order takes, the unit's own come first;
+        # copies of one encoding in several folders are one twin, the one nearest the data root, then the first by
+        # path (_one_copy_each; _unattributed_members records the others as copy_of_the_chosen_member); and where the
+        # order ties between encodings none of which the unit admits (x.raw and x.d), it takes none, and the mzXML is
+        # converted, as the sample's own input.
+        own = [item for item in chosen if _file_key(item) in admitted]
+        chosen, _copies = _one_copy_each(own or chosen, lambda item: names[item])
+        if len(chosen) > 1 and not own:
+            continue
         by_unit = any(_file_key(item) in admitted for item in chosen)
         if not chosen or not (
             by_unit or _file_key(source) in extracted or any(_file_key(item) in extracted for item in chosen)
@@ -4130,6 +4140,35 @@ def _encoding_choices(
             ),
         })
     return choices, winners
+
+
+# Why an archive member that is a copy of the member chosen for its sample (one encoding, the same name, in another
+# folder: mzML/x.mzML beside x.mzML, RAW/x.raw beside x.raw) is left out: copies are one candidate, and the one nearest
+# the data root, then the first by path, is it (review of #69 at 418766b). Its entry names that one (chosen) and what
+# chose it (chosen_by COPY_CHOSEN_BY). Not chosen_other_encoding: the two are one encoding, not two.
+COPY_OF_THE_CHOSEN = "copy_of_the_chosen_member"
+COPY_CHOSEN_BY = "nearest_the_data_root"
+
+
+def _copy_rank(relative: str) -> tuple[int, str, str]:
+    """The order copies of one encoding are taken in: the one nearest the data root, then the first by path."""
+    return relative.count("/"), relative.casefold(), relative
+
+
+def _one_copy_each(items: list[str], relative: Callable[[str], str]) -> tuple[list[str], dict[str, str]]:
+    """(items less the copies, {each copy left out: the item kept for it}), ``items`` being one sample's encodings.
+
+    Copies are items of one container suffix (encoding_preference.container_suffix of ``relative(item)``, the item's
+    path under the data root); of each such group the one _copy_rank puts first is kept. Order is kept.
+    """
+    groups: dict[str, list[str]] = {}
+    for item in items:
+        groups.setdefault(encoding_preference.container_suffix(relative(item)), []).append(item)
+    copies: dict[str, str] = {}
+    for group in groups.values():
+        ordered = sorted(group, key=lambda item: _copy_rank(relative(item)))
+        copies.update({other: ordered[0] for other in ordered[1:]})
+    return [item for item in items if item not in copies], copies
 
 
 # The words of a folder's name that say which encoding it holds rather than whose samples: ST003038's
@@ -11305,14 +11344,22 @@ def _unattributed_members(
     Catalog's encoding order (encoding_preference.prefer_encodings: a vendor folder or container, then mzML, then
     mzXML) takes one, and every other is left out as chosen_other_encoding, with the one chosen (chosen, chosen_by
     encoding_order). Where the order prefers none of them (two vendor containers of one name), each is left out as
-    two_encodings_of_one_name, as before. Where the unit admitted a member of that sample itself (a sample row names
+    two_encodings_of_one_name, as before. Copies of one encoding in several folders (x.raw and RAW/x.raw) are one
+    candidate wherever the order is asked (review of #69 at 418766b): the one nearest the data root, then the first
+    by path (_one_copy_each), and every other is left out as copy_of_the_chosen_member, with chosen the copy taken
+    and chosen_by nearest_the_data_root (admitted_by_the_unit where the copy taken is the unit's own encoding of the
+    sample). Where the unit admitted a member of that sample itself (a sample row names
     it, exactly or by a pairing rule), that member is the sample's input: an unpaired encoding of it is left out as
     chosen_other_encoding with chosen the admitted one (chosen_by encoding_order where the order puts the admitted
     one first and the unpaired one after it, admitted_by_the_unit otherwise: where the order puts the unpaired one
     first, or ranks both equal, the admission chose, not the order). The exception is the member the convert stage
     analyses instead of the sample's mzXML (a converting lease, every admitted encoding an mzXML the order puts
     after it, and a readable one): it is the sample's input through the mzXML it stands for (lineage stands_for),
-    and is listed as analysed_for_an_admitted_sample, with stands_for. chosen only ever names what runs for the
+    and is listed as analysed_for_an_admitted_sample, with stands_for. It is one member, never two, as the convert
+    stage takes it (_encoding_choices): copies of it are copies, and where the order ties between encodings of
+    the sample (x.raw and x.d) none stands in, the mzXML is converted, and each is chosen_other_encoding with
+    chosen the mzXML, chosen_by admitted_by_the_unit. Where one stands in, it, not the mzXML, is what runs: every
+    other encoding of the sample names it as chosen, chosen_by encoding_order. chosen only ever names what runs for the
     sample: where the unit admitted the sample as an mzXML and the lease converts nothing (no campaign), nothing of
     it runs, and a readable twin is left out as admitted_mzxml_not_converted, with twin_of the mzXML and
     twin_of_reason requires_conversion (whether such a twin should run for its sample outside a campaign is a
@@ -11335,7 +11382,8 @@ def _unattributed_members(
     stands_for_reason undecodable_mzml, and result["replaced"] maps it to that mzML for the lease (its lineage
     row's replaces_undecodable). The record lists the undecodable mzML in replaced_undecodable (member_name, path,
     reason undecodable_mzml, replaced_by). Where the unit admitted two such mzML of the sample (one name in two
-    folders), the twin stands for the one nearest the data root, replaces each, and each is listed so. Where the
+    folders), the twin stands for the one nearest the data root, replaces each, and each is listed so. A twin in
+    two folders is one twin (the copy nearest the data root runs; the other is copy_of_the_chosen_member). Where the
     order ties between the readable twins, none is taken, as for any tie, and the sample has no input. Where no
     twin can be read, the unit's own mzML stays the sample's, and the lease excludes it.
 
@@ -11457,7 +11505,26 @@ def _unattributed_members(
                 item for item in runs if run_roles.get(names[item]) == encoding_preference.RAW
             ] or runs
             chosen = ranked[0] if ranked else None
-            leave_out_undecodable(chosen)
+            # The member the convert stage analyses instead of the sample's mzXML (_encoding_choices): in a converting
+            # lease, where every admitted encoding is an mzXML the order puts after an unpaired one. One, never two:
+            # copies of one encoding are one (the one nearest the data root), and where the order ties between
+            # encodings (x.raw and x.d) none stands in and the mzXML is converted. It, not the mzXML, is what runs
+            # for the sample, so every other encoding of the sample names it as chosen (review of #69 at 418766b:
+            # the record named the mzXML, which never ran).
+            stand_in = None
+            if (
+                converts
+                and chosen is not None
+                and not any(item in preferred for item in admitted)
+                and all(names[item].casefold().endswith(CONVERTIBLE_SUFFIXES) for item in admitted)
+            ):
+                candidates, _copies = _one_copy_each([key for key in competing if key in preferred], names.__getitem__)
+                stand_in = candidates[0] if len(candidates) == 1 else None
+            runs_for_sample = stand_in or chosen
+            # A copy of what runs for the sample (its encoding, in another folder) is left out as such: of the stand-in,
+            # taken as the copy nearest the data root; of the unit's own encoding, which the unit admitted.
+            copy_suffix = encoding_preference.container_suffix(names[runs_for_sample]) if runs_for_sample else None
+            leave_out_undecodable(runs_for_sample)
             for key in competing:
                 name = kept.pop(key)
                 if chosen is None:
@@ -11470,15 +11537,23 @@ def _unattributed_members(
                          "twin_of_reason": "requires_conversion"}
                     )
                     continue
-                if (
-                    converts
-                    and key in preferred
-                    and not any(item in preferred for item in admitted)
-                    and all(names[item].casefold().endswith(CONVERTIBLE_SUFFIXES) for item in admitted)
-                ):
+                if key == stand_in:
                     # The convert stage analyses this one instead of the sample's mzXML (_encoding_choices).
                     left_out.append(
                         {"member_name": name, "reason": "analysed_for_an_admitted_sample", "stands_for": names[admitted[0]]}
+                    )
+                    continue
+                if encoding_preference.container_suffix(names[key]) == copy_suffix:
+                    left_out.append(
+                        {"member_name": name, "reason": COPY_OF_THE_CHOSEN, "chosen": names[runs_for_sample],
+                         "chosen_by": COPY_CHOSEN_BY if stand_in else "admitted_by_the_unit"}
+                    )
+                    continue
+                if stand_in:
+                    # The order puts the member standing in for the mzXML first and this one after it.
+                    left_out.append(
+                        {"member_name": name, "reason": "chosen_other_encoding", "chosen": names[stand_in],
+                         "chosen_by": "encoding_order"}
                     )
                     continue
                 left_out.append(
@@ -11494,18 +11569,27 @@ def _unattributed_members(
                     }
                 )
             continue
-        winners = [key for key in competing if key in preferred]
+        # Copies of one encoding in several folders are one candidate, the one nearest the data root (review of #69
+        # at 418766b: S1.raw and RAW/S1.raw tied as two_encodings_of_one_name, and a sample whose own mzML cannot be
+        # decoded had no input although its data could be read).
+        winners, copies = _one_copy_each([key for key in competing if key in preferred], names.__getitem__)
         winner = competing[0] if len(competing) == 1 else (winners[0] if len(winners) == 1 else None)
         if winner is None:
-            # No order decides between them (two vendor containers of one name), or nothing unpaired of the sample
-            # can be read: one sample's, analysed twice otherwise, or not at all.
+            # No order decides between them (two vendor containers of one name, x.raw and x.d, copies of either
+            # counted once), or nothing unpaired of the sample can be read: one sample's, analysed twice otherwise,
+            # or not at all.
             leave_out_undecodable(None)
             for key in competing:
                 left_out.append({"member_name": kept.pop(key), "reason": "two_encodings_of_one_name"})
             continue
         leave_out_undecodable(winner)
         for key in competing:
-            if key != winner:
+            if key in copies:
+                left_out.append(
+                    {"member_name": kept.pop(key), "reason": COPY_OF_THE_CHOSEN, "chosen": names[winner],
+                     "chosen_by": COPY_CHOSEN_BY}
+                )
+            elif key != winner:
                 left_out.append(
                     {"member_name": kept.pop(key), "reason": "chosen_other_encoding", "chosen": names[winner],
                      "chosen_by": "encoding_order"}

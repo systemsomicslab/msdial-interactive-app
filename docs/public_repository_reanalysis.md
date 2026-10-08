@@ -151,9 +151,9 @@ and mzML takes the mzML, the order's next encoding, and the mzXML is left out
 as `requires_conversion` (a campaign's lease pairs the mzXML and its convert
 stage analyses the mzML for it). And copies of one encoding in several folders
 (`X.mzML` and `mzML/X.mzML`) are one candidate, the one nearest the data root,
-then the first by path; the other copy is recorded as the sample's other
-encoding. Where the copy taken cannot be decoded, the readable twin runs as the
-sample (below).
+then the first by path; the other copy is left out as
+`copy_of_the_chosen_member`, with `chosen` the copy taken. Where the copy taken
+cannot be decoded, the readable twin runs as the sample (below).
 
 An archive member that no sample row pairs with, exactly, behind a prefix or by
 its leading identifier, is still an input where the unit's download is its own
@@ -215,9 +215,25 @@ Since 0.5.36 (the user's decision of 2026-10-08, second round, answer 3):
   the admitted one first, or `admitted_by_the_unit` where it puts the unpaired
   one first or ranks both equal (the admission chose); in a campaign,
   a readable member the convert stage analyses instead of an admitted mzXML is
-  listed as `analysed_for_an_admitted_sample` with `stands_for`. Two encodings
+  listed as `analysed_for_an_admitted_sample` with `stands_for`. That member,
+  not the mzXML, is what runs for the sample, so every other encoding of the
+  sample names it as `chosen` (`chosen_by` `encoding_order`). Two encodings
   the order does not tell apart (two vendor containers of one name) are both
-  left out as `two_encodings_of_one_name`, as before.
+  left out as `two_encodings_of_one_name`, as before; beside an admitted mzXML
+  in a campaign, neither stands in for it, the mzXML is converted as the
+  sample's input, and each is `chosen_other_encoding` with `chosen` the mzXML
+  and `chosen_by` `admitted_by_the_unit`.
+- Copies of one encoding in several folders (`x.raw` and `RAW/x.raw`, `x.mzML`
+  and `mzML/x.mzML`) are one candidate wherever the order is asked: for an
+  unattributed member, for a readable twin the convert stage analyses for an
+  admitted mzXML, and for a twin that runs for an undecodable mzML. The copy
+  nearest the data root, then the first by path, is taken, and each other copy
+  is left out as `copy_of_the_chosen_member`, with `chosen` the copy taken and
+  `chosen_by` `nearest_the_data_root` (`admitted_by_the_unit` where the copy
+  taken is the unit's own encoding of the sample). Until this fix both copies
+  were analysed for an admitted mzXML, so the sample had two inputs and the
+  analysis CSV refused the unit, or the copies tied and a sample whose own mzML
+  cannot be decoded ran on nothing.
 - An mzML that RawDataHandler cannot decode does not compete in that choice,
   because the lease would exclude it and a convertible mzXML outranks an
   unreadable twin (the rule of 2026-09-30). An unpaired one beside another

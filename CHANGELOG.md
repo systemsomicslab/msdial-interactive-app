@@ -132,8 +132,9 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     for the user (the readable-twin answer below names an undecodable mzML).
   - The Agent API lists `repository_unattributed_mzxml_and_encoding_order`
     and, for the items below, `repository_undecodable_mzml_readable_twin`,
-    `repository_members_no_declaration_names` and
-    `repository_one_sample_encodings_pair_as_one`.
+    `repository_members_no_declaration_names`,
+    `repository_one_sample_encodings_pair_as_one` and
+    `repository_encoding_copies_are_one_candidate`.
 - Two encodings of one sample are one candidate for the inferred name pairings
   (prefixed name and leading identifier), not two. Of
   `VV_13_HEpG2_C1_exp344_pos.mzML` and its `.raw`, the member whose container
@@ -164,9 +165,9 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - Copies of one encoding of a sample in several folders
     (`VV_13_HEpG2_C1_exp344_pos.mzML` and `mzML/VV_13_HEpG2_C1_exp344_pos.mzML`)
     are one candidate: the one nearest the data root, then the first by path,
-    as for a name a row admits in two folders. The other copy is the sample's
-    other encoding, recorded with what runs over it. Before this fix the two
-    tied, every encoding of the sample was refused
+    as for a name a row admits in two folders. The other copy is left out as
+    `copy_of_the_chosen_member` (below), naming the copy taken. Before this
+    fix the two tied, every encoding of the sample was refused
     (`leading_identifier_not_unique`, `not_one_to_one`), and its `.raw` ran as
     an unattributed member, outside the sample's Class. Now, where the root
     copy cannot be decoded, the readable twin the order takes runs as the
@@ -230,6 +231,47 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     the members a declaration does not name; which of the two governs a
     declared unit is an open question for the user, and until it is answered
     the declaration holds, as before.
+- One input stands for a sample, never two, where the encoding order is asked
+  between archive members (review of #69 at `418766b`):
+  - Copies of one encoding in several folders (`x.raw` and `RAW/x.raw`,
+    `x.mzML` and `mzML/x.mzML`) are one candidate wherever the order is asked,
+    not only in the inferred name pairings: for an unattributed member, for a
+    readable twin the convert stage analyses for an admitted mzXML
+    (`_encoding_choices`), and for a twin that runs for an undecodable mzML.
+    The copy nearest the data root, then the first by path, is taken. Each
+    other copy is left out as `copy_of_the_chosen_member`, with `chosen` the
+    copy taken and `chosen_by` `nearest_the_data_root`, or
+    `admitted_by_the_unit` where the copy taken is the unit's own encoding of
+    the sample (that case was `chosen_other_encoding` before). It is a new
+    reason, not `chosen_other_encoding`: the two are one encoding.
+  - In a campaign, a row naming `VV_13_HEpG2_C1_pos.mzXML` beside the run's
+    mzXML and a decodable mzML at the root and under `mzML/` had both mzML
+    analysed for the mzXML. Both ran as C1, and the analysis CSV refused the
+    unit (`sample_row_with_two_inputs`). This was introduced at `3a4463b`; at
+    `06d2891` the three were refused and C1 ran on nothing. The same held for
+    exact and prefixed names, and for two `.raw` copies. Now the root copy
+    stands in for the mzXML.
+  - A sample whose own mzML cannot be decoded, beside two copies of a readable
+    twin (`S1.raw` and `RAW/S1.raw`, or in a campaign `S1.mzXML` and
+    `mzXML/S1.mzXML`), ran on nothing: the copies tied as
+    `two_encodings_of_one_name`. Now the root copy runs as the sample (the
+    user's extra answer of 2026-10-08), and only it is converted.
+  - Unpaired copies with no admitted encoding of their sample (`S9.raw` and
+    `RAW/S9.raw`) were both left out as `two_encodings_of_one_name`. Now the
+    root copy is the unattributed input.
+  - In a campaign, where a readable member stands in for the sample's admitted
+    mzXML, every other encoding of the sample names that member as `chosen`
+    (`chosen_by` `encoding_order`). It used to name the mzXML, which is never
+    converted there and never runs (row `S1.mzXML`, members `S1.mzXML`,
+    `S1.mzML` and `S1.raw`: the `.raw` runs, and the mzML said the mzXML was
+    chosen). This was so at `06d2891` too.
+  - Where the order ties between readable twins of an admitted mzXML that the
+    unit does not admit itself (`S1.raw` and `S1.d`), none stands in for it.
+    The mzXML is converted as the sample's own input, and each twin is
+    `chosen_other_encoding` with `chosen` the mzXML and `chosen_by`
+    `admitted_by_the_unit`, as for any tie. Both used to be analysed for it,
+    so the sample had two inputs. Of twins the order ties between, one the
+    unit admits by itself is taken first.
 
 ### Not changed
 - All inputs sharing exactly one energy run as SWATH.

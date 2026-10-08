@@ -176,6 +176,11 @@ def summarize_jobs(
             # declared name's container suffix names, else the one the encoding order takes; the other is that sample's
             # other encoding on record, never an unattributed member for want of a one-to-one pairing.
             "repository_one_sample_encodings_pair_as_one",
+            # Since 0.5.36 (review of #69 at 418766b): copies of one encoding in several folders are one candidate
+            # wherever the encoding order is asked, the copy nearest the data root taken and every other left out as
+            # copy_of_the_chosen_member (chosen, chosen_by nearest_the_data_root or admitted_by_the_unit); one input
+            # stands for a sample's admitted mzXML, never two, and the record names it, not the mzXML, as chosen.
+            "repository_encoding_copies_are_one_candidate",
             # A unit or split part its disposition holds is never discarded, approved or confirmed, unless the
             # discard passes release_disposition_hold=true (the operator's skip), which records
             # disposition_hold_released_by "operator_skip"; a held part keeps its parent's raw data until then.
