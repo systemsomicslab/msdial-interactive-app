@@ -144,6 +144,17 @@ paired, as before. Until 0.5.36 the twin made both refused
 (`leading_identifier_not_unique`, `not_one_to_one`), so the sample's data ran
 as an unattributed member, in the Class `Unattributed`.
 
+Two refinements hold for this choice. Outside a campaign nothing converts an
+mzXML, so the declared name's suffix never pairs an mzXML over another encoding
+of its sample: a row naming `VV_13_HEpG2_C1_pos.mzXML` beside the run's mzXML
+and mzML takes the mzML, the order's next encoding, and the mzXML is left out
+as `requires_conversion` (a campaign's lease pairs the mzXML and its convert
+stage analyses the mzML for it). And copies of one encoding in several folders
+(`X.mzML` and `mzML/X.mzML`) are one candidate, the one nearest the data root,
+then the first by path; the other copy is recorded as the sample's other
+encoding. Where the copy taken cannot be decoded, the readable twin runs as the
+sample (below).
+
 An archive member that no sample row pairs with, exactly, behind a prefix or by
 its leading identifier, is still an input where the unit's download is its own
 alone (0.5.31, the user's decision of 2026-10-07): the Catalog declared no inputs

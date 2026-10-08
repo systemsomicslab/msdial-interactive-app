@@ -148,6 +148,29 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   (`leading_identifier_not_unique`, `not_one_to_one`), so the sample's data ran
   as an unattributed member, in the Class `Unattributed`, and the row had no
   input, decodable or not.
+  - Outside a campaign nothing converts an mzXML, so the declared name's suffix
+    never pairs an mzXML over another encoding of its sample. A row naming
+    `VV_13_HEpG2_C1_pos.mzXML` beside `VV_13_HEpG2_C1_exp344_pos.mzXML` and
+    `VV_13_HEpG2_C1_exp344_pos.mzML` takes the mzML, the order's next encoding
+    (2026-10-08, second round, answer 3), and it runs as C1; the mzXML is left
+    out as `requires_conversion`. Before this fix the mzXML was paired, nothing
+    converted it, and the readable mzML was left out
+    (`admitted_mzxml_not_converted`), so data that had run at `06d2891` (as an
+    unattributed member) ran nowhere. A campaign's lease still pairs the mzXML,
+    and its convert stage analyses the mzML for it, as before. A prefixed
+    member only claims a row by the row's whole name, so `x_S7.raw` never
+    claims a row naming `S7.mzXML`: that shape, like a row naming `S2.mzXML`
+    exactly, keeps the mzXML and the open question above.
+  - Copies of one encoding of a sample in several folders
+    (`VV_13_HEpG2_C1_exp344_pos.mzML` and `mzML/VV_13_HEpG2_C1_exp344_pos.mzML`)
+    are one candidate: the one nearest the data root, then the first by path,
+    as for a name a row admits in two folders. The other copy is the sample's
+    other encoding, recorded with what runs over it. Before this fix the two
+    tied, every encoding of the sample was refused
+    (`leading_identifier_not_unique`, `not_one_to_one`), and its `.raw` ran as
+    an unattributed member, outside the sample's Class. Now, where the root
+    copy cannot be decoded, the readable twin the order takes runs as the
+    sample (below), and the other copy is `chosen_other_encoding` naming it.
 - Where the unit's own mzML of a sample cannot be decoded and an unpaired twin
   of that sample can be read, the twin runs as that sample's own input, paired
   to its sample row and in its Class (the user's answer of 2026-10-08 to the

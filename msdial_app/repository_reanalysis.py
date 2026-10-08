@@ -2121,7 +2121,9 @@ def create_download_lease(
         # BioRec1.raw) or by its leading identifier (ST001359's VV_13_HEpG2_C1_exp344_pos.raw for
         # VV_13_HEpG2_C1_pos.raw), decided once, one to one, for every stage below and for the lineage; and the
         # pairings refused, recorded with them.
-        name_pairings = _member_name_pairings(project, extracted_members, data_root)
+        name_pairings = _member_name_pairings(
+            project, extracted_members, data_root, converts=bool(campaign_authorization)
+        )
         prefixed_members = name_pairings["paired"]
         # And, where the unit's download is its own alone, the members none of those rules pairs: unattributed
         # inputs, always on record (user decision, 2026-10-07). They are admitted wherever a paired member is. In a
@@ -10940,17 +10942,21 @@ def _prefixed_member_pairing(
     project: RepositoryProject,
     extracted_members: dict[str, dict[str, Any]] | None,
     data_root: Path,
+    *,
+    converts: bool = False,
 ) -> dict[str, dict[str, str]]:
     """The archive members an undeclared unit's samples name by an inferred rule, by _file_key.
 
     _member_name_pairings' pairings alone: by a prefixed name, or by a leading identifier token."""
-    return _member_name_pairings(project, extracted_members, data_root)["paired"]
+    return _member_name_pairings(project, extracted_members, data_root, converts=converts)["paired"]
 
 
 def _member_name_pairings(
     project: RepositoryProject,
     extracted_members: dict[str, dict[str, Any]] | None,
     data_root: Path,
+    *,
+    converts: bool = False,
 ) -> dict[str, Any]:
     """The archive members an undeclared unit's samples name by an inferred rule, and the pairings refused.
 
@@ -11063,23 +11069,39 @@ def _member_name_pairings(
         are one run, and refusing both for each other gave the row's data to no sample. The member whose container
         suffix is the declared name's own is it (the row names VV_13_HEpG2_C1_pos.mzML: the mzML); else, where the
         declared name has none (a row naming S7) or names none of them, the one the Catalog's encoding order takes
-        (a vendor folder or container, then mzML, then mzXML). Where the order ties too, none is. Every other
-        encoding is then the paired sample's own other encoding, which _unattributed_members records with what was
-        chosen over it and by what, and which runs for that sample where the chosen one cannot be decoded (the
-        user, 2026-10-08, extra question, A)."""
+        (a vendor folder or container, then mzML, then mzXML: 2026-10-08, second round, answer 3). Where the order
+        ties too, none is. Every other encoding is then the paired sample's own other encoding, which
+        _unattributed_members records with what was chosen over it and by what, and which runs for that sample
+        where the chosen one cannot be decoded (the user, 2026-10-08, extra question, A).
+
+        Two further rules (review of #69 at 3a4463b):
+        - Where the lease converts nothing (``converts`` false: no campaign), an mzXML is no candidate while another
+          encoding of the sample is: nothing would convert it, so pairing it by the row's suffix gave the row an
+          input that never runs and left the readable encoding out (at 06d2891 that one had run, unattributed). The
+          order's next encoding is the row's instead, as in a campaign the convert stage analyses it for the mzXML.
+        - Copies of one encoding in several folders (VV_..._pos.mzML and mzML/VV_..._pos.mzML) are one candidate:
+          the one nearest the data root, then the first by path, as for a name a row admits in two folders. The
+          other copy is the sample's other encoding like any twin. Before, the two tied, both were refused with the
+          sample's .raw, and the .raw ran unattributed, outside the sample's Class."""
         keys = sorted(keys)
         if len(keys) == 1:
             return keys[0]
         if len({_member_encoding_sample(relative(key), data_root) for key in keys}) != 1:
             return ""
+        if not converts:
+            runnable = [key for key in keys if not pool[key].endswith(CONVERTIBLE_SUFFIXES)]
+            keys = runnable or keys
         suffix = encoding_preference.container_suffix(declared_raw_file)
         same = [key for key in keys if suffix and encoding_preference.container_suffix(pool[key]) == suffix]
-        if len(same) == 1:
-            return same[0]
         candidates = same or keys
-        roles = encoding_preference.prefer_encodings([relative(key) for key in candidates])
-        preferred = [key for key in candidates if roles.get(relative(key)) == encoding_preference.RAW]
-        return preferred[0] if len(preferred) == 1 else ""
+        if len(candidates) > 1 and not same:
+            roles = encoding_preference.prefer_encodings([relative(key) for key in candidates])
+            candidates = [key for key in candidates if roles.get(relative(key)) == encoding_preference.RAW]
+        if len(candidates) > 1 and len({encoding_preference.container_suffix(pool[key]) for key in candidates}) == 1:
+            candidates = sorted(
+                candidates, key=lambda key: (relative(key).count("/"), relative(key).casefold(), relative(key))
+            )[:1]
+        return candidates[0] if len(candidates) == 1 else ""
 
     taken: set[str] = set()
     for item in project.files:

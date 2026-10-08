@@ -1459,6 +1459,188 @@ class TheMembersNoRowPairsWithAreUnattributedInputs(_Workspace):
         self.assertEqual((False, 0, "catalog_declared_inputs"), (record["applied"], record["count"], record["reason"]))
         self.assert_every_member_says_why(manifest, members)
 
+    # ---- Review of #69 at 3a4463b ------------------------------------------------------------------------------------
+
+    VV_ROW_MZXML = ("VV_13_HEpG2_C1", "VV_13_HEpG2_C1_pos.mzXML")
+    VV_MZXML = "VV_13_HEpG2_C1_exp344_pos.mzXML"
+    VV_COPY = "mzML/VV_13_HEpG2_C1_exp344_pos.mzML"
+
+    def assert_runs_as(self, manifest: dict, member: str, sample_id: str, declared: str, paired_by: str) -> None:
+        """member runs as sample_id's own input, paired to its row, and the analysis CSV puts it on that row."""
+        rows = {os.path.relpath(row["path"], manifest["input_directory"]).replace("\\", "/"): row
+                for row in manifest["input_lineage"]["rows"]}
+        row = rows[member]
+        self.assertEqual((sample_id, declared, paired_by),
+                         (row["sample_id"], row["name_pairing"]["declared_raw_file"], row["name_pairing"]["paired_by"]))
+        built = build_repository_analysis_rows(manifest)
+        self.assertEqual([], built["failures"])
+        csv_row = next(item for item in built["rows"] if Path(item["input_path"]).name == Path(member).name)
+        self.assertEqual(sample_id, csv_row["sample_id"])
+        self.assertNotIn(sample_id, built.get("samples_without_input") or [])
+        self.assertEqual([], built.get("unattributed_inputs") or [])
+
+    def test_outside_a_campaign_a_row_naming_an_mzxml_takes_its_readable_encoding(self) -> None:
+        # Probe P4cLead (medium): the row names VV_13_HEpG2_C1_pos.mzXML, and the archive holds the run as mzXML and
+        # as a decodable mzML. At 3a4463b the row's suffix paired the mzXML, which nothing converts outside a
+        # campaign, and the mzML was left out (admitted_mzxml_not_converted): data that ran at 06d2891 (unattributed)
+        # ran nowhere. Nothing converts here, so the order's next encoding is the row's: the mzML runs as C1, as a
+        # campaign's convert stage analyses it for the mzXML.
+        members = [*ST001264_MEMBERS[:3], self.VV_MZXML, self.VV_MZML]
+        samples = [*ST001264_SAMPLES[:3], self.VV_ROW_MZXML]
+        manifest = self.unit(UNIT_SCOPED, members=members, samples=samples)
+
+        self.assertIn(self.VV_MZML, [Path(item).name for item in manifest["input_candidates"]])
+        self.assert_runs_as(manifest, self.VV_MZML, "VV_13_HEpG2_C1", "VV_13_HEpG2_C1_pos.mzXML",
+                            LEADING_IDENTIFIER_TOKEN_PAIRING)
+        record = manifest["unattributed_members"]
+        self.assertEqual((0, []), (record["count"], record["members"]))
+        self.assertEqual([(self.VV_MZXML, "requires_conversion")],
+                         [(item["path"], item["reason"]) for item in record["left_out"]])
+        attribute = next(entry for entry in manifest["lease_stages"] if entry["stage"] == "attribute")
+        self.assertNotIn("refused_name_pairings", attribute)
+        self.assert_the_gate_reads_the_record_as_the_lineage(manifest)
+        self.assert_every_member_says_why(manifest, members)
+
+    def test_outside_a_campaign_a_prefixed_row_naming_an_mzxml_is_paired_to_it_as_before(self) -> None:
+        # Probe p11, unchanged: a prefix pairs only a member that carries the row's whole name, so x_S7.raw never
+        # claims S7.mzXML, and the mzXML alone is the row's (as at 06d2891). Whether its readable twin should run
+        # for the sample outside a campaign is the open question of the exact-name shape (P8), the user's to answer.
+        members = [*ST001264_MEMBERS[:3], f"{PREFIX}S7.mzXML", f"{PREFIX}S7.raw"]
+        samples = [*ST001264_SAMPLES[:3], ("Sample7", "S7.mzXML")]
+        manifest = self.unit(UNIT_SCOPED, members=members, samples=samples)
+
+        record = manifest["unattributed_members"]
+        self.assertEqual(
+            [(f"{PREFIX}S7.raw", "admitted_mzxml_not_converted", f"{PREFIX}S7.mzXML", "requires_conversion")],
+            [(item["path"], item["reason"], item["twin_of"], item["twin_of_reason"]) for item in record["left_out"]],
+        )
+        self.assert_every_member_says_why(manifest, [f"{PREFIX}S7.raw"])
+
+    def test_in_a_campaign_a_row_naming_an_mzxml_still_has_its_readable_encoding_analysed_for_it(self) -> None:
+        # Probe p4b, unchanged: the row's suffix pairs the mzXML, and the convert stage analyses the mzML for it.
+        from test_mzxml_conversion import dda_32
+
+        members = [*ST001264_MEMBERS[:3], self.VV_MZXML, self.VV_MZML]
+        samples = [*ST001264_SAMPLES[:3], self.VV_ROW_MZXML]
+        manifest = self.unit(UNIT_SCOPED, members=members, samples=samples, contents={self.VV_MZXML: dda_32()},
+                             campaign=True)
+
+        rows = {Path(row["path"]).name: row for row in manifest["input_lineage"]["rows"]}
+        self.assertEqual("VV_13_HEpG2_C1", rows[self.VV_MZML]["sample_id"])
+        self.assertEqual(self.VV_MZXML, Path(rows[self.VV_MZML]["encoding_choice"]["stands_for"]).name)
+        record = manifest["unattributed_members"]
+        self.assertEqual((0, []), (record["count"], record["members"]))
+        self.assertEqual([(self.VV_MZML, "analysed_for_an_admitted_sample", self.VV_MZXML)],
+                         [(item["path"], item["reason"], item.get("stands_for")) for item in record["left_out"]])
+        # The mzXML is on record through the row that stands for it (encoding_choice), as in every campaign.
+        self.assert_every_member_says_why(manifest, [self.VV_MZML])
+
+    def test_a_twin_runs_as_the_sample_whose_mzml_lies_in_two_folders_and_cannot_be_decoded(self) -> None:
+        # Probe q2f_lead_undec (medium): the row names VV_13_HEpG2_C1_pos.mzML; the archive holds the run's mzML at
+        # the root and under mzML/, both Numpress, and its .raw. At 3a4463b the two mzML tied, all three were refused
+        # (leading_identifier_not_unique), and the .raw ran unattributed, outside C1's Class. The two copies are one
+        # candidate, the root one is the row's, and the .raw runs as C1 in its place.
+        from test_mzml_encoding import _numpress_mzml
+
+        members = [*ST001264_MEMBERS[:3], self.VV_MZML, self.VV_COPY, self.VV_RAW]
+        samples = [*ST001264_SAMPLES[:3], self.VV_ROW]
+        manifest = self.unit(UNIT_SCOPED, members=members, samples=samples,
+                             contents={self.VV_MZML: _numpress_mzml(), self.VV_COPY: _numpress_mzml()})
+
+        record = manifest["unattributed_members"]
+        self.assertEqual((0, [], []), (record["count"], record["members"], record["paths"]))
+        self.assertEqual(
+            [{"member_name": self.VV_MZML, "path": self.VV_COPY, "reason": "chosen_other_encoding",
+              "chosen": self.VV_RAW, "chosen_by": "undecodable_mzml_set_aside"},
+             {"member_name": self.VV_RAW, "path": self.VV_RAW, "reason": "analysed_for_an_admitted_sample",
+              "stands_for": self.VV_MZML, "stands_for_reason": "undecodable_mzml"}],
+            record["left_out"],
+        )
+        self.assertEqual([(self.VV_MZML, self.VV_RAW, self.VV_RAW)],
+                         [(item["path"], item["replaced_by"], item["replaced_by_input"])
+                          for item in record["replaced_undecodable"]])
+        self.assert_runs_as(manifest, self.VV_RAW, "VV_13_HEpG2_C1", "VV_13_HEpG2_C1_pos.mzML",
+                            LEADING_IDENTIFIER_TOKEN_PAIRING)
+        attribute = next(entry for entry in manifest["lease_stages"] if entry["stage"] == "attribute")
+        self.assertNotIn("refused_name_pairings", attribute)
+        self.assert_the_gate_reads_the_record_as_the_lineage(manifest)
+        self.assert_every_member_says_why(manifest, members)
+
+    def test_a_twin_runs_as_the_prefixed_sample_whose_mzml_lies_in_two_folders_and_cannot_be_decoded(self) -> None:
+        # Probe q2f_prefix_undec: the same by a prefixed name (refused not_one_to_one at 3a4463b).
+        from test_mzml_encoding import _numpress_mzml
+
+        members = [*ST001264_MEMBERS[:3], "x_S1.mzML", "mzML/x_S1.mzML", "x_S1.raw"]
+        samples = [*ST001264_SAMPLES[:3], ("Sample1", "S1.mzML")]
+        manifest = self.unit(UNIT_SCOPED, members=members, samples=samples,
+                             contents={"x_S1.mzML": _numpress_mzml(), "mzML/x_S1.mzML": _numpress_mzml()})
+
+        record = manifest["unattributed_members"]
+        self.assertEqual((0, []), (record["count"], record["members"]))
+        self.assertEqual(
+            [("mzML/x_S1.mzML", "chosen_other_encoding", "x_S1.raw"),
+             ("x_S1.raw", "analysed_for_an_admitted_sample", None)],
+            [(item["path"], item["reason"], item.get("chosen")) for item in record["left_out"]],
+        )
+        self.assert_runs_as(manifest, "x_S1.raw", "Sample1", "S1.mzML", PREFIXED_MEMBER_PAIRING)
+        self.assert_every_member_says_why(manifest, members)
+
+    def test_of_an_mzml_in_two_folders_the_decodable_one_nearest_the_root_runs_as_the_sample(self) -> None:
+        # Probe q2f_lead_mixed, the root copy decodable: it is the row's, and runs as C1.
+        from test_mzml_encoding import _numpress_mzml
+
+        members = [*ST001264_MEMBERS[:3], self.VV_MZML, self.VV_COPY, self.VV_RAW]
+        samples = [*ST001264_SAMPLES[:3], self.VV_ROW]
+        manifest = self.unit(UNIT_SCOPED, members=members, samples=samples, contents={self.VV_COPY: _numpress_mzml()})
+
+        self.assert_runs_as(manifest, self.VV_MZML, "VV_13_HEpG2_C1", "VV_13_HEpG2_C1_pos.mzML",
+                            LEADING_IDENTIFIER_TOKEN_PAIRING)
+        record = manifest["unattributed_members"]
+        self.assertEqual(
+            [(self.VV_COPY, "chosen_other_encoding", self.VV_MZML, "undecodable_mzml_set_aside"),
+             (self.VV_RAW, "chosen_other_encoding", self.VV_MZML, "admitted_by_the_unit")],
+            [(item["path"], item["reason"], item["chosen"], item["chosen_by"]) for item in record["left_out"]],
+        )
+        self.assertNotIn("replaced_undecodable", record)
+        self.assert_every_member_says_why(manifest, members)
+
+    def test_of_an_mzml_in_two_folders_an_undecodable_root_copy_gives_way_to_the_order(self) -> None:
+        # Probe q2f_lead_mixed, the folder copy decodable: the root copy is the row's and cannot be decoded, so the
+        # readable twin the encoding order takes (the .raw, before an mzML) runs as C1 in its place.
+        from test_mzml_encoding import _numpress_mzml
+
+        members = [*ST001264_MEMBERS[:3], self.VV_MZML, self.VV_COPY, self.VV_RAW]
+        samples = [*ST001264_SAMPLES[:3], self.VV_ROW]
+        manifest = self.unit(UNIT_SCOPED, members=members, samples=samples, contents={self.VV_MZML: _numpress_mzml()})
+
+        self.assert_runs_as(manifest, self.VV_RAW, "VV_13_HEpG2_C1", "VV_13_HEpG2_C1_pos.mzML",
+                            LEADING_IDENTIFIER_TOKEN_PAIRING)
+        record = manifest["unattributed_members"]
+        self.assertEqual(
+            [(self.VV_COPY, "chosen_other_encoding", self.VV_RAW, "encoding_order"),
+             (self.VV_RAW, "analysed_for_an_admitted_sample", None, None)],
+            [(item["path"], item["reason"], item.get("chosen"), item.get("chosen_by")) for item in record["left_out"]],
+        )
+        self.assertEqual([(self.VV_MZML, self.VV_RAW)],
+                         [(item["path"], item["replaced_by_input"]) for item in record["replaced_undecodable"]])
+        self.assert_every_member_says_why(manifest, members)
+
+    def test_of_a_decodable_mzml_in_two_folders_the_one_nearest_the_root_runs_as_the_sample(self) -> None:
+        members = [*ST001264_MEMBERS[:3], self.VV_MZML, self.VV_COPY, self.VV_RAW]
+        samples = [*ST001264_SAMPLES[:3], self.VV_ROW]
+        manifest = self.unit(UNIT_SCOPED, members=members, samples=samples)
+
+        self.assert_runs_as(manifest, self.VV_MZML, "VV_13_HEpG2_C1", "VV_13_HEpG2_C1_pos.mzML",
+                            LEADING_IDENTIFIER_TOKEN_PAIRING)
+        record = manifest["unattributed_members"]
+        self.assertEqual(
+            [(self.VV_COPY, "chosen_other_encoding", self.VV_MZML, "admitted_by_the_unit"),
+             (self.VV_RAW, "chosen_other_encoding", self.VV_MZML, "admitted_by_the_unit")],
+            [(item["path"], item["reason"], item["chosen"], item["chosen_by"]) for item in record["left_out"]],
+        )
+        self.assertEqual(4, len(manifest["input_lineage"]["rows"]))
+        self.assert_every_member_says_why(manifest, members)
+
     def test_a_declared_unit_records_the_members_no_declaration_names(self) -> None:
         # R2-3 keeps them out "on record". At 4722776 a declared unit carried no unattributed_members at all, and the
         # archive's member listing was their only trace.
@@ -1962,6 +2144,48 @@ class ADeclaredNameIsPairedByItsLeadingIdentifier(_Workspace):
             [("x_s7_neg.mzml", "polarity_token_contradicts_ion_mode"), ("x_s7_neg.raw", "polarity_token_contradicts_ion_mode")],
             sorted((Path(item["member_name"]).name.casefold(), item["reason"]) for item in result["refused"]),
         )
+
+    def test_outside_a_campaign_an_mzxml_is_no_candidate_beside_another_encoding(self) -> None:
+        # Review of #69 at 3a4463b: nothing converts an mzXML outside a campaign, so the row's suffix may not pair it
+        # over a readable encoding of its sample; in a campaign it still does, and the convert stage analyses the
+        # readable one for it. A row naming no suffix (S7) takes the order's first either way, and an mzXML alone is
+        # paired as before.
+        members = ["VV_13_C1_exp344_pos.mzXML", "VV_13_C1_exp344_pos.mzML", "x_S7.mzXML", "x_S7.raw", "x_S9.mzXML"]
+        samples = [("c1", "VV_13_C1_pos.mzXML"), ("s7", "S7"), ("s9", "S9.mzXML")]
+        data_root = self.root / "raw" / "data"
+        project, _ = _st001264(members, samples)
+        extracted = {_file_key(str(data_root / name)): {"path": name} for name in members}
+
+        def paired(converts: bool) -> dict:
+            result = _member_name_pairings(project, extracted, data_root, converts=converts)
+            self.assertEqual([], result["refused"])
+            return {Path(key).name: item["declared_raw_file"] for key, item in result["paired"].items()}
+
+        self.assertEqual(
+            {"vv_13_c1_exp344_pos.mzml": "VV_13_C1_pos.mzXML", "x_s7.raw": "S7", "x_s9.mzxml": "S9.mzXML"},
+            paired(False),
+        )
+        self.assertEqual(
+            {"vv_13_c1_exp344_pos.mzxml": "VV_13_C1_pos.mzXML", "x_s7.raw": "S7", "x_s9.mzxml": "S9.mzXML"},
+            paired(True),
+        )
+
+    def test_copies_of_one_encoding_in_two_folders_are_one_candidate(self) -> None:
+        # Review of #69 at 3a4463b: VV_..._pos.mzML and mzML/VV_..._pos.mzML tied, and all three encodings were
+        # refused. The copy nearest the data root is the candidate, by the row's suffix or by the order alike.
+        data_root = self.root / "raw" / "data"
+        result = self.pairings(
+            ["VV_13_C1_exp344_pos.mzML", "mzML/VV_13_C1_exp344_pos.mzML", "VV_13_C1_exp344_pos.raw",
+             "x_S1.mzML", "mzML/x_S1.mzML", "x_S1.raw", "x_S7.mzML", "mzML/x_S7.mzML"],
+            [("c1", "VV_13_C1_pos.mzML"), ("s1", "S1.mzML"), ("s7", "S7")],
+        )
+
+        self.assertEqual(
+            {"vv_13_c1_exp344_pos.mzml": "VV_13_C1_pos.mzML", "x_s1.mzml": "S1.mzML", "x_s7.mzml": "S7"},
+            {os.path.relpath(key, _file_key(str(data_root))).replace("\\", "/"): item["declared_raw_file"]
+             for key, item in result["paired"].items()},
+        )
+        self.assertEqual([], result["refused"])
 
     def test_a_unit_whose_catalog_declared_its_inputs_is_never_paired_by_token(self) -> None:
         declared = [{"path": "VV_13_HEpG2_C1_pos.raw", "kind": "file", "sample_id": "VV_13_HEpG2_C1"}]
