@@ -23,7 +23,8 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     - `aif_multi_ce_run.energy_sets_differ` true and
       `aif_multi_ce_run.collision_energy_sets` (each distinct set and its file
       count), carried into the analysis-row record and the prepare preview;
-    - each input's own set in `aif_collision_energies_by_input`;
+    - each input's own set in `aif_collision_energies_by_input`, keyed by the
+      input's path relative to the unit's raw data root (below);
     - a project-evidence line, `aif_collision_energy_sets` in the MCP preflight
       reply, and one Materials and Methods sentence. Table S1 adds the sets and
       the per-file scope.
@@ -33,6 +34,59 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     or 0.5.35 is released by the operator's recheck with the #825 Console
     configured (preflight or `classify_preflight`), which decides it `run`.
   - The Agent API lists `campaign_multi_ce_aif_differing_energy_sets`.
+- `aif_collision_energies_by_input` is keyed by each input's path relative to
+  the unit's raw data root, never by its basename (the user's decision of
+  2026-10-08, second round, answer 2). Two inputs of one name in two folders
+  (`POS/QC_01.mzML` and `NEG/QC_01.mzML`) each keep their own set; keyed by
+  basename, the second overwrote the first.
+  - The key is the input's path relative to the manifest's `input_directory`
+    (its parent's for a split part), '/'-separated, as
+    `unattributed_members.paths` names a member. An mzML the convert stage
+    wrote beside the data root is `../converted/<its path>.mzML`. A manifest
+    that records no `input_directory` keys the path as the per-file record
+    gives it. Keys are compared without case.
+  - The disposition records the keying as
+    `aif_collision_energies_by_input_key` `path_relative_to_input_directory`,
+    and each key's basename in `aif_collision_energies_input_names`, for
+    display only.
+  - The execution gate looks each per-file record up by the same key
+    (`raw_metadata_preflight.aif_input_key`), and names a mismatched input by it.
+- Archive members a unit-scoped archive's undeclared unit leaves unpaired (the
+  user's decision of 2026-10-08, second round, answer 3; all on record in
+  `unattributed_members`):
+  - An unpaired mzXML is converted to mzML in a campaign's lease like any other
+    mzXML input, under the rule of 2026-09-30 that converts mzXML-only data.
+    `_select_conversion_sources` is given it, and the mzML written from it is
+    the unattributed input. Its lineage row is `kind` `converted`, with the
+    conversion as its source and the mzXML's basename as
+    `name_pairing.member_name`, so `members` and `paths` name the mzXML, and
+    `unattributed_members.converted` lists the members converted. Outside a
+    campaign nothing converts, and it stays left out as `requires_conversion`.
+  - Of one name in two encodings, the Catalog's encoding order takes one: a
+    vendor folder or container, then mzML, then mzXML. The other is left out as
+    `chosen_other_encoding`, with `chosen` (the path taken) and `chosen_by`
+    `encoding_order`. Members are one sample's where their names agree less
+    the container suffix and their folders agree once the words naming an
+    encoding are set aside, as the convert stage pairs an mzXML with its
+    readable twins (so `RAW/x.raw` and `mzML/x.mzML` are one sample's, and
+    `POS/x.raw` and `NEG/x.raw` two). Both used to be left out as
+    `two_encodings_of_one_name`, which now applies only where the order does
+    not tell them apart (two vendor containers of one name).
+  - Where the unit admitted an encoding of that sample itself (a sample row
+    names it, exactly or by a pairing rule), that one stays the sample's input.
+    The unpaired one is `chosen_other_encoding`, with `chosen_by`
+    `encoding_order`, or `admitted_by_the_unit` where the order would have
+    preferred the unpaired one. In a campaign, a readable member the convert
+    stage analyses instead of an admitted mzXML (it stands for that mzXML in
+    the lineage, as before) is listed as `analysed_for_an_admitted_sample`,
+    with `stands_for`, instead of as left out for its encoding.
+  - Opposite-polarity names stay left out
+    (`polarity_token_contradicts_ion_mode`), a shared archive still takes none,
+    and a unit whose Catalog declared its inputs still takes only those.
+  - `unattributed_members.count`, `members` and `paths` are read from the
+    lineage rows that say `unattributed_member`, so a converted member is
+    counted by the mzML that reached the inputs.
+  - The Agent API lists `repository_unattributed_mzxml_and_encoding_order`.
 
 ### Not changed
 - All inputs sharing exactly one energy run as SWATH.
@@ -47,9 +101,15 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   energies, and FAILs ACQ-1 otherwise. ACQ-1 blocks the run, and the campaign
   runner counts that block as a failure: after the retries the unit ends as
   failed and its raw data are deleted, with no MS-DIAL run.
-- So the campaign must not run 0.5.36 until the gate accepts per-file energy
-  sets that differ. Neither a recheck nor a fresh preflight with 0.5.36 is safe
-  before then, because either decides such a unit `run`.
+- Gate PR #37 accepts per-file energy sets that differ. It has to read
+  `aif_collision_energies_by_input` by the relative-path keys above, not by
+  basename. For an input directly in the data root the two are the same, but a
+  gate that looks up `POS/QC_01.mzML` by its basename `QC_01.mzML` finds no set,
+  and FAILs ACQ-1 the same way.
+- So gate #37, updated to read the relative-path keys, has to merge with or
+  before the 0.5.36 pin. The campaign must not run 0.5.36 before then: neither
+  a recheck nor a fresh preflight with 0.5.36 is safe, because either decides
+  such a unit `run`.
 
 ## [0.5.35] - Unreleased
 

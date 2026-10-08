@@ -32,7 +32,7 @@ import subprocess
 import time
 from collections import Counter
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping
 
 
@@ -594,7 +594,8 @@ def header_console_acquisition_type(method: str, isolation_targets: Any) -> tupl
 # multi-energy file beside a single-energy one) run as AIF with that Console as well, under the same
 # AIF_MULTI_CE_RULE, and it is recorded: the warning AIF_CE_SETS_DIFFER_RECORDED, aif_multi_ce_run's
 # energy_sets_differ and collision_energy_sets (each distinct set with its file count), and the disposition's
-# aif_collision_energies_by_input (each input's own set). Representative energies can then differ between files.
+# aif_collision_energies_by_input (each input's own set, keyed by its path under the data root: AIF_CE_BY_INPUT_KEY).
+# Representative energies can then differ between files.
 # Interactive 0.5.34-0.5.35 held such a unit instead (AIF_CE_DIFFERS_HOLD, kept only to read those records): a
 # unit held under it is released by deciding it again (a recheck), which now runs it. Without #825 such a unit is
 # held as before (AIF_MULTI_CE_HOLD).
@@ -611,6 +612,31 @@ AIF_CE_SETS_DIFFER_RECORDED = "aif_energy_sets_differ_between_inputs"
 AIF_MULTI_CE_BASIS = "aif_multi_ce_console_825"
 # The collision energies are compared to 0.1 eV.
 COLLISION_ENERGY_DECIMALS = 1
+# HOW aif_collision_energies_by_input NAMES AN INPUT (user decision, 2026-10-08, second round, answer 2). By its path
+# relative to the unit's raw data root (the manifest's input_directory, its parent's for a split part), '/'-separated,
+# as manifest.unattributed_members.paths names a member: two inputs of one basename in two folders (POS/QC_01.mzML,
+# NEG/QC_01.mzML) are two keys, each with its own set. An mzML the convert stage wrote beside the data root is
+# '../converted/<its path>.mzML'. A manifest that records no input_directory keys the path as its record gives it.
+# Keys are compared without case. aif_collision_energies_input_names gives each key's basename, for display only.
+AIF_CE_BY_INPUT_KEY = "path_relative_to_input_directory"
+
+
+def aif_input_key(path: str | Path, input_directory: str | Path | None) -> str:
+    """An input's key in aif_collision_energies_by_input: its path relative to the unit's data root (AIF_CE_BY_INPUT_KEY).
+
+    '/'-separated and case as given. Relative to ``input_directory`` where the path is absolute and the directory is
+    recorded (os.path.relpath, so a converted mzML beside the data root is '../converted/...'); otherwise the path as
+    given, '/'-separated. Never resolved: a store lease links its members in, and the link is the input.
+    """
+    text = str(path or "")
+    root = str(input_directory or "").strip()
+    if root and os.path.isabs(text) and os.path.isabs(root):
+        try:
+            return os.path.relpath(os.path.normpath(text), os.path.normpath(root)).replace("\\", "/")
+        except ValueError:
+            # Another drive: no relative path exists.
+            pass
+    return text.replace("\\", "/")
 
 
 def multi_energy_aif_ready(console: Mapping[str, Any] | None) -> bool:
@@ -1685,7 +1711,9 @@ def decide_disposition(
                 unrecorded.append(assignment["path"])
                 continue
             energies |= own
-            by_input[Path(str(assignment["path"])).name] = sorted(own)
+            # By its path under the data root, never its basename: two inputs of one name in two folders each keep
+            # their own set (AIF_CE_BY_INPUT_KEY).
+            by_input[aif_input_key(assignment["path"], manifest.get("input_directory"))] = sorted(own)
             recorded_sets.add(tuple(sorted(own)))
         listed = sorted(energies)
         differ = len(recorded_sets) > 1
@@ -1749,6 +1777,9 @@ def decide_disposition(
                     ],
                 )
                 extra["aif_collision_energies_by_input"] = dict(sorted(by_input.items()))
+                extra["aif_collision_energies_by_input_key"] = AIF_CE_BY_INPUT_KEY
+                # Each key's basename, for display only: two keys may share one.
+                extra["aif_collision_energies_input_names"] = {key: PurePosixPath(key).name for key in sorted(by_input)}
                 parts = []
                 for values in sorted(sets):
                     names = sorted(name for name, own in by_input.items() if tuple(own) == values)

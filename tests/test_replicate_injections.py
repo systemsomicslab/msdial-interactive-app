@@ -67,6 +67,7 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
 from test_folder_inputs import _Client, _exclude, _hand_made_unit, _no_backend
 from test_split_key import _Unit, _extractor
 from test_mzml_encoding import dda_spectra, mzml
+from test_raw_metadata_preflight import _APPROVAL
 
 # The default reserve is 20 GB of free space; these trees are a few kilobytes.
 LIMITS = ExtractionLimits(reserve_bytes=0)
@@ -485,9 +486,12 @@ def _zip(entries: dict[str, bytes]) -> bytes:
 PREFIX = "021518_387057_CSHp_"
 
 
-def _st001264(members: list[str], samples: list[tuple[str, str]]) -> tuple[RepositoryProject, dict[str, bytes]]:
-    """A Workbench unit whose one listed file is the study archive, and whose rows name the raw files."""
-    data = _zip({name: f"thermo raw bytes of {name}".encode() for name in members})
+def _st001264(
+    members: list[str], samples: list[tuple[str, str]], contents: dict[str, bytes] | None = None
+) -> tuple[RepositoryProject, dict[str, bytes]]:
+    """A Workbench unit whose one listed file is the study archive, and whose rows name the raw files. ``contents``
+    gives a member bytes of its own (a real mzXML for the convert stage); every other holds a line of text."""
+    data = _zip({name: (contents or {}).get(name) or f"thermo raw bytes of {name}".encode() for name in members})
     url = "https://example.org/studydownload/ST001264_POSITIVE.zip"
     project = RepositoryProject(
         repository="metabolomics_workbench", accession="ST001264", analysis_unit_id="341429fe120ee3ee9a77",
@@ -653,10 +657,19 @@ ABSTENTION = {
 
 
 class TheMembersNoRowPairsWithAreUnattributedInputs(_Workspace):
-    def unit(self, scope: dict, members: list[str] = ST001264_MEMBERS, samples=ST001264_SAMPLES) -> dict:
-        project, payloads = _st001264(members, samples)
+    def unit(
+        self, scope: dict, members: list[str] = ST001264_MEMBERS, samples=ST001264_SAMPLES, *,
+        contents: dict[str, bytes] | None = None, campaign: bool = False,
+    ) -> dict:
+        project, payloads = _st001264(members, samples, contents)
         project.download_scope = dict(scope)
-        return self.lease(project, payloads)
+        if not campaign:
+            return self.lease(project, payloads)
+        # A campaign's lease, whose convert stage converts the unit's mzXML (2026-09-30).
+        lease = create_download_lease(
+            project, self.root, 10_000_000, client=_Client(payloads), campaign_authorization=dict(_APPROVAL)
+        )
+        return read_manifest(lease["manifest_path"])
 
     def test_a_unit_scoped_archive_takes_every_member_and_records_the_unattributed_ones(self) -> None:
         from msdial_app.raw_metadata_preflight import decide_disposition
@@ -746,26 +759,118 @@ class TheMembersNoRowPairsWithAreUnattributedInputs(_Workspace):
         self.assertEqual([INFERRED_PAIRING_WARNING], manifest["warnings"])
 
     def test_an_other_polarity_member_and_an_mzxml_are_left_out_on_record(self) -> None:
+        # Outside a campaign nothing converts, so an unpaired mzXML stays out (requires_conversion). Of one name in
+        # two encodings the encoding order takes one (2026-10-08, second round, answer 3): y_S6.raw over y_S6.mzML,
+        # and an admitted BioRec1 .raw over its unpaired .mzML. Two vendor encodings of one name tie, and both stay
+        # out as before.
         members = [
             *ST001264_MEMBERS[:3], "x_S9_neg.raw", "x_S8.mzXML", "x_S7.raw", "y_S6.raw", "y_S6.mzML",
-            f"{PREFIX}BioRec1.mzML",
+            f"{PREFIX}BioRec1.mzML", "z_S5.raw", "z_S5.d/analysis.baf",
         ]
         manifest = self.unit(UNIT_SCOPED, members=members)
 
         self.assertEqual(
-            sorted([*ST001264_MEMBERS[:3], "x_S7.raw"]), sorted(Path(item).name for item in manifest["input_candidates"])
+            sorted([*ST001264_MEMBERS[:3], "x_S7.raw", "y_S6.raw"]),
+            sorted(Path(item).name for item in manifest["input_candidates"]),
         )
         record = manifest["unattributed_members"]
-        self.assertEqual(["x_S7.raw"], record["members"])
+        self.assertEqual(["x_S7.raw", "y_S6.raw"], record["members"])
         self.assertEqual(
-            [(f"{PREFIX}BioRec1.mzML", "two_encodings_of_one_name"), ("x_S8.mzXML", "requires_conversion"),
-             ("x_S9_neg.raw", "polarity_token_contradicts_ion_mode"), ("y_S6.mzML", "two_encodings_of_one_name"),
-             ("y_S6.raw", "two_encodings_of_one_name")],
+            [(f"{PREFIX}BioRec1.mzML", "chosen_other_encoding"), ("x_S8.mzXML", "requires_conversion"),
+             ("x_S9_neg.raw", "polarity_token_contradicts_ion_mode"), ("y_S6.mzML", "chosen_other_encoding"),
+             ("z_S5.d", "two_encodings_of_one_name"), ("z_S5.raw", "two_encodings_of_one_name")],
             [(item["member_name"], item["reason"]) for item in record["left_out"]],
         )
-        self.assertEqual(5, record["left_out_count"])
+        chosen = {item["member_name"]: (item.get("chosen"), item.get("chosen_by")) for item in record["left_out"]}
+        self.assertEqual((f"{PREFIX}BioRec1.raw", "encoding_order"), chosen[f"{PREFIX}BioRec1.mzML"])
+        self.assertEqual(("y_S6.raw", "encoding_order"), chosen["y_S6.mzML"])
+        self.assertEqual((None, None), chosen["z_S5.raw"])
+        self.assertEqual(6, record["left_out_count"])
         self.assertEqual(
             [item["member_name"] for item in record["left_out"]], [item["path"] for item in record["left_out"]]
+        )
+
+    def test_one_name_in_two_encoding_folders_is_one_sample_and_the_order_takes_one(self) -> None:
+        # RAW/ and mzML/ name encodings, not places (_sample_locus): the .raw is taken, the mzML left out for it.
+        # POS/ and NEG/ are places: two samples of one name, each taken.
+        members = [*ST001264_MEMBERS[:3], "RAW/q_S4.raw", "mzML/q_S4.mzML", "A/r_S3.raw", "B/r_S3.raw"]
+        record = self.unit(UNIT_SCOPED, members=members)["unattributed_members"]
+
+        self.assertEqual(["A/r_S3.raw", "B/r_S3.raw", "RAW/q_S4.raw"], record["paths"])
+        self.assertEqual(
+            [("mzML/q_S4.mzML", "chosen_other_encoding", "RAW/q_S4.raw", "encoding_order")],
+            [(item["path"], item["reason"], item["chosen"], item["chosen_by"]) for item in record["left_out"]],
+        )
+
+    def test_a_campaign_converts_an_unpaired_mzxml_and_takes_it_unattributed_on_record(self) -> None:
+        from test_mzxml_conversion import dda_32
+
+        members = [*ST001264_MEMBERS[:3], "x_S8.mzXML", "x_S9_neg.mzXML", "y_S6.raw", "mzXML/y_S6.mzXML"]
+        contents = {name: dda_32() for name in members if name.endswith(".mzXML")}
+        manifest = self.unit(UNIT_SCOPED, members=members, contents=contents, campaign=True)
+
+        record = manifest["unattributed_members"]
+        self.assertEqual((2, ["x_S8.mzXML", "y_S6.raw"], ["x_S8.mzXML", "y_S6.raw"]),
+                         (record["count"], record["members"], record["paths"]))
+        self.assertEqual(["x_S8.mzXML"], record["converted"])
+        self.assertEqual(
+            [("mzXML/y_S6.mzXML", "chosen_other_encoding", "y_S6.raw"),
+             ("x_S9_neg.mzXML", "polarity_token_contradicts_ion_mode", None)],
+            [(item["path"], item["reason"], item.get("chosen")) for item in record["left_out"]],
+        )
+        # The mzML the convert stage wrote is the input; its lineage row carries the conversion and names the mzXML.
+        rows = {Path(row["path"]).name: row for row in manifest["input_lineage"]["rows"]}
+        converted = rows["x_S8.mzML"]
+        self.assertEqual("converted", converted["kind"])
+        self.assertEqual({"paired_by": "unattributed_member", "member_name": "x_S8.mzXML"}, converted["name_pairing"])
+        self.assertEqual(("x_S8", None), (converted["sample_id"], converted["sample_row"]))
+        self.assertIn("conversion", converted["source"])
+        self.assertEqual(
+            ["x_S8.mzXML"],
+            [item["source"]["relative_path"] for item in manifest["input_conversions"]["records"]
+             if item.get("status") == "converted"],
+        )
+        self.assertEqual(
+            sorted([*ST001264_MEMBERS[:3], "x_S8.mzML", "y_S6.raw"]),
+            sorted(Path(item).name for item in manifest["input_candidates"]),
+        )
+        self.assertIn("unattributed_members_included", manifest["warnings"])
+        # The CSV gives it no sample row, as any unattributed input.
+        built = build_repository_analysis_rows(manifest)
+        self.assertEqual([], built["failures"])
+        row = next(item for item in built["rows"] if Path(item["input_path"]).name == "x_S8.mzML")
+        self.assertEqual(("Unattributed", "unattributed_member"), (row["class_id"], row["raw_file_paired_by"]))
+
+    def test_a_campaign_converts_no_unpaired_mzxml_of_a_shared_archive(self) -> None:
+        from test_mzxml_conversion import dda_32
+
+        members = [*ST001264_MEMBERS[:3], "x_S8.mzXML"]
+        manifest = self.unit(SHARED, members=members, contents={"x_S8.mzXML": dda_32()}, campaign=True)
+
+        record = manifest["unattributed_members"]
+        self.assertEqual((False, 0), (record["applied"], record["count"]))
+        self.assertEqual([("x_S8.mzXML", "shared_archive")], [(item["path"], item["reason"]) for item in record["left_out"]])
+        self.assertNotIn("input_conversions", manifest)
+        self.assertEqual(sorted(ST001264_MEMBERS[:3]), sorted(Path(item).name for item in manifest["input_candidates"]))
+
+    def test_a_vendor_twin_of_an_admitted_mzxml_is_analysed_for_its_sample_in_a_campaign(self) -> None:
+        from test_mzxml_conversion import dda_32
+
+        members = [*ST001264_MEMBERS[:3], "S1.mzXML", "S1.raw"]
+        samples = [*ST001264_SAMPLES[:3], ("Sample1", "S1.mzXML")]
+        manifest = self.unit(UNIT_SCOPED, members=members, samples=samples, contents={"S1.mzXML": dda_32()},
+                             campaign=True)
+
+        # The convert stage analyses the .raw instead of the sample's mzXML: the sample's input, not unattributed.
+        self.assertIn("S1.raw", [Path(item).name for item in manifest["input_candidates"]])
+        rows = {Path(row["path"]).name: row for row in manifest["input_lineage"]["rows"]}
+        self.assertEqual("Sample1", rows["S1.raw"]["sample_id"])
+        self.assertNotIn("name_pairing", rows["S1.raw"])
+        record = manifest["unattributed_members"]
+        self.assertEqual((0, []), (record["count"], record["members"]))
+        self.assertEqual(
+            [("S1.raw", "analysed_for_an_admitted_sample", "S1.mzXML")],
+            [(item["path"], item["reason"], item["stands_for"]) for item in record["left_out"]],
         )
 
     def test_a_nested_archive_names_its_members_by_basename_as_the_lineage_does(self) -> None:

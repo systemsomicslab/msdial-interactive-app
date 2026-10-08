@@ -156,11 +156,33 @@ the warning for its own members only). A shared archive (`shared_unit_count`
 above 1 for any bundle URL) takes none: `unattributed_members` then says
 `applied` false with its `reason` (`shared_archive`, or
 `download_scope_not_unit_scoped` where the scope says nothing) and lists the
-members as `left_out`. Left out on record too: an mzXML member
-(`requires_conversion`), a member whose path names the other polarity by a token
-of its own (`polarity_token_contradicts_ion_mode`), and a member whose name
-another member carries in another encoding, admitted or not
-(`two_encodings_of_one_name`).
+members as `left_out`. Left out on record too: a member whose path names the
+other polarity by a token of its own (`polarity_token_contradicts_ion_mode`).
+A unit whose Catalog declared its inputs takes none: its inputs are the declared
+ones.
+
+Since 0.5.36 (the user's decision of 2026-10-08, second round, answer 3):
+
+- An unpaired mzXML member is converted to mzML in a campaign's lease, like any
+  other mzXML input (the rule of 2026-09-30 converts mzXML-only data), and the
+  mzML is the unattributed input. Its lineage row is `kind` `converted` with the
+  conversion as its source, and its `name_pairing.member_name` is the mzXML's
+  basename, so `members` and `paths` name the mzXML; `unattributed_members.converted`
+  lists the members converted. Outside a campaign nothing converts, and it stays
+  left out as `requires_conversion`.
+- Of one name in two encodings (one name less its container suffix, in folders
+  that agree once the words naming an encoding are set aside, as the convert
+  stage pairs an mzXML with its readable twins), the Catalog's encoding order
+  takes one: a vendor folder or container, then mzML, then mzXML. Each other is
+  left out as `chosen_other_encoding`, with `chosen` (the path taken) and
+  `chosen_by` `encoding_order`. Where the unit admitted an encoding of that
+  sample itself, that one stays the sample's input and an unpaired one is
+  `chosen_other_encoding` with `chosen_by` `encoding_order` or, where the order
+  would have preferred the unpaired one, `admitted_by_the_unit`; in a campaign,
+  a readable member the convert stage analyses instead of an admitted mzXML is
+  listed as `analysed_for_an_admitted_sample` with `stands_for`. Two encodings
+  the order does not tell apart (two vendor containers of one name) are both
+  left out as `two_encodings_of_one_name`, as before.
 
 Agent-driven reanalysis also requires a user-reviewed `analysis_purpose` before
 download. That purpose anchors Class/contrast selection, annotation strategy,
@@ -619,7 +641,15 @@ as AIF with #825 as well (0.5.36; the user's decision of 2026-10-08, "run as
 is"), on record: the warning `aif_energy_sets_differ_between_inputs`,
 `aif_multi_ce_run`'s `energy_sets_differ` true and `collision_energy_sets` (each
 distinct set with its file count), and each input's own set in the disposition's
-`aif_collision_energies_by_input`. The project evidence, the MCP preflight reply
+`aif_collision_energies_by_input`. That map is keyed by each input's path relative
+to the unit's raw data root (the manifest's `input_directory`), `/`-separated, as
+`unattributed_members.paths` names a member, never by its basename: two inputs of
+one name in two folders (`POS/QC_01.mzML`, `NEG/QC_01.mzML`) each keep their own
+set (the user's decision of 2026-10-08, second round). An mzML the convert stage
+wrote beside the data root is `../converted/<its path>.mzML`. Keys are compared
+without case; `aif_collision_energies_by_input_key` names the keying
+(`path_relative_to_input_directory`) and `aif_collision_energies_input_names`
+gives each key's basename for display only. The project evidence, the MCP preflight reply
 (`aif_collision_energy_sets`), the analysis-row record and the Materials and
 Methods text say that the sets differ and that representative energies can
 therefore differ between files. Interactive 0.5.34 and 0.5.35 held such a unit

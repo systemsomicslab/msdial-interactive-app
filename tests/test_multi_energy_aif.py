@@ -17,18 +17,22 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from subprocess import CompletedProcess
+
 from test_raw_metadata_preflight import _APPROVAL, _Extractor, _PinnedExtractor, _Scratch, _header, _manifest, _unit
 
 from msdial_app import workflow
 from msdial_app.materials_methods import _methods_text, multi_energy_aif_evidence, supplementary_rows
 from msdial_app.raw_metadata_preflight import (
     AIF_AS_SWATH_RULE,
+    AIF_CE_BY_INPUT_KEY,
     AIF_CE_DIFFERS_HOLD,
     AIF_CE_SETS_DIFFER_RECORDED,
     AIF_CE_UNRECORDED_HOLD,
     AIF_MULTI_CE_BASIS,
     AIF_MULTI_CE_HOLD,
     AIF_MULTI_CE_RULE,
+    aif_input_key,
     decide_disposition,
     multi_energy_aif_ready,
 )
@@ -659,6 +663,122 @@ class CampaignTests(_NoConfiguredConsole):
         self.assertEqual(["AIF", "AIF"], [row["acquisition_type"] for row in built["rows"]])
         self.assertTrue(built["aif_multi_ce_run"]["energy_sets_differ"])
         self.assertEqual(2, len(built["aif_multi_ce_run"]["collision_energy_sets"]))
+
+
+
+# ---- inputs of one name in two folders (user decision, 2026-10-08, second round, answer 2) ------------------
+
+
+class _ByFolderExtractor(_Extractor):
+    """_Extractor whose verdicts are keyed by an input's folder and name ('POS/QC_01.mzML'), so two inputs of one
+    basename in two folders can record different energies."""
+
+    def __call__(self, command, **kwargs):
+        self.commands.append(list(command))
+        inputs = [command[index + 1] for index, token in enumerate(command) if token == "--input"]
+        output = Path(command[command.index("--output") + 1])
+        records = [_header(path, **self.verdicts.get("/".join(Path(path).parts[-2:]), {})) for path in inputs]
+        output.write_text(json.dumps(records[0] if len(records) == 1 else records), encoding="utf-8")
+        return CompletedProcess(command, 0, stdout=str(output), stderr="")
+
+
+class InputsOfOneNameInTwoFoldersTests(_NoConfiguredConsole):
+    """Each input's energy set is keyed by its path under the data root, never its basename: POS/QC_01.mzML and
+    NEG/QC_01.mzML keep a set each (aif_collision_energies_by_input, AIF_CE_BY_INPUT_KEY)."""
+
+    DATA = Path("C:/workspace/MTBLS-X/raw/data") if os.name == "nt" else Path("/workspace/MTBLS-X/raw/data")
+
+    def decide(self, energies: dict[str, list[float]]) -> dict:
+        manifest = _manifest([_header(str(self.DATA / name), "AIF", targets=[], energies=values)
+                              for name, values in energies.items()])
+        manifest["input_directory"] = str(self.DATA)
+        return decide_disposition(manifest, multi_energy_aif_console=multi_energy_aif_console(self.with_825))
+
+    def test_the_key_is_the_path_under_the_data_root(self) -> None:
+        self.assertEqual("POS/QC_01.mzML", aif_input_key(self.DATA / "POS" / "QC_01.mzML", self.DATA))
+        self.assertEqual("../converted/POS/QC_01.mzML",
+                         aif_input_key(self.DATA.parent / "converted" / "POS" / "QC_01.mzML", self.DATA))
+        # No data root recorded: the path as the record gives it.
+        self.assertEqual("POS/QC_01.mzML", aif_input_key("POS\\QC_01.mzML", None))
+        self.assertEqual("a.mzML", aif_input_key("a.mzML", self.DATA))
+
+    def test_differing_sets_of_one_basename_run_as_aif_each_on_record(self) -> None:
+        ran = self.decide({"POS/QC_01.mzML": [10.0, 20.0], "NEG/QC_01.mzML": [40.0]})
+
+        self.assertEqual(("run", "AIF", []), (ran["disposition"], ran["console_acquisition_type"], ran["reasons"]))
+        self.assertIn(AIF_CE_SETS_DIFFER_RECORDED, ran["warnings"])
+        self.assertEqual({"NEG/QC_01.mzML": [40.0], "POS/QC_01.mzML": [10.0, 20.0]},
+                         ran["aif_collision_energies_by_input"])
+        self.assertEqual(AIF_CE_BY_INPUT_KEY, ran["aif_collision_energies_by_input_key"])
+        self.assertEqual({"NEG/QC_01.mzML": "QC_01.mzML", "POS/QC_01.mzML": "QC_01.mzML"},
+                         ran["aif_collision_energies_input_names"])
+        self.assertEqual(
+            [{"collision_energies": [10.0, 20.0], "file_count": 1}, {"collision_energies": [40.0], "file_count": 1}],
+            ran["aif_multi_ce_run"]["collision_energy_sets"],
+        )
+        self.assertEqual(2, len(ran["assignments"]))
+
+    def test_identical_sets_of_one_basename_run_as_aif_with_nothing_per_input(self) -> None:
+        ran = self.decide({"POS/QC_01.mzML": [10.0, 20.0], "NEG/QC_01.mzML": [20.0, 10.0]})
+
+        self.assertEqual(("run", "AIF"), (ran["disposition"], ran["console_acquisition_type"]))
+        self.assertEqual({"collision_energies": [10.0, 20.0], "rule": AIF_MULTI_CE_RULE}, ran["aif_multi_ce_run"])
+        self.assertNotIn("aif_collision_energies_by_input", ran)
+        self.assertNotIn(AIF_CE_SETS_DIFFER_RECORDED, ran["warnings"])
+
+    def test_one_of_them_unrecorded_holds_the_unit(self) -> None:
+        held = self.decide({"POS/QC_01.mzML": [10.0, 20.0], "NEG/QC_01.mzML": []})
+
+        self.assertEqual(("skip", [AIF_CE_UNRECORDED_HOLD], True), (held["disposition"], held["reasons"], held["hold"]))
+        self.assertEqual({}, held["assignments"])
+        self.assertNotIn("aif_collision_energies_by_input", held)
+
+    def test_a_campaign_unit_runs_and_the_gate_holds_each_input_to_its_own_set(self) -> None:
+        verdicts = {"POS/QC_01.mzML": {"method": "AIF", "targets": [], "energies": [10.0, 20.0]},
+                    "NEG/QC_01.mzML": {"method": "AIF", "targets": [], "energies": [40.0]}}
+        for folder in ("POS", "NEG"):
+            (self.root / "unit" / "raw" / "data" / folder).mkdir(parents=True)
+        manifest, _stub, files = _unit(
+            self.root / "unit", list(verdicts), acquisition="AIF",
+            extra={"campaign_authorizations": [dict(_APPROVAL)]},
+        )
+        extractor = _PinnedExtractor.make(self.root / "build")
+        self.preflight(manifest, extractor, _ByFolderExtractor(verdicts), console_path=self.with_825)
+
+        recorded = read_manifest(manifest)
+        disposition = recorded["campaign_disposition"]
+        self.assertEqual(("run", True, "AIF"), (disposition["disposition"], disposition["applied"],
+                                                disposition["console_acquisition_type"]))
+        self.assertEqual({"NEG/QC_01.mzML": [40.0], "POS/QC_01.mzML": [10.0, 20.0]},
+                         disposition["aif_collision_energies_by_input"])
+
+        def gate() -> dict:
+            return evaluate_repository_execution_gate(
+                {
+                    "repository_run_manifest": str(manifest),
+                    "output_root": str(manifest.parent.parent / "output"),
+                    "ion_mode": "Negative",
+                    "console_path": str(self.with_825),
+                    "files": [{"file_path": str(path), "acquisition_type": "AIF"} for path in files],
+                }
+            )
+
+        allowed = gate()
+        self.assertTrue(allowed["allowed"], allowed["blockers"])
+
+        # NEG/QC_01.mzML recording the set of POS/QC_01.mzML is refused: the basename alone does not answer.
+        def neg_takes_pos_set(current: dict) -> None:
+            for entry in current["raw_metadata_preflight"]["summary"]["per_file"]:
+                if Path(entry["file"]).parent.name == "NEG":
+                    entry["ms2_collision_energies"] = [10.0, 20.0]
+
+        update_manifest(manifest, neg_takes_pos_set)
+        refused = gate()
+        self.assertFalse(refused["allowed"])
+        self.assertTrue(
+            any("1 input files record other energies; the first is NEG/QC_01.mzML" in item for item in refused["blockers"]),
+            refused["blockers"],
+        )
 
 
 if __name__ == "__main__":

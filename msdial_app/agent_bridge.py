@@ -150,8 +150,10 @@ def summarize_jobs(
             # Multi-energy AIF whose inputs record different energy sets (0.5.36, user decision 2026-10-08, "run as
             # is"): with #825 the unit runs as AIF, each file with its own per-file representative collision energy,
             # on record (warning aif_energy_sets_differ_between_inputs; aif_multi_ce_run.energy_sets_differ and
-            # collision_energy_sets; aif_collision_energies_by_input). 0.5.34-0.5.35 held it as
-            # aif_collision_energies_differ_between_inputs; a recheck with a #825 Console releases such a unit.
+            # collision_energy_sets; aif_collision_energies_by_input, keyed by each input's path relative to the
+            # data root, never its basename: aif_collision_energies_by_input_key path_relative_to_input_directory).
+            # 0.5.34-0.5.35 held it as aif_collision_energies_differ_between_inputs; a recheck with a #825 Console
+            # releases such a unit.
             "campaign_multi_ce_aif_differing_energy_sets",
             # An undeclared unit whose download is its own alone (unit_files, or every bundle URL with
             # shared_unit_count 1) takes the archive members no sample row pairs with as unattributed inputs
@@ -159,6 +161,10 @@ def summarize_jobs(
             # unattributed_members_included); a shared archive takes none and says why. The record's members are
             # basenames, as the lineage's member_name is, and its paths the members' paths under the data root.
             "repository_unattributed_archive_members",
+            # Since 0.5.36 (2026-10-08, second round): a campaign's lease converts an unpaired mzXML member and takes
+            # the mzML unattributed (unattributed_members.converted), and of one name in two encodings the encoding
+            # order takes one, the other left out as chosen_other_encoding (chosen, chosen_by).
+            "repository_unattributed_mzxml_and_encoding_order",
             # A unit or split part its disposition holds is never discarded, approved or confirmed, unless the
             # discard passes release_disposition_hold=true (the operator's skip), which records
             # disposition_hold_released_by "operator_skip"; a held part keeps its parent's raw data until then.
