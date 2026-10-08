@@ -121,9 +121,33 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     parent and its lineage row do, and lists it in `converted`. It used to
     name it by the converted mzML's lower-cased name, so PAIR-1 FAILed (record
     only).
+  - Where the unit admitted a sample as an mzXML and the lease converts
+    nothing (no campaign), a readable unpaired twin of it is left out as
+    `admitted_mzxml_not_converted`, with `twin_of` the mzXML and
+    `twin_of_reason` `requires_conversion`. It used to be
+    `chosen_other_encoding` with `chosen` the mzXML, which does not run there,
+    so the record named as chosen an input that never ran. `chosen` now only
+    ever names an input that runs for the sample. The twin still does not run:
+    whether it should run for its sample outside a campaign is an open question
+    for the user (the readable-twin answer below names an undecodable mzML).
   - The Agent API lists `repository_unattributed_mzxml_and_encoding_order`
-    and, for the two items below, `repository_undecodable_mzml_readable_twin`
-    and `repository_members_no_declaration_names`.
+    and, for the items below, `repository_undecodable_mzml_readable_twin`,
+    `repository_members_no_declaration_names` and
+    `repository_one_sample_encodings_pair_as_one`.
+- Two encodings of one sample are one candidate for the inferred name pairings
+  (prefixed name and leading identifier), not two. Of
+  `VV_13_HEpG2_C1_exp344_pos.mzML` and its `.raw`, the member whose container
+  suffix the declared name carries is paired (`VV_13_HEpG2_C1_pos.mzML`: the
+  mzML); where the declared name carries none of theirs (a row naming `S7`),
+  the encoding order takes one. The other encoding is that sample's, and
+  `unattributed_members.left_out` records it with what was chosen over it.
+  Where the chosen one cannot be decoded, the twin runs for the sample (below).
+  Where the order ties (two vendor containers of one name) neither is paired,
+  and where the chosen one's polarity is refused, every encoding of the sample
+  is refused with it. At `06d2891` the twin made both refused
+  (`leading_identifier_not_unique`, `not_one_to_one`), so the sample's data ran
+  as an unattributed member, in the Class `Unattributed`, and the row had no
+  input, decodable or not.
 - Where the unit's own mzML of a sample cannot be decoded and an unpaired twin
   of that sample can be read, the twin runs as that sample's own input, paired
   to its sample row and in its Class (the user's answer of 2026-10-08 to the
@@ -159,6 +183,14 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     `taken_instead_of_undecodable` still listed it. That list is gone.
   - Outside a campaign nothing converts. An mzXML twin stays left out
     (`requires_conversion`), and the sample has no input.
+  - Where the unit admitted the sample's mzML twice (`S1.mzML` and
+    `mzML/S1.mzML`, both undecodable), the twin stands for the one nearest the
+    data root and replaces both: its lineage row names the other in
+    `replaces_undecodable.other_paths`, both excluded rows and
+    `excluded_input_candidates` entries carry `replaced_by`, and both
+    `replaced_undecodable` entries carry `replaced_by_input`. At `06d2891` it
+    stood for the first by path only, and the other entry said both
+    `replaced_by` and `replacement_excluded` `not_an_input`.
 - A unit whose Catalog declared its inputs now records the archive members no
   declaration names (2026-10-08, second round, answer 3: left out "on record").
   `unattributed_members` says `applied` false, `reason`
@@ -168,6 +200,13 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   listed, and only those no declaration names that reached nothing of the
   lease. Before, the unit carried no `unattributed_members`, and the archive's
   member listing was their only trace.
+  - A left-out member that is an encoding of a declared mzML the lease excluded
+    as undecodable adds `twin_of` (that mzML's path under the data root) and
+    `twin_of_reason` `undecodable_mzml`. It is not run. The readable-twin answer
+    names a sample's admitted mzML, and the second round's answer 3 keeps out
+    the members a declaration does not name; which of the two governs a
+    declared unit is an open question for the user, and until it is answered
+    the declaration holds, as before.
 
 ### Not changed
 - All inputs sharing exactly one energy run as SWATH.

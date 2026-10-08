@@ -1268,6 +1268,197 @@ class TheMembersNoRowPairsWithAreUnattributedInputs(_Workspace):
         self.assertNotIn("excluded_input_candidates", manifest)
         self.assert_every_member_says_why(manifest, members)
 
+    # ---- Review of #69 at 06d2891 ------------------------------------------------------------------------------------
+
+    VV_ROW = ("VV_13_HEpG2_C1", "VV_13_HEpG2_C1_pos.mzML")
+    VV_MZML = "VV_13_HEpG2_C1_exp344_pos.mzML"
+    VV_RAW = "VV_13_HEpG2_C1_exp344_pos.raw"
+
+    def test_a_twin_of_a_member_paired_by_its_leading_identifier_runs_as_that_sample(self) -> None:
+        # Probe Q1 (high): the twin's existence made the token rule refuse both members (leading_identifier_not_unique),
+        # so the .raw ran unattributed, in the Class Unattributed, and the row's sample had no input. Two encodings
+        # of one sample are one candidate: the mzML the row names is paired, and its readable twin runs for it.
+        from test_mzml_encoding import _numpress_mzml
+
+        members = [*ST001264_MEMBERS[:3], self.VV_MZML, self.VV_RAW]
+        samples = [*ST001264_SAMPLES[:3], self.VV_ROW]
+        manifest = self.unit(UNIT_SCOPED, members=members, samples=samples, contents={self.VV_MZML: _numpress_mzml()})
+
+        record = manifest["unattributed_members"]
+        self.assertEqual((0, [], []), (record["count"], record["members"], record["paths"]))
+        self.assertEqual(
+            [(self.VV_RAW, "analysed_for_an_admitted_sample", self.VV_MZML, "undecodable_mzml")],
+            [(item["path"], item["reason"], item["stands_for"], item["stands_for_reason"]) for item in record["left_out"]],
+        )
+        self.assertEqual([(self.VV_MZML, self.VV_RAW)],
+                         [(item["path"], item["replaced_by_input"]) for item in record["replaced_undecodable"]])
+        rows = {Path(row["path"]).name: row for row in manifest["input_lineage"]["rows"]}
+        twin = rows[self.VV_RAW]
+        self.assertEqual(
+            ("VV_13_HEpG2_C1", "VV_13_HEpG2_C1_pos.mzML", LEADING_IDENTIFIER_TOKEN_PAIRING),
+            (twin["sample_id"], twin["name_pairing"]["declared_raw_file"], twin["name_pairing"]["paired_by"]),
+        )
+        self.assertEqual(self.VV_MZML, Path(twin["replaces_undecodable"]["path"]).name)
+        attribute = next(entry for entry in manifest["lease_stages"] if entry["stage"] == "attribute")
+        self.assertNotIn("refused_name_pairings", attribute)
+        self.assertNotIn("unattributed_members_included", manifest.get("warnings") or [])
+        self.assert_the_gate_reads_the_record_as_the_lineage(manifest)
+        self.assert_every_member_says_why(manifest, members)
+        built = build_repository_analysis_rows(manifest)
+        self.assertEqual([], built["failures"])
+        row = next(item for item in built["rows"] if Path(item["input_path"]).name == self.VV_RAW)
+        self.assertEqual(("VV_13_HEpG2_C1", 3), (row["sample_id"], row["sample_row_index"]))
+        self.assertNotIn("VV_13_HEpG2_C1", built.get("samples_without_input") or [])
+        self.assertEqual([], built.get("unattributed_inputs") or [])
+
+    def test_a_decodable_member_paired_by_its_leading_identifier_keeps_its_sample_beside_a_twin(self) -> None:
+        # Probe Q2: the same with a decodable mzML. It is the sample's input, as without the twin, and the .raw is
+        # its other encoding, which the row's own name chose over.
+        members = [*ST001264_MEMBERS[:3], self.VV_MZML, self.VV_RAW]
+        samples = [*ST001264_SAMPLES[:3], self.VV_ROW]
+        manifest = self.unit(UNIT_SCOPED, members=members, samples=samples)
+
+        record = manifest["unattributed_members"]
+        self.assertEqual(
+            [(self.VV_RAW, "chosen_other_encoding", self.VV_MZML, "admitted_by_the_unit")],
+            [(item["path"], item["reason"], item["chosen"], item["chosen_by"]) for item in record["left_out"]],
+        )
+        rows = {Path(row["path"]).name: row for row in manifest["input_lineage"]["rows"]}
+        self.assertEqual(("VV_13_HEpG2_C1", LEADING_IDENTIFIER_TOKEN_PAIRING),
+                         (rows[self.VV_MZML]["sample_id"], rows[self.VV_MZML]["name_pairing"]["paired_by"]))
+        self.assertNotIn(self.VV_RAW, rows)
+        self.assert_every_member_says_why(manifest, members)
+
+    def test_a_row_without_an_extension_takes_the_encoding_the_order_takes(self) -> None:
+        # Probe Q4: a row naming S7, and PREFIX_S7.mzML (undecodable) beside PREFIX_S7.raw. Both were refused
+        # (not_one_to_one) and the .raw ran unattributed. The order takes the .raw for the row; the mzML is set aside.
+        from test_mzml_encoding import _numpress_mzml
+
+        members = [*ST001264_MEMBERS[:3], f"{PREFIX}S7.mzML", f"{PREFIX}S7.raw"]
+        samples = [*ST001264_SAMPLES[:3], ("Sample7", "S7")]
+        manifest = self.unit(
+            UNIT_SCOPED, members=members, samples=samples, contents={f"{PREFIX}S7.mzML": _numpress_mzml()}
+        )
+
+        record = manifest["unattributed_members"]
+        self.assertEqual((0, []), (record["count"], record["members"]))
+        self.assertEqual(
+            [(f"{PREFIX}S7.mzML", "chosen_other_encoding", f"{PREFIX}S7.raw", "undecodable_mzml_set_aside")],
+            [(item["path"], item["reason"], item["chosen"], item["chosen_by"]) for item in record["left_out"]],
+        )
+        rows = {Path(row["path"]).name: row for row in manifest["input_lineage"]["rows"]}
+        self.assertEqual(("Sample7", "S7", PREFIXED_MEMBER_PAIRING),
+                         (rows[f"{PREFIX}S7.raw"]["sample_id"], rows[f"{PREFIX}S7.raw"]["name_pairing"]["declared_raw_file"],
+                          rows[f"{PREFIX}S7.raw"]["name_pairing"]["paired_by"]))
+        self.assert_the_gate_reads_the_record_as_the_lineage(manifest)
+        self.assert_every_member_says_why(manifest, members)
+        built = build_repository_analysis_rows(manifest)
+        self.assertEqual([], built["failures"])
+        row = next(item for item in built["rows"] if Path(item["input_path"]).name == f"{PREFIX}S7.raw")
+        self.assertEqual(("Sample7", 3), (row["sample_id"], row["sample_row_index"]))
+
+    def test_a_row_without_an_extension_leaves_a_decodable_twin_out_by_the_order(self) -> None:
+        members = [*ST001264_MEMBERS[:3], f"{PREFIX}S7.mzML", f"{PREFIX}S7.raw"]
+        samples = [*ST001264_SAMPLES[:3], ("Sample7", "S7")]
+        manifest = self.unit(UNIT_SCOPED, members=members, samples=samples)
+
+        self.assertEqual(
+            [(f"{PREFIX}S7.mzML", "chosen_other_encoding", f"{PREFIX}S7.raw", "encoding_order")],
+            [(item["path"], item["reason"], item["chosen"], item["chosen_by"])
+             for item in manifest["unattributed_members"]["left_out"]],
+        )
+        self.assertEqual(0, manifest["unattributed_members"]["count"])
+        rows = {Path(row["path"]).name: row for row in manifest["input_lineage"]["rows"]}
+        self.assertEqual(("Sample7", PREFIXED_MEMBER_PAIRING),
+                         (rows[f"{PREFIX}S7.raw"]["sample_id"], rows[f"{PREFIX}S7.raw"]["name_pairing"]["paired_by"]))
+        self.assert_every_member_says_why(manifest, members)
+
+    def test_outside_a_campaign_a_readable_twin_of_an_admitted_mzxml_names_nothing_chosen(self) -> None:
+        # Probe P8 (medium): S2.raw was left out as chosen_other_encoding with chosen S2.mzXML, which never runs
+        # outside a campaign. It is still not run (whether it should is an open question for the user), and its
+        # entry names the mzXML and why that does not run, not a chosen input.
+        members = [*ST001264_MEMBERS[:3], "S2.mzXML", "S2.raw"]
+        samples = [*ST001264_SAMPLES[:3], ("Sample2", "S2.mzXML")]
+        manifest = self.unit(UNIT_SCOPED, members=members, samples=samples)
+
+        record = manifest["unattributed_members"]
+        self.assertEqual(
+            [{"member_name": "S2.raw", "path": "S2.raw", "reason": "admitted_mzxml_not_converted",
+              "twin_of": "S2.mzXML", "twin_of_reason": "requires_conversion"}],
+            record["left_out"],
+        )
+        self.assertEqual(sorted(ST001264_MEMBERS[:3]), sorted(Path(item).name for item in manifest["input_candidates"]))
+        self.assert_every_member_says_why(manifest, [name for name in members if name != "S2.mzXML"])
+
+    def test_a_twin_replaces_every_undecodable_mzml_its_sample_was_admitted_by(self) -> None:
+        # Probe P14 (medium): S1.mzML and mzML/S1.mzML, both undecodable, both admitted by the row's name. The twin
+        # stood for mzML/S1.mzML only; the root one was listed as replaced by S1.raw and as not replaced at all.
+        from test_mzml_encoding import _numpress_mzml
+
+        members = [*ST001264_MEMBERS[:3], "S1.mzML", "mzML/S1.mzML", "S1.raw"]
+        samples = [*ST001264_SAMPLES[:3], ("Sample1", "S1.mzML")]
+        manifest = self.unit(
+            UNIT_SCOPED, members=members, samples=samples,
+            contents={"S1.mzML": _numpress_mzml(), "mzML/S1.mzML": _numpress_mzml()},
+        )
+
+        record = manifest["unattributed_members"]
+        self.assertEqual(
+            [("S1.raw", "analysed_for_an_admitted_sample", "S1.mzML")],
+            [(item["path"], item["reason"], item["stands_for"]) for item in record["left_out"]],
+        )
+        self.assertEqual(
+            [{"member_name": "S1.mzML", "path": "mzML/S1.mzML", "reason": "undecodable_mzml", "replaced_by": "S1.raw",
+              "replaced_by_input": "S1.raw"},
+             {"member_name": "S1.mzML", "path": "S1.mzML", "reason": "undecodable_mzml", "replaced_by": "S1.raw",
+              "replaced_by_input": "S1.raw"}],
+            record["replaced_undecodable"],
+        )
+        rows = {Path(row["path"]).name: row for row in manifest["input_lineage"]["rows"]}
+        replaces = rows["S1.raw"]["replaces_undecodable"]
+        self.assertEqual(
+            ("S1.mzML", ["mzML/S1.mzML"]),
+            (os.path.relpath(replaces["path"], manifest["input_directory"]).replace("\\", "/"),
+             [os.path.relpath(item, manifest["input_directory"]).replace("\\", "/") for item in replaces["other_paths"]]),
+        )
+        raw = next(item for item in manifest["input_candidates"] if Path(item).name == "S1.raw")
+        self.assertEqual([raw, raw], [row["exclusion"].get("replaced_by") for row in manifest["input_lineage"]["excluded"]])
+        self.assertEqual([raw, raw], [item.get("replaced_by") for item in manifest["excluded_input_candidates"]])
+        self.assert_every_member_says_why(manifest, members)
+
+    def test_a_declared_unit_records_the_readable_twin_of_an_undecodable_declared_mzml(self) -> None:
+        # Probe P6 (medium): the Catalog declares S1.mzML (undecodable) for Sample1, and the archive holds S1.raw too.
+        # Whether the readable-twin answer reaches a declared unit, against the second round's answer 3, is the
+        # user's to say: until then the declaration holds and S1.raw is not run, but its entry says it is the
+        # readable twin of the undecodable declared mzML.
+        from test_mzml_encoding import _numpress_mzml
+
+        members = ["S1.mzML", "S1.raw", "S2.raw"]
+        project, payloads = _st001264(
+            members, [("Sample1", "S1.mzML"), ("Sample2", "S2.raw")], {"S1.mzML": _numpress_mzml()}
+        )
+        project.download_scope = dict(UNIT_SCOPED)
+        project.analysis_inputs = [
+            {"path": "S1.mzML", "kind": "file", "sample_id": "Sample1"},
+            {"path": "S2.raw", "kind": "file", "sample_id": "Sample2"},
+        ]
+        manifest = self.lease(project, payloads)
+
+        self.assertEqual(["S2.raw"], [Path(item).name for item in manifest["input_candidates"]])
+        self.assertEqual(
+            [("S1.mzML", "unsupported_mzml_encoding", None)],
+            [(Path(item["path"]).name, item["reason"], item.get("replaced_by"))
+             for item in manifest["excluded_input_candidates"]],
+        )
+        record = manifest["unattributed_members"]
+        self.assertEqual(
+            [{"member_name": "S1.raw", "path": "S1.raw", "reason": "not_named_by_the_catalog_declaration",
+              "twin_of": "S1.mzML", "twin_of_reason": "undecodable_mzml"}],
+            record["left_out"],
+        )
+        self.assertEqual((False, 0, "catalog_declared_inputs"), (record["applied"], record["count"], record["reason"]))
+        self.assert_every_member_says_why(manifest, members)
+
     def test_a_declared_unit_records_the_members_no_declaration_names(self) -> None:
         # R2-3 keeps them out "on record". At 4722776 a declared unit carried no unattributed_members at all, and the
         # archive's member listing was their only trace.
@@ -1736,6 +1927,40 @@ class ADeclaredNameIsPairedByItsLeadingIdentifier(_Workspace):
         self.assertEqual(
             {"R_2.raw": PREFIXED_MEMBER_PAIRING, "T_3_pos.raw": LEADING_IDENTIFIER_TOKEN_PAIRING},
             {item["declared_raw_file"]: item["paired_by"] for item in result["paired"].values()},
+        )
+
+    def test_two_encodings_of_one_sample_are_one_candidate(self) -> None:
+        # Review of #69 at 06d2891, high: a twin is no second sample. The declared name's own suffix takes one, by
+        # the token rule and by a prefix alike; where it carries none, the encoding order does.
+        result = self.pairings(
+            ["VV_13_C1_exp344_pos.mzML", "VV_13_C1_exp344_pos.raw", "x_S7.mzML", "x_S7.raw", "x_S8.mzML", "x_S8.mzXML"],
+            [("c1", "VV_13_C1_pos.mzML"), ("s7", "S7"), ("s8", "S8")],
+        )
+
+        self.assertEqual(
+            {"vv_13_c1_exp344_pos.mzml": ("VV_13_C1_pos.mzML", LEADING_IDENTIFIER_TOKEN_PAIRING),
+             "x_s7.raw": ("S7", PREFIXED_MEMBER_PAIRING), "x_s8.mzml": ("S8", PREFIXED_MEMBER_PAIRING)},
+            {Path(key).name: (item["declared_raw_file"], item["paired_by"]) for key, item in result["paired"].items()},
+        )
+        self.assertEqual([], result["refused"])
+
+    def test_encodings_of_one_sample_the_order_ties_between_are_still_refused(self) -> None:
+        # Two vendor containers of one name: nothing decides which is the row's, so neither is, as before.
+        result = self.pairings(["x_S7.raw", "x_S7.d/analysis.baf"], [("s7", "S7")])
+        self.assertEqual({}, result["paired"])
+        self.assertEqual({"not_one_to_one"}, {item["reason"] for item in result["refused"]})
+
+        result = self.pairings(["VV_1_x_pos.raw", "VV_1_x_pos.d/analysis.baf"], [("a", "VV_1_a_pos.mzML")])
+        self.assertEqual({}, result["paired"])
+        self.assertEqual({"leading_identifier_not_unique"}, {item["reason"] for item in result["refused"]})
+
+    def test_encodings_of_one_sample_across_the_polarity_are_refused_together(self) -> None:
+        result = self.pairings(["x_S7_neg.mzML", "x_S7_neg.raw"], [("s7", "S7_neg")])
+
+        self.assertEqual({}, result["paired"])
+        self.assertEqual(
+            [("x_s7_neg.mzml", "polarity_token_contradicts_ion_mode"), ("x_s7_neg.raw", "polarity_token_contradicts_ion_mode")],
+            sorted((Path(item["member_name"]).name.casefold(), item["reason"]) for item in result["refused"]),
         )
 
     def test_a_unit_whose_catalog_declared_its_inputs_is_never_paired_by_token(self) -> None:

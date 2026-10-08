@@ -130,6 +130,20 @@ and sample rows), the same warning on the CSV record, and the column
 `raw_file_paired_by` (`exact`, `prefixed_member_name`,
 `leading_identifier_token`) in the reviewed sample TSV.
 
+Since 0.5.36, two encodings of one sample are one candidate for both inferred
+rules, not two (one name less its container suffix, in folders that agree once
+the words naming an encoding are set aside). Where a row declares
+`VV_13_HEpG2_C1_pos.mzML` and the archive holds
+`VV_13_HEpG2_C1_exp344_pos.mzML` and its `.raw`, the member whose container
+suffix the declared name carries is paired (the mzML); where the declared name
+carries none of theirs (a row naming `S7`), the encoding order takes one (a
+vendor folder or container, then mzML, then mzXML). The other encoding is that
+sample's, and `unattributed_members.left_out` records it with what was chosen
+over it. Where the order ties (two vendor containers of one name) neither is
+paired, as before. Until 0.5.36 the twin made both refused
+(`leading_identifier_not_unique`, `not_one_to_one`), so the sample's data ran
+as an unattributed member, in the Class `Unattributed`.
+
 An archive member that no sample row pairs with, exactly, behind a prefix or by
 its leading identifier, is still an input where the unit's download is its own
 alone (0.5.31, the user's decision of 2026-10-07): the Catalog declared no inputs
@@ -163,7 +177,12 @@ ones. Since 0.5.36 it records the archive members no declaration names:
 `unattributed_members` says `applied` false, `reason` `catalog_declared_inputs`,
 and lists each such member in `left_out` with `reason`
 `not_named_by_the_catalog_declaration` (only analysable members that reached
-nothing of the lease: no input, excluded candidate or conversion source).
+nothing of the lease: no input, excluded candidate or conversion source). A
+member that is an encoding of a declared mzML the lease excluded as
+undecodable adds `twin_of` (that mzML's path) and `twin_of_reason`
+`undecodable_mzml`. It is not run: whether the readable-twin answer below
+reaches a declared unit is an open question for the user, and until it is
+answered the declaration holds.
 
 Since 0.5.36 (the user's decision of 2026-10-08, second round, answer 3):
 
@@ -219,7 +238,17 @@ Since 0.5.36 (the user's decision of 2026-10-08, second round, answer 3):
   Where the order ties between readable twins none is taken, and outside a
   campaign an mzXML twin stays left out (`requires_conversion`): the sample then
   has no input. A shared archive, which takes no unattributed member, runs the
-  twin for its sample all the same: it is the admitted sample's own data.
+  twin for its sample all the same: it is the admitted sample's own data. Where
+  the unit admitted the sample's mzML twice (one name in two folders, neither
+  decodable), the twin stands for the one nearest the data root, its lineage row
+  names the other in `replaces_undecodable.other_paths`, and each is listed in
+  `replaced_undecodable` with the input that runs.
+- `chosen` only ever names an input that runs. Where the unit admitted a sample
+  as an mzXML and the lease converts nothing (no campaign), nothing of that
+  sample runs, and a readable unpaired twin of it is left out as
+  `admitted_mzxml_not_converted`, with `twin_of` the mzXML and `twin_of_reason`
+  `requires_conversion`. Whether such a twin should run for its sample outside a
+  campaign is an open question for the user; until it is answered it does not.
 - `count`, `members` and `paths` list every lineage row (in `rows` and in
   `excluded`) whose `name_pairing` says `unattributed_member`, once per path.
   This is the count the gate's PAIR-1 compares. A member the lease excluded

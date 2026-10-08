@@ -172,6 +172,10 @@ def summarize_jobs(
             # Since 0.5.36 (2026-10-08, second round, answer 3): a unit whose Catalog declared its inputs records the
             # archive members no declaration names, each left out (not_named_by_the_catalog_declaration).
             "repository_members_no_declaration_names",
+            # Since 0.5.36: two encodings of one sample are one candidate for the inferred name pairings, the one the
+            # declared name's container suffix names, else the one the encoding order takes; the other is that sample's
+            # other encoding on record, never an unattributed member for want of a one-to-one pairing.
+            "repository_one_sample_encodings_pair_as_one",
             # A unit or split part its disposition holds is never discarded, approved or confirmed, unless the
             # discard passes release_disposition_hold=true (the operator's skip), which records
             # disposition_hold_released_by "operator_skip"; a held part keeps its parent's raw data until then.
