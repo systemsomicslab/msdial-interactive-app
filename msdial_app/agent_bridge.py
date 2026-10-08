@@ -165,6 +165,13 @@ def summarize_jobs(
             # the mzML unattributed (unattributed_members.converted), and of one name in two encodings the encoding
             # order takes one, the other left out as chosen_other_encoding (chosen, chosen_by).
             "repository_unattributed_mzxml_and_encoding_order",
+            # Since 0.5.36 (2026-10-08, the extra question, A): where a sample's own mzML cannot be decoded, a readable
+            # twin of it (vendor, or in a campaign an mzXML, converted) runs as that sample's own input, in its Class
+            # (lineage replaces_undecodable; unattributed_members.replaced_undecodable), never unattributed.
+            "repository_undecodable_mzml_readable_twin",
+            # Since 0.5.36 (2026-10-08, second round, answer 3): a unit whose Catalog declared its inputs records the
+            # archive members no declaration names, each left out (not_named_by_the_catalog_declaration).
+            "repository_members_no_declaration_names",
             # A unit or split part its disposition holds is never discarded, approved or confirmed, unless the
             # discard passes release_disposition_hold=true (the operator's skip), which records
             # disposition_hold_released_by "operator_skip"; a held part keeps its parent's raw data until then.

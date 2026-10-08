@@ -75,8 +75,11 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - Where the unit admitted an encoding of that sample itself (a sample row
     names it, exactly or by a pairing rule), that one stays the sample's input.
     The unpaired one is `chosen_other_encoding`, with `chosen_by`
-    `encoding_order`, or `admitted_by_the_unit` where the order would have
-    preferred the unpaired one. In a campaign, a readable member the convert
+    `encoding_order` where the order puts the admitted one first and the
+    unpaired one after it, and `admitted_by_the_unit` otherwise: where the
+    order puts the unpaired one first, or ranks both equal (two vendor
+    containers of one name). On a tie the record used to say `encoding_order`,
+    although the admission chose. In a campaign, a readable member the convert
     stage analyses instead of an admitted mzXML (it stands for that mzXML in
     the lineage, as before) is listed as `analysed_for_an_admitted_sample`,
     with `stands_for`, instead of as left out for its encoding.
@@ -87,12 +90,23 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     sample, because a convertible mzXML outranks an unreadable twin (the rule
     of 2026-09-30, as `_encoding_choices` already applied it). Before, the
     order could take an unpaired undecodable mzML over its unpaired mzXML. The
-    lease then excluded the mzML, and the sample had no input at all. Now the
-    mzXML is converted and taken, and the mzML is left out as
-    `chosen_other_encoding` with `chosen_by` `undecodable_mzml_set_aside`.
-    Where the unit's own encoding of a sample cannot be decoded, the unpaired
-    member the order then takes is listed in
-    `unattributed_members.taken_instead_of_undecodable`.
+    lease then excluded the mzML, and the sample had no input at all. Now an
+    unpaired undecodable mzML beside any other encoding of its sample is never
+    taken, and its record says it could not be decoded:
+    - `chosen_other_encoding` with `chosen_by` `undecodable_mzml_set_aside`
+      and `chosen` the encoding that runs for the sample: an unpaired twin, or
+      the unit's own admitted encoding (a `.raw`, or in a campaign an mzXML,
+      converted). Beside an
+      admitted encoding it used to stay in the comparison, recorded with
+      `chosen_by` `admitted_by_the_unit` or `encoding_order`, and nothing said
+      it could not be decoded.
+    - `undecodable_mzml`, with no `chosen`, where nothing of the sample runs:
+      the order ties between the readable twins (`z_S5.raw` beside `z_S5.d`),
+      no encoding of the sample can be decoded, or the unit's own one is an
+      mzXML outside a campaign. Beside a vendor tie it used
+      to be recorded only as `two_encodings_of_one_name`.
+    - Alone, it is an unattributed member like any other, which the lease
+      excludes (`unattributed_members.excluded`, `unsupported_mzml_encoding`).
   - `unattributed_members.count`, `members` and `paths` list every lineage
     row, in `rows` and in `excluded`, that says `unattributed_member`, once per
     path, as the gate's PAIR-1 counts them. A converted member is named by its
@@ -107,7 +121,53 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     parent and its lineage row do, and lists it in `converted`. It used to
     name it by the converted mzML's lower-cased name, so PAIR-1 FAILed (record
     only).
-  - The Agent API lists `repository_unattributed_mzxml_and_encoding_order`.
+  - The Agent API lists `repository_unattributed_mzxml_and_encoding_order`
+    and, for the two items below, `repository_undecodable_mzml_readable_twin`
+    and `repository_members_no_declaration_names`.
+- Where the unit's own mzML of a sample cannot be decoded and an unpaired twin
+  of that sample can be read, the twin runs as that sample's own input, paired
+  to its sample row and in its Class (the user's answer of 2026-10-08 to the
+  extra question: "A: 読める方をそのサンプルとして使う"). The twin is a vendor
+  file, folder or container, or, in a campaign's lease, an mzXML that the
+  convert stage converts. Where several twins can be read, the encoding order
+  takes one, and where it ties none is taken. This holds beside a shared
+  archive too, which takes no unattributed member: the twin is the admitted
+  sample's own data, as a readable twin the convert stage analyses for an
+  admitted mzXML is in any lease. That is the agent's reading; the answer did
+  not name the archive's scope.
+  - The twin is no unattributed member. `unattributed_members.left_out` lists
+    it as `analysed_for_an_admitted_sample`, with `stands_for` the
+    undecodable mzML and `stands_for_reason` `undecodable_mzml`, as the gate's
+    INP-1 already reads a twin analysed for an admitted sample.
+  - `unattributed_members.replaced_undecodable` lists the undecodable mzML
+    (`member_name`, `path`, `reason` `undecodable_mzml`, `replaced_by` the
+    twin's path). It adds `replaced_by_input`, the input that runs in its place
+    relative to the data root (`../converted/<name>.mzML` for a converted
+    twin). Where the lease excluded the twin as well (its conversion failed),
+    it adds `replacement_excluded` with the lease's reason instead.
+  - The twin's lineage row carries `replaces_undecodable` (`path`, `reason`
+    `undecodable_mzml`, `rule` `readable_twin_runs_as_the_sample_2026_10_08`),
+    and the sample, the declared names and the pairing of the mzML it
+    replaces. `lineage_stands_for` reads it, so the analysis-CSV builder and a
+    split pair it with the same sample row. The mzML's excluded lineage row
+    and its `excluded_input_candidates` entry name the input that runs in its
+    place (`replaced_by`). The attribute stage counts the replacements
+    (`undecodable_mzml_replaced`).
+  - At `4722776` a vendor twin ran as an unattributed member, outside the
+    sample's Class. A converted mzXML twin ran as the sample's own input by
+    its converted name, while `unattributed_members` said `count` 0 and
+    `taken_instead_of_undecodable` still listed it. That list is gone.
+  - Outside a campaign nothing converts. An mzXML twin stays left out
+    (`requires_conversion`), and the sample has no input.
+- A unit whose Catalog declared its inputs now records the archive members no
+  declaration names (2026-10-08, second round, answer 3: left out "on record").
+  `unattributed_members` says `applied` false, `reason`
+  `catalog_declared_inputs` and `count` 0, and lists each such member in
+  `left_out` with `reason` `not_named_by_the_catalog_declaration`, by its
+  basename and its path under the data root. Only analysable members are
+  listed, and only those no declaration names that reached nothing of the
+  lease. Before, the unit carried no `unattributed_members`, and the archive's
+  member listing was their only trace.
 
 ### Not changed
 - All inputs sharing exactly one energy run as SWATH.

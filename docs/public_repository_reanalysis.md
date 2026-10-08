@@ -159,7 +159,11 @@ above 1 for any bundle URL) takes none: `unattributed_members` then says
 members as `left_out`. Left out on record too: a member whose path names the
 other polarity by a token of its own (`polarity_token_contradicts_ion_mode`).
 A unit whose Catalog declared its inputs takes none: its inputs are the declared
-ones.
+ones. Since 0.5.36 it records the archive members no declaration names:
+`unattributed_members` says `applied` false, `reason` `catalog_declared_inputs`,
+and lists each such member in `left_out` with `reason`
+`not_named_by_the_catalog_declaration` (only analysable members that reached
+nothing of the lease: no input, excluded candidate or conversion source).
 
 Since 0.5.36 (the user's decision of 2026-10-08, second round, answer 3):
 
@@ -177,21 +181,45 @@ Since 0.5.36 (the user's decision of 2026-10-08, second round, answer 3):
   left out as `chosen_other_encoding`, with `chosen` (the path taken) and
   `chosen_by` `encoding_order`. Where the unit admitted an encoding of that
   sample itself, that one stays the sample's input and an unpaired one is
-  `chosen_other_encoding` with `chosen_by` `encoding_order` or, where the order
-  would have preferred the unpaired one, `admitted_by_the_unit`; in a campaign,
+  `chosen_other_encoding` with `chosen_by` `encoding_order` where the order puts
+  the admitted one first, or `admitted_by_the_unit` where it puts the unpaired
+  one first or ranks both equal (the admission chose); in a campaign,
   a readable member the convert stage analyses instead of an admitted mzXML is
   listed as `analysed_for_an_admitted_sample` with `stands_for`. Two encodings
   the order does not tell apart (two vendor containers of one name) are both
   left out as `two_encodings_of_one_name`, as before.
 - An mzML that RawDataHandler cannot decode does not compete in that choice,
   because the lease would exclude it and a convertible mzXML outranks an
-  unreadable twin (the rule of 2026-09-30). An unpaired one is left out as
-  `chosen_other_encoding` with `chosen_by` `undecodable_mzml_set_aside`. Where
-  the unit's own encoding of a sample cannot be decoded, the unpaired member
-  the order then takes is an unattributed input, listed in
-  `unattributed_members.taken_instead_of_undecodable` (`path`, `instead_of`).
-  Where no unpaired one can be decoded either, the unit's own encoding stays
-  the sample's.
+  unreadable twin (the rule of 2026-09-30). An unpaired one beside another
+  encoding of its sample is never taken. It is left out as
+  `chosen_other_encoding` with `chosen_by` `undecodable_mzml_set_aside` and
+  `chosen` the encoding that runs for the sample (an unpaired twin, or the
+  unit's own), or as `undecodable_mzml` with nothing chosen where nothing of the
+  sample runs (the order ties, no encoding can be decoded, or the unit's own is
+  an mzXML a lease outside a campaign does not convert). Alone, it is an
+  unattributed member, which the lease excludes (`unattributed_members.excluded`).
+- Where the unit's own mzML of a sample cannot be decoded and an unpaired twin
+  of that sample can be read (a vendor file, folder or container, or in a
+  campaign an mzXML, converted), the twin runs as that sample's own input,
+  paired to its sample row and in its Class (the user's answer of 2026-10-08 to
+  the extra question, "A: 読める方をそのサンプルとして使う"). It is never an
+  unattributed member:
+  - `left_out` lists it as `analysed_for_an_admitted_sample`, with `stands_for`
+    the undecodable mzML and `stands_for_reason` `undecodable_mzml`;
+  - `unattributed_members.replaced_undecodable` lists the mzML (`member_name`,
+    `path`, `reason` `undecodable_mzml`, `replaced_by`, and `replaced_by_input`,
+    the input that runs, relative to the data root, or `replacement_excluded`
+    where the lease excluded the twin too);
+  - the twin's lineage row carries `replaces_undecodable` (`path`, `reason`,
+    `rule` `readable_twin_runs_as_the_sample_2026_10_08`) and the sample of the
+    mzML it replaces, which `lineage_stands_for` reads; the mzML's excluded
+    lineage row and its `excluded_input_candidates` entry name the input that
+    runs in its place (`replaced_by`).
+
+  Where the order ties between readable twins none is taken, and outside a
+  campaign an mzXML twin stays left out (`requires_conversion`): the sample then
+  has no input. A shared archive, which takes no unattributed member, runs the
+  twin for its sample all the same: it is the admitted sample's own data.
 - `count`, `members` and `paths` list every lineage row (in `rows` and in
   `excluded`) whose `name_pairing` says `unattributed_member`, once per path.
   This is the count the gate's PAIR-1 compares. A member the lease excluded
