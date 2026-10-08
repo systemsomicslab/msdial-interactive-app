@@ -122,11 +122,16 @@ def _handoff(accession: str, unit_id: str, files: list, inputs: list, samples: l
     }
 
 
-def _lease(root: Path, handoff: dict, payloads: dict[str, bytes]) -> Path:
+def _lease(root: Path, handoff: dict, payloads: dict[str, bytes], *, campaign: bool = False) -> Path:
     project, _workspace = mcp_server._project_from_analysis_unit_handoff(handoff)
     typed = project_from_dict(project)
     typed.eligible, typed.selection_status, typed.blocking_reasons = True, "eligible", []
-    return Path(create_download_lease(typed, root, 10_000_000, client=_Client(payloads))["manifest_path"])
+    return Path(
+        create_download_lease(
+            typed, root, 10_000_000, client=_Client(payloads),
+            **({"campaign_authorization": dict(_APPROVAL)} if campaign else {}),
+        )["manifest_path"]
+    )
 
 
 # ---- MTBKS64: four declared inputs for four rows, two per sample -------------------------------------------
@@ -873,6 +878,100 @@ class TheMembersNoRowPairsWithAreUnattributedInputs(_Workspace):
             [(item["path"], item["reason"], item["stands_for"]) for item in record["left_out"]],
         )
 
+    def assert_the_gate_reads_the_record_as_the_lineage(self, manifest: dict) -> None:
+        """What the gate's PAIR-1 compares (review ia-r2 follow-up 1): count is the number of unattributed lineage
+        rows, inputs and lease-excluded alike, and members lists each one's member_name."""
+        lineage = manifest["input_lineage"]
+        rows = {
+            row["path"].casefold(): row["name_pairing"]["member_name"]
+            for part in ("rows", "excluded")
+            for row in lineage.get(part) or []
+            if (row.get("name_pairing") or {}).get("paired_by") == "unattributed_member"
+        }
+        record = manifest["unattributed_members"]
+        self.assertEqual(len(rows), record["count"])
+        self.assertEqual(sorted(rows.values()), sorted(record["members"]))
+        if rows:
+            self.assertIn("unattributed_members_included", manifest["warnings"])
+
+    def test_a_campaign_converts_an_unpaired_mzxml_over_its_undecodable_mzml_twin(self) -> None:
+        # Review ia-r2 follow-up 1, medium: the encoding order took w_S2.mzML, which the lease then excluded, and
+        # the sample had no input. A convertible mzXML outranks an unreadable twin (the user, 2026-09-30).
+        from test_mzml_encoding import _numpress_mzml
+        from test_mzxml_conversion import dda_32
+
+        members = [*ST001264_MEMBERS[:3], "w_S2.mzXML", "w_S2.mzML"]
+        manifest = self.unit(
+            UNIT_SCOPED, members=members, contents={"w_S2.mzXML": dda_32(), "w_S2.mzML": _numpress_mzml()},
+            campaign=True,
+        )
+
+        record = manifest["unattributed_members"]
+        self.assertEqual((1, ["w_S2.mzXML"], ["w_S2.mzXML"]), (record["count"], record["members"], record["converted"]))
+        self.assertEqual(
+            [("w_S2.mzML", "chosen_other_encoding", "w_S2.mzXML", "undecodable_mzml_set_aside")],
+            [(item["path"], item["reason"], item["chosen"], item["chosen_by"]) for item in record["left_out"]],
+        )
+        rows = [row for row in manifest["input_lineage"]["rows"] if Path(row["path"]).name == "w_S2.mzML"]
+        self.assertEqual([("converted", "w_S2.mzXML")], [(row["kind"], row["name_pairing"]["member_name"]) for row in rows])
+        self.assertNotIn("excluded", record)
+        self.assert_the_gate_reads_the_record_as_the_lineage(manifest)
+
+    def test_outside_a_campaign_an_undecodable_unpaired_mzml_is_listed_as_excluded(self) -> None:
+        # Nothing converts, so the mzXML stays out; the mzML is admitted, and the lease excludes it. It is on record
+        # in count, members and excluded, as the gate counts the lineage's excluded rows too.
+        from test_mzml_encoding import _numpress_mzml
+
+        members = [*ST001264_MEMBERS[:3], "w_S2.mzXML", "w_S2.mzML"]
+        manifest = self.unit(UNIT_SCOPED, members=members, contents={"w_S2.mzML": _numpress_mzml()})
+
+        record = manifest["unattributed_members"]
+        self.assertEqual((1, ["w_S2.mzML"]), (record["count"], record["members"]))
+        self.assertEqual(
+            [{"member_name": "w_S2.mzML", "path": "w_S2.mzML", "reason": "unsupported_mzml_encoding"}], record["excluded"]
+        )
+        self.assertEqual([("w_S2.mzXML", "requires_conversion")],
+                         [(item["path"], item["reason"]) for item in record["left_out"]])
+        self.assertNotIn("w_S2.mzML", [Path(item).name for item in manifest["input_candidates"]])
+        self.assert_the_gate_reads_the_record_as_the_lineage(manifest)
+
+    def test_an_unpaired_member_whose_conversion_fails_is_counted_and_listed_as_excluded(self) -> None:
+        # Review ia-r2 follow-up 1, medium: count 0 and no member, while the lineage's excluded rows held it, so
+        # the gate's PAIR-1 FAILed (record only).
+        manifest = self.unit(
+            UNIT_SCOPED, members=[*ST001264_MEMBERS[:3], "f_S2.mzXML"], contents={"f_S2.mzXML": b"<not an mzXML"},
+            campaign=True,
+        )
+
+        record = manifest["unattributed_members"]
+        self.assertEqual((1, ["f_S2.mzXML"], ["f_S2.mzXML"]), (record["count"], record["members"], record["paths"]))
+        self.assertEqual(
+            [{"member_name": "f_S2.mzXML", "path": "f_S2.mzXML", "reason": "conversion_failed"}], record["excluded"]
+        )
+        self.assertNotIn("converted", record)
+        self.assertEqual(sorted(ST001264_MEMBERS[:3]), sorted(Path(item).name for item in manifest["input_candidates"]))
+        self.assert_the_gate_reads_the_record_as_the_lineage(manifest)
+        attribute = next(entry for entry in manifest["lease_stages"] if entry["stage"] == "attribute")
+        self.assertIn("unattributed_members_included", attribute["warnings"])
+
+    def test_a_vendor_member_is_taken_where_the_units_own_mzml_of_its_sample_cannot_be_decoded(self) -> None:
+        from test_mzml_encoding import _numpress_mzml
+
+        members = [*ST001264_MEMBERS[:3], "S1.mzML", "S1.raw"]
+        samples = [*ST001264_SAMPLES[:3], ("Sample1", "S1.mzML")]
+        manifest = self.unit(UNIT_SCOPED, members=members, samples=samples, contents={"S1.mzML": _numpress_mzml()})
+
+        record = manifest["unattributed_members"]
+        self.assertEqual((1, ["S1.raw"]), (record["count"], record["members"]))
+        self.assertEqual([{"path": "S1.raw", "instead_of": "S1.mzML"}], record["taken_instead_of_undecodable"])
+        self.assertNotIn("left_out", record)
+        self.assertIn("S1.raw", [Path(item).name for item in manifest["input_candidates"]])
+        self.assertEqual(
+            [("S1.mzML", "unsupported_mzml_encoding")],
+            [(Path(item["path"]).name, item["reason"]) for item in manifest["excluded_input_candidates"]],
+        )
+        self.assert_the_gate_reads_the_record_as_the_lineage(manifest)
+
     def test_a_nested_archive_names_its_members_by_basename_as_the_lineage_does(self) -> None:
         # Review ia-0531, medium: the record listed 'ST001264_POSITIVE/<name>', the lineage '<name>', so the
         # gate found no lineage member in the record. Both now give the basename; paths keeps where each lies.
@@ -1459,16 +1558,29 @@ def _paired_archive_handoff(members: dict[str, bytes], rows: list[tuple[str, str
 class ASplitPartCarriesItsOwnPairingRecord(_Workspace):
     """The lease's manifest-level record (warnings, input_name_pairings) went to no part (review of PR #58)."""
 
-    def split(self, members: dict[str, bytes], rows: list[tuple[str, str]], modes: dict[str, str]) -> tuple:
+    def split(
+        self, members: dict[str, bytes], rows: list[tuple[str, str]], modes: dict[str, str], *, campaign: bool = False
+    ) -> tuple:
         handoff, payloads = _paired_archive_handoff(members, rows)
-        manifest_path = _lease(self.root, handoff, payloads)
-        extractor = self.root / "RawMetadataConsoleApp.exe"
-        extractor.write_bytes(b"stub")
-        verdicts = {
-            f"{Path(path).parent.name}/{Path(path).name}": {"mode": modes.get(Path(path).name, "DDA"), "polarity": "Positive"}
-            for path in read_manifest(manifest_path)["input_candidates"]
-        }
-        with patch("msdial_app.repository_reanalysis.subprocess.run", side_effect=_extractor(verdicts)):
+        manifest_path = _lease(self.root, handoff, payloads, campaign=campaign)
+        inputs = read_manifest(manifest_path)["input_candidates"]
+        if campaign:
+            # A campaign's preflight runs a verified, pinned extractor only, and resolves a DIA scheme from the
+            # header's isolation windows (_header gives a DIA record twenty).
+            from test_raw_metadata_preflight import _Extractor, _PinnedExtractor
+
+            extractor = _PinnedExtractor.make(self.root / "build")
+            fake = _Extractor(
+                {Path(path).name: {"method": modes.get(Path(path).name, "DDA"), "polarity": "Positive"} for path in inputs}
+            )
+        else:
+            extractor = self.root / "RawMetadataConsoleApp.exe"
+            extractor.write_bytes(b"stub")
+            fake = _extractor({
+                f"{Path(path).parent.name}/{Path(path).name}": {"mode": modes.get(Path(path).name, "DDA"), "polarity": "Positive"}
+                for path in inputs
+            })
+        with patch("msdial_app.repository_reanalysis.subprocess.run", side_effect=fake):
             run_raw_metadata_preflight(manifest_path, extractor)
         result = split_unit_by_acquisition(manifest_path, confirmed=True)
         self.assertTrue(result["written"], result["blockers"])
@@ -1530,6 +1642,34 @@ class ASplitPartCarriesItsOwnPairingRecord(_Workspace):
             )
             self.assertEqual(["unattributed_members_included"], part["warnings"])
             self.assertIn("unattributed_members_included", decide_disposition(part)["warnings"])
+
+    def test_a_part_names_a_converted_member_by_its_mzxml_as_the_parent_does(self) -> None:
+        # Review ia-r2 follow-up 1, medium: the part listed 'u_9.mzml' (the converted mzML's lower-cased name),
+        # its lineage row 'U_9.mzXML', and gave no converted list.
+        from test_mzxml_conversion import dda_32
+
+        members = {name: f"thermo raw bytes of {name}".encode() for name in ["A_1_pos.raw", "D_4_pos.raw", "U_8.raw"]}
+        members["U_9.mzXML"] = dda_32()
+        parent, parts = self.split(
+            members, [("X", "A_1_pos.raw"), ("Z", "D_4_pos.raw")], {"D_4_pos.raw": "DIA", "U_8.raw": "DIA"},
+            campaign=True,
+        )
+
+        self.assertEqual((["U_8.raw", "U_9.mzXML"], ["U_9.mzXML"]),
+                         (parent["unattributed_members"]["members"], parent["unattributed_members"]["converted"]))
+        dda, dia = parts["u-split-dda"], parts["u-split-dia"]
+        self.assertEqual(
+            {"rule": "unit_scoped_archive_2026_10_07", "applied": True, "scope": "unit_files", "count": 1,
+             "members": ["U_9.mzXML"], "paths": ["U_9.mzXML"], "converted": ["U_9.mzXML"]},
+            dda["unattributed_members"],
+        )
+        self.assertEqual((["U_8.raw"], False), (dia["unattributed_members"]["members"], "converted" in dia["unattributed_members"]))
+        for part in (dda, dia):
+            lineage = [
+                row["name_pairing"]["member_name"] for row in part["input_lineage"]["rows"]
+                if (row.get("name_pairing") or {}).get("paired_by") == "unattributed_member"
+            ]
+            self.assertEqual(part["unattributed_members"]["members"], lineage)
 
     def test_a_part_of_a_nested_archive_names_its_members_by_basename_and_keeps_their_paths(self) -> None:
         # Review ia-0531, medium: the record listed paths under the data root, the lineage basenames.

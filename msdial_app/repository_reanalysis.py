@@ -2269,42 +2269,26 @@ def create_download_lease(
             prefixed_members[_file_key(item)]["paired_by"] for item in inputs if _file_key(item) in prefixed_members
         )
         inferred = inferred_name_pairings(prefixed_members, data_root)
-        # Each input whose lineage row says it is an unattributed member, and that member: the input itself, or the
-        # mzXML an mzML the convert stage wrote stands for (2026-10-08, second round, answer 3).
-        lineage_pairing = {
-            _file_key(str(row.get("path") or "")): (row.get("name_pairing") or {}).get("paired_by")
-            for row in input_lineage.get("rows") or []
-            if isinstance(row, dict)
-        }
-        unattributed_sources: dict[str, str] = {}
-        for item in inputs:
-            key = _file_key(item)
-            if lineage_pairing.get(key) != UNATTRIBUTED_MEMBER_PAIRING:
-                continue
-            stand = stands_for.get(key)
-            source = key if key in unattributed_members else (_file_key(stand) if stand else "")
-            if source in unattributed_members:
-                unattributed_sources[item] = source
-        unattributed_inputs = list(unattributed_sources)
+        # The unattributed members as the lineage holds them (unattributed_lineage_record): its rows and its
+        # excluded rows that say unattributed_member, a converted one by the mzXML it was converted from
+        # (2026-10-08, second round, answer 3), and one the lease excluded after admitting it (an mzXML whose
+        # conversion failed, an undecodable mzML) listed in excluded with the lease's reason.
+        unattributed_lineage = unattributed_lineage_record(input_lineage, _file_key(str(data_root)))
+        unattributed_inputs = [
+            item
+            for item in inputs
+            if _file_key(item) in {
+                _file_key(str(row.get("path") or ""))
+                for row in input_lineage.get("rows") or []
+                if isinstance(row, dict)
+                and (row.get("name_pairing") or {}).get("paired_by") == UNATTRIBUTED_MEMBER_PAIRING
+            }
+        ]
+        # Warned wherever the lineage holds one, an excluded one too: the gate's PAIR-1 reads the same rows.
+        unattributed_warned = bool(unattributed_lineage["count"])
         unattributed_record = unattributed["record"]
         if unattributed_record is not None and unattributed_record.get("applied"):
-            # What reached the inputs: a member the lease then excluded (an undecodable mzML, an mzXML whose
-            # conversion failed) is no input. A converted one is listed by the mzXML, as its lineage row names it.
-            data_key = _file_key(str(data_root))
-            converted_members = sorted(
-                (
-                    _member_under_root(source, data_key)
-                    for item, source in unattributed_sources.items()
-                    if source != _file_key(item)
-                ),
-                key=lambda item: (item.casefold(), item),
-            )
-            unattributed_record = {
-                **unattributed_record,
-                "count": len(unattributed_inputs),
-                **unattributed_member_names(_member_under_root(source, data_key) for source in unattributed_sources.values()),
-                **({"converted": converted_members} if converted_members else {}),
-            }
+            unattributed_record = {**unattributed_record, **unattributed_lineage}
         pruned: dict[str, Any] = {}
         if store_lease is not None:
             # Now that the unit's own files are known: the links to anything else the store's objects
@@ -2347,10 +2331,10 @@ def create_download_lease(
                 {
                     "warnings": [
                         *([INFERRED_PAIRING_WARNING] if inferred else []),
-                        *([UNATTRIBUTED_MEMBERS_WARNING] if unattributed_inputs else []),
+                        *([UNATTRIBUTED_MEMBERS_WARNING] if unattributed_warned else []),
                     ]
                 }
-                if inferred or unattributed_inputs
+                if inferred or unattributed_warned
                 else {}
             ),
             **({"refused_name_pairings": name_pairings["refused"]} if name_pairings["refused"] else {}),
@@ -2412,10 +2396,10 @@ def create_download_lease(
                 "paired": inferred,
                 "refused": list(name_pairings["refused"]),
             }
-        if inferred or unattributed_inputs:
+        if inferred or unattributed_warned:
             manifest["warnings"] = [
                 *([INFERRED_PAIRING_WARNING] if inferred else []),
-                *([UNATTRIBUTED_MEMBERS_WARNING] if unattributed_inputs else []),
+                *([UNATTRIBUTED_MEMBERS_WARNING] if unattributed_warned else []),
             ]
         if unattributed_record is not None:
             # The archive members no sample row pairs with: taken as unattributed inputs where the download is the
@@ -7713,20 +7697,13 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         if pairings["paired"]:
             part_warnings.append(INFERRED_PAIRING_WARNING)
         # The parent's unattributed members that are this part's inputs: the part carries the record and the
-        # warning only where it has one of them.
+        # warning only where it has one of them. Read as the lease reads them (unattributed_lineage_record), so a
+        # converted one is named by its mzXML, as its lineage row's member_name names it, and listed in converted.
         parent_root = _file_key(str(parent.get("input_directory") or "")) if parent.get("input_directory") else ""
-        part_unattributed = sorted(
-            (
-                _member_under_root(_file_key(str(row.get("path") or "")), parent_root)
-                if parent_root
-                else Path(str(row.get("path") or "")).name
-                for row in (part_manifest.get("input_lineage") or {}).get("rows") or []
-                if isinstance(row, dict)
-                and (row.get("name_pairing") or {}).get("paired_by") == UNATTRIBUTED_MEMBER_PAIRING
-            ),
-            key=str.casefold,
+        part_unattributed = unattributed_lineage_record(
+            {"rows": (part_manifest.get("input_lineage") or {}).get("rows") or []}, parent_root
         )
-        if part_unattributed:
+        if part_unattributed["count"]:
             part_warnings.append(UNATTRIBUTED_MEMBERS_WARNING)
             part_manifest["unattributed_members"] = {
                 **{
@@ -7734,9 +7711,8 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                     for key, value in (parent.get("unattributed_members") or {}).items()
                     if key in {"rule", "applied", "scope"}
                 },
-                "count": len(part_unattributed),
                 # Basenames, as the lineage names them; the paths under the parent's data root beside them.
-                **unattributed_member_names(part_unattributed),
+                **part_unattributed,
             }
         if part_warnings:
             part_manifest["warnings"] = part_warnings
@@ -11153,7 +11129,12 @@ def _unattributed_members(
     admitted_by_the_unit where it does not). The exception is the member the convert stage analyses instead of the
     sample's mzXML (a converting lease, every admitted encoding an mzXML the order puts after it, and a readable
     one): it is the sample's input through the mzXML it stands for (lineage stands_for), and is listed as
-    analysed_for_an_admitted_sample, with stands_for.
+    analysed_for_an_admitted_sample, with stands_for. An mzML RawDataHandler cannot decode competes with none of
+    these (the lease excludes it, and a convertible mzXML outranks an unreadable twin, the rule of 2026-09-30):
+    an unpaired one is left out as chosen_other_encoding with chosen_by undecodable_mzml_set_aside, and where the
+    unit's own encoding of the sample is one, the unpaired member the order takes instead is an unattributed
+    input, listed in taken_instead_of_undecodable. Where no unpaired one can be decoded either, the unit's own
+    stays the sample's.
 
     Never for a shared archive (a bundle URL another unit downloads too), whose other members are the other
     unit's: the record then says why none was taken (applied false, reason) and lists them as left out. Also left
@@ -11221,21 +11202,47 @@ def _unattributed_members(
             if sample in unpaired_of:
                 admitted_of.setdefault(sample, []).append(key)
 
+    scanned: dict[str, bool] = {}
+
     def undecodable(key: str) -> bool:
         # An mzML whose arrays RawDataHandler cannot decode is no readable twin of an mzXML (_encoding_choices).
-        path = on_disk(key)
-        return path.suffix.casefold() == ".mzml" and path.is_file() and bool(scan_mzml_encoding(path)["problems"])
+        if key not in scanned:
+            path = on_disk(key)
+            scanned[key] = (
+                path.suffix.casefold() == ".mzml" and path.is_file() and bool(scan_mzml_encoding(path)["problems"])
+            )
+        return scanned[key]
 
+    taken_instead: list[dict[str, str]] = []
     for _sample, keys in sorted(unpaired_of.items(), key=lambda item: sorted(item[1])):
-        admitted = sorted(admitted_of.get(_sample) or [])
-        if not admitted and len(keys) == 1:
+        # An mzML RawDataHandler cannot decode competes with no other encoding of its sample: the lease would
+        # exclude it, and a convertible mzXML outranks an unreadable twin (the user, 2026-09-30), as in
+        # _encoding_choices. So it is set aside before the encoding order is applied, the unit's own one too.
+        # Where no unpaired one can be decoded either, the unit's own encoding stays the sample's.
+        admitted_any = sorted(admitted_of.get(_sample) or [])
+        if not admitted_any and len(keys) == 1:
             continue
-        names = {key: _member_under_root(key, data_key) for key in [*admitted, *keys]}
-        roles = encoding_preference.prefer_encodings(list(names.values()))
-        preferred = {key for key in names if roles.get(names[key]) == encoding_preference.RAW}
+        readable = [key for key in keys if not undecodable(key)]
+        admitted = [key for key in admitted_any if not undecodable(key)] or ([] if readable else admitted_any)
+        competing = readable or list(keys)
+        set_aside = [key for key in keys if key not in competing]
+        names = {key: _member_under_root(key, data_key) for key in [*admitted, *competing, *set_aside]}
+        roles = encoding_preference.prefer_encodings([names[key] for key in [*admitted, *competing]])
+        preferred = {key for key in [*admitted, *competing] if roles.get(names[key]) == encoding_preference.RAW}
+
+        def leave_out_undecodable(chosen: str | None) -> None:
+            for key in set_aside:
+                left_out.append(
+                    {"member_name": kept.pop(key), "reason": "chosen_other_encoding", "chosen": names[chosen],
+                     "chosen_by": "undecodable_mzml_set_aside"}
+                    if chosen
+                    else {"member_name": kept.pop(key), "reason": "two_encodings_of_one_name"}
+                )
+
         if admitted:
             # The unit's own encoding of that sample is its input.
-            for key in keys:
+            leave_out_undecodable(next((item for item in admitted if item in preferred), admitted[0]))
+            for key in competing:
                 name = kept.pop(key)
                 if (
                     converts
@@ -11259,21 +11266,29 @@ def _unattributed_members(
                     }
                 )
             continue
-        winners = [key for key in keys if key in preferred]
-        if len(winners) == 1:
-            for key in keys:
-                if key != winners[0]:
+        winners = [key for key in competing if key in preferred]
+        if len(competing) == 1 or len(winners) == 1:
+            winner = competing[0] if len(competing) == 1 else winners[0]
+            leave_out_undecodable(winner)
+            for key in competing:
+                if key != winner:
                     left_out.append(
                         {
                             "member_name": kept.pop(key),
                             "reason": "chosen_other_encoding",
-                            "chosen": names[winners[0]],
+                            "chosen": names[winner],
                             "chosen_by": "encoding_order",
                         }
                     )
+            # The unit's own encoding of this sample, where it has one, cannot be decoded: the winner is taken in
+            # its place.
+            taken_instead.extend(
+                {"path": kept[winner], "instead_of": _member_under_root(item, data_key)} for item in admitted_any
+            )
             continue
         # No order decides between them (two vendor containers of one name): one sample's, analysed twice otherwise.
-        for key in keys:
+        leave_out_undecodable(None)
+        for key in competing:
             left_out.append({"member_name": kept.pop(key), "reason": "two_encodings_of_one_name"})
     scoped, basis = unit_scoped_download(project)
     record: dict[str, Any] = {"rule": UNATTRIBUTED_MEMBERS_RULE, "applied": scoped}
@@ -11282,6 +11297,12 @@ def _unattributed_members(
             key: {"member_name": name, "paired_by": UNATTRIBUTED_MEMBER_PAIRING} for key, name in kept.items()
         }
         record.update(count=len(kept), **unattributed_member_names(kept.values()), scope=basis)
+        if taken_instead:
+            # A member taken although the unit admitted an encoding of its sample itself, because that one
+            # cannot be decoded (the lease excludes it, unsupported_mzml_encoding).
+            record["taken_instead_of_undecodable"] = sorted(
+                taken_instead, key=lambda item: (item["path"].casefold(), item["instead_of"].casefold())
+            )
     else:
         left_out = [*({"member_name": name, "reason": basis} for name in kept.values()), *left_out]
         record.update(count=0, members=[], paths=[], reason=basis)
@@ -11317,6 +11338,55 @@ def unattributed_member_names(paths: Iterable[str]) -> dict[str, list[str]]:
     return {
         "members": sorted((PurePosixPath(item).name for item in listed), key=lambda item: (item.casefold(), item)),
         "paths": listed,
+    }
+
+
+def unattributed_lineage_record(lineage: dict[str, Any] | None, data_key: str) -> dict[str, Any]:
+    """manifest.unattributed_members' count, members, paths, converted and excluded, read from an input_lineage.
+
+    Every row of rows and of excluded whose name_pairing says unattributed_member, once per path: the members the
+    lease admitted unattributed, inputs and lease-excluded alike, as the gate's PAIR-1 counts them. A converted
+    row is the member its conversion read (source.conversion.source_path: the mzXML, 2026-10-08, second round,
+    answer 3), so converted lists those members. A row the lease excluded after admitting it (an mzXML whose
+    conversion failed or whose scans contradict the declared polarity, an mzML RawDataHandler cannot decode) is
+    listed in excluded with the lease's reason (its row's exclusion.reason). data_key is the _file_key of the data root the paths are relative
+    to (the parent's for a split part); without one a member is named by its basename.
+    """
+    lineage = lineage if isinstance(lineage, dict) else {}
+    seen: set[str] = set()
+    paths: list[str] = []
+    converted: list[str] = []
+    excluded: list[dict[str, str]] = []
+    for part in ("rows", "excluded"):
+        for row in lineage.get(part) or []:
+            if not isinstance(row, dict) or not str(row.get("path") or "").strip():
+                continue
+            pairing = row.get("name_pairing") if isinstance(row.get("name_pairing"), dict) else {}
+            key = _file_key(str(row["path"]))
+            if pairing.get("paired_by") != UNATTRIBUTED_MEMBER_PAIRING or key in seen:
+                continue
+            seen.add(key)
+            source = row.get("source") if isinstance(row.get("source"), dict) else {}
+            conversion = source.get("conversion") if isinstance(source.get("conversion"), dict) else {}
+            member = str(conversion.get("source_path") or "").strip() or str(row["path"])
+            path = _member_under_root(_file_key(member), data_key) if data_key else Path(member).name
+            paths.append(path)
+            if conversion:
+                converted.append(path)
+            if part == "excluded":
+                exclusion = row.get("exclusion") if isinstance(row.get("exclusion"), dict) else {}
+                excluded.append(
+                    {"member_name": PurePosixPath(path).name, "path": path, "reason": str(exclusion.get("reason") or "")}
+                )
+
+    def order(item: str) -> tuple[str, str]:
+        return item.casefold(), item
+
+    return {
+        "count": len(paths),
+        **unattributed_member_names(paths),
+        **({"converted": sorted(converted, key=order)} if converted else {}),
+        **({"excluded": sorted(excluded, key=lambda item: order(item["path"]))} if excluded else {}),
     }
 
 

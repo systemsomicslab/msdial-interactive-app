@@ -83,9 +83,30 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - Opposite-polarity names stay left out
     (`polarity_token_contradicts_ion_mode`), a shared archive still takes none,
     and a unit whose Catalog declared its inputs still takes only those.
-  - `unattributed_members.count`, `members` and `paths` are read from the
-    lineage rows that say `unattributed_member`, so a converted member is
-    counted by the mzML that reached the inputs.
+  - An mzML that RawDataHandler cannot decode does not compete for its
+    sample, because a convertible mzXML outranks an unreadable twin (the rule
+    of 2026-09-30, as `_encoding_choices` already applied it). Before, the
+    order could take an unpaired undecodable mzML over its unpaired mzXML. The
+    lease then excluded the mzML, and the sample had no input at all. Now the
+    mzXML is converted and taken, and the mzML is left out as
+    `chosen_other_encoding` with `chosen_by` `undecodable_mzml_set_aside`.
+    Where the unit's own encoding of a sample cannot be decoded, the unpaired
+    member the order then takes is listed in
+    `unattributed_members.taken_instead_of_undecodable`.
+  - `unattributed_members.count`, `members` and `paths` list every lineage
+    row, in `rows` and in `excluded`, that says `unattributed_member`, once per
+    path, as the gate's PAIR-1 counts them. A converted member is named by its
+    mzXML. A member the lease excluded after admitting it (an mzXML whose
+    conversion failed or whose scans contradict the declared polarity, an mzML
+    it cannot decode) used to be missing from `count` and `members` while its
+    excluded lineage row still said `unattributed_member`, so PAIR-1 FAILed
+    (record only). It is now counted, and listed in
+    `unattributed_members.excluded` with the lease's reason. The warning is
+    recorded wherever the lineage holds such a row.
+  - A split part names a converted unattributed member by its mzXML, as the
+    parent and its lineage row do, and lists it in `converted`. It used to
+    name it by the converted mzML's lower-cased name, so PAIR-1 FAILed (record
+    only).
   - The Agent API lists `repository_unattributed_mzxml_and_encoding_order`.
 
 ### Not changed

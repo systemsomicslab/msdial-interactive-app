@@ -183,6 +183,24 @@ Since 0.5.36 (the user's decision of 2026-10-08, second round, answer 3):
   listed as `analysed_for_an_admitted_sample` with `stands_for`. Two encodings
   the order does not tell apart (two vendor containers of one name) are both
   left out as `two_encodings_of_one_name`, as before.
+- An mzML that RawDataHandler cannot decode does not compete in that choice,
+  because the lease would exclude it and a convertible mzXML outranks an
+  unreadable twin (the rule of 2026-09-30). An unpaired one is left out as
+  `chosen_other_encoding` with `chosen_by` `undecodable_mzml_set_aside`. Where
+  the unit's own encoding of a sample cannot be decoded, the unpaired member
+  the order then takes is an unattributed input, listed in
+  `unattributed_members.taken_instead_of_undecodable` (`path`, `instead_of`).
+  Where no unpaired one can be decoded either, the unit's own encoding stays
+  the sample's.
+- `count`, `members` and `paths` list every lineage row (in `rows` and in
+  `excluded`) whose `name_pairing` says `unattributed_member`, once per path.
+  This is the count the gate's PAIR-1 compares. A member the lease excluded
+  after admitting it (an mzXML whose conversion failed or whose scans
+  contradict the declared polarity, an mzML it cannot decode) is counted too,
+  and is listed in `unattributed_members.excluded` (`member_name`, `path`,
+  `reason`). The warning is recorded wherever the lineage holds such a row. A
+  split part lists its own members the same way, a converted one by its mzXML
+  and in `converted`.
 
 Agent-driven reanalysis also requires a user-reviewed `analysis_purpose` before
 download. That purpose anchors Class/contrast selection, annotation strategy,
