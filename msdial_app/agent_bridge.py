@@ -161,26 +161,19 @@ def summarize_jobs(
             # unattributed_members_included); a shared archive takes none and says why. The record's members are
             # basenames, as the lineage's member_name is, and its paths the members' paths under the data root.
             "repository_unattributed_archive_members",
-            # Since 0.5.36 (2026-10-08, second round): a campaign's lease converts an unpaired mzXML member and takes
-            # the mzML unattributed (unattributed_members.converted), and of one name in two encodings the encoding
-            # order takes one, the other left out as chosen_other_encoding (chosen, chosen_by).
-            "repository_unattributed_mzxml_and_encoding_order",
-            # Since 0.5.36 (2026-10-08, the extra question, A): where a sample's own mzML cannot be decoded, a readable
-            # twin of it (vendor, or in a campaign an mzXML, converted) runs as that sample's own input, in its Class
-            # (lineage replaces_undecodable; unattributed_members.replaced_undecodable), never unattributed.
-            "repository_undecodable_mzml_readable_twin",
+            # Since 0.5.36 (2026-10-08, second round, answer 3): a campaign's lease converts an unpaired mzXML member
+            # and takes the mzML unattributed (unattributed_members.converted).
+            "repository_unattributed_mzxml",
             # Since 0.5.36 (2026-10-08, second round, answer 3): a unit whose Catalog declared its inputs records the
             # archive members no declaration names, each left out (not_named_by_the_catalog_declaration).
             "repository_members_no_declaration_names",
-            # Since 0.5.36: two encodings of one sample are one candidate for the inferred name pairings, the one the
-            # declared name's container suffix names, else the one the encoding order takes; the other is that sample's
-            # other encoding on record, never an unattributed member for want of a one-to-one pairing.
-            "repository_one_sample_encodings_pair_as_one",
-            # Since 0.5.36 (review of #69 at 418766b): copies of one encoding in several folders are one candidate
-            # wherever the encoding order is asked, the copy nearest the data root taken and every other left out as
-            # copy_of_the_chosen_member (chosen, chosen_by nearest_the_data_root or admitted_by_the_unit); one input
-            # stands for a sample's admitted mzXML, never two, and the record names it, not the mzXML, as chosen.
-            "repository_encoding_copies_are_one_candidate",
+            # Since 0.5.36, the user's one encoding rule of 2026-10-09 (msdial_app.encoding_rule): where one sample's
+            # data arrive in several encodings, copies in other folders included, exactly one readable file is used,
+            # vendor -> mzML -> mzXML (converted in a campaign), a tie to the first path without case, an unreadable
+            # one (undecodable mzML, failed conversion) giving way to the next; the file used is the sample's own
+            # input whatever its row names, and every other is on record with its reason (manifest.encoding_choices
+            # and each used input's lineage encoding_choice: {rule, used, unused: [{path, reason}], stands_for}).
+            "repository_one_encoding_rule",
             # A unit or split part its disposition holds is never discarded, approved or confirmed, unless the
             # discard passes release_disposition_hold=true (the operator's skip), which records
             # disposition_hold_released_by "operator_skip"; a held part keeps its parent's raw data until then.

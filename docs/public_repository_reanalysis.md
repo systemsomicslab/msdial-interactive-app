@@ -75,17 +75,15 @@ its preflight skips it. A full disk, or a file another process holds
 (`EACCES`/`EPERM`, after the converter has waited for it), is not a failed
 conversion: the lease stops at its `convert` stage (`download_failed`), keeping
 the records written so far, and a retry converts the rest. A re-lease reuses a
-conversion whose record still holds. Where the unit holds a vendor container or
-an mzML of the same sample beside an mzXML, the Catalog's encoding rule (shared
-test vectors `tests/vectors/encoding_preference.v1.json`) analyses that one and
-the mzXML is not converted. Files are one sample's where their folders agree
-once the words naming an encoding are set aside (`mzML/x.mzML` and
-`mzXML/x.mzXML`), or where the unit admits the readable file by itself, by its
-listing, its sample names or the archive a sample names, whatever its folder
-(`Thermo_RAW/x.raw` beside `mzXML/x.mzXML` for a sample named `x`); a study
-archive's `POS/QC_01.mzML` is no encoding of `NEG/QC_01.mzXML` for a unit whose
-samples name `QC_01.mzXML`. mzData, which nothing converts, excludes its unit in
-a campaign too.
+conversion whose record still holds. Which mzXML are converted is the one
+encoding rule's (0.5.36, the user's rule of 2026-10-09; "One encoding per
+sample" below): an mzXML is the last of a sample's encodings, so where the unit's
+candidates hold a vendor file or a decodable mzML of the same sample (one file
+stem, whatever folders), that one is used and the mzXML is not converted; and
+where a sample's first mzXML fails its conversion, its next one is converted. A
+study archive's `POS/QC_01.mzML` is no encoding of `NEG/QC_01.mzXML` (two
+polarities), and a shared archive's unpaired members are no candidates of the
+unit. mzData, which nothing converts, excludes its unit in a campaign too.
 
 A unit whose Catalog declared no analysis inputs admits a file by its listing,
 by the file names its samples declare, or through an archive one sample names.
@@ -130,30 +128,15 @@ and sample rows), the same warning on the CSV record, and the column
 `raw_file_paired_by` (`exact`, `prefixed_member_name`,
 `leading_identifier_token`) in the reviewed sample TSV.
 
-Since 0.5.36, two encodings of one sample are one candidate for both inferred
-rules, not two (one name less its container suffix, in folders that agree once
-the words naming an encoding are set aside). Where a row declares
-`VV_13_HEpG2_C1_pos.mzML` and the archive holds
-`VV_13_HEpG2_C1_exp344_pos.mzML` and its `.raw`, the member whose container
-suffix the declared name carries is paired (the mzML); where the declared name
-carries none of theirs (a row naming `S7`), the encoding order takes one (a
-vendor folder or container, then mzML, then mzXML). The other encoding is that
-sample's, and `unattributed_members.left_out` records it with what was chosen
-over it. Where the order ties (two vendor containers of one name) neither is
-paired, as before. Until 0.5.36 the twin made both refused
-(`leading_identifier_not_unique`, `not_one_to_one`), so the sample's data ran
-as an unattributed member, in the Class `Unattributed`.
-
-Two refinements hold for this choice. Outside a campaign nothing converts an
-mzXML, so the declared name's suffix never pairs an mzXML over another encoding
-of its sample: a row naming `VV_13_HEpG2_C1_pos.mzXML` beside the run's mzXML
-and mzML takes the mzML, the order's next encoding, and the mzXML is left out
-as `requires_conversion` (a campaign's lease pairs the mzXML and its convert
-stage analyses the mzML for it). And copies of one encoding in several folders
-(`X.mzML` and `mzML/X.mzML`) are one candidate, the one nearest the data root,
-then the first by path; the other copy is left out as
-`copy_of_the_chosen_member`, with `chosen` the copy taken. Where the copy taken
-cannot be decoded, the readable twin runs as the sample (below).
+Since 0.5.36, the files of one sample (one file stem, one polarity stated by
+the path, whatever folders they lie in) are one candidate for both inferred
+rules, not two: where a row declares `VV_13_HEpG2_C1_pos.mzML` and the archive
+holds `VV_13_HEpG2_C1_exp344_pos.mzML` and its `.raw`, both are paired with the
+row, and which of them runs is the one encoding rule's (below), never the
+pairing's. Until 0.5.36 the twin made both refused (`leading_identifier_not_unique`,
+`not_one_to_one`), so the sample's data ran as an unattributed member, in the
+Class `Unattributed`. Two stems a declared name both claims are still two
+samples, and neither is paired.
 
 An archive member that no sample row pairs with, exactly, behind a prefix or by
 its leading identifier, is still an input where the unit's download is its own
@@ -188,12 +171,10 @@ ones. Since 0.5.36 it records the archive members no declaration names:
 `unattributed_members` says `applied` false, `reason` `catalog_declared_inputs`,
 and lists each such member in `left_out` with `reason`
 `not_named_by_the_catalog_declaration` (only analysable members that reached
-nothing of the lease: no input, excluded candidate or conversion source). A
-member that is an encoding of a declared mzML the lease excluded as
-undecodable adds `twin_of` (that mzML's path) and `twin_of_reason`
-`undecodable_mzml`. It is not run: whether the readable-twin answer below
-reaches a declared unit is an open question for the user, and until it is
-answered the declaration holds.
+nothing of the lease: no input, excluded candidate or conversion source). Such a
+member is not run, even where it is a readable encoding of a declared mzML that
+cannot be decoded: the declaration names the sample's file, and members it does
+not name stay out (the second round's answer 3, kept by the rule below).
 
 Since 0.5.36 (the user's decision of 2026-10-08, second round, answer 3):
 
@@ -204,78 +185,6 @@ Since 0.5.36 (the user's decision of 2026-10-08, second round, answer 3):
   basename, so `members` and `paths` name the mzXML; `unattributed_members.converted`
   lists the members converted. Outside a campaign nothing converts, and it stays
   left out as `requires_conversion`.
-- Of one name in two encodings (one name less its container suffix, in folders
-  that agree once the words naming an encoding are set aside, as the convert
-  stage pairs an mzXML with its readable twins), the Catalog's encoding order
-  takes one: a vendor folder or container, then mzML, then mzXML. Each other is
-  left out as `chosen_other_encoding`, with `chosen` (the path taken) and
-  `chosen_by` `encoding_order`. Where the unit admitted an encoding of that
-  sample itself, that one stays the sample's input and an unpaired one is
-  `chosen_other_encoding` with `chosen_by` `encoding_order` where the order puts
-  the admitted one first, or `admitted_by_the_unit` where it puts the unpaired
-  one first or ranks both equal (the admission chose); in a campaign,
-  a readable member the convert stage analyses instead of an admitted mzXML is
-  listed as `analysed_for_an_admitted_sample` with `stands_for`. That member,
-  not the mzXML, is what runs for the sample, so every other encoding of the
-  sample names it as `chosen` (`chosen_by` `encoding_order`). Two encodings
-  the order does not tell apart (two vendor containers of one name) are both
-  left out as `two_encodings_of_one_name`, as before; beside an admitted mzXML
-  in a campaign, neither stands in for it, the mzXML is converted as the
-  sample's input, and each is `chosen_other_encoding` with `chosen` the mzXML
-  and `chosen_by` `admitted_by_the_unit`.
-- Copies of one encoding in several folders (`x.raw` and `RAW/x.raw`, `x.mzML`
-  and `mzML/x.mzML`) are one candidate wherever the order is asked: for an
-  unattributed member, for a readable twin the convert stage analyses for an
-  admitted mzXML, and for a twin that runs for an undecodable mzML. The copy
-  nearest the data root, then the first by path, is taken, and each other copy
-  is left out as `copy_of_the_chosen_member`, with `chosen` the copy taken and
-  `chosen_by` `nearest_the_data_root` (`admitted_by_the_unit` where the copy
-  taken is the unit's own encoding of the sample). Until this fix both copies
-  were analysed for an admitted mzXML, so the sample had two inputs and the
-  analysis CSV refused the unit, or the copies tied and a sample whose own mzML
-  cannot be decoded ran on nothing.
-- An mzML that RawDataHandler cannot decode does not compete in that choice,
-  because the lease would exclude it and a convertible mzXML outranks an
-  unreadable twin (the rule of 2026-09-30). An unpaired one beside another
-  encoding of its sample is never taken. It is left out as
-  `chosen_other_encoding` with `chosen_by` `undecodable_mzml_set_aside` and
-  `chosen` the encoding that runs for the sample (an unpaired twin, or the
-  unit's own), or as `undecodable_mzml` with nothing chosen where nothing of the
-  sample runs (the order ties, no encoding can be decoded, or the unit's own is
-  an mzXML a lease outside a campaign does not convert). Alone, it is an
-  unattributed member, which the lease excludes (`unattributed_members.excluded`).
-- Where the unit's own mzML of a sample cannot be decoded and an unpaired twin
-  of that sample can be read (a vendor file, folder or container, or in a
-  campaign an mzXML, converted), the twin runs as that sample's own input,
-  paired to its sample row and in its Class (the user's answer of 2026-10-08 to
-  the extra question, "A: 読める方をそのサンプルとして使う"). It is never an
-  unattributed member:
-  - `left_out` lists it as `analysed_for_an_admitted_sample`, with `stands_for`
-    the undecodable mzML and `stands_for_reason` `undecodable_mzml`;
-  - `unattributed_members.replaced_undecodable` lists the mzML (`member_name`,
-    `path`, `reason` `undecodable_mzml`, `replaced_by`, and `replaced_by_input`,
-    the input that runs, relative to the data root, or `replacement_excluded`
-    where the lease excluded the twin too);
-  - the twin's lineage row carries `replaces_undecodable` (`path`, `reason`,
-    `rule` `readable_twin_runs_as_the_sample_2026_10_08`) and the sample of the
-    mzML it replaces, which `lineage_stands_for` reads; the mzML's excluded
-    lineage row and its `excluded_input_candidates` entry name the input that
-    runs in its place (`replaced_by`).
-
-  Where the order ties between readable twins none is taken, and outside a
-  campaign an mzXML twin stays left out (`requires_conversion`): the sample then
-  has no input. A shared archive, which takes no unattributed member, runs the
-  twin for its sample all the same: it is the admitted sample's own data. Where
-  the unit admitted the sample's mzML twice (one name in two folders, neither
-  decodable), the twin stands for the one nearest the data root, its lineage row
-  names the other in `replaces_undecodable.other_paths`, and each is listed in
-  `replaced_undecodable` with the input that runs.
-- `chosen` only ever names an input that runs. Where the unit admitted a sample
-  as an mzXML and the lease converts nothing (no campaign), nothing of that
-  sample runs, and a readable unpaired twin of it is left out as
-  `admitted_mzxml_not_converted`, with `twin_of` the mzXML and `twin_of_reason`
-  `requires_conversion`. Whether such a twin should run for its sample outside a
-  campaign is an open question for the user; until it is answered it does not.
 - `count`, `members` and `paths` list every lineage row (in `rows` and in
   `excluded`) whose `name_pairing` says `unattributed_member`, once per path.
   This is the count the gate's PAIR-1 compares. A member the lease excluded
@@ -289,6 +198,72 @@ Since 0.5.36 (the user's decision of 2026-10-08, second round, answer 3):
 Agent-driven reanalysis also requires a user-reviewed `analysis_purpose` before
 download. That purpose anchors Class/contrast selection, annotation strategy,
 QA, and requested outputs; it is retained with repository provenance.
+
+## One encoding per sample (0.5.36, the user's rule of 2026-10-09)
+
+A sample's data may arrive more than once: `S1.raw`, `S1.mzML` and `S1.mzXML`,
+or one file in two folders. The user settled every such case with one rule ("A:
+この一つのルールで統一"), which supersedes the earlier case-by-case answers (the
+readable twin of an undecodable mzML, the encoding order between archive
+members, an admitted encoding beside an unpaired one, copies nearest the data
+root):
+
+1. Of the readable files of the sample, exactly one is used: the highest in the
+   order vendor format (a folder or a container) -> mzML -> mzXML. An mzXML is
+   converted to mzML in a campaign; outside a campaign it is no input.
+2. A tie (the same rank: one format in two folders, or two vendor formats) goes
+   to the first by path name: the path relative to the data root,
+   `/`-separated, compared without case (`RAW/S1.raw` before `S1.raw`, `S1.d`
+   before `S1.raw`).
+3. Where the chosen one cannot be read or decoded (an mzML whose arrays
+   RawDataHandler cannot decode), or its conversion fails, the next in order is
+   taken.
+4. The file used is that sample's own input, paired to its sample row and in its
+   Class, whatever encoding the row names.
+5. Every file not used is recorded with its reason, naming the file used.
+
+`msdial_app.encoding_rule.choose_encoding` is the rule, and the lease asks it
+once per sample (`_encoding_groups`, `_choose_encodings`). One sample's
+candidates are the files a sample row pairs with (exactly, by its stem, a prefix
+or a leading identifier) and every other candidate of the unit of the same file
+stem, or, for candidates no row pairs with, those of one stem. Two things keep
+files apart: a polarity the path states by a token (`POS/S1.raw` and
+`NEG/S1.raw` are two acquisitions, and a unit of both polarities is split by
+them later), and two sample rows (rows naming `S1.raw` and `S1.mzML` each keep
+their own; an unattributed member of that stem is left out on record as
+`stem_of_several_sample_rows`). The candidates are the unit's own: a shared
+archive's unpaired members are none (excluded on record, as before), and a unit
+whose Catalog declared its inputs is matched by path, so the rule has nothing to
+choose there.
+
+At the lease, readable means what the lease can establish: an mzML is scanned
+(`mzml_encoding`), an mzXML is converted, and a vendor file or folder is taken as
+readable (its header is the raw-header preflight's to read; an Unknown header
+there excludes it as before, with no fallback to another encoding). Readability
+is asked in the rule's order and only until one file is readable, so an mzXML is
+converted only where nothing before it can be read.
+
+The record:
+
+- `manifest.encoding_choices` lists every sample the rule chose for among more
+  than one candidate: `{rule: one_encoding_per_sample_2026_10_09, used,
+  unused: [{path, reason}]}`, paths relative to the data root. `used` is null
+  where no candidate could be read; those candidates keep the exclusions the
+  lease always recorded (`unsupported_mzml_encoding`, `conversion_failed`).
+- The reasons: `lower_in_encoding_order`, `tie_lexicographic`, `undecodable`,
+  `conversion_failed` (or the convert stage's
+  `polarity_contradicts_declaration`), and `requires_conversion` for an mzXML
+  outside a campaign.
+- The lineage row of each input used carries the same choice as
+  `encoding_choice`, with `stands_for` (the absolute path of the file its row
+  pairs with) where the row names another file of the sample; it takes that
+  file's sample, declared names and inferred pairing, and `lineage_stands_for`
+  reads it, so the analysis-CSV builder and a split find the same row. A split
+  part carries its own samples' choices.
+- A file left unused is no input and no excluded candidate. The attribute stage
+  counts `encoding_choices` and `unused_encodings`; the convert stage's
+  `not_converted_readable_encoding` counts the mzXML a readable encoding was used
+  before.
 
 ## Workspace and retention policy
 
