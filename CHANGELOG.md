@@ -4,6 +4,43 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.36] - Unreleased
+
+### Changed
+- Multi-energy AIF whose inputs record different MS2 collision-energy sets runs
+  as AIF with a Console that has MsdialWorkbench#825, instead of being held.
+  This is the user's decision of 2026-10-08 ("run as is"), and it replaces the
+  hold `aif_collision_energies_differ_between_inputs` of 0.5.34.
+  - It covers one energy per input but not the same one, different sets, and a
+    multi-energy input beside a single-energy one. The unit is decided `run` as
+    AIF under the same rule, `multi_ce_aif_with_console_825`, with each per-file
+    record's basis `aif_multi_ce_console_825`.
+  - #825 chooses a representative energy among one file's energies only. Each
+    file is therefore processed with its own per-file representative collision
+    energy, and representative energies can differ between files.
+  - It is on record:
+    - the disposition warning `aif_energy_sets_differ_between_inputs`;
+    - `aif_multi_ce_run.energy_sets_differ` true and
+      `aif_multi_ce_run.collision_energy_sets` (each distinct set and its file
+      count), carried into the analysis-row record and the prepare preview;
+    - each input's own set in `aif_collision_energies_by_input`;
+    - a project-evidence line, `aif_collision_energy_sets` in the MCP preflight
+      reply, and one Materials and Methods sentence. Table S1 adds the sets and
+      the per-file scope.
+  - The execution gate checks each such input's energies against its own
+    recorded set, not the unit's union.
+  - A unit held under `aif_collision_energies_differ_between_inputs` by 0.5.34
+    or 0.5.35 is released by the operator's recheck with the #825 Console
+    configured (preflight or `classify_preflight`), which decides it `run`.
+  - The Agent API lists `campaign_multi_ce_aif_differing_energy_sets`.
+
+### Not changed
+- All inputs sharing exactly one energy run as SWATH.
+- An input with no recorded MS2 collision energy holds the unit
+  (`aif_collision_energy_unrecorded`, raw data kept), with #825 or without.
+- Without #825, more than one energy over the unit is held as
+  `aif_multi_ce_awaiting_console`.
+
 ## [0.5.35] - Unreleased
 
 ### Changed

@@ -611,19 +611,36 @@ which records the same energies, more than one, is decided `run` as AIF:
 each per-file record `console_acquisition_basis` `aif_multi_ce_console_825`.
 #825 chooses a representative energy among the energies of one file, never
 across files (a file with one energy keeps its single deconvolution result), so
-with #825 inputs whose energies differ from one another are held as
-`aif_collision_energies_differ_between_inputs`, raw data kept, each input's
-energies in `aif_collision_energies_by_input`; no Console releases that hold,
-only an operator's decision. One energy still
-runs as SWATH, and an unrecorded energy is still held, since the #825 Console
-stops on an AIF file whose MS2 scans carry no energy. Without #825 nothing
-changes. A unit held earlier as `aif_multi_ce_awaiting_console` is released by
-the operator's recheck: preflighting it again (or `classify_preflight`) with
-the #825 Console configured decides it `run`. The execution gate refuses an
-`aif_multi_ce_run` unit when the workflow's Console lacks #825, a per-file
-record that claims the basis without the record, and a per-file record whose
-own energies are not the recorded ones. The Materials and Methods text
-and Table S1 state the energies and the representative-energy rule.
+each file is processed with its own per-file representative collision energy.
+
+Inputs whose energy sets differ from one another (one energy each but not the
+same one, different sets, or a multi-energy file beside a single-energy one) run
+as AIF with #825 as well (0.5.36; the user's decision of 2026-10-08, "run as
+is"), on record: the warning `aif_energy_sets_differ_between_inputs`,
+`aif_multi_ce_run`'s `energy_sets_differ` true and `collision_energy_sets` (each
+distinct set with its file count), and each input's own set in the disposition's
+`aif_collision_energies_by_input`. The project evidence, the MCP preflight reply
+(`aif_collision_energy_sets`), the analysis-row record and the Materials and
+Methods text say that the sets differ and that representative energies can
+therefore differ between files. Interactive 0.5.34 and 0.5.35 held such a unit
+as `aif_collision_energies_differ_between_inputs`; that reason is no longer
+decided, and a unit held under it is released by the same recheck as any
+multi-energy AIF hold.
+
+All inputs sharing exactly one energy still run as SWATH, and an input with no
+recorded energy still holds the unit, since the #825 Console stops on an AIF
+file whose MS2 scans carry no energy. Without #825 nothing changes: more than
+one energy over the unit, whether the inputs share it or not, is held as
+`aif_multi_ce_awaiting_console`. A unit held earlier as
+`aif_multi_ce_awaiting_console` (or `aif_collision_energies_differ_between_inputs`)
+is released by the operator's recheck: preflighting it again (or
+`classify_preflight`) with the #825 Console configured decides it `run`. The
+execution gate refuses an `aif_multi_ce_run` unit when the workflow's Console
+lacks #825, a per-file record that claims the basis without the record, and a
+per-file record whose own energies are not the recorded ones (the unit's
+energies, or, where the sets differ, the input's own recorded set). The
+Materials and Methods text and Table S1 state the energies and the
+representative-energy rule.
 
 A repository declaration of PRM, SRM, MRM, SIM or full scan is a declaration like
 any other, and untargeted status is never inferred over a declared targeted

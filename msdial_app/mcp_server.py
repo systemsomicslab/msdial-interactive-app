@@ -1890,9 +1890,12 @@ def msdial_repository_raw_metadata_preflight(
     for MsdialWorkbench#825's multi-energy AIF processing: with it, an AIF unit every input of which records the
     same MS2 collision energies, more than one, runs as AIF (aif_multi_ce_run) instead of being held
     (aif_multi_ce_awaiting_console), and preflighting a held unit again with such a Console is how its hold is
-    released. #825 chooses among one file's energies, never across files, so inputs whose energies differ from one
-    another stay held (aif_collision_energies_differ_between_inputs). Single-energy AIF still runs as SWATH, and AIF
-    with an unrecorded energy is still held.
+    released. #825 chooses among one file's energies, never across files, so each file is processed with its own
+    per-file representative collision energy. Inputs whose energy sets differ from one another run as AIF as well
+    (user decision, 2026-10-08), on record: the warning aif_energy_sets_differ_between_inputs, aif_multi_ce_run's
+    energy_sets_differ, and aif_collision_energy_sets here (each distinct set with its file count). A unit held
+    earlier for that (aif_collision_energies_differ_between_inputs, 0.5.34-0.5.35) is released by the same recheck.
+    Single-energy AIF still runs as SWATH, and AIF with an unrecorded energy is still held.
     """
     _, manifest = _repository_unit(download_job_id, manifest_path, host, port)
     from .raw_metadata_extractor import select_raw_metadata_extractor
@@ -1972,7 +1975,8 @@ def msdial_repository_raw_metadata_preflight(
                 for key in ("aif_run_as_swath", "aif_multi_ce_run", "aif_collision_energies")
                 if key in disposition
             },
-            # A hold for energies that differ between inputs: each distinct set with its file count, not every file.
+            # Energies that differ between inputs (a run on record since 0.5.36, a hold in 0.5.34-0.5.35): each
+            # distinct set with its file count, not every file.
             **(
                 {
                     "aif_collision_energy_sets": [

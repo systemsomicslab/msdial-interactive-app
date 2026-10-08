@@ -144,11 +144,15 @@ def summarize_jobs(
             # (#825 chooses among one file's energies, never across files), recorded as
             # campaign_disposition.aif_multi_ce_run (rule multi_ce_aif_with_console_825) with the probe as
             # multi_energy_aif_console, and console_acquisition_basis aif_multi_ce_console_825. Without #825 it is
-            # held as before; preflighting a held unit again with a #825 Console releases it. With #825, inputs
-            # whose energies differ from one another are held as aif_collision_energies_differ_between_inputs
-            # (aif_collision_energies_by_input). The gate refuses such a unit with a Console that lacks #825, and
-            # a per-file record whose energies are not the recorded ones.
+            # held as before; preflighting a held unit again with a #825 Console releases it. The gate refuses such
+            # a unit with a Console that lacks #825, and a per-file record whose energies are not the recorded ones.
             "campaign_multi_ce_aif_with_console_825",
+            # Multi-energy AIF whose inputs record different energy sets (0.5.36, user decision 2026-10-08, "run as
+            # is"): with #825 the unit runs as AIF, each file with its own per-file representative collision energy,
+            # on record (warning aif_energy_sets_differ_between_inputs; aif_multi_ce_run.energy_sets_differ and
+            # collision_energy_sets; aif_collision_energies_by_input). 0.5.34-0.5.35 held it as
+            # aif_collision_energies_differ_between_inputs; a recheck with a #825 Console releases such a unit.
+            "campaign_multi_ce_aif_differing_energy_sets",
             # An undeclared unit whose download is its own alone (unit_files, or every bundle URL with
             # shared_unit_count 1) takes the archive members no sample row pairs with as unattributed inputs
             # (name_pairing.paired_by unattributed_member, manifest.unattributed_members, the warning
