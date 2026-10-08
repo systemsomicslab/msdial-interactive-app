@@ -41,6 +41,16 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 - Without #825, more than one energy over the unit is held as
   `aif_multi_ce_awaiting_console`.
 
+### Upgrade order
+- The before-production gate of the reanalysis repository, as of its gate PR
+  #34, still requires every multi-energy AIF row to record the unit's union of
+  energies, and FAILs ACQ-1 otherwise. ACQ-1 blocks the run, and the campaign
+  runner counts that block as a failure: after the retries the unit ends as
+  failed and its raw data are deleted, with no MS-DIAL run.
+- So the campaign must not run 0.5.36 until the gate accepts per-file energy
+  sets that differ. Neither a recheck nor a fresh preflight with 0.5.36 is safe
+  before then, because either decides such a unit `run`.
+
 ## [0.5.35] - Unreleased
 
 ### Changed
