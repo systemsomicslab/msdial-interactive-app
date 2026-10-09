@@ -47,6 +47,7 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
         INFERRED_PAIRING_WARNING,
         LEADING_IDENTIFIER_TOKEN_PAIRING,
         PREFIXED_MEMBER_PAIRING,
+        UNATTRIBUTED_MEMBER_PAIRING,
         RepositoryFile,
         RepositoryProject,
         _file_key,
@@ -1309,12 +1310,17 @@ class TheOneEncodingRule(_Workspace):
 
         self.assertEqual([(f"{PREFIX}S7.mzML", "lower_in_encoding_order")], self.choice(manifest, f"{PREFIX}S7.raw"))
         row = self.rows(manifest)[f"{PREFIX}S7.raw"]
-        self.assertEqual(("Sample7", "S7.mzML", PREFIXED_MEMBER_PAIRING),
-                         (row["sample_id"], row["name_pairing"]["declared_raw_file"], row["name_pairing"]["paired_by"]))
-        # Only the member that runs is listed as an inferred pairing.
+        # The prefix pairs the mzML only (its name ends in _S7.mzML); the .raw is its sample's by its stem. The record
+        # names the pairing as it was made, by the mzML, and says the rule used the .raw for its sample (review of
+        # PR #69, follow-up 3): the .raw is not recorded as paired by a prefix.
         self.assertEqual(
-            [f"{PREFIX}S7.raw"],
-            [item["member_name"] for item in manifest["input_name_pairings"]["paired"]
+            ("Sample7", {"declared_raw_file": "S7.mzML", "member_name": f"{PREFIX}S7.mzML",
+                         "paired_by": PREFIXED_MEMBER_PAIRING}),
+            (row["sample_id"], row["name_pairing"]),
+        )
+        self.assertEqual(
+            [(f"{PREFIX}S7.mzML", f"{PREFIX}S7.raw")],
+            [(item["member_name"], item["encoding_used"]) for item in manifest["input_name_pairings"]["paired"]
              if item["declared_raw_file"] == "S7.mzML"],
         )
         self.assertEqual(("Sample7", 3), (self.csv_row(manifest, f"{PREFIX}S7.raw")["sample_id"],
@@ -1681,21 +1687,162 @@ class TheOneEncodingRule(_Workspace):
         self.assertEqual({}, self.pairing([f"{PREFIX}S7.mzML", "S7.mzML"], [("Sample7", "S7")]))
         self.assertEqual({f"{PREFIX}S7.raw": "S7"}, self.pairing([f"{PREFIX}S7.raw", "S7.mzML"], [("Sample7", "S7")]))
 
-    def test_a_member_of_the_rows_leading_identifier_and_an_mzml_of_its_stem_are_one_sample(self) -> None:
-        # The same through a leading identifier (ST001359's shape): VV_13_HEpG2_C1_exp344_pos.raw shares the key vv_13
-        # with the row's VV_13_HEpG2_C1_pos.raw, and VV_13_HEpG2_C1_pos.mzML is of the row's stem. The mzML is no
-        # rival for the key (it is the row's own file): the token pairs the .raw, and the rule runs it alone.
-        name = "VV_13_HEpG2_C1_exp344_pos.raw"
-        manifest = self.unit([name, "VV_13_HEpG2_C1_pos.mzML"], [("V13", "VV_13_HEpG2_C1_pos.raw")],
-                             contents={"VV_13_HEpG2_C1_pos.mzML": mzml(dda_spectra(6))})
+    # ---- a leading identifier two stems carry pairs nothing (review of PR #69, follow-up 3) ---------------------
+    #
+    # The one encoding rule does not say whether a file that shares only a row's leading identifier is that row's
+    # sample, so the token rule keeps its own words (2026-10-06): a key is paired only where it matches uniquely on
+    # both sides, the row's own files counting. Where the row's own file is there (by its exact name, or of its stem
+    # in another encoding) and a file of another stem carries the key, nothing is paired by it: the row's own file
+    # is its input, and the other file is an unattributed input of a unit-scoped archive, or left out on record from
+    # a shared one, as it was before the rule.
 
-        self.assertEqual(sorted([*self.TRIO, name]), self.names(manifest))
-        self.assertEqual([("VV_13_HEpG2_C1_pos.mzML", "lower_in_encoding_order")], self.choice(manifest, name))
-        row = self.rows(manifest)[name]
-        self.assertEqual(("V13", "leading_identifier_token"), (row["sample_id"], row["name_pairing"]["paired_by"]))
-        self.assertEqual([], manifest["input_name_pairings"]["refused"])
-        self.assertEqual([], (manifest.get("unattributed_members") or {}).get("members") or [])
-        assert_every_member_on_record(self, manifest, [name, "VV_13_HEpG2_C1_pos.mzML"])
+    V13 = "VV_13_HEpG2_C1_pos"
+
+    def assert_unpaired_beside_the_rows_own_file(
+        self, manifest: dict, own: str, other: str, scope: dict, *, own_paired: bool = False
+    ) -> None:
+        """``own`` runs as V13, by its exact name, or (``own_paired``) by the key, as the row's own-stem file alone
+        is; ``other`` is no encoding of V13 and is paired with nothing: an unattributed input, or left out."""
+        self.assertIn(own, self.names(manifest))
+        self.assertEqual("V13", self.rows(manifest)[own]["sample_id"])
+        self.assertNotIn(other, [item["used"] for item in manifest.get("encoding_choices") or []])
+        self.assertNotIn(other.casefold(), [item["path"].casefold() for choice in manifest.get("encoding_choices") or []
+                                            for item in choice["unused"]])
+        listed = [(item["member_name"], item["paired_by"])
+                  for item in (manifest.get("input_name_pairings") or {}).get("paired") or []
+                  if item["declared_raw_file"].startswith("VV_13")]
+        if own_paired:
+            self.assertEqual({"declared_raw_file": f"{self.V13}.raw", "member_name": own,
+                              "paired_by": LEADING_IDENTIFIER_TOKEN_PAIRING, "key": "vv_13"},
+                             self.rows(manifest)[own]["name_pairing"])
+            self.assertEqual([(own, LEADING_IDENTIFIER_TOKEN_PAIRING)], listed)
+        else:
+            self.assertNotIn("name_pairing", self.rows(manifest)[own])
+            self.assertEqual([], listed)
+        record = manifest["unattributed_members"]
+        if scope is UNIT_SCOPED:
+            self.assertIn(other, self.names(manifest))
+            self.assertIn(other, record["paths"])
+            self.assertEqual(UNATTRIBUTED_MEMBER_PAIRING, self.rows(manifest)[other]["name_pairing"]["paired_by"])
+        else:
+            self.assertNotIn(other, self.names(manifest))
+            self.assertIn(other, [item["path"] for item in record["left_out"]])
+        assert_every_member_on_record(self, manifest, [own, other])
+
+    def test_a_token_another_stem_carries_beside_the_rows_exact_file_pairs_nothing(self) -> None:
+        # Probe V13: the row names VV_13_HEpG2_C1_pos.raw, which is there; VV_13_HEpG2_C1_rep2_pos carries the key
+        # too, in an mzML or a .raw. It is another injection, not an encoding of V13: it runs unattributed (or is left
+        # out of a shared archive), whatever its encoding, and the row's .raw runs as V13.
+        own = f"{self.V13}.raw"
+        for other in ("VV_13_HEpG2_C1_rep2_pos.mzML", "VV_13_HEpG2_C1_rep2_pos.raw"):
+            for scope in (UNIT_SCOPED, SHARED):
+                with self.subTest(other=other, scope=scope["kind"]), tempfile.TemporaryDirectory() as temporary:
+                    self.root = Path(temporary).resolve()
+                    manifest = self.unit([own, other], [("V13", own)], scope=scope,
+                                         contents={other: mzml(dda_spectra(6))})
+
+                    self.assert_unpaired_beside_the_rows_own_file(manifest, own, other, scope)
+                    self.assertNotIn(other, [item["member_name"] for item in
+                                             (manifest.get("input_name_pairings") or {}).get("refused") or []])
+
+    def test_a_token_another_stem_carries_never_sets_aside_the_mzml_the_row_names(self) -> None:
+        # Probe L1: the row names VV_13_HEpG2_C1_pos.mzML, which is there, beside VV_13_HEpG2_C1_exp344_pos.raw. The
+        # mzML the row names runs as V13; the .raw is not paired by the key and does not displace it.
+        own, other = f"{self.V13}.mzML", "VV_13_HEpG2_C1_exp344_pos.raw"
+        for scope in (UNIT_SCOPED, SHARED):
+            with self.subTest(scope=scope["kind"]), tempfile.TemporaryDirectory() as temporary:
+                self.root = Path(temporary).resolve()
+                manifest = self.unit([own, other], [("V13", own)], scope=scope, contents={own: mzml(dda_spectra(6))})
+
+                self.assert_unpaired_beside_the_rows_own_file(manifest, own, other, scope)
+
+    def test_a_token_another_stem_carries_never_sets_aside_the_rows_own_stem(self) -> None:
+        # Probe L3: the row names VV_13_HEpG2_C1_pos.raw, which is not there; VV_13_HEpG2_C1_pos.mzML is of its stem
+        # (V13's by clause 4), and VV_13_HEpG2_C1_exp344_pos.raw shares only the key. Two stems carry it, so it is not
+        # unique: the exp344 .raw is refused the pairing, on record. The row's own-stem mzML is paired by the key as
+        # it is when it is alone (and as before the rule), and runs as V13.
+        own, other = f"{self.V13}.mzML", "VV_13_HEpG2_C1_exp344_pos.raw"
+        for scope in (UNIT_SCOPED, SHARED):
+            with self.subTest(scope=scope["kind"]), tempfile.TemporaryDirectory() as temporary:
+                self.root = Path(temporary).resolve()
+                manifest = self.unit([own, other], [("V13", f"{self.V13}.raw")], scope=scope,
+                                     contents={own: mzml(dda_spectra(6))})
+
+                self.assert_unpaired_beside_the_rows_own_file(manifest, own, other, scope, own_paired=True)
+                self.assertEqual(
+                    [(other, f"{self.V13}.raw", LEADING_IDENTIFIER_TOKEN_PAIRING, "leading_identifier_not_unique")],
+                    [(item["member_name"], item["declared_raw_file"], item["rule"], item["reason"])
+                     for item in manifest["input_name_pairings"]["refused"] if item["member_name"] == other],
+                )
+
+    def test_a_token_only_one_stem_carries_still_pairs_one_samples_files(self) -> None:
+        # What the token rule pairs is kept: where the row's name is not there and one sample (of one stem) carries
+        # the key, its files are paired, and the rule runs its vendor file.
+        name = "VV_13_HEpG2_C1_exp344_pos"
+        manifest = self.unit([f"{name}.raw", f"{name}.mzML"], [("V13", f"{self.V13}.raw")],
+                             contents={f"{name}.mzML": mzml(dda_spectra(6))})
+
+        self.assertEqual([(f"{name}.mzML", "lower_in_encoding_order")], self.choice(manifest, f"{name}.raw"))
+        row = self.rows(manifest)[f"{name}.raw"]
+        self.assertEqual(("V13", LEADING_IDENTIFIER_TOKEN_PAIRING, f"{name}.raw"),
+                         (row["sample_id"], row["name_pairing"]["paired_by"], row["name_pairing"]["member_name"]))
+
+    # ---- a file of the row's stem used for a sample a prefix paired is not itself paired (follow-up 3) ----------
+
+    def assert_paired_through(self, manifest: dict, used: str, member: str, declared: str, encoding_used: str) -> None:
+        """The input ``used`` is its row's sample's, which a prefix paired through ``member`` (unused): its lineage row
+        names that pairing as it was made (member_name ``member``), and the manifest lists it once, by ``member``,
+        saying which file the rule used for its sample."""
+        row = self.rows(manifest)[used]
+        self.assertEqual("Sample7", row["sample_id"])
+        self.assertEqual(member, Path(row["encoding_choice"]["stands_for"]).name)
+        self.assertEqual(
+            {"declared_raw_file": declared, "member_name": member, "paired_by": PREFIXED_MEMBER_PAIRING},
+            row["name_pairing"],
+        )
+        self.assertEqual(
+            [{"member_name": member, "declared_raw_file": declared, "paired_by": PREFIXED_MEMBER_PAIRING,
+              "encoding_used": encoding_used}],
+            [item for item in manifest["input_name_pairings"]["paired"] if item["declared_raw_file"] == declared],
+        )
+        self.assertIn(INFERRED_PAIRING_WARNING, manifest["warnings"])
+
+    def test_a_file_of_the_rows_stem_is_not_recorded_as_paired_by_a_prefix(self) -> None:
+        # Probe P3c: S7.raw runs as Sample7, the row naming S7.mzML. It carries no prefix; the member a prefix paired
+        # is 021518_387057_CSHp_S7.mzML, which the rule left unused. The record says that pairing, not one of S7.raw.
+        for scope in (UNIT_SCOPED, SHARED):
+            with self.subTest(scope=scope["kind"]), tempfile.TemporaryDirectory() as temporary:
+                self.root = Path(temporary).resolve()
+                manifest = self.unit([f"{PREFIX}S7.mzML", "S7.raw"], [("Sample7", "S7.mzML")], scope=scope,
+                                     contents={f"{PREFIX}S7.mzML": mzml(dda_spectra(6))})
+
+                self.assert_paired_through(manifest, "S7.raw", f"{PREFIX}S7.mzML", "S7.mzML", "S7.raw")
+                attribute = next(entry for entry in manifest["lease_stages"] if entry["stage"] == "attribute")
+                # The three BioRec members and Sample7's: S7.raw is counted once, through the member paired.
+                self.assertEqual(4, attribute["prefixed_member_pairings"])
+                self.assertEqual(manifest["input_name_pairings"]["paired"], attribute["inferred_name_pairings"])
+
+    def test_copies_of_the_rows_stem_in_folders_are_not_recorded_as_paired_by_a_prefix(self) -> None:
+        manifest = self.unit([f"{PREFIX}S7.mzML", "A/S7.raw", "RAW/S7.raw"], [("Sample7", "S7.mzML")],
+                             contents={f"{PREFIX}S7.mzML": mzml(dda_spectra(6))})
+
+        self.assertEqual([("RAW/S7.raw", "tie_lexicographic"), (f"{PREFIX}S7.mzML", "lower_in_encoding_order")],
+                         self.choice(manifest, "A/S7.raw"))
+        self.assert_paired_through(manifest, "A/S7.raw", f"{PREFIX}S7.mzML", "S7.mzML", "A/S7.raw")
+
+    def test_a_converted_file_of_the_rows_stem_keeps_its_sample_and_the_prefix_pairing(self) -> None:
+        # Probe U1 (a campaign): the prefixed mzML cannot be decoded, so the rule converts S7.mzXML, of the row's
+        # stem, and runs it as Sample7. Its lineage row keeps Sample7 and names the prefix pairing as it was made.
+        from test_mzxml_conversion import dda_32
+
+        manifest = self.unit([f"{PREFIX}S7.mzML", "S7.mzXML"], [("Sample7", "S7.mzML")], campaign=True,
+                             contents={f"{PREFIX}S7.mzML": _numpress_mzml(), "S7.mzXML": dda_32()})
+
+        self.assertEqual([(f"{PREFIX}S7.mzML", "undecodable")], self.choice(manifest, "S7.mzXML"))
+        self.assertEqual("converted", self.rows(manifest)["S7.mzXML"]["kind"])
+        self.assert_paired_through(manifest, "S7.mzXML", f"{PREFIX}S7.mzML", "S7.mzML", "S7.mzXML")
+        self.assertEqual("Sample7", self.csv_row(manifest, "S7.mzXML")["sample_id"])
+        assert_every_member_on_record(self, manifest, [f"{PREFIX}S7.mzML", "S7.mzXML"])
 
     def test_a_prefixed_name_in_the_units_polarity_folder_and_untokened_is_one_candidate(self) -> None:
         # The pairing reads one sample as the rule does: POS/<prefix>S8.raw and <prefix>S8.raw in a positive unit are
@@ -2283,6 +2430,39 @@ class ADeclaredNameIsPairedByItsLeadingIdentifier(_Workspace):
         self.assertEqual({}, result["paired"])
         self.assertEqual({"leading_identifier_not_unique"}, {item["reason"] for item in result["refused"]})
 
+    def test_a_token_is_never_paired_beside_the_rows_exact_file_in_any_encoding(self) -> None:
+        # Review of PR #69, follow-up 3: the exact-first rule keeps a token from pairing anything with a declared
+        # name a member carries exactly, whatever the member's encoding: a file of another stem that shares the key is
+        # another injection as far as the record can tell. No pairing, and no refusal: the token rule never ran.
+        for members, raw in (
+            (["VV_13_C1_pos.raw", "VV_13_C1_rep2_pos.mzML"], "VV_13_C1_pos.raw"),
+            (["VV_13_C1_pos.raw", "VV_13_C1_rep2_pos.raw"], "VV_13_C1_pos.raw"),
+            (["VV_13_C1_pos.mzML", "VV_13_C1_exp344_pos.raw"], "VV_13_C1_pos.mzML"),
+        ):
+            with self.subTest(members=members):
+                self.assertEqual({"paired": {}, "refused": []}, self.pairings(members, [("c1", raw)]))
+
+    def test_beside_another_stem_the_rows_own_stem_is_paired_and_the_other_refused(self) -> None:
+        # The key vv_13 is carried by two stems, so it does not match uniquely: VV_13_C1_exp344_pos.raw is refused.
+        # VV_13_C1_pos.mzML, of the declared name's own stem, is the row's (clause 4) and paired by the key as it is
+        # alone. The rank of either file does not change that.
+        data_key = _file_key(str(self.root / "raw" / "data"))
+        for own, other in (("VV_13_C1_pos.mzML", "VV_13_C1_exp344_pos.raw"),
+                           ("VV_13_C1_pos.mzML", "VV_13_C1_exp344_pos.mzML")):
+            with self.subTest(other=other):
+                result = self.pairings([own, other], [("c1", "VV_13_C1_pos.raw")])
+
+                self.assertEqual(
+                    {own.casefold(): ("VV_13_C1_pos.raw", LEADING_IDENTIFIER_TOKEN_PAIRING)},
+                    {os.path.relpath(key, data_key).replace("\\", "/"): (item["declared_raw_file"], item["paired_by"])
+                     for key, item in result["paired"].items()},
+                )
+                self.assertEqual([(other.casefold(), "leading_identifier_not_unique")],
+                                 [(item["member_name"].casefold(), item["reason"]) for item in result["refused"]])
+        # Alone, as always.
+        result = self.pairings(["VV_13_C1_pos.mzML"], [("c1", "VV_13_C1_pos.raw")])
+        self.assertEqual(["VV_13_C1_pos.raw"], [item["declared_raw_file"] for item in result["paired"].values()])
+
     def test_a_unit_whose_catalog_declared_its_inputs_is_never_paired_by_token(self) -> None:
         declared = [{"path": "VV_13_HEpG2_C1_pos.raw", "kind": "file", "sample_id": "VV_13_HEpG2_C1"}]
         result = self.pairings(ST001359_MEMBERS, ST001359_SAMPLES, analysis_inputs=declared)
@@ -2539,6 +2719,27 @@ class ASplitPartCarriesItsOwnPairingRecord(_Workspace):
             [("D_4_pos.raw", "Z"), ("S5.raw", "S")],
             sorted((Path(item["input_path"]).name, item["sample_id"]) for item in built["rows"]),
         )
+
+    def test_a_part_lists_a_prefix_pairing_by_the_member_paired_not_by_the_file_of_the_rows_stem(self) -> None:
+        # Review of PR #69, follow-up 3 (probe P3c through a split): S7.raw runs as S, the row naming S7.mzML, whose
+        # 021518_387057_CSHp_S7.mzML a prefix paired. The part holding S7.raw lists that pairing as it was made, by the
+        # prefixed mzML, with the file the rule used; S7.raw is never listed as paired by a prefix.
+        members = {name: f"thermo raw bytes of {name}".encode() for name in ["A_1_pos.raw", "D_4_pos.raw", "S7.raw"]}
+        members[f"{PREFIX}S7.mzML"] = mzml(dda_spectra(6))
+        parent, parts = self.split(
+            members, [("X", "A_1_pos.raw"), ("Z", "D_4_pos.raw"), ("S", "S7.mzML")], {"D_4_pos.raw": "DIA"},
+        )
+        dda, dia = parts["u-split-dda"], parts["u-split-dia"]
+
+        pairing = {"member_name": f"{PREFIX}S7.mzML", "declared_raw_file": "S7.mzML",
+                   "paired_by": PREFIXED_MEMBER_PAIRING, "encoding_used": "S7.raw"}
+        self.assertEqual([pairing], parent["input_name_pairings"]["paired"])
+        self.assertEqual([pairing], dda["input_name_pairings"]["paired"])
+        self.assertEqual([], (dia.get("input_name_pairings") or {}).get("paired") or [])
+        row = next(item for item in dda["input_lineage"]["rows"] if Path(item["path"]).name == "S7.raw")
+        self.assertEqual(("S", f"{PREFIX}S7.mzML", PREFIXED_MEMBER_PAIRING),
+                         (row["sample_id"], row["name_pairing"]["member_name"], row["name_pairing"]["paired_by"]))
+        self.assertEqual(["X", "S"], [item["sample_id"] for item in dda["project"]["sample_metadata"]])
 
     def test_a_part_names_a_converted_member_by_its_mzxml_as_the_parent_does(self) -> None:
         # Review ia-r2 follow-up 1, medium: the part listed 'u_9.mzml' (the converted mzML's lower-cased name),

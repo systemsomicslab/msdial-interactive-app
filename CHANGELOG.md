@@ -147,13 +147,28 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - The pairing rules (prefixed name, leading identifier) take one sample's
     files as one candidate and pair each of them with the row; which runs is
     the rule's. A file used for a sample whose row paired with another of its
-    files takes that pairing. A name a member carries exactly keeps a prefix
-    or a leading identifier from pairing another member with it only where
-    that member is of the same encoding rank (a prefixed `.raw` beside `S7.raw`
-    is a different file, as before); one of another rank is the row's
-    sample's other encoding and is paired (a prefixed `.raw` beside the
-    `S7.mzML` an extensionless row `S7` names). A file of the row's own stem is
-    no rival for a leading identifier.
+    files is that row's input, but no rule paired it: the pairing stays the
+    member's it was made for (see the record below). A name a member carries
+    exactly keeps a prefix from pairing another member with it only where that
+    member is of the same encoding rank (a prefixed `.raw` beside `S7.raw` is a
+    different file, as before); one of another rank is the row's sample's other
+    encoding and is paired (a prefixed `.raw` beside the `S7.mzML` an
+    extensionless row `S7` names).
+  - A leading identifier is never paired beside a member that carries the
+    declared name exactly, in any encoding, and is paired only where it matches
+    uniquely on both sides (2026-10-06), the row's own files counting. The one
+    encoding rule does not say whether a file that shares only a row's leading
+    identifier is that row's sample, so the token rule keeps its words. Beside
+    a row naming `VV_13_HEpG2_C1_pos.raw` that is there,
+    `VV_13_HEpG2_C1_rep2_pos.mzML` (or `.raw`) is not paired: it runs as an
+    unattributed input of a unit-scoped archive, or is left out on record from
+    a shared one, and the row's `.raw` runs. A row naming the mzML that is
+    there runs that mzML beside `VV_13_HEpG2_C1_exp344_pos.raw`. Where the row's
+    name is not there, a member of its own stem in another encoding
+    (`VV_13_HEpG2_C1_pos.mzML`) still counts for uniqueness: beside it
+    `VV_13_HEpG2_C1_exp344_pos.raw` is refused (`leading_identifier_not_unique`),
+    and the own-stem file, which is the row's by clause 4, is paired by the key
+    as it is when it is alone, and runs.
 
   The record (the schema gate #37 is to read):
   - `manifest.encoding_choices`: every sample the rule chose for among more
@@ -177,6 +192,18 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     source, so the analysis-CSV builder and a split find the same row. An mzXML
     used runs as the mzML the convert stage wrote, whose row carries both its
     conversion and the choice.
+  - Where a rule (a prefix, a leading identifier) paired the row with the file
+    `stands_for` names, the input's `name_pairing` is that pairing as it was
+    made: its `member_name` is the member the rule paired, not the input, which
+    no rule paired. `input_name_pairings.paired` (and the attribute stage's
+    `inferred_name_pairings`) lists it once, by that member, with
+    `encoding_used`, the path of the file the rule used for its sample, as the
+    sample's choice names it; a split part lists it where it holds that file.
+    A row naming `S7.mzML` beside `021518_387057_CSHp_S7.mzML` and `S7.raw`
+    runs `S7.raw` as the row's sample, and the record says the prefix paired
+    `021518_387057_CSHp_S7.mzML` (`encoding_used` `S7.raw`). An earlier state of
+    this version recorded `S7.raw` as paired by a prefix, and where the file
+    used was an mzXML converted, left its lineage row with no sample.
   - A file left unused is no input and no excluded candidate: it is on record
     in its sample's choice only (a listed folder left unused is not held to the
     completeness check either). The attribute stage counts `encoding_choices`
@@ -212,13 +239,15 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     folder that did not arrive whole, gives way to its sample's next encoding.
     Before, the first was excluded at the preflight with the sample's mzML
     unused, and the second failed the lease.
-  - A row's file paired by a prefix or a leading identifier and a file of the
-    row's own stem run once, the higher in the order: a row naming `S7.mzML`
-    beside `021518_387057_CSHp_S7.mzML` and `S7.raw` runs `S7.raw` as the
-    row's sample, unit-scoped archive or shared; a row naming `S7.raw` or `S7`
-    beside the prefixed `.raw` and `S7.mzML` runs the prefixed `.raw`. Before,
-    both ran (the second as an unattributed sample), or the shared archive's
-    vendor file was left out.
+  - A row's file paired by a prefix and a file of the row's own stem run once,
+    the higher in the order: a row naming `S7.mzML` beside
+    `021518_387057_CSHp_S7.mzML` and `S7.raw` runs `S7.raw` as the row's
+    sample, unit-scoped archive or shared; a row naming `S7.raw` or `S7` beside
+    the prefixed `.raw` and `S7.mzML` runs the prefixed `.raw`. Before, both ran
+    (the second as an unattributed sample), or the shared archive's vendor file
+    was left out. A file that shares only the row's leading identifier is not
+    one of them (above): an earlier state of this version paired it there,
+    and ran it in place of the row's own file.
   - Folders no longer decide whether two encodings are one sample's: the
     folder words that named an encoding (`_sample_locus`) are gone, and one
     stem with no stated polarity is one sample's in any folder.
@@ -315,7 +344,9 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   `encoding_choice` (`used`, `unused`, `stands_for`) instead: an input used for
   a sample whose row names another file stands for that file, whatever its
   encoding, and an unused file is accounted for by its sample's choice, not by
-  an exclusion.
+  an exclusion. Its PAIR-1 reads `name_pairing` from the lineage rows as
+  before; for such an input, `name_pairing.member_name` is the member the rule
+  paired (the file `stands_for` names), not the input's own name.
 - So gate #37, updated to read the relative-path keys and the encoding records,
   has to merge with or before the 0.5.36 pin. The campaign must not run 0.5.36
   before then: neither a recheck nor a fresh preflight with 0.5.36 is safe,

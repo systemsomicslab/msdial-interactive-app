@@ -2257,16 +2257,14 @@ def create_download_lease(
             }
             unattributed["record"] = _without_mates(unattributed["record"], recorded, data_root)
         unused_keys = encodings["unused"]
-        # A file used for a sample that a rule paired with its row through another of its files takes that pairing:
-        # it is the row's own input (clause 4), and the pairing of a file left unused goes with it.
-        prefixed_members = {
-            **{key: value for key, value in prefixed_members.items() if key not in unused_keys},
-            **{
-                key: prefixed_members[_file_key(stand)]
-                for key, stand in encodings["stand_ins"].items()
-                if _file_key(stand) in prefixed_members
-            },
-        }
+        # A file used for a sample that a rule paired with its row through another of its files (S7.raw, for a row
+        # naming S7.mzML whose 021518_387057_CSHp_S7.mzML a prefix paired) is the row's own input (clause 4), but it
+        # was paired by no rule itself: the pairing stays the member's it was made for (stand_pairings, by that
+        # member's _file_key). The input's lineage row names it through its encoding_choice's stands_for, and the
+        # manifest lists it by that member, with the file the rule used for its sample (review of PR #69,
+        # follow-up 3). Before, the input took the pairing as its own, and the record said S7.raw had a prefix.
+        every_pairing = prefixed_members
+        prefixed_members = {key: value for key, value in prefixed_members.items() if key not in unused_keys}
         # The file used for a sample a row pairs with is that sample's own input, never an unattributed one (clause 4).
         unattributed_members = {
             key: value
@@ -2340,6 +2338,15 @@ def create_download_lease(
             extracted_members=extracted_members,
             archive_extractions=archive_extractions,
         )
+        kept_choices = {key: value for key, value in encodings["by_input"].items() if key in kept}
+        # Each member a rule paired whose sample the rule ran on another file (stand_pairings, by the member's
+        # _file_key), and that file, as its sample's choice names it (encoding_used).
+        encoding_used = {
+            _file_key(entry["stands_for"]): str(entry["record"]["used"] or "")
+            for entry in kept_choices.values()
+            if entry["stands_for"] and _file_key(entry["stands_for"]) in every_pairing
+        }
+        stand_pairings = {key: every_pairing[key] for key in encoding_used}
         input_lineage = build_input_lineage(
             inputs,
             downloads,
@@ -2353,18 +2360,20 @@ def create_download_lease(
             excluded_inputs=excluded_inputs,
             conversions=conversions,
             stands_for={key: value for key, value in stands_for.items() if key in kept},
-            prefixed_members=prefixed_members,
+            prefixed_members={**prefixed_members, **stand_pairings},
             unattributed_members=unattributed_members,
-            encoding_choices={key: value for key, value in encodings["by_input"].items() if key in kept},
+            encoding_choices=kept_choices,
         )
         if conversion_rows:
             input_lineage["conversion_sources"] = conversion_rows
         # The inputs admitted only because a rule inferred which declared raw file they are; each lineage row
-        # says so (name_pairing), and the attribute stage and the manifest list every such pairing.
+        # says so (name_pairing), and the attribute stage and the manifest list every such pairing: by the member
+        # the rule paired, and, where the encoding rule ran its sample on another file, with that file.
         paired_by_rule = Counter(
             prefixed_members[_file_key(item)]["paired_by"] for item in inputs if _file_key(item) in prefixed_members
         )
-        inferred = inferred_name_pairings(prefixed_members, data_root)
+        paired_by_rule.update(pairing["paired_by"] for pairing in stand_pairings.values())
+        inferred = inferred_name_pairings({**prefixed_members, **stand_pairings}, data_root, encoding_used)
         # The unattributed members as the lineage holds them (unattributed_lineage_record): its rows and its
         # excluded rows that say unattributed_member, a converted one by the mzXML it was converted from
         # (2026-10-08, second round, answer 3), and one the lease excluded after admitting it (an mzXML whose
@@ -3729,12 +3738,16 @@ def build_input_lineage(
         sample_member = str(choice.get("stands_for") or "")
         if sample_member:
             # The file the encoding rule used for a sample whose row pairs with another of its files: that sample's own
-            # input (2026-10-09, clause 4). Where the row paired with that file by a rule, the lease gave its pairing to
-            # this one (prefixed_members); otherwise it is named as that file is, whatever its own name says.
+            # input (2026-10-09, clause 4), named as that file is, whatever its own name says. Where a rule paired the
+            # row with that file (the lease passes that member's pairing in prefixed_members), the row names that
+            # pairing as it was made: member_name is that file, not this one, which no rule paired (review of PR #69,
+            # follow-up 3).
             member_candidates, member_samples, member_pairing = naming(Path(sample_member), _file_key(sample_member))
             if not {item for item in candidates if item in declared}:
                 candidates = member_candidates
-            if not pairing or pairing.get("paired_by") == UNATTRIBUTED_MEMBER_PAIRING:
+            if (member_samples or member_pairing) and (
+                not pairing or pairing.get("paired_by") == UNATTRIBUTED_MEMBER_PAIRING
+            ):
                 matched_samples, pairing, paired_name = member_samples, member_pairing, Path(sample_member).name
         row: dict[str, Any] = {
             "path": str(path),
@@ -4501,14 +4514,12 @@ def _encoding_outcome(
       its sample a row pairs with by its own name, '' where the input is one}. Keyed by the input: for an mzXML used,
       the mzML the convert stage wrote from it (``converted``, {mzML key: mzXML});
     - of_a_row: each file used for a sample a row pairs with (clause 4: that sample's own input, never unattributed);
-    - stand_ins: {each file used for a sample whose row pairs with another of its files: that file's path};
     - records: manifest.encoding_choices (encoding_rule.choices_record).
     """
     outputs = {_file_key(source): key for key, source in converted.items()}
     unused: set[str] = {item["key"] for item in groups["left_out"]}
     by_input: dict[str, dict[str, Any]] = {}
     of_a_row: set[str] = set()
-    stand_ins: dict[str, str] = {}
     for group, choice in zip(groups["groups"], choices):
         if choice.used is None:
             continue
@@ -4518,14 +4529,13 @@ def _encoding_outcome(
         if group.paired:
             of_a_row.add(used)
             if choice.used not in group.paired:
-                stand = stand_ins[used] = group.paired[0]
+                stand = group.paired[0]
         if len(group.paths) > 1 or stand:
             by_input[outputs.get(used, used)] = {"record": choice.record(), "stands_for": stand}
     return {
         "unused": unused,
         "by_input": by_input,
         "of_a_row": of_a_row,
-        "stand_ins": stand_ins,
         "records": encoding_rule.choices_record(choices),
     }
 
@@ -11376,16 +11386,19 @@ def _member_name_pairings(
     EXACT MATCHES ARE DECIDED FIRST: a declared name some member, or the unit's file listing, carries exactly
     is never paired by inference with a member of that file's encoding rank (encoding_rule.encoding_rank), and a
     member a declared name names exactly is never given another. A member of another rank may still be paired with
-    it: it is another encoding of the row's sample, not a different file of its name (021518_387057_CSHp_S7.raw
-    beside the S7.mzML an extensionless row S7 names), and the one encoding rule chooses between them. A file of
-    the stem of a declared name, in another encoding, is that row's own file and no rival for its leading
-    identifier (VV_13_HEpG2_C1_pos.mzML for VV_13_HEpG2_C1_pos.raw beside VV_13_HEpG2_C1_exp344_pos.raw). THEN
+    it behind a prefix: it is another encoding of the row's sample, not a different file of its name
+    (021518_387057_CSHp_S7.raw beside the S7.mzML an extensionless row S7 names), and the one encoding rule chooses
+    between them. Never by its leading identifier: a declared name carried exactly in any rank is not paired by
+    its token at all (review of PR #69, follow-up 3). THEN
     PREFIXED NAMES (PREFIXED_MEMBER_PAIRING): a member is paired with a declared name when its name - or its
     stem, for a name a row records without an extension, as _sample_file_names reads those - ends in a
     separator (PREFIX_SEPARATORS) and then the declared name, compared without case. THEN LEADING IDENTIFIERS
     (LEADING_IDENTIFIER_TOKEN_PAIRING): a declared name still unpaired is paired with the member whose
     leading_identifier_key is its own, when that key is the key of no other declared name and of no other
-    candidate member.
+    candidate member. A member of the declared name's own stem in another encoding (VV_13_HEpG2_C1_pos.mzML for
+    VV_13_HEpG2_C1_pos.raw) is such a candidate: beside it, VV_13_HEpG2_C1_exp344_pos.raw does not match uniquely
+    and is refused, and the row's own-stem file is never refused itself but paired by the key, as it is alone (it is
+    the row's by clause 4 of the one encoding rule, whatever encoding the row names).
 
     EACH PAIRING IS ONE TO ONE: a member that ends in two declared names, or a declared name two members end
     in, pairs neither - which is why Youn_sa1.raw never takes 021518_Youn_sa11.raw, whose name ends in
@@ -11568,33 +11581,25 @@ def _member_name_pairings(
             member_keys.setdefault(token_key, set()).add(key)
     for token_key, declared_names in sorted(declared_keys.items()):
         members = member_keys.get(token_key) or set()
-        open_names = {
-            name
-            for name in declared_names
-            if name not in claimed_by and any(open_to(name, pool[key]) for key in members)
-        }
+        # A declared name something carries exactly, in any encoding rank, is never paired by its token: a file that
+        # shares only a leading identifier with a row whose own file is there is, as far as the record can tell,
+        # another injection, and the one encoding rule does not make it the row's (review of PR #69, follow-up 3).
+        open_names = {name for name in declared_names if name not in taken and name not in claimed_by}
         if not members or not open_names:
             continue
-        # The declared name's own files are no rival for it: a member that carries it exactly, and, beside members
-        # that do not, one of its stem in another encoding (VV_13_HEpG2_C1_pos.mzML for VV_13_HEpG2_C1_pos.raw, the
-        # row's file by clause 4 of the one encoding rule). The others claim it by the token.
-        exact = {key for key in members if exactly(pool[key])}
+        # Unique on both sides, a sample's files counting as one candidate (sample_of), the declared name's own files
+        # among them: a member of its stem in another encoding (VV_13_HEpG2_C1_pos.mzML for VV_13_HEpG2_C1_pos.raw)
+        # is a candidate the key names, so beside it VV_13_HEpG2_C1_exp344_pos.raw does not match uniquely and is
+        # refused. The declared name's own-stem member is never refused: alone it is paired by the key, as it always
+        # was, and beside members of other stems it still is, being the row's file by clause 4 of the one encoding
+        # rule (whatever encoding the row names); only where it is one sample (sample_of) and the name the key's only
+        # one. So the row runs on its own file, and the others are unattributed or left out, as before the rule.
         stems_named = {encoding_preference.stem(name) for name in declared_names}
-        rivals = {key for key in members - exact if encoding_preference.stem(pool[key]) not in stems_named}
-        if not rivals:
-            if exact:
-                # Only the name's own files carry the key: nothing is paired by it, as before.
-                continue
-            rivals = set(members)
-        # Unique on both sides, a sample's files counting as one candidate (sample_of). Where a member carries the name
-        # exactly in a rival's own encoding rank, the rivals are not the row's only candidates, and every member
-        # counts, as it always did.
-        open_rivals = len(declared_names) == 1 and all(open_to(next(iter(declared_names)), pool[key]) for key in rivals)
-        if not open_rivals:
-            rivals = members - exact
-        if len(declared_names) != 1 or len({sample_of(key) for key in (rivals if open_rivals else members)}) != 1:
+        own = {key for key in members if encoding_preference.stem(pool[key]) in stems_named}
+        pairable = members
+        if len(declared_names) != 1 or len({sample_of(key) for key in members}) != 1:
             for name in sorted(open_names):
-                for key in sorted(rivals):
+                for key in sorted(members - own):
                     if key not in claims:
                         refuse(
                             key,
@@ -11603,11 +11608,13 @@ def _member_name_pairings(
                             "leading_identifier_not_unique",
                             key=token_key,
                         )
-            continue
+            if len(declared_names) != 1 or not own or len({sample_of(key) for key in own}) != 1:
+                continue
+            pairable = own
         declared_name = next(iter(declared_names))
-        if not open_rivals or any(key in claims for key in rivals):
+        if any(key in claims for key in pairable):
             continue
-        for key in sorted(rivals):
+        for key in sorted(pairable):
             reason = polarity_conflict(key, written(declared_name))
             if reason:
                 refuse(key, written(declared_name), LEADING_IDENTIFIER_TOKEN_PAIRING, reason, key=token_key)
@@ -11923,9 +11930,16 @@ def part_encoding_choices(rows: Iterable[Any]) -> list[dict[str, Any]]:
     return sorted(records, key=lambda item: (str(item.get("used") or "").casefold(), str(item.get("used") or "")))
 
 
-def inferred_name_pairings(pairings: dict[str, dict[str, str]], data_root: Path) -> list[dict[str, str]]:
-    """Every inferred pairing as the attribute stage and the run manifest list it: member, declared name, rule."""
+def inferred_name_pairings(
+    pairings: dict[str, dict[str, str]], data_root: Path, encoding_used: Mapping[str, str] | None = None
+) -> list[dict[str, str]]:
+    """Every inferred pairing as the attribute stage and the run manifest list it: member, declared name, rule.
+
+    ``encoding_used`` gives, for a paired member the one encoding rule left unused for its sample (by _file_key), the
+    file it used instead, as that sample's choice names it: the entry says so (encoding_used). The member is still
+    the one the rule paired; the file used is the row's own by clause 4 and was paired by no rule itself."""
     data_key = _file_key(str(data_root))
+    encoding_used = encoding_used or {}
     listed = []
     for key, pairing in sorted(pairings.items()):
         listed.append(
@@ -11934,6 +11948,7 @@ def inferred_name_pairings(pairings: dict[str, dict[str, str]], data_root: Path)
                 "declared_raw_file": pairing["declared_raw_file"],
                 "paired_by": pairing["paired_by"],
                 **({"key": pairing["key"]} if pairing.get("key") else {}),
+                **({"encoding_used": encoding_used[key]} if encoding_used.get(key) else {}),
             }
         )
     return listed

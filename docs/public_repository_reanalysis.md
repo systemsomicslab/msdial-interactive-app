@@ -238,9 +238,19 @@ unit). One row's files are one sample's whatever their stems: a file of the stem
 of the name the row gives, in any encoding, and one a prefix or a leading
 identifier pairs with the row (`021518_387057_CSHp_S7.mzML` for a row naming
 `S7.mzML`, beside `S7.raw`: the `.raw` runs as the row's sample, and the prefixed
-mzML is unused). A name a member carries exactly keeps a prefix or a leading
-identifier from pairing another member with the row only where that member is
-of the same encoding rank; one of another rank is the sample's other encoding.
+mzML is unused). A name a member carries exactly keeps a prefix from pairing
+another member with the row only where that member is of the same encoding rank;
+one of another rank is the sample's other encoding. A leading identifier is
+never paired beside a member that carries the row's name exactly, in any
+encoding, and only where it matches uniquely on both sides, the row's own files
+counting: the rule does not say whether a file that shares only a leading
+identifier is the row's sample, so the token rule keeps its words. Beside a row
+naming `VV_13_HEpG2_C1_pos.raw` that is there, `VV_13_HEpG2_C1_rep2_pos.mzML` is
+an unattributed input (unit-scoped archive) or left out on record (shared
+archive), and the row's `.raw` runs. Where the row's name is not there, a member
+of its own stem (`VV_13_HEpG2_C1_pos.mzML`) is paired by the key and runs, and
+`VV_13_HEpG2_C1_exp344_pos.raw` beside it is refused as
+`leading_identifier_not_unique`.
 
 The candidates are what the unit admits by itself, the members of its own
 archive no row pairs with, and every other file found of an admitted file's stem
@@ -290,6 +300,12 @@ The record:
   file's sample, declared names and inferred pairing, and `lineage_stands_for`
   reads it, so the analysis-CSV builder and a split find the same row. A split
   part carries its own samples' choices.
+- Where a rule paired the row with that file, the input's `name_pairing` is that
+  pairing as it was made (`member_name` is the member paired, not the input), and
+  `input_name_pairings.paired` lists it by that member with `encoding_used`, the
+  file the rule used for its sample: `021518_387057_CSHp_S7.mzML` paired with
+  `S7.mzML`, `encoding_used` `S7.raw`. The input is never recorded as paired by
+  a rule that did not pair it.
 - A file left unused is no input and no excluded candidate, and a declared input
   left unused is not missing from the analysis CSV. The attribute stage counts
   `encoding_choices` and `unused_encodings` (and `vendor_headers_read`,
