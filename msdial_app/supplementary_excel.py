@@ -220,9 +220,14 @@ def _guided_sheet(workflow: dict[str, Any]) -> dict[str, Any]:
             ("aif_files", "AIF analysis files"),
             ("deconvolution", "Deconvolution"),
             ("representative_energy", "Representative MS/MS spectrum per feature"),
+            ("energy_sets_differ", "Energy sets differ between files"),
+            ("collision_energy_sets_ev", "MS2 collision-energy sets"),
+            ("representative_energy_scope", "Representative energy scope"),
             ("rule", "Campaign rule"),
             ("console_assembly_sha256", "Console assembly sha256"),
         ):
+            if key not in multi_energy_aif:
+                continue
             rows.append(_row([label, _typed_value(multi_energy_aif.get(key)), "Campaign disposition"], "body_left"))
 
     automatic_rt_evidence = workflow.get("automatic_rt_correction_evidence") or {}

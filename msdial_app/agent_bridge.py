@@ -144,17 +144,39 @@ def summarize_jobs(
             # (#825 chooses among one file's energies, never across files), recorded as
             # campaign_disposition.aif_multi_ce_run (rule multi_ce_aif_with_console_825) with the probe as
             # multi_energy_aif_console, and console_acquisition_basis aif_multi_ce_console_825. Without #825 it is
-            # held as before; preflighting a held unit again with a #825 Console releases it. With #825, inputs
-            # whose energies differ from one another are held as aif_collision_energies_differ_between_inputs
-            # (aif_collision_energies_by_input). The gate refuses such a unit with a Console that lacks #825, and
-            # a per-file record whose energies are not the recorded ones.
+            # held as before; preflighting a held unit again with a #825 Console releases it. The gate refuses such
+            # a unit with a Console that lacks #825, and a per-file record whose energies are not the recorded ones.
             "campaign_multi_ce_aif_with_console_825",
+            # Multi-energy AIF whose inputs record different energy sets (0.5.36, user decision 2026-10-08, "run as
+            # is"): with #825 the unit runs as AIF, each file with its own per-file representative collision energy,
+            # on record (warning aif_energy_sets_differ_between_inputs; aif_multi_ce_run.energy_sets_differ and
+            # collision_energy_sets; aif_collision_energies_by_input, keyed by each input's path relative to the
+            # data root, never its basename: aif_collision_energies_by_input_key path_relative_to_input_directory).
+            # 0.5.34-0.5.35 held it as aif_collision_energies_differ_between_inputs; a recheck with a #825 Console
+            # releases such a unit.
+            "campaign_multi_ce_aif_differing_energy_sets",
             # An undeclared unit whose download is its own alone (unit_files, or every bundle URL with
             # shared_unit_count 1) takes the archive members no sample row pairs with as unattributed inputs
             # (name_pairing.paired_by unattributed_member, manifest.unattributed_members, the warning
             # unattributed_members_included); a shared archive takes none and says why. The record's members are
             # basenames, as the lineage's member_name is, and its paths the members' paths under the data root.
             "repository_unattributed_archive_members",
+            # Since 0.5.36 (2026-10-08, second round, answer 3): a campaign's lease converts an unpaired mzXML member
+            # and takes the mzML unattributed (unattributed_members.converted).
+            "repository_unattributed_mzxml",
+            # Since 0.5.36 (2026-10-08, second round, answer 3): a unit whose Catalog declared its inputs records the
+            # archive members no declaration names, each left out (not_named_by_the_catalog_declaration).
+            "repository_members_no_declaration_names",
+            # Since 0.5.36, the user's one encoding rule of 2026-10-09 (msdial_app.encoding_rule): where one sample's
+            # data arrive in several encodings, copies in other folders included, exactly one readable file is used,
+            # vendor -> mzML -> mzXML (converted in a campaign), a tie to the first path without case, an unreadable
+            # one (undecodable mzML, failed conversion, a vendor header the lease's extractor cannot read, a listed
+            # folder that did not arrive whole) giving way to the next; .cdf/.abf/.ibf rank between vendor and mzML;
+            # the file used is the sample's own input whatever its row names, a shared archive's encoding of a named
+            # sample and two declared copies of one row included, and every other is on record with its reason
+            # (manifest.encoding_choices and each used input's lineage encoding_choice: {rule, used, unused: [{path,
+            # reason}], stands_for}).
+            "repository_one_encoding_rule",
             # A unit or split part its disposition holds is never discarded, approved or confirmed, unless the
             # discard passes release_disposition_hold=true (the operator's skip), which records
             # disposition_hold_released_by "operator_skip"; a held part keeps its parent's raw data until then.

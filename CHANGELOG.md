@@ -4,6 +4,357 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.36] - Unreleased
+
+### Changed
+- Multi-energy AIF whose inputs record different MS2 collision-energy sets runs
+  as AIF with a Console that has MsdialWorkbench#825, instead of being held.
+  This is the user's decision of 2026-10-08 ("run as is"), and it replaces the
+  hold `aif_collision_energies_differ_between_inputs` of 0.5.34.
+  - It covers one energy per input but not the same one, different sets, and a
+    multi-energy input beside a single-energy one. The unit is decided `run` as
+    AIF under the same rule, `multi_ce_aif_with_console_825`, with each per-file
+    record's basis `aif_multi_ce_console_825`.
+  - #825 chooses a representative energy among one file's energies only. Each
+    file is therefore processed with its own per-file representative collision
+    energy, and representative energies can differ between files.
+  - It is on record:
+    - the disposition warning `aif_energy_sets_differ_between_inputs`;
+    - `aif_multi_ce_run.energy_sets_differ` true and
+      `aif_multi_ce_run.collision_energy_sets` (each distinct set and its file
+      count), carried into the analysis-row record and the prepare preview;
+    - each input's own set in `aif_collision_energies_by_input`, keyed by the
+      input's path relative to the unit's raw data root (below);
+    - a project-evidence line, `aif_collision_energy_sets` in the MCP preflight
+      reply, and one Materials and Methods sentence. Table S1 adds the sets and
+      the per-file scope.
+  - The execution gate checks each such input's energies against its own
+    recorded set, not the unit's union.
+  - A unit held under `aif_collision_energies_differ_between_inputs` by 0.5.34
+    or 0.5.35 is released by the operator's recheck with the #825 Console
+    configured (preflight or `classify_preflight`), which decides it `run`.
+  - The Agent API lists `campaign_multi_ce_aif_differing_energy_sets`.
+- `aif_collision_energies_by_input` is keyed by each input's path relative to
+  the unit's raw data root, never by its basename (the user's decision of
+  2026-10-08, second round, answer 2). Two inputs of one name in two folders
+  (`POS/QC_01.mzML` and `NEG/QC_01.mzML`) each keep their own set; keyed by
+  basename, the second overwrote the first.
+  - The key is the input's path relative to the manifest's `input_directory`
+    (its parent's for a split part), '/'-separated, as
+    `unattributed_members.paths` names a member. An mzML the convert stage
+    wrote beside the data root is `../converted/<its path>.mzML`. A manifest
+    that records no `input_directory` keys the path as the per-file record
+    gives it. Keys are compared without case.
+  - The disposition records the keying as
+    `aif_collision_energies_by_input_key` `path_relative_to_input_directory`,
+    and each key's basename in `aif_collision_energies_input_names`, for
+    display only.
+  - The execution gate looks each per-file record up by the same key
+    (`raw_metadata_preflight.aif_input_key`), and names a mismatched input by it.
+- ONE ENCODING PER SAMPLE: the user's one rule of 2026-10-09 ("A: この一つの
+  ルールで統一"). It supersedes every earlier case-by-case answer about a
+  sample whose data arrive more than once, and every implementation of them in
+  this version (below). When one sample's data arrive in several encodings
+  (`S1.raw`, `S1.mzML`, `S1.mzXML`; copies in other folders included):
+  1. Of the readable ones exactly one is used: the highest in the order vendor
+     format (a folder or a container) -> mzML -> mzXML. An mzXML is converted
+     to mzML in a campaign; outside a campaign it is no input.
+  2. A tie (the same rank: one format in two folders, or two vendor formats)
+     goes to the first by path name in lexicographic order: the path relative
+     to the data root, '/'-separated, compared without case.
+  3. Where the chosen one cannot be read or decoded, or its conversion fails,
+     the next in order is taken.
+  4. The file used is that sample's own input, paired to its sample row and in
+     its Class, whatever encoding the sample row names.
+  5. Every file not used is recorded with its reason, naming the file used.
+
+  How it is implemented:
+  - One function decides it: `msdial_app.encoding_rule.choose_encoding`, given
+    one sample's candidates and what can be read of each, returns the file
+    used and every other with its reason. The lease groups each sample's
+    candidates (`_encoding_groups`) and asks it once per sample
+    (`_choose_encodings`). Inputs, the conversions, the inferred pairings, the
+    unattributed members, the lineage and the split parts are all read from
+    what it returns.
+  - "The same sample": the files a sample row pairs with (exactly, by its
+    extensionless stem, a prefixed name or a leading identifier) and every
+    other candidate of the unit of the same file stem (its name less its
+    container suffix), or, for candidates no row pairs with, those of one stem,
+    whatever folders they lie in. Two polarities that paths of one stem state
+    by tokens of their own keep files apart (`POS/S1.raw` and `NEG/S1.raw` are
+    two acquisitions, not two encodings of one; a unit of both polarities is
+    split by them later), and so do two sample rows (rows naming `S1.raw` and
+    `S1.mzML` each keep their own file; an unattributed member of that stem is
+    left out, on record, as `stem_of_several_sample_rows`). Neither case is in
+    the rule's words; both keep the existing behaviour. A path that states no
+    polarity is one sample's with a path that states the unit's own
+    (`POS/S1.raw` and `S1.raw` in a positive unit), or, in a unit that gives
+    none, the only one its stem's paths state; the pairing rules read one
+    sample the same way. One row's files are one sample's whatever their
+    stems: a file of the stem of the name the row gives, in any encoding, and
+    one a prefix or a leading identifier pairs with the row
+    (`021518_387057_CSHp_S7.mzML` for a row naming `S7.mzML`, beside `S7.raw`),
+    their polarities parting them as they part one stem's paths.
+  - The candidates: what the unit admits by itself, the members of its own
+    archive no row pairs with, and every other file found of an admitted
+    file's stem and sample polarity (`_stem_mates`), or, for a file paired by
+    a prefix or a leading identifier, of the stem of the name its row gives. The analysis CSV pairs
+    such a file with the row of that stem whatever encoding the row names, so
+    a shared archive's `S1.raw` beside the `S1.mzML` a row names is that
+    sample's encoding, not one of the archive's unpaired members, and the rule
+    reaches it "across folders and archives". A shared archive's members of no
+    admitted file's stem are still none of the unit's candidates (excluded on
+    record, as before: 2026-10-08, second round, answer 1).
+  - A unit whose Catalog declared its inputs is matched by path, and every
+    member no declaration names is left out (second round, answer 3). The rule
+    chooses among the declared inputs of one sample row and one stem
+    (`_declared_candidates`): the row of the input's `sample_id` whose
+    `raw_file` names its path, else its file name, else the sample's only row.
+    A declaration that lists one sample's file in two folders (the Catalog's
+    encoding preference leaves equally preferred copies both declared) runs the
+    first by path, and the analysis CSV accounts for the other declared input
+    by the record instead of calling it missing. Declared inputs of different
+    rows (MTBKS64's `raw/batch1/QC.RAW` and `raw/batch2/QC.RAW`, two rows of
+    S01) stay two samples.
+  - A re-encoding MS-DIAL opens that no instrument writes (netCDF/AIA `.cdf`,
+    Reifycs `.abf` and `.ibf`) is in none of the rule's ranks. It ranks after
+    every vendor format and before mzML: the place it held before, where the
+    Catalog's preference counted it among the vendor files and a real vendor
+    file still beat it. So it never wins a tie against a `.raw` or `.d`. This
+    is outside the rule's words; the existing behaviour is kept.
+  - What the lease can read: an mzML is scanned for arrays RawDataHandler can
+    decode, and an mzXML is converted (in a campaign). A vendor file or folder
+    is unreadable where it is a listed folder that did not arrive whole
+    (`incomplete_container`), or where the configured raw-metadata extractor
+    cannot read its header (`raw_header_unreadable`, or
+    `raw_header_unsupported_format` where it has no reader for it: the reasons
+    the preflight excludes an input for). The lease reads a vendor header only
+    where the rule reaches a vendor file of a sample that has another
+    candidate. A campaign's lease reads only with a verified, pinned extractor,
+    the one its preflight will run. Without an extractor, a vendor file is
+    taken as readable, as before. A sample none of whose files can be used,
+    one of which was refused only for its header, still uses that vendor file:
+    the header read at the lease is no exclusion, and the preflight decides the
+    file, as it decides a sample's only file. Its other files keep the reasons
+    they could not be used for (`undecodable`, `conversion_failed`,
+    `requires_conversion`, a header of their own), never an order reason, so
+    the preflight never reads one as a fallback not taken. Readability is asked in the
+    rule's order and only until one file is readable, so an mzXML is converted
+    only where nothing before it can be read, and where its conversion fails
+    the next mzXML of the sample is converted. The convert stage starts for
+    an mzXML that is only another encoding of an admitted sample only where
+    the rule reaches it.
+  - The pairing rules (prefixed name, leading identifier) take one sample's
+    files as one candidate and pair each of them with the row; which runs is
+    the rule's. A file used for a sample whose row paired with another of its
+    files is that row's input, but no rule paired it: the pairing stays the
+    member's it was made for (see the record below). A name a member carries
+    exactly keeps a prefix from pairing another member with it only where that
+    member is of the same encoding rank (a prefixed `.raw` beside `S7.raw` is a
+    different file, as before); one of another rank is the row's sample's other
+    encoding and is paired (a prefixed `.raw` beside the `S7.mzML` an
+    extensionless row `S7` names).
+  - A leading identifier is never paired beside a member that carries the
+    declared name exactly, in any encoding, and is paired only where it matches
+    uniquely on both sides (2026-10-06), the row's own files counting. The one
+    encoding rule does not say whether a file that shares only a row's leading
+    identifier is that row's sample, so the token rule keeps its words. Beside
+    a row naming `VV_13_HEpG2_C1_pos.raw` that is there,
+    `VV_13_HEpG2_C1_rep2_pos.mzML` (or `.raw`) is not paired: it runs as an
+    unattributed input of a unit-scoped archive, or is left out on record from
+    a shared one, and the row's `.raw` runs. A row naming the mzML that is
+    there runs that mzML beside `VV_13_HEpG2_C1_exp344_pos.raw`. Where the row's
+    name is not there, a member of its own stem in another encoding
+    (`VV_13_HEpG2_C1_pos.mzML`) still counts for uniqueness: beside it
+    `VV_13_HEpG2_C1_exp344_pos.raw` is refused (`leading_identifier_not_unique`),
+    and the own-stem file, which is the row's by clause 4, is paired by the key
+    as it is when it is alone, and runs.
+
+  The record (the schema gate #37 is to read):
+  - `manifest.encoding_choices`: every sample the rule chose for among more
+    than one candidate, `{rule: "one_encoding_per_sample_2026_10_09", used,
+    unused: [{path, reason}]}`, paths relative to the data root, '/'-separated,
+    in their own case, `unused` in the rule's order. `used` is null where no
+    candidate could be read; those candidates keep the exclusions the lease
+    always recorded (`unsupported_mzml_encoding`, `conversion_failed`,
+    `polarity_contradicts_declaration` in `excluded_input_candidates` and
+    `input_lineage.excluded`).
+  - Reasons: `lower_in_encoding_order`, `tie_lexicographic`, `undecodable`,
+    `conversion_failed` (or the convert stage's
+    `polarity_contradicts_declaration`), `requires_conversion` (an mzXML outside
+    a campaign), `incomplete_container`, `raw_header_unreadable` and
+    `raw_header_unsupported_format`.
+  - Each input used for such a sample carries the same choice on its lineage
+    row as `encoding_choice`, and `encoding_choice.stands_for` (the absolute
+    path of the file the row pairs with) where the row names another file of
+    the sample. The row then takes that file's sample, declared names and
+    pairing, and `lineage_stands_for` reads `stands_for` before a conversion's
+    source, so the analysis-CSV builder and a split find the same row. An mzXML
+    used runs as the mzML the convert stage wrote, whose row carries both its
+    conversion and the choice.
+  - Where a rule (a prefix, a leading identifier) paired the row with the file
+    `stands_for` names, the input's `name_pairing` is that pairing as it was
+    made: its `member_name` is the member the rule paired, not the input, which
+    no rule paired. `input_name_pairings.paired` (and the attribute stage's
+    `inferred_name_pairings`) lists it once, by that member, with
+    `encoding_used`, the path of the file the rule used for its sample, as the
+    sample's choice names it; a split part lists it where it holds that file.
+    The analysis-CSV record's `inferred_name_pairings` (`analysis_csv`) lists
+    the input that runs with the same `member_name` and `encoding_used`; every
+    entry there now names its `member_name`.
+    A row naming `S7.mzML` beside `021518_387057_CSHp_S7.mzML` and `S7.raw`
+    runs `S7.raw` as the row's sample, and the record says the prefix paired
+    `021518_387057_CSHp_S7.mzML` (`encoding_used` `S7.raw`). An earlier state of
+    this version recorded `S7.raw` as paired by a prefix, and where the file
+    used was an mzXML converted, left its lineage row with no sample.
+  - A file left unused is no input and no excluded candidate: it is on record
+    in its sample's choice only (a listed folder left unused is not held to the
+    completeness check either). The attribute stage counts `encoding_choices`
+    and `unused_encodings`, and, where the lease read vendor headers,
+    `vendor_headers_read` and `vendor_headers_unreadable`; the convert stage's
+    `not_converted_readable_encoding` counts the mzXML a readable encoding was
+    used before. A split part carries its own samples' choices as its
+    `encoding_choices`.
+  - A preflight that cannot read the header of a vendor file the rule used,
+    where the lease read none and the sample has an encoding ranked below it,
+    warns `encoding_fallback_not_taken` and names the next encoding in its
+    detail. Leasing the unit again with the extractor configured takes it.
+  - The Agent API lists `repository_one_encoding_rule` (and
+    `repository_unattributed_mzxml` for the conversion of an unpaired mzXML,
+    below).
+
+  What it changes against 0.5.35, by the rule's words:
+  - A row naming `S1.mzML` beside a `.raw` of that sample runs on the `.raw`,
+    in the row's Class (clause 1 and 4), whether the mzML can be decoded or
+    not. A row naming an mzXML beside a decodable mzML of its sample runs on
+    the mzML, in a campaign or not.
+  - Copies of one file in two folders run once, the first by path (`A/S1.raw`
+    before `b/S1.raw`, `RAW/S1.raw` before `S1.raw`), not the one nearest the
+    data root; two vendor encodings of one name run once (`S1.d` before
+    `S1.raw`, `S1.wiff` before `S1.wiff2`). Before, a name a row admitted in
+    two folders gave the row two inputs and the analysis CSV refused the unit
+    (`sample_row_with_two_inputs`), and so did a row naming `S1` beside
+    `S1.raw` and `S1.mzML`; two unpaired copies of one name in two folders both
+    ran as unattributed inputs. The same holds for a copy in the unit's own
+    polarity folder beside an untokened one, and for two declared copies of
+    one row's file.
+  - A vendor file whose header the lease's extractor cannot read, or a listed
+    folder that did not arrive whole, gives way to its sample's next encoding.
+    Before, the first was excluded at the preflight with the sample's mzML
+    unused, and the second failed the lease.
+  - A row's file paired by a prefix and a file of the row's own stem run once,
+    the higher in the order: a row naming `S7.mzML` beside
+    `021518_387057_CSHp_S7.mzML` and `S7.raw` runs `S7.raw` as the row's
+    sample, unit-scoped archive or shared; a row naming `S7.raw` or `S7` beside
+    the prefixed `.raw` and `S7.mzML` runs the prefixed `.raw`. Before, both ran
+    (the second as an unattributed sample), or the shared archive's vendor file
+    was left out. A file that shares only the row's leading identifier is not
+    one of them (above): an earlier state of this version paired it there,
+    and ran it in place of the row's own file.
+  - Folders no longer decide whether two encodings are one sample's: the
+    folder words that named an encoding (`_sample_locus`) are gone, and one
+    stem with no stated polarity is one sample's in any folder.
+  - A shared archive's encoding of a sample a row names is that sample's
+    candidate. ST003038's shape (an mzML archive beside an mzXML archive, rows
+    naming the mzXML, a download not the unit's own alone) runs the mzML for
+    each row and converts no mzXML, as it did at 0.5.35, now on record in each
+    sample's choice; a row naming an undecodable mzML beside a shared
+    archive's `.raw` runs the `.raw`. An earlier state of this version
+    converted the mzXML and listed the mzML as left out, against clause 1.
+
+  Superseded and removed, before any release: the readable-twin answer of
+  2026-10-08 and the record defects reviewed at `06d2891`, `3a4463b` and
+  `418766b` as this version had implemented them. `unattributed_members`
+  carries none of `chosen_other_encoding`, `chosen`, `chosen_by`,
+  `two_encodings_of_one_name`, `copy_of_the_chosen_member`,
+  `analysed_for_an_admitted_sample`, `stands_for`, `stands_for_reason`,
+  `undecodable_mzml`, `admitted_mzxml_not_converted`, `twin_of`,
+  `twin_of_reason` or `replaced_undecodable` any more; lineage rows carry no
+  `replaces_undecodable`, exclusions no `replaced_by`, the attribute stage no
+  `undecodable_mzml_replaced`, and `input_conversions` no `encoding_choices`
+  list. The Agent API no longer lists
+  `repository_unattributed_mzxml_and_encoding_order`,
+  `repository_undecodable_mzml_readable_twin`,
+  `repository_one_sample_encodings_pair_as_one` or
+  `repository_encoding_copies_are_one_candidate`.
+- Archive members a unit-scoped archive's undeclared unit leaves unpaired (the
+  user's decision of 2026-10-08, second round, answer 3; all on record in
+  `unattributed_members`):
+  - An unpaired mzXML is converted to mzML in a campaign's lease like any other
+    mzXML input, under the rule of 2026-09-30 that converts mzXML-only data,
+    where the encoding rule uses it. The mzML written from it is the
+    unattributed input. Its lineage row is `kind` `converted`, with the
+    conversion as its source and the mzXML's basename as
+    `name_pairing.member_name`, so `members` and `paths` name the mzXML, and
+    `unattributed_members.converted` lists the members converted. Outside a
+    campaign nothing converts, and it stays left out as `requires_conversion`.
+  - Opposite-polarity names stay left out
+    (`polarity_token_contradicts_ion_mode`), a shared archive still takes none,
+    and a unit whose Catalog declared its inputs still takes only those.
+  - `unattributed_members.count`, `members` and `paths` list every lineage
+    row, in `rows` and in `excluded`, that says `unattributed_member`, once per
+    path, as the gate's PAIR-1 counts them. A converted member is named by its
+    mzXML. A member the lease excluded after admitting it (an mzXML whose
+    conversion failed or whose scans contradict the declared polarity, an mzML
+    it cannot decode) used to be missing from `count` and `members` while its
+    excluded lineage row still said `unattributed_member`, so PAIR-1 FAILed
+    (record only). It is now counted, and listed in
+    `unattributed_members.excluded` with the lease's reason. The warning is
+    recorded wherever the lineage holds such a row.
+  - A split part names a converted unattributed member by its mzXML, as the
+    parent and its lineage row do, and lists it in `converted`. It used to
+    name it by the converted mzML's lower-cased name, so PAIR-1 FAILed (record
+    only).
+- A unit whose Catalog declared its inputs now records the archive members no
+  declaration names (2026-10-08, second round, answer 3: left out "on record").
+  `unattributed_members` says `applied` false, `reason`
+  `catalog_declared_inputs` and `count` 0, and lists each such member in
+  `left_out` with `reason` `not_named_by_the_catalog_declaration`, by its
+  basename and its path under the data root. Only analysable members are
+  listed, and only those no declaration names that reached nothing of the
+  lease. Such a member is not run, even where it is a readable encoding of a
+  declared mzML that cannot be decoded: the declaration names the sample's
+  file. Before, the unit carried no `unattributed_members`, and the archive's
+  member listing was their only trace. The Agent API lists
+  `repository_members_no_declaration_names`.
+
+### Not changed
+- All inputs sharing exactly one energy run as SWATH.
+- An input with no recorded MS2 collision energy holds the unit
+  (`aif_collision_energy_unrecorded`, raw data kept), with #825 or without.
+- Without #825, more than one energy over the unit is held as
+  `aif_multi_ce_awaiting_console`.
+- The Catalog's encoding preference (`encoding_preference`, its shared test
+  vectors) still decides what the Catalog lists; the one encoding rule decides
+  among the candidates a lease finds.
+
+### Upgrade order
+- The before-production gate of the reanalysis repository, as of its gate PR
+  #34, still requires every multi-energy AIF row to record the unit's union of
+  energies, and FAILs ACQ-1 otherwise. ACQ-1 blocks the run, and the campaign
+  runner counts that block as a failure: after the retries the unit ends as
+  failed and its raw data are deleted, with no MS-DIAL run.
+- Gate PR #37 accepts per-file energy sets that differ. It has to read
+  `aif_collision_energies_by_input` by the relative-path keys above, not by
+  basename. For an input directly in the data root the two are the same, but a
+  gate that looks up `POS/QC_01.mzML` by its basename `QC_01.mzML` finds no set,
+  and FAILs ACQ-1 the same way.
+- Gate PR #37 also reads this version's encoding records. As of its head
+  `e7b2901` it reads the superseded ones (`chosen_other_encoding` and
+  `chosen_by` in `unattributed_members.left_out`, `replaces_undecodable`,
+  `replaced_undecodable`, `encoding_choice.stands_for` only through an mzXML).
+  It has to read `manifest.encoding_choices` and the lineage's
+  `encoding_choice` (`used`, `unused`, `stands_for`) instead: an input used for
+  a sample whose row names another file stands for that file, whatever its
+  encoding, and an unused file is accounted for by its sample's choice, not by
+  an exclusion. Its PAIR-1 reads `name_pairing` from the lineage rows as
+  before; for such an input, `name_pairing.member_name` is the member the rule
+  paired (the file `stands_for` names), not the input's own name.
+- So gate #37, updated to read the relative-path keys and the encoding records,
+  has to merge with or before the 0.5.36 pin. The campaign must not run 0.5.36
+  before then: neither a recheck nor a fresh preflight with 0.5.36 is safe,
+  because either decides such a unit `run`.
+
 ## [0.5.35] - Unreleased
 
 ### Changed

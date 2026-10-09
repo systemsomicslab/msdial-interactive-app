@@ -533,6 +533,11 @@ MULTI_ENERGY_AIF_REPRESENTATIVE_ENERGY = (
     "the energy of the feature's MS/MS reference-spectrum match; otherwise the energy whose deconvoluted spectrum "
     "has the most product ions (the lowest such energy on a tie)"
 )
+# Where the inputs of a multi-energy AIF run record different energy sets (run as is, 2026-10-08).
+MULTI_ENERGY_AIF_PER_FILE_SCOPE = (
+    "each file was processed with its own per-file representative collision energy, so representative energies "
+    "could differ between files"
+)
 
 
 def multi_energy_aif_evidence(workflow: dict[str, Any]) -> dict[str, Any]:
@@ -569,11 +574,36 @@ def multi_energy_aif_evidence(workflow: dict[str, Any]) -> dict[str, Any]:
     if len(energies) < 2:
         return {}
     console = disposition.get("multi_energy_aif_console") if isinstance(disposition.get("multi_energy_aif_console"), dict) else {}
+    # Inputs whose energy sets differ run as they are, on record (user decision, 2026-10-08): each distinct set
+    # with its file count, never a file name.
+    differing = {}
+    if record.get("energy_sets_differ") is True:
+        sets = []
+        for item in record.get("collision_energy_sets") or []:
+            if not isinstance(item, dict):
+                continue
+            values = []
+            for value in item.get("collision_energies") or []:
+                try:
+                    values.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+            count = item.get("file_count")
+            sets.append(
+                ", ".join(f"{value:g}" for value in values) + " eV"
+                + (f" in {count} file{'s' if count != 1 else ''}" if isinstance(count, int) else "")
+            )
+        differing = {
+            "energy_sets_differ": True,
+            "collision_energy_sets_ev": "; ".join(sets),
+            "representative_energy_scope": MULTI_ENERGY_AIF_PER_FILE_SCOPE,
+        }
     return {
         "collision_energies_ev": ", ".join(f"{value:g}" for value in energies),
         "aif_files": len(aif_files),
         "deconvolution": "separately at each collision energy",
         "representative_energy": MULTI_ENERGY_AIF_REPRESENTATIVE_ENERGY,
+        **differing,
         "rule": AIF_MULTI_CE_RULE,
         "console_assembly_sha256": str(console.get("assembly_sha256") or ""),
     }
@@ -588,6 +618,12 @@ def _multi_energy_aif_sentence(evidence: dict[str, Any]) -> str:
         f"{evidence['collision_energies_ev']} eV. Product-ion spectra were deconvoluted separately at each "
         "collision energy, and each feature's representative MS/MS spectrum was taken at "
         f"{MULTI_ENERGY_AIF_REPRESENTATIVE_ENERGY}."
+        + (
+            f" The input files recorded different sets of collision energies ({evidence['collision_energy_sets_ev']}), "
+            f"and {MULTI_ENERGY_AIF_PER_FILE_SCOPE}."
+            if evidence.get("energy_sets_differ") is True
+            else ""
+        )
     )
 
 

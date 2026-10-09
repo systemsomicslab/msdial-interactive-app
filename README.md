@@ -207,10 +207,16 @@ raw-header preflight splits the unit by polarity. A file whose conversion
 fails is excluded with reason `conversion_failed`. Either exclusion is listed
 in the unit's `excluded_input_candidates` and `campaign_disposition`, and the
 rest of the unit runs; a full disk, or a file another process holds, instead
-stops the lease, so that the unit is retried. Where the unit holds a readable
-encoding of the same sample beside the mzXML, in the same place or anywhere it
-admits that file by itself, the Catalog's encoding rule analyses that one
-instead. mzData, which nothing converts, excludes its unit there too.
+stops the lease, so that the unit is retried. Where the unit's candidates hold
+several encodings of one sample (copies in other folders, a shared archive's
+encoding of a named sample and two declared copies of one row's file included),
+the user's one encoding rule of 2026-10-09 uses exactly one readable file,
+vendor -> mzML -> mzXML (`.cdf`, `.abf` and `.ibf` between vendor and mzML), a
+tie to the first path without case, an unreadable one giving way to the next (an
+undecodable mzML, a failed conversion, a vendor header the configured extractor
+cannot read, a listed folder that did not arrive whole), as that sample's own
+input; every other is on record in `encoding_choices` with its reason. mzData,
+which nothing converts, excludes its unit there too.
 Raw-header results reported as `Mixed` can be split, after explicit confirmation,
 into independent acquisition-mode units with `msdial_split_repository_unit`; the
 Mixed parent is never sent to MS-DIAL.

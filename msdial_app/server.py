@@ -2321,6 +2321,25 @@ def _run_library_download_job(job_id: str, catalog_id: str) -> None:
             _persist_jobs_locked()
 
 
+def _lease_header_reader(campaign: bool, log: Any) -> Any:
+    """The reader of vendor headers a lease gives the one encoding rule (repository_reanalysis.lease_header_reader),
+    from the extractor a preflight of the same unit would run (select_raw_metadata_extractor): in a campaign only a
+    verified, pinned one. None where there is none, or a campaign's is refused: the rule then takes a vendor file as
+    readable, and the preflight says so where it cannot read one (encoding_fallback_not_taken)."""
+    from .raw_metadata_extractor import select_raw_metadata_extractor
+    from .repository_reanalysis import lease_header_reader
+
+    try:
+        selected = select_raw_metadata_extractor("", campaign=campaign, checkout_parent=ROOT.parent)
+        if not selected.get("path"):
+            log("No raw-metadata extractor is configured: the encoding rule takes vendor files as readable.")
+            return None
+        return lease_header_reader(Path(selected["path"]))
+    except Exception as error:  # noqa: BLE001 - no reader is a recorded fallback, never a failed lease
+        log(f"The raw-metadata extractor is not used by the encoding rule: {error}")
+        return None
+
+
 def _run_repository_download_job(
     job_id: str,
     project: Any,
@@ -2418,6 +2437,7 @@ def _run_repository_download_job(
             job_id=job_id,
             store_mode=download_store_mode(),
             shared_download_callback=shared_download,
+            header_reader=_lease_header_reader(bool(campaign_authorization), log),
         )
         recognized = expand_paths_report(lease.get("input_candidates", []))
         result = {

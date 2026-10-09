@@ -29,8 +29,8 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Iterator
-from . import archives, encoding_preference
+from typing import Any, Callable, Iterable, Iterator, Mapping
+from . import archives, encoding_preference, encoding_rule
 from .archives import ArchiveError, ExtractionLimits
 from .diagnostic_paths import (
     INTERMEDIATES_DIRECTORY,
@@ -1759,8 +1759,14 @@ def create_download_lease(
     job_id: str = "",
     store_mode: str | None = None,
     shared_download_callback: Any = None,
+    header_reader: HeaderReader | None = None,
 ) -> dict[str, Any]:
     """Download one unit's objects into its workspace and write the unit's run manifest.
+
+    ``header_reader`` (lease_header_reader: the configured raw-metadata extractor) reads the raw header of a vendor
+    file the user's one encoding rule reaches for a sample that has another encoding, so that a file whose header
+    cannot be read gives way to the next (encoding_rule, clause 3). None reads nothing, and a vendor file is taken
+    as readable, as before.
 
     ``campaign_authorization`` is the crossing record a validated campaign approval produced for this
     download (msdial_app.campaign_authorization); it is written into the manifest from the first write
@@ -1802,8 +1808,9 @@ def create_download_lease(
       extraction shows a readable encoding of the same sample beside an mzXML, that one is analysed instead.
       Only under a ``campaign_authorization``: not used outside a campaign, where an mzXML is no input,
       nor where the unit has no mzXML. See the notes above _find_mzxml_files;
-    - discover: every vendor folder listed member by member checked whole (container_completeness),
-      then the MS-DIAL inputs under the data root, outermost folders only, and the mzML converted;
+    - discover: every vendor folder listed member by member checked whole (container_completeness), but one
+      the encoding rule left unused for another encoding of its sample, then the MS-DIAL inputs under the data
+      root, outermost folders only, and the mzML converted;
     - attribute: the unit's own inputs - by path, every one, when the Catalog declared them
       (analysis_inputs); a converted mzML through the mzXML it was read from - extracted files and
       declared checksums (allowlist_checksum_validation), and one input_lineage row per input. An mzML
@@ -2124,27 +2131,51 @@ def create_download_lease(
         name_pairings = _member_name_pairings(project, extracted_members, data_root)
         prefixed_members = name_pairings["paired"]
         # And, where the unit's download is its own alone, the members none of those rules pairs: unattributed
-        # inputs, always on record (user decision, 2026-10-07). They are admitted wherever a paired member is.
-        unattributed = _unattributed_members(project, extracted_members, data_root, archive_samples, prefixed_members)
+        # inputs, always on record (user decision, 2026-10-07). They are admitted wherever a paired member is. In a
+        # campaign's lease, which converts, an unpaired mzXML is one of them and is converted like any other mzXML
+        # input (2026-10-08, second round, answer 3).
+        unattributed = _unattributed_members(
+            project, extracted_members, data_root, archive_samples, prefixed_members,
+            converts=bool(campaign_authorization),
+        )
         unattributed_members = unattributed["members"]
         admitted_members = {**prefixed_members, **unattributed_members}
-        mzxml_found = _find_mzxml_files(data_root) if campaign_authorization else []
+        # The unit's own mzXML, whatever the lease: only a campaign's converts them, but outside one they are still
+        # encodings of their samples that the rule records as no input (encoding_rule.REQUIRES_CONVERSION).
+        mzxml_found = _find_mzxml_files(data_root) if project.analysis_unit_id else []
         conversion_sources = _select_conversion_sources(
-            mzxml_found, data_root, project, archive_samples, archive_extractions, prefixed_members
+            mzxml_found, data_root, project, archive_samples, archive_extractions, admitted_members
         ) if mzxml_found else []
-        conversion: dict[str, Any] | None = None
-        stands_for: dict[str, str] = {}
-        if conversion_sources:
+        # ONE ENCODING PER SAMPLE (the user's one rule of 2026-10-09, encoding_rule): every candidate of the unit,
+        # readable or not, grouped by the sample it is (_encoding_groups), and of each sample's candidates exactly
+        # one used. The convert stage converts an mzXML, and the lease reads a vendor header, only where the rule
+        # reaches it. Candidates: what the unit admits by itself, the declared inputs of a declared unit, and every
+        # other encoding of an admitted sample (_stem_mates), which is admitted to the attribute stage with it.
+        found_readable = [
+            item for item in _find_msdial_inputs(data_root) if not requires_msdial_conversion(Path(item).name)
+        ]
+        declared_samples = _declared_candidates(
+            [*found_readable, *conversion_sources], data_root, project, archive_samples, archive_extractions
+        )
+        seeds = [
+            *_readable_inputs_admitted(found_readable, data_root, project, archive_samples, admitted_members),
+            *conversion_sources,
+            *declared_samples,
+        ]
+        mates = _stem_mates(seeds, [*found_readable, *mzxml_found], data_root, project, prefixed_members)
+        groups = _encoding_groups(
+            [*seeds, *mates],
+            data_root,
+            project,
+            prefixed_members,
+            unattributed_members,
+            mates=mates,
+            declared_samples=declared_samples,
+        )
+        declaration: dict[str, Any] = {}
+
+        def start_converting() -> _LeaseConversions:
             stages.start("convert")
-            readable = _find_msdial_inputs(data_root)
-            choices, stands_for = _encoding_choices(
-                conversion_sources,
-                data_root,
-                readable,
-                _extracted_keys(extracted_members, data_root),
-                _readable_inputs_admitted(readable, data_root, project, archive_samples, prefixed_members),
-            )
-            chosen_over = {_file_key(item["mzxml"]) for item in choices}
 
             def between(name: str) -> None:
                 beat(downloaded_bytes)
@@ -2157,17 +2188,37 @@ def create_download_lease(
 
             # The polarity a scan recording none is given: the unit's Catalog handoff's, where it declares
             # exactly one, and never project.ion_mode, which a preflight rewrites from what was imputed.
-            declaration = conversion_polarity_declaration(project)
-            conversion = _run_lease_conversions(
-                [item for item in conversion_sources if _file_key(item) not in chosen_over],
-                data_root,
-                raw_root,
-                provenance,
-                choices,
-                declaration=declaration,
-                between=between,
+            declaration.update(conversion_polarity_declaration(project))
+            return _LeaseConversions(data_root, raw_root, provenance, declaration=declaration, between=between)
+
+        # The convert stage starts for the unit's own mzXML, as it always did; for an mzXML that is only another
+        # encoding of an admitted sample (_stem_mates), only where the rule reaches it (_DeferredConversions).
+        converter: _LeaseConversions | _DeferredConversions | None = None
+        if campaign_authorization and conversion_sources:
+            converter = start_converting()
+        elif campaign_authorization and any(Path(item).name.casefold().endswith(CONVERTIBLE_SUFFIXES) for item in mates):
+            converter = _DeferredConversions(start_converting)
+        choices, header_reads = _choose_encodings(
+            groups["groups"],
+            converter,
+            incomplete=incomplete_vendor_folders(data_root, project),
+            header_reader=header_reader,
+            header_directory=provenance / LEASE_HEADER_READS_DIRECTORY,
+        )
+        if isinstance(converter, _DeferredConversions):
+            converter = converter.started
+        conversion: dict[str, Any] | None = None
+        stands_for: dict[str, str] = {}
+        if converter is not None:
+            conversion = converter.finish(
+                not_converted=sum(
+                    1
+                    for choice in choices
+                    for item, reason in choice.unused
+                    if item.casefold().endswith(CONVERTIBLE_SUFFIXES) and reason in ENCODING_ORDER_REASONS
+                )
             )
-            stands_for = {**stands_for, **conversion["outputs"]}
+            stands_for = dict(conversion["outputs"])
             stages.finish(
                 "convert",
                 mzxml_found=len(mzxml_found),
@@ -2177,13 +2228,54 @@ def create_download_lease(
         else:
             stages.not_used(
                 "convert",
-                "No mzXML found here is one of this unit's inputs." if mzxml_found
+                "No mzXML found here is one of this unit's inputs." if campaign_authorization and mzxml_found
                 else "No input conversion ran in this lease.",
             )
+        # What the rule decided, by _file_key: the candidates it left unused (no input, and no excluded candidate
+        # either: each is on record in its sample's choice), and, for each input it used, its sample's choice.
+        encodings = _encoding_outcome(groups, choices, stands_for)
+        if mates:
+            # Another encoding of an admitted sample (_stem_mates) is on record in its sample's choice wherever the
+            # rule used a file of that sample, or among the members _encoding_groups left out: it is admitted with
+            # the sample to the attribute stage (the one used is the sample's input; the others are unused, and stay
+            # in the unit's tree as the record names them), and no longer listed as a shared archive's unpaired
+            # member. Where no file of its sample could be used, it keeps what it had before: not admitted.
+            on_record = {item["key"] for item in groups["left_out"]}
+            for choice in choices:
+                if choice.used is not None:
+                    on_record.update(_file_key(item) for item in choice.candidates)
+            recorded = [item for item in mates if _file_key(item) in on_record]
+            admitted_members = {
+                **admitted_members,
+                **{
+                    _file_key(item): {
+                        "member_name": _relative_under(item, data_root),
+                        "paired_by": ENCODING_OF_AN_ADMITTED_SAMPLE,
+                    }
+                    for item in recorded
+                },
+            }
+            unattributed["record"] = _without_mates(unattributed["record"], recorded, data_root)
+        unused_keys = encodings["unused"]
+        # A file used for a sample that a rule paired with its row through another of its files (S7.raw, for a row
+        # naming S7.mzML whose 021518_387057_CSHp_S7.mzML a prefix paired) is the row's own input (clause 4), but it
+        # was paired by no rule itself: the pairing stays the member's it was made for (stand_pairings, by that
+        # member's _file_key). The input's lineage row names it through its encoding_choice's stands_for, and the
+        # manifest lists it by that member, with the file the rule used for its sample (review of PR #69,
+        # follow-up 3). Before, the input took the pairing as its own, and the record said S7.raw had a prefix.
+        every_pairing = prefixed_members
+        prefixed_members = {key: value for key, value in prefixed_members.items() if key not in unused_keys}
+        # The file used for a sample a row pairs with is that sample's own input, never an unattributed one (clause 4).
+        unattributed_members = {
+            key: value
+            for key, value in unattributed_members.items()
+            if key not in unused_keys and key not in encodings["of_a_row"]
+        }
 
         stages.start("discover")
-        # Before anything is discovered: a folder that did not arrive whole is no input at all.
-        container_completeness = verify_container_completeness(data_root, project)
+        # Before anything is discovered: a folder that did not arrive whole is no input at all. One the encoding rule
+        # left unused, another encoding of its sample running instead (incomplete_container), is not held to it.
+        container_completeness = verify_container_completeness(data_root, project, unused=unused_keys)
         all_inputs = _find_msdial_inputs(data_root)
         if conversion is not None:
             # The mzML the convert stage wrote, beside the data root rather than under it.
@@ -2220,12 +2312,18 @@ def create_download_lease(
             set_aside=[item["path"] for item in (conversion or {}).get("excluded") or []],
             prefixed_members=admitted_members,
         )
+        # Each sample's one file (encoding_rule): what the rule left unused is no input.
+        inputs = [item for item in inputs if _file_key(item) not in unused_keys]
         inputs, excluded_inputs, mzml_scanned = _exclude_undecodable_inputs(inputs)
         ignored_inputs = len(all_inputs) - len(inputs) - len(excluded_inputs)
         if conversion is not None:
             # An mzXML whose conversion failed, or whose scans contradict the declared polarity, is no
-            # candidate, as an undecodable mzML is none.
-            excluded_inputs = [*conversion["excluded"], *excluded_inputs]
+            # candidate, as an undecodable mzML is none. One whose sample another file ran for is not excluded
+            # but unused, on record in that sample's choice (encoding_rule, clause 3).
+            excluded_inputs = [
+                *(entry for entry in conversion["excluded"] if _file_key(str(entry["path"])) not in unused_keys),
+                *excluded_inputs,
+            ]
         analysis_input = _common_input_path(inputs, data_root)
         kept = {_file_key(item) for item in inputs}
         conversions, conversion_rows = _conversion_lineage(
@@ -2240,6 +2338,15 @@ def create_download_lease(
             extracted_members=extracted_members,
             archive_extractions=archive_extractions,
         )
+        kept_choices = {key: value for key, value in encodings["by_input"].items() if key in kept}
+        # Each member a rule paired whose sample the rule ran on another file (stand_pairings, by the member's
+        # _file_key), and that file, as its sample's choice names it (encoding_used).
+        encoding_used = {
+            _file_key(entry["stands_for"]): str(entry["record"]["used"] or "")
+            for entry in kept_choices.values()
+            if entry["stands_for"] and _file_key(entry["stands_for"]) in every_pairing
+        }
+        stand_pairings = {key: every_pairing[key] for key in encoding_used}
         input_lineage = build_input_lineage(
             inputs,
             downloads,
@@ -2253,27 +2360,56 @@ def create_download_lease(
             excluded_inputs=excluded_inputs,
             conversions=conversions,
             stands_for={key: value for key, value in stands_for.items() if key in kept},
-            prefixed_members=prefixed_members,
+            prefixed_members={**prefixed_members, **stand_pairings},
             unattributed_members=unattributed_members,
+            encoding_choices=kept_choices,
         )
         if conversion_rows:
             input_lineage["conversion_sources"] = conversion_rows
         # The inputs admitted only because a rule inferred which declared raw file they are; each lineage row
-        # says so (name_pairing), and the attribute stage and the manifest list every such pairing.
+        # says so (name_pairing), and the attribute stage and the manifest list every such pairing: by the member
+        # the rule paired, and, where the encoding rule ran its sample on another file, with that file.
         paired_by_rule = Counter(
             prefixed_members[_file_key(item)]["paired_by"] for item in inputs if _file_key(item) in prefixed_members
         )
-        inferred = inferred_name_pairings(prefixed_members, data_root)
-        unattributed_inputs = [item for item in inputs if _file_key(item) in unattributed_members]
-        unattributed_record = unattributed["record"]
-        if unattributed_record is not None and unattributed_record.get("applied"):
-            # What reached the inputs: a member the lease then excluded (an undecodable mzML) is no input.
-            data_key = _file_key(str(data_root))
-            unattributed_record = {
-                **unattributed_record,
-                "count": len(unattributed_inputs),
-                **unattributed_member_names(_member_under_root(_file_key(item), data_key) for item in unattributed_inputs),
+        paired_by_rule.update(pairing["paired_by"] for pairing in stand_pairings.values())
+        inferred = inferred_name_pairings({**prefixed_members, **stand_pairings}, data_root, encoding_used)
+        # The unattributed members as the lineage holds them (unattributed_lineage_record): its rows and its
+        # excluded rows that say unattributed_member, a converted one by the mzXML it was converted from
+        # (2026-10-08, second round, answer 3), and one the lease excluded after admitting it (an mzXML whose
+        # conversion failed, an undecodable mzML) listed in excluded with the lease's reason.
+        unattributed_lineage = unattributed_lineage_record(input_lineage, _file_key(str(data_root)))
+        unattributed_inputs = [
+            item
+            for item in inputs
+            if _file_key(item) in {
+                _file_key(str(row.get("path") or ""))
+                for row in input_lineage.get("rows") or []
+                if isinstance(row, dict)
+                and (row.get("name_pairing") or {}).get("paired_by") == UNATTRIBUTED_MEMBER_PAIRING
             }
+        ]
+        # Warned wherever the lineage holds one, an excluded one too: the gate's PAIR-1 reads the same rows.
+        unattributed_warned = bool(unattributed_lineage["count"])
+        unattributed_record = _with_left_out(unattributed["record"], groups["left_out"])
+        if unattributed_record is not None and unattributed_record.get("applied"):
+            unattributed_record = {**unattributed_record, **unattributed_lineage}
+        if unattributed_record is None:
+            # A unit whose Catalog declared its inputs: the archive members no declaration names, each left out on
+            # record (2026-10-08, second round, answer 3: "on record"), as no input of the unit.
+            unattributed_record = _members_no_declaration_names(
+                project,
+                extracted_members,
+                data_root,
+                archive_samples,
+                archive_extractions,
+                reached={
+                    *(_file_key(item) for item in inputs),
+                    *(_file_key(str(entry["path"])) for entry in excluded_inputs),
+                    *(_file_key(item) for item in conversion_sources),
+                    *(_file_key(value) for value in stands_for.values()),
+                },
+            )
         pruned: dict[str, Any] = {}
         if store_lease is not None:
             # Now that the unit's own files are known: the links to anything else the store's objects
@@ -2312,14 +2448,29 @@ def create_download_lease(
             ),
             **({"inferred_name_pairings": inferred} if inferred else {}),
             **({"unattributed_members": len(unattributed_inputs)} if unattributed_inputs else {}),
+            # The samples the rule chose for among several encodings, and the files it left unused (encoding_rule).
+            **(
+                {"encoding_choices": len(encodings["records"]), "unused_encodings": len(unused_keys)}
+                if encodings["records"]
+                else {}
+            ),
+            # The vendor headers the lease read for the rule, and how many it could not read.
+            **(
+                {
+                    "vendor_headers_read": len(header_reads),
+                    "vendor_headers_unreadable": sum(1 for reason in header_reads.values() if reason),
+                }
+                if header_reads
+                else {}
+            ),
             **(
                 {
                     "warnings": [
                         *([INFERRED_PAIRING_WARNING] if inferred else []),
-                        *([UNATTRIBUTED_MEMBERS_WARNING] if unattributed_inputs else []),
+                        *([UNATTRIBUTED_MEMBERS_WARNING] if unattributed_warned else []),
                     ]
                 }
-                if inferred or unattributed_inputs
+                if inferred or unattributed_warned
                 else {}
             ),
             **({"refused_name_pairings": name_pairings["refused"]} if name_pairings["refused"] else {}),
@@ -2381,16 +2532,20 @@ def create_download_lease(
                 "paired": inferred,
                 "refused": list(name_pairings["refused"]),
             }
-        if inferred or unattributed_inputs:
+        if inferred or unattributed_warned:
             manifest["warnings"] = [
                 *([INFERRED_PAIRING_WARNING] if inferred else []),
-                *([UNATTRIBUTED_MEMBERS_WARNING] if unattributed_inputs else []),
+                *([UNATTRIBUTED_MEMBERS_WARNING] if unattributed_warned else []),
             ]
         if unattributed_record is not None:
             # The archive members no sample row pairs with: taken as unattributed inputs where the download is the
             # unit's own (count, members), else left out with why (applied false, reason). Only where a member was
             # left unpaired, so every other lease records what it always did.
             manifest["unattributed_members"] = unattributed_record
+        if encodings["records"]:
+            # Each sample the rule chose for among several encodings: the file used and every other, with its reason
+            # (encoding_rule, clause 5). Only where one was, so every other lease records what it always did.
+            manifest["encoding_choices"] = encodings["records"]
         warnings = _archive_warnings(archive_extractions)
         if warnings:
             manifest["archive_warnings"] = warnings
@@ -3411,6 +3566,7 @@ def build_input_lineage(
     stands_for: dict[str, str] | None = None,
     prefixed_members: dict[str, dict[str, str]] | None = None,
     unattributed_members: dict[str, dict[str, str]] | None = None,
+    encoding_choices: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """One row per analysis input: what it is, where its bytes came from, and what vouches for them.
 
@@ -3463,9 +3619,15 @@ def build_input_lineage(
     ``excluded``, each with its ``exclusion``, so where the bytes of a file that was not analysed came from
     is still recorded.
 
-    AN INPUT THAT STANDS FOR AN MZXML - one converted from it, or a readable encoding of its sample the lease
-    chose over it (``stands_for``, by _file_key; the latter's row carries encoding_choice) - is given the
-    sample and the declared names of that mzXML wherever its own name gives none.
+    AN INPUT CONVERTED FROM AN MZXML (``stands_for``, by _file_key: the mzXML) is given the sample and the declared
+    names of that mzXML wherever its own name gives none.
+
+    AN INPUT THE ENCODING RULE USED FOR ITS SAMPLE (``encoding_choices``, by _file_key, the lease's _encoding_outcome:
+    the user's one rule of 2026-10-09, msdial_app.encoding_rule) carries its sample's choice as encoding_choice: the
+    rule, the file used and every other with its reason ({rule, used, unused: [{path, reason}]}, paths under the data
+    root). Where a sample row pairs with another file of its sample and not with it (stands_for, that file's path),
+    it is that sample's own input (clause 4): it is given that file's sample, declared names and pairing, before any
+    of its own, and its encoding_choice says stands_for.
 
     AN ARCHIVE MEMBER A RULE PAIRED WITH A DECLARED NAME - behind a prefix, or by its leading identifier
     (``prefixed_members``, by _file_key, the lease's _member_name_pairings; worked out here from
@@ -3476,6 +3638,7 @@ def build_input_lineage(
     """
     verified_checksums = verified_checksums or {}
     excluded_inputs = excluded_inputs or []
+    encoding_choices = encoding_choices or {}
     conversions = conversions or {}
     stands_for = stands_for or {}
     excluded_keys = {_file_key(str(item["path"])): item for item in excluded_inputs}
@@ -3571,6 +3734,21 @@ def build_input_lineage(
                 candidates = stand_candidates
             if not matched_samples and not pairing:
                 matched_samples, pairing, paired_name = stand_samples, stand_pairing, Path(stand).name
+        choice = encoding_choices.get(key) or {}
+        sample_member = str(choice.get("stands_for") or "")
+        if sample_member:
+            # The file the encoding rule used for a sample whose row pairs with another of its files: that sample's own
+            # input (2026-10-09, clause 4), named as that file is, whatever its own name says. Where a rule paired the
+            # row with that file (the lease passes that member's pairing in prefixed_members), the row names that
+            # pairing as it was made: member_name is that file, not this one, which no rule paired (review of PR #69,
+            # follow-up 3).
+            member_candidates, member_samples, member_pairing = naming(Path(sample_member), _file_key(sample_member))
+            if not {item for item in candidates if item in declared}:
+                candidates = member_candidates
+            if (member_samples or member_pairing) and (
+                not pairing or pairing.get("paired_by") == UNATTRIBUTED_MEMBER_PAIRING
+            ):
+                matched_samples, pairing, paired_name = member_samples, member_pairing, Path(sample_member).name
         row: dict[str, Any] = {
             "path": str(path),
             "kind": "",
@@ -3702,9 +3880,9 @@ def build_input_lineage(
         else:
             row["kind"] = "vendor_folder" if path.is_dir() else "file"
             row["source"] = {"origin": "not_downloaded_by_this_lease"}
-        if stand and key not in conversions:
-            # Chosen over an mzXML of the same sample that came out of an archive beside it (_encoding_choices).
-            row["encoding_choice"] = {"stands_for": stand, "rule": "encoding_preference.v1"}
+        if choice:
+            # Its sample's choice (encoding_rule), and the file whose row it is that sample's input for, where not its own.
+            row["encoding_choice"] = {**choice["record"], **({"stands_for": sample_member} if sample_member else {})}
         rows.append(row)
     table: dict[str, Any] = {
         "schema": "msdial-input-lineage.v1",
@@ -3829,14 +4007,11 @@ def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict
 # repository's own mzML, the checksum index of raw\data never sees it, and MS-DIAL's per-file intermediates
 # land beside it inside the raw tree, released with it.
 #
-# WHAT IS CONVERTED. The unit's own mzXML only - listed for analysis, declared by the Catalog, or named by
-# its samples - and of those only the ones the Catalog's encoding rule keeps: where extraction shows a
-# vendor container or an mzML of the same sample beside an mzXML (an mzML archive beside an mzXML archive),
-# the readable one is analysed in its place and the mzXML is not converted (encoding_preference). The rule
-# is the Catalog's, applied here only to what an archive showed: a listing the Catalog saw it already
-# decided. It is given the files of one sample's place, never another folder's file of the same name
-# (_sample_locus), and wherever they are the readable files the unit admits by itself, which are its inputs
-# in any case (_readable_inputs_admitted).
+# WHAT IS CONVERTED. The unit's own mzXML only - listed for analysis, declared by the Catalog, named by its
+# samples, or an unattributed member of its own archive - and of those only the ones the user's one encoding
+# rule of 2026-10-09 reaches (encoding_rule, _choose_encodings): an mzXML is the last of a sample's encodings,
+# so it is converted only where no vendor file or decodable mzML of its sample is among the unit's candidates,
+# or where an mzXML before it in the rule's order could not be converted.
 #
 # WHAT IS INFERRED. Every inference the converter offers stays off but one: a scan whose mzXML records no
 # polarity is given the unit's declared ion mode, where its Catalog handoff declares exactly one polarity
@@ -3949,125 +4124,442 @@ def _select_conversion_sources(
     return selected
 
 
-def _encoding_choices(
-    sources: list[str],
+# ---- One encoding per sample: the user's one rule of 2026-10-09 (encoding_rule) -------------------------------
+#
+# THE SAME SAMPLE. The rule chooses among one sample's candidates, and _encoding_groups says which candidates are one
+# sample's: the files a sample row pairs with (by its exact name, its extensionless stem, a prefixed name or a leading
+# identifier: _member_name_pairings), together with every other candidate of the unit whose file stem (its name less
+# its container suffix, encoding_preference.stem) is theirs; and, of the candidates no row pairs with, those of one
+# stem. One row's files are one sample's whatever their stems: a file of the stem of the name the row gives, in any
+# encoding, is the row's (clause 4), and so is one a prefix or a leading identifier pairs with it, so
+# 021518_387057_CSHp_S7.mzML (paired with a row naming S7.mzML) and S7.raw are one sample's, and S7.raw runs.
+# Folders do not separate one sample's encodings or copies: RAW/S1.raw, mzML/S1.mzML and S1.mzXML are one
+# sample's, and so are A/S1.raw and B/S1.raw. Two things do:
+# - two polarities that paths of one stem state by tokens of their own (name_polarities): POS/S1.raw and NEG/S1.raw
+#   are two acquisitions, never two encodings of one, and a unit of both polarities is split by polarity later (the
+#   safest existing behaviour, kept where the rule's words do not reach: data of two polarities are no one sample's
+#   data). A path that states no polarity is a copy of one that states the unit's own, or, in a unit that gives
+#   none, of the only one its stem's paths state (_one_sample_polarities): POS/S1.raw and S1.raw in a positive unit
+#   are one sample's. Beside a path that states the other polarity, or beside paths of both, it stays apart;
+# - two sample rows: files that rows of different names pair with are different samples' even where they share a
+#   stem (rows naming S1.raw and S1.mzML each keep their own). An unattributed member of such a stem is no one
+#   sample's encoding, and it is left out on record (STEM_OF_SEVERAL_SAMPLE_ROWS), as an unpaired member whose name
+#   an admitted member carried always was.
+# The candidates are the unit's own: what it admits by itself, the members of its own archive no row pairs with
+# (_unattributed_members), and every other file of a sample it admits (_stem_mates: a file of an admitted file's
+# stem, or of the stem of the name the row of a file paired by its name gives, which the analysis CSV pairs with
+# that row whatever encoding the row names; clause 4). A shared
+# archive's members of no admitted file's stem stay unpaired and are excluded on record (2026-10-08, second round,
+# answer 1); one of an admitted file's stem is that sample's encoding, and the rule chooses among them.
+#
+# A unit whose Catalog declared its inputs is matched by path, and every member no declaration names stays out
+# (2026-10-08, second round, answer 3). The rule chooses among the declared inputs of one sample row and one stem
+# (_declared_candidates): a declaration that lists one sample's file in two folders (the Catalog leaves equally
+# preferred copies both declared) runs the first by path. Declared inputs of different rows, even of one name in two
+# folders (MTBKS64's raw/batch1/QC.RAW and raw/batch2/QC.RAW, two rows of S01), are different samples' files.
+
+STEM_OF_SEVERAL_SAMPLE_ROWS = "stem_of_several_sample_rows"
+# Where the lease's raw-header reads for the encoding rule write their records, under the unit's provenance.
+LEASE_HEADER_READS_DIRECTORY = "lease-header-reads"
+# How a file the unit admitted only as another encoding of one of its samples is held among the admitted members
+# (_stem_mates): what admits it to the attribute stage, never a pairing of its own.
+ENCODING_OF_AN_ADMITTED_SAMPLE = "encoding_of_an_admitted_sample"
+# The reasons the rule gives a candidate it ranked below the one used (clause 5); the others say why one was unreadable.
+ENCODING_ORDER_REASONS = frozenset({encoding_rule.LOWER_IN_ENCODING_ORDER, encoding_rule.TIE_LEXICOGRAPHIC})
+
+
+@dataclass
+class _EncodingGroup:
+    """One sample's candidates ({path: its path relative to the data root}), and those a sample row pairs with by
+    their own names (``paired``), in the rule's order."""
+
+    paths: dict[str, str]
+    paired: list[str] = field(default_factory=list)
+
+
+def _unit_polarity(project: RepositoryProject) -> str:
+    value = str(project.ion_mode or "").strip().capitalize()
+    return value if value in {"Positive", "Negative"} else ""
+
+
+def _one_sample_polarities(
+    stated: Iterable[frozenset[str]], unit_polarity: str
+) -> dict[frozenset[str], frozenset[str]]:
+    """How the polarities the paths of one stem state make samples of them: {a path's polarities: its sample's}.
+
+    The paths of one stem that state one polarity, and those that state none, are one sample's where that polarity
+    is the unit's own, or the unit gives none: POS/S1.raw and S1.raw in a positive unit. Where they state two, or
+    one that is not the unit's, each set of polarities is a sample of its own, as it always was (an empty mapping:
+    every set is its own).
+    """
+    found = {frozenset(item) for item in stated if item}
+    if len(found) != 1:
+        return {}
+    (only,) = found
+    if unit_polarity and only != frozenset({unit_polarity}):
+        return {}
+    return {frozenset(): only, only: only}
+
+
+def _relative_under(path: str, data_root: Path) -> str:
+    """A path under the data root, '/'-separated, in its own case; its name alone where it is not under the root."""
+    candidate = Path(path)
+    for base, item in ((data_root, candidate), (data_root.resolve(), candidate.resolve())):
+        try:
+            return item.relative_to(base).as_posix()
+        except ValueError:
+            continue
+    return candidate.name
+
+
+def _encoding_groups(
+    candidates: list[str],
     data_root: Path,
-    readable: list[str],
-    extracted: set[str],
-    admitted: set[str] | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    """Where the unit holds a readable encoding of an mzXML's sample: (the choices, {winner key: mzXML}).
+    project: RepositoryProject,
+    prefixed_members: dict[str, dict[str, str]],
+    unattributed: Iterable[str] = (),
+    *,
+    mates: Iterable[str] = (),
+    declared_samples: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Each sample's candidates, as THE SAME SAMPLE above says: {"groups": [_EncodingGroup], "left_out": [...]}.
 
-    The Catalog's rule (encoding_preference.prefer_encodings) decides between each mzXML and the readable
-    files of its sample's name found on disk - vendor containers, folders and mzML. It is applied only where
-    the mzXML or the encoding that wins came out of an archive (``extracted``, by _file_key, members and the
-    folders that hold them): what the repository listed file by file, the Catalog already decided. A twin the
-    unit admits by itself is the exception (below).
-
-    An mzML whose arrays RawDataHandler cannot decode (mzml_encoding) is no readable twin: the lease would
-    exclude it, and a convertible mzXML outranks an unreadable twin, as the user decided on 2026-09-30.
-
-    WHICH FILES ARE ONE SAMPLE'S. The Catalog pairs files by name within one unit's listing. A data root an
-    accession archive expanded into holds other units' files too - a study archive with a folder per
-    polarity or per column, a QC_01 in each - and pairing by name across all of it would let the positive
-    unit's POS/QC_01.mzML displace the negative unit's NEG/QC_01.mzXML. So the rule is given the files
-    whose folders agree once the words that name an encoding are set aside (_sample_locus): mzML/x.mzML
-    and mzXML/x.mzXML are one sample's, POS/x.mzML and NEG/x.mzXML are not. It is also given, whatever
-    their folders, the readable files the unit admits by itself (``admitted``, by _file_key;
-    _readable_inputs_admitted): a Thermo_RAW/x.raw that a sample named x admits is that sample's input
-    whatever else is converted, so converting mzXML/x.mzXML as well would give the sample two inputs and
-    the unit no analysis CSV. Such a twin is paired whether or not an archive held it, for the same reason.
+    ``candidates`` are every file the unit admits by itself, readable or not (an undecodable mzML, an mzXML), and
+    its ``mates`` (_stem_mates), as absolute paths; ``prefixed_members`` the inferred pairings
+    (_member_name_pairings' paired); ``unattributed`` the _file_key of each member no row pairs with that the unit
+    took (_unattributed_members). ``declared_samples`` is a declared unit's (_declared_candidates): each candidate's
+    sample row, by its path. Each left-out entry is {key, member_name (its path under the data root), reason
+    STEM_OF_SEVERAL_SAMPLE_ROWS}.
     """
-    admitted = admitted or set()
-    by_stem: dict[str, list[str]] = {}
-    for item in readable:
-        by_stem.setdefault(encoding_preference.stem(Path(item).name), []).append(item)
-    choices: list[dict[str, Any]] = []
-    winners: dict[str, str] = {}
-    for source in sources:
-        locus = _sample_locus(source, data_root)
-        twins = [
-            item
-            for item in by_stem.get(encoding_preference.stem(Path(source).name)) or []
-            if (_file_key(item) in admitted or _sample_locus(item, data_root) == locus)
-            and not (
-                Path(item).suffix.casefold() == ".mzml" and Path(item).is_file()
-                and scan_mzml_encoding(Path(item))["problems"]
-            )
-        ]
-        if not twins:
-            continue
-        names = {item: (_relative_to_data_root(Path(item), data_root) or Path(item).name) for item in [source, *twins]}
-        roles = encoding_preference.prefer_encodings(list(names.values()))
-        if roles.get(names[source]) != encoding_preference.ALTERNATE:
-            continue
-        chosen = [item for item in twins if roles.get(names[item]) == encoding_preference.RAW]
-        by_unit = any(_file_key(item) in admitted for item in chosen)
-        if not chosen or not (
-            by_unit or _file_key(source) in extracted or any(_file_key(item) in extracted for item in chosen)
+    result: dict[str, Any] = {"groups": [], "left_out": []}
+    unique = list({_file_key(item): item for item in candidates}.values())
+    if not unique or not project.analysis_unit_id:
+        return result
+    relatives = {item: _relative_under(item, data_root) for item in unique}
+
+    def order(items: Iterable[str]) -> list[str]:
+        return sorted(items, key=lambda item: encoding_rule.order_key(relatives[item]))
+
+    if declared_analysis_inputs(project):
+        # One group per declared sample row and stem (_declared_candidates); a declared input given no row is a group
+        # of its own. Each is a row's own declared input, so each is paired.
+        rows = {_file_key(item): label for item, label in (declared_samples or {}).items()}
+        declared_buckets: dict[tuple[str, str], list[str]] = {}
+        for item in unique:
+            label = rows.get(_file_key(item)) or f"input:{_file_key(item)}"
+            declared_buckets.setdefault((label, encoding_preference.stem(relatives[item])), []).append(item)
+        for items in sorted(
+            declared_buckets.values(), key=lambda members: encoding_rule.order_key(relatives[order(members)[0]])
         ):
+            members = order(items)
+            result["groups"].append(_EncodingGroup({item: relatives[item] for item in members}, members))
+        return result
+    # The names the unit's sample rows give, as the lease matches them (_sample_file_names): a row's file name, the
+    # container its packed name stands for, and an extensionless name as a stem.
+    named: dict[str, set[str]] = {}
+    stemmed: dict[str, set[str]] = {}
+    # The rows by the stem of the file they name (encoding_preference.stem): a file of that stem in any encoding is
+    # that row's sample's (clause 4), as the analysis CSV pairs it.
+    row_stems: dict[str, set[str]] = {}
+    for sample in project.sample_metadata or []:
+        raw = PurePosixPath(str((sample or {}).get("raw_file") or "").strip().replace("\\", "/")).name.casefold()
+        if not raw:
             continue
-        for item in chosen:
-            winners.setdefault(_file_key(item), source)
-        choices.append({
-            "mzxml": source,
-            "analysed_instead": chosen,
-            "rule": "encoding_preference.v1",
-            "paired_by": "admitted_by_unit" if by_unit else "same_folder",
-            "reason": (
-                "The unit admits a readable encoding of the same sample by itself - its listing, its sample "
-                "names, or the archive a sample names - and the Catalog's encoding rule analyses that one; the "
-                "mzXML is not converted."
-                if by_unit
-                else "A readable encoding of the same sample came out of an archive beside it, and the Catalog's "
-                "encoding rule analyses that one; the mzXML is not converted."
-            ),
-        })
-    return choices, winners
+        named.setdefault(raw, set()).add(raw)
+        alias = archives.container_alias(raw)
+        if alias:
+            named.setdefault(alias.casefold(), set()).add(raw)
+        if not PurePosixPath(raw).suffix:
+            stemmed.setdefault(raw, set()).add(raw)
+        row_stems.setdefault(encoding_preference.stem(raw), set()).add(raw)
 
+    def rows_of(item: str) -> tuple[str, ...]:
+        """The sample rows (by the file name they give) that pair with a candidate by its own name."""
+        pairing = prefixed_members.get(_file_key(item))
+        if pairing:
+            return (str(pairing["declared_raw_file"]).casefold(),)
+        base = Path(item).name.casefold()
+        return tuple(sorted({*named.get(base, ()), *stemmed.get(PurePosixPath(base).stem, ())}))
 
-# The words of a folder's name that say which encoding it holds rather than whose samples: ST003038's
-# mzML/ beside its mzXML/, an archive's raw/ beside its mzXML/, NEG_mzML/ beside NEG_mzXML/. A one-letter
-# word (the .d of Agilent and Bruker) names too much else to be set aside.
-_ENCODING_FOLDER_WORDS = frozenset(
-    suffix[1:]
-    for suffix in (
-        *encoding_preference.VENDOR_SUFFIXES, *encoding_preference.OPEN_SUFFIXES, ".mzxml", ".mzdata",
-    )
-    if len(suffix) > 2
-)
+    def sample_row_of(item: str) -> tuple[str, ...]:
+        """The sample row a candidate is a file of: the one that pairs with it by its own name, else the only row
+        whose named file has its stem (S7.raw for a row naming S7.mzML); () where none, or several, do."""
+        own = rows_of(item)
+        if own:
+            return own
+        by_stem = row_stems.get(encoding_preference.stem(relatives[item]), set())
+        return (next(iter(by_stem)),) if len(by_stem) == 1 else ()
 
-
-def _sample_locus(path: str, data_root: Path) -> tuple[tuple[str, ...], ...]:
-    """The folders a file lies in below the data root, each as its words less those naming an encoding.
-
-    Two encodings of a name are one sample's only where these agree (_encoding_choices). A folder whose
-    every word names an encoding (mzML, RAW) is no place of its own, so x.mzML at the root and mzXML/x.mzXML
-    agree, and NEG_mzML and NEG_mzXML are both NEG.
-    """
-    relative = _relative_to_data_root(Path(path), data_root)
-    folders = PurePosixPath(relative).parts[:-1] if relative else ()
-    locus = []
-    for folder in folders:
-        words = tuple(
-            word for word in re.split(r"[\W_]+", folder.casefold()) if word and word not in _ENCODING_FOLDER_WORDS
+    polarity_named = names_state_polarity(relatives.values())
+    unit_polarity = _unit_polarity(project)
+    # A file only another encoding of a sample admitted (_stem_mates) is left out with the unattributed ones where
+    # several rows share its stem: it is no one row's encoding, and no unpaired input either.
+    taken = {_file_key(item) for item in unattributed} | {_file_key(item) for item in mates}
+    stems: dict[str, list[str]] = {}
+    for item in unique:
+        stems.setdefault(encoding_preference.stem(relatives[item]), []).append(item)
+    buckets: dict[tuple[str, frozenset[str]], list[str]] = {}
+    for stem, items in stems.items():
+        stated = {item: frozenset(name_polarities(relatives[item], polarity_named=polarity_named)) for item in items}
+        merged = _one_sample_polarities(stated.values(), unit_polarity)
+        for item in items:
+            buckets.setdefault((stem, merged.get(stated[item], stated[item])), []).append(item)
+    # Each bucket's samples: (the sample row they are a file of, or () for none, the bucket's polarities, files).
+    parts: list[tuple[tuple[str, ...], frozenset[str], list[str]]] = []
+    for (_stem, polarities), items in buckets.items():
+        rows = {item: sample_row_of(item) for item in items}
+        identities = sorted({value for value in rows.values() if value})
+        if len(identities) <= 1:
+            parts.append((identities[0] if identities else (), polarities, items))
+            continue
+        for identity in identities:
+            parts.append((identity, polarities, [item for item in items if rows[item] == identity]))
+        unpaired = order(item for item in items if not rows[item])
+        for item in unpaired:
+            if _file_key(item) in taken:
+                result["left_out"].append(
+                    {"key": _file_key(item), "member_name": relatives[item], "reason": STEM_OF_SEVERAL_SAMPLE_ROWS}
+                )
+        rest = [item for item in unpaired if _file_key(item) not in taken]
+        if rest:
+            parts.append(((), polarities, rest))
+    # One row's files are one sample's whatever their stems (THE SAME SAMPLE): 021518_387057_CSHp_S7.mzML, which a
+    # prefix pairs with the row naming S7.mzML, and S7.raw, of the row's own stem. Their polarities part them as they
+    # part one stem's paths (_one_sample_polarities).
+    by_row: dict[tuple[str, ...], list[int]] = {}
+    for index, (identity, _polarities, _items) in enumerate(parts):
+        if identity:
+            by_row.setdefault(identity, []).append(index)
+    merged_into: dict[int, int] = {}
+    for indexes in by_row.values():
+        sample_polarities = _one_sample_polarities((parts[index][1] for index in indexes), unit_polarity)
+        first: dict[frozenset[str], int] = {}
+        for index in indexes:
+            polarities = parts[index][1]
+            merged_into[index] = first.setdefault(sample_polarities.get(polarities, polarities), index)
+    samples: dict[int, list[str]] = {}
+    for index, (_identity, _polarities, items) in enumerate(parts):
+        samples.setdefault(merged_into.get(index, index), []).extend(items)
+    for items in sorted(samples.values(), key=lambda members: encoding_rule.order_key(relatives[order(members)[0]])):
+        members = order(items)
+        result["groups"].append(
+            _EncodingGroup({item: relatives[item] for item in members}, [item for item in members if rows_of(item)])
         )
-        if words:
-            locus.append(words)
-    return tuple(locus)
+    return result
 
 
-def _extracted_keys(extracted_members: dict[str, dict[str, Any]], data_root: Path) -> set[str]:
-    """Every extracted file, and every folder under the data root holding one, by _file_key."""
-    keys = set(extracted_members)
-    stop = _file_key(str(data_root))
-    for key in list(extracted_members):
-        for parent in Path(key).parents:
-            parent_key = str(parent)
-            if parent_key == stop or len(parent_key) <= len(stop) or parent_key in keys:
-                break
-            keys.add(parent_key)
-    return keys
+# What reads a vendor candidate's raw header for the encoding rule at the lease (lease_header_reader):
+# (the files to read, a work directory) -> {_file_key: '' where it was read, else the preflight's exclusion reason}.
+HeaderReader = Callable[[list[Path], Path], Mapping[str, str]]
+
+
+def _choose_encodings(
+    groups: list[_EncodingGroup],
+    converter: "_LeaseConversions | _DeferredConversions | None",
+    *,
+    incomplete: Iterable[str] = (),
+    header_reader: HeaderReader | None = None,
+    header_directory: Path | None = None,
+) -> tuple[list[encoding_rule.EncodingChoice], dict[str, str]]:
+    """THE RULE, once per sample (encoding_rule.choose_encoding), in the order of the groups given; with the vendor
+    headers it read ({_file_key: '' or the reason}).
+
+    What the lease can say of a candidate's readability (encoding_rule's WHAT "READABLE" IS): an mzML whose arrays
+    RawDataHandler cannot decode (scan_mzml_encoding) is undecodable; an mzXML is readable once ``converter`` (a
+    campaign's convert stage) has converted it, and unreadable for the reason its conversion gave otherwise; without
+    a converter an mzXML is no input (requires_conversion). A vendor file or folder (any other candidate) is
+    unreadable where it is a listed folder that did not arrive whole (``incomplete``, by _file_key:
+    incomplete_vendor_folders), and where ``header_reader`` cannot read its raw header (raw_header_unreadable,
+    raw_header_unsupported_format); it is readable otherwise. Its header is read only where its sample has another
+    candidate, for there is nothing to take in its place otherwise: the preflight reads every input's header after
+    the lease, as it always did.
+
+    An mzXML is converted, and a vendor header read, only when the rule reaches it; the rule is then asked again and
+    goes on to the next in its order where it could not be (clause 3), until no sample waits on either. A full disk
+    stops the lease from the converter.
+
+    WHERE ONLY A HEADER STOOD IN THE WAY. A sample none of whose candidates can be used, one of which was refused only
+    for its header, uses that vendor file all the same, as a sample with no other encoding does: the lease's header
+    read is no exclusion, and the preflight decides such a file (a unit none of whose headers can be read is taken at
+    its declaration). Its other candidates keep the reasons they could not be used for (_kept_reasons): an mzML
+    after it is undecodable, not lower in the order, so the preflight never reads it as a fallback not taken.
+    """
+    scanned: dict[str, str] = {}
+    outcomes: dict[str, str] = {}
+    headers: dict[str, str] = {}
+    unfinished = {str(item).casefold() for item in incomplete}
+    contested = {_file_key(item) for group in groups if len(group.paths) > 1 for item in group.paths}
+    lenient = False
+
+    def convertible(item: str) -> bool:
+        return Path(item).name.casefold().endswith(CONVERTIBLE_SUFFIXES)
+
+    def vendor(item: str) -> bool:
+        return not convertible(item) and Path(item).suffix.casefold() not in {".mzml", ".imzml"}
+
+    def readability(item: str) -> str:
+        if convertible(item):
+            if converter is None:
+                return encoding_rule.REQUIRES_CONVERSION
+            return outcomes.get(_file_key(item), "")
+        path = Path(item)
+        key = _file_key(item)
+        if path.suffix.casefold() == ".mzml" and path.is_file():
+            if key not in scanned:
+                scanned[key] = encoding_rule.UNDECODABLE if scan_mzml_encoding(path)["problems"] else ""
+            return scanned[key]
+        if key in unfinished:
+            return encoding_rule.INCOMPLETE_CONTAINER
+        reason = headers.get(key, "")
+        return "" if lenient and reason in encoding_rule.RAW_HEADER_REASONS else reason
+
+    while True:
+        choices = [encoding_rule.choose_encoding(group.paths, readability) for group in groups]
+        to_convert = [
+            choice.used
+            for choice in choices
+            if converter is not None
+            and choice.used is not None
+            and convertible(choice.used)
+            and _file_key(choice.used) not in outcomes
+        ]
+        to_read = [
+            choice.used
+            for choice in choices
+            if header_reader is not None
+            and choice.used is not None
+            and vendor(choice.used)
+            and _file_key(choice.used) in contested
+            and _file_key(choice.used) not in headers
+        ]
+        if not to_convert and not to_read:
+            break
+        for source in dict.fromkeys(to_convert):
+            outcomes[_file_key(source)] = converter.convert(source)
+        if to_read:
+            read = header_reader([Path(item) for item in dict.fromkeys(to_read)], header_directory or Path("."))
+            for item in to_read:
+                headers[_file_key(item)] = str(read.get(_file_key(item), "") or "")
+    if any(
+        choice.used is None and any(reason in encoding_rule.RAW_HEADER_REASONS for _item, reason in choice.unused)
+        for choice in choices
+    ):
+        lenient = True
+        choices = [
+            _kept_reasons(encoding_rule.choose_encoding(group.paths, readability), choice)
+            if choice.used is None
+            else choice
+            for group, choice in zip(groups, choices)
+        ]
+    return choices, headers
+
+
+def _kept_reasons(
+    lenient: encoding_rule.EncodingChoice, strict: encoding_rule.EncodingChoice
+) -> encoding_rule.EncodingChoice:
+    """A choice made where only a header stood in the way (``lenient``), with each candidate after the one used
+    keeping the reason the first pass found it unreadable for (``strict``, where none was used): an undecodable mzML,
+    an mzXML whose conversion failed or that requires conversion, a vendor header that could not be read. The order's
+    reasons (lower_in_encoding_order, tie_lexicographic) are for a candidate that could have been used (clause 5),
+    and none of these could."""
+    found = dict(strict.unused)
+    return encoding_rule.EncodingChoice(
+        used=lenient.used,
+        unused=tuple(
+            (item, found.get(item) or reason) if reason in ENCODING_ORDER_REASONS else (item, reason)
+            for item, reason in lenient.unused
+        ),
+        paths=lenient.paths,
+    )
+
+
+def lease_header_reader(extractor_path: Path) -> HeaderReader:
+    """A HeaderReader that reads with the raw-metadata extractor (raw_metadata_preflight.run_extractor): '' for a
+    header read, raw_header_unsupported_format where the extractor has no reader for the file, raw_header_unreadable
+    for any other outcome. Its reads go to the work directory the lease gives it."""
+    from .raw_metadata_preflight import OUTCOME_UNSUPPORTED, READ_OUTCOMES, run_extractor
+
+    extractor_path = Path(extractor_path).resolve()
+    sha256 = str(raw_metadata_extractor_identity(extractor_path).get("binary_sha256") or "")
+
+    def read(paths: list[Path], work_directory: Path) -> dict[str, str]:
+        execution = run_extractor(extractor_path, list(paths), work_directory, extractor_sha256=sha256)
+        result: dict[str, str] = {}
+        for path in paths:
+            outcome = str(((execution.get("outcomes") or {}).get(_file_key(str(path))) or {}).get("outcome") or "")
+            if outcome in READ_OUTCOMES:
+                result[_file_key(str(path))] = ""
+            elif outcome == OUTCOME_UNSUPPORTED:
+                result[_file_key(str(path))] = encoding_rule.RAW_HEADER_UNSUPPORTED_FORMAT
+            else:
+                result[_file_key(str(path))] = encoding_rule.RAW_HEADER_UNREADABLE
+        return result
+
+    return read
+
+
+def _encoding_outcome(
+    groups: dict[str, Any],
+    choices: list[encoding_rule.EncodingChoice],
+    converted: dict[str, str],
+) -> dict[str, Any]:
+    """What the rule decided, as the lease uses it (all by _file_key):
+
+    - unused: every candidate of a sample some file was used for but that file, and every member left out of a group.
+      None is an input, and none is an excluded candidate either: each is on record in its sample's choice. Where no
+      file of a sample could be used, its candidates keep the exclusions the lease records for them (an undecodable
+      mzML, an mzXML whose conversion failed), as a sample's only file always did;
+    - by_input: for each input used for a sample that had more than one candidate, or that a sample row pairs with
+      through another of its sample's files, {"record": its choice (EncodingChoice.record), "stands_for": the file of
+      its sample a row pairs with by its own name, '' where the input is one}. Keyed by the input: for an mzXML used,
+      the mzML the convert stage wrote from it (``converted``, {mzML key: mzXML});
+    - of_a_row: each file used for a sample a row pairs with (clause 4: that sample's own input, never unattributed);
+    - records: manifest.encoding_choices (encoding_rule.choices_record).
+    """
+    outputs = {_file_key(source): key for key, source in converted.items()}
+    unused: set[str] = {item["key"] for item in groups["left_out"]}
+    by_input: dict[str, dict[str, Any]] = {}
+    of_a_row: set[str] = set()
+    for group, choice in zip(groups["groups"], choices):
+        if choice.used is None:
+            continue
+        unused.update(_file_key(item) for item, _reason in choice.unused)
+        used = _file_key(choice.used)
+        stand = ""
+        if group.paired:
+            of_a_row.add(used)
+            if choice.used not in group.paired:
+                stand = group.paired[0]
+        if len(group.paths) > 1 or stand:
+            by_input[outputs.get(used, used)] = {"record": choice.record(), "stands_for": stand}
+    return {
+        "unused": unused,
+        "by_input": by_input,
+        "of_a_row": of_a_row,
+        "records": encoding_rule.choices_record(choices),
+    }
+
+
+def _with_left_out(record: dict[str, Any] | None, left_out: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """manifest.unattributed_members with the members _encoding_groups left out added to its left_out; a record of
+    its own where the unit took no member and left none out before (a shared archive's encoding of a stem two rows
+    share: applied false, reason stem_of_several_sample_rows)."""
+    if not left_out:
+        return record
+    if record is None:
+        record = {
+            "rule": UNATTRIBUTED_MEMBERS_RULE, "applied": False, "count": 0, "members": [], "paths": [],
+            "reason": STEM_OF_SEVERAL_SAMPLE_ROWS,
+        }
+    entries = [
+        *(record.get("left_out") or []),
+        *(
+            {"member_name": PurePosixPath(item["member_name"]).name, "path": item["member_name"], "reason": item["reason"]}
+            for item in left_out
+        ),
+    ]
+    entries.sort(key=lambda item: (item["path"].casefold(), item["reason"]))
+    return {**record, "left_out": entries, "left_out_count": len(entries)}
 
 
 def _previous_conversion_records(provenance: Path) -> dict[str, dict[str, Any]]:
@@ -4095,61 +4587,87 @@ def _converted_destination(source: str, data_root: Path, raw_root: Path) -> tupl
     return raw_root / CONVERTED_DIRECTORY / relative.with_suffix(".mzML"), relative.as_posix()
 
 
-def _run_lease_conversions(
-    sources: list[str],
-    data_root: Path,
-    raw_root: Path,
-    provenance: Path,
-    choices: list[dict[str, Any]],
-    *,
-    declaration: dict[str, Any],
-    between: Any = None,
-) -> dict[str, Any]:
-    """Convert each mzXML, recording as it goes; raises only for a full disk or an unwritable record.
+class _DeferredConversions:
+    """A convert stage that starts (``start``, which returns the _LeaseConversions) only at its first conversion: for
+    a lease whose only mzXML are other encodings of admitted samples, which the rule may never reach. ``started`` is
+    the stage's conversions, or None where nothing was converted."""
 
-    ``declaration`` is the unit's (conversion_polarity_declaration): every conversion runs under the options
-    it gives (campaign_conversion_options), and the block records it as polarity_declaration. A file that
-    refuses the imputation they ask for is not converted (A FILE WHOSE SCANS CONTRADICT THE DECLARATION,
-    above): the converter's record of the refusal goes into the block's polarity_contradictions, not its
-    records.
+    def __init__(self, start: Callable[[], "_LeaseConversions"]) -> None:
+        self._start = start
+        self.started: _LeaseConversions | None = None
 
-    Returns the input_conversions block (INPUT_CONVERSIONS_SCHEMA, with the converter's records), the mzML
-    written by _file_key with the mzXML each was written from, and the exclusion entry of each mzXML whose
-    conversion failed (conversion_failed) or that contradicts the declaration
-    (polarity_contradicts_declaration), in source order. ``between(name)`` is called before each file, where
-    the lease beats its heartbeat and hears a cancel.
+    def convert(self, source: str) -> str:
+        if self.started is None:
+            self.started = self._start()
+        return self.started.convert(source)
 
-    A conversion the disk filled under (FULL_DISK_ERRNOS), or one stopped by a file another process held
-    after the converter waited for it (HELD_FILE_ERRNOS), says nothing about its mzXML, so it excludes no
-    sample: the block is written as stopped, with every record so far, and OSError is raised, which fails
-    the lease at its convert stage. A retry reuses what was converted and converts the rest.
+
+class _LeaseConversions:
+    """The convert stage's conversions, one mzXML at a time as the encoding rule reaches it (_choose_encodings),
+    recording as it goes; convert raises only for a full disk or an unwritable record.
+
+    ``declaration`` is the unit's (conversion_polarity_declaration): every conversion runs under the options it gives
+    (campaign_conversion_options), and the block records it as polarity_declaration. A file that refuses the
+    imputation they ask for is not converted (A FILE WHOSE SCANS CONTRADICT THE DECLARATION, above): the converter's
+    record of the refusal goes into the block's polarity_contradictions, not its records. ``between(name)`` is called
+    before each file, where the lease beats its heartbeat and hears a cancel.
+
+    finish returns the input_conversions block (INPUT_CONVERSIONS_SCHEMA, with the converter's records), the mzML
+    written by _file_key with the mzXML each was written from, and the exclusion entry of each mzXML whose conversion
+    failed (conversion_failed) or that contradicts the declaration (polarity_contradicts_declaration), in the order
+    they were converted.
+
+    A conversion the disk filled under (FULL_DISK_ERRNOS), or one stopped by a file another process held after the
+    converter waited for it (HELD_FILE_ERRNOS), says nothing about its mzXML, so it excludes no sample: the block is
+    written as stopped, with every record so far, and OSError is raised, which fails the lease at its convert stage.
+    A retry reuses what was converted and converts the rest.
     """
-    previous = _previous_conversion_records(provenance)
-    options = campaign_conversion_options(declaration)
-    block: dict[str, Any] = {
-        "schema": INPUT_CONVERSIONS_SCHEMA,
-        "status": "running",
-        "converter": converter_identity(),
-        "options": asdict(options),
-        "polarity_declaration": dict(declaration),
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "records": [],
-        "encoding_choices": choices,
-        "polarity_contradictions": [],
-    }
-    record_path = provenance / INPUT_CONVERSIONS_NAME
-    outputs: dict[str, str] = {}
-    excluded: list[dict[str, Any]] = []
-    for source in sources:
-        if between is not None:
-            between(Path(source).name)
-        destination, relative = _converted_destination(source, data_root, raw_root)
+
+    def __init__(
+        self,
+        data_root: Path,
+        raw_root: Path,
+        provenance: Path,
+        *,
+        declaration: dict[str, Any],
+        between: Any = None,
+    ) -> None:
+        self.data_root = data_root
+        self.raw_root = raw_root
+        self.between = between
+        self.previous = _previous_conversion_records(provenance)
+        self.options = campaign_conversion_options(declaration)
+        self.block: dict[str, Any] = {
+            "schema": INPUT_CONVERSIONS_SCHEMA,
+            "status": "running",
+            "converter": converter_identity(),
+            "options": asdict(self.options),
+            "polarity_declaration": dict(declaration),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            # The user's one encoding rule of 2026-10-09 decides which mzXML are converted (encoding_rule).
+            "encoding_rule": encoding_rule.RULE,
+            "records": [],
+            "polarity_contradictions": [],
+        }
+        self.record_path = provenance / INPUT_CONVERSIONS_NAME
+        self.outputs: dict[str, str] = {}
+        self.excluded: list[dict[str, Any]] = []
+        self.sources: list[str] = []
+
+    def convert(self, source: str) -> str:
+        """Convert one mzXML: '' where it was converted, else the reason it is no input (CONVERSION_FAILED,
+        POLARITY_CONTRADICTS_DECLARATION)."""
+        block = self.block
+        self.sources.append(source)
+        if self.between is not None:
+            self.between(Path(source).name)
+        destination, relative = _converted_destination(source, self.data_root, self.raw_root)
         record = convert_mzxml_to_mzml(
             source,
             destination,
-            options,
+            self.options,
             source_relative_path=relative,
-            previous=previous.get(_file_key(str(destination))),
+            previous=self.previous.get(_file_key(str(destination))),
         )
         if record.get("refused_inference") == POLARITY_IMPUTATION:
             # A scan of the file records the other polarity, so the declaration cannot stand for those that
@@ -4157,10 +4675,10 @@ def _run_lease_conversions(
             block["polarity_contradictions"].append({
                 "mzxml": source,
                 "reason": POLARITY_CONTRADICTS_DECLARATION,
-                "declared_polarity": options.impute_polarity,
+                "declared_polarity": self.options.impute_polarity,
                 "record": record,
             })
-            excluded.append({
+            self.excluded.append({
                 "path": source,
                 "reason": POLARITY_CONTRADICTS_DECLARATION,
                 "problems": [str(record.get("error") or "the polarity imputation was refused")],
@@ -4169,15 +4687,16 @@ def _run_lease_conversions(
                     "polarity_contradiction": len(block["polarity_contradictions"]) - 1,
                 },
             })
-            _write_json(record_path, block)
-            continue
+            _write_json(self.record_path, block)
+            return POLARITY_CONTRADICTS_DECLARATION
         block["records"].append(record)
+        outcome = ""
         if record.get("status") == "converted":
-            outputs[_file_key(str(destination))] = source
+            self.outputs[_file_key(str(destination))] = source
         elif record.get("error_errno") in LEASE_STOPPING_ERRNOS:
             block["status"] = "stopped"
             block["stopped_at"] = datetime.now(timezone.utc).isoformat()
-            _write_json(record_path, block)
+            _write_json(self.record_path, block)
             what = (
                 f"The disk filled while {Path(source).name} was converted to mzML"
                 if record["error_errno"] in FULL_DISK_ERRNOS
@@ -4189,45 +4708,53 @@ def _run_lease_conversions(
                 "retry converts it and the rest.",
             )
         else:
-            excluded.append({
+            self.excluded.append({
                 "path": source,
                 "reason": CONVERSION_FAILED,
                 "problems": [str(record.get("error") or "the conversion did not complete")],
                 "conversion": {"output": str(destination), "record": len(block["records"]) - 1},
             })
+            outcome = CONVERSION_FAILED
         # As each completes, so a lease that stops keeps what was done.
-        _write_json(record_path, block)
-    records = block["records"]
-    block["counts"] = {
-        "sources": len(sources),
-        "converted": sum(1 for item in records if item.get("status") == "converted"),
-        "reused": sum(1 for item in records if item.get("reused_previous_record")),
-        "failed": sum(1 for item in excluded if item["reason"] == CONVERSION_FAILED),
-        # The files excluded because their scans contradict the declared polarity, none of them converted.
-        POLARITY_CONTRADICTS_DECLARATION: len(block["polarity_contradictions"]),
-        "not_converted_readable_encoding": len(choices),
-        # The spectra given the declared polarity, which each record's polarity_imputation inference counts.
-        "imputed_polarity_spectra": sum(
-            int(item.get("spectra") or 0)
-            for record in records
-            if record.get("status") == "converted"
-            for item in record.get("inferences") or []
-            if isinstance(item, dict) and item.get("kind") == POLARITY_IMPUTATION
-        ),
-    }
-    block["status"] = "completed"
-    block["completed_at"] = datetime.now(timezone.utc).isoformat()
-    block["record_path"] = str(record_path)
-    _write_json(record_path, block)
-    return {"block": block, "outputs": outputs, "excluded": excluded}
+        _write_json(self.record_path, block)
+        return outcome
+
+    def finish(self, *, not_converted: int = 0) -> dict[str, Any]:
+        """Close the block: ``not_converted`` is the number of the unit's mzXML the rule left unconverted because it
+        used a readable encoding of their samples before them (not_converted_readable_encoding)."""
+        block = self.block
+        records = block["records"]
+        block["counts"] = {
+            "sources": len(self.sources),
+            "converted": sum(1 for item in records if item.get("status") == "converted"),
+            "reused": sum(1 for item in records if item.get("reused_previous_record")),
+            "failed": sum(1 for item in self.excluded if item["reason"] == CONVERSION_FAILED),
+            # The files excluded because their scans contradict the declared polarity, none of them converted.
+            POLARITY_CONTRADICTS_DECLARATION: len(block["polarity_contradictions"]),
+            "not_converted_readable_encoding": not_converted,
+            # The spectra given the declared polarity, which each record's polarity_imputation inference counts.
+            "imputed_polarity_spectra": sum(
+                int(item.get("spectra") or 0)
+                for record in records
+                if record.get("status") == "converted"
+                for item in record.get("inferences") or []
+                if isinstance(item, dict) and item.get("kind") == POLARITY_IMPUTATION
+            ),
+        }
+        block["status"] = "completed"
+        block["completed_at"] = datetime.now(timezone.utc).isoformat()
+        block["record_path"] = str(self.record_path)
+        _write_json(self.record_path, block)
+        return {"block": block, "outputs": dict(self.outputs), "excluded": list(self.excluded)}
 
 
 def lineage_stands_for(manifest: dict[str, Any]) -> dict[str, str]:
-    """{_file_key of an input: the mzXML it stands for}, read from the manifest's input_lineage rows.
+    """{_file_key of an input: the file whose naming gives it its sample}, read from the manifest's input_lineage rows.
 
-    A converted row stands for the mzXML its conversion read (source.conversion.source_path); a readable
-    encoding the lease chose over an mzXML of the same sample (encoding_choice.stands_for) for that mzXML.
-    The allow-list, the split plan and the analysis-CSV builder attribute such an input through it.
+    An input the encoding rule used for a sample whose row pairs with another of its files stands for that file
+    (encoding_choice.stands_for: the user's one rule of 2026-10-09, clause 4); otherwise a converted row stands for
+    the mzXML its conversion read (source.conversion.source_path). The allow-list, the split plan and the
+    analysis-CSV builder attribute such an input through it.
     """
     lineage = manifest.get("input_lineage") if isinstance(manifest.get("input_lineage"), dict) else {}
     result: dict[str, str] = {}
@@ -4237,7 +4764,7 @@ def lineage_stands_for(manifest: dict[str, Any]) -> dict[str, str]:
         source = row.get("source") if isinstance(row.get("source"), dict) else {}
         conversion = source.get("conversion") if isinstance(source.get("conversion"), dict) else {}
         choice = row.get("encoding_choice") if isinstance(row.get("encoding_choice"), dict) else {}
-        stand = str(conversion.get("source_path") or choice.get("stands_for") or "").strip()
+        stand = str(choice.get("stands_for") or conversion.get("source_path") or "").strip()
         if stand:
             result[_file_key(str(row["path"]))] = stand
     return result
@@ -5953,6 +6480,19 @@ def _apply_disposition(
                 + "), run as AIF by a Console with multi-energy AIF processing (MsdialWorkbench#825) under the "
                 f"rule {multi_ce.get('rule')}."
             )
+            if multi_ce.get("energy_sets_differ") is True:
+                sets = [item for item in multi_ce.get("collision_energy_sets") or [] if isinstance(item, dict)]
+                lines.append(
+                    f"The inputs record {len(sets)} different sets of MS2 collision energies ("
+                    + "; ".join(
+                        ", ".join(f"{float(value):g}" for value in item.get("collision_energies") or [])
+                        + f" eV in {item.get('file_count')} file(s)"
+                        for item in sets
+                    )
+                    + "). Each file is processed with its own per-file representative collision energy, so "
+                    "representative energies can differ between files; the unit runs as it is, on record (user "
+                    "decision, 2026-10-08)."
+                )
         project.evidence.extend(line for line in lines if line not in project.evidence)
         evaluated = evaluate_eligibility(
             project,
@@ -7669,20 +8209,13 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
         if pairings["paired"]:
             part_warnings.append(INFERRED_PAIRING_WARNING)
         # The parent's unattributed members that are this part's inputs: the part carries the record and the
-        # warning only where it has one of them.
+        # warning only where it has one of them. Read as the lease reads them (unattributed_lineage_record), so a
+        # converted one is named by its mzXML, as its lineage row's member_name names it, and listed in converted.
         parent_root = _file_key(str(parent.get("input_directory") or "")) if parent.get("input_directory") else ""
-        part_unattributed = sorted(
-            (
-                _member_under_root(_file_key(str(row.get("path") or "")), parent_root)
-                if parent_root
-                else Path(str(row.get("path") or "")).name
-                for row in (part_manifest.get("input_lineage") or {}).get("rows") or []
-                if isinstance(row, dict)
-                and (row.get("name_pairing") or {}).get("paired_by") == UNATTRIBUTED_MEMBER_PAIRING
-            ),
-            key=str.casefold,
+        part_unattributed = unattributed_lineage_record(
+            {"rows": (part_manifest.get("input_lineage") or {}).get("rows") or []}, parent_root
         )
-        if part_unattributed:
+        if part_unattributed["count"]:
             part_warnings.append(UNATTRIBUTED_MEMBERS_WARNING)
             part_manifest["unattributed_members"] = {
                 **{
@@ -7690,10 +8223,13 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                     for key, value in (parent.get("unattributed_members") or {}).items()
                     if key in {"rule", "applied", "scope"}
                 },
-                "count": len(part_unattributed),
                 # Basenames, as the lineage names them; the paths under the parent's data root beside them.
-                **unattributed_member_names(part_unattributed),
+                **part_unattributed,
             }
+        # The encoding rule's choices for this part's samples (2026-10-09), as its inputs' lineage rows carry them.
+        part_choices = part_encoding_choices((part_manifest.get("input_lineage") or {}).get("rows") or [])
+        if part_choices:
+            part_manifest["encoding_choices"] = part_choices
         if part_warnings:
             part_manifest["warnings"] = part_warnings
         if excluded_part:
@@ -8189,13 +8725,17 @@ def _multi_energy_aif_blockers(manifest: dict[str, Any], console_path: str) -> l
     (multi_energy_aif_console). The Console this workflow starts is probed again, from its assembly: one without
     #825 reads a single unsuffixed .dcl that a multi-energy AIF file never has. A per-file record that claims the
     rule's basis under a disposition that does not record aif_multi_ce_run is refused as well, and so is one whose
-    own MS2 collision energies are not the recorded ones: #825 chooses among one file's energies, never across
-    files, so the rule holds only where every input records the same energies. Empty otherwise.
+    own MS2 collision energies are not the recorded ones. #825 chooses among one file's energies, never across
+    files. Where every input records the same energies those are aif_multi_ce_run's collision_energies; where the
+    sets differ (energy_sets_differ, run as is on record since 2026-10-08) each input's own set is the one
+    aif_collision_energies_by_input records for it, by its path under the data root (aif_input_key), never its
+    basename. Empty otherwise.
     """
     from .raw_metadata_preflight import (
         AIF_MULTI_CE_BASIS,
         AIF_MULTI_CE_RULE,
         COLLISION_ENERGY_DECIMALS,
+        aif_input_key,
         multi_energy_aif_ready,
     )
     from .workflow import multi_energy_aif_console
@@ -8229,19 +8769,45 @@ def _multi_energy_aif_blockers(manifest: dict[str, Any], console_path: str) -> l
 
     expected = energy_set(record.get("collision_energies"))
     energies = ", ".join(f"{value:g} eV" for value in expected)
+    differ = record.get("energy_sets_differ") is True
+    by_input = applied.get("aif_collision_energies_by_input")
+    # Keyed by each input's path under the data root (raw_metadata_preflight.AIF_CE_BY_INPUT_KEY), compared without
+    # case: two inputs of one basename in two folders each have their own set.
+    by_input = (
+        {str(key).replace("\\", "/").casefold(): value for key, value in by_input.items()}
+        if isinstance(by_input, dict)
+        else {}
+    )
+    input_directory = manifest.get("input_directory")
+
+    def key_of(item: dict[str, Any]) -> str:
+        return aif_input_key(str(item.get("file") or ""), input_directory)
+
+    def recorded_for(key: str) -> tuple[float, ...] | None:
+        if not differ:
+            return expected
+        own = energy_set(by_input.get(key.casefold()))
+        return own if own and set(own) <= set(expected) else None
+
     blockers: list[str] = []
     mismatched = [
-        Path(str(item.get("file") or "")).name
+        key_of(item)
         for item in summary.get("per_file") or []
         if isinstance(item, dict)
         and str(item.get("console_acquisition_basis") or "") == AIF_MULTI_CE_BASIS
-        and energy_set(item.get("ms2_collision_energies")) != expected
+        and energy_set(item.get("ms2_collision_energies")) != recorded_for(key_of(item))
     ]
     if len(expected) < 2 or mismatched:
         blockers.append(
-            f"This unit runs as multi-energy AIF (rule {AIF_MULTI_CE_RULE}, {energies or 'no energies'}), which "
-            "holds only where every input records the same MS2 collision energies, more than one: MsdialWorkbench#825 "
-            "chooses a representative energy among one file's energies, never across files. "
+            f"This unit runs as multi-energy AIF (rule {AIF_MULTI_CE_RULE}, {energies or 'no energies'}), and each "
+            "input's MS2 collision energies must be the ones its applied disposition records: MsdialWorkbench#825 "
+            "chooses a representative energy among one file's energies, never across files, so "
+            + (
+                "each input's own set is recorded (aif_collision_energies_by_input, the sets differing between "
+                "inputs). "
+                if differ
+                else "every input records the unit's energies. "
+            )
             + (
                 f"{len(mismatched)} input files record other energies; the first is {mismatched[0]}. "
                 if mismatched
@@ -8262,9 +8828,9 @@ def _multi_energy_aif_blockers(manifest: dict[str, Any], console_path: str) -> l
 def held_by_disposition(manifest: dict[str, Any]) -> dict[str, Any]:
     """The applied campaign disposition when it holds the unit (hold true: skipped to run later, raw data kept).
 
-    With a #825 Console, AIF inputs whose collision energies differ from one another are held as well
-    (raw_metadata_preflight.AIF_CE_DIFFERS_HOLD): #825 settles no representative energy across files, so no Console
-    releases that hold; only an operator's decision does.
+    Interactive 0.5.34-0.5.35 held AIF inputs whose collision energies differ from one another with a #825 Console
+    (raw_metadata_preflight.AIF_CE_DIFFERS_HOLD). Since 0.5.36 (user decision, 2026-10-08) they run as is, on record,
+    so a unit held under that reason is released by deciding it again (a recheck) with a #825 Console.
 
     Multi-energy AIF is held until a Console that settles an all-ion spot's collision energy exists (user
     decision, 2026-10-07: raw_metadata_preflight.AIF_MULTI_CE_HOLD), and so is AIF whose collision energies are
@@ -8297,9 +8863,10 @@ def _disposition_hold_text(hold: dict[str, Any], subject: str = "The unit") -> s
         f"{subject}'s campaign disposition holds it ("
         + ", ".join(str(item) for item in hold.get("reasons") or [])
         + "): it is to run once a Console that can exists, and a held unit's raw data are kept. It is no failure. "
-        "A multi-energy AIF hold is released by preflighting the unit again with a Console that has "
-        "MsdialWorkbench#825 configured; one for collision energies that differ between inputs "
-        "(aif_collision_energies_differ_between_inputs) is not, since #825 chooses among one file's energies only. "
+        "A multi-energy AIF hold, including one for collision energies that differ between inputs "
+        "(aif_collision_energies_differ_between_inputs, which such inputs no longer get: since 0.5.36 they run as "
+        "they are, on record), is released by preflighting the unit again with a Console that has "
+        "MsdialWorkbench#825 configured. "
         "Only an operator's skip lifts the hold without running the unit: call again with "
         "release_disposition_hold=true."
     )
@@ -10817,24 +11384,36 @@ def _member_name_pairings(
     member, the declared raw file, the rule and the reason.
 
     EXACT MATCHES ARE DECIDED FIRST: a declared name some member, or the unit's file listing, carries exactly
-    is never paired by inference, and a member a declared name names exactly is never given another. THEN
+    is never paired by inference with a member of that file's encoding rank (encoding_rule.encoding_rank), and a
+    member a declared name names exactly is never given another. A member of another rank may still be paired with
+    it behind a prefix: it is another encoding of the row's sample, not a different file of its name
+    (021518_387057_CSHp_S7.raw beside the S7.mzML an extensionless row S7 names), and the one encoding rule chooses
+    between them. Never by its leading identifier: a declared name carried exactly in any rank is not paired by
+    its token at all (review of PR #69, follow-up 3). THEN
     PREFIXED NAMES (PREFIXED_MEMBER_PAIRING): a member is paired with a declared name when its name - or its
     stem, for a name a row records without an extension, as _sample_file_names reads those - ends in a
     separator (PREFIX_SEPARATORS) and then the declared name, compared without case. THEN LEADING IDENTIFIERS
     (LEADING_IDENTIFIER_TOKEN_PAIRING): a declared name still unpaired is paired with the member whose
     leading_identifier_key is its own, when that key is the key of no other declared name and of no other
-    candidate member.
+    candidate member. A member of the declared name's own stem in another encoding (VV_13_HEpG2_C1_pos.mzML for
+    VV_13_HEpG2_C1_pos.raw) is such a candidate: beside it, VV_13_HEpG2_C1_exp344_pos.raw does not match uniquely
+    and is refused, and the row's own-stem file is never refused itself but paired by the key, as it is alone (it is
+    the row's by clause 4 of the one encoding rule, whatever encoding the row names).
 
     EACH PAIRING IS ONE TO ONE: a member that ends in two declared names, or a declared name two members end
     in, pairs neither - which is why Youn_sa1.raw never takes 021518_Youn_sa11.raw, whose name ends in
     _Youn_sa11.raw and not _Youn_sa1.raw, and why a shared study archive holding POS/x_S1.raw and NEG/x_S1.raw
-    gives S1.raw to neither. AND NEVER ACROSS POLARITIES: where the member's path (its folders under the data
-    root and its name) or the declared name states a polarity by a token of its own (name_polarities) that is
-    not the unit's ion mode, or the two state different ones, the pairing is refused and recorded as such. A
-    pos/neg token beside a control, ctrl, blank or QC token names a sample (Neg_Ctrl_1.raw) and refuses
-    nothing, unless it is the name's only polarity token and that side's names (the declared names, or the
-    candidate members' paths) name files by polarity elsewhere: then it is the file's polarity
-    (name_polarities).
+    gives S1.raw to neither. The files of ONE sample are one candidate, not two (sample_of: one file stem, its name
+    less its container suffix, and one polarity its path states, whatever folders they lie in, as the user's one
+    encoding rule of 2026-10-09 reads one sample's data): VV_13_HEpG2_C1_exp344_pos.mzML and its .raw, or one
+    name in two folders, are each paired with the declared name, and which of them is the sample's input is that
+    rule's to say (encoding_rule, _encoding_groups), never the pairing's. AND NEVER ACROSS POLARITIES: where the member's
+    path (its folders under the data root and its name) or the declared name states a polarity by a token of its
+    own (name_polarities) that is not the unit's ion mode, or the two state different ones, the pairing is refused
+    and recorded as such. A pos/neg token beside a control, ctrl, blank or QC token names a sample
+    (Neg_Ctrl_1.raw) and refuses nothing, unless it is the name's only polarity token and that side's names (the
+    declared names, or the candidate members' paths) name files by polarity elsewhere: then it is the file's
+    polarity (name_polarities).
 
     Only what came out of an archive is paired (``extracted_members``: an analysable file outside a vendor
     folder, or the outermost .d/.raw folder holding members): a file the repository lists on its own is
@@ -10877,8 +11456,9 @@ def _member_name_pairings(
 
     def polarity_conflict(key: str, declared_raw_file: str) -> str:
         """Why a member and a declared name may not be paired by their polarity tokens; '' when they may."""
-        if not polarity_named:
+        if "members" not in polarity_named:
             polarity_named["members"] = names_state_polarity(relative(item) for item in pool)
+        if "declared" not in polarity_named:
             polarity_named["declared"] = names_state_polarity(written_names)
         member = name_polarities(relative(key), polarity_named=polarity_named["members"])
         declared = name_polarities(declared_raw_file, polarity_named=polarity_named["declared"])
@@ -10908,13 +11488,52 @@ def _member_name_pairings(
             }
         )
 
-    taken: set[str] = set()
+    stated_by_stem: dict[str, dict[frozenset[str], frozenset[str]]] = {}
+
+    def sample_of(key: str) -> tuple[str, frozenset[str]]:
+        """The sample a member is a file of, as the encoding rule reads one (_encoding_groups): its file stem and the
+        polarity its path states, a path stating none being one sample's with the one its stem's paths state where
+        that is the unit's own (_one_sample_polarities). Members of one sample are one candidate for a declared
+        name."""
+        if "members" not in polarity_named:
+            polarity_named["members"] = names_state_polarity(relative(item) for item in pool)
+
+        def stated(item: str) -> frozenset[str]:
+            return frozenset(name_polarities(relative(item), polarity_named=polarity_named["members"]))
+
+        stem = encoding_preference.stem(pool[key])
+        if stem not in stated_by_stem:
+            stated_by_stem[stem] = _one_sample_polarities(
+                (stated(item) for item in pool if encoding_preference.stem(pool[item]) == stem), unit_polarity
+            )
+        own = stated(key)
+        return stem, stated_by_stem[stem].get(own, own)
+
+    # The declared names a listed file or a member carries exactly, with the encoding rank (encoding_rule) of each
+    # that does: a name of no rank (a listing's archive) counts as every rank.
+    taken: dict[str, set[int | None]] = {}
+
+    def take(name: str) -> None:
+        for form in exactly(name):
+            taken.setdefault(form, set()).add(encoding_rule.encoding_rank(name))
+
+    def open_to(declared_name: str, name: str) -> bool:
+        """Whether a member (by its name) may still be paired with a declared name by inference: nothing carries the
+        name exactly in the member's own encoding rank. One that carries it in another rank is another encoding of
+        the row's sample, not a different file of the row's name: 021518_387057_CSHp_S7.raw beside S7.mzML for an
+        extensionless row S7 is that row's too, and the one encoding rule chooses between them (_encoding_groups)."""
+        ranks = taken.get(declared_name)
+        if not ranks:
+            return True
+        rank = encoding_rule.encoding_rank(name)
+        return None not in ranks and rank is not None and rank not in ranks
+
     for item in project.files:
         base = PurePosixPath(str(item.name or "").replace("\\", "/")).name.casefold()
         for name in filter(None, (base, archives.container_alias(base).casefold())):
-            taken |= exactly(name)
+            take(name)
     for name in pool.values():
-        taken |= exactly(name)
+        take(name)
     claims: dict[str, set[str]] = {}
     claimed_by: dict[str, set[str]] = {}
     for key, name in pool.items():
@@ -10924,7 +11543,7 @@ def _member_name_pairings(
             text[index + 1:]
             for text, table in ((name, named), (PurePosixPath(name).stem, stemmed))
             for index, character in enumerate(text)
-            if character in PREFIX_SEPARATORS and text[index + 1:] in table and text[index + 1:] not in taken
+            if character in PREFIX_SEPARATORS and text[index + 1:] in table and open_to(text[index + 1:], name)
         }
         if found:
             claims[key] = found
@@ -10933,7 +11552,11 @@ def _member_name_pairings(
     paired: dict[str, dict[str, str]] = result["paired"]
     for key, found in sorted(claims.items()):
         declared_name = next(iter(found))
-        if len(found) != 1 or len(claimed_by[declared_name]) != 1:
+        # One to one, a sample's files counting as one candidate: the declared name is claimed by members of one
+        # sample only, each claiming that name alone.
+        if len(found) != 1 or len({sample_of(other) for other in claimed_by[declared_name]}) != 1 or any(
+            len(claims[other]) != 1 for other in claimed_by[declared_name]
+        ):
             for name in sorted(found):
                 refuse(key, written(name), PREFIXED_MEMBER_PAIRING, "not_one_to_one")
             continue
@@ -10958,13 +11581,26 @@ def _member_name_pairings(
             member_keys.setdefault(token_key, set()).add(key)
     for token_key, declared_names in sorted(declared_keys.items()):
         members = member_keys.get(token_key) or set()
+        # A declared name something carries exactly, in any encoding rank, is never paired by its token: a file that
+        # shares only a leading identifier with a row whose own file is there is, as far as the record can tell,
+        # another injection, and the one encoding rule does not make it the row's (review of PR #69, follow-up 3).
         open_names = {name for name in declared_names if name not in taken and name not in claimed_by}
         if not members or not open_names:
             continue
-        if len(declared_names) != 1 or len(members) != 1:
+        # Unique on both sides, a sample's files counting as one candidate (sample_of), the declared name's own files
+        # among them: a member of its stem in another encoding (VV_13_HEpG2_C1_pos.mzML for VV_13_HEpG2_C1_pos.raw)
+        # is a candidate the key names, so beside it VV_13_HEpG2_C1_exp344_pos.raw does not match uniquely and is
+        # refused. The declared name's own-stem member is never refused: alone it is paired by the key, as it always
+        # was, and beside members of other stems it still is, being the row's file by clause 4 of the one encoding
+        # rule (whatever encoding the row names); only where it is one sample (sample_of) and the name the key's only
+        # one. So the row runs on its own file, and the others are unattributed or left out, as before the rule.
+        stems_named = {encoding_preference.stem(name) for name in declared_names}
+        own = {key for key in members if encoding_preference.stem(pool[key]) in stems_named}
+        pairable = members
+        if len(declared_names) != 1 or len({sample_of(key) for key in members}) != 1:
             for name in sorted(open_names):
-                for key in sorted(members):
-                    if key not in claims and not exactly(pool[key]):
+                for key in sorted(members - own):
+                    if key not in claims:
                         refuse(
                             key,
                             written(name),
@@ -10972,20 +11608,22 @@ def _member_name_pairings(
                             "leading_identifier_not_unique",
                             key=token_key,
                         )
-            continue
+            if len(declared_names) != 1 or not own or len({sample_of(key) for key in own}) != 1:
+                continue
+            pairable = own
         declared_name = next(iter(declared_names))
-        key = next(iter(members))
-        if key in claims or exactly(pool[key]):
+        if any(key in claims for key in pairable):
             continue
-        reason = polarity_conflict(key, written(declared_name))
-        if reason:
-            refuse(key, written(declared_name), LEADING_IDENTIFIER_TOKEN_PAIRING, reason, key=token_key)
-            continue
-        paired[key] = {
-            "declared_raw_file": written(declared_name),
-            "paired_by": LEADING_IDENTIFIER_TOKEN_PAIRING,
-            "key": token_key,
-        }
+        for key in sorted(pairable):
+            reason = polarity_conflict(key, written(declared_name))
+            if reason:
+                refuse(key, written(declared_name), LEADING_IDENTIFIER_TOKEN_PAIRING, reason, key=token_key)
+                continue
+            paired[key] = {
+                "declared_raw_file": written(declared_name),
+                "paired_by": LEADING_IDENTIFIER_TOKEN_PAIRING,
+                "key": token_key,
+            }
     return result
 
 
@@ -11047,6 +11685,8 @@ def _unattributed_members(
     data_root: Path,
     archive_samples: dict[str, str],
     paired: dict[str, dict[str, str]],
+    *,
+    converts: bool = False,
 ) -> dict[str, Any]:
     """The archive members an undeclared, unit-scoped unit takes as unattributed inputs (user decision, 2026-10-07).
 
@@ -11058,13 +11698,24 @@ def _unattributed_members(
     unattributed_member, and the record lists them (UNATTRIBUTED_MEMBERS_RULE). Like every input it is
     preflighted, and its raw header decides its polarity and acquisition.
 
+    AN UNPAIRED mzXML (user decision, 2026-10-08, second round, answer 3). Where the lease converts (``converts``: a
+    campaign's lease, whose convert stage converts the unit's mzXML to mzML, the rule of 2026-09-30), an unpaired
+    mzXML is taken like any other member: the mzML written from it is the unattributed input, its lineage row
+    carrying the conversion and the mzXML's name as member_name. Where the lease converts nothing, it stays left out
+    as requires_conversion.
+
+    WHICH OF A SAMPLE'S FILES RUNS is not decided here. A member taken here is a candidate like any file the unit
+    admits, and the user's one encoding rule of 2026-10-09 (encoding_rule, _encoding_groups) uses exactly one file of
+    each sample: an unpaired member of a sample a row pairs with (its file stem is that sample's) is that sample's own
+    input where the rule uses it, and none where it does not; of unpaired members of one stem, the rule uses one.
+
     Never for a shared archive (a bundle URL another unit downloads too), whose other members are the other
     unit's: the record then says why none was taken (applied false, reason) and lists them as left out. Also left
-    out, and listed so: a member that only converts to mzML (an mzXML, whose conversion is a reviewed step of its
-    own: requires_conversion); a member whose path names the polarity opposite to the unit's ion mode by a token of
-    its own, as the pairing rules read one (name_polarities: another unit's run, never this one's by any rule:
-    polarity_token_contradicts_ion_mode); and a member whose name another member carries in another encoding, an
-    admitted one or another unpaired one (one sample's, analysed twice otherwise: two_encodings_of_one_name). The record is None where no member is left unpaired.
+    out, and listed so: a member whose path names the polarity opposite to the unit's ion mode by a token of its
+    own, as the pairing rules read one (name_polarities: another unit's run, never this one's by any rule:
+    polarity_token_contradicts_ion_mode). A unit whose Catalog declared its inputs takes none: its inputs are the
+    declared ones, and a member no declaration names is no input of it (_members_no_declaration_names). The record
+    is None where no member is left unpaired.
     """
     result: dict[str, Any] = {"members": {}, "record": None}
     if not project.analysis_unit_id or not extracted_members or declared_analysis_inputs(project):
@@ -11090,12 +11741,16 @@ def _unattributed_members(
         return result
     left_out: list[dict[str, str]] = []
     kept: dict[str, str] = {}
-    stems: dict[str, list[str]] = {}
     unit_polarity = str(project.ion_mode or "").strip().capitalize()
     unit_polarity = unit_polarity if unit_polarity in {"Positive", "Negative"} else ""
     polarity_named = names_state_polarity(_member_under_root(key, data_key) for key in pool)
     for key, name in remaining.items():
-        if requires_msdial_conversion(Path(name).name) or is_convertible_input(Path(name).name):
+        base = Path(name).name
+        # An mzXML as the extract stage left it, which the convert stage finds (_find_mzxml_files) and converts.
+        convertible = base.casefold().endswith(CONVERTIBLE_SUFFIXES)
+        if (convertible and not converts) or (
+            not convertible and (requires_msdial_conversion(base) or is_convertible_input(base))
+        ):
             left_out.append({"member_name": name, "reason": "requires_conversion"})
             continue
         if unit_polarity and name_polarities(name, polarity_named=polarity_named) - {unit_polarity}:
@@ -11104,18 +11759,6 @@ def _unattributed_members(
             left_out.append({"member_name": name, "reason": "polarity_token_contradicts_ion_mode"})
             continue
         kept[key] = name
-        stems.setdefault(PurePosixPath(name.casefold()).with_suffix("").as_posix(), []).append(key)
-    # A name a member the unit admitted already carries, in another encoding (X.raw beside an admitted X.mzXML), is
-    # that sample's second encoding, and so is a name two unpaired members carry.
-    admitted_stems = {
-        PurePosixPath(_member_under_root(key, data_key).casefold()).with_suffix("").as_posix()
-        for key in pool
-        if key not in remaining
-    }
-    for stem, keys in stems.items():
-        if len(keys) > 1 or stem in admitted_stems:
-            for key in keys:
-                left_out.append({"member_name": kept.pop(key), "reason": "two_encodings_of_one_name"})
     scoped, basis = unit_scoped_download(project)
     record: dict[str, Any] = {"rule": UNATTRIBUTED_MEMBERS_RULE, "applied": scoped}
     if scoped:
@@ -11140,6 +11783,77 @@ def _unattributed_members(
     return result
 
 
+# Why a member of a unit whose Catalog declared its inputs is left out: no declaration names it.
+NOT_NAMED_BY_DECLARATION = "not_named_by_the_catalog_declaration"
+
+
+def _members_no_declaration_names(
+    project: RepositoryProject,
+    extracted_members: dict[str, dict[str, Any]] | None,
+    data_root: Path,
+    archive_samples: dict[str, str],
+    archive_extractions: list[dict[str, Any]],
+    *,
+    reached: set[str],
+) -> dict[str, Any] | None:
+    """The record of the archive members a unit whose Catalog declared its inputs leaves out, or None.
+
+    Such a unit's inputs are the declared ones, matched by path (match_declared_inputs), and a member no declaration
+    names is no input of it (2026-10-08, second round, answer 3, "on record"; kept by the one encoding rule of
+    2026-10-09, which chooses only among a sample's own candidates). Before, nothing named such a member: the
+    archive's member listing was its only trace. Each analysable member (_member_pool) that no declaration names and
+    that reached nothing of the lease (``reached``, by _file_key: the inputs, the excluded candidates, the mzXML
+    converted and those an input stands for) is listed in left_out with reason not_named_by_the_catalog_declaration,
+    by its basename and its path under the data root. A readable encoding of a declared mzML that cannot be decoded
+    is one of them: the declaration names the sample's file, and the member is not run. applied is false, and count,
+    members and paths are empty: no member is taken unattributed. None where the unit declared nothing, or no member
+    is left out.
+    """
+    declared = declared_analysis_inputs(project)
+    if not project.analysis_unit_id or not extracted_members or not declared:
+        return None
+    data_key = _file_key(str(data_root))
+    pool = _member_pool(extracted_members, data_root)
+
+    def on_disk(key: str) -> str:
+        return str(data_root / _member_under_root(key, data_key)) if key.startswith(data_key) else key
+
+    named = {
+        _file_key(item)
+        for found in match_declared_inputs(
+            [on_disk(key) for key in pool],
+            data_root,
+            declared,
+            containers=declared_archive_containers(project, declared, archive_extractions),
+            samples=archive_samples,
+        ).values()
+        for item in found
+    }
+    left_out = sorted(
+        (
+            {"member_name": PurePosixPath(name).name, "path": name, "reason": NOT_NAMED_BY_DECLARATION}
+            for name in (
+                _member_under_root(key, data_key)
+                for key in pool
+                if key not in reached and _file_key(on_disk(key)) not in named
+            )
+        ),
+        key=lambda item: (item["path"].casefold(), item["path"]),
+    )
+    if not left_out:
+        return None
+    return {
+        "rule": UNATTRIBUTED_MEMBERS_RULE,
+        "applied": False,
+        "count": 0,
+        "members": [],
+        "paths": [],
+        "reason": "catalog_declared_inputs",
+        "left_out": left_out,
+        "left_out_count": len(left_out),
+    }
+
+
 def unattributed_member_names(paths: Iterable[str]) -> dict[str, list[str]]:
     """manifest.unattributed_members' two lists, from the members' '/'-separated paths under the data root.
 
@@ -11155,9 +11869,77 @@ def unattributed_member_names(paths: Iterable[str]) -> dict[str, list[str]]:
     }
 
 
-def inferred_name_pairings(pairings: dict[str, dict[str, str]], data_root: Path) -> list[dict[str, str]]:
-    """Every inferred pairing as the attribute stage and the run manifest list it: member, declared name, rule."""
+def unattributed_lineage_record(lineage: dict[str, Any] | None, data_key: str) -> dict[str, Any]:
+    """manifest.unattributed_members' count, members, paths, converted and excluded, read from an input_lineage.
+
+    Every row of rows and of excluded whose name_pairing says unattributed_member, once per path: the members the
+    lease admitted unattributed, inputs and lease-excluded alike, as the gate's PAIR-1 counts them. A converted
+    row is the member its conversion read (source.conversion.source_path: the mzXML, 2026-10-08, second round,
+    answer 3), so converted lists those members. A row the lease excluded after admitting it (an mzXML whose
+    conversion failed or whose scans contradict the declared polarity, an mzML RawDataHandler cannot decode) is
+    listed in excluded with the lease's reason (its row's exclusion.reason). data_key is the _file_key of the data root the paths are relative
+    to (the parent's for a split part); without one a member is named by its basename.
+    """
+    lineage = lineage if isinstance(lineage, dict) else {}
+    seen: set[str] = set()
+    paths: list[str] = []
+    converted: list[str] = []
+    excluded: list[dict[str, str]] = []
+    for part in ("rows", "excluded"):
+        for row in lineage.get(part) or []:
+            if not isinstance(row, dict) or not str(row.get("path") or "").strip():
+                continue
+            pairing = row.get("name_pairing") if isinstance(row.get("name_pairing"), dict) else {}
+            key = _file_key(str(row["path"]))
+            if pairing.get("paired_by") != UNATTRIBUTED_MEMBER_PAIRING or key in seen:
+                continue
+            seen.add(key)
+            source = row.get("source") if isinstance(row.get("source"), dict) else {}
+            conversion = source.get("conversion") if isinstance(source.get("conversion"), dict) else {}
+            member = str(conversion.get("source_path") or "").strip() or str(row["path"])
+            path = _member_under_root(_file_key(member), data_key) if data_key else Path(member).name
+            paths.append(path)
+            if conversion:
+                converted.append(path)
+            if part == "excluded":
+                exclusion = row.get("exclusion") if isinstance(row.get("exclusion"), dict) else {}
+                excluded.append(
+                    {"member_name": PurePosixPath(path).name, "path": path, "reason": str(exclusion.get("reason") or "")}
+                )
+
+    def order(item: str) -> tuple[str, str]:
+        return item.casefold(), item
+
+    return {
+        "count": len(paths),
+        **unattributed_member_names(paths),
+        **({"converted": sorted(converted, key=order)} if converted else {}),
+        **({"excluded": sorted(excluded, key=lambda item: order(item["path"]))} if excluded else {}),
+    }
+
+
+def part_encoding_choices(rows: Iterable[Any]) -> list[dict[str, Any]]:
+    """manifest.encoding_choices for a split part: the choices its inputs' lineage rows carry (encoding_choice, less
+    stands_for), in the order the lease lists them (encoding_rule.choices_record)."""
+    records = [
+        {key: value for key, value in row["encoding_choice"].items() if key != "stands_for"}
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get("encoding_choice"), dict)
+        and len(row["encoding_choice"].get("unused") or []) > 0
+    ]
+    return sorted(records, key=lambda item: (str(item.get("used") or "").casefold(), str(item.get("used") or "")))
+
+
+def inferred_name_pairings(
+    pairings: dict[str, dict[str, str]], data_root: Path, encoding_used: Mapping[str, str] | None = None
+) -> list[dict[str, str]]:
+    """Every inferred pairing as the attribute stage and the run manifest list it: member, declared name, rule.
+
+    ``encoding_used`` gives, for a paired member the one encoding rule left unused for its sample (by _file_key), the
+    file it used instead, as that sample's choice names it: the entry says so (encoding_used). The member is still
+    the one the rule paired; the file used is the row's own by clause 4 and was paired by no rule itself."""
     data_key = _file_key(str(data_root))
+    encoding_used = encoding_used or {}
     listed = []
     for key, pairing in sorted(pairings.items()):
         listed.append(
@@ -11166,6 +11948,7 @@ def inferred_name_pairings(pairings: dict[str, dict[str, str]], data_root: Path)
                 "declared_raw_file": pairing["declared_raw_file"],
                 "paired_by": pairing["paired_by"],
                 **({"key": pairing["key"]} if pairing.get("key") else {}),
+                **({"encoding_used": encoding_used[key]} if encoding_used.get(key) else {}),
             }
         )
     return listed
@@ -11208,23 +11991,161 @@ def _readable_inputs_admitted(
     project: RepositoryProject,
     archive_samples: dict[str, str],
     prefixed: dict[str, dict[str, str]] | None = None,
-) -> set[str]:
-    """The readable inputs an undeclared unit admits by itself, by _file_key, as its attribute stage will.
-
-    The convert stage pairs an mzXML with these whatever their folders (_encoding_choices): such a file is
-    the unit's input in any case, so converting its sample's mzXML as well would give the sample two
-    inputs. Empty for a declared unit, whose inputs are the Catalog's, one per sample, by path.
+) -> list[str]:
+    """The readable inputs an undeclared unit admits by itself, as its attribute stage will: the candidates the
+    encoding rule chooses among, with the unit's mzXML and the other encodings of its samples (_encoding_groups,
+    _stem_mates). Empty for a declared unit, whose candidates are its declared inputs (_declared_candidates).
     """
     if not project.analysis_unit_id or declared_analysis_inputs(project):
-        return set()
+        return []
     listed = set(_project_allowlist(project, analysis_only=True))
     sample_names = _sample_file_names(project)
-    return {
-        _file_key(item)
+    return [
+        item
         for item in readable
         if not requires_msdial_conversion(Path(item).name)
         and _admitted_by_unit(Path(item), data_root, listed, sample_names, archive_samples, prefixed)
-    }
+    ]
+
+
+def _stem_mates(
+    seeds: list[str],
+    found: Iterable[str],
+    data_root: Path,
+    project: RepositoryProject,
+    prefixed_members: Mapping[str, Mapping[str, str]] | None = None,
+) -> list[str]:
+    """The files found under the data root that an undeclared unit did not admit by themselves, but that are another
+    encoding or copy of a sample it did admit (``seeds``: every candidate it admits by itself): of that candidate's
+    file stem (encoding_preference.stem), and of its sample's polarity (_one_sample_polarities), a file whose path
+    states the polarity opposite to the unit's ion mode never being one.
+
+    WHY. The analysis CSV pairs a file with the row that names its stem, whatever encoding the row names, and the one
+    encoding rule makes the file it uses that row's own input (clause 4); the rule chooses among one sample's files
+    "including across folders and archives". A shared archive's member of an admitted file's stem is not one of its
+    unpaired members (2026-10-08, second round, answer 1): it is that sample's encoding, and the rule must reach it.
+    A row naming an undecodable S1.mzML runs on the archive's S1.raw, and a row naming S1.mzXML on its readable
+    S1.mzML, where neither was a candidate before. Empty for a declared unit, whose candidates are the declared inputs.
+
+    A SEED PAIRED BY ITS NAME (``prefixed_members``, _member_name_pairings' paired) is a file of its row's sample, and
+    so is a file of the stem of the name the row gives: 021518_387057_CSHp_S7.mzML, paired with a row naming S7.mzML,
+    brings the archive's S7.raw, and the rule chooses between them (_encoding_groups).
+    """
+    if not project.analysis_unit_id or not seeds or declared_analysis_inputs(project):
+        return []
+    seed_keys = {_file_key(item) for item in seeds}
+    others = [item for item in dict.fromkeys(found) if _file_key(item) not in seed_keys]
+    if not others:
+        return []
+    relatives = {item: _relative_under(item, data_root) for item in [*seeds, *others]}
+    polarity_named = names_state_polarity(relatives.values())
+    unit_polarity = _unit_polarity(project)
+
+    def stated(item: str) -> frozenset[str]:
+        return frozenset(name_polarities(relatives[item], polarity_named=polarity_named))
+
+    def seed_stems_of(item: str) -> set[str]:
+        stems = {encoding_preference.stem(relatives[item])}
+        pairing = (prefixed_members or {}).get(_file_key(item))
+        if pairing and str(pairing.get("declared_raw_file") or ""):
+            stems.add(encoding_preference.stem(str(pairing["declared_raw_file"])))
+        return stems
+
+    by_stem: dict[str, list[str]] = {}
+    for item in seeds:
+        for stem in seed_stems_of(item):
+            by_stem.setdefault(stem, []).append(item)
+    for item in others:
+        stem = encoding_preference.stem(relatives[item])
+        if stem not in by_stem:
+            continue
+        if unit_polarity and stated(item) - {unit_polarity}:
+            continue
+        by_stem[stem].append(item)
+    mates: list[str] = []
+    for items in by_stem.values():
+        merged = _one_sample_polarities((stated(item) for item in items), unit_polarity)
+        seeded = {merged.get(stated(item), stated(item)) for item in items if _file_key(item) in seed_keys}
+        mates.extend(
+            item
+            for item in items
+            if _file_key(item) not in seed_keys and merged.get(stated(item), stated(item)) in seeded
+        )
+    return list(dict.fromkeys(mates))
+
+
+def _without_mates(record: dict[str, Any] | None, mates: list[str], data_root: Path) -> dict[str, Any] | None:
+    """manifest.unattributed_members less the members it left out that are another encoding of an admitted sample
+    (_stem_mates): each is on record in its sample's encoding choice instead, or left out by _encoding_groups. None
+    where nothing is left out and no member was taken."""
+    if record is None or not mates:
+        return record
+    paths = {_relative_under(item, data_root).casefold() for item in mates}
+    left_out = [item for item in record.get("left_out") or [] if str(item.get("path") or "").casefold() not in paths]
+    if len(left_out) == len(record.get("left_out") or []):
+        return record
+    changed = {key: value for key, value in record.items() if key not in {"left_out", "left_out_count"}}
+    if left_out:
+        changed.update(left_out=left_out, left_out_count=len(left_out))
+    elif not changed.get("applied") and not changed.get("count"):
+        return None
+    return changed
+
+
+def _declared_candidates(
+    found: list[str],
+    data_root: Path,
+    project: RepositoryProject,
+    archive_samples: dict[str, str],
+    archive_extractions: list[dict[str, Any]],
+) -> dict[str, str]:
+    """A declared unit's candidates for the encoding rule: each file found that is a declared input
+    (match_declared_inputs), with the sample row it is the declared input of ('row:<index>'; '' where that is not
+    one row), by the file's own path. Empty for an undeclared unit.
+
+    The row is the one of the declared input's sample_id whose raw_file names the declared path (the same path, or
+    one of the forms the allow-list reads); else the one that names its file name; else the sample's only row. Two
+    declared inputs of one row and one stem are one sample's copies, and the rule runs one (_encoding_groups);
+    two of different rows - MTBKS64's raw/batch1/QC.RAW and raw/batch2/QC.RAW, two rows of S01 - are not.
+    """
+    declared = declared_analysis_inputs(project)
+    if not project.analysis_unit_id or not declared or not found:
+        return {}
+    matched = match_declared_inputs(
+        found,
+        data_root,
+        declared,
+        containers=declared_archive_containers(project, declared, archive_extractions),
+        samples=archive_samples,
+    )
+    rows = [row if isinstance(row, dict) else {} for row in project.sample_metadata or []]
+
+    def written(row: dict[str, Any]) -> str:
+        return str(row.get("raw_file") or "").strip().replace("\\", "/").strip("/").casefold()
+
+    def row_of(key: str, entry: dict[str, Any]) -> str:
+        sample = str(entry.get("sample_id") or "").strip()
+        indices = [
+            index for index, row in enumerate(rows) if sample and str(row.get("sample_id") or "").strip() == sample
+        ]
+        if not indices:
+            return ""
+        forms = _allowlist_forms(key)
+        by_path = [index for index in indices if written(rows[index]) and _allowlist_forms(written(rows[index])) & forms]
+        if by_path:
+            return f"row:{by_path[0]}" if len(by_path) == 1 else ""
+        name = PurePosixPath(key).name
+        by_name = [index for index in indices if PurePosixPath(written(rows[index])).name == name]
+        if by_name:
+            return f"row:{by_name[0]}" if len(by_name) == 1 else ""
+        return f"row:{indices[0]}" if len(indices) == 1 else ""
+
+    result: dict[str, str] = {}
+    for key, items in matched.items():
+        label = row_of(key, declared[key])
+        for item in items:
+            result[item] = label
+    return result
 
 
 def _filter_inputs_by_project_allowlist(
@@ -12249,8 +13170,14 @@ def _vendor_container_of(name: str) -> str:
     return ""
 
 
-def verify_container_completeness(data_root: Path, project: RepositoryProject) -> dict[str, Any]:
+def verify_container_completeness(
+    data_root: Path, project: RepositoryProject, *, unused: Iterable[str] = ()
+) -> dict[str, Any]:
     """Whether every vendor folder the unit lists member by member arrived whole. Raises when one did not.
+
+    A folder the user's one encoding rule left unused (``unused``, by _file_key: another encoding of its sample runs
+    instead, encoding_rule clause 3, its reason incomplete_container where it was this) is no input, and is not held
+    to this; it is still counted among the containers.
 
     WHY. A folder is one data file, so a folder short of one member is a damaged data file, and its reader
     either fails deep inside a vendor SDK or reads what is there: a Waters .raw missing one _FUNCnnn.DAT has
@@ -12267,6 +13194,47 @@ def verify_container_completeness(data_root: Path, project: RepositoryProject) -
     whose listing names no folder member (every handoff before Catalog 0.6.0, an archive unit) records that
     nothing was required.
     """
+    inspection = _inspect_listed_containers(data_root, project)
+    if inspection is None:
+        return {"required": False, "containers": 0, "members": 0}
+    skipped = {str(item).casefold() for item in unused}
+    problems = [
+        message
+        for folder, message in inspection["problems"]
+        if folder is None or _file_key(str(folder)) not in skipped
+    ]
+    record: dict[str, Any] = {
+        "required": True,
+        "containers": inspection["containers"],
+        "members": inspection["members"],
+        "complete": not problems,
+        "reader_created_files": sorted(inspection["reader_created"]),
+        "unlisted_file_count": len(inspection["unlisted"]),
+        "unlisted_files": sorted(inspection["unlisted"])[:20],
+    }
+    if problems:
+        raise ValueError(
+            f"{len(problems)} of the unit's {inspection['containers']} vendor folders did not arrive whole: "
+            + "; ".join(problems[:5])
+            + (f"; and {len(problems) - 5} more" if len(problems) > 5 else "")
+            + "."
+        )
+    return record
+
+
+def incomplete_vendor_folders(data_root: Path, project: RepositoryProject) -> set[str]:
+    """The listed vendor folders on disk that did not arrive whole (verify_container_completeness), by _file_key:
+    what the encoding rule may not use (encoding_rule.INCOMPLETE_CONTAINER)."""
+    inspection = _inspect_listed_containers(data_root, project)
+    if inspection is None:
+        return set()
+    return {_file_key(str(folder)) for folder, _message in inspection["problems"] if folder is not None}
+
+
+def _inspect_listed_containers(data_root: Path, project: RepositoryProject) -> dict[str, Any] | None:
+    """What verify_container_completeness checks, without raising: None where the unit lists no folder member by
+    member, else {containers, members, problems: [(the folder on disk, or None where it is not, message)],
+    reader_created, unlisted}."""
     members: dict[str, list[RepositoryFile]] = {}
     spelled: dict[str, str] = {}
     for item in project.files:
@@ -12282,7 +13250,7 @@ def verify_container_completeness(data_root: Path, project: RepositoryProject) -
         members.setdefault(key, []).append(item)
         spelled.setdefault(key, container)
     if not members:
-        return {"required": False, "containers": 0, "members": 0}
+        return None
 
     # Where each folder is: an archive may have put the listed tree under a folder of its own (MB-POST's
     # project tar), so folders are found by the same relative forms the allow-list reads, a folder at
@@ -12303,14 +13271,14 @@ def verify_container_completeness(data_root: Path, project: RepositoryProject) -
                 if form in members:
                     on_disk.setdefault(form, path)
 
-    problems: list[str] = []
+    problems: list[tuple[Path | None, str]] = []
     reader_created: list[str] = []
     unlisted: list[str] = []
     for key, listed in sorted(members.items()):
         container = spelled[key]
         folder = on_disk.get(key)
         if folder is None:
-            problems.append(f"{container}: the folder is not in the download")
+            problems.append((None, f"{container}: the folder is not in the download"))
             continue
         offset = len(_safe_relative_name(container).as_posix()) + 1
         expected: dict[str, tuple[str, RepositoryFile]] = {}
@@ -12342,25 +13310,15 @@ def verify_container_completeness(data_root: Path, project: RepositoryProject) -
         for label, found in (("missing", missing), ("of another size", resized), ("partial", partial)):
             if found:
                 problems.append(
-                    f"{container}: {len(found)} member(s) {label}: " + ", ".join(sorted(found)[:3])
+                    (folder, f"{container}: {len(found)} member(s) {label}: " + ", ".join(sorted(found)[:3]))
                 )
-    record: dict[str, Any] = {
-        "required": True,
+    return {
         "containers": len(members),
         "members": sum(len(items) for items in members.values()),
-        "complete": not problems,
-        "reader_created_files": sorted(reader_created),
-        "unlisted_file_count": len(unlisted),
-        "unlisted_files": sorted(unlisted)[:20],
+        "problems": problems,
+        "reader_created": reader_created,
+        "unlisted": unlisted,
     }
-    if problems:
-        raise ValueError(
-            f"{len(problems)} of the unit's {len(members)} vendor folders did not arrive whole: "
-            + "; ".join(problems[:5])
-            + (f"; and {len(problems) - 5} more" if len(problems) > 5 else "")
-            + "."
-        )
-    return record
 
 
 def _find_msdial_inputs(root: Path) -> list[str]:
