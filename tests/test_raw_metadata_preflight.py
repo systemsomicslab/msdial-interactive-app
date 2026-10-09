@@ -1060,6 +1060,27 @@ class DispositionMatrixTests(unittest.TestCase):
             [(item["path"], item["reason"]) for item in disposition["excluded_inputs"]],
         )
 
+    def test_a_used_encoding_whose_header_cannot_be_read_says_the_next_was_not_taken(self) -> None:
+        # Review of PR #69, follow-up 1: a lease with no extractor takes a vendor file as readable. Where this preflight
+        # cannot read it, the sample's next encoding was not taken, and the disposition says so rather than leave the
+        # encoding choice (used: S1.lcd) to misstate what runs.
+        manifest = _manifest([_header("a.mzML", "DDA")], failures={"S1.lcd": "unsupported_format", "S2.raw": "failed"})
+        manifest["input_lineage"] = {"rows": [
+            {"path": "S1.lcd", "encoding_choice": {
+                "rule": "one_encoding_per_sample_2026_10_09", "used": "S1.lcd",
+                "unused": [{"path": "S1.mzML", "reason": "lower_in_encoding_order"}], "stands_for": ""}},
+            {"path": "S2.raw", "encoding_choice": {
+                "rule": "one_encoding_per_sample_2026_10_09", "used": "S2.raw",
+                "unused": [{"path": "S2.mzML", "reason": "undecodable"}], "stands_for": ""}},
+        ]}
+
+        disposition = decide_disposition(manifest)
+
+        self.assertEqual("run", disposition["disposition"])
+        self.assertIn("encoding_fallback_not_taken", disposition["warnings"])
+        self.assertTrue(any("S1.lcd: next S1.mzML" in item and "S2.raw" not in item for item in disposition["detail"]))
+        self.assertNotIn("encoding_fallback_not_taken", self.decide([_header("a.mzML", "DDA")], failures={"S1.lcd": "failed"})["warnings"])
+
     def test_every_file_unreadable_and_nothing_declared_is_skipped(self) -> None:
         disposition = self.decide([], failures={"a.mzML": "failed", "b.mzML": "unsupported_format"})
 

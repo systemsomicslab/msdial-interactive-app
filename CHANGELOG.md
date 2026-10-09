@@ -80,27 +80,62 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     extensionless stem, a prefixed name or a leading identifier) and every
     other candidate of the unit of the same file stem (its name less its
     container suffix), or, for candidates no row pairs with, those of one stem,
-    whatever folders they lie in. A polarity the path states by a token of its
-    own keeps files apart (`POS/S1.raw` and `NEG/S1.raw` are two acquisitions,
-    not two encodings of one; a unit of both polarities is split by them
-    later), and so do two sample rows (rows naming `S1.raw` and `S1.mzML` each
-    keep their own file; an unattributed member of that stem is left out, on
-    record, as `stem_of_several_sample_rows`). Neither case is in the rule's
-    words; both keep the existing behaviour.
-  - The candidates are the unit's own: what it admits by itself, and the
-    members of its own archive no row pairs with. A shared archive's unpaired
-    members are none (excluded on record, as before: 2026-10-08, second round,
-    answer 1), and a unit whose Catalog declared its inputs is matched by path,
-    one declared input per row, with every member no declaration names left out
-    (second round, answer 3): the rule has nothing to choose there.
+    whatever folders they lie in. Two polarities that paths of one stem state
+    by tokens of their own keep files apart (`POS/S1.raw` and `NEG/S1.raw` are
+    two acquisitions, not two encodings of one; a unit of both polarities is
+    split by them later), and so do two sample rows (rows naming `S1.raw` and
+    `S1.mzML` each keep their own file; an unattributed member of that stem is
+    left out, on record, as `stem_of_several_sample_rows`). Neither case is in
+    the rule's words; both keep the existing behaviour. A path that states no
+    polarity is one sample's with a path that states the unit's own
+    (`POS/S1.raw` and `S1.raw` in a positive unit), or, in a unit that gives
+    none, the only one its stem's paths state; the pairing rules read one
+    sample the same way.
+  - The candidates: what the unit admits by itself, the members of its own
+    archive no row pairs with, and every other file found of an admitted
+    file's stem and sample polarity (`_stem_mates`). The analysis CSV pairs
+    such a file with the row of that stem whatever encoding the row names, so
+    a shared archive's `S1.raw` beside the `S1.mzML` a row names is that
+    sample's encoding, not one of the archive's unpaired members, and the rule
+    reaches it "across folders and archives". A shared archive's members of no
+    admitted file's stem are still none of the unit's candidates (excluded on
+    record, as before: 2026-10-08, second round, answer 1).
+  - A unit whose Catalog declared its inputs is matched by path, and every
+    member no declaration names is left out (second round, answer 3). The rule
+    chooses among the declared inputs of one sample row and one stem
+    (`_declared_candidates`): the row of the input's `sample_id` whose
+    `raw_file` names its path, else its file name, else the sample's only row.
+    A declaration that lists one sample's file in two folders (the Catalog's
+    encoding preference leaves equally preferred copies both declared) runs the
+    first by path, and the analysis CSV accounts for the other declared input
+    by the record instead of calling it missing. Declared inputs of different
+    rows (MTBKS64's `raw/batch1/QC.RAW` and `raw/batch2/QC.RAW`, two rows of
+    S01) stay two samples.
+  - A re-encoding MS-DIAL opens that no instrument writes (netCDF/AIA `.cdf`,
+    Reifycs `.abf` and `.ibf`) is in none of the rule's ranks. It ranks after
+    every vendor format and before mzML: the place it held before, where the
+    Catalog's preference counted it among the vendor files and a real vendor
+    file still beat it. So it never wins a tie against a `.raw` or `.d`. This
+    is outside the rule's words; the existing behaviour is kept.
   - What the lease can read: an mzML is scanned for arrays RawDataHandler can
-    decode, an mzXML is converted (in a campaign), and a vendor file or folder
-    is taken as readable; whether its header can be read is the raw-header
-    preflight's to say, after the lease, and an Unknown header there still
-    excludes the file without falling back to another encoding. Readability is
-    asked in the rule's order and only until one file is readable, so an mzXML
-    is converted only where nothing before it can be read, and where its
-    conversion fails the next mzXML of the sample is converted.
+    decode, and an mzXML is converted (in a campaign). A vendor file or folder
+    is unreadable where it is a listed folder that did not arrive whole
+    (`incomplete_container`), or where the configured raw-metadata extractor
+    cannot read its header (`raw_header_unreadable`, or
+    `raw_header_unsupported_format` where it has no reader for it: the reasons
+    the preflight excludes an input for). The lease reads a vendor header only
+    where the rule reaches a vendor file of a sample that has another
+    candidate. A campaign's lease reads only with a verified, pinned extractor,
+    the one its preflight will run. Without an extractor, a vendor file is
+    taken as readable, as before. A sample none of whose files can be used,
+    one of which was refused only for its header, still uses that vendor file:
+    the header read at the lease is no exclusion, and the preflight decides the
+    file, as it decides a sample's only file. Readability is asked in the
+    rule's order and only until one file is readable, so an mzXML is converted
+    only where nothing before it can be read, and where its conversion fails
+    the next mzXML of the sample is converted. The convert stage starts for
+    an mzXML that is only another encoding of an admitted sample only where
+    the rule reaches it.
   - The pairing rules (prefixed name, leading identifier) take one sample's
     files as one candidate and pair each of them with the row; which runs is
     the rule's. A file used for a sample whose row paired with another of its
@@ -118,7 +153,8 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - Reasons: `lower_in_encoding_order`, `tie_lexicographic`, `undecodable`,
     `conversion_failed` (or the convert stage's
     `polarity_contradicts_declaration`), `requires_conversion` (an mzXML outside
-    a campaign).
+    a campaign), `incomplete_container`, `raw_header_unreadable` and
+    `raw_header_unsupported_format`.
   - Each input used for such a sample carries the same choice on its lineage
     row as `encoding_choice`, and `encoding_choice.stands_for` (the absolute
     path of the file the row pairs with) where the row names another file of
@@ -128,10 +164,17 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     used runs as the mzML the convert stage wrote, whose row carries both its
     conversion and the choice.
   - A file left unused is no input and no excluded candidate: it is on record
-    in its sample's choice only. The attribute stage counts `encoding_choices`
-    and `unused_encodings`; the convert stage's `not_converted_readable_encoding`
-    counts the mzXML a readable encoding was used before. A split part carries
-    its own samples' choices as its `encoding_choices`.
+    in its sample's choice only (a listed folder left unused is not held to the
+    completeness check either). The attribute stage counts `encoding_choices`
+    and `unused_encodings`, and, where the lease read vendor headers,
+    `vendor_headers_read` and `vendor_headers_unreadable`; the convert stage's
+    `not_converted_readable_encoding` counts the mzXML a readable encoding was
+    used before. A split part carries its own samples' choices as its
+    `encoding_choices`.
+  - A preflight that cannot read the header of a vendor file the rule used,
+    where the lease read none and the sample has an encoding ranked below it,
+    warns `encoding_fallback_not_taken` and names the next encoding in its
+    detail. Leasing the unit again with the extractor configured takes it.
   - The Agent API lists `repository_one_encoding_rule` (and
     `repository_unattributed_mzxml` for the conversion of an unpaired mzXML,
     below).
@@ -148,16 +191,23 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     two folders gave the row two inputs and the analysis CSV refused the unit
     (`sample_row_with_two_inputs`), and so did a row naming `S1` beside
     `S1.raw` and `S1.mzML`; two unpaired copies of one name in two folders both
-    ran as unattributed inputs.
+    ran as unattributed inputs. The same holds for a copy in the unit's own
+    polarity folder beside an untokened one, and for two declared copies of
+    one row's file.
+  - A vendor file whose header the lease's extractor cannot read, or a listed
+    folder that did not arrive whole, gives way to its sample's next encoding.
+    Before, the first was excluded at the preflight with the sample's mzML
+    unused, and the second failed the lease.
   - Folders no longer decide whether two encodings are one sample's: the
     folder words that named an encoding (`_sample_locus`) are gone, and one
     stem with no stated polarity is one sample's in any folder.
-  - A shared archive's member that no row names never stands in for the
-    unit's own mzXML: ST003038's shape (an mzML archive beside an mzXML
-    archive, rows naming the mzXML, a download not the unit's own alone) now
-    converts the mzXML, and lists the mzML as left out
-    (`download_scope_not_unit_scoped`). Where the download is the unit's own,
-    the mzML is used, as before.
+  - A shared archive's encoding of a sample a row names is that sample's
+    candidate. ST003038's shape (an mzML archive beside an mzXML archive, rows
+    naming the mzXML, a download not the unit's own alone) runs the mzML for
+    each row and converts no mzXML, as it did at 0.5.35, now on record in each
+    sample's choice; a row naming an undecodable mzML beside a shared
+    archive's `.raw` runs the `.raw`. An earlier state of this version
+    converted the mzXML and listed the mzML as left out, against clause 1.
 
   Superseded and removed, before any release: the readable-twin answer of
   2026-10-08 and the record defects reviewed at `06d2891`, `3a4463b` and

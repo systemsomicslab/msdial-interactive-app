@@ -170,9 +170,12 @@ def summarize_jobs(
             # Since 0.5.36, the user's one encoding rule of 2026-10-09 (msdial_app.encoding_rule): where one sample's
             # data arrive in several encodings, copies in other folders included, exactly one readable file is used,
             # vendor -> mzML -> mzXML (converted in a campaign), a tie to the first path without case, an unreadable
-            # one (undecodable mzML, failed conversion) giving way to the next; the file used is the sample's own
-            # input whatever its row names, and every other is on record with its reason (manifest.encoding_choices
-            # and each used input's lineage encoding_choice: {rule, used, unused: [{path, reason}], stands_for}).
+            # one (undecodable mzML, failed conversion, a vendor header the lease's extractor cannot read, a listed
+            # folder that did not arrive whole) giving way to the next; .cdf/.abf/.ibf rank between vendor and mzML;
+            # the file used is the sample's own input whatever its row names, a shared archive's encoding of a named
+            # sample and two declared copies of one row included, and every other is on record with its reason
+            # (manifest.encoding_choices and each used input's lineage encoding_choice: {rule, used, unused: [{path,
+            # reason}], stands_for}).
             "repository_one_encoding_rule",
             # A unit or split part its disposition holds is never discarded, approved or confirmed, unless the
             # discard passes release_disposition_hold=true (the operator's skip), which records

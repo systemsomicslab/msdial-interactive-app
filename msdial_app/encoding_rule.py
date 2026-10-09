@@ -7,6 +7,11 @@ several encodings - S1.raw, S1.mzML, S1.mzXML, copies in other folders included:
 
 1. Among the READABLE ones exactly one is used: the highest in the order vendor format (a folder or a container)
    -> mzML -> mzXML. An mzXML is converted to mzML in a campaign; outside a campaign it is no input.
+   A re-encoding MS-DIAL opens that is no instrument's own format (netCDF/AIA .cdf, Reifycs .abf and .ibf) is in
+   none of the rule's ranks. It ranks after every vendor format and before mzML (RE_ENCODING_RANK): the place
+   these formats held before the rule, where the Catalog's encoding preference took them as vendor files that a
+   real vendor file nevertheless beat. Outside the rule's words, so the safest existing behaviour is kept: a
+   .cdf or .abf never wins a tie against an instrument's .raw or .d.
 2. Ties (the same rank: one format in two folders, or two vendor formats) go to the first by path name in
    lexicographic order: the path relative to the unit's data root, '/'-separated, compared without case.
 3. If the chosen one cannot be read or decoded, or its conversion fails, the next in order is taken.
@@ -18,14 +23,20 @@ choose_encoding is the rule, and the one place it is decided: the lease groups t
 (repository_reanalysis._encoding_groups) and asks it once per sample, and every later reader (the lineage, the
 analysis-CSV builder, a split part) reads what it decided from the record it returns (EncodingChoice.record).
 
-WHAT "READABLE" IS, AT THE LEASE. The lease knows three facts about a candidate, and the caller's ``readability``
-says them: an mzML whose arrays RawDataHandler cannot decode (mzml_encoding) is UNDECODABLE; an mzXML whose
-conversion failed, or whose scans contradict the declared polarity, is not readable (CONVERSION_FAILED, or the
-convert stage's own reason); an mzXML outside a campaign is no input (REQUIRES_CONVERSION). A vendor file or folder
-is taken as readable: whether its header can be read is the raw-header preflight's to say, after the lease.
+WHAT "READABLE" IS, AT THE LEASE. The caller's ``readability`` says what the lease knows of a candidate: an mzML
+whose arrays RawDataHandler cannot decode (mzml_encoding) is UNDECODABLE; an mzXML whose conversion failed, or whose
+scans contradict the declared polarity, is not readable (CONVERSION_FAILED, or the convert stage's own reason); an
+mzXML outside a campaign is no input (REQUIRES_CONVERSION). A vendor folder the unit lists member by member that did
+not arrive whole is INCOMPLETE_CONTAINER. A vendor file or folder whose raw header the raw-metadata extractor cannot
+read is RAW_HEADER_UNREADABLE, or RAW_HEADER_UNSUPPORTED_FORMAT where the extractor has no reader for it: the same
+reasons the raw-header preflight excludes an input for, so a file the rule uses is one the preflight can read. The
+lease reads a vendor header only where the rule reaches a vendor candidate of a sample that has another candidate,
+and only where an extractor is configured; without one, a vendor file is taken as readable, and a preflight that
+then cannot read it says so (the warning encoding_fallback_not_taken).
 
 Readability is asked lazily, in the rule's order, only until the first readable candidate: an mzXML is converted
-only where nothing above it can be read, and an mzML is scanned only where no vendor encoding is taken.
+only where nothing above it can be read, an mzML is scanned only where no vendor encoding is taken, and a vendor
+header is read only where the rule reaches it.
 """
 
 from __future__ import annotations
@@ -37,11 +48,16 @@ from . import encoding_preference
 
 RULE = "one_encoding_per_sample_2026_10_09"
 
-# The rule's order (clause 1). Anything else is no encoding the rule ranks.
+# The rule's order (clause 1). Anything else is no encoding the rule ranks. RE_ENCODING_RANK is not the rule's: it
+# places the re-encodings MS-DIAL opens (RE_ENCODING_SUFFIXES) where they stood before it (see clause 1 above).
 VENDOR_RANK = 0
-MZML_RANK = 1
-MZXML_RANK = 2
+RE_ENCODING_RANK = 1
+MZML_RANK = 2
+MZXML_RANK = 3
 _UNRANKED = 9
+# What MS-DIAL opens that encoding_preference counts among the vendor suffixes but no instrument writes: netCDF/AIA
+# (.cdf) and Reifycs' Analysis Base File (.abf) and its ion-mobility form (.ibf), each converted from a vendor file.
+RE_ENCODING_SUFFIXES = (".cdf", ".abf", ".ibf")
 
 # Why a candidate is not used (clause 5). A candidate after the one used is lower in the order or tied with it; one
 # before it could not be read, for the reason readability gave.
@@ -50,13 +66,21 @@ TIE_LEXICOGRAPHIC = "tie_lexicographic"
 UNDECODABLE = "undecodable"
 CONVERSION_FAILED = "conversion_failed"
 REQUIRES_CONVERSION = "requires_conversion"
+# A vendor candidate the lease could not take (clause 3): a listed folder that did not arrive whole, and a header the
+# raw-metadata extractor could not read (the raw-header preflight's own exclusion reasons).
+INCOMPLETE_CONTAINER = "incomplete_container"
+RAW_HEADER_UNREADABLE = "raw_header_unreadable"
+RAW_HEADER_UNSUPPORTED_FORMAT = "raw_header_unsupported_format"
+RAW_HEADER_REASONS = frozenset({RAW_HEADER_UNREADABLE, RAW_HEADER_UNSUPPORTED_FORMAT})
 
 
 def encoding_rank(path: str) -> int | None:
-    """The rule's rank of a path's encoding: 0 vendor (a folder or container), 1 mzML, 2 mzXML; None otherwise."""
+    """The rule's rank of a path's encoding: 0 vendor (a folder or container), 1 a re-encoding MS-DIAL opens (.cdf,
+    .abf, .ibf: RE_ENCODING_RANK), 2 mzML, 3 mzXML; None otherwise."""
     kind = encoding_preference.kind(path)
     if kind == "vendor":
-        return VENDOR_RANK
+        value = (encoding_preference.unpacked(path) or _slashes(path)).casefold()
+        return RE_ENCODING_RANK if value.endswith(RE_ENCODING_SUFFIXES) else VENDOR_RANK
     if kind == "open":
         return MZML_RANK
     if kind == "convertible":

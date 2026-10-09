@@ -318,6 +318,29 @@ def build_repository_analysis_rows(
         else {}
     )
     declared_of = {candidate: form for form, found in matched.items() for candidate in found}
+    # The declared inputs the lease's one encoding rule left unused for a sample it ran another file of (a declaration
+    # that lists one sample's file in two folders): no input, and not missing either - each is on record in its
+    # sample's encoding choice (manifest.encoding_choices).
+    unused_forms: set[str] = set()
+    if declared:
+        unused_paths = [
+            str(data_root / str(item["path"]))
+            for choice in manifest.get("encoding_choices") or []
+            if isinstance(choice, dict) and choice.get("used")
+            for item in choice.get("unused") or []
+            if isinstance(item, dict) and str(item.get("path") or "").strip()
+        ]
+        if unused_paths:
+            unused_forms = {
+                form
+                for form, found in match_declared_inputs(
+                    unused_paths,
+                    data_root,
+                    declared,
+                    containers=declared_archive_containers(typed, declared, manifest.get("archive_extractions")),
+                ).items()
+                if found and not matched.get(form)
+            }
     stands_for = lineage_stands_for(manifest)
     # An archive member no sample row pairs with, included as an unattributed input (the lease's
     # _unattributed_members, user decision 2026-10-07): no sample row, the abstention's Class or Unattributed.
@@ -576,7 +599,7 @@ def build_repository_analysis_rows(
         absent = [
             str(declared[form].get("path") or form)
             for form, found in found_kept.items()
-            if not found and form not in excluded_forms
+            if not found and form not in excluded_forms and form not in unused_forms
         ]
         twice = [str(declared[form].get("path") or form) for form, found in found_kept.items() if len(found) > 1]
         if absent:

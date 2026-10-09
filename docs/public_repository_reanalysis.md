@@ -216,8 +216,9 @@ root):
    `/`-separated, compared without case (`RAW/S1.raw` before `S1.raw`, `S1.d`
    before `S1.raw`).
 3. Where the chosen one cannot be read or decoded (an mzML whose arrays
-   RawDataHandler cannot decode), or its conversion fails, the next in order is
-   taken.
+   RawDataHandler cannot decode, a vendor file whose header the raw-metadata
+   extractor cannot read, a listed vendor folder that did not arrive whole), or
+   its conversion fails, the next in order is taken.
 4. The file used is that sample's own input, paired to its sample row and in its
    Class, whatever encoding the row names.
 5. Every file not used is recorded with its reason, naming the file used.
@@ -227,21 +228,40 @@ once per sample (`_encoding_groups`, `_choose_encodings`). One sample's
 candidates are the files a sample row pairs with (exactly, by its stem, a prefix
 or a leading identifier) and every other candidate of the unit of the same file
 stem, or, for candidates no row pairs with, those of one stem. Two things keep
-files apart: a polarity the path states by a token (`POS/S1.raw` and
+files apart: two polarities that paths state by tokens (`POS/S1.raw` and
 `NEG/S1.raw` are two acquisitions, and a unit of both polarities is split by
 them later), and two sample rows (rows naming `S1.raw` and `S1.mzML` each keep
 their own; an unattributed member of that stem is left out on record as
-`stem_of_several_sample_rows`). The candidates are the unit's own: a shared
-archive's unpaired members are none (excluded on record, as before), and a unit
-whose Catalog declared its inputs is matched by path, so the rule has nothing to
-choose there.
+`stem_of_several_sample_rows`). A path that states no polarity is one sample's
+with a path that states the unit's own (`POS/S1.raw` and `S1.raw` in a positive
+unit).
+
+The candidates are what the unit admits by itself, the members of its own
+archive no row pairs with, and every other file found of an admitted file's stem
+(`_stem_mates`): a shared archive's `S1.raw` beside the `S1.mzML` a row names is
+that sample's encoding, and the rule reaches it. A shared archive's members of
+no admitted file's stem stay out (excluded on record, as before). A unit whose
+Catalog declared its inputs is matched by path; the rule chooses among the
+declared inputs of one sample row and one stem (`_declared_candidates`), so a
+declaration listing one sample's file in two folders runs the first by path,
+while declared inputs of two rows stay two samples.
+
+A re-encoding MS-DIAL opens that no instrument writes (`.cdf`, `.abf`, `.ibf`)
+is in none of the rule's ranks; it ranks after every vendor format and before
+mzML, where it stood before the rule, so it never wins a tie against a `.raw` or
+`.d`.
 
 At the lease, readable means what the lease can establish: an mzML is scanned
-(`mzml_encoding`), an mzXML is converted, and a vendor file or folder is taken as
-readable (its header is the raw-header preflight's to read; an Unknown header
-there excludes it as before, with no fallback to another encoding). Readability
-is asked in the rule's order and only until one file is readable, so an mzXML is
-converted only where nothing before it can be read.
+(`mzml_encoding`), an mzXML is converted, a listed vendor folder is checked whole,
+and a vendor file's header is read with the configured raw-metadata extractor (in
+a campaign, only a verified, pinned one) where the rule reaches it for a sample
+that has another candidate. Without an extractor a vendor file is taken as
+readable; a preflight that then cannot read it warns
+`encoding_fallback_not_taken`, naming the next encoding. A sample none of whose
+files can be used, one of which was refused only for its header, still uses that
+vendor file, and the preflight decides it as it decides a sample's only file.
+Readability is asked in the rule's order and only until one file is readable, so
+an mzXML is converted only where nothing before it can be read.
 
 The record:
 
@@ -252,16 +272,19 @@ The record:
   lease always recorded (`unsupported_mzml_encoding`, `conversion_failed`).
 - The reasons: `lower_in_encoding_order`, `tie_lexicographic`, `undecodable`,
   `conversion_failed` (or the convert stage's
-  `polarity_contradicts_declaration`), and `requires_conversion` for an mzXML
-  outside a campaign.
+  `polarity_contradicts_declaration`), `requires_conversion` for an mzXML
+  outside a campaign, `incomplete_container`, `raw_header_unreadable` and
+  `raw_header_unsupported_format`.
 - The lineage row of each input used carries the same choice as
   `encoding_choice`, with `stands_for` (the absolute path of the file its row
   pairs with) where the row names another file of the sample; it takes that
   file's sample, declared names and inferred pairing, and `lineage_stands_for`
   reads it, so the analysis-CSV builder and a split find the same row. A split
   part carries its own samples' choices.
-- A file left unused is no input and no excluded candidate. The attribute stage
-  counts `encoding_choices` and `unused_encodings`; the convert stage's
+- A file left unused is no input and no excluded candidate, and a declared input
+  left unused is not missing from the analysis CSV. The attribute stage counts
+  `encoding_choices` and `unused_encodings` (and `vendor_headers_read`,
+  `vendor_headers_unreadable` where the lease read headers); the convert stage's
   `not_converted_readable_encoding` counts the mzXML a readable encoding was used
   before.
 

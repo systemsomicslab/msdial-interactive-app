@@ -375,6 +375,22 @@ class AFolderMustArriveWhole(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, r"raw/S1.raw: 1 member\(s\) missing: _FUNC001.IDX"):
                 verify_container_completeness(Path(temporary), _folder_project(self.MEMBERS))
 
+    def test_a_folder_the_encoding_rule_left_unused_is_not_held_to_it(self) -> None:
+        # Another encoding of its sample runs instead (encoding_rule, clause 3: incomplete_container), so the folder is
+        # no input; incomplete_vendor_folders is how the rule learns it, before the check.
+        from msdial_app.repository_reanalysis import _file_key, incomplete_vendor_folders
+
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = self._folder(Path(temporary), skip="_FUNC001.IDX")
+            project = _folder_project(self.MEMBERS)
+            self.assertEqual({_file_key(str(folder))}, incomplete_vendor_folders(Path(temporary), project))
+            record = verify_container_completeness(Path(temporary), project, unused={_file_key(str(folder))})
+            self.assertEqual((True, 1), (record["complete"], record["containers"]))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            self._folder(Path(temporary))
+            self.assertEqual(set(), incomplete_vendor_folders(Path(temporary), _folder_project(self.MEMBERS)))
+
     def test_a_member_of_another_size_stops_the_lease(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             self._folder(Path(temporary), sizes={"_FUNC001.DAT": 1})

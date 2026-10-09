@@ -2,7 +2,8 @@
 
 "A: この一つのルールで統一": when one sample's data arrive in several encodings, copies in other folders included,
 
-1. of the readable ones exactly one is used, the highest in the order vendor -> mzML -> mzXML;
+1. of the readable ones exactly one is used, the highest in the order vendor -> mzML -> mzXML (a re-encoding MS-DIAL
+   opens, .cdf/.abf/.ibf, outside the rule's words, keeps its old place between vendor and mzML);
 2. a tie goes to the first by path name, lexicographic, without case, '/'-separated;
 3. a chosen one that cannot be read or decoded, or whose conversion fails, gives way to the next in order;
 4. the file used is that sample's own input, whatever encoding the sample row names (the lease's part:
@@ -20,7 +21,10 @@ import unittest
 from msdial_app import encoding_rule
 from msdial_app.encoding_rule import (
     CONVERSION_FAILED,
+    INCOMPLETE_CONTAINER,
     LOWER_IN_ENCODING_ORDER,
+    RAW_HEADER_UNREADABLE,
+    RAW_HEADER_UNSUPPORTED_FORMAT,
     REQUIRES_CONVERSION,
     RULE,
     TIE_LEXICOGRAPHIC,
@@ -46,11 +50,36 @@ def _choose(paths: list[str], unreadable: dict[str, str] | None = None, asked: l
 class Clause1TheOrderIsVendorThenMzmlThenMzxml(unittest.TestCase):
     def test_the_rank_of_each_encoding(self) -> None:
         self.assertEqual(
-            [0, 0, 0, 0, 0, 1, 2, None, None],
+            [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 2, 3, None, None],
             [encoding_rank(path) for path in (
-                "S1.raw", "S1.d", "S1.wiff", "S1.wiff2", "a/S1.RAW", "S1.mzML", "S1.mzXML", "S1.mzData", "S1.txt"
+                "S1.raw", "S1.d", "S1.wiff", "S1.wiff2", "a/S1.RAW", "S1.lcd", "S1.qgd", "S1.cdf", "S1.ABF", "S1.ibf",
+                "S1.mzML", "S1.mzXML", "S1.mzData", "S1.txt",
             )],
         )
+
+    def test_a_re_encoding_ranks_after_every_vendor_format_and_before_mzml(self) -> None:
+        # Review of PR #69, follow-up 1: .cdf and .abf ranked as vendor, and 'abf' and 'cdf' sort before 'd' and 'raw',
+        # so a netCDF or ABF re-encoding won every tie against the instrument's own file. Outside the rule's words, they
+        # keep the place they held before it: below a vendor file, above an mzML.
+        for re_encoding in ("S1.cdf", "S1.abf", "S1.ibf"):
+            with self.subTest(re_encoding=re_encoding):
+                for vendor in ("S1.raw", "S1.d", "S1.wiff"):
+                    choice = _choose([vendor, re_encoding])
+                    self.assertEqual(vendor, choice.used)
+                    self.assertEqual([(re_encoding, LOWER_IN_ENCODING_ORDER)], list(choice.unused))
+                choice = _choose(["S1.mzML", re_encoding])
+                self.assertEqual((re_encoding, [("S1.mzML", LOWER_IN_ENCODING_ORDER)]), (choice.used, list(choice.unused)))
+
+    def test_two_re_encodings_tie(self) -> None:
+        choice = _choose(["S1.cdf", "S1.abf"])
+
+        self.assertEqual(("S1.abf", [("S1.cdf", TIE_LEXICOGRAPHIC)]), (choice.used, list(choice.unused)))
+
+    def test_an_unreadable_vendor_file_gives_way_to_a_re_encoding(self) -> None:
+        choice = _choose(["S1.raw", "S1.cdf", "S1.mzML"], {"S1.raw": RAW_HEADER_UNREADABLE})
+
+        self.assertEqual("S1.cdf", choice.used)
+        self.assertEqual([("S1.raw", RAW_HEADER_UNREADABLE), ("S1.mzML", LOWER_IN_ENCODING_ORDER)], list(choice.unused))
 
     def test_a_vendor_file_is_used_before_an_mzml_and_an_mzxml(self) -> None:
         choice = _choose(["S1.mzXML", "S1.mzML", "S1.raw"])
@@ -145,6 +174,24 @@ class Clause3AnUnreadableChoiceGivesWayToTheNext(unittest.TestCase):
         asked.clear()
         _choose(["S1.mzXML", "S1.mzML"], {"S1.mzML": UNDECODABLE}, asked=asked)
         self.assertEqual(["S1.mzML", "S1.mzXML"], asked)
+
+
+class Clause3AVendorFileTheLeaseCannotReadGivesWay(unittest.TestCase):
+    def test_a_header_that_cannot_be_read_gives_way_to_the_mzml(self) -> None:
+        for reason in (RAW_HEADER_UNREADABLE, RAW_HEADER_UNSUPPORTED_FORMAT, INCOMPLETE_CONTAINER):
+            with self.subTest(reason=reason):
+                choice = _choose(["S1.lcd", "S1.mzML"], {"S1.lcd": reason})
+
+                self.assertEqual("S1.mzML", choice.used)
+                self.assertEqual({"rule": RULE, "used": "S1.mzML", "unused": [{"path": "S1.lcd", "reason": reason}]},
+                                 choice.record())
+
+    def test_the_lease_gives_the_preflights_reasons(self) -> None:
+        self.assertEqual(
+            ("raw_header_unreadable", "raw_header_unsupported_format", "incomplete_container"),
+            (RAW_HEADER_UNREADABLE, RAW_HEADER_UNSUPPORTED_FORMAT, INCOMPLETE_CONTAINER),
+        )
+        self.assertEqual(frozenset({RAW_HEADER_UNREADABLE, RAW_HEADER_UNSUPPORTED_FORMAT}), encoding_rule.RAW_HEADER_REASONS)
 
 
 class Clause5EveryFileNotUsedIsRecorded(unittest.TestCase):

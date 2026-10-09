@@ -53,6 +53,11 @@ OUTCOME_FAILED = "failed"
 OUTCOME_TIMED_OUT = "timed_out"
 OUTCOME_OS_ERROR = "os_error"
 READ_OUTCOMES = frozenset({OUTCOME_OK, OUTCOME_REUSED})
+# A disposition's warning where an input the lease's one encoding rule used for its sample is excluded for its raw
+# header while another encoding of that sample, ranked below it, was left unused (decide_disposition).
+ENCODING_FALLBACK_NOT_TAKEN_WARNING = "encoding_fallback_not_taken"
+# The reasons the rule gives a file it ranked below the one used (encoding_rule, clause 5).
+ENCODING_ORDER_REASONS = frozenset({"lower_in_encoding_order", "tie_lexicographic"})
 OUTCOMES = (OUTCOME_OK, OUTCOME_REUSED, OUTCOME_UNSUPPORTED, OUTCOME_FAILED, OUTCOME_TIMED_OUT, OUTCOME_OS_ERROR)
 
 # Wall time of one extractor process per input, measured on 2026-09-30 with the pinned build
@@ -1286,6 +1291,7 @@ def decide_disposition(
 
     def result(disposition: str, split_key: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
         settle_overrides(disposition)
+        note_fallbacks_not_taken()
         return {
             "schema": DISPOSITION_SCHEMA,
             "disposition": disposition,
@@ -1308,6 +1314,38 @@ def decide_disposition(
             **extra,
             "assignments": assignments,
         }
+
+    def note_fallbacks_not_taken() -> None:
+        # The lease's one encoding rule took a vendor file as readable where it read no header (no extractor at the
+        # lease), and its sample has another encoding the rule ranked below it. A header this preflight cannot read
+        # excludes the file, and the sample's next encoding was not taken: said here, never left for the record of
+        # the choice (used: that file) to misstate.
+        unused_after: dict[str, list[str]] = {}
+        for row in lineage_rows:
+            choice = mapping(row.get("encoding_choice"))
+            later = [
+                str(item.get("path") or "")
+                for item in choice.get("unused") or []
+                if isinstance(item, dict) and item.get("reason") in ENCODING_ORDER_REASONS
+            ]
+            if later:
+                unused_after[file_key(str(row.get("path") or ""))] = later
+        missed = [
+            (item["path"], unused_after[file_key(item["path"])])
+            for item in excluded
+            if item["reason"] in ("raw_header_unreadable", "raw_header_unsupported_format")
+            and file_key(item["path"]) in unused_after
+        ]
+        if not missed:
+            return
+        warn(ENCODING_FALLBACK_NOT_TAKEN_WARNING)
+        detail.append(
+            f"{len(missed)} input(s) the encoding rule used for their samples are excluded for a raw header this "
+            "preflight could not read, and the next encoding of each was not taken ("
+            + "; ".join(f"{Path(path).name}: next {later[0]}" for path, later in missed[:5])
+            + "): the lease read no vendor header for the rule. Lease the unit again with the raw-metadata extractor "
+            "configured, and the rule takes the next encoding (encoding_rule, clause 3)."
+        )
 
     def settle_overrides(disposition: str) -> None:
         # A header decided each file it contradicted the declaration for, but the declaration was overridden

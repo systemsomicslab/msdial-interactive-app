@@ -412,7 +412,8 @@ class TheLeaseConvertsTheUnitsMzxml(_Scratch):
         self.assertEqual(3, len(manifest["input_candidates"]))
 
     def test_an_mzxml_the_catalog_demoted_is_not_converted(self) -> None:
-        """MetaboBank MTBKS157 publishes each sample as .RAW and as .mzXML; the Catalog keeps the vendor file."""
+        """MetaboBank MTBKS157 publishes each sample as .RAW and as .mzXML; the Catalog keeps the vendor file. The
+        mzXML is that sample's lower encoding, on record in its choice, and the convert stage never starts for it."""
         payloads = {"01026_Bread_nega.RAW": b"thermo raw bytes", "01026_Bread_nega.mzXML": dda_32()}
         project = _project(payloads, checksums=False)
         project.files[1].role = "raw_alternate"
@@ -425,6 +426,11 @@ class TheLeaseConvertsTheUnitsMzxml(_Scratch):
         self.assertEqual("not_used", _stage(manifest, "convert")["status"])
         self.assertNotIn("input_conversions", manifest)
         self.assertFalse((Path(manifest["raw_directory"]) / "converted").exists())
+        self.assertEqual(
+            [{"rule": "one_encoding_per_sample_2026_10_09", "used": "01026_Bread_nega.RAW",
+              "unused": [{"path": "01026_Bread_nega.mzXML", "reason": "lower_in_encoding_order"}]}],
+            manifest["encoding_choices"],
+        )
 
     def test_a_packed_mzxml_is_converted_once_extracted(self) -> None:
         """MTBLS688's x.mzXML.lzma unpacks to x.mzXML in the extract stage, and is converted after it."""
@@ -502,22 +508,28 @@ class TheLeaseConvertsTheUnitsMzxml(_Scratch):
         self.assertEqual([], built["failures"])
         self.assertEqual(samples, [item["sample_id"] for item in built["rows"]])
 
-    def test_a_shared_archives_mzml_is_no_candidate_and_the_named_mzxml_is_converted(self) -> None:
-        """Where the download is not the unit's own alone, members no row names are no candidates of it (excluded on
-        record, 2026-10-08, second round, answer 1): the mzXML the rows name are converted, and the mzML are left
-        out, on record."""
+    def test_a_shared_archives_mzml_of_a_named_sample_is_used_before_the_named_mzxml(self) -> None:
+        """Where the download is not the unit's own alone, the other archive's mzML of a sample a row names is still
+        that sample's encoding (review of PR #69, follow-up 1): the one rule ranks it before the mzXML the row names
+        (clause 1), "across folders and archives", and runs it for that row (clause 4). No mzXML is converted, and
+        the mzML is no unpaired member left out."""
         manifest = self._st003038(mzml(dda_spectra(6)))
-        raw = Path(manifest["raw_directory"])
+        data = Path(manifest["input_directory"])
 
-        self.assertEqual([str((raw / "converted" / "mzXML" / f"{name}.mzML").resolve()) for name in self.SAMPLES],
+        self.assertEqual([str((data / "mzML" / f"{name}.mzML").resolve()) for name in self.SAMPLES],
                          manifest["input_candidates"])
-        self.assertEqual(2, _stage(manifest, "convert")["converted"])
+        convert = _stage(manifest, "convert")
+        self.assertEqual((0, 2), (convert["converted"], convert["not_converted_readable_encoding"]))
         self.assertEqual(
-            [(f"mzML/{name}.mzML", "download_scope_not_unit_scoped") for name in self.SAMPLES],
-            [(item["path"], item["reason"]) for item in manifest["unattributed_members"]["left_out"]],
+            [{"rule": "one_encoding_per_sample_2026_10_09", "used": f"mzML/{name}.mzML",
+              "unused": [{"path": f"mzXML/{name}.mzXML", "reason": "lower_in_encoding_order"}]} for name in self.SAMPLES],
+            manifest["encoding_choices"],
         )
-        self.assertNotIn("encoding_choices", manifest)
+        self.assertNotIn("unattributed_members", manifest)
         self.assertEqual(self.SAMPLES, [_rows(manifest)[f"{name}.mzML"]["sample_id"] for name in self.SAMPLES])
+        built = build_repository_analysis_rows(manifest)
+        self.assertEqual([], built["failures"])
+        self.assertEqual(self.SAMPLES, [item["sample_id"] for item in built["rows"]])
 
     def test_another_folders_mzml_of_the_same_name_does_not_displace_the_mzxml(self) -> None:
         """A study archive with a folder per polarity holds a QC_01 in each. The positive unit's POS/QC_01.mzML is
@@ -594,16 +606,25 @@ class TheLeaseConvertsTheUnitsMzxml(_Scratch):
                 self.assertEqual([], built["failures"])
                 self.assertEqual(["QC_01", "S_01"], sorted(item["sample_id"] for item in built["rows"]))
 
-    def test_samples_that_name_the_mzxml_do_not_admit_another_folders_vendor_file(self) -> None:
-        """Where the samples name QC_01.mzXML and the download is not the unit's own alone, a QC_01.raw no row names
-        is no candidate of the unit (excluded on record, 2026-10-08, second round, answer 1): the mzXML is
-        converted, as the unit asks."""
+    def test_samples_that_name_the_mzxml_run_on_another_folders_vendor_file_of_them(self) -> None:
+        """Where the samples name QC_01.mzXML and the download is not the unit's own alone, the archive's QC_01.raw is
+        still that sample's encoding (review of PR #69, follow-up 1): the vendor file runs for the row (clauses 1 and
+        4), and no mzXML is converted."""
         manifest = self._vendor_beside_mzxml("Thermo_RAW", "mzXML", raw_file="{}.mzXML")
-        converted = Path(manifest["raw_directory"]) / "converted" / "ST000777" / "mzXML"
+        data = Path(manifest["input_directory"]) / "ST000777"
 
-        self.assertEqual([str((converted / f"{stem}.mzML").resolve()) for stem in ("QC_01", "S_01")],
+        self.assertEqual([str((data / "Thermo_RAW" / f"{stem}.raw").resolve()) for stem in ("QC_01", "S_01")],
                          manifest["input_candidates"])
-        self.assertNotIn("encoding_choices", manifest)
+        self.assertEqual(
+            [{"rule": "one_encoding_per_sample_2026_10_09", "used": f"ST000777/Thermo_RAW/{stem}.raw",
+              "unused": [{"path": f"ST000777/mzXML/{stem}.mzXML", "reason": "lower_in_encoding_order"}]}
+             for stem in ("QC_01", "S_01")],
+            manifest["encoding_choices"],
+        )
+        self.assertFalse((Path(manifest["raw_directory"]) / "converted").exists())
+        built = build_repository_analysis_rows(manifest)
+        self.assertEqual([], built["failures"])
+        self.assertEqual(["QC_01", "S_01"], sorted(item["sample_id"] for item in built["rows"]))
 
     def test_a_full_disk_stops_the_lease_and_a_retry_converts_the_rest(self) -> None:
         """A full disk is not the mzXML's fault: no sample is excluded for it, and the lease fails so that the unit
@@ -692,7 +713,8 @@ class TheLeaseConvertsTheUnitsMzxml(_Scratch):
         self.assertTrue(manifest["execution_allowed"])
 
     def test_an_mzml_twin_nothing_can_decode_does_not_outrank_the_mzxml(self) -> None:
-        """A convertible mzXML outranks an unreadable twin (2026-09-30): a Numpress mzML is one."""
+        """A convertible mzXML outranks an unreadable twin (2026-09-30): a Numpress mzML is one. The one rule says the
+        same (clause 3), and records the mzML as undecodable in each sample's choice, not as an excluded candidate."""
         manifest = self._st003038(_numpress_mzml())
         raw = Path(manifest["raw_directory"])
 
@@ -700,6 +722,12 @@ class TheLeaseConvertsTheUnitsMzxml(_Scratch):
                          manifest["input_candidates"])
         convert = _stage(manifest, "convert")
         self.assertEqual((2, 0), (convert["converted"], convert["not_converted_readable_encoding"]))
+        self.assertEqual(
+            [{"rule": "one_encoding_per_sample_2026_10_09", "used": f"mzXML/{name}.mzXML",
+              "unused": [{"path": f"mzML/{name}.mzML", "reason": "undecodable"}]} for name in self.SAMPLES],
+            manifest["encoding_choices"],
+        )
+        self.assertNotIn("excluded_input_candidates", manifest)
         self.assertEqual(self.SAMPLES, [_rows(manifest)[f"{name}.mzML"]["sample_id"] for name in self.SAMPLES])
 
 
