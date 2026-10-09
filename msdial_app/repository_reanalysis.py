@@ -2162,7 +2162,7 @@ def create_download_lease(
             *conversion_sources,
             *declared_samples,
         ]
-        mates = _stem_mates(seeds, [*found_readable, *mzxml_found], data_root, project)
+        mates = _stem_mates(seeds, [*found_readable, *mzxml_found], data_root, project, prefixed_members)
         groups = _encoding_groups(
             [*seeds, *mates],
             data_root,
@@ -4117,7 +4117,10 @@ def _select_conversion_sources(
 # sample's: the files a sample row pairs with (by its exact name, its extensionless stem, a prefixed name or a leading
 # identifier: _member_name_pairings), together with every other candidate of the unit whose file stem (its name less
 # its container suffix, encoding_preference.stem) is theirs; and, of the candidates no row pairs with, those of one
-# stem. Folders do not separate one sample's encodings or copies: RAW/S1.raw, mzML/S1.mzML and S1.mzXML are one
+# stem. One row's files are one sample's whatever their stems: a file of the stem of the name the row gives, in any
+# encoding, is the row's (clause 4), and so is one a prefix or a leading identifier pairs with it, so
+# 021518_387057_CSHp_S7.mzML (paired with a row naming S7.mzML) and S7.raw are one sample's, and S7.raw runs.
+# Folders do not separate one sample's encodings or copies: RAW/S1.raw, mzML/S1.mzML and S1.mzXML are one
 # sample's, and so are A/S1.raw and B/S1.raw. Two things do:
 # - two polarities that paths of one stem state by tokens of their own (name_polarities): POS/S1.raw and NEG/S1.raw
 #   are two acquisitions, never two encodings of one, and a unit of both polarities is split by polarity later (the
@@ -4131,7 +4134,8 @@ def _select_conversion_sources(
 #   an admitted member carried always was.
 # The candidates are the unit's own: what it admits by itself, the members of its own archive no row pairs with
 # (_unattributed_members), and every other file of a sample it admits (_stem_mates: a file of an admitted file's
-# stem, which the analysis CSV pairs with that file's row whatever encoding the row names; clause 4). A shared
+# stem, or of the stem of the name the row of a file paired by its name gives, which the analysis CSV pairs with
+# that row whatever encoding the row names; clause 4). A shared
 # archive's members of no admitted file's stem stay unpaired and are excluded on record (2026-10-08, second round,
 # answer 1); one of an admitted file's stem is that sample's encoding, and the rule chooses among them.
 #
@@ -4241,6 +4245,9 @@ def _encoding_groups(
     # container its packed name stands for, and an extensionless name as a stem.
     named: dict[str, set[str]] = {}
     stemmed: dict[str, set[str]] = {}
+    # The rows by the stem of the file they name (encoding_preference.stem): a file of that stem in any encoding is
+    # that row's sample's (clause 4), as the analysis CSV pairs it.
+    row_stems: dict[str, set[str]] = {}
     for sample in project.sample_metadata or []:
         raw = PurePosixPath(str((sample or {}).get("raw_file") or "").strip().replace("\\", "/")).name.casefold()
         if not raw:
@@ -4251,6 +4258,7 @@ def _encoding_groups(
             named.setdefault(alias.casefold(), set()).add(raw)
         if not PurePosixPath(raw).suffix:
             stemmed.setdefault(raw, set()).add(raw)
+        row_stems.setdefault(encoding_preference.stem(raw), set()).add(raw)
 
     def rows_of(item: str) -> tuple[str, ...]:
         """The sample rows (by the file name they give) that pair with a candidate by its own name."""
@@ -4259,6 +4267,15 @@ def _encoding_groups(
             return (str(pairing["declared_raw_file"]).casefold(),)
         base = Path(item).name.casefold()
         return tuple(sorted({*named.get(base, ()), *stemmed.get(PurePosixPath(base).stem, ())}))
+
+    def sample_row_of(item: str) -> tuple[str, ...]:
+        """The sample row a candidate is a file of: the one that pairs with it by its own name, else the only row
+        whose named file has its stem (S7.raw for a row naming S7.mzML); () where none, or several, do."""
+        own = rows_of(item)
+        if own:
+            return own
+        by_stem = row_stems.get(encoding_preference.stem(relatives[item]), set())
+        return (next(iter(by_stem)),) if len(by_stem) == 1 else ()
 
     polarity_named = names_state_polarity(relatives.values())
     unit_polarity = _unit_polarity(project)
@@ -4274,18 +4291,16 @@ def _encoding_groups(
         merged = _one_sample_polarities(stated.values(), unit_polarity)
         for item in items:
             buckets.setdefault((stem, merged.get(stated[item], stated[item])), []).append(item)
-    for items in sorted(buckets.values(), key=lambda members: encoding_rule.order_key(relatives[order(members)[0]])):
-        rows = {item: rows_of(item) for item in items}
+    # Each bucket's samples: (the sample row they are a file of, or () for none, the bucket's polarities, files).
+    parts: list[tuple[tuple[str, ...], frozenset[str], list[str]]] = []
+    for (_stem, polarities), items in buckets.items():
+        rows = {item: sample_row_of(item) for item in items}
         identities = sorted({value for value in rows.values() if value})
         if len(identities) <= 1:
-            members = order(items)
-            result["groups"].append(
-                _EncodingGroup({item: relatives[item] for item in members}, [item for item in members if rows[item]])
-            )
+            parts.append((identities[0] if identities else (), polarities, items))
             continue
         for identity in identities:
-            members = order(item for item in items if rows[item] == identity)
-            result["groups"].append(_EncodingGroup({item: relatives[item] for item in members}, members))
+            parts.append((identity, polarities, [item for item in items if rows[item] == identity]))
         unpaired = order(item for item in items if not rows[item])
         for item in unpaired:
             if _file_key(item) in taken:
@@ -4294,7 +4309,29 @@ def _encoding_groups(
                 )
         rest = [item for item in unpaired if _file_key(item) not in taken]
         if rest:
-            result["groups"].append(_EncodingGroup({item: relatives[item] for item in rest}, []))
+            parts.append(((), polarities, rest))
+    # One row's files are one sample's whatever their stems (THE SAME SAMPLE): 021518_387057_CSHp_S7.mzML, which a
+    # prefix pairs with the row naming S7.mzML, and S7.raw, of the row's own stem. Their polarities part them as they
+    # part one stem's paths (_one_sample_polarities).
+    by_row: dict[tuple[str, ...], list[int]] = {}
+    for index, (identity, _polarities, _items) in enumerate(parts):
+        if identity:
+            by_row.setdefault(identity, []).append(index)
+    merged_into: dict[int, int] = {}
+    for indexes in by_row.values():
+        sample_polarities = _one_sample_polarities((parts[index][1] for index in indexes), unit_polarity)
+        first: dict[frozenset[str], int] = {}
+        for index in indexes:
+            polarities = parts[index][1]
+            merged_into[index] = first.setdefault(sample_polarities.get(polarities, polarities), index)
+    samples: dict[int, list[str]] = {}
+    for index, (_identity, _polarities, items) in enumerate(parts):
+        samples.setdefault(merged_into.get(index, index), []).extend(items)
+    for items in sorted(samples.values(), key=lambda members: encoding_rule.order_key(relatives[order(members)[0]])):
+        members = order(items)
+        result["groups"].append(
+            _EncodingGroup({item: relatives[item] for item in members}, [item for item in members if rows_of(item)])
+        )
     return result
 
 
@@ -4331,7 +4368,8 @@ def _choose_encodings(
     WHERE ONLY A HEADER STOOD IN THE WAY. A sample none of whose candidates can be used, one of which was refused only
     for its header, uses that vendor file all the same, as a sample with no other encoding does: the lease's header
     read is no exclusion, and the preflight decides such a file (a unit none of whose headers can be read is taken at
-    its declaration). Its other candidates are then unused by the order, and the record says so.
+    its declaration). Its other candidates keep the reasons they could not be used for (_kept_reasons): an mzML
+    after it is undecodable, not lower in the order, so the preflight never reads it as a fallback not taken.
     """
     scanned: dict[str, str] = {}
     outcomes: dict[str, str] = {}
@@ -4395,10 +4433,31 @@ def _choose_encodings(
     ):
         lenient = True
         choices = [
-            encoding_rule.choose_encoding(group.paths, readability) if choice.used is None else choice
+            _kept_reasons(encoding_rule.choose_encoding(group.paths, readability), choice)
+            if choice.used is None
+            else choice
             for group, choice in zip(groups, choices)
         ]
     return choices, headers
+
+
+def _kept_reasons(
+    lenient: encoding_rule.EncodingChoice, strict: encoding_rule.EncodingChoice
+) -> encoding_rule.EncodingChoice:
+    """A choice made where only a header stood in the way (``lenient``), with each candidate after the one used
+    keeping the reason the first pass found it unreadable for (``strict``, where none was used): an undecodable mzML,
+    an mzXML whose conversion failed or that requires conversion, a vendor header that could not be read. The order's
+    reasons (lower_in_encoding_order, tie_lexicographic) are for a candidate that could have been used (clause 5),
+    and none of these could."""
+    found = dict(strict.unused)
+    return encoding_rule.EncodingChoice(
+        used=lenient.used,
+        unused=tuple(
+            (item, found.get(item) or reason) if reason in ENCODING_ORDER_REASONS else (item, reason)
+            for item, reason in lenient.unused
+        ),
+        paths=lenient.paths,
+    )
 
 
 def lease_header_reader(extractor_path: Path) -> HeaderReader:
@@ -11315,7 +11374,12 @@ def _member_name_pairings(
     member, the declared raw file, the rule and the reason.
 
     EXACT MATCHES ARE DECIDED FIRST: a declared name some member, or the unit's file listing, carries exactly
-    is never paired by inference, and a member a declared name names exactly is never given another. THEN
+    is never paired by inference with a member of that file's encoding rank (encoding_rule.encoding_rank), and a
+    member a declared name names exactly is never given another. A member of another rank may still be paired with
+    it: it is another encoding of the row's sample, not a different file of its name (021518_387057_CSHp_S7.raw
+    beside the S7.mzML an extensionless row S7 names), and the one encoding rule chooses between them. A file of
+    the stem of a declared name, in another encoding, is that row's own file and no rival for its leading
+    identifier (VV_13_HEpG2_C1_pos.mzML for VV_13_HEpG2_C1_pos.raw beside VV_13_HEpG2_C1_exp344_pos.raw). THEN
     PREFIXED NAMES (PREFIXED_MEMBER_PAIRING): a member is paired with a declared name when its name - or its
     stem, for a name a row records without an extension, as _sample_file_names reads those - ends in a
     separator (PREFIX_SEPARATORS) and then the declared name, compared without case. THEN LEADING IDENTIFIERS
@@ -11432,13 +11496,31 @@ def _member_name_pairings(
         own = stated(key)
         return stem, stated_by_stem[stem].get(own, own)
 
-    taken: set[str] = set()
+    # The declared names a listed file or a member carries exactly, with the encoding rank (encoding_rule) of each
+    # that does: a name of no rank (a listing's archive) counts as every rank.
+    taken: dict[str, set[int | None]] = {}
+
+    def take(name: str) -> None:
+        for form in exactly(name):
+            taken.setdefault(form, set()).add(encoding_rule.encoding_rank(name))
+
+    def open_to(declared_name: str, name: str) -> bool:
+        """Whether a member (by its name) may still be paired with a declared name by inference: nothing carries the
+        name exactly in the member's own encoding rank. One that carries it in another rank is another encoding of
+        the row's sample, not a different file of the row's name: 021518_387057_CSHp_S7.raw beside S7.mzML for an
+        extensionless row S7 is that row's too, and the one encoding rule chooses between them (_encoding_groups)."""
+        ranks = taken.get(declared_name)
+        if not ranks:
+            return True
+        rank = encoding_rule.encoding_rank(name)
+        return None not in ranks and rank is not None and rank not in ranks
+
     for item in project.files:
         base = PurePosixPath(str(item.name or "").replace("\\", "/")).name.casefold()
         for name in filter(None, (base, archives.container_alias(base).casefold())):
-            taken |= exactly(name)
+            take(name)
     for name in pool.values():
-        taken |= exactly(name)
+        take(name)
     claims: dict[str, set[str]] = {}
     claimed_by: dict[str, set[str]] = {}
     for key, name in pool.items():
@@ -11448,7 +11530,7 @@ def _member_name_pairings(
             text[index + 1:]
             for text, table in ((name, named), (PurePosixPath(name).stem, stemmed))
             for index, character in enumerate(text)
-            if character in PREFIX_SEPARATORS and text[index + 1:] in table and text[index + 1:] not in taken
+            if character in PREFIX_SEPARATORS and text[index + 1:] in table and open_to(text[index + 1:], name)
         }
         if found:
             claims[key] = found
@@ -11486,14 +11568,34 @@ def _member_name_pairings(
             member_keys.setdefault(token_key, set()).add(key)
     for token_key, declared_names in sorted(declared_keys.items()):
         members = member_keys.get(token_key) or set()
-        open_names = {name for name in declared_names if name not in taken and name not in claimed_by}
+        open_names = {
+            name
+            for name in declared_names
+            if name not in claimed_by and any(open_to(name, pool[key]) for key in members)
+        }
         if not members or not open_names:
             continue
-        # Unique on both sides, a sample's files counting as one candidate (sample_of).
-        if len(declared_names) != 1 or len({sample_of(key) for key in members}) != 1:
+        # The declared name's own files are no rival for it: a member that carries it exactly, and, beside members
+        # that do not, one of its stem in another encoding (VV_13_HEpG2_C1_pos.mzML for VV_13_HEpG2_C1_pos.raw, the
+        # row's file by clause 4 of the one encoding rule). The others claim it by the token.
+        exact = {key for key in members if exactly(pool[key])}
+        stems_named = {encoding_preference.stem(name) for name in declared_names}
+        rivals = {key for key in members - exact if encoding_preference.stem(pool[key]) not in stems_named}
+        if not rivals:
+            if exact:
+                # Only the name's own files carry the key: nothing is paired by it, as before.
+                continue
+            rivals = set(members)
+        # Unique on both sides, a sample's files counting as one candidate (sample_of). Where a member carries the name
+        # exactly in a rival's own encoding rank, the rivals are not the row's only candidates, and every member
+        # counts, as it always did.
+        open_rivals = len(declared_names) == 1 and all(open_to(next(iter(declared_names)), pool[key]) for key in rivals)
+        if not open_rivals:
+            rivals = members - exact
+        if len(declared_names) != 1 or len({sample_of(key) for key in (rivals if open_rivals else members)}) != 1:
             for name in sorted(open_names):
-                for key in sorted(members):
-                    if key not in claims and not exactly(pool[key]):
+                for key in sorted(rivals):
+                    if key not in claims:
                         refuse(
                             key,
                             written(name),
@@ -11503,9 +11605,9 @@ def _member_name_pairings(
                         )
             continue
         declared_name = next(iter(declared_names))
-        if any(key in claims or exactly(pool[key]) for key in members):
+        if not open_rivals or any(key in claims for key in rivals):
             continue
-        for key in sorted(members):
+        for key in sorted(rivals):
             reason = polarity_conflict(key, written(declared_name))
             if reason:
                 refuse(key, written(declared_name), LEADING_IDENTIFIER_TOKEN_PAIRING, reason, key=token_key)
@@ -11891,7 +11993,13 @@ def _readable_inputs_admitted(
     ]
 
 
-def _stem_mates(seeds: list[str], found: Iterable[str], data_root: Path, project: RepositoryProject) -> list[str]:
+def _stem_mates(
+    seeds: list[str],
+    found: Iterable[str],
+    data_root: Path,
+    project: RepositoryProject,
+    prefixed_members: Mapping[str, Mapping[str, str]] | None = None,
+) -> list[str]:
     """The files found under the data root that an undeclared unit did not admit by themselves, but that are another
     encoding or copy of a sample it did admit (``seeds``: every candidate it admits by itself): of that candidate's
     file stem (encoding_preference.stem), and of its sample's polarity (_one_sample_polarities), a file whose path
@@ -11903,6 +12011,10 @@ def _stem_mates(seeds: list[str], found: Iterable[str], data_root: Path, project
     unpaired members (2026-10-08, second round, answer 1): it is that sample's encoding, and the rule must reach it.
     A row naming an undecodable S1.mzML runs on the archive's S1.raw, and a row naming S1.mzXML on its readable
     S1.mzML, where neither was a candidate before. Empty for a declared unit, whose candidates are the declared inputs.
+
+    A SEED PAIRED BY ITS NAME (``prefixed_members``, _member_name_pairings' paired) is a file of its row's sample, and
+    so is a file of the stem of the name the row gives: 021518_387057_CSHp_S7.mzML, paired with a row naming S7.mzML,
+    brings the archive's S7.raw, and the rule chooses between them (_encoding_groups).
     """
     if not project.analysis_unit_id or not seeds or declared_analysis_inputs(project):
         return []
@@ -11917,15 +12029,24 @@ def _stem_mates(seeds: list[str], found: Iterable[str], data_root: Path, project
     def stated(item: str) -> frozenset[str]:
         return frozenset(name_polarities(relatives[item], polarity_named=polarity_named))
 
-    seed_stems = {encoding_preference.stem(relatives[item]) for item in seeds}
+    def seed_stems_of(item: str) -> set[str]:
+        stems = {encoding_preference.stem(relatives[item])}
+        pairing = (prefixed_members or {}).get(_file_key(item))
+        if pairing and str(pairing.get("declared_raw_file") or ""):
+            stems.add(encoding_preference.stem(str(pairing["declared_raw_file"])))
+        return stems
+
     by_stem: dict[str, list[str]] = {}
-    for item in [*seeds, *others]:
+    for item in seeds:
+        for stem in seed_stems_of(item):
+            by_stem.setdefault(stem, []).append(item)
+    for item in others:
         stem = encoding_preference.stem(relatives[item])
-        if stem not in seed_stems:
+        if stem not in by_stem:
             continue
-        if _file_key(item) not in seed_keys and unit_polarity and stated(item) - {unit_polarity}:
+        if unit_polarity and stated(item) - {unit_polarity}:
             continue
-        by_stem.setdefault(stem, []).append(item)
+        by_stem[stem].append(item)
     mates: list[str] = []
     for items in by_stem.values():
         merged = _one_sample_polarities((stated(item) for item in items), unit_polarity)
@@ -11935,7 +12056,7 @@ def _stem_mates(seeds: list[str], found: Iterable[str], data_root: Path, project
             for item in items
             if _file_key(item) not in seed_keys and merged.get(stated(item), stated(item)) in seeded
         )
-    return mates
+    return list(dict.fromkeys(mates))
 
 
 def _without_mates(record: dict[str, Any] | None, mates: list[str], data_root: Path) -> dict[str, Any] | None:

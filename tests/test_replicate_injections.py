@@ -1562,8 +1562,140 @@ class TheOneEncodingRule(_Workspace):
         )
 
         self.assertEqual(sorted([*self.TRIO, "S1.lcd"]), self.names(manifest))
-        self.assertEqual([("S1.mzML", "lower_in_encoding_order")], self.choice(manifest, "S1.lcd"))
+        # Review of PR #69, follow-up 2 (probe P4): the mzML after it was set aside because it cannot be decoded, and
+        # the record says so (clause 5), not that it was lower in the order.
+        self.assertEqual([("S1.mzML", "undecodable")], self.choice(manifest, "S1.lcd"))
         self.assertNotIn("excluded_input_candidates", manifest)
+        assert_every_member_on_record(self, manifest, ["S1.lcd", "S1.mzML"])
+
+    def test_where_only_a_header_stood_in_the_way_the_preflight_names_no_fallback_not_taken(self) -> None:
+        # Probe P4 downstream: the preflight cannot read S1.lcd's header either. Its next encoding is undecodable, so
+        # no fallback was missed, and encoding_fallback_not_taken (which tells the operator to lease again with an
+        # extractor that was configured) is not raised. Had the record said lower_in_encoding_order, it would be.
+        from msdial_app.raw_metadata_preflight import decide_disposition
+        from test_raw_metadata_preflight import _header, _manifest
+
+        manifest = self.unit(
+            ["S1.lcd", "S1.mzML"], [("Sample1", "S1.lcd")], contents={"S1.mzML": _numpress_mzml()},
+            header_reader=self.headers({"S1.lcd": "raw_header_unreadable"}, []),
+        )
+        lcd = self.rows(manifest)["S1.lcd"]["path"]
+        readable = self.rows(manifest)[self.TRIO[0]]["path"]
+
+        def disposition(lineage: dict) -> dict:
+            preflight = _manifest([_header(readable, "DDA", polarity="Positive")], failures={lcd: "failed"})
+            preflight["input_lineage"] = lineage
+            return decide_disposition(preflight)
+
+        decided = disposition(manifest["input_lineage"])
+        self.assertIn("raw_header_unreadable", [item["reason"] for item in decided["excluded_inputs"]])
+        self.assertNotIn("encoding_fallback_not_taken", decided["warnings"])
+        misstated = {
+            **manifest["input_lineage"],
+            "rows": [
+                {**row, "encoding_choice": {**row["encoding_choice"], "unused": [
+                    {**item, "reason": "lower_in_encoding_order"} for item in row["encoding_choice"]["unused"]]}}
+                if row.get("encoding_choice") else row
+                for row in manifest["input_lineage"]["rows"]
+            ],
+        }
+        self.assertIn("encoding_fallback_not_taken", disposition(misstated)["warnings"])
+
+    def test_where_only_a_header_stood_in_the_way_an_mzxml_keeps_why_it_could_not_be_used(self) -> None:
+        # The same for an mzXML: one whose conversion failed in a campaign, and one outside a campaign, which needs a
+        # conversion nothing runs. Neither is lower in the order: neither could have been used.
+        for campaign, reason in ((True, "conversion_failed"), (False, "requires_conversion")):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as temporary:
+                self.root = Path(temporary).resolve()
+                manifest = self.unit(
+                    ["S1.lcd", "S1.mzXML"], [("Sample1", "S1.lcd")], contents={"S1.mzXML": b"<not an mzXML"},
+                    campaign=campaign, header_reader=self.headers({"S1.lcd": "raw_header_unreadable"}, []),
+                )
+
+                self.assertEqual(sorted([*self.TRIO, "S1.lcd"]), self.names(manifest))
+                self.assertEqual([("S1.mzXML", reason)], self.choice(manifest, "S1.lcd"))
+                self.assertNotIn("excluded_input_candidates", manifest)
+                assert_every_member_on_record(self, manifest, ["S1.lcd", "S1.mzXML"])
+
+    # ---- one row's files whatever their stems (THE SAME SAMPLE) ------------------------------------------------
+
+    def test_a_file_of_the_rows_stem_and_a_prefixed_member_of_the_row_are_one_sample(self) -> None:
+        # Review of PR #69, follow-up 2 (probes P3c, P3c'): the prefix pairs 021518_387057_CSHp_S7.mzML with the row
+        # naming S7.mzML, and S7.raw is of the row's own stem. Both are Sample7's, unit-scoped archive or shared: the
+        # vendor file is its one input (clauses 1 and 4), and the prefixed mzML is unused, on record (clause 5).
+        # Before, the prefixed mzML ran as Sample7 and S7.raw ran again as an unattributed sample, or was left out
+        # as a shared archive's member.
+        samples = [*self.TRIO_ROWS, ("Sample7", "S7.mzML")]
+        for scope in (UNIT_SCOPED, SHARED):
+            with self.subTest(scope=scope["kind"]), tempfile.TemporaryDirectory() as temporary:
+                self.root = Path(temporary).resolve()
+                manifest = self.unit([f"{PREFIX}S7.mzML", "S7.raw"], [("Sample7", "S7.mzML")], scope=scope,
+                                     contents={f"{PREFIX}S7.mzML": mzml(dda_spectra(6))})
+
+                self.assertEqual(sorted([*self.TRIO, "S7.raw"]), self.names(manifest))
+                self.assertEqual([(f"{PREFIX}S7.mzML", "lower_in_encoding_order")], self.choice(manifest, "S7.raw"))
+                record = manifest.get("unattributed_members") or {}
+                self.assertEqual([], record.get("members") or [])
+                self.assertEqual([], record.get("left_out") or [])
+                row = self.rows(manifest)["S7.raw"]
+                self.assertEqual("Sample7", row["sample_id"])
+                self.assertEqual(f"{PREFIX}S7.mzML", Path(row["encoding_choice"]["stands_for"]).name)
+                csv_row = self.csv_row(_with_classes(manifest, samples, "Sample7"), "S7.raw")
+                self.assertEqual(("Sample7", "S7.mzML", "Treated"),
+                                 (csv_row["sample_id"], csv_row["sample_raw_file"], csv_row["class_id"]))
+                assert_every_member_on_record(self, manifest, [f"{PREFIX}S7.mzML", "S7.raw"])
+
+    def test_a_prefixed_vendor_file_of_the_row_and_an_mzml_of_its_stem_are_one_sample(self) -> None:
+        # Probes P3 and N4: the row names S7.raw (P3) or S7 with no extension (N4); the prefixed .raw is the row's by
+        # its prefix, and S7.mzML by the row's stem. The vendor file runs as Sample7, and the mzML is unused; it no
+        # longer runs again as an unattributed sample. For N4 the mzML carries the row's name exactly, which before
+        # kept the prefixed .raw from being paired at all: an exact name keeps a prefix from pairing only a file of
+        # its own encoding rank, and a file of another rank is the row's sample's other encoding.
+        for raw_file in ("S7.raw", "S7"):
+            with self.subTest(raw_file=raw_file), tempfile.TemporaryDirectory() as temporary:
+                self.root = Path(temporary).resolve()
+                samples = [*self.TRIO_ROWS, ("Sample7", raw_file)]
+                manifest = self.unit([f"{PREFIX}S7.raw", "S7.mzML"], [("Sample7", raw_file)],
+                                     contents={"S7.mzML": mzml(dda_spectra(6))})
+
+                self.assertEqual(sorted([*self.TRIO, f"{PREFIX}S7.raw"]), self.names(manifest))
+                self.assertEqual([("S7.mzML", "lower_in_encoding_order")], self.choice(manifest, f"{PREFIX}S7.raw"))
+                self.assertEqual([], (manifest.get("unattributed_members") or {}).get("members") or [])
+                row = self.rows(manifest)[f"{PREFIX}S7.raw"]
+                self.assertEqual(
+                    ("Sample7", PREFIXED_MEMBER_PAIRING, raw_file),
+                    (row["sample_id"], row["name_pairing"]["paired_by"], row["name_pairing"]["declared_raw_file"]),
+                )
+                csv_row = self.csv_row(_with_classes(manifest, samples, "Sample7"), f"{PREFIX}S7.raw")
+                self.assertEqual(("Sample7", raw_file, "Treated"),
+                                 (csv_row["sample_id"], csv_row["sample_raw_file"], csv_row["class_id"]))
+                assert_every_member_on_record(self, manifest, [f"{PREFIX}S7.raw", "S7.mzML"])
+
+    def test_an_exact_name_still_keeps_a_prefix_from_pairing_a_file_of_its_own_encoding(self) -> None:
+        # What the exact-first rule protected is kept: a prefixed member of the encoding rank a member carries the
+        # row's name in is a different file (the prefixed .raw beside S7.raw, the row naming S7 or S7.raw), never
+        # paired. One of another rank is.
+        for raw_file in ("S7.raw", "S7"):
+            with self.subTest(raw_file=raw_file):
+                self.assertEqual({}, self.pairing([f"{PREFIX}S7.raw", "S7.raw"], [("Sample7", raw_file)]))
+        self.assertEqual({}, self.pairing([f"{PREFIX}S7.mzML", "S7.mzML"], [("Sample7", "S7")]))
+        self.assertEqual({f"{PREFIX}S7.raw": "S7"}, self.pairing([f"{PREFIX}S7.raw", "S7.mzML"], [("Sample7", "S7")]))
+
+    def test_a_member_of_the_rows_leading_identifier_and_an_mzml_of_its_stem_are_one_sample(self) -> None:
+        # The same through a leading identifier (ST001359's shape): VV_13_HEpG2_C1_exp344_pos.raw shares the key vv_13
+        # with the row's VV_13_HEpG2_C1_pos.raw, and VV_13_HEpG2_C1_pos.mzML is of the row's stem. The mzML is no
+        # rival for the key (it is the row's own file): the token pairs the .raw, and the rule runs it alone.
+        name = "VV_13_HEpG2_C1_exp344_pos.raw"
+        manifest = self.unit([name, "VV_13_HEpG2_C1_pos.mzML"], [("V13", "VV_13_HEpG2_C1_pos.raw")],
+                             contents={"VV_13_HEpG2_C1_pos.mzML": mzml(dda_spectra(6))})
+
+        self.assertEqual(sorted([*self.TRIO, name]), self.names(manifest))
+        self.assertEqual([("VV_13_HEpG2_C1_pos.mzML", "lower_in_encoding_order")], self.choice(manifest, name))
+        row = self.rows(manifest)[name]
+        self.assertEqual(("V13", "leading_identifier_token"), (row["sample_id"], row["name_pairing"]["paired_by"]))
+        self.assertEqual([], manifest["input_name_pairings"]["refused"])
+        self.assertEqual([], (manifest.get("unattributed_members") or {}).get("members") or [])
+        assert_every_member_on_record(self, manifest, [name, "VV_13_HEpG2_C1_pos.mzML"])
 
     def test_a_prefixed_name_in_the_units_polarity_folder_and_untokened_is_one_candidate(self) -> None:
         # The pairing reads one sample as the rule does: POS/<prefix>S8.raw and <prefix>S8.raw in a positive unit are

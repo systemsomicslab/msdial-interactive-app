@@ -90,10 +90,15 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     polarity is one sample's with a path that states the unit's own
     (`POS/S1.raw` and `S1.raw` in a positive unit), or, in a unit that gives
     none, the only one its stem's paths state; the pairing rules read one
-    sample the same way.
+    sample the same way. One row's files are one sample's whatever their
+    stems: a file of the stem of the name the row gives, in any encoding, and
+    one a prefix or a leading identifier pairs with the row
+    (`021518_387057_CSHp_S7.mzML` for a row naming `S7.mzML`, beside `S7.raw`),
+    their polarities parting them as they part one stem's paths.
   - The candidates: what the unit admits by itself, the members of its own
     archive no row pairs with, and every other file found of an admitted
-    file's stem and sample polarity (`_stem_mates`). The analysis CSV pairs
+    file's stem and sample polarity (`_stem_mates`), or, for a file paired by
+    a prefix or a leading identifier, of the stem of the name its row gives. The analysis CSV pairs
     such a file with the row of that stem whatever encoding the row names, so
     a shared archive's `S1.raw` beside the `S1.mzML` a row names is that
     sample's encoding, not one of the archive's unpaired members, and the rule
@@ -130,7 +135,10 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     taken as readable, as before. A sample none of whose files can be used,
     one of which was refused only for its header, still uses that vendor file:
     the header read at the lease is no exclusion, and the preflight decides the
-    file, as it decides a sample's only file. Readability is asked in the
+    file, as it decides a sample's only file. Its other files keep the reasons
+    they could not be used for (`undecodable`, `conversion_failed`,
+    `requires_conversion`, a header of their own), never an order reason, so
+    the preflight never reads one as a fallback not taken. Readability is asked in the
     rule's order and only until one file is readable, so an mzXML is converted
     only where nothing before it can be read, and where its conversion fails
     the next mzXML of the sample is converted. The convert stage starts for
@@ -139,7 +147,13 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - The pairing rules (prefixed name, leading identifier) take one sample's
     files as one candidate and pair each of them with the row; which runs is
     the rule's. A file used for a sample whose row paired with another of its
-    files takes that pairing.
+    files takes that pairing. A name a member carries exactly keeps a prefix
+    or a leading identifier from pairing another member with it only where
+    that member is of the same encoding rank (a prefixed `.raw` beside `S7.raw`
+    is a different file, as before); one of another rank is the row's
+    sample's other encoding and is paired (a prefixed `.raw` beside the
+    `S7.mzML` an extensionless row `S7` names). A file of the row's own stem is
+    no rival for a leading identifier.
 
   The record (the schema gate #37 is to read):
   - `manifest.encoding_choices`: every sample the rule chose for among more
@@ -198,6 +212,13 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     folder that did not arrive whole, gives way to its sample's next encoding.
     Before, the first was excluded at the preflight with the sample's mzML
     unused, and the second failed the lease.
+  - A row's file paired by a prefix or a leading identifier and a file of the
+    row's own stem run once, the higher in the order: a row naming `S7.mzML`
+    beside `021518_387057_CSHp_S7.mzML` and `S7.raw` runs `S7.raw` as the
+    row's sample, unit-scoped archive or shared; a row naming `S7.raw` or `S7`
+    beside the prefixed `.raw` and `S7.mzML` runs the prefixed `.raw`. Before,
+    both ran (the second as an unattributed sample), or the shared archive's
+    vendor file was left out.
   - Folders no longer decide whether two encodings are one sample's: the
     folder words that named an encoding (`_sample_locus`) are gone, and one
     stem with no stated polarity is one sample's in any folder.

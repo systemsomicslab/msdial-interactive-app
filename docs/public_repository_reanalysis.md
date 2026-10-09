@@ -234,10 +234,17 @@ them later), and two sample rows (rows naming `S1.raw` and `S1.mzML` each keep
 their own; an unattributed member of that stem is left out on record as
 `stem_of_several_sample_rows`). A path that states no polarity is one sample's
 with a path that states the unit's own (`POS/S1.raw` and `S1.raw` in a positive
-unit).
+unit). One row's files are one sample's whatever their stems: a file of the stem
+of the name the row gives, in any encoding, and one a prefix or a leading
+identifier pairs with the row (`021518_387057_CSHp_S7.mzML` for a row naming
+`S7.mzML`, beside `S7.raw`: the `.raw` runs as the row's sample, and the prefixed
+mzML is unused). A name a member carries exactly keeps a prefix or a leading
+identifier from pairing another member with the row only where that member is
+of the same encoding rank; one of another rank is the sample's other encoding.
 
 The candidates are what the unit admits by itself, the members of its own
 archive no row pairs with, and every other file found of an admitted file's stem
+or, for a file a prefix or a leading identifier pairs, of its row's stem
 (`_stem_mates`): a shared archive's `S1.raw` beside the `S1.mzML` a row names is
 that sample's encoding, and the rule reaches it. A shared archive's members of
 no admitted file's stem stay out (excluded on record, as before). A unit whose
@@ -259,8 +266,10 @@ that has another candidate. Without an extractor a vendor file is taken as
 readable; a preflight that then cannot read it warns
 `encoding_fallback_not_taken`, naming the next encoding. A sample none of whose
 files can be used, one of which was refused only for its header, still uses that
-vendor file, and the preflight decides it as it decides a sample's only file.
-Readability is asked in the rule's order and only until one file is readable, so
+vendor file, and the preflight decides it as it decides a sample's only file;
+its other files keep the reasons they could not be used for (`undecodable`,
+`conversion_failed`, `requires_conversion`), so the preflight never reads one as
+a fallback not taken. Readability is asked in the rule's order and only until one file is readable, so
 an mzXML is converted only where nothing before it can be read.
 
 The record:
