@@ -22,6 +22,7 @@ not one to one.
 
 from __future__ import annotations
 
+import copy
 import csv
 import hashlib
 import io
@@ -40,6 +41,7 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
     from msdial_app.repository_analysis_rows import (
         MAPPING_FAILURES,
         PARTIAL_SAMPLE_COVERAGE_WARNING,
+        analysis_csv_change,
         blocking_failures,
         build_repository_analysis_rows,
     )
@@ -1806,6 +1808,19 @@ class TheOneEncodingRule(_Workspace):
             [item for item in manifest["input_name_pairings"]["paired"] if item["declared_raw_file"] == declared],
         )
         self.assertIn(INFERRED_PAIRING_WARNING, manifest["warnings"])
+        # The analysis-CSV record (review ia-final): the input that runs is listed with the pairing as it was made,
+        # by ``member``, and with the file the rule used for its sample, never as an input a prefix paired itself.
+        built = build_repository_analysis_rows(manifest)
+        recorded = copy.deepcopy(manifest)
+        analysis_csv_change(built, "analysis.csv")(recorded)
+        csv_row = self.csv_row(manifest, used)
+        self.assertEqual(
+            [{"input": Path(csv_row["input_path"]).name, "sample_id": "Sample7", "sample_raw_file": declared,
+              "declared_raw_file": declared, "member_name": member, "paired_by": PREFIXED_MEMBER_PAIRING,
+              "encoding_used": encoding_used}],
+            [item for item in recorded["analysis_csv"]["inferred_name_pairings"]
+             if item["declared_raw_file"] == declared],
+        )
 
     def test_a_file_of_the_rows_stem_is_not_recorded_as_paired_by_a_prefix(self) -> None:
         # Probe P3c: S7.raw runs as Sample7, the row naming S7.mzML. It carries no prefix; the member a prefix paired

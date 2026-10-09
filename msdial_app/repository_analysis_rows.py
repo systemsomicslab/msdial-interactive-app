@@ -695,13 +695,28 @@ def build_repository_analysis_rows(
     for row in rows:
         if row["raw_file_paired_by"] in ("", PAIRED_EXACTLY, UNATTRIBUTED_MEMBER_PAIRING):
             continue
-        pairing = (lineage_by_key.get(_file_key(row["input_path"])) or {}).get("name_pairing") or {}
+        lineage_row = lineage_by_key.get(_file_key(row["input_path"])) or {}
+        pairing = lineage_row.get("name_pairing") or {}
+        # An input the one encoding rule used for a sample whose row a rule paired through another of its files
+        # (2026-10-09, clause 4; its encoding_choice.stands_for is the member the rule paired) is listed with that
+        # pairing as it was made, by that member, and with the file the rule used (encoding_used), as the manifest's
+        # input_name_pairings.paired lists it: the input itself was paired by no rule (review of PR #69, ia-final).
+        choice = lineage_row.get("encoding_choice") if isinstance(lineage_row.get("encoding_choice"), dict) else {}
+        member = str(pairing.get("member_name") or "")
+        stands_in = bool(member and choice.get("stands_for") and choice.get("used")) and (
+            Path(str(choice["stands_for"])).name.casefold() == member.casefold()
+        )
         inferred.append(
             {
                 "input": Path(row["input_path"]).name,
                 "sample_id": row["sample_id"],
                 "sample_raw_file": row["sample_raw_file"],
-                **{key: pairing[key] for key in ("declared_raw_file", "paired_by", "key") if key in pairing},
+                **{
+                    key: pairing[key]
+                    for key in ("declared_raw_file", "member_name", "paired_by", "key")
+                    if key in pairing
+                },
+                **({"encoding_used": str(choice["used"])} if stands_in else {}),
             }
         )
     warnings = []

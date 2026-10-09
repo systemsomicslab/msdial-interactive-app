@@ -304,7 +304,9 @@ The record:
   pairing as it was made (`member_name` is the member paired, not the input), and
   `input_name_pairings.paired` lists it by that member with `encoding_used`, the
   file the rule used for its sample: `021518_387057_CSHp_S7.mzML` paired with
-  `S7.mzML`, `encoding_used` `S7.raw`. The input is never recorded as paired by
+  `S7.mzML`, `encoding_used` `S7.raw`. The analysis-CSV record's
+  `inferred_name_pairings` lists the input that runs (`input` `S7.raw`) with the
+  same `member_name` and `encoding_used`. The input is never recorded as paired by
   a rule that did not pair it.
 - A file left unused is no input and no excluded candidate, and a declared input
   left unused is not missing from the analysis CSV. The attribute stage counts

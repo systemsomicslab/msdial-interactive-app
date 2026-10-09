@@ -199,6 +199,9 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     `inferred_name_pairings`) lists it once, by that member, with
     `encoding_used`, the path of the file the rule used for its sample, as the
     sample's choice names it; a split part lists it where it holds that file.
+    The analysis-CSV record's `inferred_name_pairings` (`analysis_csv`) lists
+    the input that runs with the same `member_name` and `encoding_used`; every
+    entry there now names its `member_name`.
     A row naming `S7.mzML` beside `021518_387057_CSHp_S7.mzML` and `S7.raw`
     runs `S7.raw` as the row's sample, and the record says the prefix paired
     `021518_387057_CSHp_S7.mzML` (`encoding_used` `S7.raw`). An earlier state of
