@@ -4,6 +4,115 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.37] - Unreleased
+
+### Changed
+- A campaign unit's `<project>_Loaded.msp2.dbs`, MS-DIAL's copy of every library
+  the run loaded, goes into a library-copy store instead of being deleted. This
+  is the user's decision of 2026-10-11: keep one copy per library set and
+  annotation settings in a local-only store, keep the containers in
+  `output/msdial-intermediates` as before, and reopen a unit through a restore
+  step. The store is `<workspace_root>\_library_copies` (`library_copy_store`).
+  - A copy is identified in one pass over the file. Its content key is the
+    sha256 of its sorted zip entries (name with `/` for `\`, CRC-32, size)
+    under a version prefix, and the object id is the key's first 32
+    characters. Its normalised sha256 is the file's sha256 with every DOS time
+    and date field zeroed, in the local headers and the central directory. Its
+    sha256 is the file as written, as recorded before. A copy is recognised
+    when it holds exactly one `Storage` entry and otherwise only
+    MetabolomicsDB, ProteomicsDB or EadLipidomicsDB databases. A file that is
+    not is keyed by its sha256 and is only ever found equal to the same bytes.
+  - A new content is moved in (copied and compared on another volume, or when
+    other names share the file), checked with `zipfile.testzip`, and
+    installed with `entry.json` and a claim. Its intent is written into
+    `incoming\<uuid>\` before the move, so a crash is completed by
+    `status --repair`, not set aside.
+  - A copy the store already holds is removed only after the object's own
+    bytes, re-read under its lock, prove equal (`deduplicated`), or after
+    every entry decompresses to the object's (`deduplicated_by_content`). One
+    with an object's key and other content goes to `quarantine\` with a
+    warning. A damaged object is replaced by the copy and kept beside it
+    (`damaged-<utc>.dbs`).
+  - A copy that cannot be stored stays in the output under the existing
+    `loaded_library_copy` sharing hold, now with `store_errors`, and the
+    hold's retry stores it. This covers no store located, a lock not taken
+    and any I/O error. A lock timeout no longer reaches the generic
+    `finalisation` hold that a person must clear.
+  - The unit records `console_run_finalisation.loaded_library_copy` (schema
+    `msdial-loaded-library-copy.v1`): the store relative to the workspace
+    root, each copy's identity, outcome and object id, and the errors.
+    Readers still accept `loaded_library_copies_deleted` from earlier runs. A
+    copy stored by the retry of a run that is no longer the unit's current one
+    is named in the top-level `library_copy_records` (schema
+    `msdial-library-copy-record.v1`).
+  - `entry.json` records the libraries by name and sha256 from
+    `console_run_finalisation.libraries`, never a path, and the run's
+    annotation settings: the method file's annotation lines and the annotator
+    tables, with every path reduced to its file name.
+  - No record, log line, job record or error names the store by an absolute
+    path. An OSError is written as its type, its Windows or POSIX code, its
+    text and the file relative to the workspace root.
+- Every Console Interactive starts for a repository unit gets TMP and TEMP
+  pointed at `<workspace_root>\_tmp\<job id>`. This covers production runs,
+  peak-count diagnostics and the retention-time preview, which now carries the
+  unit's manifest in its preparation. MS-DIAL writes every stream it saves,
+  the whole library copy among them, to a temporary file before moving it
+  into place, so every campaign run used to write the private copy through
+  the user profile's TEMP on C:.
+  - After the Console ends, what is left there is listed by name and size in
+    the job's `console_outcome.console_temp` and in the run attempt.
+  - A leftover laid out as a library copy goes to the store, or is held from
+    sharing; the rest is removed.
+  - A unit whose workspace root cannot be located runs as before and says so
+    in its log.
+  - Laboratory runs are unchanged: their Console keeps the TEMP its user has.
+- `_library_copies`, `_tmp` and `_viewing` are reserved workspace names, like
+  `_dl` and `_campaigns`: never a unit, an accession or a repository.
+- `refresh_retained_artifacts` leaves a unit restored for viewing alone
+  (`viewing_restore_active`).
+
+### Added
+- MCP tools `msdial_restore_project_for_viewing` and
+  `msdial_undo_project_restore` (`project_restore`), each a preview unless
+  `confirmed=true`.
+  - A restore copies each retained container from `output/msdial-intermediates`
+    back to the path under the raw directory its `relative_path` names. That
+    is where the `.mddata` looks. It creates the directories it needs, with
+    the raw files present or released. Containers are copied, never moved or
+    linked.
+  - It links the run's store object into the output under the run's own
+    `.dbs` name: a hard link on the same volume, else a verified copy.
+  - It backs up the `.mdproject`, `.mddata` and `_Loaded.msp2` into
+    `<workspace_root>\_viewing\r-<restore id>\`, whose `restore.local.json` lists
+    every path it made, journalled before each step.
+  - It records `viewing_restores[]` and a hold `{step: viewing_restore, blocks:
+    [sharing, raw_deletion]}` that no retry lifts. Publication, raw cleanup,
+    discard and split-parent release refuse while it stands.
+  - It refuses, writing nothing, a unit with no finalisation, no campaign
+    approval or no store object for its run. It also refuses a restore already
+    standing, any other finalisation hold, a run or download under way, a raw
+    deletion begun and not finished, and any target that exists.
+  - The preview reports counts, bytes, whether the raw files are present, and
+    every path relative to the workspace root.
+  - The undo removes exactly what the record lists and puts back a project file
+    whose sha256 changed. It reports, never deletes, any other file that
+    appeared in the output or the raw-side directories. A library copy
+    MS-DIAL's save wrote over the link goes through the store
+    (`library_copy_records`, action `undo_gui_copy`). A file still held open
+    leaves the restore `partial` and held.
+  - Nothing launches MS-DIAL.
+- `python -m msdial_app.library_copy_store` for migration, not run on real data
+  by this version. Each step is a preview unless `--confirmed` is given.
+  - `seed <dbs> --workspace-root <root>` copies a verified copy into the store,
+    never moving or linking it. It records the libraries and settings of the
+    run directory that holds it.
+  - `attach <manifest> --object <id>` appends a `library_copy_records` item
+    (action `attach`, verified by `library_and_settings_identity`) to a unit
+    finalised before 0.5.37. It refuses unless the unit's libraries (name and
+    sha256) and annotation settings equal the object's.
+  - `status --workspace-root <root> [--verify] [--repair]` reports objects,
+    claims, unfinished ingests and quarantined copies.
+
 ## [0.5.36] - Unreleased
 
 ### Changed

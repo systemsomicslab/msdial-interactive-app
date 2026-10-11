@@ -532,6 +532,8 @@ Core MCP tools:
 - `msdial_cleanup_repository_raw`: preview and explicitly confirm post-validation raw-data deletion, a split parent's release included
 - `msdial_discard_repository_raw`: preview and explicitly confirm deletion of raw data that produced no validated output
 - `msdial_download_store_status`: show the accession download stores (objects, claims, partial transfers), read-only
+- `msdial_restore_project_for_viewing`: preview and explicitly confirm reopening a finalised campaign unit's project in the MS-DIAL GUI (containers copied back, library copy linked from the store, unit held)
+- `msdial_undo_project_restore`: preview and explicitly confirm taking such a restore back
 
 Agent API 0.5 binds mzTab-M, QA, publication, and handoff operations to the
 production `job_id`. Files left by earlier runs in the same output directory are

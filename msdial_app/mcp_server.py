@@ -284,6 +284,14 @@ def _structured_validation_errors(function):
                     "detail": str(error),
                     "error_type": type(error).__name__,
                 }
+            if str(error).startswith("viewing_restore_refused:"):
+                # A restore for viewing, or its undo, refused before anything was written.
+                return {
+                    "ok": False,
+                    "reason": "viewing_restore_refused",
+                    "detail": str(error),
+                    "error_type": type(error).__name__,
+                }
             return {
                 "ok": False,
                 "reason": "validation_error",
@@ -2121,7 +2129,8 @@ def msdial_cleanup_repository_raw(
 
     A finished run whose MS-DIAL containers could not be moved out of the raw tree holds the deletion
     (finalisation_holds in the manifest). Both calls retry that move first; while it still fails the preview
-    lists it as a blocker and the deletion is refused.
+    lists it as a blocker and the deletion is refused. A project restored for viewing
+    (msdial_restore_project_for_viewing) holds it too, until msdial_undo_project_restore takes it back.
 
     A unit leased through the accession download store releases its store claims with its tree. The
     preview's download_store says how many of the tree's bytes are links to the store's files
@@ -2228,6 +2237,77 @@ def msdial_download_store_status(
     return download_store_status(
         _validated_workspace_root(workspace_root), repository=repository, accession=accession, unit_id=analysis_unit_id
     )
+
+
+def _existing_manifest(manifest_path: str) -> Path:
+    path = Path(str(manifest_path or "")).expanduser()
+    if not str(manifest_path or "").strip() or not path.is_absolute() or not path.is_file():
+        raise ValueError("Give the absolute path of an existing unit manifest (provenance/run-manifest.json).")
+    return path.resolve()
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_restore_project_for_viewing(
+    manifest_path: str,
+    job_id: str = "",
+    confirmed: bool = False,
+) -> dict[str, Any]:
+    """Preview, and only on explicit confirmation make, a finalised campaign unit's MS-DIAL project openable for viewing.
+
+    Finalisation moves a campaign unit's MS-DIAL containers into output/msdial-intermediates and its
+    loaded-library copy into the library-copy store (<workspace_root>/_library_copies), so the project cannot be
+    opened as it stands. A restore copies each container back to the path under the raw directory the .mddata
+    names - creating the directories it needs, whether the raw files are present or released - links the run's
+    store object into the output under the run's own <project>_Loaded.msp2.dbs name (a hard link on the same
+    volume, else a verified copy), and backs up the .mdproject, .mddata and _Loaded.msp2 under
+    <workspace_root>/_viewing/r-<restore_id>. Containers are copied, never moved or linked.
+
+    While it stands, a viewing_restore hold blocks sharing and raw deletion: no publication report, raw cleanup,
+    discard or split-parent release, the campaign's included, until msdial_undo_project_restore takes it back.
+
+    It is refused - nothing written - for a unit with no run finalisation or no campaign approval, a run that
+    moved no containers, no store object recorded for the run (a unit finalised before 0.5.37 needs
+    `python -m msdial_app.library_copy_store attach` first), a restore already standing, any other finalisation
+    hold, a run or download under way, a raw deletion begun and not finished, and any target path that exists.
+
+    With confirmed=false nothing is written and the result carries the store object and how it was verified,
+    the number and bytes of containers, the targets and directories it would create, whether the raw files are
+    present (when they are not, MS-DIAL needs a GUI that opens a project without them), every path relative to
+    the workspace root, and the hold. Only a caller that has shown those to the user and received an explicit
+    answer may call again with confirmed=true. job_id defaults to the unit's finalised run, the only one that
+    can be restored. Nothing here launches MS-DIAL.
+    """
+    from .project_restore import restore_project_for_viewing
+
+    return restore_project_for_viewing(_existing_manifest(manifest_path), job_id=job_id, confirmed=bool(confirmed))
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_undo_project_restore(
+    manifest_path: str,
+    restore_id: str = "",
+    confirmed: bool = False,
+) -> dict[str, Any]:
+    """Preview, and only on explicit confirmation take back, a restore made by msdial_restore_project_for_viewing.
+
+    It removes exactly what the restore's record lists - the container copies, the directories it made (only
+    when empty) and the library-copy link - puts back a .mdproject, .mddata or _Loaded.msp2 whose sha256 changed
+    since its backup (the changed file is kept under _viewing/r-<restore_id>/gui-saved), and lifts the
+    viewing_restore hold, recording the outcome in viewing_restores. Any other file that appeared in the output
+    or in the raw-side directories it copied into is reported, never deleted. If MS-DIAL's save replaced the
+    link with a new library copy, that copy goes through the library-copy store, which removes it only where it
+    holds the same content. A file still open in MS-DIAL is left and the restore stays held (state partial);
+    close MS-DIAL and call again.
+
+    With confirmed=false nothing is removed and the result lists what would be removed, put back and reported.
+    Only a caller that has shown those to the user and received an explicit answer may call again with
+    confirmed=true. restore_id defaults to the one restore standing on the unit.
+    """
+    from .project_restore import undo_project_restore
+
+    return undo_project_restore(_existing_manifest(manifest_path), restore_id=restore_id, confirmed=bool(confirmed))
 
 
 @mcp.tool()

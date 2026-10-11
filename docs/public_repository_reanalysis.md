@@ -347,12 +347,47 @@ run and before validation, the finalised run's set moves to
 `output\msdial-intermediates\` with its path under the raw directory kept, and
 is retained file by file; the job that moved it is in the record. Sets left by
 earlier attempts are recorded as superseded and go with the raw data.
-`<project>_Loaded.msp2.dbs`, MS-DIAL's copy of every library the run loaded, is
-deleted and recorded by name, size and SHA-256. The saved project cannot then be
-reopened as it stands: its `.mddata` names the containers by their
-raw-directory paths and its loader needs the library copy. Any other run,
-including a trial unit whatever its retention policy, keeps its containers
-beside its inputs and its library copy in its output, as before.
+`<project>_Loaded.msp2.dbs`, MS-DIAL's copy of every library the run loaded
+(with the private VS21 pair, a 0.28 or 0.86 GB copy of the private library),
+goes into the library-copy store, `<workspace_root>\_library_copies`, which
+keeps one copy per content and is never shared. A copy is found by a key over
+its zip entries (names, CRC-32 and sizes) and is removed from the output only
+once the store holds one proven equal: the same bytes but for the zip
+timestamps, re-read from the stored object, or entries that decompress to the
+same content. The unit records the object under
+`console_run_finalisation.loaded_library_copy` (until 0.5.37 the copy was
+deleted and recorded under `loaded_library_copies_deleted`). A copy the store
+cannot take stays in the output under the `loaded_library_copy` sharing hold,
+and the hold's retry stores it. Any other run, including a trial unit whatever
+its retention policy, keeps its containers beside its inputs and its library
+copy in its output, as before.
+
+The saved project cannot be reopened as it stands: its `.mddata` names the
+containers by their raw-directory paths and its loader reads the library copy
+beside the project. `msdial_restore_project_for_viewing` (preview with
+`confirmed=false`) copies each retained container back to the path the
+`.mddata` names, creating the directories it needs whether the raw files are
+present or released, and links the store object into the output under the
+run's own `.dbs` name; it backs up the `.mdproject`, `.mddata` and
+`_Loaded.msp2` under `<workspace_root>\_viewing\r-<restore id>`, whose
+`restore.local.json` lists every path the restore made. While it stands, a
+`viewing_restore` hold blocks sharing and raw deletion. With the raw files
+released, MS-DIAL needs a GUI that opens a project without them.
+`msdial_undo_project_restore` removes exactly what the record lists, puts back
+a project file MS-DIAL changed, and reports, never deletes, any other file
+that appeared. A unit finalised before 0.5.37 has no stored object;
+`python -m msdial_app.library_copy_store seed` copies a verified `.dbs` into the
+store, and `... attach <manifest> --object <id>` names the object a unit's
+deleted copy stands for when its recorded libraries and annotation settings
+are the object's.
+
+MS-DIAL writes every stream it saves, the whole library copy included, to a
+temporary file before moving it into place. Every Console Interactive starts
+for a repository unit, the retention-time preview included, therefore gets TMP
+and TEMP pointed at `<workspace_root>\_tmp\<job id>`; what is left there
+afterwards is listed in the run attempt (`console_temp`), a library copy goes
+to the store, and the rest is removed. A laboratory run keeps the TEMP its user
+has.
 
 What a repository unit shares carries no path from this machine: the mzTab-M's
 `database[n]-uri` is `null` for a library without a DOI or https source and
