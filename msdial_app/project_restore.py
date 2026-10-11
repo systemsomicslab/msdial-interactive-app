@@ -265,8 +265,8 @@ def _plan(manifest_path: Path, job_id: str) -> dict[str, Any]:
     link = output / name
     if os.path.lexists(extended_path(link)):
         raise RestoreRefused(
-            f"the output already holds {name}. If MS-DIAL wrote it, it is a copy of the loaded libraries: a retry "
-            "of its finalisation stores it."
+            f"the output already holds {name}. If MS-DIAL wrote it, it is a copy of the loaded libraries outside "
+            "the library-copy store, and a person decides what it is before anything is linked over it."
         )
     project_files = {suffix: output / f"{project}{suffix}" for suffix in (".mdproject", ".mddata", "_Loaded.msp2")}
     for suffix in (".mdproject", ".mddata"):
