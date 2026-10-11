@@ -76,7 +76,14 @@ from .repository_reanalysis import (
     update_manifest,
     _write_json,
 )
-from .run_finalisation import finalise_console_run
+from .library_copy_store import (
+    CONSOLE_TEMP_DIRECTORY_NAME,
+    annotation_settings,
+    console_temp_directory,
+    describe_error,
+    settle_console_temp,
+)
+from .run_finalisation import _sharing_context, finalise_console_run, hold_library_copies
 from .campaign_authorization import CampaignAuthorizationError, authorize, unit_identity
 from .process_liveness import process_created_at
 from .workflow import (
@@ -691,6 +698,67 @@ def _cancel_job(job_id: str, reason: str = "") -> tuple[HTTPStatus, dict[str, An
         }
 
 
+def _console_temp_for(job_id: str, preparation: dict[str, Any]) -> tuple[Path | None, str]:
+    """A repository unit's Console TEMP, <workspace root>/_tmp/<job id>, or None and why not.
+
+    A laboratory run names no unit, and its Console keeps the TEMP its user has, as before.
+    """
+    manifest_text = str(preparation.get("repository_run_manifest") or "").strip()
+    if not manifest_text:
+        return None, ""
+    return console_temp_directory(Path(manifest_text), job_id)
+
+
+def _settle_console_temp(
+    job_id: str, preparation: dict[str, Any], directory: Path | None, why: str, log: Callable[[str], None]
+) -> dict[str, Any] | None:
+    """What the Console left in its TEMP, settled once it has ended, and logged. Never raises.
+
+    A library copy MS-DIAL wrote there and did not move into place goes to the library-copy store, or is held
+    from sharing in the unit manifest; everything else is removed. No log line names an absolute path.
+    """
+    manifest_text = str(preparation.get("repository_run_manifest") or "").strip()
+    if not manifest_text:
+        return None
+    if directory is None:
+        log(f"WARNING: no workspace root could be located for this unit ({why}), so the Console kept its "
+            "temporary files in the system TEMP directory.")
+        return {"redirected": False, "reason": why}
+    label = f"{CONSOLE_TEMP_DIRECTORY_NAME}/{directory.name}"
+    run_directory = Path(str(preparation.get("run_directory") or "."))
+    try:
+        settled = settle_console_temp(
+            directory,
+            manifest_path=manifest_text,
+            job_id=job_id,
+            libraries=lambda: _sharing_context(preparation)[0].identities(),
+            settings=annotation_settings(run_directory, str(preparation.get("method_file") or "") or None),
+        )
+    except Exception as error:  # a record of temporary files is not worth the run
+        log(f"WARNING: the Console's temporary files in {label} could not be settled: {describe_error(error)}")
+        return {"redirected": True, "directory": label, "errors": [describe_error(error)]}
+    for item in settled["library_copies"]:
+        log(f"A loaded-library copy MS-DIAL left in {label} went to the library-copy store: {item['outcome']} as "
+            f"object {item['object_id']}.")
+    if settled["held"]:
+        hold_library_copies(
+            manifest_text, job_id, settled["held"], settled["errors"],
+            "MS-DIAL left a copy of every loaded library in the Console's temporary directory, and the "
+            "library-copy store could not take it",
+        )
+        log(f"WARNING: {len(settled['held'])} loaded-library copy(ies) MS-DIAL left in {label} could not be "
+            "stored, and they are held from sharing: " + "; ".join(settled["errors"][:3]))
+    if settled["removed_files"]:
+        log(f"Console temporary files: {settled['removed_files']} file(s) ({settled['removed_bytes']} bytes) were "
+            f"left in {label} and removed.")
+    failed = [item for item in settled["errors"] if not any(item.startswith(Path(path).name + ":")
+                                                         for path in settled["held"])]
+    if failed:
+        log(f"WARNING: {len(failed)} Console temporary file(s) could not be removed from {label} (the first is "
+            f"{failed[0]})")
+    return {"redirected": True, **settled, "held": [Path(path).name for path in settled["held"]]}
+
+
 def _run_console_for_job(
     job_id: str, kind: str, preparation: dict[str, Any], log: Callable[[str], None]
 ) -> int:
@@ -699,11 +767,14 @@ def _run_console_for_job(
     The attempt is opened in the unit manifest before the Console starts, given the Console's process id
     as soon as it has one, and closed with the exit code and the reason when it returns; a local analysis
     names no manifest and records nothing. The job holds the Console's process id and deadline while it
-    runs, and a cancel reaches the Console through the job's flag.
+    runs, and a cancel reaches the Console through the job's flag. A repository unit's Console keeps its
+    temporary files in <workspace root>/_tmp/<job id>, settled once it has ended (console_temp in the
+    outcome and in the attempt).
     """
     with JOBS_LOCK:
         entry = PROCESSES.get(job_id) or _register_process_locked(job_id, kind)
     manifest_text = str(preparation.get("repository_run_manifest") or "").strip()
+    temp_directory, temp_why = _console_temp_for(job_id, preparation)
     attempt = None
     if manifest_text:
         attempt = record_run_start(
@@ -754,8 +825,12 @@ def _run_console_for_job(
             cancel_event=entry["cancel"],
             on_start=started,
             outcome=outcome,
+            temp_directory=temp_directory,
         )
     except BaseException as error:
+        settled = _settle_console_temp(job_id, preparation, temp_directory, temp_why, log)
+        if settled is not None:
+            outcome["console_temp"] = settled
         if manifest_text:
             record_run_end(
                 Path(manifest_text),
@@ -766,9 +841,14 @@ def _run_console_for_job(
                 {
                     "error": f"{type(error).__name__}: {error}",
                     **({"stop": outcome["stop"]} if "stop" in outcome else {}),
+                    **({"console_temp": outcome["console_temp"]} if "console_temp" in outcome else {}),
                 },
             )
         raise
+    else:
+        settled = _settle_console_temp(job_id, preparation, temp_directory, temp_why, log)
+        if settled is not None:
+            outcome["console_temp"] = settled
     finally:
         with JOBS_LOCK:
             PROCESSES.pop(job_id, None)
@@ -780,7 +860,8 @@ def _run_console_for_job(
     if manifest_text:
         stop = {
             key: outcome[key]
-            for key in ("stop", "process_exit_code", "idle_seconds", "still_running", "output_left_open")
+            for key in ("stop", "process_exit_code", "idle_seconds", "still_running", "output_left_open",
+                        "console_temp")
             if key in outcome
         }
         record_run_end(
@@ -2672,8 +2753,8 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
         # tuning job has made exactly this check on its own single expected file all along.
         export_verification = _verify_expected_exports(preparation)
         # Before anything reads the outputs: the mzTab-M loses this machine's locations, and a campaign
-        # unit's MS-DIAL containers leave the raw tree and its loaded-library copy is deleted. What is
-        # validated, inventoried and shared below is what the run keeps.
+        # unit's MS-DIAL containers leave the raw tree and its loaded-library copy goes to the library-copy
+        # store. What is validated, inventoried and shared below is what the run keeps.
         finalisation = finalise_console_run(
             job_id, preparation, artifacts, exit_code, export_verification, log
         )
@@ -3026,7 +3107,14 @@ def _run_rt_correction_job(job_id: str, preparation: dict[str, Any]) -> None:
         log("Starting RT correction EIC audit.")
         log("Command: " + " ".join(preparation["command"]))
         preparation["run_started_ns"] = time.time_ns()
-        exit_code = run_console(preparation, log)
+        temp_directory, temp_why = _console_temp_for(job_id, preparation)
+        try:
+            exit_code = run_console(preparation, log, temp_directory=temp_directory)
+        finally:
+            settled = _settle_console_temp(job_id, preparation, temp_directory, temp_why, log)
+            if settled is not None:
+                with JOBS_LOCK:
+                    JOBS[job_id]["console_temp"] = settled
         result = parse_rt_correction_result(preparation) if exit_code == 0 else None
         with JOBS_LOCK:
             JOBS[job_id]["exit_code"] = exit_code

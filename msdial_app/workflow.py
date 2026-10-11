@@ -2837,6 +2837,8 @@ def prepare_rt_correction_run(state: dict[str, Any]) -> dict[str, Any]:
         "run_directory": str(output_root),
         "analysis_type": "lcms",
         "kind": "rt_correction",
+        # A repository unit's preview keeps its Console's temporary files under the workspace root, as its runs do.
+        "repository_run_manifest": str(state.get("repository_run_manifest") or ""),
         "command": command,
         "template_file": str(template_path),
         "method_file": str(method_path),
@@ -3361,6 +3363,7 @@ def run_console(
     cancel_event: threading.Event | None = None,
     on_start: Callable[[int], None] | None = None,
     outcome: dict[str, Any] | None = None,
+    temp_directory: str | Path | None = None,
 ) -> int:
     """Run the prepared Console command, passing each line of its output to ``on_line``.
 
@@ -3380,6 +3383,11 @@ def run_console(
     remaining output a bounded time to arrive.
 
     Nothing is watched unless asked: with none of the three, the Console runs exactly as it always has.
+
+    ``temp_directory``, when given, is created and becomes the Console's TMP and TEMP. MS-DIAL writes every
+    stream it saves - the whole loaded-library copy among them, 0.86 GB with the private positive-mode library -
+    to a temporary file before moving it into place (DirectoryTreeStreamManager), so without it every run wrote
+    that copy through the user profile's TEMP on C:. What is left there afterwards is the caller's to settle.
 
     ``on_start`` receives the Console's process id as soon as the process exists. If it raises, the
     Console is stopped and the exception propagates, so no Console runs that its caller could not
@@ -3412,6 +3420,12 @@ def run_console(
             {"reason": "cancelled", "exit_code": CONSOLE_EXIT_CANCELLED, "ended_at": _utc_now()}
         )
         return CONSOLE_EXIT_CANCELLED
+    environment = None
+    if temp_directory is not None:
+        # Created here, so that a directory that cannot be made stops the run rather than sending its
+        # temporary files back to the system TEMP.
+        Path(temp_directory).mkdir(parents=True, exist_ok=True)
+        environment = {**os.environ, "TMP": str(temp_directory), "TEMP": str(temp_directory)}
     process = subprocess.Popen(
         preparation["command"],
         cwd=str(Path(preparation["command"][0]).parent)
@@ -3423,6 +3437,7 @@ def run_console(
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        env=environment,
         # Its own process group, so a stop can end everything it started (POSIX; Windows uses taskkill).
         **({"start_new_session": True} if watched and os.name != "nt" else {}),
     )
