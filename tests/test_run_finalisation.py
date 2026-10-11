@@ -3,8 +3,9 @@
 MS-DIAL writes its per-file and alignment containers beside the files it reads, so deleting a unit's raw data
 deleted them; every earlier attempt left a set of its own under a minute-resolution name; and the output held
 <project>_Loaded.msp2.dbs, a serialised copy of every library the run loaded - with the private VS21 pair, a
-copy of the private library in every unit. Both were decided for the campaign; a unit no campaign approval
-covers keeps the project MS-DIAL can reopen.
+copy of the private library in every unit. It goes to the library-copy store beside the units, once per content
+(0.5.37; deleted before). Both were decided for the campaign; a unit no campaign approval covers keeps the
+project MS-DIAL can reopen.
 
 On Windows a file another process holds open cannot be replaced or deleted, and a container's path below the
 output can pass MAX_PATH. What a run could not do is held in the unit manifest, and the raw cleanup refuses
@@ -26,7 +27,10 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from msdial_app import run_finalisation, server
+from msdial_app import library_copy_store, run_finalisation, server
+from msdial_app.download_store import StoreLockTimeout
+from msdial_app.library_copy_store import STORE_DIRECTORY_NAME, LibraryCopyStore, read_copy_identity
+from msdial_app.materials_methods import generate_publication_report
 from msdial_app.diagnostic_paths import extended_path, intermediate_files, path_is_file
 from msdial_app.repository_reanalysis import (
     _write_json,
@@ -41,10 +45,11 @@ from msdial_app.run_finalisation import (
     FinalisationHeld,
     INTERMEDIATES_DIRECTORY,
     campaign_approval_recorded,
-    delete_loaded_library_copies,
     relocate_intermediates,
     resolve_finalisation_holds,
+    store_loaded_library_copies,
 )
+from test_library_copy_store import synthetic_dbs
 
 CURRENT = "20269271740"
 EARLIER = "20269261728"
@@ -303,22 +308,35 @@ class LongPathTests(unittest.TestCase):
 
 
 class LoadedLibraryCopyTests(unittest.TestCase):
-    def test_the_serialised_library_copy_is_deleted_and_recorded(self) -> None:
+    def test_the_serialised_library_copy_goes_to_the_store_and_is_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary)
-            copy = _write(output / "Project-2609270540_Loaded.msp2.dbs", b"every loaded library")
+            root = Path(temporary).resolve()
+            output = root / "metabolights" / "MTBLS-SYN" / "unit-syn" / "output"
+            copy = synthetic_dbs(output / "Project-2609270540_Loaded.msp2.dbs")
+            digest = hashlib.sha256(copy.read_bytes()).hexdigest()
             loaded = _write(output / "Project-2609270540_Loaded.msp2", b"")
             project = _write(output / "Project-2609270540.mdproject", b"PK")
-            deleted, errors = delete_loaded_library_copies(output)
+            store = LibraryCopyStore(root)
+            copies, errors = store_loaded_library_copies(output, store, unit=None, job_id="job1")
 
             self.assertEqual([], errors)
             self.assertFalse(copy.exists())
             self.assertTrue(loaded.exists())
             self.assertTrue(project.exists())
-        self.assertEqual(
-            [{"name": copy.name, "size_bytes": 20, "sha256": hashlib.sha256(b"every loaded library").hexdigest()}],
-            [{key: item[key] for key in ("name", "size_bytes", "sha256")} for item in deleted],
-        )
+            [item] = copies
+            self.assertEqual((copy.name, digest, "stored"), (item["name"], item["sha256"], item["outcome"]))
+            self.assertTrue(store.object_path(item["object_id"]).is_file())
+
+    def test_without_a_store_every_copy_stays_with_its_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            copy = synthetic_dbs(Path(temporary) / "Project-1_Loaded.msp2.dbs")
+            lines: list[str] = []
+            copies, errors = store_loaded_library_copies(copy.parent, None, unit=None, job_id="job1",
+                                                         why="no root here", log=lines.append)
+            self.assertTrue(copy.exists())
+        self.assertEqual([], copies)
+        self.assertEqual([f"{copy.name}: no library-copy store could be located (no root here)"], errors)
+        self.assertIn("stays in the output, held from sharing", lines[0])
 
 
 def _mztab(raw: Path) -> str:
@@ -341,10 +359,13 @@ class RunJobTests(unittest.TestCase):
 
     INPUTS = ["Sample_A", "QC_01"]
     DBS = "Project-2609270540_Loaded.msp2.dbs"
+    dbs_time = (2026, 9, 27, 5, 40, 0)
 
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
-        self.root = Path(self.directory.name) / "unit"
+        # <workspace root>/<repository>/<accession>/<unit>, so the library-copy store is found beside the units.
+        self.workspace_root = Path(self.directory.name).resolve()
+        self.root = self.workspace_root / "metabolights" / "MTBLS-SYN" / "unit-syn"
         self.raw = self.root / "raw"
         self.data = self.raw / "data"
         self.output = self.root / "output"
@@ -373,7 +394,7 @@ class RunJobTests(unittest.TestCase):
         self._let_go()
         self.directory.cleanup()
 
-    def _unit_manifest(self, campaign: bool) -> None:
+    def _unit_manifest(self, campaign: bool, repository: str = "metabolights") -> None:
         _write_json(self.manifest, {
             "schema": "msdial-public-reanalysis-run.v1",
             "status": "prepared",
@@ -381,7 +402,7 @@ class RunJobTests(unittest.TestCase):
             "raw_directory": str(self.raw),
             "output_directory": str(self.output),
             "raw_retention_policy": "delete_after_validated_output" if campaign else "keep",
-            "project": {"repository": "metabolights", "accession": "MTBLS-SYN", "analysis_unit_id": "unit-syn"},
+            "project": {"repository": repository, "accession": "MTBLS-SYN", "analysis_unit_id": "unit-syn"},
             # A campaign run records the approval it crossed boundary 4 under before it starts.
             **({"campaign_authorizations": [CROSSING]} if campaign else {}),
         })
@@ -411,7 +432,7 @@ class RunJobTests(unittest.TestCase):
             (self.output / f"AlignResult-{CURRENT}.mzTab").write_bytes(_mztab(self.raw).encode())
             _write(self.output / "Project-2609270540.mdproject", b"project")
             _write(self.output / "Project-2609270540_Loaded.msp2", b"")
-            _write(self.output / self.DBS, b"a copy of the private library")
+            synthetic_dbs(self.output / self.DBS, date_time=self.dbs_time)
             # Another process opens what the Console has just written, and keeps it open.
             self.handles.extend((self.root / relative).open("rb") for relative in hold)
             return exit_code
@@ -450,19 +471,78 @@ class RunJobTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256((destination / name).read_bytes()).hexdigest(), inventory[name]["sha256"])
         with zipfile.ZipFile(self.output / "msdial-project-artifacts.zip") as archive:
             self.assertEqual(["Project-2609270540.mdproject"], archive.namelist())
-        # The library copy is gone, recorded by name, size and sha256; nothing names it as an artifact.
+        # The library copy left the output for the store, which names the object it is; nothing names it as an
+        # artifact, and no record carries the store's absolute path.
         self.assertFalse((self.output / self.DBS).exists())
         finalisation = manifest["console_run_finalisation"]
         self.assertTrue(finalisation["campaign_approval_recorded"])
-        self.assertEqual([self.DBS], [item["name"] for item in finalisation["loaded_library_copies_deleted"]])
+        self.assertNotIn("loaded_library_copies_deleted", finalisation)
+        block = finalisation["loaded_library_copy"]
+        self.assertEqual(("msdial-loaded-library-copy.v1", STORE_DIRECTORY_NAME, []),
+                         (block["schema"], block["store"], block["errors"]))
+        [copy] = block["copies"]
+        self.assertEqual((self.DBS, "stored", True), (copy["name"], copy["outcome"], copy["recognised"]))
+        store = LibraryCopyStore(self.workspace_root)
+        self.assertIsNone(store.problem(copy["object_id"], full=True))
+        entry = store.entry(copy["object_id"])
+        self.assertEqual(["Synthetic-Private-pos.msp"], [item["name"] for item in entry["libraries"]])
+        self.assertEqual(copy["annotation_settings_sha256"], (entry["annotation_settings"] or {}).get("sha256"))
         self.assertNotIn(self.DBS, json.dumps(job["artifacts"]))
         self.assertEqual([], manifest[HOLDS])
+        store_root = str(self.workspace_root / STORE_DIRECTORY_NAME)
+        for text in (json.dumps(job), json.dumps(manifest), self.manifest.read_text(encoding="utf-8")):
+            self.assertNotIn(store_root, text)
+            self.assertNotIn(store_root.replace("\\", "\\\\"), text)
         # The mzTab-M that was validated is the redacted one.
         text = (self.output / f"AlignResult-{CURRENT}.mzTab").read_text(encoding="utf-8")
         self.assertIn("MTD\tdatabase[1]-uri\tnull", text)
         self.assertIn("MTD\tms_run[1]-location\traw/data/Sample_A.mzML", text)
         self.assertEqual("local_only", inventory["mztab-redaction.local.json"]["sharing"])
         self.assertEqual("passed", manifest["mztab_validation"]["summary"]["status"])
+
+    def test_a_second_unit_run_with_the_same_libraries_leaves_the_store_one_copy(self) -> None:
+        first = synthetic_dbs(self.workspace_root / "elsewhere" / "Project-1_Loaded.msp2.dbs",
+                              date_time=(2026, 9, 26, 1, 2, 4))
+        stored = LibraryCopyStore(self.workspace_root).put(first, read_copy_identity(first), unit=None, job_id="x")
+        job = self._run(self._preparation())
+        [copy] = read_manifest(self.manifest)["console_run_finalisation"]["loaded_library_copy"]["copies"]
+
+        self.assertEqual("completed", job["status"], job.get("error"))
+        self.assertEqual(("deduplicated", stored["object_id"]), (copy["outcome"], copy["object_id"]))
+        self.assertFalse((self.output / self.DBS).exists())
+        self.assertTrue(any("already holds the same bytes" in line for line in job["logs"]))
+
+    def test_a_store_lock_not_taken_holds_the_copy_from_sharing_and_never_deletes_it(self) -> None:
+        with patch.object(library_copy_store.StoreLock, "acquire", side_effect=StoreLockTimeout("held")):
+            job = self._run(self._preparation())
+        manifest = read_manifest(self.manifest)
+
+        self.assertEqual("completed", job["status"], job.get("error"))
+        self.assertTrue((self.output / self.DBS).exists())
+        [hold] = manifest[HOLDS]
+        # Not the finalisation hold a person must clear: the retry stores it.
+        self.assertEqual((["sharing"], "loaded_library_copy"), (hold["blocks"], hold["step"]))
+        self.assertIn("lock", hold["store_errors"][0])
+        self.assertEqual([], resolve_finalisation_holds(self.manifest))
+        self.assertFalse((self.output / self.DBS).exists())
+        [copy] = read_manifest(self.manifest)["console_run_finalisation"]["loaded_library_copy"]["copies"]
+        self.assertEqual("stored", copy["outcome"])
+
+    def test_a_unit_whose_store_cannot_be_located_keeps_its_copy_held(self) -> None:
+        self._unit_manifest(campaign=True, repository="elsewhere")
+        job = self._run(self._preparation())
+        manifest = read_manifest(self.manifest)
+
+        self.assertEqual("completed", job["status"], job.get("error"))
+        self.assertTrue((self.output / self.DBS).exists())
+        [hold] = manifest[HOLDS]
+        self.assertEqual("loaded_library_copy", hold["step"])
+        self.assertIn("no library-copy store could be located", hold["store_errors"][0])
+        self.assertIsNone(manifest["console_run_finalisation"]["loaded_library_copy"]["store"])
+        self.assertFalse((self.workspace_root / STORE_DIRECTORY_NAME).exists())
+        with self.assertRaises(FinalisationHeld):
+            generate_publication_report({"repository_run_manifest": str(self.manifest)}, None, self.output,
+                                        app_version="test", console_version="test")
 
     def test_a_trial_repository_run_without_a_campaign_approval_keeps_the_project_msdial_reopens(self) -> None:
         # The raw data are kept, so the project stays openable: its containers beside the inputs the .mddata
@@ -482,6 +562,8 @@ class RunJobTests(unittest.TestCase):
         self.assertFalse(finalisation["campaign_approval_recorded"])
         self.assertNotIn("msdial_intermediates", finalisation)
         self.assertNotIn("loaded_library_copies_deleted", finalisation)
+        self.assertNotIn("loaded_library_copy", finalisation)
+        self.assertFalse((self.workspace_root / STORE_DIRECTORY_NAME).exists())
         self.assertEqual(["msdial_intermediates", "loaded_library_copy"], finalisation["left_as_before"]["steps"])
         text = (self.output / f"AlignResult-{CURRENT}.mzTab").read_text(encoding="utf-8")
         self.assertIn("MTD\tdatabase[1]-uri\tnull", text)
@@ -495,6 +577,8 @@ class RunJobTests(unittest.TestCase):
         self.assertTrue((self.data / f"AlignResult-{CURRENT}.arf2").exists())
         self.assertFalse((self.output / self.DBS).exists())
         self.assertNotIn("msdial_intermediates", manifest["console_run_finalisation"])
+        [copy] = manifest["console_run_finalisation"]["loaded_library_copy"]["copies"]
+        self.assertEqual("stored", copy["outcome"])
 
     def test_a_laboratory_run_keeps_its_project_and_loses_only_the_private_library_location(self) -> None:
         settings = self.output / "workflow-settings.json"
@@ -510,6 +594,9 @@ class RunJobTests(unittest.TestCase):
         self.assertIn("MTD\tdatabase[1]-uri\tnull", text)
         self.assertIn(f"file://{self.raw.as_posix()}/data/Sample_A.mzML", text)
         self.assertEqual("laboratory", job["console_run_finalisation"]["scope"])
+        # A laboratory run keeps the TEMP its user has: no Console temporary directory is made or recorded.
+        self.assertNotIn("console_temp", job.get("console_outcome") or {})
+        self.assertFalse((self.workspace_root / "_tmp").exists())
 
     def test_a_defect_in_finalisation_holds_the_unit_for_a_person_and_the_run_is_still_validated(self) -> None:
         with patch.object(run_finalisation, "relocate_intermediates", side_effect=RuntimeError("synthetic defect")):
@@ -563,7 +650,7 @@ class RunJobTests(unittest.TestCase):
         self.assertEqual(["msdial_intermediates"], [item["step"] for item in manifest["finalisation_hold_resolutions"]])
 
     @unittest.skipUnless(WINDOWS, HELD)
-    def test_a_held_library_copy_is_held_from_sharing_and_deleted_once_let_go(self) -> None:
+    def test_a_held_library_copy_is_held_from_sharing_and_stored_once_let_go(self) -> None:
         job = self._run(self._preparation(), hold=(f"output/{self.DBS}",))
         manifest = read_manifest(self.manifest)
 
@@ -571,14 +658,22 @@ class RunJobTests(unittest.TestCase):
         [hold] = manifest[HOLDS]
         self.assertEqual((["sharing"], "loaded_library_copy"), (hold["blocks"], hold["step"]))
         self.assertTrue((self.output / self.DBS).exists())
+        self.assertTrue(hold["store_errors"])
+        self.assertNotIn(str(self.workspace_root), json.dumps(hold["store_errors"]))
         # It holds sharing, not the raw deletion: every container left the raw tree.
         self.assertTrue(plan_download_cleanup(self.manifest)["ready_for_confirmation"])
 
         self._let_go()
         self.assertEqual([], resolve_finalisation_holds(self.manifest))
         self.assertFalse((self.output / self.DBS).exists())
-        [resolution] = read_manifest(self.manifest)["finalisation_hold_resolutions"]
-        self.assertEqual([self.DBS], [item["name"] for item in resolution["deleted"]])
+        manifest = read_manifest(self.manifest)
+        [resolution] = manifest["finalisation_hold_resolutions"]
+        [stored] = resolution["library_copies"]
+        self.assertEqual((self.DBS, "stored"), (stored["name"], stored["outcome"]))
+        # The run's own record names the object, as finalisation would have.
+        self.assertEqual([stored["object_id"]], [item["object_id"] for item in
+                                                 manifest["console_run_finalisation"]["loaded_library_copy"]["copies"]])
+        self.assertIsNone(LibraryCopyStore(self.workspace_root).problem(stored["object_id"], full=True))
 
 
 class HoldTests(unittest.TestCase):
@@ -627,6 +722,26 @@ class HoldTests(unittest.TestCase):
         self.assertTrue(campaign_approval_recorded({"split_from": {"manifest_path": str(parent)}}))
         self.assertFalse(campaign_approval_recorded({"split_from": {"manifest_path": str(self.root / "none.json")}}))
         self.assertFalse(campaign_approval_recorded({}))
+
+    def test_a_retry_names_its_object_in_the_runs_record_or_by_job_for_a_superseded_run(self) -> None:
+        stored = {"name": "P_Loaded.msp2.dbs", "object_id": "a" * 32, "outcome": "stored"}
+        current = {"console_run_finalisation": {"job_id": "run2"}}
+
+        run_finalisation._record_library_copies(current, "run2", [stored], "retry")
+        self.assertEqual([stored], current["console_run_finalisation"]["loaded_library_copy"]["copies"])
+        run_finalisation._record_library_copies(current, "run1", [stored], "retry")
+        [record] = current["library_copy_records"]
+        self.assertEqual(("msdial-library-copy-record.v1", "retry", "run1", "a" * 32),
+                         (record["schema"], record["action"], record["job_id"], record["object_id"]))
+
+    def test_a_viewing_restore_is_never_lifted_by_a_retry(self) -> None:
+        hold = run_finalisation._hold(["sharing", "raw_deletion"], "viewing_restore", "job1", "restored for viewing",
+                                      restore_id="r1", record="_viewing/r-r1/restore.local.json")
+        manifest = self._unit("unit", status="mztab_validated", **{HOLDS: [hold]})
+
+        self.assertEqual((hold, None), run_finalisation._retry_hold(hold, manifest, run_finalisation._Patience()))
+        self.assertEqual([hold["id"]], [item["id"] for item in resolve_finalisation_holds(manifest)])
+        self.assertNotIn("finalisation_hold_resolutions", read_manifest(manifest))
 
 
 if __name__ == "__main__":  # pragma: no cover

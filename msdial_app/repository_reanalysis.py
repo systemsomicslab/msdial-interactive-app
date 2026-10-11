@@ -41,6 +41,11 @@ from .diagnostic_paths import (
     path_is_file,
     plain_path,
 )
+from .library_copy_store import (
+    CONSOLE_TEMP_DIRECTORY_NAME as CONSOLE_TEMP_DIRECTORY,
+    STORE_DIRECTORY_NAME as LIBRARY_COPY_STORE_DIRECTORY,
+    VIEWING_DIRECTORY_NAME as VIEWING_DIRECTORY,
+)
 from .download_store import (
     LIVE_CLAIM_STATES,
     STORE_DIRECTORY,
@@ -2944,8 +2949,12 @@ class _LeaseStages:
 # stand for its parts until the parent's own release.
 #
 # RESERVED NAMES. _dl is the store's directory beside an accession's units, and _campaigns the campaign
-# runner's beside the repositories; neither is ever a unit, an accession or a repository.
-RESERVED_WORKSPACE_NAMES = frozenset({STORE_DIRECTORY, "_campaigns"})
+# runner's beside the repositories. Beside the repositories too: _library_copies, the store of MS-DIAL's
+# loaded-library copies (library_copy_store); _tmp, a repository unit's Console TEMP, one directory per job; and
+# _viewing, what a restore for viewing keeps (project_restore). None is ever a unit, an accession or a repository.
+RESERVED_WORKSPACE_NAMES = frozenset({
+    STORE_DIRECTORY, "_campaigns", LIBRARY_COPY_STORE_DIRECTORY, CONSOLE_TEMP_DIRECTORY, VIEWING_DIRECTORY,
+})
 DOWNLOAD_CACHE_SCHEMA = "msdial-download-cache.v1"
 RAW_STORAGE_SCHEMA = "msdial-raw-storage.v1"
 STORE_RELEASE_SCHEMA = "msdial-download-store-release.v1"
@@ -5616,13 +5625,17 @@ def refresh_retained_artifacts(manifest_path: Path) -> dict[str, Any]:
     the finalisation rule would now keep, re-hashes every retained path that still exists, and keeps a
     listed path that has gone missing listed, so the cleanup plan still reports it missing.
 
-    Only a manifest that has been finalised is refreshed; anything else is reported and left alone.
+    Only a manifest that has been finalised is refreshed; anything else is reported and left alone. Nor is one
+    restored for viewing (project_restore): what MS-DIAL changes while it is open is not what the run kept.
     """
     manifest_path = Path(manifest_path).resolve()
     try:
         manifest = read_manifest(manifest_path)
         if not manifest.get("finalized_at"):
             return {"refreshed": False, "reason": "not_finalized", "manifest_path": str(manifest_path)}
+        if any(isinstance(item, dict) and item.get("step") == "viewing_restore"
+               for item in manifest.get("finalisation_holds") or []):
+            return {"refreshed": False, "reason": "viewing_restore_active", "manifest_path": str(manifest_path)}
         output = Path(str(manifest.get("output_directory") or "")).resolve()
         results, records = _retained_result_paths(output, manifest_path.parent, manifest_path)
         found = [str(path) for path in (*results, *records)]
