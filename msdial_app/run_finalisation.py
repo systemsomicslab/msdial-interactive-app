@@ -28,9 +28,13 @@ THREE THINGS, decided by the user on 2026-09-30 for the unattended repository ca
    with its path under the raw directory kept, and the job that moved it is named in the record. The other
    sets of this unit's inputs are recorded as superseded and left to be deleted with the raw tree.
 
-3. ``<project>_Loaded.msp2.dbs``, MS-DIAL's serialised copy of every library the run loaded, is deleted from
-   the output once the run is over, its name, size and sha256 recorded. With the private VS21 pair it is a
-   copy of the private library in every unit, and it can never be shared.
+3. ``<project>_Loaded.msp2.dbs``, MS-DIAL's serialised copy of every library the run loaded, leaves the output
+   once the run is over. It goes into the library-copy store beside the units (``<workspace root>/_library_copies``,
+   msdial_app.library_copy_store), which keeps one copy per content: a copy whose content the store already holds
+   is removed, and the unit records the object it equals (``loaded_library_copy``, schema
+   msdial-loaded-library-copy.v1). With the private VS21 pair it is a copy of the private library, and it can
+   never be shared. Until 0.5.37 it was deleted, its name, size and sha256 recorded under
+   ``loaded_library_copies_deleted``, which readers still accept.
 
 1 applies to every run. 2 and 3 apply only to a unit a campaign approval has been recorded for - in its own
 manifest's campaign_authorizations, or in those of the unit it was split from - because they were decided for
@@ -54,8 +58,9 @@ Console could write can have a path too long for an ordinary move. Every file st
 PermissionError within one time budget, and the moves use extended-length paths. A step that still fails does
 not end as a log line. It becomes a hold in the unit manifest's ``finalisation_holds``:
 
-- one that blocks ``sharing`` (an mzTab-M that still names a location, a library copy still in the output) is
-  refused by the publication report, and must be refused by anything else built to leave this machine;
+- one that blocks ``sharing`` (an mzTab-M that still names a location, a library copy still in the output, a
+  project restored for viewing) is refused by the publication report, and must be refused by anything else
+  built to leave this machine;
 - one that blocks ``raw_deletion`` (containers still beside the inputs) is refused by the raw cleanup and the
   discard, a split parent's included when one of its parts holds it.
 
@@ -65,10 +70,10 @@ clears itself. A laboratory run has no manifest: its hold is in the job record a
 THE PROJECT CANNOT BE REOPENED AS IT STANDS once 2 and 3 have run. The ``.mdproject`` names the output
 directory and the ``.mddata``; the ``.mddata`` names every input by its absolute raw path and every container
 by its absolute path beside it, and the project loader reads the libraries back from
-``<project>_Loaded.msp2.dbs``. After this, and after the raw data are released, MS-DIAL stops at the missing
-library copy. Copying ``msdial-intermediates/`` back under the raw directory, with the raw files
-re-downloaded, restores every path the ``.mddata`` names; the library copy is not restorable without running
-again.
+``<project>_Loaded.msp2.dbs`` beside the project. msdial_app.project_restore puts them back for viewing: a copy
+of each container at the path the ``.mddata`` names, beside the raw files or where they were, and the library
+copy as a link to its store object - and takes them away again. While a restore stands, a ``viewing_restore``
+hold keeps the unit's outputs from being shared and its raw data from being deleted.
 """
 
 from __future__ import annotations
@@ -82,10 +87,32 @@ import shutil
 import time
 import urllib.parse
 import uuid
+import zlib
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
 from .diagnostic_paths import INTERMEDIATES_DIRECTORY, extended_path, path_is_file
+from .library_copy_store import (
+    COPY_SCHEMA,
+    DEDUPLICATED,
+    DEDUPLICATED_BY_CONTENT,
+    LEGACY_LIBRARY_COPY_RECORD,
+    LIBRARY_COPY_RECORD,
+    LIBRARY_COPY_RECORDS,
+    LOADED_LIBRARY_COPY_SUFFIX,
+    PENDING,
+    RECORD_SCHEMA,
+    STORE_DIRECTORY_NAME,
+    STORED,
+    LibraryCopyPending,
+    LibraryCopyStore,
+    annotation_settings,
+    describe_error,
+    library_copy_store_for,
+    read_copy_identity,
+    unit_ref,
+    workspace_root_for,
+)
 from .sharing import PATH_POLICY, SharingContext, local_path_of
 
 
@@ -96,6 +123,14 @@ HOLDS = "finalisation_holds"
 HOLD_RESOLUTIONS = "finalisation_hold_resolutions"
 BLOCKS_SHARING = "sharing"
 BLOCKS_RAW_DELETION = "raw_deletion"
+# console_run_finalisation's record of where each library copy went (0.5.37) is LIBRARY_COPY_RECORD;
+# LEGACY_LIBRARY_COPY_RECORD before it. A run whose record is not rewritten - a superseded run's retry, an attach
+# to a finalised unit - and a copy that is not the run's own (a GUI save, a Console's temporary file) name their
+# object in the top-level LIBRARY_COPY_RECORDS instead (library_copy_store).
+# The hold project_restore records while a restore stands. No retry knows it: only its undo lifts it.
+VIEWING_RESTORE = "viewing_restore"
+# A loaded_library_copy hold on what a Console left in its temporary directory rather than in the run's output.
+CONSOLE_TEMP_ORIGIN = "console_temp"
 
 # The pauses between attempts at a file step another process holds, drawn from one budget of waiting per call:
 # a unit whose every container is held waits the budget once, not once per file.
@@ -130,10 +165,15 @@ PROJECT_REOPEN = {
         "<project>_Loaded.msp2 and <project>_Loaded.msp2.dbs."
     ),
     "restore": (
-        "Copy msdial-intermediates/<path> back under the raw directory, with the raw files at the paths the "
-        "analysis CSV lists, to restore every container path the .mddata names. The loaded-library copy was "
-        "deleted after the run, so MS-DIAL's loader still stops at <project>_Loaded.msp2.dbs; reopening needs "
-        "the run repeated."
+        "msdial_restore_project_for_viewing makes the project openable again: it copies "
+        "msdial-intermediates/<path> back to the path under the raw directory the .mddata names, whether the raw "
+        "files are there or released, and links this run's loaded-library copy from the library-copy store into "
+        "the output under its own name. msdial_undo_project_restore takes both back. With the raw files "
+        "released, MS-DIAL needs a GUI that opens a project without them."
+    ),
+    "library_copy": (
+        "Kept once per distinct content in the library-copy store (<workspace root>/_library_copies); "
+        "loaded_library_copy names the object that holds this run's copy."
     ),
 }
 
@@ -587,32 +627,135 @@ def _pinned(relocation: dict[str, Any]) -> dict[str, Any]:
 # ---- 3. the loaded-library copy ------------------------------------------------------------------------
 
 
-def delete_loaded_library_copies(
-    output_directory: Path, patience: _Patience | None = None
+def _library_copy_line(item: dict[str, Any]) -> str:
+    """The log line for one copy the store took."""
+    name, size, object_id = item.get("name"), item.get("size_bytes"), item.get("object_id")
+    outcome = item.get("outcome")
+    if outcome == STORED and item.get("repaired_object"):
+        return (f"WARNING: library-copy object {object_id} was damaged ({item.get('repaired_problem')}); this "
+                "run's verified copy replaces it, and the damaged file is kept beside it.")
+    if outcome == STORED and not item.get("recognised"):
+        return (f"WARNING: {name} is not laid out as MS-DIAL's library copy ({item.get('not_recognised_because')});"
+                f" it was stored by its sha256 as object {object_id}, and nothing was deduplicated.")
+    if outcome == STORED:
+        return (f"Stored MS-DIAL's loaded-library copy {name} ({size} bytes) in the library-copy store as object "
+                f"{object_id}; it is the first copy of its content.")
+    if outcome == DEDUPLICATED:
+        return (f"Removed MS-DIAL's loaded-library copy {name} ({size} bytes): the library-copy store already "
+                f"holds the same bytes as object {object_id}.")
+    if outcome == DEDUPLICATED_BY_CONTENT:
+        return (f"Removed MS-DIAL's loaded-library copy {name} ({size} bytes): its entries decompress to the "
+                f"content of store object {object_id}, which differs from it only in compression.")
+    if outcome == PENDING:
+        return (f"WARNING: MS-DIAL's loaded-library copy {name} left the output for the library-copy store, and its "
+                f"install stopped before its record was written ({item.get('store_error')}). It is in the store, not "
+                "in the output; python -m msdial_app.library_copy_store status --repair completes it and names its "
+                "object in this unit's manifest.")
+    return (f"WARNING: MS-DIAL's loaded-library copy {name} has the content key of store object {object_id} but "
+            "other content; it was set aside in the store's quarantine, and this run cannot be reopened from the "
+            "store until a person looks.")
+
+
+def store_loaded_library_copies(
+    directory: Path,
+    store: LibraryCopyStore | None,
+    *,
+    unit: dict[str, Any] | None,
+    job_id: str,
+    libraries: list[dict[str, Any]] | None = None,
+    settings: dict[str, Any] | None = None,
+    patience: _Patience | None = None,
+    why: str = "",
+    how: str = "finalisation",
+    log: Callable[[str], None] | None = None,
+    skip: set[tuple[int, int]] | frozenset[tuple[int, int]] = frozenset(),
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Delete MS-DIAL's serialised copies of the loaded libraries, recording each by name, size and sha256."""
+    """Put MS-DIAL's serialised copies of the loaded libraries at the top of ``directory`` into the store.
+
+    Returns the record of each copy the store took - stored, found equal to an object and removed, set aside in
+    its quarantine, or left for the store's repair (pending: it left the directory and its install stopped before
+    its record) - and an error for each it could not take, which stays where it is. ``why`` says why there is no
+    store when ``store`` is None. A file whose (st_dev, st_ino) is in ``skip`` - the link a standing viewing
+    restore made - is not this run's and is left alone. Never raises for one copy.
+    """
     patience = patience or _Patience()
-    deleted: list[dict[str, Any]] = []
+    say = log or (lambda _line: None)
+    copies: list[dict[str, Any]] = []
     errors: list[str] = []
-    if not output_directory.is_dir():
-        return deleted, errors
-    for path in sorted(output_directory.glob(LOADED_LIBRARY_COPY)):
-        if not path.is_file():
+    if not directory.is_dir():
+        return copies, errors
+    root = store.workspace_root if store is not None else None
+    for path in sorted(directory.glob(LOADED_LIBRARY_COPY)):
+        if not path.is_file() or _file_id(path) in skip:
+            continue
+        if store is None:
+            errors.append(f"{path.name}: no library-copy store could be located ({why})")
+            say(f"WARNING: no library-copy store could be located for this unit ({why}), so MS-DIAL's "
+                f"loaded-library copy {path.name} stays in the output, held from sharing.")
             continue
         try:
-            size = path.stat().st_size
-            digest = _sha256(path)
-            patience.run(path.unlink)
-        except OSError as error:
-            errors.append(f"{path.name}: {error}")
+            item = store.put(path, read_copy_identity(path), unit=unit, job_id=job_id, libraries=libraries or [],
+                             settings=settings, how=how, patience=patience)
+        except LibraryCopyPending as error:
+            # It is no longer here, so no hold on this directory keeps it: the unit records it as pending, which
+            # the store's repair completes.
+            text = describe_error(error, root)
+            errors.append(f"{path.name}: {text}")
+            item = {**error.record, "outcome": PENDING, "store_error": text, "incoming": error.incoming,
+                    "removed_at": _now()}
+        except (OSError, ValueError, zlib.error) as error:
+            # LibraryCopyStoreError is an OSError, a lock timeout a ValueError (download_store.StoreError) and a
+            # damaged deflate stream a zlib.error: whichever, the copy stays and is held, never deleted, under the
+            # loaded_library_copy hold its retry lifts - not the finalisation hold a person must clear.
+            text = describe_error(error, root)
+            errors.append(f"{path.name}: {text}")
+            say(f"WARNING: MS-DIAL's loaded-library copy {path.name} could not be stored, and it is held in the "
+                f"output: {text}" if path.exists() else
+                f"WARNING: MS-DIAL's loaded-library copy {path.name} could not be stored, and it is no longer in the "
+                f"output: {text}")
             continue
-        deleted.append({"name": path.name, "size_bytes": size, "sha256": digest, "deleted_at": _now()})
-    return deleted, errors
+        copies.append(item)
+        say(_library_copy_line(item))
+    return copies, errors
 
 
-def _library_copies(directories: list[Path]) -> list[str]:
+def _file_id(path: Path) -> tuple[int, int] | None:
+    try:
+        details = os.stat(extended_path(path))
+    except OSError:
+        return None
+    return details.st_dev, details.st_ino
+
+
+def _library_copies(directories: list[Path], skip: set[tuple[int, int]] | frozenset[tuple[int, int]] = frozenset()
+                    ) -> list[str]:
     return [str(path) for directory in directories if directory.is_dir()
-            for path in sorted(directory.glob(LOADED_LIBRARY_COPY)) if path.is_file()]
+            for path in sorted(directory.glob(LOADED_LIBRARY_COPY)) if path.is_file() and _file_id(path) not in skip]
+
+
+def restore_links(manifest: dict[str, Any], manifest_path: Path | None = None) -> set[tuple[int, int]]:
+    """The (st_dev, st_ino) of every library-copy link a standing viewing restore made in this unit's output.
+
+    A restore links the run's store object into the output under the run's own .dbs name; a finalisation that
+    met it while the restore stood would take it for its own run's copy, and the store, finding it equal, would
+    unlink it from under the open project. Read from each restore's record under the workspace root.
+    """
+    found: set[tuple[int, int]] = set()
+    holds = [item for item in standing_holds(manifest) if item.get("step") == VIEWING_RESTORE]
+    if not holds:
+        return found
+    root, _why = workspace_root_for(manifest, manifest_path)
+    if root is None:
+        return found
+    for hold in holds:
+        try:
+            record = _read_json(root / str(hold.get("record") or ""))
+        except (OSError, ValueError):
+            continue
+        link = (record or {}).get("link") if isinstance(record, dict) else None
+        if isinstance(link, dict) and link.get("st_ino") is not None:
+            found.add((link.get("st_dev"), link.get("st_ino")))
+    return found
 
 
 # ---- holds -----------------------------------------------------------------------------------------------
@@ -685,10 +828,73 @@ def describe_holds(holds: list[dict[str, Any]]) -> str:
     )
 
 
+def _record_library_copies(current: dict[str, Any], job_id: str, copies: list[dict[str, Any]], action: str) -> None:
+    """Name the store objects of copies stored after a run's finalisation, in the manifest being written.
+
+    The run's own record gains its own copy - the output's <project>_Loaded.msp2.dbs - while it is the unit's
+    current run. A superseded run's record is never rewritten, and a copy that is not the run's own (one a
+    Console left in its temporary directory, action console_temp) never enters it: both are named in
+    library_copy_records instead, by job and action.
+    """
+    from . import __version__
+
+    finalisation = current.get("console_run_finalisation")
+    own = [item for item in copies
+           if action != CONSOLE_TEMP_ORIGIN and str(item.get("name") or "").endswith(LOADED_LIBRARY_COPY_SUFFIX)]
+    if isinstance(finalisation, dict) and str(finalisation.get("job_id") or "") == job_id and own:
+        block = finalisation.get(LIBRARY_COPY_RECORD)
+        if not isinstance(block, dict):
+            block = {"schema": COPY_SCHEMA, "store": STORE_DIRECTORY_NAME, "copies": [], "errors": []}
+            finalisation[LIBRARY_COPY_RECORD] = block
+        block["copies"] = [*(block.get("copies") or []), *own]
+        copies = [item for item in copies if item not in own]
+    if not copies:
+        return
+    current[LIBRARY_COPY_RECORDS] = [
+        *(current.get(LIBRARY_COPY_RECORDS) or []),
+        *({"schema": RECORD_SCHEMA, "action": action, "job_id": job_id, **item, "recorded_at": _now(),
+           "by": f"Interactive {__version__}"} for item in copies),
+    ]
+
+
+def record_console_temp(
+    manifest_path: str | Path, job_id: str, copies: list[dict[str, Any]], files: list[str], errors: list[str],
+    reason: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Name in the unit manifest what became of the library copies a Console left in its temporary directory.
+
+    Every copy the store took - stored, found equal, set aside, or pending its repair - under library_copy_records
+    (action console_temp: never the run's own copy), and a sharing hold on those it could not take (origin
+    console_temp: their retry stores them as such). One write. Returns (the hold, or None; the error that kept
+    the write from being made, or None). Never raises.
+    """
+    from .repository_reanalysis import update_manifest
+
+    hold = _hold([BLOCKS_SHARING], "loaded_library_copy", job_id, reason, files=list(files),
+                 store_errors=list(errors), origin=CONSOLE_TEMP_ORIGIN) if files else None
+    if not copies and hold is None:
+        return None, None
+
+    def change(current: dict[str, Any]) -> None:
+        if copies:
+            _record_library_copies(current, job_id, [dict(item) for item in copies], CONSOLE_TEMP_ORIGIN)
+        if hold is not None:
+            current[HOLDS] = [*standing_holds(current), hold]
+
+    try:
+        update_manifest(Path(manifest_path), change)
+    except (OSError, ValueError) as error:
+        return None, describe_error(error)
+    return hold, None
+
+
 def _retry_hold(
     hold: dict[str, Any], manifest_path: Path, patience: _Patience
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """(the hold as it stands after one retry, or None; a resolution note, or None)."""
+    """(the hold as it stands after one retry, or None; a resolution note, or None).
+
+    A step no retry knows - finalisation itself, a viewing_restore - is returned as it stands.
+    """
     step = hold.get("step")
     now = _now()
     note = {"hold": hold.get("id"), "step": step, "job_id": hold.get("job_id"), "resolved_at": now}
@@ -718,22 +924,66 @@ def _retry_hold(
             return {**hold, "files": left, "errors": errors, "last_retried_at": now}, None
         return None, {**note, "files": done}
     if step == "loaded_library_copy":
-        left, errors, deleted = [], [], []
+        # Stored, as finalisation would have: a retry that deleted could drop the first copy of a content.
+        manifest = _read_json(manifest_path)
+        store, why = library_copy_store_for(manifest, manifest_path)
+        root = store.workspace_root if store is not None else None
+        job_id = str(hold.get("job_id") or "")
+        finalisation = manifest.get("console_run_finalisation") if isinstance(
+            manifest.get("console_run_finalisation"), dict) else {}
+        libraries = (finalisation or {}).get("libraries") if (finalisation or {}).get("job_id") == job_id else []
+        origin = str(hold.get("origin") or "")
+        unit = unit_ref(manifest, manifest_path, root)
+        left, errors, stored = [], [], []
         for file in hold.get("files") or []:
             path = Path(str(file))
+            if store is None:
+                left.append(str(file))
+                errors.append(f"{path.name}: no library-copy store could be located ({why})")
+                continue
             if not path.is_file():
+                # Gone. A retry that stored it and then could not write this manifest leaves exactly that, and
+                # the store's own records say where it went. A copy they do not name is not settled by its
+                # absence: the hold stands, and a person looks.
+                try:
+                    found = store.find_settled(unit, job_id, origin or "retry", path.name)
+                except OSError as error:
+                    # A store whose directories cannot be listed: the hold stands, and the error names the store
+                    # relative to the workspace root, never by Python's text, which holds the absolute path.
+                    left.append(str(file))
+                    errors.append(f"{path.name}: it is no longer where this hold names it, and the library-copy store "
+                                  f"could not be read ({describe_error(error, root)}); call again")
+                    continue
+                if found is not None:
+                    stored.append(found)
+                else:
+                    left.append(str(file))
+                    errors.append(f"{path.name}: it is no longer where this hold names it, and the library-copy store "
+                                  f"records no copy of it from run {job_id or 'unrecorded'}; a person looks")
                 continue
             try:
-                size, digest = path.stat().st_size, _sha256(path)
-                patience.run(path.unlink)
-            except OSError as error:
+                stored.append(store.put(
+                    path, read_copy_identity(path), unit=unit, job_id=job_id, libraries=libraries or [],
+                    settings=None if origin == CONSOLE_TEMP_ORIGIN else annotation_settings(path.parent),
+                    how=origin or "retry", patience=patience,
+                ))
+            except LibraryCopyPending as error:
+                # It left for the store: not in the output any more, and named as pending until repair.
+                stored.append({**error.record, "outcome": PENDING, "store_error": describe_error(error, root),
+                               "incoming": error.incoming, "removed_at": _now()})
+            except (OSError, ValueError, zlib.error) as error:
                 left.append(str(file))
-                errors.append(f"{path.name}: {error}")
-                continue
-            deleted.append({"name": path.name, "size_bytes": size, "sha256": digest, "deleted_at": _now()})
+                errors.append(f"{path.name}: {describe_error(error, root)}")
         if left:
-            return {**hold, "files": left, "errors": errors, "last_retried_at": now}, None
-        return None, {**note, "deleted": deleted}
+            return {**hold, "files": left, "errors": errors, "store_errors": errors, "last_retried_at": now}, None
+        if origin == CONSOLE_TEMP_ORIGIN:
+            # The Console's temporary directory was kept only for what was held in it: gone with it, when empty.
+            for folder in {Path(str(file)).parent for file in hold.get("files") or []}:
+                try:
+                    os.rmdir(extended_path(folder))
+                except OSError:
+                    pass
+        return None, {**note, "library_copies": stored, **({"origin": origin} if origin else {})}
     if step == "msdial_intermediates":
         raw = Path(str(hold.get("raw_directory") or ""))
         if not str(hold.get("raw_directory") or "").strip() or not raw.is_dir():
@@ -758,12 +1008,20 @@ def _resolve_in(manifest_path: Path, patience: _Patience, log: Callable[[str], N
     if not holds:
         return []
     outcomes: dict[str, tuple[dict[str, Any] | None, dict[str, Any] | None]] = {}
+    root: Path | None = None
     for hold in holds:
         try:
             outcomes[str(hold.get("id"))] = _retry_hold(hold, manifest_path, patience)
         except Exception as error:  # a retry must not make a refusal into a crash
+            if root is None:
+                try:
+                    root = workspace_root_for(_read_json(manifest_path), manifest_path)[0]
+                except Exception:  # noqa: BLE001 - without a root, files are named by name alone
+                    root = None
+            # Written into the hold, the log and the tools' replies: an OSError by its code and its files relative to
+            # the workspace root, never by Python's text, which holds the absolute path.
             outcomes[str(hold.get("id"))] = (
-                {**hold, "errors": [f"{type(error).__name__}: {error}"], "last_retried_at": _now()}, None
+                {**hold, "errors": [describe_error(error, root)], "last_retried_at": _now()}, None
             )
     for updated, note in outcomes.values():
         if note:
@@ -784,6 +1042,9 @@ def _resolve_in(manifest_path: Path, patience: _Patience, log: Callable[[str], N
                 kept.append(updated)
             if note:
                 current[HOLD_RESOLUTIONS] = [*(current.get(HOLD_RESOLUTIONS) or []), note]
+                if note.get("library_copies"):
+                    _record_library_copies(current, str(note.get("job_id") or ""), note["library_copies"],
+                                           str(note.get("origin") or "retry"))
         current[HOLDS] = kept
 
     try:
@@ -1003,9 +1264,10 @@ def finalise_console_run(
 
     Every run gets the mzTab-M redaction. A unit a campaign approval covers also gets the other two: the
     containers move only for a run that produced every expected export, since a failed run's set is left to
-    be deleted with the raw tree, and the loaded-library copy is deleted whatever the outcome. ``artifacts``
-    loses the paths of what was deleted, so no later record names a file that is gone. What could not be done
-    is recorded as a hold in the unit manifest, which the steps it would make unsafe refuse.
+    be deleted with the raw tree, and the loaded-library copy goes to the library-copy store whatever the
+    outcome. ``artifacts`` loses the paths of what left the output, so no later record names a file that is
+    gone. What could not be done is recorded as a hold in the unit manifest, which the steps it would make
+    unsafe refuse.
     """
     record: dict[str, Any] = {
         "schema": SCHEMA, "job_id": job_id, "finalised_at": _now(), "errors": [], "holds": [],
@@ -1093,7 +1355,7 @@ def finalise_console_run(
         try:
             reader_created = reader_created_block(manifest, "run")
         except (OSError, ValueError) as error:
-            # A record, not a step anything waits on: the containers still move and the copy is still deleted.
+            # A record, not a step anything waits on: the containers still move and the copy is still stored.
             record["errors"].append(f"reader_created_files: {error}")
         if reader_created:
             record["reader_created_files"] = sum(len(item["files"]) for item in reader_created["containers"])
@@ -1138,24 +1400,39 @@ def finalise_console_run(
 
         if campaign:
             directories = [run_directory, *([output] if output.resolve() != run_directory.resolve() else [])]
-            deleted: list[dict[str, Any]] = []
+            store, why = library_copy_store_for(manifest, manifest_path)
+            unit = unit_ref(manifest, manifest_path, store.workspace_root if store is not None else None)
+            settings = annotation_settings(run_directory, str(preparation.get("method_file") or "") or None)
+            # A restore for viewing is refused while a run is live and a run while one stands; should one stand
+            # all the same, its link is the restored run's, never this run's copy.
+            links = restore_links(_read_json(manifest_path), manifest_path)
+            copies: list[dict[str, Any]] = []
+            store_errors: list[str] = []
             for directory in directories:
-                more, errors = delete_loaded_library_copies(directory, patience)
-                deleted.extend(more)
-                record["errors"].extend(errors)
-            record["loaded_library_copies_deleted"] = deleted
-            for item in deleted:
-                log(f"Deleted MS-DIAL's loaded-library copy {item['name']} ({item['size_bytes']} bytes, "
-                    f"sha256 {item['sha256']}).")
-            left = _library_copies(directories)
+                more, errors = store_loaded_library_copies(
+                    directory, store, unit=unit, job_id=job_id, libraries=record["libraries"], settings=settings,
+                    patience=patience, why=why, log=log, skip=links,
+                )
+                copies.extend(more)
+                store_errors.extend(errors)
+            record["errors"].extend(store_errors)
+            record[LIBRARY_COPY_RECORD] = {
+                "schema": COPY_SCHEMA,
+                # Relative to the workspace root, as everything the store records is.
+                "store": STORE_DIRECTORY_NAME if store is not None else None,
+                "copies": copies,
+                "errors": store_errors,
+            }
+            left = _library_copies(directories, links)
             if left:
-                log("WARNING: MS-DIAL's loaded-library copy could not be deleted, and it is held: "
+                log("WARNING: MS-DIAL's loaded-library copy could not be stored, and it is held: "
                     + ", ".join(Path(path).name for path in left))
                 holds.append(_hold(
                     [BLOCKS_SHARING], "loaded_library_copy", job_id,
                     "MS-DIAL's copy of every loaded library is still in the output", files=left,
+                    store_errors=store_errors,
                 ))
-            gone = {item["name"].casefold() for item in deleted}
+            gone = {item["name"].casefold() for item in copies if item.get("removed_at")}
             if gone:
                 for kind, paths in list(artifacts.items()):
                     if kind != "records" and isinstance(paths, list):

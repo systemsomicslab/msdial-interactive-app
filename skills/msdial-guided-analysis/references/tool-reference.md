@@ -232,6 +232,17 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   stores (`<workspace_root>\<repository>\<accession>\_dl`): each object and the
   units whose claims keep it, partial transfers, lock holders, unclaimed
   objects, and live claims of units whose raw data are already released.
+- `msdial_restore_project_for_viewing`: preview with `confirmed=false`, then,
+  after the user approves, make a finalised campaign unit's MS-DIAL project
+  openable for viewing: its retained containers are copied back to the paths
+  the `.mddata` names and its loaded-library copy is linked from the
+  library-copy store (`<workspace_root>\_library_copies`). A `viewing_restore`
+  hold blocks sharing and raw deletion, and no Console or new production run
+  starts on the unit (`viewing_restore_active`), until
+  `msdial_undo_project_restore` (also preview first) takes it back. No new
+  download lease or split is taken on the unit meanwhile. Ask the user to close
+  MS-DIAL without saving before confirming the undo; a confirmed undo is refused
+  while `MSDIAL.exe` runs. Nothing launches MS-DIAL.
 - `msdial_repository_reanalysis_plan`: inspect metadata, eligibility, the
   default Class hierarchy, and internal-standard declarations without
   downloading raw data. Pass `analysis_unit_handoff_path` for Catalog-driven

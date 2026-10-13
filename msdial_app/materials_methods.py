@@ -41,7 +41,8 @@ def generate_publication_report(
 ) -> dict[str, Any]:
     root = Path(output_root).expanduser().resolve()
     # A unit whose run left an mzTab-M naming a location of this machine, or MS-DIAL's library copy in its
-    # output, is held: its outputs are not published until a retry has done what the run could not.
+    # output, is held: its outputs are not published until a retry has done what the run could not. So is a
+    # unit restored for viewing (project_restore), until its undo.
     manifest_text = str(workflow.get("repository_run_manifest") or "").strip()
     if manifest_text:
         from .run_finalisation import BLOCKS_SHARING, FinalisationHeld, resolve_finalisation_holds
