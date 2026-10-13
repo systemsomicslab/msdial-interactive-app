@@ -16,6 +16,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -137,12 +138,13 @@ class _Finalised(unittest.TestCase):
         update_manifest(self.manifest, apply)
 
     def tree(self) -> dict[str, str]:
-        """Every file of the unit but its manifest, which records the restore."""
+        """Every file of the unit but its manifest, which records the restore, and the lock files beside it
+        (the manifest's writer lock and the raw-deletion lock a restore takes), which are never removed."""
         found = {}
         for directory, _folders, names in os.walk(self.workspace):
             for name in names:
                 path = Path(directory) / name
-                if path == self.manifest:
+                if path == self.manifest or (path.parent == self.manifest.parent and name.endswith(".lock")):
                     continue
                 found[path.relative_to(self.workspace).as_posix()] = _sha(path)
         return found
@@ -274,6 +276,16 @@ class TheRefusals(_Finalised):
         shutil.rmtree(self.store.object_directory(self.object_id))
         self.change(console_run_finalisation=finalisation)
         self.refused("does not match its record")
+
+    def test_a_copy_a_retry_deleted_before_the_store_existed_asks_for_an_attach(self) -> None:
+        finalisation = read_manifest(self.manifest)["console_run_finalisation"]
+        legacy = {key: value for key, value in finalisation.items() if key != "loaded_library_copy"}
+        # Up to 0.5.36 a copy held at finalisation was recorded there as none, and the retry that deleted it named
+        # it only in its hold's resolution.
+        self.change(console_run_finalisation={**legacy, "loaded_library_copies_deleted": []},
+                    finalisation_hold_resolutions=[{"hold": "h1", "step": "loaded_library_copy", "job_id": "run1",
+                                                    "deleted": [{"name": DBS, "size_bytes": 1, "sha256": "12" * 32}]}])
+        self.refused("library_copy_store attach")
 
     def test_any_hold_or_a_live_run_or_a_deletion_under_way(self) -> None:
         hold = _hold(["raw_deletion"], "msdial_intermediates", "run1", "one container left")
@@ -617,6 +629,270 @@ class TheUndo(_Finalised):
         self.assertTrue(undone["undone"], undone)
         self.assertFalse(self.raw.exists())
         self.assertFalse((self.output / DBS).exists())
+
+
+class TheRaces(_Finalised):
+    """What the restore reads before it writes is read again where nothing can start in between: the deletion
+    locks, and the manifest's writer lock as its hold is recorded."""
+
+    def assert_nothing_recorded(self) -> None:
+        manifest = read_manifest(self.manifest)
+        self.assertEqual([], manifest["finalisation_holds"])
+        self.assertNotIn("viewing_restores", manifest)
+        self.assertEqual([], list((self.root / "_viewing").glob("r-*")))
+        self.assertFalse((self.output / DBS).exists())
+
+    def test_a_deletion_that_holds_its_lock_refuses_the_restore(self) -> None:
+        ready, finished = threading.Event(), threading.Event()
+
+        def deletion() -> None:
+            with repository_reanalysis._raw_deletion_lock(self.manifest):
+                ready.set()
+                finished.wait(30)
+
+        thread = threading.Thread(target=deletion)
+        thread.start()
+        try:
+            self.assertTrue(ready.wait(30))
+            with self.assertRaisesRegex(RestoreRefused, "holds its lock"):
+                self.restore()
+        finally:
+            finished.set()
+            thread.join(30)
+        self.assert_nothing_recorded()
+        self.assertTrue(self.restore()["restored"])
+
+    def test_a_deletion_begun_after_the_plan_is_refused_as_the_hold_is_written(self) -> None:
+        self.change(raw_deletion={"state": "deleting", "kind": "cleanup", "target": str(self.raw)})
+        with patch.object(project_restore, "_refuse_live", lambda *_args: None):
+            with self.assertRaisesRegex(RestoreRefused, "has begun and not finished"):
+                self.restore()
+        self.assert_nothing_recorded()
+
+    def test_a_deletion_judged_before_the_restore_stood_deletes_nothing(self) -> None:
+        self.restore()
+        # Its own write of the intent reads the holds again: the restore's is there now.
+        with self.assertRaises(FinalisationHeld):
+            repository_reanalysis._delete_raw_tree(self.manifest, self.raw, kind="cleanup", authorized_by={},
+                                                   kept={}, finish=lambda _current: None)
+        self.assertTrue((self.raw / self.relatives[0]).is_file())
+        self.assertTrue((self.data / "Sample_A.mzML").is_file())
+        self.assertNotIn("raw_deletion", read_manifest(self.manifest))
+
+    def test_a_console_job_still_being_prepared_refuses_the_restore(self) -> None:
+        key = server._unit_key(str(self.manifest))
+        with patch.dict(server.CONSOLE_SLOTS, {key: "job7"}):
+            with self.assertRaisesRegex(RestoreRefused, "job job7"):
+                self.restore()
+            # And when it took the slot after the plan was read: refused as the hold is written.
+            with patch.object(project_restore, "_refuse_live", lambda *_args: None):
+                with self.assertRaisesRegex(RestoreRefused, "job job7"):
+                    self.restore()
+        self.assert_nothing_recorded()
+
+    def test_a_job_prepared_while_a_restore_was_recorded_stops_before_its_console(self) -> None:
+        self.restore()
+        preparation = {"command": [sys.executable, "-c", "pass"], "run_directory": str(self.output),
+                       "repository_run_manifest": str(self.manifest)}
+        processes = {"job8": {"kind": "run", "cancel": threading.Event(), "timeout_seconds": None,
+                              "idle_timeout_seconds": None, "pid": None}}
+        with patch.object(server, "PROCESSES", processes), patch.object(server, "JOBS", {}), \
+                patch.object(server, "_persist_jobs_locked", lambda: None), \
+                patch.object(server, "run_console", side_effect=AssertionError("the Console started")):
+            with self.assertRaises(server.UnitRestoredError):
+                server._run_console_for_job("job8", "run", preparation, lambda _line: None)
+        self.assertEqual({}, processes)
+        self.assertNotIn("run_attempts", read_manifest(self.manifest))
+
+
+class TheUndoAgainstSaves(_Finalised):
+    """MS-DIAL saves the library copy by deleting it and moving a new file into place, and holds nothing open
+    between saves: a save on close can land while the undo runs."""
+
+    def test_a_save_between_the_plan_and_the_removal_of_the_link_is_stored_never_deleted(self) -> None:
+        self.restore()
+        link = self.output / DBS
+        planned = project_restore._planned_undo
+
+        def plan_then_save(*args, **kwargs):
+            plan = planned(*args, **kwargs)
+            if plan["link"] is not None and plan["link"]["action"] == "remove":
+                link.unlink()
+                synthetic_dbs(link, storage=b"a library the user added in the GUI")
+            return plan
+
+        with patch.object(project_restore, "_planned_undo", plan_then_save):
+            undone = self.undo()
+        self.assertTrue(undone["undone"], undone)
+        self.assertFalse(link.exists())
+        [record] = read_manifest(self.manifest)["library_copy_records"]
+        self.assertEqual(("undo_gui_copy", "stored"), (record["action"], record["outcome"]))
+        self.assertNotEqual(self.object_id, record["object_id"])
+        self.assertIsNone(self.store.problem(record["object_id"], full=True))
+        self.assertEqual(1, os.stat(self.store.object_path(self.object_id)).st_nlink)
+        self.assertEqual([], [path.name for path in self.output.iterdir() if "~" in path.name])
+
+    def test_a_save_after_the_link_was_removed_keeps_the_restore_held_for_the_next_call(self) -> None:
+        self.restore()
+        link = self.output / DBS
+        remove = project_restore._remove
+
+        def save_on_close(path, busy, root):
+            if not link.exists():
+                synthetic_dbs(link, storage=b"saved on close")
+            return remove(path, busy, root)
+
+        with patch.object(project_restore, "_remove", save_on_close):
+            partial = self.undo()
+        self.assertFalse(partial["undone"])
+        self.assertIn("saved while the undo ran", partial["message"])
+        self.assertTrue(link.exists(), "never removed unstored")
+        self.assertEqual(["viewing_restore"], [item["step"] for item in read_manifest(self.manifest)["finalisation_holds"]])
+
+        done = self.undo()
+        self.assertTrue(done["undone"], done)
+        self.assertFalse(link.exists())
+        [record] = read_manifest(self.manifest)["library_copy_records"]
+        self.assertEqual(("undo_gui_copy", "stored"), (record["action"], record["outcome"]))
+
+    def busy_once(self):
+        write = repository_reanalysis.update_manifest
+        calls = []
+
+        def busy(path, change):
+            calls.append(1)
+            if len(calls) == 1:
+                raise ValueError("manifest lock timed out")
+            return write(path, change)
+
+        return patch.object(repository_reanalysis, "update_manifest", busy)
+
+    def test_a_gui_copy_stored_by_a_call_whose_manifest_write_failed_is_named_by_the_call_that_lifts_the_hold(self) -> None:
+        self.restore()
+        link = self.output / DBS
+        link.unlink()
+        synthetic_dbs(link, storage=b"other settings")
+        with self.busy_once():
+            first = self.undo()
+        self.assertEqual("lifting_hold", first["state"])
+        [stored] = first["gui_library_copies"]
+        self.assertNotIn("library_copy_records", read_manifest(self.manifest))
+
+        second = self.undo()
+        self.assertTrue(second["undone"], second)
+        [record] = read_manifest(self.manifest)["library_copy_records"]
+        self.assertEqual(("undo_gui_copy", "stored", stored["object_id"]),
+                         (record["action"], record["outcome"], record["object_id"]))
+        self.assertEqual([stored["object_id"]], [item["object_id"] for item in second["gui_library_copies"]])
+
+    @unittest.skipUnless(WINDOWS, "Windows refuses to delete a file another handle holds open")
+    def test_a_gui_copy_stored_by_a_partial_call_whose_manifest_write_failed_is_named_once(self) -> None:
+        self.restore()
+        link = self.output / DBS
+        link.unlink()
+        synthetic_dbs(link, storage=b"other settings")
+        held = (self.raw / self.relatives[0]).open("rb")
+        try:
+            with self.busy_once():
+                first = self.undo()
+        finally:
+            held.close()
+        self.assertEqual("partial", first["state"])
+        self.assertFalse(link.exists(), "stored already")
+
+        second = self.undo()
+        self.assertTrue(second["undone"], second)
+        [record] = read_manifest(self.manifest)["library_copy_records"]
+        self.assertEqual("undo_gui_copy", record["action"])
+        self.assertEqual(record["object_id"], first["gui_library_copies"][0]["object_id"])
+
+
+class TwoPartsOfOneTree(unittest.TestCase):
+    """Two parts split from one unit read its raw tree and restore into it: released, the first restore makes its
+    directories and the second restores into them."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name).resolve()
+        accession = self.root / "metabolights" / "MTBLS-SYN"
+        self.raw = accession / "unit-syn" / "raw"
+        self.parent = accession / "unit-syn" / "provenance" / "run-manifest.json"
+        self.store = LibraryCopyStore(self.root)
+        self.parts = {
+            "dda": self.part(accession / "unit-syn-dda", "Sample_A", "20261091730", "Project-2610090530"),
+            "dia": self.part(accession / "unit-syn-dia", "QC_01", "20261091745", "Project-2610090545"),
+        }
+        _write_json(self.parent, {
+            "status": "split_by_acquisition", "workspace": str(self.parent.parent.parent),
+            "raw_directory": str(self.raw),
+            "project": {"repository": "metabolights", "accession": "MTBLS-SYN", "analysis_unit_id": "unit-syn"},
+            "split_into": [{"manifest_path": str(path)} for path in self.parts.values()],
+        })
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def part(self, workspace: Path, sample: str, stamp: str, project: str) -> Path:
+        output = workspace / "output"
+        retained = output / "msdial-intermediates"
+        output.mkdir(parents=True)
+        with (output / "analysis_files.csv").open("w", encoding="ascii", newline="") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(["file_path", "file_name"])
+            writer.writerow([str(self.raw / "data" / f"{sample}.mzML"), sample])
+        moved = []
+        for relative in [f"data/{sample}_{stamp}{suffix}" for suffix in (".dcl", ".pai2")] + [
+                f"data/AlignResult-{stamp}.arf2"]:
+            path = retained / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"container {relative}".encode())
+            moved.append({"relative_path": relative, "path": str(path), "size_bytes": path.stat().st_size})
+        (output / f"{project}.mdproject").write_bytes(b"PK project")
+        (output / f"{project}.mddata").write_bytes(b"\xc7 mddata")
+        copy = synthetic_dbs(output / f"{project}_Loaded.msp2.dbs")
+        stored = self.store.put(copy, read_copy_identity(copy), unit=None, job_id=f"run-{sample}", libraries=LIBRARIES)
+        manifest = workspace / "provenance" / "run-manifest.json"
+        _write_json(manifest, {
+            "status": "mztab_validated", "workspace": str(workspace), "raw_directory": str(self.raw),
+            "output_directory": str(output), "raw_owned_by": str(self.parent), "finalisation_holds": [],
+            "project": {"repository": "metabolights", "accession": "MTBLS-SYN", "analysis_unit_id": workspace.name},
+            "console_run_finalisation": {
+                "job_id": f"run-{sample}", "campaign_approval_recorded": True, "libraries": LIBRARIES,
+                "msdial_intermediates": {"raw_directory": str(self.raw), "moved": moved, "pending": [], "errors": []},
+                "loaded_library_copy": {"copies": [stored], "errors": []},
+            },
+        })
+        return manifest
+
+    def test_two_parts_restored_into_one_released_tree_wait_for_each_other_and_report_nothing_of_each_other(self) -> None:
+        dda, dia = self.parts["dda"], self.parts["dia"]
+        first = restore_project_for_viewing(dda, confirmed=True)
+        second = restore_project_for_viewing(dia, confirmed=True)
+        self.assertTrue(first["restored"] and second["restored"], (first, second))
+        self.assertEqual(["metabolights/MTBLS-SYN/unit-syn/raw", "metabolights/MTBLS-SYN/unit-syn/raw/data"],
+                         first["directories_to_create"])
+        self.assertEqual([], second["directories_to_create"])
+        theirs = sorted(path.name for path in (self.raw / "data").glob("QC_01_*"))
+
+        preview = undo_project_restore(dda)
+        self.assertEqual([], preview["new_files"])
+        self.assertEqual([second["restore_id"]], [item["restore_id"] for item in preview["other_restores"]])
+        waiting = undo_project_restore(dda, confirmed=True)
+        self.assertFalse(waiting["undone"])
+        self.assertEqual([], waiting["new_files"], "the other part's copies are not new files of this restore")
+        self.assertEqual([], waiting["kept_directories"])
+        self.assertEqual(["metabolights/MTBLS-SYN/unit-syn/raw/data", "metabolights/MTBLS-SYN/unit-syn/raw"],
+                         waiting["shared_directories"])
+        self.assertIn(f"restore {second['restore_id']}", waiting["message"])
+        self.assertIn("undo that restore first", waiting["message"])
+        self.assertNotIn("moves or removes them", waiting["message"])
+        self.assertEqual(theirs, sorted(path.name for path in (self.raw / "data").glob("QC_01_*")))
+        self.assertEqual(["viewing_restore"], [item["step"] for item in read_manifest(dda)["finalisation_holds"]])
+
+        self.assertTrue(undo_project_restore(dia, confirmed=True)["undone"])
+        done = undo_project_restore(dda, confirmed=True)
+        self.assertTrue(done["undone"], done)
+        self.assertFalse(self.raw.exists(), "no released raw tree is left behind")
 
 
 class TheConsoleTempCopy(_Finalised):

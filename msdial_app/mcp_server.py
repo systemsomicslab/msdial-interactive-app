@@ -2280,7 +2280,10 @@ def msdial_restore_project_for_viewing(
     finalised before 0.5.37 needs `python -m msdial_app.library_copy_store attach` first), a restore already
     standing, any other finalisation hold, a run, retention-time preview or download under way, a raw deletion
     begun and not finished, an output already holding a library copy, any target path that exists, and any path
-    it would write outside the workspace root its record names paths against.
+    it would write outside the workspace root its record names paths against. A confirmed restore holds the
+    raw-deletion locks of the unit (and of the unit whose raw tree a split part reads) from before its hold is
+    written until its last copy is made, so a cleanup, discard or split-parent release under way refuses it and
+    none starts meanwhile; a Console job of the unit still being prepared refuses it too.
 
     With confirmed=false nothing is written and the result carries the store object and how it was verified,
     the number and bytes of containers, the targets and directories it would create, whether the raw files are
@@ -2311,10 +2314,15 @@ def msdial_undo_project_restore(
     or in the raw-side directories it copied into is reported, never deleted. A library copy MS-DIAL's GUI wrote
     - over the link on a save, or beside it on a "Save as" - goes through the library-copy store, which removes
     it only where it holds the same content, and is recorded as the GUI's (library_copy_records, action
-    undo_gui_copy), never as the run's own. A file still open in MS-DIAL, a GUI copy the store could not take, a
-    directory the restore made that now holds files it did not make, or a path it could not name leaves the
-    restore held (state partial); close MS-DIAL, settle what is named and call again. If the unit manifest
-    could not be written, the restore is recorded lifting_hold and the next call only lifts the hold.
+    undo_gui_copy), never as the run's own; that record is kept in the restore's own record as it is stored, so
+    a later call names it if this one cannot write the manifest. The link is removed only as the file the undo
+    read: a save MS-DIAL makes on close in between is stored as the GUI's instead. A file still open in MS-DIAL,
+    a GUI copy the store could not take, a library copy saved while the undo ran, a directory the restore made
+    that now holds files it did not make, or a path it could not name leaves the restore held (state partial);
+    close MS-DIAL, settle what is named and call again. Two split parts restored into one released raw tree:
+    the other part's copies are never reported as new, and a directory this restore made that holds only them
+    keeps it held until that restore is undone (other_restores, shared_directories). If the unit manifest could
+    not be written, the restore is recorded lifting_hold and the next call only lifts the hold.
 
     With confirmed=false nothing is removed and the result lists what would be removed, put back and reported.
     Only a caller that has shown those to the user and received an explicit answer may call again with

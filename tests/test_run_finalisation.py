@@ -27,7 +27,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from msdial_app import library_copy_store, run_finalisation, server
+from msdial_app import library_copy_store, repository_reanalysis, run_finalisation, server
 from msdial_app.download_store import StoreLockTimeout
 from msdial_app.library_copy_store import STORE_DIRECTORY_NAME, LibraryCopyStore, read_copy_identity
 from msdial_app.materials_methods import generate_publication_report
@@ -49,7 +49,7 @@ from msdial_app.run_finalisation import (
     resolve_finalisation_holds,
     store_loaded_library_copies,
 )
-from test_library_copy_store import assert_names_no_root, synthetic_dbs
+from test_library_copy_store import assert_names_no_root, entry_data_offset, flip, synthetic_dbs
 
 CURRENT = "20269271740"
 EARLIER = "20269261728"
@@ -526,7 +526,8 @@ class RunJobTests(unittest.TestCase):
             return replace(source, target, *args, **kwargs)
 
         with patch.object(library_copy_store, "_write_json_atomic", refuse_entry), \
-                patch.object(library_copy_store, "_replace", hold_object):
+                patch.object(library_copy_store, "_replace", hold_object), \
+                patch.object(library_copy_store, "rename_back", hold_object):
             job = self._run(self._preparation())
         manifest = read_manifest(self.manifest)
 
@@ -562,6 +563,69 @@ class RunJobTests(unittest.TestCase):
         self.assertFalse((self.output / self.DBS).exists())
         [copy] = read_manifest(self.manifest)["console_run_finalisation"]["loaded_library_copy"]["copies"]
         self.assertEqual("stored", copy["outcome"])
+
+    def test_a_retry_whose_manifest_write_failed_finds_its_copy_in_the_store_and_records_it(self) -> None:
+        with patch.object(library_copy_store.StoreLock, "acquire", side_effect=StoreLockTimeout("held")):
+            job = self._run(self._preparation())
+        self.assertEqual("completed", job["status"], job.get("error"))
+        [hold] = read_manifest(self.manifest)[HOLDS]
+        write = repository_reanalysis.update_manifest
+        calls = []
+
+        def busy_once(path, change):
+            calls.append(1)
+            if len(calls) == 1:
+                raise ValueError("manifest lock timed out")
+            return write(path, change)
+
+        with patch.object(repository_reanalysis, "update_manifest", busy_once):
+            standing = resolve_finalisation_holds(self.manifest)
+        self.assertEqual([hold["id"]], [item["id"] for item in standing])
+        self.assertFalse((self.output / self.DBS).exists(), "stored, and nothing in the manifest says so yet")
+
+        # The file is gone: the store's claim says where it went, and the hold is lifted with it named.
+        self.assertEqual([], resolve_finalisation_holds(self.manifest))
+        manifest = read_manifest(self.manifest)
+        [copy] = manifest["console_run_finalisation"]["loaded_library_copy"]["copies"]
+        self.assertEqual((self.DBS, "stored", "store_claim"), (copy["name"], copy["outcome"], copy["verified_by"]))
+        self.assertIsNone(LibraryCopyStore(self.workspace_root).problem(copy["object_id"], full=True))
+        [resolution] = manifest["finalisation_hold_resolutions"]
+        self.assertEqual([copy["object_id"]], [item["object_id"] for item in resolution["library_copies"]])
+
+    def test_a_held_copy_gone_with_nothing_in_the_store_to_say_where_keeps_its_hold(self) -> None:
+        with patch.object(library_copy_store.StoreLock, "acquire", side_effect=StoreLockTimeout("held")):
+            self._run(self._preparation())
+        (self.output / self.DBS).unlink()
+        [hold] = resolve_finalisation_holds(self.manifest)
+        self.assertEqual("loaded_library_copy", hold["step"])
+        self.assertIn("a person looks", hold["errors"][0])
+        manifest = read_manifest(self.manifest)
+        self.assertEqual(["loaded_library_copy"], [item["step"] for item in manifest[HOLDS]])
+        self.assertNotIn("finalisation_hold_resolutions", manifest)
+
+    def test_a_copy_damaged_inside_its_deflate_data_is_held_from_sharing_for_its_retry(self) -> None:
+        write = synthetic_dbs
+
+        def damaged(path, **options):
+            written = write(path, **options)
+            start, _length = entry_data_offset(written)
+            flip(written, start + 5, 0x55)  # the block's code lengths: zlib.error, which zipfile lets through
+            return written
+
+        with patch(f"{__name__}.synthetic_dbs", damaged):
+            job = self._run(self._preparation())
+        manifest = read_manifest(self.manifest)
+
+        self.assertEqual("completed", job["status"], job.get("error"))
+        self.assertTrue((self.output / self.DBS).exists())
+        # The loaded_library_copy hold its retry may lift, not the finalisation hold a person must clear.
+        [hold] = manifest[HOLDS]
+        self.assertEqual((["sharing"], "loaded_library_copy"), (hold["blocks"], hold["step"]))
+        block = manifest["console_run_finalisation"]["loaded_library_copy"]
+        self.assertEqual([], block["copies"])
+        self.assertTrue(block["errors"])
+        self.assertEqual([hold["id"]], [item["id"] for item in resolve_finalisation_holds(self.manifest)])
+        self.assertTrue((self.output / self.DBS).exists())
 
     def test_a_unit_whose_store_cannot_be_located_keeps_its_copy_held(self) -> None:
         self._unit_manifest(campaign=True, repository="elsewhere")

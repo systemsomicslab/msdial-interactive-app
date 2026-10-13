@@ -26,9 +26,13 @@ WHAT A RESTORE DOES (restore_project_for_viewing; one mode):
 It refuses a unit with no run finalisation, no store object for the run, a restore already standing, any
 other finalisation hold (a retry would undo the restore), a run, a retention-time preview or a download under
 way, a raw deletion that has begun and not finished, an output already holding a library copy, any target path
-that already exists, and any path it would write outside the workspace root it records paths relative to. The
-containers it restores are those the run's finalisation moved and those a retry of its held move moved later.
-A preview (``confirmed=False``) writes nothing and names every path relative to the workspace root.
+that already exists, and any path it would write outside the workspace root it records paths relative to. From
+before its hold is written until its last copy is made it holds the raw-deletion locks of the unit and, for a
+split part, of the unit whose raw tree it reads, taken without waiting: a cleanup, a discard or a split parent's
+release under way refuses it, and none starts meanwhile; and as it records the hold it reads the deletion state
+and the live jobs again under the manifest's writer lock. The containers it restores are those the run's
+finalisation moved and those a retry of its held move moved later. A preview (``confirmed=False``) writes
+nothing and names every path relative to the workspace root.
 
 undo_project_restore removes exactly what the record lists, puts back a project file whose sha256 changed from
 its backup (keeping the changed one under the restore's directory, never over an earlier one), reports - never
@@ -36,10 +40,15 @@ deletes - any other file that appeared in the output or in the raw-side director
 and lifts the hold, recording the outcome in ``viewing_restores``. A file MS-DIAL wrote over the link on a
 save, and a library copy a "Save as" wrote beside it, is a new library copy: it goes through the library-copy
 store, which removes it only where it holds the same content, and is recorded as the GUI's (undo_gui_copy),
-never as the run's. A file the restore made itself - its link, or its copy of the object however far that got -
-is removed outright. A file another program still holds open, a directory the restore made that now holds files
-it did not make, and a path it could not name are left, and the restore stays held until a later call; so does a
-manifest that could not be written, and the next call only lifts the hold.
+never as the run's; its record is kept whole in the restore's record as it is stored, and named in the unit
+manifest by whichever call first writes it. A file the restore made itself - its link, or its copy of the object
+however far that got - is removed outright, and only as the file the undo read: renamed aside and compared first,
+so a save MS-DIAL makes on close in between is stored as the GUI's instead. A file another program still holds
+open, a directory the restore made that now holds files it did not make, a library copy saved while the undo
+ran, and a path it could not name are left, and the restore stays held until a later call; so does a manifest
+that could not be written, and the next call only lifts the hold. Two split parts restored into one released raw
+tree share its directories: the other part's copies are never reported as new, and a directory this restore made
+that holds only them keeps it held until that restore is undone.
 
 Nothing here launches MS-DIAL.
 """
@@ -52,14 +61,15 @@ import os
 import shutil
 import sys
 import uuid
+import zlib
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from . import __version__
-from .diagnostic_paths import INTERMEDIATES_DIRECTORY, extended_path, path_is_file
+from .diagnostic_paths import INTERMEDIATES_DIRECTORY, extended_path, path_is_file, plain_path
 from .download_store import StoreError, _read_json, _write_json_atomic
 from .library_copy_store import (
-    LEGACY_LIBRARY_COPY_RECORD,
     LIBRARY_COPY_RECORD,
     LIBRARY_COPY_RECORDS,
     LOADED_LIBRARY_COPY_SUFFIX,
@@ -71,9 +81,13 @@ from .library_copy_store import (
     LibraryCopyStore,
     LibraryCopyStoreError,
     describe_error,
+    file_fingerprint,
     is_library_copy_file,
     is_run_copy,
+    legacy_deleted_copies,
+    private_name,
     read_copy_identity,
+    rename_back,
     unit_ref,
     workspace_root_for,
 )
@@ -85,6 +99,7 @@ from .run_finalisation import (
     VIEWING_RESTORE,
     _console_inputs,
     _hold,
+    _split_parts,
     describe_holds,
     standing_holds,
 )
@@ -159,7 +174,8 @@ def _library_copy_of(manifest: dict[str, Any], job_id: str) -> tuple[dict[str, A
     )
     found = [item for item in found if is_run_copy(item)]
     if not found:
-        if finalisation.get(LEGACY_LIBRARY_COPY_RECORD):
+        # Its finalisation's deleted copies, and those a retry of its held deletion deleted (before 0.5.37).
+        if legacy_deleted_copies(manifest, job_id):
             return None, (
                 "the run's copy was deleted before the library-copy store existed (Interactive before 0.5.37), "
                 "and no object is attached to it; attach one with python -m msdial_app.library_copy_store attach"
@@ -179,15 +195,30 @@ def _library_copy_of(manifest: dict[str, Any], job_id: str) -> tuple[dict[str, A
     return usable[-1], ""
 
 
-def _live_job(manifest_path: Path) -> str:
+def _live_job(manifest_path: Path, timeout: float = -1) -> str:
     """A Console job of this unit this process has queued or running - a run, a diagnostic or a retention-time
-    preview, which reads the unit's raw files too - read only if its backend is loaded."""
+    preview, which reads the unit's raw files too - or is still preparing, holding the unit's slot before it is
+    registered (server._single_console_per_unit). Read only if its backend is loaded.
+
+    ``timeout`` bounds the wait for the registry's lock, for a caller that holds the unit manifest's writer lock:
+    a failing job records its failure in that manifest while it holds the registry's. A registry that stays busy
+    refuses the restore rather than leave it unknown whether a run is starting.
+    """
     server = sys.modules.get("msdial_app.server")
     if server is None:
         return ""
     try:
-        with server.JOBS_LOCK:
-            return server._live_console_job_locked(server._unit_key(str(manifest_path)), server.UNIT_JOB_KINDS)
+        key = server._unit_key(str(manifest_path))
+        if not server.JOBS_LOCK.acquire(timeout=timeout):
+            raise RestoreRefused("this backend's job registry stayed busy, so whether a run of this unit is starting "
+                                 "is not known; call again.")
+        try:
+            return str(server.CONSOLE_SLOTS.get(key) or "") or server._live_console_job_locked(
+                key, server.UNIT_JOB_KINDS)
+        finally:
+            server.JOBS_LOCK.release()
+    except RestoreRefused:
+        raise
     except Exception:  # noqa: BLE001 - a registry that cannot be read refuses nothing by itself
         return ""
 
@@ -215,8 +246,56 @@ def _moved_containers(
     return list(moved.values()), left
 
 
+def _deletion_under_way(manifest: dict[str, Any], manifest_path: Path) -> str:
+    """Why a deletion of the raw tree this unit reads has begun and not finished, or "": its own raw_deletion,
+    and for a split part its owner's raw_release."""
+    from .repository_reanalysis import DELETION_RESUMABLE_STATES, _owner_manifest_path, read_manifest
+
+    deletion = manifest.get("raw_deletion") if isinstance(manifest.get("raw_deletion"), dict) else {}
+    if str((deletion or {}).get("state") or "") in DELETION_RESUMABLE_STATES:
+        return ("a deletion of this unit's raw data has begun and not finished; a restore would write into what it "
+                "deletes. Finish or settle the deletion first.")
+    owner = _owner_manifest_path(manifest, manifest_path)
+    if owner is not None and owner.is_file():
+        try:
+            release = read_manifest(owner).get("raw_release") or {}
+        except (OSError, ValueError):
+            release = {}
+        if str((release if isinstance(release, dict) else {}).get("state") or "") in DELETION_RESUMABLE_STATES:
+            return ("the release of the raw tree this part reads has begun and not finished; a restore would write "
+                    "into what it deletes.")
+    return ""
+
+
+@contextmanager
+def _deletion_locks(manifest: dict[str, Any], manifest_path: Path) -> Iterator[None]:
+    """The raw-deletion locks of this unit and, for a split part, of the unit whose raw tree it reads: taken
+    without waiting, and held while a restore writes its hold and its copies.
+
+    A cleanup, a discard and a split parent's release each take theirs before they read the holds, and keep it
+    until the tree is gone: while one holds it a restore is refused, and while a restore holds it none starts;
+    one that starts afterwards finds the restore's hold.
+    """
+    from .repository_reanalysis import ManifestBusyError, _owner_manifest_path, _raw_deletion_lock
+
+    paths = [manifest_path]
+    owner = _owner_manifest_path(manifest, manifest_path)
+    if owner is not None and owner.is_file():
+        paths.append(owner.resolve())
+    with ExitStack() as stack:
+        for item in paths:
+            try:
+                stack.enter_context(_raw_deletion_lock(item))
+            except ManifestBusyError as error:
+                raise RestoreRefused(
+                    "a deletion of this unit's raw data, or of the raw tree it reads, is under way and holds its "
+                    "lock; restore once it has finished."
+                ) from error
+        yield
+
+
 def _refuse_live(manifest: dict[str, Any], manifest_path: Path) -> None:
-    from .repository_reanalysis import DELETION_RESUMABLE_STATES, _live_run_attempt_in, _owner_manifest_path, read_manifest
+    from .repository_reanalysis import _live_run_attempt_in
 
     live = _live_run_attempt_in(manifest)
     if live is not None:
@@ -229,22 +308,9 @@ def _refuse_live(manifest: dict[str, Any], manifest_path: Path) -> None:
         raise RestoreRefused(f"a run of this unit is live (job {job} is queued or running); restore once it has ended.")
     if str(manifest.get("status") or "") == "downloading":
         raise RestoreRefused("this unit's raw data are being downloaded; restore once the download has ended.")
-    if str((manifest.get("raw_deletion") or {}).get("state") or "") in DELETION_RESUMABLE_STATES:
-        raise RestoreRefused(
-            "a deletion of this unit's raw data has begun and not finished; a restore would write into what it "
-            "deletes. Finish or settle the deletion first."
-        )
-    owner = _owner_manifest_path(manifest, manifest_path)
-    if owner is not None and owner.is_file():
-        try:
-            release = read_manifest(owner).get("raw_release") or {}
-        except (OSError, ValueError):
-            release = {}
-        if str(release.get("state") or "") in DELETION_RESUMABLE_STATES:
-            raise RestoreRefused(
-                "the release of the raw tree this part reads has begun and not finished; a restore would write "
-                "into what it deletes."
-            )
+    deletion = _deletion_under_way(manifest, manifest_path)
+    if deletion:
+        raise RestoreRefused(deletion)
 
 
 def _plan(manifest_path: Path, job_id: str) -> dict[str, Any]:
@@ -523,8 +589,6 @@ def restore_project_for_viewing(manifest_path: str | Path, job_id: str = "", con
     failure part way is recorded (state ``failed``) and returned; the hold stands, and the undo takes back what
     the record lists.
     """
-    from .repository_reanalysis import _live_run_attempt_in, update_manifest
-
     path = Path(manifest_path).expanduser().resolve()
     plan = _planned(path, str(job_id or "").strip())
     described = _describe_plan(plan, path)
@@ -542,6 +606,16 @@ def restore_project_for_viewing(manifest_path: str | Path, job_id: str = "", con
                        "copy, whether the raw files are present and the hold to the user, and call again with "
                        "confirmed=true only after an explicit answer." + raw_note,
         }
+    # From before its hold is written until its copies are made: a deletion of the raw tree it writes into that
+    # holds these locks is under way, and one that takes them later finds the hold.
+    with _deletion_locks(plan["manifest"], path):
+        return _restore(plan, path, described, raw_note)
+
+
+def _restore(plan: dict[str, Any], path: Path, described: dict[str, Any], raw_note: str) -> dict[str, Any]:
+    """restore_project_for_viewing once confirmed, under the deletion locks."""
+    from .repository_reanalysis import _live_run_attempt_in, update_manifest
+
     root: Path = plan["root"]
     store: LibraryCopyStore = plan["store"]
     object_id = plan["object_id"]
@@ -612,6 +686,14 @@ def restore_project_for_viewing(manifest_path: str | Path, job_id: str = "", con
         live = _live_run_attempt_in(current)
         if live is not None:
             raise RestoreRefused(f"a run of this unit is live (job {live.get('job_id') or 'unrecorded'}).")
+        deletion = _deletion_under_way(current, path)
+        if deletion:
+            raise RestoreRefused(deletion)
+        # A Console job of the unit queued, running or still preparing since the plan was read; one registered
+        # from now on reads this hold before its Console starts (server._run_console_for_job).
+        job = _live_job(path, timeout=5.0)
+        if job:
+            raise RestoreRefused(f"a run of this unit is live (job {job} is queued or running).")
         current[HOLDS] = [*standing_holds(current), hold]
         current[VIEWING_RESTORES] = [*(current.get(VIEWING_RESTORES) or []), entry]
 
@@ -762,6 +844,55 @@ def _is_gui_library_copy(path: Path) -> bool:
     return path.name.endswith(LOADED_LIBRARY_COPY_SUFFIX) or is_library_copy_file(path)
 
 
+def _other_restores(
+    manifest: dict[str, Any], manifest_path: Path, root: Path, restore_id: str
+) -> list[dict[str, Any]]:
+    """The records of the other viewing restores standing on the raw tree this unit reads.
+
+    A split part restores into its owner's raw tree, which the owner's other parts read too: two parts restored
+    while the tree is released share the directories the first one made, and the copies of each lie beside the
+    other's. Read from the viewing_restore holds of the owner's other parts, as the gate reads them.
+    """
+    from .repository_reanalysis import _owner_manifest_path, read_manifest
+
+    owner = _owner_manifest_path(manifest, manifest_path)
+    if owner is None or not owner.is_file():
+        return []
+    try:
+        parts = _split_parts(read_manifest(owner))
+    except (OSError, ValueError):
+        return []
+    found = []
+    for part in parts:
+        try:
+            if os.path.normcase(str(part.resolve())) == os.path.normcase(str(manifest_path.resolve())):
+                continue
+            recorded = read_manifest(part)
+        except (OSError, ValueError):
+            continue
+        for hold in active_viewing_restores(recorded):
+            if not hold.get("record") or hold.get("restore_id") == restore_id:
+                continue
+            try:
+                record = _read_json(root / str(hold["record"]))
+            except (OSError, StoreError):
+                record = None
+            if isinstance(record, dict):
+                found.append({**record, "manifest": record.get("manifest") or _relative(part, root)})
+    return found
+
+
+def _holds_only(folder: Path, theirs: set[str]) -> bool:
+    """Whether ``folder`` holds files, every one of them made by another standing restore (``theirs``)."""
+    found = False
+    for directory, _folders, names in os.walk(extended_path(folder)):
+        for name in names:
+            if os.path.normcase(plain_path(os.path.join(directory, name))) not in theirs:
+                return False
+            found = True
+    return found
+
+
 def _undo_plan(manifest: dict[str, Any], manifest_path: Path, restore_id: str) -> dict[str, Any]:
     hold = _standing_restore(manifest, restore_id)
     root, why = workspace_root_for(manifest, manifest_path)
@@ -783,13 +914,22 @@ def _undo_plan(manifest: dict[str, Any], manifest_path: Path, restore_id: str) -
               else Path(str(manifest.get("output_directory") or "")))
     plan: dict[str, Any] = {"hold": hold, "root": root, "record_path": record_path, "record": record,
                             "store": store, "output": output, "directory": record_path.parent, "problems": problems,
-                            "lift_only": record.get("state") in {LIFTING_HOLD, "undone"}}
+                            "lift_only": record.get("state") in {LIFTING_HOLD, "undone"}, "others": [],
+                            "theirs": set()}
     if plan["lift_only"]:
         # Everything it made was taken back by an earlier call, which could not then write the unit manifest:
-        # only the hold is left to lift.
+        # only the hold is left to lift, and the GUI's library copies that call stored to name.
         plan.update(link=None, files=[], directories=[], backups=[], created_project_files=[], library_copies=[],
                     new_files=list((record.get("undo") or {}).get("new_files") or []))
         return plan
+    # Another part's restore into the same raw tree: its copies are not new files of this one, and a directory
+    # this restore made that holds only them waits for that restore's undo.
+    others = _other_restores(manifest, manifest_path, root, str(hold.get("restore_id") or ""))
+    plan["others"] = [{"restore_id": item.get("restore_id"), "manifest": item.get("manifest")} for item in others]
+    plan["theirs"] = {
+        os.path.normcase(str(root / item["path"])) for other in others for item in other.get("created_files") or []
+        if isinstance(item, dict) and item.get("path") and not str(item["path"]).startswith("<outside")
+    }
     # The link, or what MS-DIAL wrote in its place.
     link = record.get("link") or {}
     plan["link"] = None
@@ -815,7 +955,10 @@ def _undo_plan(manifest: dict[str, Any], manifest_path: Path, restore_id: str) -
                 same = ids == (stored.st_dev, stored.st_ino)
             except OSError:
                 same = False
-        plan["link"] = {"path": target, "action": "remove" if same else "store", "relative": link["path"]}
+        # The file read here, by file record, size and time: the one the undo removes as the restore's, and no
+        # other (_remove_if_same).
+        plan["link"] = {"path": target, "action": "remove" if same else "store", "relative": link["path"],
+                        "fingerprint": (details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns)}
     files = []
     for item in record.get("created_files") or []:
         target = _recorded(root, item.get("path"), problems)
@@ -869,7 +1012,8 @@ def _undo_plan(manifest: dict[str, Any], manifest_path: Path, restore_id: str) -
         before = set(snapshot.get(relative) or [])
         for entry in os.scandir(extended_path(folder)):
             path = folder / entry.name
-            if entry.is_file() and entry.name not in before and os.path.normcase(str(path)) not in ours:
+            key = os.path.normcase(str(path))
+            if entry.is_file() and entry.name not in before and key not in ours and key not in plan["theirs"]:
                 new_files.append(_relative(path, root))
     plan["new_files"] = sorted(new_files)
     plan["library_copies"] = sorted(library_copies)
@@ -897,6 +1041,7 @@ def _describe_undo(plan: dict[str, Any]) -> dict[str, Any]:
         "project_files_to_put_back": [item["name"] for item in plan["backups"]],
         "created_project_files_to_remove": [item.name for item in plan["created_project_files"]],
         "new_files": plan["new_files"],
+        "other_restores": list(plan["others"]),
         "problems": list(plan["problems"]),
     }
 
@@ -929,6 +1074,49 @@ def _remove(path: Path, busy: list[str], root: Path) -> bool:
         return False
 
 
+def _remove_if_same(
+    path: Path, fingerprint: tuple[int, int, int, int], busy: list[str], problems: list[str], root: Path
+) -> str:
+    """Remove the file the undo's plan read at ``path``, and no other: 'removed', 'gone', 'changed', 'busy', 'kept'.
+
+    It is renamed to a private name beside it and compared there with what the plan read (file record, size and
+    time) before it is removed. MS-DIAL saves the library copy by deleting it and moving a new file into place,
+    and holds nothing open between saves, so a save on close can land between the plan and the removal: what it
+    wrote is put back, never over a newer file, and goes through the store as the GUI's ('changed').
+    """
+    private = path.with_name(private_name(path.name, "undo"))
+    try:
+        os.rename(extended_path(path), extended_path(private))
+    except FileNotFoundError:
+        return "gone"  # a save that deleted it; the file it moves into place is found by the closing scan
+    except PermissionError:
+        busy.append(_relative(path, root))
+        return "busy"
+    try:
+        same = file_fingerprint(private) == tuple(fingerprint)
+    except OSError:
+        same = False
+    if not same:
+        try:
+            rename_back(private, path)
+        except OSError as error:
+            problems.append(f"{_relative(private, root)}: MS-DIAL saved over the link while the undo ran, and another "
+                            f"file has taken its name since ({describe_error(error, root)}); call again, and both go "
+                            "through the library-copy store")
+            return "kept"
+        return "changed"
+    try:
+        os.unlink(extended_path(private))
+    except PermissionError:
+        try:
+            rename_back(private, path)
+        except OSError:
+            pass  # under its private name, which keeps the suffix the closing scan reads
+        busy.append(_relative(path, root))
+        return "busy"
+    return "removed"
+
+
 def _gui_copy(
     store: LibraryCopyStore, path: Path, *, manifest: dict[str, Any], manifest_path: Path, root: Path,
     record: dict[str, Any], problems: list[str],
@@ -946,7 +1134,7 @@ def _gui_copy(
     except LibraryCopyPending as error:
         stored = {**error.record, "outcome": PENDING, "store_error": describe_error(error, root),
                   "incoming": error.incoming}
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, zlib.error) as error:
         problems.append(f"{_relative(path, root)}: {describe_error(error, root)}")
         return None
     return {"schema": RECORD_SCHEMA, "action": "undo_gui_copy", "job_id": record.get("job_id"),
@@ -964,6 +1152,11 @@ def _keep_aside(directory: Path) -> Path:
         except FileExistsError:
             continue
     raise FileExistsError(errno.EEXIST, "no free directory for the files MS-DIAL saved", "gui-saved")
+
+
+def _copy_summary(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{"name": item.get("name"), "object_id": item.get("object_id"), "outcome": item.get("outcome")}
+            for item in items]
 
 
 def undo_project_restore(manifest_path: str | Path, restore_id: str = "", confirmed: bool = False) -> dict[str, Any]:
@@ -988,11 +1181,32 @@ def undo_project_restore(manifest_path: str | Path, restore_id: str = "", confir
     problems: list[str] = list(plan["problems"])
     removed = 0
     changed = []
+    # Every library copy MS-DIAL's GUI wrote that an undo call of this restore put through the store, kept whole
+    # in its record as each is stored and named in the unit manifest by whichever call first writes it: a call
+    # whose manifest write fails loses none of them, the one that only lifts the hold included.
+    gui_records: list[dict[str, Any]] = [item for item in record.get("gui_copy_records") or [] if isinstance(item, dict)]
     gui_copies: list[dict[str, Any]] = []
+    unstored: set[str] = set()
     saved_aside: list[str] = []
     directories = 0
     kept_directories: list[str] = []
+    shared_directories: list[str] = []
     restored_files = 0
+
+    def keep_gui_copy(path_: Path, item: dict[str, Any] | None) -> None:
+        nonlocal removed
+        if item is None:
+            unstored.add(path_.name)
+            return
+        gui_copies.append(item)
+        gui_records.append(item)
+        record["gui_copy_records"] = list(gui_records)
+        removed += 1
+        try:
+            _write_record(record_path, record)
+        except OSError as error:
+            problems.append(f"{_relative(record_path, root)}: {describe_error(error, root)}")
+
     if not plan["lift_only"]:
         record["state"] = "undoing"
         _write_record(record_path, record)
@@ -1000,20 +1214,21 @@ def undo_project_restore(manifest_path: str | Path, restore_id: str = "", confir
         link = plan["link"]
         if link is not None:
             if link["action"] == "remove":
-                if _remove(link["path"], busy, root):
+                outcome = _remove_if_same(link["path"], link["fingerprint"], busy, problems, root)
+                if outcome == "removed":
                     removed += 1
+                elif outcome == "changed":
+                    # Saved over after the plan read it: a new library copy, which goes through the store.
+                    keep_gui_copy(link["path"], _gui_copy(store, link["path"], manifest=manifest, manifest_path=path,
+                                                          root=root, record=record, problems=problems))
+                elif outcome in {"busy", "kept"}:
+                    unstored.add(link["path"].name)
             else:
-                item = _gui_copy(store, link["path"], manifest=manifest, manifest_path=path, root=root,
-                                 record=record, problems=problems)
-                if item is not None:
-                    gui_copies.append(item)
-                    removed += 1
+                keep_gui_copy(link["path"], _gui_copy(store, link["path"], manifest=manifest, manifest_path=path,
+                                                      root=root, record=record, problems=problems))
         for copy in plan["library_copies"]:
-            item = _gui_copy(store, copy, manifest=manifest, manifest_path=path, root=root, record=record,
-                             problems=problems)
-            if item is not None:
-                gui_copies.append(item)
-                removed += 1
+            keep_gui_copy(copy, _gui_copy(store, copy, manifest=manifest, manifest_path=path, root=root,
+                                          record=record, problems=problems))
         # 2. the copies of the containers
         for item in plan["files"]:
             try:
@@ -1052,18 +1267,32 @@ def undo_project_restore(manifest_path: str | Path, restore_id: str = "", confir
             except FileNotFoundError:
                 continue
             except OSError:
-                kept_directories.append(_relative(folder, root))
+                if plan["theirs"] and _holds_only(folder, plan["theirs"]):
+                    shared_directories.append(_relative(folder, root))
+                else:
+                    kept_directories.append(_relative(folder, root))
+        # 5. a library copy MS-DIAL saved while this ran - after the plan read the output - is one more for the
+        # store: the restore stays held, and the next call stores it.
+        output = plan["output"]
+        if output is not None and output.is_dir():
+            late = sorted(entry.name for entry in os.scandir(output)
+                          if entry.is_file() and entry.name.endswith(LOADED_LIBRARY_COPY_SUFFIX)
+                          and entry.name not in unstored)
+            if late:
+                problems.append(f"{len(late)} library cop(ies) MS-DIAL saved while the undo ran are in the output (the "
+                                f"first is {late[0]}); call again, and they go through the library-copy store")
         # A directory the restore made that holds files it did not make is the restore's still: under a released
-        # raw tree it makes the tree read as present against its recorded deletion. A person clears it first.
-        complete = not busy and not problems and not kept_directories
+        # raw tree it makes the tree read as present against its recorded deletion. A person clears it first -
+        # unless what it holds is another standing restore's, whose own undo comes first.
+        complete = not busy and not problems and not kept_directories and not shared_directories
         record.update(
             state=LIFTING_HOLD if complete else "partial",
             undo={"at": _now(), "removed_files": removed, "removed_directories": directories,
-                  "kept_directories": kept_directories, "restored_project_files": restored_files,
-                  "changed_by_gui": changed, "new_files": plan["new_files"], "gui_saved": saved_aside, "busy": busy,
-                  "problems": problems,
-                  "gui_copies": [{"name": item.get("name"), "object_id": item.get("object_id"),
-                                  "outcome": item.get("outcome")} for item in gui_copies]},
+                  "kept_directories": kept_directories, "shared_directories": shared_directories,
+                  "waiting_for": [item["restore_id"] for item in plan["others"]] if shared_directories else [],
+                  "restored_project_files": restored_files, "changed_by_gui": changed, "new_files": plan["new_files"],
+                  "gui_saved": saved_aside, "busy": busy, "problems": problems,
+                  "gui_copies": _copy_summary(gui_records)},
         )
         _write_record(record_path, record)
     else:
@@ -1073,8 +1302,8 @@ def undo_project_restore(manifest_path: str | Path, restore_id: str = "", confir
         restored_files = int(undo.get("restored_project_files") or 0)
         changed, saved_aside = list(undo.get("changed_by_gui") or []), list(undo.get("gui_saved") or [])
     undo = {key: (record.get("undo") or {}).get(key) for key in
-            ("removed_files", "removed_directories", "kept_directories", "restored_project_files", "changed_by_gui",
-             "new_files", "gui_saved", "busy", "problems", "gui_copies")}
+            ("removed_files", "removed_directories", "kept_directories", "shared_directories", "waiting_for",
+             "restored_project_files", "changed_by_gui", "new_files", "gui_saved", "busy", "problems", "gui_copies")}
     undone_at = _now()
 
     def change(current: dict[str, Any]) -> None:
@@ -1084,14 +1313,20 @@ def undo_project_restore(manifest_path: str | Path, restore_id: str = "", confir
             if isinstance(item, dict) and item.get("restore_id") == restore:
                 item.update(state="undone" if complete else "partial",
                             **({"undone_at": undone_at} if complete else {}), undo=undo)
-        if gui_copies:
-            current[LIBRARY_COPY_RECORDS] = [*(current.get(LIBRARY_COPY_RECORDS) or []), *gui_copies]
+        recorded = [item for item in current.get(LIBRARY_COPY_RECORDS) or [] if isinstance(item, dict)]
+        named = {(str(item.get("restore_id") or ""), item.get("object_id"), item.get("sha256"))
+                 for item in recorded if item.get("action") == "undo_gui_copy"}
+        missing = [item for item in gui_records
+                   if (restore, item.get("object_id"), item.get("sha256")) not in named]
+        if missing:
+            current[LIBRARY_COPY_RECORDS] = [*(current.get(LIBRARY_COPY_RECORDS) or []), *missing]
 
     manifest_error = None
     try:
         update_manifest(path, change)
     except (OSError, ValueError) as error:
-        # The record says lifting_hold (or partial): the next call finds the hold standing and lifts it.
+        # The record says lifting_hold (or partial): the next call finds the hold standing and lifts it, and
+        # names the GUI's copies this one stored.
         manifest_error = describe_error(error, root)
     if complete and manifest_error is None:
         record.update(state="undone", undone_at=undone_at)
@@ -1102,18 +1337,17 @@ def undo_project_restore(manifest_path: str | Path, restore_id: str = "", confir
     undone = complete and manifest_error is None
     result = {**described, "undone": undone, "state": record["state"], "removed_files": removed,
               "removed_directories": directories, "kept_directories": kept_directories,
-              "restored_project_files": restored_files, "changed_by_gui": changed, "gui_saved": saved_aside,
-              "gui_library_copies": [{"name": item.get("name"), "object_id": item.get("object_id"),
-                                      "outcome": item.get("outcome")} for item in gui_copies],
+              "shared_directories": shared_directories, "restored_project_files": restored_files,
+              "changed_by_gui": changed, "gui_saved": saved_aside, "gui_library_copies": _copy_summary(gui_records),
               "busy": busy, "problems": problems}
     notes = []
     if changed:
         notes.append(f"{len(changed)} restored container(s) were rewritten by MS-DIAL while it was open (the first is "
                      f"{changed[0]}); they are removed, and the retained copies in msdial-intermediates are unchanged.")
-    if gui_copies:
-        notes.append(f"{len(gui_copies)} library cop(ies) MS-DIAL's GUI wrote went to the library-copy store as its "
+    if gui_records:
+        notes.append(f"{len(gui_records)} library cop(ies) MS-DIAL's GUI wrote went to the library-copy store as its "
                      "own, not the run's (" + ", ".join(f"{item.get('outcome')} as object {item.get('object_id')}"
-                                                        for item in gui_copies[:3]) + ").")
+                                                        for item in gui_records[:3]) + ").")
     if saved_aside:
         notes.append(f"{len(saved_aside)} project file(s) MS-DIAL saved are kept under {saved_aside[0].rsplit('/', 1)[0]}.")
     if plan["new_files"]:
@@ -1136,6 +1370,11 @@ def undo_project_restore(manifest_path: str | Path, restore_id: str = "", confir
         reasons = []
         if busy:
             reasons.append(f"{len(busy)} file(s) are still open in another program ({busy[0]})")
+        if shared_directories:
+            others = ", ".join(f"restore {item['restore_id']} of {item['manifest']}" for item in plan["others"][:3])
+            reasons.append(f"{len(shared_directories)} director(y/ies) it made (the first is {shared_directories[0]}) "
+                           f"hold only the copies of another restore standing on the same raw tree ({others}); undo "
+                           "that restore first - its files are not this restore's, and nobody removes them by hand")
         if kept_directories:
             reasons.append(f"{len(kept_directories)} director(y/ies) the restore made hold files it did not make (the "
                            f"first is {kept_directories[0]}); a person looks at them and moves or removes them")

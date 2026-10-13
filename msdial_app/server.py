@@ -83,7 +83,7 @@ from .library_copy_store import (
     describe_error,
     settle_console_temp,
 )
-from .run_finalisation import CONSOLE_TEMP_ORIGIN, _sharing_context, finalise_console_run, hold_library_copies
+from .run_finalisation import _sharing_context, finalise_console_run, record_console_temp
 from .campaign_authorization import CampaignAuthorizationError, authorize, unit_identity
 from .process_liveness import process_created_at
 from .workflow import (
@@ -631,13 +631,14 @@ def _single_console_per_unit(manifest_text: Any, job_id: str) -> Iterator[None]:
     registered job then holds it while it is queued or running. The unit manifest's run attempts are read
     as well, which is what finds a Console this registry does not know: one orphaned by a backend that
     stopped, or one started by another backend. A local analysis names no unit and is not held. A unit restored
-    for viewing is refused (UnitRestoredError) until the restore is taken back.
+    for viewing is refused (UnitRestoredError) until the restore is taken back: read once the unit is held, so
+    that a restore either finds this job's hold (project_restore._live_job) or is found by this read, and again
+    when the job's Console is about to start (_run_console_for_job).
     """
     text = str(manifest_text or "").strip()
     if not text:
         yield
         return
-    _refuse_restored_unit(text)
     key = _unit_key(text)
     with JOBS_LOCK:
         live = CONSOLE_SLOTS.get(key) or _live_console_job_locked(key)
@@ -650,6 +651,7 @@ def _single_console_per_unit(manifest_text: Any, job_id: str) -> Iterator[None]:
             )
         CONSOLE_SLOTS[key] = job_id
     try:
+        _refuse_restored_unit(text)
         orphan = live_run_attempt(text, ignore_backend_pid=os.getpid())
         if orphan:
             raise UnitBusyError(
@@ -779,13 +781,18 @@ def _settle_console_temp(
     for item in settled["library_copies"]:
         log(f"A loaded-library copy MS-DIAL left in {label} went to the library-copy store: {item['outcome']} as "
             f"object {item['object_id']}.")
+    # Every copy the store took is named in the unit manifest (library_copy_records, action console_temp), and
+    # every one it could not take is held there, in one write: no copy of the loaded libraries is in the store
+    # or left in _tmp with nothing in its unit saying so.
+    record_error = record_console_temp(
+        manifest_text, job_id, settled["library_copies"], settled["held"], settled["errors"],
+        "MS-DIAL left a copy of every loaded library in the Console's temporary directory, and the "
+        "library-copy store could not take it",
+    )[1]
+    if record_error:
+        log(f"WARNING: what became of the loaded-library copies MS-DIAL left in {label} could not be recorded in the "
+            f"unit manifest ({record_error}); the library-copy store's claims name the ones it took.")
     if settled["held"]:
-        hold_library_copies(
-            manifest_text, job_id, settled["held"], settled["errors"],
-            "MS-DIAL left a copy of every loaded library in the Console's temporary directory, and the "
-            "library-copy store could not take it",
-            origin=CONSOLE_TEMP_ORIGIN,
-        )
         log(f"WARNING: {len(settled['held'])} loaded-library copy(ies) MS-DIAL left in {label} could not be "
             "stored, and they are held from sharing: " + "; ".join(settled["errors"][:3]))
     if settled["removed_files"]:
@@ -814,6 +821,15 @@ def _run_console_for_job(
     with JOBS_LOCK:
         entry = PROCESSES.get(job_id) or _register_process_locked(job_id, kind)
     manifest_text = str(preparation.get("repository_run_manifest") or "").strip()
+    if manifest_text:
+        # Again, now that the job is registered: a restore recorded while it was being prepared stops it before
+        # its Console starts, and a restore recorded from now on finds the job registered and refuses.
+        try:
+            _refuse_restored_unit(manifest_text)
+        except UnitRestoredError:
+            with JOBS_LOCK:
+                PROCESSES.pop(job_id, None)
+            raise
     temp_directory, temp_why = _console_temp_for(job_id, preparation)
     attempt = None
     if manifest_text:
@@ -2999,7 +3015,9 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = message
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
-            _record_repository_run_failure(preparation, message, None, JOBS[job_id]["logs"])
+            if not isinstance(error, UnitRestoredError):
+                # A start refused because the unit is restored for viewing is no failed run of it.
+                _record_repository_run_failure(preparation, message, None, JOBS[job_id]["logs"])
             JOBS[job_id].pop("artifact_baseline", None)
             _persist_jobs_locked()
     finally:
@@ -3149,6 +3167,11 @@ def _run_rt_correction_job(job_id: str, preparation: dict[str, Any]) -> None:
     try:
         log("Starting RT correction EIC audit.")
         log("Command: " + " ".join(preparation["command"]))
+        manifest_text = str(preparation.get("repository_run_manifest") or "").strip()
+        if manifest_text:
+            # Its Console writes beside the unit's raw files too. Read again now that the job is registered: a
+            # restore recorded from here on finds it live and refuses.
+            _refuse_restored_unit(manifest_text)
         preparation["run_started_ns"] = time.time_ns()
         temp_directory, temp_why = _console_temp_for(job_id, preparation)
         try:

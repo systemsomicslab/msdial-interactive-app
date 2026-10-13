@@ -87,6 +87,7 @@ import shutil
 import time
 import urllib.parse
 import uuid
+import zlib
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
@@ -702,9 +703,10 @@ def store_loaded_library_copies(
             errors.append(f"{path.name}: {text}")
             item = {**error.record, "outcome": PENDING, "store_error": text, "incoming": error.incoming,
                     "removed_at": _now()}
-        except (OSError, ValueError) as error:
-            # LibraryCopyStoreError is an OSError and a lock timeout a ValueError (download_store.StoreError):
-            # either way the copy stays and is held, never deleted.
+        except (OSError, ValueError, zlib.error) as error:
+            # LibraryCopyStoreError is an OSError, a lock timeout a ValueError (download_store.StoreError) and a
+            # damaged deflate stream a zlib.error: whichever, the copy stays and is held, never deleted, under the
+            # loaded_library_copy hold its retry lifts - not the finalisation hold a person must clear.
             text = describe_error(error, root)
             errors.append(f"{path.name}: {text}")
             say(f"WARNING: MS-DIAL's loaded-library copy {path.name} could not be stored, and it is held in the "
@@ -855,29 +857,35 @@ def _record_library_copies(current: dict[str, Any], job_id: str, copies: list[di
     ]
 
 
-def hold_library_copies(
-    manifest_path: str | Path, job_id: str, files: list[str], errors: list[str], reason: str, origin: str = ""
-) -> dict[str, Any] | None:
-    """Record a sharing hold on library copies the store could not take outside a finalisation. Never raises.
+def record_console_temp(
+    manifest_path: str | Path, job_id: str, copies: list[dict[str, Any]], files: list[str], errors: list[str],
+    reason: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Name in the unit manifest what became of the library copies a Console left in its temporary directory.
 
-    ``origin`` console_temp marks copies a Console left in its temporary directory: their retry stores them as
-    copies that are not the run's own.
+    Every copy the store took - stored, found equal, set aside, or pending its repair - under library_copy_records
+    (action console_temp: never the run's own copy), and a sharing hold on those it could not take (origin
+    console_temp: their retry stores them as such). One write. Returns (the hold, or None; the error that kept
+    the write from being made, or None). Never raises.
     """
     from .repository_reanalysis import update_manifest
 
-    if not files:
-        return None
     hold = _hold([BLOCKS_SHARING], "loaded_library_copy", job_id, reason, files=list(files),
-                 store_errors=list(errors), **({"origin": origin} if origin else {}))
+                 store_errors=list(errors), origin=CONSOLE_TEMP_ORIGIN) if files else None
+    if not copies and hold is None:
+        return None, None
 
     def change(current: dict[str, Any]) -> None:
-        current[HOLDS] = [*standing_holds(current), hold]
+        if copies:
+            _record_library_copies(current, job_id, [dict(item) for item in copies], CONSOLE_TEMP_ORIGIN)
+        if hold is not None:
+            current[HOLDS] = [*standing_holds(current), hold]
 
     try:
         update_manifest(Path(manifest_path), change)
-    except (OSError, ValueError):
-        return None
-    return hold
+    except (OSError, ValueError) as error:
+        return None, describe_error(error)
+    return hold, None
 
 
 def _retry_hold(
@@ -925,19 +933,29 @@ def _retry_hold(
             manifest.get("console_run_finalisation"), dict) else {}
         libraries = (finalisation or {}).get("libraries") if (finalisation or {}).get("job_id") == job_id else []
         origin = str(hold.get("origin") or "")
+        unit = unit_ref(manifest, manifest_path, root)
         left, errors, stored = [], [], []
         for file in hold.get("files") or []:
             path = Path(str(file))
-            if not path.is_file():
-                continue
             if store is None:
                 left.append(str(file))
                 errors.append(f"{path.name}: no library-copy store could be located ({why})")
                 continue
+            if not path.is_file():
+                # Gone. A retry that stored it and then could not write this manifest leaves exactly that, and
+                # the store's own records say where it went. A copy they do not name is not settled by its
+                # absence: the hold stands, and a person looks.
+                found = store.find_settled(unit, job_id, origin or "retry", path.name)
+                if found is not None:
+                    stored.append(found)
+                else:
+                    left.append(str(file))
+                    errors.append(f"{path.name}: it is no longer where this hold names it, and the library-copy store "
+                                  f"records no copy of it from run {job_id or 'unrecorded'}; a person looks")
+                continue
             try:
                 stored.append(store.put(
-                    path, read_copy_identity(path), unit=unit_ref(manifest, manifest_path, root), job_id=job_id,
-                    libraries=libraries or [],
+                    path, read_copy_identity(path), unit=unit, job_id=job_id, libraries=libraries or [],
                     settings=None if origin == CONSOLE_TEMP_ORIGIN else annotation_settings(path.parent),
                     how=origin or "retry", patience=patience,
                 ))
@@ -945,7 +963,7 @@ def _retry_hold(
                 # It left for the store: not in the output any more, and named as pending until repair.
                 stored.append({**error.record, "outcome": PENDING, "store_error": describe_error(error, root),
                                "incoming": error.incoming, "removed_at": _now()})
-            except (OSError, ValueError) as error:
+            except (OSError, ValueError, zlib.error) as error:
                 left.append(str(file))
                 errors.append(f"{path.name}: {describe_error(error, root)}")
         if left:

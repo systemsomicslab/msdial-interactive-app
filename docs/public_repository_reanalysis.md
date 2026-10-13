@@ -354,11 +354,16 @@ keeps one copy per content and is never shared. A copy is found by a key over
 its zip entries (names, CRC-32 and sizes) and is removed from the output only
 once the store holds one proven equal: the same bytes but for the zip
 timestamps, re-read from the stored object, or entries that decompress to the
-same content. The unit records the object under
+same content, and only as the file whose identity was read: a file MS-DIAL's
+save put at its path in between is left there. An object that cannot be read
+at the moment (MS-DIAL loading it through a restore's link) is never taken for
+a damaged one. The unit records the object under
 `console_run_finalisation.loaded_library_copy` (until 0.5.37 the copy was
 deleted and recorded under `loaded_library_copies_deleted`). A copy the store
 cannot take stays in the output under the `loaded_library_copy` sharing hold,
-and the hold's retry stores it. One that left the output and whose install
+and the hold's retry stores it; a held copy gone by the time of the retry is
+looked up in the store's own records, and one they do not name keeps the hold
+for a person. One that left the output and whose install
 stopped before its record was written is recorded as `pending_repair`, and
 `python -m msdial_app.library_copy_store status --repair` completes it. Any
 other run, including a trial unit whatever its retention policy, keeps its
@@ -374,14 +379,19 @@ run's own `.dbs` name; it backs up the `.mdproject`, `.mddata` and
 `_Loaded.msp2` under `<workspace_root>\_viewing\r-<restore id>`, whose
 `restore.local.json` lists every path the restore made. While it stands, a
 `viewing_restore` hold blocks sharing and raw deletion, and no Console or new
-production run starts on the unit (`viewing_restore_active`). With the raw files
-released, MS-DIAL needs a GUI that opens a project without them.
+production run starts on the unit (`viewing_restore_active`). The restore holds
+the raw-deletion locks of the unit, and of the unit whose raw tree a split part
+reads, until its copies are made, so no cleanup, discard or split-parent release
+runs beside it. With the raw files released, MS-DIAL needs a GUI that opens a
+project without them.
 `msdial_undo_project_restore` removes exactly what the record lists, puts back
 a project file MS-DIAL changed (keeping the changed one under
 `_viewing\r-<restore id>\gui-saved\`), sends any library copy MS-DIAL's GUI
 wrote through the store as the GUI's, never the run's, and reports, never
 deletes, any other file that appeared. Until a directory the restore made holds
-none of those files, the restore stays held. A unit finalised before 0.5.37 has no stored object;
+none of those files, the restore stays held; one holding only the copies of
+another part's restore into the same released tree waits for that restore's
+undo. A unit finalised before 0.5.37 has no stored object;
 `python -m msdial_app.library_copy_store seed` copies a verified `.dbs` into the
 store, and `... attach <manifest> --object <id>` names the object a unit's
 deleted copy stands for when its recorded libraries and annotation settings
@@ -392,8 +402,9 @@ temporary file before moving it into place. Every Console Interactive starts
 for a repository unit, the retention-time preview included, therefore gets TMP
 and TEMP pointed at `<workspace_root>\_tmp\<job id>`; what is left there
 afterwards is listed in the run attempt (`console_temp`), a library copy goes
-to the store, and the rest is removed. A laboratory run keeps the TEMP its user
-has.
+to the store and is named in the unit's `library_copy_records` (action
+`console_temp`), and the rest is removed. A laboratory run keeps the TEMP its
+user has.
 
 What a repository unit shares carries no path from this machine: the mzTab-M's
 `database[n]-uri` is `null` for a library without a DOI or https source and

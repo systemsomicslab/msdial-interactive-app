@@ -36,9 +36,14 @@ or laid out otherwise - is keyed by its sha256 and is only ever found equal to t
 
 WHAT IS NEVER DONE. A copy is removed only once the store holds one proven equal: the same normalised bytes,
 re-read from the object under its lock rather than taken from entry.json, or entries that decompress to the
-same content. A copy that cannot be stored stays where it is, and its caller holds it from sharing. An install
-is one step with its object's record: one that stops before the record is written takes the copy back to where it
-was, and one that cannot is left for repair with its intent, the caller recording the copy as pending
+same content. It is removed or moved only as the file whose identity was read - renamed into the store or to a
+private name beside it first, and compared there by its file record, size and time - so a file MS-DIAL's save put
+at its path in between is never the one removed. An object is called damaged only when it is verified to differ
+from its record; one that cannot be read now (MS-DIAL loading it through a restore's link opens it sharing
+nothing) refuses the put instead. A copy that cannot be stored stays where it is, and its caller holds it from
+sharing. An install is one step with its object's record: one that stops before the record is written takes the
+copy back to where it was, never over a file that has taken its place, and one that cannot is left for repair
+with its intent, the caller recording the copy as pending
 (LibraryCopyPending) rather than holding a place it has left. Nothing
 here writes an absolute path into a record, a log line or an error text: the store and every file in it are
 named relative to the workspace root, and an OSError is described by its codes and the file's relative name
@@ -55,6 +60,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import errno
 import hashlib
 import json
 import os
@@ -63,8 +69,10 @@ import shutil
 import stat
 import struct
 import sys
+import time
 import uuid
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Iterable
@@ -129,6 +137,12 @@ _LOCAL_HEADER = b"PK\x03\x04"
 _CENTRAL_RECORD = b"PK\x01\x02"
 _CENTRAL_RECORD_SIZE = 46
 _CHUNK = 4 * 1024 * 1024
+# What reading a damaged zip raises besides an OSError. zlib.error is no zipfile exception, and ZipFile.testzip
+# catches only BadZipFile, so a corrupt deflate stream escaped every handler until it was named here.
+_ZIP_ERRORS = (zipfile.BadZipFile, EOFError, ValueError, NotImplementedError, struct.error, zlib.error)
+# What problem() found: verified against the object's record, or not read at all.
+MISMATCH = "mismatch"
+UNREADABLE = "unreadable"
 _SAFE_COMPONENT = re.compile(r"[^A-Za-z0-9._-]+")
 _ROOTED_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|/)")
 # The method-file keys that decide what MS-DIAL serialises into the .dbs: the libraries, the annotators and
@@ -225,6 +239,9 @@ class CopyIdentity:
     dos_times: tuple[dict[str, Any], ...] = ()
     storage_sha256: str | None = None
     reason: str = ""
+    # (st_dev, st_ino, st_size, st_mtime_ns) of the file that was read: what is removed or moved as this copy
+    # must be that file, not one a save put at its path since (file_fingerprint). Never recorded.
+    file_id: tuple[int, int, int, int] | None = None
 
     @property
     def object_id(self) -> str:
@@ -288,9 +305,9 @@ def _zip_layout(path: Path) -> tuple[dict[str, Any] | None, str]:
                     for chunk in iter(lambda: handle.read(_CHUNK), b""):
                         digest.update(chunk)
                 storage_sha256: str | None = digest.hexdigest()
-            except (zipfile.BadZipFile, EOFError, ValueError, NotImplementedError):
+            except _ZIP_ERRORS:
                 storage_sha256 = None
-    except (zipfile.BadZipFile, EOFError, ValueError, NotImplementedError, struct.error, KeyError):
+    except (*_ZIP_ERRORS, KeyError):
         return None, "it is not a readable zip archive"
     patches: list[tuple[int, int]] = []
     dos_times: list[dict[str, Any]] = []
@@ -357,16 +374,57 @@ def content_key_of(entries: Iterable[dict[str, Any]]) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def file_fingerprint(path: str | Path) -> tuple[int, int, int, int]:
+    """(st_dev, st_ino, st_size, st_mtime_ns): the file a path names now. A rename keeps it; a save that puts a
+    new file at the path (MS-DIAL deletes the file and moves its temporary file into place) does not."""
+    details = os.stat(extended_path(path))
+    return details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns
+
+
+def private_name(name: str, purpose: str) -> str:
+    """A name beside ``name`` that no save writes to, for a file being removed or put through the store.
+
+    A library copy keeps its _Loaded.msp2.dbs suffix, so that one a crash left under this name is still found
+    where every library copy is looked for (finalisation, the undo of a restore, the gate's FIN-3).
+    """
+    tag = f"~{purpose}-{uuid.uuid4().hex[:12]}"
+    if name.endswith(LOADED_LIBRARY_COPY_SUFFIX):
+        return name[: -len(LOADED_LIBRARY_COPY_SUFFIX)] + tag + LOADED_LIBRARY_COPY_SUFFIX
+    return f".{name}{tag}"
+
+
+def rename_back(source: str | Path, target: str | Path, attempts: int = 40, delay: float = 0.05) -> None:
+    """os.rename that never writes over a file, retried briefly on PermissionError as download_store._replace is.
+
+    Windows refuses a rename onto a name that exists (FileExistsError); elsewhere such a name is refused here
+    first. Used to put a file back where it was: a file a save has put there since is never overwritten.
+    """
+    for attempt in range(attempts):
+        try:
+            if os.name != "nt" and os.path.lexists(extended_path(target)):
+                raise FileExistsError(errno.EEXIST, "File exists", str(target))
+            os.rename(extended_path(source), extended_path(target))
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 def read_copy_identity(path: str | Path) -> CopyIdentity:
     """The identity of one library copy, read in one streaming pass (and a read of its central directory).
 
-    Raises OSError when the file cannot be read; a file that is not a recognised copy is not an error.
+    Raises OSError when the file cannot be read, and LibraryCopyStoreError when it changed while it was read; a
+    file that is not a recognised copy is not an error.
     """
     source = Path(path)
+    before = file_fingerprint(source)
     layout, reason = _zip_layout(source)
     sha256, normalized, size = _hash_file(source, (layout or {}).get("patches") or [])
+    if file_fingerprint(source) != before:
+        raise LibraryCopyStoreError(f"{source.name} changed while it was read; it was not identified")
     if layout is None:
-        return CopyIdentity(size, sha256, sha256, sha256, "file_sha256", False, reason=reason)
+        return CopyIdentity(size, sha256, sha256, sha256, "file_sha256", False, reason=reason, file_id=before)
     return CopyIdentity(
         size_bytes=size,
         sha256=sha256,
@@ -377,6 +435,7 @@ def read_copy_identity(path: str | Path) -> CopyIdentity:
         entries=tuple(layout["entries"]),
         dos_times=tuple(layout["dos_times"]),
         storage_sha256=layout["storage_sha256"],
+        file_id=before,
     )
 
 
@@ -403,11 +462,12 @@ def is_library_copy_file(path: str | Path) -> bool:
 
 
 def _testzip(path: Path) -> str | None:
-    """None when every entry decompresses to its CRC, else what failed."""
+    """None when every entry decompresses to its CRC, else what failed. An OSError - a file that cannot be
+    opened now - is raised, never taken for damage."""
     try:
         with zipfile.ZipFile(extended_path(path)) as archive:
             bad = archive.testzip()
-    except (zipfile.BadZipFile, EOFError, ValueError, NotImplementedError, struct.error) as error:
+    except _ZIP_ERRORS as error:
         return f"{type(error).__name__}: {error}"
     return None if bad is None else f"entry {bad.replace(chr(92), '/')} does not match its CRC"
 
@@ -415,49 +475,61 @@ def _testzip(path: Path) -> str | None:
 def _compare_inflated(copy: Path, stored: Path) -> str:
     """'equal', 'different', 'copy_damaged' or 'object_damaged': every entry decompressed, side by side.
 
-    zipfile checks each entry's CRC as it reaches the end, so a damaged side is told apart from a difference.
+    zipfile checks an entry's CRC only when its read reaches the entry's end, and a damaged stretch of a real
+    entry (0.39 and 0.81 GB) reads as other bytes long before that. So an entry whose bytes differ is read to
+    its end on both sides before it is called different: a damaged side raises there, and is named. An OSError
+    - a file that cannot be opened now - is raised, never taken for damage.
     """
     try:
         left_archive = zipfile.ZipFile(extended_path(copy))
-    except (zipfile.BadZipFile, EOFError, ValueError, NotImplementedError, struct.error):
+    except _ZIP_ERRORS:
         return "copy_damaged"
     try:
         try:
             right_archive = zipfile.ZipFile(extended_path(stored))
-        except (zipfile.BadZipFile, EOFError, ValueError, NotImplementedError, struct.error):
+        except _ZIP_ERRORS:
             return "object_damaged"
-        with left_archive, right_archive:
+        with right_archive:
             left = {info.filename.replace("\\", "/"): info for info in left_archive.infolist()}
             right = {info.filename.replace("\\", "/"): info for info in right_archive.infolist()}
             if sorted(left) != sorted(right):
                 return "different"
             for name in sorted(left):
-                try:
-                    left_handle = left_archive.open(left[name])
-                except (zipfile.BadZipFile, EOFError, ValueError, NotImplementedError):
-                    return "copy_damaged"
-                try:
-                    right_handle = right_archive.open(right[name])
-                except (zipfile.BadZipFile, EOFError, ValueError, NotImplementedError):
-                    left_handle.close()
-                    return "object_damaged"
-                with left_handle, right_handle:
-                    while True:
-                        try:
-                            a = left_handle.read(_CHUNK)
-                        except (zipfile.BadZipFile, EOFError, ValueError, NotImplementedError):
-                            return "copy_damaged"
-                        try:
-                            b = right_handle.read(len(a) if a else _CHUNK)
-                        except (zipfile.BadZipFile, EOFError, ValueError, NotImplementedError):
-                            return "object_damaged"
-                        if a != b:
-                            return "different"
-                        if not a:
-                            break
+                verdict = _compare_entry(left_archive, left[name], right_archive, right[name])
+                if verdict != "equal":
+                    return verdict
     finally:
         left_archive.close()
     return "equal"
+
+
+def _compare_entry(
+    left_archive: zipfile.ZipFile, left: zipfile.ZipInfo, right_archive: zipfile.ZipFile, right: zipfile.ZipInfo
+) -> str:
+    """One entry of _compare_inflated, both sides read to their ends."""
+    try:
+        left_handle = left_archive.open(left)
+    except _ZIP_ERRORS:
+        return "copy_damaged"
+    with left_handle:
+        try:
+            right_handle = right_archive.open(right)
+        except _ZIP_ERRORS:
+            return "object_damaged"
+        with right_handle:
+            differs = False
+            while True:
+                try:
+                    a = left_handle.read(_CHUNK)
+                except _ZIP_ERRORS:
+                    return "copy_damaged"
+                try:
+                    b = right_handle.read(len(a) if a else _CHUNK)
+                except _ZIP_ERRORS:
+                    return "object_damaged"
+                differs = differs or a != b
+                if not a and not b:
+                    return "different" if differs else "equal"
 
 
 def _sha256(path: Path) -> str:
@@ -737,43 +809,56 @@ class LibraryCopyStore:
 
     # -- verification
 
-    def problem(self, object_id: str, entry: dict[str, Any] | None = None, *, full: bool = False) -> str | None:
-        """What is wrong with an object, or None: its file, its size, its entries, and with ``full`` its bytes.
+    def diagnose(
+        self, object_id: str, entry: dict[str, Any] | None = None, *, full: bool = False
+    ) -> tuple[str | None, str | None]:
+        """(MISMATCH or UNREADABLE, what is wrong with an object), or (None, None).
 
-        Never raises for a file or a record that cannot be read: that is what is wrong, named relative to the
-        workspace root as everything here is.
+        MISMATCH is verified against the object's record: the record absent, the file missing, its size, its
+        entries or, with ``full``, its bytes differ. UNREADABLE is a record or a file that could not be read now
+        - a sharing violation among them, as while MS-DIAL loads a restored project through its link to the
+        object (File.Open shares nothing) - which says nothing of its bytes. Never raises: what is wrong is
+        named relative to the workspace root, as everything here is.
         """
         try:
             entry = entry if entry is not None else self.entry(object_id)
         except (OSError, StoreError) as error:
-            return f"its record cannot be read ({describe_error(error, self.workspace_root)})"
+            return UNREADABLE, f"its record cannot be read ({describe_error(error, self.workspace_root)})"
         if entry is None:
-            return "its record is absent"
+            return MISMATCH, "its record is absent"
         path = self.object_path(object_id)
         try:
             size = os.stat(extended_path(path)).st_size
         except FileNotFoundError:
-            return "its file is missing"
+            return MISMATCH, "its file is missing"
         except OSError as error:
-            return f"its file cannot be read ({describe_error(error, self.workspace_root)})"
+            return UNREADABLE, f"its file cannot be read ({describe_error(error, self.workspace_root)})"
         if size != entry.get("size_bytes"):
-            return f"its file holds {size} bytes and its record {entry.get('size_bytes')}"
+            return MISMATCH, f"its file holds {size} bytes and its record {entry.get('size_bytes')}"
         if entry.get("recognised"):
             try:
                 table = entry_table(path)
             except OSError as error:
-                return f"its file cannot be read ({describe_error(error, self.workspace_root)})"
+                return UNREADABLE, f"its file cannot be read ({describe_error(error, self.workspace_root)})"
             if table != entry.get("entries"):
-                return "its entries differ from its record"
+                return MISMATCH, "its entries differ from its record"
         if not full:
-            return None
+            return None, None
         try:
             identity = read_copy_identity(path)
         except OSError as error:
-            return f"its file cannot be read ({describe_error(error, self.workspace_root)})"
+            return UNREADABLE, f"its file cannot be read ({describe_error(error, self.workspace_root)})"
         if identity.normalized_sha256 != entry.get("normalized_sha256"):
-            return "its bytes differ from its record"
-        return None
+            return MISMATCH, "its bytes differ from its record"
+        return None, None
+
+    def problem(self, object_id: str, entry: dict[str, Any] | None = None, *, full: bool = False) -> str | None:
+        """What is wrong with an object, or None: its file, its size, its entries, and with ``full`` its bytes.
+
+        Never raises for a file or a record that cannot be read: that is what is wrong, named relative to the
+        workspace root as everything here is. diagnose says whether it was verified or could not be read.
+        """
+        return self.diagnose(object_id, entry, full=full)[1]
 
     # -- claims
 
@@ -819,6 +904,43 @@ class LibraryCopyStore:
                 found.append(record)
         return found
 
+    def find_settled(self, unit: dict[str, Any] | None, job_id: str, action: str, name: str) -> dict[str, Any] | None:
+        """What the store did with a copy a unit's run gave it, from the store's own records; None when none says.
+
+        For a copy that is no longer where its caller's record left it - a retry that stored it, and could not
+        then write the unit manifest, leaves exactly that. Its claim says it was stored or found equal; the intent
+        of an install that stopped says it is pending; a quarantine's reason says it was set aside. Matched by
+        unit, job, the step that put it (``action``) and the copy's name. Read-only.
+        """
+        file = claim_name(unit, job_id, action)
+        for object_id in self.object_ids():
+            try:
+                claim = _read_json(self.claims_directory(object_id) / file)
+            except (OSError, StoreError):
+                claim = None
+            if isinstance(claim, dict) and claim.get("name") == name:
+                return {"name": name, "sha256": claim.get("sha256"), "dos_times": claim.get("dos_times") or [],
+                        "object_id": object_id, "outcome": claim.get("outcome"), "verified_by": "store_claim",
+                        "claim": file, "removed_at": claim.get("recorded_at")}
+        label = unit_label(unit)
+        for folder, record_file, outcome in (("incoming", "intent.json", PENDING),
+                                             ("quarantine", "reason.json", QUARANTINED)):
+            directory = self.root / folder
+            for item in sorted(directory.iterdir()) if directory.is_dir() else []:
+                try:
+                    found = _read_json(item / record_file) if item.is_dir() else None
+                except (OSError, StoreError):
+                    found = None
+                copy = (found or {}).get("copy") if isinstance(found, dict) else None
+                recorded_unit = found.get("unit") if isinstance(found, dict) else None
+                if not isinstance(copy, dict) or copy.get("name") != name \
+                        or str(found.get("job_id") or "") != job_id or str(found.get("how") or "") != action \
+                        or (unit_label(recorded_unit) if isinstance(recorded_unit, dict) else recorded_unit) != label:
+                    continue
+                return {**copy, "outcome": outcome, "verified_by": "store_record", folder: self.relative(item),
+                        "removed_at": found.get("recorded_at")}
+        return None
+
     # -- putting a copy in
 
     def put(
@@ -839,17 +961,36 @@ class LibraryCopyStore:
         Under the object's lock: a content key the store does not hold is staged through incoming/ (its intent
         recorded first) and installed; one it holds is compared with the object, re-read now, and the copy is
         removed only when equal - else, if it decompresses to other content, it is moved to quarantine. A
-        damaged object is replaced by this copy and kept beside it. ``keep_source`` copies and leaves the
-        source (a seed). Raises LibraryCopyStoreError (an OSError) when the copy could not be stored; the copy
-        is then where it was. Raises LibraryCopyPending (one of them) when it had left and its install stopped
-        before its record was written, and could not be taken back: repair completes it.
+        damaged object - one verified to differ from its record - is replaced by this copy and kept beside it;
+        an object that cannot be read now is no damaged one, and the copy is not stored. The copy is removed or
+        moved only as the file whose identity was read (identity.file_id): a file a save put at its path since is
+        left there, and the put refused. ``keep_source`` copies and leaves the source (a seed). Raises
+        LibraryCopyStoreError (an OSError) when the copy could not be stored; the copy is then where it was.
+        Raises LibraryCopyPending (one of them) when it had left and its install stopped before its record was
+        written, and could not be taken back: repair completes it.
         """
         lock = self._locked(identity.object_id, job_id)
         try:
             return self._put_locked(Path(source), identity, unit=unit, job_id=job_id, libraries=libraries,
                                     settings=settings, how=how, patience=patience, keep_source=keep_source)
+        except zlib.error as error:
+            # Every read of zip data here names a damaged stream; this is the net behind them, before anything moved.
+            raise LibraryCopyStoreError(
+                f"{Path(source).name} could not be compared or tested ({describe_error(error)}); it was not stored"
+            ) from error
         finally:
             self._release(lock)
+
+    def _verified_problem(
+        self, object_id: str, entry: dict[str, Any], source: Path, *, full: bool = False
+    ) -> str | None:
+        """problem(), with an object that could not be read refusing the put: that is no damage to repair."""
+        kind, problem = self.diagnose(object_id, entry, full=full)
+        if kind == UNREADABLE:
+            raise LibraryCopyStoreError(
+                f"object {object_id} could not be read to compare {source.name} with it ({problem}); it was not stored"
+            )
+        return problem
 
     def _put_locked(
         self, source: Path, identity: CopyIdentity, *, unit: dict[str, Any] | None, job_id: str,
@@ -862,7 +1003,7 @@ class LibraryCopyStore:
         if entry is None:
             return self._install(source, identity, record, unit=unit, job_id=job_id, libraries=libraries,
                                  settings=settings, how=how, run=run, keep_source=keep_source)
-        problem = self.problem(object_id, entry)
+        problem = self._verified_problem(object_id, entry, source)
         if problem is None:
             if identity.content_key_kind != entry.get("content_key_kind"):
                 raise LibraryCopyStoreError(
@@ -871,7 +1012,7 @@ class LibraryCopyStore:
                 )
             if identity.normalized_sha256 == entry.get("normalized_sha256"):
                 # entry.json says the object is this copy; the object's own bytes, re-read now, must say so too.
-                problem = self.problem(object_id, entry, full=True)
+                problem = self._verified_problem(object_id, entry, source, full=True)
                 if problem is None:
                     verified = "normalized_sha256" if identity.recognised else "sha256"
                     return self._settle_equal(source, identity, record, entry, DEDUPLICATED, verified,
@@ -887,12 +1028,51 @@ class LibraryCopyStore:
                 if verdict == "copy_damaged":
                     raise LibraryCopyStoreError(f"{source.name} does not decompress to its own CRCs; it was not stored")
                 if verdict == "different":
-                    return self._quarantine(source, identity, record, object_id, unit=unit, job_id=job_id,
-                                            how=how, run=run, keep_source=keep_source)
-                problem = "its entries do not decompress to their CRCs"
+                    # Both sides of the entry that differs decompressed to their CRCs. The object is re-read whole
+                    # against its record all the same before it is taken for the content this copy differs from:
+                    # a damaged object is replaced, and is never why a sound copy is set aside.
+                    problem = self._verified_problem(object_id, entry, source, full=True)
+                    if problem is None:
+                        return self._quarantine(source, identity, record, object_id, unit=unit, job_id=job_id,
+                                                how=how, run=run, keep_source=keep_source)
+                else:
+                    problem = "its entries do not decompress to their CRCs"
         return self._install(source, identity, record, unit=unit, job_id=job_id, libraries=libraries,
                              settings=settings, how=how, run=run, keep_source=keep_source, damaged=problem,
                              previous=entry)
+
+    def _remove_verified(self, source: Path, identity: CopyIdentity, run: Callable[[Callable[[], Any]], Any]) -> None:
+        """Remove the copy at ``source``, only if it is still the file whose identity was read.
+
+        It is renamed to a private name beside it first and compared there by its file record, size and time, so
+        that a file a save put at ``source`` meanwhile - MS-DIAL deletes the file and moves a new one into place,
+        and does not hold it open between saves - is never the one removed. One that changed goes back, never
+        over a newer one, and LibraryCopyStoreError says so: its caller holds what is at ``source``.
+        """
+        if identity.file_id is None:
+            run(lambda: os.unlink(extended_path(source)))
+            return
+        private = source.with_name(private_name(source.name, "settling"))
+        run(lambda: os.rename(extended_path(source), extended_path(private)))
+        if file_fingerprint(private) != identity.file_id:
+            try:
+                rename_back(private, source)
+            except OSError as error:
+                raise LibraryCopyStoreError(
+                    f"{source.name} changed after it was identified, and another file has taken its name since; it "
+                    f"was kept as {private.name} ({describe_error(error, self.workspace_root)})"
+                ) from error
+            raise LibraryCopyStoreError(
+                f"{source.name} changed after it was identified (a save replaced it); it was kept"
+            )
+        try:
+            run(lambda: os.unlink(extended_path(private)))
+        except OSError:
+            try:
+                rename_back(private, source)
+            except OSError:
+                pass  # kept under its private name, which keeps the suffix every search for a copy reads
+            raise
 
     def _settle_equal(
         self, source: Path, identity: CopyIdentity, record: dict[str, Any], entry: dict[str, Any], outcome: str,
@@ -914,22 +1094,50 @@ class LibraryCopyStore:
             claim = self.claim(object_id, unit=unit, job_id=job_id, action=how, name=source.name, copy=record,
                                outcome=outcome)
         if not keep_source:
-            run(lambda: os.unlink(extended_path(source)))
+            try:
+                self._remove_verified(source, identity, run)
+            except BaseException:
+                if claim is not None:
+                    # Nothing was removed, so no claim says this unit's copy was found equal.
+                    try:
+                        os.unlink(extended_path(self.claims_directory(object_id) / claim))
+                    except OSError:
+                        pass
+                raise
         return {**record, "outcome": outcome, "verified_by": verified, "claim": claim,
                 "removed_at": None if keep_source else _now(),
                 "annotation_settings_sha256": (settings or {}).get("sha256")}
 
     def _stage(self, source: Path, staged: Path, identity: CopyIdentity, run: Callable[[Callable[[], Any]], Any],
                copy: bool) -> str:
-        """Put the copy at ``staged``: renamed on one volume, else copied and compared. Returns how."""
+        """Put the copy at ``staged``: renamed on one volume, else copied and compared. Returns how.
+
+        A renamed file is compared with the identity once it has moved, by its file record, size and time: one a
+        save put at ``source`` after the identity was read goes back, never over a newer one, and is not staged.
+        """
         if not copy:
             try:
                 run(lambda: os.replace(extended_path(source), extended_path(staged)))
-                return "rename"
             except PermissionError:
                 raise  # still held after the patience: a copy could not remove the source either
             except OSError:
                 pass  # another volume
+            else:
+                if identity.file_id is not None and file_fingerprint(staged) != identity.file_id:
+                    try:
+                        rename_back(staged, source)
+                    except OSError as error:
+                        # Left beside its intent: repair finds a staged file that is not the intent's copy and sets
+                        # it aside, never deleting it.
+                        raise LibraryCopyStoreError(
+                            f"{source.name} changed after it was identified, and another file has taken its name "
+                            f"since; it was left in {self.relative(staged.parent)} for repair "
+                            f"({describe_error(error, self.workspace_root)})"
+                        ) from error
+                    raise LibraryCopyStoreError(
+                        f"{source.name} changed after it was identified (a save replaced it); it was not stored"
+                    )
+                return "rename"
         try:
             shutil.copyfile(extended_path(source), extended_path(staged))
             if _sha256(staged) != identity.sha256:
@@ -976,7 +1184,8 @@ class LibraryCopyStore:
             linked = os.stat(extended_path(source)).st_nlink > 1
             method = self._stage(source, staged, identity, run, copy=keep_source or linked)
         except BaseException:
-            unlink_tree(incoming)
+            if not os.path.lexists(extended_path(staged)):
+                unlink_tree(incoming)
             raise
         directory = self.object_directory(object_id)
         target = self.object_path(object_id)
@@ -1003,8 +1212,9 @@ class LibraryCopyStore:
             # The install is one step with its record: until the record is written, nothing is installed.
             _write_json_atomic(self.entry_path(object_id), entry)
         except BaseException as error:
+            # A copied source never left; a renamed one goes back, unless a file has taken its place since.
             if self._roll_back(source, staged, target, kept, incoming, method, installed) or keep_source \
-                    or os.path.lexists(extended_path(source)) or not isinstance(error, Exception):
+                    or method != "rename" or not isinstance(error, Exception):
                 raise
             raise LibraryCopyPending(
                 f"{source.name} left for the library-copy store, and its install stopped before its record was "
@@ -1026,8 +1236,8 @@ class LibraryCopyStore:
         unlink_tree(incoming)
         removed = None
         if method == "copy" and not keep_source:
-            # The store holds it now; only then does the source name go.
-            run(lambda: os.unlink(extended_path(source)))
+            # The store holds it now; only then does the source name go - and only as the file identified.
+            self._remove_verified(source, identity, run)
             removed = _now()
         elif method == "rename":
             removed = _now()
@@ -1048,25 +1258,26 @@ class LibraryCopyStore:
     ) -> bool:
         """Take back an install that stopped before its record was written. Whether nothing of it is left.
 
-        A renamed copy goes back to its own place, so that its caller holds it there; a copied one is removed
-        from the store, its source never having left. A file moved aside goes back to the object's place. The
-        ingest's directory, its intent with it, goes only when the copy is back: else repair completes it.
+        A renamed copy goes back to its own place, so that its caller holds it there - never over a file a save
+        has put there since; a copied one is removed from the store, its source never having left. A file moved
+        aside goes back to the object's place. The ingest's directory, its intent with it, goes only when the
+        copy is back: else repair completes it.
         """
         returned = False
         try:
             if installed:
                 if method == "rename":
-                    _replace(Path(extended_path(target)), Path(extended_path(source)))
+                    rename_back(target, source)
                 else:
                     os.unlink(extended_path(target))
             elif method == "rename" and os.path.lexists(extended_path(staged)):
-                _replace(Path(extended_path(staged)), Path(extended_path(source)))
+                rename_back(staged, source)
             returned = True
         except OSError:
             pass
         if kept is not None and not os.path.lexists(extended_path(target)):
             try:
-                _replace(Path(extended_path(kept)), Path(extended_path(target)))
+                rename_back(kept, target)
             except OSError:
                 pass
         if returned:
@@ -1096,13 +1307,14 @@ class LibraryCopyStore:
         }
         _write_json_atomic(directory / "reason.json", reason)
         try:
-            self._stage(source, directory / OBJECT_FILE, identity, run,
-                        copy=os.stat(extended_path(source)).st_nlink > 1)
+            method = self._stage(source, directory / OBJECT_FILE, identity, run,
+                                 copy=os.stat(extended_path(source)).st_nlink > 1)
         except BaseException:
-            unlink_tree(directory)
+            if not os.path.lexists(extended_path(directory / OBJECT_FILE)):
+                unlink_tree(directory)
             raise
-        if os.path.lexists(extended_path(source)):
-            run(lambda: os.unlink(extended_path(source)))
+        if method == "copy":
+            self._remove_verified(source, identity, run)
         return {**record, "outcome": QUARANTINED, "verified_by": "decompressed_content", "claim": None,
                 "removed_at": _now(), "quarantine": self.relative(directory)}
 
@@ -1222,7 +1434,8 @@ class LibraryCopyStore:
             directory = self.workspace_root / item["incoming"]
             try:
                 result["repaired"].append({**item, **self._repair_one(directory, item)})
-            except (OSError, StoreError) as error:
+            except (OSError, ValueError, zlib.error) as error:
+                # One ingest that cannot be completed - its staged copy damaged, its lock held - stops only itself.
                 result["errors"].append(f"{item['incoming']}: {describe_error(error, self.workspace_root)}")
         return result
 
@@ -1452,11 +1665,30 @@ def _run_records(directory: Path) -> tuple[list[dict[str, Any]], dict[str, Any] 
 # ---- a finalised unit whose copy was deleted before the store existed ------------------------------------
 
 
+def legacy_deleted_copies(manifest: dict[str, Any], job_id: str) -> list[dict[str, Any]]:
+    """The library copies of a run deleted before the library-copy store existed (Interactive before 0.5.37).
+
+    Those its finalisation deleted (loaded_library_copies_deleted), and those a retry of a held deletion deleted
+    later: up to 0.5.36 a copy held at finalisation was recorded there as none, and the retry that deleted it named
+    it only in its hold's resolution (finalisation_hold_resolutions, step loaded_library_copy, ``deleted``).
+    """
+    finalisation = manifest.get("console_run_finalisation") if isinstance(
+        manifest.get("console_run_finalisation"), dict) else {}
+    found: list[dict[str, Any]] = []
+    if job_id and str((finalisation or {}).get("job_id") or "") == job_id:
+        found.extend(item for item in (finalisation or {}).get(LEGACY_LIBRARY_COPY_RECORD) or []
+                     if isinstance(item, dict))
+    for note in manifest.get("finalisation_hold_resolutions") or []:
+        if isinstance(note, dict) and note.get("step") == LIBRARY_COPY_RECORD and job_id                 and str(note.get("job_id") or "") == job_id:
+            found.extend(item for item in note.get("deleted") or [] if isinstance(item, dict))
+    return found
+
+
 def _finalised_copy(manifest: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
     finalisation = manifest.get("console_run_finalisation") if isinstance(
         manifest.get("console_run_finalisation"), dict) else {}
     job_id = str((finalisation or {}).get("job_id") or "")
-    deleted = [item for item in (finalisation or {}).get(LEGACY_LIBRARY_COPY_RECORD) or [] if isinstance(item, dict)]
+    deleted = legacy_deleted_copies(manifest, job_id)
     return job_id, (deleted[0] if len(deleted) == 1 else None)
 
 
@@ -1662,9 +1894,10 @@ def settle_console_temp(
             except LibraryCopyPending as error:
                 # It left the directory for the store: repair completes it, and no hold here would keep it.
                 result["library_copies"].append({**error.record, "outcome": PENDING,
-                                                 "store_error": describe_error(error, root)})
+                                                 "store_error": describe_error(error, root),
+                                                 "incoming": error.incoming})
                 result["errors"].append(f"{path.name}: {describe_error(error, root)}")
-            except (OSError, StoreError) as error:
+            except (OSError, ValueError, zlib.error) as error:
                 result["held"].append(str(path))
                 result["errors"].append(f"{path.name}: {describe_error(error, root)}")
     held = {str(path) for path in result["held"]}

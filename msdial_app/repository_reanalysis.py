@@ -9468,6 +9468,8 @@ def _delete_raw_tree(
     deleting, partial or removed by an earlier call of the same kind on the same tree is resumed, keeping when
     it was planned and how much it found.
     """
+    from .run_finalisation import BLOCKS_RAW_DELETION, FinalisationHeld, raw_deletion_holds
+
     planned_count, planned_bytes = _tree_size(raw_root)
     started = datetime.now(timezone.utc).isoformat()
     record: dict[str, Any] = {}
@@ -9475,6 +9477,14 @@ def _delete_raw_tree(
     def intent(current: dict[str, Any]) -> None:
         if guard is not None:
             guard(current)
+        # Every caller refused a hold on the deletion when it judged it; one recorded since - a viewing restore of
+        # the unit or of a part reading its tree, which writes into it - is refused in the intent's own write.
+        held = raw_deletion_holds(manifest_path, current)
+        if held:
+            raise FinalisationHeld(
+                BLOCKS_RAW_DELETION,
+                "a hold on this raw tree was recorded after the deletion was judged; nothing was deleted", held,
+            )
         previous = current.get(record_key)
         resumed = (
             isinstance(previous, dict)

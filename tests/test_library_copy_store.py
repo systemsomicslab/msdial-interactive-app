@@ -17,12 +17,13 @@ import hashlib
 import io
 import json
 import os
+import random
 import re
 import tempfile
 import threading
 import unittest
 import zipfile
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -87,6 +88,45 @@ def synthetic_dbs(
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@contextmanager
+def _stop_after_install():
+    """An install whose record cannot be written and whose copy cannot be taken back out of the store."""
+    write, replace, back = library_copy_store._write_json_atomic, library_copy_store._replace, library_copy_store.rename_back
+
+    def refuse_entry(path, value):
+        if Path(path).name == "entry.json":
+            raise PermissionError(13, "Access is denied", str(path))
+        return write(path, value)
+
+    def holds(move):
+        def held(source, target, *args, **kwargs):
+            if Path(source).name == OBJECT_FILE and Path(source).parent.parent.name == "o":
+                raise PermissionError(13, "held by a scanner", str(source))
+            return move(source, target, *args, **kwargs)
+        return held
+
+    with patch.object(library_copy_store, "_write_json_atomic", refuse_entry), \
+            patch.object(library_copy_store, "_replace", holds(replace)), \
+            patch.object(library_copy_store, "rename_back", holds(back)):
+        yield
+
+
+def entry_data_offset(path: Path, index: int = 0) -> tuple[int, int]:
+    """(where entry ``index``'s compressed data starts in the file, how long it is): to damage the data itself."""
+    with zipfile.ZipFile(path) as archive:
+        info = archive.infolist()[index]
+    data = path.read_bytes()
+    name_length, extra_length = int.from_bytes(data[info.header_offset + 26:info.header_offset + 28], "little"), \
+        int.from_bytes(data[info.header_offset + 28:info.header_offset + 30], "little")
+    return info.header_offset + 30 + name_length + extra_length, info.compress_size
+
+
+def flip(path: Path, offset: int, mask: int = 0xFF) -> None:
+    data = bytearray(path.read_bytes())
+    data[offset] ^= mask
+    path.write_bytes(bytes(data))
 
 
 def assert_names_no_root(case: unittest.TestCase, root: Path, text: str) -> None:
@@ -204,9 +244,8 @@ class PutTests(_Store):
     def test_an_object_damaged_inside_is_never_taken_as_proof(self) -> None:
         first = self.put(self.copy(date_time=(2026, 10, 1, 10, 0, 0)))
         object_path = self.store.object_path(first["object_id"])
-        data = bytearray(object_path.read_bytes())
-        data[60] ^= 0xFF  # inside the first entry's data: size and entry table unchanged
-        object_path.write_bytes(bytes(data))
+        start, length = entry_data_offset(object_path)
+        flip(object_path, start + length // 2)  # inside the first entry's data: size and entry table unchanged
         copy = self.copy(date_time=(2026, 10, 2, 10, 0, 0))
 
         record = self.put(copy, job_id="job2")
@@ -338,20 +377,7 @@ class PutTests(_Store):
 
     def _stop_after_install(self):
         """An install whose record cannot be written and whose copy cannot be taken back out of the store."""
-        write, replace = library_copy_store._write_json_atomic, library_copy_store._replace
-
-        def refuse_entry(path, value):
-            if Path(path).name == "entry.json":
-                raise PermissionError(13, "Access is denied", str(path))
-            return write(path, value)
-
-        def hold_object(source, target, *args, **kwargs):
-            if Path(source).name == OBJECT_FILE and Path(source).parent.parent.name == "o":
-                raise PermissionError(13, "held by a scanner", str(source))
-            return replace(source, target, *args, **kwargs)
-
-        return (patch.object(library_copy_store, "_write_json_atomic", refuse_entry),
-                patch.object(library_copy_store, "_replace", hold_object))
+        return _stop_after_install()
 
     def _unit_manifest(self, job_id: str = "job1") -> Path:
         manifest = self.root / UNIT["manifest"]
@@ -365,8 +391,7 @@ class PutTests(_Store):
         manifest = self._unit_manifest()
         copy = self.copy()
         lines: list[str] = []
-        first, second = self._stop_after_install()
-        with first, second:
+        with self._stop_after_install():
             copies, errors = store_loaded_library_copies(self.output, self.store, unit=UNIT, job_id="job1",
                                                          libraries=LIBRARIES, log=lines.append)
         [pending] = copies
@@ -397,8 +422,7 @@ class PutTests(_Store):
     def test_a_file_set_aside_with_no_record_is_named_and_its_unit_found_equal(self) -> None:
         manifest = self._unit_manifest()
         copy = self.copy(date_time=(2026, 10, 1, 10, 0, 0))
-        first, second = self._stop_after_install()
-        with first, second:
+        with self._stop_after_install():
             with self.assertRaises(LibraryCopyPending) as raised:
                 self.put(copy)
         pending = {**raised.exception.record, "outcome": PENDING}
@@ -479,6 +503,183 @@ class PutTests(_Store):
         self.assertNotIn(str(self.root), describe_error(LibraryCopyStoreError(f"x {self.root} y"), self.root))
 
 
+class SavedOverTests(_Store):
+    """MS-DIAL saves the library copy by deleting it and moving a new file into place, and holds nothing open
+    between saves: a save can land between the read of a copy's identity and its removal. What is removed or moved
+    is only ever the file that was identified."""
+
+    def save_over(self, path: Path) -> bytes:
+        path.unlink()
+        synthetic_dbs(path, storage=b"saved by MS-DIAL's GUI", date_time=(2026, 10, 12, 9, 30, 0))
+        return path.read_bytes()
+
+    def assert_no_private_names(self) -> None:
+        self.assertEqual([], [path.name for path in self.output.iterdir() if "~" in path.name or path.name.startswith(".")])
+
+    def test_an_equal_copy_saved_over_after_it_was_identified_is_left_and_unclaimed(self) -> None:
+        first = self.put(self.copy(date_time=(2026, 10, 1, 10, 0, 0)))
+        copy = self.copy("Project-2_Loaded.msp2.dbs", date_time=(2026, 10, 2, 10, 0, 0))
+        identity = read_copy_identity(copy)
+        saved = self.save_over(copy)
+
+        with self.assertRaisesRegex(LibraryCopyStoreError, "changed after it was identified"):
+            self.store.put(copy, identity, unit=UNIT, job_id="job2", libraries=LIBRARIES)
+        self.assertEqual(saved, copy.read_bytes(), "the GUI's file is never the one removed")
+        self.assertEqual(["job1"], [claim["job_id"] for claim in self.store.claims(first["object_id"])])
+        self.assert_no_private_names()
+
+    def test_a_new_copy_saved_over_after_it_was_identified_goes_back_and_nothing_is_stored(self) -> None:
+        copy = self.copy()
+        identity = read_copy_identity(copy)
+        saved = self.save_over(copy)
+
+        with self.assertRaisesRegex(LibraryCopyStoreError, "changed after it was identified"):
+            self.store.put(copy, identity, unit=UNIT, job_id="job1", libraries=LIBRARIES)
+        self.assertEqual(saved, copy.read_bytes())
+        self.assertEqual([], self.store.object_ids())
+        self.assertEqual([], list((self.root / STORE_DIRECTORY_NAME / "incoming").iterdir()))
+
+    def test_a_copy_saved_over_while_its_bytes_were_copied_in_is_left_in_place(self) -> None:
+        copy = self.copy()
+        os.link(copy, self.root / "elsewhere.dbs")  # another name: copied, never renamed
+        identity = read_copy_identity(copy)
+        claim = LibraryCopyStore.claim
+        saved: list[bytes] = []
+
+        def save_then_claim(store, *args, **kwargs):
+            saved.append(self.save_over(copy))  # between the install and the removal of the source
+            return claim(store, *args, **kwargs)
+
+        with patch.object(LibraryCopyStore, "claim", save_then_claim):
+            with self.assertRaisesRegex(LibraryCopyStoreError, "changed after it was identified"):
+                self.store.put(copy, identity, unit=UNIT, job_id="job1", libraries=LIBRARIES)
+        self.assertEqual(saved[0], copy.read_bytes())
+        # The identified bytes are in the store all the same: they were copied in and compared first.
+        self.assertIsNone(self.store.problem(identity.object_id, full=True))
+        self.assert_no_private_names()
+
+    def test_a_copy_taken_back_never_overwrites_a_file_that_took_its_place(self) -> None:
+        copy = self.copy()
+        write = library_copy_store._write_json_atomic
+        saved: list[bytes] = []
+
+        def save_then_refuse(path, value):
+            if Path(path).name == "entry.json":
+                synthetic_dbs(copy, storage=b"saved by MS-DIAL's GUI")
+                saved.append(copy.read_bytes())
+                raise PermissionError(13, "Access is denied", str(path))
+            return write(path, value)
+
+        with patch.object(library_copy_store, "_write_json_atomic", save_then_refuse):
+            with self.assertRaises(LibraryCopyPending):
+                self.put(copy)
+        self.assertEqual(saved[0], copy.read_bytes(), "never written over")
+        [done] = self.store.repair(confirmed=True)["repaired"]
+        self.assertEqual(STORED, done["outcome"])
+        self.assertIsNone(self.store.problem(done["object_id"], full=True))
+
+    def test_a_put_back_refuses_a_name_that_exists(self) -> None:
+        one, two = self.output / "one.bin", self.output / "two.bin"
+        one.write_bytes(b"one")
+        two.write_bytes(b"two")
+        with self.assertRaises(FileExistsError):
+            library_copy_store.rename_back(one, two)
+        self.assertEqual((b"one", b"two"), (one.read_bytes(), two.read_bytes()))
+
+
+# Entries larger than one read, compressible and not: a flipped bit in their deflate data is either a zlib.error
+# or other bytes that only the CRC at the entry's end names.
+_ALPHABET = random.Random(7)
+BIG_DATABASES = {
+    "MetabolomicsDB\\MspDB_1_Synthetic-Private-pos\\DataBase": bytes(_ALPHABET.choice(b"ACGT0123456789,.\n")
+                                                                      for _ in range(60_000)),
+    "MetabolomicsDB\\LbmDB\\DataBase": random.Random(8).randbytes(20_000),
+}
+
+
+class DamageTests(_Store):
+    def offsets(self, path: Path, index: int = 0, count: int = 8) -> list[int]:
+        start, length = entry_data_offset(path, index)
+        return [start + 100 + step * (length - 200) // count for step in range(count)]
+
+    def test_a_copy_damaged_inside_its_deflate_data_is_held_and_nothing_raises(self) -> None:
+        template = synthetic_dbs(self.root / "template" / "P_Loaded.msp2.dbs", databases=BIG_DATABASES,
+                                 storage=bytes(_ALPHABET.choice(b"xyz") for _ in range(8_000)))
+        offsets = self.offsets(template) + self.offsets(template, index=2, count=3)  # entry 2: Storage
+        for number, offset in enumerate(offsets):
+            with self.subTest(offset=offset):
+                output = self.output.parent / f"output-{number}"
+                output.mkdir()
+                copy = output / "Project-1_Loaded.msp2.dbs"
+                copy.write_bytes(template.read_bytes())
+                flip(copy, offset, 0x55)
+                lines: list[str] = []
+                copies, errors = store_loaded_library_copies(output, self.store, unit=UNIT, job_id=f"job{number}",
+                                                             libraries=LIBRARIES, log=lines.append)
+                self.assertEqual(([], 1), (copies, len(errors)))
+                self.assertTrue(copy.exists(), "held where it is, never deleted")
+                self.assertTrue(any("held in the output" in line for line in lines), lines)
+        self.assertEqual([], self.store.object_ids())
+
+    def test_an_object_damaged_inside_an_entry_larger_than_a_read_is_repaired_never_a_reason_to_quarantine(self) -> None:
+        with patch.object(library_copy_store, "_CHUNK", 4096):
+            template = synthetic_dbs(self.root / "template" / "P1_Loaded.msp2.dbs", databases=BIG_DATABASES)
+            for number, offset in enumerate(self.offsets(template) + self.offsets(template, index=1, count=4)):
+                with self.subTest(offset=offset):
+                    store = LibraryCopyStore(self.root / f"w{number}")
+                    first = synthetic_dbs(store.workspace_root / "u" / "P1_Loaded.msp2.dbs", databases=BIG_DATABASES)
+                    stored = store.put(first, read_copy_identity(first), unit=None, job_id="job1")
+                    flip(store.object_path(stored["object_id"]), offset, 0x10)
+                    # The same content written otherwise: one key, other bytes, compared entry by entry.
+                    copy = synthetic_dbs(store.workspace_root / "u" / "P2_Loaded.msp2.dbs", databases=BIG_DATABASES,
+                                         method=zipfile.ZIP_STORED, date_time=(2026, 10, 2, 10, 0, 0))
+                    record = store.put(copy, read_copy_identity(copy), unit=None, job_id="job2")
+
+                    self.assertEqual((STORED, True), (record["outcome"], record.get("repaired_object")))
+                    self.assertFalse(copy.exists())
+                    self.assertFalse((store.root / "quarantine").exists())
+                    self.assertIsNone(store.problem(stored["object_id"], full=True))
+                    self.assertEqual(1, len(list(store.object_directory(stored["object_id"]).glob("damaged-*.dbs"))))
+
+    def test_a_difference_is_never_believed_of_an_object_that_differs_from_its_record(self) -> None:
+        first = self.put(self.copy(method=zipfile.ZIP_STORED))
+        object_path = self.store.object_path(first["object_id"])
+        start, length = entry_data_offset(object_path)
+        flip(object_path, start + length // 2)
+        copy = self.copy("Project-2_Loaded.msp2.dbs", method=zipfile.ZIP_DEFLATED)
+        with patch.object(library_copy_store, "_compare_inflated", return_value="different"):
+            record = self.put(copy, job_id="job2")
+        self.assertEqual((STORED, True), (record["outcome"], record.get("repaired_object")))
+        self.assertFalse((self.root / STORE_DIRECTORY_NAME / "quarantine").exists())
+
+    @unittest.skipUnless(WINDOWS, "a sharing violation is how Windows refuses a file another handle holds")
+    def test_an_object_msdial_holds_open_is_never_taken_for_damaged(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        first = self.put(self.copy(date_time=(2026, 10, 1, 10, 0, 0)))
+        object_path = self.store.object_path(first["object_id"])
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        # As DirectoryTreeStreamManager.Get opens it while MS-DIAL loads a restored project: File.Open(file,
+        # FileMode.Open, FileAccess.Read), which shares nothing.
+        handle = kernel32.CreateFileW(str(object_path), 0x80000000, 0, None, 3, 0x80, None)
+        self.assertNotIn(handle, (None, ctypes.c_void_p(-1).value))
+        copy = self.copy("Project-2_Loaded.msp2.dbs", date_time=(2026, 10, 2, 10, 0, 0))
+        try:
+            with self.assertRaisesRegex(LibraryCopyStoreError, "could not be read"):
+                self.put(copy, job_id="job2")
+        finally:
+            kernel32.CloseHandle(handle)
+        self.assertTrue(copy.exists())
+        self.assertEqual([], list(object_path.parent.glob("damaged-*.dbs")))
+        self.assertNotIn("repairs", self.store.entry(first["object_id"]))
+        self.assertEqual(DEDUPLICATED, self.put(copy, job_id="job2")["outcome"])
+
+
 class RepairTests(_Store):
     def test_a_crash_after_staging_is_completed_not_quarantined(self) -> None:
         copy = self.copy()
@@ -494,7 +695,8 @@ class RepairTests(_Store):
                 raise KeyboardInterrupt  # the process dies between the move and the install: nothing after runs
             return replace(source, target, *args, **kwargs)
 
-        with patch.object(library_copy_store, "_replace", crash):
+        with patch.object(library_copy_store, "_replace", crash), \
+                patch.object(library_copy_store, "rename_back", crash):
             with self.assertRaises(KeyboardInterrupt):
                 self.put(copy)
         self.assertFalse(copy.exists(), "the only copy is in incoming/")
@@ -618,6 +820,24 @@ class SeedAndAttachTests(_Store):
         self.assertNotIn("loaded_library_copy", read_manifest(manifest)["console_run_finalisation"])
         with self.assertRaisesRegex(LibraryCopyStoreError, "already names"):
             attach(manifest, object_id)
+
+    def test_attach_reads_a_copy_the_retry_of_a_held_deletion_deleted(self) -> None:
+        object_id = self.store.seed(synthetic_dbs(self.reference / "P_Loaded.msp2.dbs"), confirmed=True)["object_id"]
+        manifest = self._finalised_unit()
+        deleted = read_manifest(manifest)["console_run_finalisation"]["loaded_library_copies_deleted"]
+
+        def held_then_retried(current):
+            # Up to 0.5.36: none deleted at finalisation, the copy held, and the hold's retry deleting it.
+            current["console_run_finalisation"]["loaded_library_copies_deleted"] = []
+            current["finalisation_hold_resolutions"] = [
+                {"hold": "h1", "step": "loaded_library_copy", "job_id": "job-earlier", "deleted": [{"name": "x"}]},
+                {"hold": "h2", "step": "loaded_library_copy", "job_id": "job-legacy", "deleted": deleted},
+            ]
+
+        update_manifest(manifest, held_then_retried)
+        done = attach(manifest, object_id, confirmed=True)
+        self.assertTrue(done["attached"], done)
+        self.assertEqual(deleted[0]["sha256"], done["deleted_copy"]["sha256"])
 
     def test_attach_refuses_other_libraries_or_other_settings(self) -> None:
         object_id = self.store.seed(synthetic_dbs(self.reference / "P_Loaded.msp2.dbs"), confirmed=True)["object_id"]

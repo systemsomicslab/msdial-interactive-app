@@ -45,15 +45,42 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     with an object's key and other content goes to `quarantine\` with a
     warning. A damaged object is replaced by the copy and kept beside it
     (`damaged-<utc>.dbs`).
+  - A copy is removed or moved only as the file whose identity was read. It
+    is renamed into the store, or to a private name beside it, and compared
+    there by file id, size and time. MS-DIAL saves the `.dbs` by deleting it
+    and moving a new file into place, and a file a save put at the path in
+    between is left there, the put refused. A copy taken back after an install
+    stopped never overwrites a file that has taken its place.
+  - An object is called damaged only when it is verified to differ from its
+    record: its size, its entry table or its bytes. An object that cannot be
+    read now refuses the put, and the copy stays held. MS-DIAL loading a
+    restored project through its link opens the object sharing nothing. Such
+    an object used to be replaced as damaged.
+  - An entry whose bytes differ is read to its end on both sides before it is
+    called different, so zipfile's CRC check names a damaged side. Real
+    entries are far larger than one read, and a damaged object used to send an
+    equal copy to quarantine. The object is also re-read whole before any copy
+    is quarantined.
+  - A damaged deflate stream (`zlib.error`, which zipfile does not catch) is
+    damage like any other. The copy is held under the `loaded_library_copy`
+    hold its retry may lift, not the `finalisation` hold a person must clear.
   - A copy that cannot be stored stays in the output under the existing
     `loaded_library_copy` sharing hold, now with `store_errors`, and the
     hold's retry stores it. This covers no store located, a lock not taken
     and any I/O error. A lock timeout no longer reaches the generic
     `finalisation` hold that a person must clear.
+  - A held copy that is gone when its hold is retried is looked up in the
+    store. A retry that stored it and then could not write the manifest leaves
+    exactly that. Its claim, the intent of an unfinished install or a
+    quarantine's reason says where it went, and the hold is lifted with the
+    copy recorded. A copy the store does not name keeps the hold, with an
+    error, for a person.
   - The unit records `console_run_finalisation.loaded_library_copy` (schema
     `msdial-loaded-library-copy.v1`): the store relative to the workspace
     root, each copy's identity, outcome and object id, and the errors.
-    Readers still accept `loaded_library_copies_deleted` from earlier runs. A
+    Readers still accept `loaded_library_copies_deleted` from earlier runs,
+    together with the copies a 0.5.36 retry deleted and recorded only in its
+    hold's resolution (`finalisation_hold_resolutions`, `deleted`). A
     copy stored by the retry of a run that is no longer the unit's current one
     is named in the top-level `library_copy_records` (schema
     `msdial-library-copy-record.v1`). So is every copy that is not the run's
@@ -78,8 +105,11 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - After the Console ends, what is left there is listed by name and size in
     the job's `console_outcome.console_temp` and in the run attempt.
   - A leftover laid out as a library copy goes to the store, or is held from
-    sharing; the rest is removed. A symbolic link or junction is listed and
-    never followed, and only the link itself is removed.
+    sharing; the rest is removed. Every copy the store took is named in the
+    unit's `library_copy_records` (action `console_temp`), in the same
+    manifest write as the hold on any it could not take. A symbolic link or
+    junction is listed and never followed, and only the link itself is
+    removed.
   - A unit whose workspace root cannot be located runs as before and says so
     in its log.
   - Laboratory runs are unchanged: their Console keeps the TEMP its user has.
@@ -105,6 +135,13 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - It records `viewing_restores[]` and a hold `{step: viewing_restore, blocks:
     [sharing, raw_deletion]}` that no retry lifts. Publication, raw cleanup,
     discard and split-parent release refuse while it stands.
+  - It holds the raw-deletion locks of the unit, and of the unit whose raw
+    tree a split part reads, from before its hold is written until its last
+    copy is made. A cleanup, discard or split-parent release under way
+    refuses it, and none starts meanwhile. It reads the deletion state and the
+    unit's live jobs again under the manifest's writer lock as it records the
+    hold. A deletion reads the holds again in the write of its intent, so one
+    judged before the restore stood deletes nothing.
   - It refuses, writing nothing, a unit with no finalisation, no campaign
     approval or no store object for its run. It also refuses a restore already
     standing, any other finalisation hold, a run, retention-time preview or
@@ -117,7 +154,9 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - While it stands, no Console starts on the unit (409, code
     `viewing_restore_active`; MCP reason `viewing_restore_active`), no new
     production run is prepared (reason `viewing_restore_active`), and a
-    finalisation leaves its link alone.
+    finalisation leaves its link alone. A Console job still being prepared
+    refuses the restore. A job prepared while a restore was recorded stops
+    before its Console starts, and is not recorded as a failed run.
   - The preview reports counts, bytes, whether the raw files are present, and
     every path relative to the workspace root.
   - Its record names the output directory it restored into, and the undo reads
@@ -131,10 +170,20 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     over it). It reports, never deletes, any other file that appeared in the
     output or the raw-side directories. A library copy MS-DIAL's GUI wrote,
     over the link on a save or beside it on a "Save as", goes through the
-    store (`library_copy_records`, action `undo_gui_copy`). A file still held
-    open, a GUI copy the store could not take, a directory the restore made
-    that holds files it did not make, or a path its record could not name
-    leaves the restore `partial` and held.
+    store (`library_copy_records`, action `undo_gui_copy`). That record is
+    kept whole in `restore.local.json` as it is stored, and the first call
+    that writes the manifest names it, the call that only lifts the hold
+    included. The link is removed only as the file the undo read: renamed
+    aside and compared first, so a save MS-DIAL makes on close in between is
+    stored as the GUI's instead. A file still held open, a GUI copy the store
+    could not take, a library copy saved while the undo ran, a directory the
+    restore made that holds files it did not make, or a path its record could
+    not name leaves the restore `partial` and held.
+  - Two split parts restored into one released raw tree share its
+    directories. The other part's copies are never reported as new files, and
+    a directory this restore made that holds only them keeps the restore held
+    (`shared_directories`), with a message to undo the other restore first
+    rather than to remove its files.
   - The undo records `undone` only once the manifest no longer holds the
     unit. A manifest write that fails leaves the record `lifting_hold` and the
     hold standing, and the next call only lifts the hold.
@@ -146,8 +195,9 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     run directory that holds it.
   - `attach <manifest> --object <id>` appends a `library_copy_records` item
     (action `attach`, verified by `library_and_settings_identity`) to a unit
-    finalised before 0.5.37. It refuses unless the unit's libraries (name and
-    sha256) and annotation settings equal the object's.
+    finalised before 0.5.37, including one whose copy a 0.5.36 retry deleted.
+    It refuses unless the unit's libraries (name and sha256) and annotation
+    settings equal the object's.
   - `status --workspace-root <root> [--verify] [--repair]` reports objects,
     claims, unfinished ingests and quarantined copies.
 

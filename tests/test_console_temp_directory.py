@@ -115,8 +115,15 @@ class TheJobsSettleIt(unittest.TestCase):
         store = LibraryCopyStore(self.root)
         self.assertIsNone(store.problem(copy["object_id"], full=True))
         self.assertEqual("console_temp", store.entry(copy["object_id"])["ingested"]["how"])
-        [attempt] = read_manifest(self.manifest)["run_attempts"]
+        manifest = read_manifest(self.manifest)
+        [attempt] = manifest["run_attempts"]
         self.assertEqual("_tmp/job1", attempt["detail"]["console_temp"]["directory"])
+        # Named in its unit as a copy that is not the run's own, so no stored copy of the loaded libraries is one
+        # no unit names.
+        [record] = manifest["library_copy_records"]
+        self.assertEqual(("console_temp", "job1", "tmpA1B2.tmp", "stored", copy["object_id"]),
+                         (record["action"], record["job_id"], record["name"], record["outcome"], record["object_id"]))
+        self.assertNotIn("finalisation_holds", manifest)
         self.assertTrue(any("were left in _tmp/job1 and removed" in line for line in lines), lines)
         recorded = json.dumps(attempt["detail"]["console_temp"]) + json.dumps(settled)
         self.assertNotIn(str(self.root), recorded)
@@ -172,6 +179,18 @@ class TheJobsSettleIt(unittest.TestCase):
             server._run_rt_correction_job("rt1", preparation)
         self.assertEqual([self.root / "_tmp" / "rt1"], seen)
         self.assertEqual("_tmp/rt1", self.jobs["rt1"]["console_temp"]["directory"])
+
+    def test_a_copy_the_retention_time_preview_left_is_named_in_its_unit(self) -> None:
+        # The preview writes no run attempt, so its unit manifest is the only durable record of what the store took.
+        preparation = self.preparation([sys.executable, "-u", "-c", _LEAVES])
+        self.jobs["rt2"] = {"id": "rt2", "status": "queued", "kind": "rt_correction", "logs": [],
+                            "preparation": preparation}
+        with patch.object(server, "parse_rt_correction_result", return_value=None):
+            server._run_rt_correction_job("rt2", preparation)
+        [copy] = self.jobs["rt2"]["console_temp"]["library_copies"]
+        [record] = read_manifest(self.manifest)["library_copy_records"]
+        self.assertEqual(("console_temp", "rt2", copy["object_id"]), (record["action"], record["job_id"], record["object_id"]))
+        self.assertFalse((self.root / "_tmp" / "rt2").exists())
 
     def test_a_unit_whose_root_cannot_be_located_runs_and_says_so_after_the_console(self) -> None:
         _write_json(self.manifest, {"status": "preflight_passed", "project": {"analysis_unit_id": "unit-a"}})
