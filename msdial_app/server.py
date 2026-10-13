@@ -70,6 +70,7 @@ from .repository_reanalysis import (
     record_run_process,
     record_run_start,
     record_split_parent_pending,
+    ViewingRestoreStands,
     refresh_retained_artifacts,
     resolve_required_download_bytes,
     split_unit_by_acquisition,
@@ -555,13 +556,16 @@ def _refuse_restored_unit(manifest_text: str) -> None:
     restores = [item for item in manifest.get("finalisation_holds") or []
                 if isinstance(item, dict) and item.get("step") == "viewing_restore"]
     if restores:
-        restore_id = str(restores[0].get("restore_id") or "")
-        raise UnitRestoredError(
-            manifest_text,
-            restore_id,
-            f"This repository unit is restored for viewing in MS-DIAL (restore {restore_id or 'unrecorded'}). No "
-            "Console starts on it until msdial_undo_project_restore takes the restore back.",
-        )
+        raise _restored_unit_error(manifest_text, str(restores[0].get("restore_id") or ""))
+
+
+def _restored_unit_error(manifest_text: str, restore_id: str) -> UnitRestoredError:
+    return UnitRestoredError(
+        manifest_text,
+        restore_id,
+        f"This repository unit is restored for viewing in MS-DIAL (restore {restore_id or 'unrecorded'}). No "
+        "Console starts on it until msdial_undo_project_restore takes the restore back.",
+    )
 
 
 class RepositoryDownloadCancelled(Exception):
@@ -782,8 +786,10 @@ def _settle_console_temp(
         log(f"A loaded-library copy MS-DIAL left in {label} went to the library-copy store: {item['outcome']} as "
             f"object {item['object_id']}.")
     # Every copy the store took is named in the unit manifest (library_copy_records, action console_temp), and
-    # every one it could not take is held there, in one write: no copy of the loaded libraries is in the store
-    # or left in _tmp with nothing in its unit saying so.
+    # every one it could not take is held there, in one write: no copy of the loaded libraries this settlement
+    # found is in the store or left in _tmp with nothing in its unit saying so. It runs once, as the Console call
+    # returns: a backend that stops while the Console runs, or a Console that outlives its stop and writes on,
+    # leaves what is in _tmp/<job id> unsettled, and nothing settles it later (a known limitation).
     record_error = record_console_temp(
         manifest_text, job_id, settled["library_copies"], settled["held"], settled["errors"],
         "MS-DIAL left a copy of every loaded library in the Console's temporary directory, and the "
@@ -833,17 +839,26 @@ def _run_console_for_job(
     temp_directory, temp_why = _console_temp_for(job_id, preparation)
     attempt = None
     if manifest_text:
-        attempt = record_run_start(
-            Path(manifest_text),
-            job_id,
-            kind,
-            output_directory=str(preparation.get("run_directory") or ""),
-            console=preparation.get("software_provenance") or {},
-            command=preparation.get("command"),
-            timeout_seconds=entry["timeout_seconds"],
-            idle_timeout_seconds=entry["idle_timeout_seconds"],
-            data_types=preparation.get("data_types") or {},
-        )
+        try:
+            # The restore's hold is read once more in the write that opens the attempt, under the manifest's writer
+            # lock: a restore made in another backend after the read above is found here, and one made after this
+            # write finds the attempt open and refuses.
+            attempt = record_run_start(
+                Path(manifest_text),
+                job_id,
+                kind,
+                output_directory=str(preparation.get("run_directory") or ""),
+                console=preparation.get("software_provenance") or {},
+                command=preparation.get("command"),
+                timeout_seconds=entry["timeout_seconds"],
+                idle_timeout_seconds=entry["idle_timeout_seconds"],
+                data_types=preparation.get("data_types") or {},
+                refuse_viewing_restore=True,
+            )
+        except ViewingRestoreStands as error:
+            with JOBS_LOCK:
+                PROCESSES.pop(job_id, None)
+            raise _restored_unit_error(manifest_text, error.restore_id) from error
         if not attempt.get("recorded"):
             log(
                 "WARNING: this run attempt could not be recorded in the unit manifest: "

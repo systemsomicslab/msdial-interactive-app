@@ -3384,7 +3384,7 @@ def run_console(
 
     Nothing is watched unless asked: with none of the three, the Console runs exactly as it always has.
 
-    ``temp_directory``, when given, is created and becomes the Console's TMP and TEMP. MS-DIAL writes every
+    ``temp_directory``, when given, is created and becomes the Console's TMP, TEMP and TMPDIR. MS-DIAL writes every
     stream it saves - the whole loaded-library copy among them, 0.86 GB with the private positive-mode library -
     to a temporary file before moving it into place (DirectoryTreeStreamManager), so without it every run wrote
     that copy through the user profile's TEMP on C:. What is left there afterwards is the caller's to settle.
@@ -3425,7 +3425,11 @@ def run_console(
         # Created here, so that a directory that cannot be made stops the run rather than sending its
         # temporary files back to the system TEMP.
         Path(temp_directory).mkdir(parents=True, exist_ok=True)
-        environment = {**os.environ, "TMP": str(temp_directory), "TEMP": str(temp_directory)}
+        # TMP and TEMP are what .NET's Path.GetTempPath reads on Windows; TMPDIR is what it reads elsewhere, and what
+        # a POSIX-style tool reads first (Git Bash exports one, inherited by every child). All three name the same
+        # directory, so no TMPDIR in the backend's environment sends the Console's files anywhere else.
+        environment = {**os.environ, "TMP": str(temp_directory), "TEMP": str(temp_directory),
+                       "TMPDIR": str(temp_directory)}
     process = subprocess.Popen(
         preparation["command"],
         cwd=str(Path(preparation["command"][0]).parent)

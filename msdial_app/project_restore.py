@@ -20,8 +20,9 @@ WHAT A RESTORE DOES (restore_project_for_viewing; one mode):
    before each step, so that a restore that stopped half way is taken back as completely as one that finished;
 4. records ``viewing_restores[]`` in the unit manifest and a hold ``{step: viewing_restore, blocks: [sharing,
    raw_deletion]}``: no publication, raw cleanup, discard or split-parent release while it stands, no retry
-   lifts it (run_finalisation._retry_hold returns a step it does not know as it stands), and no Console job or
-   new production run of the unit starts.
+   lifts it (run_finalisation._retry_hold returns a step it does not know as it stands), no Console job or new
+   production run of the unit starts, and no new download lease or split replaces the manifest that records it
+   (repository_reanalysis._viewing_restore_refusal).
 
 It refuses a unit with no run finalisation, no store object for the run, a restore already standing, any
 other finalisation hold (a retry would undo the restore), a run, a retention-time preview or a download under
@@ -29,10 +30,10 @@ way, a raw deletion that has begun and not finished, an output already holding a
 that already exists, and any path it would write outside the workspace root it records paths relative to. From
 before its hold is written until its last copy is made it holds the raw-deletion locks of the unit and, for a
 split part, of the unit whose raw tree it reads, taken without waiting: a cleanup, a discard or a split parent's
-release under way refuses it, and none starts meanwhile; and as it records the hold it reads the deletion state
-and the live jobs again under the manifest's writer lock. The containers it restores are those the run's
-finalisation moved and those a retry of its held move moved later. A preview (``confirmed=False``) writes
-nothing and names every path relative to the workspace root.
+release under way refuses it, and none starts meanwhile; and as it records the hold it reads the deletion state,
+a download under way, the finalised run and the live jobs again under the manifest's writer lock. The
+containers it restores are those the run's finalisation moved and those a retry of its held move moved later. A
+preview (``confirmed=False``) writes nothing and names every path relative to the workspace root.
 
 undo_project_restore removes exactly what the record lists, puts back a project file whose sha256 changed from
 its backup (keeping the changed one under the restore's directory, never over an earlier one), reports - never
@@ -46,19 +47,24 @@ however far that got - is removed outright, and only as the file the undo read: 
 so a save MS-DIAL makes on close in between is stored as the GUI's instead. A file another program still holds
 open, a directory the restore made that now holds files it did not make, a library copy saved while the undo
 ran, and a path it could not name are left, and the restore stays held until a later call; so does a manifest
-that could not be written, and the next call only lifts the hold. Two split parts restored into one released raw
-tree share its directories: the other part's copies are never reported as new, and a directory this restore made
-that holds only them keeps it held until that restore is undone.
+that could not be written, and the next call only lifts the hold - unless MS-DIAL saved into the output since, in
+which case that call takes it back as a full one does. Two split parts restored into one released raw tree share
+its directories: the other part's copies are never reported as new, and a directory this restore made that holds
+only them keeps it held until that restore is undone. A confirmed undo is refused while MS-DIAL's GUI runs (an open
+project holds no file, and a save after the undo would leave a library copy in the output with no hold), and while
+the raw-deletion locks are held - by a restore still making its copies, or by a deletion.
 
 Nothing here launches MS-DIAL.
 """
 
 from __future__ import annotations
 
+import csv
 import datetime as dt
 import errno
 import os
 import shutil
+import subprocess
 import sys
 import uuid
 import zlib
@@ -267,8 +273,12 @@ def _deletion_under_way(manifest: dict[str, Any], manifest_path: Path) -> str:
     return ""
 
 
+_DELETION_UNDER_WAY = ("a deletion of this unit's raw data, or of the raw tree it reads, is under way and holds its "
+                       "lock; restore once it has finished.")
+
+
 @contextmanager
-def _deletion_locks(manifest: dict[str, Any], manifest_path: Path) -> Iterator[None]:
+def _deletion_locks(manifest: dict[str, Any], manifest_path: Path, busy: str = _DELETION_UNDER_WAY) -> Iterator[None]:
     """The raw-deletion locks of this unit and, for a split part, of the unit whose raw tree it reads: taken
     without waiting, and held while a restore writes its hold and its copies.
 
@@ -287,10 +297,7 @@ def _deletion_locks(manifest: dict[str, Any], manifest_path: Path) -> Iterator[N
             try:
                 stack.enter_context(_raw_deletion_lock(item))
             except ManifestBusyError as error:
-                raise RestoreRefused(
-                    "a deletion of this unit's raw data, or of the raw tree it reads, is under way and holds its "
-                    "lock; restore once it has finished."
-                ) from error
+                raise RestoreRefused(busy) from error
         yield
 
 
@@ -559,14 +566,22 @@ def _copy_object(
     The undo knows the file by that record (copy_pending, and its file id once it exists) and removes it as the
     restore's own, however far the copy got: never taking it for a library copy MS-DIAL saved. One that does not
     match the object is removed here.
+
+    copy_pending is journalled only once the object is open for reading, and taken back if the copy's file cannot
+    be made: a restore that could not start its copy - the object opened by MS-DIAL loading another unit restored
+    from it, which shares nothing - records no copy, and its undo sends whatever is at the link's place through
+    the store rather than removing it as the restore's.
     """
-    record["link"]["method"] = "copy_pending"
-    _write_record(record_path, record)
     with open(extended_path(stored), "rb") as reader:
+        record["link"]["method"] = "copy_pending"
+        _write_record(record_path, record)
         try:
             writer = open(extended_path(link), "xb")
         except FileExistsError:
             record["link"] = None  # not this restore's file: its undo must not take it
+            raise
+        except OSError:
+            record["link"]["method"] = None  # nothing was made: what is at its place is not this restore's
             raise
         with writer:
             details = os.fstat(writer.fileno())
@@ -683,6 +698,12 @@ def _restore(plan: dict[str, Any], path: Path, described: dict[str, Any], raw_no
             raise RestoreRefused("another restore became active on this unit meanwhile; undo it first.")
         if standing_holds(current):
             raise RestoreRefused(f"finalisation holds stand on this unit ({describe_holds(standing_holds(current))}).")
+        # A lease that replaced the record since the plan was read: its later writes would replace this hold too.
+        if str(current.get("status") or "") == "downloading":
+            raise RestoreRefused("this unit's raw data are being downloaded; restore once the download has ended.")
+        finalisation = current.get("console_run_finalisation")
+        if str((finalisation if isinstance(finalisation, dict) else {}).get("job_id") or "") != plan["job_id"]:
+            raise RestoreRefused(f"run {plan['job_id']} is no longer this unit's finalised run; call again.")
         live = _live_run_attempt_in(current)
         if live is not None:
             raise RestoreRefused(f"a run of this unit is live (job {live.get('job_id') or 'unrecorded'}).")
@@ -802,7 +823,7 @@ def _restore(plan: dict[str, Any], path: Path, described: dict[str, Any], raw_no
         f"{object_id}. Sharing and raw deletion of this unit are held until msdial_undo_project_restore takes it "
         f"back. Open {plan['project']}.mdproject in the output (not the .mddata), and do not save or reprocess: "
         "MS-DIAL rewrites containers when it switches files, and a save writes the whole library copy through its "
-        "TEMP directory." + raw_note
+        "TEMP directory. Close MS-DIAL, without saving, before the undo: it is refused while MS-DIAL runs." + raw_note
     )
     return result
 
@@ -842,6 +863,59 @@ def _recorded(root: Path, text: Any, problems: list[str]) -> Path | None:
 
 def _is_gui_library_copy(path: Path) -> bool:
     return path.name.endswith(LOADED_LIBRARY_COPY_SUFFIX) or is_library_copy_file(path)
+
+
+def _saved_since(record: dict[str, Any], output: Path | None) -> bool:
+    """Whether MS-DIAL wrote into the output after an undo call took everything back: a library copy that was not
+    there when the restore was made, or a backed-up project file that no longer equals its backup."""
+    if output is None or not output.is_dir():
+        return False
+    known = set(record.get("output_snapshot") or [])
+    with os.scandir(output) as entries:
+        if any(entry.is_file() and entry.name not in known and _is_gui_library_copy(Path(entry.path))
+               for entry in entries):
+            return True
+    for item in record.get("backups") or []:
+        current = output / str(item.get("name") or "")
+        try:
+            if not current.is_file() or _sha256(current) != item.get("sha256"):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+# MS-DIAL's GUI, by the image names it runs under: MS-DIAL 5 builds MsdialGuiApp as MSDIAL.exe. The Console,
+# MSDIALCUI.exe, is not one of them.
+GUI_IMAGE_NAMES = frozenset({"msdial.exe", "msdialguiapp.exe"})
+
+
+def msdial_gui_processes() -> list[dict[str, Any]] | None:
+    """The MS-DIAL GUI processes running on this machine, or None where that cannot be told.
+
+    MS-DIAL holds no file open between saves, so a project open in it leaves nothing an undo could find busy; and
+    a save it makes after the undo - on close, say - writes a whole library copy into the output, and project files
+    over the ones the undo put back, with no hold left to keep them from sharing. Read from tasklist on Windows;
+    elsewhere, or where tasklist cannot be run, it is not known.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        completed = subprocess.run(
+            ["tasklist", "/fo", "csv", "/nh"], capture_output=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    found = []
+    # Image names are ASCII; the rest of a row is in the console's code page, which latin-1 reads byte for byte
+    # without taking any byte for a quote or a comma.
+    for row in csv.reader(completed.stdout.decode("latin-1").splitlines()):
+        if len(row) >= 2 and row[0].strip().casefold() in GUI_IMAGE_NAMES:
+            found.append({"name": row[0].strip(), "pid": int(row[1]) if row[1].strip().isdigit() else None})
+    return found
 
 
 def _other_restores(
@@ -912,10 +986,15 @@ def _undo_plan(manifest: dict[str, Any], manifest_path: Path, restore_id: str) -
     # manifest's (a new run is refused while a restore stands, so the two are one).
     output = (_recorded(root, record.get("output"), problems) if record.get("output")
               else Path(str(manifest.get("output_directory") or "")))
+    lift_only = record.get("state") in {LIFTING_HOLD, "undone"}
+    if lift_only and _saved_since(record, output):
+        # MS-DIAL saved after the call that took everything back - a save on close: a library copy in the output, or
+        # a project file other than its backup. The hold is not lifted over it; this call takes it back as a full
+        # one does.
+        lift_only = False
     plan: dict[str, Any] = {"hold": hold, "root": root, "record_path": record_path, "record": record,
                             "store": store, "output": output, "directory": record_path.parent, "problems": problems,
-                            "lift_only": record.get("state") in {LIFTING_HOLD, "undone"}, "others": [],
-                            "theirs": set()}
+                            "lift_only": lift_only, "others": [], "theirs": set()}
     if plan["lift_only"]:
         # Everything it made was taken back by an earlier call, which could not then write the unit manifest:
         # only the hold is left to lift, and the GUI's library copies that call stored to name.
@@ -944,9 +1023,10 @@ def _undo_plan(manifest: dict[str, Any], manifest_path: Path, restore_id: str) -
         elif method == "copy":
             same = ids == recorded_ids and details.st_size == link.get("size_bytes")
         elif method == "copy_pending":
-            # The restore's own copy of the object, however far it got: by its file record once it had one,
-            # and before that whatever is there was made by the restore, which never said it had restored.
-            same = link.get("st_ino") is None or ids == recorded_ids
+            # The restore's own copy of the object, however far it got, by its file record once it had one. Its
+            # file id is journalled before its first byte, so before that only an empty file can be the one it
+            # was about to make; anything else at its place goes through the store.
+            same = ids == recorded_ids if link.get("st_ino") is not None else details.st_size == 0
         else:
             # Stopped between its record and os.link: what is there is the restore's link only if it is the
             # object's own file record.
@@ -1159,19 +1239,65 @@ def _copy_summary(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for item in items]
 
 
+_UNDO_BUSY = ("a restore of this unit is still making its copies, or a deletion of its raw data or of the raw tree it "
+              "reads is under way, and holds its lock; call again once it has finished.")
+
+
+def _gui_running(gui: list[dict[str, Any]]) -> str:
+    named = ", ".join(f"{item.get('name')} (process {item.get('pid')})" for item in gui[:3])
+    return (
+        f"MS-DIAL's GUI is running ({named}). Close it first - answering No if it asks to save - and call again: "
+        "MS-DIAL holds no file open between saves, so whether it has this project open cannot be told, and a save "
+        "it made after the undo would put a whole library copy back into the output, and its project files over the "
+        "ones put back, with no hold left on the unit."
+    )
+
+
 def undo_project_restore(manifest_path: str | Path, restore_id: str = "", confirmed: bool = False) -> dict[str, Any]:
-    """Take a viewing restore back. See the module docstring. A preview unless ``confirmed``."""
-    from .repository_reanalysis import read_manifest, update_manifest
+    """Take a viewing restore back. See the module docstring. A preview unless ``confirmed``.
+
+    A confirmed undo is refused while MS-DIAL's GUI runs (msdial_gui_processes), and while the unit's raw-deletion
+    locks are held: the restore holds them until its last copy is made, so an undo never takes back a restore
+    that is still making files and would leave them with no hold.
+    """
+    from .repository_reanalysis import read_manifest
 
     path = Path(manifest_path).expanduser().resolve()
+    restore_id = str(restore_id or "").strip()
     manifest = read_manifest(path)
-    plan = _planned_undo(manifest, path, str(restore_id or "").strip())
+    plan = _planned_undo(manifest, path, restore_id)
     described = _describe_undo(plan)
+    gui = msdial_gui_processes()
     if not confirmed:
-        return {**described, "undone": False, "message": (
-            "Nothing was removed. Show what would be removed, what MS-DIAL changed or created and the files that "
-            "would be put back to the user, and call again with confirmed=true only after an explicit answer."
+        before = (
+            "MS-DIAL's GUI is running, and a confirmed undo is refused until it is closed. " if gui else
+            "Whether MS-DIAL's GUI is running could not be checked: make sure it is closed before confirming. "
+            if gui is None else ""
+        )
+        return {**described, "msdial_gui": gui, "undone": False, "message": (
+            "Nothing was removed. " + before + "Show what would be removed, what MS-DIAL changed or created and the "
+            "files that would be put back to the user, ask them to close MS-DIAL without saving, and call again with "
+            "confirmed=true only after an explicit answer."
         )}
+    if gui:
+        raise RestoreRefused(_gui_running(gui))
+    with _deletion_locks(manifest, path, busy=_UNDO_BUSY):
+        # Read again under the locks: a restore that was still copying when the plan above was read has finished.
+        manifest = read_manifest(path)
+        plan = _planned_undo(manifest, path, restore_id)
+        result = _undo(plan, path, manifest, _describe_undo(plan))
+    if gui is None:
+        result["warnings"] = [
+            "Whether MS-DIAL's GUI is running could not be checked. If it has this project open, close it without "
+            "saving: a save it makes now puts a library copy back into the output with no hold on the unit."
+        ]
+    return result
+
+
+def _undo(plan: dict[str, Any], path: Path, manifest: dict[str, Any], described: dict[str, Any]) -> dict[str, Any]:
+    """undo_project_restore once confirmed, under the raw-deletion locks."""
+    from .repository_reanalysis import update_manifest
+
     root: Path = plan["root"]
     record: dict[str, Any] = plan["record"]
     record_path: Path = plan["record_path"]

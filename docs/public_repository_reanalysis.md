@@ -378,8 +378,9 @@ present or released, and links the store object into the output under the
 run's own `.dbs` name; it backs up the `.mdproject`, `.mddata` and
 `_Loaded.msp2` under `<workspace_root>\_viewing\r-<restore id>`, whose
 `restore.local.json` lists every path the restore made. While it stands, a
-`viewing_restore` hold blocks sharing and raw deletion, and no Console or new
-production run starts on the unit (`viewing_restore_active`). The restore holds
+`viewing_restore` hold blocks sharing and raw deletion, no Console or new
+production run starts on the unit (`viewing_restore_active`), and no new
+download lease or split replaces the record its undo reads. The restore holds
 the raw-deletion locks of the unit, and of the unit whose raw tree a split part
 reads, until its copies are made, so no cleanup, discard or split-parent release
 runs beside it. With the raw files released, MS-DIAL needs a GUI that opens a
@@ -391,19 +392,24 @@ wrote through the store as the GUI's, never the run's, and reports, never
 deletes, any other file that appeared. Until a directory the restore made holds
 none of those files, the restore stays held; one holding only the copies of
 another part's restore into the same released tree waits for that restore's
-undo. A unit finalised before 0.5.37 has no stored object;
-`python -m msdial_app.library_copy_store seed` copies a verified `.dbs` into the
-store, and `... attach <manifest> --object <id>` names the object a unit's
-deleted copy stands for when its recorded libraries and annotation settings
-are the object's.
+undo. Close MS-DIAL, without saving, before confirming the undo: it holds no
+file open between saves, so the undo cannot see an open project, and a confirmed
+undo is refused while `MSDIAL.exe` runs. It is refused too while a restore of
+the unit is still making its copies. A unit finalised before 0.5.37 has no
+stored object; `python -m msdial_app.library_copy_store seed` copies a verified
+`.dbs` into the store, and `... attach <manifest> --object <id>` names the
+object a unit's deleted copy stands for when its recorded libraries and
+annotation settings are the object's.
 
 MS-DIAL writes every stream it saves, the whole library copy included, to a
 temporary file before moving it into place. Every Console Interactive starts
-for a repository unit, the retention-time preview included, therefore gets TMP
-and TEMP pointed at `<workspace_root>\_tmp\<job id>`; what is left there
+for a repository unit, the retention-time preview included, therefore gets TMP,
+TEMP and TMPDIR pointed at `<workspace_root>\_tmp\<job id>`; what is left there
 afterwards is listed in the run attempt (`console_temp`), a library copy goes
 to the store and is named in the unit's `library_copy_records` (action
-`console_temp`), and the rest is removed. A laboratory run keeps the TEMP its
+`console_temp`), and the rest is removed. This happens once, as the Console call
+returns: a backend that stops while its Console runs leaves `_tmp\<job id>`
+unsettled. A laboratory run keeps the TEMP its
 user has.
 
 What a repository unit shares carries no path from this machine: the mzTab-M's

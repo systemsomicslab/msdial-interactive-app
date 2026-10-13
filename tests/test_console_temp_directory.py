@@ -26,10 +26,12 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
     from msdial_app.workflow import prepare_rt_correction_run, run_console
 
 # A stand-in Console that writes what MS-DIAL leaves in its TEMP when it is stopped mid-save: a library copy
-# laid out as MS-DIAL writes one, and a scratch file.
+# laid out as MS-DIAL writes one, and a scratch file. It finds its temporary directory as MS-DIAL does on Windows,
+# from TMP (.NET's Path.GetTempPath), never from Python's tempfile, which reads TMPDIR first: Git Bash exports a
+# TMPDIR every child inherits, and with it a stand-in reading tempfile wrote into the user's own TEMP on C:.
 _LEAVES = r"""
 import os, sys, tempfile, zipfile
-folder = tempfile.gettempdir()
+folder = os.environ["TMP"]
 print("TEMP=" + os.environ.get("TEMP", ""))
 print("TMP=" + os.environ.get("TMP", ""))
 with zipfile.ZipFile(os.path.join(folder, "tmpA1B2.tmp"), "w") as archive:
@@ -54,11 +56,17 @@ class TheConsoleSeesItsTemp(unittest.TestCase):
     def test_tmp_and_temp_are_the_directory_given_and_it_is_made(self) -> None:
         temp = self.root / "_tmp" / "job1"
         lines: list[str] = []
-        script = "import os, tempfile; print(os.environ['TEMP']); print(os.environ['TMP']); print(tempfile.gettempdir())"
-        code = run_console({"command": [sys.executable, "-u", "-c", script]}, lines.append, temp_directory=temp)
+        script = ("import os, tempfile; print(os.environ['TEMP']); print(os.environ['TMP']); "
+                  "print(os.environ['TMPDIR']); print(tempfile.gettempdir())")
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        # Whatever the backend's own environment says: Git Bash exports TMPDIR, which Python's tempfile, and .NET
+        # outside Windows, read before TMP and TEMP.
+        with patch.dict(os.environ, {"TMPDIR": str(elsewhere), "TMP": str(elsewhere), "TEMP": str(elsewhere)}):
+            code = run_console({"command": [sys.executable, "-u", "-c", script]}, lines.append, temp_directory=temp)
 
         self.assertEqual(0, code)
-        self.assertEqual([str(temp)] * 3, [os.path.normcase(os.path.abspath(line)) == os.path.normcase(str(temp))
+        self.assertEqual([str(temp)] * 4, [os.path.normcase(os.path.abspath(line)) == os.path.normcase(str(temp))
                                            and str(temp) for line in lines])
         self.assertTrue(temp.is_dir())
 
@@ -128,6 +136,26 @@ class TheJobsSettleIt(unittest.TestCase):
         recorded = json.dumps(attempt["detail"]["console_temp"]) + json.dumps(settled)
         self.assertNotIn(str(self.root), recorded)
         self.assertNotIn(str(self.root).replace("\\", "\\\\"), recorded)
+
+    def test_a_tmpdir_in_the_backends_environment_sends_nothing_elsewhere(self) -> None:
+        # A Console reading TMPDIR first - .NET outside Windows, or any POSIX-style tool - under a backend started
+        # from Git Bash, which exports one: what it leaves is still under the workspace root, and settled there.
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        posix = _LEAVES.replace('os.environ["TMP"]', "tempfile.gettempdir()")
+        preparation = self.preparation([sys.executable, "-u", "-c", posix])
+        self.jobs["job3"] = {"id": "job3", "status": "running", "kind": "run", "logs": [], "preparation": preparation}
+        lines: list[str] = []
+        with patch.dict(os.environ, {"TMPDIR": str(elsewhere), "TMP": str(elsewhere), "TEMP": str(elsewhere)}):
+            code = server._run_console_for_job("job3", "run", preparation, lines.append)
+
+        self.assertEqual(0, code, lines)
+        self.assertEqual([], list(elsewhere.iterdir()))
+        settled = self.jobs["job3"]["console_outcome"]["console_temp"]
+        self.assertEqual({"tmpA1B2.tmp", "tmpC3D4.tmp"}, {item["name"] for item in settled["leftovers"]})
+        [copy] = settled["library_copies"]
+        self.assertEqual("stored", copy["outcome"])
+        self.assertFalse((self.root / "_tmp" / "job3").exists(), "settled and removed")
 
     def test_a_laboratory_run_is_given_no_temp_of_ours(self) -> None:
         seen: list = []

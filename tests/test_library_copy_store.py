@@ -419,6 +419,43 @@ class PutTests(_Store):
         self.assertEqual((STORED, pending["object_id"]), (item["outcome"], item["object_id"]))
         self.assertNotIn("library_copy_records", unit, "completed where the run names its copy, not twice")
 
+    def test_a_repair_that_cannot_tell_the_unit_keeps_the_intent_and_the_next_repair_tells_it(self) -> None:
+        from msdial_app import repository_reanalysis
+        from msdial_app.repository_reanalysis import ManifestBusyError
+
+        manifest = self._unit_manifest()
+        copy = self.copy()
+        with self._stop_after_install():
+            copies, errors = store_loaded_library_copies(self.output, self.store, unit=UNIT, job_id="job1",
+                                                         libraries=LIBRARIES, log=lambda _line: None)
+        [pending] = copies
+
+        def record(current):
+            current["console_run_finalisation"]["loaded_library_copy"] = {"copies": copies, "errors": errors}
+
+        update_manifest(manifest, record)
+        self.assertFalse(copy.exists())
+        busy = ManifestBusyError("Another thread held the lock on run-manifest.json; the manifest was not changed.")
+        with patch.object(repository_reanalysis, "update_manifest", side_effect=busy):
+            first = self.store.repair(confirmed=True)
+
+        # The ingest is complete, the unit was not told, and the repair says so rather than report success.
+        self.assertEqual([], first["repaired"])
+        [error] = first["errors"]
+        self.assertIn("the next repair records it", error)
+        assert_names_no_root(self, self.root, error)
+        self.assertIsNone(self.store.problem(pending["object_id"], full=True))
+        [still] = read_manifest(manifest)["console_run_finalisation"]["loaded_library_copy"]["copies"]
+        self.assertEqual(PENDING, still["outcome"])
+        [orphan] = self.store.orphans()
+        self.assertEqual("record_unit", orphan["action"])
+
+        [done] = self.store.repair(confirmed=True)["repaired"]
+        self.assertEqual((STORED, pending["object_id"]), (done["outcome"], done["object_id"]))
+        [item] = read_manifest(manifest)["console_run_finalisation"]["loaded_library_copy"]["copies"]
+        self.assertEqual((STORED, pending["object_id"]), (item["outcome"], item["object_id"]))
+        self.assertEqual([], self.store.orphans())
+
     def test_a_file_set_aside_with_no_record_is_named_and_its_unit_found_equal(self) -> None:
         manifest = self._unit_manifest()
         copy = self.copy(date_time=(2026, 10, 1, 10, 0, 0))

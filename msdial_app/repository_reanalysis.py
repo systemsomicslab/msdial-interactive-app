@@ -1875,9 +1875,10 @@ def create_download_lease(
     data_root = raw_root / "data"
     provenance = root / "provenance"
     output = root / "output"
-    for directory in (download_root, data_root, provenance, output):
-        directory.mkdir(parents=True, exist_ok=True)
     manifest_path = provenance / "run-manifest.json"
+    # Only the manifest's directory, for its lock: the rest is made once the lock is held and nothing refused the
+    # lease, so a refused lease makes nothing in a unit - a restored unit's raw tree is one its restore records.
+    provenance.mkdir(parents=True, exist_ok=True)
     # WRITTEN BEFORE THE FIRST BYTE, AND AGAIN IF THE LEASE FAILS.
     #
     # The manifest used to be written once, after every object had arrived and been extracted. A lease
@@ -1931,6 +1932,8 @@ def create_download_lease(
                 lease_record["previous_manifest"] = previous
             if superseded:
                 lease_record["superseded_manifests"] = superseded
+            for directory in (download_root, data_root, output):
+                directory.mkdir(parents=True, exist_ok=True)
             _write_json(manifest_path, lease_record)
     except BaseException:
         _release_lease(owner["lease_id"])
@@ -2715,6 +2718,25 @@ def _superseded_copy_path(manifest_path: Path) -> Path:
     return candidate
 
 
+def _viewing_restore_refusal(manifest: dict[str, Any], what: str) -> str:
+    """Why ``what`` is refused while a viewing restore stands on the unit, or "" when none does.
+
+    A restore (project_restore) records what it made - container copies beside the raw data, a link to the store's
+    library copy in the output - in its own record, named by a viewing_restore hold in this manifest, and only its
+    undo takes them back and lifts the hold. A new lease replaces this manifest, and a split marks it a parent: the
+    hold and viewing_restores would be gone, and the undo would find nothing standing to take back.
+    """
+    restores = [item for item in manifest.get("finalisation_holds") or []
+                if isinstance(item, dict) and item.get("step") == "viewing_restore"]
+    if not restores:
+        return ""
+    return (
+        f"This unit is restored for viewing in MS-DIAL (restore {restores[0].get('restore_id') or 'unrecorded'}), "
+        f"and {what} would replace the record its undo reads. Take the restore back first with "
+        "msdial_undo_project_restore."
+    )
+
+
 def _supersede_previous_manifest(manifest_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Make room for a new lease's first write without losing what the workspace already records.
 
@@ -2731,7 +2753,8 @@ def _supersede_previous_manifest(manifest_path: Path) -> tuple[dict[str, Any], l
     where finalisation keeps every file and raw cleanup removes none.
 
     Refused, before anything is written: a split parent, whose parts read its raw files in place and name
-    its manifest, which must stay split_by_acquisition; and a workspace another live lease is still
+    its manifest, which must stay split_by_acquisition; a unit restored for viewing in MS-DIAL, whose undo
+    reads its viewing_restore hold here (_viewing_restore_refusal); and a workspace another live lease is still
     downloading into. Raises when the manifest is there but cannot be read, rather than replace it unseen.
     """
     try:
@@ -2762,6 +2785,9 @@ def _supersede_previous_manifest(manifest_path: Path) -> tuple[dict[str, Any], l
             "read its raw files in place and name this manifest as their parent. A new lease would replace "
             "that record; the parent is not re-leased."
         )
+    restored = _viewing_restore_refusal(previous, "a new lease")
+    if restored:
+        raise ValueError(restored)
     if status == "downloading":
         state = lease_owner_state(previous)
         summary["lease_owner"] = previous.get("lease_owner")
@@ -5256,6 +5282,14 @@ def record_run_failure(
         return {"status": status, "manifest_error": str(error), "run_failure": record}
 
 
+class ViewingRestoreStands(ValueError):
+    """record_run_start, asked to refuse one, found a viewing restore standing on the unit as it opened the attempt."""
+
+    def __init__(self, restore_id: str) -> None:
+        super().__init__(f"This unit is restored for viewing in MS-DIAL (restore {restore_id or 'unrecorded'}).")
+        self.restore_id = restore_id
+
+
 def record_run_start(
     manifest_path: str | Path,
     job_id: str,
@@ -5267,8 +5301,14 @@ def record_run_start(
     timeout_seconds: float | None = None,
     idle_timeout_seconds: float | None = None,
     data_types: dict[str, Any] | None = None,
+    refuse_viewing_restore: bool = False,
 ) -> dict[str, Any]:
-    """Open one run attempt in the unit's manifest, before its Console starts. Never raises.
+    """Open one run attempt in the unit's manifest, before its Console starts. Never raises, but for one case.
+
+    With ``refuse_viewing_restore``, a viewing restore standing on the unit as the attempt is opened raises
+    ViewingRestoreStands and opens nothing. Read in the same write as the attempt, under the manifest's writer lock,
+    where a restore records its hold and reads the open attempts: a restore in another backend either finds this
+    attempt and refuses, or is found here, and a Console never starts on a restored unit in between.
 
     WHY BEFORE. Every other record of a run is written after the Console returns: the failure record,
     the finalised run. A backend that stops while the Console runs - a reboot, a crash, an MCP session
@@ -5327,6 +5367,11 @@ def record_run_start(
     }
 
     def change(manifest: dict[str, Any]) -> None:
+        if refuse_viewing_restore:
+            restores = [item for item in manifest.get("finalisation_holds") or []
+                        if isinstance(item, dict) and item.get("step") == "viewing_restore"]
+            if restores:
+                raise ViewingRestoreStands(str(restores[0].get("restore_id") or ""))
         attempts = list(manifest.get("run_attempts") or [])
         entry["attempt"] = 1 + sum(
             1 for item in attempts if isinstance(item, dict) and item.get("kind") == entry["kind"]
@@ -5336,6 +5381,8 @@ def record_run_start(
     try:
         update_manifest(Path(manifest_path), change)
         return {**entry, "recorded": True}
+    except ViewingRestoreStands:
+        raise
     except Exception as error:  # noqa: BLE001 - a record that fails must not stop the run it records
         return {**entry, "recorded": False, "error": f"{type(error).__name__}: {error}"}
 
@@ -7662,6 +7709,9 @@ def plan_acquisition_split(manifest_path: Path) -> dict[str, Any]:
         }
     if not parent_id:
         blockers.append("The manifest names no analysis_unit_id to derive part identifiers from.")
+    restored = _viewing_restore_refusal(manifest, "a split")
+    if restored:
+        blockers.append(restored)
     disposition = _applied_disposition(manifest)
     # A campaign disposition splits SWATH from AIF too, and both of those read "DIA" in the header; and it
     # splits by polarity where the inputs' headers differ in it.

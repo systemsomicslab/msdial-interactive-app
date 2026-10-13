@@ -99,6 +99,8 @@ STORE_DIRECTORY_NAME = "_library_copies"
 CONSOLE_TEMP_DIRECTORY_NAME = "_tmp"
 VIEWING_DIRECTORY_NAME = "_viewing"
 OBJECT_FILE = "library-copy.dbs"
+# Beside an unfinished ingest's intent once repair has completed it, until its unit is told (_repair_one).
+REPAIRED_FILE = "repaired.json"
 LOADED_LIBRARY_COPY_SUFFIX = "_Loaded.msp2.dbs"
 STORE_SCHEMA = "msdial-library-copy-store.v1"
 OBJECT_SCHEMA = "msdial-library-copy-object.v1"
@@ -1390,6 +1392,8 @@ class LibraryCopyStore:
             object_id = str((intent or {}).get("object_id") or "")
             if intent is None:
                 action = "quarantine"
+            elif (item / REPAIRED_FILE).is_file():
+                action = "record_unit"  # completed by an earlier repair, whose unit was not told
             elif staged:
                 action = "complete"
             elif object_id and self._may_hold(object_id, intent):
@@ -1423,7 +1427,7 @@ class LibraryCopyStore:
         orphans = self.orphans()
         result: dict[str, Any] = {"orphans": orphans, "repaired": [], "errors": []}
         if not confirmed:
-            complete = sum(1 for item in orphans if item["action"] in {"complete", "record", "remove"})
+            complete = sum(1 for item in orphans if item["action"] in {"complete", "record", "record_unit", "remove"})
             result["message"] = (
                 f"Nothing was changed. {complete} unfinished ingest(s) would be completed and "
                 f"{len(orphans) - complete} quarantined; call again with repair and confirmed after an "
@@ -1460,6 +1464,7 @@ class LibraryCopyStore:
         job_id = str(intent.get("job_id") or "")
         how = str(intent.get("how") or "repair")
         staged = directory / OBJECT_FILE
+        completed = directory / REPAIRED_FILE
         lock = self.lock(object_id, job_id)
         try:
             lock.acquire(timeout=0)
@@ -1467,7 +1472,12 @@ class LibraryCopyStore:
             return {"outcome": "in_progress"}  # its ingest holds the lock: not an orphan
         copy = intent.get("copy") or {}
         try:
-            if staged.is_file():
+            if completed.is_file():
+                # An earlier repair completed this ingest and could not then tell its unit: only that is left.
+                done = _read_json(completed)
+                if not isinstance(done, dict) or not done.get("outcome"):
+                    raise LibraryCopyStoreError(f"{self.relative(completed)} is not a repair's record; a person looks")
+            elif staged.is_file():
                 identity = read_copy_identity(staged)
                 if identity.sha256 != copy.get("sha256") or identity.object_id != object_id:
                     # Not the copy the intent records - a copy cut short when its process stopped. It is set
@@ -1485,10 +1495,21 @@ class LibraryCopyStore:
                 done = self._record_installed(object_id, intent, unit=unit, job_id=job_id, how=how)
             else:
                 done = {"outcome": "nothing_left", "object_id": object_id}
-            unlink_tree(directory)
+            # What was done, beside the intent, until the unit is told: an intent removed first, and a unit manifest
+            # that then could not be written, left the unit naming its copy pending_repair with nothing left to
+            # repair, and the link from the unit to its object lost.
+            _write_json_atomic(completed, done)
         finally:
             self._release(lock)
-        _record_repair(self, intent, done)
+        try:
+            _record_repair(self, intent, done)
+        except (OSError, ValueError) as error:
+            raise LibraryCopyStoreError(
+                f"the copy is {done.get('outcome')} as object {done.get('object_id')}, but its unit manifest could "
+                f"not be written ({describe_error(error, self.workspace_root)}); the intent is kept, and the next "
+                "repair records it"
+            ) from error
+        unlink_tree(directory)
         return done
 
     def _record_installed(
@@ -1642,10 +1663,8 @@ def _record_repair(store: LibraryCopyStore, intent: dict[str, Any], done: dict[s
             **repaired, "recorded_at": _now(), "by": f"Interactive {__version__}",
         }]
 
-    try:
-        update_manifest(path, change)
-    except (OSError, ValueError):
-        pass
+    # Raised to the caller, which keeps the intent for the next repair rather than drop the unit's record unseen.
+    update_manifest(path, change)
 
 
 def _run_records(directory: Path) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:

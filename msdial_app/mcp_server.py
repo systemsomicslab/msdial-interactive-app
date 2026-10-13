@@ -2271,9 +2271,9 @@ def msdial_restore_project_for_viewing(
 
     While it stands, a viewing_restore hold blocks sharing and raw deletion: no publication report, raw cleanup,
     discard or split-parent release, the campaign's included, until msdial_undo_project_restore takes it back.
-    No Console job starts on the unit meanwhile (reason viewing_restore_active), and no new production run is
-    prepared. The containers restored are those the run's finalisation moved and those a retry of its held move
-    moved later.
+    No Console job starts on the unit meanwhile (reason viewing_restore_active), no new production run is
+    prepared, and no new download lease or split replaces the record the undo reads. The containers restored are
+    those the run's finalisation moved and those a retry of its held move moved later.
 
     It is refused - nothing written - for a unit with no run finalisation or no campaign approval, a run that
     moved no containers or whose pending containers no retry moved, no store object recorded for the run (a unit
@@ -2324,9 +2324,16 @@ def msdial_undo_project_restore(
     keeps it held until that restore is undone (other_restores, shared_directories). If the unit manifest could
     not be written, the restore is recorded lifting_hold and the next call only lifts the hold.
 
+    MS-DIAL holds no file open between saves, so the undo cannot tell that the project is still open, and a save
+    MS-DIAL made after it would put a whole library copy back into the output with no hold. A confirmed undo is
+    therefore refused while MS-DIAL's GUI (MSDIAL.exe) runs; the preview names it (msdial_gui). It is refused too
+    while a restore of the unit is still making its copies. If the unit manifest could not be written by an
+    earlier call, a call that finds MS-DIAL has saved since takes the restore back again before lifting the hold.
+
     With confirmed=false nothing is removed and the result lists what would be removed, put back and reported.
-    Only a caller that has shown those to the user and received an explicit answer may call again with
-    confirmed=true. restore_id defaults to the one restore standing on the unit.
+    Only a caller that has shown those to the user, asked them to close MS-DIAL without saving, and received an
+    explicit answer may call again with confirmed=true. restore_id defaults to the one restore standing on the
+    unit.
     """
     from .project_restore import undo_project_restore
 

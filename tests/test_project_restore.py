@@ -49,6 +49,8 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
     from msdial_app import server
 
 WINDOWS = os.name == "nt"
+# The GUI check itself; every fixture below patches it out.
+GUI_PROCESSES = project_restore.msdial_gui_processes
 TS = "20261091730"
 PROJECT = "Project-2610090530"
 DBS = f"{PROJECT}_Loaded.msp2.dbs"
@@ -64,6 +66,10 @@ class _Finalised(unittest.TestCase):
     INPUTS = ("Sample_A", "QC_01")
 
     def setUp(self) -> None:
+        # Whether MS-DIAL's GUI runs on this machine is no part of a test unless the test says so.
+        gui = patch.object(project_restore, "msdial_gui_processes", return_value=[])
+        gui.start()
+        self.addCleanup(gui.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name).resolve()
         self.workspace = self.root / "metabolights" / "MTBLS-SYN" / "unit-syn"
@@ -298,6 +304,10 @@ class TheRefusals(_Finalised):
         self.change(run_attempts=[], raw_deletion={"state": "deleting"})
         self.refused("a deletion of this unit's raw data has begun")
 
+    def test_a_download_under_way(self) -> None:
+        self.change(status="downloading")
+        self.refused("being downloaded")
+
     def test_a_target_that_exists_is_never_written_over(self) -> None:
         (self.raw / self.relatives[0]).write_bytes(b"someone else's file")
         self.refused("already exist")
@@ -527,6 +537,40 @@ class TheUndo(_Finalised):
         self.assertNotIn("library_copy_records", read_manifest(self.manifest))
         self.assertEqual([self.object_id], self.store.object_ids())
 
+    def test_a_restore_that_could_not_open_the_object_records_no_copy_and_its_undo_stores_what_is_there(self) -> None:
+        # MS-DIAL loading another unit restored from the same object opens it sharing nothing: the link is refused
+        # and so is the open the copy needs. The restore made nothing at the link's place.
+        link = self.output / DBS
+        stored = os.path.normcase(str(self.store.object_path(self.object_id)))
+        builtin_open = open
+        loading: list[bool] = []
+
+        def refused_link(*_args):
+            loading.append(True)  # from here on MS-DIAL holds the object; the restore had read it whole before
+            raise PermissionError(13, "Access is denied")
+
+        def shared_nothing(path, mode="r", *args, **kwargs):
+            if loading and os.path.normcase(str(path)).endswith(stored) and "r" in mode:
+                raise PermissionError(13, "The process cannot access the file", str(path))
+            return builtin_open(path, mode, *args, **kwargs)
+
+        with patch.object(project_restore.os, "link", refused_link), patch("builtins.open", shared_nothing):
+            done = self.restore()
+        self.assertEqual("failed", done["state"])
+        self.assertFalse(link.exists())
+        record = json.loads((self.root / done["record"]).read_text(encoding="utf-8"))
+        self.assertIsNone(record["link"]["method"], "no copy was begun")
+        # A library copy of other content then appears at the link's place: never the restore's to remove.
+        synthetic_dbs(link, date_time=(2026, 10, 3, 9, 0, 0), storage=b"other annotator settings")
+
+        self.assertEqual("store", undo_project_restore(self.manifest)["library_copy"]["action"])
+        undone = self.undo()
+        self.assertTrue(undone["undone"], undone)
+        [kept] = read_manifest(self.manifest)["library_copy_records"]
+        self.assertEqual(("undo_gui_copy", "stored"), (kept["action"], kept["outcome"]))
+        self.assertIsNone(self.store.problem(kept["object_id"], full=True))
+        self.assertNotEqual(self.object_id, kept["object_id"])
+
     def test_a_copy_of_the_object_that_does_not_match_is_removed_by_the_restore(self) -> None:
         link = self.output / DBS
         copy = shutil.copyfileobj
@@ -669,6 +713,14 @@ class TheRaces(_Finalised):
                 self.restore()
         self.assert_nothing_recorded()
 
+    def test_a_lease_begun_after_the_plan_is_refused_as_the_hold_is_written(self) -> None:
+        # A lease's later writes replace the manifest whole: a hold written onto its record would be lost.
+        self.change(status="downloading")
+        with patch.object(project_restore, "_refuse_live", lambda *_args: None):
+            with self.assertRaisesRegex(RestoreRefused, "being downloaded"):
+                self.restore()
+        self.assert_nothing_recorded()
+
     def test_a_deletion_judged_before_the_restore_stood_deletes_nothing(self) -> None:
         self.restore()
         # Its own write of the intent reads the holds again: the restore's is there now.
@@ -703,6 +755,255 @@ class TheRaces(_Finalised):
                 server._run_console_for_job("job8", "run", preparation, lambda _line: None)
         self.assertEqual({}, processes)
         self.assertNotIn("run_attempts", read_manifest(self.manifest))
+
+
+class TheRestoreAgainstItsUndo(_Finalised):
+    """An undo never takes back a restore that is still making its copies: it would lift the hold, and the restore
+    would then finish and leave a library-copy link and container copies with no hold and no record."""
+
+    def test_an_undo_while_the_restore_is_still_copying_is_refused(self) -> None:
+        write = project_restore._write_record
+        writes: list[int] = []
+        answers: list = []
+
+        def undo_from_elsewhere() -> None:
+            # Another session's backend, or an agent whose client gave up waiting: a thread of its own.
+            try:
+                answers.append(undo_project_restore(self.manifest, confirmed=True))
+            except RestoreRefused as error:
+                answers.append(error)
+
+        def record(path, value):
+            write(path, value)
+            writes.append(1)
+            if len(writes) == 5:  # the journal of a container, the hold long since written
+                thread = threading.Thread(target=undo_from_elsewhere)
+                thread.start()
+                thread.join(30)
+
+        with patch.object(project_restore, "_write_record", record):
+            done = self.restore()
+
+        self.assertTrue(done["restored"], done)
+        [answer] = answers
+        self.assertIsInstance(answer, RestoreRefused)
+        self.assertIn("still making its copies", str(answer))
+        manifest = read_manifest(self.manifest)
+        self.assertEqual(["viewing_restore"], [item["step"] for item in manifest["finalisation_holds"]])
+        self.assertEqual("restored", manifest["viewing_restores"][0]["state"])
+        undone = self.undo()
+        self.assertTrue(undone["undone"], undone)
+        self.assertFalse((self.output / DBS).exists())
+        self.assertFalse((self.raw / self.relatives[0]).exists())
+
+    def test_a_restore_recorded_between_the_check_and_the_run_attempt_stops_the_console(self) -> None:
+        # The restore is made in another backend, after this one read the unit and before it opened the attempt:
+        # the write that opens the attempt finds its hold.
+        preparation = {"command": [sys.executable, "-c", "pass"], "run_directory": str(self.output),
+                       "repository_run_manifest": str(self.manifest)}
+        processes = {"job8": {"kind": "run", "cancel": threading.Event(), "timeout_seconds": None,
+                              "idle_timeout_seconds": None, "pid": None}}
+        check = server._refuse_restored_unit
+
+        def then_restored_elsewhere(manifest_text: str) -> None:
+            check(manifest_text)
+            hold = _hold(["sharing", "raw_deletion"], "viewing_restore", "run1", "restored", restore_id="r9")
+            self.change(finalisation_holds=[hold])
+
+        with patch.object(server, "PROCESSES", processes), patch.object(server, "JOBS", {}), \
+                patch.object(server, "_persist_jobs_locked", lambda: None), \
+                patch.object(server, "_refuse_restored_unit", then_restored_elsewhere), \
+                patch.object(server, "run_console", side_effect=AssertionError("the Console started")):
+            with self.assertRaises(server.UnitRestoredError) as raised:
+                server._run_console_for_job("job8", "run", preparation, lambda _line: None)
+        self.assertEqual(("viewing_restore_active", "r9"),
+                         (raised.exception.payload()["code"], raised.exception.payload()["restore_id"]))
+        self.assertEqual({}, processes)
+        self.assertNotIn("run_attempts", read_manifest(self.manifest))
+
+
+class TheUndoAndAnOpenMsdial(_Finalised):
+    """MS-DIAL holds no file open between saves: a project open in it makes nothing busy, and a save it makes after
+    the undo - on close - writes a whole library copy into the output and project files over the ones put back."""
+
+    def test_a_confirmed_undo_is_refused_while_msdial_runs_and_the_preview_says_so(self) -> None:
+        self.restore()
+        running = [{"name": "MSDIAL.exe", "pid": 4242}]
+        with patch.object(project_restore, "msdial_gui_processes", return_value=running):
+            preview = undo_project_restore(self.manifest)
+            self.assertEqual(running, preview["msdial_gui"])
+            self.assertIn("refused until it is closed", preview["message"])
+            with self.assertRaisesRegex(RestoreRefused, r"MSDIAL\.exe \(process 4242\)"):
+                self.undo()
+        manifest = read_manifest(self.manifest)
+        self.assertEqual(["viewing_restore"], [item["step"] for item in manifest["finalisation_holds"]])
+        self.assertTrue((self.output / DBS).exists())
+        self.assertTrue(self.undo()["undone"])
+
+    def test_where_it_cannot_be_told_the_undo_goes_ahead_and_says_so(self) -> None:
+        self.restore()
+        with patch.object(project_restore, "msdial_gui_processes", return_value=None):
+            self.assertIn("could not be checked", undo_project_restore(self.manifest)["message"])
+            undone = self.undo()
+        self.assertTrue(undone["undone"], undone)
+        self.assertIn("could not be checked", undone["warnings"][0])
+
+    def test_the_gui_is_found_by_its_image_name_and_the_console_is_not(self) -> None:
+        listing = ('"MSDIAL.exe","4242","Console","1","812,004 K"\r\n'
+                   '"MSDIALCUI.exe","5151","Console","1","90,000 K"\r\n'
+                   '"python.exe","6161","Console","1","9,000 K"\r\n').encode("ascii")
+        completed = project_restore.subprocess.CompletedProcess(["tasklist"], 0, stdout=listing, stderr=b"")
+        with patch.object(project_restore.os, "name", "nt"), \
+                patch.object(project_restore.subprocess, "run", return_value=completed):
+            self.assertEqual([{"name": "MSDIAL.exe", "pid": 4242}], GUI_PROCESSES())
+        failed = project_restore.subprocess.CompletedProcess(["tasklist"], 1, stdout=b"", stderr=b"")
+        with patch.object(project_restore.os, "name", "nt"), \
+                patch.object(project_restore.subprocess, "run", return_value=failed):
+            self.assertIsNone(GUI_PROCESSES())
+
+    def test_a_save_after_a_call_that_could_not_lift_the_hold_is_taken_back_before_it_is_lifted(self) -> None:
+        self.restore()
+        write = repository_reanalysis.update_manifest
+        calls = []
+
+        def busy_once(path, change):
+            calls.append(1)
+            if len(calls) == 1:
+                raise ValueError("manifest lock timed out")
+            return write(path, change)
+
+        with patch.object(repository_reanalysis, "update_manifest", busy_once):
+            self.assertEqual("lifting_hold", self.undo()["state"])
+        # MS-DIAL, still open, saves on close: a whole library copy under the link's name, and its project files.
+        synthetic_dbs(self.output / DBS, date_time=(2026, 10, 4, 9, 0, 0))
+        mdproject = self.output / f"{PROJECT}.mdproject"
+        mdproject.write_bytes(b"PK saved on close")
+
+        preview = undo_project_restore(self.manifest)
+        self.assertFalse(preview["lift_only"], "not a call that only lifts the hold")
+        undone = self.undo()
+        self.assertTrue(undone["undone"], undone)
+        self.assertFalse((self.output / DBS).exists())
+        self.assertEqual(b"PK project", mdproject.read_bytes())
+        manifest = read_manifest(self.manifest)
+        self.assertEqual([], manifest["finalisation_holds"])
+        [kept] = manifest["library_copy_records"]
+        self.assertEqual(("undo_gui_copy", self.object_id), (kept["action"], kept["object_id"]))
+
+
+class TheLeaseAndTheSplitOfARestoredUnit(_Finalised):
+    """A new lease replaces the unit manifest, and a split marks it a parent: either would drop the restore's hold
+    and its record, and no undo could take the restore back."""
+
+    def test_a_new_lease_is_refused_before_it_makes_anything_and_the_restore_still_undoes(self) -> None:
+        from msdial_app.repository_reanalysis import RepositoryFile, RepositoryProject, create_download_lease
+
+        shutil.rmtree(self.raw)  # released, as a finalised campaign unit is
+        self.restore()
+        before = self.manifest.read_bytes()
+        project = RepositoryProject(
+            repository="metabolights", accession="MTBLS-SYN", analysis_unit_id="unit-syn", eligible=True,
+            selection_status="eligible", files=[RepositoryFile("FILES/a.mzML", 3, "https://example.org/a.mzML")],
+            total_download_bytes=3, sample_metadata=[{"sample_id": "a", "raw_file": "a.mzML"}],
+        )
+
+        class Offline:
+            def download(self, *_args, **_kwargs):
+                raise AssertionError("a byte was fetched")
+
+        with self.assertRaisesRegex(ValueError, "restored for viewing in MS-DIAL"):
+            create_download_lease(project, self.root, 100, client=Offline())
+        self.assertEqual(before, self.manifest.read_bytes())
+        self.assertEqual([], list(self.manifest.parent.glob("run-manifest.superseded-*")))
+        self.assertFalse((self.raw / "downloads").exists(), "no directory was made in the restored raw tree")
+        # And under the manifest's lock, where the lease replaces the record.
+        with self.assertRaisesRegex(ValueError, "restored for viewing in MS-DIAL"):
+            repository_reanalysis._supersede_previous_manifest(self.manifest)
+        undone = self.undo()
+        self.assertTrue(undone["undone"], undone)
+        self.assertFalse(self.raw.exists())
+
+    def test_a_split_is_refused(self) -> None:
+        self.restore()
+        plan = repository_reanalysis.plan_acquisition_split(self.manifest)
+        self.assertTrue(any("restored for viewing in MS-DIAL" in item for item in plan["blockers"]), plan["blockers"])
+
+
+class TheRetentionTimePreviewOfARestoredUnit(_Finalised):
+    """Its Console writes beside the unit's raw files too: refused while a restore stands, at its endpoint and again
+    in its job, and the MCP tools read the refusal as such."""
+
+    def test_its_job_stops_before_its_console_and_leaves_no_temp(self) -> None:
+        self.restore()
+        preparation = {"command": ["MSDIALCUI.exe"], "run_directory": str(self.output),
+                       "repository_run_manifest": str(self.manifest)}
+        jobs = {"rt9": {"id": "rt9", "status": "queued", "kind": "rt_correction", "logs": [],
+                        "preparation": preparation}}
+        started: list = []
+        with patch.object(server, "JOBS", jobs), patch.object(server, "_persist_jobs_locked", lambda: None), \
+                patch.object(server, "run_console", lambda *args, **kwargs: started.append(1) or 0):
+            server._run_rt_correction_job("rt9", preparation)
+        self.assertEqual([], started, "the Console never started")
+        self.assertEqual("failed", jobs["rt9"]["status"])
+        self.assertIn("restored for viewing", jobs["rt9"]["error"])
+        self.assertFalse((self.root / "_tmp" / "rt9").exists())
+
+    def test_its_endpoint_answers_409_and_the_mcp_tools_read_it(self) -> None:
+        from http.server import ThreadingHTTPServer
+
+        from msdial_app import mcp_server
+
+        restored = self.restore()
+        backend = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=backend.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(backend.server_close)
+        self.addCleanup(backend.shutdown)
+        jobs: dict = {}
+        with patch.object(server, "JOBS", jobs), patch.object(server, "_persist_jobs_locked", lambda: None):
+            refused = mcp_server._structured_validation_errors(lambda: mcp_server._request_json(
+                "POST", "/api/rt-correction/run", port=backend.server_port,
+                body={"workflow": {"repository_run_manifest": str(self.manifest)}},
+            ))()
+        self.assertEqual((False, "viewing_restore_active", 409),
+                         (refused["ok"], refused["reason"], refused["http_status"]))
+        self.assertEqual(restored["restore_id"], refused["restore_id"])
+        self.assertEqual({}, jobs, "no job was registered")
+
+
+class TheHoldRetryAgainstAStoreItCannotRead(_Finalised):
+    """A retry's errors go into the hold, the log and the tools' replies: none names the store by an absolute path."""
+
+    def held(self) -> None:
+        gone = self.output / "Gone_Loaded.msp2.dbs"  # stored by a retry whose manifest write then failed
+        self.change(finalisation_holds=[_hold(["sharing"], "loaded_library_copy", "run1", "held", files=[str(gone)])])
+
+    def errors(self, lines: list[str]) -> list[str]:
+        [hold] = read_manifest(self.manifest)["finalisation_holds"]
+        self.assertTrue(hold["errors"], hold)
+        assert_names_no_root(self, self.root, json.dumps(hold["errors"]) + "".join(lines))
+        return hold["errors"]
+
+    def test_a_store_it_cannot_list_keeps_the_hold(self) -> None:
+        self.held()
+        denied = PermissionError(13, "Access is denied", str(self.root / "_library_copies" / "o"))
+        lines: list[str] = []
+        with patch.object(LibraryCopyStore, "object_ids", side_effect=denied):
+            resolve_finalisation_holds(self.manifest, log=lines.append)
+        [error] = self.errors(lines)
+        self.assertIn("_library_copies/o", error)
+
+    def test_any_other_error_of_a_retry_is_written_relative_to_the_root(self) -> None:
+        from msdial_app import run_finalisation
+
+        self.held()
+        denied = PermissionError(13, "Access is denied", str(self.root / "_library_copies" / "STORE.json"))
+        lines: list[str] = []
+        with patch.object(run_finalisation, "_retry_hold", side_effect=denied):
+            resolve_finalisation_holds(self.manifest, log=lines.append)
+        [error] = self.errors(lines)
+        self.assertIn("_library_copies/STORE.json", error)
 
 
 class TheUndoAgainstSaves(_Finalised):
@@ -812,6 +1113,9 @@ class TwoPartsOfOneTree(unittest.TestCase):
     directories and the second restores into them."""
 
     def setUp(self) -> None:
+        gui = patch.object(project_restore, "msdial_gui_processes", return_value=[])
+        gui.start()
+        self.addCleanup(gui.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name).resolve()
         accession = self.root / "metabolights" / "MTBLS-SYN"

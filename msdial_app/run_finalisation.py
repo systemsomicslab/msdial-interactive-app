@@ -945,7 +945,15 @@ def _retry_hold(
                 # Gone. A retry that stored it and then could not write this manifest leaves exactly that, and
                 # the store's own records say where it went. A copy they do not name is not settled by its
                 # absence: the hold stands, and a person looks.
-                found = store.find_settled(unit, job_id, origin or "retry", path.name)
+                try:
+                    found = store.find_settled(unit, job_id, origin or "retry", path.name)
+                except OSError as error:
+                    # A store whose directories cannot be listed: the hold stands, and the error names the store
+                    # relative to the workspace root, never by Python's text, which holds the absolute path.
+                    left.append(str(file))
+                    errors.append(f"{path.name}: it is no longer where this hold names it, and the library-copy store "
+                                  f"could not be read ({describe_error(error, root)}); call again")
+                    continue
                 if found is not None:
                     stored.append(found)
                 else:
@@ -1000,12 +1008,20 @@ def _resolve_in(manifest_path: Path, patience: _Patience, log: Callable[[str], N
     if not holds:
         return []
     outcomes: dict[str, tuple[dict[str, Any] | None, dict[str, Any] | None]] = {}
+    root: Path | None = None
     for hold in holds:
         try:
             outcomes[str(hold.get("id"))] = _retry_hold(hold, manifest_path, patience)
         except Exception as error:  # a retry must not make a refusal into a crash
+            if root is None:
+                try:
+                    root = workspace_root_for(_read_json(manifest_path), manifest_path)[0]
+                except Exception:  # noqa: BLE001 - without a root, files are named by name alone
+                    root = None
+            # Written into the hold, the log and the tools' replies: an OSError by its code and its files relative to
+            # the workspace root, never by Python's text, which holds the absolute path.
             outcomes[str(hold.get("id"))] = (
-                {**hold, "errors": [f"{type(error).__name__}: {error}"], "last_retried_at": _now()}, None
+                {**hold, "errors": [describe_error(error, root)], "last_retried_at": _now()}, None
             )
     for updated, note in outcomes.values():
         if note:
