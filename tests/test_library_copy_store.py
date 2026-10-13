@@ -31,9 +31,12 @@ from msdial_app.download_store import StoreLock, StoreLockTimeout
 from msdial_app.library_copy_store import (
     DEDUPLICATED,
     DEDUPLICATED_BY_CONTENT,
+    OBJECT_FILE,
+    PENDING,
     QUARANTINED,
     STORE_DIRECTORY_NAME,
     STORED,
+    LibraryCopyPending,
     LibraryCopyStore,
     LibraryCopyStoreError,
     annotation_settings,
@@ -45,7 +48,8 @@ from msdial_app.library_copy_store import (
     settle_console_temp,
     workspace_root_for,
 )
-from msdial_app.repository_reanalysis import RESERVED_WORKSPACE_NAMES, _write_json, read_manifest
+from msdial_app.repository_reanalysis import RESERVED_WORKSPACE_NAMES, _write_json, read_manifest, update_manifest
+from msdial_app.run_finalisation import store_loaded_library_copies
 
 WINDOWS = os.name == "nt"
 DATABASES = {
@@ -83,6 +87,13 @@ def synthetic_dbs(
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def assert_names_no_root(case: unittest.TestCase, root: Path, text: str) -> None:
+    """No absolute path of ``root`` in ``text``: as written, as JSON escapes it, and no drive-rooted path at all."""
+    case.assertNotIn(str(root), text)
+    case.assertNotIn(str(root).replace("\\", "\\\\"), text)
+    case.assertIsNone(re.search(r"[A-Za-z]:(?:\\\\|\\|/)", text), text)
 
 
 class _Store(unittest.TestCase):
@@ -297,6 +308,117 @@ class PutTests(_Store):
         self.assertEqual(content, copy.read_bytes())
         self.assertEqual([], list((self.root / STORE_DIRECTORY_NAME / "incoming").iterdir()))
 
+    def test_a_record_that_cannot_be_written_takes_the_install_back(self) -> None:
+        copy = self.copy()
+        content = copy.read_bytes()
+        write = library_copy_store._write_json_atomic
+
+        def refuse_entry(path, value):
+            if Path(path).name == "entry.json":
+                raise PermissionError(13, "Access is denied", str(path))
+            return write(path, value)
+
+        with patch.object(library_copy_store, "_write_json_atomic", refuse_entry):
+            with self.assertRaises(PermissionError):
+                self.put(copy)
+        # Back where it was, so that its caller holds it there; nothing of it is left in the store.
+        self.assertEqual(content, copy.read_bytes())
+        self.assertEqual([], self.store.object_ids())
+        self.assertEqual([], list((self.root / STORE_DIRECTORY_NAME / "incoming").iterdir()))
+
+    def test_a_claim_that_cannot_be_written_leaves_the_copy_stored_and_named(self) -> None:
+        copy = self.copy()
+        with patch.object(LibraryCopyStore, "claim", side_effect=PermissionError(13, "Access is denied", "x.json")):
+            record = self.put(copy)
+        self.assertEqual((STORED, None), (record["outcome"], record["claim"]))
+        self.assertIn("PermissionError", record["claim_error"])
+        self.assertFalse(copy.exists())
+        self.assertIsNone(self.store.problem(record["object_id"], full=True))
+        self.assertEqual([], self.store.orphans())
+
+    def _stop_after_install(self):
+        """An install whose record cannot be written and whose copy cannot be taken back out of the store."""
+        write, replace = library_copy_store._write_json_atomic, library_copy_store._replace
+
+        def refuse_entry(path, value):
+            if Path(path).name == "entry.json":
+                raise PermissionError(13, "Access is denied", str(path))
+            return write(path, value)
+
+        def hold_object(source, target, *args, **kwargs):
+            if Path(source).name == OBJECT_FILE and Path(source).parent.parent.name == "o":
+                raise PermissionError(13, "held by a scanner", str(source))
+            return replace(source, target, *args, **kwargs)
+
+        return (patch.object(library_copy_store, "_write_json_atomic", refuse_entry),
+                patch.object(library_copy_store, "_replace", hold_object))
+
+    def _unit_manifest(self, job_id: str = "job1") -> Path:
+        manifest = self.root / UNIT["manifest"]
+        _write_json(manifest, {"workspace": str(manifest.parent.parent), "output_directory": str(self.output),
+                               "project": {"repository": "metabolights", "accession": "MTBLS-SYN",
+                                           "analysis_unit_id": "unit-syn"},
+                               "console_run_finalisation": {"job_id": job_id}})
+        return manifest
+
+    def test_a_copy_that_left_and_whose_install_stopped_is_pending_and_repair_completes_its_record(self) -> None:
+        manifest = self._unit_manifest()
+        copy = self.copy()
+        lines: list[str] = []
+        first, second = self._stop_after_install()
+        with first, second:
+            copies, errors = store_loaded_library_copies(self.output, self.store, unit=UNIT, job_id="job1",
+                                                         libraries=LIBRARIES, log=lines.append)
+        [pending] = copies
+        # It is not in the output, so no hold there would keep it; the unit names it as pending instead.
+        self.assertFalse(copy.exists())
+        self.assertEqual((PENDING, copy.name), (pending["outcome"], pending["name"]))
+        self.assertTrue(pending["removed_at"])
+        self.assertEqual(1, len(errors))
+        self.assertTrue(any("left the output for the library-copy store" in line for line in lines), lines)
+        self.assertFalse(any("held in the output" in line for line in lines), lines)
+        assert_names_no_root(self, self.root, json.dumps(copies) + json.dumps(errors) + "".join(lines))
+
+        def record(current):
+            current["console_run_finalisation"]["loaded_library_copy"] = {"copies": copies, "errors": errors}
+
+        update_manifest(manifest, record)
+        [orphan] = self.store.orphans()
+        self.assertEqual("record", orphan["action"])
+        [done] = self.store.repair(confirmed=True)["repaired"]
+
+        self.assertEqual((STORED, pending["object_id"]), (done["outcome"], done["object_id"]))
+        self.assertIsNone(self.store.problem(pending["object_id"], full=True))
+        unit = read_manifest(manifest)
+        [item] = unit["console_run_finalisation"]["loaded_library_copy"]["copies"]
+        self.assertEqual((STORED, pending["object_id"]), (item["outcome"], item["object_id"]))
+        self.assertNotIn("library_copy_records", unit, "completed where the run names its copy, not twice")
+
+    def test_a_file_set_aside_with_no_record_is_named_and_its_unit_found_equal(self) -> None:
+        manifest = self._unit_manifest()
+        copy = self.copy(date_time=(2026, 10, 1, 10, 0, 0))
+        first, second = self._stop_after_install()
+        with first, second:
+            with self.assertRaises(LibraryCopyPending) as raised:
+                self.put(copy)
+        pending = {**raised.exception.record, "outcome": PENDING}
+
+        def record(current):
+            current["console_run_finalisation"]["loaded_library_copy"] = {"copies": [pending], "errors": []}
+
+        update_manifest(manifest, record)
+        # Another unit stores the same libraries before anyone repairs: the file with no record is moved aside.
+        later = self.put(self.copy("Project-2_Loaded.msp2.dbs", date_time=(2026, 10, 2, 10, 0, 0)), job_id="job2")
+        self.assertEqual(STORED, later["outcome"])
+        [repair] = self.store.entry(later["object_id"])["repairs"]
+        self.assertEqual(later["set_aside"], repair["kept_as"])
+        self.assertTrue((self.store.object_directory(later["object_id"]) / repair["kept_as"]).is_file())
+
+        [done] = self.store.repair(confirmed=True)["repaired"]
+        self.assertEqual(DEDUPLICATED, done["outcome"])
+        [item] = read_manifest(manifest)["console_run_finalisation"]["loaded_library_copy"]["copies"]
+        self.assertEqual((DEDUPLICATED, later["object_id"]), (item["outcome"], item["object_id"]))
+
     @unittest.skipUnless(WINDOWS, "hard links are compared by NTFS file id")
     def test_a_name_other_files_share_is_copied_so_no_object_shares_a_file_record(self) -> None:
         copy = self.copy()
@@ -333,6 +455,20 @@ class PutTests(_Store):
                 thread.join(30)
         self.assertEqual(sorted([STORED, DEDUPLICATED]), sorted(item["outcome"] for item in results))
         self.assertFalse(any(path.exists() for path in copies))
+
+    def test_an_object_that_cannot_be_read_is_a_problem_named_relative_to_the_root(self) -> None:
+        record = self.put(self.copy())
+        object_path = self.store.object_path(record["object_id"])
+        denied = PermissionError(13, "The process cannot access the file", str(object_path))
+        with patch.object(library_copy_store, "entry_table", side_effect=denied):
+            problem = self.store.problem(record["object_id"])
+        self.assertIn("cannot be read", problem)
+        self.assertIn(f"{STORE_DIRECTORY_NAME}/o/{record['object_id']}/library-copy.dbs", problem)
+        assert_names_no_root(self, self.root, problem)
+        with patch.object(library_copy_store, "_read_json", side_effect=PermissionError(13, "denied", str(object_path))):
+            problem = self.store.problem(record["object_id"])
+        self.assertIn("its record cannot be read", problem)
+        assert_names_no_root(self, self.root, problem)
 
     def test_errors_name_files_relative_to_the_workspace_root(self) -> None:
         target = self.root / STORE_DIRECTORY_NAME / "o" / ("0" * 32) / "library-copy.dbs"
@@ -377,6 +513,31 @@ class RepairTests(_Store):
         self.assertEqual([], self.store.orphans())
         [record] = read_manifest(manifest)["library_copy_records"]
         self.assertEqual(("repair", "job1", done["object_id"]), (record["action"], record["job_id"], record["object_id"]))
+
+    def test_a_staged_copy_cut_short_is_set_aside_and_recorded_nowhere(self) -> None:
+        manifest = self.output.parent / "provenance" / "run-manifest.json"
+        _write_json(manifest, {"workspace": str(self.output.parent), "project": {
+            "repository": "metabolights", "accession": "MTBLS-SYN", "analysis_unit_id": "unit-syn"}})
+        copy = self.copy()
+        identity = read_copy_identity(copy)
+        # A hard kill during the copy of a source another name shares: the intent, and a staged file cut short.
+        incoming = self.root / STORE_DIRECTORY_NAME / "incoming" / ("1" * 32)
+        incoming.mkdir(parents=True)
+        (incoming / "intent.json").write_text(json.dumps({
+            "schema": "msdial-library-copy-intent.v1", "object_id": identity.object_id,
+            "copy": identity.record(copy.name), "unit": UNIT, "job_id": "job1", "how": "retry",
+            "libraries": [], "annotation_settings": None, "keep_source": False,
+        }), encoding="utf-8")
+        (incoming / OBJECT_FILE).write_bytes(copy.read_bytes()[:300])
+
+        [done] = self.store.repair(confirmed=True)["repaired"]
+
+        self.assertEqual(QUARANTINED, done["outcome"])
+        self.assertEqual([], self.store.object_ids())
+        self.assertNotIn("library_copy_records", read_manifest(manifest))
+        reason = json.loads((self.root / done["quarantine"] / "reason.json").read_text(encoding="utf-8"))
+        self.assertEqual((identity.object_id, 300), (reason["object_id"], reason["found"]["size_bytes"]))
+        self.assertTrue(copy.exists(), "its source is untouched")
 
 
 class SeedAndAttachTests(_Store):
@@ -488,7 +649,7 @@ class SeedAndAttachTests(_Store):
         status = json.loads(out.getvalue())
         [item] = status["objects"]
         self.assertEqual((None, "full", "passed"), (item["problem"], item["verified"], item["testzip"]))
-        self.assertNotIn(str(self.root), json.dumps(status))
+        assert_names_no_root(self, self.root, json.dumps(status))
 
 
 def _settings(directory: Path, library_root: str, cutoff: str = "0.6") -> None:
@@ -548,7 +709,31 @@ class ConsoleTempTests(_Store):
         self.assertEqual((2, 15), (settled["removed_files"], settled["removed_bytes"]))
         self.assertEqual([], settled["held"])
         self.assertFalse(temp.exists())
-        self.assertNotIn(str(self.root), json.dumps(settled))
+        assert_names_no_root(self, self.root, json.dumps(settled))
+
+    @unittest.skipUnless(WINDOWS, "a directory junction is an NTFS reparse point")
+    def test_a_junction_in_it_is_listed_and_never_followed(self) -> None:
+        import _winapi
+
+        manifest = self.output.parent / "provenance" / "run-manifest.json"
+        _write_json(manifest, {"workspace": str(self.output.parent)})
+        victim = self.root / "victim"
+        victim.mkdir()
+        (victim / "keep.txt").write_bytes(b"not the Console's")
+        synthetic_dbs(victim / "Elsewhere_Loaded.msp2.dbs")
+        temp = self.root / "_tmp" / "job1"
+        temp.mkdir(parents=True)
+        (temp / "tmp1.tmp").write_bytes(b"x" * 3)
+        _winapi.CreateJunction(str(victim), str(temp / "j"))
+
+        settled = settle_console_temp(temp, manifest_path=manifest, job_id="job1")
+
+        self.assertEqual({"tmp1.tmp", "j"}, {item["name"] for item in settled["leftovers"]})
+        self.assertEqual([True], [item.get("link") for item in settled["leftovers"] if item["name"] == "j"])
+        self.assertEqual(([], 1), (settled["library_copies"], settled["removed_files"]))
+        self.assertTrue((victim / "keep.txt").is_file())
+        self.assertTrue((victim / "Elsewhere_Loaded.msp2.dbs").is_file())
+        self.assertFalse(temp.exists(), "the junction itself goes with the directory")
 
     def test_a_library_copy_with_no_store_is_held_where_it_is(self) -> None:
         manifest = self.root / "loose" / "provenance" / "run-manifest.json"

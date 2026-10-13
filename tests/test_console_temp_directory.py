@@ -23,7 +23,7 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
     from msdial_app import server
     from msdial_app.library_copy_store import LibraryCopyStore
     from msdial_app.repository_reanalysis import _write_json, read_manifest
-    from msdial_app.workflow import run_console
+    from msdial_app.workflow import prepare_rt_correction_run, run_console
 
 # A stand-in Console that writes what MS-DIAL leaves in its TEMP when it is stopped mid-save: a library copy
 # laid out as MS-DIAL writes one, and a scratch file.
@@ -144,7 +144,28 @@ class TheJobsSettleIt(unittest.TestCase):
             seen.append(watch.get("temp_directory"))
             return 1
 
-        preparation = {**self.preparation(["MSDIALCUI.exe"]), "kind": "rt_correction"}
+        raw = self.workspace / "raw" / "sample.mzML"
+        raw.parent.mkdir(parents=True)
+        raw.write_text("raw", encoding="ascii")
+        anchor = self.root / "anchors.txt"
+        anchor.write_text("Name\tRT\nSTD1\t7.5\n", encoding="ascii")
+        console_file = self.root / "MSDIALCUI.dll"
+        console_file.write_text("", encoding="ascii")
+        state = {
+            "project_type": "lcms",
+            "files": [{"file_path": str(raw), "file_name": "sample", "acquisition_type": "DDA"}],
+            "console_path": str(console_file),
+            "template_path": str(server.RESOURCES / "msdial_console_param4lipidomics.txt"),
+            "output_root": str(self.workspace / "rt-preview"),
+            "ion_mode": "Negative",
+            "rt_correction_anchor_path": str(anchor),
+            "rt_correction_selection_path": "",
+            "repository_run_manifest": str(self.manifest),
+        }
+        with patch("msdial_app.workflow.console_capabilities", return_value={"capabilities": []}):
+            preparation = prepare_rt_correction_run(state)
+        # The preparation carries the unit itself, as /api/rt-correction/run receives it.
+        self.assertEqual(str(self.manifest), preparation["repository_run_manifest"])
         self.jobs["rt1"] = {"id": "rt1", "status": "queued", "kind": "rt_correction", "logs": [],
                             "preparation": preparation}
         with patch.object(server, "run_console", console):

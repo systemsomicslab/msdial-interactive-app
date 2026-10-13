@@ -14,13 +14,14 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from msdial_app import project_restore
-from msdial_app.library_copy_store import LibraryCopyStore, read_copy_identity
+from msdial_app import library_copy_store, project_restore, repository_reanalysis
+from msdial_app.library_copy_store import LibraryCopyStore, LibraryCopyStoreError, read_copy_identity
 from msdial_app.materials_methods import generate_publication_report
 from msdial_app.process_liveness import process_created_at
 from msdial_app.project_restore import RestoreRefused, plan_project_restore, restore_project_for_viewing, undo_project_restore
@@ -29,10 +30,22 @@ from msdial_app.repository_reanalysis import (
     plan_download_cleanup,
     read_manifest,
     refresh_retained_artifacts,
+    start_new_production_run,
     update_manifest,
 )
-from msdial_app.run_finalisation import FinalisationHeld, _hold, resolve_finalisation_holds
-from test_library_copy_store import LIBRARIES, synthetic_dbs
+from msdial_app.run_finalisation import (
+    FinalisationHeld,
+    _hold,
+    _library_copies,
+    resolve_finalisation_holds,
+    restore_links,
+    store_loaded_library_copies,
+)
+from test_library_copy_store import LIBRARIES, assert_names_no_root, synthetic_dbs
+
+_CONFIG = tempfile.TemporaryDirectory()
+with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
+    from msdial_app import server
 
 WINDOWS = os.name == "nt"
 TS = "20261091730"
@@ -175,7 +188,8 @@ class TheRestore(_Finalised):
         self.assertEqual(len(self.relatives), len(record["created_files"]))
         self.assertEqual({f"{PROJECT}.mdproject", f"{PROJECT}.mddata", f"{PROJECT}_Loaded.msp2"},
                          {item["name"] for item in record["backups"]})
-        self.assertNotIn(str(self.root), json.dumps(record))
+        self.assertEqual("metabolights/MTBLS-SYN/unit-syn/output", record["output"])
+        assert_names_no_root(self, self.root, json.dumps(record))
 
         # While it stands: nothing is shared, nothing deleted, nothing re-inventoried, and no retry lifts it.
         with self.assertRaises(FinalisationHeld):
@@ -280,6 +294,50 @@ class TheRefusals(_Finalised):
         with self.assertRaisesRegex(RestoreRefused, "already holds"):
             restore_project_for_viewing(self.manifest, confirmed=True)
 
+    def test_an_output_holding_another_library_copy(self) -> None:
+        synthetic_dbs(self.output / "Other_Loaded.msp2.dbs")
+        self.refused("already holds Other_Loaded.msp2.dbs")
+
+    def test_paths_outside_the_workspace_root_it_records_against(self) -> None:
+        # A lease naming another directory as its root, which holds a copy of the store: every path the
+        # restore would write lies outside it, and its record could name none of them for the undo.
+        elsewhere = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, elsewhere, True)
+        shutil.copytree(self.root / "_library_copies", elsewhere / "_library_copies")
+        self.change(download_cache={"workspace_root": str(elsewhere)})
+        self.refused("outside the workspace root")
+        self.assertFalse((elsewhere / "_viewing").exists())
+
+    def test_a_live_retention_time_preview_of_the_unit(self) -> None:
+        jobs = {"rt1": {"id": "rt1", "kind": "rt_correction", "status": "running",
+                        "preparation": {"repository_run_manifest": str(self.manifest)}}}
+        with patch.object(server, "JOBS", jobs):
+            self.refused("job rt1 is queued or running")
+
+    def test_containers_a_retry_moved_count_and_containers_none_moved_refuse(self) -> None:
+        finalisation = read_manifest(self.manifest)["console_run_finalisation"]
+        relocation = finalisation["msdial_intermediates"]
+        *first, last = relocation["moved"]
+        held = {**relocation, "moved": first, "pending": [last["relative_path"]],
+                "errors": [f"{last['relative_path']}: held by another process"]}
+        self.change(console_run_finalisation={**finalisation, "msdial_intermediates": held})
+        self.refused("never moved")
+
+        self.change(finalisation_hold_resolutions=[{"hold": "h1", "step": "msdial_intermediates", "job_id": "run1",
+                                                    "moved": [last], "moved_bytes": last["size_bytes"]}])
+        preview = plan_project_restore(self.manifest)
+        self.assertEqual(len(self.relatives), preview["containers"])
+        self.assertTrue(self.restore()["restored"])
+        self.assertTrue((self.raw / last["relative_path"]).is_file())
+
+    def test_a_record_it_cannot_read_is_refused_without_an_absolute_path(self) -> None:
+        denied = PermissionError(13, "Access is denied", str(self.store.entry_path(self.object_id)))
+        with patch.object(library_copy_store, "_read_json", side_effect=denied):
+            with self.assertRaises(RestoreRefused) as raised:
+                plan_project_restore(self.manifest)
+        assert_names_no_root(self, self.root, str(raised.exception))
+        self.assertIn(f"_library_copies/o/{self.object_id}/entry.json", str(raised.exception))
+
     def test_a_split_parent_has_no_run_of_its_own(self) -> None:
         self.change(split_into=[{"manifest_path": str(self.root / "p" / "dda" / "provenance" / "run-manifest.json")}])
         self.refused("split parent")
@@ -307,7 +365,7 @@ class TheUndo(_Finalised):
 
         self.assertTrue(undone["undone"])
         self.assertEqual(b"\xc7 mddata", mddata.read_bytes())
-        [saved] = (self.root / "_viewing").glob("r-*/gui-saved/*.mddata")
+        [saved] = (self.root / "_viewing").glob("r-*/gui-saved/*/*.mddata")
         self.assertEqual(b"saved by MS-DIAL", saved.read_bytes())
         self.assertEqual(["data/Sample_A_%s.pai2" % TS], [item.split("/raw/")[-1] for item in undone["changed_by_gui"]])
         self.assertFalse((self.raw / "data" / f"Sample_A_{TS}.pai2").exists())
@@ -333,6 +391,7 @@ class TheUndo(_Finalised):
         [record] = read_manifest(self.manifest)["library_copy_records"]
         self.assertEqual(("undo_gui_copy", "deduplicated", self.object_id),
                          (record["action"], record["outcome"], record["object_id"]))
+        self.assert_restores_from_its_own_object_again()
 
     def test_a_save_that_wrote_other_content_keeps_it_in_the_store(self) -> None:
         self.restore()
@@ -343,9 +402,173 @@ class TheUndo(_Finalised):
 
         self.assertFalse(link.exists())
         [record] = read_manifest(self.manifest)["library_copy_records"]
-        self.assertEqual("stored", record["outcome"])
+        self.assertEqual(("undo_gui_copy", "stored"), (record["action"], record["outcome"]))
         self.assertNotEqual(self.object_id, record["object_id"])
         self.assertIsNone(self.store.problem(record["object_id"], full=True))
+        # The GUI's copy is the GUI's: the run is reopened from its own object, as often as asked.
+        self.assert_restores_from_its_own_object_again()
+
+    def assert_restores_from_its_own_object_again(self) -> None:
+        self.assertEqual(self.object_id, plan_project_restore(self.manifest)["library_copy"]["object_id"])
+        again = self.restore()
+        self.assertTrue(again["restored"], again)
+        self.assertEqual(os.stat(self.store.object_path(self.object_id)).st_ino, os.stat(self.output / DBS).st_ino)
+        self.assertTrue(self.undo()["undone"])
+
+    def test_a_save_as_library_copy_goes_through_the_store_and_one_it_cannot_take_keeps_the_hold(self) -> None:
+        self.restore()
+        other = synthetic_dbs(self.output / "Project-saved-as_Loaded.msp2.dbs", date_time=(2026, 10, 12, 9, 0, 0))
+        preview = undo_project_restore(self.manifest)
+        self.assertEqual(["metabolights/MTBLS-SYN/unit-syn/output/Project-saved-as_Loaded.msp2.dbs"],
+                         preview["library_copies_to_store"])
+        with patch.object(LibraryCopyStore, "_locked", side_effect=LibraryCopyStoreError("the lock was not taken")):
+            partial = self.undo()
+        self.assertFalse(partial["undone"])
+        self.assertTrue(other.exists())
+        self.assertEqual(["viewing_restore"], [item["step"] for item in read_manifest(self.manifest)["finalisation_holds"]])
+
+        undone = self.undo()
+        self.assertTrue(undone["undone"], undone)
+        self.assertFalse(other.exists())
+        self.assertEqual([], read_manifest(self.manifest)["finalisation_holds"])
+        [record] = read_manifest(self.manifest)["library_copy_records"]
+        self.assertEqual(("undo_gui_copy", "deduplicated", self.object_id),
+                         (record["action"], record["outcome"], record["object_id"]))
+
+    def test_a_manifest_it_cannot_write_leaves_the_hold_for_the_next_call_to_lift(self) -> None:
+        self.restore()
+        write = repository_reanalysis.update_manifest
+        calls = []
+
+        def busy_once(path, change):
+            calls.append(1)
+            if len(calls) == 1:
+                raise ValueError("manifest lock timed out")
+            return write(path, change)
+
+        with patch.object(repository_reanalysis, "update_manifest", busy_once):
+            first = self.undo()
+        self.assertFalse(first["undone"])
+        self.assertEqual("lifting_hold", first["state"])
+        self.assertIn("Call again to lift it", first["message"])
+        self.assertEqual(["viewing_restore"], [item["step"] for item in read_manifest(self.manifest)["finalisation_holds"]])
+        self.assertFalse((self.raw / self.relatives[0]).exists(), "everything it made is taken back already")
+
+        preview = undo_project_restore(self.manifest)
+        self.assertTrue(preview["lift_only"])
+        second = self.undo()
+        self.assertTrue(second["undone"], second)
+        manifest = read_manifest(self.manifest)
+        self.assertEqual([], manifest["finalisation_holds"])
+        self.assertEqual("undone", manifest["viewing_restores"][0]["state"])
+        record = json.loads((self.root / manifest["viewing_restores"][0]["record"]).read_text(encoding="utf-8"))
+        self.assertEqual("undone", record["state"])
+
+    def test_a_directory_it_made_that_holds_files_it_did_not_keeps_the_restore_and_no_save_is_lost(self) -> None:
+        shutil.rmtree(self.raw)
+        self.restore()
+        project = self.output / f"{PROJECT}.mdproject"
+        project.write_bytes(b"first save")
+        made = self.raw / "data" / "Sample_A_20261101200.dcl"
+        made.write_bytes(b"a reprocess wrote this")
+
+        partial = self.undo()
+        self.assertFalse(partial["undone"])
+        self.assertEqual(["metabolights/MTBLS-SYN/unit-syn/raw/data", "metabolights/MTBLS-SYN/unit-syn/raw"],
+                         partial["kept_directories"])
+        self.assertIn("hold files it did not make", partial["message"])
+        self.assertEqual(["viewing_restore"], [item["step"] for item in read_manifest(self.manifest)["finalisation_holds"]])
+        self.assertTrue(made.exists(), "reported, never deleted")
+
+        project.write_bytes(b"second save")  # MS-DIAL, still open, saved again on close
+        made.unlink()
+        done = self.undo()
+        self.assertTrue(done["undone"], done)
+        self.assertFalse(self.raw.exists())
+        self.assertEqual(b"PK project", project.read_bytes())
+        saves = sorted(path.read_bytes() for path in (self.root / "_viewing").glob(f"r-*/gui-saved/*/{PROJECT}.mdproject"))
+        self.assertEqual([b"first save", b"second save"], saves)
+
+    def test_a_copy_of_the_object_the_restore_did_not_finish_is_removed_never_stored(self) -> None:
+        link = self.output / DBS
+        copy = shutil.copyfileobj
+
+        def cut_short(reader, writer, length=0):
+            if os.path.basename(writer.name) == DBS:
+                writer.write(reader.read(200))
+                raise OSError(28, "No space left on device")
+            return copy(reader, writer, length)
+
+        cross_volume = OSError(None, "not the same device", None, 17)
+        cross_volume.errno = 18  # EXDEV, so that it reads as another volume on any system
+        with patch.object(project_restore.os, "link", side_effect=cross_volume), \
+                patch.object(project_restore.shutil, "copyfileobj", cut_short):
+            done = self.restore()
+        self.assertEqual("failed", done["state"])
+        self.assertEqual(200, link.stat().st_size)
+
+        preview = undo_project_restore(self.manifest)
+        self.assertEqual("remove", preview["library_copy"]["action"])
+        undone = self.undo()
+        self.assertTrue(undone["undone"], undone)
+        self.assertFalse(link.exists())
+        self.assertNotIn("library_copy_records", read_manifest(self.manifest))
+        self.assertEqual([self.object_id], self.store.object_ids())
+
+    def test_a_copy_of_the_object_that_does_not_match_is_removed_by_the_restore(self) -> None:
+        link = self.output / DBS
+        copy = shutil.copyfileobj
+
+        def garbled(reader, writer, length=0):
+            if os.path.basename(writer.name) == DBS:
+                data = bytearray(reader.read())
+                data[100] ^= 0xFF
+                writer.write(bytes(data))
+                return None
+            return copy(reader, writer, length)
+
+        cross_volume = OSError(None, "not the same device", None, 17)
+        cross_volume.errno = 18
+        with patch.object(project_restore.os, "link", side_effect=cross_volume), \
+                patch.object(project_restore.shutil, "copyfileobj", garbled):
+            done = self.restore()
+        self.assertEqual("failed", done["state"])
+        self.assertFalse(link.exists())
+        self.assertTrue(self.undo()["undone"])
+        self.assertNotIn("library_copy_records", read_manifest(self.manifest))
+        self.assertEqual([self.object_id], self.store.object_ids())
+
+    def test_the_undo_takes_back_the_output_it_restored_into_and_no_new_run_starts_meanwhile(self) -> None:
+        self.restore()
+        refused, _ = start_new_production_run({**read_manifest(self.manifest), "manifest_path": str(self.manifest)},
+                                              write=True)
+        self.assertEqual((False, "viewing_restore_active"), (refused["started"], refused["reason"]))
+        with self.assertRaises(server.UnitRestoredError) as raised:
+            with server._single_console_per_unit(str(self.manifest), "job9"):
+                pass
+        self.assertEqual("viewing_restore_active", raised.exception.payload()["code"])
+
+        mddata = self.output / f"{PROJECT}.mddata"
+        mddata.write_bytes(b"saved by MS-DIAL")
+        elsewhere = self.workspace / "output-run-2"
+        elsewhere.mkdir()
+        self.change(output_directory=str(elsewhere))  # however it came to be named
+        undone = self.undo()
+        self.assertTrue(undone["undone"], undone)
+        self.assertEqual(b"\xc7 mddata", mddata.read_bytes())
+        self.assertEqual([], list(elsewhere.iterdir()))
+        self.assertFalse((self.output / DBS).exists())
+
+    def test_a_finalisation_that_meets_a_restore_leaves_its_link_alone(self) -> None:
+        self.restore()
+        link = self.output / DBS
+        links = restore_links(read_manifest(self.manifest), self.manifest)
+        self.assertEqual({(os.stat(link).st_dev, os.stat(link).st_ino)}, links)
+        copies, errors = store_loaded_library_copies(self.output, self.store, unit=None, job_id="run2", skip=links)
+        self.assertEqual(([], []), (copies, errors))
+        self.assertEqual([], _library_copies([self.output], links))
+        self.assertTrue(link.exists())
+        self.assertEqual(2, os.stat(self.store.object_path(self.object_id)).st_nlink)
 
     @unittest.skipUnless(WINDOWS, "Windows refuses to delete a file another handle holds open")
     def test_a_file_msdial_still_holds_leaves_the_restore_held_until_a_later_call(self) -> None:
@@ -369,11 +592,14 @@ class TheUndo(_Finalised):
         shutil.rmtree(self.raw)
         copies = []
         copy = shutil.copyfileobj
+        targets = {Path(relative).name for relative in self.relatives}
 
         def stop_after_two(reader, writer, length=0):
-            if len(copies) == 2:
-                raise OSError(28, "No space left on device")
-            copies.append(1)
+            # Counted by what is written, not by call: a backup through shutil.copy2 may come here too.
+            if os.path.basename(getattr(writer, "name", "")) in targets:
+                if len(copies) == 2:
+                    raise OSError(28, "No space left on device")
+                copies.append(1)
             return copy(reader, writer, length)
 
         with patch.object(project_restore.shutil, "copyfileobj", stop_after_two):
@@ -391,6 +617,34 @@ class TheUndo(_Finalised):
         self.assertTrue(undone["undone"], undone)
         self.assertFalse(self.raw.exists())
         self.assertFalse((self.output / DBS).exists())
+
+
+class TheConsoleTempCopy(_Finalised):
+    def test_a_copy_a_console_left_held_and_stored_later_is_never_the_runs_own(self) -> None:
+        from test_console_temp_directory import _LEAVES
+
+        preparation = {"command": [sys.executable, "-u", "-c", _LEAVES], "run_directory": str(self.output),
+                       "export_folder_path": str(self.output), "repository_run_manifest": str(self.manifest),
+                       "expected_analysis_exports": [], "qa_matrix_expected": False}
+        jobs = {"run1": {"id": "run1", "status": "running", "kind": "run", "logs": [], "preparation": preparation}}
+        # The run's own job: a Console of it left a library copy in its TEMP, and the store could not take it then.
+        with patch.object(server, "JOBS", jobs), patch.object(server, "PROCESSES", {}), \
+                patch.object(server, "_persist_jobs_locked", lambda: None), \
+                patch.object(LibraryCopyStore, "_locked", side_effect=LibraryCopyStoreError("the lock was not taken")):
+            server._run_console_for_job("run1", "run", preparation, lambda _line: None)
+        [hold] = read_manifest(self.manifest)["finalisation_holds"]
+        self.assertEqual(("loaded_library_copy", "console_temp", ["sharing"]), (hold["step"], hold["origin"], hold["blocks"]))
+        self.assertEqual(["tmpA1B2.tmp"], [Path(item).name for item in hold["files"]])
+
+        self.assertEqual([], resolve_finalisation_holds(self.manifest))
+        manifest = read_manifest(self.manifest)
+        [record] = manifest["library_copy_records"]
+        self.assertEqual(("console_temp", "run1", "tmpA1B2.tmp", "stored"),
+                         (record["action"], record["job_id"], record["name"], record["outcome"]))
+        self.assertEqual([self.object_id], [item["object_id"] for item in
+                                            manifest["console_run_finalisation"]["loaded_library_copy"]["copies"]])
+        self.assertEqual(self.object_id, plan_project_restore(self.manifest)["library_copy"]["object_id"])
+        self.assertFalse((self.root / "_tmp" / "run1").exists())
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -27,6 +27,18 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     installed with `entry.json` and a claim. Its intent is written into
     `incoming\<uuid>\` before the move, so a crash is completed by
     `status --repair`, not set aside.
+  - The install is one step with its `entry.json`. If the record cannot be
+    written, the copy goes back to the output and is held there as any copy
+    the store could not take. If it cannot be taken back either, it is in the
+    store and not the output, so no hold there would keep it: the unit records
+    it as `pending_repair`, and `status --repair` completes it and turns that
+    item into the object it equals. A claim that cannot be written leaves the
+    copy stored and recorded (`claim_error`). A file with no record that an
+    install moves out of an object's place is named in the object's
+    `repairs`, and the unit whose copy it was is found equal to the object.
+  - Repair completes a staged copy only when it is the copy its intent
+    records. One cut short by a stopped process is quarantined, and no unit
+    records it.
   - A copy the store already holds is removed only after the object's own
     bytes, re-read under its lock, prove equal (`deduplicated`), or after
     every entry decompresses to the object's (`deduplicated_by_content`). One
@@ -44,14 +56,18 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     Readers still accept `loaded_library_copies_deleted` from earlier runs. A
     copy stored by the retry of a run that is no longer the unit's current one
     is named in the top-level `library_copy_records` (schema
-    `msdial-library-copy-record.v1`).
+    `msdial-library-copy-record.v1`). So is every copy that is not the run's
+    own: one a Console left in its temporary directory (action
+    `console_temp`) and one MS-DIAL's GUI wrote during a restore (action
+    `undo_gui_copy`). Neither is ever the copy the run is reopened from.
   - `entry.json` records the libraries by name and sha256 from
     `console_run_finalisation.libraries`, never a path, and the run's
     annotation settings: the method file's annotation lines and the annotator
     tables, with every path reduced to its file name.
   - No record, log line, job record or error names the store by an absolute
     path. An OSError is written as its type, its Windows or POSIX code, its
-    text and the file relative to the workspace root.
+    text and the file relative to the workspace root. An object whose file or
+    record cannot be read is reported as such, never raised.
 - Every Console Interactive starts for a repository unit gets TMP and TEMP
   pointed at `<workspace_root>\_tmp\<job id>`. This covers production runs,
   peak-count diagnostics and the retention-time preview, which now carries the
@@ -62,7 +78,8 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - After the Console ends, what is left there is listed by name and size in
     the job's `console_outcome.console_temp` and in the run attempt.
   - A leftover laid out as a library copy goes to the store, or is held from
-    sharing; the rest is removed.
+    sharing; the rest is removed. A symbolic link or junction is listed and
+    never followed, and only the link itself is removed.
   - A unit whose workspace root cannot be located runs as before and says so
     in its log.
   - Laboratory runs are unchanged: their Console keeps the TEMP its user has.
@@ -90,16 +107,37 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     discard and split-parent release refuse while it stands.
   - It refuses, writing nothing, a unit with no finalisation, no campaign
     approval or no store object for its run. It also refuses a restore already
-    standing, any other finalisation hold, a run or download under way, a raw
-    deletion begun and not finished, and any target that exists.
+    standing, any other finalisation hold, a run, retention-time preview or
+    download under way, a raw deletion begun and not finished, an output that
+    already holds a library copy, any target that exists, and any path it
+    would write outside the workspace root its record names paths against.
+  - It restores the containers the run's finalisation moved and those a retry
+    of its held move moved later (`finalisation_hold_resolutions`). It refuses
+    a run whose pending containers no retry moved.
+  - While it stands, no Console starts on the unit (409, code
+    `viewing_restore_active`; MCP reason `viewing_restore_active`), no new
+    production run is prepared (reason `viewing_restore_active`), and a
+    finalisation leaves its link alone.
   - The preview reports counts, bytes, whether the raw files are present, and
     every path relative to the workspace root.
+  - Its record names the output directory it restored into, and the undo reads
+    that one. A copy of the object made on another volume is journalled by its
+    file id before its first byte (`copy_pending`): the undo removes it as the
+    restore's own however far it got, and one that does not match the object
+    is removed by the restore itself.
   - The undo removes exactly what the record lists and puts back a project file
-    whose sha256 changed. It reports, never deletes, any other file that
-    appeared in the output or the raw-side directories. A library copy
-    MS-DIAL's save wrote over the link goes through the store
-    (`library_copy_records`, action `undo_gui_copy`). A file still held open
+    whose sha256 changed, keeping the changed one under
+    `gui-saved\<utc>\` (one directory per call, so a later call never writes
+    over it). It reports, never deletes, any other file that appeared in the
+    output or the raw-side directories. A library copy MS-DIAL's GUI wrote,
+    over the link on a save or beside it on a "Save as", goes through the
+    store (`library_copy_records`, action `undo_gui_copy`). A file still held
+    open, a GUI copy the store could not take, a directory the restore made
+    that holds files it did not make, or a path its record could not name
     leaves the restore `partial` and held.
+  - The undo records `undone` only once the manifest no longer holds the
+    unit. A manifest write that fails leaves the record `lifting_hold` and the
+    hold standing, and the next call only lifts the hold.
   - Nothing launches MS-DIAL.
 - `python -m msdial_app.library_copy_store` for migration, not run on real data
   by this version. Each step is a preview unless `--confirmed` is given.

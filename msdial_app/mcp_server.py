@@ -259,6 +259,12 @@ def _structured_validation_errors(function):
                 failure["reason"] = "unit_busy"
                 failure["live_job_id"] = str(error.payload.get("live_job_id") or "")
                 failure["repository_run_manifest"] = str(error.payload.get("repository_run_manifest") or "")
+            if error.status == 409 and error.payload.get("code") == "viewing_restore_active":
+                # The unit is restored for viewing in MS-DIAL: nothing was started, and no Console starts on it
+                # until msdial_undo_project_restore takes the restore back.
+                failure["reason"] = "viewing_restore_active"
+                failure["restore_id"] = str(error.payload.get("restore_id") or "")
+                failure["repository_run_manifest"] = str(error.payload.get("repository_run_manifest") or "")
             if error.status is not None:
                 failure["http_status"] = error.status
             if error.trace:
@@ -2265,11 +2271,16 @@ def msdial_restore_project_for_viewing(
 
     While it stands, a viewing_restore hold blocks sharing and raw deletion: no publication report, raw cleanup,
     discard or split-parent release, the campaign's included, until msdial_undo_project_restore takes it back.
+    No Console job starts on the unit meanwhile (reason viewing_restore_active), and no new production run is
+    prepared. The containers restored are those the run's finalisation moved and those a retry of its held move
+    moved later.
 
     It is refused - nothing written - for a unit with no run finalisation or no campaign approval, a run that
-    moved no containers, no store object recorded for the run (a unit finalised before 0.5.37 needs
-    `python -m msdial_app.library_copy_store attach` first), a restore already standing, any other finalisation
-    hold, a run or download under way, a raw deletion begun and not finished, and any target path that exists.
+    moved no containers or whose pending containers no retry moved, no store object recorded for the run (a unit
+    finalised before 0.5.37 needs `python -m msdial_app.library_copy_store attach` first), a restore already
+    standing, any other finalisation hold, a run, retention-time preview or download under way, a raw deletion
+    begun and not finished, an output already holding a library copy, any target path that exists, and any path
+    it would write outside the workspace root its record names paths against.
 
     With confirmed=false nothing is written and the result carries the store object and how it was verified,
     the number and bytes of containers, the targets and directories it would create, whether the raw files are
@@ -2293,13 +2304,17 @@ def msdial_undo_project_restore(
     """Preview, and only on explicit confirmation take back, a restore made by msdial_restore_project_for_viewing.
 
     It removes exactly what the restore's record lists - the container copies, the directories it made (only
-    when empty) and the library-copy link - puts back a .mdproject, .mddata or _Loaded.msp2 whose sha256 changed
-    since its backup (the changed file is kept under _viewing/r-<restore_id>/gui-saved), and lifts the
+    when empty) and the library-copy link or the restore's own copy of the object - in the output directory the
+    restore recorded, puts back a .mdproject, .mddata or _Loaded.msp2 whose sha256 changed since its backup (the
+    changed file is kept under _viewing/r-<restore_id>/gui-saved/<utc>, one directory per call), and lifts the
     viewing_restore hold, recording the outcome in viewing_restores. Any other file that appeared in the output
-    or in the raw-side directories it copied into is reported, never deleted. If MS-DIAL's save replaced the
-    link with a new library copy, that copy goes through the library-copy store, which removes it only where it
-    holds the same content. A file still open in MS-DIAL is left and the restore stays held (state partial);
-    close MS-DIAL and call again.
+    or in the raw-side directories it copied into is reported, never deleted. A library copy MS-DIAL's GUI wrote
+    - over the link on a save, or beside it on a "Save as" - goes through the library-copy store, which removes
+    it only where it holds the same content, and is recorded as the GUI's (library_copy_records, action
+    undo_gui_copy), never as the run's own. A file still open in MS-DIAL, a GUI copy the store could not take, a
+    directory the restore made that now holds files it did not make, or a path it could not name leaves the
+    restore held (state partial); close MS-DIAL, settle what is named and call again. If the unit manifest
+    could not be written, the restore is recorded lifting_hold and the next call only lifts the hold.
 
     With confirmed=false nothing is removed and the result lists what would be removed, put back and reported.
     Only a caller that has shown those to the user and received an explicit answer may call again with
@@ -2351,8 +2366,9 @@ def msdial_prepare_repository_reanalysis(
     finished run are left byte for byte as they were, the staging folder and the aliases the call made are
     removed, no failure record is written into the manifest, and the error is returned. A unit whose raw data were released
     (raw_cleaned, discarded) is refused with or without new_run (raw_released), and so is a new run while a run
-    attempt of the unit may still be running (run_in_progress), or one a legacy disposition decided again would
-    not run (would_not_run). Each refusal returns ok false and writes nothing.
+    attempt of the unit may still be running (run_in_progress), one a legacy disposition decided again would
+    not run (would_not_run), or one while the unit is restored for viewing in MS-DIAL (viewing_restore_active;
+    msdial_undo_project_restore first). Each refusal returns ok false and writes nothing.
 
     A unit whose applied campaign disposition was decided before 0.5.29 (it records no
     declared_acquisition_source) is decided again here under the header-first rule (B2), from its recorded

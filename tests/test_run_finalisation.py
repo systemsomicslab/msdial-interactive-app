@@ -49,7 +49,7 @@ from msdial_app.run_finalisation import (
     resolve_finalisation_holds,
     store_loaded_library_copies,
 )
-from test_library_copy_store import synthetic_dbs
+from test_library_copy_store import assert_names_no_root, synthetic_dbs
 
 CURRENT = "20269271740"
 EARLIER = "20269261728"
@@ -512,6 +512,41 @@ class RunJobTests(unittest.TestCase):
         self.assertFalse((self.output / self.DBS).exists())
         self.assertTrue(any("already holds the same bytes" in line for line in job["logs"]))
 
+    def test_a_copy_that_left_for_the_store_and_whose_install_stopped_is_recorded_pending_not_held(self) -> None:
+        write, replace = library_copy_store._write_json_atomic, library_copy_store._replace
+
+        def refuse_entry(path, value):
+            if Path(path).name == "entry.json":
+                raise PermissionError(13, "Access is denied", str(path))
+            return write(path, value)
+
+        def hold_object(source, target, *args, **kwargs):
+            if Path(source).name == "library-copy.dbs" and Path(source).parent.parent.name == "o":
+                raise PermissionError(13, "held by a scanner", str(source))
+            return replace(source, target, *args, **kwargs)
+
+        with patch.object(library_copy_store, "_write_json_atomic", refuse_entry), \
+                patch.object(library_copy_store, "_replace", hold_object):
+            job = self._run(self._preparation())
+        manifest = read_manifest(self.manifest)
+
+        self.assertEqual("completed", job["status"], job.get("error"))
+        self.assertFalse((self.output / self.DBS).exists())
+        # No hold on an output it is not in: the unit names the copy as pending instead, and never says it is held.
+        self.assertEqual([], manifest[HOLDS])
+        block = manifest["console_run_finalisation"]["loaded_library_copy"]
+        [copy] = block["copies"]
+        self.assertEqual((self.DBS, "pending_repair"), (copy["name"], copy["outcome"]))
+        self.assertTrue(block["errors"])
+        self.assertTrue(any("left the output for the library-copy store" in line for line in job["logs"]))
+        self.assertFalse(any("held in the output" in line for line in job["logs"]))
+        self.assertNotIn(self.DBS, json.dumps(job["artifacts"]))
+
+        LibraryCopyStore(self.workspace_root).repair(confirmed=True)
+        [copy] = read_manifest(self.manifest)["console_run_finalisation"]["loaded_library_copy"]["copies"]
+        self.assertEqual("stored", copy["outcome"])
+        self.assertIsNone(LibraryCopyStore(self.workspace_root).problem(copy["object_id"], full=True))
+
     def test_a_store_lock_not_taken_holds_the_copy_from_sharing_and_never_deletes_it(self) -> None:
         with patch.object(library_copy_store.StoreLock, "acquire", side_effect=StoreLockTimeout("held")):
             job = self._run(self._preparation())
@@ -659,7 +694,7 @@ class RunJobTests(unittest.TestCase):
         self.assertEqual((["sharing"], "loaded_library_copy"), (hold["blocks"], hold["step"]))
         self.assertTrue((self.output / self.DBS).exists())
         self.assertTrue(hold["store_errors"])
-        self.assertNotIn(str(self.workspace_root), json.dumps(hold["store_errors"]))
+        assert_names_no_root(self, self.workspace_root, json.dumps(hold["store_errors"]))
         # It holds sharing, not the raw deletion: every container left the raw tree.
         self.assertTrue(plan_download_cleanup(self.manifest)["ready_for_confirmation"])
 
@@ -733,6 +768,17 @@ class HoldTests(unittest.TestCase):
         [record] = current["library_copy_records"]
         self.assertEqual(("msdial-library-copy-record.v1", "retry", "run1", "a" * 32),
                          (record["schema"], record["action"], record["job_id"], record["object_id"]))
+
+    def test_a_copy_that_is_not_the_runs_own_never_enters_its_record(self) -> None:
+        current = {"console_run_finalisation": {"job_id": "run2", "loaded_library_copy": {"copies": []}}}
+        temp = {"name": "tmpA1B2.tmp", "object_id": "b" * 32, "outcome": "stored"}
+        dbs = {"name": "P_Loaded.msp2.dbs", "object_id": "b" * 32, "outcome": "deduplicated"}
+
+        run_finalisation._record_library_copies(current, "run2", [temp], "retry")
+        run_finalisation._record_library_copies(current, "run2", [dbs], "console_temp")
+        self.assertEqual([], current["console_run_finalisation"]["loaded_library_copy"]["copies"])
+        self.assertEqual([("retry", "tmpA1B2.tmp"), ("console_temp", "P_Loaded.msp2.dbs")],
+                         [(item["action"], item["name"]) for item in current["library_copy_records"]])
 
     def test_a_viewing_restore_is_never_lifted_by_a_retry(self) -> None:
         hold = run_finalisation._hold(["sharing", "raw_deletion"], "viewing_restore", "job1", "restored for viewing",

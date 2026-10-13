@@ -358,9 +358,11 @@ same content. The unit records the object under
 `console_run_finalisation.loaded_library_copy` (until 0.5.37 the copy was
 deleted and recorded under `loaded_library_copies_deleted`). A copy the store
 cannot take stays in the output under the `loaded_library_copy` sharing hold,
-and the hold's retry stores it. Any other run, including a trial unit whatever
-its retention policy, keeps its containers beside its inputs and its library
-copy in its output, as before.
+and the hold's retry stores it. One that left the output and whose install
+stopped before its record was written is recorded as `pending_repair`, and
+`python -m msdial_app.library_copy_store status --repair` completes it. Any
+other run, including a trial unit whatever its retention policy, keeps its
+containers beside its inputs and its library copy in its output, as before.
 
 The saved project cannot be reopened as it stands: its `.mddata` names the
 containers by their raw-directory paths and its loader reads the library copy
@@ -371,11 +373,15 @@ present or released, and links the store object into the output under the
 run's own `.dbs` name; it backs up the `.mdproject`, `.mddata` and
 `_Loaded.msp2` under `<workspace_root>\_viewing\r-<restore id>`, whose
 `restore.local.json` lists every path the restore made. While it stands, a
-`viewing_restore` hold blocks sharing and raw deletion. With the raw files
+`viewing_restore` hold blocks sharing and raw deletion, and no Console or new
+production run starts on the unit (`viewing_restore_active`). With the raw files
 released, MS-DIAL needs a GUI that opens a project without them.
 `msdial_undo_project_restore` removes exactly what the record lists, puts back
-a project file MS-DIAL changed, and reports, never deletes, any other file
-that appeared. A unit finalised before 0.5.37 has no stored object;
+a project file MS-DIAL changed (keeping the changed one under
+`_viewing\r-<restore id>\gui-saved\`), sends any library copy MS-DIAL's GUI
+wrote through the store as the GUI's, never the run's, and reports, never
+deletes, any other file that appeared. Until a directory the restore made holds
+none of those files, the restore stays held. A unit finalised before 0.5.37 has no stored object;
 `python -m msdial_app.library_copy_store seed` copies a verified `.dbs` into the
 store, and `... attach <manifest> --object <id>` names the object a unit's
 deleted copy stands for when its recorded libraries and annotation settings

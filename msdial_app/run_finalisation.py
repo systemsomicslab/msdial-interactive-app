@@ -95,15 +95,22 @@ from .library_copy_store import (
     COPY_SCHEMA,
     DEDUPLICATED,
     DEDUPLICATED_BY_CONTENT,
+    LEGACY_LIBRARY_COPY_RECORD,
+    LIBRARY_COPY_RECORD,
+    LIBRARY_COPY_RECORDS,
+    LOADED_LIBRARY_COPY_SUFFIX,
+    PENDING,
     RECORD_SCHEMA,
     STORE_DIRECTORY_NAME,
     STORED,
+    LibraryCopyPending,
     LibraryCopyStore,
     annotation_settings,
     describe_error,
     library_copy_store_for,
     read_copy_identity,
     unit_ref,
+    workspace_root_for,
 )
 from .sharing import PATH_POLICY, SharingContext, local_path_of
 
@@ -115,14 +122,14 @@ HOLDS = "finalisation_holds"
 HOLD_RESOLUTIONS = "finalisation_hold_resolutions"
 BLOCKS_SHARING = "sharing"
 BLOCKS_RAW_DELETION = "raw_deletion"
-# console_run_finalisation's record of where each library copy went (0.5.37); loaded_library_copies_deleted
-# before it. A run whose record is not rewritten - a superseded run's retry, an attach to a finalised unit -
-# names its object in the top-level library_copy_records instead.
-LIBRARY_COPY_RECORD = "loaded_library_copy"
-LIBRARY_COPY_RECORDS = "library_copy_records"
-LEGACY_LIBRARY_COPY_RECORD = "loaded_library_copies_deleted"
+# console_run_finalisation's record of where each library copy went (0.5.37) is LIBRARY_COPY_RECORD;
+# LEGACY_LIBRARY_COPY_RECORD before it. A run whose record is not rewritten - a superseded run's retry, an attach
+# to a finalised unit - and a copy that is not the run's own (a GUI save, a Console's temporary file) name their
+# object in the top-level LIBRARY_COPY_RECORDS instead (library_copy_store).
 # The hold project_restore records while a restore stands. No retry knows it: only its undo lifts it.
 VIEWING_RESTORE = "viewing_restore"
+# A loaded_library_copy hold on what a Console left in its temporary directory rather than in the run's output.
+CONSOLE_TEMP_ORIGIN = "console_temp"
 
 # The pauses between attempts at a file step another process holds, drawn from one budget of waiting per call:
 # a unit whose every container is held waits the budget once, not once per file.
@@ -638,6 +645,11 @@ def _library_copy_line(item: dict[str, Any]) -> str:
     if outcome == DEDUPLICATED_BY_CONTENT:
         return (f"Removed MS-DIAL's loaded-library copy {name} ({size} bytes): its entries decompress to the "
                 f"content of store object {object_id}, which differs from it only in compression.")
+    if outcome == PENDING:
+        return (f"WARNING: MS-DIAL's loaded-library copy {name} left the output for the library-copy store, and its "
+                f"install stopped before its record was written ({item.get('store_error')}). It is in the store, not "
+                "in the output; python -m msdial_app.library_copy_store status --repair completes it and names its "
+                "object in this unit's manifest.")
     return (f"WARNING: MS-DIAL's loaded-library copy {name} has the content key of store object {object_id} but "
             "other content; it was set aside in the store's quarantine, and this run cannot be reopened from the "
             "store until a person looks.")
@@ -655,12 +667,15 @@ def store_loaded_library_copies(
     why: str = "",
     how: str = "finalisation",
     log: Callable[[str], None] | None = None,
+    skip: set[tuple[int, int]] | frozenset[tuple[int, int]] = frozenset(),
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Put MS-DIAL's serialised copies of the loaded libraries at the top of ``directory`` into the store.
 
-    Returns the record of each copy the store took - stored, found equal to an object and removed, or set aside
-    in its quarantine - and an error for each it could not take, which stays where it is. ``why`` says why
-    there is no store when ``store`` is None. Never raises for one copy.
+    Returns the record of each copy the store took - stored, found equal to an object and removed, set aside in
+    its quarantine, or left for the store's repair (pending: it left the directory and its install stopped before
+    its record) - and an error for each it could not take, which stays where it is. ``why`` says why there is no
+    store when ``store`` is None. A file whose (st_dev, st_ino) is in ``skip`` - the link a standing viewing
+    restore made - is not this run's and is left alone. Never raises for one copy.
     """
     patience = patience or _Patience()
     say = log or (lambda _line: None)
@@ -670,7 +685,7 @@ def store_loaded_library_copies(
         return copies, errors
     root = store.workspace_root if store is not None else None
     for path in sorted(directory.glob(LOADED_LIBRARY_COPY)):
-        if not path.is_file():
+        if not path.is_file() or _file_id(path) in skip:
             continue
         if store is None:
             errors.append(f"{path.name}: no library-copy store could be located ({why})")
@@ -680,12 +695,21 @@ def store_loaded_library_copies(
         try:
             item = store.put(path, read_copy_identity(path), unit=unit, job_id=job_id, libraries=libraries or [],
                              settings=settings, how=how, patience=patience)
+        except LibraryCopyPending as error:
+            # It is no longer here, so no hold on this directory keeps it: the unit records it as pending, which
+            # the store's repair completes.
+            text = describe_error(error, root)
+            errors.append(f"{path.name}: {text}")
+            item = {**error.record, "outcome": PENDING, "store_error": text, "incoming": error.incoming,
+                    "removed_at": _now()}
         except (OSError, ValueError) as error:
             # LibraryCopyStoreError is an OSError and a lock timeout a ValueError (download_store.StoreError):
             # either way the copy stays and is held, never deleted.
             text = describe_error(error, root)
             errors.append(f"{path.name}: {text}")
             say(f"WARNING: MS-DIAL's loaded-library copy {path.name} could not be stored, and it is held in the "
+                f"output: {text}" if path.exists() else
+                f"WARNING: MS-DIAL's loaded-library copy {path.name} could not be stored, and it is no longer in the "
                 f"output: {text}")
             continue
         copies.append(item)
@@ -693,9 +717,43 @@ def store_loaded_library_copies(
     return copies, errors
 
 
-def _library_copies(directories: list[Path]) -> list[str]:
+def _file_id(path: Path) -> tuple[int, int] | None:
+    try:
+        details = os.stat(extended_path(path))
+    except OSError:
+        return None
+    return details.st_dev, details.st_ino
+
+
+def _library_copies(directories: list[Path], skip: set[tuple[int, int]] | frozenset[tuple[int, int]] = frozenset()
+                    ) -> list[str]:
     return [str(path) for directory in directories if directory.is_dir()
-            for path in sorted(directory.glob(LOADED_LIBRARY_COPY)) if path.is_file()]
+            for path in sorted(directory.glob(LOADED_LIBRARY_COPY)) if path.is_file() and _file_id(path) not in skip]
+
+
+def restore_links(manifest: dict[str, Any], manifest_path: Path | None = None) -> set[tuple[int, int]]:
+    """The (st_dev, st_ino) of every library-copy link a standing viewing restore made in this unit's output.
+
+    A restore links the run's store object into the output under the run's own .dbs name; a finalisation that
+    met it while the restore stood would take it for its own run's copy, and the store, finding it equal, would
+    unlink it from under the open project. Read from each restore's record under the workspace root.
+    """
+    found: set[tuple[int, int]] = set()
+    holds = [item for item in standing_holds(manifest) if item.get("step") == VIEWING_RESTORE]
+    if not holds:
+        return found
+    root, _why = workspace_root_for(manifest, manifest_path)
+    if root is None:
+        return found
+    for hold in holds:
+        try:
+            record = _read_json(root / str(hold.get("record") or ""))
+        except (OSError, ValueError):
+            continue
+        link = (record or {}).get("link") if isinstance(record, dict) else None
+        if isinstance(link, dict) and link.get("st_ino") is not None:
+            found.add((link.get("st_dev"), link.get("st_ino")))
+    return found
 
 
 # ---- holds -----------------------------------------------------------------------------------------------
@@ -771,18 +829,24 @@ def describe_holds(holds: list[dict[str, Any]]) -> str:
 def _record_library_copies(current: dict[str, Any], job_id: str, copies: list[dict[str, Any]], action: str) -> None:
     """Name the store objects of copies stored after a run's finalisation, in the manifest being written.
 
-    The run's own record gains them while it is the unit's current run; a superseded run's record is never
-    rewritten, so its copies are named in library_copy_records instead, by job.
+    The run's own record gains its own copy - the output's <project>_Loaded.msp2.dbs - while it is the unit's
+    current run. A superseded run's record is never rewritten, and a copy that is not the run's own (one a
+    Console left in its temporary directory, action console_temp) never enters it: both are named in
+    library_copy_records instead, by job and action.
     """
     from . import __version__
 
     finalisation = current.get("console_run_finalisation")
-    if isinstance(finalisation, dict) and str(finalisation.get("job_id") or "") == job_id:
+    own = [item for item in copies
+           if action != CONSOLE_TEMP_ORIGIN and str(item.get("name") or "").endswith(LOADED_LIBRARY_COPY_SUFFIX)]
+    if isinstance(finalisation, dict) and str(finalisation.get("job_id") or "") == job_id and own:
         block = finalisation.get(LIBRARY_COPY_RECORD)
         if not isinstance(block, dict):
             block = {"schema": COPY_SCHEMA, "store": STORE_DIRECTORY_NAME, "copies": [], "errors": []}
             finalisation[LIBRARY_COPY_RECORD] = block
-        block["copies"] = [*(block.get("copies") or []), *copies]
+        block["copies"] = [*(block.get("copies") or []), *own]
+        copies = [item for item in copies if item not in own]
+    if not copies:
         return
     current[LIBRARY_COPY_RECORDS] = [
         *(current.get(LIBRARY_COPY_RECORDS) or []),
@@ -792,15 +856,19 @@ def _record_library_copies(current: dict[str, Any], job_id: str, copies: list[di
 
 
 def hold_library_copies(
-    manifest_path: str | Path, job_id: str, files: list[str], errors: list[str], reason: str
+    manifest_path: str | Path, job_id: str, files: list[str], errors: list[str], reason: str, origin: str = ""
 ) -> dict[str, Any] | None:
-    """Record a sharing hold on library copies the store could not take outside a finalisation. Never raises."""
+    """Record a sharing hold on library copies the store could not take outside a finalisation. Never raises.
+
+    ``origin`` console_temp marks copies a Console left in its temporary directory: their retry stores them as
+    copies that are not the run's own.
+    """
     from .repository_reanalysis import update_manifest
 
     if not files:
         return None
     hold = _hold([BLOCKS_SHARING], "loaded_library_copy", job_id, reason, files=list(files),
-                 store_errors=list(errors))
+                 store_errors=list(errors), **({"origin": origin} if origin else {}))
 
     def change(current: dict[str, Any]) -> None:
         current[HOLDS] = [*standing_holds(current), hold]
@@ -856,6 +924,7 @@ def _retry_hold(
         finalisation = manifest.get("console_run_finalisation") if isinstance(
             manifest.get("console_run_finalisation"), dict) else {}
         libraries = (finalisation or {}).get("libraries") if (finalisation or {}).get("job_id") == job_id else []
+        origin = str(hold.get("origin") or "")
         left, errors, stored = [], [], []
         for file in hold.get("files") or []:
             path = Path(str(file))
@@ -868,15 +937,27 @@ def _retry_hold(
             try:
                 stored.append(store.put(
                     path, read_copy_identity(path), unit=unit_ref(manifest, manifest_path, root), job_id=job_id,
-                    libraries=libraries or [], settings=annotation_settings(path.parent), how="retry",
-                    patience=patience,
+                    libraries=libraries or [],
+                    settings=None if origin == CONSOLE_TEMP_ORIGIN else annotation_settings(path.parent),
+                    how=origin or "retry", patience=patience,
                 ))
+            except LibraryCopyPending as error:
+                # It left for the store: not in the output any more, and named as pending until repair.
+                stored.append({**error.record, "outcome": PENDING, "store_error": describe_error(error, root),
+                               "incoming": error.incoming, "removed_at": _now()})
             except (OSError, ValueError) as error:
                 left.append(str(file))
                 errors.append(f"{path.name}: {describe_error(error, root)}")
         if left:
             return {**hold, "files": left, "errors": errors, "store_errors": errors, "last_retried_at": now}, None
-        return None, {**note, "library_copies": stored}
+        if origin == CONSOLE_TEMP_ORIGIN:
+            # The Console's temporary directory was kept only for what was held in it: gone with it, when empty.
+            for folder in {Path(str(file)).parent for file in hold.get("files") or []}:
+                try:
+                    os.rmdir(extended_path(folder))
+                except OSError:
+                    pass
+        return None, {**note, "library_copies": stored, **({"origin": origin} if origin else {})}
     if step == "msdial_intermediates":
         raw = Path(str(hold.get("raw_directory") or ""))
         if not str(hold.get("raw_directory") or "").strip() or not raw.is_dir():
@@ -928,7 +1009,8 @@ def _resolve_in(manifest_path: Path, patience: _Patience, log: Callable[[str], N
             if note:
                 current[HOLD_RESOLUTIONS] = [*(current.get(HOLD_RESOLUTIONS) or []), note]
                 if note.get("library_copies"):
-                    _record_library_copies(current, str(note.get("job_id") or ""), note["library_copies"], "retry")
+                    _record_library_copies(current, str(note.get("job_id") or ""), note["library_copies"],
+                                           str(note.get("origin") or "retry"))
         current[HOLDS] = kept
 
     try:
@@ -1287,12 +1369,15 @@ def finalise_console_run(
             store, why = library_copy_store_for(manifest, manifest_path)
             unit = unit_ref(manifest, manifest_path, store.workspace_root if store is not None else None)
             settings = annotation_settings(run_directory, str(preparation.get("method_file") or "") or None)
+            # A restore for viewing is refused while a run is live and a run while one stands; should one stand
+            # all the same, its link is the restored run's, never this run's copy.
+            links = restore_links(_read_json(manifest_path), manifest_path)
             copies: list[dict[str, Any]] = []
             store_errors: list[str] = []
             for directory in directories:
                 more, errors = store_loaded_library_copies(
                     directory, store, unit=unit, job_id=job_id, libraries=record["libraries"], settings=settings,
-                    patience=patience, why=why, log=log,
+                    patience=patience, why=why, log=log, skip=links,
                 )
                 copies.extend(more)
                 store_errors.extend(errors)
@@ -1304,7 +1389,7 @@ def finalise_console_run(
                 "copies": copies,
                 "errors": store_errors,
             }
-            left = _library_copies(directories)
+            left = _library_copies(directories, links)
             if left:
                 log("WARNING: MS-DIAL's loaded-library copy could not be stored, and it is held: "
                     + ", ".join(Path(path).name for path in left))

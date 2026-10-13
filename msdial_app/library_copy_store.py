@@ -36,7 +36,10 @@ or laid out otherwise - is keyed by its sha256 and is only ever found equal to t
 
 WHAT IS NEVER DONE. A copy is removed only once the store holds one proven equal: the same normalised bytes,
 re-read from the object under its lock rather than taken from entry.json, or entries that decompress to the
-same content. A copy that cannot be stored stays where it is, and its caller holds it from sharing. Nothing
+same content. A copy that cannot be stored stays where it is, and its caller holds it from sharing. An install
+is one step with its object's record: one that stops before the record is written takes the copy back to where it
+was, and one that cannot is left for repair with its intent, the caller recording the copy as pending
+(LibraryCopyPending) rather than holding a place it has left. Nothing
 here writes an absolute path into a record, a log line or an error text: the store and every file in it are
 named relative to the workspace root, and an OSError is described by its codes and the file's relative name
 (describe_error), never by Python's own text, which carries the absolute path.
@@ -57,6 +60,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import struct
 import sys
 import uuid
@@ -72,6 +76,7 @@ from .download_store import (
     StoreError,
     StoreLock,
     StoreLockTimeout,
+    _is_link_like,
     _read_json,
     _replace,
     _unit_file_name,
@@ -103,8 +108,21 @@ STORED = "stored"
 DEDUPLICATED = "deduplicated"
 DEDUPLICATED_BY_CONTENT = "deduplicated_by_content"
 QUARANTINED = "quarantined"
-# Every outcome but a quarantined copy's leaves the run reopenable from the store.
+# A copy that left its directory for the store, whose install stopped before its record was written: it lies in
+# the store's incoming/ or at its object's place, and repair completes it and names its object.
+PENDING = "pending_repair"
+# Every outcome but a quarantined or pending copy's leaves the run reopenable from the store.
 RESTORABLE_OUTCOMES = frozenset({STORED, DEDUPLICATED, DEDUPLICATED_BY_CONTENT})
+# Where a unit manifest names the store objects of its runs' copies: the run's own finalisation record
+# (console_run_finalisation.loaded_library_copy; loaded_library_copies_deleted before 0.5.37), and, by job, the
+# top-level library_copy_records.
+LIBRARY_COPY_RECORD = "loaded_library_copy"
+LIBRARY_COPY_RECORDS = "library_copy_records"
+LEGACY_LIBRARY_COPY_RECORD = "loaded_library_copies_deleted"
+# Copies a unit stored that are not its run's own: one MS-DIAL's GUI wrote while the project was restored for
+# viewing (project_restore), and one a Console left in its temporary directory. Recorded under the run's job, and
+# never taken for the copy the run is reopened from.
+OTHER_COPY_ACTIONS = frozenset({"undo_gui_copy", "console_temp"})
 
 DBS_DATABASE = re.compile(r"^(?:MetabolomicsDB|ProteomicsDB|EadLipidomicsDB)/[^/]+(?:/DataBase)?$")
 _LOCAL_HEADER = b"PK\x03\x04"
@@ -126,6 +144,25 @@ _ANNOTATOR_PATH_COLUMNS = ("msp_file_path", "text_db_file_path")
 class LibraryCopyStoreError(OSError):
     """The store could not take a copy, or refused to. An OSError, so every caller that holds a copy it could
     not move or delete holds this one too. Its text names no absolute path."""
+
+
+class LibraryCopyPending(LibraryCopyStoreError):
+    """A copy left its directory for the store, and its install stopped before its record was written.
+
+    It is not where its caller had it, so no hold on that place keeps it: it lies in the store, in incoming/ with
+    its intent or at its object's place, and repair completes it. ``record`` is the copy's record, which the
+    caller keeps (outcome PENDING) so that the unit still names what became of it.
+    """
+
+    def __init__(self, message: str, record: dict[str, Any], incoming: str) -> None:
+        super().__init__(message)
+        self.record = dict(record)
+        self.incoming = incoming
+
+
+def is_run_copy(item: dict[str, Any]) -> bool:
+    """Whether a recorded copy is the run's own library copy, the one its project is reopened from."""
+    return not ({str(item.get("action") or ""), str(item.get("how") or "")} & OTHER_COPY_ACTIONS)
 
 
 def _now() -> str:
@@ -701,8 +738,15 @@ class LibraryCopyStore:
     # -- verification
 
     def problem(self, object_id: str, entry: dict[str, Any] | None = None, *, full: bool = False) -> str | None:
-        """What is wrong with an object, or None: its file, its size, its entries, and with ``full`` its bytes."""
-        entry = entry if entry is not None else self.entry(object_id)
+        """What is wrong with an object, or None: its file, its size, its entries, and with ``full`` its bytes.
+
+        Never raises for a file or a record that cannot be read: that is what is wrong, named relative to the
+        workspace root as everything here is.
+        """
+        try:
+            entry = entry if entry is not None else self.entry(object_id)
+        except (OSError, StoreError) as error:
+            return f"its record cannot be read ({describe_error(error, self.workspace_root)})"
         if entry is None:
             return "its record is absent"
         path = self.object_path(object_id)
@@ -715,7 +759,11 @@ class LibraryCopyStore:
         if size != entry.get("size_bytes"):
             return f"its file holds {size} bytes and its record {entry.get('size_bytes')}"
         if entry.get("recognised"):
-            if entry_table(path) != entry.get("entries"):
+            try:
+                table = entry_table(path)
+            except OSError as error:
+                return f"its file cannot be read ({describe_error(error, self.workspace_root)})"
+            if table != entry.get("entries"):
                 return "its entries differ from its record"
         if not full:
             return None
@@ -793,7 +841,8 @@ class LibraryCopyStore:
         removed only when equal - else, if it decompresses to other content, it is moved to quarantine. A
         damaged object is replaced by this copy and kept beside it. ``keep_source`` copies and leaves the
         source (a seed). Raises LibraryCopyStoreError (an OSError) when the copy could not be stored; the copy
-        is then where it was.
+        is then where it was. Raises LibraryCopyPending (one of them) when it had left and its install stopped
+        before its record was written, and could not be taken back: repair completes it.
         """
         lock = self._locked(identity.object_id, job_id)
         try:
@@ -932,41 +981,48 @@ class LibraryCopyStore:
         directory = self.object_directory(object_id)
         target = self.object_path(object_id)
         kept = None
+        installed = False
         try:
             directory.mkdir(parents=True, exist_ok=True)
             if os.path.lexists(extended_path(target)):
                 kept = directory / f"damaged-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.dbs"
                 _replace(Path(extended_path(target)), Path(extended_path(kept)))
             _replace(Path(extended_path(staged)), Path(extended_path(target)))
-        except BaseException:
-            # Nothing is installed: the damaged object goes back where it was, and a renamed copy back to its
-            # own place, so that its caller holds it there. Only if that fails too is it left for repair.
-            if kept is not None and not os.path.lexists(extended_path(target)):
-                try:
-                    _replace(Path(extended_path(kept)), Path(extended_path(target)))
-                except OSError:
-                    pass
-            try:
-                if method == "rename":
-                    _replace(Path(extended_path(staged)), Path(extended_path(source)))
-                unlink_tree(incoming)
-            except OSError:
-                pass
-            raise
-        repairs = list((previous or {}).get("repairs") or [])
-        if damaged:
-            repairs.append({"at": _now(), "problem": damaged, "kept_as": kept.name if kept else None,
-                            "job_id": job_id})
-        entry = _object_record(
-            identity, how=how, unit=unit, job_id=job_id, method=method, libraries=names,
-            settings=settings or (previous or {}).get("annotation_settings"),
-            testzip="passed" if identity.recognised else "not_a_zip", repairs=repairs,
-        )
-        _write_json_atomic(self.entry_path(object_id), entry)
+            installed = True
+            repairs = list((previous or {}).get("repairs") or [])
+            if damaged or kept is not None:
+                # A file moved aside is named whether a record called it damaged or no record described it: it
+                # may be a unit's only copy, from an install that stopped before its record.
+                repairs.append({"at": _now(), "problem": damaged or "a file no record described was in its place",
+                                "kept_as": kept.name if kept else None, "job_id": job_id})
+            entry = _object_record(
+                identity, how=how, unit=unit, job_id=job_id, method=method, libraries=names,
+                settings=settings or (previous or {}).get("annotation_settings"),
+                testzip="passed" if identity.recognised else "not_a_zip", repairs=repairs,
+            )
+            # The install is one step with its record: until the record is written, nothing is installed.
+            _write_json_atomic(self.entry_path(object_id), entry)
+        except BaseException as error:
+            if self._roll_back(source, staged, target, kept, incoming, method, installed) or keep_source \
+                    or os.path.lexists(extended_path(source)) or not isinstance(error, Exception):
+                raise
+            raise LibraryCopyPending(
+                f"{source.name} left for the library-copy store, and its install stopped before its record was "
+                f"written ({describe_error(error, self.workspace_root)}); it lies in "
+                f"{self.relative(incoming)} or at object {object_id}, and "
+                "python -m msdial_app.library_copy_store status --repair completes it",
+                record, self.relative(incoming),
+            ) from error
         claim = None
+        claim_error = None
         if unit is not None:
-            claim = self.claim(object_id, unit=unit, job_id=job_id, action=how, name=source.name, copy=record,
-                               outcome=STORED)
+            try:
+                claim = self.claim(object_id, unit=unit, job_id=job_id, action=how, name=source.name, copy=record,
+                                   outcome=STORED)
+            except OSError as error:
+                # The object and its record are installed; a claim is the store's own note of who stored it, so
+                # the copy is stored without one, and its caller records the object all the same.
+                claim_error = describe_error(error, self.workspace_root)
         unlink_tree(incoming)
         removed = None
         if method == "copy" and not keep_source:
@@ -980,7 +1036,42 @@ class LibraryCopyStore:
                   "annotation_settings_sha256": (settings or {}).get("sha256")}
         if damaged:
             result.update(repaired_object=True, repaired_problem=damaged)
+        if kept is not None and not damaged:
+            result["set_aside"] = kept.name
+        if claim_error:
+            result["claim_error"] = claim_error
         return result
+
+    @staticmethod
+    def _roll_back(
+        source: Path, staged: Path, target: Path, kept: Path | None, incoming: Path, method: str, installed: bool
+    ) -> bool:
+        """Take back an install that stopped before its record was written. Whether nothing of it is left.
+
+        A renamed copy goes back to its own place, so that its caller holds it there; a copied one is removed
+        from the store, its source never having left. A file moved aside goes back to the object's place. The
+        ingest's directory, its intent with it, goes only when the copy is back: else repair completes it.
+        """
+        returned = False
+        try:
+            if installed:
+                if method == "rename":
+                    _replace(Path(extended_path(target)), Path(extended_path(source)))
+                else:
+                    os.unlink(extended_path(target))
+            elif method == "rename" and os.path.lexists(extended_path(staged)):
+                _replace(Path(extended_path(staged)), Path(extended_path(source)))
+            returned = True
+        except OSError:
+            pass
+        if kept is not None and not os.path.lexists(extended_path(target)):
+            try:
+                _replace(Path(extended_path(kept)), Path(extended_path(target)))
+            except OSError:
+                pass
+        if returned:
+            unlink_tree(incoming)
+        return returned
 
     def _quarantine(
         self, source: Path, identity: CopyIdentity, record: dict[str, Any], object_id: str, *,
@@ -1089,7 +1180,7 @@ class LibraryCopyStore:
                 action = "quarantine"
             elif staged:
                 action = "complete"
-            elif object_id and self.object_path(object_id).is_file() and self.entry(object_id) is None:
+            elif object_id and self._may_hold(object_id, intent):
                 action = "record"
             else:
                 action = "remove"
@@ -1097,6 +1188,23 @@ class LibraryCopyStore:
                           "unit": unit_label((intent or {}).get("unit")), "job_id": (intent or {}).get("job_id"),
                           "staged_copy": staged, "action": action})
         return found
+
+    def _may_hold(self, object_id: str, intent: dict[str, Any]) -> bool:
+        """Whether an object may be, or equal, the copy an unfinished ingest's intent records. From records only.
+
+        Its file is there, and its record is absent (the install stopped before it), names the intent's copy (it
+        stopped after it), or names the same content (a later install set the intent's copy aside beside it).
+        """
+        copy = intent.get("copy") or {}
+        try:
+            if not self.object_path(object_id).is_file():
+                return False
+            entry = self.entry(object_id)
+        except (OSError, StoreError):
+            return False
+        return entry is None or (
+            bool(copy.get("sha256")) and entry.get("sha256") == copy.get("sha256")
+        ) or (bool(copy.get("normalized_sha256")) and entry.get("normalized_sha256") == copy.get("normalized_sha256"))
 
     def repair(self, *, confirmed: bool = False) -> dict[str, Any]:
         """Complete every ingest a crash interrupted; set aside only what no intent describes."""
@@ -1144,43 +1252,89 @@ class LibraryCopyStore:
             lock.acquire(timeout=0)
         except StoreLockTimeout:
             return {"outcome": "in_progress"}  # its ingest holds the lock: not an orphan
+        copy = intent.get("copy") or {}
         try:
             if staged.is_file():
+                identity = read_copy_identity(staged)
+                if identity.sha256 != copy.get("sha256") or identity.object_id != object_id:
+                    # Not the copy the intent records - a copy cut short when its process stopped. It is set
+                    # aside, and no unit is told it was stored.
+                    return self._quarantine_ingest(directory, intent, identity)
                 # The interrupted ingest is completed as a new one: the staged copy is the store's own now, so
                 # it moves, and it is removed only where the object proves equal.
-                outcome = self._put_locked(staged, read_copy_identity(staged), unit=unit, job_id=job_id,
+                outcome = self._put_locked(staged, identity, unit=unit, job_id=job_id,
                                            libraries=intent.get("libraries") or [],
                                            settings=intent.get("annotation_settings"), how=how, patience=None,
                                            keep_source=False)
-                done = {"outcome": outcome["outcome"], "object_id": outcome["object_id"]}
+                done = {"outcome": outcome["outcome"], "object_id": outcome["object_id"],
+                        "verified_by": outcome.get("verified_by")}
+            elif self._may_hold(object_id, intent):
+                done = self._record_installed(object_id, intent, unit=unit, job_id=job_id, how=how)
             else:
-                target = self.object_path(object_id)
-                if target.is_file() and self.entry(object_id) is None:
-                    # Crashed after the copy was installed and before its record was written.
-                    identity = read_copy_identity(target)
-                    if identity.object_id != object_id or identity.sha256 != (intent.get("copy") or {}).get("sha256"):
-                        raise LibraryCopyStoreError(
-                            f"object {object_id}'s file is not the copy its intent records; a person looks"
-                        )
-                    tested = _testzip(target) if identity.recognised else None
-                    _write_json_atomic(self.entry_path(object_id), _object_record(
-                        identity, how=how, unit=unit, job_id=job_id, method="repair",
-                        libraries=library_names(intent.get("libraries") or []),
-                        settings=intent.get("annotation_settings"),
-                        testzip="not_a_zip" if not identity.recognised else "passed" if tested is None else "failed",
-                    ))
-                    copy = identity.record(str((intent.get("copy") or {}).get("name") or OBJECT_FILE))
-                    if unit is not None:
-                        self.claim(object_id, unit=unit, job_id=job_id, action=how, name=copy["name"], copy=copy,
-                                   outcome=STORED)
-                    done = {"outcome": STORED, "object_id": object_id}
-                else:
-                    done = {"outcome": "nothing_left", "object_id": object_id}
+                done = {"outcome": "nothing_left", "object_id": object_id}
             unlink_tree(directory)
         finally:
             self._release(lock)
         _record_repair(self, intent, done)
         return done
+
+    def _record_installed(
+        self, object_id: str, intent: dict[str, Any], *, unit: dict[str, Any] | None, job_id: str, how: str
+    ) -> dict[str, Any]:
+        """Complete an ingest that stopped once its copy had reached the object's place. Under the object's lock.
+
+        Either the object's file, read now, is the intent's copy, and its record is written where it is absent
+        or another file's; or a later install set the intent's copy aside beside the object, and the object, read
+        now, holds the same content, so the unit's copy is equal to it as any copy proven equal is.
+        """
+        copy = intent.get("copy") or {}
+        target = self.object_path(object_id)
+        entry = self.entry(object_id)
+        identity = read_copy_identity(target)
+        if identity.object_id == object_id and identity.sha256 == copy.get("sha256"):
+            if entry is None or entry.get("sha256") != identity.sha256:
+                repairs = list((entry or {}).get("repairs") or [])
+                if entry is not None:
+                    repairs.append({"at": _now(), "job_id": job_id,
+                                    "problem": "an install stopped after its copy took the place of the recorded file"})
+                tested = _testzip(target) if identity.recognised else None
+                _write_json_atomic(self.entry_path(object_id), _object_record(
+                    identity, how=how, unit=unit, job_id=job_id, method="repair",
+                    libraries=library_names(intent.get("libraries") or [])
+                    or library_names((entry or {}).get("libraries") or []),
+                    settings=intent.get("annotation_settings") or (entry or {}).get("annotation_settings"),
+                    testzip="not_a_zip" if not identity.recognised else "passed" if tested is None else "failed",
+                    repairs=repairs,
+                ))
+            outcome, verified = STORED, "repair"
+        elif (entry is not None and identity.content_key_kind == entry.get("content_key_kind")
+              and identity.normalized_sha256 == entry.get("normalized_sha256") == copy.get("normalized_sha256")):
+            outcome, verified = DEDUPLICATED, "normalized_sha256" if identity.recognised else "sha256"
+        else:
+            raise LibraryCopyStoreError(f"object {object_id}'s file is not the copy its intent records; a person looks")
+        if unit is not None:
+            self.claim(object_id, unit=unit, job_id=job_id, action=how, name=str(copy.get("name") or OBJECT_FILE),
+                       copy=copy, outcome=outcome)
+        return {"outcome": outcome, "object_id": object_id, "verified_by": verified}
+
+    def _quarantine_ingest(self, directory: Path, intent: dict[str, Any], found: CopyIdentity) -> dict[str, Any]:
+        """Set aside an unfinished ingest whose staged file is not the copy its intent records. Under its lock."""
+        target = self.root / "quarantine" / directory.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _replace(directory, target)
+        _write_json_atomic(target / "reason.json", {
+            "schema": QUARANTINE_SCHEMA,
+            "object_id": intent.get("object_id"),
+            "reason": "an unfinished ingest's staged file is not the copy its intent records (a copy cut short "
+                      "when its process stopped); nothing was stored, and no unit records it",
+            "copy": intent.get("copy"),
+            "found": {"size_bytes": found.size_bytes, "sha256": found.sha256, "recognised": found.recognised},
+            "unit": unit_label(intent.get("unit")),
+            "job_id": intent.get("job_id"),
+            "how": intent.get("how"),
+            "recorded_at": _now(),
+        })
+        return {"outcome": QUARANTINED, "quarantine": self.relative(target), "object_id": intent.get("object_id")}
 
     def summary(self, *, verify: bool = False) -> dict[str, Any]:
         """Every object, its claims and its health; unfinished ingests; quarantined copies. Read-only."""
@@ -1227,7 +1381,13 @@ class LibraryCopyStore:
 
 
 def _record_repair(store: LibraryCopyStore, intent: dict[str, Any], done: dict[str, Any]) -> None:
-    """Name a repaired ingest in its unit's manifest, when the intent names one that does not record it yet."""
+    """Name a repaired ingest in its unit's manifest, when the intent names one that does not record it yet.
+
+    A copy the run's own finalisation recorded as pending (it left the output, and its install stopped before
+    its record) is completed in that record, where the unit names its copy; any other is named under
+    library_copy_records, with the step that stored it (``how``), so that a copy that is not the run's own - a
+    GUI save, a Console's temporary file - is never taken for it.
+    """
     from .repository_reanalysis import update_manifest
 
     unit = intent.get("unit") or {}
@@ -1239,15 +1399,34 @@ def _record_repair(store: LibraryCopyStore, intent: dict[str, Any], done: dict[s
     if not path.is_file():
         return
     copy = dict(intent.get("copy") or {})
+    how = str(intent.get("how") or "")
+    repaired = {"object_id": done["object_id"], "outcome": done["outcome"],
+                "verified_by": done.get("verified_by") or "repair", "repaired_at": _now()}
+
+    def same(item: Any) -> bool:
+        return isinstance(item, dict) and item.get("object_id") == done["object_id"] \
+            and item.get("sha256") == copy.get("sha256")
 
     def change(current: dict[str, Any]) -> None:
-        recorded = [item for item in current.get("library_copy_records") or [] if isinstance(item, dict)]
-        if any(item.get("job_id") == job_id and item.get("object_id") == done["object_id"] for item in recorded):
-            return
-        current["library_copy_records"] = [*recorded, {
-            "schema": RECORD_SCHEMA, "action": "repair", "job_id": job_id, **copy,
-            "object_id": done["object_id"], "outcome": done["outcome"], "verified_by": "repair",
-            "recorded_at": _now(), "by": f"Interactive {__version__}",
+        finalisation = current.get("console_run_finalisation")
+        block = finalisation.get(LIBRARY_COPY_RECORD) if isinstance(finalisation, dict) \
+            and str(finalisation.get("job_id") or "") == job_id else None
+        if isinstance(block, dict):
+            for item in block.get("copies") or []:
+                if same(item) and item.get("outcome") == PENDING:
+                    item.update(repaired)
+                    return
+                if same(item) and item.get("outcome") in RESTORABLE_OUTCOMES:
+                    return
+        recorded = [item for item in current.get(LIBRARY_COPY_RECORDS) or [] if isinstance(item, dict)]
+        for item in recorded:
+            if item.get("job_id") == job_id and same(item):
+                if item.get("outcome") == PENDING:
+                    item.update(repaired)  # a GUI copy an undo recorded as pending, completed where it stands
+                return
+        current[LIBRARY_COPY_RECORDS] = [*recorded, {
+            "schema": RECORD_SCHEMA, "action": "repair", "how": how or None, "job_id": job_id, **copy,
+            **repaired, "recorded_at": _now(), "by": f"Interactive {__version__}",
         }]
 
     try:
@@ -1277,7 +1456,7 @@ def _finalised_copy(manifest: dict[str, Any]) -> tuple[str, dict[str, Any] | Non
     finalisation = manifest.get("console_run_finalisation") if isinstance(
         manifest.get("console_run_finalisation"), dict) else {}
     job_id = str((finalisation or {}).get("job_id") or "")
-    deleted = [item for item in (finalisation or {}).get("loaded_library_copies_deleted") or [] if isinstance(item, dict)]
+    deleted = [item for item in (finalisation or {}).get(LEGACY_LIBRARY_COPY_RECORD) or [] if isinstance(item, dict)]
     return job_id, (deleted[0] if len(deleted) == 1 else None)
 
 
@@ -1303,9 +1482,9 @@ def attach(manifest_path: str | Path, object_id: str, *, confirmed: bool = False
         raise LibraryCopyStoreError(
             "this unit records no campaign run whose finalisation deleted its library copy; nothing to attach."
         )
-    recorded = [item for item in manifest.get("library_copy_records") or []
-                if isinstance(item, dict) and item.get("job_id") == job_id]
-    if (finalisation.get("loaded_library_copy") or {}).get("copies") or recorded:
+    recorded = [item for item in manifest.get(LIBRARY_COPY_RECORDS) or []
+                if isinstance(item, dict) and item.get("job_id") == job_id and is_run_copy(item)]
+    if (finalisation.get(LIBRARY_COPY_RECORD) or {}).get("copies") or recorded:
         raise LibraryCopyStoreError(f"run {job_id} already names the stored object of its library copy.")
     if deleted is None:
         raise LibraryCopyStoreError(f"run {job_id} records no single deleted library copy; nothing to attach.")
@@ -1366,7 +1545,7 @@ def attach(manifest_path: str | Path, object_id: str, *, confirmed: bool = False
     }
 
     def change(current: dict[str, Any]) -> None:
-        current["library_copy_records"] = [*(current.get("library_copy_records") or []), item]
+        current[LIBRARY_COPY_RECORDS] = [*(current.get(LIBRARY_COPY_RECORDS) or []), item]
 
     update_manifest(path, change)
     store.claim(object_id, unit=unit, job_id=job_id, action="attach", name=str(deleted.get("name") or ""),
@@ -1422,7 +1601,8 @@ def settle_console_temp(
     Every file is listed (relative name and size). One laid out as MS-DIAL's library copy - written there by a
     save the Console did not finish - goes into the library-copy store; one that cannot is kept, and the caller
     holds it from sharing (``held``, absolute paths, for the hold only). Everything else is removed, and the
-    directory with it once nothing is held.
+    directory with it once nothing is held. A symbolic link or a junction is listed and never followed: what it
+    points to is not the Console's, and only the link itself goes, with the directory.
     """
     from .repository_reanalysis import read_manifest
 
@@ -1433,15 +1613,32 @@ def settle_console_temp(
     if not directory.is_dir():
         return result
     files = []
-    for folder, _directories, names in os.walk(extended_path(directory, always=True)):
-        for name in names:
-            path = Path(plain_path(os.path.join(folder, name)))
+    folders = [extended_path(directory, always=True)]
+    while folders:
+        folder = folders.pop()
+        try:
+            with os.scandir(folder) as found:
+                entries = list(found)
+        except OSError as error:
+            result["errors"].append(describe_error(error, directory))
+            continue
+        for entry in entries:
+            path = Path(plain_path(entry.path))
+            name = path.relative_to(directory).as_posix()
             try:
-                size = os.stat(extended_path(path)).st_size
+                details = entry.stat(follow_symlinks=False)
             except OSError:
-                size = None
-            files.append(path)
-            result["leftovers"].append({"name": path.relative_to(directory).as_posix(), "size_bytes": size})
+                details = None
+            if details is not None and _is_link_like(details):
+                # os.walk descends into a junction (os.path.islink is false for one); nothing here follows it.
+                result["leftovers"].append({"name": name, "size_bytes": None, "link": True})
+            elif details is not None and stat.S_ISDIR(details.st_mode):
+                folders.append(entry.path)
+            else:
+                files.append(path)
+                result["leftovers"].append({"name": name, "size_bytes": details.st_size if details else None})
+    files.sort()
+    result["leftovers"].sort(key=lambda item: item["name"])
     copies = [path for path in files if is_library_copy_file(path)]
     if copies:
         try:
@@ -1462,6 +1659,11 @@ def settle_console_temp(
                     path, identity, unit=unit_ref(manifest, manifest_path, root), job_id=job_id, libraries=names,
                     settings=settings, how="console_temp",
                 ))
+            except LibraryCopyPending as error:
+                # It left the directory for the store: repair completes it, and no hold here would keep it.
+                result["library_copies"].append({**error.record, "outcome": PENDING,
+                                                 "store_error": describe_error(error, root)})
+                result["errors"].append(f"{path.name}: {describe_error(error, root)}")
             except (OSError, StoreError) as error:
                 result["held"].append(str(path))
                 result["errors"].append(f"{path.name}: {describe_error(error, root)}")

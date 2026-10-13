@@ -83,7 +83,7 @@ from .library_copy_store import (
     describe_error,
     settle_console_temp,
 )
-from .run_finalisation import _sharing_context, finalise_console_run, hold_library_copies
+from .run_finalisation import CONSOLE_TEMP_ORIGIN, _sharing_context, finalise_console_run, hold_library_copies
 from .campaign_authorization import CampaignAuthorizationError, authorize, unit_identity
 from .process_liveness import process_created_at
 from .workflow import (
@@ -140,6 +140,8 @@ JOBS_LOCK = threading.Lock()
 PROCESSES: dict[str, dict[str, Any]] = {}
 CANCELLABLE_JOB_KINDS = frozenset({"run", "tuning", "repository_download"})
 CONSOLE_JOB_KINDS = frozenset({"run", "tuning"})
+# Every job that starts a Console on a repository unit's raw files: a restore for viewing waits for each.
+UNIT_JOB_KINDS = CONSOLE_JOB_KINDS | {"rt_correction"}
 # waiting_for_shared_download: a repository download whose lease waits while another lease fetches or extracts
 # an object of the accession download store that both need. It is running, and cancellable, as any other.
 WAITING_FOR_SHARED_DOWNLOAD = "waiting_for_shared_download"
@@ -527,6 +529,41 @@ class UnitBusyError(RuntimeError):
         }
 
 
+class UnitRestoredError(UnitBusyError):
+    """A Console job was asked for a repository unit restored for viewing in MS-DIAL. Answered with 409.
+
+    The restore put copies of the run's containers beside the raw data and a link to its library copy in the
+    output (project_restore), and its undo takes back exactly what it recorded: a Console would write beside
+    them, and its finalisation would take the link for its own copy.
+    """
+
+    def __init__(self, manifest_text: str, restore_id: str, detail: str) -> None:
+        super().__init__(manifest_text, "", detail)
+        self.restore_id = restore_id
+
+    def payload(self) -> dict[str, Any]:
+        return {**super().payload(), "code": "viewing_restore_active", "restore_id": self.restore_id}
+
+
+def _refuse_restored_unit(manifest_text: str) -> None:
+    """Raise UnitRestoredError while a viewing restore stands on the unit; a manifest that cannot be read is left
+    to the checks that read it."""
+    try:
+        manifest = read_manifest(Path(manifest_text).expanduser())
+    except (OSError, ValueError):
+        return
+    restores = [item for item in manifest.get("finalisation_holds") or []
+                if isinstance(item, dict) and item.get("step") == "viewing_restore"]
+    if restores:
+        restore_id = str(restores[0].get("restore_id") or "")
+        raise UnitRestoredError(
+            manifest_text,
+            restore_id,
+            f"This repository unit is restored for viewing in MS-DIAL (restore {restore_id or 'unrecorded'}). No "
+            "Console starts on it until msdial_undo_project_restore takes the restore back.",
+        )
+
+
 class RepositoryDownloadCancelled(Exception):
     """Raised from a repository download's progress callback once its job is cancelled.
 
@@ -571,9 +608,9 @@ def _unit_key(manifest_text: str) -> str:
         return os.path.normcase(os.path.abspath(manifest_text))
 
 
-def _live_console_job_locked(key: str) -> str:
+def _live_console_job_locked(key: str, kinds: frozenset[str] = CONSOLE_JOB_KINDS) -> str:
     for job_id, job in JOBS.items():
-        if job.get("kind") not in CONSOLE_JOB_KINDS or job.get("status") not in LIVE_JOB_STATUSES:
+        if job.get("kind") not in kinds or job.get("status") not in LIVE_JOB_STATUSES:
             continue
         recorded = str((job.get("preparation") or {}).get("repository_run_manifest") or "").strip()
         if recorded and _unit_key(recorded) == key:
@@ -593,12 +630,14 @@ def _single_console_per_unit(manifest_text: Any, job_id: str) -> Iterator[None]:
     The unit is held from before the preparation writes anything until the job is registered, and the
     registered job then holds it while it is queued or running. The unit manifest's run attempts are read
     as well, which is what finds a Console this registry does not know: one orphaned by a backend that
-    stopped, or one started by another backend. A local analysis names no unit and is not held.
+    stopped, or one started by another backend. A local analysis names no unit and is not held. A unit restored
+    for viewing is refused (UnitRestoredError) until the restore is taken back.
     """
     text = str(manifest_text or "").strip()
     if not text:
         yield
         return
+    _refuse_restored_unit(text)
     key = _unit_key(text)
     with JOBS_LOCK:
         live = CONSOLE_SLOTS.get(key) or _live_console_job_locked(key)
@@ -745,6 +784,7 @@ def _settle_console_temp(
             manifest_text, job_id, settled["held"], settled["errors"],
             "MS-DIAL left a copy of every loaded library in the Console's temporary directory, and the "
             "library-copy store could not take it",
+            origin=CONSOLE_TEMP_ORIGIN,
         )
         log(f"WARNING: {len(settled['held'])} loaded-library copy(ies) MS-DIAL left in {label} could not be "
             "stored, and they are held from sharing: " + "; ".join(settled["errors"][:3]))
@@ -2231,6 +2271,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"job_id": job_id, "preparation": preparation})
             elif parsed.path == "/api/rt-correction/run":
                 state = body.get("workflow", body)
+                if str(state.get("repository_run_manifest") or "").strip():
+                    # Its Console writes beside the unit's raw files too.
+                    _refuse_restored_unit(str(state["repository_run_manifest"]))
                 preparation = prepare_rt_correction_run(state)
                 job_id = uuid.uuid4().hex
                 with JOBS_LOCK:

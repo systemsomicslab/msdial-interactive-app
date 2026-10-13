@@ -237,8 +237,10 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   openable for viewing: its retained containers are copied back to the paths
   the `.mddata` names and its loaded-library copy is linked from the
   library-copy store (`<workspace_root>\_library_copies`). A `viewing_restore`
-  hold blocks sharing and raw deletion until `msdial_undo_project_restore`
-  (also preview first) takes it back. Nothing launches MS-DIAL.
+  hold blocks sharing and raw deletion, and no Console or new production run
+  starts on the unit (`viewing_restore_active`), until
+  `msdial_undo_project_restore` (also preview first) takes it back. Nothing
+  launches MS-DIAL.
 - `msdial_repository_reanalysis_plan`: inspect metadata, eligibility, the
   default Class hierarchy, and internal-standard declarations without
   downloading raw data. Pass `analysis_unit_handoff_path` for Catalog-driven

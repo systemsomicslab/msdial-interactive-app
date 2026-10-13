@@ -6973,7 +6973,8 @@ def start_new_production_run(
     Refused, and nothing changed (``started`` false and ``reason``): a unit whose raw data were released
     (raw_released), one with a run attempt that may still be running (run_in_progress), one whose legacy
     disposition, decided again, would not run it (would_not_run: skip, exclude or split; the record carries the
-    decision made in memory), and one whose disposition could not be decided again (redecision_failed). A unit
+    decision made in memory), one whose disposition could not be decided again (redecision_failed), and one
+    restored for viewing in MS-DIAL (viewing_restore_active), whose undo reads the output it restored. A unit
     not past a run (no_finished_run) is left
     alone too; the caller prepares it as any other. Without ``write`` the same is done on a copy, which is
     returned, and nothing is created.
@@ -7009,6 +7010,19 @@ def start_new_production_run(
                 "job_id": str(attempt.get("job_id") or ""),
                 "detail": "A run attempt of this unit is open and its process may still be running; a new run is "
                 "prepared only once it has ended.",
+            }
+        restores = [item for item in current.get("finalisation_holds") or []
+                    if isinstance(item, dict) and item.get("step") == "viewing_restore"]
+        if restores:
+            # The restore's undo reads the output it wrote into, and the finished run is the one it restored.
+            return {
+                "started": False,
+                "reason": "viewing_restore_active",
+                **base,
+                "restore_id": str(restores[0].get("restore_id") or ""),
+                "detail": f"This unit is restored for viewing in MS-DIAL (restore "
+                f"{restores[0].get('restore_id') or 'unrecorded'}); a new run is prepared only once "
+                "msdial_undo_project_restore has taken the restore back.",
             }
         at = datetime.now(timezone.utc).isoformat()
         superseded = _superseded_run_record(current, at)
