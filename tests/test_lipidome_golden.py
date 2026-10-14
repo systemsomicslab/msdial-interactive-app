@@ -7,12 +7,17 @@ looked for at ../inhouse_programs/metaboservice/ beside it, or wherever
 MSDIAL_LIPIDOMICS_DEMO_RULES says. MSDIAL_LIPIDOMICS_AUDIT may name the 2026-09-06 audit folder
 whose hand-made standards.tsv and quant_rules.tsv the workbook derivation is compared with.
 
+What metaboservice.exe (2024) wrote from these inputs -- the four tables and the 357 dotplot files
+-- is held as sha256 in tests/vectors/metaboservice_2024_data2.v1.json, so only the inputs are needed.
+
 Every file is only read; outputs go to a temporary folder.
 """
 
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import os
 import tempfile
 import unittest
@@ -26,13 +31,14 @@ from msdial_app.lab_lipidomics import (
     salt_evidence,
     standards_rows,
 )
-from msdial_app.lipidome_merge import describe_export, merge_pos_neg
+from msdial_app.lipidome_merge import METABOSERVICE_2024_SAMPLE_FILE_TYPES, describe_export, merge_pos_neg
 
 DEMO = Path(os.environ.get("MSDIAL_LIPIDOMICS_DEMO", "")) if os.environ.get("MSDIAL_LIPIDOMICS_DEMO") else None
 RULES = (
     Path(os.environ["MSDIAL_LIPIDOMICS_DEMO_RULES"]) if os.environ.get("MSDIAL_LIPIDOMICS_DEMO_RULES")
     else DEMO.parent / "inhouse_programs" / "metaboservice" / "targetadduct.txt" if DEMO else None
 )
+VECTOR = Path(__file__).resolve().parent / "vectors" / "metaboservice_2024_data2.v1.json"
 AUDIT = Path(os.environ["MSDIAL_LIPIDOMICS_AUDIT"]) if os.environ.get("MSDIAL_LIPIDOMICS_AUDIT") else None
 needs_demo = unittest.skipUnless(
     DEMO is not None and (DEMO / "NormalizedHeight_Pos.txt").is_file(),
@@ -49,18 +55,80 @@ class GoldenMergeTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._directory.cleanup()
 
-    def merge(self, rules: Path, name: str) -> tuple[dict, Path]:
-        output = self.root / name
-        return merge_pos_neg(DEMO / "NormalizedHeight_Pos.txt", DEMO / "NormalizedHeight_Neg.txt", rules, output), output
+    def merge(self, rules: Path, name: str, folder: str = "out", **options) -> tuple[dict, Path]:
+        output = self.root / folder / name
+        return merge_pos_neg(DEMO / "NormalizedHeight_Pos.txt", DEMO / "NormalizedHeight_Neg.txt", rules, output,
+                             **options), output
 
     @unittest.skipUnless(RULES is not None and RULES.is_file(), "metaboservice's targetadduct.txt was not found")
-    def test_the_2024_lipidome_is_reproduced_byte_for_byte_from_its_rule_table(self) -> None:
-        result, output = self.merge(RULES, "lipid_metabolome.csv")
+    def test_the_2024_outputs_are_reproduced_byte_for_byte_but_one_digit_of_one_value(self) -> None:
+        """The four files and the 357 dotplot files metaboservice.exe (2024) wrote from these inputs.
+
+        With the 2024 program's rules: no reconciliation, and Sample columns only (the 2024 binary
+        took no QC; data2 has none anyway). The four files are compared with data2's own copies, and
+        every file with the sha256 of the 2024 binary's output (tests/vectors). One computed value is
+        one unit off in the 15th significant digit, in the two files that print it: the 32-bit .NET
+        Framework rounds it up, which exact half-up rounding does not (net_double_tostring).
+        """
+        vector = json.loads(VECTOR.read_text(encoding="ascii"))
+        for name, digest in vector["inputs_sha256"].items():
+            self.assertEqual(digest, hashlib.sha256((DEMO / name).read_bytes()).hexdigest(), name)
+        self.assertEqual(vector["rules_sha256"], hashlib.sha256(RULES.read_bytes()).hexdigest())
+        result, output = self.merge(RULES, "lipid_metabolome.csv", reconcile=False,
+                                    sample_file_types=METABOSERVICE_2024_SAMPLE_FILE_TYPES)
         self.assertEqual((372, 212, 160), (result["kept_rows"], result["kept_from_positive"], result["kept_from_negative"]))
-        self.assertEqual((DEMO / "lipid_metabolome.csv").read_bytes(), output.read_bytes())
+        self.assertEqual([], result["warnings"])
+        folder = output.parent
+        written = {str(path.relative_to(folder)).replace(os.sep, "/"): path.read_bytes()
+                   for path in folder.rglob("*") if path.is_file()}
+        self.assertEqual(set(vector["files"]), set(written))
+        self.assertEqual(357, result["outputs"]["dotplots"]["files"])
+
+        known = vector["known_difference"]
+        ours, theirs = known["value"]["interactive"].encode("ascii"), known["value"]["metaboservice_x86"].encode("ascii")
+        for relative, data in sorted(written.items()):
+            with self.subTest(file=relative):
+                if relative in known["lines"]:
+                    lines = data.split(b"\r\n")
+                    index = known["lines"][relative] - 1
+                    # Exactly this value on exactly this line, and nothing else differs.
+                    self.assertTrue(lines[index].endswith(ours) or ours + b"," in lines[index], lines[index])
+                    self.assertNotEqual(vector["files"][relative]["sha256"], hashlib.sha256(data).hexdigest())
+                    lines[index] = lines[index].replace(ours, theirs)
+                    data = b"\r\n".join(lines)
+                self.assertEqual(vector["files"][relative]["sha256"], hashlib.sha256(data).hexdigest())
+                self.assertEqual(vector["files"][relative]["bytes"], len(data))
+        for name in ("lipid_metabolome.csv", "lipid_metabolome4stat.csv", "lipid_metabolome4classsummary.csv"):
+            self.assertEqual((DEMO / name).read_bytes(), written[name], name)
+        reference = (DEMO / "lipid_metabolome4summaryplot.csv").read_bytes()
+        self.assertEqual(reference, written["lipid_metabolome4summaryplot.csv"].replace(ours, theirs))
+        self.assertEqual(1, sum(a != b for a, b in zip(reference.split(b"\r\n"),
+                                                       written["lipid_metabolome4summaryplot.csv"].split(b"\r\n"))))
+
+    @unittest.skipUnless(RULES is not None and RULES.is_file(), "metaboservice's targetadduct.txt was not found")
+    def test_the_reconciliation_names_seven_negative_ether_pe_rows_from_positive_mode(self) -> None:
+        # On by default. data2's positive BMPs are all "w/o MS2", so no PG is renamed.
+        result, output = self.merge(RULES, "lipid_metabolome.csv")
+        reconciliation = result["polarity_reconciliation"]
+        self.assertEqual((372, 212, 160), (result["kept_rows"], result["kept_from_positive"], result["kept_from_negative"]))
+        self.assertEqual({"positive_rows": 0, "matched": 0, "unmatched": 0, "ambiguous": 0, "lost_claims": 0,
+                          "positive_rows_not_converted": 0}, reconciliation["counts"]["BMP"])
+        self.assertEqual((14, 7, 7, 0, 0), tuple(reconciliation["counts"]["EtherPE"][key] for key in (
+            "positive_rows", "matched", "unmatched", "ambiguous", "lost_claims")))
+        self.assertEqual({"kept": 7, "not_quantified": 0, "not_selected": 0}, reconciliation["renamed_rows"])
+        pairs = {item["negative"]["alignment_id"]: (item["positive"]["alignment_id"], item["renamed_to"]["name"])
+                 for item in reconciliation["matched"]}
+        self.assertEqual(("1595", "PE P-38:6|PE P-16:0_22:6"), pairs["1045"])
+        self.assertEqual({"965", "1002", "1009", "1045", "1053", "1094", "1142"}, set(pairs))
+        # Same sum, other chains: exact names only, as decided.
+        unmatched = {item["positive"]["alignment_id"]: item for item in reconciliation["unmatched"]}
+        self.assertEqual("1050", unmatched["1605"]["other_names_within_tolerance"][0]["alignment_id"])
+        self.assertIn("lies 0.145 min away", unmatched["1774"]["reason"])
+        self.assertTrue(any("selects BMP [M+NH4]+ in positive mode" in item for item in result["warnings"]))
+        self.assertIn(b"PE P-16:0_22:6_1045,EtherPE,94,", (output.parent / "lipid_metabolome4summaryplot.csv").read_bytes())
 
     def test_sheet_three_keeps_the_2024_rows_and_the_positive_ether_pe(self) -> None:
-        result, output = self.merge(DEMO / "quant_utility_table.xlsx", "lipid_metabolome_sheet3.csv")
+        result, output = self.merge(DEMO / "quant_utility_table.xlsx", "lipid_metabolome_sheet3.csv", reconcile=False)
         self.assertEqual((394, 234, 160), (result["kept_rows"], result["kept_from_positive"], result["kept_from_negative"]))
         reference = {tuple(row) for row in csv.reader((DEMO / "lipid_metabolome.csv").read_text(encoding="ascii").splitlines())}
         added = [row for row in csv.reader(output.read_text(encoding="ascii").splitlines()) if tuple(row) not in reference]

@@ -128,6 +128,15 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   `scripts/generate-lipid-class-vocabulary.py`, which reads only live code. 28
   classes are spelled differently (`Cer_NS` -> `Cer-NS`), and 24 members have no
   definition.
+- `resources/lipid_category_table.tsv`, the lipid category metaboservice filed
+  each Ontology's dotplots under
+  (`LipidomicsConverter.ConvertMsdialClassDefinitionToSuperClassVS2`: 248
+  classes, `Unassigned lipid` for any other), generated from MsdialWorkbench
+  b01effaaa by `scripts/generate-lipid-category-table.py`, which reads the
+  live switch at the commit named from the repository's object store.
+- `tests/vectors/metaboservice_2024_data2.v1.json`: the sha256 of the 361 files
+  the 2024 `metaboservice.exe` wrote from the hands-on data2 exports, run in a
+  32-bit process, for the opt-in golden test.
 - Five MCP tools take a laboratory lipidomics batch from its two raw folders to
   `lipid_metabolome.csv` (`lab_lipidomics_agent`; endpoints
   `/api/lipidomics/check`, `/write-contract`, `/resolve`, `/normalize` and
@@ -206,15 +215,34 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     `Height_{Pos,Neg}.txt`, and records it all in
     `normalize_{pos,neg}.local.json`. A job whose cells were not all verified
     fails, and the merge sets those rows aside.
-  - `msdial_lipidomics_merge` previews the counts and, confirmed, writes
-    `lipid_metabolome.csv`, `lipid_metabolome_not_quantified.csv` and
-    `merge-report.json` with sheet 3 as the rules, the resolved standards and the
-    candidate table's reference matches as filters, and the contract's unit. The
-    report holds the verification, the unit, the sample amount and the build of
-    each polarity's normalize Console. It refuses a polarity not normalized under
-    this contract, not completed as planned, or whose matrix or candidate table
-    changed since, and an `output_name` that would write over its own side file
-    or report or a file normalize wrote.
+  - `msdial_lipidomics_merge` previews the counts and, confirmed, writes into
+    `<root>/quant/lipidome` (the folder `metabolomics_service.R` is run in: it
+    reads every subfolder of its folder as a dotplot folder, and `quant` holds
+    normalize's `pos` and `neg`) `lipid_metabolome.csv`, the three statistics
+    tables and the dotplot folders (see `lipidome_merge` under Changed),
+    `lipid_metabolome_not_quantified.csv` and `merge-report.json`, with sheet 3
+    as the rules, the resolved standards and the candidate table's reference
+    matches as filters, and the contract's unit. The report holds the
+    verification, the unit, the sample amount, the build of each polarity's
+    normalize Console, and the positive/negative reconciliation with the
+    standard each renamed row was normalized against (a PG renamed BMP was
+    normalized as PG; a difference from sheet 2's BMP standard is warned about).
+    `reconcile_polarities` and `reconciliation_rt_tolerance` follow the
+    contract unless given; another value is applied, warned about and recorded
+    as a deviation. The record's `merged` event keeps the four tables' sha256,
+    the dotplot count, the sample file types and the reconciliation's
+    parameters and counts. The tool returns the report without the per-file
+    dotplot manifest, which stays in `merge-report.json`. It refuses a polarity
+    not normalized under this contract, not completed as planned, or whose
+    matrix or candidate table changed since, and an `output_name` that would
+    write over its own side file or report or a file normalize wrote.
+  - The contract states the merge method (`merge`: Sample and QC columns, the
+    reconciliation on with 0.1 min), and `msdial_lipidomics_check_inputs` warns
+    (`merge_selection_warnings`) when sheet 3 selects BMP or EtherPE in
+    positive mode, or does not select BMP `[M-H]-` or EtherPE `[M-H]-`: the
+    reconciliation takes both from negative `[M-H]-`, so a positive selection
+    counts the class twice and a missing `[M-H]-` loses the renamed rows. The
+    workbook is never changed; the person edits sheet 3.
 - The guided path's laboratory lipidomics profile: a plan from a contract
   (`lab_lipidomics_contract_path`), or LC-MS lipidomics with
   `library_strategy: existing` outside a repository unit.
@@ -263,15 +291,73 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   carried. A guided plan refuses one.
 
 ### Changed
-- `lipidome_merge` writes what the laboratory's own program (metaboservice)
-  wrote. On the 2024 hands-on exports and its `targetadduct.txt` the result is
-  `lipid_metabolome.csv` byte for byte (372 rows); with sheet 3 of
-  `quant_utility_table.xlsx` it is 394 (the same plus 22 positive EtherPE).
-  - Comma separated for a `.csv` (tab otherwise), CRLF, minimal quoting, ASCII,
-    or UTF-8 with a warning when a cell is not ASCII.
-  - Rows ordered by ontology and then name as .NET compares them (symbols, then
-    digits, then letters without case), without touching the process locale.
-    The ordinal order put `BRSE` before `BileAcid`.
+- `lipidome_merge` writes what the laboratory's own program (metaboservice,
+  `MetabolomicsServiceUtility.IntegratePosNegResults`) wrote, every file of it.
+  On the 2024 hands-on exports and its `targetadduct.txt`, with the
+  reconciliation off and the 2024 sample rule, `lipid_metabolome.csv`,
+  `lipid_metabolome4stat.csv` and `lipid_metabolome4classsummary.csv` (372
+  rows) and 356 of the 357 dotplot files are the 2024 program's byte for byte;
+  `lipid_metabolome4summaryplot.csv` and `Summary_Dotplots/Glycerophospholipids.csv`
+  differ in one digit of one value, `-0.0479667909938783` where the 32-bit .NET
+  Framework printed `...784` (its unpublished x87 formatting rounds about 0.4 %
+  of values lying just below a 15-digit midpoint up; no rounding rule
+  reproduces it). With sheet 3 of `quant_utility_table.xlsx` it keeps 394 rows
+  (the same plus 22 positive EtherPE).
+  - The three tables `metabolomics_service.R` reads, named after the lipidome
+    (`<stem>4stat.csv`, `<stem>4classsummary.csv`, `<stem>4summaryplot.csv`),
+    and the `Summary_Dotplots`, `category_<category>` and `subclass_<ontology>`
+    folders it reads too, with metaboservice's quirks kept: metabolite keys are
+    the last `|` part of the name and the alignment ID, a lipid's dotplot file
+    only within the top 41 of its class, invalid file-name characters as `_`.
+  - The statistics are over the Sample and QC columns of the positive header,
+    never a Blank (metaboservice's 2025 rule, the laboratory's decision; the
+    2024 program took Sample only, kept as `METABOSERVICE_2024_SAMPLE_FILE_TYPES`
+    for reproducing it). Sample names are Class_Injection order.
+  - ASCII, CRLF after every line, no byte-order mark, comma separated and never
+    quoted, as the program wrote them (a cell holding a comma is warned about:
+    its row has an extra column); UTF-8 with a warning where a cell is not ASCII,
+    where the program wrote `?`.
+  - Rows ordered by ontology and then name as .NET's default comparison ordered
+    them on Windows, stably: the NLS "word sort" key, checked byte for byte
+    against `LCMapStringEx` (`BileAcid` before `BRSE`, `TG 56:1|` before
+    `TG 56:10|`, `-` and `'` only a last tie-break), without touching the
+    process locale. The earlier approximation ignored those last rules.
+  - Numbers as .NET Framework's `Double.ToString()`: 15 significant digits,
+    rounded half-up, `E+XX` outside 1e-5..1e15, `-0` as `0`, -infinity as `-?`
+    (an all-zero lipid in the summary plot) and `NaN`. Values parse as
+    `double.Parse` does.
+  - The positive/negative reconciliation (the laboratory's rules, 2026-10-14),
+    on by default, between the row filters and sheet 3's selection. BMP is
+    annotatable only in positive mode and is annotated PG in negative mode: a
+    kept negative PG row whose name equals a kept positive BMP row's with BMP ->
+    PG in every `|` part, within 0.1 min (`Average Rt(min)`, compared exactly as
+    decimals), becomes BMP, name and Ontology. Negative mode annotates PE P- and
+    PE O- both as PE O-: a kept negative EtherPE row whose name equals a kept
+    positive PE P- row's PE O- spelling (`P-x:y` -> `O-x:(y+1)` in every part:
+    `PE P-34:1` is `PE O-34:2`) takes the PE P- name. Exact names only, no
+    sum-composition fallback. Several candidates: the smallest |delta RT|, then
+    the higher mean over the sample and QC columns; one negative row claimed
+    twice: the closer positive row wins and the other is left unmatched. The
+    renamed row's Comment says what it was, from which positive row and at what
+    delta RT. It keeps and drops nothing: sheet 3 decides (BMP and EtherPE
+    positive adducts FALSE, BMP `[M-H]-` and EtherPE `[M-H]-` TRUE), and a
+    renamed row sheet 3 does not select, or a positive selection of either
+    class, is warned about. The report lists every matched pair, every
+    unmatched positive row with the same-name negative rows outside the window
+    and the other names inside it, every tie and every lost claim. On the 2024
+    hands-on data 7 of 14 positive PE P- rows name a negative row; 3 of the 7
+    others have a negative row of the same sum and other chains.
+  - A dotplot file an earlier merge recorded writing (its manifest in
+    `merge-report.json`) and this one does not write is removed, with a folder it
+    leaves empty, so R does not plot it with the new ones; any other file in the
+    dotplot folders refuses the write. Another folder beside the tables, which R
+    would also read, is warned about, and so are repeated sample names, constant
+    lipids (`prcomp(scale=TRUE)` fails on them), lipids without a finite log10
+    mean and repeated lipid keys.
+  - A selected row with a sample or QC cell that holds no number goes to the
+    not-quantified file (metaboservice stopped on it). The two exports must also
+    agree on each sample's file type, since the positive header decides which
+    columns are samples.
   - The rule table may be the workbook itself; its third sheet is read.
   - New filters, the first that applies being the reason: an internal standard
     by the resolver's alignment IDs (beside the `(d` rule), and a row whose

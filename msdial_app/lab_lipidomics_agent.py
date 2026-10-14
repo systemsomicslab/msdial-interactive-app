@@ -18,7 +18,9 @@ with the agent, and what stops it:
    binds what the person is shown.
 4. plan_normalize / finish_normalize: the standards table and the exact MSDIALCUI normalize command,
    run as a job only once confirmed, and every quantified cell recomputed afterwards.
-5. merge_lipidome: lipid_metabolome.csv from the two verified matrices and sheet 3.
+5. merge_lipidome: lipid_metabolome.csv from the two verified matrices and sheet 3, with the
+   positive/negative reconciliation of BMP and PE P- before the selection, and the tables and
+   dotplot folders the laboratory's R script reads, in <analysis root>/quant/lipidome.
 
 The contract and its record name the LBM2 by its location, so both are local only (sharing.py). The
 Console is named per contract, never through Interactive's shared settings.
@@ -29,6 +31,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -75,7 +78,18 @@ from .lab_lipidomics import (
     write_resolution_tsv,
     write_standards_tsv,
 )
-from .lipidome_merge import MergeRefused, merge_pos_neg, reference_matched_ids, strip_polarity
+from .lipidome_merge import (
+    DEFAULT_RECONCILIATION_RT_TOLERANCE,
+    SAMPLE_FILE_TYPES,
+    MergeRefused,
+    companion_names,
+    merge_pos_neg,
+    reconciliation_parameters,
+    reconciliation_selection_warnings,
+    reference_matched_ids,
+    strip_polarity,
+    without_manifest,
+)
 from .workflow import (
     ANNOTATION_CANDIDATES_CAPABILITY,
     AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY,
@@ -97,6 +111,9 @@ FOLDERS = {POSITIVE: "pos", NEGATIVE: "neg"}
 LABELS = {POSITIVE: "Pos", NEGATIVE: "Neg"}
 NOT_QUANTIFIED_NAME = "lipid_metabolome_not_quantified.csv"
 MERGE_REPORT_NAME = "merge-report.json"
+# The merge's own folder inside quant: metabolomics_service.R reads every subfolder of the folder it
+# runs in as a dotplot folder, and quant holds normalize's pos and neg output folders.
+MERGE_FOLDER = "lipidome"
 # What normalize writes into the quant folder (plan_normalize's paths), by name prefix, folded.
 QUANT_FILE_PREFIXES = ("normalizedheight_", "height_", "standards_", "is_resolution_", "normalize_")
 RT_CORRECTION_FAILED = "Automatic alignment RT correction failed"
@@ -250,6 +267,12 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
     result["quant_table"] = _workbook_report(workbook) if workbook.get("preparation") else (
         {"path": workbook.get("path"), "sha256": workbook.get("sha256")} if workbook else {}
     )
+    if (workbook.get("quant_info") or {}).get("selected"):
+        # The merge reconciles BMP and PE P- between the polarities and takes both from negative
+        # [M-H]-; a sheet 3 that says otherwise is the person's to change, before anything runs.
+        selection = reconciliation_selection_warnings(workbook["quant_info"]["selected"])
+        warnings.extend(selection)
+        result["merge_selection_warnings"] = selection
 
     # R2: the salt, beside what the libraries and sheet 3 say about it.
     salt: dict[str, Any] = {}
@@ -373,7 +396,13 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
             "candidate instead"
         ),
         "method_files": {key: {"name": item["name"], "sha256": item["sha256"]} for key, item in lab_method_files().items()},
-        "merge": "rows whose representative annotation is not reference matched are dropped",
+        "merge": (
+            "rows whose representative annotation is not reference matched are dropped; a negative PG row that "
+            "positive mode annotates as BMP, and a negative PE O- row positive mode annotates as PE P-, is renamed "
+            f"before sheet 3 selects (same name after the class substitution, within "
+            f"{DEFAULT_RECONCILIATION_RT_TOLERANCE} min); the statistics tables take the Sample and QC columns"
+        ),
+        "merge_method": lab_merge_method(),
         "dilution": "each file's factor in the sample table multiplies its concentrations (MS-DIAL -d)",
     }
     result["derived_preview"] = {
@@ -819,6 +848,7 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
         "salt": parsed["salt"]["salt"],
         "unit": workbook.get("unit"),
         "method_files": {key: {"name": item["name"], "sha256": item["sha256"]} for key, item in method_files.items()},
+        "merge": lab_merge_method(),
         "check_digest": check["check_digest"],
     }
     if request.get("confirmed") is not True:
@@ -914,6 +944,8 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
             "corrected": table["corrected"],
         },
         "method": lab_method_answers(),
+        # How the merge reads the two matrices, unless the merge is told otherwise (and records it).
+        "merge": lab_merge_method(),
         "number_of_threads": int(float(args["number_of_threads"])) if args.get("number_of_threads") else None,
         "check_digest": check["check_digest"],
         "replaced_contract": replaced,
@@ -1771,12 +1803,35 @@ def finish_normalize(plan: dict[str, Any], exit_code: int | None, log_lines: Ite
 # ---------------------------------------------------------------------------------------------
 
 
-def merge_lipidome(contract_path: str, output_name: str = "lipid_metabolome.csv", *, write: bool = False) -> dict[str, Any]:
-    """lipid_metabolome.csv from the two normalized matrices, as the laboratory's program wrote it.
+def lab_merge_method() -> dict[str, Any]:
+    """How the laboratory merge reads the two normalized matrices, as the contract states it."""
+    return {
+        "sample_file_types": list(SAMPLE_FILE_TYPES),
+        "polarity_reconciliation": reconciliation_parameters(True, DEFAULT_RECONCILIATION_RT_TOLERANCE),
+        "outputs": (
+            f"<quant>/{MERGE_FOLDER}: lipid_metabolome.csv and, named after it, lipid_metabolome4stat.csv, "
+            "lipid_metabolome4classsummary.csv and lipid_metabolome4summaryplot.csv; the Summary_Dotplots, "
+            f"category_<category> and subclass_<ontology> folders; {NOT_QUANTIFIED_NAME} and {MERGE_REPORT_NAME}"
+        ),
+    }
+
+
+def merge_lipidome(
+    contract_path: str,
+    output_name: str = "lipid_metabolome.csv",
+    *,
+    write: bool = False,
+    reconcile_polarities: bool | None = None,
+    reconciliation_rt_tolerance: float | None = None,
+) -> dict[str, Any]:
+    """lipid_metabolome.csv and its statistics tables and dotplot folders, as the laboratory's program wrote them.
 
     Each polarity's normalize must have completed as planned, and its matrix must be the one its
     record names. Rows that failed verification go to the not-quantified file with the NOT QUANTIFIED
-    ones; nothing in the merge does arithmetic.
+    ones. Before sheet 3 selects, the negative rows positive mode identifies as BMP or PE P- are
+    renamed (the contract's merge method: on, 0.1 min); reconcile_polarities=False or another
+    reconciliation_rt_tolerance is applied and recorded as a deviation from the contract. Everything is
+    written into <quant>/lipidome, the folder metabolomics_service.R is run in.
     """
     contract = load_contract(contract_path)
     name = str(output_name or "").strip()
@@ -1785,11 +1840,32 @@ def merge_lipidome(contract_path: str, output_name: str = "lipid_metabolome.csv"
     folded = name.casefold()
     if folded in {NOT_QUANTIFIED_NAME.casefold(), MERGE_REPORT_NAME.casefold()} or folded.startswith(QUANT_FILE_PREFIXES):
         # The merge writes its side file and report beside the lipidome, and normalize's records bind
-        # its matrices by sha256: writing over one of them would undo what it is read from.
+        # its matrices by sha256: a name of theirs is refused wherever the lipidome is written.
         raise LabContractError(
-            f"output_name {name} is a file the merge or normalize writes in {contract['quant_folder']}; choose another name."
+            f"output_name {name} is a file the merge or normalize writes under {contract['quant_folder']}; choose another name."
         )
+    stated = (contract.get("merge") or {}).get("polarity_reconciliation") or {}
+    contract_reconcile = stated.get("enabled", True) is not False
+    contract_tolerance = float(stated.get("rt_tolerance_min", DEFAULT_RECONCILIATION_RT_TOLERANCE))
+    reconcile = contract_reconcile if reconcile_polarities is None else reconcile_polarities is True
+    tolerance = contract_tolerance if reconciliation_rt_tolerance is None else reconciliation_rt_tolerance
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or not math.isfinite(tolerance) or tolerance <= 0:
+        raise LabContractError(
+            f"reconciliation_rt_tolerance must be a positive number of minutes, not {reconciliation_rt_tolerance!r}."
+        )
+    tolerance = float(tolerance)
+    deviations: list[str] = []
+    if reconcile != contract_reconcile:
+        deviations.append(
+            f"the positive/negative reconciliation is {'on' if reconcile else 'off'}; the contract says "
+            f"{'on' if contract_reconcile else 'off'}"
+        )
+    if reconcile and tolerance != contract_tolerance:
+        deviations.append(f"the reconciliation RT tolerance is {tolerance:g} min; the contract says {contract_tolerance:g}")
+    sample_file_types = tuple((contract.get("merge") or {}).get("sample_file_types") or SAMPLE_FILE_TYPES)
+
     quant = Path(contract["quant_folder"])
+    folder = quant / MERGE_FOLDER
     records: dict[str, dict[str, Any]] = {}
     for polarity in POLARITIES:
         path = quant / f"normalize_{FOLDERS[polarity]}.local.json"
@@ -1813,10 +1889,16 @@ def merge_lipidome(contract_path: str, output_name: str = "lipid_metabolome.csv"
         records[polarity] = record
     workbook = read_quant_workbook(contract["inputs"]["quant_table"]["path"], contract["amount_column"])
     labels = {POSITIVE: "positive", NEGATIVE: "negative"}
+    # The dotplot files the last merge here wrote, which this one may replace.
+    try:
+        previous = json.loads((folder / MERGE_REPORT_NAME).read_text(encoding="utf-8"))
+        replaceable = dict(((previous.get("outputs") or {}).get("dotplots") or {}).get("manifest") or {})
+    except (OSError, ValueError, AttributeError, TypeError):
+        replaceable = {}
     try:
         report = merge_pos_neg(
             records[POSITIVE]["outputs"]["normalized_copy"], records[NEGATIVE]["outputs"]["normalized_copy"],
-            None, quant / name,
+            None, folder / name,
             rules=workbook["quant_info"],
             internal_standard_ids={labels[polarity]: records[polarity]["internal_standard_ids"] for polarity in POLARITIES},
             reference_matched_ids={
@@ -1827,13 +1909,28 @@ def merge_lipidome(contract_path: str, output_name: str = "lipid_metabolome.csv"
                 labels[polarity]: (records[polarity].get("verification") or {}).get("failed_ids", [])
                 for polarity in POLARITIES
             },
-            not_quantified_path=quant / NOT_QUANTIFIED_NAME,
+            not_quantified_path=folder / NOT_QUANTIFIED_NAME,
             # Written below, once what this step adds (verification, unit, Console) is in it.
             report_path=None,
+            reconcile=reconcile,
+            reconciliation_rt_tolerance=tolerance,
+            sample_file_types=sample_file_types,
+            replaceable_dotplot_files=replaceable,
             write=write,
         )
     except MergeRefused as error:
         raise LabContractError(str(error)) from None
+    reconciliation = report["polarity_reconciliation"]
+    reconciliation["deviations_from_contract"] = deviations
+    report["warnings"].extend(f"Not as the contract states: {item}." for item in deviations)
+    if reconcile:
+        reconciliation["normalized_as"] = _reconciled_standards(contract)
+        bmp = reconciliation["normalized_as"]["BMP"]
+        if bmp["differs"] and (reconciliation["counts"].get("BMP") or {}).get("matched"):
+            report["warnings"].append(
+                f"The negative rows renamed BMP carry the concentration normalize computed for them as PG, against "
+                f"{bmp['pg_standard'] or 'no standard'}; sheet 2 names {bmp['bmp_standard'] or 'no standard'} for BMP."
+            )
     report["verification"] = {
         polarity: {"verified": records[polarity]["verified"],
                    "failed_rows": len((records[polarity].get("verification") or {}).get("failed_rows", []))}
@@ -1851,14 +1948,42 @@ def merge_lipidome(contract_path: str, output_name: str = "lipid_metabolome.csv"
         for polarity in POLARITIES
     }
     if write:
-        target = quant / MERGE_REPORT_NAME
+        target = folder / MERGE_REPORT_NAME
         target.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
         report["report"] = str(target.resolve())
+        outputs = report["outputs"]
         record_event(contract["_path"], {
             "event": "merged", "output": report["output"], "output_sha256": report["output_sha256"],
+            "output_folder": report["output_folder"],
+            "tables": {
+                Path(outputs[key]["path"]).name: outputs[key]["sha256"] for key in companion_names(name)
+            },
+            "dotplot_files": outputs["dotplots"]["files"],
             "kept_rows": report["kept_rows"], "not_quantified_rows": report["not_quantified"]["rows"],
+            "sample_file_types": list(sample_file_types),
+            "polarity_reconciliation": {
+                "enabled": reconcile, "rt_tolerance_min": tolerance, "counts": reconciliation.get("counts", {}),
+                "renamed_rows": reconciliation.get("renamed_rows", {}), "deviations_from_contract": deviations,
+            },
         })
-    return report
+    return without_manifest(report)
+
+
+def _reconciled_standards(contract: dict[str, Any]) -> dict[str, Any]:
+    """Which standard normalize quantified a renamed row against: its negative class's, not its new one's.
+
+    A PG row renamed BMP was normalized as PG. Said beside the standard sheet 2 names for BMP, so a
+    difference between the two is visible; EtherPE keeps its class, and so its standard.
+    """
+    lookup = {row["target_class"]: row["standard"] for row in contract.get("lookup", [])}
+    fallback = lookup.get("Any others", "")
+    pg_standard = lookup.get("PG", fallback)
+    bmp_standard = lookup.get("BMP", fallback)
+    return {
+        "BMP": {"normalized_as": "PG", "pg_standard": pg_standard, "bmp_standard": bmp_standard,
+                "differs": pg_standard != bmp_standard},
+        "EtherPE": {"normalized_as": "EtherPE", "standard": lookup.get("EtherPE", fallback)},
+    }
 
 
 # ---------------------------------------------------------------------------------------------

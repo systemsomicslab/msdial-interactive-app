@@ -3180,7 +3180,8 @@ def msdial_lipidomics_write_contract(
     {"lab_lipidomics_contract_path": ..., "ion_mode": ...}). The contract fixes the salt, the LBM2,
     the RT tolerances, the internal-standard library, the sample table, the output and export
     folder, the Console, the parameter template and the LBM query list, and states the method (12
-    anchors, the 1.5 min local window, annotation candidates, QA).
+    anchors, the 1.5 min local window, annotation candidates, QA) and the merge's (Sample and QC
+    columns; the positive/negative reconciliation of BMP and PE P-, on, within 0.1 min).
     """
     body: dict[str, Any] = {
         "pos_path": pos_path, "neg_path": neg_path, "lbm_path": lbm_path, "solvent_type": solvent_type,
@@ -3292,24 +3293,45 @@ def msdial_lipidomics_merge(
     contract_path: str,
     output_name: str = "lipid_metabolome.csv",
     confirmed: bool = False,
+    reconcile_polarities: bool | None = None,
+    reconciliation_rt_tolerance: float | None = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
     """Merge the two normalized polarities into lipid_metabolome.csv, writing only once confirmed.
 
     Both polarities must have been normalized under this contract, and their matrices must be the
-    ones normalize wrote. The rows kept are sheet 3's selected class and adduct pairs, annotated,
-    reference matched, not an internal standard and not excluded in the Comment; a selected row
-    without a valid concentration goes to lipid_metabolome_not_quantified.csv. Comma separated,
-    CRLF, as the laboratory's program wrote it. confirmed=false returns the counts and nothing is
-    written; confirmed=true writes the two tables and merge-report.json into <analysis_root>/quant.
+    ones normalize wrote. First the rows that are no lipid of the lipidome are set aside (not
+    annotated, an internal standard, not reference matched, excluded by name or in the Comment).
+    Then the positive/negative reconciliation renames, and keeps or drops nothing: a negative PG row
+    named as a positive BMP row with BMP -> PG, and a negative PE O- row named as a positive PE P- row
+    with P-x:y -> O-x:(y+1), each within reconciliation_rt_tolerance minutes (0.1), becomes BMP or the
+    PE P- name, its Comment saying so. Then sheet 3's selected class and adduct pairs are kept; a
+    selected row without a valid concentration goes to lipid_metabolome_not_quantified.csv.
+    reconcile_polarities and reconciliation_rt_tolerance follow the contract unless given;
+    reconcile_polarities=false turns the reconciliation off and is recorded as a deviation.
+
+    The outputs are the laboratory program's (metaboservice): lipid_metabolome.csv,
+    lipid_metabolome4stat.csv, lipid_metabolome4classsummary.csv, lipid_metabolome4summaryplot.csv
+    (over the Sample and QC columns, never a Blank) and the Summary_Dotplots, category_* and
+    subclass_* folders metabolomics_service.R reads; ASCII, CRLF, comma separated and unquoted.
+    confirmed=false returns the counts, polarity_reconciliation (matched pairs, unmatched positive
+    rows with the negative rows that nearly matched, ambiguous choices, lost claims) and warnings,
+    and nothing is written; confirmed=true writes them, the not-quantified file and
+    merge-report.json into <analysis_root>/quant/lipidome, the folder to run the R script in. A file
+    in the dotplot folders that no earlier merge there recorded refuses the write.
     """
+    body: dict[str, Any] = {"contract_path": contract_path, "output_name": output_name, "confirmed": confirmed is True}
+    if reconcile_polarities is not None:
+        body["reconcile_polarities"] = reconcile_polarities is True
+    if reconciliation_rt_tolerance is not None:
+        body["reconciliation_rt_tolerance"] = reconciliation_rt_tolerance
     return _request_json(
         "POST",
         "/api/lipidomics/merge",
         host=host,
         port=port,
-        body={"contract_path": contract_path, "output_name": output_name, "confirmed": confirmed is True},
+        body=body,
         timeout=300,
     )
 

@@ -207,11 +207,23 @@ adduct each polarity keeps). Five MCP tools take it from the folders to
    never looked up by name. Every quantified cell is then recomputed from the
    Height matrix the same call wrote. A Console without `--peak-ids-only` is
    refused; one rebuilt since the contract is said, and its build recorded.
-5. `msdial_lipidomics_merge` writes `lipid_metabolome.csv` as the laboratory's
-   own program wrote it (comma separated, CRLF), with the selected rows that have
-   no valid concentration in `lipid_metabolome_not_quantified.csv` and a
+5. `msdial_lipidomics_merge` writes what the laboratory's own program
+   (metaboservice) wrote, into `<root>/quant/lipidome`, the folder the
+   laboratory's `metabolomics_service.R` is run in: `lipid_metabolome.csv`,
+   `lipid_metabolome4stat.csv`, `lipid_metabolome4classsummary.csv`,
+   `lipid_metabolome4summaryplot.csv` (over the Sample and QC columns, never a
+   Blank) and the `Summary_Dotplots`, `category_*` and `subclass_*` folders;
+   ASCII, CRLF, comma separated and unquoted, rows in the order .NET sorted them
+   on Windows, numbers as .NET Framework printed them. Before sheet 3 selects,
+   the laboratory's positive/negative reconciliation renames a negative PG row
+   that positive mode annotates as BMP, and a negative PE O- row that positive
+   mode annotates as PE P- (same name after the class substitution, within
+   0.1 min); the report lists every pair, every positive row left unmatched and
+   every tie. Selected rows with no valid concentration go to
+   `lipid_metabolome_not_quantified.csv`, and everything is reported in
    `merge-report.json`. It never writes over its own side file or report, or a
-   file normalize wrote.
+   file normalize wrote, and replaces only the dotplot files its last merge
+   wrote.
 
 Outside a contract, LC-MS lipidomics with the laboratory's own libraries is the
 same profile: the salt, the LBM2 (an `.lbm2` with content), the annotation RT
@@ -594,8 +606,9 @@ Core MCP tools:
   explicit confirmation
 - `msdial_lipidomics_resolve_standards` (read-only) / `msdial_lipidomics_normalize` /
   `msdial_lipidomics_merge`: find the internal standards in each run, normalize with
-  `--peak-ids-only` and verify every cell, and write `lipid_metabolome.csv`; normalize
-  and merge preview by default and act only with `confirmed=true`
+  `--peak-ids-only` and verify every cell, and write `lipid_metabolome.csv` with the
+  tables and dotplot folders the laboratory's R script reads; normalize and merge
+  preview by default and act only with `confirmed=true`
 - `msdial_interactive_create_handoff`: create `datamining-handoff.json`
 - `msdial_inspect_repository_metadata`: inspect public sample metadata and publication provenance
 - `msdial_project_repository_classes`: project a user-selected metadata hierarchy into MS-DIAL `Class`

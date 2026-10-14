@@ -2026,13 +2026,21 @@ class Handler(BaseHTTPRequestHandler):
                     str(body.get("contract_path") or ""),
                     str(body.get("output_name") or "lipid_metabolome.csv"),
                     write=confirmed,
+                    # Absent follows the contract (on, 0.1 min); only a literal false turns it off.
+                    reconcile_polarities=(
+                        None if body.get("reconcile_polarities") is None else body.get("reconcile_polarities") is not False
+                    ),
+                    reconciliation_rt_tolerance=body.get("reconciliation_rt_tolerance"),
                 )
                 self._json(
                     {
                         "written": confirmed,
                         **({} if confirmed else {
                             "confirmation_required": True,
-                            "message": "Show the person the counts, then call again with confirmed=true to write.",
+                            "message": (
+                                "Show the person the counts, the reconciliation and the warnings, then call again "
+                                "with confirmed=true to write."
+                            ),
                         }),
                         "report": report,
                     }

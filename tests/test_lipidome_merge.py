@@ -346,9 +346,13 @@ class LaboratoryMergeTests(unittest.TestCase):
         self.assertNotIn(b"\n", data.replace(b"\r\n", b""))
         self.assertTrue(data.startswith(b","))
 
-    def test_a_cell_holding_a_comma_is_quoted(self) -> None:
-        _, data = self.merge([_identified(1, "PC 34:1", "[M+H]+", "PC", comment="checked, kept")], [])
-        self.assertIn(b'"checked, kept"', data)
+    def test_a_cell_holding_a_comma_is_written_unquoted_as_the_program_did_and_said(self) -> None:
+        # metaboservice joined cells with ',' and never quoted; such a row has an extra column.
+        result, data = self.merge([_identified(1, "PC 34:1", "[M+H]+", "PC", comment="checked, kept")], [])
+        self.assertIn(b",checked, kept,", data)
+        self.assertNotIn(b'"', data)
+        self.assertEqual("none", result["format"]["quoting"])
+        self.assertTrue(any("inside a cell (1)" in item and "unquoted" in item for item in result["warnings"]))
 
     def test_rows_are_ordered_the_way_dotnet_compares_names(self) -> None:
         names = ["BRSE", "BileAcid", "CAR", "CerP", "Cer_NS"]

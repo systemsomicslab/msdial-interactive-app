@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from lab_batch_fixture import ALIGNMENT, UNIT, Batch, capabilities_patches, guided_answers, normalize_outputs, write_run
+from lab_export_fixture import LBM
 from xlsx_fixture import NEGATIVE_LIBRARY, POSITIVE_LIBRARY
 
 _CONFIG = tempfile.TemporaryDirectory()
@@ -96,6 +97,20 @@ class CheckingTheInputs(_Batch):
         )
         self.assertTrue(result["paired_sample_table"]["matched"])
         self.assertEqual(64, len(result["check_digest"]))
+
+    def test_a_sheet_three_that_contradicts_the_merges_reconciliation_is_said_and_not_changed(self) -> None:
+        # The fixture's sheet 3 takes EtherPE from both polarities and selects no BMP: both are the person's to change.
+        before = self.batch.workbook.read_bytes()
+        result = public_check(check_inputs(self.batch.request()))
+        selection = result["merge_selection_warnings"]
+        self.assertEqual(2, len(selection))
+        self.assertIn("does not select BMP [M-H]-", selection[0])
+        self.assertIn("in neither BMP nor PG", selection[0])
+        self.assertIn("selects EtherPE [M+H]+ in positive mode", selection[1])
+        self.assertTrue(set(selection) <= set(result["warnings"]))
+        self.assertEqual([], result["blockers"])
+        self.assertEqual(0.1, result["stated_defaults"]["merge_method"]["polarity_reconciliation"]["rt_tolerance_min"])
+        self.assertEqual(before, self.batch.workbook.read_bytes())
 
     def test_the_folders_must_be_two_and_each_its_own_polarity(self) -> None:
         same = public_check(check_inputs(self.batch.request(neg_path=str(self.batch.pos))))
@@ -548,9 +563,10 @@ class FromTheRunToTheLipidome(_Batch):
     def test_the_merge_previews_then_writes_the_lipidome(self) -> None:
         self.normalize("Positive", accept_searched=["Cer 18:1;O2/15:0(d7)"])
         self.normalize("Negative")
-        quant = self.batch.analysis / "quant"
+        # The merge's own folder: R reads every subfolder of the folder it runs in, and quant holds pos and neg.
+        quant = self.batch.analysis / "quant" / "lipidome"
         preview = merge_lipidome(self.contract)
-        self.assertFalse((quant / "lipid_metabolome.csv").exists())
+        self.assertFalse(quant.exists())
         self.assertFalse(preview["written"])
         written = merge_lipidome(self.contract, write=True)
         self.assertEqual(preview["output_sha256"], written["output_sha256"])
@@ -560,7 +576,14 @@ class FromTheRunToTheLipidome(_Batch):
         self.assertIn(b"\r\n", text)
         self.assertNotIn(b"(d7)", text)
         self.assertTrue((quant / "lipid_metabolome_not_quantified.csv").is_file())
+        for name in ("lipid_metabolome4stat.csv", "lipid_metabolome4classsummary.csv", "lipid_metabolome4summaryplot.csv"):
+            self.assertTrue((quant / name).is_file(), name)
+        # The samples and QCs, never the blank: S1 and S2 here.
+        self.assertEqual(["SPF_1", "GF_2"], [item["name"] for item in written["samples"]["taken"]])
+        self.assertTrue((quant / "Summary_Dotplots").is_dir())
+        self.assertNotIn("manifest", written["outputs"]["dotplots"])
         report = json.loads((quant / "merge-report.json").read_text(encoding="utf-8"))
+        self.assertEqual(written["outputs"]["dotplots"]["files"], len(report["outputs"]["dotplots"]["manifest"]))
         # What the merge step adds is in the file too, the build that normalized each polarity included.
         self.assertEqual(UNIT, report["unit"])
         self.assertEqual({"Positive", "Negative"}, set(report["verification"]))
@@ -606,7 +629,63 @@ class FromTheRunToTheLipidome(_Batch):
         with self.assertRaises(LabContractError) as raised:
             merge_lipidome(self.contract)
         self.assertIn("did not complete as planned", str(raised.exception))
-        self.assertFalse((self.batch.analysis / "quant" / "lipid_metabolome.csv").exists())
+        self.assertFalse((self.batch.analysis / "quant" / "lipidome" / "lipid_metabolome.csv").exists())
+
+    def test_the_merge_reconciles_the_polarities_as_the_contract_states_and_records_it(self) -> None:
+        # A plasmenyl PE that positive mode names PE P-34:1 and negative mode names PE O-34:2.
+        extra = {
+            "Positive": [dict(alignment_id=20, mz=702.5436, rt=10.00, name="PE P-34:1", adduct="[M+H]+",
+                              ontology="EtherPE", method=LBM, cells=[5000, 4000, 0])],
+            "Negative": [dict(alignment_id=120, mz=700.5291, rt=10.04, name="PE O-34:2", adduct="[M-H]-",
+                              ontology="EtherPE", method=LBM, cells=[6000, 5000, 0])],
+        }
+        self.runs = {polarity: write_run(self.batch, self.contract, polarity, extra_spots=extra[polarity])
+                     for polarity in ("Positive", "Negative")}
+        for polarity, accepted in (("Positive", ["Cer 18:1;O2/15:0(d7)"]), ("Negative", [])):
+            plan = self.plan(polarity, accept_searched=accepted)
+            write_normalize_inputs(plan)
+            _, _, report = normalize_outputs(public_normalize_plan(plan), polarity, extra_spots=extra[polarity])
+            self.assertTrue(finish_normalize(plan, 0, report.splitlines())["completed"])
+        contract = load_contract(self.contract)
+        self.assertEqual((True, 0.1), (contract["merge"]["polarity_reconciliation"]["enabled"],
+                                       contract["merge"]["polarity_reconciliation"]["rt_tolerance_min"]))
+        self.assertEqual(["Sample", "QC"], contract["merge"]["sample_file_types"])
+
+        preview = merge_lipidome(self.contract)
+        reconciliation = preview["polarity_reconciliation"]
+        self.assertEqual(1, reconciliation["counts"]["EtherPE"]["matched"])
+        self.assertEqual(("20", "120", "PE P-34:1"), (
+            reconciliation["matched"][0]["positive"]["alignment_id"], reconciliation["matched"][0]["negative"]["alignment_id"],
+            reconciliation["matched"][0]["renamed_to"]["name"]))
+        self.assertEqual([], reconciliation["deviations_from_contract"])
+        # The fixture's sheet 3 still takes EtherPE from positive mode too, which the merge says.
+        self.assertTrue(any("selects EtherPE [M+H]+ in positive mode" in item for item in preview["warnings"]))
+        self.assertEqual("EtherPE", reconciliation["normalized_as"]["EtherPE"]["normalized_as"])
+
+        off = merge_lipidome(self.contract, write=True, reconcile_polarities=False)
+        self.assertFalse(off["polarity_reconciliation"]["enabled"])
+        self.assertEqual(["the positive/negative reconciliation is off; the contract says on"],
+                         off["polarity_reconciliation"]["deviations_from_contract"])
+        folder = self.batch.analysis / "quant" / "lipidome"
+        self.assertIn(b",PE O-34:2,", (folder / "lipid_metabolome.csv").read_bytes())
+        # Merged again as the contract says: the earlier merge's dotplot files are replaced, not left for R.
+        on = merge_lipidome(self.contract, write=True)
+        self.assertEqual(1, on["outputs"]["dotplots"]["replaced_files_of_earlier_merge"])
+        self.assertFalse((folder / "subclass_EtherPE" / "PE O-34_2_120.csv").exists())
+        self.assertTrue((folder / "subclass_EtherPE" / "PE P-34_1_120.csv").is_file())
+        merged = [json.loads(line) for line in (self.batch.analysis / "inputs" / "lab-lipidomics-record.jsonl")
+                  .read_text(encoding="utf-8").splitlines() if json.loads(line)["event"] == "merged"]
+        self.assertEqual([False, True], [item["polarity_reconciliation"]["enabled"] for item in merged])
+        self.assertEqual(1, merged[-1]["polarity_reconciliation"]["counts"]["EtherPE"]["matched"])
+        self.assertEqual({"kept": 1, "not_quantified": 0, "not_selected": 0}, merged[-1]["polarity_reconciliation"]["renamed_rows"])
+        self.assertEqual(["Sample", "QC"], merged[-1]["sample_file_types"])
+        self.assertIn("lipid_metabolome4stat.csv", merged[-1]["tables"])
+        for tolerance in (0, -0.1, float("nan"), True):
+            with self.subTest(tolerance=tolerance), self.assertRaises(LabContractError):
+                merge_lipidome(self.contract, reconciliation_rt_tolerance=tolerance)
+        wider = merge_lipidome(self.contract, reconciliation_rt_tolerance=0.2)
+        self.assertEqual(["the reconciliation RT tolerance is 0.2 min; the contract says 0.1"],
+                         wider["polarity_reconciliation"]["deviations_from_contract"])
 
     def test_the_merge_refuses_a_contract_or_a_candidate_table_changed_since_normalize(self) -> None:
         self.normalize("Positive", accept_searched=["Cer 18:1;O2/15:0(d7)"])
@@ -850,7 +929,7 @@ class TheNormalizeJob(_Batch):
             write_normalize_inputs(plan)
             _, _, report = normalize_outputs(public_normalize_plan(plan), polarity)
             self.assertTrue(finish_normalize(plan, 0, report.splitlines())["completed"])
-        output = self.batch.analysis / "quant" / "lipid_metabolome.csv"
+        output = self.batch.analysis / "quant" / "lipidome" / "lipid_metabolome.csv"
         for body in ({"contract_path": self.contract}, {"contract_path": self.contract, "confirmed": "true"}):
             status, preview = self.post("/api/lipidomics/merge", body)
             self.assertEqual(200, status, preview)
