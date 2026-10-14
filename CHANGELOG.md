@@ -4,6 +4,68 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.39] - Unreleased
+
+### Fixed
+- A declared analysis input that is an archive inside the download is matched
+  by what it held. MB-POST MPST000213 (unit `334ab3e2f0e7600f4290`) failed its
+  lease three times in the MB-POST preflight campaign of 2026-10-14: "3 of its 3
+  declared analysis inputs are not in the download:
+  Rubroshorea_leprosula_from_Borneo_ID_01.zip, ...". Its one download object is
+  the project tar, and the Catalog declares, for each sample row, the per-sample
+  zip inside it (kind `file`). The extract stage expands every archive inside a
+  download in place (`archives._expand_nested`, with the outer archive's listing
+  validation, member, byte and depth budget, digests and member listing), so the
+  declared zip was no longer on disk, and only a path equal to it was looked for.
+  - The place a nested archive expanded to is read from its extraction record's
+    destination rule (`nested_rooted`, `nested_directory`, `container_*`,
+    `stream_file`), so a download-store record made by an earlier version
+    answers too. `declared_archive_containers` returns that place, and every
+    input under it is that declared input's (`match_declared_inputs`). The
+    lease, the one encoding rule, the convert stage, the analysis-CSV builder
+    and a split part ask the same function, so they answer alike.
+  - What one declared archive held is one sample's. The one encoding rule
+    (2026-10-09) uses one of its encodings and records the others, which no
+    longer count as the declared input found twice. Two runs in one declared
+    zip are still refused as one declared input found more than once ("2 inputs
+    in what the archive held"), as one input per sample requires.
+  - An mzXML inside a declared archive is converted in a campaign, as a
+    declared mzXML is.
+  - A declared per-sample archive the unit downloads itself, which expands at
+    the data root with its own paths, is matched through the sample the
+    archive's name gives its files, as an archived container already was.
+  - A declared archive whose contents hold nothing MS-DIAL opens is still
+    missing, and the error now says what it held: for MPST000213, "3 of them
+    were archives inside MPST000213.tar that the extract stage expanded, and
+    none of the files they held is one MS-DIAL opens
+    (Rubroshorea_leprosula_from_Borneo_ID_01.zip: 1028 file(s) under
+    MB-POST_files_MPST000213.0/Rubroshorea_leprosula_from_Borneo_ID_01, ...)",
+    with the commonest suffixes when the tree is on disk.
+
+### Added
+- `manifest.declared_archive_inputs`, only where a declared input was such an
+  archive: for each, the declared path and sample; the archive's path under the
+  data root, the archive it was in, its depth, format and destination rule;
+  where it expanded (`expanded_to`), its file count and bytes; its sha256 and
+  md5 from before it expanded and whether the declared checksum matched them;
+  and the inputs it gave (an mzML the convert stage wrote is named by the mzXML
+  it stands for). Its nested extraction record names the declared input
+  (`declared_input`), and the attribute stage counts them
+  (`declared_archive_inputs`).
+
+### Not changed
+- What is extracted, and how: `archives.py`, the extraction records and the
+  member listing are as they were. An unsafe member name in an inner zip still
+  refuses the whole extraction, and its members still count against the one
+  member budget.
+- MPST000213 itself does not become runnable. Each of its zips holds a JEOL
+  msAxel project (`Data/<run>/RD/MsData.RPS`, `MS/<n>/Profile.dfa`, ...) of
+  several acquisitions (5, 10 and 4 sample runs, with PEG calibration runs and,
+  in ID_01, a reference run), which no RawDataHandler reader opens; the unit is
+  DART-TOF MS without chromatography or product-ion spectra, the Catalog
+  already blocks it for its acquisition mode, and the campaign gate's ELIG-1
+  failed it. It now fails with the error above instead of the misleading one.
+
 ## [0.5.38] - Unreleased
 
 ### Changes a campaign run planned with this version
