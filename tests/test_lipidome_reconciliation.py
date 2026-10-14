@@ -173,6 +173,50 @@ class BmpTests(_Exports):
         self.assertEqual([0.05, 0.05], [item["delta_rt"] for item in report["ambiguous"][0]["candidates"]])
         self.assertEqual([20.0, 10.0], [item["mean_intensity"] for item in report["ambiguous"][0]["candidates"]])
 
+    def test_the_merge_breaks_a_tie_on_the_sample_and_qc_columns_never_the_blank(self) -> None:
+        # Equally close, and counting the Blank would make 20 the more intense: the merge's own
+        # value columns (Sample and QC) must choose 21.
+        report, output = self.merge(
+            [lipid(10, "BMP 36:2", "[M+NH4]+", "BMP", 8.30)],
+            [lipid(20, "PG 36:2", "[M-H]-", "PG", 8.35, cells=(10, 10, 10, 99999)),
+             lipid(21, "PG 36:2", "[M-H]-", "PG", 8.25, cells=(20, 20, 20, 0))],
+        )
+        ambiguous = report["polarity_reconciliation"]["ambiguous"][0]
+        self.assertEqual("21", ambiguous["chosen_alignment_id"])
+        self.assertEqual([("21", 20.0), ("20", 10.0)],
+                         [(item["alignment_id"], item["mean_intensity"]) for item in ambiguous["candidates"]])
+        rows = [line.split(",") for line in output.read_bytes().decode("ascii").split("\r\n")[5:] if line]
+        self.assertEqual([("21", "BMP 36:2", "BMP"), ("20", "PG 36:2", "PG")], [(row[0], row[3], row[11]) for row in rows])
+
+    def test_a_positive_bmp_whose_name_has_no_bmp_token_is_not_converted_and_not_counted_as_unmatched(self) -> None:
+        _, report, _ = self.reconcile(
+            [lipid(10, "Bis(monoacylglycero)phosphate 36:2", "[M+NH4]+", "BMP", 8.30),
+             lipid(11, "BMP 34:1", "[M+NH4]+", "BMP", 8.00)],
+            [lipid(20, "PG 36:2", "[M-H]-", "PG", 8.30)],
+        )
+        counts = report["counts"]["BMP"]
+        self.assertEqual((1, 0, 1, 1), (counts["positive_rows"], counts["matched"], counts["unmatched"],
+                                        counts["positive_rows_not_converted"]))
+        self.assertEqual(["11"], [item["positive"]["alignment_id"] for item in report["unmatched"]])
+        self.assertEqual([("BMP", "10", "its name has no BMP class token to read as PG")],
+                         [(item["rule"], item["positive"]["alignment_id"], item["reason"]) for item in report["not_converted"]])
+        # For every rule: positive_rows = matched + unmatched + lost_claims, and the not_converted list is its count.
+        for rule, item in report["counts"].items():
+            with self.subTest(rule=rule):
+                self.assertEqual(item["positive_rows"], item["matched"] + item["unmatched"] + item["lost_claims"])
+                self.assertEqual(item["unmatched"], sum(1 for entry in report["unmatched"] if entry["rule"] == rule))
+                self.assertEqual(item["positive_rows_not_converted"],
+                                 sum(1 for entry in report["not_converted"] if entry["rule"] == rule))
+
+    def test_names_and_ontologies_are_compared_as_written(self) -> None:
+        # Exact means exact: a negative name with a trailing space, or an Ontology 'PG ', is no candidate.
+        rows, report, columns = self.reconcile(
+            [lipid(10, "BMP 36:2", "[M+NH4]+", "BMP", 8.30), lipid(11, "BMP 34:1", "[M+NH4]+", "BMP", 8.00)],
+            [lipid(20, "PG 36:2 ", "[M-H]-", "PG", 8.30), lipid(21, "PG 34:1", "[M-H]-", "PG ", 8.00)],
+        )
+        self.assertEqual(["PG", "PG "], [row[columns["ontology"]] for row in rows])
+        self.assertEqual((0, 2), (report["counts"]["BMP"]["matched"], report["counts"]["BMP"]["unmatched"]))
+
     def test_two_positive_rows_claiming_one_negative_row_the_closer_wins_and_the_other_is_reported(self) -> None:
         # The same BMP seen as two adducts names the same negative row twice.
         rows, report, columns = self.reconcile(
@@ -216,8 +260,9 @@ class EtherPeTests(_Exports):
         self.assertIn("Renamed from PE O-34:2 to PE P-34:1 by the positive-mode plasmenyl annotation PE P-34:1 "
                       "(positive alignment ID 11; delta RT 0.020 min)", rows[1][columns["comment"]])
         counts = report["counts"]["EtherPE"]
-        # The positive PE O- (a plasmanyl positive mode itself names) is no evidence for a rename.
+        # The positive PE O- (a plasmanyl positive mode itself names) is no evidence for a rename, and is listed.
         self.assertEqual((2, 2, 1), (counts["positive_rows"], counts["matched"], counts["positive_rows_not_converted"]))
+        self.assertEqual([("EtherPE", "12")], [(item["rule"], item["positive"]["alignment_id"]) for item in report["not_converted"]])
 
     def test_a_chain_composition_that_differs_is_not_matched_even_at_the_same_sum(self) -> None:
         rows, report, columns = self.reconcile(

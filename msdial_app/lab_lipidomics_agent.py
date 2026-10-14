@@ -1809,8 +1809,9 @@ def lab_merge_method() -> dict[str, Any]:
         "sample_file_types": list(SAMPLE_FILE_TYPES),
         "polarity_reconciliation": reconciliation_parameters(True, DEFAULT_RECONCILIATION_RT_TOLERANCE),
         "outputs": (
-            f"<quant>/{MERGE_FOLDER}: lipid_metabolome.csv and, named after it, lipid_metabolome4stat.csv, "
-            "lipid_metabolome4classsummary.csv and lipid_metabolome4summaryplot.csv; the Summary_Dotplots, "
+            f"<quant>/{MERGE_FOLDER}: lipid_metabolome.csv (or output_name) and, under these names whatever it is "
+            "called, lipid_metabolome4stat.csv, lipid_metabolome4classsummary.csv and lipid_metabolome4summaryplot.csv; "
+            "the Summary_Dotplots, "
             f"category_<category> and subclass_<ontology> folders; {NOT_QUANTIFIED_NAME} and {MERGE_REPORT_NAME}"
         ),
     }
@@ -1830,24 +1831,30 @@ def merge_lipidome(
     record names. Rows that failed verification go to the not-quantified file with the NOT QUANTIFIED
     ones. Before sheet 3 selects, the negative rows positive mode identifies as BMP or PE P- are
     renamed (the contract's merge method: on, 0.1 min); reconcile_polarities=False or another
-    reconciliation_rt_tolerance is applied and recorded as a deviation from the contract. Everything is
-    written into <quant>/lipidome, the folder metabolomics_service.R is run in.
+    reconciliation_rt_tolerance is applied and recorded as a deviation from the contract;
+    reconcile_polarities is true, false or None (the contract), never another value. Everything is
+    written into <quant>/lipidome, the folder metabolomics_service.R is run in; output_name names the
+    lipidome only, and the three tables keep metaboservice's names, which the R script reads.
     """
     contract = load_contract(contract_path)
     name = str(output_name or "").strip()
     if not name or Path(name).name != name or Path(name).suffix.casefold() not in {".csv", ".txt", ".tsv"}:
         raise LabContractError("output_name is a file name ending in .csv, .tsv or .txt, without a folder.")
     folded = name.casefold()
-    if folded in {NOT_QUANTIFIED_NAME.casefold(), MERGE_REPORT_NAME.casefold()} or folded.startswith(QUANT_FILE_PREFIXES):
+    tables = {table.casefold() for table in companion_names().values()}
+    if folded in {NOT_QUANTIFIED_NAME.casefold(), MERGE_REPORT_NAME.casefold(), *tables} or folded.startswith(QUANT_FILE_PREFIXES):
         # The merge writes its side file and report beside the lipidome, and normalize's records bind
         # its matrices by sha256: a name of theirs is refused wherever the lipidome is written.
         raise LabContractError(
             f"output_name {name} is a file the merge or normalize writes under {contract['quant_folder']}; choose another name."
         )
+    if reconcile_polarities is not None and not isinstance(reconcile_polarities, bool):
+        # A JSON "false" is text, and text is no answer: neither on nor off is assumed from it.
+        raise LabContractError(f"reconcile_polarities is true or false, not {reconcile_polarities!r}.")
     stated = (contract.get("merge") or {}).get("polarity_reconciliation") or {}
     contract_reconcile = stated.get("enabled", True) is not False
     contract_tolerance = float(stated.get("rt_tolerance_min", DEFAULT_RECONCILIATION_RT_TOLERANCE))
-    reconcile = contract_reconcile if reconcile_polarities is None else reconcile_polarities is True
+    reconcile = contract_reconcile if reconcile_polarities is None else reconcile_polarities
     tolerance = contract_tolerance if reconciliation_rt_tolerance is None else reconciliation_rt_tolerance
     if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or not math.isfinite(tolerance) or tolerance <= 0:
         raise LabContractError(
@@ -1889,12 +1896,13 @@ def merge_lipidome(
         records[polarity] = record
     workbook = read_quant_workbook(contract["inputs"]["quant_table"]["path"], contract["amount_column"])
     labels = {POSITIVE: "positive", NEGATIVE: "negative"}
-    # The dotplot files the last merge here wrote, which this one may replace.
+    # The dotplot files the last merge here wrote, which this one may replace, and its lipidome.
     try:
         previous = json.loads((folder / MERGE_REPORT_NAME).read_text(encoding="utf-8"))
         replaceable = dict(((previous.get("outputs") or {}).get("dotplots") or {}).get("manifest") or {})
+        previous_output = Path(str(previous.get("output") or ""))
     except (OSError, ValueError, AttributeError, TypeError):
-        replaceable = {}
+        replaceable, previous_output = {}, None
     try:
         report = merge_pos_neg(
             records[POSITIVE]["outputs"]["normalized_copy"], records[NEGATIVE]["outputs"]["normalized_copy"],
@@ -1920,6 +1928,14 @@ def merge_lipidome(
         )
     except MergeRefused as error:
         raise LabContractError(str(error)) from None
+    if (previous_output is not None and previous_output.name and previous_output.name.casefold() != name.casefold()
+            and (folder / previous_output.name).is_file()):
+        # The three tables and the dotplots are rewritten under their own names; a lipidome named otherwise is not.
+        report["warnings"].append(
+            f"{previous_output.name}, the lipidome the earlier merge here wrote, stays beside this merge's {name}; the "
+            "statistics tables and the dotplot folders are this merge's. Say which lipidome is current, or move the "
+            "other out of the folder."
+        )
     reconciliation = report["polarity_reconciliation"]
     reconciliation["deviations_from_contract"] = deviations
     report["warnings"].extend(f"Not as the contract states: {item}." for item in deviations)
@@ -1956,7 +1972,7 @@ def merge_lipidome(
             "event": "merged", "output": report["output"], "output_sha256": report["output_sha256"],
             "output_folder": report["output_folder"],
             "tables": {
-                Path(outputs[key]["path"]).name: outputs[key]["sha256"] for key in companion_names(name)
+                Path(outputs[key]["path"]).name: outputs[key]["sha256"] for key in companion_names()
             },
             "dotplot_files": outputs["dotplots"]["files"],
             "kept_rows": report["kept_rows"], "not_quantified_rows": report["not_quantified"]["rows"],

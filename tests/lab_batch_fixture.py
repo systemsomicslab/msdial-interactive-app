@@ -22,6 +22,10 @@ from msdial_app.workflow import (
 )
 
 STEMS = [("S1", "Sample"), ("S2", "Sample"), ("Blank", "Blank")]
+# The same batch with a QC injected between the samples and the blank. A spot's cells are given for
+# S1, S2 and Blank; the QC's is the mean of S1 and S2 (_expand).
+STEMS_WITH_QC = [("S1", "Sample"), ("S2", "Sample"), ("QC1", "QC"), ("Blank", "Blank")]
+CLASSES = {"S1": "SPF", "S2": "GF", "QC1": "QC", "Blank": "Blank"}
 EVERY_CAPABILITY = {
     "capability_probe": "test",
     "capabilities": sorted({
@@ -49,14 +53,15 @@ def capabilities_patches(found: dict[str, Any] | None = None) -> ExitStack:
 
 
 class Batch:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, stems: list[tuple[str, str]] = STEMS) -> None:
         self.root = root
+        self.stems = list(stems)
         data = root / "data"
         self.pos = data / "pos"
         self.neg = data / "neg"
         for folder, label in ((self.pos, "Pos"), (self.neg, "Neg")):
             folder.mkdir(parents=True)
-            for stem, _ in STEMS:
+            for stem, _ in self.stems:
                 (folder / f"{stem}_{label}.mzML").write_text("", encoding="ascii")
         self.is_pos = data / "20200121_MsdialTxtDB_Pos_EquiSPLASH.txt"
         self.is_neg = data / "20200121_MsdialTxtDB_Neg_EquiSPLASH.txt"
@@ -90,8 +95,8 @@ class Batch:
         written = lab_lipidomics_agent.write_contract({
             **self.request(**extra), "check_digest": check["check_digest"], "sample_table_confirmed": True,
             "sample_table": [
-                {"stem": "S1", "class_id": "SPF"}, {"stem": "S2", "class_id": "GF"},
-                {"stem": "Blank", "class_id": "Blank", "file_type": "Blank"},
+                {"stem": stem, "class_id": CLASSES[stem], **({} if kind == "Sample" else {"file_type": kind})}
+                for stem, kind in self.stems
             ],
             "confirmed_by": "the analyst", "confirmed": True,
         })
@@ -138,12 +143,17 @@ NEGATIVE_SPOTS = [
          method=LBM, cells=[2000, 2100, 0]),
 ]
 VS2 = {"PC": "PC", "LPC": "LPC", "CE": "CE", "HexCer_NS": "HexCer-NS", "Cer_NS": "Cer-NS", "FA": "FA",
-       "AHexCS": "AHexCS"}
+       "AHexCS": "AHexCS", "PG": "PG", "BMP": "BMP"}
 
 
-def _samples(label: str) -> list[tuple[str, str, str]]:
-    classes = {"S1": "SPF", "S2": "GF", "Blank": "Blank"}
-    return [(f"{stem}_{label}", classes[stem], kind) for stem, kind in STEMS]
+def _samples(label: str, stems: list[tuple[str, str]] = STEMS) -> list[tuple[str, str, str]]:
+    return [(f"{stem}_{label}", CLASSES[stem], kind) for stem, kind in stems]
+
+
+def _expand(cells: list[Any], stems: list[tuple[str, str]]) -> list[Any]:
+    """A spot's S1, S2 and Blank cells for these stems: a QC's is the mean of S1 and S2."""
+    given = dict(zip((stem for stem, _ in STEMS), cells))
+    return [given[stem] if stem in given else (given["S1"] + given["S2"]) // 2 for stem, _ in stems]
 
 
 def guided_answers(contract_path: str, polarity: str) -> str:
@@ -155,8 +165,11 @@ def guided_answers(contract_path: str, polarity: str) -> str:
     })
 
 
-def run_spots(polarity: str, extra: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    return (POSITIVE_SPOTS if polarity == "Positive" else NEGATIVE_SPOTS) + list(extra or [])
+def run_spots(
+    polarity: str, extra: list[dict[str, Any]] | None = None, stems: list[tuple[str, str]] = STEMS
+) -> list[dict[str, Any]]:
+    spots = (POSITIVE_SPOTS if polarity == "Positive" else NEGATIVE_SPOTS) + list(extra or [])
+    return [{**item, "cells": _expand(item["cells"], stems)} for item in spots]
 
 
 def write_run(
@@ -167,10 +180,10 @@ def write_run(
     label = "Pos" if polarity == "Positive" else "Neg"
     output = batch.analysis / label.lower()
     output.mkdir(parents=True, exist_ok=True)
-    spots = run_spots(polarity, extra_spots)
+    spots = run_spots(polarity, extra_spots, batch.stems)
     height = write_export(
         output / f"{ALIGNMENT}_Height.txt",
-        [spot(**{**item, "unit": "Height"}) for item in spots], _samples(label),
+        [spot(**{**item, "unit": "Height"}) for item in spots], _samples(label, batch.stems),
     )
     rows = []
     for item in spots:
@@ -196,6 +209,7 @@ def write_run(
 def normalize_outputs(
     plan: dict[str, Any], polarity: str, *, wrong_cell: int | None = None, stored_names: dict[int, str] | None = None,
     extra_spots: list[dict[str, Any]] | None = None, factors: dict[str, float] | None = None,
+    stems: list[tuple[str, str]] = STEMS,
 ) -> tuple[str, str, str]:
     """What MSDIALCUI normalize writes for this plan's table, and the report it prints.
 
@@ -207,8 +221,8 @@ def normalize_outputs(
     plan's prediction; stored_names gives a spot another stored name than its export name.
     """
     label = "Pos" if polarity == "Positive" else "Neg"
-    spots = run_spots(polarity, extra_spots)
-    multipliers = [float((factors or {}).get(name, 1.0)) for name, _, _ in _samples(label)]
+    spots = run_spots(polarity, extra_spots, stems)
+    multipliers = [float((factors or {}).get(name, 1.0)) for name, _, _ in _samples(label, stems)]
     rows = plan["standards_table"]
     own = {}
     for row in rows:
@@ -231,7 +245,7 @@ def normalize_outputs(
         if standard["PeakID"] < 0:
             comment = (f"NOT QUANTIFIED: the {standard['TargetClass']} standard {standard['StandardName']} did not "
                        "resolve in this alignment")
-            normalized.append(spot(**{**entry, "comment": comment, "cells": ["", "", ""]}))
+            normalized.append(spot(**{**entry, "comment": comment, "cells": [""] * len(multipliers)}))
             continue
         base = by_id[standard["PeakID"]]["cells"]
         amount = float(standard["Concentration"])
@@ -269,7 +283,7 @@ def normalize_outputs(
     report.append(f"Dilution factor applied: {'-d' in plan['command']}")
     folder = Path(plan["paths"]["output_folder"])
     height_path = write_export(folder / f"{ALIGNMENT}_Height.txt",
-                               [spot(**{**item, "unit": "Height"}) for item in spots], _samples(label))
-    normalized_path = write_export(folder / f"{ALIGNMENT}_NormalizedHeight.txt", normalized, _samples(label))
+                               [spot(**{**item, "unit": "Height"}) for item in spots], _samples(label, stems))
+    normalized_path = write_export(folder / f"{ALIGNMENT}_NormalizedHeight.txt", normalized, _samples(label, stems))
     report.extend([str(height_path), str(normalized_path)])
     return str(height_path), str(normalized_path), "\n".join(report)

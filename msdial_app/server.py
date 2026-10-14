@@ -2026,10 +2026,9 @@ class Handler(BaseHTTPRequestHandler):
                     str(body.get("contract_path") or ""),
                     str(body.get("output_name") or "lipid_metabolome.csv"),
                     write=confirmed,
-                    # Absent follows the contract (on, 0.1 min); only a literal false turns it off.
-                    reconcile_polarities=(
-                        None if body.get("reconcile_polarities") is None else body.get("reconcile_polarities") is not False
-                    ),
+                    # Absent follows the contract (on, 0.1 min); true or false is applied; anything else
+                    # (the text "false", say) is refused rather than read as either.
+                    reconcile_polarities=body.get("reconcile_polarities"),
                     reconciliation_rt_tolerance=body.get("reconciliation_rt_tolerance"),
                 )
                 self._json(

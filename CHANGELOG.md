@@ -229,13 +229,16 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     normalized as PG; a difference from sheet 2's BMP standard is warned about).
     `reconcile_polarities` and `reconciliation_rt_tolerance` follow the
     contract unless given; another value is applied, warned about and recorded
-    as a deviation. The record's `merged` event keeps the four tables' sha256,
-    the dotplot count, the sample file types and the reconciliation's
-    parameters and counts. The tool returns the report without the per-file
+    as a deviation. `reconcile_polarities` is true or false; anything else (the
+    text `"false"`) is refused, where the endpoint read it as on. The record's
+    `merged` event keeps the four tables' sha256, the dotplot count, the sample
+    file types and the reconciliation's parameters and counts. The tool returns the report without the per-file
     dotplot manifest, which stays in `merge-report.json`. It refuses a polarity
     not normalized under this contract, not completed as planned, or whose
     matrix or candidate table changed since, and an `output_name` that would
-    write over its own side file or report or a file normalize wrote.
+    write over its own side file or report, one of the three statistics
+    tables, or a file normalize wrote. A lipidome an earlier merge wrote there
+    under another name, which stays, is warned about.
   - The contract states the merge method (`merge`: Sample and QC columns, the
     reconciliation on with 0.1 min), and `msdial_lipidomics_check_inputs` warns
     (`merge_selection_warnings`) when sheet 3 selects BMP or EtherPE in
@@ -303,20 +306,38 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   of values lying just below a 15-digit midpoint up; no rounding rule
   reproduces it). With sheet 3 of `quant_utility_table.xlsx` it keeps 394 rows
   (the same plus 22 positive EtherPE).
-  - The three tables `metabolomics_service.R` reads, named after the lipidome
-    (`<stem>4stat.csv`, `<stem>4classsummary.csv`, `<stem>4summaryplot.csv`),
-    and the `Summary_Dotplots`, `category_<category>` and `subclass_<ontology>`
+  - The three tables `metabolomics_service.R` reads, always under
+    metaboservice's names (`lipid_metabolome4stat.csv`,
+    `lipid_metabolome4classsummary.csv`, `lipid_metabolome4summaryplot.csv`)
+    whatever the lipidome is called, since the R script reads those names; a
+    lipidome may not take one of them. And the `Summary_Dotplots`,
+    `category_<category>` and `subclass_<ontology>`
     folders it reads too, with metaboservice's quirks kept: metabolite keys are
     the last `|` part of the name and the alignment ID, a lipid's dotplot file
     only within the top 41 of its class, invalid file-name characters as `_`.
   - The statistics are over the Sample and QC columns of the positive header,
     never a Blank (metaboservice's 2025 rule, the laboratory's decision; the
     2024 program took Sample only, kept as `METABOSERVICE_2024_SAMPLE_FILE_TYPES`
-    for reproducing it). Sample names are Class_Injection order.
+    for reproducing it). Sample names are Class_Injection order. The sample
+    columns end only at a Class of exactly `NA`, as metaboservice's
+    `set_metadata` ended them: a sample whose class is empty (or `Na`) is
+    taken, and an empty class is warned about. They ended at the first empty
+    class, so every later sample was dropped from the tables without a word.
+  - Rows are chosen as metaboservice's `isKeepLipid` chose them, on the cells
+    as written: untrimmed, case-sensitive and ordinal. A Comment starting with
+    a lower-case `x` sets its row aside, and one starting `X` or ` x` does not;
+    the name filters and the Ontology/Adduct match compare the cells untrimmed.
+    A text rule table selects a row only when its flag is exactly `TRUE`, with
+    Class and Adduct as written (`readReferenceFile`); `true`, `1` or `yes` no
+    longer select, and are warned about. The reconciliation compares names and
+    ontologies untrimmed too. They were trimmed, `x` ignored case, and `true`,
+    `1` and `yes` selected.
   - ASCII, CRLF after every line, no byte-order mark, comma separated and never
     quoted, as the program wrote them (a cell holding a comma is warned about:
     its row has an extra column); UTF-8 with a warning where a cell is not ASCII,
-    where the program wrote `?`.
+    where the program wrote one `?` per byte (a recorded decision: two class
+    labels of one length, such as `対照` and `処理`, would have become one class).
+    Rows keep the order those `?` gave.
   - Rows ordered by ontology and then name as .NET's default comparison ordered
     them on Windows, stably: the NLS "word sort" key, checked byte for byte
     against `LCMapStringEx` (`BileAcid` before `BRSE`, `TG 56:1|` before
@@ -344,7 +365,10 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     renamed row sheet 3 does not select, or a positive selection of either
     class, is warned about. The report lists every matched pair, every
     unmatched positive row with the same-name negative rows outside the window
-    and the other names inside it, every tie and every lost claim. On the 2024
+    and the other names inside it, every tie and every lost claim, and
+    (`not_converted`) every positive row of either class whose name names no
+    negative row: a PE O- positive mode names itself, or a BMP with no BMP
+    token, which was listed as unmatched without being counted. On the 2024
     hands-on data 7 of 14 positive PE P- rows name a negative row; 3 of the 7
     others have a negative row of the same sum and other chains.
   - A dotplot file an earlier merge recorded writing (its manifest in

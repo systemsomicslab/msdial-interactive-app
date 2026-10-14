@@ -156,8 +156,10 @@ intervals while adding a small computational cost.
    positive/negative reconciliation (BMP from a negative PG, PE P- from a
    negative PE O-, by name and within 0.1 min: `polarity_reconciliation`) and
    the warnings; `confirmed=true` writes `lipid_metabolome.csv`, the three
-   statistics tables, the dotplot folders, `lipid_metabolome_not_quantified.csv`
-   and `merge-report.json` into `<root>/quant/lipidome`.
+   statistics tables (always under metaboservice's names, which
+   `metabolomics_service.R` reads), the dotplot folders,
+   `lipid_metabolome_not_quantified.csv` and `merge-report.json` into
+   `<root>/quant/lipidome`.
    `reconcile_polarities=false` or another `reconciliation_rt_tolerance` is
    recorded as a deviation from the contract.
 8. Report the LBM2 by name and sha256, the salt, every setting, what was assumed

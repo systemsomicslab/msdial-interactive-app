@@ -72,12 +72,41 @@ class AdductRuleTests(unittest.TestCase):
             with self.assertRaisesRegex(MergeRefused, "every one is unselected"):
                 read_adduct_rules(path)
 
-    def test_a_numeric_selection_flag_is_read_the_same_way(self) -> None:
-        # The rule table is kept both as text and as a spreadsheet sheet, which writes 1/0.
+    def test_only_an_exact_true_selects_and_a_flag_that_looks_selected_is_said(self) -> None:
+        # metaboservice's readReferenceFile: field 4 exactly "TRUE", Class and Adduct as written.
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "rules.txt"
+            path.write_text(
+                "Class\tAdduct\tIon mode\tIsSelected\nPC\t[M+H]+\tPositive\ttrue\nPE\t[M-H]-\tNegative\t1\n"
+                "LPC\t[M+H]+\tPositive\tTRUE\nCAR \t[M+H]+\tPositive\tTRUE\nSM\t[M+H]+\tPositive\t TRUE\n",
+                encoding="utf-8",
+            )
+            rules = read_adduct_rules(path)
+            self.assertEqual({("LPC", "[M+H]+"), ("CAR ", "[M+H]+")}, rules["selected"])
+            self.assertEqual(1, len(rules["flag_warnings"]))
+            for part in ("3 row(s)", "line 2 PC [M+H]+ ('true')", "line 3 PE [M-H]- ('1')", "line 6 SM [M+H]+ (' TRUE')"):
+                self.assertIn(part, rules["flag_warnings"][0])
+            # The untrimmed class selects no row of an export, whose Ontology is 'CAR'.
+            keep, reason = should_keep(_row("CAR 16:0", "[M+H]+", "CAR"), rules)
+            self.assertFalse(keep)
+            self.assertEqual("CAR is not quantified as [M+H]+", reason)
             path.write_text("Class\tAdduct\tIon mode\tIsSelected\nPC\t[M+H]+\tPositive\t1\n", encoding="utf-8")
-            self.assertIn(("PC", "[M+H]+"), read_adduct_rules(path)["selected"])
+            with self.assertRaisesRegex(MergeRefused, r"every one is unselected .*line 2 PC \[M\+H\]\+ \('1'\)"):
+                read_adduct_rules(path)
+
+    def test_a_flag_that_looks_selected_reaches_the_merge_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            rules = directory / "rules.txt"
+            rules.write_text(RULES + "LPC\t[M+H]+\tPositive\tTrue\n", encoding="utf-8")
+            positive = directory / "pos.txt"
+            negative = directory / "neg.txt"
+            positive.write_text(_export([("A_Pos", "SPF")], [_row("PC 34:1", "[M+H]+", "PC", values=["1"]),
+                                                             _row("LPC 18:1", "[M+H]+", "LPC", values=["1"])]), encoding="utf-8")
+            negative.write_text(_export([("A_Neg", "SPF")], [_row("PE 34:1", "[M-H]-", "PE", values=["1"])]), encoding="utf-8")
+            report = merge_pos_neg(positive, negative, rules, directory / "out" / "lipid_metabolome.csv", reconcile=False)
+        self.assertEqual((1, 1), (report["kept_from_positive"], report["kept_from_negative"]))
+        self.assertTrue(any("line 5 LPC [M+H]+ ('True')" in item for item in report["warnings"]))
 
 
 class RowSelectionTests(unittest.TestCase):
@@ -113,6 +142,25 @@ class RowSelectionTests(unittest.TestCase):
         keep, reason = should_keep(_row("PC 34:1", "[M+H]+", "PC", comment="x removed on review"), self.rules)
         self.assertFalse(keep)
         self.assertIn("manually excluded", reason)
+
+    def test_the_comment_mark_is_a_lower_case_x_at_the_very_start_as_metaboservice_tested_it(self) -> None:
+        # comment.StartsWith("x") on the cell as written: an upper-case X or a leading space keeps the row.
+        for comment in ("X checked", " x", "checked x"):
+            with self.subTest(comment=comment):
+                keep, reason = should_keep(_row("PC 34:1", "[M+H]+", "PC", comment=comment), self.rules)
+                self.assertTrue(keep, reason)
+        self.assertFalse(should_keep(_row("PC 34:1", "[M+H]+", "PC", comment="xx"), self.rules)[0])
+
+    def test_names_ontologies_and_adducts_are_compared_as_written(self) -> None:
+        # isKeepLipid compares the raw cells: a name with a space before it is no "Unknown", no prefix
+        # filter applies to it, and an Ontology or Adduct with a trailing space matches no rule.
+        for name in ("Unknown ", " low score: PC 34:1", " no MS2: PC 34:1"):
+            with self.subTest(name=name):
+                self.assertTrue(should_keep(_row(name, "[M+H]+", "PC"), self.rules)[0])
+        self.assertFalse(should_keep(_row("PC 34:1", "[M+H]+", "PC "), self.rules)[0])
+        self.assertFalse(should_keep(_row("PC 34:1", "[M+H]+ ", "PC"), self.rules)[0])
+        # Contains is ordinal and case-sensitive too: "riken" and "(D" are not the filters' text.
+        self.assertTrue(should_keep(_row("PC 34:1 riken (D)", "[M+H]+", "PC"), self.rules)[0])
 
     def test_an_annotation_below_the_reporting_bar_is_dropped(self) -> None:
         for name in ("low score: PC 34:1", "no MS2: PC 34:1"):

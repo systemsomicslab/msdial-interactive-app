@@ -211,10 +211,14 @@ adduct each polarity keeps). Five MCP tools take it from the folders to
    (metaboservice) wrote, into `<root>/quant/lipidome`, the folder the
    laboratory's `metabolomics_service.R` is run in: `lipid_metabolome.csv`,
    `lipid_metabolome4stat.csv`, `lipid_metabolome4classsummary.csv`,
-   `lipid_metabolome4summaryplot.csv` (over the Sample and QC columns, never a
-   Blank) and the `Summary_Dotplots`, `category_*` and `subclass_*` folders;
-   ASCII, CRLF, comma separated and unquoted, rows in the order .NET sorted them
-   on Windows, numbers as .NET Framework printed them. Before sheet 3 selects,
+   `lipid_metabolome4summaryplot.csv` (always these names, which the R script
+   reads; over the Sample and QC columns, never a Blank) and the
+   `Summary_Dotplots`, `category_*` and `subclass_*` folders; ASCII, CRLF, comma
+   separated and unquoted (UTF-8, warned about, where a cell is not ASCII and
+   metaboservice wrote `?`), rows in the order .NET sorted them on Windows,
+   numbers as .NET Framework printed them. Rows are chosen as metaboservice chose
+   them: names, the Comment's `x` and the rule flag `TRUE` compared as written,
+   untrimmed and case-sensitive. Before sheet 3 selects,
    the laboratory's positive/negative reconciliation renames a negative PG row
    that positive mode annotates as BMP, and a negative PE O- row that positive
    mode annotates as PE P- (same name after the class substitution, within

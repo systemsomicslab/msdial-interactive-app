@@ -20,13 +20,18 @@ the class from the negative [M-H]- measurement.
 
 The outputs are what the laboratory's own merge program wrote (metaboservice,
 MetabolomicsServiceUtility.IntegratePosNegResults): lipid_metabolome.csv, the three tables
-metabolomics_service.R reads (lipid_metabolome4stat.csv, ...4classsummary.csv and
-...4summaryplot.csv) and the Summary_Dotplots, category_<category> and subclass_<ontology>
-folders it reads too. ASCII, CRLF, comma separated and never quoted; rows in the order .NET
-sorted them on Windows (nls_sort_key); numbers as .NET Framework printed a double
-(net_double_tostring). On the 2024 hands-on exports and the rule table that produced them,
-with the reconciliation off and the 2024 sample rule, every file is metaboservice's byte for
+metabolomics_service.R reads, always under metaboservice's names (lipid_metabolome4stat.csv,
+...4classsummary.csv and ...4summaryplot.csv), and the Summary_Dotplots, category_<category> and
+subclass_<ontology> folders it reads too. ASCII, CRLF, comma separated and never quoted; rows in
+the order .NET sorted them on Windows (nls_sort_key); numbers as .NET Framework printed a double
+(net_double_tostring). Rows are chosen as metaboservice's isKeepLipid chose them: on the cells as
+written, untrimmed, case-sensitive. On the 2024 hands-on exports and the rule table that produced
+them, with the reconciliation off and the 2024 sample rule, every file is metaboservice's byte for
 byte but one digit of one computed value (see net_double_tostring).
+
+One deliberate difference: a cell outside ASCII is written as UTF-8 and warned about, where
+metaboservice wrote one '?' per byte (two Japanese class labels of the same length would have
+become one class). Rows are still ordered as metaboservice ordered those '?'.
 """
 
 from __future__ import annotations
@@ -63,6 +68,7 @@ EXCLUDED_NAME_FRAGMENTS = ("w/o", "RIKEN")
 # Exports before MS-DIAL 2026-09-15 named suggestions this way. Current exports strip the
 # prefix, so this filter no longer sees them; the candidate table does (reference_matched_ids).
 EXCLUDED_NAME_PREFIXES = ("low score: ", "no MS2: ")
+# comment.StartsWith("x") in isKeepLipid: lower-case x at the very start of the cell as written.
 MANUAL_EXCLUSION_COMMENT_PREFIX = "x"
 # Rows the rule table selects but that carry no valid concentration. They go to their own
 # file rather than vanishing into a count, because a selected class with no numbers is a
@@ -76,12 +82,17 @@ NOT_QUANTIFIED_COMMENT_PREFIX = "NOT QUANTIFIED"
 SAMPLE_FILE_TYPES = ("Sample", "QC")
 METABOSERVICE_2024_SAMPLE_FILE_TYPES = ("Sample",)
 
-# What metaboservice wrote beside lipid_metabolome.csv, named after it.
-COMPANION_SUFFIXES = {
-    "stat": "4stat.csv",
-    "class_summary": "4classsummary.csv",
-    "summary_plot": "4summaryplot.csv",
+# What metaboservice wrote beside lipid_metabolome.csv (cs:590-593), always under these names:
+# metabolomics_service.R reads them by name, whatever the lipidome itself is called.
+METABOSERVICE_TABLE_NAMES = {
+    "stat": "lipid_metabolome4stat.csv",
+    "class_summary": "lipid_metabolome4classsummary.csv",
+    "summary_plot": "lipid_metabolome4summaryplot.csv",
 }
+# readReferenceFile (cs:916-931) keeps a rule only when its fourth field is exactly this.
+SELECTED_FLAG = "TRUE"
+# Spellings a person may mean as selected, which metaboservice did not take: said, never taken.
+NEAR_SELECTED_FLAGS = frozenset({"true", "1", "yes"})
 SUMMARY_DOTPLOTS = "Summary_Dotplots"
 CATEGORY_PREFIX = "category_"
 SUBCLASS_PREFIX = "subclass_"
@@ -284,8 +295,11 @@ def read_adduct_rules(path: str | Path) -> dict[str, Any]:
     """Read the class/adduct table that says which measurement of a class to keep.
 
     Tab-separated, one row per class and adduct, with a column saying whether that
-    combination is the selected one. Only selected rows are returned. A quant_utility_table
-    workbook (.xlsx) is read from its third sheet, which holds the same four columns.
+    combination is the selected one. Only selected rows are returned. A text table is read as
+    metaboservice's readReferenceFile read it: a row is selected only when its flag is exactly
+    TRUE, and Class and Adduct are compared as written, untrimmed. A flag such as 'true', '1' or
+    'yes' selects nothing and is warned about. A quant_utility_table workbook (.xlsx) is read from
+    its third sheet, which holds the same four columns as cells (parse_quant_info).
     """
     if Path(path).suffix.lower() == ".xlsx":
         return _rules_from_workbook(path)
@@ -307,30 +321,37 @@ def read_adduct_rules(path: str | Path) -> dict[str, Any]:
 
     selected: set[tuple[str, str]] = set()
     considered = 0
-    for row in rows[1:]:
+    by_mode: dict[str, int] = {}
+    near: list[str] = []
+    for number, row in enumerate(rows[1:], start=2):
         if len(row) <= max(class_column, adduct_column, selected_column):
             continue
         considered += 1
-        flag = row[selected_column].strip().lower()
-        if flag not in {"true", "1", "yes"}:
+        flag = row[selected_column]
+        if flag != SELECTED_FLAG:
+            if flag.strip().lower() in NEAR_SELECTED_FLAGS:
+                near.append(f"line {number} {row[class_column]} {row[adduct_column]} ({flag!r})")
             continue
-        selected.add((row[class_column].strip(), row[adduct_column].strip()))
+        selected.add((row[class_column], row[adduct_column]))
+        mode = row[mode_column].strip() if 0 <= mode_column < len(row) else ""
+        by_mode[mode or "unspecified"] = by_mode.get(mode or "unspecified", 0) + 1
+    flag_warnings = []
+    if near:
+        flag_warnings.append(
+            f"{len(near)} row(s) of the rule table are flagged as if selected but not exactly {SELECTED_FLAG} "
+            f"({'; '.join(near[:5])}). metaboservice selected only {SELECTED_FLAG}, and so does this merge: "
+            f"they are not selected. Write {SELECTED_FLAG} where a row is meant."
+        )
     if not selected:
         raise MergeRefused(
             f"No class/adduct combination is selected in {path}; "
-            f"{considered} row(s) were read and every one is unselected."
+            f"{considered} row(s) were read and every one is unselected (none is flagged exactly {SELECTED_FLAG})."
+            + (" " + flag_warnings[0] if flag_warnings else "")
         )
-    by_mode: dict[str, int] = {}
-    for row in rows[1:]:
-        if len(row) <= max(class_column, adduct_column, selected_column):
-            continue
-        if row[selected_column].strip().lower() not in {"true", "1", "yes"}:
-            continue
-        mode = row[mode_column].strip() if 0 <= mode_column < len(row) else ""
-        by_mode[mode or "unspecified"] = by_mode.get(mode or "unspecified", 0) + 1
     return {
         "path": str(Path(path).resolve()),
         "selected": selected,
+        "flag_warnings": flag_warnings,
         "rule_count": considered,
         # An annotation search list and a quantification selection list have the same four
         # columns, and passing one for the other is accepted in silence -- it just keeps
@@ -376,11 +397,17 @@ def describe_export(path: str | Path) -> dict[str, Any]:
     column_names = rows[COLUMN_NAME_ROW]
     file_types = rows[FILE_TYPE_ROW]
     for index in range(start, len(class_row)):
-        label = class_row[index].strip()
-        # The statistics columns that follow the samples are labelled NA here.
-        if label.upper() == "NA" or not label:
+        # The statistics columns that follow the samples are labelled NA here. metaboservice's
+        # set_metadata stops there and nowhere else: a sample whose class is empty, or "Na", is
+        # still a sample.
+        if class_row[index] == "NA":
             break
-        names.append(column_names[index].strip() if index < len(column_names) else "")
+        label = class_row[index].strip()
+        name = column_names[index].strip() if index < len(column_names) else ""
+        kind = file_types[index].strip() if index < len(file_types) else ""
+        if not (label or name or kind):
+            break  # an empty cell at the end of the line, not a column
+        names.append(name)
         classes.append(label)
     if not names:
         raise MergeRefused(f"{path} lists no sample columns.")
@@ -496,8 +523,15 @@ def _default_columns() -> dict[str, int]:
 
 
 def _field(row: list[str], columns: dict[str, int], key: str) -> str:
+    """A cell trimmed, for what the report says and for the merge's own comparisons."""
     index = columns.get(key, -1)
     return row[index].strip() if 0 <= index < len(row) else ""
+
+
+def _cell(row: list[str], columns: dict[str, int], key: str) -> str:
+    """A cell as the file holds it, untrimmed: what metaboservice's isKeepLipid compared."""
+    index = columns.get(key, -1)
+    return row[index] if 0 <= index < len(row) else ""
 
 
 def row_filter_reason(
@@ -510,14 +544,18 @@ def row_filter_reason(
     """Why a row is no lipid of the lipidome whatever sheet 3 selects; "" when it may be one.
 
     These run before the positive/negative reconciliation: a row they drop is evidence for nothing.
+    The name and Comment tests are metaboservice's isKeepLipid (2025), on the cells as written:
+    untrimmed and case-sensitive, so a Comment starting 'X' or ' x' keeps its row, as it did there.
+    An empty name, the resolver's internal-standard IDs and the reference-match filter are this
+    merge's own additions.
     """
     columns = columns or _default_columns()
     if len(row) <= columns["ontology"]:
         return "row is too short to carry an ontology"
     alignment_id = _field(row, columns, "alignment_id")
-    name = _field(row, columns, "metabolite_name")
-    comment = _field(row, columns, "comment")
-    if not name or name == "Unknown":
+    name = _cell(row, columns, "metabolite_name")
+    comment = _cell(row, columns, "comment")
+    if not name.strip() or name == "Unknown":
         return "unannotated"
     if (internal_standard_ids is not None and alignment_id in internal_standard_ids) or (
         INTERNAL_STANDARD_NAME_FRAGMENT in name
@@ -532,7 +570,7 @@ def row_filter_reason(
         return "annotation below the reporting bar"
     if reference_matched_ids is not None and alignment_id not in reference_matched_ids:
         return "not reference-matched"
-    if comment.lower().startswith(MANUAL_EXCLUSION_COMMENT_PREFIX):
+    if comment.startswith(MANUAL_EXCLUSION_COMMENT_PREFIX):
         return "manually excluded in the comment column"
     return ""
 
@@ -549,12 +587,13 @@ def selection_reason(
     """Why sheet 3 does not take a row, or why it has no valid concentration; "" when it is kept.
 
     A row without a valid concentration is refused with a reason starting "not quantified",
-    which the merge writes to its own file instead of dropping.
+    which the merge writes to its own file instead of dropping. Ontology and Adduct are matched
+    against the rules as written, untrimmed, as isKeepLipid matched them.
     """
     columns = columns or _default_columns()
     alignment_id = _field(row, columns, "alignment_id")
-    adduct = _field(row, columns, "adduct")
-    ontology = _field(row, columns, "ontology")
+    adduct = _cell(row, columns, "adduct")
+    ontology = _cell(row, columns, "ontology")
     comment = _field(row, columns, "comment")
     if (ontology, adduct) not in rules["selected"]:
         return f"{ontology or '(no ontology)'} is not quantified as {adduct or '(no adduct)'}"
@@ -777,9 +816,12 @@ def reconcile_polarities(
     positive_rows and negative_rows are the rows that passed row_filter_reason, in file order.
     Returns the negative rows (a renamed row is a new list; the others are the same objects) and
     the report: each matched pair, each positive row left unmatched (with the negative rows that
-    nearly matched), each choice among several candidates, and each positive row that lost a
-    negative row another positive row was closer to. A renamed row's Comment says what it was.
-    For each rule, positive_rows = matched + unmatched + lost_claims.
+    nearly matched), each choice among several candidates, each positive row that lost a negative
+    row another positive row was closer to, and each positive row of the class whose name names no
+    negative row (not_converted: a PE O- positive mode names itself, or a BMP without a BMP token).
+    A renamed row's Comment says what it was. For each rule, positive_rows = matched + unmatched +
+    lost_claims, and positive_rows_not_converted is the length of its not_converted entries.
+    Ontologies and names are compared as the cells are written, untrimmed: exact means exact.
     """
     columns = columns or _default_columns()
     value_columns = list(value_columns)
@@ -797,7 +839,7 @@ def reconcile_polarities(
 
     report: dict[str, Any] = {
         **reconciliation_parameters(True, rt_tolerance),
-        "counts": {}, "matched": [], "unmatched": [], "ambiguous": [], "lost_claims": [],
+        "counts": {}, "matched": [], "unmatched": [], "ambiguous": [], "lost_claims": [], "not_converted": [],
     }
     for rule in RECONCILIATION_RULES:
         counts = {"positive_rows": 0, "matched": 0, "unmatched": 0, "ambiguous": 0, "lost_claims": 0,
@@ -805,22 +847,25 @@ def reconcile_polarities(
         negatives = [
             (index, row, _decimal_rt(_field(row, columns, "rt")))
             for index, row in enumerate(negative_rows)
-            if _field(row, columns, "ontology") == rule["negative_ontology"]
+            if _cell(row, columns, "ontology") == rule["negative_ontology"]
         ]
         claims: dict[int, list[dict[str, Any]]] = {}
         for order, row in enumerate(positive_rows):
-            if _field(row, columns, "ontology") != rule["positive_ontology"]:
+            if _cell(row, columns, "ontology") != rule["positive_ontology"]:
                 continue
-            name = _field(row, columns, "metabolite_name")
+            name = _cell(row, columns, "metabolite_name")
             expected = rule["negative_name"](name)
             if expected is None:
-                # A positive EtherPE that is not a PE P- name (a PE O- in positive mode) is no evidence here.
+                # A positive EtherPE that is not a PE P- name (a PE O- in positive mode) is no evidence here;
+                # a positive BMP whose name has no BMP token should not occur, and is listed with it.
                 counts["positive_rows_not_converted"] += 1
-                if rule["rule"] == "BMP":
-                    report["unmatched"].append({
-                        "rule": rule["rule"], "positive": identity(row),
-                        "reason": "its name has no BMP class token to read as PG",
-                    })
+                report["not_converted"].append({
+                    "rule": rule["rule"], "positive": identity(row),
+                    "reason": (
+                        "its name has no BMP class token to read as PG" if rule["rule"] == "BMP"
+                        else "its name is not PE P- in every '|' part, so it names no negative PE O- row"
+                    ),
+                })
                 continue
             counts["positive_rows"] += 1
             rt = _decimal_rt(_field(row, columns, "rt"))
@@ -834,13 +879,13 @@ def reconcile_polarities(
             candidates = [
                 (index, negative, abs(negative_rt - rt))
                 for index, negative, negative_rt in negatives
-                if negative_rt is not None and _field(negative, columns, "metabolite_name") == expected
+                if negative_rt is not None and _cell(negative, columns, "metabolite_name") == expected
                 and abs(negative_rt - rt) <= tolerance
             ]
             if not candidates:
                 same_name = sorted(
                     (abs(negative_rt - rt), index) for index, negative, negative_rt in negatives
-                    if negative_rt is not None and _field(negative, columns, "metabolite_name") == expected
+                    if negative_rt is not None and _cell(negative, columns, "metabolite_name") == expected
                 )
                 nearby = sorted(
                     (abs(negative_rt - rt), index) for index, negative, negative_rt in negatives
@@ -892,9 +937,9 @@ def reconcile_polarities(
                 })
                 counts["lost_claims"] += 1
             positive = winner["row"]
-            positive_name = _field(positive, columns, "metabolite_name")
-            before_name = _field(negative, columns, "metabolite_name")
-            before_ontology = _field(negative, columns, "ontology")
+            positive_name = _cell(positive, columns, "metabolite_name")
+            before_name = _cell(negative, columns, "metabolite_name")
+            before_ontology = _cell(negative, columns, "ontology")
             after_name = rule["renamed_name"](before_name)
             if after_name != positive_name:
                 # The two conversions are inverse; a name they do not round-trip takes the positive spelling.
@@ -933,10 +978,9 @@ def reconcile_polarities(
 # ---------------------------------------------------------------------------------------------
 
 
-def companion_names(output_name: str) -> dict[str, str]:
-    """The three tables metaboservice wrote beside lipid_metabolome.csv, named after it."""
-    stem = Path(output_name).stem
-    return {key: stem + suffix for key, suffix in COMPANION_SUFFIXES.items()}
+def companion_names() -> dict[str, str]:
+    """The three tables metaboservice wrote beside the lipidome, under its fixed names whatever the lipidome is called."""
+    return dict(METABOSERVICE_TABLE_NAMES)
 
 
 def _dotplot_folder(name: str) -> bool:
@@ -952,7 +996,6 @@ def metaboservice_tables(
     rows: list[list[str]],
     columns: dict[str, int],
     sample_columns: list[int],
-    output_name: str = "lipid_metabolome.csv",
 ) -> dict[str, Any]:
     """The tables and dotplot files IntegratePosNegResults wrote, as lines, from the sorted rows.
 
@@ -980,7 +1023,7 @@ def metaboservice_tables(
         stat_table.append(values)
         class_table.append([sums[ontology] for ontology in ontologies_unique])
 
-    names = companion_names(output_name)
+    names = companion_names()
     files: dict[str, list[str]] = {}
     files[names["stat"]] = ["Metabolite,Class," + ",".join(metabolites)] + [            # cs:654-666
         ",".join([name, class_ids[i]] + [number_text(value) for value in stat_table[i]])
@@ -1165,8 +1208,9 @@ def merge_pos_neg(
     and the IDs whose normalized values failed verification. reconcile renames the negative
     rows positive mode names BMP or PE P- (reconcile_polarities) before sheet 3 selects;
     sample_file_types are the columns the statistics tables take. Everything is written into
-    output_path's folder: the table, the three statistics tables named after it, and the
-    dotplot folders. replaceable_dotplot_files ({relative path: sha256}) are the dotplot files an
+    output_path's folder: the table, the three statistics tables under metaboservice's fixed names
+    (metabolomics_service.R reads those names, whatever output_path is called), and the dotplot
+    folders. replaceable_dotplot_files ({relative path: sha256}) are the dotplot files an
     earlier merge recorded writing there, which this one may remove when it does not write them
     again; any other file in those folders refuses the write, because metabolomics_service.R
     reads every file in them. With write false nothing is written and the report says what would
@@ -1182,10 +1226,19 @@ def merge_pos_neg(
             "same order, and the merged table pairs them by position: "
             + "; ".join(order["problems"])
         )
+    output_path = Path(output_path)
+    if output_path.name.casefold() in {name.casefold() for name in METABOSERVICE_TABLE_NAMES.values()}:
+        raise MergeRefused(
+            f"{output_path.name} is one of the tables metaboservice writes beside the lipidome; name the lipidome otherwise."
+        )
     columns = positive["columns"]
     file_types = set(sample_file_types)
     start = positive["first_sample_column"]
     sample_columns = [start + offset for offset, kind in enumerate(positive["file_types"]) if kind in file_types]
+    unlabelled = [
+        positive["sample_names"][offset] for offset, kind in enumerate(positive["file_types"])
+        if kind in file_types and not positive["sample_classes"][offset]
+    ]
 
     # 1. The rows that may be lipids at all, per polarity, in file order.
     candidates: dict[str, list[list[str]]] = {"positive": [], "negative": []}
@@ -1254,9 +1307,14 @@ def merge_pos_neg(
         for label, _, reason in not_quantified:
             drop(label, reason)
 
-    output_path = Path(output_path)
     folder = output_path.parent
-    warnings: list[str] = []
+    warnings: list[str] = list(rules.get("flag_warnings") or [])
+    if unlabelled:
+        warnings.append(
+            f"{len(unlabelled)} {' or '.join(sorted(file_types))} column(s) have no class label ({', '.join(unlabelled[:5])}). "
+            "They are taken, as metaboservice took them, with an empty class and a sample name of '_' and the "
+            "injection order, which metabolomics_service.R compares as a group of its own."
+        )
     delimiter = "," if output_path.suffix.lower() == ".csv" else "\t"
     main_lines = [delimiter.join(cells) for cells in positive["header"]] + [delimiter.join(row) for _, row in kept]
     with_delimiter = (["header"] if any(delimiter in cell for cells in positive["header"] for cell in cells) else []) + [
@@ -1268,7 +1326,7 @@ def merge_pos_neg(
             f"{', '.join(with_delimiter[:5])}); written unquoted, as the laboratory's program wrote them, those rows "
             "have extra columns."
         )
-    tables = metaboservice_tables(positive["header"], [row for _, row in kept], columns, sample_columns, output_path.name)
+    tables = metaboservice_tables(positive["header"], [row for _, row in kept], columns, sample_columns)
     warnings.extend(tables["warnings"])
     planned: dict[str, bytes] = {output_path.name: _encode(main_lines)}
     for name, lines in tables["files"].items():
@@ -1281,10 +1339,12 @@ def merge_pos_neg(
         ]
     not_ascii = sorted(name for name, data in {**planned, **dotplots}.items() if not data.isascii())
     if not_ascii:
-        # A raw file name or a comment outside ASCII is the analyst's text, not an error; the
-        # laboratory's program wrote ASCII ('?' for it), so the difference is said rather than refused.
+        # A raw file name, a class label or a comment outside ASCII is the analyst's text, not an error.
+        # The laboratory's program wrote one '?' per byte, which can make two class labels one; the
+        # text is kept as UTF-8 instead (a recorded decision), and the difference is said.
         warnings.append(
-            f"{len(not_ascii)} file(s) hold non-ASCII text and are written as UTF-8 ({', '.join(not_ascii[:3])})."
+            f"{len(not_ascii)} file(s) hold non-ASCII text and are written as UTF-8 ({', '.join(not_ascii[:3])}), "
+            "where metaboservice wrote one '?' per byte; rows keep the order those '?' gave."
         )
 
     # The dotplot folders as they stand: a file this merge does not write would be read by R with
@@ -1325,8 +1385,9 @@ def merge_pos_neg(
     def cell(row: list[str], key: str) -> str:
         return _field(row, columns, key)
 
-    kept_pairs = {(cell(row, "ontology"), cell(row, "adduct")) for _, row in kept}
-    not_quantified_pairs = {(cell(row, "ontology"), cell(row, "adduct")) for _, row, _ in not_quantified}
+    # As the selection matched them: untrimmed.
+    kept_pairs = {(_cell(row, columns, "ontology"), _cell(row, columns, "adduct")) for _, row in kept}
+    not_quantified_pairs = {(_cell(row, columns, "ontology"), _cell(row, columns, "adduct")) for _, row, _ in not_quantified}
     ontologies_by_polarity = {
         label: {cell(row, "ontology") for polarity, row in kept if polarity == label}
         for label in ("positive", "negative")
@@ -1354,7 +1415,7 @@ def merge_pos_neg(
         },
         "outputs": {
             **{key: written[name] for key, name in (("lipid_metabolome", output_path.name),
-                                                     *companion_names(output_path.name).items())},
+                                                     *companion_names().items())},
             "dotplots": {
                 "folders": sorted({relative.split("/")[0] for relative in dotplots}),
                 "files": len(dotplots),

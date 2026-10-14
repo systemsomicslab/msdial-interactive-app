@@ -21,9 +21,18 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-from lab_batch_fixture import ALIGNMENT, UNIT, Batch, capabilities_patches, guided_answers, normalize_outputs, write_run
+from lab_batch_fixture import (
+    ALIGNMENT,
+    STEMS_WITH_QC,
+    UNIT,
+    Batch,
+    capabilities_patches,
+    guided_answers,
+    normalize_outputs,
+    write_run,
+)
 from lab_export_fixture import LBM
-from xlsx_fixture import NEGATIVE_LIBRARY, POSITIVE_LIBRARY
+from xlsx_fixture import LOOKUP, NEGATIVE_LIBRARY, POSITIVE_LIBRARY, QUANT_INFO, lookup_sheet, quant_sheet, quant_workbook
 
 _CONFIG = tempfile.TemporaryDirectory()
 with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
@@ -613,11 +622,32 @@ class FromTheRunToTheLipidome(_Batch):
         quant = self.batch.analysis / "quant"
         kept = {path.name: path.read_bytes() for path in quant.iterdir() if path.is_file()}
         for name in ("lipid_metabolome_not_quantified.csv", "LIPID_METABOLOME_NOT_QUANTIFIED.CSV",
-                     "NormalizedHeight_Pos.txt", "height_neg.txt", "standards_pos.tsv", "is_resolution_neg.tsv"):
+                     "NormalizedHeight_Pos.txt", "height_neg.txt", "standards_pos.tsv", "is_resolution_neg.tsv",
+                     "lipid_metabolome4stat.csv", "Lipid_Metabolome4ClassSummary.csv"):
             with self.subTest(name=name), self.assertRaisesRegex(LabContractError, "choose another name"):
                 merge_lipidome(self.contract, output_name=name, write=True)
         self.assertEqual(kept, {path.name: path.read_bytes() for path in quant.iterdir() if path.is_file()})
-        self.assertTrue(merge_lipidome(self.contract, output_name="lipidome_2026.csv", write=True)["written"])
+        first = merge_lipidome(self.contract, output_name="lipidome_2026.csv", write=True)
+        self.assertTrue(first["written"])
+        # The three tables keep metaboservice's names, which metabolomics_service.R reads, whatever the lipidome is called.
+        folder = quant / "lipidome"
+        self.assertEqual(
+            ["lipid_metabolome4classsummary.csv", "lipid_metabolome4stat.csv", "lipid_metabolome4summaryplot.csv",
+             "lipid_metabolome_not_quantified.csv", "lipidome_2026.csv", "merge-report.json"],
+            sorted(path.name for path in folder.iterdir() if path.is_file()),
+        )
+        stat = (folder / "lipid_metabolome4stat.csv").read_bytes()
+        # Merged again under the default name: the tables are rewritten, and the earlier lipidome left beside it is said.
+        second = merge_lipidome(self.contract, write=True)
+        self.assertTrue(any("lipidome_2026.csv, the lipidome the earlier merge here wrote, stays beside this merge's "
+                            "lipid_metabolome.csv" in item for item in second["warnings"]))
+        self.assertEqual(stat, (folder / "lipid_metabolome4stat.csv").read_bytes())
+        merged = [json.loads(line) for line in (self.batch.analysis / "inputs" / "lab-lipidomics-record.jsonl")
+                  .read_text(encoding="utf-8").splitlines() if json.loads(line)["event"] == "merged"]
+        self.assertEqual(
+            [{"lipid_metabolome4stat.csv", "lipid_metabolome4classsummary.csv", "lipid_metabolome4summaryplot.csv"}] * 2,
+            [set(item["tables"]) for item in merged],
+        )
 
     def test_the_merge_refuses_a_normalize_not_completed_as_planned(self) -> None:
         self.normalize("Positive", accept_searched=["Cer 18:1;O2/15:0(d7)"])
@@ -704,6 +734,79 @@ class FromTheRunToTheLipidome(_Batch):
         with self.assertRaises(LabContractError) as raised:
             merge_lipidome(self.contract)
         self.assertIn("made under another contract", str(raised.exception))
+
+
+class TheMergeAsTheLaboratoryRunsIt(_Batch):
+    """A batch with a QC file, and a sheet 2 that names other standards for BMP and PG."""
+
+    def prepare(self, *, stems=None, workbook=None, extra=None) -> str:
+        root = Path(self.directory.name) / "lab"
+        self.batch = Batch(root, stems=stems) if stems else Batch(root)
+        if workbook:
+            quant_workbook(self.batch.workbook, **workbook)
+        contract = self.batch.contract()
+        extra = extra or {}
+        for polarity, accepted in (("Positive", ["Cer 18:1;O2/15:0(d7)"]), ("Negative", [])):
+            run = write_run(self.batch, contract, polarity, extra_spots=extra.get(polarity))
+            resolved = resolve_standards_for_contract(contract, {polarity: run})
+            plan = plan_normalize(contract, run, resolved["polarities"][polarity]["resolution_digest"],
+                                  accept_searched=accepted)
+            write_normalize_inputs(plan)
+            _, _, report = normalize_outputs(public_normalize_plan(plan), polarity, extra_spots=extra.get(polarity),
+                                             stems=self.batch.stems)
+            record = finish_normalize(plan, 0, report.splitlines())
+            self.assertTrue(record["completed"], record.get("problems"))
+        return contract
+
+    def test_the_statistics_take_the_qc_with_the_samples_and_never_the_blank(self) -> None:
+        # The laboratory's decision (metaboservice 2025): Sample and QC columns, a Blank never.
+        contract = self.prepare(stems=STEMS_WITH_QC)
+        written = merge_lipidome(contract, write=True)
+        self.assertEqual(["SPF_1", "GF_2", "QC_3"], [item["name"] for item in written["samples"]["taken"]])
+        self.assertEqual(["Blank_Pos"], [item["file"] for item in written["samples"]["not_taken"]])
+        folder = self.batch.analysis / "quant" / "lipidome"
+
+        def rows(path: Path) -> list[list[str]]:
+            return [line.split(",") for line in path.read_bytes().decode("ascii").split("\r\n")[1:-1]]
+
+        self.assertEqual([["SPF_1", "SPF"], ["GF_2", "GF"], ["QC_3", "QC"]],
+                         [row[:2] for row in rows(folder / "lipid_metabolome4stat.csv")])
+        self.assertEqual(["SPF_1", "GF_2", "QC_3"], [row[0] for row in rows(folder / "lipid_metabolome4classsummary.csv")])
+        self.assertEqual(["GF", "QC", "SPF"], [row[1] for row in rows(folder / "subclass_LPC" / "LPC 16_0_10.csv")])
+
+    def bmp_batch(self, bmp_standard: str) -> str:
+        workbook = {
+            "lookup": lookup_sheet(LOOKUP + [("PC 15:0_18:1(d7)", "PG"), (bmp_standard, "BMP")]),
+            "quant": quant_sheet(QUANT_INFO + [("PG", "[M-H]-", "Negative", True), ("BMP", "[M-H]-", "Negative", True),
+                                               ("BMP", "[M+NH4]+", "Positive", False)]),
+        }
+        extra = {
+            "Positive": [dict(alignment_id=21, mz=792.5538, rt=8.30, name="BMP 36:2", adduct="[M+NH4]+", ontology="BMP",
+                              method=LBM, cells=[4000, 3000, 0])],
+            "Negative": [dict(alignment_id=121, mz=773.5338, rt=8.33, name="PG 36:2", adduct="[M-H]-", ontology="PG",
+                              method=LBM, cells=[7000, 6000, 0])],
+        }
+        return self.prepare(workbook=workbook, extra=extra)
+
+    def test_a_pg_renamed_bmp_against_another_standard_than_sheet_two_names_for_bmp_is_said(self) -> None:
+        preview = merge_lipidome(self.bmp_batch("LPC 18:1(d7)"))
+        reconciliation = preview["polarity_reconciliation"]
+        self.assertEqual(1, reconciliation["counts"]["BMP"]["matched"])
+        self.assertEqual(("21", "121", "BMP 36:2"), (
+            reconciliation["matched"][0]["positive"]["alignment_id"], reconciliation["matched"][0]["negative"]["alignment_id"],
+            reconciliation["matched"][0]["renamed_to"]["name"]))
+        bmp = reconciliation["normalized_as"]["BMP"]
+        self.assertEqual((True, "PC 15:0_18:1(d7)", "LPC 18:1(d7)"), (bmp["differs"], bmp["pg_standard"], bmp["bmp_standard"]))
+        self.assertIn(
+            "The negative rows renamed BMP carry the concentration normalize computed for them as PG, against "
+            "PC 15:0_18:1(d7); sheet 2 names LPC 18:1(d7) for BMP.", preview["warnings"])
+        self.assertEqual({"kept": 1, "not_quantified": 0, "not_selected": 0}, reconciliation["renamed_rows"])
+
+    def test_a_bmp_normalized_against_the_standard_sheet_two_names_for_it_is_not_said(self) -> None:
+        preview = merge_lipidome(self.bmp_batch("PC 15:0_18:1(d7)"))
+        self.assertEqual(1, preview["polarity_reconciliation"]["counts"]["BMP"]["matched"])
+        self.assertFalse(preview["polarity_reconciliation"]["normalized_as"]["BMP"]["differs"])
+        self.assertFalse(any("renamed BMP carry" in item for item in preview["warnings"]))
 
 
 class WorksetsAndSharing(_Batch):
@@ -825,6 +928,20 @@ class TheToolsAndTheirGates(unittest.TestCase):
                 self.assertIs(False, self.capture(function, **arguments, confirmed="yes")["body"]["confirmed"])
                 self.assertIs(True, self.capture(function, **arguments, confirmed=True)["body"]["confirmed"])
 
+    def test_the_merge_tool_passes_the_reconciliation_options_and_leaves_them_out_when_not_given(self) -> None:
+        body = self.capture(mcp_server.msdial_lipidomics_merge, contract_path="c", reconcile_polarities=False,
+                            reconciliation_rt_tolerance=0.2)["body"]
+        self.assertIs(False, body["reconcile_polarities"])
+        self.assertEqual(0.2, body["reconciliation_rt_tolerance"])
+        self.assertIs(True, self.capture(mcp_server.msdial_lipidomics_merge, contract_path="c",
+                                         reconcile_polarities=True)["body"]["reconcile_polarities"])
+        body = self.capture(mcp_server.msdial_lipidomics_merge, contract_path="c")["body"]
+        self.assertNotIn("reconcile_polarities", body)
+        self.assertNotIn("reconciliation_rt_tolerance", body)
+
+    def test_the_check_tool_says_what_merge_selection_warnings_are(self) -> None:
+        self.assertIn("merge_selection_warnings", mcp_server.msdial_lipidomics_check_inputs.__doc__)
+
     def test_the_contract_tool_defaults_to_a_preview(self) -> None:
         body = self.capture(
             mcp_server.msdial_lipidomics_write_contract, pos_path="p", neg_path="n", lbm_path="l",
@@ -940,6 +1057,38 @@ class TheNormalizeJob(_Batch):
         self.assertEqual(200, status, written)
         self.assertTrue(written["written"])
         self.assertTrue(output.is_file())
+
+    def test_the_merge_endpoint_takes_the_reconciliation_off_only_for_a_literal_false(self) -> None:
+        runs = {"Positive": write_run(self.batch, self.contract, "Positive"), "Negative": self.run}
+        for polarity, accepted in (("Positive", ["Cer 18:1;O2/15:0(d7)"]), ("Negative", [])):
+            resolved = resolve_standards_for_contract(self.contract, {polarity: runs[polarity]})
+            plan = plan_normalize(self.contract, runs[polarity], resolved["polarities"][polarity]["resolution_digest"],
+                                  accept_searched=accepted)
+            write_normalize_inputs(plan)
+            _, _, report = normalize_outputs(public_normalize_plan(plan), polarity)
+            self.assertTrue(finish_normalize(plan, 0, report.splitlines())["completed"])
+        status, off = self.post("/api/lipidomics/merge", {"contract_path": self.contract, "reconcile_polarities": False})
+        self.assertEqual(200, status, off)
+        reconciliation = off["report"]["polarity_reconciliation"]
+        self.assertFalse(reconciliation["enabled"])
+        self.assertEqual(["the positive/negative reconciliation is off; the contract says on"],
+                         reconciliation["deviations_from_contract"])
+        status, wider = self.post("/api/lipidomics/merge", {"contract_path": self.contract, "reconciliation_rt_tolerance": 0.2})
+        self.assertEqual(200, status, wider)
+        self.assertEqual((True, 0.2), (wider["report"]["polarity_reconciliation"]["enabled"],
+                                       wider["report"]["polarity_reconciliation"]["rt_tolerance_min"]))
+        status, on = self.post("/api/lipidomics/merge", {"contract_path": self.contract})
+        self.assertEqual((200, True, []), (status, on["report"]["polarity_reconciliation"]["enabled"],
+                                           on["report"]["polarity_reconciliation"]["deviations_from_contract"]))
+        # Text is no answer: "false" neither turns it off nor leaves it on.
+        for value in ("false", "true", 0, 1):
+            with self.subTest(value=value):
+                status, refused = self.post("/api/lipidomics/merge", {"contract_path": self.contract, "reconcile_polarities": value})
+                self.assertEqual(400, status, refused)
+                self.assertIn("reconcile_polarities is true or false", refused["error"])
+        status, refused = self.post("/api/lipidomics/merge", {"contract_path": self.contract, "reconciliation_rt_tolerance": "0.2"})
+        self.assertEqual(400, status, refused)
+        self.assertFalse((self.batch.analysis / "quant" / "lipidome" / "lipid_metabolome.csv").exists())
 
     def test_a_diagnostic_from_the_contract_starts_only_on_the_contracts_raw_folder(self) -> None:
         # The same file names in another folder: the person's original data, say, rather than the copy.

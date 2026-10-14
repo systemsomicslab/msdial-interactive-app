@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from lab_export_fixture import spot, write_export
+from lab_export_fixture import export_text, spot, write_export
 from msdial_app.lipidome_merge import (
     CATEGORY_TABLE_PATH,
     MergeRefused,
@@ -299,6 +299,70 @@ class SampleColumnTests(_Merge):
                             sample_file_types=("Sample",))
         self.assertEqual(["SPF_1", "GF_2"], [item["name"] for item in report["samples"]["taken"]])
         self.assertEqual(3, len(lines(self.out / "lipid_metabolome4stat.csv")))
+
+    def test_a_sample_without_a_class_label_is_taken_as_metaboservice_took_it_and_said(self) -> None:
+        # set_metadata stops only at a Class of exactly "NA": an empty or an "Na" class is a sample like any other.
+        samples = {
+            label: [(f"A_{tag}", "SPF", "Sample"), (f"B_{tag}", "", "Sample"), (f"C_{tag}", "Na", "QC"),
+                    (f"Blank_{tag}", "Blank", "Blank")]
+            for label, tag in (("Positive", "Pos"), ("Negative", "Neg"))
+        }
+        write_export(self.root / "pos.txt", [lipid(1, "PC 34:1", "[M+H]+", "PC", (1, 2, 3, 0))], samples["Positive"])
+        write_export(self.root / "neg.txt", [lipid(9, "PE 34:1", "[M-H]-", "PE", (4, 5, 6, 0))], samples["Negative"])
+        report = merge_pos_neg(self.root / "pos.txt", self.root / "neg.txt", self.rules, self.out / "lipid_metabolome.csv")
+        self.assertEqual(["SPF_1", "_2", "Na_3"], [item["name"] for item in report["samples"]["taken"]])
+        self.assertEqual(["Metabolite,Class,PC 34:1_1,PE 34:1_9", "SPF_1,SPF,1,4", "_2,,2,5", "Na_3,Na,3,6"],
+                         lines(self.out / "lipid_metabolome4stat.csv"))
+        self.assertEqual(["Value,Class,Metabolite", "2,,PC 34:1_1", "3,Na,PC 34:1_1", "1,SPF,PC 34:1_1"],
+                         lines(self.out / "subclass_PC" / "PC 34_1_1.csv"))
+        self.assertTrue(any("1 QC or Sample column(s) have no class label (B_Pos)" in item for item in report["warnings"]))
+
+
+class TableNameTests(_Merge):
+    def write_exports(self) -> None:
+        write_export(self.root / "pos.txt", [lipid(1, "PC 34:1", "[M+H]+", "PC", (1, 2, 3, 0))], SAMPLES["Positive"])
+        write_export(self.root / "neg.txt", [lipid(9, "PE 34:1", "[M-H]-", "PE", (1, 2, 3, 0))], SAMPLES["Negative"])
+
+    def test_the_three_tables_keep_metaboservices_names_whatever_the_lipidome_is_called(self) -> None:
+        # IntegratePosNegResults wrote them under fixed names, and metabolomics_service.R reads those names.
+        self.write_exports()
+        report = merge_pos_neg(self.root / "pos.txt", self.root / "neg.txt", self.rules, self.out / "lipid_metabolome_v2.csv")
+        self.assertEqual(
+            ["lipid_metabolome4classsummary.csv", "lipid_metabolome4stat.csv", "lipid_metabolome4summaryplot.csv",
+             "lipid_metabolome_v2.csv"],
+            sorted(path.name for path in self.out.iterdir() if path.is_file()),
+        )
+        self.assertEqual(str((self.out / "lipid_metabolome4stat.csv").resolve()), report["outputs"]["stat"]["path"])
+        self.assertEqual(str((self.out / "lipid_metabolome_v2.csv").resolve()), report["output"])
+
+    def test_the_lipidome_cannot_take_a_tables_name(self) -> None:
+        self.write_exports()
+        for name in ("lipid_metabolome4stat.csv", "LIPID_METABOLOME4SUMMARYPLOT.CSV"):
+            with self.subTest(name=name), self.assertRaisesRegex(MergeRefused, "one of the tables metaboservice writes"):
+                merge_pos_neg(self.root / "pos.txt", self.root / "neg.txt", self.rules, self.out / name)
+        self.assertFalse(self.out.exists())
+
+
+class TextOutsideAsciiTests(_Merge):
+    def test_text_outside_ascii_is_written_as_utf8_and_said_and_ordered_as_metaboservice_read_it(self) -> None:
+        # A recorded decision: metaboservice wrote one '?' per byte, so 対照 and 処理 would both have been
+        # '??????', one class. The text is kept; the rows keep the order those '?' gave (file order here,
+        # where Unicode order would put 処理 first).
+        samples = {
+            label: [(f"A_{tag}", "対照", "Sample"), (f"B_{tag}", "処理", "Sample")]
+            for label, tag in (("Positive", "Pos"), ("Negative", "Neg"))
+        }
+        for name, rows, label in (("pos.txt", [lipid(1, "PC 34:1", "[M+H]+", "PC", (1, 2))], "Positive"),
+                                  ("neg.txt", [lipid(9, "PE 34:1", "[M-H]-", "PE", (4, 5))], "Negative")):
+            (self.root / name).write_text(export_text(rows, samples[label]), encoding="utf-8", newline="")
+        report = merge_pos_neg(self.root / "pos.txt", self.root / "neg.txt", self.rules, self.out / "lipid_metabolome.csv")
+        self.assertEqual("Metabolite,Class,PC 34:1_1,PE 34:1_9\r\n対照_1,対照,1,4\r\n処理_2,処理,2,5\r\n",
+                         (self.out / "lipid_metabolome4stat.csv").read_bytes().decode("utf-8"))
+        self.assertEqual("Value,Class,Metabolite\r\n1,対照,PC 34:1_1\r\n2,処理,PC 34:1_1\r\n",
+                         (self.out / "subclass_PC" / "PC 34_1_1.csv").read_bytes().decode("utf-8"))
+        self.assertEqual("utf-8", report["format"]["encoding"])
+        self.assertEqual("utf-8", report["outputs"]["stat"]["encoding"])
+        self.assertTrue(any("written as UTF-8" in item and "one '?' per byte" in item for item in report["warnings"]))
 
 
 class CategoryTableTests(unittest.TestCase):

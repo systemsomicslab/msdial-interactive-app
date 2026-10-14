@@ -3106,7 +3106,10 @@ def msdial_lipidomics_check_inputs(
     The result says what blocks a contract (blockers), what is still to be asked (questions), the
     salt beside the adducts the negative standards and sheet 3 use (salt_evidence), the classes each
     polarity can only leave NOT QUANTIFIED (expected_resolution), and the sample table proposed for
-    both polarities (paired_sample_table), which the person must confirm. check_digest binds what
+    both polarities (paired_sample_table), which the person must confirm. merge_selection_warnings
+    says where sheet 3 contradicts the merge's positive/negative reconciliation: it selects BMP or
+    EtherPE in positive mode, or does not select BMP [M-H]- or EtherPE [M-H]-. The person changes
+    sheet 3 and saves it; the workbook is never edited here. check_digest binds what
     was read; pass it to msdial_lipidomics_write_contract. workset_id fills unanswered inputs from a
     laboratory lipidomics workset and warns when one of its files has changed.
 
@@ -3302,7 +3305,8 @@ def msdial_lipidomics_merge(
 
     Both polarities must have been normalized under this contract, and their matrices must be the
     ones normalize wrote. First the rows that are no lipid of the lipidome are set aside (not
-    annotated, an internal standard, not reference matched, excluded by name or in the Comment).
+    annotated, an internal standard, not reference matched, excluded by name, or a Comment that
+    starts with a lower-case x, as metaboservice tested the cell: case-sensitive, untrimmed).
     Then the positive/negative reconciliation renames, and keeps or drops nothing: a negative PG row
     named as a positive BMP row with BMP -> PG, and a negative PE O- row named as a positive PE P- row
     with P-x:y -> O-x:(y+1), each within reconciliation_rt_tolerance minutes (0.1), becomes BMP or the
@@ -3311,19 +3315,23 @@ def msdial_lipidomics_merge(
     reconcile_polarities and reconciliation_rt_tolerance follow the contract unless given;
     reconcile_polarities=false turns the reconciliation off and is recorded as a deviation.
 
-    The outputs are the laboratory program's (metaboservice): lipid_metabolome.csv,
+    The outputs are the laboratory program's (metaboservice): lipid_metabolome.csv (output_name),
     lipid_metabolome4stat.csv, lipid_metabolome4classsummary.csv, lipid_metabolome4summaryplot.csv
-    (over the Sample and QC columns, never a Blank) and the Summary_Dotplots, category_* and
-    subclass_* folders metabolomics_service.R reads; ASCII, CRLF, comma separated and unquoted.
+    (always these names, which metabolomics_service.R reads; over the Sample and QC columns, never a
+    Blank) and the Summary_Dotplots, category_* and subclass_* folders the R script reads; ASCII,
+    CRLF, comma separated and unquoted (text outside ASCII is written as UTF-8 and warned about,
+    where metaboservice wrote '?').
     confirmed=false returns the counts, polarity_reconciliation (matched pairs, unmatched positive
-    rows with the negative rows that nearly matched, ambiguous choices, lost claims) and warnings,
+    rows with the negative rows that nearly matched, ambiguous choices, lost claims, and positive rows
+    of either class whose name names no negative row: not_converted) and warnings,
     and nothing is written; confirmed=true writes them, the not-quantified file and
     merge-report.json into <analysis_root>/quant/lipidome, the folder to run the R script in. A file
     in the dotplot folders that no earlier merge there recorded refuses the write.
     """
     body: dict[str, Any] = {"contract_path": contract_path, "output_name": output_name, "confirmed": confirmed is True}
     if reconcile_polarities is not None:
-        body["reconcile_polarities"] = reconcile_polarities is True
+        # Passed as given: the backend applies true or false and refuses anything else.
+        body["reconcile_polarities"] = reconcile_polarities
     if reconciliation_rt_tolerance is not None:
         body["reconciliation_rt_tolerance"] = reconciliation_rt_tolerance
     return _request_json(
