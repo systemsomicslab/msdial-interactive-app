@@ -171,7 +171,12 @@ adduct each polarity keeps). Five MCP tools take it from the folders to
    answers it checks each input and the inputs against each other: the salt
    against the adducts the standards and sheet 3 use, the classes each polarity
    can only leave NOT QUANTIFIED, no output folder in or over a raw folder, and
-   one sample table proposed for both polarities.
+   one sample table proposed for both polarities. A sheet 3 that contradicts the
+   merge's positive/negative reconciliation (BMP or EtherPE selected in positive
+   mode, or BMP or EtherPE `[M-H]-` not selected) is a question,
+   `merge_selection_accepted`: the person changes sheet 3 before the contract, or
+   keeps it, and the contract records that. Once the contract holds the workbook,
+   changing it needs a new contract and new runs.
 2. `msdial_lipidomics_write_contract` writes `<root>/inputs/`: the contract, the
    internal-standard libraries in the column order MS-DIAL reads, the standards
    template and the selection rules. It is refused if an input, the raw folders
@@ -222,8 +227,12 @@ adduct each polarity keeps). Five MCP tools take it from the folders to
    the laboratory's positive/negative reconciliation renames a negative PG row
    that positive mode annotates as BMP, and a negative PE O- row that positive
    mode annotates as PE P- (same name after the class substitution, within
-   0.1 min); the report lists every pair, every positive row left unmatched and
-   every tie. Selected rows with no valid concentration go to
+   0.1 min); the report lists every pair, every positive row left unmatched,
+   every choice among several candidates, every positive row that lost all its
+   candidates to closer ones (the claims are settled together, so a positive row
+   that loses one candidate takes its next), and every renamed row whose own name
+   positive mode also annotates. The dotplot categories are metaboservice's own
+   (the converter it was built with, not current MS-DIAL's). Selected rows with no valid concentration go to
    `lipid_metabolome_not_quantified.csv`, and everything is reported in
    `merge-report.json`. It never writes over its own side file or report, or a
    file normalize wrote, and replaces only the dotplot files its last merge

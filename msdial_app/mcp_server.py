@@ -12,7 +12,7 @@ from collections import Counter
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from functools import wraps
-from typing import Any
+from typing import Annotated, Any
 
 from . import __version__
 from .campaign_authorization import CampaignAuthorizationError
@@ -67,6 +67,14 @@ except ImportError as error:
         "The MCP Python SDK is required for the MS-DIAL Interactive MCP server. "
         "Install it with: python -m pip install \"mcp[cli]\""
     ) from error
+
+from pydantic import Strict  # noqa: E402  (the MCP SDK's own dependency)
+
+# A confirmation or a switch of the laboratory lipidomics tools is a JSON true or false, and a tolerance a
+# JSON number. Declared plainly, the SDK converts "false", "yes", 0 and 1 to a bool, and "0.2" to a
+# number, before the tool sees them; the endpoint refuses those values, so the two would disagree.
+StrictFlag = Annotated[bool, Strict()]
+StrictNumber = Annotated[float, Strict()]
 
 
 def _base_url(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> str:
@@ -3089,6 +3097,7 @@ def msdial_lipidomics_check_inputs(
     raw_location: str = "",
     number_of_threads: int | None = None,
     workset_id: str = "",
+    merge_selection_accepted: StrictFlag = False,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
@@ -3108,8 +3117,11 @@ def msdial_lipidomics_check_inputs(
     polarity can only leave NOT QUANTIFIED (expected_resolution), and the sample table proposed for
     both polarities (paired_sample_table), which the person must confirm. merge_selection_warnings
     says where sheet 3 contradicts the merge's positive/negative reconciliation: it selects BMP or
-    EtherPE in positive mode, or does not select BMP [M-H]- or EtherPE [M-H]-. The person changes
-    sheet 3 and saves it; the workbook is never edited here. check_digest binds what
+    EtherPE in positive mode, or does not select BMP [M-H]- or EtherPE [M-H]-. While it has any,
+    the question merge_selection_accepted stays open: the person changes sheet 3, saves it and you
+    check again (the workbook is never edited here), or keeps it as it is, and you pass
+    merge_selection_accepted=true, which the contract records. After the contract the workbook
+    cannot change without a new contract and new runs of both polarities. check_digest binds what
     was read; pass it to msdial_lipidomics_write_contract. workset_id fills unanswered inputs from a
     laboratory lipidomics workset and warns when one of its files has changed.
 
@@ -3127,6 +3139,7 @@ def msdial_lipidomics_check_inputs(
         "internal_standard_rt_tolerance": internal_standard_rt_tolerance, "analysis_root": analysis_root,
         "analysis_purpose": analysis_purpose, "console_path": console_path, "raw_location": raw_location,
         "number_of_threads": number_of_threads, "workset_id": workset_id,
+        "merge_selection_accepted": merge_selection_accepted is True,
     }
     return _request_json("POST", "/api/lipidomics/check", host=host, port=port, body=body, timeout=600)
 
@@ -3148,15 +3161,16 @@ def msdial_lipidomics_write_contract(
     console_path: str,
     raw_location: str,
     check_digest: str,
-    sample_table_confirmed: bool = False,
+    sample_table_confirmed: StrictFlag = False,
     sample_table: list[dict[str, Any]] | None = None,
     confirmed_by: str = "",
     sample_metadata_path: str = "",
     internal_standard_rt_tolerance: float | None = None,
     number_of_threads: int | None = None,
-    replace_existing: bool = False,
-    confirmed: bool = False,
+    replace_existing: StrictFlag = False,
+    confirmed: StrictFlag = False,
     workset_id: str = "",
+    merge_selection_accepted: StrictFlag = False,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
@@ -3171,7 +3185,8 @@ def msdial_lipidomics_write_contract(
     for (in_place or copy); the preview shows it with the raw folders MS-DIAL will read and write
     beside. confirmed=false (the default) previews the files; with confirmed=true it writes the
     contract, the internal-standard libraries in the layout MS-DIAL reads, standards_template.tsv,
-    quant_rules.tsv and the record.
+    quant_rules.tsv and the record. merge_selection_accepted is the answer the check asked for when
+    sheet 3 contradicts the merge's reconciliation and the person keeps it; the contract records it.
 
     When a contract already exists there, even the preview is refused until replace_existing=true,
     and the refusal shows existing_contract: when it was written, the diagnostics, runs, normalizes
@@ -3196,6 +3211,7 @@ def msdial_lipidomics_write_contract(
         "number_of_threads": number_of_threads, "check_digest": check_digest,
         "sample_table_confirmed": sample_table_confirmed is True, "sample_table": sample_table or [],
         "confirmed_by": confirmed_by, "replace_existing": replace_existing is True, "workset_id": workset_id,
+        "merge_selection_accepted": merge_selection_accepted is True,
         # The gate is here and again in the backend: only a literal true writes.
         "confirmed": confirmed is True,
     }
@@ -3208,7 +3224,7 @@ def msdial_lipidomics_resolve_standards(
     contract_path: str,
     pos_job_id: str = "",
     neg_job_id: str = "",
-    read_output_folders: bool = False,
+    read_output_folders: StrictFlag = False,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
@@ -3253,7 +3269,7 @@ def msdial_lipidomics_normalize(
     accept_searched: list[str] | None = None,
     accept_unresolved: list[str] | None = None,
     accept_spot: dict[str, int] | None = None,
-    confirmed: bool = False,
+    confirmed: StrictFlag = False,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
@@ -3295,9 +3311,9 @@ def msdial_lipidomics_normalize(
 def msdial_lipidomics_merge(
     contract_path: str,
     output_name: str = "lipid_metabolome.csv",
-    confirmed: bool = False,
-    reconcile_polarities: bool | None = None,
-    reconciliation_rt_tolerance: float | None = None,
+    confirmed: StrictFlag = False,
+    reconcile_polarities: StrictFlag | None = None,
+    reconciliation_rt_tolerance: StrictNumber | None = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
@@ -3313,7 +3329,9 @@ def msdial_lipidomics_merge(
     PE P- name, its Comment saying so. Then sheet 3's selected class and adduct pairs are kept; a
     selected row without a valid concentration goes to lipid_metabolome_not_quantified.csv.
     reconcile_polarities and reconciliation_rt_tolerance follow the contract unless given;
-    reconcile_polarities=false turns the reconciliation off and is recorded as a deviation.
+    reconcile_polarities=false turns the reconciliation off and is recorded as a deviation. Both,
+    and confirmed, are JSON values: true or false, and a number of minutes. Text such as "false",
+    or 0 and 1 for a flag, is refused, here as by the endpoint.
 
     The outputs are the laboratory program's (metaboservice): lipid_metabolome.csv (output_name),
     lipid_metabolome4stat.csv, lipid_metabolome4classsummary.csv, lipid_metabolome4summaryplot.csv
@@ -3322,15 +3340,17 @@ def msdial_lipidomics_merge(
     CRLF, comma separated and unquoted (text outside ASCII is written as UTF-8 and warned about,
     where metaboservice wrote '?').
     confirmed=false returns the counts, polarity_reconciliation (matched pairs, unmatched positive
-    rows with the negative rows that nearly matched, ambiguous choices, lost claims, and positive rows
-    of either class whose name names no negative row: not_converted) and warnings,
+    rows with the negative rows that nearly matched, ambiguous cases: several candidates, or a renamed
+    negative row whose own name positive mode also annotates; lost claims, settled together so that a
+    positive row that loses one candidate takes its next; and positive rows of either class whose name
+    names no negative row: not_converted, with any negative row of their very name) and warnings,
     and nothing is written; confirmed=true writes them, the not-quantified file and
     merge-report.json into <analysis_root>/quant/lipidome, the folder to run the R script in. A file
     in the dotplot folders that no earlier merge there recorded refuses the write.
     """
     body: dict[str, Any] = {"contract_path": contract_path, "output_name": output_name, "confirmed": confirmed is True}
     if reconcile_polarities is not None:
-        # Passed as given: the backend applies true or false and refuses anything else.
+        # A JSON true or false (StrictFlag); the backend refuses anything else again.
         body["reconcile_polarities"] = reconcile_polarities
     if reconciliation_rt_tolerance is not None:
         body["reconciliation_rt_tolerance"] = reconciliation_rt_tolerance

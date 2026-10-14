@@ -112,6 +112,11 @@ intervals while adding a small computational cost.
    (analysis purpose, LBM2, salt, annotation RT tolerance, internal-standard
    libraries, `quant_utility_table.xlsx` and its amount column, analysis root,
    `raw_location`, Console). Call it again with the answers. Nothing is written.
+   When sheet 3 contradicts the merge's reconciliation (`merge_selection_warnings`),
+   `merge_selection_accepted` is asked too: the person changes sheet 3, saves it
+   and the check runs again, or keeps it (`merge_selection_accepted=true`, recorded
+   in the contract). After the contract, changing the workbook needs a new
+   contract and new runs of both polarities.
 2. `raw_location` is asked with the sentence that MS-DIAL writes `.dcl`, `.pai2`
    and tag files beside the raw files it reads, the one-file diagnostic included,
    and no output setting prevents it. Whether to run on the data in place
@@ -161,7 +166,9 @@ intervals while adding a small computational cost.
    `lipid_metabolome_not_quantified.csv` and `merge-report.json` into
    `<root>/quant/lipidome`.
    `reconcile_polarities=false` or another `reconciliation_rt_tolerance` is
-   recorded as a deviation from the contract.
+   recorded as a deviation from the contract. The flags are JSON booleans and the
+   tolerance a JSON number; text is refused. A sheet-3 warning at this step says
+   what the lipidome counts: sheet 3 can no longer change under this contract.
 8. Report the LBM2 by name and sha256, the salt, every setting, what was assumed
    (the workbook's sample amount, the sample table), and any step skipped. Offer
    `msdial_save_workset(name, lab_lipidomics_contract_path=...)`.

@@ -9,6 +9,8 @@ whose hand-made standards.tsv and quant_rules.tsv the workbook derivation is com
 
 What metaboservice.exe (2024) wrote from these inputs -- the four tables and the 357 dotplot files
 -- is held as sha256 in tests/vectors/metaboservice_2024_data2.v1.json, so only the inputs are needed.
+The tests that read quant_utility_table.xlsx expect it as saved on 2025-03-19 (DEMO_WORKBOOK_SHA256),
+and fail with "the demo workbook changed" otherwise: their counts are that sheet 3's.
 
 Every file is only read; outputs go to a temporary folder.
 """
@@ -44,6 +46,21 @@ needs_demo = unittest.skipUnless(
     DEMO is not None and (DEMO / "NormalizedHeight_Pos.txt").is_file(),
     "set MSDIAL_LIPIDOMICS_DEMO to the hands-on data2 folder",
 )
+# data2's quant_utility_table.xlsx as saved on 2025-03-19. Its sheet 3 selects BMP [M+NH4]+ and EtherPE [M+H]+,
+# which the reconciliation warns about, and Hex3Cer [M+CH3COO]-; the laboratory means to change those, and the
+# counts below are for this workbook only.
+DEMO_WORKBOOK_SHA256 = "da49269258de17e41aef7695a77a714f9a94ba35c506c1c99cd091dff1038110"
+
+
+def demo_workbook(case: unittest.TestCase) -> Path:
+    path = DEMO / "quant_utility_table.xlsx"
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != DEMO_WORKBOOK_SHA256:
+        case.fail(
+            f"the demo workbook changed: {path} is sha256 {digest}, and these expectations are for "
+            f"{DEMO_WORKBOOK_SHA256} (as saved 2025-03-19). Update them, and DEMO_WORKBOOK_SHA256, to the edited sheets."
+        )
+    return path
 
 
 @needs_demo
@@ -111,10 +128,13 @@ class GoldenMergeTests(unittest.TestCase):
         result, output = self.merge(RULES, "lipid_metabolome.csv")
         reconciliation = result["polarity_reconciliation"]
         self.assertEqual((372, 212, 160), (result["kept_rows"], result["kept_from_positive"], result["kept_from_negative"]))
-        self.assertEqual({"positive_rows": 0, "matched": 0, "unmatched": 0, "ambiguous": 0, "lost_claims": 0,
-                          "positive_rows_not_converted": 0}, reconciliation["counts"]["BMP"])
-        self.assertEqual((14, 7, 7, 0, 0), tuple(reconciliation["counts"]["EtherPE"][key] for key in (
-            "positive_rows", "matched", "unmatched", "ambiguous", "lost_claims")))
+        self.assertEqual({"positive_rows": 0, "matched": 0, "unmatched": 0, "lost_claims": 0, "rematched": 0,
+                          "ambiguous": 0, "conflicting_positive_evidence": 0, "positive_rows_not_converted": 0},
+                         reconciliation["counts"]["BMP"])
+        self.assertEqual((14, 7, 7, 0, 0, 0, 8), tuple(reconciliation["counts"]["EtherPE"][key] for key in (
+            "positive_rows", "matched", "unmatched", "ambiguous", "lost_claims", "rematched", "positive_rows_not_converted")))
+        # The eight positive PE O- name no negative row of their very name (data2's negative ones are chain-level).
+        self.assertTrue(all(item["names_negative"] == [] for item in reconciliation["not_converted"]))
         self.assertEqual({"kept": 7, "not_quantified": 0, "not_selected": 0}, reconciliation["renamed_rows"])
         pairs = {item["negative"]["alignment_id"]: (item["positive"]["alignment_id"], item["renamed_to"]["name"])
                  for item in reconciliation["matched"]}
@@ -127,14 +147,51 @@ class GoldenMergeTests(unittest.TestCase):
         self.assertTrue(any("selects BMP [M+NH4]+ in positive mode" in item for item in result["warnings"]))
         self.assertIn(b"PE P-16:0_22:6_1045,EtherPE,94,", (output.parent / "lipid_metabolome4summaryplot.csv").read_bytes())
 
-    def test_sheet_three_keeps_the_2024_rows_and_the_positive_ether_pe(self) -> None:
-        result, output = self.merge(DEMO / "quant_utility_table.xlsx", "lipid_metabolome_sheet3.csv", reconcile=False)
+    def test_sheet_three_under_the_2024_rules_adds_the_positive_ether_pe_to_the_2024_rows(self) -> None:
+        """Not the laboratory's configuration: sheet 3 read as the 2024 program read its rules (no reconciliation).
+
+        The 22 rows beyond the 2024 lipidome are all EtherPE [M+H]+, the selection the reconciliation warns
+        about as counting EtherPE from both polarities. The laboratory's configuration is the test below.
+        """
+        result, output = self.merge(demo_workbook(self), "lipid_metabolome_sheet3.csv", reconcile=False)
         self.assertEqual((394, 234, 160), (result["kept_rows"], result["kept_from_positive"], result["kept_from_negative"]))
         reference = {tuple(row) for row in csv.reader((DEMO / "lipid_metabolome.csv").read_text(encoding="ascii").splitlines())}
         added = [row for row in csv.reader(output.read_text(encoding="ascii").splitlines()) if tuple(row) not in reference]
         self.assertEqual(22, len(added))
         self.assertEqual({("EtherPE", "[M+H]+")}, {(row[11], row[4]) for row in added})
         self.assertEqual(15, len(result["rules"]["multi_adduct_classes"]))
+        self.assertFalse(any("reconciliation" in item for item in result["warnings"]))
+
+    def test_the_laboratory_configuration_sheet_three_with_the_reconciliation_on(self) -> None:
+        """Sheet 3 as saved, the reconciliation on, Sample and QC columns (data2 has no QC).
+
+        Seven negative EtherPE rows take their PE P- names. Sheet 3 still selects BMP [M+NH4]+ and EtherPE
+        [M+H]+, so the merge says EtherPE (and BMP) would be counted from both polarities, and the double
+        counts it reports include each positive PE P- beside the negative row renamed from it.
+        """
+        result, output = self.merge(demo_workbook(self), "lipid_metabolome.csv", folder="lab")
+        reconciliation = result["polarity_reconciliation"]
+        self.assertEqual((394, 234, 160), (result["kept_rows"], result["kept_from_positive"], result["kept_from_negative"]))
+        self.assertEqual({"kept": 7, "not_quantified": 0, "not_selected": 0}, reconciliation["renamed_rows"])
+        pairs = {(item["positive"]["alignment_id"], item["negative"]["alignment_id"]) for item in reconciliation["matched"]}
+        self.assertEqual({("1433", "965"), ("1508", "1002"), ("1519", "1009"), ("1595", "1045"), ("1613", "1053"),
+                          ("1747", "1094"), ("1900", "1142")}, pairs)
+        self.assertEqual(([], []), (reconciliation["ambiguous"], reconciliation["lost_claims"]))
+        selection = [item for item in result["warnings"] if "in positive mode" in item]
+        self.assertEqual(2, len(selection), result["warnings"])
+        self.assertIn("selects BMP [M+NH4]+ in positive mode", selection[0])
+        self.assertIn("selects EtherPE [M+H]+ in positive mode", selection[1])
+        doubled = {
+            (positive["alignment_id"], negative["alignment_id"])
+            for group in result["possible_double_counts"] if group["ontology"] == "EtherPE"
+            for positive in group["rows"] if positive["polarity"] == "positive"
+            for negative in group["rows"] if negative["polarity"] == "negative" and negative["name"] == positive["name"]
+        }
+        self.assertEqual(pairs, doubled)
+        self.assertEqual(16, sum(1 for group in result["possible_double_counts"] if group["ontology"] == "EtherPE"))
+        text = output.read_text(encoding="ascii")
+        self.assertIn("PE P-38:6|PE P-16:0_22:6,[M-H]-", text)
+        self.assertEqual([], result["outputs"]["category_unassigned_ontologies"])
 
     def test_the_two_exports_pair_their_samples(self) -> None:
         positive = describe_export(DEMO / "NormalizedHeight_Pos.txt")
@@ -147,7 +204,7 @@ class GoldenMergeTests(unittest.TestCase):
 @needs_demo
 class GoldenWorkbookTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.workbook = read_quant_workbook(DEMO / "quant_utility_table.xlsx", "H")
+        self.workbook = read_quant_workbook(demo_workbook(self), "H")
         self.positive = read_internal_standard_text(DEMO / "20200121_MsdialTxtDB_Pos_EquiSPLASH.txt", "Positive")
         self.negative = read_internal_standard_text(DEMO / "20200121_MsdialTxtDB_Neg_EquiSPLASH.txt", "Negative")
 
@@ -211,6 +268,7 @@ class GoldenInputCheckTests(unittest.TestCase):
     def test_the_batch_checks_clean_and_its_sample_table_is_the_metadata(self) -> None:
         from msdial_app.lab_lipidomics_agent import check_inputs, public_check
 
+        demo_workbook(self)
         result = public_check(check_inputs({
             "pos_path": str(DEMO / "pos"), "neg_path": str(DEMO / "neg"),
             "is_text_pos": str(DEMO / "20200121_MsdialTxtDB_Pos_EquiSPLASH.txt"),
@@ -221,8 +279,10 @@ class GoldenInputCheckTests(unittest.TestCase):
             "sample_metadata_path": str(DEMO / "metadata.xlsx"),
         }))
         self.assertEqual([], result["blockers"])
-        self.assertEqual(["lbm_path", "analysis_root", "raw_location", "console_path"],
+        # Sheet 3 as saved contradicts the reconciliation (BMP [M+NH4]+, EtherPE [M+H]+): asked about.
+        self.assertEqual(["lbm_path", "merge_selection_accepted", "analysis_root", "raw_location", "console_path"],
                          [item["id"] for item in result["questions"]])
+        self.assertEqual(2, len(result["merge_selection_warnings"]))
         self.assertEqual((7, 7), (result["folders"]["Positive"]["file_count"], result["folders"]["Negative"]["file_count"]))
         table = result["paired_sample_table"]
         self.assertTrue(table["matched"], table["problems"])

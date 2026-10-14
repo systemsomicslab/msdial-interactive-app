@@ -112,8 +112,9 @@ class BmpTests(_Exports):
         self.assertIn("BMP 36:2|BMP 18:1_18:1 (positive alignment ID 10; delta RT 0.050 min)", comment)
         self.assertNotIn(",", comment)
         self.assertEqual("PG 34:1|PG 16:0_18:1", rows[1][columns["metabolite_name"]])
-        self.assertEqual({"positive_rows": 1, "matched": 1, "unmatched": 0, "ambiguous": 0, "lost_claims": 0,
-                          "positive_rows_not_converted": 0}, report["counts"]["BMP"])
+        self.assertEqual({"positive_rows": 1, "matched": 1, "unmatched": 0, "lost_claims": 0, "rematched": 0,
+                          "ambiguous": 0, "conflicting_positive_evidence": 0, "positive_rows_not_converted": 0},
+                         report["counts"]["BMP"])
         pair = report["matched"][0]
         self.assertEqual(("10", "20", 0.05), (pair["positive"]["alignment_id"], pair["negative"]["alignment_id"], pair["delta_rt"]))
         self.assertEqual({"name": "BMP 36:2|BMP 18:1_18:1", "ontology": "BMP"}, pair["renamed_to"])
@@ -230,6 +231,83 @@ class BmpTests(_Exports):
         self.assertEqual(("10", "11", "20"), (lost["positive"]["alignment_id"], lost["won_by"]["alignment_id"],
                                              lost["negative"]["alignment_id"]))
         self.assertEqual((0.06, 0.01), (lost["delta_rt"], lost["winner_delta_rt"]))
+        self.assertEqual([("20", "11")], [(item["negative"]["alignment_id"], item["won_by"]["alignment_id"])
+                                          for item in lost["lost"]])
+
+    def test_equally_close_claimants_the_more_intense_positive_row_wins(self) -> None:
+        # The same |delta RT| from both sides: the higher mean over the sample and QC columns of the positive
+        # row decides, whichever row comes first (the Blank, 99999 here, is not counted).
+        for first, second in ((10, 11), (11, 10)):
+            with self.subTest(first=first):
+                rows = {10: lipid(10, "BMP 36:2", "[M+NH4]+", "BMP", 8.35, cells=(10, 10, 10, 99999)),
+                        11: lipid(11, "BMP 36:2", "[M+H]+", "BMP", 8.25, cells=(30, 30, 30, 0))}
+                renamed, report, columns = self.reconcile([rows[first], rows[second]],
+                                                          [lipid(20, "PG 36:2", "[M-H]-", "PG", 8.30)])
+                self.assertIn("positive alignment ID 11;", renamed[0][columns["comment"]])
+                self.assertEqual([("11", "20")], [(item["positive"]["alignment_id"], item["negative"]["alignment_id"])
+                                                  for item in report["matched"]])
+                self.assertEqual([("10", 0.05, "11", 0.05)], [
+                    (item["positive"]["alignment_id"], item["delta_rt"], item["won_by"]["alignment_id"],
+                     item["winner_delta_rt"]) for item in report["lost_claims"]])
+
+    def test_a_positive_row_that_loses_a_claim_takes_its_next_candidate(self) -> None:
+        # Two positive BMPs of one name and two negative PGs of that name 0.08 min apart: the claim on 11 goes
+        # to positive 2 (0.01 against 0.03), and positive 1 then takes 12, which nobody else names. Nothing
+        # that a BMP names is left as PG.
+        name = "BMP 36:2|BMP 18:1_18:1"
+        positives = [lipid(1, name, "[M+NH4]+", "BMP", 10.00), lipid(2, name, "[M+NH4]+", "BMP", 10.04)]
+        negatives = [lipid(11, "PG 36:2|PG 18:1_18:1", "[M-H]-", "PG", 10.03),
+                     lipid(12, "PG 36:2|PG 18:1_18:1", "[M-H]-", "PG", 9.95)]
+        for order in (positives, positives[::-1]):
+            with self.subTest(first=order[0]["Alignment ID"]):
+                renamed, report, columns = self.reconcile(order, negatives)
+                self.assertEqual(["BMP", "BMP"], [row[columns["ontology"]] for row in renamed])
+                self.assertEqual([("2", "11", 0.01), ("1", "12", 0.05)], [
+                    (item["positive"]["alignment_id"], item["negative"]["alignment_id"], item["delta_rt"])
+                    for item in report["matched"]])
+                counts = report["counts"]["BMP"]
+                self.assertEqual((2, 2, 0, 0, 1), (counts["positive_rows"], counts["matched"], counts["unmatched"],
+                                                   counts["lost_claims"], counts["rematched"]))
+                self.assertEqual([], report["lost_claims"])
+                rematched = next(item for item in report["matched"] if item["positive"]["alignment_id"] == "1")
+                self.assertEqual([("11", "2", 0.03, 0.01)], [
+                    (item["negative"]["alignment_id"], item["won_by"]["alignment_id"], item["delta_rt"],
+                     item["winner_delta_rt"]) for item in rematched["after_losing"]])
+                # The ambiguous entries name the rows each positive row was finally given.
+                chosen = {item["positive"]["alignment_id"]: item["chosen_alignment_id"] for item in report["ambiguous"]}
+                self.assertEqual({"1": "12", "2": "11"}, chosen)
+                passed_over = next(item for item in report["ambiguous"] if item["positive"]["alignment_id"] == "1")
+                self.assertEqual({"11": "2"}, {item["alignment_id"]: item["taken_by"]
+                                               for item in passed_over["candidates"] if "taken_by" in item})
+
+    def test_a_positive_row_whose_every_candidate_goes_to_a_closer_row_is_left_unmatched(self) -> None:
+        renamed, report, columns = self.reconcile(
+            [lipid(1, "BMP 36:2", "[M+NH4]+", "BMP", 8.30), lipid(2, "BMP 36:2", "[M+NH4]+", "BMP", 8.24),
+             lipid(3, "BMP 36:2", "[M+NH4]+", "BMP", 8.37)],
+            [lipid(11, "PG 36:2", "[M-H]-", "PG", 8.25), lipid(12, "PG 36:2", "[M-H]-", "PG", 8.36)],
+        )
+        self.assertEqual(["BMP", "BMP"], [row[columns["ontology"]] for row in renamed])
+        self.assertEqual({"positive_rows": 3, "matched": 2, "unmatched": 0, "lost_claims": 1},
+                         {key: report["counts"]["BMP"][key] for key in ("positive_rows", "matched", "unmatched", "lost_claims")})
+        lost = report["lost_claims"][0]
+        self.assertEqual("1", lost["positive"]["alignment_id"])
+        self.assertEqual([("11", "2"), ("12", "3")], [(item["negative"]["alignment_id"], item["won_by"]["alignment_id"])
+                                                      for item in lost["lost"]])
+        ambiguous = next(item for item in report["ambiguous"] if item["positive"]["alignment_id"] == "1")
+        self.assertIsNone(ambiguous["chosen_alignment_id"])
+        self.assertIn("lost_claims", ambiguous["why"])
+
+    def test_a_renamed_pg_whose_own_name_positive_mode_also_annotates_is_reported_as_conflicting(self) -> None:
+        renamed, report, columns = self.reconcile(
+            [lipid(10, "BMP 36:2", "[M+NH4]+", "BMP", 8.30), lipid(11, "PG 36:2", "[M+NH4]+", "PG", 8.34)],
+            [lipid(20, "PG 36:2", "[M-H]-", "PG", 8.32)],
+        )
+        self.assertEqual("BMP", renamed[0][columns["ontology"]])
+        conflict = [item for item in report["ambiguous"] if item["kind"] == "conflicting positive evidence"]
+        self.assertEqual([("10", "20", ["11"])], [
+            (item["positive"]["alignment_id"], item["negative"]["alignment_id"],
+             [other["alignment_id"] for other in item["conflicting_positive"]]) for item in conflict])
+        self.assertEqual((1, 1), (report["counts"]["BMP"]["ambiguous"], report["counts"]["BMP"]["conflicting_positive_evidence"]))
 
     def test_an_unmatched_positive_bmp_is_reported_and_left_to_the_selection(self) -> None:
         report, output = self.merge(
@@ -263,6 +341,43 @@ class EtherPeTests(_Exports):
         # The positive PE O- (a plasmanyl positive mode itself names) is no evidence for a rename, and is listed.
         self.assertEqual((2, 2, 1), (counts["positive_rows"], counts["matched"], counts["positive_rows_not_converted"]))
         self.assertEqual([("EtherPE", "12")], [(item["rule"], item["positive"]["alignment_id"]) for item in report["not_converted"]])
+
+    def test_a_positive_pe_o_naming_the_negative_row_a_pe_p_renames_is_reported_as_conflicting(self) -> None:
+        # Positive mode calls one feature plasmanyl PE O-36:5 and, 0.05 min away, plasmenyl PE P-36:4, whose PE O-
+        # spelling is the same name; negative mode has one PE O-36:5. The rule renames it, and both are said.
+        renamed, report, columns = self.reconcile(
+            [lipid(1, "PE O-36:5|PE O-16:1_20:4", "[M+H]+", "EtherPE", 9.85),
+             lipid(2, "PE P-36:4|PE P-16:0_20:4", "[M+H]+", "EtherPE", 9.80)],
+            [lipid(11, "PE O-36:5|PE O-16:1_20:4", "[M-H]-", "EtherPE", 9.86)],
+        )
+        self.assertEqual("PE P-36:4|PE P-16:0_20:4", renamed[0][columns["metabolite_name"]])
+        conflict = [item for item in report["ambiguous"] if item["kind"] == "conflicting positive evidence"]
+        self.assertEqual(1, len(conflict))
+        self.assertEqual(("2", "11"), (conflict[0]["positive"]["alignment_id"], conflict[0]["negative"]["alignment_id"]))
+        self.assertEqual([("1", 0.01)], [(item["alignment_id"], item["delta_rt_to_negative"])
+                                         for item in conflict[0]["conflicting_positive"]])
+        not_converted = report["not_converted"][0]
+        self.assertEqual("1", not_converted["positive"]["alignment_id"])
+        self.assertIn("was renamed PE P- by another positive row (11 -> PE P-36:4|PE P-16:0_20:4 by positive 2)",
+                      not_converted["reason"])
+        self.assertEqual([("11", 0.01, "PE P-36:4|PE P-16:0_20:4", "2")], [
+            (item["alignment_id"], item["delta_rt"], item["renamed_to"], item["renamed_by"])
+            for item in not_converted["names_negative"]])
+        counts = report["counts"]["EtherPE"]
+        self.assertEqual((1, 1, 1, 1), (counts["matched"], counts["ambiguous"], counts["conflicting_positive_evidence"],
+                                        counts["positive_rows_not_converted"]))
+
+    def test_a_positive_pe_o_says_which_negative_rows_carry_its_name(self) -> None:
+        _, report, _ = self.reconcile(
+            [lipid(1, "PE O-36:2", "[M+H]+", "EtherPE", 11.17), lipid(2, "PE O-38:2", "[M+H]+", "EtherPE", 12.00)],
+            [lipid(11, "PE O-36:2", "[M-H]-", "EtherPE", 11.20), lipid(12, "PE O-38:2", "[M-H]-", "EtherPE", 12.30)],
+        )
+        reasons = {item["positive"]["alignment_id"]: item for item in report["not_converted"]}
+        self.assertIn("(11) keep that name", reasons["1"]["reason"])
+        self.assertEqual([("11", None)], [(item["alignment_id"], item["renamed_to"]) for item in reasons["1"]["names_negative"]])
+        self.assertIn("no kept negative EtherPE row of that very name lies within the tolerance", reasons["2"]["reason"])
+        self.assertEqual([], reasons["2"]["names_negative"])
+        self.assertEqual([], report["ambiguous"])
 
     def test_a_chain_composition_that_differs_is_not_matched_even_at_the_same_sum(self) -> None:
         rows, report, columns = self.reconcile(
@@ -318,6 +433,30 @@ class SelectionWarningTests(_Exports):
         self.assertTrue(any("does not select EtherPE [M-H]-" in item for item in
                             reconciliation_selection_warnings({("EtherPE", "[M+H]+")})))
         self.assertEqual([], reconciliation_selection_warnings({("BMP", "[M-H]-"), ("EtherPE", "[M-H]-")}))
+
+    def test_a_selection_that_can_no_longer_change_is_said_as_what_the_lipidome_counts(self) -> None:
+        bound = "Sheet 3 is part of the contract."
+        warnings = reconciliation_selection_warnings({("BMP", "[M+NH4]+"), ("EtherPE", "[M+H]+")}, "Sheet 3", bound=bound)
+        self.assertEqual(4, len(warnings))
+        self.assertTrue(warnings[0].startswith("Sheet 3 selects BMP [M+NH4]+ in positive mode, so this lipidome counts BMP "
+                                               "from both polarities"))
+        self.assertTrue(all(item.endswith(" " + bound) for item in warnings))
+        self.assertFalse(any("FALSE" in item or "TRUE" in item for item in warnings))
+        self.assertIn("so in this lipidome the negative PG rows the reconciliation renamed BMP are in neither BMP nor PG",
+                      warnings[1])
+
+    def test_with_the_reconciliation_off_the_selection_is_not_warned_about(self) -> None:
+        # The 2024 rules: positive BMP and EtherPE selected, no reconciliation, so nothing contradicts it.
+        self.rules.write_text(RULES.replace("BMP\t[M+NH4]+\tPositive\tFALSE", "BMP\t[M+NH4]+\tPositive\tTRUE")
+                              .replace("EtherPE\t[M+H]+\tPositive\tFALSE", "EtherPE\t[M+H]+\tPositive\tTRUE"),
+                              encoding="utf-8")
+        report, _ = self.merge([lipid(11, "BMP 36:2", "[M+NH4]+", "BMP", 8.30), lipid(12, "PE P-34:1", "[M+H]+", "EtherPE", 10.0)],
+                               [lipid(22, "PG 36:2", "[M-H]-", "PG", 8.31)], reconcile=False)
+        self.assertEqual(2, report["kept_from_positive"])
+        self.assertFalse(any("reconciliation" in item for item in report["warnings"]), report["warnings"])
+        on, _ = self.merge([lipid(11, "BMP 36:2", "[M+NH4]+", "BMP", 8.30), lipid(12, "PE P-34:1", "[M+H]+", "EtherPE", 10.0)],
+                           [lipid(22, "PG 36:2", "[M-H]-", "PG", 8.31)], write=False)
+        self.assertTrue(any("selects BMP [M+NH4]+ in positive mode" in item for item in on["warnings"]))
 
     def test_renamed_rows_the_rule_table_does_not_select_are_said(self) -> None:
         self.rules.write_text(RULES.replace("BMP\t[M-H]-\tNegative\tTRUE", "BMP\t[M-H]-\tNegative\tFALSE"), encoding="utf-8")

@@ -84,6 +84,8 @@ class Batch:
             "quant_table_path": str(self.workbook), "amount_column": "H",
             "analysis_root": str(self.analysis), "analysis_purpose": "SPF versus GF plasma lipidome",
             "console_path": str(self.console), "raw_location": "copy",
+            # The fixture's sheet 3 takes EtherPE from positive mode too and selects no BMP: kept as it is.
+            "merge_selection_accepted": True,
         }
         request.update(extra)
         return request

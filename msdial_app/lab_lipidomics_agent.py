@@ -127,6 +127,13 @@ RAW_LOCATION_SENTENCE = (
     "MS-DIAL writes its per-file .dcl, .pai2 and tag files and the alignment container beside the raw files it "
     "reads, the one-file diagnostic included, and no output setting prevents it."
 )
+MERGE_SELECTION_QUESTION = (
+    "Sheet 3 contradicts the merge's positive/negative reconciliation, which takes BMP and EtherPE from negative "
+    "[M-H]- only. Either change sheet 3 (BMP and EtherPE positive adducts FALSE, BMP [M-H]- and EtherPE [M-H]- "
+    "TRUE), save it and check again: once the contract is written it holds the workbook, and any change to it "
+    "then needs a new contract and new runs of both polarities. Or keep sheet 3 as it is with "
+    "merge_selection_accepted=true, which the contract records; the merge then says what the lipidome counts."
+)
 RAW_LOCATION_QUESTION = (
     f"{RAW_LOCATION_SENTENCE} Are pos_path and neg_path the data as acquired (in_place: the files are written "
     "there) or a copy made for this analysis (copy)? A copy is made only on your word, before the contract."
@@ -267,12 +274,19 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
     result["quant_table"] = _workbook_report(workbook) if workbook.get("preparation") else (
         {"path": workbook.get("path"), "sha256": workbook.get("sha256")} if workbook else {}
     )
+    selection_accepted = False
     if (workbook.get("quant_info") or {}).get("selected"):
         # The merge reconciles BMP and PE P- between the polarities and takes both from negative
-        # [M-H]-; a sheet 3 that says otherwise is the person's to change, before anything runs.
-        selection = reconciliation_selection_warnings(workbook["quant_info"]["selected"])
+        # [M-H]-; a sheet 3 that says otherwise is the person's to change, before anything runs. After
+        # the contract it cannot change without a new contract and new runs (the contract binds the
+        # workbook), so a sheet 3 kept as it is is the person's explicit answer, recorded.
+        selection = reconciliation_selection_warnings(workbook["quant_info"]["selected"], "Sheet 3")
         warnings.extend(selection)
         result["merge_selection_warnings"] = selection
+        selection_accepted = bool(selection) and args.get("merge_selection_accepted") is True
+        if selection and not selection_accepted:
+            ask("merge_selection_accepted", MERGE_SELECTION_QUESTION + " " + " ".join(selection), ["change sheet 3", "true"])
+        result["merge_selection_accepted"] = selection_accepted
 
     # R2: the salt, beside what the libraries and sheet 3 say about it.
     salt: dict[str, Any] = {}
@@ -412,6 +426,8 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         "internal_standards": {polarity: len(libraries[polarity]) for polarity in POLARITIES},
     }
     identity = _input_identity(args, inventory, lbm, library_reports, workbook, metadata_report)
+    # The answer to the sheet-3 question as it applies: accepting a selection that contradicts nothing is no answer.
+    identity["answers"]["merge_selection_accepted"] = selection_accepted
     result.update({
         "questions": questions,
         "blockers": list(dict.fromkeys(blockers)),
@@ -829,6 +845,8 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
     # A contract already there has runs planned from it, which a new one leaves unusable: the person
     # is shown it and asked about replacing it before confirming anything.
     existing = _existing_contract(contract_path) if contract_path.exists() else None
+    # The sheet-3 contradictions of the reconciliation the person kept (merge_selection_accepted), or none.
+    accepted_selection = list(check.get("merge_selection_warnings") or []) if check.get("merge_selection_accepted") else []
     if existing is not None and request.get("replace_existing") is not True:
         return {**refusal, "existing_contract": existing, "error": (
             f"{contract_path} already exists. Show the person existing_contract (what was done under it, and what "
@@ -848,7 +866,7 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
         "salt": parsed["salt"]["salt"],
         "unit": workbook.get("unit"),
         "method_files": {key: {"name": item["name"], "sha256": item["sha256"]} for key, item in method_files.items()},
-        "merge": lab_merge_method(),
+        "merge": {**lab_merge_method(), "selection_warnings_accepted": accepted_selection},
         "check_digest": check["check_digest"],
     }
     if request.get("confirmed") is not True:
@@ -944,8 +962,9 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
             "corrected": table["corrected"],
         },
         "method": lab_method_answers(),
-        # How the merge reads the two matrices, unless the merge is told otherwise (and records it).
-        "merge": lab_merge_method(),
+        # How the merge reads the two matrices, unless the merge is told otherwise (and records it), and the
+        # sheet-3 selection the person kept although it contradicts the reconciliation.
+        "merge": {**lab_merge_method(), "selection_warnings_accepted": accepted_selection},
         "number_of_threads": int(float(args["number_of_threads"])) if args.get("number_of_threads") else None,
         "check_digest": check["check_digest"],
         "replaced_contract": replaced,
@@ -958,6 +977,7 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
         "event": "contract_written", "contract_sha256": contract_sha256, "check_digest": check["check_digest"],
         "sample_table_confirmed_by": contract["sample_table"]["confirmed_by"], "replaced_contract": replaced,
         "raw_folders": contract["raw_folders"], "raw_location": contract["raw_location"]["answer"],
+        "merge_selection_accepted": accepted_selection,
     })
     return {
         "written": True,
@@ -1924,6 +1944,8 @@ def merge_lipidome(
             reconciliation_rt_tolerance=tolerance,
             sample_file_types=sample_file_types,
             replaceable_dotplot_files=replaceable,
+            rules_label="Sheet 3",
+            selection_bound=_selection_bound(contract),
             write=write,
         )
     except MergeRefused as error:
@@ -1943,9 +1965,13 @@ def merge_lipidome(
         reconciliation["normalized_as"] = _reconciled_standards(contract)
         bmp = reconciliation["normalized_as"]["BMP"]
         if bmp["differs"] and (reconciliation["counts"].get("BMP") or {}).get("matched"):
+            gives = (
+                f"sheet 2 names {bmp['bmp_standard'] or 'no standard'} for BMP" if bmp["bmp_standard_from"] == "BMP"
+                else f"sheet 2 names no standard for BMP, so BMP falls to Any others ({bmp['bmp_standard'] or 'no standard'})"
+            )
             report["warnings"].append(
                 f"The negative rows renamed BMP carry the concentration normalize computed for them as PG, against "
-                f"{bmp['pg_standard'] or 'no standard'}; sheet 2 names {bmp['bmp_standard'] or 'no standard'} for BMP."
+                f"{bmp['pg_standard'] or 'no standard'}; {gives}."
             )
     report["verification"] = {
         polarity: {"verified": records[polarity]["verified"],
@@ -1985,20 +2011,35 @@ def merge_lipidome(
     return without_manifest(report)
 
 
+def _selection_bound(contract: dict[str, Any]) -> str:
+    """Why sheet 3 can no longer change at the merge: the contract holds the workbook."""
+    accepted = (contract.get("merge") or {}).get("selection_warnings_accepted") or []
+    return (
+        ("The contract accepted this sheet 3 as it is (merge_selection_accepted). " if accepted else "")
+        + "Sheet 3 is part of the contract: changing it now needs a new contract and new runs of both polarities."
+    )
+
+
 def _reconciled_standards(contract: dict[str, Any]) -> dict[str, Any]:
     """Which standard normalize quantified a renamed row against: its negative class's, not its new one's.
 
-    A PG row renamed BMP was normalized as PG. Said beside the standard sheet 2 names for BMP, so a
-    difference between the two is visible; EtherPE keeps its class, and so its standard.
+    A PG row renamed BMP was normalized as PG. Said beside the standard sheet 2 gives BMP (its own row,
+    or 'Any others' when it names none), so a difference between the two is visible; EtherPE keeps its
+    class, and so its standard.
     """
     lookup = {row["target_class"]: row["standard"] for row in contract.get("lookup", [])}
     fallback = lookup.get("Any others", "")
-    pg_standard = lookup.get("PG", fallback)
-    bmp_standard = lookup.get("BMP", fallback)
+
+    def standard(klass: str) -> tuple[str, str]:
+        return (lookup[klass], klass) if klass in lookup else (fallback, "Any others")
+
+    pg_standard, pg_from = standard("PG")
+    bmp_standard, bmp_from = standard("BMP")
+    ether_standard, ether_from = standard("EtherPE")
     return {
-        "BMP": {"normalized_as": "PG", "pg_standard": pg_standard, "bmp_standard": bmp_standard,
-                "differs": pg_standard != bmp_standard},
-        "EtherPE": {"normalized_as": "EtherPE", "standard": lookup.get("EtherPE", fallback)},
+        "BMP": {"normalized_as": "PG", "pg_standard": pg_standard, "pg_standard_from": pg_from,
+                "bmp_standard": bmp_standard, "bmp_standard_from": bmp_from, "differs": pg_standard != bmp_standard},
+        "EtherPE": {"normalized_as": "EtherPE", "standard": ether_standard, "standard_from": ether_from},
     }
 
 

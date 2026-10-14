@@ -40,6 +40,7 @@ import hashlib
 import json
 import math
 import re
+from collections import deque
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path
@@ -258,15 +259,19 @@ collation_key = nls_sort_key
 
 @lru_cache(maxsize=4)
 def load_lipid_category_table(path: str | None = None) -> tuple[dict[str, str], str, str]:
-    """LipidomicsConverter.ConvertMsdialClassDefinitionToSuperClassVS2 as (cases, default, source)."""
+    """metaboservice's ConvertMsdialClassDefinitionToSuperClassVS2 as (cases, default, source).
+
+    source is the converter the table was generated from, by path below the metaboservice source
+    folder and sha256 (scripts/generate-lipid-category-table.py).
+    """
     source = Path(path) if path else CATEGORY_TABLE_PATH
     cases: dict[str, str] = {}
     default = None
     origin = ""
     for line in source.read_text(encoding="ascii").splitlines():
         if line.startswith("#"):
-            if not origin and "MsdialWorkbench" in line:
-                origin = line.lstrip("# ").strip()
+            if not origin and line.startswith("# source: "):
+                origin = line[len("# source: "):].strip()
             continue
         cells = line.split("\t")
         if len(cells) != 3 or cells[0] == "kind":
@@ -281,7 +286,12 @@ def load_lipid_category_table(path: str | None = None) -> tuple[dict[str, str], 
 
 
 def lipid_category(ontology: str) -> str:
-    """The lipid category metaboservice filed an ontology's dotplots under."""
+    """The lipid category metaboservice filed an ontology's dotplots under.
+
+    From the converter metaboservice was built with, not current MS-DIAL's: a class newer than it
+    (WE, NATau, ASHexCer, DGTA, ...) is "Unassigned lipid", as metaboservice filed it, where
+    MsdialWorkbench now names a category.
+    """
     cases, default, _ = load_lipid_category_table()
     return cases.get(ontology, default)
 
@@ -741,7 +751,14 @@ def reconciliation_parameters(enabled: bool = True, rt_tolerance: float = DEFAUL
         "ties": (
             "several negative candidates: the smallest |delta RT|, then the higher mean intensity over the "
             "sample and QC columns; one negative row claimed by several positive rows: the smallest "
-            "|delta RT| wins (then the higher mean intensity), and a positive row that loses is left unmatched"
+            "|delta RT| wins (then the higher mean intensity of the positive row), and a positive row that loses "
+            "takes its next candidate no other positive row is closer to, or is left unmatched when none is left "
+            "(lost_claims). The claims are settled together, so the pairs do not depend on the rows' order"
+        ),
+        "conflicting_evidence": (
+            "a renamed negative row whose own name positive mode also annotates within the tolerance (a positive "
+            "PE O- of the same name, or a positive PG of the same name) is renamed as the rule says and reported "
+            "as ambiguous: the two positive annotations disagree"
         ),
         "selection": (
             "the reconciliation renames and reports; it keeps and drops nothing. Sheet 3 decides: BMP and "
@@ -750,28 +767,50 @@ def reconciliation_parameters(enabled: bool = True, rt_tolerance: float = DEFAUL
     }
 
 
-def reconciliation_selection_warnings(selected: Iterable[tuple[str, str]], source: str = "sheet 3") -> list[str]:
-    """What in a selection contradicts the reconciliation: a positive BMP or EtherPE, or no [M-H]-."""
+def reconciliation_selection_warnings(
+    selected: Iterable[tuple[str, str]], source: str = "sheet 3", *, bound: str | None = None
+) -> list[str]:
+    """What in a selection contradicts the reconciliation: a positive BMP or EtherPE, or no [M-H]-.
+
+    Without bound, each warning says how to change the selection: the selection can still change.
+    With bound (why it cannot change any more, as for sheet 3 once a contract holds the workbook),
+    each one says what this lipidome counts, followed by that sentence.
+    """
     selected = {(klass.strip(), adduct.strip()) for klass, adduct in selected}
     warnings: list[str] = []
+    tail = f" {bound}" if bound else ""
     for klass in RECONCILED_CLASSES:
         positive = sorted(adduct for name, adduct in selected if name == klass and adduct.endswith("+"))
         if positive:
-            warnings.append(
-                f"{source} selects {klass} {', '.join(positive)} in positive mode. The merge's positive/negative "
-                f"reconciliation takes {klass} from negative [M-H]- (positive mode only names which negative rows "
-                f"are {klass}{' rather than PG' if klass == 'BMP' else ' plasmenyl'}), so {klass} would be counted "
-                "from both polarities: set the positive row(s) FALSE."
-            )
+            if bound:
+                warnings.append(
+                    f"{source} selects {klass} {', '.join(positive)} in positive mode, so this lipidome counts {klass} "
+                    f"from both polarities: the positive rows, and the negative [M-H]- rows the positive/negative "
+                    f"reconciliation takes {klass} from.{tail}"
+                )
+            else:
+                warnings.append(
+                    f"{source} selects {klass} {', '.join(positive)} in positive mode. The merge's positive/negative "
+                    f"reconciliation takes {klass} from negative [M-H]- (positive mode only names which negative rows "
+                    f"are {klass}{' rather than PG' if klass == 'BMP' else ' plasmenyl'}), so {klass} would be counted "
+                    "from both polarities: set the positive row(s) FALSE."
+                )
         if (klass, "[M-H]-") not in selected:
-            consequence = (
-                "the negative PG rows it renames BMP would then be in neither BMP nor PG"
-                if klass == "BMP" else "no EtherPE would be kept from negative mode, renamed or not"
-            )
-            warnings.append(
-                f"{source} does not select {klass} [M-H]-, which the merge's positive/negative reconciliation "
-                f"takes {klass} from: {consequence}. Set {klass} [M-H]- TRUE."
-            )
+            if bound:
+                consequence = (
+                    "the negative PG rows the reconciliation renamed BMP are in neither BMP nor PG"
+                    if klass == "BMP" else "no EtherPE is kept from negative mode, renamed or not"
+                )
+                warnings.append(f"{source} does not select {klass} [M-H]-, so in this lipidome {consequence}.{tail}")
+            else:
+                consequence = (
+                    "the negative PG rows it renames BMP would then be in neither BMP nor PG"
+                    if klass == "BMP" else "no EtherPE would be kept from negative mode, renamed or not"
+                )
+                warnings.append(
+                    f"{source} does not select {klass} [M-H]-, which the merge's positive/negative reconciliation "
+                    f"takes {klass} from: {consequence}. Set {klass} [M-H]- TRUE."
+                )
     return warnings
 
 
@@ -816,12 +855,23 @@ def reconcile_polarities(
     positive_rows and negative_rows are the rows that passed row_filter_reason, in file order.
     Returns the negative rows (a renamed row is a new list; the others are the same objects) and
     the report: each matched pair, each positive row left unmatched (with the negative rows that
-    nearly matched), each choice among several candidates, each positive row that lost a negative
-    row another positive row was closer to, and each positive row of the class whose name names no
-    negative row (not_converted: a PE O- positive mode names itself, or a BMP without a BMP token).
+    nearly matched), each positive row with several candidates (ambiguous, with the one it was
+    finally given), each positive row that lost every candidate to positive rows closer in RT
+    (lost_claims), each renamed negative row whose own name positive mode also annotates
+    (ambiguous, conflicting positive evidence), and each positive row of the class whose name names
+    no negative row (not_converted: a PE O- positive mode names itself, with the negative rows of that
+    very name, or a BMP without a BMP token).
+
+    The claims are settled together: every positive row asks for its best candidate (smallest
+    |delta RT|, then the more intense negative row); a negative row asked for twice goes to the closer
+    positive row (then the more intense one, then the earlier), and the other asks for its next
+    candidate. The pairs therefore do not depend on the rows' order, and a negative row is left
+    unrenamed only when every positive row naming it has a closer pair.
+
     A renamed row's Comment says what it was. For each rule, positive_rows = matched + unmatched +
-    lost_claims, and positive_rows_not_converted is the length of its not_converted entries.
-    Ontologies and names are compared as the cells are written, untrimmed: exact means exact.
+    lost_claims; rematched (within matched) counts the positive rows that lost a candidate and took
+    another; positive_rows_not_converted is the length of its not_converted entries. Ontologies and
+    names are compared as the cells are written, untrimmed: exact means exact.
     """
     columns = columns or _default_columns()
     value_columns = list(value_columns)
@@ -837,35 +887,40 @@ def reconcile_polarities(
             "adduct": _field(row, columns, "adduct"), "rt": float(rt) if rt is not None else None,
         }
 
+    def row_id(row: list[str]) -> str:
+        return _field(row, columns, "alignment_id")
+
     report: dict[str, Any] = {
         **reconciliation_parameters(True, rt_tolerance),
         "counts": {}, "matched": [], "unmatched": [], "ambiguous": [], "lost_claims": [], "not_converted": [],
     }
     for rule in RECONCILIATION_RULES:
-        counts = {"positive_rows": 0, "matched": 0, "unmatched": 0, "ambiguous": 0, "lost_claims": 0,
-                  "positive_rows_not_converted": 0}
+        counts = {"positive_rows": 0, "matched": 0, "unmatched": 0, "lost_claims": 0, "rematched": 0,
+                  "ambiguous": 0, "conflicting_positive_evidence": 0, "positive_rows_not_converted": 0}
         negatives = [
             (index, row, _decimal_rt(_field(row, columns, "rt")))
             for index, row in enumerate(negative_rows)
             if _cell(row, columns, "ontology") == rule["negative_ontology"]
         ]
-        claims: dict[int, list[dict[str, Any]]] = {}
+        negative_rt = {index: rt for index, _, rt in negatives}
+        negative_means: dict[int, float] = {}
+
+        def negative_mean(index: int) -> float:
+            if index not in negative_means:
+                negative_means[index] = _mean(negative_rows[index], value_columns)
+            return negative_means[index]
+
+        claimants: list[dict[str, Any]] = []
+        not_converted: list[list[str]] = []
         for order, row in enumerate(positive_rows):
             if _cell(row, columns, "ontology") != rule["positive_ontology"]:
                 continue
             name = _cell(row, columns, "metabolite_name")
             expected = rule["negative_name"](name)
             if expected is None:
-                # A positive EtherPE that is not a PE P- name (a PE O- in positive mode) is no evidence here;
-                # a positive BMP whose name has no BMP token should not occur, and is listed with it.
-                counts["positive_rows_not_converted"] += 1
-                report["not_converted"].append({
-                    "rule": rule["rule"], "positive": identity(row),
-                    "reason": (
-                        "its name has no BMP class token to read as PG" if rule["rule"] == "BMP"
-                        else "its name is not PE P- in every '|' part, so it names no negative PE O- row"
-                    ),
-                })
+                # A positive EtherPE that is not a PE P- name (a PE O- in positive mode) is no evidence for a
+                # rename; a positive BMP whose name has no BMP token should not occur, and is listed with it.
+                not_converted.append(row)
                 continue
             counts["positive_rows"] += 1
             rt = _decimal_rt(_field(row, columns, "rt"))
@@ -877,19 +932,19 @@ def reconcile_polarities(
                 counts["unmatched"] += 1
                 continue
             candidates = [
-                (index, negative, abs(negative_rt - rt))
-                for index, negative, negative_rt in negatives
-                if negative_rt is not None and _cell(negative, columns, "metabolite_name") == expected
-                and abs(negative_rt - rt) <= tolerance
+                (abs(other_rt - rt), index)
+                for index, negative, other_rt in negatives
+                if other_rt is not None and _cell(negative, columns, "metabolite_name") == expected
+                and abs(other_rt - rt) <= tolerance
             ]
             if not candidates:
                 same_name = sorted(
-                    (abs(negative_rt - rt), index) for index, negative, negative_rt in negatives
-                    if negative_rt is not None and _cell(negative, columns, "metabolite_name") == expected
+                    (abs(other_rt - rt), index) for index, negative, other_rt in negatives
+                    if other_rt is not None and _cell(negative, columns, "metabolite_name") == expected
                 )
                 nearby = sorted(
-                    (abs(negative_rt - rt), index) for index, negative, negative_rt in negatives
-                    if negative_rt is not None and abs(negative_rt - rt) <= tolerance
+                    (abs(other_rt - rt), index) for index, negative, other_rt in negatives
+                    if other_rt is not None and abs(other_rt - rt) <= tolerance
                 )[:5]
                 report["unmatched"].append({
                     "rule": rule["rule"], "positive": identity(row), "negative_name": expected,
@@ -906,36 +961,84 @@ def reconcile_polarities(
                 })
                 counts["unmatched"] += 1
                 continue
-            means = {index: _mean(negative, value_columns) for index, negative, _ in candidates}
-            candidates.sort(key=lambda item: (item[2], _intensity_order(means[item[0]]), item[0]))
-            chosen_index, _, delta = candidates[0]
-            if len(candidates) > 1:
+            candidates.sort(key=lambda item: (item[0], _intensity_order(negative_mean(item[1])), item[1]))
+            claimants.append({"order": order, "row": row, "candidates": candidates, "next": 0,
+                              "mean": _mean(row, value_columns), "held": None, "lost": []})
+
+        # Settle the claims together. A positive row asks for its best candidate not yet refused to it; a
+        # negative row keeps the closest claimant (then the more intense, then the earlier row), and a claimant
+        # it turns away, or gives up for a closer one, asks for its next candidate.
+        def claim_key(claimant: dict[str, Any], delta: Decimal) -> tuple[Any, ...]:
+            return (delta, _intensity_order(claimant["mean"]), claimant["order"])
+
+        holders: dict[int, dict[str, Any]] = {}
+        waiting = deque(claimants)
+        while waiting:
+            claimant = waiting.popleft()
+            if claimant["next"] >= len(claimant["candidates"]):
+                continue
+            delta, index = claimant["candidates"][claimant["next"]]
+            claimant["next"] += 1
+            holder = holders.get(index)
+            if holder is None:
+                holders[index], claimant["held"] = claimant, (delta, index)
+            elif claim_key(claimant, delta) < claim_key(holder, holder["held"][0]):
+                holder["lost"].append((index, holder["held"][0]))
+                holder["held"] = None
+                holders[index], claimant["held"] = claimant, (delta, index)
+                waiting.append(holder)
+            else:
+                claimant["lost"].append((index, delta))
+                waiting.append(claimant)
+
+        def lost_entries(claimant: dict[str, Any]) -> list[dict[str, Any]]:
+            # Who holds each lost row at the end: a row once claimed is always held by someone.
+            return [
+                {"negative": identity(negative_rows[index]), "delta_rt": float(delta),
+                 "won_by": identity(holders[index]["row"]), "winner_delta_rt": float(holders[index]["held"][0])}
+                for index, delta in claimant["lost"]
+            ]
+
+        for claimant in claimants:
+            held = claimant["held"]
+            if len(claimant["candidates"]) > 1:
+                passed_over = {index for index, _ in claimant["lost"]}
+                why = "the smallest |delta RT|, then the higher mean intensity"
+                if passed_over and held:
+                    why += "; a candidate a closer positive row took is passed over"
+                elif not held:
+                    why += "; every candidate went to a closer positive row (lost_claims)"
                 report["ambiguous"].append({
-                    "rule": rule["rule"], "positive": identity(row),
+                    "rule": rule["rule"], "kind": "several negative candidates", "positive": identity(claimant["row"]),
                     "candidates": [
-                        {**identity(negative_rows[index]), "delta_rt": float(candidate_delta),
-                         "mean_intensity": means[index] if means[index] == means[index] else None}
-                        for index, _, candidate_delta in candidates
+                        {**identity(negative_rows[index]), "delta_rt": float(delta),
+                         "mean_intensity": negative_mean(index) if negative_mean(index) == negative_mean(index) else None,
+                         **({"taken_by": row_id(holders[index]["row"])} if index in passed_over else {})}
+                        for delta, index in claimant["candidates"]
                     ],
-                    "chosen_alignment_id": _field(negative_rows[chosen_index], columns, "alignment_id"),
-                    "why": "the smallest |delta RT|, then the higher mean intensity",
+                    "chosen_alignment_id": row_id(negative_rows[held[1]]) if held else None,
+                    "why": why,
                 })
                 counts["ambiguous"] += 1
-            claims.setdefault(chosen_index, []).append({
-                "order": order, "row": row, "delta": delta, "mean": _mean(row, value_columns),
-            })
-        for index in sorted(claims):
-            claimants = sorted(claims[index], key=lambda item: (item["delta"], _intensity_order(item["mean"]), item["order"]))
-            winner = claimants[0]
-            negative = negative_rows[index]
-            for loser in claimants[1:]:
+            if held is None:
+                lost = lost_entries(claimant)
+                first = lost[0]
                 report["lost_claims"].append({
-                    "rule": rule["rule"], "positive": identity(loser["row"]), "delta_rt": float(loser["delta"]),
-                    "negative": identity(negative), "won_by": identity(winner["row"]),
-                    "winner_delta_rt": float(winner["delta"]),
-                    "why": "another positive row is closer in RT (then more intense); this one is left unmatched",
+                    "rule": rule["rule"], "positive": identity(claimant["row"]), "delta_rt": first["delta_rt"],
+                    "negative": first["negative"], "won_by": first["won_by"], "winner_delta_rt": first["winner_delta_rt"],
+                    "lost": lost,
+                    "why": (
+                        "every negative row it names within the tolerance went to another positive row closer in RT "
+                        "(then more intense), and none is left for it: it is left unmatched"
+                    ),
                 })
                 counts["lost_claims"] += 1
+
+        renamed_by: dict[int, dict[str, Any]] = {}
+        for index in sorted(holders):
+            winner = holders[index]
+            delta = winner["held"][0]
+            negative = negative_rows[index]
             positive = winner["row"]
             positive_name = _cell(positive, columns, "metabolite_name")
             before_name = _cell(negative, columns, "metabolite_name")
@@ -944,8 +1047,8 @@ def reconcile_polarities(
             if after_name != positive_name:
                 # The two conversions are inverse; a name they do not round-trip takes the positive spelling.
                 after_name = positive_name
-            delta_text = _delta_text(winner["delta"])
-            positive_id = _field(positive, columns, "alignment_id")
+            delta_text = _delta_text(delta)
+            positive_id = row_id(positive)
             if before_ontology != rule["renamed_ontology"]:
                 note = (f"Reassigned from {before_ontology} to {rule['renamed_ontology']} by the positive-mode "
                         f"{rule['renamed_ontology']} annotation {positive_name} (positive alignment ID {positive_id}; "
@@ -961,14 +1064,96 @@ def reconcile_polarities(
                 current = updated[comment_index]
                 updated[comment_index] = f"{current}; {note}" if current.strip() else note
             renamed_rows[index] = updated
-            report["matched"].append({
+            renamed_by[index] = winner
+            pair: dict[str, Any] = {
                 "rule": rule["rule"],
                 "positive": identity(positive),
                 "negative": {**identity(negative), "ontology": before_ontology},
                 "renamed_to": {"name": after_name, "ontology": rule["renamed_ontology"]},
-                "delta_rt": float(winner["delta"]),
-            })
+                "delta_rt": float(delta),
+            }
+            if winner["lost"]:
+                # It lost a nearer candidate to a closer positive row and took this one.
+                pair["after_losing"] = lost_entries(winner)
+                counts["rematched"] += 1
+            report["matched"].append(pair)
             counts["matched"] += 1
+
+            # Positive mode may also annotate the negative row's own name (a positive PE O- or PG of that very
+            # name) within the tolerance: two positive annotations of one negative row that disagree.
+            own_rt = negative_rt.get(index)
+            conflicting = []
+            for order, other in enumerate(positive_rows):
+                if (_cell(other, columns, "ontology") != rule["negative_ontology"]
+                        or _cell(other, columns, "metabolite_name") != before_name or own_rt is None):
+                    continue
+                other_rt = _decimal_rt(_field(other, columns, "rt"))
+                if other_rt is not None and abs(other_rt - own_rt) <= tolerance:
+                    conflicting.append((abs(other_rt - own_rt), order))
+            if conflicting:
+                report["ambiguous"].append({
+                    "rule": rule["rule"], "kind": "conflicting positive evidence",
+                    "positive": identity(positive), "negative": {**identity(negative), "ontology": before_ontology},
+                    "renamed_to": {"name": after_name, "ontology": rule["renamed_ontology"]},
+                    "delta_rt": float(delta),
+                    "conflicting_positive": [
+                        {**identity(positive_rows[order]), "ontology": rule["negative_ontology"],
+                         "delta_rt_to_negative": float(other_delta)}
+                        for other_delta, order in sorted(conflicting)
+                    ],
+                    "chosen_alignment_id": row_id(negative),
+                    "why": (
+                        f"positive mode also annotates this negative row's own name, {before_name} "
+                        f"({rule['negative_ontology']}), within the tolerance. It was renamed as the {rule['rule']} rule "
+                        "says, but the two positive annotations disagree: check the spectra"
+                    ),
+                })
+                counts["ambiguous"] += 1
+                counts["conflicting_positive_evidence"] += 1
+
+        # The positive rows of the class that name no negative row, with the negative rows of their very name.
+        for row in not_converted:
+            counts["positive_rows_not_converted"] += 1
+            if rule["rule"] == "BMP":
+                report["not_converted"].append({
+                    "rule": rule["rule"], "positive": identity(row), "reason": "its name has no BMP class token to read as PG",
+                })
+                continue
+            name = _cell(row, columns, "metabolite_name")
+            rt = _decimal_rt(_field(row, columns, "rt"))
+            same = [] if rt is None else sorted(
+                (abs(other_rt - rt), index) for index, negative, other_rt in negatives
+                if other_rt is not None and _cell(negative, columns, "metabolite_name") == name
+                and abs(other_rt - rt) <= tolerance
+            )
+            names_negative = [
+                {**identity(negative_rows[index]), "delta_rt": float(delta),
+                 "renamed_to": renamed_rows[index][columns["metabolite_name"]] if index in renamed_by else None,
+                 "renamed_by": row_id(renamed_by[index]["row"]) if index in renamed_by else None}
+                for delta, index in same
+            ]
+            taken = [item for item in names_negative if item["renamed_to"] is not None]
+            if taken:
+                reason = (
+                    "positive mode names it PE O- (plasmanyl) itself, but the negative row of that very name within the "
+                    "tolerance was renamed PE P- by another positive row ("
+                    + "; ".join(f"{item['alignment_id']} -> {item['renamed_to']} by positive {item['renamed_by']}"
+                                for item in taken)
+                    + "): the two positive annotations disagree (ambiguous, conflicting positive evidence)"
+                )
+            elif names_negative:
+                reason = (
+                    "positive mode names it PE O- (plasmanyl) itself, and the negative row(s) of that very name within "
+                    f"the tolerance ({', '.join(item['alignment_id'] for item in names_negative)}) keep that name"
+                )
+            else:
+                reason = (
+                    "its name is not PE P- in every '|' part (positive mode names it plasmanyl itself), and no kept "
+                    "negative EtherPE row of that very name lies within the tolerance"
+                )
+            report["not_converted"].append({
+                "rule": rule["rule"], "positive": identity(row), "reason": reason, "names_negative": names_negative,
+            })
         report["counts"][rule["rule"]] = counts
     return renamed_rows, report
 
@@ -1153,6 +1338,9 @@ def metaboservice_tables(
         "warnings": warnings,
         "categories": categories_unique,
         "ontologies": ontologies_unique,
+        # Filed under metaboservice's default category because its converter does not name them.
+        "unassigned_ontologies": [ontology for ontology in ontologies_unique
+                                  if ontology not in load_lipid_category_table()[0]],
     }
 
 
@@ -1198,6 +1386,8 @@ def merge_pos_neg(
     reconciliation_rt_tolerance: float = DEFAULT_RECONCILIATION_RT_TOLERANCE,
     sample_file_types: Collection[str] = SAMPLE_FILE_TYPES,
     replaceable_dotplot_files: dict[str, str] | None = None,
+    rules_label: str = "The rule table",
+    selection_bound: str | None = None,
     write: bool = True,
 ) -> dict[str, Any]:
     """Merge the two polarities into one table and metaboservice's other outputs beside it.
@@ -1215,6 +1405,10 @@ def merge_pos_neg(
     again; any other file in those folders refuses the write, because metabolomics_service.R
     reads every file in them. With write false nothing is written and the report says what would
     be: a preview the person confirms.
+
+    With the reconciliation on, a selection that contradicts it is warned about under rules_label.
+    selection_bound says why the selection can no longer change (a contract holds the workbook);
+    the warnings then say what this lipidome counts instead of how to change the selection.
     """
     rules = rules if rules is not None else read_adduct_rules(rules_path)
     positive = describe_export(positive_path)
@@ -1397,10 +1591,13 @@ def merge_pos_neg(
         reconciliation["renamed_rows"] = renamed_outcome
         if renamed_outcome["not_selected"]:
             warnings.append(
-                f"{renamed_outcome['not_selected']} negative row(s) the reconciliation renamed are not selected by the "
-                "rule table, so they are in neither class: select BMP [M-H]- and EtherPE [M-H]-."
+                f"{renamed_outcome['not_selected']} negative row(s) the reconciliation renamed are not selected by "
+                f"{rules_label[:1].lower() + rules_label[1:]}, so this lipidome has them in neither class. {selection_bound}"
+                if selection_bound else
+                f"{renamed_outcome['not_selected']} negative row(s) the reconciliation renamed are not selected by "
+                f"{rules_label[:1].lower() + rules_label[1:]}, so they are in neither class: select BMP [M-H]- and EtherPE [M-H]-."
             )
-        warnings.extend(reconciliation_selection_warnings(rules["selected"], "The rule table"))
+        warnings.extend(reconciliation_selection_warnings(rules["selected"], rules_label, bound=selection_bound))
     report = {
         "output": main["path"],
         "output_folder": str(folder.resolve()),
@@ -1424,6 +1621,8 @@ def merge_pos_neg(
                 "manifest": {relative: hashlib.sha256(data).hexdigest() for relative, data in dotplots.items()},
             },
             "category_table": load_lipid_category_table()[2],
+            # Ontologies metaboservice's converter does not name, in category_Unassigned lipid as it filed them.
+            "category_unassigned_ontologies": tables["unassigned_ontologies"],
         },
         "samples": {
             "file_types": sorted(file_types),

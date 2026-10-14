@@ -7,6 +7,7 @@ Python script that copies them and prints normalize's report. Nothing here runs 
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -52,6 +53,13 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
     )
     from msdial_app.sharing import bundle_member_allowed
     from msdial_app.worksets import LAB_LIPIDOMICS_WORKSET_KIND, get_workset, save_lab_lipidomics_workset
+
+
+# The fixture's sheet 3 as the merge's reconciliation needs it: BMP and EtherPE from negative [M-H]- only.
+RECONCILED_QUANT_INFO = [
+    (klass, adduct, mode, False if (klass, adduct) == ("EtherPE", "[M+H]+") else selected)
+    for klass, adduct, mode, selected in QUANT_INFO
+] + [("PG", "[M-H]-", "Negative", True), ("BMP", "[M-H]-", "Negative", True), ("BMP", "[M+NH4]+", "Positive", False)]
 
 
 class _Batch(unittest.TestCase):
@@ -107,10 +115,11 @@ class CheckingTheInputs(_Batch):
         self.assertTrue(result["paired_sample_table"]["matched"])
         self.assertEqual(64, len(result["check_digest"]))
 
-    def test_a_sheet_three_that_contradicts_the_merges_reconciliation_is_said_and_not_changed(self) -> None:
-        # The fixture's sheet 3 takes EtherPE from both polarities and selects no BMP: both are the person's to change.
+    def test_a_sheet_three_that_contradicts_the_merges_reconciliation_is_asked_about_and_not_changed(self) -> None:
+        # The fixture's sheet 3 takes EtherPE from both polarities and selects no BMP: both are the person's to
+        # change before the contract, or to keep, explicitly. After the contract the workbook is bound.
         before = self.batch.workbook.read_bytes()
-        result = public_check(check_inputs(self.batch.request()))
+        result = public_check(check_inputs(self.batch.request(merge_selection_accepted=None)))
         selection = result["merge_selection_warnings"]
         self.assertEqual(2, len(selection))
         self.assertIn("does not select BMP [M-H]-", selection[0])
@@ -118,8 +127,29 @@ class CheckingTheInputs(_Batch):
         self.assertIn("selects EtherPE [M+H]+ in positive mode", selection[1])
         self.assertTrue(set(selection) <= set(result["warnings"]))
         self.assertEqual([], result["blockers"])
+        self.assertEqual(["merge_selection_accepted"], [item["id"] for item in result["questions"]])
+        question = result["questions"][0]["prompt"]
+        self.assertIn("new contract and new runs of both polarities", question)
+        self.assertTrue(all(item in question for item in selection))
+        self.assertFalse(result["ready_for_contract"])
+        self.assertFalse(result["merge_selection_accepted"])
         self.assertEqual(0.1, result["stated_defaults"]["merge_method"]["polarity_reconciliation"]["rt_tolerance_min"])
+        # Kept as it is: the question is answered, and the answer is bound by the digest.
+        kept = public_check(check_inputs(self.batch.request()))
+        self.assertTrue(kept["ready_for_contract"], kept["questions"])
+        self.assertTrue(kept["merge_selection_accepted"])
+        self.assertNotEqual(result["check_digest"], kept["check_digest"])
         self.assertEqual(before, self.batch.workbook.read_bytes())
+
+    def test_a_sheet_three_changed_as_the_check_says_asks_nothing(self) -> None:
+        # The advice followed: BMP and EtherPE positive FALSE, their [M-H]- TRUE, saved, checked again.
+        quant_workbook(self.batch.workbook, quant=quant_sheet(RECONCILED_QUANT_INFO))
+        result = public_check(check_inputs(self.batch.request(merge_selection_accepted=None)))
+        self.assertEqual([], result["merge_selection_warnings"])
+        self.assertTrue(result["ready_for_contract"], result["questions"])
+        self.assertFalse(result["merge_selection_accepted"])
+        # Accepting a selection that contradicts nothing is no answer, and changes nothing.
+        self.assertEqual(result["check_digest"], public_check(check_inputs(self.batch.request()))["check_digest"])
 
     def test_the_folders_must_be_two_and_each_its_own_polarity(self) -> None:
         same = public_check(check_inputs(self.batch.request(neg_path=str(self.batch.pos))))
@@ -688,8 +718,21 @@ class FromTheRunToTheLipidome(_Batch):
             reconciliation["matched"][0]["positive"]["alignment_id"], reconciliation["matched"][0]["negative"]["alignment_id"],
             reconciliation["matched"][0]["renamed_to"]["name"]))
         self.assertEqual([], reconciliation["deviations_from_contract"])
-        # The fixture's sheet 3 still takes EtherPE from positive mode too, which the merge says.
-        self.assertTrue(any("selects EtherPE [M+H]+ in positive mode" in item for item in preview["warnings"]))
+        # The fixture's sheet 3 still takes EtherPE from positive mode too, which the person kept at the check and
+        # the contract records. The merge says what the lipidome counts, not how to change sheet 3: an edit now
+        # would make the contract, and everything run under it, unusable.
+        self.assertEqual(2, len(contract["merge"]["selection_warnings_accepted"]))
+        selection = [item for item in preview["warnings"] if "positive mode, so this lipidome counts" in item
+                     or "does not select BMP [M-H]-" in item]
+        self.assertEqual(2, len(selection), preview["warnings"])
+        self.assertTrue(selection[1].startswith("Sheet 3 selects EtherPE [M+H]+ in positive mode, so this lipidome counts "
+                                                "EtherPE from both polarities"), selection)
+        for item in selection:
+            self.assertTrue(item.endswith("The contract accepted this sheet 3 as it is (merge_selection_accepted). Sheet 3 "
+                                          "is part of the contract: changing it now needs a new contract and new runs of "
+                                          "both polarities."), item)
+            self.assertNotIn("FALSE", item)
+            self.assertNotIn("TRUE", item)
         self.assertEqual("EtherPE", reconciliation["normalized_as"]["EtherPE"]["normalized_as"])
 
         off = merge_lipidome(self.contract, write=True, reconcile_polarities=False)
@@ -716,6 +759,15 @@ class FromTheRunToTheLipidome(_Batch):
         wider = merge_lipidome(self.contract, reconciliation_rt_tolerance=0.2)
         self.assertEqual(["the reconciliation RT tolerance is 0.2 min; the contract says 0.1"],
                          wider["polarity_reconciliation"]["deviations_from_contract"])
+
+    def test_a_sheet_three_changed_after_the_contract_makes_the_merge_refuse(self) -> None:
+        # Why the merge does not advise editing sheet 3: the contract holds the workbook.
+        self.normalize("Positive", accept_searched=["Cer 18:1;O2/15:0(d7)"])
+        self.normalize("Negative")
+        quant_workbook(self.batch.workbook, quant=quant_sheet(RECONCILED_QUANT_INFO))
+        with self.assertRaises(LabContractError) as raised:
+            merge_lipidome(self.contract)
+        self.assertIn("quant table quant_utility_table.xlsx has changed", str(raised.exception))
 
     def test_the_merge_refuses_a_contract_or_a_candidate_table_changed_since_normalize(self) -> None:
         self.normalize("Positive", accept_searched=["Cer 18:1;O2/15:0(d7)"])
@@ -774,9 +826,26 @@ class TheMergeAsTheLaboratoryRunsIt(_Batch):
         self.assertEqual(["SPF_1", "GF_2", "QC_3"], [row[0] for row in rows(folder / "lipid_metabolome4classsummary.csv")])
         self.assertEqual(["GF", "QC", "SPF"], [row[1] for row in rows(folder / "subclass_LPC" / "LPC 16_0_10.csv")])
 
-    def bmp_batch(self, bmp_standard: str) -> str:
+    def test_a_sheet_three_changed_before_the_contract_leaves_nothing_to_say_at_the_merge(self) -> None:
+        extra = {
+            "Positive": [dict(alignment_id=20, mz=702.5436, rt=10.00, name="PE P-34:1", adduct="[M+H]+",
+                              ontology="EtherPE", method=LBM, cells=[5000, 4000, 0])],
+            "Negative": [dict(alignment_id=120, mz=700.5291, rt=10.04, name="PE O-34:2", adduct="[M-H]-",
+                              ontology="EtherPE", method=LBM, cells=[6000, 5000, 0])],
+        }
+        contract = self.prepare(workbook={"quant": quant_sheet(RECONCILED_QUANT_INFO)}, extra=extra)
+        self.assertEqual([], load_contract(contract)["merge"]["selection_warnings_accepted"])
+        preview = merge_lipidome(contract)
+        self.assertEqual(1, preview["polarity_reconciliation"]["counts"]["EtherPE"]["matched"])
+        self.assertEqual({"kept": 1, "not_quantified": 0, "not_selected": 0}, preview["polarity_reconciliation"]["renamed_rows"])
+        self.assertFalse(any("Sheet 3" in item for item in preview["warnings"]), preview["warnings"])
+        # The renamed row is the only EtherPE: the positive PE P- is not selected.
+        self.assertEqual(0, sum(1 for item in preview["possible_double_counts"] if item["ontology"] == "EtherPE"))
+
+    def bmp_batch(self, bmp_standard: str | None) -> str:
         workbook = {
-            "lookup": lookup_sheet(LOOKUP + [("PC 15:0_18:1(d7)", "PG"), (bmp_standard, "BMP")]),
+            "lookup": lookup_sheet(LOOKUP + [("PC 15:0_18:1(d7)", "PG")]
+                                   + ([(bmp_standard, "BMP")] if bmp_standard is not None else [])),
             "quant": quant_sheet(QUANT_INFO + [("PG", "[M-H]-", "Negative", True), ("BMP", "[M-H]-", "Negative", True),
                                                ("BMP", "[M+NH4]+", "Positive", False)]),
         }
@@ -802,6 +871,17 @@ class TheMergeAsTheLaboratoryRunsIt(_Batch):
             "PC 15:0_18:1(d7); sheet 2 names LPC 18:1(d7) for BMP.", preview["warnings"])
         self.assertEqual({"kept": 1, "not_quantified": 0, "not_selected": 0}, reconciliation["renamed_rows"])
 
+    def test_a_bmp_sheet_two_does_not_name_falls_to_any_others_and_that_is_said(self) -> None:
+        preview = merge_lipidome(self.bmp_batch(None))
+        bmp = preview["polarity_reconciliation"]["normalized_as"]["BMP"]
+        self.assertEqual(("LPC 18:1(d7)", "Any others", "PC 15:0_18:1(d7)", "PG", True),
+                         (bmp["bmp_standard"], bmp["bmp_standard_from"], bmp["pg_standard"], bmp["pg_standard_from"],
+                          bmp["differs"]))
+        self.assertIn(
+            "The negative rows renamed BMP carry the concentration normalize computed for them as PG, against "
+            "PC 15:0_18:1(d7); sheet 2 names no standard for BMP, so BMP falls to Any others (LPC 18:1(d7)).",
+            preview["warnings"])
+
     def test_a_bmp_normalized_against_the_standard_sheet_two_names_for_it_is_not_said(self) -> None:
         preview = merge_lipidome(self.bmp_batch("PC 15:0_18:1(d7)"))
         self.assertEqual(1, preview["polarity_reconciliation"]["counts"]["BMP"]["matched"])
@@ -826,7 +906,8 @@ class WorksetsAndSharing(_Batch):
             result = public_check(check_inputs({
                 "pos_path": str(self.batch.pos), "neg_path": str(self.batch.neg), "workset_id": saved["id"],
             }))
-            self.assertEqual(["analysis_purpose", "analysis_root", "raw_location"],
+            # The answer about a sheet 3 that contradicts the reconciliation is the batch's, never carried.
+            self.assertEqual(["analysis_purpose", "merge_selection_accepted", "analysis_root", "raw_location"],
                              [item["id"] for item in result["questions"]])
             self.assertTrue(any("has changed since workset" in item for item in result["warnings"]))
             from msdial_app.agent_workflow import build_guided_plan
@@ -857,7 +938,8 @@ class WorksetsAndSharing(_Batch):
         contract = self.batch.contract(internal_standard_rt_tolerance=0.3, number_of_threads=4)
         settings = lab_lipidomics_agent.lab_workset_settings(contract)
         batch = {"pos_path": str(self.batch.pos), "neg_path": str(self.batch.neg), "raw_location": "copy",
-                 "analysis_purpose": "the next batch", "analysis_root": str(self.batch.root / "next")}
+                 "analysis_purpose": "the next batch", "analysis_root": str(self.batch.root / "next"),
+                 "merge_selection_accepted": True}
         with patch("msdial_app.worksets.workset_directory", return_value=self.batch.root / "worksets"):
             saved = save_lab_lipidomics_workset("Plasma lipidomics", settings)
             check = public_check(check_inputs({**batch, "workset_id": saved["id"]}))
@@ -905,6 +987,8 @@ class WorksetsAndSharing(_Batch):
 
 
 class TheToolsAndTheirGates(unittest.TestCase):
+    """The tools as a client calls them: through the SDK, whose argument validation runs before the tool."""
+
     def capture(self, function, **arguments) -> dict:
         captured = {}
 
@@ -913,8 +997,15 @@ class TheToolsAndTheirGates(unittest.TestCase):
             return {"ok": True}
 
         with patch.object(mcp_server, "_request_json", side_effect=request):
-            function(**arguments)
+            asyncio.run(mcp_server.mcp.call_tool(function.__name__, arguments))
         return captured
+
+    def refused(self, function, **arguments) -> str:
+        with patch.object(mcp_server, "_request_json", side_effect=AssertionError("the backend was called")):
+            with self.assertRaises(Exception) as raised:
+                asyncio.run(mcp_server.mcp.call_tool(function.__name__, arguments))
+        self.assertIn("validation error", str(raised.exception))
+        return str(raised.exception)
 
     def test_only_a_literal_true_confirms(self) -> None:
         for function, arguments, path in (
@@ -925,8 +1016,26 @@ class TheToolsAndTheirGates(unittest.TestCase):
             with self.subTest(tool=function.__name__):
                 self.assertEqual(path, self.capture(function, **arguments)["path"])
                 self.assertIs(False, self.capture(function, **arguments)["body"]["confirmed"])
-                self.assertIs(False, self.capture(function, **arguments, confirmed="yes")["body"]["confirmed"])
                 self.assertIs(True, self.capture(function, **arguments, confirmed=True)["body"]["confirmed"])
+                # The SDK would read these as true; a gate takes only a JSON true.
+                for value in ("yes", "true", 1):
+                    with self.subTest(value=value):
+                        self.assertIn("confirmed", self.refused(function, **arguments, confirmed=value))
+
+    def test_the_contract_tools_flags_are_json_booleans(self) -> None:
+        arguments = dict(pos_path="p", neg_path="n", lbm_path="l", solvent_type="s", retention_time_tolerance=1.5,
+                         is_text_pos="a", is_text_neg="b", quant_table_path="q", amount_column="H", analysis_root="r",
+                         analysis_purpose="x", console_path="c", raw_location="copy", check_digest="d")
+        for flag in ("confirmed", "sample_table_confirmed", "replace_existing", "merge_selection_accepted"):
+            with self.subTest(flag=flag):
+                self.assertIs(True, self.capture(mcp_server.msdial_lipidomics_write_contract, **arguments, **{flag: True})
+                              ["body"][flag])
+                self.refused(mcp_server.msdial_lipidomics_write_contract, **arguments, **{flag: "yes"})
+        body = self.capture(mcp_server.msdial_lipidomics_check_inputs, pos_path="p", neg_path="n",
+                            merge_selection_accepted=True)["body"]
+        self.assertIs(True, body["merge_selection_accepted"])
+        self.refused(mcp_server.msdial_lipidomics_check_inputs, pos_path="p", neg_path="n", merge_selection_accepted="true")
+        self.refused(mcp_server.msdial_lipidomics_resolve_standards, contract_path="c", read_output_folders="true")
 
     def test_the_merge_tool_passes_the_reconciliation_options_and_leaves_them_out_when_not_given(self) -> None:
         body = self.capture(mcp_server.msdial_lipidomics_merge, contract_path="c", reconcile_polarities=False,
@@ -938,6 +1047,14 @@ class TheToolsAndTheirGates(unittest.TestCase):
         body = self.capture(mcp_server.msdial_lipidomics_merge, contract_path="c")["body"]
         self.assertNotIn("reconcile_polarities", body)
         self.assertNotIn("reconciliation_rt_tolerance", body)
+        # As the endpoint refuses them: text, or a number for a flag, is no answer.
+        for value in ("false", "true", "yes", 0, 1):
+            with self.subTest(value=value):
+                self.assertIn("reconcile_polarities", self.refused(mcp_server.msdial_lipidomics_merge, contract_path="c",
+                                                                   reconcile_polarities=value))
+        self.refused(mcp_server.msdial_lipidomics_merge, contract_path="c", reconciliation_rt_tolerance="0.2")
+        self.assertEqual(1.0, self.capture(mcp_server.msdial_lipidomics_merge, contract_path="c",
+                                           reconciliation_rt_tolerance=1)["body"]["reconciliation_rt_tolerance"])
 
     def test_the_check_tool_says_what_merge_selection_warnings_are(self) -> None:
         self.assertIn("merge_selection_warnings", mcp_server.msdial_lipidomics_check_inputs.__doc__)
