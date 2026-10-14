@@ -4,6 +4,94 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.39] - Unreleased
+
+### Fixed
+- A declared analysis input that is an archive inside the download is matched
+  by what it held. MB-POST MPST000213 (unit `334ab3e2f0e7600f4290`) failed its
+  lease three times in the MB-POST preflight campaign of 2026-10-14: "3 of its 3
+  declared analysis inputs are not in the download:
+  Rubroshorea_leprosula_from_Borneo_ID_01.zip, ...". Its one download object is
+  the project tar, and the Catalog declares, for each sample row, the per-sample
+  zip inside it (kind `file`). The extract stage expands every archive inside a
+  download in place (`archives._expand_nested`, with the outer archive's listing
+  validation, member, byte and depth budget, digests and member listing), so the
+  declared zip was no longer on disk, and only a path equal to it was looked for.
+  - The place a nested archive expanded to is read from its extraction record's
+    destination rule (`nested_rooted`, `nested_directory`, `container_*`,
+    `stream_file`), so a download-store record made by an earlier version
+    answers too. `declared_archive_containers` returns that place as `path/`,
+    and the input at it or under it is that declared input's
+    (`match_declared_inputs`). A place is one location under the data root: it
+    is tested against the input's full path there, never against the shorter
+    forms a listed name is read in, so `QC/S1/x.mzML` is not under the place
+    `S1/`. The lease, the one encoding rule, the convert stage, the analysis-CSV
+    builder and a split part ask the same function, so they answer alike.
+  - What one declared archive held is one sample's. The one encoding rule
+    (2026-10-09) uses one of its encodings and records the others. Of those,
+    a file beside the one used (the same folder and stem, whatever its rank:
+    `S1/S1.mzML` beside `S1/S1.cdf`, or `S1/S1.wiff` beside `S1/S1.d`, a tie
+    the rule's clause 2 gives the first by path) does not count as the
+    declared input found twice. Two runs (`run_1.mzML`, `run_2.mzML`) and both
+    polarities' folders (`POS/S1.mzML`, `NEG/S1.mzML`) in one declared zip are
+    refused as one declared input found more than once ("2 inputs in what the
+    archive held"), as one input per sample requires. An archived container,
+    or a declared file, counts every input it matched, as it always did.
+  - **An exception to the one encoding rule that the user has not decided.**
+    A file the rule left unused in another folder of the same declared zip
+    also counts, so the zip is refused: `S1/A/S1.mzML` beside `S1/B/S1.mzML`,
+    `S1/RAW/S1.d` beside `S1/mzML/S1.mzML`, and, in a positive unit,
+    `S1/POS/S1.mzML` beside `S1/S1.mzML`. This departs from the rule's clauses
+    1 and 2 ("copies in other folders included"; a tie goes to the first by
+    path), under which one of them would run and the other would be recorded.
+    The folders inside one sample's archive may be its runs (`run_a/data.mzML`
+    and `run_b/data.mzML`, the shape of MPST000213's
+    `Data/<run>/RD/MsData.RPS`), and the rule's grouping (one sample row and
+    one stem) cannot tell runs from copies. Whether such folders are runs or
+    copies is a scientific decision that has not been made. Until it is, the
+    lease stops rather than choose one by path. This is a stop, not a reading
+    of the rule, and the `encoding_rule` module says so.
+  - An mzXML inside a declared archive is converted in a campaign, as a
+    declared mzXML is.
+  - A declared per-sample archive the unit downloads itself, which expands at
+    the data root with its own paths, is matched through the sample the
+    archive's name gives its files, as an archived container already was.
+  - A declared archive whose contents hold nothing MS-DIAL opens is still
+    missing, and the error now says what it held: for MPST000213, "3 of them
+    were archives inside MPST000213.tar that the extract stage expanded, and
+    none of the files they held is one MS-DIAL opens
+    (Rubroshorea_leprosula_from_Borneo_ID_01.zip: 1028 file(s) under
+    MB-POST_files_MPST000213.0/Rubroshorea_leprosula_from_Borneo_ID_01, ...)",
+    with the commonest suffixes when the tree is on disk. The place it names is
+    the folder as it is written on disk (see `expanded_to` below).
+
+### Added
+- `manifest.declared_archive_inputs`, only where a declared input was such an
+  archive: for each, the declared path and sample; the archive's path under the
+  data root, the archive it was in, its depth, format and destination rule;
+  where it expanded (`expanded_to`, each folder as it is written on disk: a zip
+  holding exactly its own folder in another case, `S1.zip` holding `s1/`, is
+  `nested_rooted`, and its place is `s1`, which a case-sensitive file system
+  finds, not the zip's `S1`), its file count and bytes; its sha256 and
+  md5 from before it expanded and whether the declared checksum matched them;
+  and the inputs it gave (an mzML the convert stage wrote is named by the mzXML
+  it stands for). Its nested extraction record names the declared input
+  (`declared_input`), and the attribute stage counts them
+  (`declared_archive_inputs`).
+
+### Not changed
+- What is extracted, and how: `archives.py`, the extraction records and the
+  member listing are as they were. An unsafe member name in an inner zip still
+  refuses the whole extraction, and its members still count against the one
+  member budget.
+- MPST000213 itself does not become runnable. Each of its zips holds a JEOL
+  msAxel project (`Data/<run>/RD/MsData.RPS`, `MS/<n>/Profile.dfa`, ...) of
+  several acquisitions (5, 10 and 4 sample runs, with PEG calibration runs and,
+  in ID_01, a reference run), which no RawDataHandler reader opens; the unit is
+  DART-TOF MS without chromatography or product-ion spectra, the Catalog
+  already blocks it for its acquisition mode, and the campaign gate's ELIG-1
+  failed it. It now fails with the error above instead of the misleading one.
+
 ## [0.5.38] - Unreleased
 
 ### Changes a campaign run planned with this version

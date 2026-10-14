@@ -23,6 +23,20 @@ choose_encoding is the rule, and the one place it is decided: the lease groups t
 (repository_reanalysis._encoding_groups) and asks it once per sample, and every later reader (the lineage, the
 analysis-CSV builder, a split part) reads what it decided from the record it returns (EncodingChoice.record).
 
+ONE EXCEPTION THE USER HAS NOT DECIDED (Interactive 0.5.39). A declared analysis input that is itself an archive
+(MB-POST's per-sample zips inside a project tar) is one sample, and what it held is grouped and chosen among by the
+rule as above. Where the file the rule left unused lies in the same folder as the one it used and has its stem
+(S1/S1.mzML beside S1/S1.cdf; S1/S1.wiff beside S1/S1.d, a tie clause 2 gives the first by path), the rule applies
+as written. Where it lies in another folder of that archive, it does NOT: the lease refuses the unit as that declared
+input found more than once, where the rule ("copies in other folders included", clause 2) would use one and record
+the other - S1/A/S1.mzML beside S1/B/S1.mzML, S1/RAW/S1.d beside S1/mzML/S1.mzML, and, in a positive unit,
+S1/POS/S1.mzML beside S1/S1.mzML. The reason is that the folders inside one sample's archive may be its runs rather
+than copies (S1/run_a/data.mzML and S1/run_b/data.mzML; MPST000213's Data/<run>/RD/MsData.RPS), the grouping cannot
+tell which, and running one chosen by path would silently drop the others. Whether folders inside one declared
+per-sample archive are runs or copies is a scientific decision for the user that has not been made; the refusal is
+a stop until it is, not a reading of this rule (repository_reanalysis._another_encoding_beside). Everywhere else the
+rule applies as written.
+
 WHAT "READABLE" IS, AT THE LEASE. The caller's ``readability`` says what the lease knows of a candidate: an mzML
 whose arrays RawDataHandler cannot decode (mzml_encoding) is UNDECODABLE; an mzXML whose conversion failed, or whose
 scans contradict the declared polarity, is not readable (CONVERSION_FAILED, or the convert stage's own reason); an
