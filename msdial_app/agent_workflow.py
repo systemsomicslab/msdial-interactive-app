@@ -230,6 +230,13 @@ def build_guided_plan(
     merged.update(supplied)
     if overrides:
         merged["workflow_overrides"] = overrides
+    if lab_contract is not None and overrides:
+        # Overrides reach the state last, after everything the contract fixed was set.
+        from .lab_lipidomics_agent import contract_override_problems
+
+        overridden = contract_override_problems(overrides)
+        contract_blockers.extend(overridden["blockers"])
+        lab_contract["deviations"] = [*lab_contract["deviations"], *overridden["deviations"]]
     unknown_answer_keys = sorted(set(merged) - SUPPORTED_ANSWER_KEYS)
     inspection = inspect_analysis_input(input_path)
     manifest_override = str((merged.get("workflow_overrides") or {}).get("repository_run_manifest") or "")
@@ -238,17 +245,17 @@ def build_guided_plan(
             manifest_override, inspection.get("files", []), inspection.get("sample_table_proposal")
         )
     questions = _questions(merged)
-    blockers: list[str] = list(contract_blockers)
     if (workset or {}).get("kind") == LAB_LIPIDOMICS_WORKSET_KIND:
-        blockers.append(
+        contract_blockers.append(
             f"Workset '{workset.get('id')}' is a laboratory lipidomics workset for both polarities; it fills "
             "msdial_lipidomics_check_inputs, not a guided plan for one."
         )
+    if merged.get("sample_table"):
+        contract_blockers.extend(sample_table_problems(inspection["files"], merged["sample_table"]))
+    blockers: list[str] = list(contract_blockers)
     official_library: dict[str, Any] | None = None
     if not inspection["files"]:
         blockers.append("No supported analysis files were found at input_path.")
-    if merged.get("sample_table"):
-        blockers.extend(sample_table_problems(inspection["files"], merged["sample_table"]))
     lab_profile = _is_lab_lipidomics_profile(merged)
     if merged.get("solvent_type") not in (None, ""):
         from .lab_lipidomics import normalize_salt
@@ -287,10 +294,9 @@ def build_guided_plan(
     tuning_strategy = merged.get("parameter_strategy") in {
         "target_peak_count", "auto_peak_range"
     }
+    tuning_blocker = "Peak-count tuning requires a diagnostic run and an accepted minimum_peak_height."
     if tuning_strategy and not _has_minimum_peak_height(merged):
-        blockers.append(
-            "Peak-count tuning requires a diagnostic run and an accepted minimum_peak_height."
-        )
+        blockers.append(tuning_blocker)
 
     # An unanswered advisory question leaves a conservative default in place, so the
     # workflow can still be built and shown; only a required one makes it unknowable.
@@ -302,6 +308,12 @@ def build_guided_plan(
         blockers.extend(
             item["message"] for item in validation if item.get("level") == "error"
         )
+    # What stops the one-file diagnostic as well. It runs before a threshold exists, so it cannot
+    # wait for ready_to_prepare, yet it starts the Console on input_path and writes beside its
+    # files: a plan from a contract may run it only when nothing but the threshold is missing.
+    diagnostic_blockers = (
+        [item for item in blockers if item != tuning_blocker] if lab_contract is not None else list(contract_blockers)
+    )
     return {
         "schema": "msdial-interactive.guided-plan.v1",
         "input": inspection,
@@ -329,6 +341,7 @@ def build_guided_plan(
         ],
         "unknown_answer_keys": unknown_answer_keys,
         "blockers": list(dict.fromkeys(blockers)),
+        "diagnostic_blockers": list(dict.fromkeys(diagnostic_blockers)),
         "official_library": official_library,
         "ready_to_prepare": not pending_required and not blockers,
         "requires_diagnostic": tuning_strategy and not _has_minimum_peak_height(merged),

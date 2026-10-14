@@ -230,10 +230,6 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(3, sum(result["dropped_reasons"].values()))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ExportGeometryTests(unittest.TestCase):
     """Rows from both exports are concatenated and then read by position."""
 
@@ -448,3 +444,7 @@ class LaboratoryMergeTests(unittest.TestCase):
         path = quant_workbook(self.root / "quant_utility_table.xlsx", quant=bad)
         with self.assertRaisesRegex(MergeRefused, "cannot be used"):
             read_adduct_rules(path)
+
+
+if __name__ == "__main__":
+    unittest.main()

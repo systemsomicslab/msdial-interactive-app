@@ -111,11 +111,13 @@ intervals while adding a small computational cost.
    show the person what is there, then ask every open question in one message
    (analysis purpose, LBM2, salt, annotation RT tolerance, internal-standard
    libraries, `quant_utility_table.xlsx` and its amount column, analysis root,
-   Console). Call it again with the answers. Nothing is written.
-2. Say that MS-DIAL writes `.dcl`, `.pai2` and tag files beside the raw files it
-   reads, the one-file diagnostic included, and no output setting prevents it.
-   Whether to run on the data in place or on a copy is the person's decision; a
-   copy is made only on their word.
+   `raw_location`, Console). Call it again with the answers. Nothing is written.
+2. `raw_location` is asked with the sentence that MS-DIAL writes `.dcl`, `.pai2`
+   and tag files beside the raw files it reads, the one-file diagnostic included,
+   and no output setting prevents it. Whether to run on the data in place
+   (`in_place`) or on a copy (`copy`) is the person's decision; a copy is made
+   only on their word, and the check is then repeated on the copy's folders. The
+   contract records the answer.
 3. Show `paired_sample_table`; the person confirms it or corrects it by stem.
    `msdial_lipidomics_write_contract(..., check_digest, sample_table_confirmed=true,
    sample_table=<corrections>)` previews, and with `confirmed=true` writes
@@ -123,14 +125,19 @@ intervals while adding a small computational cost.
 4. For each polarity: `msdial_guided_analysis_plan(input_path=<raw folder>,
    answers={"lab_lipidomics_contract_path": ..., "ion_mode": ...})`, the
    diagnostic (confirmed), `msdial_estimate_peak_height`, then the production run
-   (confirmed). Positive and negative run one after the other. The diagnostic's
-   estimate and each start are recorded in `<root>/inputs/lab-lipidomics-record.jsonl`.
+   (confirmed, with `minimum_peak_height` added). Positive and negative run one
+   after the other. The diagnostic is refused while the plan has any blocker but
+   the missing threshold (`diagnostic_blockers`). The diagnostic's estimate and
+   each start are recorded in `<root>/inputs/lab-lipidomics-record.jsonl`, and
+   each run's `guided-answers.json` keeps the contract's sha256.
    A run whose automatic RT correction failed is reported; running it again
    uncorrected is the person's decision, and the plan reports it as a deviation.
 5. `msdial_lipidomics_resolve_standards(contract_path, pos_job_id, neg_job_id)`:
    read each standard's tier and the classes that would be NOT QUANTIFIED to the
-   person. Standards found only by text candidate or search, and standards not
-   found, each need their decision.
+   person. Standards awaiting acceptance (`needs_confirmation`: a text candidate,
+   a search, or an LBM annotation outside the internal-standard RT tolerance
+   while another spot lies inside it), and standards not found, each need their
+   decision.
 6. `msdial_lipidomics_normalize(contract_path, job_id, resolution_digest,
    accept_searched, accept_unresolved)` previews the standards table and the
    exact command; each polarity is confirmed separately. Poll the job with

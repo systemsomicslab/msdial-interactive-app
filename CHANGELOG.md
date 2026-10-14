@@ -47,8 +47,9 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
       with more than one adduct are listed.
   - The internal-standard text libraries, by header in any order and case,
     ASCII or UTF-8 with or without a BOM. Name, MZ, RT, Adduct and Ontology are
-    required; the adduct's charge must match the polarity; an MZ more than 5 mDa
-    from formula + adduct is warned about. A canonical writer gives the Console's
+    required; the adduct's charge must match the polarity; a name may appear once
+    per polarity, so one file can hold both; an MZ more than 5 mDa from formula +
+    adduct is warned about. A canonical writer gives the Console's
     positional layout and never writes an empty RT or CCS field, either of which
     makes the Console drop the row.
   - Adducts and masses: `[M+CH3COO]-` and `[M+Hac-H]-` are one ion, as are
@@ -64,20 +65,27 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - The internal-standard resolver. Every candidate sits at the library adduct's
     m/z (MS-DIAL's Text-DB window: 0.01 Da, or 20 ppm above m/z 500), so a spot
     of another adduct never competes. Tier A: the LBM library annotated it
-    (reference matched, name-equivalent at chain or sum level), within the
-    annotation RT tolerance. B: its text row annotated it, within the IS RT
-    tolerance (default 0.5 min). C: its text row matched but another annotation
-    won. D: any spot in that window. The first tier with a member decides, and
-    the most intense spot in it over the non-Blank files. C and D need the
-    person's confirmation. A chosen spot with no height in a sample or QC file is
-    invalid; a Blank without it is allowed and recorded. One spot chosen for two
-    standards is refused for both. Other adducts, isotopes and label
-    disagreements are recorded, and the result is written to
-    `is_resolution_{pos,neg}.tsv` and bound by a digest.
+    (reference matched, name-equivalent), within the annotation RT tolerance. A
+    sum-level name is equivalent to any chain-level name of its sum; two
+    chain-level names must agree chain for chain, so an isobaric endogenous lipid
+    (TG 16:0_17:0_18:0 beside TG 17:0_17:0_17:0) is not the standard. B: its text
+    row annotated it as a reference match, within the IS RT tolerance (default
+    0.5 min). C: its text row matched but another annotation won, or matched only
+    below the score cutoff (MS-DIAL names the annotator in the Comment for a
+    suggestion too). D: any spot in that window. The first tier with a member
+    decides; in A a spot inside the IS RT tolerance comes before a farther one,
+    whatever its height; then the most intense spot over the sample and QC files.
+    C and D need the person's confirmation, as does an A spot outside the IS RT
+    tolerance chosen while another spot lies inside it. A chosen spot with no
+    height in a sample or QC file is invalid; a Blank or Standard file without it
+    is allowed and recorded. One spot chosen for two standards is refused for
+    both. Other adducts, isotopes and label disagreements are recorded, and the
+    result is written to `is_resolution_{pos,neg}.tsv` and bound by a digest.
   - The standards table normalize reads: `StandardName`, `TargetClass`,
     `Concentration`, `PeakID` and `AssignName`. A standard without a usable spot
-    gets PeakID -1, which `--peak-ids-only` never replaces by a name lookup. An
-    accepted tier C or D standard gets AssignName, so MS-DIAL's export names it.
+    gets PeakID -1, which `--peak-ids-only` never replaces by a name lookup. A
+    standard awaiting acceptance gets its ID only once accepted, and an accepted
+    tier C or D standard gets AssignName, so MS-DIAL's export names it.
     The standards normalize will report as mismatched are predicted from the
     candidate table with the Console's own alias rule.
   - normalize's report is read (the current and the earlier format) and compared
@@ -94,10 +102,14 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     into one table.
   - The positive and negative raw folders must be two folders, neither inside
     the other. An analysis root in a code checkout or a temporary folder is
-    refused; the system drive and the user profile are said.
+    refused, and so is one inside a raw folder or whose `pos`, `neg`, `inputs` or
+    `quant` folder would be, hold or lie inside a raw folder (a root named as
+    the parent of raw folders called pos and neg made each run's output folder
+    the raw folder itself); the system drive and the user profile are said.
   - `lab_method_answers`: what every laboratory run states rather than asks,
     written out in full: 12 anchors, the 1.5 min local window, blank
-    interpolation from the confirmed sample table, and the rest.
+    interpolation from the confirmed sample table, Materials and Methods, and
+    the rest, so that a plan from the contract leaves no question open.
 - `resources/lipid_class_vocabulary.tsv`, the LbmClass members and the class
   definition MS-DIAL gives each, generated from MsdialWorkbench b01effaaa by
   `scripts/generate-lipid-class-vocabulary.py`, which reads only live code. 28
@@ -114,17 +126,22 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     LBM2 never proposed), and Excel lock files, and asks every open question: the
     analysis purpose, the LBM2, the salt, the annotation RT tolerance, the
     internal-standard libraries (two files, or one split by charge), the workbook
-    and its amount column, the analysis root and the Console. With the answers it
-    checks the two folders are distinct and each holds its polarity's files (a
-    `.wiff` needs its `.wiff.scan`); the LBM2 is an `.lbm2` with content,
-    identified by sha256, its sibling variants listed; the Console offers
-    `normalize --peak-ids-only`, the annotation candidate table and the local RT
-    test (MsdialWorkbench#826); the analysis root lies outside the raw folders, a
-    code checkout and the temporary folder. It reports the salt beside the
-    adducts the negative standards and sheet 3 use, the classes each polarity can
-    only leave NOT QUANTIFIED, the workbook's sample amount and notes read back,
-    a sample metadata table joined by stem (corroboration only), and one sample
-    table proposed for both polarities. `check_digest` binds what was read.
+    and its amount column, the analysis root, `raw_location` (the raw folders
+    are the data as acquired, `in_place`, or a copy, `copy`; asked with the
+    sentence that MS-DIAL writes its intermediates beside them) and the Console.
+    With the answers it checks the two folders are distinct and each holds its
+    polarity's files (a `.wiff` needs its `.wiff.scan`); the LBM2 is an `.lbm2`
+    with content, identified by sha256, its sibling variants listed; the Console
+    offers `normalize --peak-ids-only`, the annotation candidate table and the
+    local RT test (MsdialWorkbench#826); the analysis root and its folders lie
+    outside the raw folders, a code checkout and the temporary folder. It reports
+    the salt beside the adducts the negative standards and sheet 3 use, the
+    classes each polarity can only leave NOT QUANTIFIED, the workbook's sample
+    amount and notes read back, a sample metadata table joined by stem
+    (corroboration only), and one sample table proposed for both polarities.
+    `check_digest` binds what was read, the raw folders by location as well as
+    by file names and sizes. The internal-standard RT tolerance is 0.5 min unless
+    given or carried by a workset.
   - `msdial_lipidomics_write_contract` writes `<root>/inputs/`:
     `lab-lipidomics-contract.json`
     (`msdial-interactive.lab-lipidomics-contract.v1`), the internal-standard
@@ -134,14 +151,18 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     stands, when an input differs from what `check_digest` bound, and until the
     person has confirmed the sample table (`sample_table_confirmed`; corrections
     by stem in `sample_table`, every sample listed; `included: false` leaves a
-    sample out of both polarities). An existing contract is kept under a dated
-    name only with `replace_existing`. Every later step hashes the inputs and the
-    derived files again and refuses on any difference.
+    sample out of both polarities). The preview names the raw folders and the
+    `raw_location` answer, and the contract and its record keep both. An
+    existing contract is kept under a dated name only with `replace_existing`.
+    Every later step hashes the inputs and the derived files again and refuses on
+    any difference.
   - `msdial_lipidomics_resolve_standards`, read-only: each polarity's standards,
     decided from its run's own exports (a job's files; with
     `read_output_folders`, the output folder when it holds one run). The run must
-    be the contract's (its output folder, its `guided-answers.json`, the
-    contract's salt in `method.txt`), with the candidate table exported, the
+    be the contract's (its output folder, its `guided-answers.json` naming this
+    contract and its sha256, so a run planned from a contract since replaced at
+    the same path is refused, the contract's salt in `method.txt`), with the
+    candidate table exported, the
     library copy beside its project, and LBM annotations at all, since the Console
     skips a missing LBM2 without a word. A run whose automatic RT correction
     failed is reported, and running it again uncorrected is left to the person.
@@ -181,9 +202,13 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - From a contract, the plan takes the polarity from `ion_mode` and must be given
     the contract's raw folder. What the contract fixes (salt, LBM2, tolerances,
     internal-standard library, sample table, output folder, Console, purpose)
-    cannot be answered otherwise; a method default changed by the caller is
-    reported as a deviation. A Console without `normalize --peak-ids-only` is
-    refused before the run.
+    cannot be answered otherwise, through `workflow_overrides` neither; a method
+    default changed by the caller, or another override, is reported as a
+    deviation. A Console without `normalize --peak-ids-only` is refused before
+    the run. The one-file diagnostic is refused while the plan has any blocker
+    but the missing threshold (`diagnostic_blockers`): it starts the Console on
+    `input_path` and writes beside its raw files. The run's `guided-answers.json`
+    keeps the plan's `lab_lipidomics` block with the contract's sha256.
   - The internal standards are searched in the same run as the Text-DB annotator
     `internal_standards_{pos,neg}`: retention time used for scoring and
     filtering within the internal-standard tolerance (0.5 min by default, apart
@@ -203,8 +228,8 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   column, the Console and the method, for the next batch's
   `msdial_lipidomics_check_inputs(workset_id=...)`, which warns when a carried
   file has changed. The sample table, the purpose, the workbook's sample amount,
-  dilution factors, paths and the accepted threshold are not carried. A guided
-  plan refuses one.
+  dilution factors, paths, `raw_location` and the accepted threshold are not
+  carried. A guided plan refuses one.
 
 ### Changed
 - `lipidome_merge` writes what the laboratory's own program (metaboservice)

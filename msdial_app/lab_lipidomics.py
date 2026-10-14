@@ -1124,7 +1124,9 @@ def read_internal_standard_text(path: str | Path, polarity: str | None = None) -
         )
         return result
     records: list[InternalStandard] = []
-    seen: dict[str, int] = {}
+    # By name within a polarity: one file holding both polarities lists most standards twice,
+    # once per adduct, and that is not a repeat.
+    seen: dict[tuple[str, str | None], int] = {}
     for offset, line in enumerate(lines[header_index + 1:], start=header_index + 2):
         if not line.strip():
             continue
@@ -1163,12 +1165,13 @@ def read_internal_standard_text(path: str | Path, polarity: str | None = None) -
                 problems.append(f"{adduct} is a {ion.polarity.lower()} ion in the {polarity.lower()} library")
         except ValueError as error:
             problems.append(str(error))
-        if name and name.casefold() in seen:
-            problems.append(f"repeats the name on line {seen[name.casefold()]}")
+        key = (name.casefold(), polarity or (ion.polarity if ion is not None else None))
+        if name and key in seen:
+            problems.append(f"repeats the name on line {seen[key]}")
         if problems:
             blockers.append(f"{source.name} line {offset} ({name or 'unnamed'}): " + "; ".join(problems) + ".")
             continue
-        seen[name.casefold()] = offset
+        seen[key] = offset
         record = InternalStandard(
             name=name, mz=mz, rt=rt, adduct=adduct, ontology=ontology, inchikey=cell("inchikey"),
             formula=cell("formula"), smiles=cell("smiles"), ccs=ccs, mz_text=cell("mz"),
@@ -1454,38 +1457,76 @@ def _clean_name(name: str) -> str:
     return _LEGACY_OXYGEN.sub(r";O\1", text)
 
 
-def _lipid_sum(name: str) -> tuple[Any, ...] | None:
+def _lipid_chains(name: str) -> dict[str, Any] | None:
+    """A lipid name as its class, its chains (ether, carbons, double bonds, oxygens) and its labels."""
     labels = tuple(sorted(_LABEL.findall(name)))
     text = _LABEL.sub("", name).strip()
-    head, _, chains = text.partition(" ")
-    if not chains:
+    head, _, written = text.partition(" ")
+    if not written:
         return None
-    carbon = bonds = oxygen = 0
-    ethers = []
-    for part in re.split(r"[_/]", chains.strip()):
+    chains = []
+    for part in re.split(r"[_/]", written.strip()):
         match = _CHAIN.match(part.strip())
         if not match:
             return None
-        carbon += int(match.group("carbon"))
-        bonds += int(match.group("bonds"))
-        if match.group("oxygen"):
-            oxygen += int(match.group("count") or 1)
-        if match.group("ether"):
-            ethers.append(match.group("ether"))
-    return (head.casefold(), carbon, bonds, oxygen, tuple(sorted(ethers)), labels)
+        chains.append((
+            match.group("ether") or "", int(match.group("carbon")), int(match.group("bonds")),
+            int(match.group("count") or 1) if match.group("oxygen") else 0,
+        ))
+    return {"head": head.casefold(), "chains": chains, "labels": labels, "positional": "_" not in written}
+
+
+def _chain_sum(chains: Iterable[tuple[str, int, int, int]]) -> tuple[Any, ...]:
+    chains = list(chains)
+    return (sum(chain[1] for chain in chains), sum(chain[2] for chain in chains), sum(chain[3] for chain in chains),
+            tuple(sorted(chain[0] for chain in chains if chain[0])))
+
+
+def _same_lipid(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Two parsed names of one lipid: equal sums, and, where both resolve chains, no chain in conflict.
+
+    A sum composition (one chain) says nothing about the chains, so it agrees with any name of
+    that sum. Two chain-resolved names must agree chain for chain; the shorter may merge some of
+    the longer's chains into one (TG 15:0_33:1 for TG 15:0_18:1_15:0), never contradict them.
+    """
+    if left["head"] != right["head"] or left["labels"] != right["labels"]:
+        return False
+    if _chain_sum(left["chains"]) != _chain_sum(right["chains"]):
+        return False
+    short, long = sorted((left["chains"], right["chains"]), key=len)
+    if len(short) == 1:
+        return True
+    if len(short) == len(long):
+        if left["positional"] and right["positional"]:
+            return left["chains"] == right["chains"]
+        return sorted(short) == sorted(long)
+    for index, merged in enumerate(short):
+        rest = list(long)
+        for chain in short[:index] + short[index + 1:]:
+            if chain not in rest:
+                break
+            rest.remove(chain)
+        else:
+            if _chain_sum([merged]) == _chain_sum(rest):
+                return True
+    return False
 
 
 def name_equivalent(spot_name: str, standard_name: str) -> bool:
-    """Whether an annotation names this standard, at chain or sum level: PC 33:1(d7) is PC 15:0_18:1(d7)."""
+    """Whether an annotation names this standard: PC 33:1(d7) is PC 15:0_18:1(d7), PC 16:0_17:1(d7) is not."""
     left = [_clean_name(part) for part in str(spot_name or "").split("|") if part.strip()]
     right = [_clean_name(part) for part in str(standard_name or "").split("|") if part.strip()]
     if not left or not right:
         return False
     if {part.casefold() for part in left} & {part.casefold() for part in right}:
         return True
-    left_sums = {_lipid_sum(part) for part in left} - {None}
-    right_sums = {_lipid_sum(part) for part in right} - {None}
-    return bool(left_sums & right_sums)
+    # Every part of the annotation must agree with the standard: MS-DIAL's sum-level part of
+    # "TG 51:0|TG 16:0_17:0_18:0" matches TG 17:0_17:0_17:0, its chain-level part does not.
+    parsed_left = [_lipid_chains(part) for part in left]
+    parsed_right = [_lipid_chains(part) for part in right]
+    if None in parsed_left or None in parsed_right:
+        return False
+    return any(all(_same_lipid(item, other) for item in parsed_left) for other in parsed_right)
 
 
 def console_name_aliases(name: str) -> set[str]:
@@ -1519,10 +1560,16 @@ def _is_zero_height(text: str) -> bool:
     return not float(value).is_integer()
 
 
+# The files every standard must be in: the samples and QCs it quantifies. A Blank or an
+# authentic-standard injection often carries none, and is not what the standard is chosen for.
+STANDARD_REQUIRED_FILE_TYPES = ("sample", "qc")
+
+
 def _mean_intensity(spot: dict[str, Any], file_types: list[str]) -> float:
-    # The Blank is left out: a blank that carries the standards would otherwise decide which peak
-    # the samples are quantified against.
-    values = [parse_number(cell) or 0.0 for cell, kind in zip(spot["cells"], file_types) if kind.lower() != "blank"]
+    # Blanks and Standard files are left out: a blank that carries the standards would otherwise
+    # decide which peak the samples are quantified against.
+    values = [parse_number(cell) or 0.0 for cell, kind in zip(spot["cells"], file_types)
+              if kind.lower() in STANDARD_REQUIRED_FILE_TYPES]
     if not values:
         values = [parse_number(cell) or 0.0 for cell in spot["cells"]]
     return sum(values) / len(values) if values else 0.0
@@ -1547,14 +1594,19 @@ def resolve_standards(
 
     - A: the LBM library annotated the standard (name-equivalent, reference matched), within the
       annotation RT tolerance. The LBM decision comes first, as the analyst's procedure says.
-    - B: the standard's own text-library row annotated the spot, within the IS RT tolerance.
-    - C: that row matched the spot but another annotation won; needs the person's confirmation.
+    - B: the standard's own text-library row annotated the spot as a reference match, within the
+      IS RT tolerance.
+    - C: that row matched the spot, but another annotation won it or the match is only a
+      suggestion below the score cutoff; needs the person's confirmation.
     - D: any spot within the IS RT tolerance; needs the person's confirmation.
 
-    The first tier with a member decides, and the most intense spot in it (mean height over the
-    non-Blank files) is chosen; ties go to Fill %, then RT and m/z closeness, then the lower ID.
-    A chosen spot with no height in a sample or QC file is invalid; a Blank without it is allowed
-    and recorded, because a solvent blank often carries no standard.
+    The first tier with a member decides. Within tier A a spot inside the IS RT tolerance comes
+    before one only inside the annotation tolerance; then the most intense spot (mean height over
+    the sample and QC files) is chosen; ties go to Fill %, then RT and m/z closeness, then the
+    lower ID. A tier-A spot outside the IS RT tolerance chosen while another spot lies inside it
+    needs the person's confirmation too. A chosen spot with no height in a sample or QC file is
+    invalid; a Blank or Standard file without it is allowed and recorded, because a solvent blank
+    or an authentic-standard injection often carries no internal standard.
     """
     annotator_id = annotator_id or INTERNAL_STANDARD_ANNOTATOR_IDS.get(polarity, "")
     spots = export["spots"]
@@ -1586,16 +1638,20 @@ def resolve_standards(
             tier = None
             lbm = spot["method"].startswith("LbmDB")
             # Without a candidate table, an old export's name prefix is the only sign of a suggestion.
+            # MS-DIAL names the annotator in the Comment for any database hit, a suggestion below the
+            # score cutoff included, and the export no longer prefixes such a name.
             matched = (representative["is_reference_matched"] if representative
                        else not spot["name"].lower().startswith(tuple(item.lower() for item in _NAME_PREFIXES)))
+            named = record.name.casefold() in console_name_aliases(spot["name"])
             if (lbm and matched and within(spot, annotation_rt_tolerance)
                     and name_equivalent(spot["name"], record.name)):
                 tier = "A"
             elif within(spot, internal_standard_rt_tolerance):
-                if spot["method"] == annotator_id and record.name.casefold() in console_name_aliases(spot["name"]):
+                if spot["method"] == annotator_id and matched and named:
                     tier = "B"
-                elif any(
-                    row["annotator_id"] == annotator_id and not row["is_representative"]
+                elif (spot["method"] == annotator_id and named) or any(
+                    row["annotator_id"] == annotator_id
+                    and (not row["is_representative"] or not row["is_reference_matched"])
                     and record.name.casefold() in console_name_aliases(row["name"])
                     for row in (candidates or {}).get("by_spot", {}).get(spot["id"], [])
                 ):
@@ -1608,6 +1664,9 @@ def resolve_standards(
         def rank(item: dict[str, Any]) -> tuple[Any, ...]:
             spot = item["spot"]
             return (
+                # Tier A reaches out to the annotation tolerance for a stale library RT; a spot in
+                # the IS window still comes first, whatever a farther one's height.
+                0 if within(spot, internal_standard_rt_tolerance) else 1,
                 -intensity[spot["id"]], -spot["fill"], abs(spot["rt"] - record.rt), abs(spot["mz"] - record.mz),
                 _id_number(spot["id"]),
             )
@@ -1627,7 +1686,7 @@ def resolve_standards(
             "isotopic_spots_in_window": isotopic,
             "other_observations": [],
             "label_disagreement": None,
-            "zero_height_files": [], "blank_zero_height_files": [],
+            "zero_height_files": [], "tolerated_zero_height_files": [],
             "warnings": [], "reason": "",
         }
         for spot in spots:
@@ -1659,7 +1718,8 @@ def resolve_standards(
             "reason": {
                 "A": "the LBM library annotated it at the library adduct's m/z",
                 "B": "its internal-standard text row annotated it",
-                "C": "its text row matched, but another annotation was kept for the spot",
+                "C": "its text row matched, but another annotation was kept for the spot or the match is only "
+                     "a suggestion below the score cutoff",
                 "D": "the most intense spot at the library adduct's m/z and RT, whatever its annotation",
             }[chosen["tier"]],
         })
@@ -1671,12 +1731,21 @@ def resolve_standards(
                 f"{record.name} was annotated by the LBM library {delta_rt:+.2f} min from the library RT "
                 f"{record.rt}; the library RT may be stale."
             )
+            in_window = [item["spot"]["id"] for item in listed if within(item["spot"], internal_standard_rt_tolerance)]
+            if in_window:
+                # A stale library RT, or another lipid the LBM library named as the standard: which
+                # one, the spots inside the window cannot say on their own.
+                entry["needs_confirmation"] = True
+                entry["reason"] += (
+                    f", {delta_rt:+.2f} min from the library RT, while spot(s) {', '.join(in_window)} lie within "
+                    f"{internal_standard_rt_tolerance} min of it"
+                )
         elif abs(delta_rt) > internal_standard_rt_tolerance / 2:
             entry["warnings"].append(f"{record.name} lies {delta_rt:+.2f} min from the library RT {record.rt}.")
         for cell, kind, name in zip(spot["cells"], file_types, sample_names):
             if _is_zero_height(cell):
-                key = "blank_zero_height_files" if kind.lower() == "blank" else "zero_height_files"
-                entry[key].append(name)
+                required = kind.lower() in STANDARD_REQUIRED_FILE_TYPES
+                entry["zero_height_files" if required else "tolerated_zero_height_files"].append(name)
         if entry["zero_height_files"]:
             entry["status"] = "invalid"
             entry["needs_confirmation"] = False
@@ -1717,7 +1786,7 @@ def resolve_standards(
         "peak_ids": {
             entry["name"]: entry["alignment_id"] for entry in entries if entry["status"] in RESOLVED_STATUSES
         },
-        "needs_confirmation": names_with(*NEEDS_CONFIRMATION),
+        "needs_confirmation": [entry["name"] for entry in entries if entry.get("needs_confirmation")],
         "unresolved_expected": names_with("unresolved_expected"),
         "unresolved_missing": names_with("unresolved_missing"),
         "invalid": names_with("invalid", "conflict"),
@@ -1751,7 +1820,7 @@ RESOLUTION_COLUMNS = (
     "standard", "polarity", "library_mz", "library_rt", "library_adduct", "tier", "status",
     "alignment_id", "ms_dial_name", "ms_dial_adduct", "mz", "rt", "annotation_method",
     "delta_mz_mda", "delta_mz_ppm", "delta_rt", "intensity", "fill", "zero_height_files",
-    "blank_zero_height_files", "candidates", "other_observations", "label_disagreement", "reason",
+    "tolerated_zero_height_files", "candidates", "other_observations", "label_disagreement", "reason",
     "warnings", "height_export_sha256", "candidate_table_sha256",
 )
 
@@ -1773,7 +1842,7 @@ def write_resolution_tsv(resolution: dict[str, Any], path: str | Path) -> dict[s
             spot.get("name"), spot.get("adduct"), spot.get("mz"), spot.get("rt"), spot.get("method"),
             entry.get("delta_mz_mda"), entry.get("delta_mz_ppm"), entry.get("delta_rt"),
             spot.get("intensity"), spot.get("fill"), "; ".join(entry.get("zero_height_files", [])),
-            "; ".join(entry.get("blank_zero_height_files", [])),
+            "; ".join(entry.get("tolerated_zero_height_files", [])),
             "; ".join(f"{item['alignment_id']} {item['tier']} {item['name']} {item['adduct']} "
                       f"m/z {item['mz']} RT {item['rt']} I {item['intensity']:.0f}"
                       for item in entry.get("candidates", [])),
@@ -1804,8 +1873,9 @@ def standards_rows(
 
     A standard the resolver found only by text candidate or plain search (tiers C and D) is used
     only once the person accepted it, and then with AssignName, so MS-DIAL's own export names the
-    spot as the standard it is. Any other standard without a valid spot gets -1, which normalize
-    run with --peak-ids-only never replaces by a lookup of its own.
+    spot as the standard it is. An LBM annotation the resolver asked the person about is likewise
+    used only once accepted, under the name MS-DIAL gave it. Any other standard without a valid
+    spot gets -1, which normalize run with --peak-ids-only never replaces by a lookup of its own.
     """
     accepted_names = set(accepted)
     by_name = {entry["name"]: entry for entry in resolution.get("standards", [])}
@@ -1813,9 +1883,8 @@ def standards_rows(
     for row in lookup.get("rows", []):
         entry = by_name.get(row["standard"], {})
         status = entry.get("status")
-        usable = status in RESOLVED_STATUSES and (
-            status not in NEEDS_CONFIRMATION or row["standard"] in accepted_names
-        )
+        asks = status in NEEDS_CONFIRMATION or bool(entry.get("needs_confirmation"))
+        usable = status in RESOLVED_STATUSES and (not asks or row["standard"] in accepted_names)
         peak_id = int(entry["alignment_id"]) if usable else -1
         rows.append({
             "StandardName": row["standard"], "TargetClass": row["target_class"],
@@ -2328,6 +2397,41 @@ def folder_layout_problems(positive_folder: str | Path, negative_folder: str | P
     return []
 
 
+def _folder_key(path: str | Path) -> str:
+    return os.path.normcase(str(Path(path).expanduser().resolve()))
+
+
+def raw_folder_overlaps(
+    root: str | Path, subfolders: dict[str, str | Path], raw_folders: dict[str, str | Path | None]
+) -> list[str]:
+    """Where an analysis would write into the raw data: the root inside a raw folder, or one of its
+    subfolders (the runs' output folders, inputs, quant) being, holding or lying inside one.
+
+    A root named as the parent of folders called pos and neg makes each run's output folder the raw
+    folder itself: the method, the project, the exports and the library copy would land beside the
+    raw files, on top of the intermediates MS-DIAL already writes there. A root that merely holds the
+    raw folders elsewhere is allowed.
+    """
+    problems: list[str] = []
+    root_key = _folder_key(root)
+    for polarity, raw in raw_folders.items():
+        if not raw:
+            continue
+        raw_key = _folder_key(raw)
+        if root_key == raw_key or root_key.startswith(raw_key.rstrip(os.sep) + os.sep):
+            problems.append(f"The analysis root {Path(root)} lies inside the {polarity.lower()} raw-data folder.")
+            continue
+        for label, folder in subfolders.items():
+            key = _folder_key(folder)
+            if key == raw_key:
+                problems.append(f"The {label} {Path(folder)} would be the {polarity.lower()} raw-data folder itself.")
+            elif key.startswith(raw_key.rstrip(os.sep) + os.sep):
+                problems.append(f"The {label} {Path(folder)} would lie inside the {polarity.lower()} raw-data folder.")
+            elif raw_key.startswith(key.rstrip(os.sep) + os.sep):
+                problems.append(f"The {label} {Path(folder)} would hold the {polarity.lower()} raw-data folder {Path(raw)}.")
+    return problems
+
+
 def analysis_root_problems(
     root: str | Path, *, home: str | Path | None = None, temporary: Iterable[str | Path] | None = None
 ) -> dict[str, list[str]]:
@@ -2381,6 +2485,9 @@ def lab_method_answers() -> dict[str, Any]:
         "height_matrix_export": True,
         "export_annotation_candidates": True,
         "stage_inputs": False,
+        # Stated so that a plan from the contract leaves no question open; the text is written when
+        # the run is completed (msdial_complete_guided_analysis).
+        "generate_materials_methods": True,
     }
     basis = {
         "automatic_rt_correction_interpolate_blanks_by_analytical_order": (

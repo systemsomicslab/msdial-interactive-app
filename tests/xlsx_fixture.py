@@ -185,7 +185,8 @@ def preparation_sheet(standards=STANDARDS, *, plasma_microliters: float = 10.0, 
     cells: dict[str, Any] = {
         "E3": "Put liquid volume in LC-MS vial", "F3": "Put mg tissue weight in solvent",
         "G3": "Put cell number in solvent when 10^6 cells cosidered", "H3": "Put uL in solvent",
-        "E4": 320, "F4": 10, "G4": 0.25, "H4": plasma_microliters,
+        # F4 differs from H4, so that reading one column for the other shows.
+        "E4": 320, "F4": 5, "G4": 0.25, "H4": plasma_microliters,
         "B5": "Name", "C5": "mM in LC-MS vial", "D5": "Class name", "E5": "pmol",
         "F5": "int (pmol/mg tissue)", "G5": "int (pmol/10^6 cells)", "H5": "int (pmol/ul plasma)",
     }
@@ -195,7 +196,7 @@ def preparation_sheet(standards=STANDARDS, *, plasma_microliters: float = 10.0, 
         cells[f"C{row}"] = pmol / 320
         cells[f"D{row}"] = klass
         cells[f"E{row}"] = Formula(f"C{row}*$E$4", pmol)
-        cells[f"F{row}"] = Formula(f"E{row}/$F$4", pmol / 10)
+        cells[f"F{row}"] = Formula(f"E{row}/$F$4", pmol / 5)
         cells[f"G{row}"] = Formula(f"E{row}*$G$4", pmol * 0.25)
         cells[f"H{row}"] = Formula(f"E{row}/$H$4", pmol / plasma_microliters)
         row += 1

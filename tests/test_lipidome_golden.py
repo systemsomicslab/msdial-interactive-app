@@ -153,7 +153,8 @@ class GoldenInputCheckTests(unittest.TestCase):
             "sample_metadata_path": str(DEMO / "metadata.xlsx"),
         }))
         self.assertEqual([], result["blockers"])
-        self.assertEqual(["lbm_path", "analysis_root", "console_path"], [item["id"] for item in result["questions"]])
+        self.assertEqual(["lbm_path", "analysis_root", "raw_location", "console_path"],
+                         [item["id"] for item in result["questions"]])
         self.assertEqual((7, 7), (result["folders"]["Positive"]["file_count"], result["folders"]["Negative"]["file_count"]))
         table = result["paired_sample_table"]
         self.assertTrue(table["matched"], table["problems"])

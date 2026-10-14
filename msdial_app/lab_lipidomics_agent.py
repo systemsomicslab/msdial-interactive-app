@@ -58,6 +58,7 @@ from .lab_lipidomics import (
     pair_sample_tables,
     parse_normalize_stdout,
     predict_peak_id_mismatches,
+    raw_folder_overlaps,
     read_alignment_export,
     read_candidate_table,
     read_internal_standard_text,
@@ -97,6 +98,16 @@ MERGE_REPORT_NAME = "merge-report.json"
 RT_CORRECTION_FAILED = "Automatic alignment RT correction failed"
 # R3: an annotation RT tolerance outside this is allowed and said.
 ANNOTATION_RT_TOLERANCE_USUAL = (0.1, 3.0)
+# Where MS-DIAL reads the raw data: the folders as acquired, or a copy made for this analysis.
+RAW_LOCATIONS = ("in_place", "copy")
+RAW_LOCATION_SENTENCE = (
+    "MS-DIAL writes its per-file .dcl, .pai2 and tag files and the alignment container beside the raw files it "
+    "reads, the one-file diagnostic included, and no output setting prevents it."
+)
+RAW_LOCATION_QUESTION = (
+    f"{RAW_LOCATION_SENTENCE} Are pos_path and neg_path the data as acquired (in_place: the files are written "
+    "there) or a copy made for this analysis (copy)? A copy is made only on your word, before the contract."
+)
 
 
 class LabContractError(ValueError):
@@ -280,13 +291,20 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         verdict = analysis_root_problems(analysis_root)
         blockers.extend(verdict["blockers"])
         warnings.extend(verdict["warnings"])
-        for polarity, folder in folders.items():
-            if folder and (analysis_root == folder or folder in analysis_root.parents):
-                blockers.append(f"The analysis root {analysis_root} lies inside the {polarity.lower()} raw-data folder.")
+        blockers.extend(raw_folder_overlaps(analysis_root, _analysis_subfolders(analysis_root), folders))
         result["outputs"] = {
             "inputs": str(analysis_root / INPUTS_FOLDER), "quant": str(analysis_root / QUANT_FOLDER),
             **{polarity: str(analysis_root / FOLDERS[polarity]) for polarity in POLARITIES},
         }
+
+    # Where MS-DIAL reads the raw data: it writes its intermediates beside the files it reads, and
+    # only the person can say whether these folders are the data as acquired or a copy for this.
+    raw_location = str(args.get("raw_location") or "").strip().casefold()
+    if not raw_location:
+        ask("raw_location", RAW_LOCATION_QUESTION, list(RAW_LOCATIONS))
+    elif raw_location not in RAW_LOCATIONS:
+        blockers.append(f"raw_location '{args.get('raw_location')}' is neither {' nor '.join(RAW_LOCATIONS)}.")
+    result["raw_location"] = {"answer": raw_location, "writes_beside_raw": RAW_LOCATION_SENTENCE}
 
     # The Console that runs both polarities and normalize, named here rather than in the shared settings.
     console_text = str(args.get("console_path") or "").strip()
@@ -335,6 +353,13 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
     result["stated_defaults"] = {
         **method,
         "internal_standard_rt_tolerance": is_rt_tolerance,
+        "internal_standard_search": (
+            f"an LBM annotation of a standard counts out to the annotation RT tolerance "
+            f"({rt_tolerance if rt_tolerance is not None else 'R3'} min) from its text RT: one within "
+            f"{is_rt_tolerance} min is taken first, and a farther one only on the person's confirmation when another "
+            f"spot lies within {is_rt_tolerance} min. Its text row's annotation and any other spot at its m/z count "
+            f"only within {is_rt_tolerance} min"
+        ),
         "merge": "rows whose representative annotation is not reference matched are dropped",
         "dilution": "each file's factor in the sample table multiplies its concentrations (MS-DIAL -d)",
     }
@@ -365,6 +390,14 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
 
 def public_check(result: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in result.items() if not key.startswith("_")}
+
+
+def _analysis_subfolders(root: Path) -> dict[str, Path]:
+    """The folders an analysis root holds, by what the overlap check calls them."""
+    return {
+        **{f"{polarity.lower()} output folder": root / FOLDERS[polarity] for polarity in POLARITIES},
+        "inputs folder": root / INPUTS_FOLDER, "quant folder": root / QUANT_FOLDER,
+    }
 
 
 def _arguments(request: dict[str, Any]) -> dict[str, Any]:
@@ -647,11 +680,14 @@ def _input_identity(
         # As read, so that 2 and 2.0, or a path spelled two ways, do not count as a change.
         "answers": {
             **{key: str(args.get(key, "")).strip() for key in ("solvent_type", "amount_column", "analysis_purpose")},
+            "raw_location": str(args.get("raw_location", "")).strip().casefold(),
             **{key: repr(_positive_number(args.get(key))) for key in ("retention_time_tolerance", "number_of_threads")},
             "internal_standard_rt_tolerance": repr(_positive_number(
                 args.get("internal_standard_rt_tolerance", DEFAULT_INTERNAL_STANDARD_RT_TOLERANCE)
             )),
-            **{key: _path_key(args.get(key)) for key in ("analysis_root", "console_path")},
+            # The raw folders by location too: two copies of one batch have the same names and sizes,
+            # and the one the person was shown is the one MS-DIAL writes beside.
+            **{key: _path_key(args.get(key)) for key in ("analysis_root", "console_path", "pos_path", "neg_path")},
         },
     }
 
@@ -738,6 +774,8 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
             str(contract_path), *(str(path) for path in derived_paths["internal_standard_libraries"].values()),
             str(derived_paths["standards_template"]), str(derived_paths["quant_rules"]), str(inputs / RECORD_NAME),
         ],
+        "raw_folders": {polarity: str(parsed["folders"][polarity]) for polarity in POLARITIES},
+        "raw_location": check["raw_location"],
         "output_roots": {polarity: str(root / FOLDERS[polarity]) for polarity in POLARITIES},
         "sample_table": table["rows"],
         "salt": parsed["salt"]["salt"],
@@ -790,6 +828,8 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
         "analysis_purpose": str(args.get("analysis_purpose")).strip(),
         "analysis_root": str(root),
         "raw_folders": {polarity: str(parsed["folders"][polarity]) for polarity in POLARITIES},
+        # The person's answer, read back with the sentence they were given.
+        "raw_location": check["raw_location"],
         "output_roots": {polarity: str(root / FOLDERS[polarity]) for polarity in POLARITIES},
         "quant_folder": str(root / QUANT_FOLDER),
         "console_path": parsed["console"]["path"],
@@ -846,6 +886,7 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
     record = record_event(contract_path, {
         "event": "contract_written", "contract_sha256": contract_sha256, "check_digest": check["check_digest"],
         "sample_table_confirmed_by": contract["sample_table"]["confirmed_by"], "replaced_contract": replaced,
+        "raw_folders": contract["raw_folders"], "raw_location": contract["raw_location"]["answer"],
     })
     return {
         "written": True,
@@ -1006,6 +1047,10 @@ def contract_plan_answers(contract_path: str, supplied: dict[str, Any], input_pa
         outcome["blockers"].append(
             f"input_path must be the contract's {polarity.lower()} raw-data folder, {raw}."
         )
+    # Checked when the contract was written, and again here for a contract written by hand or
+    # before the check existed.
+    root = Path(contract["analysis_root"])
+    outcome["blockers"].extend(raw_folder_overlaps(root, _analysis_subfolders(root), contract["raw_folders"]))
     fixed = {
         "project_type": "lcms",
         "target_omics": "Lipidomics",
@@ -1036,6 +1081,35 @@ def contract_plan_answers(contract_path: str, supplied: dict[str, Any], input_pa
     outcome.update({"answers": answers, "fixed": {**fixed, "lab_lipidomics_contract_path": contract["_path"]},
                     "fixed_keys": sorted(fixed)})
     return outcome
+
+
+# The workflow state a contract decides, by key or by prefix: the libraries and their scoring, the
+# salt, the files and sample table, where the run writes, the Console, the internal-standard search.
+# workflow_overrides are applied after everything else, so one of these would replace the contract's
+# choice in the run without a word.
+CONTRACT_FIXED_STATE_KEYS = frozenset({
+    "solvent", "files", "sample_table_proposal",
+    "output_root", "export_folder_path", "console_path", "ion_mode", "project_type", "target_omics",
+    "template_path", "selected_lipids", "selected_adducts", "internal_standard_rt_tolerance",
+    "lab_lipidomics_contract_path", "lab_lipidomics_profile", "analysis_purpose", "repository_run_manifest",
+    "repository_metadata", "repository_metadata_source_path",
+})
+CONTRACT_FIXED_STATE_PREFIXES = ("lbm_", "msp_", "text_")
+
+
+def contract_override_problems(overrides: dict[str, Any]) -> dict[str, list[Any]]:
+    """workflow_overrides on a plan from a contract: refused where the contract decides, reported otherwise."""
+    blockers: list[str] = []
+    deviations: list[dict[str, Any]] = []
+    for key, value in sorted((overrides or {}).items()):
+        if key in CONTRACT_FIXED_STATE_KEYS or key.startswith(CONTRACT_FIXED_STATE_PREFIXES):
+            blockers.append(
+                f"workflow_overrides.{key} would replace what the laboratory lipidomics contract decides; write a "
+                "new contract to change it."
+            )
+        else:
+            deviations.append({"key": f"workflow_overrides.{key}", "contract": None, "given": value})
+    return {"blockers": blockers, "deviations": deviations}
 
 
 def _same_answer(key: str, left: Any, right: Any) -> bool:
@@ -1098,8 +1172,9 @@ def run_outputs(contract: dict[str, Any], polarity: str, job: dict[str, Any] | N
                 f"Job {job.get('id')} wrote into {preparation.get('run_directory')}, not the contract's "
                 f"{polarity.lower()} output folder {output_root}."
             )
+        # As the files stand now: a job lists what the run wrote, and one deleted since is not there.
         artifacts = [Path(path) for kind, paths in (job.get("artifacts") or {}).items() if kind != "records"
-                     for path in paths]
+                     for path in paths if Path(path).is_file()]
         if not artifacts:
             found_by = "output folder"
             artifacts = _folder_files(output_root, preparation.get("export_folder_path"))
@@ -1149,12 +1224,20 @@ def run_outputs(contract: dict[str, Any], polarity: str, job: dict[str, Any] | N
             )
     answers_file = output_root / "guided-answers.json"
     try:
-        answers = json.loads(answers_file.read_text(encoding="utf-8-sig")).get("answers", {})
-    except (OSError, ValueError):
-        answers = {}
+        recorded = json.loads(answers_file.read_text(encoding="utf-8-sig"))
+        answers = recorded.get("answers", {})
+    except (OSError, ValueError, AttributeError):
+        recorded, answers = {}, {}
         problems.append(f"{answers_file} cannot be read, so this run cannot be shown to come from the contract.")
     if answers and not _same_path(answers.get("lab_lipidomics_contract_path", ""), contract["_path"]):
         problems.append(f"The run in {output_root} was not planned from this contract.")
+    elif answers and (recorded.get("lab_lipidomics") or {}).get("contract_sha256") != contract["_sha256"]:
+        # A contract replaced at the same path rewrites the internal-standard libraries in place;
+        # the run was annotated with the earlier ones.
+        problems.append(
+            f"The run in {output_root} was planned from another version of this contract (its sha256 differs); "
+            "run it again from the current contract."
+        )
     method_file = output_root / "method.txt"
     if method_file.is_file():
         lines = method_file.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -1221,11 +1304,11 @@ def resolve_polarity(contract: dict[str, Any], polarity: str, job: dict[str, Any
         "resolution_digest": digest,
         "summary": {
             "standards": [
-                {key: entry.get(key) for key in ("name", "tier", "status", "alignment_id", "delta_mz_mda",
-                                                 "delta_rt", "label_disagreement", "reason")}
+                {key: entry.get(key) for key in ("name", "tier", "status", "alignment_id", "needs_confirmation",
+                                                 "delta_mz_mda", "delta_rt", "label_disagreement", "reason")}
                 | {"ms_dial_name": (entry.get("spot") or {}).get("name"),
                    "zero_height_files": entry.get("zero_height_files", []),
-                   "blank_zero_height_files": entry.get("blank_zero_height_files", []),
+                   "tolerated_zero_height_files": entry.get("tolerated_zero_height_files", []),
                    "candidates": len(entry.get("candidates", [])),
                    "other_observations": len(entry.get("other_observations", []))}
                 for entry in resolution["standards"]
@@ -1255,8 +1338,9 @@ def resolve_standards_for_contract(contract_path: str, jobs: dict[str, dict[str,
         "contract_path": contract["_path"], "contract_sha256": contract["_sha256"], "polarities": polarities,
         "decisions": (
             "For each polarity, read the tiers to the person. A standard found only by its text candidate or by "
-            "search (needs_confirmation) is used only if they accept it (accept_searched); a standard that was not "
-            "found, or whose spot is invalid, is left unresolved only if they accept that (accept_unresolved). "
+            "search, or by an LBM annotation outside the internal-standard RT tolerance while another spot lies "
+            "inside it (needs_confirmation), is used only if they accept it (accept_searched); a standard that was "
+            "not found, or whose spot is invalid, is left unresolved only if they accept that (accept_unresolved). "
             "The classes it quantifies are then NOT QUANTIFIED."
         ),
     }
@@ -1322,7 +1406,7 @@ def plan_normalize(
     unknown = sorted(accepted - searched)
     if unknown:
         raise LabContractError(
-            f"accept_searched names {', '.join(unknown)}, which this resolution did not find by text candidate or search."
+            f"accept_searched names {', '.join(unknown)}, which this resolution does not ask the person to accept."
         )
     unresolvable = {
         name for name in used
@@ -1409,11 +1493,12 @@ def plan_normalize(
         "paths": {key: str(value) for key, value in paths.items()},
         "resolution": resolution,
         "computes": (
-            "Each standard's own spot is its amount in every file. Every other spot is amount x its height / the "
-            "standard's height in that file (x the file's dilution factor with -d), the standard being its class's "
-            "own or 'Any others'; a spot not reference matched is quantified by 'Any others'. A class whose "
-            "standard did not resolve is emptied with a NOT QUANTIFIED comment, and a file whose standard has no "
-            "height is empty for that class. Blanks are normalized like samples; nothing is subtracted."
+            "Each standard's own spot is its amount x the file's dilution factor (its amount when -d is not "
+            "passed). Every other spot is amount x its height / the standard's height in that file, x the file's "
+            "dilution factor with -d, the standard being its class's own or 'Any others'; a spot not reference "
+            "matched is quantified by 'Any others'. A class whose standard did not resolve is emptied with a NOT "
+            "QUANTIFIED comment, and a file whose standard has no height is empty for that class. Blanks are "
+            "normalized like samples; nothing is subtracted."
         ),
     }
 

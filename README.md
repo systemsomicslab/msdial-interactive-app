@@ -166,25 +166,32 @@ adduct each polarity keeps). Five MCP tools take it from the folders to
    the folders alone it lists what is there and every question still open (what
    the analysis is for, the LBM2, the salt, the annotation RT tolerance, the
    internal-standard libraries, the workbook and its amount column, where to
-   write, and the Console). With the answers it checks each input and the inputs
-   against each other: the salt against the adducts the standards and sheet 3
-   use, the classes each polarity can only leave NOT QUANTIFIED, and one sample
-   table proposed for both polarities.
+   write, whether the raw folders are the data as acquired or a copy, since
+   MS-DIAL writes its intermediates beside them, and the Console). With the
+   answers it checks each input and the inputs against each other: the salt
+   against the adducts the standards and sheet 3 use, the classes each polarity
+   can only leave NOT QUANTIFIED, no output folder in or over a raw folder, and
+   one sample table proposed for both polarities.
 2. `msdial_lipidomics_write_contract` writes `<root>/inputs/`: the contract, the
    internal-standard libraries in the column order MS-DIAL reads, the standards
-   template and the selection rules. It is refused if an input changed after the
-   check the person saw. Each polarity is then planned with
-   `msdial_guided_analysis_plan` and `lab_lipidomics_contract_path`; the
-   contract fixes the salt, the LBM2, both RT tolerances, the internal-standard
-   library (searched in the same run as a Text-DB annotator with retention time
-   on), the sample table and the output folder, and states the method
-   (`TimeBasedLinearWeightedMovingAverage`, automatic RT correction with 12
-   anchors and the 1.5 min local window, the annotation candidate table, QA).
+   template and the selection rules. It is refused if an input, the raw folders
+   included, changed after the check the person saw. Each polarity is then
+   planned with `msdial_guided_analysis_plan` and `lab_lipidomics_contract_path`;
+   the contract fixes the salt, the LBM2, both RT tolerances, the
+   internal-standard library (searched in the same run as a Text-DB annotator
+   with retention time on), the sample table and the output folder, and states
+   the method (`TimeBasedLinearWeightedMovingAverage`, automatic RT correction
+   with 12 anchors and the 1.5 min local window, the annotation candidate table,
+   QA). Neither the answers nor `workflow_overrides` can change what it fixes,
+   and the one-file diagnostic is refused, as the run is, for any problem but the
+   missing threshold. Each run records the contract's sha256 beside it.
 3. `msdial_lipidomics_resolve_standards` decides which aligned spot is each
-   standard: at the m/z of the adduct the library names, LBM annotation first,
-   then the standard's own text row, then a hidden text candidate or a plain
-   search, which need the person's acceptance; the most intense spot over the
-   non-Blank files within the first tier that has one.
+   standard: at the m/z of the adduct the library names, an LBM annotation of
+   that standard first (out to the annotation RT tolerance, one inside the
+   internal-standard tolerance before a farther one), then the standard's own
+   text row as a reference match, then a hidden or below-cutoff text candidate or
+   a plain search, which need the person's acceptance; the most intense spot over
+   the sample and QC files within the first tier that has one.
 4. `msdial_lipidomics_normalize` writes the standards table with each chosen
    alignment ID and runs `MSDIALCUI normalize --peak-ids-only`, so a standard the
    resolver rejected is never looked up by name. Every quantified cell is then

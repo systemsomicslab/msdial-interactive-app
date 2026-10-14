@@ -3082,10 +3082,11 @@ def msdial_lipidomics_check_inputs(
     quant_table_path: str = "",
     amount_column: str = "",
     sample_metadata_path: str = "",
-    internal_standard_rt_tolerance: float = 0.5,
+    internal_standard_rt_tolerance: float | None = None,
     analysis_root: str = "",
     analysis_purpose: str = "",
     console_path: str = "",
+    raw_location: str = "",
     number_of_threads: int | None = None,
     workset_id: str = "",
     host: str = DEFAULT_HOST,
@@ -3100,6 +3101,7 @@ def msdial_lipidomics_check_inputs(
     answers. is_text_pos and is_text_neg may name one file holding both polarities; it is split by the
     adducts' charge. amount_column is the sheet-1 column (F per mg tissue, G per 10^6 cells, H per uL
     plasma); its sample amount (row 4) and any note below the standards are read back for the person.
+    internal_standard_rt_tolerance is 0.5 min unless given or carried by the workset.
 
     The result says what blocks a contract (blockers), what is still to be asked (questions), the
     salt beside the adducts the negative standards and sheet 3 use (salt_evidence), the classes each
@@ -3108,9 +3110,11 @@ def msdial_lipidomics_check_inputs(
     was read; pass it to msdial_lipidomics_write_contract. workset_id fills unanswered inputs from a
     laboratory lipidomics workset and warns when one of its files has changed.
 
-    Before any run, tell the person that MS-DIAL writes .dcl, .pai2 and tag files beside the raw files
-    it reads, the one-file diagnostic included, and no output setting prevents it. Whether to run on
-    the data where it is or on a copy is theirs to decide, and a copy is made only on their word.
+    raw_location is the person's answer to where MS-DIAL reads the raw data: in_place (pos_path and
+    neg_path are the data as acquired) or copy (a copy made for this analysis). Ask it with the
+    sentence the question carries: MS-DIAL writes .dcl, .pai2 and tag files beside the raw files it
+    reads, the one-file diagnostic included, and no output setting prevents it. A copy is made only on
+    their word, before the contract, and pos_path and neg_path then name the copy.
     """
     body: dict[str, Any] = {
         "pos_path": pos_path, "neg_path": neg_path, "lbm_path": lbm_path, "solvent_type": solvent_type,
@@ -3118,7 +3122,7 @@ def msdial_lipidomics_check_inputs(
         "is_text_neg": is_text_neg, "quant_table_path": quant_table_path, "amount_column": amount_column,
         "sample_metadata_path": sample_metadata_path,
         "internal_standard_rt_tolerance": internal_standard_rt_tolerance, "analysis_root": analysis_root,
-        "analysis_purpose": analysis_purpose, "console_path": console_path,
+        "analysis_purpose": analysis_purpose, "console_path": console_path, "raw_location": raw_location,
         "number_of_threads": number_of_threads, "workset_id": workset_id,
     }
     return _request_json("POST", "/api/lipidomics/check", host=host, port=port, body=body, timeout=600)
@@ -3139,12 +3143,13 @@ def msdial_lipidomics_write_contract(
     analysis_root: str,
     analysis_purpose: str,
     console_path: str,
+    raw_location: str,
     check_digest: str,
     sample_table_confirmed: bool = False,
     sample_table: list[dict[str, Any]] | None = None,
     confirmed_by: str = "",
     sample_metadata_path: str = "",
-    internal_standard_rt_tolerance: float = 0.5,
+    internal_standard_rt_tolerance: float | None = None,
     number_of_threads: int | None = None,
     replace_existing: bool = False,
     confirmed: bool = False,
@@ -3157,7 +3162,9 @@ def msdial_lipidomics_write_contract(
     person saw the check refuses the write. sample_table_confirmed=true says the person confirmed
     paired_sample_table; sample_table carries their corrections by stem (file_type, class_id,
     analytical_order, batch_order, factor, included, acquisition_type), every sample listed.
-    confirmed_by names who confirmed it. confirmed=false (the default) previews the files; with
+    confirmed_by names who confirmed it. raw_location is the answer the check asked for (in_place or
+    copy); the preview shows it with the raw folders MS-DIAL will read and write beside.
+    confirmed=false (the default) previews the files; with
     confirmed=true it writes the contract, the internal-standard libraries in the layout MS-DIAL
     reads, standards_template.tsv, quant_rules.tsv and the record. An existing contract is kept
     under a dated name only with replace_existing=true.
@@ -3173,7 +3180,7 @@ def msdial_lipidomics_write_contract(
         "is_text_neg": is_text_neg, "quant_table_path": quant_table_path, "amount_column": amount_column,
         "sample_metadata_path": sample_metadata_path,
         "internal_standard_rt_tolerance": internal_standard_rt_tolerance, "analysis_root": analysis_root,
-        "analysis_purpose": analysis_purpose, "console_path": console_path,
+        "analysis_purpose": analysis_purpose, "console_path": console_path, "raw_location": raw_location,
         "number_of_threads": number_of_threads, "check_digest": check_digest,
         "sample_table_confirmed": sample_table_confirmed is True, "sample_table": sample_table or [],
         "confirmed_by": confirmed_by, "replace_existing": replace_existing is True,
@@ -3197,9 +3204,12 @@ def msdial_lipidomics_resolve_standards(
 
     Every candidate sits at the m/z of the adduct the internal-standard library names, so a spot of
     another adduct never competes. Tier A: the LBM library annotated it (within the annotation RT
-    tolerance); B: its text-library row annotated it; C: its row matched but another annotation won;
-    D: any spot in the window. The first tier with a member decides, and the most intense spot in it
-    over the non-Blank files. C and D need the person's acceptance.
+    tolerance); B: its text-library row annotated it as a reference match; C: its row matched but
+    another annotation won, or matched only below the score cutoff; D: any spot in the window. B, C
+    and D lie within the internal-standard RT tolerance. The first tier with a member decides; in A a
+    spot inside the internal-standard tolerance comes first; then the most intense spot over the
+    sample and QC files. C and D need the person's acceptance, and so does an A spot outside the
+    internal-standard tolerance chosen while another spot lies inside it (needs_confirmation).
 
     Read each standard's tier, alignment ID, m/z and RT error, and zero-height files to the person,
     with the classes that would be NOT QUANTIFIED. Pass the polarity's resolution_digest to
@@ -3234,8 +3244,9 @@ def msdial_lipidomics_normalize(
     """Normalize one polarity's run with MSDIALCUI normalize, only after explicit confirmation.
 
     job_id is the polarity's production run. The resolution is computed again and must carry
-    resolution_digest. accept_searched lists the standards found only by text candidate or search
-    that the person accepts (MS-DIAL's exports then name the spot as the standard); accept_unresolved
+    resolution_digest. accept_searched lists the standards awaiting acceptance (needs_confirmation)
+    that the person accepts (a text candidate or search spot is then named as the standard in
+    MS-DIAL's exports); accept_unresolved
     lists the standards they accept leaving unresolved (not found, invalid, or a search they
     declined), whose classes are then NOT QUANTIFIED. confirmed=false previews the standards table,
     the exact command and why each flag is there; confirmed=true writes standards_{pos,neg}.tsv and

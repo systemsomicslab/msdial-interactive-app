@@ -78,7 +78,7 @@ class Batch:
             "is_text_pos": str(self.is_pos), "is_text_neg": str(self.is_neg),
             "quant_table_path": str(self.workbook), "amount_column": "H",
             "analysis_root": str(self.analysis), "analysis_purpose": "SPF versus GF plasma lipidome",
-            "console_path": str(self.console),
+            "console_path": str(self.console), "raw_location": "copy",
         }
         request.update(extra)
         return request
@@ -146,6 +146,15 @@ def _samples(label: str) -> list[tuple[str, str, str]]:
     return [(f"{stem}_{label}", classes[stem], kind) for stem, kind in STEMS]
 
 
+def guided_answers(contract_path: str, polarity: str) -> str:
+    """guided-answers.json as the backend writes it beside a run planned from the contract."""
+    return json.dumps({
+        "answers": {"lab_lipidomics_contract_path": contract_path},
+        "lab_lipidomics": {"contract_path": contract_path, "polarity": polarity,
+                           "contract_sha256": lab_lipidomics.file_sha256(contract_path)},
+    })
+
+
 def write_run(batch: Batch, contract_path: str, polarity: str, *, salt: str = "CH3COONH4") -> dict[str, Any]:
     """What a production run of the contract leaves in its output folder, and the job that made it."""
     label = "Pos" if polarity == "Positive" else "Neg"
@@ -169,9 +178,7 @@ def write_run(batch: Batch, contract_path: str, polarity: str, *, salt: str = "C
     project.write_bytes(b"project")
     (output / f"{PROJECT}_Loaded.msp2.dbs").write_bytes(b"library copy")
     (output / "method.txt").write_text(f"Ion mode: {polarity}\nSolvent type: {salt}\n", encoding="utf-8")
-    (output / "guided-answers.json").write_text(
-        json.dumps({"answers": {"lab_lipidomics_contract_path": contract_path}}), encoding="utf-8"
-    )
+    (output / "guided-answers.json").write_text(guided_answers(contract_path, polarity), encoding="utf-8")
     return {
         "id": f"run-{label.lower()}", "kind": "run", "status": "completed", "logs": [],
         "preparation": {"run_directory": str(output), "export_folder_path": str(output)},
@@ -179,11 +186,16 @@ def write_run(batch: Batch, contract_path: str, polarity: str, *, salt: str = "C
     }
 
 
-def normalize_outputs(plan: dict[str, Any], polarity: str, *, wrong_cell: int | None = None) -> tuple[str, str, str]:
+def normalize_outputs(
+    plan: dict[str, Any], polarity: str, *, wrong_cell: int | None = None, stored_names: dict[int, str] | None = None,
+) -> tuple[str, str, str]:
     """What MSDIALCUI normalize writes for this plan's table, and the report it prints.
 
     The values follow MS-DIAL's rule (amount x height / standard height, the class's own standard or
     Any others, NOT QUANTIFIED where the standard did not resolve); wrong_cell perturbs one spot.
+    The report's mismatches come from the stand-in's own comparison of each row's standard with the
+    spot's stored name, as the Console makes it (NormalizationProcess.NameAliases), never from the
+    plan's prediction; stored_names gives a spot another stored name than its export name.
     """
     label = "Pos" if polarity == "Positive" else "Neg"
     spots = POSITIVE_SPOTS if polarity == "Positive" else NEGATIVE_SPOTS
@@ -229,12 +241,19 @@ def normalize_outputs(plan: dict[str, Any], polarity: str, *, wrong_cell: int | 
             unresolved.setdefault(row["StandardName"], []).append(row["TargetClass"])
     for name, classes in unresolved.items():
         report.append(f"  UNRESOLVED {name} -- named for {len(classes)} class(es): {', '.join(classes)}")
-    mismatched = plan.get("predicted_mismatches", [])
+    mismatched = []
+    for row in rows:
+        if row["PeakID"] < 0:
+            continue
+        stored = (stored_names or {}).get(row["PeakID"], by_id[row["PeakID"]]["name"])
+        stored = "" if stored == "Unknown" else stored
+        # One item per table row, as the Console adds them.
+        if row["StandardName"].casefold() not in lab_lipidomics.console_name_aliases(stored):
+            mismatched.append(f"{row['StandardName']} (alignment ID {row['PeakID']} is annotated '{stored}')")
     if mismatched:
         report.append(
             f"WARNING: {len(mismatched)} standard(s) were taken from an alignment ID that holds a different compound: "
-            + "; ".join(f"{item['standard']} (alignment ID {item['alignment_id']} is annotated '{item['ms_dial_name']}')"
-                        for item in mismatched) + "."
+            + "; ".join(mismatched) + "."
         )
     report.append(f"Normalized unit: {UNIT}")
     report.append(f"Dilution factor applied: {'-d' in plan['command']}")

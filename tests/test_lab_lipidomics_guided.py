@@ -10,6 +10,7 @@ candidate table is exported, which the resolver and the merge read.
 from __future__ import annotations
 
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -246,10 +247,11 @@ class PlanFromAContract(unittest.TestCase):
         self.directory.cleanup()
 
     def plan(self, polarity: str = "Negative", folder: Path | None = None, **extra) -> dict:
+        # The answers the skill gives: the contract, the polarity and the accepted threshold, nothing else.
         answers = {"lab_lipidomics_contract_path": self.contract, "ion_mode": polarity,
-                   "minimum_peak_height": 500, "generate_materials_methods": False, **extra}
+                   "minimum_peak_height": 500, **extra}
         target = folder or (self.batch.neg if polarity == "Negative" else self.batch.pos)
-        return build_guided_plan(str(target), answers)
+        return build_guided_plan(str(target), {key: value for key, value in answers.items() if value is not None})
 
     def test_the_contract_answers_every_laboratory_question(self) -> None:
         plan = self.plan()
@@ -309,6 +311,44 @@ class PlanFromAContract(unittest.TestCase):
         self.assertTrue(any("input_path must be the contract's negative" in item for item in plan["blockers"]))
         plan = self.plan(polarity="")
         self.assertTrue(any("Name the ion mode" in item for item in plan["blockers"]))
+
+    def test_workflow_overrides_cannot_replace_what_the_contract_fixes(self) -> None:
+        other = self.batch.root / "lib" / "other.lbm2"
+        other.write_bytes(b"another laboratory library")
+        plan = self.plan(workflow_overrides={"lbm_path": str(other), "text_annotators": [], "lbm_rt_tolerance": 100})
+        self.assertFalse(plan["ready_to_prepare"])
+        for key in ("lbm_path", "text_annotators", "lbm_rt_tolerance"):
+            self.assertTrue(any(f"workflow_overrides.{key} would replace" in item for item in plan["blockers"]), key)
+        self.assertEqual(3, len(plan["diagnostic_blockers"]))
+        plan = self.plan(workflow_overrides={"ms1_tolerance": 0.02})
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        self.assertEqual([{"key": "workflow_overrides.ms1_tolerance", "contract": None, "given": 0.02}],
+                         plan["lab_lipidomics"]["deviations"])
+
+    def test_the_diagnostic_may_start_only_when_nothing_but_the_threshold_is_missing(self) -> None:
+        plan = self.plan(minimum_peak_height=None)
+        self.assertTrue(plan["requires_diagnostic"])
+        self.assertEqual([], plan["diagnostic_blockers"])
+        self.assertEqual(["Peak-count tuning requires a diagnostic run and an accepted minimum_peak_height."],
+                         plan["blockers"])
+        other = self.batch.root / "original" / "neg"
+        other.mkdir(parents=True)
+        for item in self.batch.neg.iterdir():
+            (other / item.name).write_bytes(item.read_bytes())
+        plan = self.plan(minimum_peak_height=None, folder=other)
+        self.assertIsNotNone(plan["workflow"])
+        self.assertTrue(any("input_path must be" in item for item in plan["diagnostic_blockers"]))
+
+    def test_a_contract_whose_output_folders_are_the_raw_folders_is_refused(self) -> None:
+        # Written by hand, or by a version that did not check it.
+        contract = json.loads(Path(self.contract).read_text(encoding="utf-8"))
+        root = self.batch.neg.parent
+        contract["analysis_root"] = str(root)
+        contract["output_roots"] = {"Positive": str(root / "pos"), "Negative": str(root / "neg")}
+        Path(self.contract).write_text(json.dumps(contract), encoding="utf-8")
+        plan = self.plan()
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertTrue(any("the negative raw-data folder itself" in item for item in plan["blockers"]), plan["blockers"])
 
     def test_a_changed_method_default_is_a_reported_deviation(self) -> None:
         plan = self.plan(execute_automatic_rt_correction=False)

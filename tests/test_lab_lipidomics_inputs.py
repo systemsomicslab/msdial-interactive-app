@@ -33,6 +33,7 @@ from msdial_app.lab_lipidomics import (
     salt_drops,
     salt_evidence,
     same_adduct,
+    split_by_polarity,
     write_canonical_text_db,
 )
 from xlsx_fixture import (
@@ -199,7 +200,7 @@ class LookupSheetTests(Workspace):
         self.assertAlmostEqual(66.3917, result["rows"][0]["amount"])
         # Column B is a VLOOKUP into a copy of the plasma column; with F it is recomputed.
         tissue = self.parse(column="F")
-        self.assertAlmostEqual(66.3917, tissue["rows"][0]["amount"])
+        self.assertAlmostEqual(663.917 / 5, tissue["rows"][0]["amount"])
         cells = self.parse(column="G")
         self.assertAlmostEqual(165.97925, cells["rows"][0]["amount"])
         self.assertTrue(any("caches" in item for item in cells["warnings"]))
@@ -424,6 +425,17 @@ class InternalStandardTextTests(Workspace):
         lines = POSITIVE_LIBRARY.splitlines()
         result = read_internal_standard_text(self.library("\r\n".join(lines + [lines[1]]) + "\r\n"), "Positive")
         self.assertTrue(any("repeats the name" in item for item in result["blockers"]))
+
+    def test_one_file_holding_both_polarities_lists_a_standard_once_in_each(self) -> None:
+        # PC, LPC and Cer d7 are in both polarities, under one name and two adducts.
+        both = POSITIVE_LIBRARY + "".join(NEGATIVE_LIBRARY.splitlines(keepends=True)[1:])
+        result = read_internal_standard_text(self.library(both, "both.txt"))
+        self.assertEqual([], result["blockers"])
+        self.assertEqual((4, 5), tuple(len(records) for records in split_by_polarity(result["records"]).values()))
+        repeated = both + NEGATIVE_LIBRARY.splitlines(keepends=True)[1]
+        result = read_internal_standard_text(self.library(repeated, "repeated.txt"))
+        self.assertEqual(1, len(result["blockers"]))
+        self.assertIn("repeats the name on line 6", result["blockers"][0])
 
     def test_an_mz_that_disagrees_with_formula_and_adduct_is_warned_about(self) -> None:
         text = "Name\tMZ\tRT\tAdduct\tFormula\tOntology\r\nPC 15:0_18:1(d7)\t753.6234\t9.5\t[M+H]+\tC41H73D7NO8P\tPC\r\n"

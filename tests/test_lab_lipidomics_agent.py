@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -20,7 +21,8 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-from lab_batch_fixture import ALIGNMENT, UNIT, Batch, capabilities_patches, normalize_outputs, write_run
+from lab_batch_fixture import ALIGNMENT, UNIT, Batch, capabilities_patches, guided_answers, normalize_outputs, write_run
+from xlsx_fixture import NEGATIVE_LIBRARY, POSITIVE_LIBRARY
 
 _CONFIG = tempfile.TemporaryDirectory()
 with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
@@ -61,7 +63,7 @@ class CheckingTheInputs(_Batch):
         result = public_check(check_inputs({"pos_path": str(self.batch.pos), "neg_path": str(self.batch.neg)}))
         self.assertEqual(
             ["analysis_purpose", "lbm_path", "is_text_pos/is_text_neg", "quant_table_path", "amount_column",
-             "solvent_type", "retention_time_tolerance", "analysis_root", "console_path"],
+             "solvent_type", "retention_time_tolerance", "analysis_root", "raw_location", "console_path"],
             [item["id"] for item in result["questions"]],
         )
         self.assertEqual(3, result["folders"]["Positive"]["file_count"])
@@ -109,6 +111,42 @@ class CheckingTheInputs(_Batch):
         inside = public_check(check_inputs(self.batch.request(analysis_root=str(self.batch.pos / "analysis"))))
         self.assertTrue(any("lies inside the positive raw-data folder" in item for item in inside["blockers"]))
 
+    def test_a_root_whose_pos_and_neg_are_the_raw_folders_blocks(self) -> None:
+        # data\pos and data\neg are the raw folders; data as the root would make them the runs' output folders.
+        result = public_check(check_inputs(self.batch.request(analysis_root=str(self.batch.pos.parent))))
+        self.assertFalse(result["ready_for_contract"])
+        for polarity in ("positive", "negative"):
+            self.assertTrue(any(f"output folder" in item and f"the {polarity} raw-data folder itself" in item
+                                for item in result["blockers"]), result["blockers"])
+        # A root that only holds the raw folders, under other names, is fine.
+        holder = self.batch.root / "batch"
+        (holder / "raw").mkdir(parents=True)
+        shutil.copytree(self.batch.pos, holder / "raw" / "pos")
+        shutil.copytree(self.batch.neg, holder / "raw" / "neg")
+        fine = public_check(check_inputs(self.batch.request(
+            pos_path=str(holder / "raw" / "pos"), neg_path=str(holder / "raw" / "neg"), analysis_root=str(holder))))
+        self.assertTrue(fine["ready_for_contract"], fine["blockers"])
+
+    def test_where_ms_dial_reads_the_raw_data_is_asked_and_must_be_an_answer(self) -> None:
+        asked = public_check(check_inputs(self.batch.request(raw_location="")))
+        question = next(item for item in asked["questions"] if item["id"] == "raw_location")
+        self.assertIn("writes its per-file .dcl, .pai2", question["prompt"])
+        self.assertEqual(["in_place", "copy"], question["choices"])
+        self.assertFalse(asked["ready_for_contract"])
+        wrong = public_check(check_inputs(self.batch.request(raw_location="somewhere")))
+        self.assertTrue(any("raw_location 'somewhere'" in item for item in wrong["blockers"]))
+        self.assertEqual("in_place", public_check(check_inputs(self.batch.request(raw_location="In_Place")))[
+            "raw_location"]["answer"])
+
+    def test_the_digest_binds_the_raw_folders_by_where_they_are(self) -> None:
+        # A copy of the batch: the same file names and sizes in other folders.
+        copy = self.batch.root / "copy"
+        shutil.copytree(self.batch.pos, copy / "pos")
+        shutil.copytree(self.batch.neg, copy / "neg")
+        original = check_inputs(self.batch.request())["check_digest"]
+        copied = check_inputs(self.batch.request(pos_path=str(copy / "pos"), neg_path=str(copy / "neg")))["check_digest"]
+        self.assertNotEqual(original, copied)
+
     def test_a_console_without_what_the_profile_needs_blocks(self) -> None:
         with patch.object(lab_lipidomics_agent, "console_capabilities",
                           return_value={"capabilities": ["automatic_alignment_rt_correction_local_support"]}):
@@ -145,6 +183,33 @@ class WritingTheContract(_Batch):
         self.assertFalse(refused["written"])
         self.assertIn("changed after it was checked", refused["error"])
 
+    def test_the_preview_names_the_raw_folders_and_another_folder_pair_needs_its_own_check(self) -> None:
+        preview = self.write(confirmed=False)
+        self.assertEqual({"Positive": str(self.batch.pos.resolve()), "Negative": str(self.batch.neg.resolve())},
+                         preview["raw_folders"])
+        self.assertEqual("copy", preview["raw_location"]["answer"])
+        copy = self.batch.root / "copy"
+        shutil.copytree(self.batch.pos, copy / "pos")
+        shutil.copytree(self.batch.neg, copy / "neg")
+        refused = self.write(pos_path=str(copy / "pos"), neg_path=str(copy / "neg"))
+        self.assertFalse(refused["written"])
+        self.assertIn("changed after it was checked", refused["error"])
+
+    def test_one_library_holding_both_polarities_runs_through_to_the_resolution(self) -> None:
+        both = self.batch.root / "data" / "is_both.txt"
+        both.write_bytes((POSITIVE_LIBRARY + "".join(NEGATIVE_LIBRARY.splitlines(keepends=True)[1:])).encode("ascii"))
+        check = public_check(self.checked(is_text_pos=str(both), is_text_neg=str(both)))
+        self.assertTrue(check["ready_for_contract"], check["blockers"])
+        self.assertTrue(check["internal_standard_libraries"]["Positive"]["shared_by_polarities"])
+        contract = self.batch.contract(is_text_pos=str(both), is_text_neg=str(both))
+        derived = load_contract(contract)["derived"]["internal_standard_libraries"]
+        self.assertEqual((4, 5), (derived["Positive"]["records"], derived["Negative"]["records"]))
+        runs = {polarity: write_run(self.batch, contract, polarity) for polarity in ("Positive", "Negative")}
+        resolved = resolve_standards_for_contract(contract, runs)["polarities"]
+        self.assertEqual(([], []), (resolved["Positive"]["problems"], resolved["Negative"]["problems"]))
+        negative = {item["name"]: item["tier"] for item in resolved["Negative"]["summary"]["standards"]}
+        self.assertEqual("B", negative["PC 15:0_18:1(d7)"])
+
     def test_corrections_must_name_every_sample(self) -> None:
         result = self.write(sample_table=[{"stem": "S1", "class_id": "SPF"}])
         self.assertIn("no row for", result["error"])
@@ -168,8 +233,11 @@ class WritingTheContract(_Batch):
         self.assertEqual("Name\tMZ\tRT\tAdduct\tInChIKey\tFormula\tSMILES\tOntology\tCCS", canonical[0])
         self.assertEqual("StandardName\tTargetClass\tConcentration", (inputs / "standards_template.tsv").read_text().splitlines()[0])
         self.assertIn("LipidA\t[M-H]-\tNegative\tFALSE", (inputs / "quant_rules.tsv").read_text())
-        events = [json.loads(line)["event"] for line in (inputs / "lab-lipidomics-record.jsonl").read_text().splitlines()]
-        self.assertEqual(["contract_written"], events)
+        events = [json.loads(line) for line in (inputs / "lab-lipidomics-record.jsonl").read_text().splitlines()]
+        self.assertEqual(["contract_written"], [event["event"] for event in events])
+        self.assertEqual("copy", events[0]["raw_location"])
+        self.assertEqual("copy", contract["raw_location"]["answer"])
+        self.assertIn("beside the raw files it reads", contract["raw_location"]["writes_beside_raw"])
 
     def test_an_existing_contract_is_replaced_only_when_asked_and_kept(self) -> None:
         self.batch.contract()
@@ -219,7 +287,7 @@ class FromTheRunToTheLipidome(_Batch):
         self.assertEqual(["Cer-NS", "FA", "HexCer-NS"], result["Positive"]["summary"]["classes_not_quantified_if_unchanged"])
         negative = {item["name"]: item for item in result["Negative"]["summary"]["standards"]}
         self.assertEqual("B", negative["FA 18:0(d3)"]["tier"])
-        self.assertEqual(["Blank_Neg"], negative["FA 18:0(d3)"]["blank_zero_height_files"])
+        self.assertEqual(["Blank_Neg"], negative["FA 18:0(d3)"]["tolerated_zero_height_files"])
         self.assertEqual(["AHexCS", "CE"], result["Negative"]["summary"]["classes_not_quantified_if_unchanged"])
 
     def test_a_run_not_made_from_the_contract_is_refused(self) -> None:
@@ -231,6 +299,44 @@ class FromTheRunToTheLipidome(_Batch):
         negative = " ".join(result["polarities"]["Negative"]["problems"])
         self.assertIn("is failed", negative)
         self.assertIn("never retry it unasked", negative)
+
+    def test_a_run_planned_from_a_replaced_contract_is_refused(self) -> None:
+        from msdial_app.agent_workflow import build_guided_plan
+
+        # The backend writes the contract's sha256 beside the run it plans.
+        plan = build_guided_plan(str(self.batch.neg), {"lab_lipidomics_contract_path": self.contract,
+                                                       "ion_mode": "Negative", "minimum_peak_height": 500})
+        written = server._write_guided_answers({"run_directory": self.runs["Negative"]["preparation"]["run_directory"]},
+                                               plan)
+        self.assertEqual(load_contract(self.contract)["_sha256"],
+                         json.loads(Path(written).read_text(encoding="utf-8"))["lab_lipidomics"]["contract_sha256"])
+        self.assertEqual([], self.resolved()["polarities"]["Negative"]["problems"])
+        check = check_inputs(self.batch.request(internal_standard_rt_tolerance=0.3))
+        replaced = write_contract({**self.batch.request(internal_standard_rt_tolerance=0.3),
+                                   "check_digest": check["check_digest"], "sample_table_confirmed": True,
+                                   "replace_existing": True, "confirmed": True})
+        self.assertTrue(replaced["written"], replaced)
+        problems = " ".join(self.resolved()["polarities"]["Negative"]["problems"])
+        self.assertIn("another version of this contract", problems)
+
+    def test_a_run_whose_files_or_annotations_are_missing_is_refused(self) -> None:
+        output = Path(self.runs["Negative"]["preparation"]["run_directory"])
+        cases = {
+            "not planned from this contract": lambda: (output / "guided-answers.json").write_text(json.dumps(
+                {"answers": {"lab_lipidomics_contract_path": str(self.batch.root / "other" / "contract.json")}}),
+                encoding="utf-8"),
+            ".mdcandidate.tsv is missing": lambda: (output / f"{ALIGNMENT}.mdcandidate.tsv").unlink(),
+            "_Loaded.msp2.dbs is not beside the project": lambda: next(output.glob("*_Loaded.msp2.dbs")).unlink(),
+            "No spot in the run is annotated by the LBM library": lambda: (output / f"{ALIGNMENT}_Height.txt").write_text(
+                (output / f"{ALIGNMENT}_Height.txt").read_text(encoding="ascii").replace("LbmDB: ", "Other: "),
+                encoding="ascii", newline=""),
+        }
+        for message, damage in cases.items():
+            with self.subTest(message=message):
+                self.runs["Negative"] = write_run(self.batch, self.contract, "Negative")
+                damage()
+                problems = " ".join(self.resolved()["polarities"]["Negative"]["problems"])
+                self.assertIn(message, problems)
 
     def test_normalize_needs_the_digest_shown_and_a_decision_for_every_searched_standard(self) -> None:
         with self.assertRaises(LabContractError) as raised:
@@ -262,9 +368,10 @@ class FromTheRunToTheLipidome(_Batch):
         contract = json.loads(Path(self.contract).read_text(encoding="utf-8"))
         contract["sample_table"]["rows"][0]["factor"] = 2.0
         Path(self.contract).write_text(json.dumps(contract), encoding="utf-8")
-        for run in self.runs.values():
+        for polarity, run in self.runs.items():
+            # The runs are planned again from the rewritten contract.
             (Path(run["preparation"]["run_directory"]) / "guided-answers.json").write_text(
-                json.dumps({"answers": {"lab_lipidomics_contract_path": self.contract}}), encoding="utf-8")
+                guided_answers(self.contract, polarity), encoding="utf-8")
         plan = self.plan("Negative")
         self.assertIn("-d", plan["command"])
         self.assertIn("multiplies", plan["flags"]["-d"])
@@ -297,6 +404,24 @@ class FromTheRunToTheLipidome(_Batch):
         record = finish_normalize(plan, 0, tampered)
         self.assertFalse(record["completed"])
         self.assertTrue(any("normalize used 110" in item for item in record["problems"]))
+
+    def test_mismatches_normalize_reports_must_be_the_predicted_ones(self) -> None:
+        # Normalize finds the negative PC d7 spot stored under its sum-level name: a mismatch nobody predicted.
+        plan = self.plan("Negative")
+        write_normalize_inputs(plan)
+        self.assertEqual([], plan["predicted_mismatches"])
+        _, _, report = normalize_outputs(public_normalize_plan(plan), "Negative", stored_names={101: "PC 33:1(d7)"})
+        record = finish_normalize(plan, 0, report.splitlines())
+        self.assertFalse(record["completed"])
+        self.assertTrue(any("other mismatched standards than were predicted" in item for item in record["problems"]))
+        # The searched positive Cer d7 spot is predicted to be reported, and normalize says nothing of it.
+        plan = self.plan("Positive", accept_searched=["Cer 18:1;O2/15:0(d7)"])
+        write_normalize_inputs(plan)
+        self.assertEqual(["Cer 18:1;O2/15:0(d7)"], [item["standard"] for item in plan["predicted_mismatches"]])
+        _, _, report = normalize_outputs(public_normalize_plan(plan), "Positive",
+                                         stored_names={3: "Cer 18:1;O2/15:0(d7)"})
+        record = finish_normalize(plan, 0, report.splitlines())
+        self.assertFalse(record["completed"])
 
     def test_the_merge_previews_then_writes_the_lipidome(self) -> None:
         self.normalize("Positive", accept_searched=["Cer 18:1;O2/15:0(d7)"])
@@ -331,6 +456,36 @@ class FromTheRunToTheLipidome(_Batch):
         with self.assertRaises(LabContractError):
             merge_lipidome(self.contract, output_name="..\\elsewhere.csv")
 
+    def test_the_merge_refuses_a_normalize_not_completed_as_planned(self) -> None:
+        self.normalize("Positive", accept_searched=["Cer 18:1;O2/15:0(d7)"])
+        plan = self.plan("Negative")
+        write_normalize_inputs(plan)
+        _, _, report = normalize_outputs(public_normalize_plan(plan), "Negative")
+        # The matrices are there and match their sha256; normalize's own account did not match the table.
+        finish_normalize(plan, 0, [line.replace("alignment ID 101", "alignment ID 110") for line in report.splitlines()])
+        with self.assertRaises(LabContractError) as raised:
+            merge_lipidome(self.contract)
+        self.assertIn("did not complete as planned", str(raised.exception))
+        self.assertFalse((self.batch.analysis / "quant" / "lipid_metabolome.csv").exists())
+
+    def test_the_merge_refuses_a_contract_or_a_candidate_table_changed_since_normalize(self) -> None:
+        self.normalize("Positive", accept_searched=["Cer 18:1;O2/15:0(d7)"])
+        self.normalize("Negative")
+        candidates = self.batch.analysis / "neg" / f"{ALIGNMENT}.mdcandidate.tsv"
+        kept = candidates.read_bytes()
+        candidates.write_bytes(kept + b"\n")
+        with self.assertRaises(LabContractError) as raised:
+            merge_lipidome(self.contract)
+        self.assertIn("candidate table has changed since normalize", str(raised.exception))
+        candidates.write_bytes(kept)
+        merge_lipidome(self.contract)
+        check = check_inputs(self.batch.request())
+        write_contract({**self.batch.request(), "check_digest": check["check_digest"], "sample_table_confirmed": True,
+                        "replace_existing": True, "confirmed": True})
+        with self.assertRaises(LabContractError) as raised:
+            merge_lipidome(self.contract)
+        self.assertIn("made under another contract", str(raised.exception))
+
 
 class WorksetsAndSharing(_Batch):
     def test_a_laboratory_workset_carries_the_inputs_and_not_the_batch(self) -> None:
@@ -349,12 +504,32 @@ class WorksetsAndSharing(_Batch):
             result = public_check(check_inputs({
                 "pos_path": str(self.batch.pos), "neg_path": str(self.batch.neg), "workset_id": saved["id"],
             }))
-            self.assertEqual(["analysis_purpose", "analysis_root"], [item["id"] for item in result["questions"]])
+            self.assertEqual(["analysis_purpose", "analysis_root", "raw_location"],
+                             [item["id"] for item in result["questions"]])
             self.assertTrue(any("has changed since workset" in item for item in result["warnings"]))
             from msdial_app.agent_workflow import build_guided_plan
 
             plan = build_guided_plan(str(self.batch.pos), {"ion_mode": "Positive"}, saved["id"])
             self.assertTrue(any("laboratory lipidomics workset" in item for item in plan["blockers"]))
+
+    def test_the_workset_carries_the_internal_standard_rt_tolerance_through_the_tool(self) -> None:
+        contract = self.batch.contract(internal_standard_rt_tolerance=0.3)
+        settings = lab_lipidomics_agent.lab_workset_settings(contract)
+        captured = {}
+
+        def request(method, path, **options):
+            captured.update(options.get("body") or {})
+            return {}
+
+        with patch.object(mcp_server, "_request_json", side_effect=request):
+            mcp_server.msdial_lipidomics_check_inputs(pos_path=str(self.batch.pos), neg_path=str(self.batch.neg),
+                                                      workset_id="w")
+        self.assertIsNone(captured["internal_standard_rt_tolerance"])
+        with patch("msdial_app.worksets.workset_directory", return_value=self.batch.root / "worksets"):
+            saved = save_lab_lipidomics_workset("Plasma lipidomics", settings)
+            result = public_check(check_inputs({**captured, "workset_id": saved["id"]}))
+        self.assertEqual(0.3, result["tolerances"]["internal_standard_rt"])
+        self.assertEqual(0.5, public_check(check_inputs({**captured, "workset_id": ""}))["tolerances"]["internal_standard_rt"])
 
     def test_the_contract_and_its_record_never_leave_this_machine(self) -> None:
         for name in ("lab-lipidomics-contract.json", "lab-lipidomics-contract.20261014120000.json",
@@ -405,7 +580,7 @@ class TheToolsAndTheirGates(unittest.TestCase):
             mcp_server.msdial_lipidomics_write_contract, pos_path="p", neg_path="n", lbm_path="l",
             solvent_type="s", retention_time_tolerance=1.5, is_text_pos="a", is_text_neg="b",
             quant_table_path="q", amount_column="H", analysis_root="r", analysis_purpose="x",
-            console_path="c", check_digest="d",
+            console_path="c", raw_location="copy", check_digest="d",
         )["body"]
         self.assertIs(False, body["confirmed"])
         self.assertIs(False, body["sample_table_confirmed"])
@@ -494,6 +669,51 @@ class TheNormalizeJob(_Batch):
         record = json.loads(Path(job["result"]["record"]).read_text(encoding="utf-8"))
         self.assertEqual("Negative", record["polarity"])
         self.assertTrue((self.batch.analysis / "quant" / "NormalizedHeight_Neg.txt").is_file())
+
+    def test_the_merge_endpoint_writes_only_when_confirmed(self) -> None:
+        runs = {"Positive": write_run(self.batch, self.contract, "Positive"), "Negative": self.run}
+        for polarity, accepted in (("Positive", ["Cer 18:1;O2/15:0(d7)"]), ("Negative", [])):
+            resolved = resolve_standards_for_contract(self.contract, {polarity: runs[polarity]})
+            plan = plan_normalize(self.contract, runs[polarity], resolved["polarities"][polarity]["resolution_digest"],
+                                  accept_searched=accepted)
+            write_normalize_inputs(plan)
+            _, _, report = normalize_outputs(public_normalize_plan(plan), polarity)
+            self.assertTrue(finish_normalize(plan, 0, report.splitlines())["completed"])
+        output = self.batch.analysis / "quant" / "lipid_metabolome.csv"
+        for body in ({"contract_path": self.contract}, {"contract_path": self.contract, "confirmed": "true"}):
+            status, preview = self.post("/api/lipidomics/merge", body)
+            self.assertEqual(200, status, preview)
+            self.assertFalse(preview["written"])
+            self.assertTrue(preview["confirmation_required"])
+            self.assertFalse(output.exists())
+        status, written = self.post("/api/lipidomics/merge", {"contract_path": self.contract, "confirmed": True})
+        self.assertEqual(200, status, written)
+        self.assertTrue(written["written"])
+        self.assertTrue(output.is_file())
+
+    def test_a_diagnostic_from_the_contract_starts_only_on_the_contracts_raw_folder(self) -> None:
+        # The same file names in another folder: the person's original data, say, rather than the copy.
+        other = self.batch.root / "original" / "neg"
+        shutil.copytree(self.batch.neg, other)
+        started: list[str] = []
+
+        def prepare(workflow, representative, directory, **options):
+            started.append(str(representative))
+            raise ValueError("stopped before the Console")
+
+        answers = {"lab_lipidomics_contract_path": self.contract, "ion_mode": "Negative"}
+        with patch.object(server, "prepare_tuning_run", side_effect=prepare):
+            for confirmed in (False, True):
+                status, refused = self.post("/api/agent/tuning/run",
+                                            {"input_path": str(other), "answers": answers, "confirmed": confirmed})
+                self.assertEqual(400, status, refused)
+                self.assertIn("The diagnostic is refused", refused["error"])
+                self.assertIn("input_path must be the contract's negative raw-data folder", refused["error"])
+            self.assertEqual([], started)
+            status, stopped = self.post("/api/agent/tuning/run",
+                                        {"input_path": str(self.batch.neg), "answers": answers, "confirmed": True})
+        self.assertIn("stopped before the Console", stopped["error"])
+        self.assertEqual([self.batch.neg.resolve()], [Path(item).parent.resolve() for item in started])
 
     def test_a_second_normalize_of_one_polarity_waits_for_the_first(self) -> None:
         _, resolved = self.post("/api/lipidomics/resolve", {"contract_path": self.contract, "neg_job_id": self.run["id"]})

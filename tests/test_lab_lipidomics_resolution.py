@@ -58,10 +58,21 @@ class NameEquivalenceTests(unittest.TestCase):
         self.assertFalse(name_equivalent("PE 33:1(d7)", "PC 15:0_18:1(d7)"))
         self.assertFalse(name_equivalent("Unknown", "PC 15:0_18:1(d7)"))
 
+    def test_two_chain_resolved_names_must_agree_chain_by_chain(self) -> None:
+        # Isobaric endogenous lipids of an unlabelled odd-chain standard, and another labelled isomer.
+        self.assertFalse(name_equivalent("TG 51:0|TG 16:0_17:0_18:0", "TG 17:0_17:0_17:0"))
+        self.assertFalse(name_equivalent("PC 34:0|PC 16:0_18:0", "PC 17:0_17:0"))
+        self.assertFalse(name_equivalent("PC 15:0_18:1(d7)", "PC 16:0_17:1(d7)"))
+        self.assertTrue(name_equivalent("TG 51:0|TG 17:0_17:0_17:0", "TG 17:0_17:0_17:0"))
+        self.assertTrue(name_equivalent("PC 18:1_15:0(d7)", "PC 15:0_18:1(d7)"))
+        # A name that merges some chains into one agrees with the chains it merges.
+        self.assertTrue(name_equivalent("TG 15:0_33:1(d7)", "TG 15:0_18:1(d7)_15:0"))
+        self.assertFalse(name_equivalent("TG 16:0_32:1(d7)", "TG 15:0_18:1(d7)_15:0"))
+
 
 class ResolverTests(Workspace):
-    def resolve(self, spots, candidates=(), standards=None, **options):
-        export = read_alignment_export(write_export(self.root / "height.txt", spots))
+    def resolve(self, spots, candidates=(), standards=None, samples=SAMPLES, **options):
+        export = read_alignment_export(write_export(self.root / "height.txt", spots, samples))
         table = read_candidate_table(write_candidates(self.root / "candidates.tsv", list(candidates)))
         options.setdefault("annotation_rt_tolerance", 1.5)
         return resolve_standards(export, table, standards or [standard()], polarity="Positive", **options)
@@ -140,7 +151,7 @@ class ResolverTests(Workspace):
         ]))
         self.assertEqual("10", entry["alignment_id"])
         self.assertEqual("resolved_search", entry["status"])
-        self.assertEqual(["Blank_Pos"], entry["blank_zero_height_files"])
+        self.assertEqual(["Blank_Pos"], entry["tolerated_zero_height_files"])
 
     def test_a_standard_with_no_height_in_a_sample_is_invalid(self) -> None:
         resolution = self.resolve([spot(1, 753.6131, 9.45, "PC 33:1(d7)", method=LBM, cells=[1000, 0, 1000])],
@@ -180,12 +191,87 @@ class ResolverTests(Workspace):
         self.assertTrue(resolution["warnings"])
 
     def test_an_lbm_annotation_beyond_the_library_rt_is_used_and_the_rt_called_stale(self) -> None:
-        entry = self.only(self.resolve([
+        alone = self.only(self.resolve([spot(1, 753.6131, 10.5, "PC 33:1(d7)", method=LBM, cells=[100, 100, 0])],
+                                       [candidate(1, "PC 33:1(d7)")]))
+        self.assertEqual(("A", "1", False), (alone["tier"], alone["alignment_id"], alone["needs_confirmation"]))
+        self.assertTrue(any("stale" in item for item in alone["warnings"]))
+        # With another spot inside the internal-standard window, which one is the standard is the person's call.
+        resolution = self.resolve([
             spot(1, 753.6131, 10.5, "PC 33:1(d7)", method=LBM, cells=[100, 100, 0]),
             spot(2, 753.6131, 9.5, cells=[9000, 9000, 0]),
-        ], [candidate(1, "PC 33:1(d7)")]))
-        self.assertEqual(("A", "1"), (entry["tier"], entry["alignment_id"]))
-        self.assertTrue(any("stale" in item for item in entry["warnings"]))
+        ], [candidate(1, "PC 33:1(d7)")])
+        entry = self.only(resolution)
+        self.assertEqual(("A", "1", True), (entry["tier"], entry["alignment_id"], entry["needs_confirmation"]))
+        self.assertIn("spot(s) 2 lie within", entry["reason"])
+        self.assertEqual(["PC 15:0_18:1(d7)"], resolution["needs_confirmation"])
+        lookup = {"rows": [{"standard": "PC 15:0_18:1(d7)", "target_class": "PC", "amount": 66.3917}]}
+        self.assertEqual(-1, standards_rows(lookup, resolution)[0]["PeakID"])
+        accepted = standards_rows(lookup, resolution, accepted=["PC 15:0_18:1(d7)"])[0]
+        self.assertEqual((1, False), (accepted["PeakID"], accepted["AssignName"]))
+
+    def test_inside_tier_a_the_spot_in_the_standards_window_beats_a_more_intense_farther_one(self) -> None:
+        # The 2026-09-06 positive audit export: ID 275 is the 13C peak of PC 34:2 [M+H]+, 0.88 min from the
+        # PG d7 library RT; ID 276 is the spiked PG d7 itself, in the blank too.
+        pg = standard("PG 15:0_18:1(d7)", mz=759.58765, rt=8.42, adduct="[M+NH4]+", ontology="PG")
+        resolution = self.resolve([
+            spot(275, 759.57446, 9.303, "PG 15:0_18:1(d7)", adduct="[M+NH4]+", method=LBM,
+                 cells=[134000, 134500, 27]),
+            spot(276, 759.58796, 8.345, "PG 33:1(d7)|PG 15:0_18:1(d7)", adduct="[M+NH4]+", method=LBM,
+                 cells=[39000, 39500, 30513]),
+        ], [candidate(275, "PG 15:0_18:1(d7)"), candidate(276, "PG 33:1(d7)|PG 15:0_18:1(d7)")], standards=[pg])
+        entry = self.only(resolution)
+        self.assertEqual(("A", "resolved_lbm", "276", False),
+                         (entry["tier"], entry["status"], entry["alignment_id"], entry["needs_confirmation"]))
+        self.assertEqual(["276", "275"], [item["alignment_id"] for item in entry["candidates"]])
+
+    def test_an_lbm_annotation_beyond_the_annotation_tolerance_is_not_tier_a(self) -> None:
+        entry = self.only(self.resolve([
+            spot(1, 753.6131, 11.5, "PC 33:1(d7)", method=LBM, cells=[90000, 90000, 0]),
+            spot(2, 753.6132, 9.55, "PC 15:0_18:1(d7)", method=TEXT, cells=[1000, 1000, 0]),
+        ], [candidate(1, "PC 33:1(d7)"), candidate(2, "PC 15:0_18:1(d7)", annotator=TEXT, source="TextDB")]))
+        self.assertEqual(("B", "2"), (entry["tier"], entry["alignment_id"]))
+        self.assertEqual(["1"], [item["alignment_id"] for item in entry["other_observations"]])
+
+    def test_a_text_match_below_the_score_cutoff_is_only_a_candidate_needing_confirmation(self) -> None:
+        # MS-DIAL names the annotator in the Comment for a suggestion too, and the export drops its prefix.
+        resolution = self.resolve([
+            spot(1, 753.6131, 9.45, "PC 15:0_18:1(d7)", method=TEXT, cells=[1000, 1000, 0]),
+            spot(2, 753.6133, 9.90, "PC 15:0_18:1(d7)", method=TEXT, cells=[50000, 50000, 0]),
+        ], [candidate(1, "PC 15:0_18:1(d7)", annotator=TEXT, source="TextDB"),
+            candidate(2, "PC 15:0_18:1(d7)", annotator=TEXT, source="TextDB", matched=False, suggested=True)])
+        entry = self.only(resolution)
+        self.assertEqual(("B", "1", False), (entry["tier"], entry["alignment_id"], entry["needs_confirmation"]))
+        self.assertEqual([("1", "B"), ("2", "C")],
+                         [(item["alignment_id"], item["tier"]) for item in entry["candidates"]])
+        alone = self.only(self.resolve(
+            [spot(2, 753.6133, 9.90, "PC 15:0_18:1(d7)", method=TEXT)],
+            [candidate(2, "PC 15:0_18:1(d7)", annotator=TEXT, source="TextDB", matched=False, suggested=True)],
+        ))
+        self.assertEqual(("C", "resolved_hidden_text", True),
+                         (alone["tier"], alone["status"], alone["needs_confirmation"]))
+
+    def test_an_isobaric_lipid_with_other_chains_is_not_the_standard(self) -> None:
+        tg = standard("TG 17:0_17:0_17:0", mz=902.8174, rt=14.40, adduct="[M+NH4]+", ontology="TG")
+        entry = self.only(self.resolve([
+            spot(10, 902.8170, 14.40, "TG 51:0|TG 17:0_17:0_17:0", adduct="[M+NH4]+", method=LBM,
+                 cells=[2000, 2000, 0]),
+            spot(11, 902.8178, 14.55, "TG 51:0|TG 16:0_17:0_18:0", adduct="[M+NH4]+", method=LBM,
+                 cells=[9000, 9000, 0]),
+        ], [candidate(10, "TG 51:0|TG 17:0_17:0_17:0"), candidate(11, "TG 51:0|TG 16:0_17:0_18:0")], standards=[tg]))
+        self.assertEqual(("A", "10"), (entry["tier"], entry["alignment_id"]))
+
+    def test_a_standard_file_without_the_standard_is_allowed_and_does_not_rank(self) -> None:
+        samples = [("S1_Pos", "SPF", "Sample"), ("S2_Pos", "GF", "Sample"), ("Mix_Pos", "Mix", "Standard"),
+                   ("Blank_Pos", "Blank", "Blank")]
+        entry = self.only(self.resolve([spot(1, 753.6131, 9.45, "PC 33:1(d7)", method=LBM, cells=[1000, 1000, 0, 0])],
+                                       [candidate(1, "PC 33:1(d7)")], samples=samples))
+        self.assertEqual(("resolved_lbm", [], ["Mix_Pos", "Blank_Pos"]),
+                         (entry["status"], entry["zero_height_files"], entry["tolerated_zero_height_files"]))
+        ranked = self.only(self.resolve([
+            spot(2, 753.6134, 9.5, cells=[100, 100, 900000, 0]),
+            spot(3, 753.6134, 9.6, cells=[500, 500, 0, 0]),
+        ], samples=samples))
+        self.assertEqual("3", ranked["alignment_id"])
 
     def test_a_label_that_disagrees_with_the_library_adduct_is_recorded(self) -> None:
         entry = self.only(self.resolve([spot(3, 753.6134, 9.5, adduct="[M+NH4]+")]))
@@ -318,6 +404,14 @@ class NormalizeReportTests(unittest.TestCase):
         self.assertEqual(160, parsed["resolved"]["PC 15:0_18:1(d7)"]["alignment_id"])
         self.assertEqual(["PC", "EtherPC"], parsed["resolved"]["PC 15:0_18:1(d7)"]["classes"])
         self.assertEqual({"CE 18:1(d7)": ["CE"]}, parsed["unresolved"])
+
+    def test_a_standard_the_table_left_unresolved_but_normalize_found_by_name_is_caught(self) -> None:
+        # What a Console ignoring --peak-ids-only does: it looks the -1 standard up by name.
+        rows = [{"StandardName": "PC 15:0_18:1(d7)", "PeakID": 10}, {"StandardName": "CE 18:1(d7)", "PeakID": -1}]
+        report = ("  PC 15:0_18:1(d7) via alignment ID 10, concentration 66.3917\n"
+                  "  CE 18:1(d7) via annotation, alignment ID 40, concentration 75.97\n")
+        self.assertEqual(["normalize resolved CE 18:1(d7), which the table left unresolved."],
+                         compare_normalize_stdout(parse_normalize_stdout(report), rows))
 
     def test_a_report_that_differs_from_the_table_is_caught(self) -> None:
         rows = [
@@ -455,6 +549,20 @@ class VerificationTests(Workspace):
         paths = self.write(factors=(2.0, 1.0, 1.0))
         self.assertTrue(self.verify(*paths, dilution_factors={"S1_Pos": 2.0})["passed"])
         self.assertFalse(self.verify(*paths)["passed"])
+
+    def test_a_row_in_another_unit_fails(self) -> None:
+        report = self.verify(*self.write({20: {"Comment": "Normalized unit: pmol_per_mg_tissue"}}))
+        self.assertEqual(["20"], report["failed_ids"])
+        self.assertIn("pmol_per_mg_tissue", report["failed_rows"][0]["reason"])
+
+    def test_matrices_of_other_samples_fail_the_whole_check(self) -> None:
+        height, normalized = self.write()
+        text = normalized.read_text(encoding="ascii").replace("\tS2_Pos\t", "\tS3_Pos\t")
+        normalized.write_text(text, encoding="ascii", newline="")
+        report = self.verify(height, normalized)
+        self.assertFalse(report["passed"])
+        self.assertEqual([], report["failed_rows"])
+        self.assertIn("different samples", report["problems"][0])
 
     def test_the_candidate_table_is_required(self) -> None:
         with self.assertRaises(LabInputError):

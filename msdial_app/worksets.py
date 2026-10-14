@@ -49,6 +49,7 @@ LAB_LIPIDOMICS_NOT_CARRIED: dict[str, str] = {
     ),
     "dilution_factors": "belong to how one batch was prepared, and scale every concentration",
     "raw_and_output_paths": "name this batch's data and where its analysis was written",
+    "raw_location": "whether MS-DIAL may write beside this batch's raw files is asked for each batch",
     "minimum_peak_height": "is measured by each batch's own diagnostic",
 }
 

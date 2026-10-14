@@ -1107,6 +1107,9 @@ def _write_guided_answers(preparation: dict, plan: dict) -> str:
         "workset_id": (plan.get("workset") or {}).get("id", ""),
         "answers": plan.get("answers", {}),
         "workset_suggestion": plan.get("workset_suggestion", {}),
+        # A laboratory lipidomics run is bound to the contract it was planned from by content: a contract
+        # replaced at the same path afterwards is another contract.
+        **({"lab_lipidomics": plan["lab_lipidomics"]} if plan.get("lab_lipidomics") else {}),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1842,6 +1845,19 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError(
                         "Complete the guided questions and choose target_peak_count before diagnostic tuning."
                     )
+                if plan.get("diagnostic_blockers"):
+                    # The diagnostic writes beside input_path's raw files: a plan from a laboratory
+                    # contract that names another folder, or overrides what the contract fixes, is
+                    # refused here as its production run would be.
+                    self._json(
+                        {
+                            "started": False,
+                            "plan": plan,
+                            "error": "The diagnostic is refused: " + " ".join(plan["diagnostic_blockers"]),
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 watch = _console_watch_request(body)
                 # The diagnostic starts the Console, so it is boundary 4's as the production run is.
                 authorized = _campaign_crossing(
