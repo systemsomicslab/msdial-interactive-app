@@ -4,6 +4,123 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.38] - Unreleased
+
+### Added
+- `lab_lipidomics`, the laboratory lipidomics agent's reading and checking, with
+  the standard library only. Nothing in it runs MS-DIAL; it writes only the files
+  it is handed a path for.
+  - An .xlsx reader (zipfile + ElementTree). It reads the values Excel saved:
+    cached formula values, shared and inline strings, rich text without the
+    phonetic guides a Japanese Excel adds, booleans, and merged ranges as their
+    top-left value. An error cell (`#N/A`) is no value. A formula Excel never
+    calculated is refused when read rather than read as empty. A workbook asking
+    to be recalculated on open, and an Excel lock file beside it, are warned about.
+  - `quant_utility_table.xlsx`, sheets taken by position.
+    - Sheet 1: the header is the row with Name in B and Class name in D, and the
+      standards run to the first empty B, so the worked example below them is
+      never read. The amount column's header names normalize's `-u`
+      (`int (pmol/ul plasma)` -> `pmol_per_microL_plasma`; F, G and H, and nmol
+      and fmol). The sample amount above it (H4) and free notes below the
+      standards are read back, never interpreted. A formula that multiplies by
+      the sample amount (G) is warned about.
+    - Sheet 2: no header; A the standard, C the class. B is recomputed from the
+      chosen sheet-1 column, because it is a VLOOKUP into a copy of the plasma
+      column. A class normalize never assigns, a class named twice (normalize
+      would use the first), `Any others` missing, repeated or in another case,
+      and a standard sheet 1 does not prepare are blockers.
+    - Sheet 3: classes must be LbmClass names (the export's Ontology spelling).
+      A selected class MS-DIAL has no class definition for (LipidA, OxPA) is
+      flagged as falling to `Any others`. An adduct must read and match the ion
+      mode. A problem in an unselected row is only a warning. Classes selected
+      with more than one adduct are listed.
+  - The internal-standard text libraries, by header in any order and case,
+    ASCII or UTF-8 with or without a BOM. Name, MZ, RT, Adduct and Ontology are
+    required; the adduct's charge must match the polarity; an MZ more than 5 mDa
+    from formula + adduct is warned about. A canonical writer gives the Console's
+    positional layout and never writes an empty RT or CCS field, either of which
+    makes the Console drop the row.
+  - Adducts and masses: `[M+CH3COO]-` and `[M+Hac-H]-` are one ion, as are
+    `[M+HCOO]-` and `[M+FA-H]-`.
+  - The salt: every spelling of the three anions (Japanese included) maps to the
+    Console's enum string, and an answer naming two is not guessed. Each salt's
+    negative-mode LBM filter is checked against sheet 3 (a dropped selected row
+    is a blocker) and the standards (a dropped standard is a warning, because
+    its text-library row still finds it).
+  - The expected resolution, before anything runs: per polarity, the standards
+    absent from its library, the selected classes that can only come out NOT
+    QUANTIFIED, and those quantified by `Any others`.
+  - The internal-standard resolver. Every candidate sits at the library adduct's
+    m/z (MS-DIAL's Text-DB window: 0.01 Da, or 20 ppm above m/z 500), so a spot
+    of another adduct never competes. Tier A: the LBM library annotated it
+    (reference matched, name-equivalent at chain or sum level), within the
+    annotation RT tolerance. B: its text row annotated it, within the IS RT
+    tolerance (default 0.5 min). C: its text row matched but another annotation
+    won. D: any spot in that window. The first tier with a member decides, and
+    the most intense spot in it over the non-Blank files. C and D need the
+    person's confirmation. A chosen spot with no height in a sample or QC file is
+    invalid; a Blank without it is allowed and recorded. One spot chosen for two
+    standards is refused for both. Other adducts, isotopes and label
+    disagreements are recorded, and the result is written to
+    `is_resolution_{pos,neg}.tsv` and bound by a digest.
+  - The standards table normalize reads: `StandardName`, `TargetClass`,
+    `Concentration`, `PeakID` and `AssignName`. A standard without a usable spot
+    gets PeakID -1, which `--peak-ids-only` never replaces by a name lookup. An
+    accepted tier C or D standard gets AssignName, so MS-DIAL's export names it.
+    The standards normalize will report as mismatched are predicted from the
+    candidate table with the Console's own alias rule.
+  - normalize's report is read (the current and the earlier format) and compared
+    with the table. Its numbers are recomputed from the Height matrix the same
+    call wrote: within the interval the export's rounding of heights allows,
+    with dilution factors multiplying, and with each spot's class decided as
+    `GetAnnotatedLipidClass` decides it (a spot not reference matched goes to
+    `Any others` whatever its Ontology). A class whose standard did not resolve
+    must be emptied with a NOT QUANTIFIED comment, a file whose standard has no
+    height must be empty for it, and no row may be raw Intensity.
+  - Sample tables with MS-DIAL's GUI headers (`Acquisiotion type` included),
+    from .xlsx, .tsv or .csv, joined to the proposed files by stem. A dilution
+    factor other than 1 is accepted, and said to multiply. Both polarities pair
+    into one table.
+  - The positive and negative raw folders must be two folders, neither inside
+    the other. An analysis root in a code checkout or a temporary folder is
+    refused; the system drive and the user profile are said.
+  - `lab_method_answers`: what every laboratory run states rather than asks,
+    written out in full: 12 anchors, the 1.5 min local window, blank
+    interpolation from the confirmed sample table, and the rest.
+- `resources/lipid_class_vocabulary.tsv`, the LbmClass members and the class
+  definition MS-DIAL gives each, generated from MsdialWorkbench b01effaaa by
+  `scripts/generate-lipid-class-vocabulary.py`, which reads only live code. 28
+  classes are spelled differently (`Cer_NS` -> `Cer-NS`), and 24 members have no
+  definition.
+
+### Changed
+- `lipidome_merge` writes what the laboratory's own program (metaboservice)
+  wrote. On the 2024 hands-on exports and its `targetadduct.txt` the result is
+  `lipid_metabolome.csv` byte for byte (372 rows); with sheet 3 of
+  `quant_utility_table.xlsx` it is 394 (the same plus 22 positive EtherPE).
+  - Comma separated for a `.csv` (tab otherwise), CRLF, minimal quoting, ASCII,
+    or UTF-8 with a warning when a cell is not ASCII.
+  - Rows ordered by ontology and then name as .NET compares them (symbols, then
+    digits, then letters without case), without touching the process locale.
+    The ordinal order put `BRSE` before `BileAcid`.
+  - The rule table may be the workbook itself; its third sheet is read.
+  - New filters, the first that applies being the reason: an internal standard
+    by the resolver's alignment IDs (beside the `(d` rule), and a row whose
+    representative annotation is not reference matched, from the candidate
+    table. The `low score:` prefix filter is kept for old exports; current
+    exports no longer write the prefix.
+  - A selected row with no valid concentration (NOT QUANTIFIED, raw Intensity,
+    another unit, or failed verification) goes to its own file
+    (`lipid_metabolome_not_quantified.csv`) instead of the lipidome.
+  - The report adds drops by polarity, selected pairs without rows, ontologies
+    from both polarities, same-formula rows within an ontology (possible double
+    counts, such as EtherPE in both polarities), and the inputs' sha256. It can
+    be written as `merge-report.json`.
+
+### Not changed
+- No MCP tool, guided-path answer or method line uses any of this yet; nothing
+  a run does differs from 0.5.37.
+
 ## [0.5.37] - Unreleased
 
 ### Changed

@@ -298,3 +298,153 @@ class RuleTableIdentityTests(unittest.TestCase):
         self.assertEqual(1, read["selected_classes"])
         self.assertEqual(3, len(read["selected"]))
         self.assertEqual({"Positive": 3}, read["selected_by_ion_mode"])
+
+
+from msdial_app.lipidome_merge import collation_key, reference_matched_ids  # noqa: E402
+from lab_export_fixture import candidate, write_candidates  # noqa: E402
+from xlsx_fixture import quant_sheet, quant_workbook  # noqa: E402
+
+UNIT = "Normalized unit: pmol_per_microL_plasma"
+LAB_RULES = (
+    "Class\tAdduct\tIon mode\tIsSelected\n"
+    "PC\t[M+H]+\tPositive\tTRUE\nPE\t[M-H]-\tNegative\tTRUE\n"
+    "BRSE\t[M+NH4]+\tPositive\tTRUE\nBileAcid\t[M-H]-\tNegative\tTRUE\n"
+    "EtherPE\t[M+H]+\tPositive\tTRUE\nEtherPE\t[M-H]-\tNegative\tTRUE\nCAR\t[M+H]+\tPositive\tTRUE\n"
+)
+
+
+def _identified(alignment_id: int, name: str, adduct: str, ontology: str, comment: str = UNIT,
+                formula: str = "", values: list[str] | None = None) -> list[str]:
+    cells = _row(name, adduct, ontology, comment, values)
+    cells[0] = str(alignment_id)
+    cells[10] = formula
+    return cells
+
+
+class LaboratoryMergeTests(unittest.TestCase):
+    """The laboratory's merge: its file format, its order, and what never reaches the lipidome."""
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.root = Path(self._directory.name)
+        self.rules = self.root / "rules.txt"
+        self.rules.write_text(LAB_RULES, encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._directory.cleanup()
+
+    def merge(self, positive_rows, negative_rows, output: str = "lipid_metabolome.csv", **options):
+        positive = self.root / "pos.txt"
+        negative = self.root / "neg.txt"
+        # An export always has rows; an unannotated one stands in where a test needs none.
+        filler = [_identified(99, "Unknown", "[M-H]-", "")]
+        positive.write_text(_export([("A_Pos", "SPF"), ("B_Pos", "GF")], positive_rows or filler), encoding="utf-8")
+        negative.write_text(_export([("A_Neg", "SPF"), ("B_Neg", "GF")], negative_rows or filler), encoding="utf-8")
+        result = merge_pos_neg(positive, negative, self.rules, self.root / output, **options)
+        return result, (self.root / output).read_bytes()
+
+    def test_a_csv_is_comma_separated_with_crlf_as_the_laboratory_program_wrote_it(self) -> None:
+        _, data = self.merge([_identified(1, "PC 34:1", "[M+H]+", "PC")], [_identified(2, "PE 34:1", "[M-H]-", "PE")])
+        self.assertNotIn(b"\t", data)
+        self.assertEqual(5 + 2, data.count(b"\r\n"))
+        self.assertNotIn(b"\n", data.replace(b"\r\n", b""))
+        self.assertTrue(data.startswith(b","))
+
+    def test_a_cell_holding_a_comma_is_quoted(self) -> None:
+        _, data = self.merge([_identified(1, "PC 34:1", "[M+H]+", "PC", comment="checked, kept")], [])
+        self.assertIn(b'"checked, kept"', data)
+
+    def test_rows_are_ordered_the_way_dotnet_compares_names(self) -> None:
+        names = ["BRSE", "BileAcid", "CAR", "CerP", "Cer_NS"]
+        self.assertEqual(["BileAcid", "BRSE", "CAR", "Cer_NS", "CerP"], sorted(names, key=collation_key))
+        result, data = self.merge(
+            [_identified(1, "BRSE 18:1", "[M+NH4]+", "BRSE"), _identified(2, "CAR 16:0", "[M+H]+", "CAR")],
+            [_identified(3, "BileAcid 24:1", "[M-H]-", "BileAcid")],
+        )
+        order = [line.split(b",")[11] for line in data.split(b"\r\n")[5:] if line]
+        self.assertEqual([b"BileAcid", b"BRSE", b"CAR"], order)
+        self.assertEqual(3, result["kept_rows"])
+
+    def test_a_standard_is_excluded_by_its_alignment_id_even_without_a_label(self) -> None:
+        result, _ = self.merge(
+            [_identified(1, "PC 33:1", "[M+H]+", "PC"), _identified(2, "PC 34:1", "[M+H]+", "PC")], [],
+            internal_standard_ids={"positive": {"1"}},
+        )
+        self.assertEqual(1, result["kept_rows"])
+        self.assertEqual({"internal standard": 1}, result["dropped_by_polarity"]["positive"])
+
+    def test_with_the_candidate_table_only_reference_matched_rows_are_kept(self) -> None:
+        table = write_candidates(self.root / "pos.mdcandidate.tsv", [
+            candidate(1, "PC 34:1"), candidate(2, "PC 36:2", matched=False, suggested=True),
+        ])
+        matched = reference_matched_ids(table)
+        self.assertEqual({"1"}, matched)
+        result, _ = self.merge(
+            [_identified(1, "PC 34:1", "[M+H]+", "PC"), _identified(2, "PC 36:2", "[M+H]+", "PC")],
+            [_identified(3, "PE 34:1", "[M-H]-", "PE")],
+            reference_matched_ids={"positive": matched, "negative": None},
+        )
+        self.assertEqual((1, 1), (result["kept_from_positive"], result["kept_from_negative"]))
+        self.assertEqual({"not reference-matched": 1}, result["dropped_by_polarity"]["positive"])
+
+    def test_selected_rows_without_a_concentration_go_to_their_own_file(self) -> None:
+        result, _ = self.merge(
+            [
+                _identified(1, "PC 34:1", "[M+H]+", "PC"),
+                _identified(2, "PC 36:2", "[M+H]+", "PC", comment="NOT QUANTIFIED: the PC standard X did not resolve"),
+                _identified(3, "PC 38:4", "[M+H]+", "PC", comment="Normalized unit: Intensity"),
+                _identified(4, "PC 40:6", "[M+H]+", "PC", comment="Normalized unit: pmol_per_mg_tissue"),
+                _identified(5, "PC 32:0", "[M+H]+", "PC"),
+            ],
+            [],
+            expected_unit="pmol_per_microL_plasma",
+            unquantified_ids={"positive": {"5"}},
+            not_quantified_path=self.root / "lipid_metabolome_not_quantified.csv",
+        )
+        self.assertEqual(1, result["kept_rows"])
+        self.assertEqual(4, result["not_quantified"]["rows"])
+        self.assertEqual({"PC": 4}, result["not_quantified"]["by_class"])
+        side = (self.root / "lipid_metabolome_not_quantified.csv").read_bytes()
+        self.assertEqual(5 + 4, side.count(b"\r\n"))
+        reasons = [item["reason"] for item in result["not_quantified"]["items"]]
+        self.assertTrue(all(reason.startswith("not quantified") for reason in reasons))
+        self.assertEqual({}, result["dropped_by_polarity"]["positive"])
+
+    def test_without_a_side_file_they_are_counted_as_dropped(self) -> None:
+        result, _ = self.merge(
+            [_identified(2, "PC 36:2", "[M+H]+", "PC", comment="NOT QUANTIFIED: the PC standard X did not resolve")], [],
+        )
+        self.assertEqual(1, result["dropped_reasons"]["not quantified: its standard did not resolve"])
+        self.assertIsNone(result["not_quantified"]["output"])
+
+    def test_non_ascii_text_is_written_as_utf8_and_said(self) -> None:
+        result, data = self.merge([_identified(1, "PC 34:1", "[M+H]+", "PC", comment="確認")], [])
+        self.assertEqual("utf-8", result["format"]["encoding"])
+        self.assertTrue(result["warnings"])
+        self.assertIn("確認".encode("utf-8"), data)
+
+    def test_the_report_names_double_counts_and_selections_without_rows(self) -> None:
+        result, _ = self.merge(
+            [_identified(1, "PE P-36:2", "[M+H]+", "EtherPE", formula="C41H78NO7P"),
+             _identified(2, "PC 34:1", "[M+H]+", "PC", formula="C42H82NO8P")],
+            [_identified(3, "PE O-36:3", "[M-H]-", "EtherPE", formula="C41H78NO7P"),
+             _identified(4, "PE 37:1", "[M-H]-", "PE", formula="C42H82NO8P")],
+            report_path=self.root / "merge-report.json",
+        )
+        # PC 34:1 and PE 37:1 share a formula and are different lipids; only EtherPE is a double count.
+        self.assertEqual(["EtherPE"], [group["ontology"] for group in result["possible_double_counts"]])
+        self.assertIn({"class": "BRSE", "adduct": "[M+NH4]+"}, result["selected_pairs_without_rows"])
+        self.assertEqual(["EtherPE"], result["ontologies_from_both_polarities"])
+        self.assertTrue((self.root / "merge-report.json").is_file())
+        self.assertEqual(64, len(result["inputs"]["positive_sha256"]))
+
+    def test_the_selection_is_read_from_the_workbooks_third_sheet(self) -> None:
+        rules = read_adduct_rules(quant_workbook(self.root / "quant_utility_table.xlsx"))
+        self.assertIn(("PC", "[M+CH3COO]-"), rules["selected"])
+        self.assertEqual(["EtherPE"], [item["class"] for item in rules["multi_adduct_classes"]])
+
+    def test_a_workbook_selection_with_a_problem_is_refused(self) -> None:
+        bad = quant_sheet([("PC", "[M+H]+", "Negative", True)])
+        path = quant_workbook(self.root / "quant_utility_table.xlsx", quant=bad)
+        with self.assertRaisesRegex(MergeRefused, "cannot be used"):
+            read_adduct_rules(path)
