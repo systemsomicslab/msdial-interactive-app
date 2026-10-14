@@ -4212,6 +4212,11 @@ def _select_conversion_sources(
 # (_declared_candidates): a declaration that lists one sample's file in two folders (the Catalog leaves equally
 # preferred copies both declared) runs the first by path. Declared inputs of different rows, even of one name in two
 # folders (MTBKS64's raw/batch1/QC.RAW and raw/batch2/QC.RAW, two rows of S01), are different samples' files.
+# What one declared archive held (a declared input that is itself an archive: MB-POST's per-sample zips) is grouped
+# the same way, and the rule chooses among it; but where the files it chose among lie in different folders of that
+# archive, the lease refuses the archive as one declared input found more than once instead of running the one it
+# chose. That is an exception to "folders do not separate" that the user has not decided (encoding_rule, ONE
+# EXCEPTION THE USER HAS NOT DECIDED; _another_encoding_beside).
 
 STEM_OF_SEVERAL_SAMPLE_ROWS = "stem_of_several_sample_rows"
 # Where the lease's raw-header reads for the encoding rule write their records, under the unit's provenance.
@@ -12284,7 +12289,7 @@ def _filter_inputs_by_project_allowlist(
     excluded, whose conversion failed or whose scans contradict the declared polarity: a declared input
     they are is not missing, and a unit left with nothing else selects nothing rather than raising, so the
     lease can record why. unused is what the one encoding rule left unused (by _file_key): in a declared unit,
-    one of them that is another encoding beside the file used, inside one declared archive
+    one of them beside the file used (its folder and its stem), inside one declared archive
     (_another_encoding_beside), is not that input found twice; any other still is.
     """
     if not project.analysis_unit_id:
@@ -12449,6 +12454,11 @@ def _expanded_places(nested: dict[str, Any]) -> list[str]:
     (nested_directory, container_stem); an archived container is the container it produced
     (container_root); a compressed stream is the file it unpacks to. Nothing where the record says too
     little to tell its contents from what was beside it.
+
+    A nested_rooted place is built from the archive's name, and its folder need not have that name's case:
+    destination_rule compares them without case, so S1.zip holding s1/S1.mzML expanded to s1, and no record says
+    so. declared_archive_expansions, given the data root, reads that folder's own case from the disk
+    (_as_written).
     """
     archive_path = str(nested.get("archive_path") or "").replace("\\", "/").strip("/")
     parent = archive_path.rsplit("/", 1)[0] if "/" in archive_path else ""
@@ -12473,17 +12483,28 @@ def _expanded_places(nested: dict[str, Any]) -> list[str]:
 def declared_archive_expansions(
     declared: dict[str, dict[str, Any]],
     archive_extractions: list[dict[str, Any]] | None,
+    *,
+    data_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Each declared archive input (is_declared_archive) that was expanded inside a downloaded archive.
 
     One entry per nested extraction record whose path - its archive_path under the record's placement, in the
     forms the allow-list reads (_allowlist_forms) - is a declared archive input's: {key, entry, record, nested,
-    archive_path and places, both relative to the data root as written}. The member of the project tar is gone
-    once it has expanded; what the sample is lies at its places.
+    archive_path and places, both relative to the data root}. The member of the project tar is gone once it has
+    expanded; what the sample is lies at its places.
+
+    archive_path is as the extraction wrote it. A place is as the record gives it (_expanded_places), and with
+    ``data_root`` as it is written on disk there (_as_written): what a record names, and what a case-sensitive file
+    system finds. Without it a place may differ from the disk in case only, which matching (casefolded) ignores.
     """
     archived = {key for key, entry in declared.items() if is_declared_archive(key, entry)}
     if not archived or not archive_extractions:
         return []
+    listings: dict[Path, list[str] | None] = {}
+
+    def written(place: str) -> str:
+        return _as_written(data_root, place, listings) if data_root is not None else place
+
     result: list[dict[str, Any]] = []
     for record in archive_extractions:
         if not isinstance(record, dict):
@@ -12504,11 +12525,41 @@ def declared_archive_expansions(
                     "nested": nested,
                     "archive_path": relative,
                     "places": [
-                        "/".join(part for part in (placement, place) if part) for place in _expanded_places(nested)
+                        written("/".join(part for part in (placement, place) if part))
+                        for place in _expanded_places(nested)
                     ],
                 }
             )
     return result
+
+
+def _as_written(data_root: Path, relative: str, listings: dict[Path, list[str] | None] | None = None) -> str:
+    """A '/'-separated path under the data root with each part as it is written on disk there.
+
+    A part that is on disk as given stays; otherwise the one entry of its folder that matches it without case is
+    taken (the extract stage refuses to write a second entry beside one that matches it so: archives._entry_exists).
+    From the first part that matches none, or more than one, the rest is as given. ``listings`` caches each folder's
+    entries across calls.
+    """
+    listings = {} if listings is None else listings
+    parts = [part for part in relative.split("/") if part]
+    folder = data_root
+    for index, part in enumerate(parts):
+        if folder not in listings:
+            try:
+                listings[folder] = os.listdir(folder)
+            except OSError:
+                listings[folder] = None
+        names = listings[folder]
+        if names is None:
+            break
+        if part not in names:
+            matches = [name for name in names if name.casefold() == part.casefold()]
+            if len(matches) != 1:
+                break
+            parts[index] = matches[0]
+        folder = folder / parts[index]
+    return "/".join(parts)
 
 
 def match_declared_inputs(
@@ -12615,10 +12666,11 @@ def _select_declared_inputs(
 
     A declared archive that was expanded inside another (declared_archive_expansions) is matched by what it
     held: the inputs under the place it expanded to. Of those the one encoding rule left unused (``unused``,
-    by _file_key), only another encoding of the very file it used does not count it twice
-    (_another_encoding_beside): S1/S1.mzML beside S1/S1.cdf. Every other one counts, so two runs, two
-    polarities' folders, or one name in two folders are refused as one declared input found more than once.
-    One whose contents hold nothing MS-DIAL opens is missing, and the error says what it did hold.
+    by _file_key), only one beside the very file it used, in its folder and of its stem, does not count it twice
+    (_another_encoding_beside): S1/S1.mzML beside S1/S1.cdf, S1/S1.wiff beside S1/S1.d. Every other one counts,
+    so two runs, two polarities' folders, or one name in two folders are refused as one declared input found more
+    than once; for one name in two folders that is an exception to the rule the user has not decided
+    (encoding_rule). One whose contents hold nothing MS-DIAL opens is missing, and the error says what it did hold.
 
     WHY BY PATH, AND WHY EVERY ONE. Before the Catalog declared its inputs, an input was admitted when a
     listed name or a sample's file name matched its basename. A Waters folder matched neither - its
@@ -12653,8 +12705,8 @@ def _select_declared_inputs(
 
     def counted(key: str, matched: list[str]) -> list[str]:
         """The inputs that count toward a declared input found more than once: all of them, less, for a declared
-        archive (is_declared_archive) only, an unused encoding beside the one the rule used (an archived
-        container, or a declared file, counts every input it matched, as it always did)."""
+        archive (is_declared_archive) only, an unused file beside one the rule used (_another_encoding_beside; an
+        archived container, or a declared file, counts every input it matched, as it always did)."""
         if not unused or not is_declared_archive(key, declared[key]):
             return matched
         used = [item for item in matched if _file_key(item) not in unused]
@@ -12695,28 +12747,32 @@ def _select_declared_inputs(
 
 
 def _another_encoding_beside(item: str, used: list[str], data_root: Path, stands_for: dict[str, str]) -> bool:
-    """Whether an input the one encoding rule left unused is another encoding of a file it used: in the same folder,
-    of the same stem (encoding_preference.stem), in an encoding of another rank (encoding_rule.encoding_rank).
+    """Whether an input the one encoding rule left unused lies beside a file it used: in the same folder and of the
+    same stem (encoding_preference.stem), whatever its rank (encoding_rule.encoding_rank).
 
-    S1/S1.mzML beside S1/S1.cdf is one acquisition written twice. Nothing else is, inside a declared archive: its
-    folders may be its runs, and the rule's grouping of a declared unit (_encoding_groups: one sample row and one
-    stem) does not see them. MPST000213's zips hold Data/<run>/RD/MsData.RPS for every run, all of one stem;
-    S1/run_a/data.mzML and S1/run_b/data.mzML, or S1/NEG/S1.mzML and S1/POS/S1.mzML (two acquisitions, never two
-    encodings of one: THE SAME SAMPLE above), would otherwise run one of them, chosen by path. So a file of the used
-    one's rank (a tie: one format twice, or two vendor formats), or in another folder, is not another encoding here,
-    and counts. An mzML the convert stage wrote is placed where the mzXML it stands for lies.
+    Two names in one folder that differ only by their container suffix are one acquisition, never two runs:
+    S1/S1.mzML beside S1/S1.cdf (another rank, clause 1), or S1/S1.wiff beside S1/S1.d (one rank, two vendor
+    formats: a tie clause 2 gives the first by path). Such a file is the rule's to leave unused, and does not count.
+
+    A file in another folder of a declared archive does count, so the lease refuses the archive as one declared input
+    found more than once. That is an EXCEPTION to the rule, not the rule (encoding_rule, ONE EXCEPTION THE USER HAS
+    NOT DECIDED). By the rule's words ("copies in other folders included", clause 2) and THE SAME SAMPLE above,
+    S1/A/S1.mzML beside S1/B/S1.mzML, S1/RAW/S1.d beside S1/mzML/S1.mzML and, in a positive unit, S1/POS/S1.mzML
+    beside S1/S1.mzML are one sample's copies, and one would run. But the folders inside one sample's archive may be
+    its runs, which the rule's grouping of a declared unit (_encoding_groups: one sample row and one stem) cannot
+    tell from copies: MPST000213's zips hold Data/<run>/RD/MsData.RPS for every run, all of one stem, and
+    S1/run_a/data.mzML beside S1/run_b/data.mzML would run one of them, chosen by path. Whether such folders are runs
+    or copies is the user's to decide; until that answer is on record the lease refuses rather than choose. (Two
+    polarities' folders, S1/NEG/S1.mzML and S1/POS/S1.mzML, are two acquisitions by the rule itself, and must count
+    whatever that answer is.) An mzML the convert stage wrote is placed where the mzXML it stands for lies.
     """
 
-    def where(path: str) -> tuple[str, str, int | None]:
+    def where(path: str) -> tuple[str, str]:
         relative = _relative_under(stands_for.get(_file_key(path)) or path, data_root)
         folder = relative.rsplit("/", 1)[0] if "/" in relative else ""
-        return folder.casefold(), encoding_preference.stem(relative), encoding_rule.encoding_rank(relative)
+        return folder.casefold(), encoding_preference.stem(relative)
 
-    folder, stem, rank = where(item)
-    return any(
-        other_folder == folder and other_stem == stem and other_rank != rank
-        for other_folder, other_stem, other_rank in (where(path) for path in used)
-    )
+    return where(item) in {where(path) for path in used}
 
 
 def _expanded_without_input(
@@ -12731,7 +12787,7 @@ def _expanded_without_input(
     Profile.dfa, ...), and its lease said only that they were "not in the download", which they had been.
     """
     expansions: dict[str, list[dict[str, Any]]] = {}
-    for item in declared_archive_expansions(declared, archive_extractions):
+    for item in declared_archive_expansions(declared, archive_extractions, data_root=data_root):
         if item["key"] in missing:
             expansions.setdefault(item["key"], []).append(item)
     if not expansions:
@@ -12779,13 +12835,13 @@ def declared_archive_inputs_record(
     One entry per declared input that names an archive the extract stage expanded inside a downloaded one
     (declared_archive_expansions): the declared path and its sample; the archive's path under the data root,
     the archive it was in, its depth (2 for a zip in the project tar) and destination rule; where it expanded
-    (expanded_to, under the data root); its digests from before it expanded and whether the declared checksum
-    matched them; and the inputs that are its sample's, under the data root (an mzML the convert stage wrote is
-    named by the mzXML it stands for, which is what lies there). The nested extraction record is marked with the
-    declared path (declared_input). Empty where no declared input was such an archive.
+    (expanded_to, under the data root as written on disk: _as_written); its digests from before it expanded and
+    whether the declared checksum matched them; and the inputs that are its sample's, under the data root (an mzML
+    the convert stage wrote is named by the mzXML it stands for, which is what lies there). The nested extraction
+    record is marked with the declared path (declared_input). Empty where no declared input was such an archive.
     """
     declared = declared_analysis_inputs(project)
-    expansions = declared_archive_expansions(declared, archive_extractions)
+    expansions = declared_archive_expansions(declared, archive_extractions, data_root=data_root)
     if not expansions:
         return []
     found = match_declared_inputs(

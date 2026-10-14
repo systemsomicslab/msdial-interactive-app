@@ -263,6 +263,20 @@ declared inputs of one sample row and one stem (`_declared_candidates`), so a
 declaration listing one sample's file in two folders runs the first by path,
 while declared inputs of two rows stay two samples.
 
+One exception to the rule has not been decided by the user (0.5.39). A declared
+input that is itself an archive (MB-POST's per-sample zips inside a project tar)
+is one sample, and the rule chooses among what it held. A file the rule leaves
+unused beside the one used, in its folder and of its stem (`S1/S1.cdf` beside
+`S1/S1.mzML`, or `S1/S1.wiff` beside `S1/S1.d`), is recorded as the rule says.
+A file in another folder of that archive is not: `S1/A/S1.mzML` beside
+`S1/B/S1.mzML`, or `S1/RAW/S1.d` beside `S1/mzML/S1.mzML`, makes the lease
+refuse the unit as that declared input found more than once, where clauses 1
+and 2 would run one and record the other. The folders of one sample's archive
+may be its runs (`run_a/data.mzML` and `run_b/data.mzML`; MPST000213's
+`Data/<run>/RD/MsData.RPS`), and the grouping cannot tell runs from copies.
+Whether such folders are runs or copies is a decision for the user. Until it is
+recorded, the lease stops rather than choose one by path.
+
 A re-encoding MS-DIAL opens that no instrument writes (`.cdf`, `.abf`, `.ibf`)
 is in none of the rule's ranks; it ranks after every vendor format and before
 mzML, where it stood before the rule, so it never wins a tie against a `.raw` or

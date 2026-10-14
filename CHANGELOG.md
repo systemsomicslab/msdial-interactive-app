@@ -29,18 +29,28 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     builder and a split part ask the same function, so they answer alike.
   - What one declared archive held is one sample's. The one encoding rule
     (2026-10-09) uses one of its encodings and records the others. Of those,
-    only another encoding beside the file used (the same folder and stem,
-    another rank in the rule's order: `S1/S1.mzML` beside `S1/S1.cdf`) does
-    not count as the declared input found twice. Anything else in one declared
-    zip is refused as one declared input found more than once ("2 inputs in
-    what the archive held"), as one input per sample requires: two runs
-    (`run_1.mzML`, `run_2.mzML`, or `run_a/data.mzML` and `run_b/data.mzML`,
-    the shape of MPST000213's `Data/<run>/RD/MsData.RPS`), both polarities'
-    folders (`POS/S1.mzML`, `NEG/S1.mzML`), or one name in two folders
-    (`cdf/S1.cdf`, `mzML/S1.mzML`). The rule groups a declared unit's files by
-    sample row and stem, so without this one of them would run, chosen by path.
-    An archived container, or a declared file, counts every input it matched,
-    as it always did.
+    a file beside the one used (the same folder and stem, whatever its rank:
+    `S1/S1.mzML` beside `S1/S1.cdf`, or `S1/S1.wiff` beside `S1/S1.d`, a tie
+    the rule's clause 2 gives the first by path) does not count as the
+    declared input found twice. Two runs (`run_1.mzML`, `run_2.mzML`) and both
+    polarities' folders (`POS/S1.mzML`, `NEG/S1.mzML`) in one declared zip are
+    refused as one declared input found more than once ("2 inputs in what the
+    archive held"), as one input per sample requires. An archived container,
+    or a declared file, counts every input it matched, as it always did.
+  - **An exception to the one encoding rule that the user has not decided.**
+    A file the rule left unused in another folder of the same declared zip
+    also counts, so the zip is refused: `S1/A/S1.mzML` beside `S1/B/S1.mzML`,
+    `S1/RAW/S1.d` beside `S1/mzML/S1.mzML`, and, in a positive unit,
+    `S1/POS/S1.mzML` beside `S1/S1.mzML`. This departs from the rule's clauses
+    1 and 2 ("copies in other folders included"; a tie goes to the first by
+    path), under which one of them would run and the other would be recorded.
+    The folders inside one sample's archive may be its runs (`run_a/data.mzML`
+    and `run_b/data.mzML`, the shape of MPST000213's
+    `Data/<run>/RD/MsData.RPS`), and the rule's grouping (one sample row and
+    one stem) cannot tell runs from copies. Whether such folders are runs or
+    copies is a scientific decision that has not been made. Until it is, the
+    lease stops rather than choose one by path. This is a stop, not a reading
+    of the rule, and the `encoding_rule` module says so.
   - An mzXML inside a declared archive is converted in a campaign, as a
     declared mzXML is.
   - A declared per-sample archive the unit downloads itself, which expands at
@@ -52,13 +62,17 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     none of the files they held is one MS-DIAL opens
     (Rubroshorea_leprosula_from_Borneo_ID_01.zip: 1028 file(s) under
     MB-POST_files_MPST000213.0/Rubroshorea_leprosula_from_Borneo_ID_01, ...)",
-    with the commonest suffixes when the tree is on disk.
+    with the commonest suffixes when the tree is on disk. The place it names is
+    the folder as it is written on disk (see `expanded_to` below).
 
 ### Added
 - `manifest.declared_archive_inputs`, only where a declared input was such an
   archive: for each, the declared path and sample; the archive's path under the
   data root, the archive it was in, its depth, format and destination rule;
-  where it expanded (`expanded_to`), its file count and bytes; its sha256 and
+  where it expanded (`expanded_to`, each folder as it is written on disk: a zip
+  holding exactly its own folder in another case, `S1.zip` holding `s1/`, is
+  `nested_rooted`, and its place is `s1`, which a case-sensitive file system
+  finds, not the zip's `S1`), its file count and bytes; its sha256 and
   md5 from before it expanded and whether the declared checksum matched them;
   and the inputs it gave (an mzML the convert stage wrote is named by the mzXML
   it stands for). Its nested extraction record names the declared input

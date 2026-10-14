@@ -14,11 +14,13 @@ What is pinned here, with synthetic tars of synthetic zips (nothing leaves the m
   own folder kept, a folder made for it, a vendor folder inside it), and the CSV gives them that sample's row;
 - the manifest records the nesting (declared_archive_inputs; the nested extraction record names the declared input);
 - the inner zip is held to the outer archive's rules: an unsafe member name, the member budget, its published MD5;
-- one sample's encodings side by side inside one zip are one sample's (the one encoding rule); two runs (of two
-  names, or of one name in their own folders), both polarities' folders, or one name in two folders are one declared
-  input found more than once, and refused; an archived container still counts every input it matched; a zip holding
-  nothing MS-DIAL opens (MPST000213's JEOL msAxel project) says what it held;
-- a place is matched by the full path under the data root only;
+- one sample's encodings side by side inside one zip, in one folder and of one stem, are one sample's (the one
+  encoding rule), whatever their rank: S1.cdf beside S1.mzML, and S1.d beside S1.wiff (a tie, the first by path);
+  two runs (of two names, or of one name in their own folders) and both polarities' folders are one declared input
+  found more than once, and refused; so is one name in two folders, which is an exception to the rule the user has
+  not decided (encoding_rule), pinned as a stop until the user does; an archived container still counts every input
+  it matched; a zip holding nothing MS-DIAL opens (MPST000213's JEOL msAxel project) says what it held;
+- a place is matched by the full path under the data root only, and recorded as it is written on disk;
 - an mzXML inside a declared zip is converted in a campaign, as a declared mzXML is;
 - where no record says where a declared per-sample zip went (one the unit downloads itself), its sample decides;
 - a store record made before 0.5.39, shaped as MPST000213's is, says where each zip went.
@@ -189,6 +191,12 @@ class _Workspace(unittest.TestCase):
         )
         return read_manifest(lease["manifest_path"])
 
+    def fresh_root(self, name: str) -> None:
+        """A workspace of its own for one subtest: a lease keeps what an earlier lease of its unit left in the tree,
+        so a second synthetic tar in one workspace would be read beside the first one's files."""
+        self.root = Path(self._temporary.name).resolve() / name
+        self.root.mkdir()
+
     def relative(self, manifest: dict, paths: list[str]) -> list[str]:
         data = Path(manifest["input_directory"])
         return sorted(Path(item).relative_to(data).as_posix() for item in paths)
@@ -282,6 +290,19 @@ class TheContentsOfADeclaredZipInTheProjectTarAreItsSample(_Workspace):
         )
         self.assertEqual([], built["samples_without_input"])
 
+    def test_a_folder_of_another_case_than_its_zip_is_recorded_as_it_is_written(self) -> None:
+        """Second review of 0.5.39: a zip holding exactly its own folder in another case is nested_rooted
+        (destination_rule compares them without case), and expanded_to named the zip's case, S1, where the disk has
+        s1: a path a case-sensitive file system does not have."""
+        manifest = self.lease({"S1.zip": _zip({"s1/S1.mzML": MZML})})
+
+        (record,) = manifest["declared_archive_inputs"]
+        self.assertEqual(
+            ("nested_rooted", [f"{TAR_ROOT}/s1"], [f"{TAR_ROOT}/s1/S1.mzML"]),
+            (record["destination_rule"], record["expanded_to"], record["inputs"]),
+        )
+        self.assertEqual(["s1"], sorted(path.name for path in (Path(manifest["input_directory"]) / TAR_ROOT).iterdir()))
+
     def test_a_unit_of_files_listed_one_by_one_records_no_declared_archive(self) -> None:
         """Only where one was, so every other lease records what it always did."""
         payloads = {"https://example.org/FILES/S1.mzML": MZML}
@@ -356,23 +377,58 @@ class WhatOneZipHoldsIsOneSample(_Workspace):
     def test_both_polarities_folders_in_one_declared_zip_are_refused_not_chosen_by_path(self) -> None:
         """POS/S1.mzML and NEG/S1.mzML are two acquisitions, never two encodings of one; in this positive unit the
         lease ran NEG/S1.mzML, first by path, before the review of 0.5.39."""
-        for files in (
+        for index, files in enumerate((
             {"S1/NEG/S1.mzML": MZML, "S1/POS/S1.mzML": MZML},
             # Another encoding as well as another folder: still two acquisitions.
             {"S1/NEG/S1.mzML": MZML, "S1/POS/S1.cdf": b"CDF\x01netcdf"},
-        ):
+        )):
+            self.fresh_root(f"case-{index}")
             with self.subTest(files=sorted(files)), self.assertRaisesRegex(
                 ValueError, r"found more than once: S1\.zip \(2 inputs in what the archive held\)"
             ):
                 self.lease({"S1.zip": _zip(files)})
 
-    def test_one_name_in_two_folders_of_a_declared_zip_is_refused(self) -> None:
-        """Only an encoding beside the one used is another encoding of it: a folder inside a declared zip may be a
-        run, so cdf/S1.cdf and mzML/S1.mzML are not taken for one acquisition."""
-        with self.assertRaisesRegex(
-            ValueError, r"found more than once: S1\.zip \(2 inputs in what the archive held\)"
-        ):
-            self.lease({"S1.zip": _zip({"S1/cdf/S1.cdf": b"CDF\x01netcdf", "S1/mzML/S1.mzML": MZML})})
+    def test_two_vendor_formats_beside_each_other_are_a_tie_the_rule_gives_the_first_by_path(self) -> None:
+        """Second review of 0.5.39: the exemption also asked for another rank, so S1/S1.d beside S1/S1.wiff - clause
+        2's 'two vendor formats', two names in one folder that differ only by their suffix, never two runs - was
+        refused as found twice."""
+        cases = (
+            ({"S1/S1.d/AcqData/MSScan.bin": b"scan", "S1/S1.wiff": b"wiff"}, "S1/S1.d", "S1/S1.wiff"),
+            # Two re-encodings of one rank (RE_ENCODING_RANK).
+            ({"S1/S1.cdf": b"CDF\x01netcdf", "S1/S1.abf": b"ABF"}, "S1/S1.abf", "S1/S1.cdf"),
+        )
+        for index, (files, used, unused) in enumerate(cases):
+            self.fresh_root(f"case-{index}")
+            with self.subTest(files=sorted(files)):
+                manifest = self.lease({"S1.zip": _zip(files)})
+
+                self.assertEqual([f"{TAR_ROOT}/{used}"], self.relative(manifest, manifest["input_candidates"]))
+                (choice,) = manifest["encoding_choices"]
+                self.assertEqual(f"{TAR_ROOT}/{used}", choice["used"])
+                self.assertEqual(
+                    [(f"{TAR_ROOT}/{unused}", "tie_lexicographic")],
+                    [(item["path"], item["reason"]) for item in choice["unused"]],
+                )
+                self.assertEqual([f"{TAR_ROOT}/{used}"], manifest["declared_archive_inputs"][0]["inputs"])
+
+    def test_one_name_in_two_folders_of_a_declared_zip_is_refused_until_the_user_decides(self) -> None:
+        """AN EXCEPTION TO THE ONE ENCODING RULE THAT THE USER HAS NOT DECIDED (encoding_rule). By the rule's words
+        each pair is one sample's copies or encodings, and one would run ('copies in other folders included', clause
+        2; POS/S1.mzML beside S1.mzML in a positive unit is one sample's, _one_sample_polarities). But a folder
+        inside one sample's archive may be a run, which the grouping cannot tell from a copy, so the lease refuses
+        rather than choose by path. Whether such folders are runs or copies is the user's to decide; this pins the
+        stop until that answer is on record, not a reading of the rule."""
+        for index, files in enumerate((
+            {"S1/cdf/S1.cdf": b"CDF\x01netcdf", "S1/mzML/S1.mzML": MZML},
+            {"S1/A/S1.mzML": MZML, "S1/B/S1.mzML": MZML},
+            {"S1/RAW/S1.d/AcqData/MSScan.bin": b"scan", "S1/mzML/S1.mzML": MZML},
+            {"S1/POS/S1.mzML": MZML, "S1/S1.mzML": MZML},
+        )):
+            self.fresh_root(f"case-{index}")
+            with self.subTest(files=sorted(files)), self.assertRaisesRegex(
+                ValueError, r"found more than once: S1\.zip \(2 inputs in what the archive held\)"
+            ):
+                self.lease({"S1.zip": _zip(files)})
 
     def test_a_zip_holding_nothing_ms_dial_opens_says_what_it_held(self) -> None:
         """MPST000213: each zip held a JEOL msAxel project, which no RawDataHandler reader opens."""
@@ -395,6 +451,16 @@ class WhatOneZipHoldsIsOneSample(_Workspace):
         self.assertIn(f"3 of them were archives inside {ACCESSION}.tar that the extract stage expanded", message)
         self.assertIn(f"Borneo_ID_01.zip: 5 file(s) under {TAR_ROOT}/Borneo_ID_01, by suffix .dfa 2,", message)
         self.assertIn(".rps 1", message)
+
+    def test_what_a_zip_held_is_named_by_its_folder_as_written(self) -> None:
+        """The folder is found, and named, in its own case (second review of 0.5.39): on a case-sensitive file
+        system the zip's case found no folder, and the message lost its count by suffix."""
+        with self.assertRaises(ValueError) as caught:
+            self.lease({"Borneo_ID_01.zip": _zip({"borneo_id_01/Data/RD/MsData.RPS": b"rps"})})
+
+        self.assertIn(
+            f"(Borneo_ID_01.zip: 1 file(s) under {TAR_ROOT}/borneo_id_01, by suffix .rps 1)", str(caught.exception)
+        )
 
 
 class AnMzxmlInADeclaredZipIsConvertedInACampaign(_Workspace):
@@ -595,6 +661,33 @@ class AStoreRecordMadeBeforeThisVersionSaysWhereEachZipWent(unittest.TestCase):
         self.assertEqual([], repository_reanalysis._expanded_places(
             {"archive_name": "S1.zip", "archive_path": "A/S1.zip", "destination_rule": "container_files"}
         ))
+
+
+class APlaceIsNamedAsItIsWrittenOnDisk(unittest.TestCase):
+    """_as_written: each part of a place in its own case on disk, read part by part (second review of 0.5.39)."""
+
+    def test_each_part_takes_the_case_it_has_on_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "MB" / "s1" / "Data").mkdir(parents=True)
+
+            self.assertEqual("MB/s1", repository_reanalysis._as_written(root, "mb/S1"))
+            self.assertEqual("MB/s1/Data", repository_reanalysis._as_written(root, "MB/S1/data"))
+            # From a part that is not there, the rest is as given.
+            self.assertEqual("MB/s1/Gone/X", repository_reanalysis._as_written(root, "mb/s1/Gone/X"))
+            self.assertEqual("Elsewhere/S1", repository_reanalysis._as_written(root / "missing", "Elsewhere/S1"))
+
+    def test_a_case_sensitive_folder_is_read_by_its_listing(self) -> None:
+        """What a case-sensitive file system lists, given as the folders' listings: a part found as given stays, one
+        found once without case takes that case, and one found twice so is left as given."""
+        root = Path("root")
+        listings = {root: ["MB"], root / "MB": ["s1", "S2", "s2"]}
+
+        self.assertEqual("MB/s1", repository_reanalysis._as_written(root, "MB/S1", dict(listings)))
+        self.assertEqual("MB/S2", repository_reanalysis._as_written(root, "MB/S2", dict(listings)))
+        self.assertEqual("MB/s2", repository_reanalysis._as_written(root, "MB/s2", dict(listings)))
+        self.assertEqual("MB/S3", repository_reanalysis._as_written(root, "mb/S3", dict(listings)))
+        self.assertEqual("mb/S2", repository_reanalysis._as_written(Path("other"), "mb/S2", {Path("other"): ["MB", "mB"]}))
 
 
 if __name__ == "__main__":
