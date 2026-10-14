@@ -121,7 +121,11 @@ intervals while adding a small computational cost.
 3. Show `paired_sample_table`; the person confirms it or corrects it by stem.
    `msdial_lipidomics_write_contract(..., check_digest, sample_table_confirmed=true,
    sample_table=<corrections>)` previews, and with `confirmed=true` writes
-   `<root>/inputs/`.
+   `<root>/inputs/`. A check filled from a workset (`filled_from_workset`) is
+   written with the same `workset_id`. A contract already at the root refuses
+   even the preview and shows `existing_contract` (the steps recorded under it,
+   and that replacing it leaves them unusable); preview again with
+   `replace_existing=true` only if the person wants it replaced.
 4. For each polarity: `msdial_guided_analysis_plan(input_path=<raw folder>,
    answers={"lab_lipidomics_contract_path": ..., "ion_mode": ...})`, the
    diagnostic (confirmed), `msdial_estimate_peak_height`, then the production run
@@ -132,16 +136,22 @@ intervals while adding a small computational cost.
    each run's `guided-answers.json` keeps the contract's sha256.
    A run whose automatic RT correction failed is reported; running it again
    uncorrected is the person's decision, and the plan reports it as a deviation.
+   The contract fixes the parameter template, the LBM query list and the export
+   folder too; any answer it does not state is reported as a deviation, so
+   `lab_lipidomics.deviations` is empty only for a plan that is the contract's.
 5. `msdial_lipidomics_resolve_standards(contract_path, pos_job_id, neg_job_id)`:
-   read each standard's tier and the classes that would be NOT QUANTIFIED to the
-   person. Standards awaiting acceptance (`needs_confirmation`: a text candidate,
-   a search, or an LBM annotation outside the internal-standard RT tolerance
-   while another spot lies inside it), and standards not found, each need their
-   decision.
+   read each standard's tier, its candidates and `valid_alternatives`, and the
+   classes that would be NOT QUANTIFIED to the person. Standards awaiting
+   acceptance (`needs_confirmation`: a text candidate, a search, or an LBM
+   annotation outside the internal-standard RT tolerance while another spot lies
+   inside it), and standards not found or invalid, each need their decision.
 6. `msdial_lipidomics_normalize(contract_path, job_id, resolution_digest,
-   accept_searched, accept_unresolved)` previews the standards table and the
-   exact command; each polarity is confirmed separately. Poll the job with
-   `msdial_interactive_job`; its result says whether every cell was verified.
+   accept_searched, accept_unresolved, accept_spot)` previews the standards table
+   and the exact command; each polarity is confirmed separately. `accept_spot`
+   takes another listed candidate for a standard (`{"LPE 18:1(d7)": 11}`). The
+   preview warns when the Console is not the build the contract recorded. Poll
+   the job with `msdial_interactive_job`; its result says whether every cell was
+   verified.
 7. `msdial_lipidomics_merge(contract_path)` previews the counts; `confirmed=true`
    writes `lipid_metabolome.csv`, `lipid_metabolome_not_quantified.csv` and
    `merge-report.json` into `<root>/quant`.

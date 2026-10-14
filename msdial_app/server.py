@@ -3307,6 +3307,7 @@ def _start_laboratory_normalize(body: dict[str, Any]) -> dict[str, Any]:
         str(body.get("resolution_digest") or ""),
         body.get("accept_searched") or [],
         body.get("accept_unresolved") or [],
+        body.get("accept_spot") or None,
     )
     shown = lab_public_normalize_plan(plan)
     if body.get("confirmed") is not True:

@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import __version__
-from .agent_workflow import apply_sample_table, inspect_analysis_input
+from .agent_workflow import RESOURCES, apply_sample_table, inspect_analysis_input
 from .lab_lipidomics import (
     DEFAULT_INTERNAL_STANDARD_RT_TOLERANCE,
     INTERNAL_STANDARD_ANNOTATOR_IDS,
@@ -46,6 +46,7 @@ from .lab_lipidomics import (
     InternalStandard,
     LabInputError,
     analysis_root_problems,
+    chosen_candidate,
     compare_normalize_stdout,
     cross_check_standards,
     excel_lock_files,
@@ -82,6 +83,7 @@ from .workflow import (
     NORMALIZE_PEAK_IDS_ONLY_OPTION,
     console_capabilities,
     file_identity,
+    inspect_console_path,
 )
 
 CHECK_SCHEMA = "msdial-interactive.lab-lipidomics-check.v1"
@@ -95,7 +97,11 @@ FOLDERS = {POSITIVE: "pos", NEGATIVE: "neg"}
 LABELS = {POSITIVE: "Pos", NEGATIVE: "Neg"}
 NOT_QUANTIFIED_NAME = "lipid_metabolome_not_quantified.csv"
 MERGE_REPORT_NAME = "merge-report.json"
+# What normalize writes into the quant folder (plan_normalize's paths), by name prefix, folded.
+QUANT_FILE_PREFIXES = ("normalizedheight_", "height_", "standards_", "is_resolution_", "normalize_")
 RT_CORRECTION_FAILED = "Automatic alignment RT correction failed"
+LAB_PARAMETER_TEMPLATE = RESOURCES / "msdial_console_param4lipidomics.txt"
+LAB_LBM_QUERIES = RESOURCES / "LbmQueries.txt"
 # R3: an annotation RT tolerance outside this is allowed and said.
 ANNOTATION_RT_TOLERANCE_USUAL = (0.1, 3.0)
 # Where MS-DIAL reads the raw data: the folders as acquired, or a copy made for this analysis.
@@ -133,6 +139,11 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
     notes: list[str] = []
     questions: list[dict[str, Any]] = []
     result: dict[str, Any] = {"schema": CHECK_SCHEMA, "interactive_version": __version__}
+    # What a workset answered, every value of it: check_digest binds them, so write_contract must be
+    # given the same workset_id or these values.
+    filled = args.pop("_workset_filled", None)
+    if filled is not None:
+        result["filled_from_workset"] = filled
 
     def ask(identifier: str, prompt: str, choices: list[str] | None = None) -> None:
         questions.append({"id": identifier, "prompt": prompt, "choices": choices or [], "required": True})
@@ -355,11 +366,13 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         "internal_standard_rt_tolerance": is_rt_tolerance,
         "internal_standard_search": (
             f"an LBM annotation of a standard counts out to the annotation RT tolerance "
-            f"({rt_tolerance if rt_tolerance is not None else 'R3'} min) from its text RT: one within "
-            f"{is_rt_tolerance} min is taken first, and a farther one only on the person's confirmation when another "
-            f"spot lies within {is_rt_tolerance} min. Its text row's annotation and any other spot at its m/z count "
-            f"only within {is_rt_tolerance} min"
+            f"({rt_tolerance if rt_tolerance is not None else 'R3'} min), or {is_rt_tolerance} min where that is "
+            f"wider, from its text RT: one within {is_rt_tolerance} min is taken first, and a farther one only on the "
+            f"person's confirmation when another spot lies within {is_rt_tolerance} min. Its text row's annotation "
+            f"and any other spot at its m/z count only within {is_rt_tolerance} min. The person may take any listed "
+            "candidate instead"
         ),
+        "method_files": {key: {"name": item["name"], "sha256": item["sha256"]} for key, item in lab_method_files().items()},
         "merge": "rows whose representative annotation is not reference matched are dropped",
         "dilution": "each file's factor in the sample table multiplies its concentrations (MS-DIAL -d)",
     }
@@ -413,8 +426,10 @@ def _arguments(request: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Workset '{workset_id}' is not a laboratory lipidomics workset.")
     settings = dict(workset.get("lab_lipidomics") or {})
     warnings: list[str] = []
+    filled: dict[str, Any] = {}
     for key, value in settings.get("answers", {}).items():
-        args.setdefault(key, value)
+        if key not in args:
+            args[key] = filled[key] = value
     for key, recorded in settings.get("files", {}).items():
         path = args.get(key)
         if path and recorded.get("sha256") and Path(str(path)).expanduser().is_file():
@@ -424,6 +439,7 @@ def _arguments(request: dict[str, Any]) -> dict[str, Any]:
                     f"{Path(str(path)).name} has changed since workset '{workset_id}' was saved; it is checked as it is now."
                 )
     args["_workset_warnings"] = warnings
+    args["_workset_filled"] = {"workset_id": workset_id, "answers": filled}
     return args
 
 
@@ -567,6 +583,17 @@ def _console_verdict(path: Path) -> dict[str, Any]:
         blockers.append(f"The Console {path.name} lacks {', '.join(missing)}, which a laboratory lipidomics run needs.")
     verdict["blockers"] = blockers
     return verdict
+
+
+# What identifies a Console build: its assembly, and every file of its folder by one digest (a
+# rebuild of MsdialCore alone leaves MSDIALCUI.dll as it was).
+CONSOLE_BUILD_KEYS = ("assembly_sha256", "inventory_sha256")
+
+
+def console_identity(path: str | Path) -> dict[str, Any]:
+    """The Console by the build it is, not by where it sits: Console folders are rebuilt in place."""
+    found = inspect_console_path(path)
+    return {key: found.get(key, "") for key in ("path", "version", *CONSOLE_BUILD_KEYS, "provenance_status")}
 
 
 def _library_report(read: dict[str, Any], records: list[InternalStandard], polarity: str, *, shared: bool) -> dict[str, Any]:
@@ -747,7 +774,8 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
     if given_digest != check["check_digest"]:
         return {**refusal, "error": (
             "An input changed after it was checked (a file's content, a raw file, or an answer); check the "
-            "inputs again and show the person the result before writing the contract."
+            "inputs again and show the person the result before writing the contract. A check filled from a "
+            "workset binds the workset's answers too (filled_from_workset): pass the same workset_id here."
         )}
     if request.get("sample_table_confirmed") is not True:
         return {**refusal, "error": (
@@ -768,8 +796,18 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
     }
     workbook = parsed["workbook"]
     libraries = parsed["libraries"]
+    method_files = lab_method_files()
+    # A contract already there has runs planned from it, which a new one leaves unusable: the person
+    # is shown it and asked about replacing it before confirming anything.
+    existing = _existing_contract(contract_path) if contract_path.exists() else None
+    if existing is not None and request.get("replace_existing") is not True:
+        return {**refusal, "existing_contract": existing, "error": (
+            f"{contract_path} already exists. Show the person existing_contract (what was done under it, and what "
+            "replacing it does), then preview again with replace_existing=true if they want it replaced."
+        )}
     preview = {
         "contract_path": str(contract_path),
+        "existing_contract": existing,
         "would_write": [
             str(contract_path), *(str(path) for path in derived_paths["internal_standard_libraries"].values()),
             str(derived_paths["standards_template"]), str(derived_paths["quant_rules"]), str(inputs / RECORD_NAME),
@@ -780,16 +818,12 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
         "sample_table": table["rows"],
         "salt": parsed["salt"]["salt"],
         "unit": workbook.get("unit"),
+        "method_files": {key: {"name": item["name"], "sha256": item["sha256"]} for key, item in method_files.items()},
         "check_digest": check["check_digest"],
     }
     if request.get("confirmed") is not True:
         return {"written": False, "confirmation_required": True, **preview,
                 "message": "Show the person what would be written, then call again with confirmed=true."}
-    if contract_path.exists() and request.get("replace_existing") is not True:
-        return {**refusal, "error": (
-            f"{contract_path} already exists, and runs may have been planned from it. Pass replace_existing=true "
-            "to keep it under a dated name and write a new one."
-        )}
 
     inputs.mkdir(parents=True, exist_ok=True)
     replaced = ""
@@ -833,8 +867,13 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
         "output_roots": {polarity: str(root / FOLDERS[polarity]) for polarity in POLARITIES},
         "quant_folder": str(root / QUANT_FOLDER),
         "console_path": parsed["console"]["path"],
+        # The build as well as the path: normalize says when it runs another build than this.
+        "console": console_identity(parsed["console"]["path"]),
         "inputs": {
             "lbm": {key: parsed["lbm"].get(key) for key in ("path", "name", "sha256", "size_bytes")},
+            # The method template and the LBM query list every plan from the contract uses, whatever
+            # the shared settings or a workset name: both polarities run the same method.
+            **{key: {"path": item["path"], "sha256": item["sha256"]} for key, item in method_files.items()},
             "internal_standard_texts": {
                 polarity: {"path": library_reports[polarity]["path"], "sha256": library_reports[polarity]["sha256"]}
                 for polarity in POLARITIES
@@ -966,6 +1005,55 @@ def _write_tsv(path: Path, columns: tuple[str, ...], rows: list[dict[str, Any]])
     return {"path": str(path), "sha256": hashlib.sha256(data).hexdigest(), "rows": len(rows)}
 
 
+def lab_method_files() -> dict[str, dict[str, Any]]:
+    """The parameter template and LBM query list a laboratory contract fixes, by path and sha256.
+
+    Interactive's own laboratory template (LBM cutoffs 0.1 / 0.1 / 0.1) and query list, never what
+    the shared settings name: a template saved from the GUI would otherwise replace the method of
+    one polarity and not the other without a word.
+    """
+    return {
+        key: {"path": str(path.resolve()), "name": path.name, "sha256": file_sha256(path)}
+        for key, path in (("parameter_template", LAB_PARAMETER_TEMPLATE), ("lbm_queries", LAB_LBM_QUERIES))
+    }
+
+
+# The steps a contract's record holds that a replacement leaves unusable.
+RECORDED_STEPS = ("peak_height_diagnostic", "production_run_started", "normalized", "merged")
+
+
+def _existing_contract(contract_path: Path) -> dict[str, Any]:
+    """A contract already at the path, and what was done under it: what replacing it would orphan."""
+    sha256 = file_sha256(contract_path)
+    try:
+        created_at = json.loads(contract_path.read_text(encoding="utf-8-sig")).get("created_at")
+    except (OSError, ValueError, AttributeError):
+        created_at = None
+    steps: list[dict[str, Any]] = []
+    current = False
+    try:
+        lines = (contract_path.parent / RECORD_NAME).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("event") == "contract_written":
+            current = event.get("contract_sha256") == sha256
+        elif current and event.get("event") in RECORDED_STEPS:
+            steps.append({key: event.get(key) for key in ("event", "at", "polarity", "job_id") if event.get(key)})
+    return {
+        "path": str(contract_path), "sha256": sha256, "created_at": created_at, "recorded_steps": steps,
+        "replacing_it": (
+            "keeps it under a dated name and rewrites is_pos.txt and is_neg.txt; every diagnostic, run and "
+            "normalize made under it can then no longer be resolved, normalized or merged, and is made again "
+            "under the new contract"
+        ),
+    }
+
+
 def record_event(contract_path: str | Path, event: dict[str, Any]) -> str:
     """Append one decision or step to the contract's record, beside it."""
     path = Path(contract_path).expanduser().resolve().parent / RECORD_NAME
@@ -1019,12 +1107,20 @@ def contract_drift(contract: dict[str, Any]) -> list[str]:
     return drift
 
 
+# What a plan from a contract is given besides the contract's own answers: the contract, the
+# polarity and the accepted threshold (and workflow_overrides, judged on their own).
+CONTRACT_PLAN_KEYS = frozenset({"lab_lipidomics_contract_path", "ion_mode", "minimum_peak_height", "workflow_overrides"})
+
+
 def contract_plan_answers(contract_path: str, supplied: dict[str, Any], input_path: str) -> dict[str, Any]:
     """The guided answers a contract gives one polarity, and the blockers in using it.
 
-    "fixed" holds what the contract decides for both polarities; a caller who gives one of them
-    otherwise is refused. "answers" holds the method the contract states (S1-S7); a caller may
-    change one, and the change is reported as a deviation from the contract.
+    supplied is everything the plan was given, the caller's answers over a workset's. "fixed"
+    holds what the contract decides for both polarities; a plan given one of them otherwise is
+    refused. "answers" holds the method the contract states (S1-S7); a plan may change one, and
+    the change is reported as a deviation from the contract. Any other answer (an RT-correction
+    tuning value, say) is applied and reported as a deviation too, so that a plan reported as the
+    contract's is the contract's.
     """
     outcome: dict[str, Any] = {
         "answers": {}, "fixed": {}, "blockers": [], "contract_path": str(contract_path), "contract_sha256": "",
@@ -1051,6 +1147,20 @@ def contract_plan_answers(contract_path: str, supplied: dict[str, Any], input_pa
     # before the check existed.
     root = Path(contract["analysis_root"])
     outcome["blockers"].extend(raw_folder_overlaps(root, _analysis_subfolders(root), contract["raw_folders"]))
+    # The method files are Interactive's own, so an upgrade may change them under a contract: the
+    # runs already made stand, and a plan made now would run another method.
+    method_files = {key: contract["inputs"].get(key) or {} for key in ("parameter_template", "lbm_queries")}
+    for key, item in method_files.items():
+        label = key.replace("_", " ")
+        if not item.get("sha256"):
+            outcome["blockers"].append(f"The contract names no {label}; it was written by an earlier version. Write a new contract.")
+        elif not Path(str(item.get("path"))).is_file():
+            outcome["blockers"].append(f"The contract's {label} {item.get('path')} is gone.")
+        elif file_sha256(item["path"]) != item["sha256"]:
+            outcome["blockers"].append(
+                f"The contract's {label} {Path(str(item['path'])).name} has changed since the contract was written, so "
+                "this polarity would run another method than the contract states. Write a new contract."
+            )
     fixed = {
         "project_type": "lcms",
         "target_omics": "Lipidomics",
@@ -1065,10 +1175,16 @@ def contract_plan_answers(contract_path: str, supplied: dict[str, Any], input_pa
         "class_assignment_confirmed": True,
         "analysis_purpose": contract["analysis_purpose"],
         "output_root": contract["output_roots"][polarity],
+        # The exports land in the output folder, never in or over a raw folder.
+        "export_folder_path": contract["output_roots"][polarity],
         "console_path": contract["console_path"],
+        "template_path": method_files["parameter_template"].get("path", ""),
+        "queries_path": method_files["lbm_queries"].get("path", ""),
     }
+    # An empty answer is no answer: the contract's stands.
+    given = {key: value for key, value in supplied.items() if value is not None and value != ""}
     for key, value in fixed.items():
-        if key in supplied and not _same_answer(key, supplied[key], value):
+        if key in given and not _same_answer(key, given[key], value):
             outcome["blockers"].append(
                 f"{key} is fixed by the contract {contract['_path']} for both polarities; write a new contract to change it."
             )
@@ -1076,8 +1192,10 @@ def contract_plan_answers(contract_path: str, supplied: dict[str, Any], input_pa
     if contract.get("number_of_threads"):
         answers["number_of_threads"] = contract["number_of_threads"]
     for key, value in answers.items():
-        if key in supplied and not _same_answer(key, supplied[key], value):
-            outcome["deviations"].append({"key": key, "contract": value, "given": supplied[key]})
+        if key in given and not _same_answer(key, given[key], value):
+            outcome["deviations"].append({"key": key, "contract": value, "given": given[key]})
+    for key in sorted(set(given) - set(fixed) - set(answers) - CONTRACT_PLAN_KEYS):
+        outcome["deviations"].append({"key": key, "contract": None, "given": given[key]})
     outcome.update({"answers": answers, "fixed": {**fixed, "lab_lipidomics_contract_path": contract["_path"]},
                     "fixed_keys": sorted(fixed)})
     return outcome
@@ -1113,7 +1231,8 @@ def contract_override_problems(overrides: dict[str, Any]) -> dict[str, list[Any]
 
 
 def _same_answer(key: str, left: Any, right: Any) -> bool:
-    if key in {"output_root", "console_path", "internal_standard_text_path"}:
+    if key in {"output_root", "export_folder_path", "console_path", "internal_standard_text_path", "template_path",
+               "queries_path"}:
         return _same_path(left, right)
     if key == "libraries":
         return isinstance(left, dict) and _same_path(left.get("lbm_path", ""), (right or {}).get("lbm_path", "")) and not (
@@ -1310,6 +1429,7 @@ def resolve_polarity(contract: dict[str, Any], polarity: str, job: dict[str, Any
                    "zero_height_files": entry.get("zero_height_files", []),
                    "tolerated_zero_height_files": entry.get("tolerated_zero_height_files", []),
                    "candidates": len(entry.get("candidates", [])),
+                   "valid_alternatives": entry.get("valid_alternatives", []),
                    "other_observations": len(entry.get("other_observations", []))}
                 for entry in resolution["standards"]
             ],
@@ -1340,8 +1460,9 @@ def resolve_standards_for_contract(contract_path: str, jobs: dict[str, dict[str,
             "For each polarity, read the tiers to the person. A standard found only by its text candidate or by "
             "search, or by an LBM annotation outside the internal-standard RT tolerance while another spot lies "
             "inside it (needs_confirmation), is used only if they accept it (accept_searched); a standard that was "
-            "not found, or whose spot is invalid, is left unresolved only if they accept that (accept_unresolved). "
-            "The classes it quantifies are then NOT QUANTIFIED."
+            "not found, or whose spot is invalid, is left unresolved only if they accept that (accept_unresolved), "
+            "and the classes it quantifies are then NOT QUANTIFIED. For any standard they may instead take another "
+            "of its listed candidates (valid_alternatives; accept_spot, by standard)."
         ),
     }
 
@@ -1349,7 +1470,8 @@ def resolve_standards_for_contract(contract_path: str, jobs: dict[str, dict[str,
 def _resolution_rows(resolution: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {"name": entry["name"], "candidates": [
-            {key: item.get(key) for key in ("alignment_id", "tier", "name", "adduct", "mz", "rt", "intensity", "method")}
+            {key: item.get(key) for key in ("alignment_id", "tier", "name", "adduct", "mz", "rt", "intensity", "method",
+                                            "valid", "zero_height_files")}
             for item in entry.get("candidates", [])
         ], "other_observations": entry.get("other_observations", []), "warnings": entry.get("warnings", [])}
         for entry in resolution["standards"]
@@ -1378,14 +1500,16 @@ def plan_normalize(
     resolution_digest_text: str,
     accept_searched: Iterable[str] = (),
     accept_unresolved: Iterable[str] = (),
+    accept_spot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The standards table and the exact normalize command for one polarity, or why not.
 
     The resolution is computed again and must carry the digest the person was shown. Every
     standard sheet 2 uses must be resolved, or the person must have decided about it: a searched
-    spot accepted (it is then named by AssignName in MS-DIAL's exports), or the standard left
-    unresolved, which empties the classes it quantifies. --peak-ids-only always: a standard left
-    at -1 is never looked up by name.
+    spot accepted (it is then named by AssignName in MS-DIAL's exports), another of its listed
+    candidates taken instead (accept_spot, by standard), or the standard left unresolved, which
+    empties the classes it quantifies. --peak-ids-only always: a standard left at -1 is never
+    looked up by name.
     """
     contract = load_contract(contract_path)
     polarity = polarity_of_job(contract, job)
@@ -1403,11 +1527,26 @@ def plan_normalize(
     searched = {name for name in resolution["needs_confirmation"] if name in used}
     accepted = {str(name) for name in accept_searched}
     left = {str(name) for name in accept_unresolved}
+    if accept_spot is not None and not isinstance(accept_spot, dict):
+        raise LabContractError("accept_spot maps a standard's name to the alignment ID the person chose for it.")
+    chosen = {str(name): value for name, value in (accept_spot or {}).items()}
     unknown = sorted(accepted - searched)
     if unknown:
         raise LabContractError(
             f"accept_searched names {', '.join(unknown)}, which this resolution does not ask the person to accept."
         )
+    for name, alignment_id in sorted(chosen.items()):
+        if name not in used:
+            raise LabContractError(f"accept_spot names {name}, which sheet 2 does not use.")
+        if name in accepted or name in left:
+            raise LabContractError(
+                f"{name} is given more than one decision; accept_spot, accept_searched and accept_unresolved exclude "
+                "one another."
+            )
+        try:
+            chosen_candidate(by_name.get(name, {"name": name}), alignment_id)
+        except LabInputError as error:
+            raise LabContractError(f"accept_spot: {error}") from None
     unresolvable = {
         name for name in used
         if by_name.get(name, {}).get("status") in {"unresolved_missing", "invalid", "conflict"}
@@ -1415,20 +1554,42 @@ def plan_normalize(
     stray = sorted(left - unresolvable - (searched - accepted))
     if stray:
         raise LabContractError(f"accept_unresolved names {', '.join(stray)}, which is not a standard awaiting that decision.")
-    undecided = sorted((unresolvable | (searched - accepted)) - left)
+    undecided = sorted((unresolvable | (searched - accepted)) - left - set(chosen))
     if undecided:
         raise LabContractError(
             "Each of these standards needs the person's decision before normalize: "
             + "; ".join(f"{name} ({by_name[name]['status']}: {by_name[name].get('reason', '')})" for name in undecided)
-            + ". Accept a searched spot with accept_searched, or leave the standard unresolved with accept_unresolved."
+            + ". Accept a searched spot with accept_searched, take another listed candidate with accept_spot, or "
+            "leave the standard unresolved with accept_unresolved."
         )
     lookup = {"rows": [dict(row) for row in contract["lookup"]]}
-    rows = standards_rows(lookup, resolution, accepted)
+    rows = standards_rows(lookup, resolution, accepted, chosen)
+    owners: dict[int, set[str]] = {}
+    for row in rows:
+        if int(row["PeakID"]) >= 0:
+            owners.setdefault(int(row["PeakID"]), set()).add(row["StandardName"])
+    shared = {peak_id: names for peak_id, names in owners.items() if len(names) > 1}
+    if shared:
+        raise LabContractError(
+            "One spot would be more than one standard: "
+            + "; ".join(f"alignment ID {peak_id} for {', '.join(sorted(names))}" for peak_id, names in sorted(shared.items()))
+            + "."
+        )
     console = Path(contract["console_path"])
     if NORMALIZE_PEAK_IDS_ONLY_CAPABILITY not in console_capabilities(str(console))["capabilities"]:
         raise LabContractError(
             f"The contract's Console {console} offers no normalize {NORMALIZE_PEAK_IDS_ONLY_OPTION}; without it a "
             "standard the resolver rejected would be looked up by name. Normalize is refused."
+        )
+    identity = console_identity(console)
+    recorded_console = contract.get("console") or {}
+    changed = [key for key in CONSOLE_BUILD_KEYS if recorded_console.get(key) and recorded_console[key] != identity.get(key)]
+    plan_warnings: list[str] = []
+    if changed:
+        # Redaction and AssignName differ between normalize builds; which one ran is said and recorded.
+        plan_warnings.append(
+            f"The Console {console} is not the build the contract recorded ({', '.join(changed)} differ): it was "
+            "rebuilt or replaced since, and normalize runs the build there now. Both are recorded with the result."
         )
     outputs = resolved["outputs"]
     candidates = read_candidate_table(outputs["candidate_table"])
@@ -1485,6 +1646,10 @@ def plan_normalize(
         "rows": rows,
         "accepted_searched": sorted(accepted),
         "accepted_unresolved": sorted(left),
+        "accepted_spots": {name: int(chosen_candidate(by_name[name], value)["alignment_id"])
+                           for name, value in sorted(chosen.items())},
+        "console": {"contract": recorded_console, "now": identity, "changed_since_contract": bool(changed)},
+        "warnings": plan_warnings,
         "predicted_mismatches": predicted,
         "not_quantified_classes": sorted({row["TargetClass"] for row in rows if int(row["PeakID"]) < 0}),
         "dilution_factors": factors if apply_dilution else {},
@@ -1540,6 +1705,9 @@ def finish_normalize(plan: dict[str, Any], exit_code: int | None, log_lines: Ite
         "polarity": plan["polarity"], "run_job_id": plan["job_id"], "resolution_digest": plan["resolution_digest"],
         "unit": plan["unit"], "command": plan["command"], "flags": plan["flags"], "exit_code": exit_code,
         "accepted_searched": plan["accepted_searched"], "accepted_unresolved": plan["accepted_unresolved"],
+        "accepted_spots": plan.get("accepted_spots", {}),
+        # The build that normalized, beside the one the contract recorded: Console folders are rebuilt in place.
+        "console": plan.get("console", {}),
         "internal_standard_ids": sorted({str(int(row["PeakID"])) for row in plan["rows"] if int(row["PeakID"]) >= 0}),
         "not_quantified_classes": plan["not_quantified_classes"],
         "candidate_table": plan["outputs"]["candidate_table"], "candidate_table_sha256": plan["candidate_table_sha256"],
@@ -1592,6 +1760,8 @@ def finish_normalize(plan: dict[str, Any], exit_code: int | None, log_lines: Ite
         "completed": record["completed"], "verified": record["verified"],
         "failed_rows": len((verification or {}).get("failed_rows", [])), "record": str(target),
         "accepted_searched": plan["accepted_searched"], "accepted_unresolved": plan["accepted_unresolved"],
+        "accepted_spots": plan.get("accepted_spots", {}),
+        "console_changed_since_contract": bool((plan.get("console") or {}).get("changed_since_contract")),
     })
     return record
 
@@ -1612,6 +1782,13 @@ def merge_lipidome(contract_path: str, output_name: str = "lipid_metabolome.csv"
     name = str(output_name or "").strip()
     if not name or Path(name).name != name or Path(name).suffix.casefold() not in {".csv", ".txt", ".tsv"}:
         raise LabContractError("output_name is a file name ending in .csv, .tsv or .txt, without a folder.")
+    folded = name.casefold()
+    if folded in {NOT_QUANTIFIED_NAME.casefold(), MERGE_REPORT_NAME.casefold()} or folded.startswith(QUANT_FILE_PREFIXES):
+        # The merge writes its side file and report beside the lipidome, and normalize's records bind
+        # its matrices by sha256: writing over one of them would undo what it is read from.
+        raise LabContractError(
+            f"output_name {name} is a file the merge or normalize writes in {contract['quant_folder']}; choose another name."
+        )
     quant = Path(contract["quant_folder"])
     records: dict[str, dict[str, Any]] = {}
     for polarity in POLARITIES:
@@ -1651,7 +1828,8 @@ def merge_lipidome(contract_path: str, output_name: str = "lipid_metabolome.csv"
                 for polarity in POLARITIES
             },
             not_quantified_path=quant / NOT_QUANTIFIED_NAME,
-            report_path=quant / MERGE_REPORT_NAME,
+            # Written below, once what this step adds (verification, unit, Console) is in it.
+            report_path=None,
             write=write,
         )
     except MergeRefused as error:
@@ -1663,7 +1841,19 @@ def merge_lipidome(contract_path: str, output_name: str = "lipid_metabolome.csv"
     }
     report["sample_parameter"] = contract["inputs"]["quant_table"].get("sample_parameter")
     report["unit"] = contract["unit"]
+    # Which normalize build made each matrix, by its build and not its path.
+    report["normalize_console"] = {
+        polarity: {
+            **{key: ((records[polarity].get("console") or {}).get("now") or {}).get(key, "")
+               for key in ("version", *CONSOLE_BUILD_KEYS)},
+            "changed_since_contract": bool((records[polarity].get("console") or {}).get("changed_since_contract")),
+        }
+        for polarity in POLARITIES
+    }
     if write:
+        target = quant / MERGE_REPORT_NAME
+        target.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
+        report["report"] = str(target.resolve())
         record_event(contract["_path"], {
             "event": "merged", "output": report["output"], "output_sha256": report["output_sha256"],
             "kept_rows": report["kept_rows"], "not_quantified_rows": report["not_quantified"]["rows"],

@@ -232,6 +232,37 @@ class ResolverTests(Workspace):
         self.assertEqual(("B", "2"), (entry["tier"], entry["alignment_id"]))
         self.assertEqual(["1"], [item["alignment_id"] for item in entry["other_observations"]])
 
+    def test_an_lbm_annotation_inside_the_standards_window_is_tier_a_whatever_the_annotation_tolerance(self) -> None:
+        # R3 0.3 min below the 0.5 min IS tolerance: the LBM-confirmed standard 0.4 min off is not passed over for
+        # a minor spot only its text row named.
+        spots = [
+            spot(10, 753.6131, 9.9, "PC 15:0_18:1(d7)", method=LBM, cells=[900000, 900000, 0]),
+            spot(11, 753.6133, 9.55, "PC 15:0_18:1(d7)", method=TEXT, cells=[40000, 40000, 0]),
+        ]
+        candidates = [candidate(10, "PC 15:0_18:1(d7)"),
+                      candidate(11, "PC 15:0_18:1(d7)", annotator=TEXT, source="TextDB")]
+        entry = self.only(self.resolve(spots, candidates, annotation_rt_tolerance=0.3))
+        self.assertEqual(("A", "10", False), (entry["tier"], entry["alignment_id"], entry["needs_confirmation"]))
+        self.assertEqual([("10", "A"), ("11", "B")], [(item["alignment_id"], item["tier"]) for item in entry["candidates"]])
+        # Beyond both tolerances it is no tier-A candidate.
+        farther = [dict(spots[0], **{"Average Rt(min)": "10.100"}), spots[1]]
+        moved = self.only(self.resolve(farther, candidates, annotation_rt_tolerance=0.3))
+        self.assertEqual(("B", "11"), (moved["tier"], moved["alignment_id"]))
+
+    def test_every_candidate_says_whether_it_could_be_taken_instead(self) -> None:
+        resolution = self.resolve([
+            spot(1, 753.6131, 9.45, "PC 33:1(d7)", method=LBM, cells=[1000, 0, 1000]),
+            spot(2, 753.6134, 9.6, cells=[500, 500, 0]),
+            # A non-whole height is MS-DIAL's replacement for a zero.
+            spot(3, 753.6134, 9.7, cells=[700, 1400.03, 0]),
+        ], [candidate(1, "PC 33:1(d7)")])
+        entry = self.only(resolution)
+        self.assertEqual(("invalid", "1"), (entry["status"], entry["alignment_id"]))
+        self.assertEqual({"1": ["S2_Pos"], "2": [], "3": ["S2_Pos"]},
+                         {item["alignment_id"]: item["zero_height_files"] for item in entry["candidates"]})
+        self.assertEqual(["2"], entry["valid_alternatives"])
+        self.assertIn("spot(s) 2", entry["reason"])
+
     def test_a_text_match_below_the_score_cutoff_is_only_a_candidate_needing_confirmation(self) -> None:
         # MS-DIAL names the annotator in the Comment for a suggestion too, and the export drops its prefix.
         resolution = self.resolve([
@@ -325,6 +356,24 @@ class StandardsTableTests(Workspace):
         self.assertEqual([10, 10, 12, -1, -1, 12, 12], [row["PeakID"] for row in accepted])
         self.assertEqual([False, False, True, False, False, True, True], [row["AssignName"] for row in accepted])
         self.assertEqual("75.96936915035859", accepted[4]["Concentration"])
+
+    def test_a_spot_the_person_chose_is_used_and_named_when_no_library_named_it(self) -> None:
+        resolution = {"standards": [{
+            "name": "LPC 18:1(d7)", "status": "invalid", "alignment_id": "12", "candidates": [
+                {"alignment_id": "12", "tier": "A", "zero_height_files": ["S2_Pos"]},
+                {"alignment_id": "13", "tier": "D", "zero_height_files": []},
+                {"alignment_id": "14", "tier": "B", "zero_height_files": []},
+            ],
+        }]}
+        lookup = {"rows": [row for row in LOOKUP["rows"] if row["standard"] == "LPC 18:1(d7)"]}
+        searched = standards_rows(lookup, resolution, chosen={"LPC 18:1(d7)": 13})
+        self.assertEqual([(13, True, "chosen_by_person")] * 3,
+                         [(row["PeakID"], row["AssignName"], row["status"]) for row in searched])
+        named = standards_rows(lookup, resolution, chosen={"LPC 18:1(d7)": "14"})
+        self.assertEqual([(14, False)] * 3, [(row["PeakID"], row["AssignName"]) for row in named])
+        for wanted, message in ((12, "no height in S2_Pos"), (99, "not a candidate")):
+            with self.subTest(wanted=wanted), self.assertRaisesRegex(LabInputError, message):
+                standards_rows(lookup, resolution, chosen={"LPC 18:1(d7)": wanted})
 
     def test_the_file_is_the_console_layout(self) -> None:
         rows = standards_rows(LOOKUP, RESOLUTION, accepted=["LPC 18:1(d7)"])
@@ -549,6 +598,36 @@ class VerificationTests(Workspace):
         paths = self.write(factors=(2.0, 1.0, 1.0))
         self.assertTrue(self.verify(*paths, dilution_factors={"S1_Pos": 2.0})["passed"])
         self.assertFalse(self.verify(*paths)["passed"])
+
+    def test_zeros_replaced_in_both_matrices_pass(self) -> None:
+        # 'Replace true zero values' writes a zero as 0.1 x the row's smallest true value, in each matrix apart.
+        standard_heights, lipid_heights = [30000.4, 28000.2, 29000.3], [60001.4, 14000.3, 0.0]
+        amount = 66.3917
+        height = [
+            spot(10, 753.6, 9.5, "PC 33:1(d7)", ontology="PC", unit="Height",
+                 cells=[round(value) for value in standard_heights]),
+            spot(20, 760.6, 10.0, "PC 34:1", ontology="PC", unit="Height",
+                 cells=[round(lipid_heights[0]), round(lipid_heights[1]), repr(0.1 * min(lipid_heights[:2]))]),
+        ]
+        true_values = [amount * h / b for h, b in zip(lipid_heights[:2], standard_heights[:2])]
+        normalized = [
+            spot(10, 753.6, 9.5, "PC 33:1(d7)", ontology="PC", unit=UNIT, cells=[repr(amount)] * 3),
+            spot(20, 760.6, 10.0, "PC 34:1", ontology="PC", unit=UNIT,
+                 cells=[repr(value) for value in true_values] + [repr(0.1 * min(true_values))]),
+        ]
+        paths = (write_export(self.root / "AlignResult_Height.txt", height),
+                 write_export(self.root / "AlignResult_NormalizedHeight.txt", normalized))
+        table = [{"StandardName": "PC 15:0_18:1(d7)", "TargetClass": "PC", "Concentration": repr(amount), "PeakID": 10},
+                 {"StandardName": "PC 15:0_18:1(d7)", "TargetClass": "Any others", "Concentration": repr(amount),
+                  "PeakID": 10}]
+        candidates = read_candidate_table(write_candidates(self.root / "c.tsv", [
+            candidate(10, "PC 33:1(d7)", ontology="PC"), candidate(20, "PC 34:1", ontology="PC"),
+        ]))
+        report = verify_normalized(*paths, table, candidates, unit=UNIT)
+        self.assertTrue(report["passed"], report["failed_rows"])
+        normalized[1]["cells"][2] = repr(0.01 * min(true_values))
+        write_export(self.root / "AlignResult_NormalizedHeight.txt", normalized)
+        self.assertEqual(["20"], verify_normalized(*paths, table, candidates, unit=UNIT)["failed_ids"])
 
     def test_a_row_in_another_unit_fails(self) -> None:
         report = self.verify(*self.write({20: {"Comment": "Normalized unit: pmol_per_mg_tissue"}}))

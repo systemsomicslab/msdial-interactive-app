@@ -246,6 +246,18 @@ class LookupSheetTests(Workspace):
         result = parse_lookup_table(workbook.sheets[1], parse_is_preparation(workbook.sheets[0], "H"))
         self.assertEqual(["LPC 18:1(d7)"] * 3, [row["standard"] for row in result["rows"]])
 
+    def test_a_blank_row_does_not_end_the_table(self) -> None:
+        # A separator row in a hand-kept table: the classes below it keep their own standard.
+        cells = {}
+        for row, (name, target) in enumerate(LOOKUP[:2] + [("", "")] + LOOKUP[2:], start=1):
+            if name:
+                cells.update({f"A{row}": name, f"C{row}": target})
+        path = build_xlsx(self.root / "q.xlsx", [preparation_sheet(), Sheet("2. Lookup table", cells)])
+        workbook = read_xlsx(path)
+        result = parse_lookup_table(workbook.sheets[1], parse_is_preparation(workbook.sheets[0], "H"))
+        self.assertEqual([], result["blockers"])
+        self.assertEqual([target for _, target in LOOKUP], [row["target_class"] for row in result["rows"]])
+
     def test_a_prepared_standard_no_class_uses_is_reported(self) -> None:
         self.assertEqual(["FA 16:0(d3)"], self.parse()["unused_standards"])
 

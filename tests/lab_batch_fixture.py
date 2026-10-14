@@ -155,19 +155,26 @@ def guided_answers(contract_path: str, polarity: str) -> str:
     })
 
 
-def write_run(batch: Batch, contract_path: str, polarity: str, *, salt: str = "CH3COONH4") -> dict[str, Any]:
+def run_spots(polarity: str, extra: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    return (POSITIVE_SPOTS if polarity == "Positive" else NEGATIVE_SPOTS) + list(extra or [])
+
+
+def write_run(
+    batch: Batch, contract_path: str, polarity: str, *, salt: str = "CH3COONH4",
+    extra_spots: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """What a production run of the contract leaves in its output folder, and the job that made it."""
     label = "Pos" if polarity == "Positive" else "Neg"
     output = batch.analysis / label.lower()
     output.mkdir(parents=True, exist_ok=True)
-    spots = POSITIVE_SPOTS if polarity == "Positive" else NEGATIVE_SPOTS
+    spots = run_spots(polarity, extra_spots)
     height = write_export(
         output / f"{ALIGNMENT}_Height.txt",
         [spot(**{**item, "unit": "Height"}) for item in spots], _samples(label),
     )
     rows = []
     for item in spots:
-        if item["name"] == "Unknown":
+        if item["name"] == "Unknown" or not item.get("method"):
             continue
         source = "TextDB" if item["method"].startswith("internal_standards") else "MspDB"
         rows.append(candidate(item["alignment_id"], item["name"], annotator=item["method"], source=source,
@@ -188,17 +195,20 @@ def write_run(batch: Batch, contract_path: str, polarity: str, *, salt: str = "C
 
 def normalize_outputs(
     plan: dict[str, Any], polarity: str, *, wrong_cell: int | None = None, stored_names: dict[int, str] | None = None,
+    extra_spots: list[dict[str, Any]] | None = None, factors: dict[str, float] | None = None,
 ) -> tuple[str, str, str]:
     """What MSDIALCUI normalize writes for this plan's table, and the report it prints.
 
     The values follow MS-DIAL's rule (amount x height / standard height, the class's own standard or
     Any others, NOT QUANTIFIED where the standard did not resolve); wrong_cell perturbs one spot.
+    factors (by sample name) multiply each file's values, standards' included, as -d does.
     The report's mismatches come from the stand-in's own comparison of each row's standard with the
     spot's stored name, as the Console makes it (NormalizationProcess.NameAliases), never from the
     plan's prediction; stored_names gives a spot another stored name than its export name.
     """
     label = "Pos" if polarity == "Positive" else "Neg"
-    spots = POSITIVE_SPOTS if polarity == "Positive" else NEGATIVE_SPOTS
+    spots = run_spots(polarity, extra_spots)
+    multipliers = [float((factors or {}).get(name, 1.0)) for name, _, _ in _samples(label)]
     rows = plan["standards_table"]
     own = {}
     for row in rows:
@@ -214,7 +224,7 @@ def normalize_outputs(
             entry["method"] = "internal standard assignment"
         if item["alignment_id"] in standards:
             amount = float(standards[item["alignment_id"]]["Concentration"])
-            normalized.append(spot(**{**entry, "unit": UNIT, "cells": [repr(amount)] * 3}))
+            normalized.append(spot(**{**entry, "unit": UNIT, "cells": [repr(amount * f) for f in multipliers]}))
             continue
         klass = VS2.get(item.get("ontology", ""), "Unknown") if item["name"] != "Unknown" else "Unknown"
         standard = own.get(klass) if klass in own else own["Any others"]
@@ -225,7 +235,7 @@ def normalize_outputs(
             continue
         base = by_id[standard["PeakID"]]["cells"]
         amount = float(standard["Concentration"])
-        cells = ["" if b <= 0 else repr(amount * h / b) for h, b in zip(item["cells"], base)]
+        cells = ["" if b <= 0 else repr(amount * h / b * f) for h, b, f in zip(item["cells"], base, multipliers)]
         if wrong_cell == item["alignment_id"]:
             cells[0] = repr(float(cells[0]) * 2)
         normalized.append(spot(**{**entry, "unit": UNIT, "cells": cells}))

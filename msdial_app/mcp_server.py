@@ -3153,26 +3153,34 @@ def msdial_lipidomics_write_contract(
     number_of_threads: int | None = None,
     replace_existing: bool = False,
     confirmed: bool = False,
+    workset_id: str = "",
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
     """Write the laboratory lipidomics contract under <analysis_root>/inputs, after confirmation.
 
     The inputs are checked again and must be what check_digest bound: a file changed since the
-    person saw the check refuses the write. sample_table_confirmed=true says the person confirmed
-    paired_sample_table; sample_table carries their corrections by stem (file_type, class_id,
-    analytical_order, batch_order, factor, included, acquisition_type), every sample listed.
-    confirmed_by names who confirmed it. raw_location is the answer the check asked for (in_place or
-    copy); the preview shows it with the raw folders MS-DIAL will read and write beside.
-    confirmed=false (the default) previews the files; with
-    confirmed=true it writes the contract, the internal-standard libraries in the layout MS-DIAL
-    reads, standards_template.tsv, quant_rules.tsv and the record. An existing contract is kept
-    under a dated name only with replace_existing=true.
+    person saw the check refuses the write. A check filled from a workset binds the workset's
+    answers too (filled_from_workset): pass the same workset_id here. sample_table_confirmed=true
+    says the person confirmed paired_sample_table; sample_table carries their corrections by stem
+    (file_type, class_id, analytical_order, batch_order, factor, included, acquisition_type), every
+    sample listed. confirmed_by names who confirmed it. raw_location is the answer the check asked
+    for (in_place or copy); the preview shows it with the raw folders MS-DIAL will read and write
+    beside. confirmed=false (the default) previews the files; with confirmed=true it writes the
+    contract, the internal-standard libraries in the layout MS-DIAL reads, standards_template.tsv,
+    quant_rules.tsv and the record.
+
+    When a contract already exists there, even the preview is refused until replace_existing=true,
+    and the refusal shows existing_contract: when it was written, the diagnostics, runs, normalizes
+    and merges recorded under it, and that replacing it leaves them unusable. Show it to the person,
+    and preview with replace_existing=true only if they want it replaced; the old one is kept under
+    a dated name.
 
     Then plan each polarity with msdial_guided_analysis_plan(input_path=<its raw folder>, answers=
     {"lab_lipidomics_contract_path": ..., "ion_mode": ...}). The contract fixes the salt, the LBM2,
-    the RT tolerances, the internal-standard library, the sample table and the output folder, and
-    states the method (12 anchors, the 1.5 min local window, annotation candidates, QA).
+    the RT tolerances, the internal-standard library, the sample table, the output and export
+    folder, the Console, the parameter template and the LBM query list, and states the method (12
+    anchors, the 1.5 min local window, annotation candidates, QA).
     """
     body: dict[str, Any] = {
         "pos_path": pos_path, "neg_path": neg_path, "lbm_path": lbm_path, "solvent_type": solvent_type,
@@ -3183,7 +3191,7 @@ def msdial_lipidomics_write_contract(
         "analysis_purpose": analysis_purpose, "console_path": console_path, "raw_location": raw_location,
         "number_of_threads": number_of_threads, "check_digest": check_digest,
         "sample_table_confirmed": sample_table_confirmed is True, "sample_table": sample_table or [],
-        "confirmed_by": confirmed_by, "replace_existing": replace_existing is True,
+        "confirmed_by": confirmed_by, "replace_existing": replace_existing is True, "workset_id": workset_id,
         # The gate is here and again in the backend: only a literal true writes.
         "confirmed": confirmed is True,
     }
@@ -3204,7 +3212,8 @@ def msdial_lipidomics_resolve_standards(
 
     Every candidate sits at the m/z of the adduct the internal-standard library names, so a spot of
     another adduct never competes. Tier A: the LBM library annotated it (within the annotation RT
-    tolerance); B: its text-library row annotated it as a reference match; C: its row matched but
+    tolerance, or the internal-standard tolerance where that is wider); B: its text-library row
+    annotated it as a reference match; C: its row matched but
     another annotation won, or matched only below the score cutoff; D: any spot in the window. B, C
     and D lie within the internal-standard RT tolerance. The first tier with a member decides; in A a
     spot inside the internal-standard tolerance comes first; then the most intense spot over the
@@ -3212,7 +3221,9 @@ def msdial_lipidomics_resolve_standards(
     internal-standard tolerance chosen while another spot lies inside it (needs_confirmation).
 
     Read each standard's tier, alignment ID, m/z and RT error, and zero-height files to the person,
-    with the classes that would be NOT QUANTIFIED. Pass the polarity's resolution_digest to
+    with the classes that would be NOT QUANTIFIED, and its valid_alternatives: the other listed
+    candidates with a height in every sample and QC, any of which the person may take instead
+    (msdial_lipidomics_normalize accept_spot). Pass the polarity's resolution_digest to
     msdial_lipidomics_normalize. A run must have completed; one whose log says automatic RT
     correction failed is reported, and running it again uncorrected is the person's decision.
     read_output_folders=true reads a polarity given no job id from its output folder, refusing when
@@ -3237,6 +3248,7 @@ def msdial_lipidomics_normalize(
     resolution_digest: str,
     accept_searched: list[str] | None = None,
     accept_unresolved: list[str] | None = None,
+    accept_spot: dict[str, int] | None = None,
     confirmed: bool = False,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
@@ -3246,10 +3258,14 @@ def msdial_lipidomics_normalize(
     job_id is the polarity's production run. The resolution is computed again and must carry
     resolution_digest. accept_searched lists the standards awaiting acceptance (needs_confirmation)
     that the person accepts (a text candidate or search spot is then named as the standard in
-    MS-DIAL's exports); accept_unresolved
-    lists the standards they accept leaving unresolved (not found, invalid, or a search they
-    declined), whose classes are then NOT QUANTIFIED. confirmed=false previews the standards table,
-    the exact command and why each flag is there; confirmed=true writes standards_{pos,neg}.tsv and
+    MS-DIAL's exports); accept_spot maps a standard to another of its listed candidates the person
+    takes instead ({"LPE 18:1(d7)": 11}), for any standard, an invalid or contested one included:
+    the spot must be one the resolver listed for it, with a height in every sample and QC, and a
+    tier C or D spot is named as the standard; accept_unresolved lists the standards they accept
+    leaving unresolved (not found, invalid, or a search they declined), whose classes are then NOT
+    QUANTIFIED. A standard takes one of the three decisions. confirmed=false previews the standards
+    table, the exact command, why each flag is there, and a warning when the Console is not the build
+    the contract recorded; confirmed=true writes standards_{pos,neg}.tsv and
     is_resolution_{pos,neg}.tsv into <analysis_root>/quant and starts the Console as a job: poll it
     with msdial_interactive_job. The job checks normalize's own report against the table and
     recomputes every quantified cell from the Height matrix the same call wrote; a row that does not
@@ -3263,6 +3279,7 @@ def msdial_lipidomics_normalize(
         body={
             "contract_path": contract_path, "job_id": job_id, "resolution_digest": resolution_digest,
             "accept_searched": list(accept_searched or []), "accept_unresolved": list(accept_unresolved or []),
+            "accept_spot": dict(accept_spot or {}),
             "confirmed": confirmed is True,
         },
         timeout=300,

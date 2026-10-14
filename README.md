@@ -175,32 +175,43 @@ adduct each polarity keeps). Five MCP tools take it from the folders to
 2. `msdial_lipidomics_write_contract` writes `<root>/inputs/`: the contract, the
    internal-standard libraries in the column order MS-DIAL reads, the standards
    template and the selection rules. It is refused if an input, the raw folders
-   included, changed after the check the person saw. Each polarity is then
-   planned with `msdial_guided_analysis_plan` and `lab_lipidomics_contract_path`;
-   the contract fixes the salt, the LBM2, both RT tolerances, the
-   internal-standard library (searched in the same run as a Text-DB annotator
-   with retention time on), the sample table and the output folder, and states
-   the method (`TimeBasedLinearWeightedMovingAverage`, automatic RT correction
-   with 12 anchors and the 1.5 min local window, the annotation candidate table,
-   QA). Neither the answers nor `workflow_overrides` can change what it fixes,
-   and the one-file diagnostic is refused, as the run is, for any problem but the
-   missing threshold. Each run records the contract's sha256 beside it.
+   included, changed after the check the person saw; a check filled from a
+   workset is written with the same `workset_id`. A contract already at the root
+   is shown in the preview, with what was done under it, and is replaced only
+   when the preview itself was asked with `replace_existing`. Each polarity is
+   then planned with `msdial_guided_analysis_plan` and
+   `lab_lipidomics_contract_path`; the contract fixes the salt, the LBM2, both RT
+   tolerances, the internal-standard library (searched in the same run as a
+   Text-DB annotator with retention time on), the sample table, the output and
+   export folder, the Console, and Interactive's laboratory parameter template
+   and LBM query list (by sha256, whatever the shared settings or a workset
+   name), and states the method (`TimeBasedLinearWeightedMovingAverage`,
+   automatic RT correction with 12 anchors and the 1.5 min local window, the
+   annotation candidate table, QA). Neither the answers, a workset nor
+   `workflow_overrides` can change what it fixes; any other answer is applied and
+   reported as a deviation. The one-file diagnostic is refused, as the run is,
+   for any problem but the missing threshold. Each run records the contract's
+   sha256 beside it.
 3. `msdial_lipidomics_resolve_standards` decides which aligned spot is each
    standard: at the m/z of the adduct the library names, an LBM annotation of
-   that standard first (out to the annotation RT tolerance, one inside the
+   that standard first (out to the annotation RT tolerance, or the
+   internal-standard tolerance where that is wider, one inside the
    internal-standard tolerance before a farther one), then the standard's own
    text row as a reference match, then a hidden or below-cutoff text candidate or
    a plain search, which need the person's acceptance; the most intense spot over
-   the sample and QC files within the first tier that has one.
+   the sample and QC files within the first tier that has one. Every candidate is
+   listed, and the person may take another valid one instead.
 4. `msdial_lipidomics_normalize` writes the standards table with each chosen
-   alignment ID and runs `MSDIALCUI normalize --peak-ids-only`, so a standard the
-   resolver rejected is never looked up by name. Every quantified cell is then
-   recomputed from the Height matrix the same call wrote. A Console without
-   `--peak-ids-only` is refused.
+   alignment ID (or the spot the person took, `accept_spot`) and runs
+   `MSDIALCUI normalize --peak-ids-only`, so a standard the resolver rejected is
+   never looked up by name. Every quantified cell is then recomputed from the
+   Height matrix the same call wrote. A Console without `--peak-ids-only` is
+   refused; one rebuilt since the contract is said, and its build recorded.
 5. `msdial_lipidomics_merge` writes `lipid_metabolome.csv` as the laboratory's
    own program wrote it (comma separated, CRLF), with the selected rows that have
    no valid concentration in `lipid_metabolome_not_quantified.csv` and a
-   `merge-report.json`.
+   `merge-report.json`. It never writes over its own side file or report, or a
+   file normalize wrote.
 
 Outside a contract, LC-MS lipidomics with the laboratory's own libraries is the
 same profile: the salt, the LBM2 (an `.lbm2` with content), the annotation RT

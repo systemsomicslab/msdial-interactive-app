@@ -359,6 +359,62 @@ class PlanFromAContract(unittest.TestCase):
         )
         self.assertFalse(plan["workflow"]["execute_automatic_rt_correction"])
 
+    def test_the_template_and_query_list_are_the_contracts_whatever_else_names_them(self) -> None:
+        custom = self.batch.root / "gui_template.txt"
+        custom.write_text(
+            TEMPLATE.read_text(encoding="utf-8").replace(
+                "Weighted dot product cutoff for LBM-based annotation: 0.1",
+                "Weighted dot product cutoff for LBM-based annotation: 0.6",
+            ),
+            encoding="utf-8",
+        )
+        queries = self.batch.root / "LbmQueries.txt"
+        queries.write_bytes((ROOT / "resources" / "LbmQueries.txt").read_bytes())
+        for key, value in (("template_path", custom), ("queries_path", queries)):
+            with self.subTest(answer=key):
+                plan = self.plan(**{key: str(value)})
+                self.assertFalse(plan["ready_to_prepare"])
+                self.assertTrue(any(f"{key} is fixed by the contract" in item for item in plan["blockers"]), plan["blockers"])
+        # A regular workset answers alike, and is judged alike.
+        workset = {"id": "w", "kind": "user", "answers": {"template_path": str(custom)}}
+        with patch("msdial_app.agent_workflow.get_workset", return_value=workset):
+            plan = build_guided_plan(str(self.batch.neg), {"lab_lipidomics_contract_path": self.contract,
+                                                           "ion_mode": "Negative", "minimum_peak_height": 500}, "w")
+        self.assertTrue(any("template_path is fixed by the contract" in item for item in plan["blockers"]), plan["blockers"])
+        # The shared settings are not asked at all.
+        with patch("msdial_app.agent_workflow.load_user_settings",
+                   return_value={"template_path": str(custom), "queries_path": str(queries)}):
+            plan = self.plan()
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        self.assertEqual(str(TEMPLATE.resolve()), plan["workflow"]["template_path"])
+        self.assertEqual(0.1, float(plan["workflow"]["lbm_weighted_dot_product"]))
+        self.assertEqual([], plan["lab_lipidomics"]["deviations"])
+
+    def test_a_method_file_changed_since_the_contract_stops_the_plan(self) -> None:
+        contract = json.loads(Path(self.contract).read_text(encoding="utf-8"))
+        contract["inputs"]["parameter_template"]["sha256"] = "0" * 64
+        Path(self.contract).write_text(json.dumps(contract), encoding="utf-8")
+        plan = self.plan()
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertTrue(any("parameter template msdial_console_param4lipidomics.txt has changed" in item
+                            for item in plan["blockers"]), plan["blockers"])
+
+    def test_an_answer_the_contract_does_not_state_is_a_deviation(self) -> None:
+        plan = self.plan(automatic_rt_correction_match_rt_tolerance=2.0, alignment_light_mode=True)
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        self.assertEqual(
+            [{"key": "alignment_light_mode", "contract": None, "given": True},
+             {"key": "automatic_rt_correction_match_rt_tolerance", "contract": None, "given": 2.0}],
+            plan["lab_lipidomics"]["deviations"],
+        )
+
+    def test_the_exports_cannot_be_sent_into_a_raw_folder(self) -> None:
+        plan = self.plan(export_folder_path=str(self.batch.neg))
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertTrue(any("export_folder_path is fixed by the contract" in item for item in plan["blockers"]),
+                        plan["blockers"])
+        self.assertEqual((self.batch.analysis / "neg").resolve(), Path(self.plan()["workflow"]["export_folder_path"]).resolve())
+
     def test_a_changed_input_stops_every_plan_from_the_contract(self) -> None:
         self.batch.is_neg.write_bytes(self.batch.is_neg.read_bytes() + b"\r\n")
         plan = self.plan()

@@ -817,6 +817,7 @@ def parse_lookup_table(
 ) -> dict[str, Any]:
     """Sheet 2: which standard quantifies which lipid class (A standard, C class; no header).
 
+    Every row down to the sheet's last is read; blank rows are skipped, never taken as the end.
     Column B is not read as the amount: it is a VLOOKUP into a local copy of one sheet-1 column,
     so it is recomputed from the column the person chose and a cached value that differs is
     reported. Column D (old peak IDs) is ignored. Classes use the VS2 spelling normalize looks up.
@@ -838,7 +839,10 @@ def parse_lookup_table(
             standard = sheet.text(f"A{row}").strip()
             target = sheet.text(f"C{row}").strip()
             if not standard and not target:
-                break
+                # A blank separator row does not end the table: a class below it read as missing
+                # would fall to 'Any others' without a word.
+                row += 1
+                continue
             if not standard:
                 blockers.append(f"'{sheet.name}'!C{row} names {target} but A{row} names no standard.")
                 row += 1
@@ -1593,7 +1597,9 @@ def resolve_standards(
     standard as another adduct never competes, however intense. Within that m/z:
 
     - A: the LBM library annotated the standard (name-equivalent, reference matched), within the
-      annotation RT tolerance. The LBM decision comes first, as the analyst's procedure says.
+      annotation RT tolerance, or the IS RT tolerance where that is wider: an LBM match the IS
+      window would admit as a text match is never passed over for one. The LBM decision comes
+      first, as the analyst's procedure says.
     - B: the standard's own text-library row annotated the spot as a reference match, within the
       IS RT tolerance.
     - C: that row matched the spot, but another annotation won it or the match is only a
@@ -1607,14 +1613,27 @@ def resolve_standards(
     needs the person's confirmation too. A chosen spot with no height in a sample or QC file is
     invalid; a Blank or Standard file without it is allowed and recorded, because a solvent blank
     or an authentic-standard injection often carries no internal standard.
+
+    Every candidate is listed with the files it has no height in, and the valid ones other than
+    the chosen spot as valid_alternatives: the person may take any of them instead (an invalid
+    choice included), which plan_normalize accepts as accept_spot.
     """
     annotator_id = annotator_id or INTERNAL_STANDARD_ANNOTATOR_IDS.get(polarity, "")
     spots = export["spots"]
     file_types = export["file_types"]
     sample_names = export["sample_names"]
     intensity = {spot["id"]: _mean_intensity(spot, file_types) for spot in spots}
+    lbm_rt_tolerance = max(annotation_rt_tolerance, internal_standard_rt_tolerance)
     records = list(standards)
     entries: list[dict[str, Any]] = []
+
+    def zero_heights(spot: dict[str, Any]) -> tuple[list[str], list[str]]:
+        required: list[str] = []
+        tolerated: list[str] = []
+        for cell, kind, name in zip(spot["cells"], file_types, sample_names):
+            if _is_zero_height(cell):
+                (required if kind.lower() in STANDARD_REQUIRED_FILE_TYPES else tolerated).append(name)
+        return required, tolerated
 
     for record in records:
         window_mz = ms1_tolerance_for(record.mz, ms1_tolerance)
@@ -1643,7 +1662,7 @@ def resolve_standards(
             matched = (representative["is_reference_matched"] if representative
                        else not spot["name"].lower().startswith(tuple(item.lower() for item in _NAME_PREFIXES)))
             named = record.name.casefold() in console_name_aliases(spot["name"])
-            if (lbm and matched and within(spot, annotation_rt_tolerance)
+            if (lbm and matched and within(spot, lbm_rt_tolerance)
                     and name_equivalent(spot["name"], record.name)):
                 tier = "A"
             elif within(spot, internal_standard_rt_tolerance):
@@ -1680,9 +1699,12 @@ def resolve_standards(
             "candidates": [
                 {"alignment_id": item["spot"]["id"], "tier": item["tier"], "name": item["spot"]["name"],
                  "adduct": item["spot"]["adduct"], "mz": item["spot"]["mz"], "rt": item["spot"]["rt"],
-                 "intensity": intensity[item["spot"]["id"]], "method": item["spot"]["method"]}
+                 "intensity": intensity[item["spot"]["id"]], "method": item["spot"]["method"],
+                 "zero_height_files": zero_heights(item["spot"])[0],
+                 "valid": not zero_heights(item["spot"])[0]}
                 for item in listed
             ],
+            "valid_alternatives": [],
             "isotopic_spots_in_window": isotopic,
             "other_observations": [],
             "label_disagreement": None,
@@ -1742,10 +1764,10 @@ def resolve_standards(
                 )
         elif abs(delta_rt) > internal_standard_rt_tolerance / 2:
             entry["warnings"].append(f"{record.name} lies {delta_rt:+.2f} min from the library RT {record.rt}.")
-        for cell, kind, name in zip(spot["cells"], file_types, sample_names):
-            if _is_zero_height(cell):
-                required = kind.lower() in STANDARD_REQUIRED_FILE_TYPES
-                entry["zero_height_files" if required else "tolerated_zero_height_files"].append(name)
+        entry["zero_height_files"], entry["tolerated_zero_height_files"] = zero_heights(spot)
+        entry["valid_alternatives"] = [
+            item["alignment_id"] for item in entry["candidates"] if item["valid"] and item["alignment_id"] != spot["id"]
+        ]
         if entry["zero_height_files"]:
             entry["status"] = "invalid"
             entry["needs_confirmation"] = False
@@ -1753,6 +1775,11 @@ def resolve_standards(
                 f"spot {spot['id']} has no height in {', '.join(entry['zero_height_files'])}, and a "
                 "concentration divided by nothing is not a concentration"
             )
+            if entry["valid_alternatives"]:
+                entry["reason"] += (
+                    f"; spot(s) {', '.join(entry['valid_alternatives'])} at its m/z and RT have a height in every "
+                    "sample and QC, and the person may take one instead"
+                )
         entries.append(entry)
 
     claimed: dict[str, list[dict[str, Any]]] = {}
@@ -1793,6 +1820,7 @@ def resolve_standards(
         "parameters": {
             "annotation_rt_tolerance": annotation_rt_tolerance,
             "internal_standard_rt_tolerance": internal_standard_rt_tolerance,
+            "lbm_rt_tolerance": lbm_rt_tolerance,
             "ms1_tolerance": ms1_tolerance, "annotator_id": annotator_id,
             "intensity": "mean exported height over the non-Blank files",
         },
@@ -1866,30 +1894,63 @@ def write_resolution_tsv(resolution: dict[str, Any], path: str | Path) -> dict[s
 STANDARDS_COLUMNS = ("StandardName", "TargetClass", "Concentration", "PeakID", "AssignName")
 
 
+def chosen_candidate(entry: dict[str, Any], alignment_id: Any) -> dict[str, Any]:
+    """The candidate a person named for a standard, if the resolver listed it and it can be used.
+
+    Only a spot the resolver listed for that standard qualifies: at the library adduct's m/z and
+    inside its RT window, so naming a spot never reaches past what was searched. It must have a
+    height in every sample and QC file, as the resolver's own choice must.
+    """
+    wanted = str(alignment_id).strip()
+    name = entry.get("name", "this standard")
+    for item in entry.get("candidates", []):
+        if str(item["alignment_id"]) == wanted:
+            if item.get("zero_height_files"):
+                raise LabInputError(
+                    f"Spot {wanted} has no height in {', '.join(item['zero_height_files'])}, so it cannot be {name}."
+                )
+            return item
+    listed = ", ".join(str(item["alignment_id"]) for item in entry.get("candidates", [])) or "none"
+    raise LabInputError(
+        f"Spot {wanted} is not a candidate for {name} at its library m/z and RT (candidates: {listed})."
+    )
+
+
 def standards_rows(
-    lookup: dict[str, Any], resolution: dict[str, Any], accepted: Iterable[str] = ()
+    lookup: dict[str, Any],
+    resolution: dict[str, Any],
+    accepted: Iterable[str] = (),
+    chosen: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Sheet 2 with each standard's chosen alignment ID; -1 where the standard is not to be used.
 
     A standard the resolver found only by text candidate or plain search (tiers C and D) is used
     only once the person accepted it, and then with AssignName, so MS-DIAL's own export names the
     spot as the standard it is. An LBM annotation the resolver asked the person about is likewise
-    used only once accepted, under the name MS-DIAL gave it. Any other standard without a valid
-    spot gets -1, which normalize run with --peak-ids-only never replaces by a lookup of its own.
+    used only once accepted, under the name MS-DIAL gave it. A spot the person chose instead
+    (chosen, by standard; see chosen_candidate) is used whatever the resolver decided, with
+    AssignName when it is a tier C or D spot. Any other standard without a valid spot gets -1,
+    which normalize run with --peak-ids-only never replaces by a lookup of its own.
     """
     accepted_names = set(accepted)
+    chosen = {str(name): value for name, value in (chosen or {}).items()}
     by_name = {entry["name"]: entry for entry in resolution.get("standards", [])}
     rows = []
     for row in lookup.get("rows", []):
         entry = by_name.get(row["standard"], {})
         status = entry.get("status")
-        asks = status in NEEDS_CONFIRMATION or bool(entry.get("needs_confirmation"))
-        usable = status in RESOLVED_STATUSES and (not asks or row["standard"] in accepted_names)
-        peak_id = int(entry["alignment_id"]) if usable else -1
+        if row["standard"] in chosen:
+            item = chosen_candidate(entry, chosen[row["standard"]])
+            peak_id, assign, status = int(item["alignment_id"]), item["tier"] in ("C", "D"), "chosen_by_person"
+        else:
+            asks = status in NEEDS_CONFIRMATION or bool(entry.get("needs_confirmation"))
+            usable = status in RESOLVED_STATUSES and (not asks or row["standard"] in accepted_names)
+            peak_id = int(entry["alignment_id"]) if usable else -1
+            assign = bool(usable and status in NEEDS_CONFIRMATION)
         rows.append({
             "StandardName": row["standard"], "TargetClass": row["target_class"],
             "Concentration": repr(float(row["amount"])) if row.get("amount") is not None else "",
-            "PeakID": peak_id, "AssignName": bool(usable and status in NEEDS_CONFIRMATION),
+            "PeakID": peak_id, "AssignName": assign,
             "status": status or "unresolved_expected",
         })
     return rows
@@ -2168,9 +2229,16 @@ def verify_normalized(
             fail(spot, f"the standard's alignment ID {standard['PeakID']} is not in the Height export")
             continue
         amount = float(standard["Concentration"])
-        replaced = [parse_number(cell) for cell in spot["cells"]]
-        positive = [value for value in replaced if value is not None and value > 0]
-        replacement = 0.1 * min(positive) if positive else None
+        # 'Replace true zero values' writes a zero as 0.1 x the row's smallest true value, matrix by
+        # matrix (LegacyQuantValueAccessor): here the smallest normalized value of a file with a
+        # height, never a replaced cell, which is smaller still.
+        true_values = [
+            parse_number(cell) for cell, height_cell in zip(spot["cells"], source["cells"])
+            if not _is_zero_height(height_cell)
+        ]
+        positive = [value for value in true_values if value is not None and value > 0]
+        # With no true value at all MS-DIAL takes 1 as the minimum.
+        replacement = 0.1 * (min(positive) if positive else 1.0)
         bad = []
         for cell, height_cell, standard_cell, factor, kind, name in zip(
             spot["cells"], source["cells"], standard_spot["cells"], factors, file_types, sample_names
@@ -2192,7 +2260,7 @@ def verify_normalized(
                 # A zero, or MS-DIAL's replacement for one, in this file: the value is zero or the
                 # normalized matrix's own replacement.
                 target = 0.0
-                if replacement is not None and math.isclose(value, replacement, rel_tol=1e-6):
+                if math.isclose(value, replacement, rel_tol=1e-6):
                     continue
             low = amount * max(0.0, target - 0.5) / (standard_height + 0.5) * factor
             high = amount * (target + 0.5) / (standard_height - 0.5) * factor

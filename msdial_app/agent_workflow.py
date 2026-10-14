@@ -210,14 +210,16 @@ def build_guided_plan(
     lab_contract: dict[str, Any] | None = None
     contract_text = str(supplied.get("lab_lipidomics_contract_path") or "").strip()
     if contract_text:
-        # The contract's answers sit under the caller's: the caller names the polarity, and may
-        # change a method default (a recorded deviation); what the contract fixes for both
-        # polarities it fixes here too.
+        # The contract's answers sit under the caller's and a workset's: the caller names the
+        # polarity, and may change a method default (a recorded deviation); what the contract
+        # fixes for both polarities it fixes here too. A workset's answers are judged with the
+        # caller's, since the plan applies them alike.
         from .lab_lipidomics_agent import contract_plan_answers
 
-        lab_contract = contract_plan_answers(contract_text, supplied, input_path)
+        given = {**dict((workset or {}).get("answers", {})), **supplied}
+        lab_contract = contract_plan_answers(contract_text, given, input_path)
         contract_blockers.extend(lab_contract["blockers"])
-        supplied = {**lab_contract["answers"], **supplied, **lab_contract["fixed"]}
+        supplied = {**lab_contract["answers"], **given, **lab_contract["fixed"]}
     merged = dict((workset or {}).get("answers", {}))
     # A workset stores answers and workflow_overrides side by side, and only the answers
     # were ever read back: overrides saved into a workset were accepted, written to disk,
