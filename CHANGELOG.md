@@ -6,6 +6,17 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
 ## [0.5.38] - Unreleased
 
+### Changes a campaign run planned with this version
+- **LBM score cutoffs are 0.1 / 0.1 / 0.1** (weighted, simple and reverse dot
+  product) by default, for laboratory and public-repository runs alike (decided
+  2026-10-14). They were 0.15 / 0.15 / 0.3: Interactive's own defaults, which
+  replaced the laboratory template's 0.1 / 0.1 / 0.1 on every guided and
+  repository run. Every campaign unit planned with this version annotates lipids
+  with the lower cutoffs, so more LBM annotations pass. The campaign now running
+  was planned and preflighted with a frozen 0.5.37 and is not affected. A
+  parameter template that states its own cutoffs is now followed; the GUI's
+  defaults are the same 0.1.
+
 ### Added
 - `lab_lipidomics`, the laboratory lipidomics agent's reading and checking, with
   the standard library only. Nothing in it runs MS-DIAL; it writes only the files
@@ -92,6 +103,108 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   `scripts/generate-lipid-class-vocabulary.py`, which reads only live code. 28
   classes are spelled differently (`Cer_NS` -> `Cer-NS`), and 24 members have no
   definition.
+- Five MCP tools take a laboratory lipidomics batch from its two raw folders to
+  `lipid_metabolome.csv` (`lab_lipidomics_agent`; endpoints
+  `/api/lipidomics/check`, `/write-contract`, `/resolve`, `/normalize` and
+  `/merge`). Each writing step previews by default and acts only on a literal
+  `confirmed=true`, in the MCP tool and again in the backend.
+  - `msdial_lipidomics_check_inputs`, read-only. With the folders alone it lists
+    the raw files of each polarity, MS-DIAL intermediates already beside them,
+    and the text libraries, workbooks and LBM2 files beside the data (listed, an
+    LBM2 never proposed), and Excel lock files, and asks every open question: the
+    analysis purpose, the LBM2, the salt, the annotation RT tolerance, the
+    internal-standard libraries (two files, or one split by charge), the workbook
+    and its amount column, the analysis root and the Console. With the answers it
+    checks the two folders are distinct and each holds its polarity's files (a
+    `.wiff` needs its `.wiff.scan`); the LBM2 is an `.lbm2` with content,
+    identified by sha256, its sibling variants listed; the Console offers
+    `normalize --peak-ids-only`, the annotation candidate table and the local RT
+    test (MsdialWorkbench#826); the analysis root lies outside the raw folders, a
+    code checkout and the temporary folder. It reports the salt beside the
+    adducts the negative standards and sheet 3 use, the classes each polarity can
+    only leave NOT QUANTIFIED, the workbook's sample amount and notes read back,
+    a sample metadata table joined by stem (corroboration only), and one sample
+    table proposed for both polarities. `check_digest` binds what was read.
+  - `msdial_lipidomics_write_contract` writes `<root>/inputs/`:
+    `lab-lipidomics-contract.json`
+    (`msdial-interactive.lab-lipidomics-contract.v1`), the internal-standard
+    libraries in the Console's column order (`is_pos.txt`, `is_neg.txt`),
+    `standards_template.tsv`, `quant_rules.tsv` and
+    `lab-lipidomics-record.jsonl`. It is refused while a question or a blocker
+    stands, when an input differs from what `check_digest` bound, and until the
+    person has confirmed the sample table (`sample_table_confirmed`; corrections
+    by stem in `sample_table`, every sample listed; `included: false` leaves a
+    sample out of both polarities). An existing contract is kept under a dated
+    name only with `replace_existing`. Every later step hashes the inputs and the
+    derived files again and refuses on any difference.
+  - `msdial_lipidomics_resolve_standards`, read-only: each polarity's standards,
+    decided from its run's own exports (a job's files; with
+    `read_output_folders`, the output folder when it holds one run). The run must
+    be the contract's (its output folder, its `guided-answers.json`, the
+    contract's salt in `method.txt`), with the candidate table exported, the
+    library copy beside its project, and LBM annotations at all, since the Console
+    skips a missing LBM2 without a word. A run whose automatic RT correction
+    failed is reported, and running it again uncorrected is left to the person.
+    A digest binds the resolution and the contract.
+  - `msdial_lipidomics_normalize`: the resolution recomputed and matched to the
+    digest shown, and every searched standard and every standard not found
+    decided by the person (`accept_searched`, `accept_unresolved`). The command
+    is `MSDIALCUI normalize -i <project> -s <quant>/standards_{pos,neg}.tsv -o
+    <quant>/{pos,neg} -u <unit> --peak-ids-only`, with
+    `--allow-unresolved-standards` when a standard stays unresolved,
+    `--allow-mismatched-peak-ids` when a mismatch is predicted, and `-d` when a
+    sample's dilution factor differs from 1 (MS-DIAL multiplies by it); the
+    preview says why each is there. Confirmed, it runs as a cancellable
+    `normalize` job that compares normalize's report with the table and its
+    mismatches with the prediction, recomputes every quantified cell, copies the
+    matrices to `<quant>/NormalizedHeight_{Pos,Neg}.txt` and
+    `Height_{Pos,Neg}.txt`, and records it all in
+    `normalize_{pos,neg}.local.json`. A job whose cells were not all verified
+    fails, and the merge sets those rows aside.
+  - `msdial_lipidomics_merge` previews the counts and, confirmed, writes
+    `lipid_metabolome.csv`, `lipid_metabolome_not_quantified.csv` and
+    `merge-report.json` with sheet 3 as the rules, the resolved standards and the
+    candidate table's reference matches as filters, and the contract's unit. It
+    refuses a polarity not normalized under this contract, not completed as
+    planned, or whose matrix or candidate table changed since.
+- The guided path's laboratory lipidomics profile: a plan from a contract
+  (`lab_lipidomics_contract_path`), or LC-MS lipidomics with
+  `library_strategy: existing` outside a repository unit.
+  - New answers: `solvent_type` (any spelling of the three anions, Japanese
+    included), `sample_table`, `internal_standard_text_path`,
+    `internal_standard_rt_tolerance`, `export_annotation_candidates`,
+    `lab_lipidomics_contract_path` and `analysis_purpose`.
+  - Required on the profile: `analysis_purpose`, `solvent_type`,
+    `libraries.lbm_path`, `use_retention_time_for_annotation` and then
+    `retention_time_tolerance`, and `output_root`. The LBM2 must be an `.lbm2`
+    with content.
+  - From a contract, the plan takes the polarity from `ion_mode` and must be given
+    the contract's raw folder. What the contract fixes (salt, LBM2, tolerances,
+    internal-standard library, sample table, output folder, Console, purpose)
+    cannot be answered otherwise; a method default changed by the caller is
+    reported as a deviation. A Console without `normalize --peak-ids-only` is
+    refused before the run.
+  - The internal standards are searched in the same run as the Text-DB annotator
+    `internal_standards_{pos,neg}`: retention time used for scoring and
+    filtering within the internal-standard tolerance (0.5 min by default, apart
+    from the 1.5 min annotation tolerance), priority 1, score cutoff 0.8. Only a
+    library in the Console's column order is used; the contract writes one. QA's
+    internal standards default to the same library.
+  - `Export annotation candidates: True` is written when asked, and refused with
+    a Console that does not write the table; a diagnostic never writes it.
+  - A diagnostic's estimate and each production start of a contract run are
+    recorded in the contract's record.
+- Console capabilities `normalize_peak_ids_only` (`normalize --help` names
+  `--peak-ids-only`, asked only of a Console that started) and
+  `annotation_candidates_export` (both of its assembly markers).
+- Worksets of kind `lab-lipidomics` (`msdial_save_workset` with
+  `lab_lipidomics_contract_path`): the LBM2, the salt, both tolerances, the
+  internal-standard libraries and the workbook with their sha256, the amount
+  column, the Console and the method, for the next batch's
+  `msdial_lipidomics_check_inputs(workset_id=...)`, which warns when a carried
+  file has changed. The sample table, the purpose, the workbook's sample amount,
+  dilution factors, paths and the accepted threshold are not carried. A guided
+  plan refuses one.
 
 ### Changed
 - `lipidome_merge` writes what the laboratory's own program (metaboservice)
@@ -115,11 +228,40 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - The report adds drops by polarity, selected pairs without rows, ontologies
     from both polarities, same-formula rows within an ontology (possible double
     counts, such as EtherPE in both polarities), and the inputs' sha256. It can
-    be written as `merge-report.json`.
+    be written as `merge-report.json`. With `write=False` it writes nothing and
+    reports what it would write, with the output's sha256.
+- Text annotator rows from `libraries.text_paths` follow
+  `use_retention_time_for_annotation` and `retention_time_tolerance`. They were
+  written with retention time off and 0.5 min whatever was answered, because each
+  row's own value wins in `text_annotator_settings.tsv`.
+- The parameter template's LBM score cutoffs reach the method file. Only the
+  template's workflow section reached the state, so its values were replaced by
+  the writer's defaults.
+- A guided plan for LC-MS lipidomics with the laboratory's own libraries
+  (`library_strategy: existing`, no repository unit) is the laboratory
+  lipidomics profile and is not ready until the salt, the analysis purpose, the
+  output folder and the annotation RT decision are answered and the LBM2 is an
+  `.lbm2` with content. A workset carries the salt once it has been answered;
+  the purpose and the output folder belong to each dataset and are asked again.
+- `class_assignment_confirmed: false` no longer answers the Class question: the
+  plan went ahead with the classes it had just been told were wrong. A
+  `sample_table` with the assignment to use answers it.
+- `Solvent type` must be one of CH3COONH4, HCOONH4 and NH4HCO3, or the plan is
+  refused. The Console reports any other value as applied, ignores it, and
+  searches the CH3COONH4 records.
+- The laboratory lipidomics contract (`lab-lipidomics-contract.json`, and the
+  dated copy a replacement keeps) and its record (`lab-lipidomics-record.jsonl`)
+  are local only: they name the LBM2 and the raw data where they are kept.
 
 ### Not changed
-- No MCP tool, guided-path answer or method line uses any of this yet; nothing
-  a run does differs from 0.5.37.
+- MsdialWorkbench is not changed here. `normalize --peak-ids-only`, the
+  `AssignName` column, the class-spelling redaction and the empty cells for a
+  standard without height are the Console's (MsdialWorkbench, normalize track);
+  a Console without `--peak-ids-only` is refused by every laboratory lipidomics
+  step, so no run of this version normalizes by name.
+- The running campaign is unaffected: it runs a frozen Interactive with its own
+  preflight. Its Console path comes from the campaign's own answers, as the lab
+  agent's comes from its contract; neither is read from Interactive's settings.
 
 ## [0.5.37] - Unreleased
 

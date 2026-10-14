@@ -89,7 +89,31 @@ class WorkflowTests(unittest.TestCase):
             ["lcms_alignment_qa_matrix", "rt_correction_review"],
             result["capabilities"],
         )
-        self.assertEqual([str(console), "rtcorrection", "--help"], run.call_args.args[0])
+        self.assertEqual([str(console), "rtcorrection", "--help"], run.call_args_list[0].args[0])
+        # A Console that started is asked about normalize too; this help names no --peak-ids-only.
+        self.assertEqual([str(console), "normalize", "--help"], run.call_args_list[1].args[0])
+
+    @patch("msdial_app.workflow.subprocess.run")
+    def test_console_capability_probes_normalize_and_the_candidate_table(self, run: Mock) -> None:
+        def help_text(command, **_):
+            text = "--peak-ids-only  Take each standard from its PeakID" if command[1] == "normalize" else ""
+            return Mock(returncode=0, stdout=text, stderr="")
+
+        run.side_effect = help_text
+        with tempfile.TemporaryDirectory() as temporary:
+            console = Path(temporary) / "MSDIALCUI.exe"
+            console.write_bytes(
+                "export annotation candidates".encode("utf-16-le") + "Annotation candidates: ".encode("utf-16-le")
+            )
+            found = console_capabilities(str(console))["capabilities"]
+            self.assertIn("normalize_peak_ids_only", found)
+            self.assertIn("annotation_candidates_export", found)
+
+            console.write_bytes("export annotation candidates".encode("utf-16-le"))
+            run.side_effect = lambda command, **_: Mock(returncode=0, stdout="--standards", stderr="")
+            found = console_capabilities(str(console))["capabilities"]
+            self.assertNotIn("normalize_peak_ids_only", found)
+            self.assertNotIn("annotation_candidates_export", found, "both markers are required")
 
     @patch("msdial_app.workflow.subprocess.run")
     def test_console_capability_falls_back_to_qa_assembly_marker(self, run: Mock) -> None:

@@ -186,6 +186,22 @@ MULTI_ENERGY_AIF_CONSOLE_MARKERS = (
     "The collision-energy files of ",
     " nor a collision-energy file exists.",
 )
+# MSDIALCUI normalize with --peak-ids-only: a standard is taken from its PeakID or not at all, never
+# looked up by name, so a standard the laboratory lipidomics resolver rejected stays unresolved. Probed
+# from `normalize --help`, which names the option; a Console without it is refused by that profile.
+NORMALIZE_PEAK_IDS_ONLY_CAPABILITY = "normalize_peak_ids_only"
+NORMALIZE_PEAK_IDS_ONLY_OPTION = "--peak-ids-only"
+# The .mdcandidate.tsv sidecar: the lowercase key the Console's ConfigParser reads and the line its
+# LC-MS process writes when it exports the table, both in the Console assembly.
+ANNOTATION_CANDIDATES_CAPABILITY = "annotation_candidates_export"
+ANNOTATION_CANDIDATES_CONSOLE_MARKERS = ("export annotation candidates", "Annotation candidates: ")
+# SolventType as the Console's ConfigParser reads it: exactly these, case-sensitive. Any other value is
+# reported as applied and ignored, and the run searches the CH3COONH4 records.
+SOLVENT_TYPES = ("CH3COONH4", "HCOONH4", "NH4HCO3")
+# The LBM score cutoffs a run uses when neither its template nor its answers state them: the laboratory
+# template's (resources/msdial_console_param4lipidomics.txt), decided for laboratory and repository runs
+# alike on 2026-10-14. They were 0.15/0.15/0.3.
+LBM_DOT_PRODUCT_CUTOFFS = {"weighted": 0.1, "simple": 0.1, "reverse": 0.1}
 
 
 def console_assembly_path(console_path: str | Path) -> Path:
@@ -1483,9 +1499,15 @@ def load_parameter_template(
         "rt_tolerance": number("rt tolerance for lbm-based annotation", default=100),
         "ms1_tolerance": number("ms1 tolerance for lbm-based annotation", default=0.01),
         "ms2_tolerance": number("ms2 tolerance for lbm-based annotation", default=0.025),
-        "weighted_dot_product_cutoff": number("weighted dot product cutoff for lbm-based annotation", default=0.15),
-        "simple_dot_product_cutoff": number("simple dot product cutoff for lbm-based annotation", default=0.15),
-        "reverse_dot_product_cutoff": number("reverse dot product cutoff for lbm-based annotation", default=0.3),
+        "weighted_dot_product_cutoff": number(
+            "weighted dot product cutoff for lbm-based annotation", default=LBM_DOT_PRODUCT_CUTOFFS["weighted"]
+        ),
+        "simple_dot_product_cutoff": number(
+            "simple dot product cutoff for lbm-based annotation", default=LBM_DOT_PRODUCT_CUTOFFS["simple"]
+        ),
+        "reverse_dot_product_cutoff": number(
+            "reverse dot product cutoff for lbm-based annotation", default=LBM_DOT_PRODUCT_CUTOFFS["reverse"]
+        ),
         "matched_peaks_percentage_cutoff": number("matched peaks percentage cutoff for lbm-based annotation", default=0),
         "minimum_spectrum_match": int(number("minimum spectrum match for lbm-based annotation", default=1)),
         "use_rt_scoring": boolean("use retention information for lbm-based annotation scoring"),
@@ -1924,6 +1946,18 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
         if value and not Path(value).exists():
             label = str(annotator.get("annotator_id", "")).strip() or f"Text annotator row {index}"
             issues.append({"level": "error", "message": f"{label} Text library file not found: {value}"})
+    if project_type == "lcms" and str(state.get("solvent", "CH3COONH4")) not in SOLVENT_TYPES:
+        issues.append(
+            {
+                "level": "error",
+                "message": (
+                    f"Solvent type '{state.get('solvent')}' is not one the MS-DIAL Console reads "
+                    f"({', '.join(SOLVENT_TYPES)}); it would report the line as applied and search "
+                    "the CH3COONH4 records."
+                ),
+            }
+        )
+    issues.extend(_laboratory_lipidomics_issues(state, project_type))
     selected = state.get("selected_lipids", [])
     if project_type != "gcms" and state.get("target_omics") == "Lipidomics" and not selected:
         issues.append({"level": "error", "message": "No lipid annotation query is selected."})
@@ -1976,6 +2010,64 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                     issues.append({"level": "error", "message": "Set the alkane/FAME carbon-RT file for RI calculation."})
                 elif not Path(standard).exists():
                     issues.append({"level": "error", "message": f"RI carbon-RT file not found: {standard}"})
+    return issues
+
+
+def _laboratory_lipidomics_issues(state: dict[str, Any], project_type: str) -> list[dict[str, str]]:
+    """What a laboratory lipidomics run needs that another guided run does not.
+
+    The laboratory's LBM2 is required: a missing or empty LBM library is skipped by the Console
+    without a word, and the run then annotates no lipid at all. The annotation candidate table is
+    what tells a reference match from a suggestion once exports stopped writing the prefix. And a
+    run planned from a contract is only worth its hours if its normalize can keep a rejected
+    standard unresolved, which a Console without --peak-ids-only cannot.
+    """
+    issues: list[dict[str, str]] = []
+    console_path = Path(str(state.get("console_path", "")).strip()).expanduser()
+    needs_candidates = project_type == "lcms" and bool(state.get("export_annotation_candidates"))
+    needs_normalize = project_type == "lcms" and bool(str(state.get("lab_lipidomics_contract_path") or "").strip())
+    found = (
+        console_capabilities(str(console_path))["capabilities"]
+        if (needs_candidates or needs_normalize) and console_path.is_file()
+        else None
+    )
+    if needs_candidates and found is not None and ANNOTATION_CANDIDATES_CAPABILITY not in found:
+        issues.append(
+            {
+                "level": "error",
+                "message": (
+                    "Export annotation candidates is set, but the selected MS-DIAL Console does not write "
+                    "the annotation candidate table (.mdcandidate.tsv). Select a Console that does."
+                ),
+            }
+        )
+    if needs_normalize and found is not None and NORMALIZE_PEAK_IDS_ONLY_CAPABILITY not in found:
+        issues.append(
+            {
+                "level": "error",
+                "message": (
+                    "This run is planned from a laboratory lipidomics contract, whose normalize step "
+                    f"needs MSDIALCUI normalize {NORMALIZE_PEAK_IDS_ONLY_OPTION}; the selected Console's "
+                    "normalize --help does not offer it. Select a Console that does before running."
+                ),
+            }
+        )
+    # A peak-count diagnostic loads no annotation library on purpose (DIAGNOSTIC_ANNOTATION_SKIPPED_REASON).
+    if not state.get("lab_lipidomics_profile") or project_type != "lcms" or diagnostic_skips_annotation(state):
+        return issues
+    lbm_path = str(state.get("lbm_path", "")).strip()
+    if not lbm_path:
+        issues.append(
+            {"level": "error", "message": "A laboratory lipidomics run needs the laboratory's LBM2 library (lbm_path)."}
+        )
+    elif Path(lbm_path).suffix.casefold() != ".lbm2":
+        issues.append(
+            {"level": "error", "message": f"A laboratory lipidomics run reads an .lbm2 library; {Path(lbm_path).name} is not one."}
+        )
+    elif Path(lbm_path).is_file() and Path(lbm_path).stat().st_size == 0:
+        issues.append(
+            {"level": "error", "message": f"{Path(lbm_path).name} is empty; the Console would skip it without a word."}
+        )
     return issues
 
 
@@ -2407,6 +2499,8 @@ def prepare_tuning_run(
     # state that had enabled automatic RT correction could not be tuned at all.
     tuning["execute_automatic_rt_correction"] = False
     tuning["alignment_light_mode"] = False
+    # Exported from the alignment, which the diagnostic does not make.
+    tuning["export_annotation_candidates"] = False
     project_type = str(tuning.get("project_type", "lcms")).lower()
     if project_type == "gcms":
         tuning["minimum_peak_height"] = state.get("minimum_peak_height", 1000)
@@ -4023,9 +4117,15 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         "rt tolerance for lbm-based annotation": state.get("lbm_rt_tolerance", 100),
         "ms1 tolerance for lbm-based annotation": state.get("lbm_ms1_tolerance", 0.01),
         "ms2 tolerance for lbm-based annotation": state.get("lbm_ms2_tolerance", 0.025),
-        "weighted dot product cutoff for lbm-based annotation": state.get("lbm_weighted_dot_product", 0.15),
-        "simple dot product cutoff for lbm-based annotation": state.get("lbm_simple_dot_product", 0.15),
-        "reverse dot product cutoff for lbm-based annotation": state.get("lbm_reverse_dot_product", 0.3),
+        "weighted dot product cutoff for lbm-based annotation": state.get(
+            "lbm_weighted_dot_product", LBM_DOT_PRODUCT_CUTOFFS["weighted"]
+        ),
+        "simple dot product cutoff for lbm-based annotation": state.get(
+            "lbm_simple_dot_product", LBM_DOT_PRODUCT_CUTOFFS["simple"]
+        ),
+        "reverse dot product cutoff for lbm-based annotation": state.get(
+            "lbm_reverse_dot_product", LBM_DOT_PRODUCT_CUTOFFS["reverse"]
+        ),
         "matched peaks percentage cutoff for lbm-based annotation": state.get("lbm_matched_peaks_percentage", 0),
         "minimum spectrum match for lbm-based annotation": state.get("lbm_minimum_spectrum_match", 1),
         "use retention information for lbm-based annotation scoring": state.get("lbm_use_rt_scoring", False),
@@ -4077,6 +4177,9 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         replacements["alignment light mode"] = bool(state.get("alignment_light_mode", False))
         if state.get("annotation_pipeline_profile"):
             replacements["annotation pipeline profile"] = state["annotation_pipeline_profile"]
+        # Written only when asked for, as a Console without the key would list it as unrecognised.
+        if state.get("export_annotation_candidates"):
+            replacements["export annotation candidates"] = True
     if msp_annotator_settings_path is not None:
         replacements["msp annotator settings file path"] = str(msp_annotator_settings_path)
     if text_annotator_settings_path is not None:
@@ -4374,6 +4477,7 @@ def _title_for_key(key: str) -> str:
         "use retention information for lbm-based annotation filtering": "Use retention information for LBM-based annotation filtering",
         "together with alignment": "Together with alignment",
         "alignment light mode": "Alignment light mode",
+        "export annotation candidates": "Export annotation candidates",
         "export as mztabm format": "Export as mztabM format",
         "export folder path": "Export folder path",
         "height matrix export": "Height matrix export",
@@ -4748,6 +4852,24 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
         if "--library" in help_text and "--selection" in help_text:
             capabilities.add(RT_CORRECTION_REVIEW_CAPABILITY)
             probes.append("rtcorrection help")
+    if result is not None:
+        # Only a Console that started at all is asked again: a file that is not one fails both.
+        try:
+            normalize_help = subprocess.run(
+                command + ["normalize", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            normalize_help = None
+        if normalize_help is not None and normalize_help.returncode == 0 and (
+            NORMALIZE_PEAK_IDS_ONLY_OPTION in normalize_help.stdout + normalize_help.stderr
+        ):
+            capabilities.add(NORMALIZE_PEAK_IDS_ONLY_CAPABILITY)
+            probes.append("normalize help")
 
     # QA export is not a standalone command, so recognize the exact exporter
     # message embedded in compatible builds and verify the artifact after a run.
@@ -4776,6 +4898,9 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
     if _has_every_marker(binary, MULTI_ENERGY_AIF_CONSOLE_MARKERS):
         capabilities.add(MULTI_ENERGY_AIF_CAPABILITY)
         probes.append("multi-energy AIF marker")
+    if _has_every_marker(binary, ANNOTATION_CANDIDATES_CONSOLE_MARKERS):
+        capabilities.add(ANNOTATION_CANDIDATES_CAPABILITY)
+        probes.append("annotation candidates marker")
     return {
         "capability_probe": " + ".join(probes) if probes else "unsupported",
         "capabilities": sorted(capabilities),

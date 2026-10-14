@@ -336,13 +336,15 @@ def merge_pos_neg(
     unquantified_ids: dict[str, Iterable[str]] | None = None,
     not_quantified_path: str | Path | None = None,
     report_path: str | Path | None = None,
+    write: bool = True,
 ) -> dict[str, Any]:
     """Merge the two polarities into one table, refusing when the samples disagree.
 
     The per-polarity filters are keyed "positive" and "negative": the alignment IDs of the
     resolved internal standards, the IDs whose representative annotation is reference
     matched (from the candidate table; None leaves that filter off, as for an old export),
-    and the IDs whose normalized values failed verification.
+    and the IDs whose normalized values failed verification. With write false nothing is
+    written and the report says what would be: a preview the person confirms.
     """
     rules = rules if rules is not None else read_adduct_rules(rules_path)
     positive = describe_export(positive_path)
@@ -390,11 +392,11 @@ def merge_pos_neg(
     ))
 
     output_path = Path(output_path)
-    written = _write_table(output_path, positive["header"], [row for _, row in kept])
+    written = _write_table(output_path, positive["header"], [row for _, row in kept], write=write)
     side_file = None
     if not_quantified_path is not None:
         side_file = _write_table(
-            Path(not_quantified_path), positive["header"], [row for _, row, _ in not_quantified]
+            Path(not_quantified_path), positive["header"], [row for _, row, _ in not_quantified], write=write
         )
     elif not_quantified:
         for label, _, reason in not_quantified:
@@ -413,6 +415,9 @@ def merge_pos_neg(
     }
     report = {
         "output": str(output_path.resolve()),
+        "written": write,
+        "output_sha256": written["sha256"],
+        "output_bytes": written["bytes"],
         "format": {"delimiter": written["delimiter"], "newline": "CRLF", "encoding": written["encoding"]},
         "rules": {
             "path": rules.get("path", ""),
@@ -443,6 +448,7 @@ def merge_pos_neg(
         "possible_double_counts": _same_formula_groups(kept, cell),
         "not_quantified": {
             "output": side_file["path"] if side_file else None,
+            "output_sha256": side_file["sha256"] if side_file else None,
             "rows": len(not_quantified),
             "by_class": _count_by(not_quantified, lambda item: cell(item[1], "ontology")),
             "items": [
@@ -467,7 +473,7 @@ def merge_pos_neg(
             "expected_unit": expected_unit,
         },
     }
-    if report_path is not None:
+    if report_path is not None and write:
         target = Path(report_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
@@ -538,7 +544,7 @@ def _count_by(items: Iterable[Any], key: Any) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def _write_table(path: Path, header: list[list[str]], rows: list[list[str]]) -> dict[str, Any]:
+def _write_table(path: Path, header: list[list[str]], rows: list[list[str]], *, write: bool = True) -> dict[str, Any]:
     # Comma for a .csv, as the laboratory's program wrote it; tab otherwise. Quoting only where
     # a cell holds the delimiter, so a table without one is the plain join the program produced.
     delimiter = "," if path.suffix.lower() == ".csv" else "\t"
@@ -557,9 +563,11 @@ def _write_table(path: Path, header: list[list[str]], rows: list[list[str]]) -> 
         data = text.encode("utf-8")
         encoding = "utf-8"
         warnings.append(f"{path.name} holds non-ASCII text and is written as UTF-8.")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
-    return {"path": str(path.resolve()), "delimiter": delimiter, "encoding": encoding, "warnings": warnings}
+    if write:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return {"path": str(path.resolve()), "delimiter": delimiter, "encoding": encoding, "warnings": warnings,
+            "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
 def _sha256(path: str | Path) -> str:

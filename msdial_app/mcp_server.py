@@ -3036,6 +3036,7 @@ def msdial_save_workset(
     run_directory: str = "",
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    lab_lipidomics_contract_path: str = "",
 ) -> dict[str, Any]:
     """Save reusable scientific choices as a named local workset.
 
@@ -3043,6 +3044,13 @@ def msdial_save_workset(
     retyping them; the run records them beside its bundle. Dataset-scoped answers --
     the Class confirmation, the dilution factor, the paths -- are left out on purpose
     and the result names them under not_reusable.
+
+    Give lab_lipidomics_contract_path instead to save a laboratory lipidomics workset (kind
+    lab-lipidomics) for both polarities: the LBM2, the salt, both RT tolerances, the
+    internal-standard libraries and the workbook, each with its sha256, the amount column and the
+    method. It fills msdial_lipidomics_check_inputs(workset_id=...) for the next batch; the sample
+    table, the analysis purpose, the workbook's sample amount, dilution factors, paths and the
+    accepted threshold are not carried.
     """
     return _request_json(
         "POST",
@@ -3055,7 +3063,226 @@ def msdial_save_workset(
             "answers": answers or {},
             "workflow_overrides": workflow_overrides or {},
             "run_directory": run_directory,
+            "lab_lipidomics_contract_path": lab_lipidomics_contract_path,
         },
+        timeout=120,
+    )
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_lipidomics_check_inputs(
+    pos_path: str,
+    neg_path: str,
+    lbm_path: str = "",
+    solvent_type: str = "",
+    retention_time_tolerance: float | None = None,
+    is_text_pos: str = "",
+    is_text_neg: str = "",
+    quant_table_path: str = "",
+    amount_column: str = "",
+    sample_metadata_path: str = "",
+    internal_standard_rt_tolerance: float = 0.5,
+    analysis_root: str = "",
+    analysis_purpose: str = "",
+    console_path: str = "",
+    number_of_threads: int | None = None,
+    workset_id: str = "",
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Check a laboratory lipidomics batch's inputs; read-only, nothing is written or run.
+
+    Call it first with only the two raw folders: it lists what is there (raw files per polarity,
+    MS-DIAL intermediates already beside them, candidate text libraries, workbooks and LBM2 files
+    beside the data, which are listed and never proposed, and Excel lock files) and every question
+    still open. Then ask the person every open question in one message and call it again with the
+    answers. is_text_pos and is_text_neg may name one file holding both polarities; it is split by the
+    adducts' charge. amount_column is the sheet-1 column (F per mg tissue, G per 10^6 cells, H per uL
+    plasma); its sample amount (row 4) and any note below the standards are read back for the person.
+
+    The result says what blocks a contract (blockers), what is still to be asked (questions), the
+    salt beside the adducts the negative standards and sheet 3 use (salt_evidence), the classes each
+    polarity can only leave NOT QUANTIFIED (expected_resolution), and the sample table proposed for
+    both polarities (paired_sample_table), which the person must confirm. check_digest binds what
+    was read; pass it to msdial_lipidomics_write_contract. workset_id fills unanswered inputs from a
+    laboratory lipidomics workset and warns when one of its files has changed.
+
+    Before any run, tell the person that MS-DIAL writes .dcl, .pai2 and tag files beside the raw files
+    it reads, the one-file diagnostic included, and no output setting prevents it. Whether to run on
+    the data where it is or on a copy is theirs to decide, and a copy is made only on their word.
+    """
+    body: dict[str, Any] = {
+        "pos_path": pos_path, "neg_path": neg_path, "lbm_path": lbm_path, "solvent_type": solvent_type,
+        "retention_time_tolerance": retention_time_tolerance, "is_text_pos": is_text_pos,
+        "is_text_neg": is_text_neg, "quant_table_path": quant_table_path, "amount_column": amount_column,
+        "sample_metadata_path": sample_metadata_path,
+        "internal_standard_rt_tolerance": internal_standard_rt_tolerance, "analysis_root": analysis_root,
+        "analysis_purpose": analysis_purpose, "console_path": console_path,
+        "number_of_threads": number_of_threads, "workset_id": workset_id,
+    }
+    return _request_json("POST", "/api/lipidomics/check", host=host, port=port, body=body, timeout=600)
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_lipidomics_write_contract(
+    pos_path: str,
+    neg_path: str,
+    lbm_path: str,
+    solvent_type: str,
+    retention_time_tolerance: float,
+    is_text_pos: str,
+    is_text_neg: str,
+    quant_table_path: str,
+    amount_column: str,
+    analysis_root: str,
+    analysis_purpose: str,
+    console_path: str,
+    check_digest: str,
+    sample_table_confirmed: bool = False,
+    sample_table: list[dict[str, Any]] | None = None,
+    confirmed_by: str = "",
+    sample_metadata_path: str = "",
+    internal_standard_rt_tolerance: float = 0.5,
+    number_of_threads: int | None = None,
+    replace_existing: bool = False,
+    confirmed: bool = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Write the laboratory lipidomics contract under <analysis_root>/inputs, after confirmation.
+
+    The inputs are checked again and must be what check_digest bound: a file changed since the
+    person saw the check refuses the write. sample_table_confirmed=true says the person confirmed
+    paired_sample_table; sample_table carries their corrections by stem (file_type, class_id,
+    analytical_order, batch_order, factor, included, acquisition_type), every sample listed.
+    confirmed_by names who confirmed it. confirmed=false (the default) previews the files; with
+    confirmed=true it writes the contract, the internal-standard libraries in the layout MS-DIAL
+    reads, standards_template.tsv, quant_rules.tsv and the record. An existing contract is kept
+    under a dated name only with replace_existing=true.
+
+    Then plan each polarity with msdial_guided_analysis_plan(input_path=<its raw folder>, answers=
+    {"lab_lipidomics_contract_path": ..., "ion_mode": ...}). The contract fixes the salt, the LBM2,
+    the RT tolerances, the internal-standard library, the sample table and the output folder, and
+    states the method (12 anchors, the 1.5 min local window, annotation candidates, QA).
+    """
+    body: dict[str, Any] = {
+        "pos_path": pos_path, "neg_path": neg_path, "lbm_path": lbm_path, "solvent_type": solvent_type,
+        "retention_time_tolerance": retention_time_tolerance, "is_text_pos": is_text_pos,
+        "is_text_neg": is_text_neg, "quant_table_path": quant_table_path, "amount_column": amount_column,
+        "sample_metadata_path": sample_metadata_path,
+        "internal_standard_rt_tolerance": internal_standard_rt_tolerance, "analysis_root": analysis_root,
+        "analysis_purpose": analysis_purpose, "console_path": console_path,
+        "number_of_threads": number_of_threads, "check_digest": check_digest,
+        "sample_table_confirmed": sample_table_confirmed is True, "sample_table": sample_table or [],
+        "confirmed_by": confirmed_by, "replace_existing": replace_existing is True,
+        # The gate is here and again in the backend: only a literal true writes.
+        "confirmed": confirmed is True,
+    }
+    return _request_json("POST", "/api/lipidomics/write-contract", host=host, port=port, body=body, timeout=600)
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_lipidomics_resolve_standards(
+    contract_path: str,
+    pos_job_id: str = "",
+    neg_job_id: str = "",
+    read_output_folders: bool = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Find each internal standard in a production run of the contract; read-only.
+
+    Every candidate sits at the m/z of the adduct the internal-standard library names, so a spot of
+    another adduct never competes. Tier A: the LBM library annotated it (within the annotation RT
+    tolerance); B: its text-library row annotated it; C: its row matched but another annotation won;
+    D: any spot in the window. The first tier with a member decides, and the most intense spot in it
+    over the non-Blank files. C and D need the person's acceptance.
+
+    Read each standard's tier, alignment ID, m/z and RT error, and zero-height files to the person,
+    with the classes that would be NOT QUANTIFIED. Pass the polarity's resolution_digest to
+    msdial_lipidomics_normalize. A run must have completed; one whose log says automatic RT
+    correction failed is reported, and running it again uncorrected is the person's decision.
+    read_output_folders=true reads a polarity given no job id from its output folder, refusing when
+    the folder holds more than one run's exports.
+    """
+    return _request_json(
+        "POST",
+        "/api/lipidomics/resolve",
+        host=host,
+        port=port,
+        body={"contract_path": contract_path, "pos_job_id": pos_job_id, "neg_job_id": neg_job_id,
+              "read_output_folders": read_output_folders is True},
+        timeout=300,
+    )
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_lipidomics_normalize(
+    contract_path: str,
+    job_id: str,
+    resolution_digest: str,
+    accept_searched: list[str] | None = None,
+    accept_unresolved: list[str] | None = None,
+    confirmed: bool = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Normalize one polarity's run with MSDIALCUI normalize, only after explicit confirmation.
+
+    job_id is the polarity's production run. The resolution is computed again and must carry
+    resolution_digest. accept_searched lists the standards found only by text candidate or search
+    that the person accepts (MS-DIAL's exports then name the spot as the standard); accept_unresolved
+    lists the standards they accept leaving unresolved (not found, invalid, or a search they
+    declined), whose classes are then NOT QUANTIFIED. confirmed=false previews the standards table,
+    the exact command and why each flag is there; confirmed=true writes standards_{pos,neg}.tsv and
+    is_resolution_{pos,neg}.tsv into <analysis_root>/quant and starts the Console as a job: poll it
+    with msdial_interactive_job. The job checks normalize's own report against the table and
+    recomputes every quantified cell from the Height matrix the same call wrote; a row that does not
+    follow is set aside by the merge. The Console must offer normalize --peak-ids-only.
+    """
+    return _request_json(
+        "POST",
+        "/api/lipidomics/normalize",
+        host=host,
+        port=port,
+        body={
+            "contract_path": contract_path, "job_id": job_id, "resolution_digest": resolution_digest,
+            "accept_searched": list(accept_searched or []), "accept_unresolved": list(accept_unresolved or []),
+            "confirmed": confirmed is True,
+        },
+        timeout=300,
+    )
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_lipidomics_merge(
+    contract_path: str,
+    output_name: str = "lipid_metabolome.csv",
+    confirmed: bool = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Merge the two normalized polarities into lipid_metabolome.csv, writing only once confirmed.
+
+    Both polarities must have been normalized under this contract, and their matrices must be the
+    ones normalize wrote. The rows kept are sheet 3's selected class and adduct pairs, annotated,
+    reference matched, not an internal standard and not excluded in the Comment; a selected row
+    without a valid concentration goes to lipid_metabolome_not_quantified.csv. Comma separated,
+    CRLF, as the laboratory's program wrote it. confirmed=false returns the counts and nothing is
+    written; confirmed=true writes the two tables and merge-report.json into <analysis_root>/quant.
+    """
+    return _request_json(
+        "POST",
+        "/api/lipidomics/merge",
+        host=host,
+        port=port,
+        body={"contract_path": contract_path, "output_name": output_name, "confirmed": confirmed is True},
+        timeout=300,
     )
 
 

@@ -105,6 +105,47 @@ Public repository answer seeds use `TimeBasedLinearWeightedMovingAverage` and
 automatic peak-count tuning. This smoother accounts for irregular scan
 intervals while adding a small computational cost.
 
+## Laboratory lipidomics flow
+
+1. `msdial_lipidomics_check_inputs(pos_path, neg_path)` with the folders only:
+   show the person what is there, then ask every open question in one message
+   (analysis purpose, LBM2, salt, annotation RT tolerance, internal-standard
+   libraries, `quant_utility_table.xlsx` and its amount column, analysis root,
+   Console). Call it again with the answers. Nothing is written.
+2. Say that MS-DIAL writes `.dcl`, `.pai2` and tag files beside the raw files it
+   reads, the one-file diagnostic included, and no output setting prevents it.
+   Whether to run on the data in place or on a copy is the person's decision; a
+   copy is made only on their word.
+3. Show `paired_sample_table`; the person confirms it or corrects it by stem.
+   `msdial_lipidomics_write_contract(..., check_digest, sample_table_confirmed=true,
+   sample_table=<corrections>)` previews, and with `confirmed=true` writes
+   `<root>/inputs/`.
+4. For each polarity: `msdial_guided_analysis_plan(input_path=<raw folder>,
+   answers={"lab_lipidomics_contract_path": ..., "ion_mode": ...})`, the
+   diagnostic (confirmed), `msdial_estimate_peak_height`, then the production run
+   (confirmed). Positive and negative run one after the other. The diagnostic's
+   estimate and each start are recorded in `<root>/inputs/lab-lipidomics-record.jsonl`.
+   A run whose automatic RT correction failed is reported; running it again
+   uncorrected is the person's decision, and the plan reports it as a deviation.
+5. `msdial_lipidomics_resolve_standards(contract_path, pos_job_id, neg_job_id)`:
+   read each standard's tier and the classes that would be NOT QUANTIFIED to the
+   person. Standards found only by text candidate or search, and standards not
+   found, each need their decision.
+6. `msdial_lipidomics_normalize(contract_path, job_id, resolution_digest,
+   accept_searched, accept_unresolved)` previews the standards table and the
+   exact command; each polarity is confirmed separately. Poll the job with
+   `msdial_interactive_job`; its result says whether every cell was verified.
+7. `msdial_lipidomics_merge(contract_path)` previews the counts; `confirmed=true`
+   writes `lipid_metabolome.csv`, `lipid_metabolome_not_quantified.csv` and
+   `merge-report.json` into `<root>/quant`.
+8. Report the LBM2 by name and sha256, the salt, every setting, what was assumed
+   (the workbook's sample amount, the sample table), and any step skipped. Offer
+   `msdial_save_workset(name, lab_lipidomics_contract_path=...)`.
+
+The Console must offer `MSDIALCUI normalize --peak-ids-only` and the annotation
+candidate table; the check, the plan and normalize each refuse one that does not.
+It is named per contract, never through the shared settings.
+
 ## Built-in worksets
 
 - `gcms-metabolomics`
@@ -149,8 +190,13 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 - `msdial_generate_lcms_qa`
 - `msdial_generate_publication_report`
 - `msdial_complete_guided_analysis`
-- `msdial_save_workset`
+- `msdial_save_workset` (with `lab_lipidomics_contract_path`, a laboratory lipidomics workset)
 - `msdial_interactive_create_handoff`
+- `msdial_lipidomics_check_inputs` (read-only)
+- `msdial_lipidomics_write_contract` (preview by default; writing requires `confirmed=true`)
+- `msdial_lipidomics_resolve_standards` (read-only)
+- `msdial_lipidomics_normalize` (preview by default; the Console starts only with `confirmed=true`)
+- `msdial_lipidomics_merge` (preview by default; writing requires `confirmed=true`)
 
 Run completion, mzTab-M validation/preview, LC-MS QA, publication generation,
 and handoff should receive the exact `job_id` returned by the production run.
@@ -182,6 +228,11 @@ not a standalone Console command.
 - `POST /api/agent/tuning/run`
 - `POST /api/agent/tuning/estimate`
 - `GET|POST /api/agent/handoff`
+- `POST /api/lipidomics/check`
+- `POST /api/lipidomics/write-contract`
+- `POST /api/lipidomics/resolve`
+- `POST /api/lipidomics/normalize`
+- `POST /api/lipidomics/merge`
 
 ## Test prompts
 

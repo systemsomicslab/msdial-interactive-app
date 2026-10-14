@@ -60,6 +60,10 @@ class AgentRunCarriesTheRepositoryManifest(unittest.TestCase):
             "template_path": str(TEMPLATE),
             "output_root": str(self.root / "out"),
             "class_assignment_confirmed": True,
+            # Without a repository manifest this is the laboratory lipidomics profile.
+            "solvent_type": "CH3COONH4",
+            "analysis_purpose": "parity test",
+            "use_retention_time_for_annotation": False,
         }
         answers.update(extra)
         return answers

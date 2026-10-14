@@ -149,6 +149,60 @@ as a tentative candidate source and should not be reported as equivalent to a
 high-quality spectral match. Private MSP files remain at their original local
 paths and are never bundled or redistributed by the app.
 
+LBM score cutoffs default to the laboratory template's 0.1 (weighted, simple
+and reverse dot product) for every run, laboratory and repository alike; a
+parameter template that states others is followed.
+
+## Laboratory lipidomics
+
+A laboratory batch is two raw folders (positive and negative), the laboratory's
+LBM2 library, the salt in the mobile phase, a text library of internal standards
+per polarity, and `quant_utility_table.xlsx` (sheet 1 the standards and their
+amounts, sheet 2 which standard quantifies which class, sheet 3 which class and
+adduct each polarity keeps). Five MCP tools take it from the folders to
+`lipid_metabolome.csv`, each step writing only once the person has confirmed it:
+
+1. `msdial_lipidomics_check_inputs` reads everything and changes nothing. With
+   the folders alone it lists what is there and every question still open (what
+   the analysis is for, the LBM2, the salt, the annotation RT tolerance, the
+   internal-standard libraries, the workbook and its amount column, where to
+   write, and the Console). With the answers it checks each input and the inputs
+   against each other: the salt against the adducts the standards and sheet 3
+   use, the classes each polarity can only leave NOT QUANTIFIED, and one sample
+   table proposed for both polarities.
+2. `msdial_lipidomics_write_contract` writes `<root>/inputs/`: the contract, the
+   internal-standard libraries in the column order MS-DIAL reads, the standards
+   template and the selection rules. It is refused if an input changed after the
+   check the person saw. Each polarity is then planned with
+   `msdial_guided_analysis_plan` and `lab_lipidomics_contract_path`; the
+   contract fixes the salt, the LBM2, both RT tolerances, the internal-standard
+   library (searched in the same run as a Text-DB annotator with retention time
+   on), the sample table and the output folder, and states the method
+   (`TimeBasedLinearWeightedMovingAverage`, automatic RT correction with 12
+   anchors and the 1.5 min local window, the annotation candidate table, QA).
+3. `msdial_lipidomics_resolve_standards` decides which aligned spot is each
+   standard: at the m/z of the adduct the library names, LBM annotation first,
+   then the standard's own text row, then a hidden text candidate or a plain
+   search, which need the person's acceptance; the most intense spot over the
+   non-Blank files within the first tier that has one.
+4. `msdial_lipidomics_normalize` writes the standards table with each chosen
+   alignment ID and runs `MSDIALCUI normalize --peak-ids-only`, so a standard the
+   resolver rejected is never looked up by name. Every quantified cell is then
+   recomputed from the Height matrix the same call wrote. A Console without
+   `--peak-ids-only` is refused.
+5. `msdial_lipidomics_merge` writes `lipid_metabolome.csv` as the laboratory's
+   own program wrote it (comma separated, CRLF), with the selected rows that have
+   no valid concentration in `lipid_metabolome_not_quantified.csv` and a
+   `merge-report.json`.
+
+Outside a contract, LC-MS lipidomics with the laboratory's own libraries is the
+same profile: the salt, the LBM2 (an `.lbm2` with content), the annotation RT
+decision, the output folder and the analysis purpose are required questions.
+`sample_table` answers the Class confirmation with corrections; `false` alone no
+longer does. The contract and its record name the LBM2 where it is kept and are
+never part of a bundle. `msdial_save_workset` with `lab_lipidomics_contract_path`
+saves the fixed inputs for the next batch's check.
+
 ## Publication reporting
 
 The **7. Publication report** workspace generates an English Materials and
@@ -517,6 +571,13 @@ Core MCP tools:
 - `msdial_generate_publication_report`: create text, Excel, audit, and ZIP files
 - `msdial_complete_guided_analysis`: wait for one job and complete validation,
   QA, publication, and handoff without browser interaction
+- `msdial_lipidomics_check_inputs` / `msdial_lipidomics_write_contract`: check a
+  laboratory lipidomics batch's inputs (read-only) and fix them in a contract after
+  explicit confirmation
+- `msdial_lipidomics_resolve_standards` (read-only) / `msdial_lipidomics_normalize` /
+  `msdial_lipidomics_merge`: find the internal standards in each run, normalize with
+  `--peak-ids-only` and verify every cell, and write `lipid_metabolome.csv`; normalize
+  and merge preview by default and act only with `confirmed=true`
 - `msdial_interactive_create_handoff`: create `datamining-handoff.json`
 - `msdial_inspect_repository_metadata`: inspect public sample metadata and publication provenance
 - `msdial_project_repository_classes`: project a user-selected metadata hierarchy into MS-DIAL `Class`

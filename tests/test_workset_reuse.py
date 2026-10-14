@@ -101,7 +101,7 @@ class WorksetRoundTripTests(unittest.TestCase):
         self.console = self.root / "MSDIALCUI.exe"
         self.console.write_text("", encoding="ascii")
         self.lbm = self.root / "lab_library.lbm2"
-        self.lbm.write_text("", encoding="ascii")
+        self.lbm.write_bytes(b"laboratory library")
         self.saved: list[Path] = []
 
     def tearDown(self) -> None:
@@ -127,6 +127,10 @@ class WorksetRoundTripTests(unittest.TestCase):
             "console_path": str(self.console),
             "template_path": str(TEMPLATE),
             "class_assignment_confirmed": True,
+            # The laboratory lipidomics profile's own answers.
+            "solvent_type": "CH3COONH4",
+            "analysis_purpose": "reuse test",
+            "output_root": str(self.root / "out"),
         }
         answers.update(extra)
         return answers
@@ -146,12 +150,15 @@ class WorksetRoundTripTests(unittest.TestCase):
 
     def test_the_second_dataset_inherits_the_settings(self) -> None:
         item = self._save("lab lipidomics reuse test", self._answers())
+        # The study's question and where it writes belong to the dataset, and are asked again.
         second = build_guided_plan(
             str(self.root),
-            {"class_assignment_confirmed": True},
+            {"class_assignment_confirmed": True, "analysis_purpose": "second batch",
+             "output_root": str(self.root / "second")},
             item["id"],
         )
         self.assertTrue(second["ready_to_prepare"], second["blockers"])
+        self.assertEqual("CH3COONH4", second["workflow"]["solvent"])
         workflow = second["workflow"]
         self.assertEqual(8, workflow["number_of_threads"])
         self.assertEqual(str(self.lbm), workflow["lbm_path"])

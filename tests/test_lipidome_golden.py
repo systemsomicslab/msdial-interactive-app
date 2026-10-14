@@ -2,7 +2,7 @@
 
 Set MSDIAL_LIPIDOMICS_DEMO to the hands-on data2 folder (NormalizedHeight_Pos.txt,
 NormalizedHeight_Neg.txt, lipid_metabolome.csv, quant_utility_table.xlsx and the two EquiSPLASH
-libraries). The rule table that produced the 2024 file, metaboservice's targetadduct.txt, is
+libraries; its pos and neg raw folders and metadata.xlsx for the input check). The rule table that produced the 2024 file, metaboservice's targetadduct.txt, is
 looked for at ../inhouse_programs/metaboservice/ beside it, or wherever
 MSDIAL_LIPIDOMICS_DEMO_RULES says. MSDIAL_LIPIDOMICS_AUDIT may name the 2026-09-06 audit folder
 whose hand-made standards.tsv and quant_rules.tsv the workbook derivation is compared with.
@@ -132,6 +132,41 @@ class GoldenWorkbookTests(unittest.TestCase):
         sheet = {(row["class"], row["adduct"], row["ion_mode"]): row["selected"]
                  for row in self.workbook["quant_info"]["rows"]}
         self.assertEqual(rules, sheet)
+
+
+@needs_demo
+@unittest.skipUnless(DEMO is not None and (DEMO / "pos").is_dir() and (DEMO / "neg").is_dir(),
+                     "the hands-on data2 folder has no pos and neg raw folders")
+class GoldenInputCheckTests(unittest.TestCase):
+    """msdial_lipidomics_check_inputs on the hands-on batch, reading only: no LBM2, root or Console given."""
+
+    def test_the_batch_checks_clean_and_its_sample_table_is_the_metadata(self) -> None:
+        from msdial_app.lab_lipidomics_agent import check_inputs, public_check
+
+        result = public_check(check_inputs({
+            "pos_path": str(DEMO / "pos"), "neg_path": str(DEMO / "neg"),
+            "is_text_pos": str(DEMO / "20200121_MsdialTxtDB_Pos_EquiSPLASH.txt"),
+            "is_text_neg": str(DEMO / "20200121_MsdialTxtDB_Neg_EquiSPLASH.txt"),
+            "quant_table_path": str(DEMO / "quant_utility_table.xlsx"), "amount_column": "H",
+            "solvent_type": "酢酸アンモニウム", "retention_time_tolerance": 1.5,
+            "analysis_purpose": "SPF versus GF mouse plasma lipidome",
+            "sample_metadata_path": str(DEMO / "metadata.xlsx"),
+        }))
+        self.assertEqual([], result["blockers"])
+        self.assertEqual(["lbm_path", "analysis_root", "console_path"], [item["id"] for item in result["questions"]])
+        self.assertEqual((7, 7), (result["folders"]["Positive"]["file_count"], result["folders"]["Negative"]["file_count"]))
+        table = result["paired_sample_table"]
+        self.assertTrue(table["matched"], table["problems"])
+        self.assertEqual(
+            ["SPF", "GF", "GF", "GF", "SPF", "SPF", "Blank"],
+            [row["class_id"] for row in sorted(table["rows"], key=lambda row: row["analytical_order"])],
+        )
+        joined = result["sample_metadata"]["joined"]["Negative"]
+        self.assertEqual((7, [], []), (joined["matched"], joined["unmatched"], joined["disagreements"]))
+        self.assertEqual(["AHexBRS", "AHexCAS", "AHexCS", "AHexSIS", "AHexSTS"],
+                         result["expected_resolution"]["by_polarity"]["Negative"]["not_quantified"])
+        self.assertEqual(10.0, result["quant_table"]["sample_parameter"]["value"])
+        self.assertEqual("CH3COONH4", result["salt"]["salt"])
 
 
 if __name__ == "__main__":
