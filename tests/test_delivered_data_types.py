@@ -585,6 +585,10 @@ class PlanTests(_UnitCase):
             "template_path": str(TEMPLATE),
             "output_root": str(self.root / "out"),
             "class_assignment_confirmed": True,
+            # A laboratory analysis (no manifest) is the laboratory lipidomics profile.
+            "solvent_type": "CH3COONH4",
+            "analysis_purpose": "data type test",
+            "use_retention_time_for_annotation": False,
             "workflow_overrides": {**({"repository_run_manifest": str(manifest)} if manifest else {}), **overrides},
         }
         plan = build_guided_plan(str(self.data), answers)

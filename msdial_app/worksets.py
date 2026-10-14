@@ -31,6 +31,26 @@ DATASET_SCOPED_ANSWERS: dict[str, str] = {
     "repository_metadata_path": "names this accession's metadata",
     "rt_correction_anchor_path": "names this batch's retention-time anchors",
     "rt_correction_selection_path": "names this batch's retention-time anchors",
+    "sample_table": "is one person's agreement about these files; the next dataset has its own",
+    "analysis_purpose": "is what this study is asked to answer; the next one is asked again",
+    "lab_lipidomics_contract_path": "names this batch's contract",
+    "internal_standard_text_path": "names this batch's copy of the internal-standard library",
+}
+
+# A laboratory lipidomics workset holds both polarities' fixed inputs, for the next batch's
+# msdial_lipidomics_check_inputs rather than for a guided plan (agent_workflow refuses it there).
+LAB_LIPIDOMICS_WORKSET_KIND = "lab-lipidomics"
+LAB_LIPIDOMICS_NOT_CARRIED: dict[str, str] = {
+    "sample_table": "is one person's agreement about one batch's files, and is confirmed for each batch",
+    "analysis_purpose": "is what one study is asked to answer",
+    "sample_parameter": (
+        "the sample amount in the workbook's row 4 (the plasma volume, the tissue weight) is read back and "
+        "confirmed for each batch"
+    ),
+    "dilution_factors": "belong to how one batch was prepared, and scale every concentration",
+    "raw_and_output_paths": "name this batch's data and where its analysis was written",
+    "raw_location": "whether MS-DIAL may write beside this batch's raw files is asked for each batch",
+    "minimum_peak_height": "is measured by each batch's own diagnostic",
 }
 
 
@@ -187,6 +207,41 @@ def save_workset(
         json.dumps(item, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    temporary.replace(path)
+    item["file"] = str(path)
+    return item
+
+
+def save_lab_lipidomics_workset(name: str, settings: dict[str, Any], *, description: str = "") -> dict[str, Any]:
+    """Save what one laboratory lipidomics contract fixed, for the next batch's input check.
+
+    settings is lab_lipidomics_agent.lab_workset_settings: answers, each input file with the sha256
+    it had, and the stated method. What a batch must confirm for itself is listed as not carried.
+    """
+    label = str(name).strip()
+    if not label:
+        raise ValueError("Set a workset name.")
+    identifier = _slug(label)
+    if any(item["id"] == identifier for item in _BUILTIN_WORKSETS):
+        identifier += "-custom"
+    item = {
+        "schema": WORKSET_SCHEMA,
+        "kind": LAB_LIPIDOMICS_WORKSET_KIND,
+        "id": identifier,
+        "name": label,
+        "description": str(description).strip(),
+        "builtin": False,
+        "created_at": dt.datetime.now().astimezone().isoformat(),
+        # No guided answers: each polarity's plan is built from its batch's contract.
+        "answers": {},
+        "lab_lipidomics": dict(settings),
+        "not_carried": dict(LAB_LIPIDOMICS_NOT_CARRIED),
+    }
+    directory = workset_directory()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{identifier}.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(item, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
     item["file"] = str(path)
     return item

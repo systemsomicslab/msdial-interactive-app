@@ -27,6 +27,12 @@ def _base_answers(console: Path, lbm: Path) -> dict:
         "template_path": str(TEMPLATE),
         # The Class assignment is a required confirmation on the laboratory path.
         "class_assignment_confirmed": True,
+        # LC-MS lipidomics with the laboratory's own LBM2 is the laboratory lipidomics profile, which
+        # also requires these (agent_workflow._is_lab_lipidomics_profile).
+        "analysis_purpose": "test the guided path",
+        "solvent_type": "CH3COONH4",
+        "use_retention_time_for_annotation": False,
+        "output_root": str(lbm.parent / "out"),
     }
 
 
@@ -38,13 +44,14 @@ class RetentionTimeQuestionTests(unittest.TestCase):
         self.console = self.root / "MSDIALCUI.exe"
         self.console.write_text("", encoding="ascii")
         self.lbm = self.root / "lab.lbm2"
-        self.lbm.write_text("", encoding="ascii")
+        self.lbm.write_bytes(b"laboratory library")
 
     def tearDown(self) -> None:
         self.directory.cleanup()
 
     def _plan(self, **extra) -> dict:
         answers = _base_answers(self.console, self.lbm)
+        answers.pop("use_retention_time_for_annotation")
         answers.update(extra)
         return build_guided_plan(str(self.root), answers)
 
@@ -76,13 +83,25 @@ class RetentionTimeQuestionTests(unittest.TestCase):
 
     def test_an_unanswered_advisory_question_does_not_hold_the_plan_up(self) -> None:
         # Leaving them unanswered keeps the conservative default -- annotation without
-        # retention time -- which is a defensible position, not a guess.
-        plan = self._plan()
+        # retention time -- which is a defensible position, not a guess. Outside the
+        # laboratory lipidomics profile, that is.
+        plan = self._plan(target_omics="Metabolomics")
         self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
         self.assertIsNotNone(plan["workflow"])
         advisory = [item["id"] for item in plan["advisory_questions"]]
         self.assertIn("use_retention_time_for_annotation", advisory)
         self.assertIn("number_of_threads", advisory)
+
+    def test_the_laboratory_lipidomics_profile_requires_the_annotation_rt_decision(self) -> None:
+        plan = self._plan()
+        required = [item["id"] for item in plan["remaining_questions"] if item["required"]]
+        self.assertIn("use_retention_time_for_annotation", required)
+        self.assertFalse(plan["ready_to_prepare"])
+        tolerance = self._plan(use_retention_time_for_annotation=True)
+        self.assertIn(
+            "retention_time_tolerance",
+            [item["id"] for item in tolerance["remaining_questions"] if item["required"]],
+        )
 
 
 class RetentionTimeReachesTheParameterFileTests(unittest.TestCase):
@@ -95,7 +114,7 @@ class RetentionTimeReachesTheParameterFileTests(unittest.TestCase):
         self.console = self.root / "MSDIALCUI.exe"
         self.console.write_text("", encoding="ascii")
         self.lbm = self.root / "lab.lbm2"
-        self.lbm.write_text("", encoding="ascii")
+        self.lbm.write_bytes(b"laboratory library")
 
     def tearDown(self) -> None:
         self.directory.cleanup()
@@ -188,7 +207,7 @@ class WorksetOverrideTests(unittest.TestCase):
         self.console = self.root / "MSDIALCUI.exe"
         self.console.write_text("", encoding="ascii")
         self.lbm = self.root / "lab.lbm2"
-        self.lbm.write_text("", encoding="ascii")
+        self.lbm.write_bytes(b"laboratory library")
         self.saved: list[Path] = []
 
     def tearDown(self) -> None:
@@ -247,7 +266,7 @@ class SampleTableConfirmationTests(unittest.TestCase):
         self.console = self.root / "MSDIALCUI.exe"
         self.console.write_text("", encoding="ascii")
         self.lbm = self.root / "lab.lbm2"
-        self.lbm.write_text("", encoding="ascii")
+        self.lbm.write_bytes(b"laboratory library")
 
     def tearDown(self) -> None:
         self.directory.cleanup()

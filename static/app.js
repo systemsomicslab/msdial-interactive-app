@@ -63,9 +63,10 @@ const DEFAULT_LBM_SETTINGS = {
   rt_tolerance: 100,
   ms1_tolerance: 0.01,
   ms2_tolerance: 0.025,
-  weighted_dot_product_cutoff: 0.15,
-  simple_dot_product_cutoff: 0.15,
-  reverse_dot_product_cutoff: 0.3,
+  // workflow.LBM_DOT_PRODUCT_CUTOFFS: the laboratory template's, for laboratory and repository runs alike.
+  weighted_dot_product_cutoff: 0.1,
+  simple_dot_product_cutoff: 0.1,
+  reverse_dot_product_cutoff: 0.1,
   matched_peaks_percentage_cutoff: 0,
   minimum_spectrum_match: 1,
   use_rt_scoring: false,

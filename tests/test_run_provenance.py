@@ -80,6 +80,10 @@ class ManifestProvenanceTests(unittest.TestCase):
                 "template_path": str(TEMPLATE),
                 "output_root": str(self.root / output),
                 "class_assignment_confirmed": True,
+                # LC-MS lipidomics with the laboratory's own LBM2: the laboratory profile's answers.
+                "solvent_type": "CH3COONH4",
+                "analysis_purpose": "provenance test",
+                "use_retention_time_for_annotation": False,
             },
         )
         self.assertIsNotNone(plan["workflow"], plan["blockers"])
@@ -203,7 +207,7 @@ class PlanReportsOneThresholdTests(unittest.TestCase):
         self.console = self.root / "MSDIALCUI.exe"
         self.console.write_text("", encoding="ascii")
         self.lbm = self.root / "lab.lbm2"
-        self.lbm.write_text("", encoding="ascii")
+        self.lbm.write_bytes(b"laboratory library")
 
     def tearDown(self) -> None:
         self.directory.cleanup()
@@ -227,6 +231,11 @@ class PlanReportsOneThresholdTests(unittest.TestCase):
                 "template_path": str(TEMPLATE),
                 "minimum_peak_height": 300,
                 "class_assignment_confirmed": True,
+                "output_root": str(self.root / "out"),
+                # LC-MS lipidomics with the laboratory's own LBM2: the laboratory profile's answers.
+                "solvent_type": "CH3COONH4",
+                "analysis_purpose": "provenance test",
+                "use_retention_time_for_annotation": False,
             },
         )
         for item in plan["input"]["files"]:

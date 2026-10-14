@@ -4,6 +4,481 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.38] - Unreleased
+
+### Changes a campaign run planned with this version
+- **LBM score cutoffs are 0.1 / 0.1 / 0.1** (weighted, simple and reverse dot
+  product) by default, for laboratory and public-repository runs alike (decided
+  2026-10-14). They were 0.15 / 0.15 / 0.3: Interactive's own defaults, which
+  replaced the laboratory template's 0.1 / 0.1 / 0.1 on every guided and
+  repository run. Every campaign unit planned with this version annotates lipids
+  with the lower cutoffs, so more LBM annotations pass. The campaign now running
+  was planned and preflighted with a frozen 0.5.37 and is not affected. A
+  parameter template that states its own cutoffs is now followed; the GUI's
+  defaults are the same 0.1.
+
+### Added
+- `lab_lipidomics`, the laboratory lipidomics agent's reading and checking, with
+  the standard library only. Nothing in it runs MS-DIAL; it writes only the files
+  it is handed a path for.
+  - An .xlsx reader (zipfile + ElementTree). It reads the values Excel saved:
+    cached formula values, shared and inline strings, rich text without the
+    phonetic guides a Japanese Excel adds, booleans, and merged ranges as their
+    top-left value. An error cell (`#N/A`) is no value. A formula Excel never
+    calculated is refused when read rather than read as empty. A workbook asking
+    to be recalculated on open, and an Excel lock file beside it, are warned about.
+  - `quant_utility_table.xlsx`, sheets taken by position.
+    - Sheet 1: the header is the row with Name in B and Class name in D, and the
+      standards run to the first empty B, so the worked example below them is
+      never read. The amount column's header names normalize's `-u`
+      (`int (pmol/ul plasma)` -> `pmol_per_microL_plasma`; F, G and H, and nmol
+      and fmol). The sample amount above it (H4) and free notes below the
+      standards are read back, never interpreted. A formula that multiplies by
+      the sample amount (G) is warned about.
+    - Sheet 2: no header; A the standard, C the class, read down to the sheet's
+      last row: a blank separator row is skipped, never taken as the end, which
+      would send every class below it to `Any others`. B is recomputed from the
+      chosen sheet-1 column, because it is a VLOOKUP into a copy of the plasma
+      column. A class normalize never assigns, a class named twice (normalize
+      would use the first), `Any others` missing, repeated or in another case,
+      and a standard sheet 1 does not prepare are blockers.
+    - Sheet 3: classes must be LbmClass names (the export's Ontology spelling).
+      A selected class MS-DIAL has no class definition for (LipidA, OxPA) is
+      flagged as falling to `Any others`. An adduct must read and match the ion
+      mode. A problem in an unselected row is only a warning. Classes selected
+      with more than one adduct are listed.
+  - The internal-standard text libraries, by header in any order and case,
+    ASCII or UTF-8 with or without a BOM. Name, MZ, RT, Adduct and Ontology are
+    required; the adduct's charge must match the polarity; a name may appear once
+    per polarity, so one file can hold both; an MZ more than 5 mDa from formula +
+    adduct is warned about. A canonical writer gives the Console's
+    positional layout and never writes an empty RT or CCS field, either of which
+    makes the Console drop the row.
+  - Adducts and masses: `[M+CH3COO]-` and `[M+Hac-H]-` are one ion, as are
+    `[M+HCOO]-` and `[M+FA-H]-`.
+  - The salt: every spelling of the three anions (Japanese included) maps to the
+    Console's enum string, and an answer naming two is not guessed. Each salt's
+    negative-mode LBM filter is checked against sheet 3 (a dropped selected row
+    is a blocker) and the standards (a dropped standard is a warning, because
+    its text-library row still finds it).
+  - The expected resolution, before anything runs: per polarity, the standards
+    absent from its library, the selected classes that can only come out NOT
+    QUANTIFIED, and those quantified by `Any others`.
+  - The internal-standard resolver. Every candidate sits at the library adduct's
+    m/z (MS-DIAL's Text-DB window: 0.01 Da, or 20 ppm above m/z 500), so a spot
+    of another adduct never competes. Tier A: the LBM library annotated it
+    (reference matched, name-equivalent), within the annotation RT tolerance, or
+    the IS RT tolerance where that is wider (an annotation tolerance below the IS
+    tolerance used to pass an LBM-confirmed standard over for a minor spot only
+    its text row named). A
+    sum-level name is equivalent to any chain-level name of its sum; two
+    chain-level names must agree chain for chain, so an isobaric endogenous lipid
+    (TG 16:0_17:0_18:0 beside TG 17:0_17:0_17:0) is not the standard. B: its text
+    row annotated it as a reference match, within the IS RT tolerance (default
+    0.5 min). C: its text row matched but another annotation won, or matched only
+    below the score cutoff (MS-DIAL names the annotator in the Comment for a
+    suggestion too). D: any spot in that window. The first tier with a member
+    decides; in A a spot inside the IS RT tolerance comes before a farther one,
+    whatever its height; then the most intense spot over the sample and QC files.
+    C and D need the person's confirmation, as does an A spot outside the IS RT
+    tolerance chosen while another spot lies inside it. A chosen spot with no
+    height in a sample or QC file is invalid; a Blank or Standard file without it
+    is allowed and recorded. One spot chosen for two standards is refused for
+    both. Every candidate is listed with the files it has no height in (a
+    non-whole Height cell is MS-DIAL's replacement for a zero), and the valid
+    ones besides the chosen spot as `valid_alternatives`. Other adducts, isotopes
+    and label disagreements are recorded, and the result is written to
+    `is_resolution_{pos,neg}.tsv` and bound by a digest.
+  - The standards table normalize reads: `StandardName`, `TargetClass`,
+    `Concentration`, `PeakID` and `AssignName`. A standard without a usable spot
+    gets PeakID -1, which `--peak-ids-only` never replaces by a name lookup. A
+    standard awaiting acceptance gets its ID only once accepted, and an accepted
+    tier C or D standard gets AssignName, so MS-DIAL's export names it. A spot
+    the person takes instead (any candidate the resolver listed for that
+    standard, with a height in every sample and QC) is used whatever the
+    resolver chose, with AssignName when it is a tier C or D spot.
+    The standards normalize will report as mismatched are predicted from the
+    candidate table with the Console's own alias rule.
+  - normalize's report is read (the current and the earlier format) and compared
+    with the table. Its numbers are recomputed from the Height matrix the same
+    call wrote: within the interval the export's rounding of heights allows,
+    with dilution factors multiplying, and with each spot's class decided as
+    `GetAnnotatedLipidClass` decides it (a spot not reference matched goes to
+    `Any others` whatever its Ontology). A zero the template's "Replace true zero
+    values" replaced is checked against 0.1 x the smallest true value of its row
+    in that matrix, as MS-DIAL writes it. A class whose standard did not resolve
+    must be emptied with a NOT QUANTIFIED comment, a file whose standard has no
+    height must be empty for it, and no row may be raw Intensity.
+  - Sample tables with MS-DIAL's GUI headers (`Acquisiotion type` included),
+    from .xlsx, .tsv or .csv, joined to the proposed files by stem. A dilution
+    factor other than 1 is accepted, and said to multiply. Both polarities pair
+    into one table.
+  - The positive and negative raw folders must be two folders, neither inside
+    the other. An analysis root in a code checkout or a temporary folder is
+    refused, and so is one inside a raw folder or whose `pos`, `neg`, `inputs` or
+    `quant` folder would be, hold or lie inside a raw folder (a root named as
+    the parent of raw folders called pos and neg made each run's output folder
+    the raw folder itself); the system drive and the user profile are said.
+  - `lab_method_answers`: what every laboratory run states rather than asks,
+    written out in full: 12 anchors, the 1.5 min local window, blank
+    interpolation from the confirmed sample table, Materials and Methods, and
+    the rest, so that a plan from the contract leaves no question open.
+- `resources/lipid_class_vocabulary.tsv`, the LbmClass members and the class
+  definition MS-DIAL gives each, generated from MsdialWorkbench b01effaaa by
+  `scripts/generate-lipid-class-vocabulary.py`, which reads only live code. 28
+  classes are spelled differently (`Cer_NS` -> `Cer-NS`), and 24 members have no
+  definition.
+- `resources/lipid_category_table.tsv`, the lipid category metaboservice filed
+  each Ontology's dotplots under
+  (`LipidomicsConverter.ConvertMsdialClassDefinitionToSuperClassVS2`: 228
+  classes, `Unassigned lipid` for any other), generated by
+  `scripts/generate-lipid-category-table.py` from the converter metaboservice
+  was built with: the CommonStandard copy `metaboservice.csproj` references
+  (`metaboservice_csharp_source/CommonStandard/Lipidomics/LipidomicsConverter.cs`,
+  June 2023, identified by its sha256 since it is not under version control;
+  the 2024 binary's `Common.dll` agrees with it). It is not current
+  MsdialWorkbench's switch (248 classes): 46 classes newer than that copy are
+  `Unassigned lipid` here, as metaboservice filed them, where MS-DIAL now names
+  a category (WE and the N-acyl amino acids NATau, NAPhe, NASer, NAAla, NAGln,
+  NALeu, NAVal, NAAnt, NAGABA, NA5HT and NATryA as FattyAcyls; DGTA, LDGTA and
+  BisMeLPA; ASHexCer, PT and Cer_AH/NH/ABP; DMEDFA, DMEDFAHFA and DMEDOxFA; the
+  deuterated standards' classes), and 26 classes only that copy names
+  (GlcCer_*, GalCer_*, Gal2Cer, GalGlcCer, BA_Conjugated, BA_Unconjugated) are
+  filed as it files them. No class both name is filed differently. Sheet 3 of
+  the hands-on workbook selects three of the 46 (ASHexCer, NATau, WE). The
+  merge report lists the kept ontologies filed under `Unassigned lipid`
+  (`outputs.category_unassigned_ontologies`).
+- `tests/vectors/metaboservice_2024_data2.v1.json`: the sha256 of the 361 files
+  the 2024 `metaboservice.exe` wrote from the hands-on data2 exports, run in a
+  32-bit process, for the opt-in golden test. The opt-in tests that read the
+  hands-on `quant_utility_table.xlsx` name it by sha256 and fail with "the demo
+  workbook changed" once it is edited, since their counts are that sheet 3's;
+  one of them is the laboratory's configuration (sheet 3, the reconciliation on:
+  seven negative EtherPE rows renamed, each beside its positive PE P- among the
+  possible double counts while sheet 3 still selects EtherPE `[M+H]+`).
+- Five MCP tools take a laboratory lipidomics batch from its two raw folders to
+  `lipid_metabolome.csv` (`lab_lipidomics_agent`; endpoints
+  `/api/lipidomics/check`, `/write-contract`, `/resolve`, `/normalize` and
+  `/merge`). Each writing step previews by default and acts only on a literal
+  `confirmed=true`, in the MCP tool and again in the backend. The tools'
+  confirmations and switches are declared as strict booleans (and the merge's
+  tolerance as a strict number), so the MCP SDK refuses `"yes"`, `"true"`,
+  `"false"`, `0` and `1` (and `"0.2"`) as the endpoints do, instead of
+  converting them before the tool sees them.
+  - `msdial_lipidomics_check_inputs`, read-only. With the folders alone it lists
+    the raw files of each polarity, MS-DIAL intermediates already beside them,
+    and the text libraries, workbooks and LBM2 files beside the data (listed, an
+    LBM2 never proposed), and Excel lock files, and asks every open question: the
+    analysis purpose, the LBM2, the salt, the annotation RT tolerance, the
+    internal-standard libraries (two files, or one split by charge), the workbook
+    and its amount column, the analysis root, `raw_location` (the raw folders
+    are the data as acquired, `in_place`, or a copy, `copy`; asked with the
+    sentence that MS-DIAL writes its intermediates beside them) and the Console.
+    With the answers it checks the two folders are distinct and each holds its
+    polarity's files (a `.wiff` needs its `.wiff.scan`); the LBM2 is an `.lbm2`
+    with content, identified by sha256, its sibling variants listed; the Console
+    offers `normalize --peak-ids-only`, the annotation candidate table and the
+    local RT test (MsdialWorkbench#826); the analysis root and its folders lie
+    outside the raw folders, a code checkout and the temporary folder. It reports
+    the salt beside the adducts the negative standards and sheet 3 use, the
+    classes each polarity can only leave NOT QUANTIFIED, the workbook's sample
+    amount and notes read back, a sample metadata table joined by stem
+    (corroboration only), and one sample table proposed for both polarities.
+    `check_digest` binds what was read, the raw folders by location as well as
+    by file names and sizes. The internal-standard RT tolerance is 0.5 min unless
+    given or carried by a workset; what a workset filled in is shown as
+    `filled_from_workset`.
+  - `msdial_lipidomics_write_contract` writes `<root>/inputs/`:
+    `lab-lipidomics-contract.json`
+    (`msdial-interactive.lab-lipidomics-contract.v1`), the internal-standard
+    libraries in the Console's column order (`is_pos.txt`, `is_neg.txt`),
+    `standards_template.tsv`, `quant_rules.tsv` and
+    `lab-lipidomics-record.jsonl`. It is refused while a question or a blocker
+    stands, when an input differs from what `check_digest` bound, and until the
+    person has confirmed the sample table (`sample_table_confirmed`; corrections
+    by stem in `sample_table`, every sample listed; `included: false` leaves a
+    sample out of both polarities). A check filled from a workset is written with
+    the same `workset_id`. The preview names the raw folders and the
+    `raw_location` answer, and the contract and its record keep both. A contract
+    already at the root refuses even the preview until `replace_existing=true`,
+    and shows `existing_contract`: when it was written, the diagnostics, runs,
+    normalizes and merges its record holds, and that replacing it leaves them
+    unusable; it is then kept under a dated name. The contract records
+    Interactive's laboratory parameter template and LBM query list by path and
+    sha256, and the Console's build (assembly and folder inventory sha256,
+    version). Every later step hashes the inputs and the derived files again and
+    refuses on any difference.
+  - `msdial_lipidomics_resolve_standards`, read-only: each polarity's standards,
+    decided from its run's own exports (a job's files; with
+    `read_output_folders`, the output folder when it holds one run). The run must
+    be the contract's (its output folder, its `guided-answers.json` naming this
+    contract and its sha256, so a run planned from a contract since replaced at
+    the same path is refused, the contract's salt in `method.txt`), with the
+    candidate table exported, the
+    library copy beside its project, and LBM annotations at all, since the Console
+    skips a missing LBM2 without a word. A run whose automatic RT correction
+    failed is reported, and running it again uncorrected is left to the person.
+    A digest binds the resolution and the contract.
+  - `msdial_lipidomics_normalize`: the resolution recomputed and matched to the
+    digest shown, and every searched standard and every standard not found
+    decided by the person (`accept_searched`, `accept_unresolved`, or
+    `accept_spot`, which takes another listed candidate for any standard, an
+    invalid or contested one included; one decision per standard, and no spot
+    for two standards). A Console that is not the build the contract recorded is
+    warned about in the preview, and both builds are recorded. The command
+    is `MSDIALCUI normalize -i <project> -s <quant>/standards_{pos,neg}.tsv -o
+    <quant>/{pos,neg} -u <unit> --peak-ids-only`, with
+    `--allow-unresolved-standards` when a standard stays unresolved,
+    `--allow-mismatched-peak-ids` when a mismatch is predicted, and `-d` when a
+    sample's dilution factor differs from 1 (MS-DIAL multiplies by it); the
+    preview says why each is there. Confirmed, it runs as a cancellable
+    `normalize` job that compares normalize's report with the table and its
+    mismatches with the prediction, recomputes every quantified cell, copies the
+    matrices to `<quant>/NormalizedHeight_{Pos,Neg}.txt` and
+    `Height_{Pos,Neg}.txt`, and records it all in
+    `normalize_{pos,neg}.local.json`. A job whose cells were not all verified
+    fails, and the merge sets those rows aside.
+  - `msdial_lipidomics_merge` previews the counts and, confirmed, writes into
+    `<root>/quant/lipidome` (the folder `metabolomics_service.R` is run in: it
+    reads every subfolder of its folder as a dotplot folder, and `quant` holds
+    normalize's `pos` and `neg`) `lipid_metabolome.csv`, the three statistics
+    tables and the dotplot folders (see `lipidome_merge` under Changed),
+    `lipid_metabolome_not_quantified.csv` and `merge-report.json`, with sheet 3
+    as the rules, the resolved standards and the candidate table's reference
+    matches as filters, and the contract's unit. The report holds the
+    verification, the unit, the sample amount, the build of each polarity's
+    normalize Console, and the positive/negative reconciliation with the
+    standard each renamed row was normalized against (a PG renamed BMP was
+    normalized as PG; a difference from the standard sheet 2 gives BMP, its own
+    row or `Any others` when it names none, is warned about and says which).
+    `reconcile_polarities` and `reconciliation_rt_tolerance` follow the
+    contract unless given; another value is applied, warned about and recorded
+    as a deviation. `reconcile_polarities` is true or false; anything else (the
+    text `"false"`) is refused, by the endpoint and by the MCP tool, where the
+    endpoint read it as on. The record's
+    `merged` event keeps the four tables' sha256, the dotplot count, the sample
+    file types and the reconciliation's parameters and counts. The tool returns the report without the per-file
+    dotplot manifest, which stays in `merge-report.json`. It refuses a polarity
+    not normalized under this contract, not completed as planned, or whose
+    matrix or candidate table changed since, and an `output_name` that would
+    write over its own side file or report, one of the three statistics
+    tables, or a file normalize wrote. A lipidome an earlier merge wrote there
+    under another name, which stays, is warned about.
+  - The contract states the merge method (`merge`: Sample and QC columns, the
+    reconciliation on with 0.1 min), and `msdial_lipidomics_check_inputs` warns
+    (`merge_selection_warnings`) when sheet 3 selects BMP or EtherPE in
+    positive mode, or does not select BMP `[M-H]-` or EtherPE `[M-H]-`: the
+    reconciliation takes both from negative `[M-H]-`, so a positive selection
+    counts the class twice and a missing `[M-H]-` loses the renamed rows. The
+    workbook is never changed; the person edits sheet 3. While it contradicts the
+    reconciliation, the check asks `merge_selection_accepted` and is not ready
+    for a contract: the contract binds the workbook, so a change after it needs
+    a new contract and new runs of both polarities. The person changes sheet 3
+    and the check runs again, or keeps it (`merge_selection_accepted=true`, bound
+    by `check_digest`), and the contract and its record keep the warnings they
+    accepted (`merge.selection_warnings_accepted`). At the merge the same
+    contradictions are said as what the lipidome counts, with the sentence that
+    sheet 3 is part of the contract, never as an edit to make: the merge warned
+    "set the positive row(s) FALSE", which voided the contract and every run
+    under it. A workset does not carry the answer.
+- The guided path's laboratory lipidomics profile: a plan from a contract
+  (`lab_lipidomics_contract_path`), or LC-MS lipidomics with
+  `library_strategy: existing` outside a repository unit.
+  - New answers: `solvent_type` (any spelling of the three anions, Japanese
+    included), `sample_table`, `internal_standard_text_path`,
+    `internal_standard_rt_tolerance`, `export_annotation_candidates`,
+    `lab_lipidomics_contract_path` and `analysis_purpose`.
+  - Required on the profile: `analysis_purpose`, `solvent_type`,
+    `libraries.lbm_path`, `use_retention_time_for_annotation` and then
+    `retention_time_tolerance`, and `output_root`. The LBM2 must be an `.lbm2`
+    with content.
+  - From a contract, the plan takes the polarity from `ion_mode` and must be given
+    the contract's raw folder. What the contract fixes (salt, LBM2, tolerances,
+    internal-standard library, sample table, output and export folder, Console,
+    purpose, parameter template and LBM query list) cannot be answered otherwise,
+    by the caller, a workset or `workflow_overrides`; the shared settings'
+    template and query list are not read. A method default changed, any other
+    answer (an RT-correction tuning value, say) or another override is applied
+    and reported as a deviation. A template or query list changed since the
+    contract was written stops the plan. A Console without
+    `normalize --peak-ids-only` is refused before the run. The one-file
+    diagnostic is refused while the plan has any blocker but the missing
+    threshold (`diagnostic_blockers`): it starts the Console on `input_path` and
+    writes beside its raw files. The run's `guided-answers.json` keeps the plan's
+    `lab_lipidomics` block with the contract's sha256.
+  - The internal standards are searched in the same run as the Text-DB annotator
+    `internal_standards_{pos,neg}`: retention time used for scoring and
+    filtering within the internal-standard tolerance (0.5 min by default, apart
+    from the 1.5 min annotation tolerance), priority 1, score cutoff 0.8. Only a
+    library in the Console's column order is used; the contract writes one. QA's
+    internal standards default to the same library.
+  - `Export annotation candidates: True` is written when asked, and refused with
+    a Console that does not write the table; a diagnostic never writes it.
+  - A diagnostic's estimate and each production start of a contract run are
+    recorded in the contract's record.
+- Console capabilities `normalize_peak_ids_only` (`normalize --help` names
+  `--peak-ids-only`, asked only of a Console that started) and
+  `annotation_candidates_export` (both of its assembly markers).
+- Worksets of kind `lab-lipidomics` (`msdial_save_workset` with
+  `lab_lipidomics_contract_path`): the LBM2, the salt, both tolerances, the
+  internal-standard libraries and the workbook with their sha256, the amount
+  column, the Console and the method, for the next batch's
+  `msdial_lipidomics_check_inputs(workset_id=...)`, which warns when a carried
+  file has changed. The sample table, the purpose, the workbook's sample amount,
+  dilution factors, paths, `raw_location` and the accepted threshold are not
+  carried. A guided plan refuses one.
+
+### Changed
+- `lipidome_merge` writes what the laboratory's own program (metaboservice,
+  `MetabolomicsServiceUtility.IntegratePosNegResults`) wrote, every file of it.
+  On the 2024 hands-on exports and its `targetadduct.txt`, with the
+  reconciliation off and the 2024 sample rule, `lipid_metabolome.csv`,
+  `lipid_metabolome4stat.csv` and `lipid_metabolome4classsummary.csv` (372
+  rows) and 356 of the 357 dotplot files are the 2024 program's byte for byte;
+  `lipid_metabolome4summaryplot.csv` and `Summary_Dotplots/Glycerophospholipids.csv`
+  differ in one digit of one value, `-0.0479667909938783` where the 32-bit .NET
+  Framework printed `...784` (its unpublished x87 formatting rounds about 0.4 %
+  of values lying just below a 15-digit midpoint up; no rounding rule
+  reproduces it). With sheet 3 of `quant_utility_table.xlsx` it keeps 394 rows
+  (the same plus 22 positive EtherPE).
+  - The three tables `metabolomics_service.R` reads, always under
+    metaboservice's names (`lipid_metabolome4stat.csv`,
+    `lipid_metabolome4classsummary.csv`, `lipid_metabolome4summaryplot.csv`)
+    whatever the lipidome is called, since the R script reads those names; a
+    lipidome may not take one of them. And the `Summary_Dotplots`,
+    `category_<category>` and `subclass_<ontology>`
+    folders it reads too, with metaboservice's quirks kept: metabolite keys are
+    the last `|` part of the name and the alignment ID, a lipid's dotplot file
+    only within the top 41 of its class, invalid file-name characters as `_`.
+  - The statistics are over the Sample and QC columns of the positive header,
+    never a Blank (metaboservice's 2025 rule, the laboratory's decision; the
+    2024 program took Sample only, kept as `METABOSERVICE_2024_SAMPLE_FILE_TYPES`
+    for reproducing it). Sample names are Class_Injection order. The sample
+    columns end only at a Class of exactly `NA`, as metaboservice's
+    `set_metadata` ended them: a sample whose class is empty (or `Na`) is
+    taken, and an empty class is warned about. They ended at the first empty
+    class, so every later sample was dropped from the tables without a word.
+  - Rows are chosen as metaboservice's `isKeepLipid` chose them, on the cells
+    as written: untrimmed, case-sensitive and ordinal. A Comment starting with
+    a lower-case `x` sets its row aside, and one starting `X` or ` x` does not;
+    the name filters and the Ontology/Adduct match compare the cells untrimmed.
+    A text rule table selects a row only when its flag is exactly `TRUE`, with
+    Class and Adduct as written (`readReferenceFile`); `true`, `1` or `yes` no
+    longer select, and are warned about. The reconciliation compares names and
+    ontologies untrimmed too. They were trimmed, `x` ignored case, and `true`,
+    `1` and `yes` selected.
+  - ASCII, CRLF after every line, no byte-order mark, comma separated and never
+    quoted, as the program wrote them (a cell holding a comma is warned about:
+    its row has an extra column); UTF-8 with a warning where a cell is not ASCII,
+    where the program wrote one `?` per byte (a recorded decision: two class
+    labels of one length, such as `対照` and `処理`, would have become one class).
+    Rows keep the order those `?` gave.
+  - Rows ordered by ontology and then name as .NET's default comparison ordered
+    them on Windows, stably: the NLS "word sort" key, checked byte for byte
+    against `LCMapStringEx` (`BileAcid` before `BRSE`, `TG 56:1|` before
+    `TG 56:10|`, `-` and `'` only a last tie-break), without touching the
+    process locale. The earlier approximation ignored those last rules.
+  - Numbers as .NET Framework's `Double.ToString()`: 15 significant digits,
+    rounded half-up, `E+XX` outside 1e-5..1e15, `-0` as `0`, -infinity as `-?`
+    (an all-zero lipid in the summary plot) and `NaN`. Values parse as
+    `double.Parse` does.
+  - The positive/negative reconciliation (the laboratory's rules, 2026-10-14),
+    on by default, between the row filters and sheet 3's selection. BMP is
+    annotatable only in positive mode and is annotated PG in negative mode: a
+    kept negative PG row whose name equals a kept positive BMP row's with BMP ->
+    PG in every `|` part, within 0.1 min (`Average Rt(min)`, compared exactly as
+    decimals), becomes BMP, name and Ontology. Negative mode annotates PE P- and
+    PE O- both as PE O-: a kept negative EtherPE row whose name equals a kept
+    positive PE P- row's PE O- spelling (`P-x:y` -> `O-x:(y+1)` in every part:
+    `PE P-34:1` is `PE O-34:2`) takes the PE P- name. Exact names only, no
+    sum-composition fallback. Several candidates: the smallest |delta RT|, then
+    the higher mean over the sample and QC columns; one negative row claimed
+    twice: the closer positive row wins (then the more intense), and the other
+    takes its next candidate no closer positive row holds, or is left unmatched
+    when none is left (`lost_claims`, with every candidate it lost and to whom).
+    The claims are settled together (deferred acceptance), so the pairs do not
+    depend on the rows' order: two positive BMPs of one name 0.04 min apart and
+    two negative PGs of that name now both become BMP, where the loser of the
+    first claim was left unmatched with its other candidate left as PG, and its
+    `ambiguous` entry named the row it lost. A renamed negative row whose own
+    name positive mode also annotates within the tolerance (a positive PE O- or
+    PG of that very name) is renamed as the rule says and reported as
+    `ambiguous`, kind `conflicting positive evidence`. The renamed row's Comment
+    says what it was, from which positive row and at what delta RT. It keeps and drops nothing: sheet 3 decides (BMP and EtherPE
+    positive adducts FALSE, BMP `[M-H]-` and EtherPE `[M-H]-` TRUE), and a
+    renamed row sheet 3 does not select, or a positive selection of either
+    class, is warned about. The report lists every matched pair, every
+    unmatched positive row with the same-name negative rows outside the window
+    and the other names inside it, every tie and every lost claim, and
+    (`not_converted`) every positive row of either class whose name names no
+    negative row: a PE O- positive mode names itself, with the negative rows of
+    that very name within the tolerance and whether a PE P- rename took one
+    (`names_negative`; it said "names no negative PE O- row" whatever the
+    negative rows were), or a BMP with no BMP token, which was listed as
+    unmatched without being counted. Counts per class: `positive_rows` =
+    `matched` + `unmatched` + `lost_claims`, with `rematched` (within matched),
+    `ambiguous`, `conflicting_positive_evidence` and
+    `positive_rows_not_converted`. On the 2024
+    hands-on data 7 of 14 positive PE P- rows name a negative row; 3 of the 7
+    others have a negative row of the same sum and other chains.
+  - A dotplot file an earlier merge recorded writing (its manifest in
+    `merge-report.json`) and this one does not write is removed, with a folder it
+    leaves empty, so R does not plot it with the new ones; any other file in the
+    dotplot folders refuses the write. Another folder beside the tables, which R
+    would also read, is warned about, and so are repeated sample names, constant
+    lipids (`prcomp(scale=TRUE)` fails on them), lipids without a finite log10
+    mean and repeated lipid keys.
+  - A selected row with a sample or QC cell that holds no number goes to the
+    not-quantified file (metaboservice stopped on it). The two exports must also
+    agree on each sample's file type, since the positive header decides which
+    columns are samples.
+  - The rule table may be the workbook itself; its third sheet is read.
+  - New filters, the first that applies being the reason: an internal standard
+    by the resolver's alignment IDs (beside the `(d` rule), and a row whose
+    representative annotation is not reference matched, from the candidate
+    table. The `low score:` prefix filter is kept for old exports; current
+    exports no longer write the prefix.
+  - A selected row with no valid concentration (NOT QUANTIFIED, raw Intensity,
+    another unit, or failed verification) goes to its own file
+    (`lipid_metabolome_not_quantified.csv`) instead of the lipidome.
+  - The report adds drops by polarity, selected pairs without rows, ontologies
+    from both polarities, same-formula rows within an ontology (possible double
+    counts, such as EtherPE in both polarities), and the inputs' sha256. It can
+    be written as `merge-report.json`. With `write=False` it writes nothing and
+    reports what it would write, with the output's sha256.
+- Text annotator rows from `libraries.text_paths` follow
+  `use_retention_time_for_annotation` and `retention_time_tolerance`. They were
+  written with retention time off and 0.5 min whatever was answered, because each
+  row's own value wins in `text_annotator_settings.tsv`.
+- The parameter template's LBM score cutoffs reach the method file. Only the
+  template's workflow section reached the state, so its values were replaced by
+  the writer's defaults.
+- A guided plan for LC-MS lipidomics with the laboratory's own libraries
+  (`library_strategy: existing`, no repository unit) is the laboratory
+  lipidomics profile and is not ready until the salt, the analysis purpose, the
+  output folder and the annotation RT decision are answered and the LBM2 is an
+  `.lbm2` with content. A workset carries the salt once it has been answered;
+  the purpose and the output folder belong to each dataset and are asked again.
+- `class_assignment_confirmed: false` no longer answers the Class question: the
+  plan went ahead with the classes it had just been told were wrong. A
+  `sample_table` with the assignment to use answers it.
+- `Solvent type` must be one of CH3COONH4, HCOONH4 and NH4HCO3, or the plan is
+  refused. The Console reports any other value as applied, ignores it, and
+  searches the CH3COONH4 records.
+- The laboratory lipidomics contract (`lab-lipidomics-contract.json`, and the
+  dated copy a replacement keeps) and its record (`lab-lipidomics-record.jsonl`)
+  are local only: they name the LBM2 and the raw data where they are kept.
+
+### Not changed
+- MsdialWorkbench is not changed here. `normalize --peak-ids-only`, the
+  `AssignName` column, the class-spelling redaction and the empty cells for a
+  standard without height are the Console's (MsdialWorkbench, normalize track);
+  a Console without `--peak-ids-only` is refused by every laboratory lipidomics
+  step, so no run of this version normalizes by name.
+- The running campaign is unaffected: it runs a frozen Interactive with its own
+  preflight. Its Console path comes from the campaign's own answers, as the lab
+  agent's comes from its contract; neither is read from Interactive's settings.
+
 ## [0.5.37] - Unreleased
 
 ### Changed

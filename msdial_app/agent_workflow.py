@@ -4,6 +4,7 @@ import copy
 import json
 import math
 from bisect import bisect_left
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,7 @@ from .workflow import (
     read_lipid_queries,
     validate_workflow,
 )
-from .worksets import describe_workset_candidate, get_workset
+from .worksets import LAB_LIPIDOMICS_WORKSET_KIND, describe_workset_candidate, get_workset
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -63,6 +64,19 @@ SUPPORTED_ANSWER_KEYS = {
     "gcms_retention_type",
     "gcms_alignment_index_type", "gcms_ri_compound_type", "gcms_ri_source",
     "gcms_ri_standard_path", "gcms_ri_dictionary_path",
+    # The laboratory lipidomics profile (lab_lipidomics, lab_lipidomics_agent).
+    "solvent_type", "sample_table", "internal_standard_text_path",
+    "internal_standard_rt_tolerance", "export_annotation_candidates",
+    "lab_lipidomics_contract_path", "analysis_purpose",
+}
+SAMPLE_TABLE_FILE_TYPES = ("Sample", "QC", "Blank", "Standard")
+# The LBM score cutoffs a parameter template states, by the state key the method writer reads. Only
+# the template's workflow section reached the state, so its 0.1/0.1/0.1 used to be replaced by the
+# writer's own defaults.
+LBM_TEMPLATE_CUTOFFS = {
+    "lbm_weighted_dot_product": "weighted_dot_product_cutoff",
+    "lbm_simple_dot_product": "simple_dot_product_cutoff",
+    "lbm_reverse_dot_product": "reverse_dot_product_cutoff",
 }
 
 
@@ -192,6 +206,20 @@ def build_guided_plan(
 ) -> dict[str, Any]:
     supplied = dict(answers or {})
     workset = get_workset(workset_id)
+    contract_blockers: list[str] = []
+    lab_contract: dict[str, Any] | None = None
+    contract_text = str(supplied.get("lab_lipidomics_contract_path") or "").strip()
+    if contract_text:
+        # The contract's answers sit under the caller's and a workset's: the caller names the
+        # polarity, and may change a method default (a recorded deviation); what the contract
+        # fixes for both polarities it fixes here too. A workset's answers are judged with the
+        # caller's, since the plan applies them alike.
+        from .lab_lipidomics_agent import contract_plan_answers
+
+        given = {**dict((workset or {}).get("answers", {})), **supplied}
+        lab_contract = contract_plan_answers(contract_text, given, input_path)
+        contract_blockers.extend(lab_contract["blockers"])
+        supplied = {**lab_contract["answers"], **given, **lab_contract["fixed"]}
     merged = dict((workset or {}).get("answers", {}))
     # A workset stores answers and workflow_overrides side by side, and only the answers
     # were ever read back: overrides saved into a workset were accepted, written to disk,
@@ -204,6 +232,13 @@ def build_guided_plan(
     merged.update(supplied)
     if overrides:
         merged["workflow_overrides"] = overrides
+    if lab_contract is not None and overrides:
+        # Overrides reach the state last, after everything the contract fixed was set.
+        from .lab_lipidomics_agent import contract_override_problems
+
+        overridden = contract_override_problems(overrides)
+        contract_blockers.extend(overridden["blockers"])
+        lab_contract["deviations"] = [*lab_contract["deviations"], *overridden["deviations"]]
     unknown_answer_keys = sorted(set(merged) - SUPPORTED_ANSWER_KEYS)
     inspection = inspect_analysis_input(input_path)
     manifest_override = str((merged.get("workflow_overrides") or {}).get("repository_run_manifest") or "")
@@ -212,10 +247,29 @@ def build_guided_plan(
             manifest_override, inspection.get("files", []), inspection.get("sample_table_proposal")
         )
     questions = _questions(merged)
-    blockers: list[str] = []
+    if (workset or {}).get("kind") == LAB_LIPIDOMICS_WORKSET_KIND:
+        contract_blockers.append(
+            f"Workset '{workset.get('id')}' is a laboratory lipidomics workset for both polarities; it fills "
+            "msdial_lipidomics_check_inputs, not a guided plan for one."
+        )
+    if merged.get("sample_table"):
+        contract_blockers.extend(sample_table_problems(inspection["files"], merged["sample_table"]))
+    blockers: list[str] = list(contract_blockers)
     official_library: dict[str, Any] | None = None
     if not inspection["files"]:
         blockers.append("No supported analysis files were found at input_path.")
+    lab_profile = _is_lab_lipidomics_profile(merged)
+    if merged.get("solvent_type") not in (None, ""):
+        from .lab_lipidomics import normalize_salt
+
+        salt = normalize_salt(merged["solvent_type"])
+        if salt["problem"]:
+            blockers.append(f"solvent_type: {salt['problem']}")
+    internal_standard_text = str(merged.get("internal_standard_text_path") or "").strip()
+    library_standards: list[dict[str, Any]] = []
+    if internal_standard_text:
+        problems, library_standards = _internal_standard_library_problems(merged, internal_standard_text)
+        blockers.extend(problems)
     project_type = str(merged.get("project_type", "")).casefold()
     if project_type and project_type not in SUPPORTED_PROJECT_TYPES:
         blockers.append(
@@ -242,10 +296,9 @@ def build_guided_plan(
     tuning_strategy = merged.get("parameter_strategy") in {
         "target_peak_count", "auto_peak_range"
     }
+    tuning_blocker = "Peak-count tuning requires a diagnostic run and an accepted minimum_peak_height."
     if tuning_strategy and not _has_minimum_peak_height(merged):
-        blockers.append(
-            "Peak-count tuning requires a diagnostic run and an accepted minimum_peak_height."
-        )
+        blockers.append(tuning_blocker)
 
     # An unanswered advisory question leaves a conservative default in place, so the
     # workflow can still be built and shown; only a required one makes it unknowable.
@@ -257,6 +310,12 @@ def build_guided_plan(
         blockers.extend(
             item["message"] for item in validation if item.get("level") == "error"
         )
+    # What stops the one-file diagnostic as well. It runs before a threshold exists, so it cannot
+    # wait for ready_to_prepare, yet it starts the Console on input_path and writes beside its
+    # files: a plan from a contract may run it only when nothing but the threshold is missing.
+    diagnostic_blockers = (
+        [item for item in blockers if item != tuning_blocker] if lab_contract is not None else list(contract_blockers)
+    )
     return {
         "schema": "msdial-interactive.guided-plan.v1",
         "input": inspection,
@@ -284,16 +343,29 @@ def build_guided_plan(
         ],
         "unknown_answer_keys": unknown_answer_keys,
         "blockers": list(dict.fromkeys(blockers)),
+        "diagnostic_blockers": list(dict.fromkeys(diagnostic_blockers)),
         "official_library": official_library,
         "ready_to_prepare": not pending_required and not blockers,
         "requires_diagnostic": tuning_strategy and not _has_minimum_peak_height(merged),
         "post_run_actions": {
             "quality_assurance": _as_bool(merged.get("run_qa")),
-            "internal_standards": merged.get("internal_standards", []),
+            # QA checks the standards the run's own library names unless the caller listed others.
+            "internal_standards": merged.get("internal_standards") or library_standards,
             "materials_and_methods": _as_bool(
                 merged.get("generate_materials_methods")
             ),
         },
+        "profile": "lab_lipidomics" if lab_profile else "",
+        **(
+            {
+                "lab_lipidomics": {
+                    key: lab_contract[key]
+                    for key in ("contract_path", "contract_sha256", "polarity", "deviations", "fixed_keys")
+                }
+            }
+            if lab_contract is not None
+            else {}
+        ),
     }
 
 
@@ -777,11 +849,38 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
             ask("gcms_ri_compound_type", "Use Kovats alkane RI or Fiehn FAME RI?", ["Alkanes", "Fames"])
         if not answers.get("gcms_ri_standard_path") and not answers.get("gcms_ri_dictionary_path"):
             ask("gcms_ri_standard_path", "Provide the alkane/FAME carbon-number and RT file path.")
+    # The laboratory lipidomics profile: what the analysis is for, the salt, the laboratory's LBM2,
+    # the annotation RT tolerance and where the run writes are decisions only the analyst can make,
+    # and each of them changes the result without a word when it is left to a default.
+    lab_profile = _is_lab_lipidomics_profile(answers)
+    if lab_profile and not str(answers.get("analysis_purpose") or "").strip():
+        ask(
+            "analysis_purpose",
+            "What do you want to learn from this analysis: the question, the biological comparison, "
+            "whether annotation or comparative profiling is central, and the outputs you need?",
+        )
+    if lab_profile and not str(answers.get("solvent_type") or "").strip():
+        ask(
+            "solvent_type",
+            "Which salt is in the mobile phase? It decides which negative-mode LBM records MS-DIAL "
+            "searches (acetate or formate adducts), and an unknown value is silently read as CH3COONH4.",
+            ["CH3COONH4", "HCOONH4", "NH4HCO3"],
+        )
     if not answers.get("library_strategy") or answers.get("library_strategy") == "ask":
         ask(
             "library_strategy",
             "Which annotation libraries should be used?",
             ["official", "existing", "tiered_lipid_msp", "none"],
+        )
+    elif (
+        lab_profile
+        and answers.get("library_strategy") == "existing"
+        and not str((answers.get("libraries") or {}).get("lbm_path") or "").strip()
+    ):
+        ask(
+            "libraries",
+            "Provide libraries.lbm_path, the laboratory's .lbm2 library for this chromatography; "
+            "msp_paths and text_paths are optional.",
         )
     elif answers.get("library_strategy") == "existing" and not _has_existing_library(answers):
         ask(
@@ -807,7 +906,7 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
             "Does this library carry retention times for this chromatography, so that "
             "annotation should be scored and filtered on them?",
             ["true", "false"],
-            required=False,
+            required=lab_profile,
         )
     if (
         library_chosen
@@ -817,7 +916,14 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
         ask(
             "retention_time_tolerance",
             "Within how many minutes of the library retention time should a match be accepted?",
-            required=False,
+            required=lab_profile,
+        )
+    if lab_profile and not str(answers.get("output_root") or "").strip():
+        # Unasked, the run writes its method, alignment and project into the raw-data folder.
+        ask(
+            "output_root",
+            "Where should this run write its method, alignment and project? Not the raw-data "
+            "folder, a code checkout or a temporary folder.",
         )
     if "dilution_factor" not in answers:
         ask(
@@ -845,14 +951,18 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
     # this axis, correcting it afterwards means re-running, and answering it costs a
     # word. A repository reanalysis has its own gate and no analyst to ask, so it is
     # raised only where the classes came from reading file names.
-    if (
-        not answers.get("repository_metadata_path")
-        and "class_assignment_confirmed" not in answers
+    # "false" is not an answer to it: the plan would go ahead with the classes it was just told are
+    # wrong. A sample_table is the assignment to use instead.
+    if not answers.get("repository_metadata_path") and (
+        "class_assignment_confirmed" not in answers
+        or (not _as_bool(answers.get("class_assignment_confirmed")) and not answers.get("sample_table"))
     ):
         ask(
             "class_assignment_confirmed",
             "The Class assignment was read from the file names. Confirm it is the "
-            "comparison this experiment is about, or give the assignment to use.",
+            "comparison this experiment is about, or give the assignment to use as "
+            "sample_table (file_name with class_id, file_type, analytical_order, batch_order, "
+            "factor and included).",
             ["true", "false"],
         )
     if project_type == "lcms" and "run_qa" not in answers:
@@ -885,6 +995,12 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
         )
     loaded = load_parameter_template(template, queries_path)
     state = dict(loaded["workflow"])
+    if project_type == "lcms":
+        # The template's LBM score cutoffs, which the method writer used to replace with its own.
+        lbm = loaded.get("lbm_annotator") or {}
+        for state_key, template_key in LBM_TEMPLATE_CUTOFFS.items():
+            if template_key in lbm:
+                state[state_key] = lbm[template_key]
     output_root = str(answers.get("output_root") or inspection["default_output_root"])
     run_qa = _as_bool(answers.get("run_qa"))
     state.update(
@@ -961,6 +1077,8 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             item["acquisition_type"] = acquisition_type
     _apply_libraries(state, loaded, answers)
     _apply_retention_time_use(state, answers)
+    if project_type == "lcms":
+        _apply_internal_standard_library(state, answers)
     if answers.get("number_of_threads") is not None:
         state["number_of_threads"] = max(1, int(answers["number_of_threads"]))
     if answers.get("stage_inputs") is not None:
@@ -970,6 +1088,23 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
         if factor > 0:
             for item in state["files"]:
                 item["factor"] = factor
+    if answers.get("sample_table"):
+        # The confirmed table is the more specific answer, so it is applied after the run-wide
+        # acquisition type and dilution factor; its problems are the plan's blockers.
+        state["files"] = apply_sample_table(state["files"], answers["sample_table"])["files"]
+    if str(answers.get("solvent_type") or "").strip():
+        from .lab_lipidomics import normalize_salt
+
+        # An unknown spelling is kept as given, for validate_workflow to refuse by name.
+        state["solvent"] = normalize_salt(answers["solvent_type"])["salt"] or str(answers["solvent_type"]).strip()
+    if answers.get("export_annotation_candidates") is not None:
+        state["export_annotation_candidates"] = _as_bool(answers.get("export_annotation_candidates"))
+    if _is_lab_lipidomics_profile(answers):
+        state["lab_lipidomics_profile"] = True
+        state["analysis_purpose"] = str(answers.get("analysis_purpose") or "").strip()
+        contract_path = str(answers.get("lab_lipidomics_contract_path") or "").strip()
+        if contract_path:
+            state["lab_lipidomics_contract_path"] = str(Path(contract_path).expanduser().resolve())
     if project_type == "lcms":
         ion_mode = str(state["ion_mode"])
         state["selected_adducts"] = [
@@ -1106,6 +1241,13 @@ def _apply_retention_time_use(state: dict[str, Any], answers: dict[str, Any]) ->
     for kind in ("lbm", "msp", "text"):
         state[f"{kind}_use_rt_scoring"] = use_rt
         state[f"{kind}_use_rt_filtering"] = use_rt
+    # The state keys above reach the LBM lines only: each Text annotator row carries its own RT
+    # settings, and the row wins in text_annotator_settings.tsv, so the decision is written into the
+    # rows of the analyst's text libraries too. The internal-standard row keeps its own tolerance.
+    text_rows = [row for row in state.get("text_annotators", []) if not row.get("internal_standards")]
+    for row in text_rows:
+        row["use_rt_scoring"] = use_rt
+        row["use_rt_filtering"] = use_rt
     tolerance = answers.get("retention_time_tolerance")
     if not use_rt or tolerance is None:
         return
@@ -1114,6 +1256,195 @@ def _apply_retention_time_use(state: dict[str, Any], answers: dict[str, Any]) ->
         return
     for kind in ("lbm", "msp", "text"):
         state[f"{kind}_rt_tolerance"] = value
+    for row in text_rows:
+        row["rt_tolerance"] = value
+
+
+def _apply_internal_standard_library(state: dict[str, Any], answers: dict[str, Any]) -> None:
+    """The polarity's internal standards as a Text-DB annotator searched in the same run.
+
+    MS-DIAL then names a standard the LBM library did not annotate, in its own exports, the
+    GUI and mzTab-M, and keeps it through blank filtering. Retention time is used for both
+    scoring and filtering, within the internal-standard tolerance rather than the annotation
+    one: a wider window admits a second spot of the same m/z (the 2024 LPE d7 at 7.395 min).
+    The annotator ID is what an export's Comment names, which is how the resolver tells a
+    text-library annotation from an LBM one.
+    """
+    path = str(answers.get("internal_standard_text_path") or "").strip()
+    if not path:
+        return
+    from .lab_lipidomics import DEFAULT_INTERNAL_STANDARD_RT_TOLERANCE, INTERNAL_STANDARD_ANNOTATOR_IDS
+
+    tolerance = answers.get("internal_standard_rt_tolerance")
+    state["text_annotators"] = [
+        row for row in state.get("text_annotators", []) if not row.get("internal_standards")
+    ] + [
+        {
+            "annotator_id": INTERNAL_STANDARD_ANNOTATOR_IDS.get(str(state.get("ion_mode")), "internal_standards"),
+            "text_db_file_path": str(Path(path).expanduser().resolve()),
+            "priority": 1,
+            "rt_tolerance": float(tolerance) if tolerance not in (None, "") else DEFAULT_INTERNAL_STANDARD_RT_TOLERANCE,
+            "ms1_tolerance": float(state.get("ms1_tolerance", 0.01) or 0.01),
+            "total_score_cutoff": 0.8,
+            "use_rt_scoring": True,
+            "use_rt_filtering": True,
+            "internal_standards": True,
+        }
+    ]
+    state["internal_standard_rt_tolerance"] = state["text_annotators"][-1]["rt_tolerance"]
+
+
+def _is_lab_lipidomics_profile(answers: dict[str, Any]) -> bool:
+    """A laboratory lipidomics run: one planned from a contract, or LC-MS lipidomics with the
+    laboratory's own libraries. A repository unit is never one; it has its own contract."""
+    if str(answers.get("lab_lipidomics_contract_path") or "").strip():
+        return True
+    if answers.get("repository_metadata_path") or (answers.get("workflow_overrides") or {}).get(
+        "repository_run_manifest"
+    ):
+        return False
+    return (
+        str(answers.get("project_type", "")).casefold() == "lcms"
+        and answers.get("target_omics") == "Lipidomics"
+        and answers.get("library_strategy") == "existing"
+    )
+
+
+def _internal_standard_library_problems(
+    answers: dict[str, Any], path_text: str
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """The internal-standard library must be one the Console reads as written.
+
+    The Console reads a text library by column position and drops a row whose RT or CCS field is
+    present but does not parse, so only a file already in the canonical layout is run as it is;
+    msdial_lipidomics_write_contract writes one from any header order.
+    """
+    from .lab_lipidomics import (
+        canonical_text_db_lines,
+        internal_standards_for_qa,
+        read_internal_standard_text,
+    )
+
+    path = Path(path_text).expanduser()
+    if not path.is_file():
+        return [f"internal_standard_text_path not found: {path}"], []
+    ion_mode = str(answers.get("ion_mode") or "")
+    read = read_internal_standard_text(path, ion_mode if ion_mode in {"Positive", "Negative"} else None)
+    problems = [f"internal_standard_text_path: {item}" for item in read["blockers"]]
+    if problems:
+        return problems, []
+    written = [line for line in path.read_bytes().decode("ascii", errors="replace").splitlines() if line.strip()]
+    if written != canonical_text_db_lines(read["records"]):
+        problems.append(
+            f"{path.name} is not in the column order MS-DIAL reads a text library in (Name, MZ, RT, Adduct, "
+            "InChIKey, Formula, SMILES, Ontology, CCS, no empty RT or CCS); "
+            "msdial_lipidomics_write_contract writes a copy that is."
+        )
+    tolerance = answers.get("internal_standard_rt_tolerance")
+    try:
+        rt_tolerance = float(tolerance) if tolerance not in (None, "") else 0.5
+    except (TypeError, ValueError):
+        return [f"internal_standard_rt_tolerance '{tolerance}' is not a number of minutes."], []
+    if rt_tolerance <= 0:
+        problems.append("internal_standard_rt_tolerance must be greater than 0 minutes.")
+    return problems, internal_standards_for_qa(read["records"], rt_tolerance)
+
+
+def sample_table_problems(files: list[dict[str, Any]], table: Any) -> list[str]:
+    return apply_sample_table(files, table)["problems"]
+
+
+def apply_sample_table(files: list[dict[str, Any]], table: Any) -> dict[str, Any]:
+    """Apply the confirmed sample table to the inspected files, by file name.
+
+    Every file needs a row and every row a file: a table written for other files would otherwise
+    leave some files with the classes read from their names and say nothing. A row with included
+    false leaves its file out of the run.
+    """
+    problems: list[str] = []
+    if not isinstance(table, list) or not all(isinstance(row, dict) for row in table):
+        return {"files": list(files), "problems": ["sample_table must be a list of rows, one per file."],
+                "excluded": []}
+    by_name = {str(item.get("file_name", "")).casefold(): item for item in files}
+    rows: dict[str, dict[str, Any]] = {}
+    for number, row in enumerate(table, start=1):
+        name = str(row.get("file_name") or "").strip()
+        if not name:
+            problems.append(f"sample_table row {number} names no file_name.")
+            continue
+        if name.casefold() in rows:
+            problems.append(f"sample_table names {name} twice.")
+            continue
+        if name.casefold() not in by_name:
+            problems.append(f"sample_table names {name}, which is not among the files at input_path.")
+            continue
+        rows[name.casefold()] = row
+    for key, item in by_name.items():
+        if key not in rows:
+            problems.append(f"sample_table has no row for {item.get('file_name')}.")
+    result: list[dict[str, Any]] = []
+    excluded: list[str] = []
+    for item in files:
+        row = rows.get(str(item.get("file_name", "")).casefold())
+        if row is None:
+            result.append(item)
+            continue
+        name = str(item.get("file_name"))
+        included = row.get("included", True)
+        if not isinstance(included, bool):
+            text = str(included).strip().casefold()
+            if text not in {"true", "false", "1", "0", "yes", "no"}:
+                problems.append(f"sample_table: included '{included}' for {name} is not true or false.")
+            included = text in {"true", "1", "yes"}
+        if not included:
+            excluded.append(name)
+            continue
+        updated = dict(item)
+        if row.get("file_type") not in (None, ""):
+            # Named exactly: the Console reads any other word as Sample, a mistyped Blank included.
+            text = str(row["file_type"]).strip()
+            file_type = next((kind for kind in SAMPLE_TABLE_FILE_TYPES if kind.casefold() == text.casefold()), None)
+            if file_type is None:
+                problems.append(f"sample_table: file_type '{row['file_type']}' for {name} is not one of "
+                                f"{', '.join(SAMPLE_TABLE_FILE_TYPES)}.")
+            else:
+                updated["file_type"] = file_type
+        if row.get("class_id") not in (None, ""):
+            class_id = str(row["class_id"]).strip()
+            if not class_id or "," in class_id:
+                problems.append(f"sample_table: class_id '{row['class_id']}' for {name} is empty or holds a comma.")
+            updated["class_id"] = class_id
+        for key in ("analytical_order", "batch_order"):
+            if row.get(key) in (None, ""):
+                continue
+            try:
+                number = float(row[key])
+            except (TypeError, ValueError):
+                number = math.nan
+            if not number.is_integer() or number < 1:
+                problems.append(f"sample_table: {key} '{row[key]}' for {name} is not a whole number from 1.")
+                continue
+            updated[key] = int(number)
+        if row.get("factor") not in (None, ""):
+            try:
+                factor = float(row["factor"])
+            except (TypeError, ValueError):
+                factor = math.nan
+            # MS-DIAL multiplies a file's concentrations by its dilution factor.
+            if not math.isfinite(factor) or factor <= 0:
+                problems.append(f"sample_table: factor '{row['factor']}' for {name} is not a positive number.")
+            else:
+                updated["factor"] = factor
+        if row.get("acquisition_type") not in (None, ""):
+            updated["acquisition_type"] = str(row["acquisition_type"]).strip()
+        result.append(updated)
+    if not result and not problems:
+        problems.append("sample_table leaves every file out of the run.")
+    orders = Counter(item.get("analytical_order") for item in result if item.get("analytical_order"))
+    for order, count in sorted(orders.items()):
+        if count > 1:
+            problems.append(f"sample_table gives analytical order {order} to {count} files.")
+    return {"files": result, "problems": problems, "excluded": excluded}
 
 
 def _apply_libraries(

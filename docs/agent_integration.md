@@ -105,6 +105,78 @@ Public repository answer seeds use `TimeBasedLinearWeightedMovingAverage` and
 automatic peak-count tuning. This smoother accounts for irregular scan
 intervals while adding a small computational cost.
 
+## Laboratory lipidomics flow
+
+1. `msdial_lipidomics_check_inputs(pos_path, neg_path)` with the folders only:
+   show the person what is there, then ask every open question in one message
+   (analysis purpose, LBM2, salt, annotation RT tolerance, internal-standard
+   libraries, `quant_utility_table.xlsx` and its amount column, analysis root,
+   `raw_location`, Console). Call it again with the answers. Nothing is written.
+   When sheet 3 contradicts the merge's reconciliation (`merge_selection_warnings`),
+   `merge_selection_accepted` is asked too: the person changes sheet 3, saves it
+   and the check runs again, or keeps it (`merge_selection_accepted=true`, recorded
+   in the contract). After the contract, changing the workbook needs a new
+   contract and new runs of both polarities.
+2. `raw_location` is asked with the sentence that MS-DIAL writes `.dcl`, `.pai2`
+   and tag files beside the raw files it reads, the one-file diagnostic included,
+   and no output setting prevents it. Whether to run on the data in place
+   (`in_place`) or on a copy (`copy`) is the person's decision; a copy is made
+   only on their word, and the check is then repeated on the copy's folders. The
+   contract records the answer.
+3. Show `paired_sample_table`; the person confirms it or corrects it by stem.
+   `msdial_lipidomics_write_contract(..., check_digest, sample_table_confirmed=true,
+   sample_table=<corrections>)` previews, and with `confirmed=true` writes
+   `<root>/inputs/`. A check filled from a workset (`filled_from_workset`) is
+   written with the same `workset_id`. A contract already at the root refuses
+   even the preview and shows `existing_contract` (the steps recorded under it,
+   and that replacing it leaves them unusable); preview again with
+   `replace_existing=true` only if the person wants it replaced.
+4. For each polarity: `msdial_guided_analysis_plan(input_path=<raw folder>,
+   answers={"lab_lipidomics_contract_path": ..., "ion_mode": ...})`, the
+   diagnostic (confirmed), `msdial_estimate_peak_height`, then the production run
+   (confirmed, with `minimum_peak_height` added). Positive and negative run one
+   after the other. The diagnostic is refused while the plan has any blocker but
+   the missing threshold (`diagnostic_blockers`). The diagnostic's estimate and
+   each start are recorded in `<root>/inputs/lab-lipidomics-record.jsonl`, and
+   each run's `guided-answers.json` keeps the contract's sha256.
+   A run whose automatic RT correction failed is reported; running it again
+   uncorrected is the person's decision, and the plan reports it as a deviation.
+   The contract fixes the parameter template, the LBM query list and the export
+   folder too; any answer it does not state is reported as a deviation, so
+   `lab_lipidomics.deviations` is empty only for a plan that is the contract's.
+5. `msdial_lipidomics_resolve_standards(contract_path, pos_job_id, neg_job_id)`:
+   read each standard's tier, its candidates and `valid_alternatives`, and the
+   classes that would be NOT QUANTIFIED to the person. Standards awaiting
+   acceptance (`needs_confirmation`: a text candidate, a search, or an LBM
+   annotation outside the internal-standard RT tolerance while another spot lies
+   inside it), and standards not found or invalid, each need their decision.
+6. `msdial_lipidomics_normalize(contract_path, job_id, resolution_digest,
+   accept_searched, accept_unresolved, accept_spot)` previews the standards table
+   and the exact command; each polarity is confirmed separately. `accept_spot`
+   takes another listed candidate for a standard (`{"LPE 18:1(d7)": 11}`). The
+   preview warns when the Console is not the build the contract recorded. Poll
+   the job with `msdial_interactive_job`; its result says whether every cell was
+   verified.
+7. `msdial_lipidomics_merge(contract_path)` previews the counts, the
+   positive/negative reconciliation (BMP from a negative PG, PE P- from a
+   negative PE O-, by name and within 0.1 min: `polarity_reconciliation`) and
+   the warnings; `confirmed=true` writes `lipid_metabolome.csv`, the three
+   statistics tables (always under metaboservice's names, which
+   `metabolomics_service.R` reads), the dotplot folders,
+   `lipid_metabolome_not_quantified.csv` and `merge-report.json` into
+   `<root>/quant/lipidome`.
+   `reconcile_polarities=false` or another `reconciliation_rt_tolerance` is
+   recorded as a deviation from the contract. The flags are JSON booleans and the
+   tolerance a JSON number; text is refused. A sheet-3 warning at this step says
+   what the lipidome counts: sheet 3 can no longer change under this contract.
+8. Report the LBM2 by name and sha256, the salt, every setting, what was assumed
+   (the workbook's sample amount, the sample table), and any step skipped. Offer
+   `msdial_save_workset(name, lab_lipidomics_contract_path=...)`.
+
+The Console must offer `MSDIALCUI normalize --peak-ids-only` and the annotation
+candidate table; the check, the plan and normalize each refuse one that does not.
+It is named per contract, never through the shared settings.
+
 ## Built-in worksets
 
 - `gcms-metabolomics`
@@ -149,8 +221,13 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 - `msdial_generate_lcms_qa`
 - `msdial_generate_publication_report`
 - `msdial_complete_guided_analysis`
-- `msdial_save_workset`
+- `msdial_save_workset` (with `lab_lipidomics_contract_path`, a laboratory lipidomics workset)
 - `msdial_interactive_create_handoff`
+- `msdial_lipidomics_check_inputs` (read-only)
+- `msdial_lipidomics_write_contract` (preview by default; writing requires `confirmed=true`)
+- `msdial_lipidomics_resolve_standards` (read-only)
+- `msdial_lipidomics_normalize` (preview by default; the Console starts only with `confirmed=true`)
+- `msdial_lipidomics_merge` (preview by default; writing requires `confirmed=true`)
 
 Run completion, mzTab-M validation/preview, LC-MS QA, publication generation,
 and handoff should receive the exact `job_id` returned by the production run.
@@ -182,6 +259,11 @@ not a standalone Console command.
 - `POST /api/agent/tuning/run`
 - `POST /api/agent/tuning/estimate`
 - `GET|POST /api/agent/handoff`
+- `POST /api/lipidomics/check`
+- `POST /api/lipidomics/write-contract`
+- `POST /api/lipidomics/resolve`
+- `POST /api/lipidomics/normalize`
+- `POST /api/lipidomics/merge`
 
 ## Test prompts
 

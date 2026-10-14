@@ -1,0 +1,1466 @@
+{
+ "schema": "msdial-interactive.metaboservice-golden.v1",
+ "source": "inhouse_programs/metaboservice/metaboservice.exe (February 2024), IntegratePosNegResults run in a 32-bit process on data2/NormalizedHeight_Pos.txt (input 1) and NormalizedHeight_Neg.txt (input 2) with inhouse_programs/metaboservice/targetadduct.txt, 2026-10-14",
+ "inputs_sha256": {
+  "NormalizedHeight_Pos.txt": "12f5d515dda9209f4eea2dac55a52ec015ed1d36af928aa284c723462106e323",
+  "NormalizedHeight_Neg.txt": "41a978af505eb4d394e684c19539e90cef41709b1882238cee991a4277a24784"
+ },
+ "rules_sha256": "82934f7d79880df139ec85298f8f10d745f2465b492ba58afa7e989198e65e2c",
+ "known_difference": {
+  "value": {
+   "metaboservice_x86": "-0.0479667909938784",
+   "interactive": "-0.0479667909938783"
+  },
+  "lines": {
+   "lipid_metabolome4summaryplot.csv": 95,
+   "Summary_Dotplots/Glycerophospholipids.csv": 26
+  },
+  "why": "log10 of the mean of PE O-16:1_22:6 (alignment 1045) printed to 15 significant digits; the 32-bit .NET Framework rounds this value up, the exact half-up rounding (64-bit .NET Framework) does not"
+ },
+ "files": {
+  "category_FattyAcyls/CAR.csv": {
+   "bytes": 183,
+   "sha256": "c4db0e10a3f2b27f8e62809e28b9c8214596d29bdef3c468fe92990367c2e976"
+  },
+  "category_FattyAcyls/FA.csv": {
+   "bytes": 171,
+   "sha256": "7bb5c4a6105dbdb16e5361ca046ceacd47d358c727e80f586eb4f489369f4d7a"
+  },
+  "category_FattyAcyls/NAE.csv": {
+   "bytes": 189,
+   "sha256": "95d94ec48434dffc5f1dc81875737e9b2e97dc77a504a8f0f36df8265a3f62cc"
+  },
+  "category_FattyAcyls/OxFA.csv": {
+   "bytes": 189,
+   "sha256": "7b7a85453945c7107e7aff1a5799992067a427512c8f68ef50552dbb89b1ee45"
+  },
+  "category_Glycerolipids/DG.csv": {
+   "bytes": 171,
+   "sha256": "3fed25bc2f7af2835432fb4eaa718eb115f04268f82d9dcfe114358e6341d342"
+  },
+  "category_Glycerolipids/DGGA.csv": {
+   "bytes": 187,
+   "sha256": "93250d7e0ac29eacc3ee54cd296cdebc3fd2f8e90d08bdba21baddbfc60aab78"
+  },
+  "category_Glycerolipids/EtherTG.csv": {
+   "bytes": 207,
+   "sha256": "2b5796c8a5bf8d6793d3ca0e1033bf5605bb75cc5c7aa3406cc08920be77f00b"
+  },
+  "category_Glycerolipids/MG.csv": {
+   "bytes": 170,
+   "sha256": "40c48e6e47d776ef24821f9001e9b14026e1b96a05d9650df8ea4c75c1bc8916"
+  },
+  "category_Glycerolipids/MGDG.csv": {
+   "bytes": 189,
+   "sha256": "1ebe131b9c7a52ba80f239cdc768185aadd6ef2bd69d9ced981a5d89226de6e9"
+  },
+  "category_Glycerolipids/OxTG.csv": {
+   "bytes": 189,
+   "sha256": "681e64d8841d40f19626909362da09ea85a61930d27a5afb2ec9df196582da6c"
+  },
+  "category_Glycerolipids/TG.csv": {
+   "bytes": 170,
+   "sha256": "dc6f4722f39f116aefee3beeb2fc164dc52f8ce3b9114a7f994d6208176d7549"
+  },
+  "category_Glycerophospholipids/EtherLPC.csv": {
+   "bytes": 213,
+   "sha256": "95cf505c75d115bf1c82a7101d64629ab0a95f03a337d172d5a34d12ad05646c"
+  },
+  "category_Glycerophospholipids/EtherPC.csv": {
+   "bytes": 199,
+   "sha256": "d7a9ad17a8c56592a9ea0afce44704e6390307f2d9fce0c0ed569c7917afdf38"
+  },
+  "category_Glycerophospholipids/EtherPE.csv": {
+   "bytes": 201,
+   "sha256": "c784842dcf993325fe83d2948250ed946dda1646f8ec46144fac7da181024f0e"
+  },
+  "category_Glycerophospholipids/LPA.csv": {
+   "bytes": 179,
+   "sha256": "62a6e4915783305773c5ffa07c0e209981bc927c7f3ce0c8ac0737a811ba1701"
+  },
+  "category_Glycerophospholipids/LPC.csv": {
+   "bytes": 175,
+   "sha256": "0cabb7cc54adb47f40e297b2b3ff5aec8da755ab6b0a55c17cc5966f23431705"
+  },
+  "category_Glycerophospholipids/LPE.csv": {
+   "bytes": 177,
+   "sha256": "7849847b6e1567a28c5513a984011b9ea9714bcda51eab6ed25588ab0097059d"
+  },
+  "category_Glycerophospholipids/LPI.csv": {
+   "bytes": 182,
+   "sha256": "a6b5718cf0bbe168a8d6efa4ecd0fe7805def8aff9ec841b94dc3181395009c7"
+  },
+  "category_Glycerophospholipids/PC.csv": {
+   "bytes": 168,
+   "sha256": "1cd8cfb4d86789453379695cb8eb536fca4b46bd506f9fb14d76d7eea93fcbee"
+  },
+  "category_Glycerophospholipids/PE.csv": {
+   "bytes": 169,
+   "sha256": "60e358f00453499abe6e13669635257f816a5aad6f68c7276f4a83c4770b23b8"
+  },
+  "category_Glycerophospholipids/PG.csv": {
+   "bytes": 177,
+   "sha256": "aa936292a2e5fc183bb5ea46839a207f6f30988af714370d61095ab00d6bb620"
+  },
+  "category_Glycerophospholipids/PI.csv": {
+   "bytes": 170,
+   "sha256": "752ce3ca16323b6700dc313e42ddc11772961e95eb369708671d66f28f7bb97f"
+  },
+  "category_Glycerophospholipids/PS.csv": {
+   "bytes": 178,
+   "sha256": "9944e84adbf243120f5d52e2f9762662b3fe49a03abc15217fefadc13c1a843e"
+  },
+  "category_Sphingolipids/ASM.csv": {
+   "bytes": 188,
+   "sha256": "3319c6c33665de4925ed77a70e1a235feb599b73a4ffb24b1c677202c73c034c"
+  },
+  "category_Sphingolipids/Cer_NP.csv": {
+   "bytes": 203,
+   "sha256": "844baf641b01c4cea9813c546798354f670ba3784c9d3f6693ea5e8176e81d8e"
+  },
+  "category_Sphingolipids/Cer_NS.csv": {
+   "bytes": 201,
+   "sha256": "cc041ac05f233f2ee1f9af5528be03a5e81ece89d46624f5f1f987150505dc42"
+  },
+  "category_Sphingolipids/HexCer_NS.csv": {
+   "bytes": 216,
+   "sha256": "5553f0191550c3200df8ab218afa8eee39d986dead344c31aae9b7cd755e6a7e"
+  },
+  "category_Sphingolipids/SL.csv": {
+   "bytes": 167,
+   "sha256": "aea9fb347991e8e70c51b1c11156725f2e0a60d046d4292c60ec121d17928754"
+  },
+  "category_Sphingolipids/SM.csv": {
+   "bytes": 170,
+   "sha256": "7f0b1457820ed634d7ac91759a2242fdd3ba4dc5d2d887099b508a29900cb6a6"
+  },
+  "category_SterolLipids/BileAcid.csv": {
+   "bytes": 215,
+   "sha256": "c2d31ef47df4bbaf3f06d1d1541b1fbc966850d20f0a4e12d4c71cecc661c8e2"
+  },
+  "category_SterolLipids/BRSE.csv": {
+   "bytes": 189,
+   "sha256": "66dfdd98e32b5a5c3fe63675f4154b32503a85b89306ca96a8c0f288e352d773"
+  },
+  "category_SterolLipids/CASE.csv": {
+   "bytes": 183,
+   "sha256": "3e09dd354459ea1ef85cf99d1e49ad21cd7072bda31599047cb3e0a49bebc376"
+  },
+  "category_SterolLipids/CE.csv": {
+   "bytes": 171,
+   "sha256": "a8585e9460d93ba62241fc472d1ae30f93f0c5df214150f25fbd570a54e4fbb5"
+  },
+  "category_SterolLipids/SISE.csv": {
+   "bytes": 186,
+   "sha256": "12c7205b988477d06aa2fa24cbc5ff9b509a696e33cffc1b830e16478e2acf37"
+  },
+  "category_SterolLipids/SSulfate.csv": {
+   "bytes": 207,
+   "sha256": "7d5dd03427217ab8b740efb5e447575306dbe21cab54cf9ffa6ecd5f6dfe2e07"
+  },
+  "category_SterolLipids/ST.csv": {
+   "bytes": 175,
+   "sha256": "6f59cf5188d279b2d241fe6cb7c5854e3547e1419ab437988676f683b0cfe9b2"
+  },
+  "lipid_metabolome.csv": {
+   "bytes": 608970,
+   "sha256": "47a76ecc73748ef12bbf1ff6c3af8279e157b9e27a91acaa56be995d633a1d1e"
+  },
+  "lipid_metabolome4classsummary.csv": {
+   "bytes": 4031,
+   "sha256": "05b59b2b67caf28ff15c75c75d3167847634bb65aefa4b6279cbedf6f6161b25"
+  },
+  "lipid_metabolome4stat.csv": {
+   "bytes": 47140,
+   "sha256": "5593cd26e44f6f30f5d16d1b434a75cb317160d92756183e42fa735e22f66637"
+  },
+  "lipid_metabolome4summaryplot.csv": {
+   "bytes": 17156,
+   "sha256": "1477ccb20dcb08e72e5c4052c08b1ac954e997f76889e68e9d2fe49e63468c84"
+  },
+  "subclass_ASM/SM 40_4;O2_1851.csv": {
+   "bytes": 260,
+   "sha256": "6c5f1a745a2eb41c8063b9f18fda5630cdff66f8333b39b4dd613a6c2a3acacc"
+  },
+  "subclass_BileAcid/BA 24_1;O4;T_612.csv": {
+   "bytes": 263,
+   "sha256": "e070df07853dfa6035c17070d3dbd0b6f4b228c3d0ee2cb5514a4815610c92f7"
+  },
+  "subclass_BRSE/SE 28_2_16_1_1280.csv": {
+   "bytes": 267,
+   "sha256": "32a38b637d4db3a5647c60494fd55a357a1123930957907de67f7485445b2562"
+  },
+  "subclass_BRSE/SE 28_2_19_0_1425.csv": {
+   "bytes": 268,
+   "sha256": "02b436ff91109c72eb8440d323cabae34a9d65490acb65ff9bbce5df38bef24f"
+  },
+  "subclass_CAR/CAR 16_0_556.csv": {
+   "bytes": 243,
+   "sha256": "80926ea40c933bdc1537561274a3e962b8effdfd41c61f6e802f9cb25dac2d3f"
+  },
+  "subclass_CAR/CAR 18_1_616.csv": {
+   "bytes": 241,
+   "sha256": "3013ac31e8d519373f5f19f03d485139b9c0079e6e42a962cc3fa5d3dd7c9392"
+  },
+  "subclass_CASE/SE 28_1_16_0_1287.csv": {
+   "bytes": 266,
+   "sha256": "4bcc36a6adeb3bb3febf7d8581fd47b438181968371354cb811c2acecc9efd20"
+  },
+  "subclass_CASE/SE 28_1_18_1_1388.csv": {
+   "bytes": 267,
+   "sha256": "d6769b10008551fae47f184635bb4769de0f7c5bf670d9b04cf735e8989406e8"
+  },
+  "subclass_CASE/SE 28_1_18_2_1379.csv": {
+   "bytes": 264,
+   "sha256": "faa31312cd11f3273abe76ea8376f7907424fb246bf956d5d3c685757e7da1bb"
+  },
+  "subclass_CASE/SE 28_1_20_3_1456.csv": {
+   "bytes": 270,
+   "sha256": "a04065bea4c74a0cf85f60505566bebcd50b6eb88e7f399a4017eb2e8b097ddc"
+  },
+  "subclass_CASE/SE 28_1_20_5_1440.csv": {
+   "bytes": 266,
+   "sha256": "22468320b5675221f96fee481bbc02d2cf0f79ad47a30907908f26f4563f8050"
+  },
+  "subclass_CE/CE 14_1_1153.csv": {
+   "bytes": 238,
+   "sha256": "0317d3e474d7462a2a484c1bd826826f304260a6f79b6d674e80d13c96ecdd6a"
+  },
+  "subclass_CE/CE 15_0_1194.csv": {
+   "bytes": 236,
+   "sha256": "ded523c6ccdcceb22dd29efb6d6ad0e64b86bbdeaa714e40842edbda6dbb4681"
+  },
+  "subclass_CE/CE 15_2_1186.csv": {
+   "bytes": 237,
+   "sha256": "ba672bb4bd0f21d11b5644c099f760a8f114d763d8120a328252a71a0a8a0220"
+  },
+  "subclass_CE/CE 16_0_1248.csv": {
+   "bytes": 231,
+   "sha256": "de78a459d231fa53cac5910f3fad3b7ba4b66ecbbae83c16d5288e9541067244"
+  },
+  "subclass_CE/CE 16_1_1241.csv": {
+   "bytes": 230,
+   "sha256": "6dd33ee4bc0337ba26b95ee94682b7b3f2e76dc3558149231e2e99ba4e555f2f"
+  },
+  "subclass_CE/CE 16_2_1235.csv": {
+   "bytes": 235,
+   "sha256": "9a4b9fdfeb7f5a8d548fc6fd873f8c596d71e789328f8677b415cb4e646b748b"
+  },
+  "subclass_CE/CE 16_3_1220.csv": {
+   "bytes": 236,
+   "sha256": "1086ee1cd8e970cf060dff2bbecacb17da386869cc1193a82b5308605820992b"
+  },
+  "subclass_CE/CE 17_1_1284.csv": {
+   "bytes": 230,
+   "sha256": "d2cca35c666ad288c21aab83145aa3c4a1321bed01335317e4a3207faf9d85f2"
+  },
+  "subclass_CE/CE 18_0_1332.csv": {
+   "bytes": 232,
+   "sha256": "d2434f664ad4e06c81022fcd573f3e0c77951ae18eecfcd50d17a646446b75a1"
+  },
+  "subclass_CE/CE 18_1_1327.csv": {
+   "bytes": 228,
+   "sha256": "3a2c545136fb017def3ca3775b428c90b5ed41caeaa2010cd0344f9a5b90a1cb"
+  },
+  "subclass_CE/CE 18_2_1322.csv": {
+   "bytes": 230,
+   "sha256": "65aba112611eab0cbfe41a8937d489473a00e0dea7c31fbf295838663356b9d8"
+  },
+  "subclass_CE/CE 18_3_1312.csv": {
+   "bytes": 229,
+   "sha256": "1af00194fbb2764b8a41b0192680747a5474581e7784d215d11cea8c66d02e8e"
+  },
+  "subclass_CE/CE 18_4_1306.csv": {
+   "bytes": 237,
+   "sha256": "1fb3319bd6d3980ec6df90d0aee046fe1f0fd38bcea72728941c419e5fb3d232"
+  },
+  "subclass_CE/CE 19_2_1378.csv": {
+   "bytes": 230,
+   "sha256": "a2a7941e9b6611cb83084dada1277ea6a61bf63f1e2fe5e86f31b6f75df84540"
+  },
+  "subclass_CE/CE 19_3_1369.csv": {
+   "bytes": 229,
+   "sha256": "cb8160346f16721bb3de86f5dfb3e43a69ae3c422c8aca65c3f5c519f60052da"
+  },
+  "subclass_CE/CE 19_4_1364.csv": {
+   "bytes": 236,
+   "sha256": "05a497e7faee944135538d519eb44ba40583d989514c1c45be0acb33cd4a28e8"
+  },
+  "subclass_CE/CE 20_1_1426.csv": {
+   "bytes": 237,
+   "sha256": "8b917e7a27e1de014b0314b9b54b97085886b8789263314ae619f478f19731fd"
+  },
+  "subclass_CE/CE 20_3_1410.csv": {
+   "bytes": 228,
+   "sha256": "eff6a4465510fe7ba44eede36ed86cee1482cc566a127e1b2fd0cb94f364c320"
+  },
+  "subclass_CE/CE 20_4_1408.csv": {
+   "bytes": 230,
+   "sha256": "24a50d1edaeab9e0b236ce95f0cafe0f78ad16b22a77660ac5faeef0c4894436"
+  },
+  "subclass_CE/CE 20_5_1401.csv": {
+   "bytes": 229,
+   "sha256": "079f45410410b89c4d03773aefbb4f6a5f1cc48393e7dad93d88f4362c7c398e"
+  },
+  "subclass_CE/CE 21_5_1441.csv": {
+   "bytes": 230,
+   "sha256": "49d20ce6977a5d0fa81b91a7f2e0ddd72d79cff61108577cf8a092ed4abb343f"
+  },
+  "subclass_CE/CE 22_1_1510.csv": {
+   "bytes": 242,
+   "sha256": "45020d28b3c2aca00e977323636f514cfeaae09fde2514960d7ce00d709b5fea"
+  },
+  "subclass_CE/CE 22_6_1474.csv": {
+   "bytes": 230,
+   "sha256": "bf596fb1a9d1ab5e63fecf98f9f1691ea97d52f43b6bee30f408b82c97260598"
+  },
+  "subclass_Cer_NP/Cer 18_0;O3_24_0_1010.csv": {
+   "bytes": 293,
+   "sha256": "c7c0271fb6c086a44102fdae80889734d559e1672f9f67698f965d99c803cb8d"
+  },
+  "subclass_Cer_NS/Cer 18_1;O2_22_0_927.csv": {
+   "bytes": 284,
+   "sha256": "7383f2d4fb6bf817ee9c709a7eb8ba68815b8414f270b36017da449ab5e29f2a"
+  },
+  "subclass_Cer_NS/Cer 18_1;O2_23_0_961.csv": {
+   "bytes": 289,
+   "sha256": "39c86329db45506e1b0af652d6ab5c2723a1e73f34e6d7cb7c0d57749a446edb"
+  },
+  "subclass_Cer_NS/Cer 18_1;O2_24_0_974.csv": {
+   "bytes": 285,
+   "sha256": "c0ce90512eeed5c3a20ccd47a2c7da3a09506551bea2bd21cbd080dd6c8b8d47"
+  },
+  "subclass_Cer_NS/Cer 18_2;O2_24_0_972.csv": {
+   "bytes": 284,
+   "sha256": "5b82f62052cb6b591bbf15c6798dd37ea93234013d5397749f7d141174655301"
+  },
+  "subclass_DG/DG 15_0_15_0_990.csv": {
+   "bytes": 267,
+   "sha256": "8810a988e32da3dc18b644666a83882ee151a4196ec1113e2177ddac5dcd8259"
+  },
+  "subclass_DG/DG 16_0_16_0_1062.csv": {
+   "bytes": 270,
+   "sha256": "ee7af00aaed8eb95184634b6f5766311f10e6109f7edc301b3261c90fb5df2d7"
+  },
+  "subclass_DG/DG 16_0_16_1_1060.csv": {
+   "bytes": 268,
+   "sha256": "1d2e0b8e52f45e0cb1c9c58c8e90810dc69fbb0bebcd3b4045a62b0414163eba"
+  },
+  "subclass_DG/DG 16_0_18_0_1158.csv": {
+   "bytes": 266,
+   "sha256": "dc1335ab35cdf0dd49aea074bd56ad01f1a7edd77ad73b610c847af61e698ca8"
+  },
+  "subclass_DG/DG 16_0_18_1_1152.csv": {
+   "bytes": 266,
+   "sha256": "4fd95e9950b7bd1e83efb68d17c35702a5dad9451794893d5b5969049c300f09"
+  },
+  "subclass_DG/DG 16_0_18_2_1144.csv": {
+   "bytes": 267,
+   "sha256": "b32629efffc57c51dae1c8411cb8c2bdcbe1509f14dc10d71247dfff88e0166a"
+  },
+  "subclass_DG/DG 16_1_16_1_1057.csv": {
+   "bytes": 272,
+   "sha256": "557c70616a671ef459368042dcc871e46f7c8af6db49b08effe7bcae9cb1f122"
+  },
+  "subclass_DG/DG 16_1_18_2_1130.csv": {
+   "bytes": 270,
+   "sha256": "28cf88191df8aeec3cf173c568c033ed5e80d19ae3018de1c5ab94b4972ef10f"
+  },
+  "subclass_DG/DG 18_0_18_0_1247.csv": {
+   "bytes": 266,
+   "sha256": "e77456e5b67c2fee45a1bfe505932f0a2d1b70fc09c84ef8b4623d62f42374ef"
+  },
+  "subclass_DG/DG 18_0_18_1_1240.csv": {
+   "bytes": 265,
+   "sha256": "a836642373dc181956a89bed12f9ed7dc36ac5dca66cb068f6e016ec5c731418"
+  },
+  "subclass_DG/DG 18_1_18_1_1234.csv": {
+   "bytes": 266,
+   "sha256": "7ef09684ff10c206da9a36855078015fa8f31892852d68bf45ddf8c7a0ed2f53"
+  },
+  "subclass_DG/DG 18_1_18_2_1219.csv": {
+   "bytes": 266,
+   "sha256": "667fb11bc794717713bec674d43cd0d43beafac94e8509a4e74b6f3e2b41be4d"
+  },
+  "subclass_DG/DG 18_1_20_1_1321.csv": {
+   "bytes": 266,
+   "sha256": "e9cd88b9a615afc8ba715ba72eded666616f6fce9b12718595d15e5c98cb5662"
+  },
+  "subclass_DG/DG 18_1_20_4_1303.csv": {
+   "bytes": 269,
+   "sha256": "68d03d0d881aafb89d45b637f03a326957219e2fb8e4301ab4074823d90662c1"
+  },
+  "subclass_DG/DG 18_2_18_2_1210.csv": {
+   "bytes": 269,
+   "sha256": "1e9ec7f28e80992a51a02e9bdb886714870c0f38747aff854f83cb115b63d829"
+  },
+  "subclass_DG/DG 18_2_18_3_1204.csv": {
+   "bytes": 271,
+   "sha256": "4dbc3f810c3ab8a3f35ade327ef67f9031d0a2846b72e291708dfeeaa5e8e523"
+  },
+  "subclass_DGGA/DGGA 18_1_20_1_1194.csv": {
+   "bytes": 279,
+   "sha256": "2c640dc568bcd3a63b9240953dc0fb7ce3c906808ed071b376e22c8c71aaa4ea"
+  },
+  "subclass_DGGA/DGGA 20_3_20_4_1235.csv": {
+   "bytes": 277,
+   "sha256": "66b04956da18b95f66224378ebd453f6960774d2d1bb8e7fb9d6b38b258ed4f1"
+  },
+  "subclass_DGGA/DGGA 22_5_22_5_1365.csv": {
+   "bytes": 279,
+   "sha256": "41e8b201c7a6a6d554753e579c24917878d8c6b6174ef83dd8a7052e4e839632"
+  },
+  "subclass_EtherLPC/LPC O-16_0_749.csv": {
+   "bytes": 249,
+   "sha256": "aed965f9a36eb5ae51fea9e2d3a8a83b74a2de488ae7fd13ab4545634b46c650"
+  },
+  "subclass_EtherLPC/LPC O-16_2_738.csv": {
+   "bytes": 252,
+   "sha256": "6a2d2a1bd9beece68a48314d0cac94bc270072668c8e645f37f8a40258f13c48"
+  },
+  "subclass_EtherLPC/LPC O-18_1_811.csv": {
+   "bytes": 254,
+   "sha256": "ace1a04370df721bd5281bad86c4c44279c36f41c3ff6e6352c047f8997b9d68"
+  },
+  "subclass_EtherPC/PC O-16_0_16_0_1104.csv": {
+   "bytes": 279,
+   "sha256": "10ad5d02388b94e70313514ded89026c48fb52ad12e17b1e0e311fe5ba6bfd77"
+  },
+  "subclass_EtherPC/PC O-16_0_18_2_1143.csv": {
+   "bytes": 278,
+   "sha256": "24c8dff826a9121b3eafec47c5eae69b1567c1753d1edbad231187a87989df65"
+  },
+  "subclass_EtherPC/PC O-16_0_20_4_1199.csv": {
+   "bytes": 278,
+   "sha256": "201916da2efa5029fd0f3d793b99095b3fee105becd7185b3569c64c198eb4f1"
+  },
+  "subclass_EtherPC/PC O-16_0_22_6_1264.csv": {
+   "bytes": 279,
+   "sha256": "6509d67154799f42bceb46ddb4103d2e6f8c282607dd268ed6822f20922aa574"
+  },
+  "subclass_EtherPC/PC O-16_1_18_2_1137.csv": {
+   "bytes": 279,
+   "sha256": "8ed4f70b1007381c2e79fbdb94ca20e4dfe1cbfcf6d5bb25b00707aa7955fe4e"
+  },
+  "subclass_EtherPC/PC O-16_1_20_4_1196.csv": {
+   "bytes": 278,
+   "sha256": "64d33e4a5c509fa0c9c1fefc6b87c2e54ff664518804e650f6813e7ecdf4c3fb"
+  },
+  "subclass_EtherPC/PC O-16_1_22_6_1258.csv": {
+   "bytes": 279,
+   "sha256": "58c7293e074946ccab4a67fdeabc5b4a4bb69c884efca617d29f75711f83cd9c"
+  },
+  "subclass_EtherPC/PC O-18_1_16_0_1149.csv": {
+   "bytes": 279,
+   "sha256": "29054681e8c01753c59aeb517078e7ea9f41c8877ff9c72c37695f6a124da6c1"
+  },
+  "subclass_EtherPC/PC O-18_1_20_4_1269.csv": {
+   "bytes": 279,
+   "sha256": "c6701a98b5defcf31acee925c30a53651ad4c7dce8d3ae7b93cc240e7558239f"
+  },
+  "subclass_EtherPC/PC O-18_1_22_6_1330.csv": {
+   "bytes": 278,
+   "sha256": "5dadc9f14887b18c34a2068e3148d24f887afb887a3e8aae487752aff96fd44b"
+  },
+  "subclass_EtherPC/PC O-22_6_21_4_1409.csv": {
+   "bytes": 279,
+   "sha256": "4ac8308b8648ddd53a9bd7e638648076f564500f8a31cd83012971f8347279c0"
+  },
+  "subclass_EtherPE/PE O-16_0_20_4_1004.csv": {
+   "bytes": 282,
+   "sha256": "a9e058e7dd00b6039fe98745a5d4bc98a6c594b39121ebaa688d2395fb7d444e"
+  },
+  "subclass_EtherPE/PE O-16_0_22_6_1050.csv": {
+   "bytes": 279,
+   "sha256": "7d81b99a34f58782e571428491e6c65d5af202c6c9ef838eec066d0d3a68f35d"
+  },
+  "subclass_EtherPE/PE O-16_1_18_2_965.csv": {
+   "bytes": 274,
+   "sha256": "11865d42b9e161ff34b174d35416f46281befc2aa136563a41d39ea169313abe"
+  },
+  "subclass_EtherPE/PE O-16_1_20_4_1002.csv": {
+   "bytes": 277,
+   "sha256": "5539fbeea756244160c6ed4919df6c32610665cf52d23039d895c2ce1c019a35"
+  },
+  "subclass_EtherPE/PE O-16_1_22_6_1045.csv": {
+   "bytes": 277,
+   "sha256": "8afbe9f909d638320765b2b5a243a1f09868e136a19b79e71a85b3ba0f5bbd1a"
+  },
+  "subclass_EtherPE/PE O-18_0_18_2_1012.csv": {
+   "bytes": 279,
+   "sha256": "ce7fcf6e4827aeadd73a3ec63ac2a80015b6ad0283ef310c99c43898d72f356c"
+  },
+  "subclass_EtherPE/PE O-18_0_20_4_1057.csv": {
+   "bytes": 279,
+   "sha256": "251574cd773511607dc8b9522c497c31e8b9d4c8f363daa5b3504e1f5eb410df"
+  },
+  "subclass_EtherPE/PE O-18_0_22_6_1099.csv": {
+   "bytes": 276,
+   "sha256": "fa56266e2df4b41bf5e705d385d4fd260bba3f099e140188a88e11e4d21cc9a5"
+  },
+  "subclass_EtherPE/PE O-18_1_18_2_1009.csv": {
+   "bytes": 278,
+   "sha256": "4a85c874ff906df0045cc7f3b01a7274802111344c361f17f5550611a00d62ff"
+  },
+  "subclass_EtherPE/PE O-18_1_20_4_1053.csv": {
+   "bytes": 279,
+   "sha256": "8713b02878532c72b9579ae3f09b850f89711278df6ca0f9397d427b79bb1eba"
+  },
+  "subclass_EtherPE/PE O-18_1_22_6_1094.csv": {
+   "bytes": 279,
+   "sha256": "bb7497a30db06daf88878f59862e000df1444dc0452c745617cb623fd6e32368"
+  },
+  "subclass_EtherPE/PE O-20_0_18_1_1069.csv": {
+   "bytes": 280,
+   "sha256": "94b967b0edc78e17032ec77762e2d1430693786e9e99156b3a2e6f3df2973742"
+  },
+  "subclass_EtherPE/PE O-20_0_18_2_1065.csv": {
+   "bytes": 281,
+   "sha256": "2e85a14997872739ebde1f487ca7b7e1bea077dfe506e9559f3d47669332e9d4"
+  },
+  "subclass_EtherPE/PE O-20_0_20_4_1106.csv": {
+   "bytes": 279,
+   "sha256": "d0cc1beab670b8f44b2c69337466b872a4f5f4ee8e9137d5f6e90e3634f9df49"
+  },
+  "subclass_EtherPE/PE O-20_0_22_6_1147.csv": {
+   "bytes": 283,
+   "sha256": "32bda277e435d803fea25cc5de9147c7a6148af06ebde55931f009cd30d7b72e"
+  },
+  "subclass_EtherPE/PE O-20_0_22_6_1148.csv": {
+   "bytes": 281,
+   "sha256": "52881eb49e76b7e516d9cfa9f14ddac117d1549863d2818f095f3ebad042849a"
+  },
+  "subclass_EtherPE/PE O-20_1_20_4_1103.csv": {
+   "bytes": 283,
+   "sha256": "ac348a88786d849e4a04ff743ddde78ff1d360966bc826c37f6594138014d3a1"
+  },
+  "subclass_EtherPE/PE O-20_1_22_6_1141.csv": {
+   "bytes": 283,
+   "sha256": "cd3a9a7453285e5e8effe2418633d58da4bc9a2a6b90ebc6da64a0d803bd7df7"
+  },
+  "subclass_EtherPE/PE O-20_1_22_6_1142.csv": {
+   "bytes": 281,
+   "sha256": "f69e74c9e940ad63bb6d5ffb7ffb520163e47d97b3edae34f69d9baa822bc974"
+  },
+  "subclass_EtherTG/TG O-16_0_16_0_18_1_2051.csv": {
+   "bytes": 313,
+   "sha256": "7cb42d32f0de4be8e867fc26812c4eba7eed1f76392db71ee22307dee01dce1c"
+  },
+  "subclass_EtherTG/TG O-16_0_16_0_18_2_2042.csv": {
+   "bytes": 315,
+   "sha256": "5ea61137682f0ff67a887ee50a9ce7c52dcef12a3895a9fad4c889b840ec7a12"
+  },
+  "subclass_EtherTG/TG O-16_0_18_1_18_2_2135.csv": {
+   "bytes": 312,
+   "sha256": "73a9eb42ef2a13a6c483ad211c67d5e1168886e6970e1ac9df8098ea70e1d377"
+  },
+  "subclass_EtherTG/TG O-18_0_14_0_18_0_2058.csv": {
+   "bytes": 315,
+   "sha256": "c3ab79f1d128800f618570f3e6c979620ed8862defcd8c1426a46716c642a3b3"
+  },
+  "subclass_EtherTG/TG O-18_0_16_0_18_0_2158.csv": {
+   "bytes": 313,
+   "sha256": "b8e12b9fc43dfe0dfde284cfa433dc613e7a938f867bc27fef56a1ba60c2dc11"
+  },
+  "subclass_EtherTG/TG O-18_0_16_0_18_1_2149.csv": {
+   "bytes": 315,
+   "sha256": "31833111d486a684439a0a5fb2c544394010bb83ab1c75c091ce72ff02ce9249"
+  },
+  "subclass_EtherTG/TG O-18_0_16_0_18_2_2141.csv": {
+   "bytes": 314,
+   "sha256": "5141c3526e4a581d778bde28ae4cf0e198ece1509025f7aacd28b9aad548d4a0"
+  },
+  "subclass_EtherTG/TG O-18_0_18_1_18_2_2241.csv": {
+   "bytes": 314,
+   "sha256": "fcf6e9cdea85342b14c0313480f3ece3d57d50a1e6675d2549d06c3b1600b31b"
+  },
+  "subclass_EtherTG/TG O-20_0_16_0_18_1_2258.csv": {
+   "bytes": 314,
+   "sha256": "b1518b4aea565ec931edab7b483a7a930bd7a4f6f9d034fb7b601fcce52343a2"
+  },
+  "subclass_EtherTG/TG O-20_0_16_0_18_2_2250.csv": {
+   "bytes": 313,
+   "sha256": "f5abe9519d9b4200dc4a98065a35d64d31948f4a1b1343274ffbd5ce792c653c"
+  },
+  "subclass_EtherTG/TG O-20_0_18_1_18_2_2353.csv": {
+   "bytes": 312,
+   "sha256": "4f72a6e519b8fbf9ad4f0fbd6216832a207dc43a40344c99bc91e2fa0ee48dab"
+  },
+  "subclass_FA/FA 15_0_216.csv": {
+   "bytes": 231,
+   "sha256": "ded4d8e846b528962614140b153b6c8ed6dc9e12a36769ff83e152762527eb37"
+  },
+  "subclass_FA/FA 15_2_201.csv": {
+   "bytes": 230,
+   "sha256": "e3e74a9beefc0bd8dea80a8b7e818795b9231e8438d0a5167bf534b5d9477655"
+  },
+  "subclass_FA/FA 16_0_234.csv": {
+   "bytes": 223,
+   "sha256": "6129bea768cb568a0a27ab6b32d8c7e87c6770dca7f6c8cf8555d68c5f000af8"
+  },
+  "subclass_FA/FA 16_1_231.csv": {
+   "bytes": 225,
+   "sha256": "0560115b3db1934a7bd34992028be856ad3b578709c2e370791d35b1230756ad"
+  },
+  "subclass_FA/FA 17_0_245.csv": {
+   "bytes": 224,
+   "sha256": "4040bb729e22aa4917e222ba1c5fe6757f3a1858738e232fc8b496a4e238791c"
+  },
+  "subclass_FA/FA 17_1_244.csv": {
+   "bytes": 231,
+   "sha256": "3f23c79439c583890c71662dd1593bd29b05aad15be530ab70e6cb87a0c336bf"
+  },
+  "subclass_FA/FA 18_0_262.csv": {
+   "bytes": 225,
+   "sha256": "6114766150545fdcad6306a723975a48de8398bf6e91e501260dd10312d12e6f"
+  },
+  "subclass_FA/FA 18_1_258.csv": {
+   "bytes": 224,
+   "sha256": "fca82684ee1742a8f4ab669c1e7d93208a54cba814cea4d990d1229da5c8a112"
+  },
+  "subclass_FA/FA 18_2_254.csv": {
+   "bytes": 225,
+   "sha256": "748fc1e47b90cef8ef9e4e03aec586b7976bec70c5c5a72d19f22714b0de7990"
+  },
+  "subclass_FA/FA 18_3_250.csv": {
+   "bytes": 227,
+   "sha256": "5f68a4eca310f10dcdc5007491870de7bb408b51d5289a5b9206d86a6e6a9341"
+  },
+  "subclass_FA/FA 19_1_277.csv": {
+   "bytes": 237,
+   "sha256": "84e111a222e9f76581c2ca62f8fcd24c99e16d5e95768a0ff7b5b756990babe0"
+  },
+  "subclass_FA/FA 20_1_296.csv": {
+   "bytes": 231,
+   "sha256": "7aef127114aa5abdfa9bc3eb70b39bae390b471bbed0df37fd4d86ffd72dfc61"
+  },
+  "subclass_FA/FA 20_2_294.csv": {
+   "bytes": 231,
+   "sha256": "de7b297108a60c08a9bc6b996000a37b2696b740bda1ff80e8edff127ae439b8"
+  },
+  "subclass_FA/FA 20_4_291.csv": {
+   "bytes": 224,
+   "sha256": "8edfef5a715df7fb962ce3869e28ed047c904eff43863dad8b5025159ce0926c"
+  },
+  "subclass_FA/FA 22_0_330.csv": {
+   "bytes": 231,
+   "sha256": "c95ce234321d1eb35fb09a93c33273d0196d25db839eb2b437f19579e70f58a6"
+  },
+  "subclass_FA/FA 22_1_327.csv": {
+   "bytes": 232,
+   "sha256": "c1c9c11a7be0a402c301ea5d483a6063c2d95f70cfab848839b6ea99d9713074"
+  },
+  "subclass_FA/FA 22_4_322.csv": {
+   "bytes": 231,
+   "sha256": "b1523bd2fd0020f400578b71023bf86780385f79a43d18bc92e39cc023bdd644"
+  },
+  "subclass_FA/FA 22_5_320.csv": {
+   "bytes": 230,
+   "sha256": "e234abf127b834100b3e6e45637b14dc5b0489a45a43b5157c5c022296125bd3"
+  },
+  "subclass_FA/FA 23_0_347.csv": {
+   "bytes": 236,
+   "sha256": "d3cb9e740cc119f6511751497f81455e5402d29b70273a182b94521829b6cc07"
+  },
+  "subclass_FA/FA 24_0_362.csv": {
+   "bytes": 231,
+   "sha256": "c9f82ff9d9efe3528cad03d8c48c44efccb6c50b51b8b9d59a1bbabdcc045391"
+  },
+  "subclass_FA/FA 25_0_380.csv": {
+   "bytes": 236,
+   "sha256": "5753c73d4e1062c7d1abc8037883c56bd979d4a7986d212ca6228bec7f2e79e0"
+  },
+  "subclass_HexCer_NS/HexCer 18_1;O2_16_0_1434.csv": {
+   "bytes": 314,
+   "sha256": "2067303a2ca2f37656ee784e216f8e928c73f95c63b69b166bb483fdd756acf0"
+  },
+  "subclass_HexCer_NS/HexCer 18_1;O2_22_0_1797.csv": {
+   "bytes": 309,
+   "sha256": "682913beb27d1260097b4667ee8e1faf8184559d736c881c485193a7e944e2c4"
+  },
+  "subclass_HexCer_NS/HexCer 18_1;O2_22_1_1784.csv": {
+   "bytes": 315,
+   "sha256": "9658a81fd54af8e3e5c906f7393f81a3f12d790bf5f1b7fe10528f6d65d2ca1f"
+  },
+  "subclass_HexCer_NS/HexCer 18_1;O2_23_0_1867.csv": {
+   "bytes": 312,
+   "sha256": "dc53b0a430981f28a27bd68a399cb62bc1e398698e88dd2e2c54ddf081941e18"
+  },
+  "subclass_HexCer_NS/HexCer 18_1;O2_24_0_1941.csv": {
+   "bytes": 309,
+   "sha256": "8cef372de151d3bedb9cc7aa59c4791dc2c99a3c29150c52ad0d01cb3ca901ec"
+  },
+  "subclass_HexCer_NS/HexCer 18_1;O2_24_1_1929.csv": {
+   "bytes": 308,
+   "sha256": "c7e026661c7f4078d9b004001fc9ecbbcc2118afeee17b0a9772aead68fb24bc"
+  },
+  "subclass_HexCer_NS/HexCer 18_1;O2_24_3_1909.csv": {
+   "bytes": 311,
+   "sha256": "0a6e04fc5ffd5e4cdb422315b2a470dbc25a9e0c338077499549aa0c5ee39b08"
+  },
+  "subclass_LPA/LPA 16_0_444.csv": {
+   "bytes": 236,
+   "sha256": "953820f8f32a7d2410023ff0f016dcd178663789c8c72a66d021e4da093bd6e2"
+  },
+  "subclass_LPA/LPA 18_0_484.csv": {
+   "bytes": 235,
+   "sha256": "15239678bc52dd04fcdf53fb03bbd38006e75a7da4bd8e018fa8a809f8f64ffa"
+  },
+  "subclass_LPC/LPC 14_0_717.csv": {
+   "bytes": 239,
+   "sha256": "52f97a2fd87edfadd6943496512f1c273bcc8927e19c62e55edc27b202443246"
+  },
+  "subclass_LPC/LPC 15_0_748.csv": {
+   "bytes": 237,
+   "sha256": "f88e6f42ac3cd62555fc07eb059c09c2b71596d7fc3d5c019217aabfabfa6c71"
+  },
+  "subclass_LPC/LPC 16_0_0_0_783.csv": {
+   "bytes": 255,
+   "sha256": "10722634624b1f9c601f3d9ffd1f3033de74b9055a352e7508ac1fbe12b59c33"
+  },
+  "subclass_LPC/LPC 16_1_0_0_779.csv": {
+   "bytes": 258,
+   "sha256": "ecbf81478b9857f89e76c9a89f3053613d5cf0bc8c4432b7b3125619b9462547"
+  },
+  "subclass_LPC/LPC 17_1_0_0_810.csv": {
+   "bytes": 267,
+   "sha256": "efaf95bebbb20296250827186251564521d0cfb4385e9694c92979c3756daa27"
+  },
+  "subclass_LPC/LPC 18_0_852.csv": {
+   "bytes": 231,
+   "sha256": "ebc2caf1c182d5b68fe1fc1656fe1bfadc6f7e74771eed4e2540cacbf99f3a9f"
+  },
+  "subclass_LPC/LPC 18_1_0_0_846.csv": {
+   "bytes": 254,
+   "sha256": "f2237bd59c90dfc21492a69e0843872ebb4de59008a6c8e57ceb95d26e08864d"
+  },
+  "subclass_LPC/LPC 18_2_0_0_838.csv": {
+   "bytes": 252,
+   "sha256": "e0b00629a12ae2571cafe508fc8279c747d4ce38d0e2e7c8f2454e0feeb49789"
+  },
+  "subclass_LPC/LPC 18_3_832.csv": {
+   "bytes": 235,
+   "sha256": "9d5b45e620d2c7973031021bbd7262078f18070692540783ff19cc23df37908d"
+  },
+  "subclass_LPC/LPC 19_0_904.csv": {
+   "bytes": 239,
+   "sha256": "14ba33ca88221fa15fa1085cf10196cdc2356690e0e93e7c78234a3db345a87c"
+  },
+  "subclass_LPC/LPC 20_0_963.csv": {
+   "bytes": 238,
+   "sha256": "440b2d5947a8f92a10e47022d36ef1649afc6a7aabab098e67c64f363bf220b1"
+  },
+  "subclass_LPC/LPC 20_1_0_0_944.csv": {
+   "bytes": 260,
+   "sha256": "cab933f490c4902a2c9326068d4b5a832a238073c96346ccb10228d729bee91c"
+  },
+  "subclass_LPC/LPC 20_2_0_0_936.csv": {
+   "bytes": 262,
+   "sha256": "3d98fe7d6023ed332f795d164f226ce1e3b7804fb77f843c92018dec04e74f42"
+  },
+  "subclass_LPC/LPC 20_3_930.csv": {
+   "bytes": 231,
+   "sha256": "9dd223ffb71be49fb9799507c9b046bb8c872cf3b5e2e38cec21b4bbbfe19fb6"
+  },
+  "subclass_LPC/LPC 20_4_0_0_925.csv": {
+   "bytes": 255,
+   "sha256": "a81df900c2a1e77898a7c9dfbf302b8a2442b2d8efdda66c830eeefb9de3f000"
+  },
+  "subclass_LPC/LPC 20_5_0_0_922.csv": {
+   "bytes": 259,
+   "sha256": "1224d55b664bfb18488909d7f07206c48ea9f9bea9f64d778d50be96fdc298d3"
+  },
+  "subclass_LPC/LPC 22_0_0_0_1051.csv": {
+   "bytes": 272,
+   "sha256": "dc9f8583c2f52ffbe47d6ae5562e4b677703f69fba99024598808520a555c872"
+  },
+  "subclass_LPC/LPC 22_4_0_0_1017.csv": {
+   "bytes": 272,
+   "sha256": "d8de12c3c20cb4757a89ab575a0dacc165f0af6110e18b7c6fc0fd408f179805"
+  },
+  "subclass_LPC/LPC 22_5_0_0_1011.csv": {
+   "bytes": 266,
+   "sha256": "6b95f88206df68d20fb6b03c741c80a1e0e9743b88a5c01323e88e7741e13e3f"
+  },
+  "subclass_LPC/LPC 22_5_1010.csv": {
+   "bytes": 244,
+   "sha256": "51753a10fe48164f7b061b19ad2b70c4b540e5022ca015f6981fdabfca69bb11"
+  },
+  "subclass_LPC/LPC 22_6_0_0_1004.csv": {
+   "bytes": 261,
+   "sha256": "51700ae8235885bec0e0f7f26916ff10677cbf8fdcf639b3312c662c50a7057a"
+  },
+  "subclass_LPC/LPC 24_0_1129.csv": {
+   "bytes": 245,
+   "sha256": "368eca8b36d5e602a505c77ab5258374c9456990ad7c937742f4b6a0f6739b01"
+  },
+  "subclass_LPC/LPC 26_0_1218.csv": {
+   "bytes": 243,
+   "sha256": "17dcdb43a38dff9211b586bab075aff677a59439593d83d18508abc5a52946c0"
+  },
+  "subclass_LPE/LPE 15_0_639.csv": {
+   "bytes": 235,
+   "sha256": "a4a785d3f487106030aac37fd0f6b854dcce6cfed1d1133fcbd5b2576d94e335"
+  },
+  "subclass_LPE/LPE 16_0_682.csv": {
+   "bytes": 235,
+   "sha256": "0f591e86d0cddad5ee88607add4d701902b9c515529d5024af0ea93d5c47a3bc"
+  },
+  "subclass_LPE/LPE 18_0_747.csv": {
+   "bytes": 236,
+   "sha256": "c19e03c36cb7e5f199f5d74d9a52a9f6ec25147c6b45059a1bee2ca3d9aea739"
+  },
+  "subclass_LPE/LPE 18_1_743.csv": {
+   "bytes": 237,
+   "sha256": "db3512cee14fd0d7a53edbaff1c2d74d9402ecd6f7dce602a736a529b754897a"
+  },
+  "subclass_LPE/LPE 18_2_737.csv": {
+   "bytes": 236,
+   "sha256": "b7cca54f7a125db83cf8b84a0c42a5f1ed690a5097e8675794b9b00c3250e6ca"
+  },
+  "subclass_LPE/LPE 20_4_797.csv": {
+   "bytes": 237,
+   "sha256": "f576bf6197f6d9629fea3bf8268f81b9a8ddf669ab775171990ff632169ed950"
+  },
+  "subclass_LPE/LPE 22_6_854.csv": {
+   "bytes": 237,
+   "sha256": "e65cc8460319b9b455284711a83248922386aafb059e26c3a3d225fc3d667b59"
+  },
+  "subclass_LPI/LPI 20_4_794.csv": {
+   "bytes": 236,
+   "sha256": "a36ffb2bf5c2b927763c47fe6fadaf9eda5b10f09bf1e0dfffc4243e09e754ed"
+  },
+  "subclass_MG/MG 18_0_480.csv": {
+   "bytes": 224,
+   "sha256": "fb8e42f70b6c87eaead59a68236e67a269437e95e4649162f4de6e09cb9edb62"
+  },
+  "subclass_MG/MG 18_1_476.csv": {
+   "bytes": 230,
+   "sha256": "209a2b66145e92e7722c6551c5fe8bd3ea5db23ba88ba8f3440ea6ad65f1d691"
+  },
+  "subclass_MG/MG 18_2_471.csv": {
+   "bytes": 228,
+   "sha256": "e0923286b126600cb75d181a3542e697b0c851e4edcfa57c23632cee8a4933cb"
+  },
+  "subclass_MGDG/MGDG 18_0_18_0_1249.csv": {
+   "bytes": 279,
+   "sha256": "be9423eaf0c22b5342ae7d1415e756650e3d6588d4ec44172afb92ab06a08ba9"
+  },
+  "subclass_NAE/NAE 12_0_218.csv": {
+   "bytes": 243,
+   "sha256": "a1c20316f5e4c38c86422e537d3c3ebc6d89fc4a35badeb44e87c48fc2204eb2"
+  },
+  "subclass_OxFA/FA 18_1;O_282.csv": {
+   "bytes": 239,
+   "sha256": "8a005c59d639eb3fdbcf3ff0b5ff796c2979e43b83cb029d2d645dfbfa541b55"
+  },
+  "subclass_OxFA/FA 18_1;O_283.csv": {
+   "bytes": 242,
+   "sha256": "e310bf099b13a2085d5644e82e8b1b74fd38cf56659d22742e1645fd108094e9"
+  },
+  "subclass_OxFA/FA 22_1;O2_365.csv": {
+   "bytes": 247,
+   "sha256": "88b6d387e00ce13fca2127dffe7462c13a242ad697cc158a7b5caa3fc8750910"
+  },
+  "subclass_OxTG/TG 18_1_18_1_18_0;O3_2475.csv": {
+   "bytes": 320,
+   "sha256": "45886fea9e6110197d6b1a2360e0c53f3d7e0f054807d156a5edf17c8159eedd"
+  },
+  "subclass_OxTG/TG 18_1_18_1_19_1;O_2413.csv": {
+   "bytes": 312,
+   "sha256": "b2f98f7fb7c38007790fcfb8d806cdce5c3f6fa5752f0b8335dda2d95a0fb7ee"
+  },
+  "subclass_OxTG/TG 18_1_18_2_18_2;O_2344.csv": {
+   "bytes": 316,
+   "sha256": "f017fe900c4b520dc2b5f0fd146b1d64136f217d0b5a7706674663adf2b74ec3"
+  },
+  "subclass_OxTG/TG 19_1_19_1_17_0;O_2424.csv": {
+   "bytes": 315,
+   "sha256": "220937f1084a9cb584f80355cb63360dc888e14bdab7ef357859c6dc8c5aa7f3"
+  },
+  "subclass_OxTG/TG 19_2_19_2_17_1;O_2395.csv": {
+   "bytes": 312,
+   "sha256": "f6bfb840400b085f5ef8d9db273ad358054b4952e96a6b097faa007a6815d780"
+  },
+  "subclass_PC/PC 14_0_18_2_1116.csv": {
+   "bytes": 267,
+   "sha256": "8db94ae690b9126586a9c6f2b4b06b39436d81af2476d0a2069850f004287a52"
+  },
+  "subclass_PC/PC 15_0_18_2_1139.csv": {
+   "bytes": 267,
+   "sha256": "301c8e8cc848016844cf7d8d5aa48e714273ba8df0598aad6df514c241ff8efb"
+  },
+  "subclass_PC/PC 16_0_16_0_1125.csv": {
+   "bytes": 261,
+   "sha256": "527a49414abcbd3e162dd89b0042146bab7de58743553ecc7c047e5fc8fa3b75"
+  },
+  "subclass_PC/PC 16_0_16_1_1120.csv": {
+   "bytes": 260,
+   "sha256": "c80e46622de12755ff6e08f91ec38c3737bd4d4bf11c9a704b207e012474d658"
+  },
+  "subclass_PC/PC 16_0_17_1_1145.csv": {
+   "bytes": 266,
+   "sha256": "558f941f7b11238e3fb0aa5db2196ec0f2e20be7b6cd3fe887214356cf2c9afe"
+  },
+  "subclass_PC/PC 16_0_18_0_1190.csv": {
+   "bytes": 267,
+   "sha256": "1aa8a3e1176182e08c81946d21d6bd63f7ce9d399367ec7cc7b43b340ff934ee"
+  },
+  "subclass_PC/PC 16_0_18_1_1185.csv": {
+   "bytes": 261,
+   "sha256": "5e1da0a6a7796c248eb77232fe7a3e4dd91d64a2fa83ef2d1c32bd2f3721f4dd"
+  },
+  "subclass_PC/PC 16_0_18_2_1178.csv": {
+   "bytes": 260,
+   "sha256": "2435b18ab9e76fe7b5417a4807919f30e8194fe67586a9852e8a4dec9bc1f8f1"
+  },
+  "subclass_PC/PC 16_0_18_3_1170.csv": {
+   "bytes": 261,
+   "sha256": "f4e9325eb3cf842e7a1ac6cfb700f0733323cf8ae8f8a68cef79dd96f005ea81"
+  },
+  "subclass_PC/PC 16_0_20_3_1241.csv": {
+   "bytes": 261,
+   "sha256": "eef473549cc55fa0b12651bee9fa7b8ec569ecc3be4f693f29e27f2498591385"
+  },
+  "subclass_PC/PC 16_0_20_4_1233.csv": {
+   "bytes": 261,
+   "sha256": "56755e527e9758f9c2936a5301ff41f6d7113b1cc31bba779d84ca3ea2df61a7"
+  },
+  "subclass_PC/PC 16_0_20_5_1229.csv": {
+   "bytes": 261,
+   "sha256": "51c11ebe461f17cfab767ce1b68b83c28070eaf69a9e4ef1557fe2bb3bf35493"
+  },
+  "subclass_PC/PC 16_0_22_5_1304.csv": {
+   "bytes": 261,
+   "sha256": "d7bba4ece901978dcf8b6882516e369fab1bce84b59b5fa57be886a68286d484"
+  },
+  "subclass_PC/PC 16_0_22_6_1300.csv": {
+   "bytes": 260,
+   "sha256": "9d91892ca0dcc0734df7434784cdab42e4248fa54e2c1d707e19bd2b6c72168a"
+  },
+  "subclass_PC/PC 16_1_18_2_1169.csv": {
+   "bytes": 261,
+   "sha256": "cdb110b51ba5bebc8d4625aa6c498cdc777c339f9f65b7793fe7a79706635277"
+  },
+  "subclass_PC/PC 16_1_20_4_1228.csv": {
+   "bytes": 266,
+   "sha256": "85d018d3e9a3e8fab2af6e79a9420da131103db7050f0cffc8e0d0ab959d02bf"
+  },
+  "subclass_PC/PC 17_0_18_2_1210.csv": {
+   "bytes": 263,
+   "sha256": "c84d2c1baa523b64aec04457ff8ff7160e94d811c518532069e3bc350cea6338"
+  },
+  "subclass_PC/PC 17_1_18_2_1205.csv": {
+   "bytes": 267,
+   "sha256": "58054bb2b6a7a9c0d69ee053424c62e002939ca5e9100276ca35c78f6718b99e"
+  },
+  "subclass_PC/PC 18_0_18_1_1253.csv": {
+   "bytes": 261,
+   "sha256": "a18acbcb92c7e2e00d4f05a9445c9b0217c301a4622736f299e46c870519d5e0"
+  },
+  "subclass_PC/PC 18_0_18_2_1247.csv": {
+   "bytes": 259,
+   "sha256": "17081a3e9d3f52c7cc3971715dde2b1839f3ead2402a3bc01a7506bebaab806f"
+  },
+  "subclass_PC/PC 18_0_20_2_1325.csv": {
+   "bytes": 266,
+   "sha256": "5f999977febf3cd5aa69b9e859453ea64656f64657521a70ef1185faeb808f94"
+  },
+  "subclass_PC/PC 18_0_20_3_1317.csv": {
+   "bytes": 261,
+   "sha256": "0eac634096455ef6e0539cd6a9186a44006c50a1bcf8de8206b2a6e7d54d40a4"
+  },
+  "subclass_PC/PC 18_0_20_4_1309.csv": {
+   "bytes": 259,
+   "sha256": "b2c1c5ba3e586acee2ad895fc8c6bda113ff1c1bc933bf5946998e7fa722fcc6"
+  },
+  "subclass_PC/PC 18_0_22_4_1379.csv": {
+   "bytes": 265,
+   "sha256": "bc7da8d48ef520a56d517ca419114d3e8e5124631b2ae49db8b334a0e9f7c6c8"
+  },
+  "subclass_PC/PC 18_0_22_5_1374.csv": {
+   "bytes": 266,
+   "sha256": "5a56ad14e4f19e3b464aedfe7358aff887076663b1f3cb1789a733f38219d796"
+  },
+  "subclass_PC/PC 18_0_22_6_1369.csv": {
+   "bytes": 259,
+   "sha256": "3a289f942573829ddab76520ee236804c911f3027b393584efbe39f9778f5d75"
+  },
+  "subclass_PC/PC 18_1_18_2_1242.csv": {
+   "bytes": 260,
+   "sha256": "475ba2248dbcf5eeaf96a6ac1857c6d63ea300e4874d177b193eb13d241252db"
+  },
+  "subclass_PC/PC 18_1_20_4_1305.csv": {
+   "bytes": 261,
+   "sha256": "d466e2583fe5b82a7a4e2d953d8d5ff223ccd704db2404d94d029d3a3334a8a6"
+  },
+  "subclass_PC/PC 18_1_22_5_1368.csv": {
+   "bytes": 266,
+   "sha256": "b03086e762b30ce0b9739339f15f6ef2a4e16c9d8582642ee6a7b620a692f4ea"
+  },
+  "subclass_PC/PC 18_1_22_6_1361.csv": {
+   "bytes": 261,
+   "sha256": "ae10530fbd402cb5da7807687b5afa540b88884ca1d01cfd46162686862cbc35"
+  },
+  "subclass_PC/PC 18_2_18_2_1232.csv": {
+   "bytes": 259,
+   "sha256": "969e2b760d554c29657b39594a7df5cc16313695adb4745c2a052ab4182b5e99"
+  },
+  "subclass_PC/PC 18_2_20_4_1299.csv": {
+   "bytes": 259,
+   "sha256": "092778d76e3efd0e41486bd80093102721e5bb5cfc468e2376d308b3f5a5b8dd"
+  },
+  "subclass_PC/PC 19_0_18_2_1282.csv": {
+   "bytes": 266,
+   "sha256": "b10387a6d7e95319a05ba274d8ceaad66c092f050d0ace07512efa53fe4a5092"
+  },
+  "subclass_PC/PC 19_0_20_4_1345.csv": {
+   "bytes": 267,
+   "sha256": "01fb30f33f7238787536a48543f7e5052b96217df07df1f2e709c53488c9607f"
+  },
+  "subclass_PC/PC 20_0_20_4_1378.csv": {
+   "bytes": 267,
+   "sha256": "b3437f4dab773bee7566466e8cde4146e26e1cf748103e410828cd7b2642fe76"
+  },
+  "subclass_PC/PC 20_1_20_4_1373.csv": {
+   "bytes": 267,
+   "sha256": "db22b144837cd20567e0f519ddaa9a9d24d64f7a060277b2a4328f5c613a89cd"
+  },
+  "subclass_PC/PC 20_1_22_6_1421.csv": {
+   "bytes": 266,
+   "sha256": "a8e8c67ffb0f6435ee03e270c62816c3e409a3703b8e3211bafa7bc3d24af900"
+  },
+  "subclass_PC/PC 20_4_22_6_1406.csv": {
+   "bytes": 267,
+   "sha256": "e31e201447cf9962ec06cc79a12370265b7dc2277a7040d4d840ebba4c8567cb"
+  },
+  "subclass_PE/PE 16_0_18_1_991.csv": {
+   "bytes": 263,
+   "sha256": "e0af76f7858fec4f8189100da07ff2671ff22b0745a367f5732f9c30eaaafc9e"
+  },
+  "subclass_PE/PE 16_0_18_2_986.csv": {
+   "bytes": 261,
+   "sha256": "9640a62c7f2db96fefeff103e5cba38fadd3fcde50a0bea7db03ebcc2a451d92"
+  },
+  "subclass_PE/PE 16_0_20_4_1027.csv": {
+   "bytes": 267,
+   "sha256": "ca8f92545456e3f1afcbf1c9d7054aaafaf0f4581eacbd9c841b7276f2004d15"
+  },
+  "subclass_PE/PE 16_0_22_6_1073.csv": {
+   "bytes": 265,
+   "sha256": "a0e584491d6132eb9d653016e97b038f361c96b3da2554624f1d0f397babf22c"
+  },
+  "subclass_PE/PE 18_0_18_1_1041.csv": {
+   "bytes": 271,
+   "sha256": "f52d727c45f14c82d3b976195340a30a71b66e19294c0bb86c36169c9f118670"
+  },
+  "subclass_PE/PE 18_0_18_2_1037.csv": {
+   "bytes": 263,
+   "sha256": "fc541f4217e433b0f04d07283370e2932a7d5db537ce23db04a1efdc89af7f32"
+  },
+  "subclass_PE/PE 18_0_20_2_1087.csv": {
+   "bytes": 266,
+   "sha256": "32c1e1972275c296d9cfdaa557f795d45c4c2329fa8c14aeb72bbbbb45f68c20"
+  },
+  "subclass_PE/PE 18_0_20_4_1082.csv": {
+   "bytes": 262,
+   "sha256": "f2271ece8fb6dd3a6dec0783d891f5c712dfef0186f3001777504b4b0ce53e9e"
+  },
+  "subclass_PE/PE 18_0_22_6_1119.csv": {
+   "bytes": 267,
+   "sha256": "9a5a856a8fea65d2d7508497cc4c4b2def88940dbcd967684a23ab8697ca0204"
+  },
+  "subclass_PE/PE 18_1_18_1_1036.csv": {
+   "bytes": 267,
+   "sha256": "dc3a543547f238180ccb059058de52c97d5470fe699bbb84f8f0a697a1d6168a"
+  },
+  "subclass_PE/PE 18_1_18_2_1032.csv": {
+   "bytes": 265,
+   "sha256": "61a44b48bf9244b7c1ecb08c72a33b314f648fe595532ab445f89954b27e200b"
+  },
+  "subclass_PE/PE 18_1_20_3_1081.csv": {
+   "bytes": 267,
+   "sha256": "52f9295c85ebdeb818ab9183a6f31a1064eef04ece6fe980553ab904f6404361"
+  },
+  "subclass_PE/PE 18_1_20_4_1078.csv": {
+   "bytes": 267,
+   "sha256": "5569f896f55d939952dfab766a3cbbd894b2b233ef1e342b777a2ea64bb2e582"
+  },
+  "subclass_PE/PE 18_1_22_6_1115.csv": {
+   "bytes": 265,
+   "sha256": "f15a4ed192222cfe5fd1f37d7b6560b2f999608c72ceaf6c1c47e632422b9d59"
+  },
+  "subclass_PE/PE 18_2_18_2_1028.csv": {
+   "bytes": 268,
+   "sha256": "172c213d5e0e34e2c0b7151f03d131c18404d6b3c21fd700bb9686fb4c9b36ae"
+  },
+  "subclass_PG/PG 16_0_18_1_1047.csv": {
+   "bytes": 272,
+   "sha256": "47d69bc6ba47cacf49a0dfda84566a3ed1ad8c2c8928b198cd10bc6627370f56"
+  },
+  "subclass_PG/PG 16_0_18_2_1042.csv": {
+   "bytes": 271,
+   "sha256": "ecfaac9934b383362bf67368cd09cb682dc1c7c15ac3191c4600ca91d1148b29"
+  },
+  "subclass_PG/PG 18_0_18_2_1093.csv": {
+   "bytes": 273,
+   "sha256": "92256b92efcdfc2829a0c14a8e4980446a691fca1568ca444655cd1855d72938"
+  },
+  "subclass_PI/PI 16_0_18_1_1223.csv": {
+   "bytes": 267,
+   "sha256": "c8c6f07759db023e29ba518e539fe5147390fa0a2d6dd490421e19ccaa438180"
+  },
+  "subclass_PI/PI 16_0_18_1_1224.csv": {
+   "bytes": 271,
+   "sha256": "3c15ae00f564d83b2c3d9173e4da23fc11c04b069c20689f31f6440e25d8226d"
+  },
+  "subclass_PI/PI 16_0_18_2_1216.csv": {
+   "bytes": 267,
+   "sha256": "5f69e9c46af326458c2a9b4983336daea000ce5534f60a63b6eac8671c2fe5e0"
+  },
+  "subclass_PI/PI 16_0_20_4_1278.csv": {
+   "bytes": 260,
+   "sha256": "c9bf39477022b4321be4c20e1bfd7da6fd876c11cabe135faddd82857cbd52ed"
+  },
+  "subclass_PI/PI 16_0_22_6_1341.csv": {
+   "bytes": 267,
+   "sha256": "a9c52c9556ecf1b94e61bd1ea27cdd70fb6cec8e77d8c5fa76fe205bb951b30c"
+  },
+  "subclass_PI/PI 16_1_20_4_1272.csv": {
+   "bytes": 273,
+   "sha256": "5a386ca6963915cd8e602bdc6f5ac7725dd1cb838c85c988ed3665f88b0c5285"
+  },
+  "subclass_PI/PI 17_0_20_4_1322.csv": {
+   "bytes": 268,
+   "sha256": "83194219275b236d3921610c2512c34073d169ff8c8b1afc776a244821778e1f"
+  },
+  "subclass_PI/PI 18_0_18_1_1297.csv": {
+   "bytes": 273,
+   "sha256": "fc1fe1bbc423fb6ecd2075609b00a59c5b4f0ebc4eeebaca32e4aa08d7f0a871"
+  },
+  "subclass_PI/PI 18_0_18_2_1290.csv": {
+   "bytes": 263,
+   "sha256": "df5a189f6cc0804137ae5fd10c98b0c9f4193b5cdcd379e7d2b59e59ae7c11f1"
+  },
+  "subclass_PI/PI 18_0_20_3_1354.csv": {
+   "bytes": 266,
+   "sha256": "8489155cce1b1e653ea9e3ba16b725f6c8286bf859e093b0e9c913cabd58e56e"
+  },
+  "subclass_PI/PI 18_0_20_4_1349.csv": {
+   "bytes": 260,
+   "sha256": "76043d268fe7b55cb24f081e2c71ee1ed6ec8ee9770006f749dce79a78e78146"
+  },
+  "subclass_PI/PI 18_0_22_6_1399.csv": {
+   "bytes": 266,
+   "sha256": "dd05bf21929fcb9865ce921ab99fc31deedcc5a8575f51e962529d601df5dccd"
+  },
+  "subclass_PI/PI 18_1_20_4_1346.csv": {
+   "bytes": 267,
+   "sha256": "ccd514e398a8d03fb520364bd427bb6003b3c7dabced61e43b78d53951d483f1"
+  },
+  "subclass_PI/PI 19_0_20_4_1381.csv": {
+   "bytes": 273,
+   "sha256": "bdf7b68bb5f57e1c2b5cb731e9f8085494a5d1ce815f0f4a298083e980e02347"
+  },
+  "subclass_PS/PS 17_0_14_1_996.csv": {
+   "bytes": 269,
+   "sha256": "2251ec8b01de498340584925d0c0444e587808f3a6ed4e502d2a05fa3dc159b3"
+  },
+  "subclass_PS/PS 18_0_20_4_1160.csv": {
+   "bytes": 272,
+   "sha256": "7a56d3641189710ab0dd249b7c576e6efb5c48ff429c99fd24d4789bc1e78401"
+  },
+  "subclass_PS/PS 20_4_20_4_1209.csv": {
+   "bytes": 271,
+   "sha256": "2ec59ea2c6ad0b999361a59de9a8a0dad2fe046b7cb353804282f2cbca4eb52b"
+  },
+  "subclass_SISE/SE 29_1_18_1_1427.csv": {
+   "bytes": 269,
+   "sha256": "5af678e64bb1ad5d252308f46a9e736b969613ef8fc763c868891552b998b17b"
+  },
+  "subclass_SISE/SE 29_1_20_2_1501.csv": {
+   "bytes": 271,
+   "sha256": "24d1dd57aeeb8c352621434e6cf3057eef1b724273af995a31efaa6e6c8c0263"
+  },
+  "subclass_SISE/SE 29_1_20_4_1493.csv": {
+   "bytes": 266,
+   "sha256": "f96db0e23b4e0e859801ef49357d0eef7f5056a08ca9e27509d1955c5e2af01b"
+  },
+  "subclass_SISE/SE 29_1_20_4_1494.csv": {
+   "bytes": 263,
+   "sha256": "28c78e92228af5779f4484793a129a34051b78724559a1cb2a90327ed310c02c"
+  },
+  "subclass_SL/SL 17_0;O_17_0;O_791.csv": {
+   "bytes": 275,
+   "sha256": "e3677e62c6f449872bd6625d01451bdfb94aa0245e470311eea2e4558f18fafa"
+  },
+  "subclass_SM/SM 17_1;O2_16_0_1048.csv": {
+   "bytes": 285,
+   "sha256": "420100b279a089db07e56e19882624bbbbb26a59d773fed3ecdbffd274e59e22"
+  },
+  "subclass_SM/SM 17_1;O2_22_0_1213.csv": {
+   "bytes": 286,
+   "sha256": "e6ecacce0009863e97dd85c3e1929db295c6771612e2d8248f90612b2d0cd5de"
+  },
+  "subclass_SM/SM 17_1;O2_24_0_1284.csv": {
+   "bytes": 284,
+   "sha256": "ec7c133fd57a907ed96a77f50456f9d866fec6b5cac79f7238e8ff785f49e09e"
+  },
+  "subclass_SM/SM 18_1;O2_16_0_1072.csv": {
+   "bytes": 278,
+   "sha256": "130e6ab8a9b2e97810c12219fa53c648e7c5f1e68131ef6c889dd5af86f3ddfe"
+  },
+  "subclass_SM/SM 18_1;O2_22_0_1251.csv": {
+   "bytes": 282,
+   "sha256": "cc2443d090a84993ea18a9bd2e86f3a41f7228f9839ce6b5000c485d747764cf"
+  },
+  "subclass_SM/SM 18_1;O2_22_1_1246.csv": {
+   "bytes": 284,
+   "sha256": "a6337f34df0a96b39d0acc83f7f1aa28953d925185eabef5ec87f17faa68ec45"
+  },
+  "subclass_SM/SM 18_1;O2_24_0_1326.csv": {
+   "bytes": 279,
+   "sha256": "582062f127ae69aa7f79ec315136c494dcc77ed089549a62f8c6d6632a4faf69"
+  },
+  "subclass_SM/SM 18_1;O2_24_1_1323.csv": {
+   "bytes": 280,
+   "sha256": "6517dcd02401731a8d5c5e19d982a7052eeb27818fb785e93628b09bd99c3513"
+  },
+  "subclass_SM/SM 18_2;O2_16_0_1071.csv": {
+   "bytes": 277,
+   "sha256": "3cf7b7f30db516b778757a1caaa4eb33d1b64dac25ab42121a52e7be5fd1adf2"
+  },
+  "subclass_SM/SM 18_2;O2_22_0_1245.csv": {
+   "bytes": 283,
+   "sha256": "b84f8f803189ec0023ffaaa91cf94ffdc063b0c4cde77d3ffad265303a276f7d"
+  },
+  "subclass_SM/SM 18_2;O2_24_1_1312.csv": {
+   "bytes": 285,
+   "sha256": "ec69407b5bb6cedd39a84960ceb54957773acb9b772223460b9e167c489f6492"
+  },
+  "subclass_SM/SM 32_1;O2_1019.csv": {
+   "bytes": 255,
+   "sha256": "8497450568eecf73a40da021c6a51bf5e9680659e7166d25c5466685d4f43086"
+  },
+  "subclass_SM/SM 36_1;O2_1117.csv": {
+   "bytes": 255,
+   "sha256": "fab6769be66bdb487573bd20be63cea542d1e07f5f87ef3243a88e6a22770403"
+  },
+  "subclass_SM/SM 36_2;O2_1114.csv": {
+   "bytes": 253,
+   "sha256": "252ba60746812541de416beb93d2d4f8997549a0c64730ea8dbdfaa3fccadd1b"
+  },
+  "subclass_SM/SM 38_1;O2_1184.csv": {
+   "bytes": 252,
+   "sha256": "cad3c7743edf25c149ca104610295b564dc5b1301ccc148febe0cd61d8fa67ac"
+  },
+  "subclass_SM/SM 41_2;O2_1280.csv": {
+   "bytes": 255,
+   "sha256": "f1586a5ae4fcde4d0e6476988edca6669708539924a63252348ded4aa22a7efe"
+  },
+  "subclass_SSulfate/ST 27_1;O;S_523.csv": {
+   "bytes": 246,
+   "sha256": "eaa665a3b4451e84b62325dca18a618c344aa6bf9c97b4a5f67e773f557dff4d"
+  },
+  "subclass_SSulfate/ST 28_1;O;S_548.csv": {
+   "bytes": 259,
+   "sha256": "a3853de3221a0334ca0974aaee652e38c884a25fbc635d2d875cc653bac0d850"
+  },
+  "subclass_SSulfate/ST 29_1;O;S_575.csv": {
+   "bytes": 257,
+   "sha256": "a0223ff1fc6af445c4c06469016f6ded1de804568f7478a1b3d6d254b57cb759"
+  },
+  "subclass_ST/ST 27_1;O_450.csv": {
+   "bytes": 242,
+   "sha256": "db51781598648549cc24a2b6166938551126e41c1d5180647e084fae905b825d"
+  },
+  "subclass_ST/ST 27_1;O_566.csv": {
+   "bytes": 241,
+   "sha256": "1d5f04001ffb23c435369249292916911e315979f16baa7d40648f24b996e7bc"
+  },
+  "subclass_TG/TG 14_0_16_0_18_1_1986.csv": {
+   "bytes": 293,
+   "sha256": "c7fc42dc121eedff2ffcc31c2c3844a901f699058df17548a8d255deae1da868"
+  },
+  "subclass_TG/TG 14_0_16_1_18_1_1980.csv": {
+   "bytes": 295,
+   "sha256": "03f09466ee3739ddc544f6938216f9712b3bc70ccdc7407dca8282eee0dc013e"
+  },
+  "subclass_TG/TG 14_0_16_1_18_2_1972.csv": {
+   "bytes": 297,
+   "sha256": "bb0a11736f1b0342be6971d6c402dc7f82ac6e8d1dae97d6aee1f580a990d10a"
+  },
+  "subclass_TG/TG 16_0_16_0_16_0_1996.csv": {
+   "bytes": 297,
+   "sha256": "404220ca56ef3a91195d8c83101809f4f2f55715c6207c24ea9bcd04dc9409e9"
+  },
+  "subclass_TG/TG 16_0_16_0_18_1_2101.csv": {
+   "bytes": 291,
+   "sha256": "1a7a92d39ef802774b546dbde1d22ac622a3f6216fd18d4342661e1a19084f50"
+  },
+  "subclass_TG/TG 16_0_16_1_16_1_1981.csv": {
+   "bytes": 292,
+   "sha256": "fe56d69a23beba2f8e6f2b837077e2f852429329c85576ec10a6551c8c46201c"
+  },
+  "subclass_TG/TG 16_0_16_1_18_1_2095.csv": {
+   "bytes": 291,
+   "sha256": "9667984d4db5b85cdcfcfe33b330f3248447adb1a4783116e1b5a5ec11ab8828"
+  },
+  "subclass_TG/TG 16_0_16_1_18_2_2088.csv": {
+   "bytes": 291,
+   "sha256": "0a73aa7a1a71e54f975839c1058bd00277a3545b23316ef4e9f446ec62faacea"
+  },
+  "subclass_TG/TG 16_0_17_1_18_1_2140.csv": {
+   "bytes": 295,
+   "sha256": "67e34a7a456c2bdd5acae94faddf322c59b8d38061134d930cf168707e97c850"
+  },
+  "subclass_TG/TG 16_0_17_1_18_2_2134.csv": {
+   "bytes": 296,
+   "sha256": "39a790e8a17f8c97f1f9e42bc516f1d1f3c61f91fa1be8c1e4fac5d6b81072d6"
+  },
+  "subclass_TG/TG 16_0_18_0_18_1_2206.csv": {
+   "bytes": 293,
+   "sha256": "8f47f7a17f064b414492442f4788eafd1cb2d655d2177dc43ccbf33101373e4c"
+  },
+  "subclass_TG/TG 16_0_18_1_18_1_2196.csv": {
+   "bytes": 291,
+   "sha256": "87c86dc3f1658b7424996d56af892c3549b78dd6bc29e3a08c11e7ecf940d731"
+  },
+  "subclass_TG/TG 16_0_18_1_18_1_2197.csv": {
+   "bytes": 291,
+   "sha256": "3fdf61bd7af69a101c8253b86326752bd0564bdb3b95cb639080f1685c7f38f8"
+  },
+  "subclass_TG/TG 16_0_18_1_18_2_2185.csv": {
+   "bytes": 291,
+   "sha256": "27ed76ec9f7871ab0a1fbc2ad659d276f6bd7e897b6cd55390f000604d291f77"
+  },
+  "subclass_TG/TG 16_0_18_1_18_2_2186.csv": {
+   "bytes": 290,
+   "sha256": "8ea6a5ce3154313be9e2e794e7baad488b6593e24bc0a962983a73104e73ccd0"
+  },
+  "subclass_TG/TG 16_0_18_1_20_1_2311.csv": {
+   "bytes": 290,
+   "sha256": "38b0b8c1bcf3f1a201821f41bdd240a5a00b88fa1fdf137b2c43a432f1343fdf"
+  },
+  "subclass_TG/TG 16_0_18_1_22_6_2377.csv": {
+   "bytes": 293,
+   "sha256": "f4353c56141e6b7fc1302d70845de11b1549c007b83582cd2659ddef1370a965"
+  },
+  "subclass_TG/TG 16_0_18_2_18_2_2178.csv": {
+   "bytes": 290,
+   "sha256": "af33d940a59eda272ca4d889967ef009d1b680dfba8dcaa5a1f2ea5899ff24f8"
+  },
+  "subclass_TG/TG 16_0_18_2_18_3_2172.csv": {
+   "bytes": 291,
+   "sha256": "ee2ba501827ce950af2d4caf137f2f9e286ffe9c2b4c5722b9c3317d98b61e40"
+  },
+  "subclass_TG/TG 16_0_18_2_20_4_2278.csv": {
+   "bytes": 294,
+   "sha256": "2cfb81effa8267d4ea6b3418560480908067c11d8a9e7c2f5f7116f03f9aacbc"
+  },
+  "subclass_TG/TG 16_0_18_2_20_5_2270.csv": {
+   "bytes": 297,
+   "sha256": "05ae449a33e2de50bc96d71a1aae7e7b1ad5e23d306d6ff2e961e4980466f3b9"
+  },
+  "subclass_TG/TG 16_0_18_2_22_6_2370.csv": {
+   "bytes": 293,
+   "sha256": "1c8c3fcd146eb48875e264e5193ec4eead20f3f3919b68fb71ba9efde103768e"
+  },
+  "subclass_TG/TG 16_0_20_0_18_1_2318.csv": {
+   "bytes": 299,
+   "sha256": "3b8ed2fd762603eef5b1cfafc5ff9d439f5105dc8aa0472337e5613df4f553ff"
+  },
+  "subclass_TG/TG 16_1_16_1_18_2_2082.csv": {
+   "bytes": 293,
+   "sha256": "071bfc803d156a1631062596d9aeac052acc763345ffc87d38f5d786604c5f30"
+  },
+  "subclass_TG/TG 16_1_18_2_18_3_2165.csv": {
+   "bytes": 299,
+   "sha256": "1a988761d7401418c3721bae8ef15433ca865a085b36cc1b62c3e6b474faf3d9"
+  },
+  "subclass_TG/TG 17_1_18_1_18_1_2240.csv": {
+   "bytes": 297,
+   "sha256": "02a1f0fdde64b73ff8b2ef38c7f71008c053bbf306d0ee5fb419e2a5177107ea"
+  },
+  "subclass_TG/TG 18_1_18_1_18_1_2305.csv": {
+   "bytes": 290,
+   "sha256": "f984e8fd53527ca3262e86bf03c75cd2f37c623ab66c85fb04691b937764b672"
+  },
+  "subclass_TG/TG 18_1_18_1_18_2_2295.csv": {
+   "bytes": 291,
+   "sha256": "05971cb47d2013e339a41eebed37e9d1c8f11bc793856ad0cb71e2837412295a"
+  },
+  "subclass_TG/TG 18_1_18_1_18_2_2296.csv": {
+   "bytes": 291,
+   "sha256": "6cf6949d4d6196eb57235eea6f943a9f2f2745b8ca110f4249ce25b78f31a454"
+  },
+  "subclass_TG/TG 18_1_18_1_20_1_2406.csv": {
+   "bytes": 296,
+   "sha256": "0a7ea465e69076c5edf89ffcc0738028316e45c8c79659e6f1093e5e0d24eb47"
+  },
+  "subclass_TG/TG 18_1_18_1_20_3_2390.csv": {
+   "bytes": 294,
+   "sha256": "4752a2e7f114a2663d3bc1af69fa45d08f7bc041c9a7e15c05cfd59daf5d8d07"
+  },
+  "subclass_TG/TG 18_1_18_1_20_4_2383.csv": {
+   "bytes": 293,
+   "sha256": "6fc68bfe133147933c041d438e0bc5b8ecc7b827b8a70ecc40eedf6250160161"
+  },
+  "subclass_TG/TG 18_1_18_1_22_5_2469.csv": {
+   "bytes": 297,
+   "sha256": "8739f8223464b8b0d62b588bd0500fdec1fe4c7480875a7f8b1dfbed7a7d9aee"
+  },
+  "subclass_TG/TG 18_1_18_1_22_6_2467.csv": {
+   "bytes": 297,
+   "sha256": "6457ef015451ba70c3a2c14624e52e36d44dc4d1f22b998394b99420d5eeafb9"
+  },
+  "subclass_TG/TG 18_1_18_2_18_2_2283.csv": {
+   "bytes": 290,
+   "sha256": "11dc1bca26dc5bde9688607e200f6e679968694f3449438718285a9633454f54"
+  },
+  "subclass_TG/TG 18_1_18_2_18_2_2284.csv": {
+   "bytes": 291,
+   "sha256": "7fcbbc536ceae1f596d96a3f1be9c52581558b42331ade4b00379615196f9ce0"
+  },
+  "subclass_TG/TG 18_1_18_2_22_6_2462.csv": {
+   "bytes": 294,
+   "sha256": "6c44a96d6f5cee06be2482352854a782239e569e88a49cf16fe7c575f148e733"
+  },
+  "subclass_TG/TG 18_1_20_1_18_2_2396.csv": {
+   "bytes": 293,
+   "sha256": "83c32abbbe8a9c83e564e9c1140d062bdc058441b42d38f3f9a23ea3cca5634f"
+  },
+  "subclass_TG/TG 18_2_18_2_18_2_2279.csv": {
+   "bytes": 291,
+   "sha256": "b744f3228d2113aa5d9c9d6623a3850c5bc8aab0744b89f7d5fecd3671cacfda"
+  },
+  "subclass_TG/TG 18_2_18_2_18_3_2271.csv": {
+   "bytes": 294,
+   "sha256": "d9541f68c36ba7022d13caa31975ecdfebb9e55449cf03d0d55e7bebd6258faf"
+  },
+  "subclass_TG/TG 18_2_18_2_22_6_2456.csv": {
+   "bytes": 297,
+   "sha256": "eba75d7464fe263cda7e92811f3614f8cf425f4d50e37fbf96caca41c5e9fcff"
+  },
+  "Summary_Dotplots/FattyAcyls.csv": {
+   "bytes": 929,
+   "sha256": "e9ea31b86ee5a7e1c27d81b14bb29cfe60a910eaed90eb2ee1449906287fb9b2"
+  },
+  "Summary_Dotplots/Glycerolipids.csv": {
+   "bytes": 5023,
+   "sha256": "67d424e1bb9ce430b7c1e840b73d8491b4ce22e7084c858c35a103de25080cb4"
+  },
+  "Summary_Dotplots/Glycerophospholipids.csv": {
+   "bytes": 6272,
+   "sha256": "890d75bcdde52c832fbc2cf7b02af756e938f3a106c805969d1ae48cdf634870"
+  },
+  "Summary_Dotplots/Sphingolipids.csv": {
+   "bytes": 1192,
+   "sha256": "89b7722d4d48f3656afca3611ef5ee2aef1cc7a623f876dcd7fd2081395ffdaf"
+  },
+  "Summary_Dotplots/SterolLipids.csv": {
+   "bytes": 1480,
+   "sha256": "e2425d8a159d3ba7ce856e348ae2e69a2f216cd3e0063833044d579a2af58dcb"
+  }
+ }
+}

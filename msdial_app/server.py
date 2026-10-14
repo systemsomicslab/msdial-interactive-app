@@ -125,7 +125,21 @@ from .user_settings import (
     settings_path,
     user_data_directory,
 )
-from .worksets import describe_workset_candidate, list_worksets, save_workset
+from .worksets import describe_workset_candidate, list_worksets, save_lab_lipidomics_workset, save_workset
+from .lab_lipidomics import NEGATIVE as LAB_NEGATIVE, POSITIVE as LAB_POSITIVE
+from .lab_lipidomics_agent import (
+    check_inputs as lab_check_inputs,
+    finish_normalize as lab_finish_normalize,
+    lab_workset_settings,
+    merge_lipidome as lab_merge_lipidome,
+    plan_normalize as lab_plan_normalize,
+    public_check as lab_public_check,
+    public_normalize_plan as lab_public_normalize_plan,
+    record_event as lab_record_event,
+    resolve_standards_for_contract as lab_resolve_standards,
+    write_contract as lab_write_contract,
+    write_normalize_inputs as lab_write_normalize_inputs,
+)
 from .diagnostic_paths import diagnostic_run_directory, is_diagnostic_artifact
 
 
@@ -139,7 +153,7 @@ JOBS_LOCK = threading.Lock()
 # checks, the time limits its Console runs under, and the Console's process id once it has one. In memory
 # only; a job an earlier backend process left "running" is not running in this one.
 PROCESSES: dict[str, dict[str, Any]] = {}
-CANCELLABLE_JOB_KINDS = frozenset({"run", "tuning", "repository_download"})
+CANCELLABLE_JOB_KINDS = frozenset({"run", "tuning", "repository_download", "normalize"})
 CONSOLE_JOB_KINDS = frozenset({"run", "tuning"})
 # Every job that starts a Console on a repository unit's raw files: a restore for viewing waits for each.
 UNIT_JOB_KINDS = CONSOLE_JOB_KINDS | {"rt_correction"}
@@ -241,6 +255,22 @@ def _record_peak_height_diagnostic(
     from .repository_reanalysis import record_peak_height_diagnostic
 
     manifest = str(preparation.get("repository_run_manifest") or "").strip()
+    contract = str(preparation.get("lab_lipidomics_contract_path") or "").strip()
+    if not manifest and contract:
+        # A laboratory lipidomics run keeps its decisions beside its contract instead.
+        try:
+            record = lab_record_event(contract, {
+                "event": "peak_height_diagnostic", "polarity": preparation.get("lab_lipidomics_polarity"),
+                "job_id": job_id, "representative": {
+                    key: representative.get(key)
+                    for key in ("file_name", "selection_reason", "instrument_family", "threshold_step")
+                },
+                "estimate": estimate,
+                "diagnostic_directory": str(preparation.get("diagnostic_run_directory") or ""),
+            })
+        except OSError as error:
+            return {"recorded": False, "reason": f"lab_lipidomics_record_unwritable: {error}"}
+        return {"recorded": True, "lab_lipidomics_record": record}
     if not manifest:
         return {"recorded": False, "reason": "no_repository_manifest"}
     return record_peak_height_diagnostic(
@@ -699,8 +729,8 @@ def _cancel_job(job_id: str, reason: str = "") -> tuple[HTTPStatus, dict[str, An
         if kind not in CANCELLABLE_JOB_KINDS:
             return HTTPStatus.BAD_REQUEST, {
                 "error": (
-                    f"A {kind or 'job of unknown kind'} job cannot be cancelled; only run, tuning and "
-                    "repository_download jobs can."
+                    f"A {kind or 'job of unknown kind'} job cannot be cancelled; only run, tuning, normalize "
+                    "and repository_download jobs can."
                 ),
                 "code": "not_cancellable",
                 "job_id": job_id,
@@ -1077,6 +1107,9 @@ def _write_guided_answers(preparation: dict, plan: dict) -> str:
         "workset_id": (plan.get("workset") or {}).get("id", ""),
         "answers": plan.get("answers", {}),
         "workset_suggestion": plan.get("workset_suggestion", {}),
+        # A laboratory lipidomics run is bound to the contract it was planned from by content: a contract
+        # replaced at the same path afterwards is another contract.
+        **({"lab_lipidomics": plan["lab_lipidomics"]} if plan.get("lab_lipidomics") else {}),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1665,6 +1698,14 @@ class Handler(BaseHTTPRequestHandler):
                         body.get("workset_id", ""),
                     )
                 )
+            elif parsed.path == "/api/agent/worksets/save" and str(
+                body.get("lab_lipidomics_contract_path") or ""
+            ).strip():
+                settings = lab_workset_settings(str(body["lab_lipidomics_contract_path"]))
+                saved = save_lab_lipidomics_workset(
+                    body.get("name", ""), settings, description=body.get("description", "")
+                )
+                self._json({"workset": saved, "not_reusable": saved["not_carried"]})
             elif parsed.path == "/api/agent/worksets/save":
                 answers = dict(body.get("answers") or {})
                 source_run = str(body.get("run_directory", "")).strip()
@@ -1781,6 +1822,7 @@ class Handler(BaseHTTPRequestHandler):
                         args=(job_id, preparation),
                         daemon=True,
                     ).start()
+                _record_laboratory_run_start(plan, job_id, preparation)
                 self._json(
                     {
                         "started": True,
@@ -1803,6 +1845,19 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError(
                         "Complete the guided questions and choose target_peak_count before diagnostic tuning."
                     )
+                if plan.get("diagnostic_blockers"):
+                    # The diagnostic writes beside input_path's raw files: a plan from a laboratory
+                    # contract that names another folder, or overrides what the contract fixes, is
+                    # refused here as its production run would be.
+                    self._json(
+                        {
+                            "started": False,
+                            "plan": plan,
+                            "error": "The diagnostic is refused: " + " ".join(plan["diagnostic_blockers"]),
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 watch = _console_watch_request(body)
                 # The diagnostic starts the Console, so it is boundary 4's as the production run is.
                 authorized = _campaign_crossing(
@@ -1863,6 +1918,9 @@ class Handler(BaseHTTPRequestHandler):
                         key: value for key, value in profile.items() if key != "file"
                     }
                     preparation["diagnostic_run_directory"] = str(diagnostic_root)
+                    if workflow.get("lab_lipidomics_contract_path"):
+                        preparation["lab_lipidomics_contract_path"] = workflow["lab_lipidomics_contract_path"]
+                        preparation["lab_lipidomics_polarity"] = workflow.get("ion_mode")
                     if authorized:
                         record_campaign_authorization(authorized[0], {**authorized[1], "job_id": job_id})
                     _write_diagnostic_record(job_id, preparation, "queued")
@@ -1952,6 +2010,38 @@ class Handler(BaseHTTPRequestHandler):
                         "representative": profile,
                         "estimate": estimate,
                         "provenance": recorded,
+                    }
+                )
+            elif parsed.path == "/api/lipidomics/check":
+                self._json(lab_public_check(lab_check_inputs(body)))
+            elif parsed.path == "/api/lipidomics/write-contract":
+                self._json(lab_write_contract(body))
+            elif parsed.path == "/api/lipidomics/resolve":
+                self._json(lab_resolve_standards(str(body.get("contract_path") or ""), _laboratory_runs(body)))
+            elif parsed.path == "/api/lipidomics/normalize":
+                self._json(_start_laboratory_normalize(body))
+            elif parsed.path == "/api/lipidomics/merge":
+                confirmed = body.get("confirmed") is True
+                report = lab_merge_lipidome(
+                    str(body.get("contract_path") or ""),
+                    str(body.get("output_name") or "lipid_metabolome.csv"),
+                    write=confirmed,
+                    # Absent follows the contract (on, 0.1 min); true or false is applied; anything else
+                    # (the text "false", say) is refused rather than read as either.
+                    reconcile_polarities=body.get("reconcile_polarities"),
+                    reconciliation_rt_tolerance=body.get("reconciliation_rt_tolerance"),
+                )
+                self._json(
+                    {
+                        "written": confirmed,
+                        **({} if confirmed else {
+                            "confirmation_required": True,
+                            "message": (
+                                "Show the person the counts, the reconciliation and the warnings, then call again "
+                                "with confirmed=true to write."
+                            ),
+                        }),
+                        "report": report,
                     }
                 )
             elif parsed.path == "/api/validate":
@@ -3167,6 +3257,161 @@ def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
             preparation.get("diagnostic_input_folder") or preparation.get("temporary_input_folder"),
             log,
         )
+
+
+def _record_laboratory_run_start(plan: dict[str, Any], job_id: str, preparation: dict[str, Any]) -> None:
+    """A laboratory lipidomics production run, in its contract's record. Never stops the run."""
+    workflow = plan.get("workflow") or {}
+    contract = str(workflow.get("lab_lipidomics_contract_path") or "").strip()
+    if not contract:
+        return
+    try:
+        lab_record_event(contract, {
+            "event": "production_run_started", "polarity": workflow.get("ion_mode"), "job_id": job_id,
+            "minimum_peak_height": workflow.get("minimum_peak_height"),
+            "deviations": (plan.get("lab_lipidomics") or {}).get("deviations", []),
+            "method_file": preparation.get("method_file"), "command": preparation.get("command"),
+        })
+    except OSError:
+        pass
+
+
+def _laboratory_runs(body: dict[str, Any]) -> dict[str, dict[str, Any] | None]:
+    """The runs to resolve, by polarity: each named job, or each output folder when asked to read them.
+
+    A job this backend does not know is refused rather than replaced by its folder, which may hold
+    another run's exports.
+    """
+    runs: dict[str, dict[str, Any] | None] = {}
+    for polarity, key in ((LAB_POSITIVE, "pos_job_id"), (LAB_NEGATIVE, "neg_job_id")):
+        job_id = str(body.get(key) or "").strip()
+        if job_id:
+            with JOBS_LOCK:
+                job = copy.deepcopy(JOBS.get(job_id))
+            if job is None:
+                raise ValueError(
+                    f"Job {job_id} is not known to this backend. Pass read_output_folders=true without a job id for "
+                    "that polarity to read its output folder instead."
+                )
+            runs[polarity] = job
+        elif body.get("read_output_folders") is True:
+            runs[polarity] = None
+    if not runs:
+        raise ValueError("Name pos_job_id and/or neg_job_id, the production runs to resolve.")
+    return runs
+
+
+def _start_laboratory_normalize(body: dict[str, Any]) -> dict[str, Any]:
+    """Preview, or once confirmed start, MSDIALCUI normalize for one polarity of a contract."""
+    job_id = str(body.get("job_id") or "").strip()
+    with JOBS_LOCK:
+        run = copy.deepcopy(JOBS.get(job_id))
+    if run is None:
+        raise ValueError(f"Run job {job_id} is not known to this backend.")
+    plan = lab_plan_normalize(
+        str(body.get("contract_path") or ""),
+        run,
+        str(body.get("resolution_digest") or ""),
+        body.get("accept_searched") or [],
+        body.get("accept_unresolved") or [],
+        body.get("accept_spot") or None,
+    )
+    shown = lab_public_normalize_plan(plan)
+    if body.get("confirmed") is not True:
+        return {
+            "started": False,
+            "confirmation_required": True,
+            "plan": shown,
+            "message": "Show the person the standards table and the exact command, then call again with confirmed=true.",
+        }
+    with JOBS_LOCK:
+        # One normalize per polarity at a time: a second writes the same quant files under the first.
+        live = next(
+            (
+                job_id for job_id, job in JOBS.items()
+                if job.get("kind") == "normalize" and job.get("status") in LIVE_JOB_STATUSES
+                and (job.get("preparation") or {}).get("lab_lipidomics_contract_path") == plan["contract_path"]
+                and (job.get("preparation") or {}).get("lab_lipidomics_polarity") == plan["polarity"]
+            ),
+            "",
+        )
+    if live:
+        raise ValueError(
+            f"Normalize job {live} for the {plan['polarity'].lower()} polarity of this contract is still running; "
+            "wait for it or cancel it."
+        )
+    written = lab_write_normalize_inputs(plan)
+    normalize_id = uuid.uuid4().hex
+    preparation = {
+        "command": plan["command"],
+        "run_directory": plan["paths"]["output_folder"],
+        "export_folder_path": plan["paths"]["output_folder"],
+        "lab_lipidomics_contract_path": plan["contract_path"],
+        "lab_lipidomics_polarity": plan["polarity"],
+    }
+    with JOBS_LOCK:
+        JOBS[normalize_id] = {
+            "id": normalize_id,
+            "status": "queued",
+            "kind": "normalize",
+            "logs": [],
+            "preparation": preparation,
+            "exit_code": None,
+            "result": None,
+            "created_at": dt.datetime.now().astimezone().isoformat(),
+        }
+        _register_process_locked(normalize_id, "normalize")
+        _persist_jobs_locked()
+    threading.Thread(target=_run_normalize_job, args=(normalize_id, plan), daemon=True).start()
+    return {"started": True, "job_id": normalize_id, "plan": shown, "inputs_written": written}
+
+
+def _run_normalize_job(job_id: str, plan: dict[str, Any]) -> None:
+    def log(line: str) -> None:
+        with JOBS_LOCK:
+            JOBS[job_id]["logs"].append(line)
+            JOBS[job_id]["logs"] = JOBS[job_id]["logs"][-2000:]
+
+    with JOBS_LOCK:
+        JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+        preparation = dict(JOBS[job_id]["preparation"])
+        _persist_jobs_locked()
+    try:
+        exit_code = _run_console_for_job(job_id, "normalize", preparation, log)
+        with JOBS_LOCK:
+            lines = list(JOBS[job_id]["logs"])
+        record = lab_finish_normalize(plan, exit_code, lines)
+        verification = record.get("verification") or {}
+        result = {
+            "record": record["record"],
+            "completed": record["completed"],
+            "verified": record["verified"],
+            "problems": record["problems"],
+            "failed_rows": len(verification.get("failed_rows", [])),
+            "quantified_rows": verification.get("quantified_rows"),
+            "outputs": record.get("outputs", {}),
+        }
+        with JOBS_LOCK:
+            JOBS[job_id]["exit_code"] = exit_code
+            JOBS[job_id]["result"] = result
+            # Not verified is a failure of the step, as the person must hear; the record still lets the
+            # merge set the failed rows aside when normalize itself completed as planned.
+            JOBS[job_id]["status"] = "completed" if record["verified"] else "failed"
+            if not record["verified"]:
+                JOBS[job_id]["error"] = (
+                    " ".join(record["problems"])
+                    or f"{result['failed_rows']} row(s) failed verification; the merge sets them aside as not quantified."
+                )
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
+    except Exception as error:
+        log(traceback.format_exc())
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "failed"
+            JOBS[job_id]["error"] = str(error)
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
 
 
 def _run_rt_correction_job(job_id: str, preparation: dict[str, Any]) -> None:

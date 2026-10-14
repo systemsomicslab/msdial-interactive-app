@@ -249,6 +249,10 @@ class AnUnreadablePolicyIsNormalisedAndReported(unittest.TestCase):
                     "template_path": str(template),
                     "output_root": str(root / "out"),
                     "class_assignment_confirmed": True,
+                    # Without a repository manifest this is the laboratory lipidomics profile.
+                    "solvent_type": "CH3COONH4",
+                    "analysis_purpose": "retention test",
+                    "use_retention_time_for_annotation": False,
                     "workflow_overrides": {"repository_raw_retention_policy": "delete"},
                 },
             )

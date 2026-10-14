@@ -149,6 +149,103 @@ as a tentative candidate source and should not be reported as equivalent to a
 high-quality spectral match. Private MSP files remain at their original local
 paths and are never bundled or redistributed by the app.
 
+LBM score cutoffs default to the laboratory template's 0.1 (weighted, simple
+and reverse dot product) for every run, laboratory and repository alike; a
+parameter template that states others is followed.
+
+## Laboratory lipidomics
+
+A laboratory batch is two raw folders (positive and negative), the laboratory's
+LBM2 library, the salt in the mobile phase, a text library of internal standards
+per polarity, and `quant_utility_table.xlsx` (sheet 1 the standards and their
+amounts, sheet 2 which standard quantifies which class, sheet 3 which class and
+adduct each polarity keeps). Five MCP tools take it from the folders to
+`lipid_metabolome.csv`, each step writing only once the person has confirmed it:
+
+1. `msdial_lipidomics_check_inputs` reads everything and changes nothing. With
+   the folders alone it lists what is there and every question still open (what
+   the analysis is for, the LBM2, the salt, the annotation RT tolerance, the
+   internal-standard libraries, the workbook and its amount column, where to
+   write, whether the raw folders are the data as acquired or a copy, since
+   MS-DIAL writes its intermediates beside them, and the Console). With the
+   answers it checks each input and the inputs against each other: the salt
+   against the adducts the standards and sheet 3 use, the classes each polarity
+   can only leave NOT QUANTIFIED, no output folder in or over a raw folder, and
+   one sample table proposed for both polarities. A sheet 3 that contradicts the
+   merge's positive/negative reconciliation (BMP or EtherPE selected in positive
+   mode, or BMP or EtherPE `[M-H]-` not selected) is a question,
+   `merge_selection_accepted`: the person changes sheet 3 before the contract, or
+   keeps it, and the contract records that. Once the contract holds the workbook,
+   changing it needs a new contract and new runs.
+2. `msdial_lipidomics_write_contract` writes `<root>/inputs/`: the contract, the
+   internal-standard libraries in the column order MS-DIAL reads, the standards
+   template and the selection rules. It is refused if an input, the raw folders
+   included, changed after the check the person saw; a check filled from a
+   workset is written with the same `workset_id`. A contract already at the root
+   is shown in the preview, with what was done under it, and is replaced only
+   when the preview itself was asked with `replace_existing`. Each polarity is
+   then planned with `msdial_guided_analysis_plan` and
+   `lab_lipidomics_contract_path`; the contract fixes the salt, the LBM2, both RT
+   tolerances, the internal-standard library (searched in the same run as a
+   Text-DB annotator with retention time on), the sample table, the output and
+   export folder, the Console, and Interactive's laboratory parameter template
+   and LBM query list (by sha256, whatever the shared settings or a workset
+   name), and states the method (`TimeBasedLinearWeightedMovingAverage`,
+   automatic RT correction with 12 anchors and the 1.5 min local window, the
+   annotation candidate table, QA). Neither the answers, a workset nor
+   `workflow_overrides` can change what it fixes; any other answer is applied and
+   reported as a deviation. The one-file diagnostic is refused, as the run is,
+   for any problem but the missing threshold. Each run records the contract's
+   sha256 beside it.
+3. `msdial_lipidomics_resolve_standards` decides which aligned spot is each
+   standard: at the m/z of the adduct the library names, an LBM annotation of
+   that standard first (out to the annotation RT tolerance, or the
+   internal-standard tolerance where that is wider, one inside the
+   internal-standard tolerance before a farther one), then the standard's own
+   text row as a reference match, then a hidden or below-cutoff text candidate or
+   a plain search, which need the person's acceptance; the most intense spot over
+   the sample and QC files within the first tier that has one. Every candidate is
+   listed, and the person may take another valid one instead.
+4. `msdial_lipidomics_normalize` writes the standards table with each chosen
+   alignment ID (or the spot the person took, `accept_spot`) and runs
+   `MSDIALCUI normalize --peak-ids-only`, so a standard the resolver rejected is
+   never looked up by name. Every quantified cell is then recomputed from the
+   Height matrix the same call wrote. A Console without `--peak-ids-only` is
+   refused; one rebuilt since the contract is said, and its build recorded.
+5. `msdial_lipidomics_merge` writes what the laboratory's own program
+   (metaboservice) wrote, into `<root>/quant/lipidome`, the folder the
+   laboratory's `metabolomics_service.R` is run in: `lipid_metabolome.csv`,
+   `lipid_metabolome4stat.csv`, `lipid_metabolome4classsummary.csv`,
+   `lipid_metabolome4summaryplot.csv` (always these names, which the R script
+   reads; over the Sample and QC columns, never a Blank) and the
+   `Summary_Dotplots`, `category_*` and `subclass_*` folders; ASCII, CRLF, comma
+   separated and unquoted (UTF-8, warned about, where a cell is not ASCII and
+   metaboservice wrote `?`), rows in the order .NET sorted them on Windows,
+   numbers as .NET Framework printed them. Rows are chosen as metaboservice chose
+   them: names, the Comment's `x` and the rule flag `TRUE` compared as written,
+   untrimmed and case-sensitive. Before sheet 3 selects,
+   the laboratory's positive/negative reconciliation renames a negative PG row
+   that positive mode annotates as BMP, and a negative PE O- row that positive
+   mode annotates as PE P- (same name after the class substitution, within
+   0.1 min); the report lists every pair, every positive row left unmatched,
+   every choice among several candidates, every positive row that lost all its
+   candidates to closer ones (the claims are settled together, so a positive row
+   that loses one candidate takes its next), and every renamed row whose own name
+   positive mode also annotates. The dotplot categories are metaboservice's own
+   (the converter it was built with, not current MS-DIAL's). Selected rows with no valid concentration go to
+   `lipid_metabolome_not_quantified.csv`, and everything is reported in
+   `merge-report.json`. It never writes over its own side file or report, or a
+   file normalize wrote, and replaces only the dotplot files its last merge
+   wrote.
+
+Outside a contract, LC-MS lipidomics with the laboratory's own libraries is the
+same profile: the salt, the LBM2 (an `.lbm2` with content), the annotation RT
+decision, the output folder and the analysis purpose are required questions.
+`sample_table` answers the Class confirmation with corrections; `false` alone no
+longer does. The contract and its record name the LBM2 where it is kept and are
+never part of a bundle. `msdial_save_workset` with `lab_lipidomics_contract_path`
+saves the fixed inputs for the next batch's check.
+
 ## Publication reporting
 
 The **7. Publication report** workspace generates an English Materials and
@@ -517,6 +614,14 @@ Core MCP tools:
 - `msdial_generate_publication_report`: create text, Excel, audit, and ZIP files
 - `msdial_complete_guided_analysis`: wait for one job and complete validation,
   QA, publication, and handoff without browser interaction
+- `msdial_lipidomics_check_inputs` / `msdial_lipidomics_write_contract`: check a
+  laboratory lipidomics batch's inputs (read-only) and fix them in a contract after
+  explicit confirmation
+- `msdial_lipidomics_resolve_standards` (read-only) / `msdial_lipidomics_normalize` /
+  `msdial_lipidomics_merge`: find the internal standards in each run, normalize with
+  `--peak-ids-only` and verify every cell, and write `lipid_metabolome.csv` with the
+  tables and dotplot folders the laboratory's R script reads; normalize and merge
+  preview by default and act only with `confirmed=true`
 - `msdial_interactive_create_handoff`: create `datamining-handoff.json`
 - `msdial_inspect_repository_metadata`: inspect public sample metadata and publication provenance
 - `msdial_project_repository_classes`: project a user-selected metadata hierarchy into MS-DIAL `Class`
