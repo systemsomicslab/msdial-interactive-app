@@ -14,8 +14,11 @@ What is pinned here, with synthetic tars of synthetic zips (nothing leaves the m
   own folder kept, a folder made for it, a vendor folder inside it), and the CSV gives them that sample's row;
 - the manifest records the nesting (declared_archive_inputs; the nested extraction record names the declared input);
 - the inner zip is held to the outer archive's rules: an unsafe member name, the member budget, its published MD5;
-- one sample's encodings inside one zip are one sample's (the one encoding rule), two runs are two inputs, and a
-  zip holding nothing MS-DIAL opens (MPST000213's JEOL msAxel project) says what it held;
+- one sample's encodings side by side inside one zip are one sample's (the one encoding rule); two runs (of two
+  names, or of one name in their own folders), both polarities' folders, or one name in two folders are one declared
+  input found more than once, and refused; an archived container still counts every input it matched; a zip holding
+  nothing MS-DIAL opens (MPST000213's JEOL msAxel project) says what it held;
+- a place is matched by the full path under the data root only;
 - an mzXML inside a declared zip is converted in a campaign, as a declared mzXML is;
 - where no record says where a declared per-sample zip went (one the unit downloads itself), its sample decides;
 - a store record made before 0.5.39, shaped as MPST000213's is, says where each zip went.
@@ -339,6 +342,38 @@ class WhatOneZipHoldsIsOneSample(_Workspace):
         ):
             self.lease({"S1.zip": _zip({"S1/run_1.mzML": MZML, "S1/run_2.mzML": MZML})})
 
+    def test_two_runs_of_one_file_name_in_their_own_folders_are_refused_not_chosen_by_path(self) -> None:
+        """Review of 0.5.39: the rule groups a declared unit's files by row and stem, so run_a/data.mzML and
+        run_b/data.mzML were one group, run_b was left unused ('tie_lexicographic'), and the lease ran run_a alone.
+        MPST000213's zips have this shape: every run is Data/<run>/RD/MsData.RPS."""
+        runs = {"S1/run_a/data.mzML": mzml(dda_spectra(2)), "S1/run_b/data.mzML": mzml(dda_spectra(3))}
+        zips = {"S1.zip": _zip(runs)}
+        with self.assertRaisesRegex(
+            ValueError, r"found more than once: S1\.zip \(2 inputs in what the archive held\)"
+        ):
+            self.lease(zips)
+
+    def test_both_polarities_folders_in_one_declared_zip_are_refused_not_chosen_by_path(self) -> None:
+        """POS/S1.mzML and NEG/S1.mzML are two acquisitions, never two encodings of one; in this positive unit the
+        lease ran NEG/S1.mzML, first by path, before the review of 0.5.39."""
+        for files in (
+            {"S1/NEG/S1.mzML": MZML, "S1/POS/S1.mzML": MZML},
+            # Another encoding as well as another folder: still two acquisitions.
+            {"S1/NEG/S1.mzML": MZML, "S1/POS/S1.cdf": b"CDF\x01netcdf"},
+        ):
+            with self.subTest(files=sorted(files)), self.assertRaisesRegex(
+                ValueError, r"found more than once: S1\.zip \(2 inputs in what the archive held\)"
+            ):
+                self.lease({"S1.zip": _zip(files)})
+
+    def test_one_name_in_two_folders_of_a_declared_zip_is_refused(self) -> None:
+        """Only an encoding beside the one used is another encoding of it: a folder inside a declared zip may be a
+        run, so cdf/S1.cdf and mzML/S1.mzML are not taken for one acquisition."""
+        with self.assertRaisesRegex(
+            ValueError, r"found more than once: S1\.zip \(2 inputs in what the archive held\)"
+        ):
+            self.lease({"S1.zip": _zip({"S1/cdf/S1.cdf": b"CDF\x01netcdf", "S1/mzML/S1.mzML": MZML})})
+
     def test_a_zip_holding_nothing_ms_dial_opens_says_what_it_held(self) -> None:
         """MPST000213: each zip held a JEOL msAxel project, which no RawDataHandler reader opens."""
         msaxel = {
@@ -405,6 +440,31 @@ class APerSampleZipTheUnitDownloadsIsMatchedThroughItsSample(_Workspace):
         self.assertNotIn("declared_archive_inputs", manifest)
 
 
+class AnArchivedContainerStillCountsEveryInputItMatched(unittest.TestCase):
+    """Review of 0.5.39: the exemption for unused encodings applied to every declared input, so an archived container
+    matched through its sample in two folders (A/S1.d, B/S1.d), which was refused as found twice, was no longer."""
+
+    def test_two_containers_of_one_name_matched_through_their_sample_are_refused(self) -> None:
+        project = RepositoryProject(
+            repository="metabolights", accession="MTBLS-AC", analysis_unit_id="ac", eligible=True,
+            selection_status="eligible", files=[RepositoryFile("raw/S1.d.zip", 10, "https://example.org/S1.d.zip")],
+            total_download_bytes=10, sample_metadata=[{"sample_id": "S1", "raw_file": "raw/S1.d"}],
+            analysis_inputs=[
+                {"path": "raw/S1.d", "kind": "archived_container", "archive": "raw/S1.d.zip", "sample_id": "S1"}
+            ],
+            analysis_inputs_declared=True,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            first, second = str(root / "A" / "S1.d"), str(root / "B" / "S1.d")
+            with self.assertRaisesRegex(ValueError, r"found more than once: raw/S1\.d \(2 inputs\)"):
+                _filter_inputs_by_project_allowlist(
+                    [first, second], root, project,
+                    archive_samples={_file_key(first): "S1", _file_key(second): "S1"},
+                    unused={_file_key(second)},
+                )
+
+
 # The nested record of Rubroshorea_leprosula_from_Borneo_ID_01.zip as the download store wrote it for MPST000213 on
 # 2026-10-14 (Interactive 0.5.37), less its timings and tool: no field this version added.
 MPST000213_ZIP = "Rubroshorea_leprosula_from_Borneo_ID_01.zip"
@@ -460,9 +520,7 @@ class AStoreRecordMadeBeforeThisVersionSaysWhereEachZipWent(unittest.TestCase):
 
         key = MPST000213_ZIP.casefold()
         place = "mb-post_files_mpst000213.0/rubroshorea_leprosula_from_borneo_id_01"
-        self.assertEqual(
-            {place: key, place + "/": key}, declared_archive_containers(project, declared, [MPST000213_RECORD])
-        )
+        self.assertEqual({place + "/": key}, declared_archive_containers(project, declared, [MPST000213_RECORD]))
         (expansion,) = declared_archive_expansions(declared, [MPST000213_RECORD])
         self.assertEqual(
             (
@@ -490,7 +548,38 @@ class AStoreRecordMadeBeforeThisVersionSaysWhereEachZipWent(unittest.TestCase):
 
         self.assertEqual({MPST000213_ZIP.casefold(): [str(inside)]}, found)
 
-    def test_each_destination_rule_names_its_place(self) -> None:
+    def test_a_place_is_matched_by_the_full_path_under_the_data_root_only(self) -> None:
+        """Review of 0.5.39: the place S1/ of a zip expanded at the root of a root-less archive was also tested
+        against each path less its first folder (_allowlist_forms), so QC/S1/x.mzML was S1.zip's input."""
+        project = RepositoryProject(
+            repository="metabolights", accession="MTBLS-PLACE", analysis_unit_id="place", eligible=True,
+            selection_status="eligible", files=[RepositoryFile("S1.zip", 10, "https://example.org/bundle.tar")],
+            total_download_bytes=10, sample_metadata=[{"sample_id": "S1", "raw_file": "S1.zip"}],
+            analysis_inputs=[{"path": "S1.zip", "kind": "file", "sample_id": "S1"}], analysis_inputs_declared=True,
+        )
+        declared = declared_analysis_inputs(project)
+
+        def record(rule: str, destination: str, container: str = "") -> dict:
+            return {
+                "archive_name": "bundle.tar", "placement": "", "destination_rule": "archive_root",
+                "nested": [{"archive_name": "S1.zip", "archive_path": "S1.zip", "depth": 2, "destination_rule": rule,
+                            "destination_relative": destination, "container_root": container}],
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for extraction, expected in (
+                # The zip's contents in a folder made for it, at the root.
+                (record("nested_directory", "S1"), {"S1/y.mzML": True, "QC/S1/x.mzML": False}),
+                # A vendor folder the zip held is the place itself, and the input.
+                (record("container_stem", "A/S1.d", "A/S1.d"), {"A/S1.d": True, "Q/A/S1.d": False, "A/S1.d0": False}),
+            ):
+                containers = declared_archive_containers(project, declared, [extraction])
+                for relative, matches in expected.items():
+                    with self.subTest(rule=extraction["nested"][0]["destination_rule"], input=relative):
+                        path = str(root.joinpath(*relative.split("/")))
+                        found = match_declared_inputs([path], root, declared, containers=containers)
+                        self.assertEqual([path] if matches else [], found["s1.zip"])
         rules = {
             ("nested_directory", "A/S1", ""): "A/S1",
             ("container_stem", "A/S1.d", "A/S1.d"): "A/S1.d",

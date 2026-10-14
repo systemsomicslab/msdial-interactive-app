@@ -20,15 +20,27 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - The place a nested archive expanded to is read from its extraction record's
     destination rule (`nested_rooted`, `nested_directory`, `container_*`,
     `stream_file`), so a download-store record made by an earlier version
-    answers too. `declared_archive_containers` returns that place, and every
-    input under it is that declared input's (`match_declared_inputs`). The
-    lease, the one encoding rule, the convert stage, the analysis-CSV builder
-    and a split part ask the same function, so they answer alike.
+    answers too. `declared_archive_containers` returns that place as `path/`,
+    and the input at it or under it is that declared input's
+    (`match_declared_inputs`). A place is one location under the data root: it
+    is tested against the input's full path there, never against the shorter
+    forms a listed name is read in, so `QC/S1/x.mzML` is not under the place
+    `S1/`. The lease, the one encoding rule, the convert stage, the analysis-CSV
+    builder and a split part ask the same function, so they answer alike.
   - What one declared archive held is one sample's. The one encoding rule
-    (2026-10-09) uses one of its encodings and records the others, which no
-    longer count as the declared input found twice. Two runs in one declared
-    zip are still refused as one declared input found more than once ("2 inputs
-    in what the archive held"), as one input per sample requires.
+    (2026-10-09) uses one of its encodings and records the others. Of those,
+    only another encoding beside the file used (the same folder and stem,
+    another rank in the rule's order: `S1/S1.mzML` beside `S1/S1.cdf`) does
+    not count as the declared input found twice. Anything else in one declared
+    zip is refused as one declared input found more than once ("2 inputs in
+    what the archive held"), as one input per sample requires: two runs
+    (`run_1.mzML`, `run_2.mzML`, or `run_a/data.mzML` and `run_b/data.mzML`,
+    the shape of MPST000213's `Data/<run>/RD/MsData.RPS`), both polarities'
+    folders (`POS/S1.mzML`, `NEG/S1.mzML`), or one name in two folders
+    (`cdf/S1.cdf`, `mzML/S1.mzML`). The rule groups a declared unit's files by
+    sample row and stem, so without this one of them would run, chosen by path.
+    An archived container, or a declared file, counts every input it matched,
+    as it always did.
   - An mzXML inside a declared archive is converted in a campaign, as a
     declared mzXML is.
   - A declared per-sample archive the unit downloads itself, which expands at
