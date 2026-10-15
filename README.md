@@ -312,8 +312,16 @@ vendor -> mzML -> mzXML (`.cdf`, `.abf` and `.ibf` between vendor and mzML), a
 tie to the first path without case, an unreadable one giving way to the next (an
 undecodable mzML, a failed conversion, a vendor header the configured extractor
 cannot read, a listed folder that did not arrive whole), as that sample's own
-input; every other is on record in `encoding_choices` with its reason. mzData,
-which nothing converts, excludes its unit there too.
+input; every other is on record in `encoding_choices` with its reason. Inside
+one declared per-sample archive (MB-POST's per-sample zips) the folders are
+copies too (the user's decision of 2026-10-15): one is used, and the others are
+named in `declared_archive_inputs` (`copies_unused`) and warned of; two
+polarities' folders, folders one of which may state a polarity by a mark the
+rule does not read (`Posi/` and `Nega/`, `ESI+/` and `ESI-/`), or two stems, in
+one such archive are still refused. A unit whose declared archives, seen on
+disk, hold files of no format MS-DIAL opens ends its lease with an exclusion
+(`download_failure.disposition`, `retryable` false), which a campaign does not
+retry. mzData, which nothing converts, excludes its unit there too.
 Raw-header results reported as `Mixed` can be split, after explicit confirmation,
 into independent acquisition-mode units with `msdial_split_repository_unit`; the
 Mixed parent is never sent to MS-DIAL.

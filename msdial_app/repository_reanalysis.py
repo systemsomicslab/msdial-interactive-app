@@ -66,6 +66,7 @@ from .mzxml_conversion import (
 )
 from .process_liveness import process_created_at, process_is_alive
 from .raw_metadata_preflight import (
+    DECLARED_ARCHIVE_COPIES_WARNING,
     INFERRED_PAIRING_WARNING,
     UNATTRIBUTED_MEMBER_PAIRING,
     UNATTRIBUTED_MEMBERS_RULE,
@@ -2335,15 +2336,21 @@ def create_download_lease(
             ]
         analysis_input = _common_input_path(inputs, data_root)
         kept = {_file_key(item) for item in inputs}
-        # Each declared input that was an archive inside the download, where it expanded and what it gave; its
-        # nested extraction record is marked with the declared path.
+        kept_choices = {key: value for key, value in encodings["by_input"].items() if key in kept}
+        # Each declared input that was an archive inside the download, where it expanded and what it gave, and the
+        # copies of its sample the rule left unused in its other folders (2026-10-15); its nested extraction record
+        # is marked with the declared path.
         declared_archives = declared_archive_inputs_record(
             inputs,
             data_root,
             project,
             archive_extractions,
             stands_for={key: value for key, value in stands_for.items() if key in kept},
+            encoding_choices=kept_choices,
         )
+        # Said wherever the lease left a copy unused: the folders inside one per-sample archive are copies, and
+        # one runs (the user's decision of 2026-10-15), never silently.
+        copy_warnings = declared_archive_copy_warnings(declared_archives)
         conversions, conversion_rows = _conversion_lineage(
             conversion,
             kept,
@@ -2356,7 +2363,6 @@ def create_download_lease(
             extracted_members=extracted_members,
             archive_extractions=archive_extractions,
         )
-        kept_choices = {key: value for key, value in encodings["by_input"].items() if key in kept}
         # Each member a rule paired whose sample the rule ran on another file (stand_pairings, by the member's
         # _file_key), and that file, as its sample's choice names it (encoding_used).
         encoding_used = {
@@ -2482,14 +2488,16 @@ def create_download_lease(
                 if header_reads
                 else {}
             ),
+            **({"declared_archive_copies_unused": len(copy_warnings)} if copy_warnings else {}),
             **(
                 {
                     "warnings": [
                         *([INFERRED_PAIRING_WARNING] if inferred else []),
                         *([UNATTRIBUTED_MEMBERS_WARNING] if unattributed_warned else []),
+                        *([DECLARED_ARCHIVE_COPIES_WARNING] if copy_warnings else []),
                     ]
                 }
-                if inferred or unattributed_warned
+                if inferred or unattributed_warned or copy_warnings
                 else {}
             ),
             **({"refused_name_pairings": name_pairings["refused"]} if name_pairings["refused"] else {}),
@@ -2551,10 +2559,13 @@ def create_download_lease(
                 "paired": inferred,
                 "refused": list(name_pairings["refused"]),
             }
-        if inferred or unattributed_warned:
+        if inferred or unattributed_warned or copy_warnings:
             manifest["warnings"] = [
                 *([INFERRED_PAIRING_WARNING] if inferred else []),
                 *([UNATTRIBUTED_MEMBERS_WARNING] if unattributed_warned else []),
+                # A declared per-sample archive whose copies in other folders the rule left unused (2026-10-15): the
+                # preflight's disposition and the analysis-CSV record carry it on, naming the copies.
+                *([DECLARED_ARCHIVE_COPIES_WARNING] if copy_warnings else []),
             ]
         if unattributed_record is not None:
             # The archive members no sample row pairs with: taken as unattributed inputs where the download is the
@@ -2567,10 +2578,11 @@ def create_download_lease(
             manifest["encoding_choices"] = encodings["records"]
         if declared_archives:
             # A declared input that was an archive inside the download (MB-POST's per-sample zips in its project
-            # tar): where it expanded and the inputs it gave. Only where one was, so every other lease records what
-            # it always did.
+            # tar): where it expanded and the inputs it gave, and the copies left unused (2026-10-15). Only where one
+            # was, so every other lease records what it always did.
             manifest["declared_archive_inputs"] = declared_archives
-        warnings = _archive_warnings(archive_extractions)
+        # The extraction's own warnings, then each declared archive whose copies the rule left unused, by name.
+        warnings = [*_archive_warnings(archive_extractions), *copy_warnings]
         if warnings:
             manifest["archive_warnings"] = warnings
         if store_lease is not None:
@@ -2829,6 +2841,28 @@ def _supersede_previous_manifest(manifest_path: Path) -> tuple[dict[str, Any], l
     return summary, superseded
 
 
+def download_exclusion(manifest: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The disposition a failed lease recorded where it ended its unit as one to exclude, else None.
+
+    A manifest whose status is download_failed and whose download_failure.disposition decides "exclude"
+    (DeclaredInputsUnsupportedError: every declared input it lacked is an archive that held no format MS-DIAL
+    opens). Its raw data are discarded as any excluded unit's are: discard_download_lease takes such a manifest,
+    under a campaign approval covering boundary 5 or with confirmed=true, like any other failed download.
+    """
+    if not isinstance(manifest, Mapping) or manifest.get("status") != "download_failed":
+        return None
+    return _failure_exclusion(manifest.get("download_failure"))
+
+
+def _failure_exclusion(failure: Any) -> dict[str, Any] | None:
+    """A download_failure's disposition where it decides "exclude", else None; whatever the manifest's status (a
+    discard that stopped part-way and is resumed reads it from a manifest already marked discarded)."""
+    disposition = failure.get("disposition") if isinstance(failure, Mapping) else None
+    if isinstance(disposition, Mapping) and disposition.get("decision") == "exclude":
+        return dict(disposition)
+    return None
+
+
 def _record_download_failure(
     manifest_path: Path,
     lease_record: dict[str, Any],
@@ -2841,6 +2875,12 @@ def _record_download_failure(
     The caller is already on its error path, and an exception here would replace the one that explains
     what went wrong. ``stage`` is the lease stage that failed; an archive that was refused also leaves
     its reason code and the members it refused (archive_failure).
+
+    A unit whose declared inputs hold no format MS-DIAL opens (DeclaredInputsUnsupportedError) also leaves
+    retryable false and its disposition (decision exclude, reason declared_inputs_unsupported_format, and each
+    such input with what it held), which the campaign runner reads as an exclusion rather than a failure to retry.
+    The record is also set on the error as ``download_failure``, so the download job that ran the lease carries
+    the same record, verbatim (server._run_repository_download_job), and its poll says what the manifest says.
     """
     record = dict(lease_record)
     record["status"] = "download_failed"
@@ -2872,6 +2912,14 @@ def _record_download_failure(
     if isinstance(error, MaterializationCollision):
         # The download store's: the paths two of its objects, or an object and a file already there, wanted.
         record["download_failure"]["materialization_collisions"] = error.collisions[:20]
+    if isinstance(error, DeclaredInputsUnsupportedError):
+        # No other download of the same objects holds anything else: an exclusion, never a retry.
+        record["download_failure"]["retryable"] = False
+        record["download_failure"]["disposition"] = error.disposition()
+    try:
+        error.download_failure = dict(record["download_failure"])  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
     try:
         _write_json(manifest_path, record)
     except (OSError, ValueError, TypeError):
@@ -4213,10 +4261,13 @@ def _select_conversion_sources(
 # preferred copies both declared) runs the first by path. Declared inputs of different rows, even of one name in two
 # folders (MTBKS64's raw/batch1/QC.RAW and raw/batch2/QC.RAW, two rows of S01), are different samples' files.
 # What one declared archive held (a declared input that is itself an archive: MB-POST's per-sample zips) is grouped
-# the same way, and the rule chooses among it; but where the files it chose among lie in different folders of that
-# archive, the lease refuses the archive as one declared input found more than once instead of running the one it
-# chose. That is an exception to "folders do not separate" that the user has not decided (encoding_rule, ONE
-# EXCEPTION THE USER HAS NOT DECIDED; _another_encoding_beside).
+# the same way, and the rule chooses among it, copies in other folders of that archive included: the folders inside
+# one per-sample archive are copies, and one is used (the user's decision of 2026-10-15; encoding_rule, FOLDERS INSIDE
+# ONE DECLARED PER-SAMPLE ARCHIVE ARE COPIES). The copies left unused are named in manifest.declared_archive_inputs
+# (declared_archive_inputs_record) and warned of. Where the files it chose among state two polarities (NEG/S1.mzML,
+# POS/S1.mzML), which this grouping by row and stem does not part, or lie in folders one of which may state a polarity
+# by a mark the rule does not read (Posi/, ESI-/: _unread_polarity_mark), the lease refuses the archive as one declared
+# input found more than once (_another_encoding_beside), as it refuses two stems (two runs) in one archive.
 
 STEM_OF_SEVERAL_SAMPLE_ROWS = "stem_of_several_sample_rows"
 # Where the lease's raw-header reads for the encoding rule write their records, under the unit's provenance.
@@ -8306,10 +8357,17 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
             part_manifest["input_name_pairings"] = pairings
         part_warnings = [
             item for item in parent.get("warnings") or []
-            if item not in {INFERRED_PAIRING_WARNING, UNATTRIBUTED_MEMBERS_WARNING}
+            if item not in {INFERRED_PAIRING_WARNING, UNATTRIBUTED_MEMBERS_WARNING, DECLARED_ARCHIVE_COPIES_WARNING}
         ]
         if pairings["paired"]:
             part_warnings.append(INFERRED_PAIRING_WARNING)
+        # The parent's declared archives whose input is this part's, with the copies the rule left unused in them
+        # (2026-10-15): the part carries the record and the warning only where it has such an input.
+        part_archives = _part_declared_archive_inputs(parent, part["input_candidates"], stands_for)
+        if part_archives:
+            part_manifest["declared_archive_inputs"] = part_archives
+        if any(item.get("copies_unused") for item in part_archives):
+            part_warnings.append(DECLARED_ARCHIVE_COPIES_WARNING)
         # The parent's unattributed members that are this part's inputs: the part carries the record and the
         # warning only where it has one of them. Read as the lease reads them (unattributed_lineage_record), so a
         # converted one is named by its mzXML, as its lineage row's member_name names it, and listed in converted.
@@ -10657,6 +10715,14 @@ def discard_download_lease(
                     "lease's record was left as it is."
                 )
 
+        # A lease that ended its unit as one to exclude (download_exclusion), read from its failure record, which a
+        # resumed discard finds beside a status already replaced.
+        exclusion = (
+            _failure_exclusion(manifest.get("download_failure"))
+            if manifest.get("status") in {"download_failed", "discarded"}
+            else None
+        )
+
         def change(current: dict[str, Any]) -> None:
             same_lease(current)
             current["status"] = "discarded"
@@ -10669,6 +10735,13 @@ def discard_download_lease(
                     "The run produced no validated mzTab-M output. Its raw data were deleted under the campaign "
                     "approval; its mzTab-M, that mzTab-M's validation and its failure record are kept as failure "
                     "artifacts."
+                )
+            elif exclusion is not None:
+                # Its lease ended download_failed with an exclusion (DeclaredInputsUnsupportedError): said as what it
+                # is, its download_failure kept beside it.
+                current["discard_reason"] = (
+                    "The download was excluded: every declared input it lacked is an archive that held no format "
+                    f"MS-DIAL opens ({DECLARED_INPUTS_UNSUPPORTED_FORMAT}; download_failure.disposition)."
                 )
             else:
                 current["discard_reason"] = (
@@ -12289,8 +12362,10 @@ def _filter_inputs_by_project_allowlist(
     excluded, whose conversion failed or whose scans contradict the declared polarity: a declared input
     they are is not missing, and a unit left with nothing else selects nothing rather than raising, so the
     lease can record why. unused is what the one encoding rule left unused (by _file_key): in a declared unit,
-    one of them beside the file used (its folder and its stem), inside one declared archive
-    (_another_encoding_beside), is not that input found twice; any other still is.
+    one of them inside one declared archive that is a copy or another encoding of the file used (its stem, in any
+    folder of the archive whose path states no other polarity, and whose folders apart from the used one's bear no
+    polarity mark the rule does not read: _another_encoding_beside, the user's decision of 2026-10-15) is not that
+    input found twice; any other still is.
     """
     if not project.analysis_unit_id:
         return inputs
@@ -12646,6 +12721,45 @@ def match_declared_inputs(
     return found
 
 
+# Why a lease ends a unit as excluded rather than failed: every declared input it lacks is a declared archive the
+# extract stage expanded, and none of the files it held is one MS-DIAL opens (DeclaredInputsUnsupportedError).
+DECLARED_INPUTS_UNSUPPORTED_FORMAT = "declared_inputs_unsupported_format"
+# How many of an archive's commonest suffixes the disposition names for it (the error's own text names five).
+DISPOSITION_SUFFIXES = 10
+
+
+class DeclaredInputsUnsupportedError(ValueError):
+    """A declared unit whose missing declared inputs are, every one of them, a declared archive that the extract
+    stage expanded and that held nothing MS-DIAL opens, with no declared input found more than once. "Held" is what
+    the lease saw: files on disk at a place the extraction record names, none of a format MS-DIAL opens, a campaign
+    converts, or an archive left packed (_expanded_without_input); a record at odds with the disk, an archive that
+    held no file, or one holding .ibf, .lrp or .imzML, which MS-DIAL opens and the lease takes as no input, is a
+    plain failure (review of 0.5.40, 2026-10-15).
+
+    Its text is the plain ValueError's, word for word. What it adds is what the failed lease records of it
+    (_record_download_failure): download_failure.retryable false, and download_failure.disposition {decision
+    "exclude", reason declared_inputs_unsupported_format, inputs: [{declared, archive, files, suffixes}]}. Another
+    download of the same objects expands the same archives into the same files, so a retry cannot succeed: MB-POST
+    MPST000213 (unit 334ab3e2f0e7600f4290), whose three per-sample zips each held a JEOL msAxel project (.xml, .pm,
+    .dfa, .ba, .ppl ...), was counted as a failed download three times by the campaign runner, which now reads the
+    disposition and ends such a unit as excluded, discarding its raw data under the campaign approval as it does for
+    every exclusion. Any other failure of the attribute stage - an input missing for another reason, an input found
+    more than once - stays the plain ValueError, with no disposition.
+    """
+
+    def __init__(self, message: str, inputs: list[dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.inputs = [dict(item) for item in inputs]
+
+    def disposition(self) -> dict[str, Any]:
+        """download_failure.disposition, as the campaign runner reads it."""
+        return {
+            "decision": "exclude",
+            "reason": DECLARED_INPUTS_UNSUPPORTED_FORMAT,
+            "inputs": [{**item, "suffixes": dict(item.get("suffixes") or {})} for item in self.inputs],
+        }
+
+
 def _select_declared_inputs(
     inputs: list[str],
     data_root: Path,
@@ -12666,11 +12780,17 @@ def _select_declared_inputs(
 
     A declared archive that was expanded inside another (declared_archive_expansions) is matched by what it
     held: the inputs under the place it expanded to. Of those the one encoding rule left unused (``unused``,
-    by _file_key), only one beside the very file it used, in its folder and of its stem, does not count it twice
-    (_another_encoding_beside): S1/S1.mzML beside S1/S1.cdf, S1/S1.wiff beside S1/S1.d. Every other one counts,
-    so two runs, two polarities' folders, or one name in two folders are refused as one declared input found more
-    than once; for one name in two folders that is an exception to the rule the user has not decided
-    (encoding_rule). One whose contents hold nothing MS-DIAL opens is missing, and the error says what it did hold.
+    by _file_key), one that is a copy or another encoding of a file it used does not count it twice
+    (_another_encoding_beside): of that file's stem, in its folder (S1/S1.mzML beside S1/S1.cdf, S1/S1.wiff beside
+    S1/S1.d) or in another folder of the archive whose path states no other polarity (S1/A/S1.mzML beside
+    S1/B/S1.mzML; the user's decision of 2026-10-15 that the folders inside one per-sample archive are copies). Every
+    other one counts, so two runs of two stems (run_1.mzML, run_2.mzML), two polarities' folders (NEG/S1.mzML,
+    POS/S1.mzML), and folders one of which may state a polarity by a mark the rule does not read (Posi/S1.mzML,
+    Nega/S1.mzML; ESI+/, ESI-/) are refused as one declared input found more than once. One whose contents hold
+    nothing MS-DIAL opens is missing, and the error says what it did hold; where every missing input is such an
+    archive, seen on disk to hold files of which none is of a format MS-DIAL opens (_expanded_without_input), and
+    none is found more than once, the error is a DeclaredInputsUnsupportedError, which the failed lease records as an
+    exclusion (download_failure.disposition) rather than a failure to retry.
 
     WHY BY PATH, AND WHY EVERY ONE. Before the Catalog declared its inputs, an input was admitted when a
     listed name or a sample's file name matched its basename. A Waters folder matched neither - its
@@ -12702,19 +12822,28 @@ def _select_declared_inputs(
     missing = [str(declared[key].get("path") or key) for key in missing_keys]
     unused = unused or set()
     expanded = {item["key"] for item in declared_archive_expansions(declared, archive_extractions)}
+    unit_polarity = _unit_polarity(project)
 
     def counted(key: str, matched: list[str]) -> list[str]:
         """The inputs that count toward a declared input found more than once: all of them, less, for a declared
-        archive (is_declared_archive) only, an unused file beside one the rule used (_another_encoding_beside; an
-        archived container, or a declared file, counts every input it matched, as it always did)."""
+        archive (is_declared_archive) only, an unused file that is a copy or another encoding of one the rule used
+        (_another_encoding_beside; an archived container, or a declared file, counts every input it matched, as it
+        always did)."""
         if not unused or not is_declared_archive(key, declared[key]):
             return matched
         used = [item for item in matched if _file_key(item) not in unused]
+        # Whether the archive's paths name files by polarity (names_state_polarity), as _encoding_groups asks it of
+        # a unit's candidates: only then does a pos/neg token beside a QC, blank or control token state one.
+        polarity_named = names_state_polarity(
+            _relative_under((stands_for or {}).get(_file_key(item)) or item, data_root) for item in matched
+        )
         return [
             item
             for item in matched
             if _file_key(item) not in unused
-            or not _another_encoding_beside(item, used, data_root, stands_for or {})
+            or not _another_encoding_beside(
+                item, used, data_root, stands_for or {}, unit_polarity=unit_polarity, polarity_named=polarity_named
+            )
         ]
 
     doubled = [
@@ -12726,6 +12855,7 @@ def _select_declared_inputs(
     ]
     if missing or doubled:
         problems = []
+        emptied: dict[str, Any] = {"text": "", "inputs": []}
         if missing:
             problems.append(
                 f"{len(missing)} of its {len(declared)} declared analysis inputs are not in the download: "
@@ -12733,46 +12863,146 @@ def _select_declared_inputs(
                 + (f", and {len(missing) - 5} more" if len(missing) > 5 else "")
             )
             emptied = _expanded_without_input(missing_keys, declared, archive_extractions, data_root)
-            if emptied:
-                problems.append(emptied)
+            if emptied["text"]:
+                problems.append(emptied["text"])
         if doubled:
             problems.append("declared inputs found more than once: " + ", ".join(doubled[:5]))
-        raise ValueError(
+        message = (
             f"Analysis unit {project.analysis_unit_id} declares its analysis inputs, and "
             + "; ".join(problems)
             + ". Refusing to run it without them."
         )
+        # Every missing input an archive that held nothing MS-DIAL opens, and none found twice: no retry downloads
+        # anything else, and the failed lease records the unit as one to exclude (DeclaredInputsUnsupportedError).
+        if missing and not doubled and len(emptied["inputs"]) == len(missing_keys):
+            raise DeclaredInputsUnsupportedError(message, emptied["inputs"])
+        raise ValueError(message)
     selected = {item for matched in found.values() for item in matched}
     return [item for item in inputs if item in selected]
 
 
-def _another_encoding_beside(item: str, used: list[str], data_root: Path, stands_for: dict[str, str]) -> bool:
-    """Whether an input the one encoding rule left unused lies beside a file it used: in the same folder and of the
-    same stem (encoding_preference.stem), whatever its rank (encoding_rule.encoding_rank).
+def _another_encoding_beside(
+    item: str,
+    used: list[str],
+    data_root: Path,
+    stands_for: dict[str, str],
+    *,
+    unit_polarity: str = "",
+    polarity_named: bool = False,
+) -> bool:
+    """Whether an input the one encoding rule left unused in a declared archive is a copy or another encoding of a
+    file it used there: of the same stem (encoding_preference.stem), whatever its rank (encoding_rule.encoding_rank)
+    and whatever folder of the archive it lies in, unless the two paths state two polarities, or a folder one of them
+    lies in and the other does not may state one by a mark the rule does not read.
 
     Two names in one folder that differ only by their container suffix are one acquisition, never two runs:
     S1/S1.mzML beside S1/S1.cdf (another rank, clause 1), or S1/S1.wiff beside S1/S1.d (one rank, two vendor
     formats: a tie clause 2 gives the first by path). Such a file is the rule's to leave unused, and does not count.
 
-    A file in another folder of a declared archive does count, so the lease refuses the archive as one declared input
-    found more than once. That is an EXCEPTION to the rule, not the rule (encoding_rule, ONE EXCEPTION THE USER HAS
-    NOT DECIDED). By the rule's words ("copies in other folders included", clause 2) and THE SAME SAMPLE above,
-    S1/A/S1.mzML beside S1/B/S1.mzML, S1/RAW/S1.d beside S1/mzML/S1.mzML and, in a positive unit, S1/POS/S1.mzML
-    beside S1/S1.mzML are one sample's copies, and one would run. But the folders inside one sample's archive may be
-    its runs, which the rule's grouping of a declared unit (_encoding_groups: one sample row and one stem) cannot
-    tell from copies: MPST000213's zips hold Data/<run>/RD/MsData.RPS for every run, all of one stem, and
-    S1/run_a/data.mzML beside S1/run_b/data.mzML would run one of them, chosen by path. Whether such folders are runs
-    or copies is the user's to decide; until that answer is on record the lease refuses rather than choose. (Two
-    polarities' folders, S1/NEG/S1.mzML and S1/POS/S1.mzML, are two acquisitions by the rule itself, and must count
-    whatever that answer is.) An mzML the convert stage wrote is placed where the mzXML it stands for lies.
+    FOLDERS INSIDE ONE PER-SAMPLE ARCHIVE ARE COPIES (the user's decision of 2026-10-15: "1つだけで良いと思っています",
+    one is enough). One sample's file of one stem in two folders of its declared archive - S1/A/S1.mzML beside
+    S1/B/S1.mzML, S1/RAW/S1.d beside S1/mzML/S1.mzML, S1/run_a/data.mzML beside S1/run_b/data.mzML, and, in a
+    positive unit, S1/POS/S1.mzML beside S1/S1.mzML - is copies of one acquisition, and the rule applies as written:
+    it uses one (by rank, then the first by path on a tie: clauses 1 and 2) and records the others, which do not
+    count. Until that decision (0.5.39) such a file counted, and the lease refused the archive as one declared input
+    found more than once, because the folders might have been runs. The copies left unused are named in
+    manifest.declared_archive_inputs (copies_unused, copy_rule) and in a warning of the lease
+    (declared_archive_inputs_record, DECLARED_ARCHIVE_COPIES_WARNING).
+
+    What still counts, so the archive is still refused as found more than once:
+    - two polarities' folders (S1/NEG/S1.mzML and S1/POS/S1.mzML), two acquisitions by the rule itself (THE SAME
+      SAMPLE above). The polarities are those the paths state by tokens of their own (name_polarities, reading a
+      pos/neg token beside a QC, blank or control token only where ``polarity_named``), and a path that states none
+      is one sample's with one that states the unit's own, or the only one stated where the unit gives none
+      (_one_sample_polarities, ``unit_polarity``): S1/POS/S1.mzML and S1/S1.mzML are copies in a positive unit, and
+      are refused in a negative one;
+    - two folders of which one may state a polarity by a mark that name_polarities does not read (Posi/ and Nega/,
+      ESI+/ and ESI-/, ESIpos/ and ESIneg/, P/ and N/, (+)/ and (-)/; _unread_polarity_mark), wherever the two
+      paths' folders differ (_folders_bear_an_unread_polarity_mark). Such folders are neither read as two polarities
+      nor taken as copies: a positive unit took S1/Nega/S1.mzML, first by path, as the copy of S1/Posi/S1.mzML that it
+      used, and would have run the negative file under the positive declaration (review of 0.5.40, 2026-10-15). The
+      archive is refused as 0.5.39 refused it, a stop for a person to look at rather than a polarity guessed from a
+      folder's name. That holds in a unit of either polarity, and beside a folder of no mark as well (S1/Posi/S1.mzML
+      beside S1/S1.mzML), since what such a mark states is not read;
+    - two stems (run_1.mzML and run_2.mzML), which are two runs: the rule groups a declared unit's files by sample
+      row and stem (_encoding_groups), uses one of each, and leaves neither unused.
+
+    Folders that differ by names bearing no polarity mark are copies: S1/A/ and S1/B/, S1/RAW/ and S1/mzML/, and a
+    copy a desktop made (S1/S1 - Copy/, whose '-' stands between spaces, not at a word's end).
+
+    An mzML the convert stage wrote is placed where the mzXML it stands for lies.
     """
 
-    def where(path: str) -> tuple[str, str]:
+    def where(path: str) -> tuple[str, str, frozenset[str]]:
         relative = _relative_under(stands_for.get(_file_key(path)) or path, data_root)
-        folder = relative.rsplit("/", 1)[0] if "/" in relative else ""
-        return folder.casefold(), encoding_preference.stem(relative)
+        return (
+            relative,
+            encoding_preference.stem(relative),
+            frozenset(name_polarities(relative, polarity_named=polarity_named)),
+        )
 
-    return where(item) in {where(path) for path in used}
+    relative, stem, stated = where(item)
+    for path in used:
+        other_relative, other_stem, other = where(path)
+        if other_stem != stem:
+            continue
+        samples = _one_sample_polarities((stated, other), unit_polarity)
+        if samples.get(stated, stated) != samples.get(other, other):
+            continue
+        if _folders_bear_an_unread_polarity_mark(relative, other_relative):
+            continue
+        return True
+    return False
+
+
+# MARKS A FOLDER MAY STATE A POLARITY BY THAT name_polarities DOES NOT READ (review of 0.5.40, 2026-10-15). The rule
+# reads a polarity from a name only by a pos, positive, neg or negative token of its own (POLARITY_NAME_TOKENS), as the
+# Catalog does. A per-sample archive's folders may state one otherwise: Posi/ and Nega/, ESI+/ and ESI-/, ESIpos/ and
+# ESIneg/, P/ and N/, (+)/ and (-)/, ポジ/ and ネガ/. Those are not read as polarities here either (widening the rule's
+# reader is not this check's to do); a folder bearing one only stops two files from being taken as copies
+# (_another_encoding_beside), so a false mark costs a refusal for a person to look at, never a run.
+# A token that begins with pos or neg, or ends in a form of either (esipos, ionneg, esipositive).
+_UNREAD_POLARITY_TOKEN = re.compile(r"^(?:pos|neg)|(?:pos|posi|positiv|positive|neg|nega|negativ|negative)$")
+# A '+' anywhere; a '-' that ends a word (ESI-, ESI- mode) or begins one (-ESI); a '-' in brackets ((-), [ - ]). A '-'
+# between two words' characters (run-a, 2026-10-15) or between spaces (S1 - Copy) is a separator, not a sign.
+_UNREAD_POLARITY_SIGN = re.compile(r"\+|[^\W_]-(?![^\W_])|(?<![^\W_])-[^\W_]|[(\[]\s*-\s*[)\]]")
+# A token of one letter: P/ and N/.
+_UNREAD_POLARITY_LETTERS = frozenset({"p", "n"})
+# Japanese words for the two (positive, negative; cation, anion).
+_UNREAD_POLARITY_WORDS = ("ポジ", "ネガ", "陽イオン", "陰イオン", "正イオン", "負イオン")
+
+
+def _unread_polarity_mark(segment: str) -> bool:
+    """Whether a folder's name may state a polarity by a mark name_polarities does not read (_UNREAD_POLARITY_TOKEN,
+    _UNREAD_POLARITY_SIGN, _UNREAD_POLARITY_LETTERS, _UNREAD_POLARITY_WORDS).
+
+    A token name_polarities reads (POS, Negative, QC_NEG's neg) is not such a mark: what it states is read, and
+    _one_sample_polarities decides by it. Another token of the same folder still is, and so is a token the reader
+    does not see as one of its own: pos(1) states nothing the rule reads, so its pos is a mark.
+    """
+    text = str(segment or "").casefold()
+    if _UNREAD_POLARITY_SIGN.search(text) or any(word in text for word in _UNREAD_POLARITY_WORDS):
+        return True
+    read = {token for token in _name_tokens(text) if token in POLARITY_NAME_TOKENS}
+    for token in re.split(r"[\W_]+", text):
+        if not token or token in read:
+            continue
+        if token in _UNREAD_POLARITY_LETTERS or _UNREAD_POLARITY_TOKEN.search(token):
+            return True
+    return False
+
+
+def _folders_bear_an_unread_polarity_mark(first: str, second: str) -> bool:
+    """Whether a folder that one of two paths under the data root lies in and the other does not (compared without
+    case) may state a polarity by a mark name_polarities does not read (_unread_polarity_mark). The folders the two
+    share say the same of both, and the file names are of one stem, so only where the folders differ can a mark make
+    two acquisitions of what would otherwise be copies."""
+
+    def folders(relative: str) -> set[str]:
+        parts = [part for part in str(relative or "").replace("\\", "/").split("/") if part]
+        return {part.casefold() for part in parts[:-1]}
+
+    return any(_unread_polarity_mark(part) for part in folders(first) ^ folders(second))
 
 
 def _expanded_without_input(
@@ -12780,45 +13010,113 @@ def _expanded_without_input(
     declared: dict[str, dict[str, Any]],
     archive_extractions: list[dict[str, Any]] | None,
     data_root: Path,
-) -> str:
-    """What the missing declared archives held, where they were expanded and none of it is an input; '' if none.
+) -> dict[str, Any]:
+    """What the missing declared archives held, where they were expanded and none of it is an input: {"text": the
+    clause the lease's error carries, '' where no missing input was such an archive; "inputs": the disposition's}.
 
     MPST000213's three per-sample zips each held a JEOL msAxel project (Data/<run>/RD/MsData.RPS, MS/<n>/
     Profile.dfa, ...), and its lease said only that they were "not in the download", which they had been.
+
+    ``inputs`` (DeclaredInputsUnsupportedError) holds one entry per missing declared archive whose files were seen,
+    and of which none is of a format MS-DIAL opens or a campaign converts (_held_as_input_format): {declared: the
+    declared path; archive: its path under the data root as its extraction recorded it (archive_path); files: how many
+    files lie at its places; suffixes: {suffix: count}, its commonest DISPOSITION_SUFFIXES}. An exclusion deletes the
+    unit's raw data and is never retried, so an entry stands only on what was seen (review of 0.5.40, 2026-10-15):
+    - at least one of its places is on disk under the data root, and was walked, the place itself included (a
+      nested_rooted S1.d.zip expands to the vendor folder S1.d, which the walk of what lies inside it does not
+      name). A record whose places are not on disk (one that disagrees with the disk) says nothing of what the
+      archive held, and no file was seen;
+    - at least one file lies there (an archive that expanded to nothing has no suffix to say it held);
+    - nothing there is of a format MS-DIAL opens (encoding_preference's VENDOR_SUFFIXES and OPEN_SUFFIXES, from
+      MsdialCore's SupportFormat.cs: .ibf, .lrp and .imzML too, which the lease takes as no input), a campaign
+      converts (an mzXML), or an archive the extract stage left packed (nested_skipped), whose contents no one saw.
+    An archive whose place no record names, whose places are not on disk, that held no file, or under which such a
+    file lies has no entry: it is missing for a reason other than what it held (a gap of the lease, a record at odds
+    with the disk), and its unit stays a failure, not one to exclude for its format.
     """
     expansions: dict[str, list[dict[str, Any]]] = {}
     for item in declared_archive_expansions(declared, archive_extractions, data_root=data_root):
         if item["key"] in missing:
             expansions.setdefault(item["key"], []).append(item)
     if not expansions:
-        return ""
+        return {"text": "", "inputs": []}
     described = []
-    for key in sorted(expansions, key=str.casefold)[:3]:
-        for item in expansions[key][:1]:
-            suffixes: Counter[str] = Counter()
-            for place in item["places"]:
-                target = data_root.joinpath(*place.split("/"))
-                walked = [target] if target.is_file() else (target.rglob("*") if target.is_dir() else [])
-                suffixes.update(path.suffix.casefold() or "(none)" for path in walked if path.is_file())
-            files = sum(suffixes.values()) or int(item["nested"].get("file_count") or 0)
+    inputs: list[dict[str, Any]] = []
+    for index, key in enumerate(sorted(expansions, key=str.casefold)):
+        item = expansions[key][0]
+        suffixes: Counter[str] = Counter()
+        # What lies there that MS-DIAL opens, a campaign converts, or that is an archive left packed, by suffix.
+        opened: Counter[str] = Counter()
+        examined = False
+        for place in item["places"]:
+            target = data_root.joinpath(*place.split("/"))
+            if target.is_file():
+                walked: Iterable[Path] = [target]
+            elif target.is_dir():
+                walked = [target, *target.rglob("*")]
+            else:
+                continue
+            examined = True
+            for path in walked:
+                if _held_as_input_format(path.name):
+                    opened[path.suffix.casefold() or "(none)"] += 1
+                if path.is_file():
+                    suffixes[path.suffix.casefold() or "(none)"] += 1
+        files = sum(suffixes.values()) or int(item["nested"].get("file_count") or 0)
+        if examined and suffixes and not opened:
+            inputs.append(
+                {
+                    "declared": str(declared[key].get("path") or key),
+                    "archive": item["archive_path"],
+                    "files": files,
+                    "suffixes": dict(suffixes.most_common(DISPOSITION_SUFFIXES)),
+                }
+            )
+        if index < 3:
             where = ", ".join(item["places"]) or "a place its record does not name"
             kinds = ", ".join(f"{suffix} {count}" for suffix, count in suffixes.most_common(5))
+            held = ", ".join(f"{suffix} {count}" for suffix, count in opened.most_common(5))
             described.append(
                 f"{declared[key].get('path') or key}: {files} file(s) under {where}"
+                + (" (not on disk)" if item["places"] and not examined else "")
                 + (f", by suffix {kinds}" if kinds else "")
+                + (
+                    f", among them {held} of a format MS-DIAL opens or a campaign converts, or an archive left packed"
+                    if held
+                    else ""
+                )
             )
     inside = sorted(
         {str(item["record"].get("archive_name") or "") for items in expansions.values() for item in items} - {""}
     )
-    return (
+    text = (
         f"{len(expansions)} of them {'was an archive' if len(expansions) == 1 else 'were archives'} inside "
         + (", ".join(inside) or "the download")
         + " that the extract stage expanded, and none of the files "
         + ("it" if len(expansions) == 1 else "they")
-        + " held is one MS-DIAL opens ("
+        # Said of what they held only where every one was seen to hold nothing MS-DIAL opens; else of the inputs.
+        + (" held is one MS-DIAL opens (" if len(inputs) == len(expansions) else " held is an input the lease takes (")
         + "; ".join(described)
         + (f"; and {len(expansions) - 3} more" if len(expansions) > 3 else "")
         + ")"
+    )
+    return {"text": text, "inputs": inputs}
+
+
+def _held_as_input_format(name: str) -> bool:
+    """Whether a file or folder a declared archive held is of a format MS-DIAL opens (encoding_preference's
+    VENDOR_SUFFIXES, OPEN_SUFFIXES and FOLDER_SUFFIXES, from MsdialCore's SupportFormat.cs, and the lease's own
+    RAW_SUFFIXES), a campaign converts (CONVERTIBLE_SUFFIXES), packed or not (S1.mzML.gz), or is an archive the
+    extract stage left packed, whose contents are unseen (_expanded_without_input). .ibf and .lrp are vendor formats
+    MS-DIAL opens that the lease's discovery takes as no input; .imzML (imaging, outside the campaign) is one too: an
+    archive holding any of them is no unsupported format."""
+    lower = str(name or "").casefold()
+    return (
+        PurePosixPath(lower).suffix in RAW_SUFFIXES
+        or lower.endswith(CONVERTIBLE_SUFFIXES)
+        or encoding_preference.kind(lower) in {"vendor", "open", "convertible"}
+        or lower.endswith(encoding_preference.FOLDER_SUFFIXES)
+        or archives.is_archive_name(lower)
     )
 
 
@@ -12829,6 +13127,7 @@ def declared_archive_inputs_record(
     archive_extractions: list[dict[str, Any]] | None,
     *,
     stands_for: dict[str, str] | None = None,
+    encoding_choices: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """manifest.declared_archive_inputs: each declared archive expanded inside another, and the inputs it gave.
 
@@ -12839,6 +13138,15 @@ def declared_archive_inputs_record(
     whether the declared checksum matched them; and the inputs that are its sample's, under the data root (an mzML
     the convert stage wrote is named by the mzXML it stands for, which is what lies there). The nested extraction
     record is marked with the declared path (declared_input). Empty where no declared input was such an archive.
+
+    COPIES LEFT UNUSED (the user's decision of 2026-10-15: the folders inside one per-sample archive are copies, and
+    one is used; _another_encoding_beside). Where the one encoding rule used an input of the archive and left a file
+    of its sample unused in another folder of the archive, the entry also says so: copies_unused, those files' paths
+    under the data root as the rule's choice records them (each with its reason in manifest.encoding_choices), and
+    copy_rule (encoding_rule.DECLARED_ARCHIVE_COPY_RULE). ``encoding_choices`` is the lease's, by each input's
+    _file_key ({"record": EncodingChoice.record()}: _encoding_outcome's by_input). A file left unused in the folder of
+    the one used (S1/S1.mzML beside S1/S1.cdf) is the rule as it always applied, no copy, and is not listed here. Only
+    where a copy was left, so every other lease records what it always did; declared_archive_copy_warnings says it.
     """
     declared = declared_analysis_inputs(project)
     expansions = declared_archive_expansions(declared, archive_extractions, data_root=data_root)
@@ -12852,16 +13160,30 @@ def declared_archive_inputs_record(
         stands_for=stands_for,
     )
     stands_for = stands_for or {}
+    encoding_choices = encoding_choices or {}
+
+    def folder(relative: str) -> str:
+        return relative.rsplit("/", 1)[0].casefold() if "/" in relative else ""
+
     result = []
     for item in expansions:
         nested = item["nested"]
         entry = item["entry"]
         nested["declared_input"] = str(entry.get("path") or item["key"])
+        places = [place.casefold() for place in item["places"]]
         used = []
+        copies: list[str] = []
         for path in found.get(item["key"]) or []:
             source = stands_for.get(_file_key(path)) or path
             relative = _relative_under(source, data_root)
             used.append(relative)
+            choice = (encoding_choices.get(_file_key(path)) or {}).get("record") or {}
+            chosen = str(choice.get("used") or "")
+            for unused in choice.get("unused") or [] if chosen else []:
+                other = str((unused or {}).get("path") or "")
+                within = any(other.casefold() == place or other.casefold().startswith(place + "/") for place in places)
+                if other and within and folder(other) != folder(chosen) and other not in copies:
+                    copies.append(other)
         result.append(
             {
                 "declared_path": str(entry.get("path") or item["key"]),
@@ -12878,9 +13200,67 @@ def declared_archive_inputs_record(
                 "archive_md5": str(nested.get("archive_md5") or ""),
                 "declared_checksum_verified": bool(nested.get("declared_checksum_verified")),
                 "inputs": sorted(used, key=lambda value: (value.casefold(), value)),
+                **(
+                    {
+                        "copies_unused": sorted(copies, key=lambda value: (value.casefold(), value)),
+                        "copy_rule": encoding_rule.DECLARED_ARCHIVE_COPY_RULE,
+                    }
+                    if copies
+                    else {}
+                ),
             }
         )
     return result
+
+
+def _part_declared_archive_inputs(
+    parent: Mapping[str, Any], inputs: Iterable[str], stands_for: Mapping[str, str]
+) -> list[dict[str, Any]]:
+    """A split part's manifest.declared_archive_inputs: the parent's entries whose inputs are among the part's,
+    matched by their path under the parent's data root (an mzML the convert stage wrote by the mzXML it stands for,
+    ``stands_for`` being lineage_stands_for of the parent), with their copies left unused. Empty where none is."""
+    entries = [item for item in parent.get("declared_archive_inputs") or [] if isinstance(item, Mapping)]
+    root = str(parent.get("input_directory") or "").strip()
+    if not entries or not root:
+        return []
+    data_root = Path(root)
+    mine: set[str] = set()
+    for item in inputs:
+        mine.add(_relative_under(item, data_root).casefold())
+        source = stands_for.get(_file_key(item))
+        if source:
+            mine.add(_relative_under(source, data_root).casefold())
+    return [
+        dict(entry) for entry in entries if any(str(path).casefold() in mine for path in entry.get("inputs") or [])
+    ]
+
+
+def declared_archive_copy_warnings(records: Iterable[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """What a reader of the unit is told of each declared archive whose copies the lease left unused: one
+    manifest.archive_warnings entry each, {archive, kind DECLARED_ARCHIVE_COPIES_WARNING, message}, the message naming
+    the declared archive, the copy used and the copies left (declared_archive_inputs_record's copies_unused). Empty
+    where no copy was left."""
+    warnings: list[dict[str, str]] = []
+    for record in records:
+        copies = [str(item) for item in record.get("copies_unused") or []]
+        if not copies:
+            continue
+        used = [str(item) for item in record.get("inputs") or []]
+        inside = str(record.get("inside") or "")
+        warnings.append(
+            {
+                "archive": str(record.get("archive_path") or record.get("declared_path") or ""),
+                "kind": DECLARED_ARCHIVE_COPIES_WARNING,
+                "message": (
+                    f"{record.get('declared_path')}"
+                    + (f" (inside {inside})" if inside else "")
+                    + " held its sample's file in more than one of its folders. The folders inside one per-sample "
+                    "archive are copies of one acquisition, and one is used (user decision 2026-10-15). "
+                    + f"Used: {', '.join(used) or 'none'}; left unused: {', '.join(copies)}."
+                ),
+            }
+        )
+    return warnings
 
 
 def _allowlist_forms(relative: str) -> set[str]:

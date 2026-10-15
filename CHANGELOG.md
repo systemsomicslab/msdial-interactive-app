@@ -4,6 +4,128 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.40] - Unreleased
+
+### Changes a campaign run planned with this version
+- **The folders inside one declared per-sample archive are copies** (the
+  user's decision of 2026-10-15: "1つだけで良いと思っています", one is enough).
+  0.5.39 left this undecided and refused such an archive: a file of the used
+  one's stem in another folder of the same declared zip counted as the declared
+  input found a second time, so `S1.zip` holding `S1/A/S1.mzML` and
+  `S1/B/S1.mzML`, `S1/RAW/S1.d` and `S1/mzML/S1.mzML`, `S1/run_a/data.mzML` and
+  `S1/run_b/data.mzML`, or, in a positive unit, `S1/POS/S1.mzML` and
+  `S1/S1.mzML`, stopped the lease ("2 inputs in what the archive held"). Now
+  the one encoding rule applies as written: it uses one copy (by rank, then the
+  first by path on a tie) and records the others with their reasons in
+  `encoding_choices`, and such a unit runs. What is still refused as found more
+  than once is what the rule itself keeps apart: two polarities' folders
+  (`S1/NEG/S1.mzML` beside `S1/POS/S1.mzML`, and `S1/POS/S1.mzML` beside
+  `S1/S1.mzML` in a negative unit), read by the polarity tokens the rule
+  already reads (`name_polarities`, `_one_sample_polarities`), and two stems
+  (`run_1.mzML` beside `run_2.mzML`, in one folder or two), which are two runs.
+  Also still refused, as 0.5.39 refused it: a pair whose folders differ by one
+  that may state a polarity by a mark the rule does not read (`Posi/` and
+  `Nega/`, `ESI+/` and `ESI-/`, `ESIpos/` and `ESIneg/`, `P/` and `N/`, `(+)/`
+  and `(-)/`, `ポジ/` and `ネガ/`, and such a folder beside one of no mark), in a
+  unit of either polarity (`_unread_polarity_mark`,
+  `_folders_bear_an_unread_polarity_mark`). The rule reads a polarity only from
+  a `pos`, `positive`, `neg` or `negative` token, and such a mark is still not
+  read as one; but before the review the decision took `S1/Posi/S1.mzML` and
+  `S1/Nega/S1.mzML` for copies, and a positive unit used the `Nega/` file, the
+  first by path, under its positive declaration. A false mark costs a refusal
+  for a person to look at, never a run; folders whose names bear none (`A/`,
+  `RAW/`, a desktop's `S1 - Copy/`) are copies.
+  `_another_encoding_beside` decides it; its docstring, the `encoding_rule`
+  module docstring and `docs/public_repository_reanalysis.md` state the
+  decision in place of the undecided exception, and the README says it too.
+
+### Added
+- The copies left unused are on record. A `manifest.declared_archive_inputs`
+  entry whose archive held its sample in more than one folder gains
+  `copies_unused` (the paths under the data root of the copies left in other
+  folders) and `copy_rule` `per_sample_archive_folders_are_copies_2026_10_15`.
+  The lease warns of them: `declared_archive_copies_unused` in the manifest's
+  and the attribute stage's warnings (the stage counts
+  `declared_archive_copies_unused`), and one `archive_warnings` entry per such
+  archive whose message names the archive, the copy used and the copies left.
+  The preflight's `campaign_disposition` carries the warning with a detail line
+  naming them, and the analysis-CSV record carries it with
+  `declared_archive_copies`. A split part carries the parent's
+  `declared_archive_inputs` entries of its own inputs, and the warning only
+  where one of them left a copy. Only where a copy was left, so every other
+  lease records what it always did.
+- **A unit whose declared inputs hold no format MS-DIAL opens is an exclusion,
+  not a failure to retry.** MB-POST MPST000213 (unit `334ab3e2f0e7600f4290`):
+  its three per-sample zips inside `MPST000213.tar` each held a JEOL msAxel
+  project (`.xml`, `.pm`, `.dfa`, `.ba`, `.ppl` ...), and the campaign runner
+  counted its lease as a failed download three times, though every retry
+  downloads the same objects into the same files. Where every missing declared
+  input is a declared archive the extract stage expanded, whose files the lease
+  saw on disk, none of them of a format MS-DIAL opens, a campaign converts or an
+  archive left packed, and no declared input is found more than once, the
+  attribute stage raises
+  `DeclaredInputsUnsupportedError` (a `ValueError` with the same text), and the
+  failed lease's `download_failure` gains `retryable: false` and `disposition`
+  `{decision: "exclude", reason: "declared_inputs_unsupported_format", inputs:
+  [{declared, archive, files, suffixes}]}` (the archive's path under the data
+  root as its extraction recorded it, the files it held and its ten commonest
+  suffixes). `error_type` names the subclass. Any other combination (an input
+  missing for another reason, an input found more than once) keeps the plain
+  failure with no `disposition`. `download_exclusion(manifest)` reads it.
+  An exclusion is never retried and deletes the raw data, so it stands only on
+  what the lease saw (review of 0.5.40): an archive holding a format MS-DIAL
+  opens by `SupportFormat.cs` (`encoding_preference`'s vendor, open and folder
+  suffixes as well as the lease's raw suffixes, so `.ibf`, `.lrp` and `.imzML`,
+  which the lease takes as no input, too), an mzXML, or an archive the extract
+  stage left packed; an archive none of whose places is on disk (a record at
+  odds with the disk); and one that expanded to no file are each the plain
+  failure, and its message names what lies there or says `(not on disk)`. The
+  place itself is walked too, so a zip that expanded to the vendor folder
+  `S1.d` is seen to hold one.
+- A failed repository download job carries the record its lease wrote into the
+  unit manifest, verbatim, as `download_failure` (the job's summary, which
+  `/api/jobs/<id>` and `msdial_interactive_job` return, includes it), so a
+  poll of the job says what the manifest says, `disposition` and `retryable`
+  included. A job whose lease wrote no record (refused before it began) has
+  none.
+- The capabilities `repository_declared_archive_copies` and
+  `repository_download_exclusion_disposition`.
+
+### Changed
+- The campaign-authorized discard (`msdial_discard_repository_raw`,
+  `discard_download_lease`) already took a `download_failed` unit; one whose
+  failure is such an exclusion is discarded the same way, under an approval
+  covering boundary 5 or with `confirmed=true`, and its `discard_reason` now
+  names `declared_inputs_unsupported_format` (its `download_failure` stays on
+  record).
+
+### Tests
+- `test_nested_archive_inputs`: the tests that pinned the 0.5.39 refusal are
+  updated to the decision. `test_one_name_in_two_folders_of_a_declared_zip_is_refused_until_the_user_decides`
+  is now `test_one_name_in_two_folders_of_a_declared_zip_is_copies_and_one_is_used`
+  (the same four pairs, and three copies, each with one used and the others
+  recorded and warned of), and
+  `test_two_runs_of_one_file_name_in_their_own_folders_are_refused_not_chosen_by_path`
+  is now `test_one_file_name_in_two_run_folders_is_one_acquisitions_copies_by_the_decision`.
+  Still refused: both polarities' folders (unchanged), a copy beside one of the
+  other polarity in a negative unit (new), two stems, now also in two folders,
+  and (review) folders a polarity mark the rule does not read may separate,
+  `Posi/`/`Nega/`, `ESI+/`/`ESI-/`, `ESIpos/`/`ESIneg/`, `P/`/`N/`,
+  `(+)/`/`(-)/`, `ポジ/`/`ネガ/` and `Posi/` beside an unmarked folder, in units
+  of both polarities (new), with the marks read folder by folder (new); a
+  desktop's `S1 - Copy/` is one more pair of copies.
+- `test_declared_inputs_disposition` (new): the all-unsupported case, the
+  commonest ten suffixes, an input missing for another reason, a declared
+  archive no record says was expanded, one the download does not hold, an input
+  found more than once, the job's record and its poll, and the discard of such a
+  unit under a campaign approval (and its refusal where the unit keeps its raw
+  data). From the review: an archive holding `.ibf`, `.lrp`, `.imzML`, an
+  archive left packed, or a JEOL project beside an `.ibf` is a plain failure; on
+  the records alone, a place not on disk, an archive that expanded to nothing
+  and a zip that expanded to the vendor folder `S1.d` are plain failures, and a
+  place on disk holding only JEOL files is still an exclusion whose `files`
+  counts what was seen.
+
 ## [0.5.39] - Unreleased
 
 ### Fixed
