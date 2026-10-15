@@ -4265,8 +4265,9 @@ def _select_conversion_sources(
 # one per-sample archive are copies, and one is used (the user's decision of 2026-10-15; encoding_rule, FOLDERS INSIDE
 # ONE DECLARED PER-SAMPLE ARCHIVE ARE COPIES). The copies left unused are named in manifest.declared_archive_inputs
 # (declared_archive_inputs_record) and warned of. Where the files it chose among state two polarities (NEG/S1.mzML,
-# POS/S1.mzML), which this grouping by row and stem does not part, the lease refuses the archive as one declared input
-# found more than once (_another_encoding_beside), as it refuses two stems (two runs) in one archive.
+# POS/S1.mzML), which this grouping by row and stem does not part, or lie in folders one of which may state a polarity
+# by a mark the rule does not read (Posi/, ESI-/: _unread_polarity_mark), the lease refuses the archive as one declared
+# input found more than once (_another_encoding_beside), as it refuses two stems (two runs) in one archive.
 
 STEM_OF_SEVERAL_SAMPLE_ROWS = "stem_of_several_sample_rows"
 # Where the lease's raw-header reads for the encoding rule write their records, under the unit's provenance.
@@ -12362,8 +12363,9 @@ def _filter_inputs_by_project_allowlist(
     they are is not missing, and a unit left with nothing else selects nothing rather than raising, so the
     lease can record why. unused is what the one encoding rule left unused (by _file_key): in a declared unit,
     one of them inside one declared archive that is a copy or another encoding of the file used (its stem, in any
-    folder of the archive whose path states no other polarity: _another_encoding_beside, the user's decision of
-    2026-10-15) is not that input found twice; any other still is.
+    folder of the archive whose path states no other polarity, and whose folders apart from the used one's bear no
+    polarity mark the rule does not read: _another_encoding_beside, the user's decision of 2026-10-15) is not that
+    input found twice; any other still is.
     """
     if not project.analysis_unit_id:
         return inputs
@@ -12728,7 +12730,11 @@ DISPOSITION_SUFFIXES = 10
 
 class DeclaredInputsUnsupportedError(ValueError):
     """A declared unit whose missing declared inputs are, every one of them, a declared archive that the extract
-    stage expanded and that held nothing MS-DIAL opens, with no declared input found more than once.
+    stage expanded and that held nothing MS-DIAL opens, with no declared input found more than once. "Held" is what
+    the lease saw: files on disk at a place the extraction record names, none of a format MS-DIAL opens, a campaign
+    converts, or an archive left packed (_expanded_without_input); a record at odds with the disk, an archive that
+    held no file, or one holding .ibf, .lrp or .imzML, which MS-DIAL opens and the lease takes as no input, is a
+    plain failure (review of 0.5.40, 2026-10-15).
 
     Its text is the plain ValueError's, word for word. What it adds is what the failed lease records of it
     (_record_download_failure): download_failure.retryable false, and download_failure.disposition {decision
@@ -12778,10 +12784,12 @@ def _select_declared_inputs(
     (_another_encoding_beside): of that file's stem, in its folder (S1/S1.mzML beside S1/S1.cdf, S1/S1.wiff beside
     S1/S1.d) or in another folder of the archive whose path states no other polarity (S1/A/S1.mzML beside
     S1/B/S1.mzML; the user's decision of 2026-10-15 that the folders inside one per-sample archive are copies). Every
-    other one counts, so two runs of two stems (run_1.mzML, run_2.mzML) and two polarities' folders (NEG/S1.mzML,
-    POS/S1.mzML) are refused as one declared input found more than once. One whose contents hold nothing MS-DIAL
-    opens is missing, and the error says what it did hold; where every missing input is such an archive and none is
-    found more than once, the error is a DeclaredInputsUnsupportedError, which the failed lease records as an
+    other one counts, so two runs of two stems (run_1.mzML, run_2.mzML), two polarities' folders (NEG/S1.mzML,
+    POS/S1.mzML), and folders one of which may state a polarity by a mark the rule does not read (Posi/S1.mzML,
+    Nega/S1.mzML; ESI+/, ESI-/) are refused as one declared input found more than once. One whose contents hold
+    nothing MS-DIAL opens is missing, and the error says what it did hold; where every missing input is such an
+    archive, seen on disk to hold files of which none is of a format MS-DIAL opens (_expanded_without_input), and
+    none is found more than once, the error is a DeclaredInputsUnsupportedError, which the failed lease records as an
     exclusion (download_failure.disposition) rather than a failure to retry.
 
     WHY BY PATH, AND WHY EVERY ONE. Before the Catalog declared its inputs, an input was admitted when a
@@ -12884,7 +12892,8 @@ def _another_encoding_beside(
 ) -> bool:
     """Whether an input the one encoding rule left unused in a declared archive is a copy or another encoding of a
     file it used there: of the same stem (encoding_preference.stem), whatever its rank (encoding_rule.encoding_rank)
-    and whatever folder of the archive it lies in, unless the two paths state two polarities.
+    and whatever folder of the archive it lies in, unless the two paths state two polarities, or a folder one of them
+    lies in and the other does not may state one by a mark the rule does not read.
 
     Two names in one folder that differ only by their container suffix are one acquisition, never two runs:
     S1/S1.mzML beside S1/S1.cdf (another rank, clause 1), or S1/S1.wiff beside S1/S1.d (one rank, two vendor
@@ -12907,25 +12916,93 @@ def _another_encoding_beside(
       is one sample's with one that states the unit's own, or the only one stated where the unit gives none
       (_one_sample_polarities, ``unit_polarity``): S1/POS/S1.mzML and S1/S1.mzML are copies in a positive unit, and
       are refused in a negative one;
+    - two folders of which one may state a polarity by a mark that name_polarities does not read (Posi/ and Nega/,
+      ESI+/ and ESI-/, ESIpos/ and ESIneg/, P/ and N/, (+)/ and (-)/; _unread_polarity_mark), wherever the two
+      paths' folders differ (_folders_bear_an_unread_polarity_mark). Such folders are neither read as two polarities
+      nor taken as copies: a positive unit took S1/Nega/S1.mzML, first by path, as the copy of S1/Posi/S1.mzML that it
+      used, and would have run the negative file under the positive declaration (review of 0.5.40, 2026-10-15). The
+      archive is refused as 0.5.39 refused it, a stop for a person to look at rather than a polarity guessed from a
+      folder's name. That holds in a unit of either polarity, and beside a folder of no mark as well (S1/Posi/S1.mzML
+      beside S1/S1.mzML), since what such a mark states is not read;
     - two stems (run_1.mzML and run_2.mzML), which are two runs: the rule groups a declared unit's files by sample
       row and stem (_encoding_groups), uses one of each, and leaves neither unused.
+
+    Folders that differ by names bearing no polarity mark are copies: S1/A/ and S1/B/, S1/RAW/ and S1/mzML/, and a
+    copy a desktop made (S1/S1 - Copy/, whose '-' stands between spaces, not at a word's end).
 
     An mzML the convert stage wrote is placed where the mzXML it stands for lies.
     """
 
-    def where(path: str) -> tuple[str, frozenset[str]]:
+    def where(path: str) -> tuple[str, str, frozenset[str]]:
         relative = _relative_under(stands_for.get(_file_key(path)) or path, data_root)
-        return encoding_preference.stem(relative), frozenset(name_polarities(relative, polarity_named=polarity_named))
+        return (
+            relative,
+            encoding_preference.stem(relative),
+            frozenset(name_polarities(relative, polarity_named=polarity_named)),
+        )
 
-    stem, stated = where(item)
+    relative, stem, stated = where(item)
     for path in used:
-        other_stem, other = where(path)
+        other_relative, other_stem, other = where(path)
         if other_stem != stem:
             continue
         samples = _one_sample_polarities((stated, other), unit_polarity)
-        if samples.get(stated, stated) == samples.get(other, other):
+        if samples.get(stated, stated) != samples.get(other, other):
+            continue
+        if _folders_bear_an_unread_polarity_mark(relative, other_relative):
+            continue
+        return True
+    return False
+
+
+# MARKS A FOLDER MAY STATE A POLARITY BY THAT name_polarities DOES NOT READ (review of 0.5.40, 2026-10-15). The rule
+# reads a polarity from a name only by a pos, positive, neg or negative token of its own (POLARITY_NAME_TOKENS), as the
+# Catalog does. A per-sample archive's folders may state one otherwise: Posi/ and Nega/, ESI+/ and ESI-/, ESIpos/ and
+# ESIneg/, P/ and N/, (+)/ and (-)/, ポジ/ and ネガ/. Those are not read as polarities here either (widening the rule's
+# reader is not this check's to do); a folder bearing one only stops two files from being taken as copies
+# (_another_encoding_beside), so a false mark costs a refusal for a person to look at, never a run.
+# A token that begins with pos or neg, or ends in a form of either (esipos, ionneg, esipositive).
+_UNREAD_POLARITY_TOKEN = re.compile(r"^(?:pos|neg)|(?:pos|posi|positiv|positive|neg|nega|negativ|negative)$")
+# A '+' anywhere; a '-' that ends a word (ESI-, ESI- mode) or begins one (-ESI); a '-' in brackets ((-), [ - ]). A '-'
+# between two words' characters (run-a, 2026-10-15) or between spaces (S1 - Copy) is a separator, not a sign.
+_UNREAD_POLARITY_SIGN = re.compile(r"\+|[^\W_]-(?![^\W_])|(?<![^\W_])-[^\W_]|[(\[]\s*-\s*[)\]]")
+# A token of one letter: P/ and N/.
+_UNREAD_POLARITY_LETTERS = frozenset({"p", "n"})
+# Japanese words for the two (positive, negative; cation, anion).
+_UNREAD_POLARITY_WORDS = ("ポジ", "ネガ", "陽イオン", "陰イオン", "正イオン", "負イオン")
+
+
+def _unread_polarity_mark(segment: str) -> bool:
+    """Whether a folder's name may state a polarity by a mark name_polarities does not read (_UNREAD_POLARITY_TOKEN,
+    _UNREAD_POLARITY_SIGN, _UNREAD_POLARITY_LETTERS, _UNREAD_POLARITY_WORDS).
+
+    A token name_polarities reads (POS, Negative, QC_NEG's neg) is not such a mark: what it states is read, and
+    _one_sample_polarities decides by it. Another token of the same folder still is, and so is a token the reader
+    does not see as one of its own: pos(1) states nothing the rule reads, so its pos is a mark.
+    """
+    text = str(segment or "").casefold()
+    if _UNREAD_POLARITY_SIGN.search(text) or any(word in text for word in _UNREAD_POLARITY_WORDS):
+        return True
+    read = {token for token in _name_tokens(text) if token in POLARITY_NAME_TOKENS}
+    for token in re.split(r"[\W_]+", text):
+        if not token or token in read:
+            continue
+        if token in _UNREAD_POLARITY_LETTERS or _UNREAD_POLARITY_TOKEN.search(token):
             return True
     return False
+
+
+def _folders_bear_an_unread_polarity_mark(first: str, second: str) -> bool:
+    """Whether a folder that one of two paths under the data root lies in and the other does not (compared without
+    case) may state a polarity by a mark name_polarities does not read (_unread_polarity_mark). The folders the two
+    share say the same of both, and the file names are of one stem, so only where the folders differ can a mark make
+    two acquisitions of what would otherwise be copies."""
+
+    def folders(relative: str) -> set[str]:
+        parts = [part for part in str(relative or "").replace("\\", "/").split("/") if part]
+        return {part.casefold() for part in parts[:-1]}
+
+    return any(_unread_polarity_mark(part) for part in folders(first) ^ folders(second))
 
 
 def _expanded_without_input(
@@ -12940,12 +13017,22 @@ def _expanded_without_input(
     MPST000213's three per-sample zips each held a JEOL msAxel project (Data/<run>/RD/MsData.RPS, MS/<n>/
     Profile.dfa, ...), and its lease said only that they were "not in the download", which they had been.
 
-    ``inputs`` (DeclaredInputsUnsupportedError) holds one entry per missing declared archive whose place its record
-    names and under which nothing is of a format MS-DIAL opens or a campaign converts (RAW_SUFFIXES, a .d or .raw
-    folder, an mzXML): {declared: the declared path; archive: its path under the data root as its extraction
-    recorded it (archive_path); files: how many files it held; suffixes: {suffix: count}, its commonest
-    DISPOSITION_SUFFIXES}. An archive whose place no record names, or under which such a file lies, has no entry:
-    it is missing for a reason other than what it held, and its unit is not one to exclude for its format.
+    ``inputs`` (DeclaredInputsUnsupportedError) holds one entry per missing declared archive whose files were seen,
+    and of which none is of a format MS-DIAL opens or a campaign converts (_held_as_input_format): {declared: the
+    declared path; archive: its path under the data root as its extraction recorded it (archive_path); files: how many
+    files lie at its places; suffixes: {suffix: count}, its commonest DISPOSITION_SUFFIXES}. An exclusion deletes the
+    unit's raw data and is never retried, so an entry stands only on what was seen (review of 0.5.40, 2026-10-15):
+    - at least one of its places is on disk under the data root, and was walked, the place itself included (a
+      nested_rooted S1.d.zip expands to the vendor folder S1.d, which the walk of what lies inside it does not
+      name). A record whose places are not on disk (one that disagrees with the disk) says nothing of what the
+      archive held, and no file was seen;
+    - at least one file lies there (an archive that expanded to nothing has no suffix to say it held);
+    - nothing there is of a format MS-DIAL opens (encoding_preference's VENDOR_SUFFIXES and OPEN_SUFFIXES, from
+      MsdialCore's SupportFormat.cs: .ibf, .lrp and .imzML too, which the lease takes as no input), a campaign
+      converts (an mzXML), or an archive the extract stage left packed (nested_skipped), whose contents no one saw.
+    An archive whose place no record names, whose places are not on disk, that held no file, or under which such a
+    file lies has no entry: it is missing for a reason other than what it held (a gap of the lease, a record at odds
+    with the disk), and its unit stays a failure, not one to exclude for its format.
     """
     expansions: dict[str, list[dict[str, Any]]] = {}
     for item in declared_archive_expansions(declared, archive_extractions, data_root=data_root):
@@ -12958,17 +13045,25 @@ def _expanded_without_input(
     for index, key in enumerate(sorted(expansions, key=str.casefold)):
         item = expansions[key][0]
         suffixes: Counter[str] = Counter()
-        opened = False
+        # What lies there that MS-DIAL opens, a campaign converts, or that is an archive left packed, by suffix.
+        opened: Counter[str] = Counter()
+        examined = False
         for place in item["places"]:
             target = data_root.joinpath(*place.split("/"))
-            walked = [target] if target.is_file() else (target.rglob("*") if target.is_dir() else [])
+            if target.is_file():
+                walked: Iterable[Path] = [target]
+            elif target.is_dir():
+                walked = [target, *target.rglob("*")]
+            else:
+                continue
+            examined = True
             for path in walked:
-                if path.suffix.casefold() in RAW_SUFFIXES or path.name.casefold().endswith(CONVERTIBLE_SUFFIXES):
-                    opened = True
+                if _held_as_input_format(path.name):
+                    opened[path.suffix.casefold() or "(none)"] += 1
                 if path.is_file():
                     suffixes[path.suffix.casefold() or "(none)"] += 1
         files = sum(suffixes.values()) or int(item["nested"].get("file_count") or 0)
-        if item["places"] and not opened:
+        if examined and suffixes and not opened:
             inputs.append(
                 {
                     "declared": str(declared[key].get("path") or key),
@@ -12980,9 +13075,16 @@ def _expanded_without_input(
         if index < 3:
             where = ", ".join(item["places"]) or "a place its record does not name"
             kinds = ", ".join(f"{suffix} {count}" for suffix, count in suffixes.most_common(5))
+            held = ", ".join(f"{suffix} {count}" for suffix, count in opened.most_common(5))
             described.append(
                 f"{declared[key].get('path') or key}: {files} file(s) under {where}"
+                + (" (not on disk)" if item["places"] and not examined else "")
                 + (f", by suffix {kinds}" if kinds else "")
+                + (
+                    f", among them {held} of a format MS-DIAL opens or a campaign converts, or an archive left packed"
+                    if held
+                    else ""
+                )
             )
     inside = sorted(
         {str(item["record"].get("archive_name") or "") for items in expansions.values() for item in items} - {""}
@@ -12992,12 +13094,30 @@ def _expanded_without_input(
         + (", ".join(inside) or "the download")
         + " that the extract stage expanded, and none of the files "
         + ("it" if len(expansions) == 1 else "they")
-        + " held is one MS-DIAL opens ("
+        # Said of what they held only where every one was seen to hold nothing MS-DIAL opens; else of the inputs.
+        + (" held is one MS-DIAL opens (" if len(inputs) == len(expansions) else " held is an input the lease takes (")
         + "; ".join(described)
         + (f"; and {len(expansions) - 3} more" if len(expansions) > 3 else "")
         + ")"
     )
     return {"text": text, "inputs": inputs}
+
+
+def _held_as_input_format(name: str) -> bool:
+    """Whether a file or folder a declared archive held is of a format MS-DIAL opens (encoding_preference's
+    VENDOR_SUFFIXES, OPEN_SUFFIXES and FOLDER_SUFFIXES, from MsdialCore's SupportFormat.cs, and the lease's own
+    RAW_SUFFIXES), a campaign converts (CONVERTIBLE_SUFFIXES), packed or not (S1.mzML.gz), or is an archive the
+    extract stage left packed, whose contents are unseen (_expanded_without_input). .ibf and .lrp are vendor formats
+    MS-DIAL opens that the lease's discovery takes as no input; .imzML (imaging, outside the campaign) is one too: an
+    archive holding any of them is no unsupported format."""
+    lower = str(name or "").casefold()
+    return (
+        PurePosixPath(lower).suffix in RAW_SUFFIXES
+        or lower.endswith(CONVERTIBLE_SUFFIXES)
+        or encoding_preference.kind(lower) in {"vendor", "open", "convertible"}
+        or lower.endswith(encoding_preference.FOLDER_SUFFIXES)
+        or archives.is_archive_name(lower)
+    )
 
 
 def declared_archive_inputs_record(

@@ -23,6 +23,18 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   `S1/S1.mzML` in a negative unit), read by the polarity tokens the rule
   already reads (`name_polarities`, `_one_sample_polarities`), and two stems
   (`run_1.mzML` beside `run_2.mzML`, in one folder or two), which are two runs.
+  Also still refused, as 0.5.39 refused it: a pair whose folders differ by one
+  that may state a polarity by a mark the rule does not read (`Posi/` and
+  `Nega/`, `ESI+/` and `ESI-/`, `ESIpos/` and `ESIneg/`, `P/` and `N/`, `(+)/`
+  and `(-)/`, `ポジ/` and `ネガ/`, and such a folder beside one of no mark), in a
+  unit of either polarity (`_unread_polarity_mark`,
+  `_folders_bear_an_unread_polarity_mark`). The rule reads a polarity only from
+  a `pos`, `positive`, `neg` or `negative` token, and such a mark is still not
+  read as one; but before the review the decision took `S1/Posi/S1.mzML` and
+  `S1/Nega/S1.mzML` for copies, and a positive unit used the `Nega/` file, the
+  first by path, under its positive declaration. A false mark costs a refusal
+  for a person to look at, never a run; folders whose names bear none (`A/`,
+  `RAW/`, a desktop's `S1 - Copy/`) are copies.
   `_another_encoding_beside` decides it; its docstring, the `encoding_rule`
   module docstring and `docs/public_repository_reanalysis.md` state the
   decision in place of the undecided exception, and the README says it too.
@@ -48,9 +60,10 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   project (`.xml`, `.pm`, `.dfa`, `.ba`, `.ppl` ...), and the campaign runner
   counted its lease as a failed download three times, though every retry
   downloads the same objects into the same files. Where every missing declared
-  input is a declared archive the extract stage expanded, nothing it held is of
-  a raw suffix, a `.d` or `.raw` folder or an mzXML, and no declared input is
-  found more than once, the attribute stage raises
+  input is a declared archive the extract stage expanded, whose files the lease
+  saw on disk, none of them of a format MS-DIAL opens, a campaign converts or an
+  archive left packed, and no declared input is found more than once, the
+  attribute stage raises
   `DeclaredInputsUnsupportedError` (a `ValueError` with the same text), and the
   failed lease's `download_failure` gains `retryable: false` and `disposition`
   `{decision: "exclude", reason: "declared_inputs_unsupported_format", inputs:
@@ -59,6 +72,16 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   suffixes). `error_type` names the subclass. Any other combination (an input
   missing for another reason, an input found more than once) keeps the plain
   failure with no `disposition`. `download_exclusion(manifest)` reads it.
+  An exclusion is never retried and deletes the raw data, so it stands only on
+  what the lease saw (review of 0.5.40): an archive holding a format MS-DIAL
+  opens by `SupportFormat.cs` (`encoding_preference`'s vendor, open and folder
+  suffixes as well as the lease's raw suffixes, so `.ibf`, `.lrp` and `.imzML`,
+  which the lease takes as no input, too), an mzXML, or an archive the extract
+  stage left packed; an archive none of whose places is on disk (a record at
+  odds with the disk); and one that expanded to no file are each the plain
+  failure, and its message names what lies there or says `(not on disk)`. The
+  place itself is walked too, so a zip that expanded to the vendor folder
+  `S1.d` is seen to hold one.
 - A failed repository download job carries the record its lease wrote into the
   unit manifest, verbatim, as `download_failure` (the job's summary, which
   `/api/jobs/<id>` and `msdial_interactive_job` return, includes it), so a
@@ -85,14 +108,23 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   `test_two_runs_of_one_file_name_in_their_own_folders_are_refused_not_chosen_by_path`
   is now `test_one_file_name_in_two_run_folders_is_one_acquisitions_copies_by_the_decision`.
   Still refused: both polarities' folders (unchanged), a copy beside one of the
-  other polarity in a negative unit (new), and two stems, now also in two
-  folders.
+  other polarity in a negative unit (new), two stems, now also in two folders,
+  and (review) folders a polarity mark the rule does not read may separate,
+  `Posi/`/`Nega/`, `ESI+/`/`ESI-/`, `ESIpos/`/`ESIneg/`, `P/`/`N/`,
+  `(+)/`/`(-)/`, `ポジ/`/`ネガ/` and `Posi/` beside an unmarked folder, in units
+  of both polarities (new), with the marks read folder by folder (new); a
+  desktop's `S1 - Copy/` is one more pair of copies.
 - `test_declared_inputs_disposition` (new): the all-unsupported case, the
   commonest ten suffixes, an input missing for another reason, a declared
   archive no record says was expanded, one the download does not hold, an input
   found more than once, the job's record and its poll, and the discard of such a
   unit under a campaign approval (and its refusal where the unit keeps its raw
-  data).
+  data). From the review: an archive holding `.ibf`, `.lrp`, `.imzML`, an
+  archive left packed, or a JEOL project beside an `.ibf` is a plain failure; on
+  the records alone, a place not on disk, an archive that expanded to nothing
+  and a zip that expanded to the vendor folder `S1.d` are plain failures, and a
+  place on disk holding only JEOL files is still an exclusion whose `files`
+  counts what was seen.
 
 ## [0.5.39] - Unreleased
 

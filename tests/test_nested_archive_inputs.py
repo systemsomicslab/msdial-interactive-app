@@ -18,8 +18,10 @@ What is pinned here, with synthetic tars of synthetic zips (nothing leaves the m
   encoding rule), whatever their rank: S1.cdf beside S1.mzML, and S1.d beside S1.wiff (a tie, the first by path);
   so are one name's copies in several folders of the zip, which the user decided on 2026-10-15 are copies (0.5.40;
   until then an undecided exception that refused the zip): one is used by the rule and the others are named in
-  declared_archive_inputs (copies_unused, copy_rule) and in a warning; two runs of two names and both polarities'
-  folders are still one declared input found more than once, and refused; an archived container still counts every
+  declared_archive_inputs (copies_unused, copy_rule) and in a warning; two runs of two names, both polarities'
+  folders, and folders one of which may state a polarity by a mark the rule does not read (Posi/ and Nega/, ESI+/
+  and ESI-/: review of 0.5.40) are still one declared input found more than once, and refused; an archived
+  container still counts every
   input it matched; a zip holding nothing MS-DIAL opens (MPST000213's JEOL msAxel project) says what it held (its
   disposition, an exclusion, is pinned in test_declared_inputs_disposition);
 - a place is matched by the full path under the data root only, and recorded as it is written on disk;
@@ -472,6 +474,10 @@ class WhatOneZipHoldsIsOneSample(_Workspace):
             # Three copies: one used, both others named.
             ({"S1/A/S1.mzML": MZML, "S1/B/S1.mzML": MZML, "S1/C/S1.mzML": MZML}, "S1/A/S1.mzML",
              ["S1/B/S1.mzML", "S1/C/S1.mzML"], "tie_lexicographic"),
+            # A copy a desktop made: its '-' stands between spaces, a separator and no polarity's sign
+            # (_unread_polarity_mark), so the review of 0.5.40 leaves it a copy.
+            ({"S1/S1 - Copy/S1.mzML": MZML, "S1/S1.mzML": MZML}, "S1/S1 - Copy/S1.mzML", ["S1/S1.mzML"],
+             "tie_lexicographic"),
         )
         for index, (files, used, copies, reason) in enumerate(cases):
             self.fresh_root(f"case-{index}")
@@ -485,6 +491,55 @@ class WhatOneZipHoldsIsOneSample(_Workspace):
             ValueError, r"found more than once: S1\.zip \(2 inputs in what the archive held\)"
         ):
             self.lease({"S1.zip": _zip({"S1/POS/S1.mzML": MZML, "S1/S1.mzML": MZML})}, ion_mode="Negative")
+
+    def test_folders_that_may_state_a_polarity_by_a_mark_the_rule_does_not_read_are_refused(self) -> None:
+        """REVIEW OF 0.5.40 (2026-10-15). The rule reads a polarity only from a pos, positive, neg or negative token
+        of its own, so Posi/ and Nega/ stated none, and the decision of 2026-10-15 took the two files as copies: a
+        positive unit used S1/Nega/S1.mzML, the first by path, and recorded S1/Posi/S1.mzML as the copy left unused;
+        a negative unit used ESI+/S1.mzML. 0.5.39 refused every such pair. Such a mark is still not read as a
+        polarity, but a folder bearing one where the two paths' folders differ keeps the two from being copies, so the
+        zip is refused as one declared input found more than once, in a unit of either polarity, and beside an
+        unmarked folder too (_folders_bear_an_unread_polarity_mark)."""
+        pairs = (
+            ("Posi", "Nega"),
+            ("ESI+", "ESI-"),
+            ("ESIpos", "ESIneg"),
+            ("P", "N"),
+            ("(+)", "(-)"),
+            ("ポジ", "ネガ"),
+            # The positive one's mark beside a folder of none, in a positive unit as well.
+            ("Posi", ""),
+        )
+        index = 0
+        for first, second in pairs:
+            for ion_mode in ("Positive", "Negative"):
+                index += 1
+                self.fresh_root(f"case-{index}")
+                files = {
+                    "/".join(part for part in ("S1", first, "S1.mzML") if part): MZML,
+                    "/".join(part for part in ("S1", second, "S1.mzML") if part): MZML,
+                }
+                with self.subTest(files=sorted(files), ion_mode=ion_mode), self.assertRaisesRegex(
+                    ValueError, r"found more than once: S1\.zip \(2 inputs in what the archive held\)"
+                ):
+                    self.lease({"S1.zip": _zip(files)}, ion_mode=ion_mode)
+
+    def test_which_folder_names_bear_a_polarity_mark_the_rule_does_not_read(self) -> None:
+        """_unread_polarity_mark, folder by folder: a mark is what may state a polarity and is not a token the rule
+        reads (those decide through _one_sample_polarities); a separator, a run's or a copy's name is none."""
+        mark = repository_reanalysis._unread_polarity_mark
+        for name in (
+            "Posi", "Nega", "ESI+", "ESI-", "ESI- mode", "-ESI", "ESIpos", "ESIneg", "ionmode_positiv", "P", "n",
+            "(+)", "( - )", "pos(1)", "ポジ", "陰イオン",
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(mark(name))
+        for name in (
+            "A", "b", "RAW", "mzML", "run_a", "run-a", "S1 - Copy", "2026-10-15", "Data", "POS", "neg", "Positive",
+            "QC_NEG", "esi_pos",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(mark(name))
 
     def test_the_copies_left_unused_reach_the_analysis_csv_record_and_the_disposition(self) -> None:
         """A run's records say it too: the analysis-CSV record (warnings, declared_archive_copies) and the preflight's

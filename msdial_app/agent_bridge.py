@@ -184,10 +184,12 @@ def summarize_jobs(
             # Since 0.5.40 (the user's decision of 2026-10-15): the folders inside one declared per-sample archive
             # are copies; the one encoding rule uses one and the lease names the others
             # (declared_archive_inputs.copies_unused and copy_rule; the warning declared_archive_copies_unused).
-            # Two polarities' folders and two stems in one such archive are still refused as found more than once.
+            # Two polarities' folders, folders one of which may state a polarity by a mark the rule does not read
+            # (Posi/ and Nega/, ESI+/ and ESI-/), and two stems in one such archive are still refused as found more
+            # than once.
             "repository_declared_archive_copies",
-            # Since 0.5.40: a lease whose every missing declared input is a declared archive that held no format
-            # MS-DIAL opens ends download_failed with download_failure.retryable false and download_failure.disposition
+            # Since 0.5.40: a lease whose every missing declared input is a declared archive seen on disk to hold
+            # files of no format MS-DIAL opens ends download_failed with download_failure.retryable false and download_failure.disposition
             # {decision "exclude", reason "declared_inputs_unsupported_format", inputs: [{declared, archive, files,
             # suffixes}]}; the download job carries the record verbatim (download_failure), and the campaign discard
             # takes such a unit.

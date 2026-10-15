@@ -34,7 +34,10 @@ records the others (clause 5); the lease names the copies it left unused where i
 (declared_archive_copies_unused). Before that decision (0.5.39) this was an exception the user had not decided: the
 lease refused such an archive as one declared input found more than once, because the folders might have been the
 sample's runs. What is still refused is what the rule itself keeps apart: two polarities' folders (S1/NEG/S1.mzML
-beside S1/POS/S1.mzML are two acquisitions), and two stems (run_1.mzML and run_2.mzML are two runs). See
+beside S1/POS/S1.mzML are two acquisitions), and two stems (run_1.mzML and run_2.mzML are two runs). So is a pair whose
+folders differ by one that may state a polarity by a mark the rule does not read (S1/Posi/ and S1/Nega/, S1/ESI+/ and
+S1/ESI-/, S1/P/ and S1/N/; review of 0.5.40): such marks are not read as polarities, and the two files are not taken as
+copies either, since one of them may be the other polarity's acquisition. See
 repository_reanalysis._another_encoding_beside. Everywhere else the rule applies as written, as it always did.
 
 WHAT "READABLE" IS, AT THE LEASE. The caller's ``readability`` says what the lease knows of a candidate: an mzML

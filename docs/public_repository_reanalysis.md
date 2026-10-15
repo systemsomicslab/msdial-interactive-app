@@ -281,7 +281,16 @@ decided that one copy is enough. Still refused as one declared input found more
 than once: two polarities' folders (`S1/NEG/S1.mzML` beside `S1/POS/S1.mzML`, two
 acquisitions by the rule itself; and `S1/POS/S1.mzML` beside `S1/S1.mzML` in a
 negative unit), and two stems (`run_1.mzML` beside `run_2.mzML`, two runs), in
-one folder or in two.
+one folder or in two. Also still refused: a pair whose folders differ by one
+that may state a polarity by a mark the rule does not read (`S1/Posi/` and
+`S1/Nega/`, `S1/ESI+/` and `S1/ESI-/`, `S1/ESIpos/` and `S1/ESIneg/`, `S1/P/` and
+`S1/N/`, `S1/(+)/` and `S1/(-)/`, and `S1/Posi/S1.mzML` beside `S1/S1.mzML`), in a
+unit of either polarity. The rule reads a polarity only from a `pos`,
+`positive`, `neg` or `negative` token, and such a mark is not read as one; but
+taking the two files as copies would let a positive unit run the `Nega/` file,
+first by path, under its positive declaration (review of 0.5.40), so the lease
+stops for a person to look, as 0.5.39 did. Folders whose names bear no such
+mark (`A/` and `B/`, `RAW/` and `mzML/`, a desktop's `S1 - Copy/`) are copies.
 
 A re-encoding MS-DIAL opens that no instrument writes (`.cdf`, `.abf`, `.ibf`)
 is in none of the rule's ranks; it ranks after every vendor format and before
@@ -938,10 +947,11 @@ equally well is neither one's, and those samples are reported unclaimed.
 
 A lease ends `download_failed` at its attribute stage when a declared input is
 not in the download. Where every missing declared input is a declared archive
-the extract stage expanded and none of the files it held is one MS-DIAL opens
-(nothing of a raw suffix, no `.d` or `.raw` folder, no mzXML), and no declared
-input is found more than once, the lease raises `DeclaredInputsUnsupportedError`
-(a `ValueError` with the same text), and its `download_failure` also carries:
+the extract stage expanded, whose files the lease saw on disk at the place its
+extraction record names and none of which is one MS-DIAL opens or a campaign
+converts, and no declared input is found more than once, the lease raises
+`DeclaredInputsUnsupportedError` (a `ValueError` with the same text), and its
+`download_failure` also carries:
 
 ```json
 "retryable": false,
@@ -954,8 +964,8 @@ input is found more than once, the lease raises `DeclaredInputsUnsupportedError`
 ```
 
 `files` counts what the archive held, and `suffixes` are its ten commonest (the
-counts above are a synthetic example). Any other attribute-stage failure
-(an input missing for another reason, an input found more than once) has no
+counts above are a synthetic example). Any other attribute-stage failure (an
+input missing for another reason, an input found more than once) has no
 `disposition`, as before. A retry of such a unit downloads the same objects and
 expands them into the same files, so the campaign runner reads the disposition
 and ends the unit as excluded rather than counting a failed download and retrying
@@ -969,6 +979,17 @@ under a campaign approval covering boundary 5, or with `confirmed=true`, its raw
 data are deleted, the manifest becomes `discarded` with a `discard_reason` that
 names `declared_inputs_unsupported_format`, and its `download_failure` stays on
 record.
+
+An exclusion is never retried and its raw data are deleted, so it stands only
+on what the lease saw (review of 0.5.40). A missing declared archive is no
+unsupported format, and its unit keeps the plain failure with no
+`disposition`, where it holds anything of a format MS-DIAL opens by MsdialCore's
+`SupportFormat.cs` (a raw suffix; a `.d` or `.raw` folder, the place itself
+included; and `.ibf`, `.lrp` and `.imzML`, which the lease takes as no input),
+an mzXML, or an archive the extract stage left packed, whose contents nobody
+saw; where none of its places is on disk (a record at odds with the disk); or
+where it held no file. Its message then says which of its files is of such a
+format, or that its place is not on disk.
 
 ## Finalize and clean up
 

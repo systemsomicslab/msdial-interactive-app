@@ -14,6 +14,11 @@ gains retryable false and disposition {decision "exclude", reason "declared_inpu
 unit. Any other combination - an input missing for another reason, an input found more than once - keeps the plain
 failure, with no disposition.
 
+AN EXCLUSION STANDS ONLY ON WHAT THE LEASE SAW (review of 0.5.40, 2026-10-15). It is never retried and deletes the
+unit's raw data, so an archive holding a format MS-DIAL opens that the lease takes as no input (.ibf, .lrp, .imzML),
+an archive the extract stage left packed, a record whose place is not on disk, and an archive that expanded to nothing
+are each the plain failure; and a zip that expanded to a vendor folder is seen to hold one.
+
 Everything here is synthetic: tars of zips built in memory, served by a stand-in client; nothing leaves the machine.
 """
 
@@ -78,6 +83,41 @@ def _expected_input(stem: str) -> dict:
         "files": 5,
         "suffixes": {".dfa": 2, ".rps": 1, ".rpc": 1, ".xml": 1},
     }
+
+
+def _records_of(*names: str, file_count: int = 1) -> list[dict]:
+    """The extraction record of MPST-NEST.tar, each named zip inside it expanded as one holding exactly its own folder
+    (nested_rooted): its place is TAR_ROOT/<the zip's name less .zip>. Nothing is written to disk."""
+    return [
+        {
+            "archive_name": f"{ACCESSION}.tar",
+            "placement": "",
+            "destination_rule": "archive_root",
+            "nested": [
+                {
+                    "format": "zip", "file_count": file_count, "depth": 2, "archive_name": name,
+                    "archive_path": f"{TAR_ROOT}/{name}", "destination_relative": TAR_ROOT,
+                    "destination_rule": "nested_rooted", "container_stem": "", "container_root": "",
+                    "nested": [], "nested_skipped": [],
+                }
+                for name in names
+            ],
+        }
+    ]
+
+
+def _declared_project(names: tuple[str, ...]) -> RepositoryProject:
+    """A positive unit declaring each named zip as its sample's one input (kind file), as MPST000213's handoff does."""
+    stems = [name[: -len(".zip")] for name in names]
+    return RepositoryProject(
+        repository="mb_post", accession=ACCESSION, analysis_unit_id=UNIT, eligible=True,
+        selection_status="eligible", ion_mode="Positive",
+        files=[RepositoryFile(name, 10, TAR_URL) for name in names],
+        total_download_bytes=10,
+        sample_metadata=[{"sample_id": stem, "raw_file": name} for name, stem in zip(names, stems)],
+        analysis_inputs=[{"path": name, "kind": "file", "sample_id": stem} for name, stem in zip(names, stems)],
+        analysis_inputs_declared=True,
+    )
 
 
 def _approval(path: Path, units: list[str]) -> Path:
@@ -185,37 +225,14 @@ class AnyOtherFailureKeepsThePlainFailure(_Lease):
         place = data_root / TAR_ROOT / "S1" / "Data" / "RD"
         place.mkdir(parents=True)
         (place / "MsData.RPS").write_bytes(b"rps")
-        records = [
-            {
-                "archive_name": f"{ACCESSION}.tar",
-                "placement": "",
-                "destination_rule": "archive_root",
-                "nested": [
-                    {
-                        "format": "zip", "file_count": 1, "depth": 2, "archive_name": "S1.zip",
-                        "archive_path": f"{TAR_ROOT}/S1.zip", "destination_relative": TAR_ROOT,
-                        "destination_rule": "nested_rooted", "container_stem": "", "container_root": "",
-                        "nested": [], "nested_skipped": [],
-                    }
-                ],
-            }
-        ]
-
-        def project(stems: tuple[str, ...]) -> RepositoryProject:
-            return RepositoryProject(
-                repository="mb_post", accession=ACCESSION, analysis_unit_id=UNIT, eligible=True,
-                selection_status="eligible", ion_mode="Positive",
-                files=[RepositoryFile(f"{stem}.zip", 10, TAR_URL) for stem in stems],
-                total_download_bytes=10,
-                sample_metadata=[{"sample_id": stem, "raw_file": f"{stem}.zip"} for stem in stems],
-                analysis_inputs=[{"path": f"{stem}.zip", "kind": "file", "sample_id": stem} for stem in stems],
-                analysis_inputs_declared=True,
-            )
+        records = _records_of("S1.zip")
 
         with self.assertRaises(ValueError) as both:
-            _filter_inputs_by_project_allowlist([], data_root, project(("S1", "S2")), archive_extractions=records)
+            _filter_inputs_by_project_allowlist(
+                [], data_root, _declared_project(("S1.zip", "S2.zip")), archive_extractions=records
+            )
         with self.assertRaises(DeclaredInputsUnsupportedError) as alone:
-            _filter_inputs_by_project_allowlist([], data_root, project(("S1",)), archive_extractions=records)
+            _filter_inputs_by_project_allowlist([], data_root, _declared_project(("S1.zip",)), archive_extractions=records)
 
         self.assertIs(ValueError, type(both.exception))
         self.assertIn("2 of its 2 declared analysis inputs are not in the download", str(both.exception))
@@ -224,6 +241,40 @@ class AnyOtherFailureKeepsThePlainFailure(_Lease):
             [{"declared": "S1.zip", "archive": f"{TAR_ROOT}/S1.zip", "files": 1, "suffixes": {".rps": 1}}],
             alone.exception.disposition()["inputs"],
         )
+
+    def test_an_archive_holding_a_format_ms_dial_opens_gives_no_disposition(self) -> None:
+        """REVIEW OF 0.5.40 (2026-10-15). The check asked only for the lease's RAW_SUFFIXES and mzXML, so a zip
+        holding S1.ibf or S1.lrp - formats MS-DIAL opens (SupportFormat.cs; encoding_preference.VENDOR_SUFFIXES),
+        which the lease's discovery takes as no input - was recorded as declared_inputs_unsupported_format: a false
+        scientific record, never retried, and the raw data deleted under boundary 5. So were an imzML (imaging,
+        outside the campaign, but a format MS-DIAL opens) and a zip inside it that the extract stage left packed,
+        whose contents no one saw. Each is the plain failure, and its message names what lies there."""
+        cases = (
+            ({"S1/S1.ibf": b"ibf"}, ".ibf 1"),
+            ({"S1/S1.lrp": b"lrp"}, ".lrp 1"),
+            ({"S1/S1.imzML": b"<imzML/>", "S1/S1.ibd": b"ibd"}, ".imzml 1"),
+            # Not an archive at all, though named as one: the extract stage leaves it packed (nested_skipped).
+            ({"S1/inner.zip": b"not a zip at all"}, ".zip 1"),
+            # Beside a JEOL project, one such file is enough.
+            ({**{f"S1/{name}": data for name, data in MSAXEL.items()}, "S1/extra/S1.ibf": b"ibf"}, ".ibf 1"),
+        )
+        for index, (files, held) in enumerate(cases):
+            self.fresh_root(f"case-{index}")
+            with self.subTest(files=sorted(files)):
+                error, manifest = self.failed({"S1.zip": _zip(files)})
+
+                self.assertIs(ValueError, type(error))
+                self.assertIn("1 of its 1 declared analysis inputs are not in the download: S1.zip", str(error))
+                self.assertIn("none of the files it held is an input the lease takes", str(error))
+                self.assertIn(
+                    f"among them {held} of a format MS-DIAL opens or a campaign converts, or an archive left packed",
+                    str(error),
+                )
+                failure = manifest["download_failure"]
+                self.assertEqual(("attribute", "ValueError"), (failure["stage"], failure["error_type"]))
+                self.assertNotIn("disposition", failure)
+                self.assertNotIn("retryable", failure)
+                self.assertIsNone(download_exclusion(manifest))
 
     def test_a_declared_archive_the_download_does_not_hold_is_refused_before_the_attribute_stage(self) -> None:
         """S2.zip is declared and not in the tar the repository served: the declared checksums' stage refuses the
@@ -245,6 +296,72 @@ class AnyOtherFailureKeepsThePlainFailure(_Lease):
         self.assertIn("found more than once: S2.zip (2 inputs in what the archive held)", str(error))
         self.assertNotIn("disposition", manifest["download_failure"])
         self.assertIsNone(download_exclusion(manifest))
+
+
+class AnExclusionStandsOnlyOnWhatTheLeaseSaw(unittest.TestCase):
+    """REVIEW OF 0.5.40 (2026-10-15): the attribute stage on the extraction records alone. An exclusion is never
+    retried and deletes the unit's raw data, so _expanded_without_input gives a declared archive an entry only where
+    one of its places is on disk, was walked (the place itself included), and held at least one file, none of a format
+    MS-DIAL opens. Before the review a record whose place was not on disk gave an entry of the record's file_count and
+    no suffix, and a zip that expanded to the vendor folder S1.d gave one, since the walk named only what lies inside
+    the folder."""
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.data_root = Path(self._temporary.name).resolve() / "data"
+        self.data_root.mkdir()
+
+    def refused(self, name: str, **record_options) -> ValueError:
+        with self.assertRaises(ValueError) as caught:
+            _filter_inputs_by_project_allowlist(
+                [], self.data_root, _declared_project((name,)), archive_extractions=_records_of(name, **record_options)
+            )
+        return caught.exception
+
+    def test_a_record_whose_place_is_not_on_disk_gives_no_disposition(self) -> None:
+        """The record names TAR_ROOT/S1, and nothing lies there: what the zip held was not seen, and a record at odds
+        with the disk is the lease's own failure, never a format to exclude."""
+        error = self.refused("S1.zip", file_count=7)
+
+        self.assertIs(ValueError, type(error))
+        self.assertIn(f"S1.zip: 7 file(s) under {TAR_ROOT}/S1 (not on disk)", str(error))
+        self.assertIn("none of the files it held is an input the lease takes", str(error))
+
+    def test_an_archive_that_expanded_to_nothing_gives_no_disposition(self) -> None:
+        (self.data_root / TAR_ROOT / "S1").mkdir(parents=True)
+
+        error = self.refused("S1.zip", file_count=0)
+
+        self.assertIs(ValueError, type(error))
+        self.assertIn(f"S1.zip: 0 file(s) under {TAR_ROOT}/S1", str(error))
+
+    def test_a_zip_that_expanded_to_a_vendor_folder_gives_no_disposition(self) -> None:
+        """S1.d.zip holding exactly its own folder expands to TAR_ROOT/S1.d (nested_rooted), whose walk names
+        AcqData/MSScan.bin and not the folder itself: the place is walked with it."""
+        acquisition = self.data_root / TAR_ROOT / "S1.d" / "AcqData"
+        acquisition.mkdir(parents=True)
+        (acquisition / "MSScan.bin").write_bytes(b"scan")
+
+        error = self.refused("S1.d.zip")
+
+        self.assertIs(ValueError, type(error))
+        self.assertIn(f"S1.d.zip: 1 file(s) under {TAR_ROOT}/S1.d, by suffix .bin 1, among them .d 1", str(error))
+
+    def test_a_place_on_disk_holding_files_ms_dial_does_not_open_is_still_an_exclusion(self) -> None:
+        place = self.data_root / TAR_ROOT / "S1" / "Data" / "RD"
+        place.mkdir(parents=True)
+        (place / "MsData.RPS").write_bytes(b"rps")
+
+        error = self.refused("S1.zip", file_count=7)
+
+        self.assertIsInstance(error, DeclaredInputsUnsupportedError)
+        self.assertIn("none of the files it held is one MS-DIAL opens", str(error))
+        self.assertEqual(
+            [{"declared": "S1.zip", "archive": f"{TAR_ROOT}/S1.zip", "files": 1, "suffixes": {".rps": 1}}],
+            error.disposition()["inputs"],
+            "files counts what was seen, not the record's file_count",
+        )
 
 
 class TheDownloadJobCarriesTheDisposition(_Lease):
