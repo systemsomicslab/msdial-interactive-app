@@ -2729,9 +2729,16 @@ def _run_repository_download_job(
             _persist_jobs_locked()
     except Exception as error:
         log(traceback.format_exc())
+        # The record the lease wrote into the unit manifest as it failed (download_failure), verbatim: its stage,
+        # error type and, where the lease says so, retryable and disposition. A unit whose declared inputs hold no
+        # format MS-DIAL opens is one to exclude (disposition decision "exclude"), never a failure to retry, and
+        # the job's poll says so as the manifest does. Absent where the lease wrote none (refused before it began).
+        failure = getattr(error, "download_failure", None)
         with JOBS_LOCK:
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = str(error)
+            if isinstance(failure, dict):
+                JOBS[job_id]["download_failure"] = dict(failure)
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             _persist_jobs_locked()
     finally:

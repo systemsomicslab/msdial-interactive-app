@@ -1048,6 +1048,12 @@ UNATTRIBUTED_MEMBERS_RULE = "unit_scoped_archive_2026_10_07"
 # The Class an unattributed input's CSV row takes where the unit's Class is no abstention (where it is, the
 # abstention's one Class, "All").
 UNATTRIBUTED_CLASS = "Unattributed"
+# COPIES IN A DECLARED ARCHIVE (user decision, 2026-10-15: "1つだけで良いと思っています"). The folders inside one declared
+# per-sample archive (MB-POST's per-sample zips) are copies of its sample's one acquisition: the lease's one encoding
+# rule uses one and leaves the others unused, on record (manifest.declared_archive_inputs copies_unused and
+# copy_rule; repository_reanalysis._another_encoding_beside). Every lease, disposition and CSV record of such a unit
+# carries this warning, and the disposition's detail names the archive, the copy used and the copies left.
+DECLARED_ARCHIVE_COPIES_WARNING = "declared_archive_copies_unused"
 DISPOSITIONS = ("run", "skip", "exclude", "split")
 # HEADER FIRST (user decision, 2026-10-06). A file whose header was read, that has MS2, and whose header gives
 # one of these runs as its header says, whatever the unit declares and whatever confidence the extractor gave:
@@ -1288,6 +1294,25 @@ def decide_disposition(
         mapping(row.get("name_pairing")).get("paired_by") == UNATTRIBUTED_MEMBER_PAIRING for row in lineage_rows
     ):
         warn(UNATTRIBUTED_MEMBERS_WARNING)
+    # A declared per-sample archive that held its sample in several folders, which are copies: the lease used one and
+    # left the others unused (2026-10-15). Always on record, by name, whatever the disposition decides.
+    copied = [
+        item for item in manifest.get("declared_archive_inputs") or []
+        if isinstance(item, dict) and item.get("copies_unused")
+    ]
+    if copied or DECLARED_ARCHIVE_COPIES_WARNING in (manifest.get("warnings") or []):
+        warn(DECLARED_ARCHIVE_COPIES_WARNING)
+    for item in copied[:5]:
+        detail.append(
+            f"The declared archive {item.get('declared_path')} held its sample's file in more than one folder; the "
+            "folders inside one per-sample archive are copies (user decision 2026-10-15), so "
+            + (", ".join(str(path) for path in item.get("inputs") or []) or "one of them")
+            + " is used and "
+            + ", ".join(str(path) for path in item.get("copies_unused") or [])
+            + " left unused."
+        )
+    if len(copied) > 5:
+        detail.append(f"{len(copied) - 5} more declared archive(s) had copies left unused (declared_archive_inputs).")
 
     def result(disposition: str, split_key: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
         settle_overrides(disposition)

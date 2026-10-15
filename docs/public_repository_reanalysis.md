@@ -263,19 +263,25 @@ declared inputs of one sample row and one stem (`_declared_candidates`), so a
 declaration listing one sample's file in two folders runs the first by path,
 while declared inputs of two rows stay two samples.
 
-One exception to the rule has not been decided by the user (0.5.39). A declared
-input that is itself an archive (MB-POST's per-sample zips inside a project tar)
-is one sample, and the rule chooses among what it held. A file the rule leaves
-unused beside the one used, in its folder and of its stem (`S1/S1.cdf` beside
-`S1/S1.mzML`, or `S1/S1.wiff` beside `S1/S1.d`), is recorded as the rule says.
-A file in another folder of that archive is not: `S1/A/S1.mzML` beside
-`S1/B/S1.mzML`, or `S1/RAW/S1.d` beside `S1/mzML/S1.mzML`, makes the lease
-refuse the unit as that declared input found more than once, where clauses 1
-and 2 would run one and record the other. The folders of one sample's archive
-may be its runs (`run_a/data.mzML` and `run_b/data.mzML`; MPST000213's
-`Data/<run>/RD/MsData.RPS`), and the grouping cannot tell runs from copies.
-Whether such folders are runs or copies is a decision for the user. Until it is
-recorded, the lease stops rather than choose one by path.
+The folders inside one declared per-sample archive are copies (0.5.40, the
+user's decision of 2026-10-15). A declared input that is itself an archive
+(MB-POST's per-sample zips inside a project tar) is one sample, and the rule
+chooses among what it held, copies in its other folders included. A file of the
+used one's stem is that acquisition's copy or other encoding wherever it lies in
+the archive: beside it (`S1/S1.cdf` beside `S1/S1.mzML`, or `S1/S1.wiff` beside
+`S1/S1.d`) or in another folder (`S1/A/S1.mzML` beside `S1/B/S1.mzML`,
+`S1/RAW/S1.d` beside `S1/mzML/S1.mzML`, `S1/run_a/data.mzML` beside
+`S1/run_b/data.mzML`, and, in a positive unit, `S1/POS/S1.mzML` beside
+`S1/S1.mzML`). The rule uses one (by rank, then the first by path) and records
+the others; the copies left in other folders are named where the nesting is
+recorded (below) and warned of. In 0.5.39 such a file made the lease refuse the
+unit as that declared input found more than once, because the folders might have
+been the sample's runs; that was a stop until the user decided, and the user
+decided that one copy is enough. Still refused as one declared input found more
+than once: two polarities' folders (`S1/NEG/S1.mzML` beside `S1/POS/S1.mzML`, two
+acquisitions by the rule itself; and `S1/POS/S1.mzML` beside `S1/S1.mzML` in a
+negative unit), and two stems (`run_1.mzML` beside `run_2.mzML`, two runs), in
+one folder or in two.
 
 A re-encoding MS-DIAL opens that no instrument writes (`.cdf`, `.abf`, `.ibf`)
 is in none of the rule's ranks; it ranks after every vendor format and before
@@ -328,6 +334,20 @@ The record:
   `vendor_headers_unreadable` where the lease read headers); the convert stage's
   `not_converted_readable_encoding` counts the mzXML a readable encoding was used
   before.
+- A declared per-sample archive whose copies in other folders the rule left
+  unused (0.5.40) says so in its `manifest.declared_archive_inputs` entry:
+  `copies_unused` (their paths under the data root, each with its reason in
+  `encoding_choices`) and `copy_rule`
+  `per_sample_archive_folders_are_copies_2026_10_15`. The manifest's and the
+  attribute stage's warnings carry `declared_archive_copies_unused` (the stage
+  also counts `declared_archive_copies_unused`), and `archive_warnings` has one
+  entry per such archive (`kind` `declared_archive_copies_unused`) whose message
+  names the archive, the copy used and the copies left. The preflight's
+  `campaign_disposition` carries the warning with a detail line naming them, and
+  the analysis-CSV record carries it with `declared_archive_copies` (`declared_path`,
+  `used`, `copies_unused`, `copy_rule`). A split part carries the record and the
+  warning only where its inputs include such an archive's. Only where a copy was
+  left, so every other lease records what it always did.
 
 ## Workspace and retention policy
 
@@ -913,6 +933,42 @@ matched by path, and its own samples: those its declared inputs or its lineage
 name, and otherwise those whose `raw_file` matches its inputs' paths, a sample's
 name being used only where no path accounts for it. An input two samples match
 equally well is neither one's, and those samples are reported unclaimed.
+
+### A unit whose declared inputs hold no format MS-DIAL opens (0.5.40)
+
+A lease ends `download_failed` at its attribute stage when a declared input is
+not in the download. Where every missing declared input is a declared archive
+the extract stage expanded and none of the files it held is one MS-DIAL opens
+(nothing of a raw suffix, no `.d` or `.raw` folder, no mzXML), and no declared
+input is found more than once, the lease raises `DeclaredInputsUnsupportedError`
+(a `ValueError` with the same text), and its `download_failure` also carries:
+
+```json
+"retryable": false,
+"disposition": {
+  "decision": "exclude",
+  "reason": "declared_inputs_unsupported_format",
+  "inputs": [{"declared": "<declared path>", "archive": "<archive path under the data root>",
+              "files": 5, "suffixes": {".dfa": 2, ".rps": 1, ".rpc": 1, ".xml": 1}}]
+}
+```
+
+`files` counts what the archive held, and `suffixes` are its ten commonest (the
+counts above are a synthetic example). Any other attribute-stage failure
+(an input missing for another reason, an input found more than once) has no
+`disposition`, as before. A retry of such a unit downloads the same objects and
+expands them into the same files, so the campaign runner reads the disposition
+and ends the unit as excluded rather than counting a failed download and retrying
+it: MB-POST MPST000213, whose three per-sample zips each hold a JEOL msAxel
+project, was retried three times. The unit manifest keeps the record, and the
+download job carries it verbatim as `download_failure` (the job's poll returns
+it), so the runner finds it whether it polls the job or reads the manifest of a
+job the backend no longer knows. `msdial_discard_repository_raw` (and
+`discard_download_lease`) takes such a unit as it takes any failed download:
+under a campaign approval covering boundary 5, or with `confirmed=true`, its raw
+data are deleted, the manifest becomes `discarded` with a `discard_reason` that
+names `declared_inputs_unsupported_format`, and its `download_failure` stays on
+record.
 
 ## Finalize and clean up
 

@@ -181,6 +181,17 @@ def summarize_jobs(
             # discard passes release_disposition_hold=true (the operator's skip), which records
             # disposition_hold_released_by "operator_skip"; a held part keeps its parent's raw data until then.
             "discard_release_disposition_hold",
+            # Since 0.5.40 (the user's decision of 2026-10-15): the folders inside one declared per-sample archive
+            # are copies; the one encoding rule uses one and the lease names the others
+            # (declared_archive_inputs.copies_unused and copy_rule; the warning declared_archive_copies_unused).
+            # Two polarities' folders and two stems in one such archive are still refused as found more than once.
+            "repository_declared_archive_copies",
+            # Since 0.5.40: a lease whose every missing declared input is a declared archive that held no format
+            # MS-DIAL opens ends download_failed with download_failure.retryable false and download_failure.disposition
+            # {decision "exclude", reason "declared_inputs_unsupported_format", inputs: [{declared, archive, files,
+            # suffixes}]}; the download job carries the record verbatim (download_failure), and the campaign discard
+            # takes such a unit.
+            "repository_download_exclusion_disposition",
         ],
         "workflow_outline": [
             "Inspect the input path and collect the guided scientific choices.",
@@ -298,6 +309,10 @@ def summarize_job(
         summary["artifacts"] = {
             key: list(artifacts.get(key, [])) for key in ("mztab", "qa", "msdial")
         }
+    if isinstance(job.get("download_failure"), dict):
+        # A failed repository download: the record its lease wrote into the unit manifest, verbatim, where
+        # retryable false and disposition {decision "exclude", ...} say the unit is to be excluded, not retried.
+        summary["download_failure"] = dict(job["download_failure"])
     return summary
 
 

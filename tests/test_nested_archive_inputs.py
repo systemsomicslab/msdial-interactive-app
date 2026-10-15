@@ -16,10 +16,12 @@ What is pinned here, with synthetic tars of synthetic zips (nothing leaves the m
 - the inner zip is held to the outer archive's rules: an unsafe member name, the member budget, its published MD5;
 - one sample's encodings side by side inside one zip, in one folder and of one stem, are one sample's (the one
   encoding rule), whatever their rank: S1.cdf beside S1.mzML, and S1.d beside S1.wiff (a tie, the first by path);
-  two runs (of two names, or of one name in their own folders) and both polarities' folders are one declared input
-  found more than once, and refused; so is one name in two folders, which is an exception to the rule the user has
-  not decided (encoding_rule), pinned as a stop until the user does; an archived container still counts every input
-  it matched; a zip holding nothing MS-DIAL opens (MPST000213's JEOL msAxel project) says what it held;
+  so are one name's copies in several folders of the zip, which the user decided on 2026-10-15 are copies (0.5.40;
+  until then an undecided exception that refused the zip): one is used by the rule and the others are named in
+  declared_archive_inputs (copies_unused, copy_rule) and in a warning; two runs of two names and both polarities'
+  folders are still one declared input found more than once, and refused; an archived container still counts every
+  input it matched; a zip holding nothing MS-DIAL opens (MPST000213's JEOL msAxel project) says what it held (its
+  disposition, an exclusion, is pinned in test_declared_inputs_disposition);
 - a place is matched by the full path under the data root only, and recorded as it is written on disk;
 - an mzXML inside a declared zip is converted in a campaign, as a declared mzXML is;
 - where no record says where a declared per-sample zip went (one the unit downloads itself), its sample decides;
@@ -86,7 +88,9 @@ def _tar(members: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
-def _handoff(zips: dict[str, bytes], tar: bytes, *, checksums: dict[str, str] | None = None) -> dict:
+def _handoff(
+    zips: dict[str, bytes], tar: bytes, *, checksums: dict[str, str] | None = None, ion_mode: str = "Positive"
+) -> dict:
     """A Catalog handoff shaped as MPST000213's: each sample row declares the per-sample zip in the project tar."""
     checksums = checksums or {}
     stems = [name[: -len(".zip")] for name in zips]
@@ -98,7 +102,7 @@ def _handoff(zips: dict[str, bytes], tar: bytes, *, checksums: dict[str, str] | 
         "title": ACCESSION,
         "technical_settings": {
             "separation": "LC-MS",
-            "ion_mode": "Positive",
+            "ion_mode": ion_mode,
             "acquisition_mode": "DDA",
             "untargeted": True,
             "target_omics": "Metabolomics",
@@ -358,25 +362,65 @@ class WhatOneZipHoldsIsOneSample(_Workspace):
         self.assertEqual([f"{TAR_ROOT}/S1/S1.cdf"], manifest["declared_archive_inputs"][0]["inputs"])
 
     def test_two_runs_in_one_declared_zip_are_refused_as_one_input_found_twice(self) -> None:
-        with self.assertRaisesRegex(
-            ValueError, r"found more than once: S1\.zip \(2 inputs in what the archive held\)"
-        ):
-            self.lease({"S1.zip": _zip({"S1/run_1.mzML": MZML, "S1/run_2.mzML": MZML})})
+        """Two stems are two runs, and still refused after the user's decision of 2026-10-15 that a per-sample
+        archive's folders are copies: the rule groups a declared unit's files by row and stem, uses one of each, and
+        leaves neither unused."""
+        for index, files in enumerate((
+            {"S1/run_1.mzML": MZML, "S1/run_2.mzML": MZML},
+            # In folders of their own as well: the folders being copies does not make two stems one.
+            {"S1/A/run_1.mzML": MZML, "S1/B/run_2.mzML": MZML},
+        )):
+            self.fresh_root(f"case-{index}")
+            with self.subTest(files=sorted(files)), self.assertRaisesRegex(
+                ValueError, r"found more than once: S1\.zip \(2 inputs in what the archive held\)"
+            ):
+                self.lease({"S1.zip": _zip(files)})
 
-    def test_two_runs_of_one_file_name_in_their_own_folders_are_refused_not_chosen_by_path(self) -> None:
-        """Review of 0.5.39: the rule groups a declared unit's files by row and stem, so run_a/data.mzML and
-        run_b/data.mzML were one group, run_b was left unused ('tie_lexicographic'), and the lease ran run_a alone.
-        MPST000213's zips have this shape: every run is Data/<run>/RD/MsData.RPS."""
+    def test_one_file_name_in_two_run_folders_is_one_acquisitions_copies_by_the_decision(self) -> None:
+        """THE USER'S DECISION OF 2026-10-15 ("1つだけで良いと思っています"): the folders inside one per-sample archive
+        are copies, and one is used. Until 0.5.40 run_a/data.mzML beside run_b/data.mzML was refused as found twice,
+        because such folders might have been the sample's runs (the review of 0.5.39, which this test pinned until
+        the decision); now the rule uses run_a/data.mzML, the first by path (clause 2), and records run_b's as a copy
+        left unused, with a warning."""
         runs = {"S1/run_a/data.mzML": mzml(dda_spectra(2)), "S1/run_b/data.mzML": mzml(dda_spectra(3))}
-        zips = {"S1.zip": _zip(runs)}
-        with self.assertRaisesRegex(
-            ValueError, r"found more than once: S1\.zip \(2 inputs in what the archive held\)"
-        ):
-            self.lease(zips)
+        manifest = self.lease({"S1.zip": _zip(runs)})
+
+        self.assert_one_copy_used(manifest, "S1/run_a/data.mzML", ["S1/run_b/data.mzML"], "tie_lexicographic")
+
+    def assert_one_copy_used(self, manifest: dict, used: str, copies: list[str], reason: str) -> None:
+        """One input, the copy the rule used; the others left unused with their reason, named in
+        declared_archive_inputs (copies_unused, copy_rule), in the manifest's and the attribute stage's warnings, and
+        in an archive warning that names the archive, the copy used and the copies left."""
+        self.assertEqual("prepared", manifest["status"])
+        self.assertEqual([f"{TAR_ROOT}/{used}"], self.relative(manifest, manifest["input_candidates"]))
+        (choice,) = manifest["encoding_choices"]
+        self.assertEqual(f"{TAR_ROOT}/{used}", choice["used"])
+        self.assertEqual(
+            [(f"{TAR_ROOT}/{item}", reason) for item in copies],
+            [(item["path"], item["reason"]) for item in choice["unused"]],
+        )
+        (record,) = manifest["declared_archive_inputs"]
+        self.assertEqual([f"{TAR_ROOT}/{used}"], record["inputs"])
+        self.assertEqual([f"{TAR_ROOT}/{item}" for item in copies], record["copies_unused"])
+        self.assertEqual("per_sample_archive_folders_are_copies_2026_10_15", record["copy_rule"])
+        self.assertIn("declared_archive_copies_unused", manifest["warnings"])
+        (warning,) = [item for item in manifest["archive_warnings"] if item["kind"] == "declared_archive_copies_unused"]
+        self.assertEqual(f"{TAR_ROOT}/S1.zip", warning["archive"])
+        self.assertIn(
+            f"S1.zip (inside {ACCESSION}.tar) held its sample's file in more than one of its folders", warning["message"]
+        )
+        self.assertIn(
+            f"Used: {TAR_ROOT}/{used}; left unused: " + ", ".join(f"{TAR_ROOT}/{item}" for item in copies) + ".",
+            warning["message"],
+        )
+        attribute = next(entry for entry in manifest["lease_stages"] if entry["stage"] == "attribute")
+        self.assertEqual(1, attribute["declared_archive_copies_unused"])
+        self.assertIn("declared_archive_copies_unused", attribute["warnings"])
 
     def test_both_polarities_folders_in_one_declared_zip_are_refused_not_chosen_by_path(self) -> None:
         """POS/S1.mzML and NEG/S1.mzML are two acquisitions, never two encodings of one; in this positive unit the
-        lease ran NEG/S1.mzML, first by path, before the review of 0.5.39."""
+        lease ran NEG/S1.mzML, first by path, before the review of 0.5.39. The user's decision of 2026-10-15 that a
+        per-sample archive's folders are copies does not reach them: the rule itself keeps two polarities apart."""
         for index, files in enumerate((
             {"S1/NEG/S1.mzML": MZML, "S1/POS/S1.mzML": MZML},
             # Another encoding as well as another folder: still two acquisitions.
@@ -411,24 +455,78 @@ class WhatOneZipHoldsIsOneSample(_Workspace):
                 )
                 self.assertEqual([f"{TAR_ROOT}/{used}"], manifest["declared_archive_inputs"][0]["inputs"])
 
-    def test_one_name_in_two_folders_of_a_declared_zip_is_refused_until_the_user_decides(self) -> None:
-        """AN EXCEPTION TO THE ONE ENCODING RULE THAT THE USER HAS NOT DECIDED (encoding_rule). By the rule's words
-        each pair is one sample's copies or encodings, and one would run ('copies in other folders included', clause
-        2; POS/S1.mzML beside S1.mzML in a positive unit is one sample's, _one_sample_polarities). But a folder
-        inside one sample's archive may be a run, which the grouping cannot tell from a copy, so the lease refuses
-        rather than choose by path. Whether such folders are runs or copies is the user's to decide; this pins the
-        stop until that answer is on record, not a reading of the rule."""
-        for index, files in enumerate((
-            {"S1/cdf/S1.cdf": b"CDF\x01netcdf", "S1/mzML/S1.mzML": MZML},
-            {"S1/A/S1.mzML": MZML, "S1/B/S1.mzML": MZML},
-            {"S1/RAW/S1.d/AcqData/MSScan.bin": b"scan", "S1/mzML/S1.mzML": MZML},
-            {"S1/POS/S1.mzML": MZML, "S1/S1.mzML": MZML},
-        )):
+    def test_one_name_in_two_folders_of_a_declared_zip_is_copies_and_one_is_used(self) -> None:
+        """THE USER'S DECISION OF 2026-10-15 (encoding_rule, FOLDERS INSIDE ONE DECLARED PER-SAMPLE ARCHIVE ARE
+        COPIES). Until 0.5.40 each pair was refused as one declared input found more than once, an exception to the
+        rule the user had not decided, and this test pinned that stop. Now each pair is one acquisition's copies or
+        encodings, as the rule's words say ('copies in other folders included', clause 2; POS/S1.mzML beside S1.mzML
+        in a positive unit is one sample's, _one_sample_polarities): the rule uses one, by rank and then the first by
+        path, and the others are recorded and warned of."""
+        cases = (
+            ({"S1/cdf/S1.cdf": b"CDF\x01netcdf", "S1/mzML/S1.mzML": MZML}, "S1/cdf/S1.cdf", ["S1/mzML/S1.mzML"],
+             "lower_in_encoding_order"),
+            ({"S1/A/S1.mzML": MZML, "S1/B/S1.mzML": MZML}, "S1/A/S1.mzML", ["S1/B/S1.mzML"], "tie_lexicographic"),
+            ({"S1/RAW/S1.d/AcqData/MSScan.bin": b"scan", "S1/mzML/S1.mzML": MZML}, "S1/RAW/S1.d",
+             ["S1/mzML/S1.mzML"], "lower_in_encoding_order"),
+            ({"S1/POS/S1.mzML": MZML, "S1/S1.mzML": MZML}, "S1/POS/S1.mzML", ["S1/S1.mzML"], "tie_lexicographic"),
+            # Three copies: one used, both others named.
+            ({"S1/A/S1.mzML": MZML, "S1/B/S1.mzML": MZML, "S1/C/S1.mzML": MZML}, "S1/A/S1.mzML",
+             ["S1/B/S1.mzML", "S1/C/S1.mzML"], "tie_lexicographic"),
+        )
+        for index, (files, used, copies, reason) in enumerate(cases):
             self.fresh_root(f"case-{index}")
-            with self.subTest(files=sorted(files)), self.assertRaisesRegex(
-                ValueError, r"found more than once: S1\.zip \(2 inputs in what the archive held\)"
-            ):
-                self.lease({"S1.zip": _zip(files)})
+            with self.subTest(files=sorted(files)):
+                self.assert_one_copy_used(self.lease({"S1.zip": _zip(files)}), used, copies, reason)
+
+    def test_a_copy_beside_one_of_the_other_polarity_is_still_refused(self) -> None:
+        """S1/S1.mzML states no polarity, and is a copy of S1/POS/S1.mzML only where the unit is positive
+        (_one_sample_polarities); in a negative unit the two stay apart, and the zip is refused as found twice."""
+        with self.assertRaisesRegex(
+            ValueError, r"found more than once: S1\.zip \(2 inputs in what the archive held\)"
+        ):
+            self.lease({"S1.zip": _zip({"S1/POS/S1.mzML": MZML, "S1/S1.mzML": MZML})}, ion_mode="Negative")
+
+    def test_the_copies_left_unused_reach_the_analysis_csv_record_and_the_disposition(self) -> None:
+        """A run's records say it too: the analysis-CSV record (warnings, declared_archive_copies) and the preflight's
+        disposition (its warning, and a detail line naming the archive, the copy used and the copy left)."""
+        from msdial_app.raw_metadata_preflight import decide_disposition
+
+        manifest = self.lease({"S1.zip": _zip({"S1/A/S1.mzML": MZML, "S1/B/S1.mzML": MZML})})
+        manifest_path = Path(manifest["input_directory"]).parents[1] / "provenance" / "run-manifest.json"
+        _set_preflight(manifest_path, {"*": "DDA"})
+        current = read_manifest(manifest_path)
+        built = build_repository_analysis_rows(current)
+        disposition = decide_disposition(current)
+
+        self.assertEqual([], built["failures"])
+        self.assertIn("declared_archive_copies_unused", built["warnings"])
+        self.assertEqual(
+            [{
+                "declared_path": "S1.zip",
+                "used": [f"{TAR_ROOT}/S1/A/S1.mzML"],
+                "copies_unused": [f"{TAR_ROOT}/S1/B/S1.mzML"],
+                "copy_rule": "per_sample_archive_folders_are_copies_2026_10_15",
+            }],
+            built["declared_archive_copies"],
+        )
+        self.assertIn("declared_archive_copies_unused", disposition["warnings"])
+        self.assertTrue(
+            any(
+                "S1.zip" in line and f"{TAR_ROOT}/S1/A/S1.mzML is used" in line and f"{TAR_ROOT}/S1/B/S1.mzML" in line
+                for line in disposition["detail"]
+            ),
+            disposition["detail"],
+        )
+
+    def test_a_unit_whose_zips_hold_one_copy_each_records_no_copies(self) -> None:
+        """Only where a copy was left, so every other lease records what it always did."""
+        manifest = self.lease({"S1.zip": _zip({"S1/S1.mzML": MZML, "S1/S1.cdf": b"CDF\x01netcdf"})})
+
+        self.assertNotIn("copies_unused", manifest["declared_archive_inputs"][0])
+        self.assertNotIn("warnings", manifest)
+        self.assertFalse(
+            any(item["kind"] == "declared_archive_copies_unused" for item in manifest.get("archive_warnings") or [])
+        )
 
     def test_a_zip_holding_nothing_ms_dial_opens_says_what_it_held(self) -> None:
         """MPST000213: each zip held a JEOL msAxel project, which no RawDataHandler reader opens."""
@@ -688,6 +786,34 @@ class APlaceIsNamedAsItIsWrittenOnDisk(unittest.TestCase):
         self.assertEqual("MB/s2", repository_reanalysis._as_written(root, "MB/s2", dict(listings)))
         self.assertEqual("MB/S3", repository_reanalysis._as_written(root, "mb/S3", dict(listings)))
         self.assertEqual("mb/S2", repository_reanalysis._as_written(Path("other"), "mb/S2", {Path("other"): ["MB", "mB"]}))
+
+
+class ASplitPartCarriesOnlyItsOwnArchivesCopies(unittest.TestCase):
+    """_part_declared_archive_inputs: a part takes the parent's declared_archive_inputs entries whose input is one of
+    its own (an mzML the convert stage wrote by the mzXML it stands for), so its copies warning is its own."""
+
+    def test_the_part_takes_the_entries_of_its_own_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_root = Path(temporary).resolve() / "raw" / "data"
+            converted = Path(temporary).resolve() / "raw" / "converted" / "S2.mzML"
+            parent = {
+                "input_directory": str(data_root),
+                "declared_archive_inputs": [
+                    {"declared_path": "S1.zip", "inputs": [f"{TAR_ROOT}/S1/A/S1.mzML"],
+                     "copies_unused": [f"{TAR_ROOT}/S1/B/S1.mzML"], "copy_rule": "x"},
+                    {"declared_path": "S2.zip", "inputs": [f"{TAR_ROOT}/S2/S2.mzXML"]},
+                ],
+            }
+            take = repository_reanalysis._part_declared_archive_inputs
+
+            first = take(parent, [str(data_root / TAR_ROOT / "S1" / "A" / "S1.mzML")], {})
+            second = take(
+                parent, [str(converted)], {_file_key(str(converted)): str(data_root / TAR_ROOT / "S2" / "S2.mzXML")}
+            )
+
+            self.assertEqual(["S1.zip"], [item["declared_path"] for item in first])
+            self.assertEqual(["S2.zip"], [item["declared_path"] for item in second])
+            self.assertEqual([], take({**parent, "input_directory": ""}, [str(converted)], {}))
 
 
 if __name__ == "__main__":

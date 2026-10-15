@@ -23,19 +23,19 @@ choose_encoding is the rule, and the one place it is decided: the lease groups t
 (repository_reanalysis._encoding_groups) and asks it once per sample, and every later reader (the lineage, the
 analysis-CSV builder, a split part) reads what it decided from the record it returns (EncodingChoice.record).
 
-ONE EXCEPTION THE USER HAS NOT DECIDED (Interactive 0.5.39). A declared analysis input that is itself an archive
-(MB-POST's per-sample zips inside a project tar) is one sample, and what it held is grouped and chosen among by the
-rule as above. Where the file the rule left unused lies in the same folder as the one it used and has its stem
-(S1/S1.mzML beside S1/S1.cdf; S1/S1.wiff beside S1/S1.d, a tie clause 2 gives the first by path), the rule applies
-as written. Where it lies in another folder of that archive, it does NOT: the lease refuses the unit as that declared
-input found more than once, where the rule ("copies in other folders included", clause 2) would use one and record
-the other - S1/A/S1.mzML beside S1/B/S1.mzML, S1/RAW/S1.d beside S1/mzML/S1.mzML, and, in a positive unit,
-S1/POS/S1.mzML beside S1/S1.mzML. The reason is that the folders inside one sample's archive may be its runs rather
-than copies (S1/run_a/data.mzML and S1/run_b/data.mzML; MPST000213's Data/<run>/RD/MsData.RPS), the grouping cannot
-tell which, and running one chosen by path would silently drop the others. Whether folders inside one declared
-per-sample archive are runs or copies is a scientific decision for the user that has not been made; the refusal is
-a stop until it is, not a reading of this rule (repository_reanalysis._another_encoding_beside). Everywhere else the
-rule applies as written.
+FOLDERS INSIDE ONE DECLARED PER-SAMPLE ARCHIVE ARE COPIES (the user's decision of 2026-10-15, Interactive 0.5.40:
+"1つだけで良いと思っています", one is enough). A declared analysis input that is itself an archive (MB-POST's per-sample
+zips inside a project tar) is one sample, and what it held is grouped and chosen among by the rule as above, copies
+in other folders of the archive included: S1/A/S1.mzML beside S1/B/S1.mzML, S1/RAW/S1.d beside S1/mzML/S1.mzML,
+S1/run_a/data.mzML beside S1/run_b/data.mzML, and, in a positive unit, S1/POS/S1.mzML beside S1/S1.mzML are one
+acquisition's copies. The rule uses one of them (clause 1, its rank; clause 2, the first by path on a tie) and
+records the others (clause 5); the lease names the copies it left unused where it records the nesting
+(manifest.declared_archive_inputs: copies_unused, and copy_rule DECLARED_ARCHIVE_COPY_RULE) and warns of them
+(declared_archive_copies_unused). Before that decision (0.5.39) this was an exception the user had not decided: the
+lease refused such an archive as one declared input found more than once, because the folders might have been the
+sample's runs. What is still refused is what the rule itself keeps apart: two polarities' folders (S1/NEG/S1.mzML
+beside S1/POS/S1.mzML are two acquisitions), and two stems (run_1.mzML and run_2.mzML are two runs). See
+repository_reanalysis._another_encoding_beside. Everywhere else the rule applies as written, as it always did.
 
 WHAT "READABLE" IS, AT THE LEASE. The caller's ``readability`` says what the lease knows of a candidate: an mzML
 whose arrays RawDataHandler cannot decode (mzml_encoding) is UNDECODABLE; an mzXML whose conversion failed, or whose
@@ -61,6 +61,9 @@ from typing import Any, Callable, Iterable, Mapping
 from . import encoding_preference
 
 RULE = "one_encoding_per_sample_2026_10_09"
+# The user's decision of 2026-10-15 that the folders inside one declared per-sample archive are copies, of which the
+# rule uses one (manifest.declared_archive_inputs copy_rule, beside the copies it left unused).
+DECLARED_ARCHIVE_COPY_RULE = "per_sample_archive_folders_are_copies_2026_10_15"
 
 # The rule's order (clause 1). Anything else is no encoding the rule ranks. RE_ENCODING_RANK is not the rule's: it
 # places the re-encodings MS-DIAL opens (RE_ENCODING_SUFFIXES) where they stood before it (see clause 1 above).

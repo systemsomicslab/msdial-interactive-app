@@ -85,6 +85,7 @@ from .repository_metadata import (
     rows_naming_input,
 )
 from .raw_metadata_preflight import (
+    DECLARED_ARCHIVE_COPIES_WARNING,
     INFERRED_PAIRING_WARNING,
     UNATTRIBUTED_CLASS,
     UNATTRIBUTED_MEMBER_PAIRING,
@@ -726,6 +727,20 @@ def build_repository_analysis_rows(
         warnings.append(INFERRED_PAIRING_WARNING)
     if unattributed:
         warnings.append(UNATTRIBUTED_MEMBERS_WARNING)
+    # Each declared per-sample archive that held its sample in several folders, which are copies: the lease used one
+    # and left the others unused (the user's decision of 2026-10-15), always on record with the CSV.
+    archive_copies = [
+        {
+            "declared_path": str(item.get("declared_path") or ""),
+            "used": [str(path) for path in item.get("inputs") or []],
+            "copies_unused": [str(path) for path in item.get("copies_unused") or []],
+            "copy_rule": str(item.get("copy_rule") or ""),
+        }
+        for item in manifest.get("declared_archive_inputs") or []
+        if isinstance(item, dict) and item.get("copies_unused")
+    ]
+    if archive_copies:
+        warnings.append(DECLARED_ARCHIVE_COPIES_WARNING)
     applied = _applied_disposition(manifest)
     as_swath = applied.get("aif_run_as_swath") if applied.get("disposition") == "run" else None
     multi_ce = applied.get("aif_multi_ce_run") if applied.get("disposition") == "run" else None
@@ -776,6 +791,8 @@ def build_repository_analysis_rows(
         # energy and the Console it was decided for has MsdialWorkbench#825. The Console reads the energies from
         # the data; the column says AIF and nothing more.
         **({"aif_multi_ce_run": dict(multi_ce)} if isinstance(multi_ce, dict) else {}),
+        # The declared archives whose copies in other folders the lease left unused (2026-10-15), only where one was.
+        **({"declared_archive_copies": archive_copies} if archive_copies else {}),
         "warnings": warnings,
     }
 
@@ -1040,6 +1057,8 @@ def analysis_csv_change(built: dict[str, Any], csv_path: str | Path) -> Any:
         summary["aif_run_as_swath"] = dict(built["aif_run_as_swath"])
     if built.get("aif_multi_ce_run"):
         summary["aif_multi_ce_run"] = dict(built["aif_multi_ce_run"])
+    if built.get("declared_archive_copies"):
+        summary["declared_archive_copies"] = [dict(item) for item in built["declared_archive_copies"]]
 
     def change(manifest: dict[str, Any]) -> None:
         lineage = manifest.get("input_lineage")
