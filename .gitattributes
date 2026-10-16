@@ -1,0 +1,5 @@
+# Windows batch files keep CRLF in every checkout and in GitHub's source ZIP: cmd.exe misreads some
+# LF-only batch files.
+*.cmd text eol=crlf
+# Workbooks are ZIP archives; never convert their bytes.
+*.xlsx binary

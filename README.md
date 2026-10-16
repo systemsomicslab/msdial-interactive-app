@@ -3,6 +3,23 @@
 Cross-platform local web application for building and running MS-DIAL Console
 LC-MS and GC-MS workflows.
 
+## Quick start: laboratory lipidomics with Claude
+
+Claude Code or Claude Desktop can run a whole lipidomics batch with internal standards
+through this app: from a positive and a negative raw-data folder to a quantified
+`lipid_metabolome.csv`, asking every scientific question and starting MS-DIAL only after
+your yes. Everything runs on your computer.
+
+1. Install Python 3.10 or newer and Claude Code or Claude Desktop, and get an MS-DIAL
+   Console new enough for laboratory lipidomics (the Console prerelease 5.5.2610xx or
+   later; the tutorial says where, and how to build one from source meanwhile).
+2. Run the setup: on Windows double-click `Setup MS-DIAL for Claude.cmd`; elsewhere run
+   `python3 scripts/setup_claude.py`. It explains each step and asks before it changes
+   anything (`--dry-run` shows the plan only).
+3. Follow [the tutorial](docs/tutorials/lab-lipidomics.md) with the public demo data
+   (Zenodo [10.5281/zenodo.10957708](https://doi.org/10.5281/zenodo.10957708)) and the
+   example workbook in [`examples/lab-lipidomics`](examples/lab-lipidomics/README.md).
+
 ## Why Python + local web UI
 
 - The same application code runs on Windows, macOS, and Linux.
@@ -160,7 +177,12 @@ LBM2 library, the salt in the mobile phase, a text library of internal standards
 per polarity, and `quant_utility_table.xlsx` (sheet 1 the standards and their
 amounts, sheet 2 which standard quantifies which class, sheet 3 which class and
 adduct each polarity keeps). Five MCP tools take it from the folders to
-`lipid_metabolome.csv`, each step writing only once the person has confirmed it:
+`lipid_metabolome.csv`, each step writing only once the person has confirmed it.
+The Agent Skill `skills/msdial-lipidomics-workflow` walks Claude through them;
+[`docs/tutorials/lab-lipidomics.md`](docs/tutorials/lab-lipidomics.md) is the
+step-by-step tutorial with the public demo data, and
+[`examples/lab-lipidomics/quant_utility_table.xlsx`](examples/lab-lipidomics/README.md)
+the demo's workbook, to start your own from.
 
 1. `msdial_lipidomics_check_inputs` reads everything and changes nothing. With
    the folders alone it lists what is there and every question still open (what
@@ -579,14 +601,37 @@ The bundle contains no raw data.
 
 MS-DIAL Interactive combines two complementary layers:
 
-- the Agent Skill defines the scientific interview, confirmation boundaries,
+- the Agent Skills define the scientific interview, confirmation boundaries,
   QA interpretation, and publication workflow;
 - the local MCP server inspects data paths, runs MS-DIAL, reports job state,
   validates mzTab-M, generates QA, and creates publication artifacts.
 
+Two skills are bundled under `skills/`:
+
+- `msdial-guided-analysis`: guided LC-MS and GC-MS analysis of a local folder or a
+  public repository accession, through mzTab-M, QA and publication artifacts;
+- `msdial-lipidomics-workflow`: a laboratory lipidomics batch with internal standards,
+  from two raw folders to `lipid_metabolome.csv` (see
+  [the tutorial](docs/tutorials/lab-lipidomics.md)).
+
 Raw data stay on the user's PC. Guided execution currently supports LC-MS and
 GC-MS. Five built-in worksets cover GC-MS metabolomics and positive/negative
 LC-MS metabolomics/lipidomics; accepted choices can be saved as user worksets.
+
+The one-command setup does everything below for Claude Code and Claude Desktop, and
+asks before each change:
+
+```bash
+python scripts/setup_claude.py            # or double-click "Setup MS-DIAL for Claude.cmd" on Windows
+python scripts/setup_claude.py --dry-run  # the plan only; nothing is changed
+```
+
+It checks Python (3.10+), installs the MCP dependency when it is missing, registers the
+MCP server with Claude Code at user scope (`claude mcp add --scope user`) and in Claude
+Desktop's `claude_desktop_config.json` (after a timestamped backup, other keys left as
+they are), copies both skills into `~/.claude/skills` (a differing copy is backed up to
+`~/.claude/skill-backups` first), builds the skill ZIPs for Claude Desktop, and says
+whether the MS-DIAL Consoles it finds are new enough for laboratory lipidomics.
 
 Install the optional MCP dependency:
 
@@ -658,9 +703,9 @@ Claude Desktop example:
 {
   "mcpServers": {
     "msdial-interactive": {
-      "command": "C:\\Users\\<user>\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
+      "command": "C:\\path\\to\\python.exe",
       "args": [
-        "D:\\0_SourceCode\\msdial_interactive_app\\scripts\\msdial-interactive-mcp.py"
+        "C:\\path\\to\\msdial-interactive-app\\scripts\\msdial-interactive-mcp.py"
       ]
     }
   }
@@ -668,7 +713,8 @@ Claude Desktop example:
 ```
 
 Use the actual Python path on that PC. Restart Claude Desktop after editing its
-configuration.
+configuration. The setup script writes this entry for you; Claude Code's equivalent
+is `claude mcp add --scope user msdial-interactive -- <python> <checkout>/scripts/msdial-interactive-mcp.py`.
 
 If a newly added control reports `Unknown endpoint`, first refresh the browser
 and confirm `/api/config` reports the current app version. An older local app
@@ -676,24 +722,32 @@ may still be using port 8765. Current builds use an exclusive port binding and
 exit with a clear message instead of allowing old and new servers to share the
 same port.
 
-Package the cross-platform Agent Skill:
+Package the cross-platform Agent Skills:
 
 ```bash
-python scripts/package-agent-skill.py
+python scripts/package-agent-skill.py                                   # every skill
+python scripts/package-agent-skill.py --skill msdial-lipidomics-workflow  # one skill
 ```
 
-Upload `dist/msdial-guided-analysis.skill.zip` from Claude's
-`Customize > Skills` screen, or install the folder
-`skills/msdial-guided-analysis` in another Agent Skills-compatible host. The
-format follows the open Agent Skills standard. See
-[`docs/agent_integration.md`](docs/agent_integration.md) for setup, tool flow,
-and test prompts.
+Each skill becomes `dist/<name>.skill.zip` (`dist/msdial-guided-analysis.skill.zip`
+and `dist/msdial-lipidomics-workflow.skill.zip`), with the skill's folder at the
+root. Upload them from Claude's `Customize > Skills` screen, or install the folders
+under `skills/` in another Agent Skills-compatible host (Claude Code reads
+`~/.claude/skills/<name>/SKILL.md`). The format follows the open Agent Skills
+standard. See [`docs/agent_integration.md`](docs/agent_integration.md) for setup,
+tool flow, and test prompts.
 
-Example prompt:
+Example prompts:
 
 ```text
-D:\0_SourceCode\MsdialWorkbenchDemo\console_fastlc_demo の質量分析データを
-MS-DIALで解析し、mzTab-M検証、QA、Materials and Methods生成まで案内して。
+Analyze the mass-spectrometry data in <folder> with MS-DIAL, and guide me through
+mzTab-M validation, QA and the Materials and Methods.
+```
+
+```text
+Run the laboratory lipidomics workflow. Positive raw files: <folder>\pos.
+Negative raw files: <folder>\neg. Look at the folders first, then ask me everything
+you need in one message.
 ```
 
 ## Literature-based starting parameters
@@ -723,7 +777,7 @@ Python 3.10 or newer is required.
 ### Windows
 
 ```powershell
-cd D:\0_SourceCode\msdial_interactive_app
+cd C:\path\to\msdial-interactive-app
 .\scripts\start-local-windows.ps1
 ```
 

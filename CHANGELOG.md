@@ -4,6 +4,78 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.41] - Unreleased
+
+### Added
+- **The laboratory lipidomics skill ships with Interactive, for anyone** (the
+  user's decision of 2026-10-16). `skills/msdial-lipidomics-workflow` is the
+  Agent Skill that drives the five `msdial_lipidomics_*` tools and the guided-run
+  tools from two raw folders to `lipid_metabolome.csv`. It was kept in the public
+  reanalysis repository (`.claude/skills/msdial-lipidomics-workflow`, at 3f01ee0)
+  and is now here, reviewed for a general audience: any laboratory's own LBM2,
+  standards and workbook, the official LBM2 (`msdial_download_official_library`
+  `lipidomics`) for a laboratory without one, the public demo and the example
+  workbook named, where a new enough Console comes from (the prerelease, or the
+  local-source build with `select_after_build=false`), and the analysis root
+  rules as `check_inputs` applies them (a code checkout or a temporary folder is
+  refused, a system drive or the user profile is said). Every confirmation rule
+  is kept, and so is the private-library rule, now its own section. Interactive
+  is its canonical home; `msdial-guided-analysis` points to it for such a batch.
+- **`scripts/setup_claude.py` and `Setup MS-DIAL for Claude.cmd`: setup in one
+  command.** Standard library only, no administrator rights; it explains each
+  step and asks before it changes anything (`--yes` answers yes, `--dry-run`
+  shows the plan and changes nothing). It checks Python 3.10+; runs
+  `<python> -m pip install -e .[mcp]` only when `mcp` or `psutil` is missing or
+  outside the extra's range (`--user` where site-packages is not writable);
+  registers the MCP server with `claude mcp add --scope user` when the `claude`
+  CLI is on PATH, showing an existing user-scope registration first (command and
+  arguments, environment variable names only) and replacing it only on a yes;
+  merges an `msdial-interactive` entry into Claude Desktop's
+  `claude_desktop_config.json` (the Microsoft Store installation's copy
+  included) after a timestamped backup, every other key kept, or creates one
+  with `--desktop`; copies both skills into `~/.claude/skills` (or
+  `$CLAUDE_CONFIG_DIR/skills`), moving a differing copy to
+  `~/.claude/skill-backups` first, outside the folder Claude Code loads skills
+  from, and removing a link or junction there without writing through it;
+  builds the skill ZIPs; and asks each MS-DIAL Console it finds for
+  `normalize --help`, checking `--peak-ids-only` and the annotation-candidate
+  and automatic-RT local-test markers `check_inputs` requires. It never saves a
+  Console setting and never prints an environment variable's value.
+- **`examples/lab-lipidomics/quant_utility_table.xlsx`**: the workbook the MS-DIAL
+  laboratory uses with the public demo (sheet 3 already reconciled for the
+  merge), which the demo archive lacks, with a README on its three sheets and the
+  columns the agent reads. Two parts differ from the laboratory's copy:
+  `docProps/core.xml`'s creator and last-modified-by are empty, and
+  `xl/workbook.xml` no longer holds Excel's `absPath`, the local folder it was
+  last saved in. Every other member is the source's, byte for byte and in order,
+  and Interactive's reader reads it exactly as it read the source
+  (`tests/test_example_workbook.py`).
+- **`docs/tutorials/lab-lipidomics.md`**: a beginner-safe English tutorial with
+  the public demo (Zenodo 10.5281/zenodo.10957708): what you get, what you need,
+  the setup, the demo's download and folder layout, the analysis root and
+  `raw_location`, the conversation step by step with the MS-DIAL laboratory's
+  answers, every confirmation and why, timings, the outputs, your own data
+  (standards text format included), troubleshooting and privacy. The Console it
+  needs is named as "the MS-DIAL Console prerelease 5.5.2610xx or later", a
+  marked placeholder until the prerelease is cut, with the build from source as
+  the way meanwhile.
+
+### Changed
+- `scripts/package-agent-skill.py` packages every skill under `skills/` into
+  `dist/<name>.skill.zip` (`msdial-guided-analysis.skill.zip` keeps its name);
+  `--skill NAME` packages one (repeatable) and `--list` prints the names. Each
+  ZIP holds the skill's folder at its root, with a fixed timestamp so that the
+  same skill always packages to the same bytes, and a skill whose frontmatter
+  does not name its own folder, or has no description, is refused.
+- The distribution ZIP carries the setup wrapper and `examples/`.
+- README: a quick start for laboratory lipidomics with Claude near the top, and
+  the Agent Skill section names both skills, the packager options and the setup.
+  `docs/agent_integration.md` describes the setup and the manual route for both
+  hosts. Both now use placeholder paths where they named this project's own
+  folders, and the test prompts are in English.
+- `.gitattributes`: `*.cmd` keeps CRLF in every checkout and source ZIP, and
+  `*.xlsx` is binary.
+
 ## [0.5.40] - Unreleased
 
 ### Changes a campaign run planned with this version

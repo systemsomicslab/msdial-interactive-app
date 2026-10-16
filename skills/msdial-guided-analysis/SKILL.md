@@ -20,6 +20,10 @@ Keep `open_browser=false` unless the user asks to inspect or edit the web UI. Th
 
 Do not infer GC-MS versus LC-MS, ion mode, or target omics from a filename alone. Ask when the user has not explicitly supplied the value. Explain that guided execution currently supports LC-MS and GC-MS; direct other project types to the web UI without pretending they are supported.
 
+## Laboratory Lipidomics
+
+A lipidomics batch quantified with internal standards (a positive and a negative raw folder, an LBM2, internal-standard text libraries and `quant_utility_table.xlsx`, merged into `lipid_metabolome.csv`) has its own skill, `msdial-lipidomics-workflow`, and its own tools (`msdial_lipidomics_check_inputs` to `msdial_lipidomics_merge`). Use that skill for it rather than this guided flow.
+
 ## Public Repository Reanalysis
 
 When the user supplies a Metabolomics Workbench (`ST...`), MetaboLights
