@@ -15,10 +15,12 @@ your yes. Everything runs on your computer.
    later; the tutorial says where, and how to build one from source meanwhile).
 2. Run the setup: on Windows double-click `Setup MS-DIAL for Claude.cmd`; elsewhere run
    `python3 scripts/setup_claude.py`. It explains each step and asks before it changes
-   anything (`--dry-run` shows the plan only).
+   anything (`--dry-run` shows the plan only; on Windows, `py -3 scripts\setup_claude.py
+   --dry-run`).
 3. Follow [the tutorial](docs/tutorials/lab-lipidomics.md) with the public demo data
-   (Zenodo [10.5281/zenodo.10957708](https://doi.org/10.5281/zenodo.10957708)) and the
-   example workbook in [`examples/lab-lipidomics`](examples/lab-lipidomics/README.md).
+   (Zenodo [10.5281/zenodo.10957708](https://doi.org/10.5281/zenodo.10957708), CC BY 4.0)
+   and the example workbook and standard texts in
+   [`examples/lab-lipidomics`](examples/lab-lipidomics/README.md).
 
 ## Why Python + local web UI
 
@@ -622,16 +624,18 @@ The one-command setup does everything below for Claude Code and Claude Desktop, 
 asks before each change:
 
 ```bash
-python scripts/setup_claude.py            # or double-click "Setup MS-DIAL for Claude.cmd" on Windows
-python scripts/setup_claude.py --dry-run  # the plan only; nothing is changed
+python3 scripts/setup_claude.py            # Windows: double-click "Setup MS-DIAL for Claude.cmd", or py -3
+python3 scripts/setup_claude.py --dry-run  # the plan only; nothing is changed or started
 ```
 
 It checks Python (3.10+), installs the MCP dependency when it is missing, registers the
-MCP server with Claude Code at user scope (`claude mcp add --scope user`) and in Claude
-Desktop's `claude_desktop_config.json` (after a timestamped backup, other keys left as
-they are), copies both skills into `~/.claude/skills` (a differing copy is backed up to
+MCP server with Claude Code at user scope (`claude mcp add --scope user`; a different
+existing entry is saved to `~/.claude/mcp-backups` first) and in Claude Desktop's
+`claude_desktop_config.json` (after a timestamped backup, other keys left as they are),
+copies both skills into `~/.claude/skills` (a differing copy is backed up to
 `~/.claude/skill-backups` first), builds the skill ZIPs for Claude Desktop, and says
-whether the MS-DIAL Consoles it finds are new enough for laboratory lipidomics.
+whether the MS-DIAL Consoles it finds are new enough for laboratory lipidomics, by what
+their assemblies hold.
 
 Install the optional MCP dependency:
 

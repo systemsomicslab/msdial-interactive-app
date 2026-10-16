@@ -1,7 +1,8 @@
 """scripts/setup_claude.py: every change is explained, asked for, backed up, and absent from a dry run.
 
-Nothing here installs, registers or starts anything: every subprocess the setup would start goes to a
-recorder, and the home folder, Claude's configuration and the checkout are temporary folders.
+Nothing here installs, registers or starts anything: every subprocess the setup would start, and every
+Console it would start for its capabilities, goes to a recorder, and the home folder, Claude's
+configuration and the checkout are temporary folders.
 """
 
 from __future__ import annotations
@@ -24,13 +25,17 @@ setup = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = setup
 SPEC.loader.exec_module(setup)
 
+from msdial_app.lab_lipidomics_agent import LAB_CONSOLE_NEEDS  # noqa: E402
 from msdial_app.workflow import (  # noqa: E402
     ANNOTATION_CANDIDATES_CONSOLE_MARKERS,
     AUTOMATIC_RT_LOCAL_SUPPORT_CONSOLE_MARKERS,
+    NORMALIZE_PEAK_IDS_ONLY_CAPABILITY,
+    NORMALIZE_PEAK_IDS_ONLY_OPTION,
 )
 
 PYTHON = r"C:\Python312\python.exe"
 SECRET = "do-not-print-this-value"
+EVERY_CAPABILITY = list(LAB_CONSOLE_NEEDS)
 
 
 class Recorder:
@@ -130,14 +135,14 @@ class DryRunTests(SetupTestCase):
         console.write_bytes(b"not a real console")
         before = snapshot(self.base)
         missing = {name: {"installed": None, "ok": False} for name in setup.DEPENDENCIES}
+        starter = Starter()
         with mock.patch.object(setup, "dependency_status", return_value=missing):
-            code = setup.run_setup(self.context(dry_run=True, console_paths=[str(console)]))
+            code = setup.run_setup(self.context(dry_run=True, console_paths=[str(console)], console_capabilities=starter))
         self.assertEqual(0, code)
         self.assertEqual(before, snapshot(self.base))
-        # Only read-only queries ran: the Console's own help.
-        self.assertTrue(all(call[-2:] == ["normalize", "--help"] for call in self.runner.calls), self.runner.calls)
-        self.assertFalse(self.runner.ran("pip"))
-        self.assertFalse(self.runner.ran("mcp add") or self.runner.ran("mcp remove"))
+        # Nothing was started: no pip, no claude, and no Console (a Console is only read).
+        self.assertEqual([], self.runner.calls)
+        self.assertEqual([], starter.started)
         self.assertIn("dry run", self.printed)
         self.assertIn("would ask", self.printed)
         self.assertNotIn(SECRET, self.printed)
@@ -189,9 +194,11 @@ class ClaudeCodeTests(SetupTestCase):
         self.assertIn(r"D:\old\mcp.py", self.printed)
         self.assertIn("WORKSPACE", self.printed)
         self.assertNotIn(SECRET, self.printed)
+        self.assertFalse((self.home / ".claude" / "mcp-backups").exists())
 
-    def test_on_yes_the_existing_registration_is_removed_and_this_one_added_at_user_scope(self) -> None:
-        self.write_claude_code_config({"msdial-interactive": {"command": r"D:\old\python.exe", "args": [r"D:\old\mcp.py"]}})
+    def test_on_yes_the_existing_entry_is_saved_then_removed_and_this_one_added_at_user_scope(self) -> None:
+        old = {"type": "stdio", "command": r"D:\old\python.exe", "args": [r"D:\old\mcp.py"], "env": {"WORKSPACE": SECRET}}
+        self.write_claude_code_config({"msdial-interactive": old})
         result = setup.register_claude_code(self.context(assume_yes=True))
         self.assertEqual("done", result.status)
         self.assertEqual(
@@ -201,6 +208,22 @@ class ClaudeCodeTests(SetupTestCase):
             ],
             self.runner.calls,
         )
+        backup = self.home / ".claude" / "mcp-backups" / "msdial-interactive-20261016-093000.json"
+        self.assertEqual(old, json.loads(backup.read_text(encoding="utf-8")))
+        self.assertIn(str(backup), self.printed)
+        self.assertNotIn(SECRET, self.printed)
+
+    def test_a_failed_add_after_the_removal_restores_the_saved_entry(self) -> None:
+        old = {"command": r"D:\old\python.exe", "args": [r"D:\old\mcp.py"], "env": {"WORKSPACE": SECRET}}
+        self.write_claude_code_config({"msdial-interactive": old})
+        self.runner.answers["mcp add --scope"] = subprocess.CompletedProcess([], 1, stdout="", stderr="add failed")
+        result = setup.register_claude_code(self.context(assume_yes=True))
+        self.assertEqual("failed", result.status)
+        restore = self.runner.calls[-1]
+        self.assertEqual([r"C:\npm\claude.CMD", "mcp", "add-json", "--scope", "user", "msdial-interactive"], restore[:-1])
+        self.assertEqual({**old, "type": "stdio"}, json.loads(restore[-1]))
+        self.assertIn("The earlier registration is back.", self.printed)
+        self.assertNotIn(SECRET, self.printed)
 
     def test_a_new_registration_is_added_on_yes(self) -> None:
         result = setup.register_claude_code(self.context(assume_yes=True))
@@ -227,7 +250,7 @@ class ClaudeCodeTests(SetupTestCase):
         self.runner.answers["mcp remove"] = subprocess.CompletedProcess([], 1, stdout="", stderr="no such server")
         result = setup.register_claude_code(self.context(assume_yes=True))
         self.assertEqual("failed", result.status)
-        self.assertFalse(self.runner.ran("mcp add"))
+        self.assertFalse(self.runner.ran("mcp add"))  # neither the new entry nor a restore
 
     def test_claude_config_dir_is_honoured(self) -> None:
         custom = self.base / "claude-config"
@@ -421,46 +444,132 @@ class SkillZipTests(SetupTestCase):
         self.assertFalse((self.root / "dist").exists())
 
 
+class Starter:
+    """Stands in for Interactive's console_capabilities: records each Console started."""
+
+    def __init__(self, capabilities: list[str] | None = None) -> None:
+        self.started: list[str] = []
+        self.capabilities = list(EVERY_CAPABILITY if capabilities is None else capabilities)
+
+    def __call__(self, path: str) -> dict[str, Any]:
+        self.started.append(path)
+        return {"capability_probe": "test", "capabilities": list(self.capabilities)}
+
+
 class ConsoleTests(SetupTestCase):
-    def console(self, assembly: bytes, folder: str = "MSDIAL.console") -> Path:
-        path = self.base / folder / "MSDIALCUI.exe"
-        path.parent.mkdir(parents=True)
+    def setUp(self) -> None:
+        super().setUp()
+        self.starter = Starter()
+
+    def context(self, **overrides: Any) -> Any:
+        overrides.setdefault("console_capabilities", self.starter)
+        return super().context(**overrides)
+
+    def console(self, assembly: bytes, folder: str = "MSDIAL.console", name: str = "MSDIALCUI.exe") -> Path:
+        path = self.base / folder / name
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(assembly)
         return path
 
     @staticmethod
-    def markers() -> bytes:
-        text = " ".join(ANNOTATION_CANDIDATES_CONSOLE_MARKERS + AUTOMATIC_RT_LOCAL_SUPPORT_CONSOLE_MARKERS)
-        return b"MZ " + text.encode("utf-16-le")
+    def markers(*, peak_ids_only: bool = True) -> bytes:
+        parts = list(ANNOTATION_CANDIDATES_CONSOLE_MARKERS + AUTOMATIC_RT_LOCAL_SUPPORT_CONSOLE_MARKERS)
+        if peak_ids_only:
+            parts.append(NORMALIZE_PEAK_IDS_ONLY_OPTION)
+        return b"MZ " + " ".join(parts).encode("utf-16-le")
 
-    def test_a_console_with_every_capability_is_ready(self) -> None:
-        console = self.console(self.markers())
-        self.runner.answers["normalize --help"] = subprocess.CompletedProcess(
-            [], 0, stdout="Options:\n  --peak-ids-only  Take each standard from its PeakID.\n", stderr=""
-        )
-        result = setup.check_console(self.context(console_paths=[str(console)]))
+    def test_a_found_console_is_judged_by_its_assembly_and_started_only_after_a_yes(self) -> None:
+        console = self.console(self.markers())  # beside the checkout: found, not named
+        result = setup.check_console(self.context())
         self.assertEqual("ok", result.status)
-        self.assertEqual([[str(console), "normalize", "--help"]], self.runner.calls)
-        self.assertIn("new enough", self.printed)
+        self.assertIn("(by its assembly)", result.detail)
+        self.assertEqual([], self.starter.started)  # nobody to answer: not started
+        self.assertEqual([], self.runner.calls)
+        self.assertIn("new enough, by what its assembly holds", self.printed)
+        self.assertIn("Start this Console the same way now?", self.printed)
+        result = setup.check_console(self.context(assume_yes=True))
+        self.assertEqual(("ok", str(console)), (result.status, result.detail))
+        self.assertEqual([str(console)], self.starter.started)
 
-    def test_a_console_without_peak_ids_only_is_too_old_and_the_way_to_a_new_one_is_said(self) -> None:
-        console = self.console(self.markers())
-        self.runner.answers["normalize --help"] = subprocess.CompletedProcess([], 0, stdout="Options:\n  -d\n", stderr="")
+    def test_a_named_console_is_started_as_the_input_check_starts_it(self) -> None:
+        console = self.console(self.markers(), "elsewhere")
         result = setup.check_console(self.context(console_paths=[str(console)]))
+        self.assertEqual(("ok", str(console)), (result.status, result.detail))
+        self.assertEqual([str(console)], self.starter.started)
+        self.assertNotIn("Start this Console", self.printed)
+
+    def test_a_dry_run_starts_no_console(self) -> None:
+        named = self.console(self.markers(), "elsewhere")
+        self.console(self.markers())
+        result = setup.check_console(self.context(dry_run=True, assume_yes=True, console_paths=[str(named)]))
+        self.assertEqual("ok", result.status)
+        self.assertEqual([], self.starter.started)
+        self.assertEqual([], self.runner.calls)
+        self.assertIn("none is started now", self.printed)
+
+    def test_what_the_assembly_lacks_is_said_in_the_input_checks_words(self) -> None:
+        self.console(self.markers(peak_ids_only=False), "MSDIAL.old-normalize")
+        self.console(b"MZ an old console", "MSDIAL.old")
+        result = setup.check_console(self.context(assume_yes=True))
         self.assertEqual("attention", result.status)
-        self.assertIn("--peak-ids-only", self.printed)
+        self.assertEqual([], self.starter.started)  # nothing qualifies, so nothing is started
+        self.assertIn("it lacks normalize --peak-ids-only.", self.printed)
+        self.assertIn(
+            "it lacks normalize --peak-ids-only; the annotation candidate table; automatic RT correction's local "
+            "test (MsdialWorkbench#826).",
+            self.printed,
+        )
         self.assertIn(setup.CONSOLE_RELEASES_URL, self.printed)
         self.assertIn("msdial_build_console_from_local_source", self.printed)
+        self.assertIn("Git and the .NET SDK 8 or later", self.printed)
 
-    def test_the_assembly_capabilities_are_checked_too(self) -> None:
-        console = self.console(b"MZ an old console")
-        self.runner.answers["normalize --help"] = subprocess.CompletedProcess([], 0, stdout="--peak-ids-only", stderr="")
-        verdict = setup.probe_console(self.context(), console)
-        self.assertFalse(verdict["ready"])
-        self.assertEqual(
-            ["the annotation candidate table", "automatic RT correction's local test (MsdialWorkbench#826)"],
-            verdict["missing"],
-        )
+    def test_every_console_found_is_judged(self) -> None:
+        for index in range(12):
+            self.console(b"MZ an old console", f"MSDIAL.old{index:02d}")
+        newest = self.console(self.markers(), "MSDIAL.zz-newest")
+        result = setup.check_console(self.context())
+        self.assertEqual("ok", result.status)
+        self.assertEqual(str(newest) + " (by its assembly)", result.detail)
+        self.assertEqual(13, self.printed.count("(common folder)"))
+
+    def test_a_console_that_does_not_answer_its_help_is_not_new_enough(self) -> None:
+        console = self.console(self.markers(), "elsewhere")
+        self.starter.capabilities.remove(NORMALIZE_PEAK_IDS_ONLY_CAPABILITY)
+        result = setup.check_console(self.context(console_paths=[str(console)]))
+        self.assertEqual("attention", result.status)
+        self.assertIn("but started it did not answer", self.printed)
+        self.assertIn("Interactive's 10 s", self.printed)
+
+    def test_a_dll_without_dotnet_is_not_started(self) -> None:
+        console = self.console(self.markers(), "elsewhere", "MSDIALCUI.dll")
+        result = setup.check_console(self.context(console_paths=[str(console)]))
+        self.assertEqual("attention", result.status)
+        self.assertEqual([], self.starter.started)
+        self.assertIn("needs the dotnet command", self.printed)
+
+    def test_a_named_console_that_is_not_there_is_said_with_who_named_it(self) -> None:
+        typo = self.base / "typo" / "MSDIALCUI.exe"
+        settings = self.localappdata / "MSDIALInteractive" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"console_path": str(self.base / "gone" / "MSDIALCUI.exe")}), encoding="utf-8")
+        found = self.console(self.markers())
+        result = setup.check_console(self.context(console_paths=[str(typo)]))
+        self.assertEqual("attention", result.status)
+        self.assertIn(f"{typo}  (--console): not found.", self.printed)
+        self.assertIn(f"{self.base / 'gone' / 'MSDIALCUI.exe'}  (Interactive's saved setting): not found.", self.printed)
+        self.assertIn(f"new enough: {found}", result.detail)
+
+    def test_a_named_folder_stands_for_the_console_in_it(self) -> None:
+        console = self.console(self.markers(), "unpacked")
+        result = setup.check_console(self.context(env={**self.context().env, "MSDIAL_CONSOLE_PATH": str(console.parent)}))
+        self.assertEqual("ok", result.status)
+        self.assertIn(f"{console}  (MSDIAL_CONSOLE_PATH)", self.printed)
+        empty = self.base / "empty-folder"
+        empty.mkdir()
+        self.output.clear()
+        result = setup.check_console(self.context(console_paths=[str(empty)]))
+        self.assertEqual("attention", result.status)
+        self.assertIn("a folder without MSDIALCUI.exe or MSDIALCUI.dll in it", self.printed)
 
     def test_the_saved_console_setting_is_read(self) -> None:
         console = self.console(self.markers(), "saved")
@@ -470,13 +579,51 @@ class ConsoleTests(SetupTestCase):
         found = setup.console_candidates(self.context())
         self.assertIn(("Interactive's saved setting", console), found)
 
+    def test_the_setup_reads_the_input_checks_own_requirements(self) -> None:
+        checks = setup.interactive_console_checks()
+        self.assertEqual(LAB_CONSOLE_NEEDS, checks["needs"])
+        self.assertEqual(list(LAB_CONSOLE_NEEDS), list(checks["markers"]))
+
     def test_no_console_found_points_to_the_prerelease_and_the_source_build(self) -> None:
         with mock.patch.object(setup, "console_candidates", return_value=[]):
             result = setup.check_console(self.context())
         self.assertEqual("attention", result.status)
         self.assertEqual([], self.runner.calls)
+        self.assertEqual([], self.starter.started)
         self.assertIn(setup.CONSOLE_PRERELEASE_LABEL, self.printed)
         self.assertIn(setup.MSDIAL_SOURCE_URL, self.printed)
+
+
+class OutputEncodingTests(unittest.TestCase):
+    class Stream:
+        def __init__(self, tty: bool) -> None:
+            self.tty = tty
+            self.settings: dict[str, str] = {}
+
+        def isatty(self) -> bool:
+            return self.tty
+
+        def reconfigure(self, **settings: str) -> None:
+            self.settings = settings
+
+    def streams_after_main(self, tty: bool, environment: dict[str, str]) -> list[dict[str, str]]:
+        out, err = self.Stream(tty), self.Stream(tty)
+        with mock.patch.object(setup.sys, "stdout", out), mock.patch.object(setup.sys, "stderr", err), \
+                mock.patch.dict(setup.os.environ, environment), mock.patch.object(setup, "run_setup", return_value=0):
+            setup.main(["--dry-run"])
+        return [out.settings, err.settings]
+
+    def test_redirected_output_is_utf8_so_that_a_non_ascii_path_survives(self) -> None:
+        with mock.patch.dict(setup.os.environ):
+            setup.os.environ.pop("PYTHONIOENCODING", None)
+            settings = self.streams_after_main(False, {})
+        self.assertEqual([{"encoding": "utf-8", "errors": "replace"}] * 2, settings)
+
+    def test_a_terminal_or_a_chosen_encoding_is_left_as_it_is(self) -> None:
+        with mock.patch.dict(setup.os.environ):
+            setup.os.environ.pop("PYTHONIOENCODING", None)
+            self.assertEqual([{"errors": "replace"}] * 2, self.streams_after_main(True, {}))
+        self.assertEqual([{"errors": "replace"}] * 2, self.streams_after_main(False, {"PYTHONIOENCODING": "cp932"}))
 
 
 class AnswerTests(SetupTestCase):

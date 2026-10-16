@@ -1,27 +1,30 @@
 """Set up MS-DIAL Interactive for Claude Code and Claude Desktop, one explained step at a time.
 
-    python scripts/setup_claude.py              explain each step and ask before changing anything
-    python scripts/setup_claude.py --dry-run    show the plan; change nothing
-    python scripts/setup_claude.py --yes        answer yes to every question
+    python3 scripts/setup_claude.py             explain each step and ask before changing anything
+    python3 scripts/setup_claude.py --dry-run   show the plan; change nothing
+    python3 scripts/setup_claude.py --yes       answer yes to every question
 
-On Windows, double-click "Setup MS-DIAL for Claude.cmd" in the folder above this one.
+On Windows, double-click "Setup MS-DIAL for Claude.cmd" in the folder above this one, or run
+"py -3 scripts\\setup_claude.py" with the options in a terminal there.
 
 The steps:
   1. Python: 3.10 or newer.
   2. The MCP dependency: "<this python> -m pip install -e .[mcp]" from this checkout, unless the
      mcp and psutil packages are already there.
   3. Claude Code: register the msdial-interactive MCP server at user scope with the claude CLI. An
-     existing registration is shown, and replaced only on your yes.
+     existing registration is shown, and replaced only on your yes, after it is saved to a file.
   4. Claude Desktop: merge an msdial-interactive entry into claude_desktop_config.json's
      mcpServers, after a timestamped backup; every other key is left as it is.
   5. Skills: copy every skill under skills/ into Claude Code's skills folder (~/.claude/skills).
      A differing copy already there is backed up first, outside that folder.
   6. Skill ZIPs for Claude Desktop: dist/<name>.skill.zip, to upload under Customize > Skills.
-  7. MS-DIAL Console: find one and say whether it is new enough for laboratory lipidomics.
+  7. MS-DIAL Console: find them and say whether one is new enough for laboratory lipidomics, by
+     what each Console's assembly holds. A Console named with --console is also started for its
+     --help, as the agent's input check starts it; the others only after one question.
   8. A summary and a first prompt to try.
 
 Only the standard library is used, nothing needs administrator rights, and nothing is uploaded.
-Read-only queries (reading configuration files, the Console's own --help) also run in a dry run;
+A dry run only reads (configuration files, the Consoles' assemblies): it starts no Console, and
 nothing is installed, registered, copied or written. Values of environment variables in any
 configuration are never printed.
 """
@@ -58,11 +61,11 @@ MINIMUM_PYTHON = (3, 10)
 DEPENDENCIES = {"mcp": ((1, 28), (3,)), "psutil": ((6,), (8,))}
 CONSOLE_RELEASES_URL = "https://github.com/systemsomicslab/MsdialWorkbench/releases"
 MSDIAL_SOURCE_URL = "https://github.com/systemsomicslab/MsdialWorkbench"
-# PLACEHOLDER: the official Console prerelease with MsdialWorkbench#826 and #830 is not published yet.
-# Replace both with the release tag once it exists, and say so in docs/tutorials/lab-lipidomics.md.
+# PLACEHOLDER(console-prerelease): the official Console prerelease with MsdialWorkbench#826 and #830
+# is not published yet. Fill in the tag here and replace "5.5.2610xx" wherever the comment of that name
+# in docs/tutorials/lab-lipidomics.md lists it.
 CONSOLE_PRERELEASE_TAG = ""
 CONSOLE_PRERELEASE_LABEL = "the MS-DIAL Console prerelease 5.5.2610xx or later"
-NORMALIZE_OPTION = "--peak-ids-only"
 FIRST_PROMPT = (
     "Check that MS-DIAL Interactive is ready for laboratory lipidomics: start its backend, list the "
     "MS-DIAL Consoles you can find and say whether one is new enough. Do not run any analysis yet."
@@ -91,6 +94,8 @@ class Context:
     console_paths: list[str] = field(default_factory=list)
     # Drive roots searched for an MSDIAL* Console folder; None: C:\ and D:\ on Windows, none elsewhere.
     drive_roots: list[Path] | None = None
+    # Starts a Console for its capabilities; None: Interactive's own msdial_app.workflow.console_capabilities.
+    console_capabilities: Callable[[str], dict[str, Any]] | None = None
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run
     which: Callable[[str], str | None] = shutil.which
     ask_input: Callable[[str], str] = input
@@ -325,6 +330,7 @@ def register_claude_code(ctx: Context) -> StepResult:
         return StepResult("Claude Code MCP", "skipped", "claude CLI not found")
     state, entry = existing_claude_code_entry(ctx)
     replace = False
+    backup: Path | None = None
     if state == "present":
         if _entry_matches(entry, ctx.python, arguments, ctx.windows):
             ctx.say(f"  '{SERVER_NAME}' is already registered at user scope for this Python and this checkout; nothing to do.")
@@ -335,9 +341,13 @@ def register_claude_code(ctx: Context) -> StepResult:
         ctx.say("  This setup would register:")
         for line in _describe_entry({"command": ctx.python, "args": arguments}):
             ctx.say(line)
-        if isinstance(entry, dict) and entry.get("env"):
-            ctx.say("  Its environment variables are not carried over; add them again with 'claude mcp add -e' if needed.")
         replace = True
+        # 'claude mcp remove' keeps nothing, and the values of the entry's environment variables are
+        # never shown here, so the entry is saved whole first; a failed add restores it from there.
+        backup = claude_code_config_dir(ctx) / "mcp-backups" / f"{SERVER_NAME}-{ctx.timestamp()}.json"
+        ctx.say(f"  The existing entry is saved first, environment values included: {backup}")
+        if isinstance(entry, dict) and entry.get("env"):
+            ctx.say("  Its environment variables are not carried over; the saved entry keeps them.")
     elif state == "unreadable":
         ctx.say(f"  {claude_code_config_file(ctx)} could not be read, so an existing registration cannot be shown.")
     commands = []
@@ -353,20 +363,54 @@ def register_claude_code(ctx: Context) -> StepResult:
         return StepResult("Claude Code MCP", "planned", "replace" if replace else "register")
     if not ctx.ask(question, not replace):
         return StepResult("Claude Code MCP", "skipped", "declined" + ("; the existing registration is kept" if replace else ""))
-    for command in commands:
+    if backup is not None:
         try:
-            result = ctx.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            _write_json(backup, entry)
         except OSError as error:
-            ctx.say(f"  'claude' could not be started: {error}")
-            return StepResult("Claude Code MCP", "failed", str(error))
-        output = ((result.stdout or "") + (result.stderr or "")).strip()
-        if output:
-            for line in output.splitlines()[:10]:
-                ctx.say(f"    {line}")
-        if result.returncode != 0:
+            ctx.say(f"  The existing entry could not be saved ({error}), so it is left as it is.")
+            return StepResult("Claude Code MCP", "failed", f"backup not written: {error}")
+    removed = False
+    for command in commands:
+        result = _run_claude(ctx, command)
+        if result is not None and result.returncode == 0:
+            removed = removed or command[2] == "remove"
+            continue
+        if result is not None:
             ctx.say(f"  'claude {' '.join(command[1:3])}' exited with code {result.returncode}.")
-            return StepResult("Claude Code MCP", "failed", f"claude exit code {result.returncode}")
-    return StepResult("Claude Code MCP", "done", "replaced" if replace else "registered")
+        if removed and backup is not None:
+            _restore_claude_code_entry(ctx, claude, entry, backup)
+        detail = "claude could not be started" if result is None else f"claude exit code {result.returncode}"
+        return StepResult("Claude Code MCP", "failed", detail)
+    detail = f"replaced (the old entry is in {backup})" if backup is not None else "registered"
+    return StepResult("Claude Code MCP", "done", detail)
+
+
+def _run_claude(ctx: Context, command: list[str]) -> subprocess.CompletedProcess | None:
+    """One claude CLI call, its first lines of output shown; None when it could not be started."""
+    try:
+        result = ctx.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    except OSError as error:
+        ctx.say(f"  'claude' could not be started: {error}")
+        return None
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    for line in output.splitlines()[:10]:
+        ctx.say(f"    {line}")
+    return result
+
+
+def _restore_claude_code_entry(ctx: Context, claude: str, entry: Any, backup: Path) -> bool:
+    """After a removal whose add failed: put the saved entry back with 'claude mcp add-json'."""
+    saved = dict(entry) if isinstance(entry, dict) else {}
+    if "command" in saved and "url" not in saved:
+        saved.setdefault("type", "stdio")
+    ctx.say(f"  Restoring the earlier registration from {backup}:")
+    ctx.say(f"    claude mcp add-json --scope user {SERVER_NAME} <the JSON in that file>")
+    result = _run_claude(ctx, [claude, "mcp", "add-json", "--scope", "user", SERVER_NAME, json.dumps(saved)])
+    if result is not None and result.returncode == 0:
+        ctx.say("  The earlier registration is back.")
+        return True
+    ctx.say("  It could not be restored. Run the command above yourself, with the file's JSON as its last argument.")
+    return False
 
 
 # ---------------------------------------------------------------------------------------------
@@ -688,17 +732,30 @@ def _saved_console(ctx: Context) -> str:
     return str(value.get("console_path", "") or "").strip() if isinstance(value, dict) else ""
 
 
-def console_candidates(ctx: Context) -> list[tuple[str, Path]]:
-    """(where it was found, the Console) for every Console found, the most explicit first."""
-    found: list[tuple[str, Path]] = []
-    for text in ctx.console_paths:
-        found.append(("--console", Path(text).expanduser()))
+def _console_in(path: Path) -> Path:
+    """A folder given as a Console stands for the MSDIALCUI in it; anything else is itself."""
+    if path.is_dir():
+        for name in ("MSDIALCUI.exe", "MSDIALCUI", "MSDIALCUI.dll"):
+            if (path / name).is_file():
+                return path / name
+    return path
+
+
+def named_consoles(ctx: Context) -> list[tuple[str, Path]]:
+    """(who named it, the Console): --console, Interactive's saved setting, MSDIAL_CONSOLE_PATH."""
+    named = [("--console", Path(text).expanduser()) for text in ctx.console_paths]
     saved = _saved_console(ctx)
     if saved:
-        found.append(("Interactive's saved setting", Path(saved)))
+        named.append(("Interactive's saved setting", Path(saved).expanduser()))
     environment = ctx.env.get("MSDIAL_CONSOLE_PATH", "").strip()
     if environment:
-        found.append(("MSDIAL_CONSOLE_PATH", Path(environment)))
+        named.append(("MSDIAL_CONSOLE_PATH", Path(environment).expanduser()))
+    return [(source, _console_in(path)) for source, path in named]
+
+
+def console_candidates(ctx: Context) -> list[tuple[str, Path]]:
+    """(where it was found, the Console) for every Console found, the most explicit first."""
+    found = named_consoles(ctx)
     for name in ("MSDIALCUI.exe", "MSDIALCUI"):
         on_path = ctx.which(name)
         if on_path:
@@ -725,7 +782,7 @@ def console_candidates(ctx: Context) -> list[tuple[str, Path]]:
     seen: set[str] = set()
     for source, path in found:
         if not path.is_file():
-            continue
+            continue  # a named Console that is not there is said by check_console
         key = os.path.normcase(str(path.resolve()))
         if key in seen:
             continue
@@ -734,99 +791,150 @@ def console_candidates(ctx: Context) -> list[tuple[str, Path]]:
     return unique
 
 
-def _assembly_checks(path: Path) -> dict[str, bool] | None:
-    """The two capabilities Interactive reads from the Console assembly, by Interactive's own markers."""
+def interactive_console_checks() -> dict[str, Any] | None:
+    """Interactive's own Console checks, from this checkout's msdial_app (standard library only)."""
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
     try:
-        from msdial_app.workflow import (  # noqa: PLC0415  (stdlib-only module of this checkout)
-            ANNOTATION_CANDIDATES_CONSOLE_MARKERS,
-            AUTOMATIC_RT_LOCAL_SUPPORT_CONSOLE_MARKERS,
-            console_assembly_path,
-        )
-    except Exception:  # noqa: BLE001  (a checkout that cannot be imported only loses this detail)
+        from msdial_app import lab_lipidomics_agent, workflow  # noqa: PLC0415
+    except Exception:  # noqa: BLE001  (a checkout that cannot be imported loses only this step)
         return None
+    return {
+        # What msdial_lipidomics_check_inputs requires, in its words.
+        "needs": dict(lab_lipidomics_agent.LAB_CONSOLE_NEEDS),
+        "normalize": lab_lipidomics_agent.LAB_CONSOLE_NEEDS[workflow.NORMALIZE_PEAK_IDS_ONLY_CAPABILITY],
+        "assembly_path": workflow.console_assembly_path,
+        "start": workflow.console_capabilities,
+        # What each requirement leaves in the Console's assembly, read without starting it: the normalize
+        # option as the string its command defines, and the markers console_capabilities reads, by its
+        # rules (every annotation-candidate marker, any automatic-RT local-test marker).
+        "markers": {
+            workflow.NORMALIZE_PEAK_IDS_ONLY_CAPABILITY: ((workflow.NORMALIZE_PEAK_IDS_ONLY_OPTION,), all),
+            workflow.ANNOTATION_CANDIDATES_CAPABILITY: (workflow.ANNOTATION_CANDIDATES_CONSOLE_MARKERS, all),
+            workflow.AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY: (workflow.AUTOMATIC_RT_LOCAL_SUPPORT_CONSOLE_MARKERS, any),
+        },
+    }
+
+
+def assembly_verdict(checks: dict[str, Any], path: Path) -> dict[str, Any]:
+    """What a Console lacks, by what its assembly holds; nothing is started."""
     try:
-        binary = console_assembly_path(path).read_bytes()
-    except OSError:
-        return None
+        binary = checks["assembly_path"](path).read_bytes()
+    except OSError as error:
+        return {"read": False, "error": str(error), "missing": []}
 
     def has(marker: str) -> bool:
         return marker.encode("utf-8") in binary or marker.encode("utf-16-le") in binary
 
-    return {
-        "the annotation candidate table": all(has(marker) for marker in ANNOTATION_CANDIDATES_CONSOLE_MARKERS),
-        "automatic RT correction's local test (MsdialWorkbench#826)": all(
-            has(marker) for marker in AUTOMATIC_RT_LOCAL_SUPPORT_CONSOLE_MARKERS
-        ),
-    }
+    missing = [
+        checks["needs"][capability]
+        for capability, (markers, rule) in checks["markers"].items()
+        if not (markers and rule(has(marker) for marker in markers))
+    ]
+    return {"read": True, "missing": missing}
 
 
-def probe_console(ctx: Context, path: Path) -> dict[str, Any]:
-    """Whether a Console is new enough for laboratory lipidomics; it is only asked for its --help."""
-    if path.suffix.casefold() == ".dll":
-        dotnet = ctx.which("dotnet")
-        if not dotnet:
-            return {"ready": False, "missing": ["the dotnet runtime, to start MSDIALCUI.dll"], "help": "not run"}
-        command = [dotnet, str(path), "normalize", "--help"]
-    else:
-        command = [str(path), "normalize", "--help"]
-    try:
-        result = ctx.run(
-            command, capture_output=True, text=True, timeout=60, encoding="utf-8", errors="replace",
-        )
-        help_text = (result.stdout or "") + (result.stderr or "")
-        started = True
-    except (OSError, subprocess.TimeoutExpired) as error:
-        help_text, started = str(error), False
-    missing: list[str] = []
-    if not started:
-        missing.append("a Console that starts (it did not answer normalize --help)")
-    elif NORMALIZE_OPTION not in help_text:
-        missing.append(f"normalize {NORMALIZE_OPTION} (MsdialWorkbench#830)")
-    assembly = _assembly_checks(path)
-    if assembly is not None:
-        missing.extend(label for label, present in assembly.items() if not present)
-    return {
-        "ready": not missing,
-        "missing": missing,
-        "help": "answered" if started else "did not start",
-        "assembly_checked": assembly is not None,
-    }
+def started_verdict(ctx: Context, checks: dict[str, Any], path: Path) -> list[str]:
+    """What a Console lacks when it is started as msdial_lipidomics_check_inputs starts it."""
+    start = ctx.console_capabilities or checks["start"]
+    found = set(start(str(path)).get("capabilities", []))
+    return [label for capability, label in checks["needs"].items() if capability not in found]
+
+
+def _start_consoles(
+    ctx: Context, checks: dict[str, Any], likely: list[tuple[str, Path]]
+) -> tuple[list[Path], list[Path]]:
+    """(started and new enough, started and not) among the Consoles whose assembly qualifies.
+
+    One named with --console is started without a question, the others only after one, and a dry
+    run starts none. Starting adds only whether the Console runs here and answers its --help.
+    """
+    named = [path for source, path in likely if source == "--console"]
+    found = [path for source, path in likely if source != "--console"]
+    to_start = [] if ctx.dry_run else list(named)
+    if ctx.dry_run and named:
+        ctx.say("  (dry run) A Console named with --console would be started for its --help; none is started now.")
+    if found:
+        what = "this Console" if len(found) == 1 else f"these {len(found)} Consoles"
+        ctx.say("  The agent's input check starts its Console for 'rtcorrection --help' and 'normalize --help'.")
+        if ctx.ask(f"Start {what} the same way now?", True):
+            to_start.extend(found)
+    normalize = checks["normalize"]
+    confirmed: list[Path] = []
+    refused: list[Path] = []
+    for path in to_start:
+        if path.suffix.casefold() == ".dll" and not ctx.which("dotnet"):
+            ctx.say(f"  {path}: not started; MSDIALCUI.dll needs the dotnet command (the .NET 8 runtime) on PATH.")
+            refused.append(path)
+            continue
+        missing = started_verdict(ctx, checks, path)
+        if not missing:
+            ctx.say(f"  {path}: started, and new enough.")
+            confirmed.append(path)
+            continue
+        refused.append(path)
+        if missing == [normalize]:
+            # Its assembly defines the option, so it did not answer: an error exit, or no answer in time.
+            ctx.say(f"  {path}: its assembly has {normalize}, but started it did not answer")
+            ctx.say("    'normalize --help' with it (an error exit, or no answer within Interactive's 10 s). Run")
+            ctx.say("    it with 'normalize --help' yourself to see why; MSDIALCUI.dll needs the .NET 8 runtime.")
+        else:
+            ctx.say(f"  {path}: started, it lacks {'; '.join(missing)}.")
+    return confirmed, refused
 
 
 def check_console(ctx: Context) -> StepResult:
+    label = "MS-DIAL Console"
     ctx.say("Laboratory lipidomics needs an MS-DIAL Console (MSDIALCUI) with 'normalize --peak-ids-only'")
     ctx.say("(MsdialWorkbench#830), the annotation candidate table and the automatic-RT local test (#826).")
+    ctx.say("Each Console found is judged by what its assembly holds, without starting it.")
+    not_found = [(source, path) for source, path in named_consoles(ctx) if not path.is_file()]
+    for source, path in not_found:
+        why = "a folder without MSDIALCUI.exe or MSDIALCUI.dll in it" if path.is_dir() else "not found"
+        ctx.say(f"  {path}  ({source}): {why}.")
     candidates = console_candidates(ctx)
-    ready: list[Path] = []
     if not candidates:
         ctx.say("  No MS-DIAL Console was found (Interactive's saved setting, MSDIAL_CONSOLE_PATH, PATH, and")
         ctx.say("  MSDIAL* folders beside this checkout, in your home, Downloads, Desktop and Documents).")
-    for source, path in candidates[:8]:
-        verdict = probe_console(ctx, path)
+    checks = interactive_console_checks() if candidates else None
+    if candidates and checks is None:
+        ctx.say("  This checkout's msdial_app could not be loaded, so no Console is judged here. Once Claude")
+        ctx.say("  sees the MS-DIAL tools, ask it to check one with msdial_check_console_path.")
+        return StepResult(label, "attention", "Console checks unavailable")
+    likely: list[tuple[str, Path]] = []
+    for source, path in candidates:
+        verdict = assembly_verdict(checks, path)
         ctx.say(f"  {path}  ({source})")
-        if verdict["ready"]:
-            ready.append(path)
-            ctx.say("    new enough for laboratory lipidomics.")
-        else:
+        if not verdict["read"]:
+            ctx.say(f"    could not be read: {verdict['error']}")
+        elif verdict["missing"]:
             ctx.say(f"    not new enough: it lacks {'; '.join(verdict['missing'])}.")
-        if not verdict.get("assembly_checked") and verdict["ready"]:
-            ctx.say("    (only its normalize option was checked here; the agent's input check tests the rest.)")
+        else:
+            ctx.say("    new enough, by what its assembly holds.")
+            likely.append((source, path))
+    confirmed, refused = _start_consoles(ctx, checks, likely) if likely else ([], [])
+    ready = confirmed + [path for _, path in likely if path not in confirmed and path not in refused]
     if ready:
-        ctx.say("  When the agent asks which Console runs the analysis, name this one. Setup does not save it")
-        ctx.say("  in Interactive's settings: the laboratory workflow names its Console per analysis.")
-        return StepResult("MS-DIAL Console", "ok", str(ready[0]))
-    tag = CONSOLE_PRERELEASE_TAG or "(tag not published yet)"
-    ctx.say(f"  Get {CONSOLE_PRERELEASE_LABEL} {tag}:")
-    ctx.say(f"    {CONSOLE_RELEASES_URL}")
-    ctx.say("    Unpack its MSDIAL.console ZIP into a folder of your own, e.g. beside this checkout, and run")
-    ctx.say("    this setup again (or pass --console <path to MSDIALCUI.exe>).")
-    ctx.say("  Until it exists, build the Console from source: clone")
-    ctx.say(f"    {MSDIAL_SOURCE_URL}")
-    ctx.say("  install the .NET SDK, and ask Claude to use msdial_check_local_console_source and")
-    ctx.say("  msdial_build_console_from_local_source on that folder (it shows the build command and asks first).")
-    return StepResult("MS-DIAL Console", "attention", "none new enough found")
+        ctx.say("  When the agent asks which Console runs the analysis, name a new enough one; its input check")
+        ctx.say("  starts it before anything runs. Setup does not save it in Interactive's settings: the")
+        ctx.say("  laboratory workflow names its Console per analysis.")
+    else:
+        tag = CONSOLE_PRERELEASE_TAG or "(tag not published yet)"
+        ctx.say(f"  Get {CONSOLE_PRERELEASE_LABEL} {tag}:")
+        ctx.say(f"    {CONSOLE_RELEASES_URL}")
+        ctx.say("    Unpack its MSDIAL.console ZIP into a folder of your own, e.g. beside this checkout, and run")
+        ctx.say("    this setup again (or pass --console <path to MSDIALCUI.exe>).")
+        ctx.say("  Until it exists, build the Console from source: install Git and the .NET SDK 8 or later,")
+        ctx.say("  restart Claude Code or Claude Desktop so that the MCP server finds git and dotnet, clone")
+        ctx.say(f"    {MSDIAL_SOURCE_URL}")
+        ctx.say("  and ask Claude to use msdial_check_local_console_source and msdial_build_console_from_local_source")
+        ctx.say("  on that folder (it shows the build command and asks first).")
+    if not_found:
+        named = "; ".join(f"{path} ({source})" for source, path in not_found)
+        return StepResult(label, "attention", f"not found: {named}" + (f"; new enough: {ready[0]}" if ready else ""))
+    if ready:
+        return StepResult(label, "ok", str(ready[0]) + ("" if ready[0] in confirmed else " (by its assembly)"))
+    return StepResult(label, "attention", "none new enough found")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -898,7 +1006,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-claude-code", action="store_true", help="leave Claude Code (MCP and skills) alone")
     parser.add_argument("--skip-install", action="store_true", help="do not run pip")
     parser.add_argument("--console", action="append", default=[], metavar="PATH",
-                        help="an MSDIALCUI.exe or MSDIALCUI.dll to check as well")
+                        help="an MSDIALCUI.exe or MSDIALCUI.dll (or its folder) to check as well, starting it for its --help")
     return parser.parse_args(argv)
 
 
@@ -907,8 +1015,13 @@ def main(argv: list[str] | None = None) -> int:
     sys.dont_write_bytecode = True
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(errors="replace")  # type: ignore[attr-defined]
-        except (AttributeError, ValueError):
+            if stream.isatty() or os.environ.get("PYTHONIOENCODING"):
+                stream.reconfigure(errors="replace")  # type: ignore[attr-defined]
+            else:
+                # Redirected to a file or read by another program: the ANSI code page would print a
+                # non-ASCII user or folder name as '?', in the commands shown to copy as well.
+                stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError, OSError):
             pass
     args = parse_arguments(argv)
     ctx = Context(

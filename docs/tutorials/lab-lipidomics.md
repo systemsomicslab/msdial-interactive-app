@@ -46,12 +46,13 @@ what it is about to do, and starts MS-DIAL only after your yes.
 - **A Windows 10 or 11 PC.** The setup also runs on macOS and Linux, but the demo's
   SCIEX `.wiff` files and the steps below were written for Windows.
 - **About 4 GB of free disk space**: the download and its first unpacking (about
-  1.5 GB, which you may delete afterwards), the unpacked demo (about 1.1 GB), a working
-  copy of the raw data (about 1 GB) and the outputs (about 0.6 GB). Running on the data
-  in place (see below) saves the copy.
+  1.5 GB, most of which you may delete afterwards), the unpacked demo (about 1.1 GB), a
+  working copy of the raw data (about 1 GB) and the outputs (about 0.6 GB). Running on
+  the data in place (see below) saves the copy.
 - **Python 3.10 or newer** from [python.org](https://www.python.org/downloads/). On
-  Windows the python.org installer needs no administrator rights for a per-user
-  installation; it also installs the `py` launcher the setup uses.
+  Windows it needs no administrator rights for a per-user installation and brings the
+  `py` command the setup uses. With python.org's Python install manager (its default
+  from 3.14 on), also install a Python with it: `py install 3.14` in a terminal.
 - **Claude Code** ([claude.com/claude-code](https://claude.com/claude-code)) or
   **Claude Desktop** ([claude.ai/download](https://claude.ai/download)), signed in.
   The MCP server runs locally, so no API key is needed.
@@ -63,8 +64,12 @@ what it is about to do, and starts MS-DIAL only after your yes.
   the automatic-RT local test (MsdialWorkbench#826). Releases up to 5.5.260820
   (2026-08-20) lack them, and Interactive refuses those for this workflow.
 
-<!-- PLACEHOLDER(console-prerelease): replace "5.5.2610xx" and "MSDIAL-v5.5.2610xx" in this
-file, and CONSOLE_PRERELEASE_TAG in scripts/setup_claude.py, with the published tag. -->
+<!-- PLACEHOLDER(console-prerelease): once the prerelease is cut, replace "5.5.2610xx" (and
+"MSDIAL-v5.5.2610xx") with the published version and tag in every place that holds it: this file
+(this section, the answers table and the example answers of step 2), README.md (the quick start),
+skills/msdial-lipidomics-workflow/SKILL.md (step A), and scripts/setup_claude.py
+(CONSOLE_PRERELEASE_LABEL, and CONSOLE_PRERELEASE_TAG, which is empty until then).
+"git grep 2610xx" lists them all. -->
 > [!IMPORTANT]
 > **The Console prerelease is not published yet.** Use **the MS-DIAL Console
 > prerelease 5.5.2610xx or later** from the
@@ -75,10 +80,13 @@ file, and CONSOLE_PRERELEASE_TAG in scripts/setup_claude.py, with the published 
 > `D:\msdial\MSDIAL.console.v5.5.2610xx`. The file you will name is `MSDIALCUI.exe`
 > inside it.
 >
-> Until the prerelease exists, build the Console from source: clone
-> [MsdialWorkbench](https://github.com/systemsomicslab/MsdialWorkbench), install the
-> [.NET SDK](https://dotnet.microsoft.com/download), and, once the setup below is done,
-> ask Claude:
+> Until the prerelease exists, build the Console from source. Install
+> [Git for Windows](https://git-scm.com/download/win) and the
+> [.NET SDK](https://dotnet.microsoft.com/download), version 8 or later, and clone
+> [MsdialWorkbench](https://github.com/systemsomicslab/MsdialWorkbench). Claude's MCP
+> server runs `git` and `dotnet` itself, so it must find both on its `PATH`: if Claude
+> Code or Claude Desktop was running while you installed them, quit it completely and
+> start it again. Then, once the setup below is done, ask Claude:
 >
 > ```text
 > My MsdialWorkbench clone is in D:\msdial\MsdialWorkbench. Check it against
@@ -95,10 +103,14 @@ file, and CONSOLE_PRERELEASE_TAG in scripts/setup_claude.py, with the published 
 In the MS-DIAL Interactive folder, double-click **`Setup MS-DIAL for Claude.cmd`**. On
 macOS or Linux, run `python3 scripts/setup_claude.py` in a terminal in that folder.
 
-The setup explains each step and asks before it changes anything. To see the plan
-first without changing anything, run it with `--dry-run`
-(`python scripts\setup_claude.py --dry-run`); `--yes` answers yes to every question,
-and `--help` lists the other options. Its eight steps:
+The setup explains each step and asks before it changes anything. Options go on the
+command line, in a terminal opened in the MS-DIAL Interactive folder: on Windows
+`py -3 scripts\setup_claude.py --dry-run`, or the double-click file with the same
+options (`"Setup MS-DIAL for Claude.cmd" --dry-run` in Command Prompt). `--dry-run`
+shows the plan and changes nothing; `--yes` answers yes to every question;
+`--desktop` sets up Claude Desktop even before it has written its configuration file
+(otherwise start Claude Desktop once first); `--console <path>` names a Console to
+check; `--help` lists the rest. Its eight steps:
 
 1. **Python**: checks that it is 3.10 or newer.
 2. **The MCP dependency**: if the `mcp` and `psutil` packages are missing, runs
@@ -106,7 +118,9 @@ and `--help` lists the other options. Its eight steps:
 3. **Claude Code**: if the `claude` command is on your PATH, registers the
    `msdial-interactive` MCP server for your user
    (`claude mcp add --scope user msdial-interactive -- <python> <folder>\scripts\msdial-interactive-mcp.py`).
-   An existing registration is shown first and replaced only if you say so.
+   An existing registration is shown first and replaced only if you say so, after it is
+   saved to `%USERPROFILE%\.claude\mcp-backups`; if the new one cannot be added, the old
+   one is put back.
 4. **Claude Desktop**: if Claude Desktop's `claude_desktop_config.json` exists (or you
    pass `--desktop`), adds an `msdial-interactive` entry to its `mcpServers`. It writes a
    timestamped backup first and leaves every other server and setting as it was.
@@ -118,8 +132,10 @@ and `--help` lists the other options. Its eight steps:
    and `dist\msdial-guided-analysis.skill.zip`.
 7. **MS-DIAL Console**: looks for Consoles (Interactive's saved setting, `PATH`, and
    `MSDIAL*` folders beside the Interactive folder, in your home, Downloads, Desktop and
-   Documents) and says for each whether it is new enough, by asking it for
-   `normalize --help`. `--console <path to MSDIALCUI.exe>` checks one you name.
+   Documents) and says for each whether it is new enough, by what its program file
+   holds, without starting it. `--console <path to MSDIALCUI.exe>` checks one you name,
+   and also starts it for its `--help`, as the agent's input check will; the Consoles it
+   found are started that way only if you say yes. A dry run starts none.
 8. **Summary**, and a first prompt to try.
 
 Then:
@@ -177,43 +193,56 @@ and upload the two ZIPs from `dist\`. Use the full path of the Python that has t
 
 ## Get the demo data
 
-The demo is Zenodo record
-[10.5281/zenodo.10957708](https://doi.org/10.5281/zenodo.10957708) (CC BY 4.0).
+The demo data: *Lecture files* (2024), Zenodo,
+[doi:10.5281/zenodo.10957708](https://doi.org/10.5281/zenodo.10957708), licensed
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); the record names its creator.
+Credit it this way if you share the data, or results built on it. The record holds
+several lecture archives, some of them large; only `metabolomics_hands-on.zip` is needed.
+
+This tutorial puts everything in `D:\lipidomics-demo`:
 
 1. Download **`metabolomics_hands-on.zip`** (773 MB) from the record.
-2. Unpack it. Inside `metabolomics_hands-on` is **`data2.zip`** (695 MB).
-3. Unpack `data2.zip`. Check that you get `...\data2\pos`, not `...\data2\data2\pos`
-   (Windows' *Extract All* adds a folder of its own; move the inner `data2` up if so).
-4. Copy **`examples\lab-lipidomics\quant_utility_table.xlsx`** from the MS-DIAL
-   Interactive folder next to `data2`. The demo archive has no workbook in the format
-   the agent reads; its `concentrations.xlsx` is an older format and is not used. The
-   example's [README](../../examples/lab-lipidomics/README.md) explains its three
-   sheets.
-
-This tutorial uses `D:\lipidomics-demo` for all of it:
+2. Extract it anywhere, for example into your Downloads folder. Inside
+   `metabolomics_hands-on` is **`data2.zip`** (695 MB).
+3. Extract `data2.zip` into **`D:\lipidomics-demo`**, so that you have
+   `D:\lipidomics-demo\data2\pos`. Windows' *Extract All* proposes a folder named after
+   the ZIP: if you get `D:\lipidomics-demo\data2\data2\pos`, move the inner `data2` up
+   one level.
+4. Copy the three files of **`examples\lab-lipidomics`** in the MS-DIAL Interactive
+   folder into `D:\lipidomics-demo\data2`: `quant_utility_table.xlsx`,
+   `EquiSPLASH_Pos.txt` and `EquiSPLASH_Neg.txt`. The archive has no workbook in the
+   format the agent reads (its `concentrations.xlsx` is an older format), and its two
+   standard texts write two standards' names differently from the workbook, so that
+   the check would stop on them. The example's
+   [README](../../examples/lab-lipidomics/README.md) explains the three files and
+   exactly what was changed in the texts.
 
 ```text
 D:\lipidomics-demo\
   data2\
     pos\        7 SCIEX runs (.wiff with its .wiff.scan): 3 SPF, 3 GF, 1 Blank
     neg\        the same 7 samples in negative mode
-    20200121_MsdialTxtDB_Pos_EquiSPLASH.txt     positive internal standards
-    20200121_MsdialTxtDB_Neg_EquiSPLASH.txt     negative internal standards
     Msp20231101141520_conventional_converted_dev_custum.lbm2   the LBM2 library
+    quant_utility_table.xlsx      copied from examples\lab-lipidomics\
+    EquiSPLASH_Pos.txt            positive internal standards, copied from examples\lab-lipidomics\
+    EquiSPLASH_Neg.txt            negative internal standards, copied from examples\lab-lipidomics\
+    20200121_MsdialTxtDB_*_EquiSPLASH.txt   the archive's standard texts: not used
     metadata.xlsx, concentrations.xlsx, msdial_tutorial.docx, ...   not needed here
-  quant_utility_table.xlsx      copied from examples\lab-lipidomics\
 ```
 
-You may delete the two ZIP files once they are unpacked; `data2.zip` is your untouched
-original if you later want the data as published.
+You may delete `metabolomics_hands-on.zip` and the extracted `metabolomics_hands-on`
+folder afterwards. Keep `data2.zip` if you choose `in_place` below: it is then your only
+copy of the data as published.
 
 ## Choose where the analysis goes
 
 **The analysis root** is the folder the agent writes into: `inputs`, `pos`, `neg` and
 `quant` are made inside it. This tutorial uses `D:\lipidomics-demo\analysis`.
 
-- It must not be inside a raw-data folder, inside a code checkout (such as the MS-DIAL
-  Interactive folder) or inside a temporary folder; the agent refuses all three.
+- It must not be inside a raw-data folder, the MS-DIAL Interactive folder or a temporary
+  folder. The agent refuses a raw-data folder, a temporary folder and any git clone, a
+  clone of MS-DIAL Interactive included; an Interactive folder downloaded as a ZIP has
+  no `.git`, so the agent cannot tell, and keeping out of it is up to you.
 - On the system drive `C:` or inside your user profile is allowed; the agent says so
   and goes on.
 - Keep the path short and out of cloud-synced folders such as OneDrive: MS-DIAL's
@@ -224,12 +253,16 @@ included, writes `.dcl`, `.pai2` and tag files and the alignment container next 
 raw files, and no output setting prevents it. So the agent asks where MS-DIAL should
 read the data (`raw_location`):
 
-- **copy**: it copies the raw files (each `.wiff` with its `.wiff.scan`) to a folder you
-  name, after telling you what, where and how much, and only on your yes. MS-DIAL then
-  reads and writes there. The MS-DIAL laboratory chose this for the demo, with the copy
-  in `D:\lipidomics-demo\run\pos` and `D:\lipidomics-demo\run\neg`.
+- **copy**: MS-DIAL reads a copy of the raw files (each `.wiff` with its `.wiff.scan`)
+  in a folder you name, and writes there. The MS-DIAL laboratory chose this for the
+  demo, with the copy in `D:\lipidomics-demo\run\pos` and `D:\lipidomics-demo\run\neg`.
+  Who makes the copy depends on where you talk to Claude (step 3): in **Claude Code**,
+  Claude copies the files after telling you what, where and how much, and only on your
+  yes; **Claude Desktop** has no tool that copies files, so you make the copy yourself,
+  for example in Explorer, and give Claude the copy's two folders.
 - **in_place**: MS-DIAL reads `data2\pos` and `data2\neg` themselves and writes its
-  files there. For the demo this is reasonable too, since `data2.zip` is your original.
+  files there. For the demo this is reasonable too, if you keep `data2.zip` as your
+  original.
 
 After the run, the demo folder looks like this:
 
@@ -262,10 +295,12 @@ Look at the folders first, then ask me everything you need in one message.
 Claude makes sure the backend runs, then calls `msdial_lipidomics_check_inputs` with
 the two folders only. That call reads and never writes. Claude reports what it found
 before asking anything: seven SCIEX `.wiff` files per folder, the polarity the folder
-and file names say, no MS-DIAL intermediates yet, and the files beside the data that
-look like inputs (the two EquiSPLASH texts, the workbooks, the `.lbm2` library). It
-names the library but does not propose it: which library fits your chromatography is
-your call.
+and file names say, no MS-DIAL intermediates yet, and the files in `data2` that look
+like inputs: four standard texts (the two you copied and the archive's two), three
+workbooks (`quant_utility_table.xlsx`, and the archive's `metadata.xlsx` and
+`concentrations.xlsx`) and the `.lbm2` library. It names them but proposes none: which
+library fits your chromatography, and which texts and workbook belong to your batch,
+are your call.
 
 ### 2. Answer the questions in one message
 
@@ -277,8 +312,8 @@ Claude asks every open question at once. The demo's answers:
 | The LBM2 library | the lipid annotation rules and retention times | `D:\lipidomics-demo\data2\Msp20231101141520_conventional_converted_dev_custum.lbm2` |
 | The salt in the mobile phase | which negative-mode adducts MS-DIAL searches | ammonium acetate |
 | The annotation RT tolerance | how far from the library's retention time an annotation is accepted | 1.5 min |
-| The internal-standard texts | the standards searched in each polarity | the two `20200121_MsdialTxtDB_*_EquiSPLASH.txt` files |
-| The quant workbook | standards' amounts, class-to-standard lookup, which class and adduct each polarity keeps | `D:\lipidomics-demo\quant_utility_table.xlsx` |
+| The internal-standard texts | the standards searched in each polarity | `EquiSPLASH_Pos.txt` and `EquiSPLASH_Neg.txt` in `data2`, the copies from `examples\lab-lipidomics` |
+| The quant workbook | standards' amounts, class-to-standard lookup, which class and adduct each polarity keeps | `D:\lipidomics-demo\data2\quant_utility_table.xlsx` |
 | Its amount column | the unit: F per mg tissue, G per 10^6 cells, H per µL plasma | H |
 | The analysis root | where everything is written | `D:\lipidomics-demo\analysis` |
 | Where MS-DIAL reads the raw data | `copy` or `in_place` (see above) | copy, into `D:\lipidomics-demo\run` |
@@ -292,13 +327,16 @@ is central; I need lipid_metabolome.csv and the QA report.
 LBM2: D:\lipidomics-demo\data2\Msp20231101141520_conventional_converted_dev_custum.lbm2
 Salt: ammonium acetate
 Annotation RT tolerance: 1.5 min
-Internal standards: D:\lipidomics-demo\data2\20200121_MsdialTxtDB_Pos_EquiSPLASH.txt
-(positive) and D:\lipidomics-demo\data2\20200121_MsdialTxtDB_Neg_EquiSPLASH.txt (negative)
-Workbook: D:\lipidomics-demo\quant_utility_table.xlsx, amount column H
+Internal standards: D:\lipidomics-demo\data2\EquiSPLASH_Pos.txt (positive) and
+D:\lipidomics-demo\data2\EquiSPLASH_Neg.txt (negative)
+Workbook: D:\lipidomics-demo\data2\quant_utility_table.xlsx, amount column H
 Analysis root: D:\lipidomics-demo\analysis
 Raw data: make a copy in D:\lipidomics-demo\run
 Console: D:\msdial\MSDIAL.console.v5.5.2610xx\MSDIALCUI.exe
 ```
+
+In Claude Desktop, make the copy yourself first (step 3) and answer instead
+*Raw data: copy, which I made in D:\lipidomics-demo\run\pos and D:\lipidomics-demo\run\neg*.
 
 In the same message Claude tells you what is set without asking, so that you can object
 in a word: the internal standards' own RT tolerance (0.5 min), the peak-height
@@ -314,10 +352,20 @@ without a warning, so this one is worth checking against your method.
 
 ### 3. The copy
 
-If you chose `copy`, Claude states the source, the destination, the number of files and
-their size (about 0.9 GB for the demo) and that the copy is kept afterwards. On your yes
-it copies each `.wiff` with its `.wiff.scan`, compares names and sizes, and checks the
-copy's folders again: from here on, MS-DIAL reads the copy.
+If you chose `copy`, the copy holds each `.wiff` with its `.wiff.scan` (about 0.9 GB for
+the demo), and nothing else.
+
+- **In Claude Code**, Claude states the source, the destination, the number of files and
+  their size, and that the copy is kept afterwards. On your yes it copies them with its
+  own file tools and compares names and sizes with the originals.
+- **In Claude Desktop**, which cannot copy files, you copy them yourself: in Explorer,
+  copy everything in `data2\pos` to `D:\lipidomics-demo\run\pos` and everything in
+  `data2\neg` to `D:\lipidomics-demo\run\neg`, and compare the two folders' sizes
+  (*Properties*). Then give Claude the copy's two folders.
+
+Either way, Claude then checks the copy's folders with `msdial_lipidomics_check_inputs`:
+the same seven files per polarity, by name, and each `.wiff` with its `.wiff.scan`. From
+here on, MS-DIAL reads the copy.
 
 ### 4. The check, read back
 
@@ -441,7 +489,7 @@ everything is. The raw data, or its copy, is kept.
 
 | # | Confirmation | Why it is asked |
 | --- | --- | --- |
-| 1 | The copy of the raw data (only with `copy`) | it writes about 1 GB and decides where MS-DIAL writes its intermediates |
+| 1 | The copy of the raw data (only with `copy`, in Claude Code; in Claude Desktop you make it) | it writes about 1 GB and decides where MS-DIAL writes its intermediates |
 | 2 | The sample table | it decides groups, order and dilution for both polarities |
 | 3 | Writing the contract | it fixes every input and answer for the runs that follow |
 | 4, 5 | The positive and the negative diagnostic | each starts MS-DIAL and writes beside one raw file |
@@ -484,6 +532,15 @@ Nothing in this workflow deletes your data.
 The tables are comma separated and unquoted, as the MS-DIAL laboratory's earlier merge
 program (metaboservice) wrote them, so its R script, `metabolomics_service.R`, reads
 them unchanged; any spreadsheet or R/Python reads them too.
+
+**Statistics with the R script.** The script is in the same Zenodo record:
+`metabolomics_hands-on.zip` holds `metabolomics_hands-on\inhouse_programs.zip`, which
+holds `inhouse_programs\statistics\metabolomics_service.R` and, beside it, the folder
+`metabolomics_service_function` it loads its functions from. Claude does not run it,
+and it is not set up for you: open it in R or RStudio and set by hand what its comments
+ask for, such as the folder of `metabolomics_service_function`, the folder to analyse
+(`analysis\quant\lipidome`), the groups to compare (`my_comparisons`; for the demo, SPF
+against GF) and the unit, then run it. It needs the R packages it loads at its top.
 
 `analysis\quant\` holds each polarity's normalized matrix (`NormalizedHeight_Pos.txt`,
 `NormalizedHeight_Neg.txt`) beside the raw heights it was divided from
@@ -547,7 +604,8 @@ batch, include at least three QC injections to have precision assessed.
 **The Console is refused as too old.** The check says the Console *lacks normalize
 --peak-ids-only, the annotation candidate table or automatic RT correction's local test*.
 Get the prerelease or build from source (see [What you need](#what-you-need)), then check
-it with `python scripts\setup_claude.py --dry-run --console <path to MSDIALCUI.exe>`.
+it with `py -3 scripts\setup_claude.py --console <path to MSDIALCUI.exe>` in a terminal in
+the MS-DIAL Interactive folder (with `--dry-run`, it is only read, not started).
 
 **Claude does not see the MS-DIAL tools.** In Claude Code, run `/mcp` or
 `claude mcp list` and start a new session after the setup; in Claude Desktop, quit it
@@ -582,9 +640,12 @@ only what was last saved. Save and close the workbook, then check again.
 done under the existing contract. Choose another analysis root, or replace it knowingly:
 replacing makes every run under it unusable.
 
-**Double-clicking the setup says Python was not found.** Install Python from python.org
-(it brings the `py` launcher), or turn off the Microsoft Store `python` alias under
-*Settings > Apps > Advanced app settings > App execution aliases*, then run it again.
+**Double-clicking the setup says Python was not found.** It looks for `py -3`, then
+`python`, and takes one only if it runs Python 3.10 or newer; it never installs a Python
+itself, and it skips the Microsoft Store's `python` alias. Install Python from
+python.org. If you installed python.org's Python install manager (its default from
+3.14 on), it also needs a Python runtime: run `py install 3.14` in a terminal. Then run
+the setup again.
 
 **pip refuses to install (macOS or Linux).** An "externally managed" Python cannot take
 packages. Make a virtual environment (`python3 -m venv .venv`) and run the setup with its

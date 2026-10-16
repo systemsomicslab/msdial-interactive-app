@@ -58,11 +58,16 @@ and let the person confirm.
 
 The public demo is Zenodo record 10.5281/zenodo.10957708 (CC BY 4.0), file
 `metabolomics_hands-on.zip`, which holds `metabolomics_hands-on/data2.zip`; that unpacks
-to `data2/` with `pos/` and `neg/` (mouse plasma, SCIEX), the two EquiSPLASH standard
-texts and an LBM2. Its workbook is Interactive's example. The person downloads and
-unpacks it; if they ask you to, state the source, the size (773 MB) and the destination,
-and wait for their yes. The tutorial lists the answers the MS-DIAL team gave for it;
-they are an example, and the person still answers each question.
+to `data2/` with `pos/` and `neg/` (mouse plasma, SCIEX), two EquiSPLASH standard texts
+and an LBM2. Its workbook and its standard texts are Interactive's examples in
+`examples/lab-lipidomics/`: `quant_utility_table.xlsx`, `EquiSPLASH_Pos.txt` and
+`EquiSPLASH_Neg.txt`, which the tutorial has the person copy into `data2`. The archive's
+own texts (`20200121_MsdialTxtDB_*_EquiSPLASH.txt`) write SM and Cer with `;2O`, which
+sheet 1 does not, so with them the check stops; if the person names them, say so and
+point to the examples' README. The person downloads and unpacks the demo; if they ask
+you to, state the source, the size (773 MB) and the destination, and wait for their yes.
+The tutorial lists the answers the MS-DIAL team gave for it; they are an example, and
+the person still answers each question.
 
 ## A. Before starting
 
@@ -74,20 +79,25 @@ they are an example, and the person still answers each question.
   (MsdialWorkbench#830), the annotation candidate table and the automatic-RT local test
   (MsdialWorkbench#826). `check_inputs` refuses any other. `msdial_check_console_path`
   lists the Consoles it finds; prefer one whose `provenance_status` is `verified`.
-- Where to get one: the official MS-DIAL Console prerelease 5.5.2610xx or later (the
-  exact tag is still to be announced in `docs/tutorials/lab-lipidomics.md`);
-  `msdial_check_official_console_releases` shows the newest stable and prerelease
-  Console packages. Releases dated 2026-08-20 and earlier lack both. Otherwise, from a
-  local clone of MsdialWorkbench with the .NET SDK, `msdial_check_local_console_source`
-  compares it with `origin/master`, and `msdial_build_console_from_local_source(...,
+- Where to get one: the official MS-DIAL Console prerelease 5.5.2610xx or later. Call
+  `msdial_check_official_console_releases` for the newest stable and prerelease Console
+  packages and their tags, and name the one it returns rather than a version from
+  memory. Releases dated 2026-08-20 and earlier lack both. Otherwise, from a local clone
+  of MsdialWorkbench, `msdial_check_local_console_source` compares it with
+  `origin/master`, and `msdial_build_console_from_local_source(...,
   select_after_build=false)` previews the build, which runs only on the person's yes.
+  Both run `git` and `dotnet` (the .NET SDK 8 or later) from the MCP server's `PATH`:
+  when either is missing, the person installs it and restarts Claude Code or Claude
+  Desktop, so that the server starts again with the new `PATH`.
 - The Console is named per analysis, as `console_path`, and the contract fixes it for
   every run and normalize. Never select it with `msdial_set_console_path`, and do not let
   a build select it: that changes the shared settings other work reads.
-- The analysis root is never a code checkout or a temporary folder; the check refuses
-  both. A system drive or the user profile is the person's call; the check says so rather
-  than refuses. Short paths outside cloud-synced folders keep Windows path limits and
-  file locking out of the way.
+- The analysis root is never a code checkout or a temporary folder. The check refuses a
+  temporary folder and a git checkout; MS-DIAL Interactive downloaded as a ZIP has no
+  `.git` and is not recognised, so keep the root out of it yourself. A system drive or
+  the user profile is the person's call; the check says so rather than refuses. Short
+  paths outside cloud-synced folders keep Windows path limits and file locking out of
+  the way.
 
 ## B. Look at the data before asking anything
 
@@ -189,17 +199,26 @@ ask them to find it in the method record. There is no salt probe for laboratory 
 
 ## D. Make the copy, if they chose one
 
-Copying is a confirmation of its own. Before it, state the source, the destination, the
-file count and size, and that the copy is kept afterwards. Copy only on a yes, never on
-your own initiative.
-- Copy the raw files with their companions: a `.wiff` with its `.wiff.scan`, a `.d` or
-  `.raw` folder whole. Leave out intermediates already beside them.
-- Then compare names and sizes with the source.
-- Nothing is moved; the originals are only read.
+No MCP tool copies files. Whether you can make the copy depends on the host:
+- **With file tools of your own** (Claude Code's shell): copying is a confirmation of
+  its own. Before it, state the source, the destination, the file count and size, and
+  that the copy is kept afterwards. Copy only on a yes, never on your own initiative.
+  Copy the raw files with their companions: a `.wiff` with its `.wiff.scan`, a `.d` or
+  `.raw` folder whole. Leave out intermediates already beside them. Then compare names
+  and sizes with the source. Nothing is moved; the originals are only read.
+- **Without them** (Claude Desktop): the person makes the copy, for example in
+  Explorer, with the same companions and without the intermediates, and gives you the
+  copy's two folders. Say what to copy and where; do not improvise a copy by other means.
+
+Either way, call `msdial_lipidomics_check_inputs` on the copy's two folders and compare
+it with the check of the originals: the same `file_count` per polarity in `folders`, the
+same file names in `paired_sample_table`, and no `.wiff` without its `.wiff.scan` (that
+is a blocker). The check does not report sizes; when you did not copy, ask the person to
+compare the folders' sizes.
 
 From here on, `pos_path` and `neg_path` are the folders MS-DIAL will read, with
-`raw_location="copy"`. The check binds the folders by where they are, so check the copy
-again before the contract.
+`raw_location="copy"`. The check binds the folders by where they are, so the contract is
+written from the check of the copy.
 
 ## E. Check the answers
 
@@ -392,8 +411,9 @@ three decisions. It previews:
 - `warnings`: the Console is not the build the contract recorded (it was rebuilt or
   replaced). Say so before the confirmation; both builds are recorded with the result.
 
-Confirm each polarity separately, then call with `confirmed=true` and poll
-`msdial_interactive_job(job_id)`. The job compares normalize's own report with the table,
+Confirm each polarity separately, then call with `confirmed=true`. That starts a new job
+and returns its own `job_id`: poll `msdial_interactive_job` with that one, the normalize
+job, not the production run's. The job compares normalize's own report with the table,
 and recomputes every quantified cell from the Height matrix the same call wrote. Report
 `verified`, `quantified_rows` and `failed_rows`. A row that fails is set aside by the
 merge, never repaired by hand.
@@ -601,8 +621,11 @@ tools report about them.
 
 - Reviewing the annotations for false positives and false negatives, between H and I, is
   manual.
-- `metabolomics_service.R` itself is not run. Its comparisons (`my_comparisons`) and
-  working folder are set by hand in the script.
+- `metabolomics_service.R` itself is not run. It is in the demo record
+  (`metabolomics_hands-on.zip` > `inhouse_programs.zip` >
+  `inhouse_programs/statistics/`, with its `metabolomics_service_function` folder). Its
+  comparisons (`my_comparisons`), its working folders and the unit are set by hand in
+  the script.
 - These tools cannot resolve, normalize or merge a run that was not made under a contract
   (in the GUI, or by another tool). Offer to run it under one; do not fall back to running
   `MSDIALCUI normalize` by hand.

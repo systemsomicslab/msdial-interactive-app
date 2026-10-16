@@ -20,13 +20,17 @@ tunnel rather than a direct localhost connection.
 ## Set up in one command
 
 From the source checkout, on Windows double-click `Setup MS-DIAL for Claude.cmd`, or
-run:
+run (`python3` on macOS and Linux):
 
 ```powershell
-python scripts/setup_claude.py            # explains each step and asks before each change
-python scripts/setup_claude.py --dry-run  # shows the plan and changes nothing
-python scripts/setup_claude.py --yes      # answers yes to every question
+py -3 scripts/setup_claude.py            # explains each step and asks before each change
+py -3 scripts/setup_claude.py --dry-run  # shows the plan; changes nothing and starts no Console
+py -3 scripts/setup_claude.py --yes      # answers yes to every question
 ```
+
+The `.cmd` passes its arguments on, takes `py -3` or else `python` only when it runs
+Python 3.10 or newer, and turns off the Python install manager's automatic install, so
+that it never installs a Python itself.
 
 It uses only the standard library and needs no administrator rights. Its steps:
 
@@ -36,7 +40,10 @@ It uses only the standard library and needs no administrator rights. Its steps:
 3. Claude Code: `claude mcp add --scope user msdial-interactive -- <python>
    <checkout>/scripts/msdial-interactive-mcp.py`, when the `claude` CLI is on PATH. An
    existing user-scope registration is shown (command and arguments; environment
-   variable names, never their values) and replaced only on a yes.
+   variable names, never their values) and replaced only on a yes, after the whole entry
+   is saved to `~/.claude/mcp-backups/msdial-interactive-<time>.json` (or
+   `$CLAUDE_CONFIG_DIR/mcp-backups`). If the new entry cannot be added after the old one
+   was removed, the saved one is put back with `claude mcp add-json`.
 4. Claude Desktop: an `msdial-interactive` entry merged into `mcpServers` of
    `claude_desktop_config.json` (Windows `%APPDATA%\Claude\`, or a Microsoft Store
    installation's `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\`; macOS
@@ -48,10 +55,15 @@ It uses only the standard library and needs no administrator rights. Its steps:
    (what it points at is untouched), never written through.
 6. The skill ZIPs for Claude Desktop, `dist/<name>.skill.zip`.
 7. The MS-DIAL Consoles it finds (Interactive's saved setting, `MSDIAL_CONSOLE_PATH`,
-   `PATH`, `MSDIAL*` folders nearby, or `--console <path>`), each asked for
-   `normalize --help` and checked for `--peak-ids-only` and for the annotation
-   candidate and automatic-RT local-test markers that `msdial_lipidomics_check_inputs`
-   requires. It saves no Console setting.
+   `PATH`, `MSDIAL*` folders nearby, or `--console <path>`; a folder stands for the
+   `MSDIALCUI` in it, and a named one that is not there is said). Every one is judged
+   without starting it, by what its assembly holds: the `--peak-ids-only` option and
+   the annotation-candidate and automatic-RT local-test markers that
+   `msdial_lipidomics_check_inputs` requires, in its words
+   (`lab_lipidomics_agent.LAB_CONSOLE_NEEDS`). One that qualifies is then started as the
+   check starts it (Interactive's `console_capabilities`): one named with `--console`
+   without a question, the others after one; a dry run starts none. It saves no Console
+   setting.
 8. A summary and a first prompt.
 
 ## Install the local MCP server by hand

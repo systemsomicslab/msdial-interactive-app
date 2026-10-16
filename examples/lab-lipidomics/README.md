@@ -1,10 +1,44 @@
-# Example `quant_utility_table.xlsx`
+# Example inputs for the laboratory lipidomics demo
 
-`quant_utility_table.xlsx` is the workbook the MS-DIAL laboratory uses with the public
-lipidomics demo (mouse plasma, SCIEX, EquiSPLASH internal standards; Zenodo
-[10.5281/zenodo.10957708](https://doi.org/10.5281/zenodo.10957708), `data2`). The demo
-archive does not include it, so it is shipped here. Its document properties carry no
-author, and nothing else about it was changed.
+This folder holds the inputs the MS-DIAL laboratory uses with the public lipidomics demo
+(mouse plasma, SCIEX, EquiSPLASH internal standards) that the demo archive lacks or holds
+in a form the agent cannot use as it is:
+
+| File | What it is |
+| --- | --- |
+| `quant_utility_table.xlsx` | the quant workbook: standards and amounts, class-to-standard lookup, class and adduct selection |
+| `EquiSPLASH_Pos.txt`, `EquiSPLASH_Neg.txt` | the internal-standard texts, positive and negative, edited from the archive's (see [below](#the-internal-standard-texts)) |
+
+**The demo data:** *Lecture files* (2024), Zenodo,
+[doi:10.5281/zenodo.10957708](https://doi.org/10.5281/zenodo.10957708), licensed
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); the record names its creator.
+The demo is `metabolomics_hands-on.zip` > `data2.zip` > `data2`. Credit the record this
+way when you share the data, or results built on it. The three files here belong to that
+demo and are offered under the same CC BY 4.0 licence, with that credit.
+
+## The internal-standard texts
+
+The archive's `data2` holds `20200121_MsdialTxtDB_Pos_EquiSPLASH.txt` and
+`20200121_MsdialTxtDB_Neg_EquiSPLASH.txt`. Used as they are with this workbook, the
+agent's input check stops: they write the sphingoid base of two standards as `;2O`, and
+sheet 1 names them as current MS-DIAL does, with `;O2`, and a standard's name must match
+character for character. `EquiSPLASH_Pos.txt` and `EquiSPLASH_Neg.txt` are those two
+files as the MS-DIAL laboratory edited them for its demo run, with exactly these changes:
+
+- in both, `SM 18:1;2O/18:1(d9)` is renamed `SM 18:1;O2/18:1(d9)`, and
+  `Cer 18:1;2O/15:0(d7)` is renamed `Cer 18:1;O2/15:0(d7)`;
+- in the negative text, the row for `PA 15:0_18:1(d7)`, which sheet 1 does not prepare,
+  is removed.
+
+Every other byte is the archive's (`tests/test_example_standards.py` undoes the changes
+and compares the result with the record's checksums). With your own standards, write
+the names in your texts and on sheet 1 the same way.
+
+## The workbook, `quant_utility_table.xlsx`
+
+The workbook is not in the record. Its document properties carry no author, and Excel's
+record of the folder it was last saved in (`absPath` in `xl/workbook.xml`) was removed;
+nothing else was changed (`tests/test_example_workbook.py` checks this).
 
 The laboratory lipidomics agent (see
 [`docs/tutorials/lab-lipidomics.md`](../../docs/tutorials/lab-lipidomics.md)) reads it
@@ -91,10 +125,10 @@ all of them. Every one is still yours to give.
 
 | Question | Demo answer |
 | --- | --- |
-| Workbook | this file |
+| Workbook | `quant_utility_table.xlsx` from this folder |
 | Amount column | H (pmol/µL plasma), with H4 = 10 as saved |
 | Sheet 3 | as it is (no reconciliation question arises) |
 | Salt | ammonium acetate (`CH3COONH4`) |
 | Annotation RT tolerance | 1.5 min (internal standards: 0.5 min, the default) |
-| Internal standards | the two `20200121_MsdialTxtDB_*_EquiSPLASH.txt` files in `data2` |
+| Internal standards | `EquiSPLASH_Pos.txt` and `EquiSPLASH_Neg.txt` from this folder, not the archive's two texts |
 | LBM2 | `Msp20231101141520_conventional_converted_dev_custum.lbm2` in `data2` |

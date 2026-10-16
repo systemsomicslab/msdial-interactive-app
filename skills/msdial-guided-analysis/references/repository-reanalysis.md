@@ -180,7 +180,7 @@ For `MB-POST MPST000007`, begin with:
 msdial_repository_reanalysis_plan(
   repository="mb_post",
   accession="MPST000007",
-  workspace_root="D:/13_MSDIAL_Public_Reanalysis/analysis",
+  workspace_root="<absolute analysis root, e.g. D:/msdial-reanalysis/analysis>",
   analysis_unit_handoff_path=<handoff_path returned by msdial_catalog_reanalysis_handoff>,
   raw_retention_policy="keep",
   analysis_purpose="<reviewed scientific purpose>"

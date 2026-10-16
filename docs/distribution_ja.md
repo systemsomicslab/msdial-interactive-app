@@ -48,7 +48,7 @@ report画面に表示します。vendor RAWフォルダーの内部までは再�
 開発者PCで以下を実行します。
 
 ```bash
-cd D:/0_SourceCode/msdial_interactive_app
+cd <path to msdial-interactive-app>
 python scripts/build-distribution.py
 ```
 
