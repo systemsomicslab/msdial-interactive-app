@@ -1,0 +1,12 @@
+interface:
+  display_name: "MS-DIAL Laboratory Lipidomics"
+  short_description: "Quantify a positive and negative lipidomics batch with internal standards"
+  default_prompt: "Use $msdial-lipidomics-workflow to quantify the lipidomics data in these positive and negative folders with MS-DIAL."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "msdial-interactive"
+      description: "Local MS-DIAL Interactive lipidomics check, run, standards, normalize and merge tools"
+      transport: "stdio"
+policy:
+  allow_implicit_invocation: true

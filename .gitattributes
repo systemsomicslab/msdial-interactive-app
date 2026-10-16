@@ -1,0 +1,8 @@
+# Windows batch files keep CRLF in every checkout and in GitHub's source ZIP: cmd.exe misreads some
+# LF-only batch files.
+*.cmd text eol=crlf
+# Workbooks are ZIP archives; never convert their bytes.
+*.xlsx binary
+# The example internal-standard texts are kept byte for byte as the demo used them (CRLF), so that
+# their checksums and the changes their README states hold in every checkout.
+examples/lab-lipidomics/*.txt -text

@@ -664,7 +664,7 @@ the metadata extractor against representative inputs:
 ```powershell
 python scripts/repository-reanalysis.py preflight `
   D:\MSDIAL_Public_Reanalysis\mb_post\MPST000007\provenance\run-manifest.json `
-  --extractor D:\0_SourceCode\msrawdataworkbench\RawMetadataConsoleApp\bin\Release\net48\RawMetadataConsoleApp.exe `
+  --extractor <path to RawMetadataConsoleApp.exe> `
   --max-inputs 3
 ```
 

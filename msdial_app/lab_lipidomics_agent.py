@@ -609,6 +609,15 @@ def _lbm_verdict(path: Path) -> dict[str, Any]:
     return verdict
 
 
+# What a laboratory lipidomics run needs of its Console, each with the words a refusal uses for it.
+# scripts/setup_claude.py reads this too, so that the setup and the input check judge a Console alike.
+LAB_CONSOLE_NEEDS = {
+    NORMALIZE_PEAK_IDS_ONLY_CAPABILITY: f"normalize {NORMALIZE_PEAK_IDS_ONLY_OPTION}",
+    ANNOTATION_CANDIDATES_CAPABILITY: "the annotation candidate table",
+    AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY: "automatic RT correction's local test (MsdialWorkbench#826)",
+}
+
+
 def _console_verdict(path: Path) -> dict[str, Any]:
     blockers: list[str] = []
     verdict: dict[str, Any] = {"path": str(path.resolve()) if path.exists() else str(path)}
@@ -618,12 +627,7 @@ def _console_verdict(path: Path) -> dict[str, Any]:
         return verdict
     found = console_capabilities(str(path))["capabilities"]
     verdict["capabilities"] = found
-    needed = {
-        NORMALIZE_PEAK_IDS_ONLY_CAPABILITY: f"normalize {NORMALIZE_PEAK_IDS_ONLY_OPTION}",
-        ANNOTATION_CANDIDATES_CAPABILITY: "the annotation candidate table",
-        AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY: "automatic RT correction's local test (MsdialWorkbench#826)",
-    }
-    missing = [label for capability, label in needed.items() if capability not in found]
+    missing = [label for capability, label in LAB_CONSOLE_NEEDS.items() if capability not in found]
     if missing:
         blockers.append(f"The Console {path.name} lacks {', '.join(missing)}, which a laboratory lipidomics run needs.")
     verdict["blockers"] = blockers
