@@ -4,6 +4,118 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.41] - Unreleased
+
+### Added
+- **The laboratory lipidomics skill ships with Interactive, for anyone** (the
+  user's decision of 2026-10-16). `skills/msdial-lipidomics-workflow` is the
+  Agent Skill that drives the five `msdial_lipidomics_*` tools and the guided-run
+  tools from two raw folders to `lipid_metabolome.csv`. It was kept in the public
+  reanalysis repository (`.claude/skills/msdial-lipidomics-workflow`, at 3f01ee0)
+  and is now here, reviewed for a general audience: any laboratory's own LBM2,
+  standards and workbook, the official LBM2 (`msdial_download_official_library`
+  `lipidomics`) for a laboratory without one, the public demo and the example
+  workbook and standard texts named, where a new enough Console comes from (the
+  prerelease, named from `msdial_check_official_console_releases`, or the
+  local-source build with `select_after_build=false`, which needs `git` and the
+  .NET SDK 8+ on the MCP server's PATH), and the analysis root rules as
+  `check_inputs` applies them (a git checkout or a temporary folder is refused, a
+  system drive or the user profile is said). The raw-data copy is made by the
+  agent only where it has file tools of its own (Claude Code); in Claude Desktop
+  the person makes it, and either way the copy is checked with `check_inputs`
+  before the contract. The normalize job is polled by the `job_id` the confirmed
+  call returns. Every confirmation rule is kept, and so is the private-library
+  rule, now its own section. Interactive is its canonical home;
+  `msdial-guided-analysis` points to it for such a batch.
+- **`scripts/setup_claude.py` and `Setup MS-DIAL for Claude.cmd`: setup in one
+  command.** Standard library only, no administrator rights; it explains each
+  step and asks before it changes anything (`--yes` answers yes, `--dry-run`
+  shows the plan, changes nothing and starts no Console). The `.cmd` takes
+  `py -3`, then `python`, only when it runs Python 3.10 or newer (so not the
+  Microsoft Store alias, a launcher without Python 3, or an older Python), with
+  the Python install manager's automatic install turned off
+  (`PYTHON_MANAGER_AUTOMATIC_INSTALL=false`): it never installs a Python before
+  the setup asks anything. The setup checks Python 3.10+; runs
+  `<python> -m pip install -e .[mcp]` only when `mcp` or `psutil` is missing or
+  outside the extra's range (`--user` where site-packages is not writable);
+  registers the MCP server with `claude mcp add --scope user` when the `claude`
+  CLI is on PATH, showing an existing user-scope registration first (command and
+  arguments, environment variable names only) and replacing it only on a yes,
+  after saving the whole entry to `~/.claude/mcp-backups/` and restoring it with
+  `claude mcp add-json` when the add fails after the removal; merges an
+  `msdial-interactive` entry into Claude Desktop's `claude_desktop_config.json`
+  (the Microsoft Store installation's copy included) after a timestamped backup,
+  every other key kept, or creates one with `--desktop`; copies both skills into
+  `~/.claude/skills` (or `$CLAUDE_CONFIG_DIR/skills`), moving a differing copy to
+  `~/.claude/skill-backups` first, outside the folder Claude Code loads skills
+  from, and removing a link or junction there without writing through it;
+  builds the skill ZIPs; and judges every MS-DIAL Console it finds without
+  starting it, by what its assembly holds (`--peak-ids-only` and the markers
+  `check_inputs` requires, in its words, `LAB_CONSOLE_NEEDS`). A Console named
+  with `--console`, or the ones found after one question, is then started as
+  `check_inputs` starts it (`console_capabilities`); a named Console that is not
+  there, a stale saved setting included, is said, and a folder stands for the
+  `MSDIALCUI` in it. Redirected output is UTF-8, so that a non-ASCII path in a
+  command to copy survives. It never saves a Console setting and never prints an
+  environment variable's value.
+- **`examples/lab-lipidomics/`**: the inputs of the public demo that its archive
+  lacks or holds in a form the agent cannot use, under the demo's CC BY 4.0
+  licence, with a README crediting the record and explaining them.
+  - `quant_utility_table.xlsx`, the workbook the MS-DIAL laboratory uses with the
+    demo (sheet 3 already reconciled for the merge), with its three sheets and the
+    columns the agent reads. Two parts differ from the laboratory's copy:
+    `docProps/core.xml`'s creator and last-modified-by are empty, and
+    `xl/workbook.xml` no longer holds Excel's `absPath`, the local folder it was
+    last saved in. Every other member is the source's, byte for byte and in
+    order, and Interactive's reader reads it exactly as it read the source
+    (`tests/test_example_workbook.py`).
+  - `EquiSPLASH_Pos.txt` and `EquiSPLASH_Neg.txt`, the archive's two standard
+    texts as the laboratory edited them for its 2026-10-15 demo run (the sha256
+    digests its contract recorded): `SM 18:1;2O/18:1(d9)` and
+    `Cer 18:1;2O/15:0(d7)` renamed with `;O2`, as sheet 1 names them, and the
+    negative text's `PA 15:0_18:1(d7)` row, which sheet 1 does not prepare,
+    removed. As published, the texts stop `check_inputs` with the example
+    workbook (two prepared standards in neither library).
+    `tests/test_example_standards.py` undoes the edits and compares the result
+    with the record's CRC-32s, and checks that the shipped texts give the
+    tutorial's step-4 read-out with no blocker. `.gitattributes` keeps their
+    CRLF bytes as they are.
+- **`docs/tutorials/lab-lipidomics.md`**: a beginner-safe English tutorial with
+  the public demo (Zenodo 10.5281/zenodo.10957708, credited in full): what you
+  get, what you need, the setup (Windows options through `py -3` or the `.cmd`),
+  the demo's download into one folder with the example files copied into
+  `data2`, the analysis root and `raw_location` (who makes a copy in Claude Code
+  and in Claude Desktop), the conversation step by step with the MS-DIAL
+  laboratory's answers, every confirmation and why, timings, the outputs and the
+  R script from the same record, your own data (standards text format
+  included), troubleshooting and privacy. The Console it needs is named as "the
+  MS-DIAL Console prerelease 5.5.2610xx or later", a marked placeholder until the
+  prerelease is cut (its comment lists every file that holds it), with the build
+  from source (Git and the .NET SDK 8+) as the way meanwhile.
+
+### Changed
+- `scripts/package-agent-skill.py` packages every skill under `skills/` into
+  `dist/<name>.skill.zip` (`msdial-guided-analysis.skill.zip` keeps its name);
+  `--skill NAME` packages one (repeatable) and `--list` prints the names. Each
+  ZIP holds the skill's folder at its root, with a fixed timestamp so that the
+  same skill always packages to the same bytes, and a skill whose frontmatter
+  does not name its own folder, or has no description, is refused.
+- The distribution ZIP carries the setup wrapper and `examples/`.
+- README: a quick start for laboratory lipidomics with Claude near the top, and
+  the Agent Skill section names both skills, the packager options and the setup.
+  `docs/agent_integration.md` describes the setup and the manual route for both
+  hosts. Both now use placeholder paths where they named this project's own
+  folders, and the test prompts are in English. So do
+  `skills/msdial-guided-analysis/references/repository-reanalysis.md` (the
+  example `workspace_root`), `docs/distribution_ja.md` and
+  `docs/public_repository_reanalysis.md`, which named folders of the developer's
+  PC; the setup copies the first into every user's skills.
+- `lab_lipidomics_agent.LAB_CONSOLE_NEEDS`: what `check_inputs` requires of a
+  Console, in the words of its refusal, now a module constant the setup reads too.
+  The check itself is unchanged.
+- `.gitattributes`: `*.cmd` keeps CRLF in every checkout and source ZIP,
+  `*.xlsx` is binary, and the example standard texts are not converted.
+
 ## [0.5.40] - Unreleased
 
 ### Changes a campaign run planned with this version

@@ -1,6 +1,6 @@
 # Agent Integration
 
-MS-DIAL Interactive uses an Agent Skill for procedure and a local MCP server for
+MS-DIAL Interactive uses Agent Skills for procedure and a local MCP server for
 execution. This matches the intended division: Skills teach a repeatable
 workflow, while MCP connects the model to tools and local data. See the official
 [Claude Skills overview](https://support.claude.com/en/articles/12512176-what-are-skills)
@@ -17,54 +17,121 @@ Claude Desktop supports local MCP servers and desktop extensions. ChatGPT custom
 MCP support is plan-dependent and may require a remote MCP endpoint or secure
 tunnel rather than a direct localhost connection.
 
-## Install the local MCP server
+## Set up in one command
+
+From the source checkout, on Windows double-click `Setup MS-DIAL for Claude.cmd`, or
+run (`python3` on macOS and Linux):
+
+```powershell
+py -3 scripts/setup_claude.py            # explains each step and asks before each change
+py -3 scripts/setup_claude.py --dry-run  # shows the plan; changes nothing and starts no Console
+py -3 scripts/setup_claude.py --yes      # answers yes to every question
+```
+
+The `.cmd` passes its arguments on, takes `py -3` or else `python` only when it runs
+Python 3.10 or newer, and turns off the Python install manager's automatic install, so
+that it never installs a Python itself.
+
+It uses only the standard library and needs no administrator rights. Its steps:
+
+1. Python 3.10 or newer.
+2. The MCP dependency, `<this python> -m pip install -e .[mcp]` from the checkout, only
+   when `mcp` or `psutil` is missing or outside the range `pyproject.toml` asks for.
+3. Claude Code: `claude mcp add --scope user msdial-interactive -- <python>
+   <checkout>/scripts/msdial-interactive-mcp.py`, when the `claude` CLI is on PATH. An
+   existing user-scope registration is shown (command and arguments; environment
+   variable names, never their values) and replaced only on a yes, after the whole entry
+   is saved to `~/.claude/mcp-backups/msdial-interactive-<time>.json` (or
+   `$CLAUDE_CONFIG_DIR/mcp-backups`). If the new entry cannot be added after the old one
+   was removed, the saved one is put back with `claude mcp add-json`.
+4. Claude Desktop: an `msdial-interactive` entry merged into `mcpServers` of
+   `claude_desktop_config.json` (Windows `%APPDATA%\Claude\`, or a Microsoft Store
+   installation's `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\`; macOS
+   `~/Library/Application Support/Claude/`), after a timestamped backup. Every other key
+   is kept. Without a configuration file it is skipped unless `--desktop` is given.
+5. Both skills copied into Claude Code's `~/.claude/skills/<name>/` (or
+   `$CLAUDE_CONFIG_DIR/skills`). A differing copy is moved to `~/.claude/skill-backups/`
+   first, outside the folder Claude Code loads skills from; a link there is removed
+   (what it points at is untouched), never written through.
+6. The skill ZIPs for Claude Desktop, `dist/<name>.skill.zip`.
+7. The MS-DIAL Consoles it finds (Interactive's saved setting, `MSDIAL_CONSOLE_PATH`,
+   `PATH`, `MSDIAL*` folders nearby, or `--console <path>`; a folder stands for the
+   `MSDIALCUI` in it, and a named one that is not there is said). Every one is judged
+   without starting it, by what its assembly holds: the `--peak-ids-only` option and
+   the annotation-candidate and automatic-RT local-test markers that
+   `msdial_lipidomics_check_inputs` requires, in its words
+   (`lab_lipidomics_agent.LAB_CONSOLE_NEEDS`). One that qualifies is then started as the
+   check starts it (Interactive's `console_capabilities`): one named with `--console`
+   without a question, the others after one; a dry run starts none. It saves no Console
+   setting.
+8. A summary and a first prompt.
+
+## Install the local MCP server by hand
 
 From the source checkout:
 
 ```powershell
-cd D:\0_SourceCode\msdial_interactive_app
+cd C:\path\to\msdial-interactive-app
 python -m pip install -e ".[mcp]"
 ```
 
-Use the full Python path in Claude Desktop's `claude_desktop_config.json`:
+Claude Code:
+
+```powershell
+claude mcp add --scope user msdial-interactive -- "C:\path\to\python.exe" "C:\path\to\msdial-interactive-app\scripts\msdial-interactive-mcp.py"
+```
+
+Claude Desktop, with the full Python path, in `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "msdial-interactive": {
-      "command": "C:\\Users\\<user>\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
+      "command": "C:\\path\\to\\python.exe",
       "args": [
-        "D:\\0_SourceCode\\msdial_interactive_app\\scripts\\msdial-interactive-mcp.py"
+        "C:\\path\\to\\msdial-interactive-app\\scripts\\msdial-interactive-mcp.py"
       ]
     }
   }
 }
 ```
 
-Replace the Python path as needed and restart Claude Desktop. The MCP process
+Replace the paths as needed and restart Claude Desktop. The MCP process
 uses stdio and can launch the app backend on `http://127.0.0.1:8765` without
 opening a browser. If an older app occupies the port,
 `msdial_interactive_status` reports `compatible: false` and
 `msdial_interactive_restart` can replace only a recognized local MS-DIAL
 Interactive process after explicit confirmation.
 
-## Install the Agent Skill
+## Install the Agent Skills by hand
 
-Build the upload ZIP:
+Two skills are bundled under `skills/`:
+
+- `msdial-guided-analysis`: guided LC-MS and GC-MS analysis and public repository
+  reanalysis;
+- `msdial-lipidomics-workflow`: the laboratory lipidomics flow below, from two raw
+  folders to `lipid_metabolome.csv`. Its tutorial is
+  [`docs/tutorials/lab-lipidomics.md`](tutorials/lab-lipidomics.md), and the demo's
+  workbook is [`examples/lab-lipidomics`](../examples/lab-lipidomics/README.md).
+
+Build the upload ZIPs:
 
 ```powershell
-python scripts/package-agent-skill.py
+python scripts/package-agent-skill.py                                   # every skill
+python scripts/package-agent-skill.py --skill msdial-lipidomics-workflow  # one skill
+python scripts/package-agent-skill.py --list                            # the names
 ```
 
-In Claude Desktop, open `Customize > Skills`, choose `+`, and upload:
+In Claude Desktop, open `Customize > Skills`, choose `+`, and upload each of:
 
 ```text
 dist/msdial-guided-analysis.skill.zip
+dist/msdial-lipidomics-workflow.skill.zip
 ```
 
-The source skill is in `skills/msdial-guided-analysis`. Claude Code users can
-also place that folder under `.claude/skills/`; other compatible agents can use
-the same Agent Skills package.
+Claude Code users can instead place the folders under `~/.claude/skills/` (every
+project) or a project's `.claude/skills/`; other compatible agents can use the same
+Agent Skills packages.
 
 ## Guided flow
 
@@ -106,6 +173,10 @@ automatic peak-count tuning. This smoother accounts for irregular scan
 intervals while adding a small computational cost.
 
 ## Laboratory lipidomics flow
+
+The skill `msdial-lipidomics-workflow` carries this flow; the tutorial
+[`docs/tutorials/lab-lipidomics.md`](tutorials/lab-lipidomics.md) walks through it
+with the public demo.
 
 1. `msdial_lipidomics_check_inputs(pos_path, neg_path)` with the folders only:
    show the person what is there, then ask every open question in one message
@@ -267,18 +338,35 @@ not a standalone Console command.
 
 ## Test prompts
 
+Check the setup:
+
+```text
+Check that MS-DIAL Interactive is ready for laboratory lipidomics: start its backend,
+list the MS-DIAL Consoles you can find and say whether one is new enough. Do not run
+any analysis yet.
+```
+
 Start from scratch:
 
 ```text
-D:\0_SourceCode\MsdialWorkbenchDemo\console_fastlc_demo にある質量分析データを
-解析して。MS-DIALの条件を順番に質問し、実行前に最終確認して。
+Analyze the mass-spectrometry data in <folder>. Ask me the MS-DIAL conditions one at
+a time, and confirm with me before running.
 ```
 
 Start from a workset:
 
 ```text
-lcms-negative-lipidomics worksetを使ってこのフォルダーを解析して。
-ピーク数は代表1ファイルで約10000になるよう調整し、QAとMethodsも作って。
+Analyze this folder with the lcms-negative-lipidomics workset. Tune the peak count to
+about 10,000 on one representative file, and make the QA report and the Methods too.
+```
+
+A laboratory lipidomics batch (the tutorial's demo):
+
+```text
+Run the laboratory lipidomics workflow on the MS-DIAL demo data.
+Positive raw files: <demo>\data2\pos
+Negative raw files: <demo>\data2\neg
+Look at the folders first, then ask me everything you need in one message.
 ```
 
 The final data-mining handoff is written as
