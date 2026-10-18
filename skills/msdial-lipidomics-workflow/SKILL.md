@@ -328,7 +328,9 @@ annotator, the threshold, the smoothing and the RT correction.
 On a yes, call `msdial_start_guided_analysis(..., confirmed=true)`. Then call
 `msdial_complete_guided_analysis(job_id, internal_standards=<the plan's
 post_run_actions.internal_standards>)`, which waits, validates mzTab-M and writes QA. A
-run of a few files takes minutes; say so.
+run of a few files takes minutes; say so. The QA also draws the run's figures into
+`<root>/pos/qa_figures` or `<root>/neg/qa_figures` (see "The QA figures" below); give
+the person the path of its `qa_report.html`.
 
 - **One Console at a time.** Start the negative run only after the positive one has
   finished.
@@ -416,7 +418,10 @@ and returns its own `job_id`: poll `msdial_interactive_job` with that one, the n
 job, not the production run's. The job compares normalize's own report with the table,
 and recomputes every quantified cell from the Height matrix the same call wrote. Report
 `verified`, `quantified_rows` and `failed_rows`. A row that fails is set aside by the
-merge, never repaired by hand.
+merge, never repaired by hand. The confirmed call also draws figure 04 for the polarity,
+`<root>/quant/qa_figures/04_internal_standards_<positive|negative>.svg`: each standard
+the table uses, its height in each non-Blank injection relative to its mean, and its CV.
+Give its path; a standard drifting with injection order is worth saying before the merge.
 
 State what MS-DIAL computed in the result:
 - The spot of a standard sheet 2 uses is its amount times the file's dilution factor
@@ -564,6 +569,36 @@ The three statistics tables always keep the names above, because the R script re
 by name. A lipidome an earlier merge left there under another name stays and is warned
 about; say which one is current.
 
+## The QA figures
+
+The tools draw the QA figures themselves. Never write plotting code (R, Python or
+anything else) for them, and never read an SVG into the conversation; each result's
+`qa_figures` names the folder, the page (`qa_report.html`) and every figure's file and
+title, with each figure not drawn under `skipped` with its reason, and `warnings`.
+- **Each run's QA** (`msdial_complete_guided_analysis`): `<root>/pos/qa_figures` and
+  `<root>/neg/qa_figures`, with detected features (01), summed height (02) and the
+  peak-height distribution (03) per injection, a PCA of the study injections from the
+  reference-matched features (05), the sample-to-Blank ratio per feature (06) and the
+  RT-correction anchor offsets (07).
+- **A confirmed normalize**: figure 04 for its polarity in `<root>/quant/qa_figures`.
+- **A confirmed merge**: the batch's page, `<root>/quant/qa_figures/qa_report.html`:
+  both polarities side by side for 01 to 03 and 05 to 07, both 04s, and the lipid class
+  totals per sample (08) from `lipid_metabolome4classsummary.csv`, with links to each
+  run's own page. They are kept out of `quant/lipidome`, whose every subfolder
+  `metabolomics_service.R` reads.
+
+After each of these steps give the person the page's path and offer to open it. Read out
+every skipped figure and why (a run without the RT-correction audit has no figure 07,
+and a PCA needs at least three study injections). The figures describe the data; they decide nothing, and they never change the QA report or
+its status. Two of them count differently from a quick script: the PCA keeps every study
+height of a feature that is reference matched in at least one study injection, and the
+sample-to-Blank histogram counts each aligned feature once. Figure 06 prints two shares:
+its own, by means, where a feature with no Blank signal counts as clean, and the QA
+report's `sample_blank_ratio_ge_3`, by medians over the features detected in a Blank
+only; when you report blank separation, quote the criterion and say which is which.
+Figure 04's subtitle names the standards it does not draw (not resolved in that
+polarity, or resolved but not used by normalize); say them with the figure.
+
 ## L. Save the method, and report
 
 Offer `msdial_save_workset(name, lab_lipidomics_contract_path=...)`, and read both halves
@@ -600,7 +635,9 @@ are:
   (`merge.selection_warnings_accepted` in the contract), and what the lipidome therefore
   counts;
 - where the R inputs are (`<root>/quant/lipidome`), and that the statistics took the
-  Sample and QC files.
+  Sample and QC files;
+- where the QA figures are: each run's `qa_figures/qa_report.html` and the batch's
+  `<root>/quant/qa_figures/qa_report.html`, and which figures were skipped and why.
 
 Name what was assumed rather than confirmed, such as the acquisition type or a dilution
 factor nobody stated. When a step was skipped, say so: a workflow that reports success

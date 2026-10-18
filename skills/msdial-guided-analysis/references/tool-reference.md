@@ -184,6 +184,11 @@ Pass the production `job_id` to:
 - `msdial_generate_publication_report`
 - `msdial_complete_guided_analysis`
 
+Job-scoped QA also writes the QA figures into `<run directory>/qa_figures/` and
+returns them by path (`qa_figures`: folder, `qa_report.html`, each figure's file
+and title, skipped figures with their reasons). Show those paths; never write
+plotting code for these figures.
+
 Do not substitute `run_directory` for `job_id` in an automated workflow. A
 directory can contain outputs from unrelated runs. Set `run_qa: false` on
 `msdial_generate_publication_report` when Materials and Methods and supplementary

@@ -44,6 +44,17 @@ from .mztab_validation import list_mztab_outputs, validate_mztab_files, validate
 from .mztab_preview import preview_mztab_outputs
 from .materials_methods import generate_publication_report, qa_report_for_run
 from .quality_assurance import build_lcms_qa_report_from_file, find_qa_files
+from .qa_figure_outputs import (
+    NOT_WRITTEN_FOR_PATH as QA_FIGURES_NOT_WRITTEN_FOR_PATH,
+    QA_FIGURES_FOLDER,
+    QaMatrixReader,
+    current_run_figures,
+    failed_result as qa_figures_failed,
+    figures_are_current,
+    write_internal_standard_figure,
+    write_lipidomics_qa_figures,
+    write_run_qa_figures,
+)
 from .repository_metadata import (
     apply_classes_to_analysis_files,
     metadata_workspace,
@@ -425,6 +436,20 @@ def _run_job_from_manifest(manifest_text: str, job_id: str = "") -> dict[str, An
 def _recovered_from(job: dict[str, Any] | None) -> dict[str, Any]:
     """Name the manifest a job was rebuilt from, so a reply says it did not come from the registry."""
     return {"recovered_from": job["recovered_from"]} if (job or {}).get("recovered_from") else {}
+
+
+def _job_qa_figures(job: dict[str, Any] | None, qa_path: str, reader: QaMatrixReader | None = None) -> dict[str, Any]:
+    """The run's QA figures, written into <run directory>/qa_figures; a failure is a warning only.
+
+    reader holds what the QA report's own read of the matrix gave the figures, so it is not read twice.
+    """
+    if job is None:
+        return {"status": "not_written", "reason": QA_FIGURES_NOT_WRITTEN_FOR_PATH}
+    run_directory = str((job.get("preparation") or {}).get("run_directory") or "").strip()
+    try:
+        return write_run_qa_figures(qa_path, run_directory or None, reader=reader)
+    except Exception as error:
+        return qa_figures_failed("this run", error)
 
 
 def _scoped_run_job(body: dict[str, Any]) -> dict[str, Any] | None:
@@ -2031,6 +2056,14 @@ class Handler(BaseHTTPRequestHandler):
                     reconcile_polarities=body.get("reconcile_polarities"),
                     reconciliation_rt_tolerance=body.get("reconciliation_rt_tolerance"),
                 )
+                figures: dict[str, Any] = {}
+                if confirmed:
+                    # Written only with the lipidome; a preview writes nothing. A failure here is a
+                    # warning beside a merge that has already been written.
+                    try:
+                        figures = {"qa_figures": write_lipidomics_qa_figures(str(body.get("contract_path") or ""), report)}
+                    except Exception as error:
+                        figures = {"qa_figures": qa_figures_failed("the merged batch", error)}
                 self._json(
                     {
                         "written": confirmed,
@@ -2042,6 +2075,7 @@ class Handler(BaseHTTPRequestHandler):
                             ),
                         }),
                         "report": report,
+                        **figures,
                     }
                 )
             elif parsed.path == "/api/validate":
@@ -2144,9 +2178,12 @@ class Handler(BaseHTTPRequestHandler):
                     qa_path = qa_files[0]
                 elif not qa_path:
                     raise ValueError("Set job_id, manifest_path or an explicit QA file_path.")
+                # A job's QA also draws its figures, from the same single read of the matrix.
+                figure_reader = QaMatrixReader() if job is not None else None
                 qa_report = build_lcms_qa_report_from_file(
                     qa_path,
                     body.get("internal_standards", []),
+                    spot_observer=figure_reader.add_qa_spot if figure_reader is not None else None,
                 )
                 if job is not None:
                     # As its publication report will: a run-order statistic computed against the file
@@ -2159,6 +2196,8 @@ class Handler(BaseHTTPRequestHandler):
                         "report": qa_report,
                         "job_id": job_id,
                         "qa_file": qa_path,
+                        # Drawn after the report, which they never change; named by path, never inlined.
+                        "qa_figures": _job_qa_figures(job, qa_path, figure_reader),
                         **_recovered_from(job),
                     }
                 )
@@ -2207,10 +2246,31 @@ class Handler(BaseHTTPRequestHandler):
                         "No QA matrix is associated with this publication request. "
                         "Set run_qa=false to generate Materials and Methods without QA."
                     )
+                with_figures = bool(run_qa and job is not None and qa_path)
+                # Figures that must be drawn again are fed by the QA report's read of the matrix.
+                figure_reader = (
+                    QaMatrixReader()
+                    if with_figures and not qa_report and not figures_are_current(qa_path, run_directory or None)
+                    else None
+                )
                 if run_qa and not qa_report and qa_path:
                     qa_report = build_lcms_qa_report_from_file(
-                        qa_path, body.get("internal_standards", [])
+                        qa_path, body.get("internal_standards", []),
+                        spot_observer=figure_reader.add_qa_spot if figure_reader is not None else None,
                     )
+                publication_figures: dict[str, Any] = {}
+                bundle_figures: list[tuple[Path, str]] = []
+                if with_figures:
+                    # The bundle carries the QA figures this version draws from this same matrix and
+                    # anchor audit; they are drawn now when the ones there are not those.
+                    try:
+                        figure_result, figure_files = current_run_figures(
+                            qa_path, run_directory or None, reader=figure_reader
+                        )
+                        bundle_figures = [(path, f"qa_figures/{path.name}") for path in figure_files]
+                        publication_figures = {"qa_figures": figure_result}
+                    except Exception as error:
+                        publication_figures = {"qa_figures": qa_figures_failed("this run", error)}
                 result = generate_publication_report(
                     state,
                     qa_report,
@@ -2228,6 +2288,7 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     ),
                     qa_criteria=body.get("qa_criteria"),
+                    supplementary_files=bundle_figures,
                 )
                 # The retained inventory a raw deletion is judged against was taken before this report
                 # existed; it now has to list what was just written.
@@ -2251,6 +2312,7 @@ class Handler(BaseHTTPRequestHandler):
                         "qa_file": qa_path,
                         "job_id": job_id,
                         "qa_included": bool(qa_report),
+                        **publication_figures,
                         **({"retained_artifacts_refresh": retained_refresh} if retained_refresh else {}),
                         **_recovered_from(job),
                     }
@@ -3348,6 +3410,16 @@ def _start_laboratory_normalize(body: dict[str, Any]) -> dict[str, Any]:
             "wait for it or cancel it."
         )
     written = lab_write_normalize_inputs(plan)
+    # Figure 04 from the run's Height export and the standards just written for normalize; the
+    # resolve step stays read-only, and a figure that fails is a warning, never a refusal.
+    try:
+        standard_figure = write_internal_standard_figure(
+            plan["polarity"], plan["outputs"]["height_export"], plan["rows"],
+            Path(plan["paths"]["standards"]).parent / QA_FIGURES_FOLDER,
+            resolution_rows=(plan.get("resolution") or {}).get("standards") or [],
+        )
+    except Exception as error:
+        standard_figure = qa_figures_failed(f"the {plan['polarity'].lower()} internal standards", error)
     normalize_id = uuid.uuid4().hex
     preparation = {
         "command": plan["command"],
@@ -3370,7 +3442,8 @@ def _start_laboratory_normalize(body: dict[str, Any]) -> dict[str, Any]:
         _register_process_locked(normalize_id, "normalize")
         _persist_jobs_locked()
     threading.Thread(target=_run_normalize_job, args=(normalize_id, plan), daemon=True).start()
-    return {"started": True, "job_id": normalize_id, "plan": shown, "inputs_written": written}
+    return {"started": True, "job_id": normalize_id, "plan": shown, "inputs_written": written,
+            "qa_figures": standard_figure}
 
 
 def _run_normalize_job(job_id: str, plan: dict[str, Any]) -> None:

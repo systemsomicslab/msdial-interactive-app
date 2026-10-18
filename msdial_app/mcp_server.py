@@ -3290,6 +3290,9 @@ def msdial_lipidomics_normalize(
     with msdial_interactive_job. The job checks normalize's own report against the table and
     recomputes every quantified cell from the Height matrix the same call wrote; a row that does not
     follow is set aside by the merge. The Console must offer normalize --peak-ids-only.
+    confirmed=true also draws figure 04, the response of each standard the table uses across the
+    non-Blank injections, into <analysis_root>/quant/qa_figures/04_internal_standards_<polarity>.svg
+    (qa_figures in the result: the file and its title); a preview draws nothing.
     """
     return _request_json(
         "POST",
@@ -3346,7 +3349,11 @@ def msdial_lipidomics_merge(
     names no negative row: not_converted, with any negative row of their very name) and warnings,
     and nothing is written; confirmed=true writes them, the not-quantified file and
     merge-report.json into <analysis_root>/quant/lipidome, the folder to run the R script in. A file
-    in the dotplot folders that no earlier merge there recorded refuses the write.
+    in the dotplot folders that no earlier merge there recorded refuses the write. confirmed=true then
+    draws the batch's QA figures into <analysis_root>/quant/qa_figures (both runs side by side, each
+    polarity's internal standards, the lipid class totals) with a self-contained qa_report.html;
+    qa_figures in the result names the folder, the page and each figure. Show those paths; do not
+    write plotting code for these figures.
     """
     body: dict[str, Any] = {"contract_path": contract_path, "output_name": output_name, "confirmed": confirmed is True}
     if reconcile_polarities is not None:
@@ -3685,6 +3692,13 @@ def msdial_generate_lcms_qa(
 
     manifest_path reaches that job's matrix through the run the unit manifest recorded when it was
     finalised, after the backend has forgotten the job.
+
+    For a job (or manifest) it also draws the QA figures into <run directory>/qa_figures: detected
+    features, summed height and height distribution per injection, PCA of the study injections,
+    sample-to-Blank ratio and RT-correction anchor offsets, as SVG files and a self-contained
+    qa_report.html. The result's qa_figures names the folder, the page and each figure's file and
+    title; show those paths to the person rather than writing plotting code. A figure that cannot be
+    drawn is listed under skipped with its reason; the QA report itself is unchanged by them.
     """
     return _request_json(
         "POST",
@@ -3697,7 +3711,9 @@ def msdial_generate_lcms_qa(
             "file_path": file_path,
             "internal_standards": internal_standards or [],
         },
-        timeout=120,
+        # The figures are fed by the QA's own read of the matrix and add about 40% to it on a large
+        # unit; msdial_complete_guided_analysis gives this same request 180 s.
+        timeout=180,
     )
 
 
@@ -3719,6 +3735,9 @@ def msdial_generate_publication_report(
     unit the retained-artifact inventory is refreshed afterwards, so it lists the publication artifacts.
     A unit whose run left an mzTab-M it could not redact, or MS-DIAL's library copy it could not delete, is
     held from sharing: the step is retried first, and while it still fails nothing is written.
+    With job-scoped QA the bundle also carries the run's QA figures (qa_figures/), drawn first unless
+    the ones in <run directory>/qa_figures were drawn by this version from the same QA matrix and
+    RT-correction audit.
     """
     return _request_json(
         "POST",
@@ -3751,7 +3770,11 @@ def msdial_complete_guided_analysis(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
-    """Wait for one run, then validate/preview mzTab-M and generate requested QA/publication artifacts."""
+    """Wait for one run, then validate/preview mzTab-M and generate requested QA/publication artifacts.
+
+    With LC-MS QA the result carries qa_figures: the folder, qa_report.html and each SVG figure's file
+    and title (see msdial_generate_lcms_qa). The publication bundle carries the same figures.
+    """
     deadline = time.time() + max(1, timeout_seconds)
     while True:
         job = _request_json("GET", f"/api/jobs/{job_id}", host=host, port=port, timeout=10)
@@ -3800,7 +3823,7 @@ def msdial_complete_guided_analysis(
     qa_report = None
     if run_qa and str(preparation.get("analysis_type", "lcms")).casefold() == "lcms":
         try:
-            qa_report = _request_json(
+            qa_response = _request_json(
                 "POST",
                 "/api/qa/report",
                 host=host,
@@ -3810,8 +3833,12 @@ def msdial_complete_guided_analysis(
                     "internal_standards": internal_standards or [],
                 },
                 timeout=180,
-            ).get("report")
+            )
+            qa_report = qa_response.get("report")
             result["quality_assurance"] = qa_report
+            # The QA figures by path only: the folder, the page and each figure's file and title.
+            if qa_response.get("qa_figures") is not None:
+                result["qa_figures"] = qa_response.get("qa_figures")
         except RuntimeError as error:
             result["quality_assurance_error"] = str(error)
 
