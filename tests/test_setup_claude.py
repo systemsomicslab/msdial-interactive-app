@@ -7,13 +7,16 @@ configuration and the checkout are temporary folders.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -95,6 +98,7 @@ class SetupTestCase(unittest.TestCase):
             env={"APPDATA": str(self.appdata), "LOCALAPPDATA": str(self.localappdata)},
             system="Windows",
             drive_roots=[],
+            download_console=False,  # ConsoleDownloadTests turn it on, with a fake download
             run=self.runner,
             which=lambda name: {"claude": r"C:\npm\claude.CMD"}.get(name),
             interactive=False,
@@ -592,6 +596,140 @@ class ConsoleTests(SetupTestCase):
         self.assertEqual([], self.starter.started)
         self.assertIn(setup.CONSOLE_PRERELEASE_LABEL, self.printed)
         self.assertIn(setup.MSDIAL_SOURCE_URL, self.printed)
+
+
+class ConsoleDownloadTests(SetupTestCase):
+    """With no Console new enough, the official archive is offered: checked against the pinned values, then unpacked."""
+
+    ASSET = "MSDIAL.console.v9.9.991231-linux-net8.zip"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.starter = Starter()
+        self.fetched: list[str] = []
+        self.archive = self.zip_of(
+            {
+                "MSDIALCUI": b"\x7fELF launcher",
+                "MSDIALCUI.dll": ConsoleTests.markers(),
+                "MSDIALCUI.runtimeconfig.json": b"{}",
+                "createdump": b"\x7fELF createdump",
+                "README.md": b"# Console\n",
+            }
+        )
+        self.pin(self.archive)
+
+    @staticmethod
+    def zip_of(members: dict[str, bytes]) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as bundle:
+            for name, data in members.items():
+                bundle.writestr(name, data)
+        return buffer.getvalue()
+
+    def pin(self, data: bytes, system: str = "Linux") -> None:
+        patcher = mock.patch.dict(
+            setup.CONSOLE_ARCHIVES, {system: (self.ASSET, len(data), hashlib.sha256(data).hexdigest())}, clear=True
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fetch(self, served: bytes | None = None) -> Any:
+        def answer(url: str) -> io.BytesIO:
+            self.fetched.append(url)
+            return io.BytesIO(self.archive if served is None else served)
+
+        return answer
+
+    def context(self, **overrides: Any) -> Any:
+        overrides.setdefault("console_capabilities", self.starter)
+        overrides.setdefault("system", "Linux")
+        overrides.setdefault("download_console", True)
+        overrides.setdefault("fetch", self.fetch())
+        return super().context(**overrides)
+
+    @property
+    def folder(self) -> Path:
+        return self.base / "MSDIAL.console.v9.9.991231-linux-net8"
+
+    def test_on_yes_the_archive_is_checked_unpacked_judged_and_started(self) -> None:
+        result = setup.check_console(self.context(assume_yes=True))
+        console = self.folder / "MSDIALCUI"
+        self.assertEqual(("ok", f"{console} (installed)"), (result.status, result.detail))
+        self.assertEqual(
+            [f"https://github.com/systemsomicslab/MsdialWorkbench/releases/download/{setup.CONSOLE_PRERELEASE_TAG}/{self.ASSET}"],
+            self.fetched,
+        )
+        self.assertEqual([str(console)], self.starter.started)
+        self.assertEqual(b"# Console\n", (self.folder / "README.md").read_bytes())
+        self.assertEqual([], [path.name for path in self.base.iterdir() if path.name.endswith((".download", ".partial"))])
+        if os.name != "nt":
+            self.assertTrue(os.access(console, os.X_OK))
+            self.assertTrue(os.access(self.folder / "createdump", os.X_OK))
+        self.assertIn("convert vendor data to mzML first", self.printed)
+        # Run again, it is found beside the checkout, by its launcher rather than its dll.
+        self.assertEqual([("common folder", console)], setup.console_candidates(self.context()))
+
+    def test_nothing_is_downloaded_without_a_yes_or_in_a_dry_run(self) -> None:
+        result = setup.check_console(self.context())  # no terminal to answer in, no --yes
+        self.assertEqual("attention", result.status)
+        self.assertIn("Download and unpack the MS-DIAL Console", self.printed)
+        self.assertIn(setup.CONSOLE_RELEASES_URL, self.printed)
+        result = setup.check_console(self.context(dry_run=True, assume_yes=True))
+        self.assertEqual("planned", result.status)
+        self.assertEqual([], self.fetched)
+        self.assertFalse(self.folder.exists())
+        result = setup.check_console(self.context(assume_yes=True, download_console=False))
+        self.assertEqual("attention", result.status)
+        self.assertEqual([], self.fetched)
+
+    def test_an_archive_that_is_not_the_pinned_one_installs_nothing(self) -> None:
+        tampered = self.zip_of({"MSDIALCUI": b"something else"})
+        result = setup.check_console(self.context(assume_yes=True, fetch=self.fetch(tampered)))
+        self.assertEqual("failed", result.status)
+        self.assertFalse(self.folder.exists())
+        self.assertEqual([], [path.name for path in self.base.iterdir() if path.name.startswith("MSDIAL")])
+        self.assertIn(setup.CONSOLE_RELEASES_URL, self.printed)  # where to get one by hand
+
+    def test_a_member_outside_the_folder_is_refused(self) -> None:
+        self.archive = self.zip_of({"MSDIALCUI": b"launcher", "../escaped.txt": b"outside"})
+        self.pin(self.archive)
+        result = setup.check_console(self.context(assume_yes=True))
+        self.assertEqual("failed", result.status)
+        self.assertIn("unexpected path", result.detail)
+        self.assertFalse((self.base / "escaped.txt").exists())
+        self.assertFalse(self.folder.exists())
+
+    def test_a_folder_in_the_way_is_left_alone(self) -> None:
+        (self.folder / "notes").mkdir(parents=True)
+        result = setup.check_console(self.context(assume_yes=True))
+        self.assertEqual("attention", result.status)
+        self.assertEqual([], self.fetched)
+        self.assertEqual(["notes"], [path.name for path in self.folder.iterdir()])
+
+    def test_a_mac_without_rosetta_is_told_how_to_install_it(self) -> None:
+        self.pin(self.archive, "Darwin")
+        self.runner.answers["arch -x86_64"] = subprocess.CompletedProcess([], 1, stdout="", stderr="Bad CPU type")
+        result = setup.check_console(self.context(system="Darwin", assume_yes=True))
+        self.assertEqual(("attention", "the macOS Console needs Rosetta 2"), (result.status, result.detail))
+        self.assertIn("softwareupdate --install-rosetta --agree-to-license", self.printed)
+        self.assertEqual([], self.fetched)
+
+
+class ClaudeCliTests(SetupTestCase):
+    def test_without_claude_on_path_the_claude_code_running_the_setup_is_used(self) -> None:
+        running = self.base / "claude-code" / "2.1.299" / "claude.exe"
+        running.parent.mkdir(parents=True)
+        running.write_bytes(b"MZ")
+        ctx = self.context(which=lambda name: None, env={**self.context().env, "CLAUDE_CODE_EXECPATH": str(running)})
+        self.assertEqual(str(running), setup.find_claude(ctx))
+        result = setup.register_claude_code(self.context(
+            which=lambda name: None, assume_yes=True, env={**self.context().env, "CLAUDE_CODE_EXECPATH": str(running)}
+        ))
+        self.assertEqual("done", result.status)
+        self.assertEqual(str(running), self.runner.calls[-1][0])
+        node = self.base / "node.exe"
+        node.write_bytes(b"MZ")
+        self.assertIsNone(setup.find_claude(self.context(which=lambda name: None, env={"CLAUDE_CODE_EXECPATH": str(node)})))
 
 
 class OutputEncodingTests(unittest.TestCase):

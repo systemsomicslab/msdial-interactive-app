@@ -20,11 +20,14 @@ The steps:
   6. Skill ZIPs for Claude Desktop: dist/<name>.skill.zip, to upload under Customize > Skills.
   7. MS-DIAL Console: find them and say whether one is new enough for laboratory lipidomics, by
      what each Console's assembly holds. A Console named with --console is also started for its
-     --help, as the agent's input check starts it; the others only after one question.
+     --help, as the agent's input check starts it; the others only after one question. When none
+     is, offer the official Console archive for this system from GitHub: its size and SHA-256 are
+     checked against the values pinned here before it is unpacked beside this checkout.
   8. A summary and a first prompt to try.
 
 Only the standard library is used, nothing needs administrator rights, and nothing is uploaded.
-A dry run only reads (configuration files, the Consoles' assemblies): it starts no Console, and
+Started by Claude Code (no terminal to answer in), it asks nothing and declines every change unless
+--yes is given: show the person the --dry-run plan first. A dry run only reads (configuration files, the Consoles' assemblies): it starts no Console, and
 nothing is installed, registered, copied or written. Values of environment variables in any
 configuration are never printed.
 """
@@ -34,6 +37,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import filecmp
+import hashlib
 import importlib.metadata
 import importlib.util
 import json
@@ -44,6 +48,8 @@ import stat
 import subprocess
 import sys
 import sysconfig
+import urllib.request
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -61,11 +67,21 @@ MINIMUM_PYTHON = (3, 10)
 DEPENDENCIES = {"mcp": ((1, 28), (3,)), "psutil": ((6,), (8,))}
 CONSOLE_RELEASES_URL = "https://github.com/systemsomicslab/MsdialWorkbench/releases"
 MSDIAL_SOURCE_URL = "https://github.com/systemsomicslab/MsdialWorkbench"
-# PLACEHOLDER(console-prerelease): the official Console prerelease with MsdialWorkbench#826 and #830
-# is not published yet. Fill in the tag here and replace "5.5.2610xx" wherever the comment of that name
-# in docs/tutorials/lab-lipidomics.md lists it.
-CONSOLE_PRERELEASE_TAG = ""
-CONSOLE_PRERELEASE_LABEL = "the MS-DIAL Console prerelease 5.5.2610xx or later"
+# The first official Console with what laboratory lipidomics needs (MsdialWorkbench#826, #830, #832).
+CONSOLE_PRERELEASE_TAG = "MSDIAL-v5.5.261018"
+CONSOLE_PRERELEASE_LABEL = "the MS-DIAL Console prerelease 5.5.261018 or later"
+CONSOLE_DOWNLOAD_URL = "https://github.com/systemsomicslab/MsdialWorkbench/releases/download/{tag}/{asset}"
+# CONSOLE_PRERELEASE_TAG's archives by platform.system(): (asset, bytes, SHA-256). Each unpacks flat and
+# carries no Unix modes. The Linux and macOS builds are x64, self-contained and vendor unsupported: they
+# read mzML, ABF and netCDF, not vendor formats. On Apple silicon the macOS one runs under Rosetta 2.
+CONSOLE_ARCHIVES = {
+    "Windows": ("MSDIAL.console.v5.5.261018-windows-net48.zip", 39864294,
+                "75a1d9fed10577ada8b82fc336f5c9c00e2cd7cf939580fa570092e650359a6d"),
+    "Darwin": ("MSDIAL.console.v5.5.261018-osx-net8.zip", 44927084,
+               "ece4df8e4ebc71f455b43b144b66a77a5290ee4536d68a49a81eec7dd8920b0f"),
+    "Linux": ("MSDIAL.console.v5.5.261018-linux-net8.zip", 45848833,
+              "89d1245c5b6fa361a2a9fa898a3b90e4ff3e2d9c75ca7a3e99fc14d80c725147"),
+}
 FIRST_PROMPT = (
     "Check that MS-DIAL Interactive is ready for laboratory lipidomics: start its backend, list the "
     "MS-DIAL Consoles you can find and say whether one is new enough. Do not run any analysis yet."
@@ -75,6 +91,10 @@ FIRST_PROMPT = (
 # ---------------------------------------------------------------------------------------------
 # What the steps read and how they talk
 # ---------------------------------------------------------------------------------------------
+
+
+def _open_url(url: str) -> Any:
+    return urllib.request.urlopen(url, timeout=60)  # noqa: S310  (a pinned https URL)
 
 
 @dataclass
@@ -92,6 +112,8 @@ class Context:
     claude_code: bool = True
     install: bool = True
     console_paths: list[str] = field(default_factory=list)
+    download_console: bool = True  # offer the official Console archive when no Console is new enough
+    fetch: Callable[[str], Any] = _open_url
     # Drive roots searched for an MSDIAL* Console folder; None: C:\ and D:\ on Windows, none elsewhere.
     drive_roots: list[Path] | None = None
     # Starts a Console for its capabilities; None: Interactive's own msdial_app.workflow.console_capabilities.
@@ -320,7 +342,7 @@ def register_claude_code(ctx: Context) -> StepResult:
     ctx.say("available in every folder you open Claude Code in.")
     if not ctx.claude_code:
         return StepResult("Claude Code MCP", "skipped", "--no-claude-code")
-    claude = ctx.which("claude")
+    claude = find_claude(ctx)
     arguments = _server_args(ctx)
     add = ["claude", "mcp", "add", "--scope", "user", SERVER_NAME, "--", ctx.python, *arguments]
     if not claude:
@@ -383,6 +405,17 @@ def register_claude_code(ctx: Context) -> StepResult:
         return StepResult("Claude Code MCP", "failed", detail)
     detail = f"replaced (the old entry is in {backup})" if backup is not None else "registered"
     return StepResult("Claude Code MCP", "done", detail)
+
+
+def find_claude(ctx: Context) -> str | None:
+    """The claude CLI on PATH, else the Claude Code that started this setup (its desktop app puts none on PATH)."""
+    found = ctx.which("claude")
+    if found:
+        return found
+    running = ctx.env.get("CLAUDE_CODE_EXECPATH", "").strip()
+    if running and Path(running).name.casefold() in {"claude", "claude.exe"} and Path(running).is_file():
+        return running
+    return None
 
 
 def _run_claude(ctx: Context, command: list[str]) -> subprocess.CompletedProcess | None:
@@ -766,7 +799,8 @@ def console_candidates(ctx: Context) -> list[tuple[str, Path]]:
     elif ctx.windows:
         bases.extend(Path(f"{drive}:\\") for drive in "CD")
     patterns = (
-        "MSDIAL*/MSDIALCUI.exe", "MSDIAL*/MSDIALCUI.dll", "MSDIAL*/*/MSDIALCUI.exe", "MSDIAL*/*/MSDIALCUI.dll",
+        "MSDIAL*/MSDIALCUI.exe", "MSDIAL*/MSDIALCUI", "MSDIAL*/MSDIALCUI.dll",
+        "MSDIAL*/*/MSDIALCUI.exe", "MSDIAL*/*/MSDIALCUI", "MSDIAL*/*/MSDIALCUI.dll",
         "MsdialWorkbench*/tests/MSDIAL5/MsdialCoreTestApp/bin/Release/net48/MSDIALCUI.exe",
         "MsdialWorkbench*/tests/MSDIAL5/MsdialCoreTestApp/bin/Release/net8/MSDIALCUI.dll",
     )
@@ -775,7 +809,12 @@ def console_candidates(ctx: Context) -> list[tuple[str, Path]]:
             if not base.is_dir():
                 continue
             for pattern in patterns:
-                found.extend(("common folder", path) for path in sorted(base.glob(pattern)))
+                found.extend(
+                    ("common folder", path)
+                    for path in sorted(base.glob(pattern))
+                    # A self-contained Console is started by its launcher; its dll would need dotnet.
+                    if not (path.suffix.casefold() == ".dll" and _console_executable(path.parent, False).is_file())
+                )
         except OSError:
             continue
     unique: list[tuple[str, Path]] = []
@@ -883,6 +922,155 @@ def _start_consoles(
     return confirmed, refused
 
 
+def _console_executable(folder: Path, windows: bool) -> Path:
+    return folder / ("MSDIALCUI.exe" if windows else "MSDIALCUI")
+
+
+def console_install_folder(ctx: Context, asset: str) -> Path:
+    """Beside this checkout: where this setup and Interactive's own Console search both look."""
+    return ctx.root.parent / Path(asset).stem
+
+
+def rosetta_missing(ctx: Context) -> bool:
+    """A Mac that cannot run an x64 program: Apple silicon without Rosetta 2."""
+    try:
+        result = ctx.run(["/usr/bin/arch", "-x86_64", "/usr/bin/true"], capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return result.returncode != 0
+
+
+def download_archive(ctx: Context, url: str, target: Path, size: int, digest: str) -> str:
+    """Write url to target; '' when its size and SHA-256 are the pinned ones, else why not (target removed)."""
+    sha256 = hashlib.sha256()
+    written = 0
+    problem = ""
+    try:
+        with ctx.fetch(url) as response, target.open("wb") as stream:
+            while chunk := response.read(1 << 20):
+                stream.write(chunk)
+                sha256.update(chunk)
+                written += len(chunk)
+    except (OSError, ValueError) as error:  # urllib's URLError is an OSError
+        problem = f"the download failed: {error}"
+    if not problem and written != size:
+        problem = f"{written:,} bytes arrived, {size:,} expected"
+    elif not problem and sha256.hexdigest() != digest:
+        problem = "its SHA-256 is not the one this setup pins"
+    if problem:
+        target.unlink(missing_ok=True)
+    return problem
+
+
+def unpack_archive(archive: Path, folder: Path, windows: bool) -> None:
+    """Unpack a Console archive into folder; a member outside it is refused, and the launcher made executable."""
+    with zipfile.ZipFile(archive) as bundle:
+        for member in bundle.infolist():
+            name = member.filename.replace("\\", "/")
+            parts = [part for part in name.split("/") if part not in ("", ".")]
+            if not parts or ".." in parts or name.startswith("/") or ":" in parts[0]:
+                raise ValueError(f"the archive holds an unexpected path: {member.filename}")
+            target = folder.joinpath(*parts)
+            if name.endswith("/"):
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with bundle.open(member) as source, target.open("wb") as stream:
+                shutil.copyfileobj(source, stream)
+    if not windows:
+        for name in ("MSDIALCUI", "createdump"):  # the archives carry no Unix modes
+            path = folder / name
+            if path.is_file():
+                path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def install_official_console(ctx: Context) -> tuple[StepResult | None, Path | None]:
+    """Offer the official Console archive for this system: (what to report instead, the Console installed)."""
+    label = "MS-DIAL Console"
+    archive = CONSOLE_ARCHIVES.get(ctx.system)
+    if archive is None or not ctx.download_console:
+        return None, None
+    asset, size, digest = archive
+    url = CONSOLE_DOWNLOAD_URL.format(tag=CONSOLE_PRERELEASE_TAG, asset=asset)
+    folder = console_install_folder(ctx, asset)
+    ctx.say(f"  This setup can install the official {asset} ({size / 1e6:.1f} MB) from")
+    ctx.say(f"    {url}")
+    ctx.say(f"  into {folder}. Its size and SHA-256 are checked against the values this setup pins")
+    ctx.say("  before it is unpacked; the folder is kept, and nothing else is changed.")
+    if not ctx.windows:
+        ctx.say("  This build reads mzML, ABF and netCDF, not vendor formats: convert vendor data to mzML first.")
+    if ctx.system == "Darwin":
+        ctx.say("  It is an Intel (x64) build; on Apple silicon it runs under Rosetta 2.")
+        if rosetta_missing(ctx):
+            ctx.say("  Rosetta 2 is not installed. Install it in Terminal, then run this setup again:")
+            ctx.say("    softwareupdate --install-rosetta --agree-to-license")
+            return StepResult(label, "attention", "the macOS Console needs Rosetta 2"), None
+    if folder.exists():
+        ctx.say(f"  {folder} is already there without a Console this setup can use. Move it away and run")
+        ctx.say("  this setup again, or name a Console with --console.")
+        return StepResult(label, "attention", f"{folder} is in the way"), None
+    question = f"Download and unpack the MS-DIAL Console {CONSOLE_PRERELEASE_TAG}?"
+    if ctx.dry_run:
+        ctx.ask(question, True)
+        return StepResult(label, "planned", f"install {asset} into {folder}"), None
+    if not ctx.ask(question, True):
+        return None, None
+    partial = folder.with_name(folder.name + ".partial")
+    download = folder.with_name(asset + ".download")
+    try:
+        shutil.rmtree(partial, ignore_errors=True)
+        ctx.say(f"  Downloading {asset} ...")
+        problem = download_archive(ctx, url, download, size, digest)
+        if problem:
+            ctx.say(f"  Not installed: {problem}.")
+            return StepResult(label, "failed", problem), None
+        unpack_archive(download, partial, ctx.windows)
+        partial.rename(folder)
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        shutil.rmtree(partial, ignore_errors=True)
+        ctx.say(f"  Not installed: {error}.")
+        return StepResult(label, "failed", str(error)), None
+    finally:
+        download.unlink(missing_ok=True)
+    console = _console_executable(folder, ctx.windows)
+    ctx.say(f"  Installed {console}; the archive was checked and removed.")
+    return None, console
+
+
+def check_installed_console(ctx: Context, console: Path) -> StepResult:
+    """Judge a Console this setup just installed, and start it for its --help as the input check would."""
+    label = "MS-DIAL Console"
+    checks = interactive_console_checks()
+    if checks is None:
+        ctx.say("  This checkout's msdial_app could not be loaded, so the Console is not judged here.")
+        return StepResult(label, "attention", f"installed {console}; not judged")
+    verdict = assembly_verdict(checks, console)
+    missing = verdict["missing"] if verdict["read"] else [verdict["error"]]
+    if not missing:
+        missing = started_verdict(ctx, checks, console)
+    if missing:
+        ctx.say(f"  {console}: it lacks {'; '.join(missing)}.")
+        return StepResult(label, "attention", f"installed {console}, but it is not usable here")
+    ctx.say(f"  {console}: started, and new enough. Name it when the agent asks which Console runs")
+    ctx.say("  the analysis; the laboratory workflow names its Console per analysis.")
+    return StepResult(label, "ok", f"{console} (installed)")
+
+
+def say_where_to_get_a_console(ctx: Context) -> None:
+    ctx.say(f"  Get {CONSOLE_PRERELEASE_LABEL} ({CONSOLE_PRERELEASE_TAG}):")
+    ctx.say(f"    {CONSOLE_RELEASES_URL}")
+    ctx.say("    Unpack the MSDIAL.console ZIP for your system into a folder of your own, e.g. beside this")
+    ctx.say("    checkout, and run this setup again (or pass --console <the MSDIALCUI.exe, or MSDIALCUI>). On")
+    ctx.say("    macOS and Linux, make MSDIALCUI executable (chmod +x); on macOS also run")
+    ctx.say("    'xattr -dr com.apple.quarantine <that folder>' when the ZIP came through a browser.")
+    ctx.say("  On a system without an archive, build the Console from source:")
+    ctx.say("  install Git and the .NET SDK 8 or later, restart Claude Code or Claude Desktop so that the MCP")
+    ctx.say("  server finds git and dotnet, clone")
+    ctx.say(f"    {MSDIAL_SOURCE_URL}")
+    ctx.say("  and ask Claude to use msdial_check_local_console_source and msdial_build_console_from_local_source")
+    ctx.say("  on that folder (it shows the build command and asks first).")
+
+
 def check_console(ctx: Context) -> StepResult:
     label = "MS-DIAL Console"
     ctx.say("Laboratory lipidomics needs an MS-DIAL Console (MSDIALCUI) with 'normalize --peak-ids-only'")
@@ -919,16 +1107,13 @@ def check_console(ctx: Context) -> StepResult:
         ctx.say("  starts it before anything runs. Setup does not save it in Interactive's settings: the")
         ctx.say("  laboratory workflow names its Console per analysis.")
     else:
-        tag = CONSOLE_PRERELEASE_TAG or "(tag not published yet)"
-        ctx.say(f"  Get {CONSOLE_PRERELEASE_LABEL} {tag}:")
-        ctx.say(f"    {CONSOLE_RELEASES_URL}")
-        ctx.say("    Unpack its MSDIAL.console ZIP into a folder of your own, e.g. beside this checkout, and run")
-        ctx.say("    this setup again (or pass --console <path to MSDIALCUI.exe>).")
-        ctx.say("  Until it exists, build the Console from source: install Git and the .NET SDK 8 or later,")
-        ctx.say("  restart Claude Code or Claude Desktop so that the MCP server finds git and dotnet, clone")
-        ctx.say(f"    {MSDIAL_SOURCE_URL}")
-        ctx.say("  and ask Claude to use msdial_check_local_console_source and msdial_build_console_from_local_source")
-        ctx.say("  on that folder (it shows the build command and asks first).")
+        offered, installed = install_official_console(ctx)
+        if installed is not None:
+            return check_installed_console(ctx, installed)
+        if offered is None or offered.status == "failed":
+            say_where_to_get_a_console(ctx)
+        if offered is not None:
+            return offered
     if not_found:
         named = "; ".join(f"{path} ({source})" for source, path in not_found)
         return StepResult(label, "attention", f"not found: {named}" + (f"; new enough: {ready[0]}" if ready else ""))
@@ -1007,6 +1192,8 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-install", action="store_true", help="do not run pip")
     parser.add_argument("--console", action="append", default=[], metavar="PATH",
                         help="an MSDIALCUI.exe or MSDIALCUI.dll (or its folder) to check as well, starting it for its --help")
+    parser.add_argument("--no-console-download", action="store_true",
+                        help="never offer to download the official MS-DIAL Console")
     return parser.parse_args(argv)
 
 
@@ -1034,6 +1221,7 @@ def main(argv: list[str] | None = None) -> int:
         claude_code=not args.no_claude_code,
         install=not args.skip_install,
         console_paths=list(args.console),
+        download_console=not args.no_console_download,
     )
     try:
         return run_setup(ctx)

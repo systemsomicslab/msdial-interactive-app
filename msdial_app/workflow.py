@@ -693,8 +693,10 @@ def discover_console_paths(search_roots: Iterable[str | Path] | None = None) -> 
         if base.is_dir():
             candidates.extend(
                 ("console distribution", path)
-                for pattern in ("MSDIAL.console*/MSDIALCUI.exe", "MSDIAL.console*/MSDIALCUI.dll")
+                for pattern in ("MSDIAL.console*/MSDIALCUI.exe", "MSDIAL.console*/MSDIALCUI", "MSDIAL.console*/MSDIALCUI.dll")
                 for path in base.glob(pattern)
+                # A self-contained Linux or macOS Console is started by its launcher; its dll would need dotnet.
+                if not (path.suffix.lower() == ".dll" and path.with_suffix("").is_file())
             )
     for raw_root in search_roots or []:
         root = Path(raw_root).expanduser()
