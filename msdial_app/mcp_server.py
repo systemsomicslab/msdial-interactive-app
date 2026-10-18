@@ -3711,7 +3711,9 @@ def msdial_generate_lcms_qa(
             "file_path": file_path,
             "internal_standards": internal_standards or [],
         },
-        timeout=120,
+        # The figures are fed by the QA's own read of the matrix and add about 40% to it on a large
+        # unit; msdial_complete_guided_analysis gives this same request 180 s.
+        timeout=180,
     )
 
 
@@ -3733,8 +3735,9 @@ def msdial_generate_publication_report(
     unit the retained-artifact inventory is refreshed afterwards, so it lists the publication artifacts.
     A unit whose run left an mzTab-M it could not redact, or MS-DIAL's library copy it could not delete, is
     held from sharing: the step is retried first, and while it still fails nothing is written.
-    With job-scoped QA the bundle also carries the run's QA figures (qa_figures/), drawn first when
-    the ones in <run directory>/qa_figures were not drawn from the same QA matrix.
+    With job-scoped QA the bundle also carries the run's QA figures (qa_figures/), drawn first unless
+    the ones in <run directory>/qa_figures were drawn by this version from the same QA matrix and
+    RT-correction audit.
     """
     return _request_json(
         "POST",

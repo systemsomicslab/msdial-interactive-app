@@ -6,7 +6,7 @@ import math
 import random
 from pathlib import Path
 from statistics import median
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from .diagnostic_paths import is_diagnostic_artifact
 
 
@@ -76,7 +76,13 @@ def find_qa_files(
 def build_lcms_qa_report(
     path: str | Path,
     internal_standards: Iterable[dict[str, Any]] | None = None,
+    spot_observer: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> dict[str, Any]:
+    """The QA report of one matrix, read once.
+
+    spot_observer, when given, is called with each spot's parsed rows as the matrix is read, so that
+    another consumer (the QA figures) needs no second read. The report does not depend on it.
+    """
     qa_files = find_qa_files(path)
     if not qa_files:
         raise FileNotFoundError(f"No LC-MS QA matrix (*{QA_SUFFIX}) was found in {Path(path).expanduser()}.")
@@ -128,6 +134,8 @@ def build_lcms_qa_report(
                     standards,
                     standard_matches,
                 )
+                if spot_observer is not None:
+                    spot_observer(spot_rows)
                 spot_count += 1
                 spot_rows = []
             row = _parse_row(raw)
@@ -156,6 +164,8 @@ def build_lcms_qa_report(
                 standards,
                 standard_matches,
             )
+            if spot_observer is not None:
+                spot_observer(spot_rows)
             spot_count += 1
 
     sample_summaries = _summarize_samples(samples, sample_reservoirs, sn_reservoirs, msms_available)
@@ -196,11 +206,12 @@ def build_lcms_qa_report(
 def build_lcms_qa_report_from_file(
     path: str | Path,
     internal_standards: Iterable[dict[str, Any]] | None = None,
+    spot_observer: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> dict[str, Any]:
     target = Path(path).expanduser().resolve()
     if not target.is_file() or not target.name.lower().endswith(QA_SUFFIX):
         raise FileNotFoundError(f"LC-MS QA matrix not found: {target}")
-    return build_lcms_qa_report(target, internal_standards)
+    return build_lcms_qa_report(target, internal_standards, spot_observer)
 
 
 class _Reservoir:
@@ -230,6 +241,7 @@ def _validate_headers(headers: list[str]) -> None:
 
 
 def _parse_row(raw: dict[str, str]) -> dict[str, Any]:
+    height = _number(raw.get("Height"), math.nan)
     return {
         "id": str(raw.get("ID", "")).strip(),
         "file": str(raw.get("File", "")).strip(),
@@ -237,7 +249,10 @@ def _parse_row(raw: dict[str, str]) -> dict[str, Any]:
         "file_type": str(raw.get("File type", "Sample")).strip() or "Sample",
         "order": _integer(raw.get("Injection order")),
         "batch": _integer(raw.get("Batch ID"), 1),
-        "height": max(0.0, _number(raw.get("Height"))),
+        # A height that is empty or not a finite number counts as 0, as before; the QA figures say
+        # how many there were.
+        "height": max(0.0, height) if height == height else 0.0,
+        "height_numeric": height == height,
         "rt": _number(raw.get("RT")),
         "mz": _number(raw.get("MZ")),
         "sn": _number(raw.get("SN")),

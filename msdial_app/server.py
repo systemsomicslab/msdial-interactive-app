@@ -47,8 +47,10 @@ from .quality_assurance import build_lcms_qa_report_from_file, find_qa_files
 from .qa_figure_outputs import (
     NOT_WRITTEN_FOR_PATH as QA_FIGURES_NOT_WRITTEN_FOR_PATH,
     QA_FIGURES_FOLDER,
+    QaMatrixReader,
     current_run_figures,
     failed_result as qa_figures_failed,
+    figures_are_current,
     write_internal_standard_figure,
     write_lipidomics_qa_figures,
     write_run_qa_figures,
@@ -436,13 +438,16 @@ def _recovered_from(job: dict[str, Any] | None) -> dict[str, Any]:
     return {"recovered_from": job["recovered_from"]} if (job or {}).get("recovered_from") else {}
 
 
-def _job_qa_figures(job: dict[str, Any] | None, qa_path: str) -> dict[str, Any]:
-    """The run's QA figures, written into <run directory>/qa_figures; a failure is a warning only."""
+def _job_qa_figures(job: dict[str, Any] | None, qa_path: str, reader: QaMatrixReader | None = None) -> dict[str, Any]:
+    """The run's QA figures, written into <run directory>/qa_figures; a failure is a warning only.
+
+    reader holds what the QA report's own read of the matrix gave the figures, so it is not read twice.
+    """
     if job is None:
         return {"status": "not_written", "reason": QA_FIGURES_NOT_WRITTEN_FOR_PATH}
     run_directory = str((job.get("preparation") or {}).get("run_directory") or "").strip()
     try:
-        return write_run_qa_figures(qa_path, run_directory or None)
+        return write_run_qa_figures(qa_path, run_directory or None, reader=reader)
     except Exception as error:
         return qa_figures_failed("this run", error)
 
@@ -2173,9 +2178,12 @@ class Handler(BaseHTTPRequestHandler):
                     qa_path = qa_files[0]
                 elif not qa_path:
                     raise ValueError("Set job_id, manifest_path or an explicit QA file_path.")
+                # A job's QA also draws its figures, from the same single read of the matrix.
+                figure_reader = QaMatrixReader() if job is not None else None
                 qa_report = build_lcms_qa_report_from_file(
                     qa_path,
                     body.get("internal_standards", []),
+                    spot_observer=figure_reader.add_qa_spot if figure_reader is not None else None,
                 )
                 if job is not None:
                     # As its publication report will: a run-order statistic computed against the file
@@ -2189,7 +2197,7 @@ class Handler(BaseHTTPRequestHandler):
                         "job_id": job_id,
                         "qa_file": qa_path,
                         # Drawn after the report, which they never change; named by path, never inlined.
-                        "qa_figures": _job_qa_figures(job, qa_path),
+                        "qa_figures": _job_qa_figures(job, qa_path, figure_reader),
                         **_recovered_from(job),
                     }
                 )
@@ -2238,17 +2246,27 @@ class Handler(BaseHTTPRequestHandler):
                         "No QA matrix is associated with this publication request. "
                         "Set run_qa=false to generate Materials and Methods without QA."
                     )
+                with_figures = bool(run_qa and job is not None and qa_path)
+                # Figures that must be drawn again are fed by the QA report's read of the matrix.
+                figure_reader = (
+                    QaMatrixReader()
+                    if with_figures and not qa_report and not figures_are_current(qa_path, run_directory or None)
+                    else None
+                )
                 if run_qa and not qa_report and qa_path:
                     qa_report = build_lcms_qa_report_from_file(
-                        qa_path, body.get("internal_standards", [])
+                        qa_path, body.get("internal_standards", []),
+                        spot_observer=figure_reader.add_qa_spot if figure_reader is not None else None,
                     )
                 publication_figures: dict[str, Any] = {}
                 bundle_figures: list[tuple[Path, str]] = []
-                if run_qa and job is not None and qa_path:
-                    # The bundle carries the QA figures drawn from this same matrix; they are drawn
-                    # now when they were not, or were drawn from another one.
+                if with_figures:
+                    # The bundle carries the QA figures this version draws from this same matrix and
+                    # anchor audit; they are drawn now when the ones there are not those.
                     try:
-                        figure_result, figure_files = current_run_figures(qa_path, run_directory or None)
+                        figure_result, figure_files = current_run_figures(
+                            qa_path, run_directory or None, reader=figure_reader
+                        )
                         bundle_figures = [(path, f"qa_figures/{path.name}") for path in figure_files]
                         publication_figures = {"qa_figures": figure_result}
                     except Exception as error:
@@ -3398,6 +3416,7 @@ def _start_laboratory_normalize(body: dict[str, Any]) -> dict[str, Any]:
         standard_figure = write_internal_standard_figure(
             plan["polarity"], plan["outputs"]["height_export"], plan["rows"],
             Path(plan["paths"]["standards"]).parent / QA_FIGURES_FOLDER,
+            resolution_rows=(plan.get("resolution") or {}).get("standards") or [],
         )
     except Exception as error:
         standard_figure = qa_figures_failed(f"the {plan['polarity'].lower()} internal standards", error)

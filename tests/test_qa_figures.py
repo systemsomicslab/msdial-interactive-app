@@ -92,6 +92,19 @@ def parse(svg: str) -> ET.Element:
     return ET.fromstring(svg)
 
 
+SVG = "{http://www.w3.org/2000/svg}"
+
+
+def svg_text(svg: str) -> str:
+    """Every text element's text, joined by spaces (a wrapped subtitle reads as one sentence)."""
+    return " ".join("".join(node.itertext()) for node in parse(svg).iter(f"{SVG}text"))
+
+
+def tooltip_of(node: ET.Element) -> str:
+    title = node.find(f"{SVG}title")
+    return title.text if title is not None and title.text else ""
+
+
 class TheArithmetic(unittest.TestCase):
     def test_pca_of_a_hand_checked_matrix(self) -> None:
         # Two features over four samples. Autoscaled, their correlation r gives eigenvalues 1 +/- r of
@@ -199,7 +212,36 @@ class TheArithmetic(unittest.TestCase):
         self.assertEqual((qf.SERIES[0], qf.SERIES[1], qf.BLANK_COLOR, qf.QC_COLOR),
                          (one["GF"], one["SPF"], one["Blank"], two["QC"]))
         many = qf.group_colors([f"G{index:02d}" for index in range(10)])
-        self.assertEqual(qf.OTHER_COLOR, many["G09"])  # a ninth group gets no generated hue
+        # No generated hue: the ninth and tenth groups reuse the palette with squares.
+        self.assertEqual((qf.SERIES[0], "square"), (many["G08"], qf.group_shape(many, "G08")))
+        self.assertEqual((qf.SERIES[1], "square"), (many["G09"], qf.group_shape(many, "G09")))
+        self.assertEqual("dot", qf.group_shape(many, "G00"))
+        self.assertEqual("cross", qf.group_shape(many, "Blank"))
+
+    def test_every_group_keeps_its_own_colour_and_shape(self) -> None:
+        names = [f"G{index:02d}" for index in range(len(qf.SERIES) * len(qf.SHAPES))]
+        colors = qf.group_colors(names + ["QC", "Blank"])
+        styles = {(colors[name], qf.group_shape(colors, name)) for name in names}
+        self.assertEqual(len(names), len(styles))
+        legend = qf.group_legend(names, colors)
+        self.assertEqual(len(names), len({(color, shape) for _, color, shape in legend}))
+        # Beyond the palette's styles a group is "other", and the legend says so once.
+        more = qf.group_colors(names + ["Z1", "Z2"])
+        self.assertEqual((qf.OTHER_COLOR, qf.OTHER_COLOR), (more["Z1"], more["Z2"]))
+        self.assertEqual(("2 other group(s), not told apart", qf.OTHER_COLOR, "dot"),
+                         qf.group_legend(names + ["Z1", "Z2"], more)[-1])
+
+    def test_a_box_median_stands_out_on_every_group_colour(self) -> None:
+        for fill in (*qf.SERIES, qf.QC_COLOR, qf.BLANK_COLOR, qf.OTHER_COLOR):
+            ink = qf.ink_on(fill)
+            self.assertNotEqual(fill, ink)
+            self.assertGreaterEqual(qf.contrast_ratio(fill, ink), 3.0, fill)
+        self.assertEqual(qf.SURFACE, qf.ink_on(qf.QC_COLOR))  # light on the QC box, which is near-black
+
+    def test_a_nice_axis_ends_on_ticks(self) -> None:
+        low, high, ticks, step = qf.nice_axis(877.0, 1510.0, 6)
+        self.assertEqual((800.0, 1600.0, 200.0), (low, high, step))
+        self.assertEqual([800.0, 1000.0, 1200.0, 1400.0, 1600.0], ticks)
 
 
 class TheFigures(unittest.TestCase):
@@ -280,6 +322,131 @@ class TheFigures(unittest.TestCase):
         points = [node for node in pca.iter("{http://www.w3.org/2000/svg}circle")
                   if node.find("{http://www.w3.org/2000/svg}title") is not None]  # the legend's have no tooltip
         self.assertEqual(59, len(points))
+
+    def test_a_qc_box_shows_its_median(self) -> None:
+        run = run_from(self.root)
+        children = list(parse(qf.height_distribution_figure([run]).svg))
+        boxes = [index for index, node in enumerate(children)
+                 if node.tag == f"{SVG}rect" and tooltip_of(node).startswith(("QC ", "SPF ", "GF ", "Blank"))]
+        self.assertEqual(6, len(boxes))
+        for index in boxes:
+            box, median = children[index], children[index + 1]
+            self.assertEqual(f"{SVG}line", median.tag)
+            self.assertNotEqual(box.get("fill"), median.get("stroke"), tooltip_of(box))
+            if tooltip_of(box).startswith("QC "):
+                self.assertEqual((qf.QC_COLOR, qf.SURFACE), (box.get("fill"), median.get("stroke")))
+
+    def test_counts_and_sums_are_read_between_labelled_lines_and_join_study_injections_only(self) -> None:
+        injections = [INJECTIONS[0], ("Blank", "Blank", "Blank", 2), *INJECTIONS[1:5]]
+        injections = [(stem, klass, kind, order + 1) for order, (stem, klass, kind, _) in enumerate(injections)]
+        run = run_from(self.root, injections=injections)
+        for figure in (qf.detected_features_figure([run]), qf.summed_height_figure([run])):
+            element = parse(figure.svg)
+            labels = [float(node.text.replace(",", "")) for node in element.iter(f"{SVG}text")
+                      if node.get("text-anchor") == "end" and node.text and node.text.replace(",", "").replace(".", "").isdigit()]
+            values = run.detected if figure.key == "01" else [value / 1e3 for value in run.summed]
+            self.assertLessEqual(max(values), max(labels), figure.key)
+            self.assertGreaterEqual(min(values), min(labels), figure.key)
+            lines = list(element.iter(f"{SVG}polyline"))
+            self.assertEqual(1, len(lines))
+            self.assertEqual(5, len(lines[0].get("points").split()))  # the Blank between them is not joined
+
+    def test_the_ratio_figure_states_the_qa_criterion_beside_its_own_share(self) -> None:
+        qa = write_qa_matrix(self.root / "AlignResult-1.qa.tsv")
+        run = qa_figure_outputs.read_qa_matrix(qa, "Positive")
+        criterion = build_lcms_qa_report_from_file(qa)["summary"]["sample_blank_ratio_ge_3"]
+        at_least, counted = run.blank_criterion
+        self.assertEqual(8, counted)  # the Blank has a peak on every third spot only
+        self.assertEqual(criterion, at_least / counted)
+        text = svg_text(qf.sample_blank_ratio_figure([run]).svg)
+        self.assertIn("% of features at >= 3x by mean (no Blank signal counts as >= 3x)", text)
+        self.assertIn(f"QA criterion (median, 8 Blank-detected features): {criterion * 100:.0f}%", text)
+        self.assertIn("counts at or above 3x here", qf.FIGURES["06"]["how"] + text)
+
+    def test_the_standards_figure_names_the_standards_it_does_not_draw(self) -> None:
+        rows = [{"StandardName": "PC d7", "PeakID": "5"}, {"StandardName": "PC d7", "PeakID": "5"},
+                {"StandardName": "FA 18:0(d3)", "PeakID": "-1"}, {"StandardName": "CE d7", "PeakID": "-1"}]
+        resolution = [{"standard": "PC d7", "status": "resolved_lbm"}, {"standard": "FA 16:0(d3)", "status": "resolved_text"},
+                      {"standard": "TG d7", "status": "unresolved_expected"}, {"name": "LPC d7", "status": "resolved_search"}]
+        self.assertEqual(["FA 18:0(d3)", "CE d7"], qa_figure_outputs.unresolved_standards(rows))
+        self.assertEqual(["FA 16:0(d3)", "LPC d7"], qa_figure_outputs.resolved_but_unused(resolution, rows))
+        notes = qa_figure_outputs.standard_notes(rows, resolution)
+        injections = [qf.Injection(file_name(stem), klass, kind, "Blank" if kind == "Blank" else "Sample", order)
+                      for stem, klass, kind, order in INJECTIONS if kind != "QC"]
+        one = [qf.StandardResponse("PC d7", "5", [90.0, 100.0, 110.0, 100.0, 5.0])]
+        text = svg_text(qf.internal_standard_figure("Positive", injections, one, notes=notes).svg)
+        self.assertIn("1 standard used by normalize", text)
+        self.assertIn("Not resolved in this polarity, so the classes they serve are not quantified from it: "
+                      "FA 18:0(d3), CE d7", text)
+        self.assertIn("Resolved but not used by normalize (the quantification rules do not name them): "
+                      "FA 16:0(d3), LPC d7", text)
+        two = one + [qf.StandardResponse("PE d7", "6", [100.0, 100.0, 100.0, 100.0, 1.0])]
+        self.assertIn("2 standards used by normalize", svg_text(qf.internal_standard_figure("Positive", injections, two).svg))
+        none = qf.internal_standard_figure("Positive", injections, [], notes=notes)
+        self.assertIn("FA 18:0(d3), CE d7", none.skipped)
+
+    def test_samples_of_one_group_with_equal_totals_stay_apart(self) -> None:
+        samples = ["GF_1", "GF_2", "GF_3", "SPF_1", "SPF_2", "SPF_3"]
+        groups = ["GF", "GF", "GF", "SPF", "SPF", "SPF"]
+        values = [[18.817, 5.0], [18.806, 5.0], [18.968, 5.01], [12.0, 5.0], [12.0, 5.0], [12.01, 5.0]]
+        table = qf.ClassTotals(samples=samples, groups=groups, classes=["EtherPE", "CE"], values=values)
+        element = parse(qf.lipid_class_totals_figure(table).svg)
+        points = [(float(node.get("cx")), float(node.get("cy")), tooltip_of(node)) for node in element.iter(f"{SVG}circle")
+                  if tooltip_of(node)]
+        self.assertEqual(12, len(points))
+        for first in range(len(points)):
+            for second in range(first + 1, len(points)):
+                (x1, y1, a), (x2, y2, b) = points[first], points[second]
+                if a.split(",")[0] == b.split(",")[0] and a.split("(")[-1] == b.split("(")[-1]:
+                    self.assertGreater(math.hypot(x1 - x2, y1 - y2), 3.5, (a, b))  # more than a marker radius
+
+    def test_a_long_run_draws_one_outlier_per_side_of_a_box(self) -> None:
+        injections = [(f"L{order:04d}", ("Case", "Control")[order % 2], "Sample", order) for order in range(1, 1001)]
+
+        def cell(spot, stem, height):
+            extreme = {26: 10 ** 7.5, 27: 10 ** 8, 28: 10 ** 0.3, 29: 10 ** 0.5}
+            return f"{extreme.get(spot, 10 ** (3 + 0.01 * spot)):g}"
+
+        run = run_from(self.root, injections=injections, spots=30, cell=cell)
+        figure = qf.height_distribution_figure([run])
+        size = len(figure.svg.encode("utf-8"))
+        self.assertLess(size, 700_000)
+        self.assertEqual(2 * 1000, figure.svg.count("<circle"))  # four outliers each, the most extreme of a side drawn
+        self.assertIn("only its most extreme outlier on each side is drawn", svg_text(figure.svg))
+        short = run_from(self.root / "short", injections=injections[:6], spots=30, cell=cell)
+        self.assertEqual(4 * 6, qf.height_distribution_figure([short]).svg.count("<circle"))  # wide boxes: all of them
+
+    def test_the_pca_bounds_choose_spread_injections_and_the_most_variable_features(self) -> None:
+        injections = [(f"S{order:02d}", ("A", "B")[order % 2], "Sample", order) for order in range(1, 14) if order != 7]
+        injections.insert(6, ("Blank", "Blank", "Blank", 7))
+
+        def cell(spot, stem, height):
+            if stem == "Blank":
+                return "0"
+            order = int(stem[1:])
+            return f"{1000 * (1 + (spot + 1) * 0.01 * order) + 3 * ((spot * order) % 5):g}"
+
+        with patch.object(qa_figure_outputs, "PCA_SAMPLE_LIMIT", 5), patch.object(qa_figure_outputs, "PCA_FEATURE_LIMIT", 10):
+            run = run_from(self.root, injections=injections, spots=30, cell=cell)
+        study = [position for position, item in enumerate(run.injections) if item.category != "Blank"]
+        self.assertEqual([study[index] for index in (0, 3, 6, 8, 11)], run.pca_injections)  # first, last and between
+        self.assertEqual([1, 4, 8, 10, 13], [run.injections[position].order for position in run.pca_injections])
+        self.assertTrue(run.pca_sample_limited and run.pca_feature_limited)
+        # The ten matched features of greatest variance over those injections, in matrix order.
+        matched = [spot for spot in range(30) if spot % 4 != 3]
+        vectors = {spot: [math.log10(float(cell(spot, run.injections[position].file.split("_")[2], 0)) + 1.0)
+                          for position in run.pca_injections] for spot in matched}
+
+        def variance(values):
+            mean = sum(values) / len(values)
+            return sum((value - mean) ** 2 for value in values)
+
+        chosen = sorted(sorted(matched, key=lambda spot: (-variance(vectors[spot]), spot))[:10])
+        self.assertEqual([vectors[spot] for spot in chosen], run.pca_matrix)
+        self.assertEqual(len(matched), run.pca_reference_matched)
+        text = svg_text(qf.pca_figure([run]).svg)
+        self.assertIn(f"Positive: the 10 most variable of {len(matched)} features", text)
+        self.assertIn("Positive: 5 study injections spread over the run order", text)
 
     def test_an_anchor_file_of_another_run_is_not_drawn(self) -> None:
         write_anchor_audit(self.root, suffix="Neg")
@@ -417,6 +584,98 @@ class TheWrittenFolders(unittest.TestCase):
         result, _ = qa_figure_outputs.current_run_figures(qa, self.root)
         self.assertEqual("written", result["status"])
 
+    def test_figures_of_another_version_audit_or_with_a_file_missing_are_redrawn(self) -> None:
+        qa = write_qa_matrix(self.root / "AlignResult-1.qa.tsv")
+        write_anchor_audit(self.root)
+        folder = self.root / "qa_figures"
+        qa_figure_outputs.write_run_qa_figures(qa, self.root)
+        self.assertTrue(qa_figure_outputs.figures_are_current(qa, self.root))
+        manifest = folder / "figures.json"
+        record = json.loads(manifest.read_text(encoding="utf-8"))
+        manifest.write_text(json.dumps({**record, "msdial_interactive_version": "0.0.1"}), encoding="utf-8")
+        self.assertFalse(qa_figure_outputs.figures_are_current(qa, self.root))
+        result, _ = qa_figure_outputs.current_run_figures(qa, self.root)
+        self.assertEqual("written", result["status"])  # drawn by an older version: drawn again
+        self.assertEqual(qa_figure_outputs.__version__,
+                         json.loads(manifest.read_text(encoding="utf-8"))["msdial_interactive_version"])
+        anchors = self.root / qa_figure_outputs.ANCHORS_NAME
+        anchors.write_text(anchors.read_text(encoding="utf-8").replace("\t0.8\t", "\t0.7\t"), encoding="utf-8")
+        result, _ = qa_figure_outputs.current_run_figures(qa, self.root)
+        self.assertEqual("written", result["status"])  # the anchor audit changed
+        (folder / "05_pca_injections.svg").unlink()
+        result, files = qa_figure_outputs.current_run_figures(qa, self.root)
+        self.assertEqual("written", result["status"])  # a listed figure is missing
+        self.assertIn("05_pca_injections.svg", [path.name for path in files])
+        result, files = qa_figure_outputs.current_run_figures(qa, self.root)
+        self.assertEqual("current", result["status"])
+        self.assertEqual(sorted(path.name for path in files if path.suffix == ".svg"),
+                         sorted(Path(item["file"]).name for item in result["figures"]))
+
+    def test_an_unreadable_anchor_audit_loses_only_its_own_figure(self) -> None:
+        qa = write_qa_matrix(self.root / "AlignResult-1.qa.tsv")
+        write_anchor_audit(self.root)
+        locked = PermissionError(13, "Permission denied", str(self.root / qa_figure_outputs.ANCHORS_NAME))
+        with patch.object(qa_figure_outputs, "attach_rt_anchors", side_effect=locked):
+            result = qa_figure_outputs.write_run_qa_figures(qa, self.root)
+        self.assertEqual(5, len(result["figures"]))
+        self.assertEqual(["07_rt_correction_offsets.svg"], [item["file"] for item in result["skipped"]])
+        self.assertIn("could not be read (PermissionError: Permission denied)", result["skipped"][0]["reason"])
+        self.assertTrue(any("07_rt_correction_offsets.svg" in warning for warning in result["warnings"]))
+        self.assertNotIn(str(self.root), (self.root / "qa_figures" / "qa_report.html").read_text(encoding="utf-8"))
+
+    def test_writers_of_one_folder_at_once_do_not_collide(self) -> None:
+        qa = write_qa_matrix(self.root / "AlignResult-1.qa.tsv")
+        write_anchor_audit(self.root)
+        errors: list[BaseException] = []
+
+        def draw(index: int) -> None:
+            try:
+                if index % 2:
+                    qa_figure_outputs.write_run_qa_figures(qa, self.root)
+                else:
+                    qa_figure_outputs.current_run_figures(qa, self.root)
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = [threading.Thread(target=draw, args=(index,)) for index in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertEqual([], errors)
+        names = sorted(path.name for path in (self.root / "qa_figures").iterdir())
+        self.assertEqual([], [name for name in names if name.endswith(".writing")])
+        self.assertTrue(qa_figure_outputs.figures_are_current(qa, self.root))
+
+    def test_a_link_to_a_folder_with_reserved_characters_is_encoded(self) -> None:
+        page = self.root / "run #1 50%?" / "qa_figures" / "qa_report.html"
+        href = qa_figure_outputs.relative_link(page, self.root / "quant" / "qa_figures")
+        self.assertEqual("../../run%20%231%2050%25%3F/qa_figures/qa_report.html", href)
+        html = qf.report_html("t", "l", [], [("Positive", href)])
+        self.assertIn('href="../../run%20%231%2050%25%3F/qa_figures/qa_report.html"', html)
+
+    def test_the_figures_fed_by_the_qa_read_equal_a_read_of_their_own(self) -> None:
+        def cell(spot, stem, height):
+            return "NaN" if (spot, stem) == (0, "S1") else ("" if (spot, stem) == (1, "S2") else f"{height:g}")
+
+        qa = write_qa_matrix(self.root / "AlignResult-1.qa.tsv", cell=cell)
+        reader = qa_figure_outputs.QaMatrixReader()
+        report = build_lcms_qa_report_from_file(qa, spot_observer=reader.add_qa_spot)
+        self.assertEqual(build_lcms_qa_report_from_file(qa), report)  # observing changes nothing
+        self.assertEqual(qa_figure_outputs.read_qa_matrix(qa, "Positive"), reader.finish("Positive"))
+        self.assertEqual(2, reader.non_numeric)
+
+    def test_a_failing_figure_reader_changes_no_qa_and_the_figures_read_the_matrix_themselves(self) -> None:
+        qa = write_qa_matrix(self.root / "AlignResult-1.qa.tsv")
+        reader = qa_figure_outputs.QaMatrixReader()
+        with patch.object(reader, "add_spot", side_effect=RuntimeError("broken reader")):
+            report = build_lcms_qa_report_from_file(qa, spot_observer=reader.add_qa_spot)
+        self.assertEqual(build_lcms_qa_report_from_file(qa), report)
+        self.assertIsInstance(reader.error, RuntimeError)
+        result = qa_figure_outputs.write_run_qa_figures(qa, self.root, reader=reader)
+        self.assertEqual("written", result["status"])
+        self.assertEqual(5, len(result["figures"]))  # 07 has no audit here
+
 
 def _post(port: int, path: str, body: dict) -> dict:
     request = urllib.request.Request(
@@ -464,6 +723,39 @@ class TheQaEndpoint(unittest.TestCase):
         self.assertNotIn("<svg", json.dumps(response))
         expected = qa_report_for_run(build_lcms_qa_report_from_file(self.qa), str(self.root / "run"))
         self.assertEqual(json.loads(json.dumps(expected)), response["report"])
+
+    def test_a_jobs_qa_reads_its_matrix_once(self) -> None:
+        parsed = []
+        original = server.build_lcms_qa_report_from_file
+
+        def counted(*arguments, **options):
+            parsed.append(arguments[0])
+            return original(*arguments, **options)
+
+        second_read = AssertionError("the QA figures read the matrix a second time")
+        with patch.object(qa_figure_outputs, "read_qa_matrix", side_effect=second_read), \
+                patch.object(server, "build_lcms_qa_report_from_file", side_effect=counted):
+            response = _post(self.backend.server_port, "/api/qa/report", {"job_id": "job-1"})
+        self.assertEqual([str(self.qa)], [str(item) for item in parsed])
+        self.assertEqual("written", response["qa_figures"]["status"])
+        self.assertEqual(6, len(response["qa_figures"]["figures"]))
+
+    def test_a_publication_reuses_current_figures_and_feeds_stale_ones_from_its_qa_read(self) -> None:
+        _post(self.backend.server_port, "/api/qa/report", {"job_id": "job-1"})
+        workflow = {"project_type": "lcms", "files": []}
+        second_read = AssertionError("the QA figures read the matrix a second time")
+        with patch.object(qa_figure_outputs, "read_qa_matrix", side_effect=second_read):
+            current = _post(self.backend.server_port, "/api/publication/report",
+                            {"job_id": "job-1", "workflow": workflow, "use_saved_run": False})
+            self.assertEqual("current", current["qa_figures"]["status"])
+            manifest = self.root / "run" / "qa_figures" / "figures.json"
+            record = json.loads(manifest.read_text(encoding="utf-8"))
+            manifest.write_text(json.dumps({**record, "msdial_interactive_version": "0.0.1"}), encoding="utf-8")
+            redrawn = _post(self.backend.server_port, "/api/publication/report",
+                            {"job_id": "job-1", "workflow": workflow, "use_saved_run": False})
+        self.assertEqual("written", redrawn["qa_figures"]["status"])
+        with zipfile.ZipFile(redrawn["report"]["bundle"]) as archive:
+            self.assertIn("qa_figures/05_pca_injections.svg", archive.namelist())
 
     def test_a_figure_failure_leaves_the_qa_as_it_was(self) -> None:
         normal = _post(self.backend.server_port, "/api/qa/report", {"job_id": "job-1"})
@@ -631,6 +923,36 @@ class TheLaboratorySteps(unittest.TestCase):
         page = (self.figures / "qa_report.html").read_text(encoding="utf-8")
         self.assertIn("PCA needs at least three study injections; there are 2", page)
         self.assertIn("The negative run&#x27;s QA matrix", page)
+
+    def test_an_unreadable_input_of_the_batch_page_loses_only_its_own_figures(self) -> None:
+        self.normalize("Positive", ["Cer 18:1;O2/15:0(d7)"])
+        self.normalize("Negative", [])
+        empty = self.batch.analysis / "empty_classsummary.csv"
+        empty.write_text("Metabolite,Class\n", encoding="utf-8")
+        result = qa_figure_outputs.write_lipidomics_qa_figures(
+            self.contract, {"outputs": {"class_summary": {"path": str(empty)}}})
+        drawn = {Path(item["file"]).name for item in result["figures"]}
+        self.assertEqual({"04_internal_standards_positive.svg", "04_internal_standards_negative.svg"}, drawn)
+        reasons = {item["file"]: item["reason"] for item in result["skipped"]}
+        self.assertIn("the class summary empty_classsummary.csv could not be read (ValueError", reasons["08_lipid_class_totals.svg"])
+        self.assertTrue(any("08_lipid_class_totals.svg" in warning for warning in result["warnings"]))
+        self.assertTrue((self.figures / "qa_report.html").is_file())
+        # A standards table that cannot be read leaves out that polarity's figure 04 alone.
+        original = qa_figure_outputs.read_height_export
+
+        def torn(path):
+            if "pos" in Path(path).name.casefold():
+                raise ValueError("torn file")
+            return original(path)
+
+        with patch.object(qa_figure_outputs, "read_height_export", side_effect=torn):
+            again = qa_figure_outputs.write_lipidomics_qa_figures(
+                self.contract, {"outputs": {"class_summary": {"path": str(empty)}}})
+        drawn = {Path(item["file"]).name for item in again["figures"]}
+        self.assertEqual({"04_internal_standards_negative.svg"}, drawn)
+        reasons = {item["file"]: item["reason"] for item in again["skipped"]}
+        self.assertIn("the positive standards table or Height matrix could not be read (ValueError: torn file)",
+                      reasons["04_internal_standards_positive.svg"])
 
 
 if __name__ == "__main__":

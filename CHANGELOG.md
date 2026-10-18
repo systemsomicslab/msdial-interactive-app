@@ -19,20 +19,40 @@ Contains 0.5.41 (#74), which is not merged yet; merge this after it.
   metrics so that it never leaves its panel. The look follows the laboratory's reference
   figures: group colours from the reference categorical palette in a fixed order over
   the sorted class names (the same group, the same colour, in every figure of a page),
-  QC near-black, Blank grey and drawn as a cross. Eight figures, each a function of
+  QC near-black, Blank grey and drawn as a cross. No hue is generated beyond the
+  palette's eight: the ninth to sixteenth study groups reuse it with squares, then
+  triangles, then diamonds, so that every group stays distinct (beyond 32 groups the
+  rest share one "other" legend entry). Eight figures, each a function of
   parsed inputs that returns SVG text or the reason it was not drawn:
   01 aligned features with a detected peak per injection; 02 summed peak height per
-  injection; 03 log10 peak-height boxplots per injection; 04 each internal standard's
+  injection (both on an axis that starts and ends on a labelled line, the line joining
+  the study injections only, never through a Blank); 03 log10 peak-height boxplots per
+  injection, the median drawn in whichever of near-black or the surface stands out on
+  the box (light on a QC box), and, where a box is narrower than 8 px, only its most
+  extreme outlier on each side and no outline, so that the figure stays small on a long
+  run; 04 each internal standard's
   height relative to its mean over the non-Blank injections, a +/-20% band and its CV in
-  the panel title; 05 a PCA of the study injections (Blank excluded) from the
+  the panel title, the subtitle naming the standards not drawn: those the standards table
+  could not resolve in that polarity, and those the resolution found but normalize did
+  not use; 05 a PCA of the study injections (Blank excluded) from the
   reference-matched features, log10(height + 1), autoscaled, by the eigenvectors of the
   samples x samples Gram matrix (cyclic Jacobi up to 80 injections, subspace iteration
   above), with explained variance, feature count and labels placed so that they do not
   overlap; 06 the sample-to-Blank ratio per feature, log10((mean sample + 1) / (mean
-  Blank + 1)), stacked by reference match, with the share at 3x or more; 07 the automatic
-  RT correction's anchor offsets per injection, used and not used, from
+  Blank + 1)), stacked by reference match, with the share at 3x or more and, beside it,
+  the QA report's `sample_blank_ratio_ge_3` computed the report's way (median Sample over
+  median Blank height, over the features detected in a Blank only): a feature with no
+  Blank signal counts as clean in the figure and is left out by the criterion; 07 the
+  automatic RT correction's anchor offsets per injection, used and not used, from
   `automatic_alignment_rt_correction_anchors.tsv`; 08 the lipid class totals per sample
-  from `lipid_metabolome4classsummary.csv`, on a log scale, classes ordered by median.
+  from `lipid_metabolome4classsummary.csv`, on a log scale, classes ordered by median,
+  one lane per group with its samples spread across it, so that samples with equal
+  totals stay separate points. The QA matrix marks `Reference matched` per injection: a
+  feature counts as reference-matched when the peak of any study injection in it is, and
+  then all its study heights enter the PCA; figure 06 counts each feature once; figure 04
+  draws the standards normalize used, not every one the resolution found. Figures drawn
+  earlier by ad-hoc code that set the unmatched peaks of a matched feature to 0, or
+  counted a feature once per flag value, show other numbers (see Validated).
   A figure the data cannot support is skipped with its reason (no Blank, no anchor file or
   one naming another run's files, fewer than three study injections or two varying
   features for the PCA, one non-Blank injection for 04, no positive concentration for
@@ -48,8 +68,15 @@ Contains 0.5.41 (#74), which is not merged yet; merge this after it.
     on): 01, 02, 03, 05, 06 and 07 into `<run directory>/qa_figures/`, with a
     self-contained `qa_report.html` (every SVG inline, a one-sentence caption and a note
     on how to read each) and `figures.json`, which records the QA matrix and the anchor
-    file by name and sha256. A figure no longer drawn has its earlier file removed. A QA
-    matrix named by `file_path` alone gets none (`not_written`): it has no run folder;
+    file by name and sha256 and the Interactive version that drew them. A figure no
+    longer drawn has its earlier file removed. A QA matrix named by `file_path` alone gets
+    none (`not_written`): it has no run folder. The matrix is read once: the QA report
+    hands each spot's parsed rows to the figures (`build_lcms_qa_report`'s new
+    `spot_observer`; the report does not depend on it and never sees its failure), so the
+    figures add their drawing, not a second read. On a synthetic 10,000-feature,
+    300-injection matrix (3 million rows) the QA took 21 s alone and 30 s with the
+    figures, so `msdial_generate_lcms_qa` now gives the request 180 s instead of 120 s,
+    as `msdial_complete_guided_analysis` already did;
   - a confirmed `msdial_lipidomics_normalize`: figure 04 for its polarity, from the run's
     Height export and the standards table just written, into
     `<root>/quant/qa_figures/`; the preview and `msdial_lipidomics_resolve_standards`
@@ -63,14 +90,23 @@ Contains 0.5.41 (#74), which is not merged yet; merge this after it.
     writes nothing.
   A figure that fails, or a step whose figures cannot be written at all, is a warning in
   the result: the QA report and its status, the normalize and the merge are exactly as
-  before.
+  before. An input that cannot be read costs only the figures it feeds (an anchor audit,
+  figure 07; the class summary, 08; a polarity's standards table or Height matrix, its
+  04; a polarity's QA matrix, its run panels), with the reason on the page and in the
+  warnings, and the reason names no path of this machine. One writer at a time works in a
+  figures folder (the backend serves requests on threads), and each file is written under
+  a temporary name of its own and renamed into place. The batch page's links to each
+  run's page are percent-encoded, so a folder name with `#`, `?`, `%` or a space works.
 
 ### Changed
 - **The publication bundle carries the run's QA figures** (`qa_figures/`: the SVG files,
   `qa_report.html` and `figures.json`) when the report is made for a job with QA. The
-  figures are drawn first when the ones in `<run directory>/qa_figures` were not drawn
-  from the same QA matrix (`figures.json`'s sha256), so a standalone
-  `msdial_generate_publication_report` has them too. Each is scanned as the bundle is;
+  figures are drawn first unless the ones in `<run directory>/qa_figures` were drawn by
+  this Interactive version from the same QA matrix and anchor audit (`figures.json`'s
+  version and sha256s) and every one is still there, so a standalone
+  `msdial_generate_publication_report` has them too and figures drawn before an upgrade
+  are never bundled; a redraw is fed by the report's own read of the matrix. Each is
+  scanned as the bundle is;
   one that names what a shared report may not is left out with a warning
   (`bundle_warnings`) rather than refusing the report. Without figures the report, its
   audit and its bundle are as before.
@@ -95,7 +131,13 @@ Contains 0.5.41 (#74), which is not merged yet; merge this after it.
   63% and 59% at 3x or more). Here a feature matched in any study injection keeps every
   study height and each feature counts once: PC1/PC2 66%/14% and 52%/18% (R's prcomp on
   the same matrix gives the same), and 55% and 55% at 3x or more. Fed the R script's
-  matrix, the PCA here reproduces its 52.06%/15.36% and 37.07%/19.74%.
+  matrix, the PCA here reproduces its 52.06%/15.36% and 37.07%/19.74%. Beside that share,
+  figure 06 prints the QA criterion as the QA report computes it, 45% (482 of 1,075
+  Blank-detected features) and 23% (209 of 906), equal to the run's
+  `sample_blank_ratio_ge_3` (0.448 and 0.231). The positive figure 04 names FA 18:0(d3)
+  as not resolved in that polarity; the negative one names CE, MG, DG and TG as not
+  resolved and FA 16:0(d3) as resolved but not used by normalize. The figures fed by the
+  QA report's read of each matrix equal those from a read of their own.
 
 ## [0.5.41] - Unreleased
 

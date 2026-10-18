@@ -276,8 +276,9 @@ The **7. Publication report** workspace generates an English Materials and
 Methods draft, a separate QA Results draft, an Excel supplementary workbook, a
 long-format supplementary TSV, and a machine-readable JSON audit file. The
 complete reporting bundle contains all five files and, when the report is made
-for a job with QA, the run's QA figures under `qa_figures/` (drawn first when the
-figures beside the run were not drawn from the same QA matrix). The two manuscript drafts
+for a job with QA, the run's QA figures under `qa_figures/` (drawn first unless the
+figures beside the run were drawn by this version from the same QA matrix and
+RT-correction audit). The two manuscript drafts
 remain editable in the browser and can be copied or downloaded after editing.
 
 The Excel workbook is the primary human-readable supplementary output:

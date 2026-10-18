@@ -51,8 +51,11 @@ BLANK_COLOR = "#8a8984"
 QC_COLOR = "#3b3a36"
 OTHER_COLOR = "#6f6e69"
 # The reference categorical palette, in its fixed order (blue, orange, aqua, yellow, magenta,
-# green, violet, red). A ninth group is not given a generated hue; it is drawn as "other".
+# green, violet, red). No hue is generated beyond it: from the ninth study group on, the palette
+# is reused with a second channel, the marker shape (SHAPES, eight groups each), so that every
+# group stays distinct; groups beyond len(SERIES) * len(SHAPES) are drawn as "other".
 SERIES = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948")
+SHAPES = ("dot", "square", "triangle", "diamond")
 REFERENCE_MATCHED_COLOR = SERIES[0]
 FONT_FAMILY = "Helvetica, Arial, 'Liberation Sans', sans-serif"
 
@@ -80,6 +83,8 @@ STANDARD_BAND = (80.0, 120.0)
 # Above this many study injections the PCA eigenproblem is solved by subspace iteration
 # instead of Jacobi rotations, which are exact but cubic in pure Python.
 JACOBI_LIMIT = 80
+# Below this box spacing (px) figure 03 draws one outlier per side of a box and no grid line per box.
+OUTLIER_BAND_LIMIT = 8.0
 # Panels drawn per run in the RT-correction figure, at most.
 RT_PANEL_LIMIT = 48
 # Above this many injections in a PCA panel its points are not labelled (each keeps its tooltip).
@@ -130,6 +135,9 @@ class RunQa:
     summed: list[float]
     height_bins: list[dict[int, int]]
     blank_ratios: list[tuple[float, bool]] = field(default_factory=list)
+    # The QA report's sample_blank_ratio_ge_3, exactly: (features at >= 3x, features counted), over the
+    # features detected in a Blank and in a Sample, as median Sample height / median Blank height (> 0).
+    blank_criterion: tuple[int, int] | None = None
     pca_matrix: list[list[float]] = field(default_factory=list)  # features x pca_injections
     pca_injections: list[int] = field(default_factory=list)  # indices into injections
     pca_reference_matched: int = 0
@@ -219,8 +227,8 @@ FIGURES: dict[str, dict[str, str]] = {
     "06": {
         "file": "06_sample_blank_ratio.svg",
         "title": "Sample-to-Blank ratio per aligned feature",
-        "caption": "Each aligned feature's mean height over the Sample injections divided by its mean height in the Blank injections, as log10 of (sample + 1) / (blank + 1), with the share of features at or above 3x.",
-        "how": "Features left of the dashed line are about as high in the Blank as in the samples and are likely background or carryover; blue marks the reference-matched ones. MS-DIAL's QA report applies its own median-based ratio; this figure uses means.",
+        "caption": "Each aligned feature's mean height over the Sample injections divided by its mean height in the Blank injections, as log10 of (sample + 1) / (blank + 1), with the share of features at or above 3x and, beside it, the QA report's criterion of the same name.",
+        "how": "Features left of the dashed line are about as high in the Blank as in the samples and are likely background or carryover; blue marks the reference-matched ones. A feature with no Blank signal counts here, at or above 3x. The QA criterion (sample_blank_ratio_ge_3 in the QA results) is computed differently: median Sample over median Blank height, over the features detected in a Blank only, so it leaves out the features this figure counts as clean and is usually the lower of the two.",
     },
     "07": {
         "file": "07_rt_correction_offsets.svg",
@@ -256,17 +264,53 @@ def group_sort_key(name: str) -> tuple[int, str, str]:
     return (special, name.casefold(), name)
 
 
-def group_colors(groups: Iterable[str]) -> dict[str, str]:
+class GroupColors(dict):
+    """Each group's colour (the mapping), and the marker shape that sets apart groups sharing one."""
+
+    def __init__(self, colors: dict[str, str], shapes: dict[str, str]) -> None:
+        super().__init__(colors)
+        self.shapes = shapes
+
+
+def group_colors(groups: Iterable[str]) -> GroupColors:
     """Each group's colour: the palette in its fixed order over the sorted study groups.
 
     The same groups give the same colours in every figure of a page, whichever figure
-    shows which of them; QC is near-black and Blank grey whatever else is present.
+    shows which of them; QC is near-black and Blank grey whatever else is present. The
+    ninth to sixteenth study groups reuse the palette with squares, the next eight with
+    triangles, then diamonds (group_shape); beyond those a group is "other" grey.
     """
     names = sorted({name for name in groups if name not in (QC_GROUP, BLANK_GROUP)}, key=group_sort_key)
-    colors = {name: (SERIES[index] if index < len(SERIES) else OTHER_COLOR) for index, name in enumerate(names)}
+    styles = len(SERIES) * len(SHAPES)
+    colors = {name: (SERIES[index % len(SERIES)] if index < styles else OTHER_COLOR) for index, name in enumerate(names)}
+    shapes = {name: SHAPES[index // len(SERIES)] for index, name in enumerate(names) if index < styles}
     colors[QC_GROUP] = QC_COLOR
     colors[BLANK_GROUP] = BLANK_COLOR
-    return colors
+    return GroupColors(colors, shapes)
+
+
+def group_shape(colors: dict[str, str], group: str) -> str:
+    """The marker of a group: a cross for the Blank, else the shape group_colors gave it (a dot)."""
+    if group == BLANK_GROUP:
+        return "cross"
+    return getattr(colors, "shapes", {}).get(group, "dot")
+
+
+def _luminance(color: str) -> float:
+    """WCAG relative luminance of a #rrggbb colour."""
+    channels = [int(color[index:index + 2], 16) / 255.0 for index in (1, 3, 5)]
+    linear = [value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4 for value in channels]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def contrast_ratio(first: str, second: str) -> float:
+    light, dark = sorted((_luminance(first), _luminance(second)), reverse=True)
+    return (light + 0.05) / (dark + 0.05)
+
+
+def ink_on(fill: str) -> str:
+    """The line colour that stands out on a fill: the surface on a dark fill, near-black on a light one."""
+    return SURFACE if contrast_ratio(SURFACE, fill) >= contrast_ratio(QC_COLOR, fill) else QC_COLOR
 
 
 def ordered_groups(groups: Iterable[str]) -> list[str]:
@@ -446,6 +490,19 @@ def linear_ticks(low: float, high: float, target: int = 5) -> tuple[list[float],
     return ticks, step
 
 
+def nice_axis(low: float, high: float, target: int = 5) -> tuple[float, float, list[float], float]:
+    """A domain that starts and ends on a tick, so that every value lies between two labelled lines.
+
+    The step is chosen for [low, high]; the domain then widens to the multiples of the step around them.
+    """
+    step = nice_step(high - low, target)
+    first = math.floor(low / step + 1e-9)
+    last = math.ceil(high / step - 1e-9)
+    if last <= first:
+        last = first + 1
+    return first * step, last * step, [index * step for index in range(first, last + 1)], step
+
+
 def integer_ticks(low: float, high: float, target: int = 8) -> tuple[list[float], float]:
     """Ticks on whole numbers only, every one where few fit."""
     span = high - low
@@ -541,8 +598,12 @@ class Canvas:
         )
 
     def marker(self, x: float, y: float, shape: str, color: str, *, radius: float = POINT_RADIUS,
-               tooltip: str | None = None) -> None:
+               tooltip: str | None = None, translucent: bool = False) -> None:
+        """A point. translucent draws a filled shape at 55% opacity outlined in its own colour, so that
+        points drawn over one another darken instead of hiding each other."""
         title = f"<title>{escape(tooltip)}</title>" if tooltip else ""
+        paint = (f'fill="{color}" fill-opacity="0.55" stroke="{color}" stroke-width="1"' if translucent
+                 else f'fill="{color}" stroke="{SURFACE}" stroke-width="1"')
         if shape == "cross":
             r = radius * 0.95
             path = (f"M{num(x - r)},{num(y - r)}L{num(x + r)},{num(y + r)}"
@@ -554,15 +615,22 @@ class Canvas:
                 f'stroke-width="1.3">{title}</circle>'
             )
         elif shape == "square":
+            r = radius * 0.9
             self.add(
-                f'<rect x="{num(x - radius)}" y="{num(y - radius)}" width="{num(2 * radius)}" '
-                f'height="{num(2 * radius)}" fill="{color}" rx="1">{title}</rect>'
+                f'<rect x="{num(x - r)}" y="{num(y - r)}" width="{num(2 * r)}" '
+                f'height="{num(2 * r)}" {paint}>{title}</rect>'
             )
+        elif shape == "triangle":
+            r = radius * 1.15
+            path = (f"M{num(x)},{num(y - r)}L{num(x + r * 0.866)},{num(y + r * 0.5)}"
+                    f"L{num(x - r * 0.866)},{num(y + r * 0.5)}Z")
+            self.add(f'<path d="{path}" {paint}>{title}</path>')
+        elif shape == "diamond":
+            r = radius * 1.15
+            path = f"M{num(x)},{num(y - r)}L{num(x + r)},{num(y)}L{num(x)},{num(y + r)}L{num(x - r)},{num(y)}Z"
+            self.add(f'<path d="{path}" {paint}>{title}</path>')
         else:
-            self.add(
-                f'<circle cx="{num(x)}" cy="{num(y)}" r="{num(radius)}" fill="{color}" stroke="{SURFACE}" '
-                f'stroke-width="1">{title}</circle>'
-            )
+            self.add(f'<circle cx="{num(x)}" cy="{num(y)}" r="{num(radius)}" {paint}>{title}</circle>')
 
     def render(self, height: float, key: str, title: str, description: str) -> str:
         identifier = re.sub(r"[^A-Za-z0-9]+", "-", key).strip("-") or "figure"
@@ -588,13 +656,13 @@ def legend_width(items: Sequence[tuple[str, str, str]]) -> list[float]:
 
 def draw_header(
     canvas: Canvas, left: float, right: float, title: str, subtitle: str,
-    legend: Sequence[tuple[str, str, str]] = (),
+    legend: Sequence[tuple[str, str, str]] = (), max_lines: int = 3,
 ) -> float:
     """Title, wrapped subtitle and a centred legend; returns where the body may start."""
     width = right - left
     y = 32.0
     canvas.text(left, y, fit_text(title, width, TITLE_SIZE, bold=True), size=TITLE_SIZE, color=INK, bold=True)
-    for line in wrap_text(subtitle, width, SUBTITLE_SIZE) if subtitle else []:
+    for line in wrap_text(subtitle, width, SUBTITLE_SIZE, max_lines=max_lines) if subtitle else []:
         y += 20
         canvas.text(left, y, line, size=SUBTITLE_SIZE, color=INK_SECONDARY)
     if legend:
@@ -663,8 +731,18 @@ def tick_label_width(ticks: Sequence[float], step: float,
 
 
 def group_legend(groups: Iterable[str], colors: dict[str, str]) -> list[tuple[str, str, str]]:
-    return [(name, colors.get(name, OTHER_COLOR), "cross" if name == BLANK_GROUP else "dot")
-            for name in ordered_groups(groups)]
+    """One entry per group in its colour and shape; groups beyond the palette's styles share one entry."""
+    entries = []
+    others = 0
+    for name in ordered_groups(groups):
+        color = colors.get(name, OTHER_COLOR)
+        if color == OTHER_COLOR and name not in (QC_GROUP, BLANK_GROUP):
+            others += 1
+            continue
+        entries.append((name, color, group_shape(colors, name)))
+    if others:
+        entries.append((f"{others} other group(s), not told apart", OTHER_COLOR, "dot"))
+    return entries
 
 
 def _figure(key: str, svg: str | None = None, skipped: str | None = None, **values: str) -> FigureOutput:
@@ -1000,7 +1078,10 @@ def _per_injection_figure(
     for run in runs:
         values = [value / divisor for value in values_of(run)]
         low, high = padded(min(values), max(values))
-        ticks, step = linear_ticks(low, high, 6)
+        if low < 0 <= min(values):
+            low = 0.0  # a count or a sum is never negative
+        # The domain ends on ticks, so that the study injections are read between labelled lines.
+        low, high, ticks, step = nice_axis(low, high, 6)
         xs, x_label = _x_positions(run)
         facets.append((run, values, low, high, ticks, step, xs, x_label))
         label_width = max(label_width, tick_label_width(ticks, step))
@@ -1024,12 +1105,14 @@ def _per_injection_figure(
         x_axis(canvas, x_scale, x_ticks, x_step, panel_top, panel_bottom)
         y_axis(canvas, y_scale, ticks, step, panel_left, panel_right)
         points = [(x_scale(x), y_scale(value)) for x, value in zip(xs, values)]
-        canvas.polyline(sorted(points), CONNECTOR, 1.3)
+        # The connector joins the study injections only; a Blank between them would make drift a zigzag.
+        canvas.polyline(sorted(point for point, injection in zip(points, run.injections)
+                               if injection.group != BLANK_GROUP), CONNECTOR, 1.3)
         spacing = (panel_right - panel_left) / max(1, len(points))
         radius = max(2.2, min(POINT_RADIUS, spacing * 0.42))
         for injection, (px, py), value in zip(run.injections, points, values):
             group = injection.group
-            canvas.marker(px, py, "cross" if group == BLANK_GROUP else "dot", colors.get(group, OTHER_COLOR),
+            canvas.marker(px, py, group_shape(colors, group), colors.get(group, OTHER_COLOR),
                           radius=radius, tooltip=tooltip(injection, value * divisor))
         bottom = max(bottom, panel_bottom)
     x_label = facets[0][7]
@@ -1086,11 +1169,17 @@ def height_distribution_figure(runs: Sequence[RunQa], colors: dict[str, str] | N
     y_label = "log10 height"
     left = _left_margin(y_label)
     groups = {item.group for run in runs for item in run.injections}
-    legend = [(name, colors.get(name, OTHER_COLOR), "bar") for name in ordered_groups(groups)]
-    top = draw_header(canvas, left, width - MARGIN, info["title"], "Aligned features with height > 0, in injection order",
-                      legend)
+    # Groups that reuse a colour are told apart by a marker under each box, as in the other figures.
+    shaped = any(group_shape(colors, name) not in ("dot", "cross") for name in groups)
+    legend = [(name, colors.get(name, OTHER_COLOR), group_shape(colors, name) if shaped else "bar")
+              for name in ordered_groups(groups)]
     panel_left = left + tick_label_width(ticks, step) + 8
     panel_right = width - MARGIN
+    thinned = any((panel_right - panel_left) / len(run.injections) < OUTLIER_BAND_LIMIT for run in runs)
+    subtitle = ("Aligned features with height > 0, in injection order"
+                + (f"; where a box is narrower than {OUTLIER_BAND_LIMIT:g} px only its most extreme outlier on "
+                   "each side is drawn" if thinned else ""))
+    top = draw_header(canvas, left, width - MARGIN, info["title"], subtitle, legend)
     panel_height = 250.0 if len(runs) > 1 else 320.0
     y = top
     label_room = 24.0
@@ -1103,6 +1192,7 @@ def height_distribution_figure(runs: Sequence[RunQa], colors: dict[str, str] | N
         y_axis(canvas, y_scale, ticks, step, panel_left, panel_right)
         count = len(run.injections)
         band = (panel_right - panel_left) / count
+        narrow = band < OUTLIER_BAND_LIMIT
         box_width = min(70.0, band * 0.65)
         last = run_index == len(runs) - 1
         labels = [fit_text(item.label, 150, TICK_SIZE) for item in run.injections]
@@ -1114,20 +1204,36 @@ def height_distribution_figure(runs: Sequence[RunQa], colors: dict[str, str] | N
             label_room = max(text_width(label, TICK_SIZE) for label in labels) * 0.58 + 22
         for index, (injection, item) in enumerate(zip(run.injections, run_stats)):
             centre = panel_left + band * (index + 0.5)
-            canvas.line(centre, panel_top, centre, panel_bottom, GRID, 0.8)
+            if not narrow:
+                canvas.line(centre, panel_top, centre, panel_bottom, GRID, 0.8)
             if item:
                 color = colors.get(injection.group, OTHER_COLOR)
-                for value in item["outliers"]:
+                outliers = item["outliers"]
+                if narrow and outliers:
+                    # One point per side at most: a box this narrow cannot show the rest, and the
+                    # figure (inlined in the page and the bundle) would grow with every injection.
+                    median_value = item["median"]
+                    below = [value for value in outliers if value < median_value]
+                    above = [value for value in outliers if value > median_value]
+                    outliers = ([min(below)] if below else []) + ([max(above)] if above else [])
+                for value in outliers:
                     canvas.add(f'<circle cx="{num(centre)}" cy="{num(y_scale(value))}" r="1.4" fill="{MUTED}"/>')
-                canvas.line(centre, y_scale(item["whisker_low"]), centre, y_scale(item["q1"]), INK_SECONDARY, 0.9)
-                canvas.line(centre, y_scale(item["q3"]), centre, y_scale(item["whisker_high"]), INK_SECONDARY, 0.9)
+                # Narrow boxes keep their fill visible: lighter whiskers and no outline.
+                whisker = (MUTED, 0.6) if narrow else (INK_SECONDARY, 0.9)
+                canvas.line(centre, y_scale(item["whisker_low"]), centre, y_scale(item["q1"]), *whisker)
+                canvas.line(centre, y_scale(item["q3"]), centre, y_scale(item["whisker_high"]), *whisker)
                 tooltip = (f"{injection.label} (injection {injection.order}): median {item['median']:.2f}, "
                            f"IQR {item['q1']:.2f} to {item['q3']:.2f}, {format_count(item['count'])} features")
                 canvas.rect(centre - box_width / 2, y_scale(item["q3"]), box_width,
-                            y_scale(item["q1"]) - y_scale(item["q3"]), color, stroke=INK_SECONDARY,
-                            stroke_width=0.8, tooltip=tooltip)
+                            y_scale(item["q1"]) - y_scale(item["q3"]), color,
+                            stroke=None if narrow else INK_SECONDARY, stroke_width=0.8, tooltip=tooltip)
+                # The median in a colour that stands out on the box: light on QC near-black and other
+                # dark fills, near-black on light ones.
                 canvas.line(centre - box_width / 2, y_scale(item["median"]), centre + box_width / 2,
-                            y_scale(item["median"]), QC_COLOR, 1.8)
+                            y_scale(item["median"]), ink_on(color), 1.8)
+            if shaped:
+                canvas.marker(centre, panel_bottom - 7, group_shape(colors, injection.group),
+                              colors.get(injection.group, OTHER_COLOR), radius=min(3.2, max(1.6, band * 0.3)))
             if last and index % every == 0:
                 if upright:
                     canvas.text(centre, panel_bottom + 16, labels[index], anchor="middle")
@@ -1147,16 +1253,22 @@ def height_distribution_figure(runs: Sequence[RunQa], colors: dict[str, str] | N
 
 def internal_standard_figure(
     polarity: str, injections: Sequence[Injection], standards: Sequence[StandardResponse],
-    colors: dict[str, str] | None = None,
+    colors: dict[str, str] | None = None, notes: Sequence[str] = (),
 ) -> FigureOutput:
-    """04: each standard's height relative to its mean over the non-Blank injections, small multiples."""
+    """04: each standard's height relative to its mean over the non-Blank injections, small multiples.
+
+    notes are sentences the subtitle carries about the standards not drawn: those the standards table
+    names but could not resolve in this polarity, and those resolved but not used by normalize.
+    """
     key = "04"
     slug = polarity.casefold() or "run"
     info = figure_info(key, polarity=slug, label=polarity or "run")
     study = [index for index, item in enumerate(injections) if item.category != "Blank"]
     if not standards:
-        return _figure(key, skipped="normalize used no resolved internal standard in this polarity",
-                       polarity=slug, label=polarity or "run")
+        reason = "normalize used no resolved internal standard in this polarity"
+        if notes:
+            reason += " (" + "; ".join(note.rstrip(".") for note in notes) + ")"
+        return _figure(key, skipped=reason, polarity=slug, label=polarity or "run")
     if len(study) < 2:
         return _figure(key, skipped=f"a response across samples needs at least two non-Blank injections; there are {len(study)}",
                        polarity=slug, label=polarity or "run")
@@ -1187,8 +1299,10 @@ def internal_standard_figure(
     left = _left_margin(y_label)
     groups = {item.group for item in study_items}
     subtitle = (f"Height relative to the standard's mean over the {len(study)} non-Blank injections; "
-                f"band = +/- 20%; {len(panels)} standard(s) normalize used")
-    top = draw_header(canvas, left, width - MARGIN, info["title"], subtitle, group_legend(groups, colors))
+                f"band = +/- 20%; {len(panels)} standard{'' if len(panels) == 1 else 's'} used by normalize"
+                + "".join(f". {note.rstrip('.')}" for note in notes))
+    top = draw_header(canvas, left, width - MARGIN, info["title"], subtitle, group_legend(groups, colors),
+                      max_lines=5)
     label_width = tick_label_width(ticks, step) + 8
     gap = 12.0
     cell = (width - MARGIN - left - label_width - gap * (columns - 1)) / columns
@@ -1225,7 +1339,8 @@ def internal_standard_figure(
             points.append((x_scale(x), y_scale(value), injection, value, height))
         canvas.polyline([(px, py) for px, py, _, _, _ in points], CONNECTOR, 1.2)
         for px, py, injection, value, height in points:
-            canvas.marker(px, py, "dot", colors.get(injection.group, OTHER_COLOR), radius=3.8,
+            canvas.marker(px, py, group_shape(colors, injection.group), colors.get(injection.group, OTHER_COLOR),
+                          radius=3.8,
                           tooltip=f"{injection.label} (injection {injection.order}): {value:.0f}% of mean, height {format_value(height or 0.0)}")
     bottom = top + rows * (panel_height + 62) - 26
     height = _axis_titles(canvas, left + label_width, width - MARGIN, top, bottom, x_label, y_label, x_offset=42)
@@ -1365,7 +1480,8 @@ def pca_figure(runs: Sequence[RunQa], colors: dict[str, str] | None = None) -> F
         labelled = len(points) <= PCA_LABEL_LIMIT
         labels = _place_labels(points, panel_left, panel_right, panel_top, panel_bottom) if labelled else []
         for (px, py, _), item, a, b in zip(points, injections, pc1, pc2):
-            canvas.marker(px, py, "dot", colors.get(item.group, OTHER_COLOR), radius=5.0 if labelled else 3.6,
+            canvas.marker(px, py, group_shape(colors, item.group), colors.get(item.group, OTHER_COLOR),
+                          radius=5.0 if labelled else 3.6,
                           tooltip=f"{item.label} (injection {item.order}): PC1 {a:.2f}, PC2 {b:.2f}")
         for lx, ly, text, anchor in labels:
             canvas.text(lx, ly, text, anchor=anchor, color=INK_SECONDARY)
@@ -1410,7 +1526,8 @@ def sample_blank_ratio_figure(runs: Sequence[RunQa]) -> FigureOutput:
     legend = [("Reference matched", REFERENCE_MATCHED_COLOR, "bar"), ("Not reference matched", CONNECTOR, "bar")]
     sample_counts = sorted({sum(1 for item in run.injections if item.category == "Sample") for run in usable})
     subtitle = (f"Mean of the {' / '.join(map(str, sample_counts))} Sample injections over the Blank mean, per feature; "
-                "dashed line = 3x (MS-DIAL's QA report uses its own median-based ratio)")
+                "a feature with no Blank signal counts at or above 3x here; dashed line = 3x. The QA criterion "
+                "beside it is the QA report's: median heights, over the features detected in a Blank only")
     top = draw_header(canvas, left, width - MARGIN, info["title"], subtitle, legend)
     panel_left = left + tick_label_width(y_ticks, y_step) + 8
     panel_right = width - MARGIN
@@ -1451,8 +1568,20 @@ def sample_blank_ratio_figure(runs: Sequence[RunQa]) -> FigureOutput:
         line_x = x_scale(threshold)
         canvas.line(line_x, panel_top, line_x, panel_bottom, INK, 1.0, dash="4 3")
         share = share_at_least(run.blank_ratios)
+        lines = []
         if share is not None:
-            canvas.text(line_x + 8, panel_top + 16, f"{share * 100:.0f}% of features at >= 3x", color=INK, size=12.0)
+            lines.append((f"{share * 100:.0f}% of features at >= 3x by mean (no Blank signal counts as >= 3x)", INK))
+        if run.blank_criterion is not None:
+            at_least, counted = run.blank_criterion
+            lines.append((
+                (f"QA criterion (median, {format_count(counted)} Blank-detected features): {at_least / counted * 100:.0f}%"
+                 if counted else "QA criterion: no feature detected in both a Blank and a Sample"), INK_SECONDARY))
+        widest = max((text_width(text, 12.0) for text, _ in lines), default=0.0)
+        # Beside the line, on whichever side has room for the text.
+        anchor, text_x = ("start", line_x + 8) if line_x + 8 + widest <= panel_right - 4 else ("end", line_x - 8)
+        for position, (text, color) in enumerate(lines):
+            canvas.text(text_x, panel_top + 16 + 16 * position, fit_text(text, panel_right - panel_left - 16, 12.0),
+                        color=color, size=12.0, anchor=anchor)
         y = panel_bottom + (6 if not last else 0)
     height = _axis_titles(canvas, panel_left, panel_right, top, y, "log10(sample / blank)", y_label)
     return _figure(key, svg=_render(canvas, height, key, info["title"], info["caption"]))
@@ -1649,8 +1778,12 @@ def lipid_class_totals_figure(table: ClassTotals, unit: str = "", colors: dict[s
     unit_text = unit_label(unit)
     subtitle = ("Sum of quantified lipids in each class" + (f", {unit_text}" if unit_text else "") + ", log scale"
                 + (f"; {dropped} empty or zero cell(s) left out" if dropped else ""))
+    subtitle += "; each group has its own lane and its samples are spread across it, in sample order"
     top = draw_header(canvas, MARGIN, width - MARGIN, info["title"], subtitle, group_legend(groups, colors))
-    row_height = 22.0
+    # One lane per group in each class's row, and the group's samples spread over the lane: samples
+    # with nearly equal totals stay separate points instead of one.
+    lane = 14.0 if len(groups) <= 2 else 12.0
+    row_height = max(22.0, lane * len(groups) + 4.0)
     panel_left = left
     panel_right = width - MARGIN
     panel_top = top
@@ -1667,16 +1800,20 @@ def lipid_class_totals_figure(table: ClassTotals, unit: str = "", colors: dict[s
                 if low < value < high:
                     x = x_scale(value)
                     canvas.line(x, panel_top, x, panel_bottom, GRID, 0.4)
-    spread = 0.5 / max(1, len(groups))
     for row, klass in enumerate(classes):
         centre = panel_top + row_height * (row + 0.5)
         canvas.line(panel_left, centre, panel_right, centre, GRID, 0.8)
         canvas.text(panel_left - 8, centre + 4, fit_text(klass, class_width - 10, TICK_SIZE), anchor="end",
                     color=INK_SECONDARY)
-        for value, group, sample in sorted(entries[klass], key=lambda item: (group_sort_key(item[1]), item[2])):
-            offset = (groups.index(group) - (len(groups) - 1) / 2) * spread * row_height
-            canvas.marker(x_scale(math.log10(value)), centre + offset, "dot", colors.get(group, OTHER_COLOR),
-                          radius=4.0, tooltip=f"{klass}, {sample} ({group}): {format_value(value)}")
+        for lane_index, group in enumerate(groups):
+            members = sorted((sample, value) for value, member_group, sample in entries[klass] if member_group == group)
+            lane_centre = centre + (lane_index - (len(groups) - 1) / 2) * lane
+            half = 0.32 * lane if len(members) > 1 else 0.0
+            for position, (sample, value) in enumerate(members):
+                offset = -half + 2 * half * position / (len(members) - 1) if len(members) > 1 else 0.0
+                canvas.marker(x_scale(math.log10(value)), lane_centre + offset, group_shape(colors, group),
+                              colors.get(group, OTHER_COLOR), radius=3.5, translucent=True,
+                              tooltip=f"{klass}, {sample} ({group}): {format_value(value)}")
     x_label = unit_text or "Concentration"
     height = _axis_titles(canvas, panel_left, panel_right, panel_top, panel_bottom, x_label, "")
     return _figure(key, svg=_render(canvas, height, key, info["title"], info["caption"]))

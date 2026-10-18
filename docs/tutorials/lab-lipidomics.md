@@ -576,16 +576,29 @@ also an SVG file beside it, and each run has its own page in its `qa_figures` fo
 | 01 detected features per injection | aligned features with a peak (height > 0, gap-filled included) in each injection, in injection order; the Blank far below the samples |
 | 02 summed peak height per injection | run-order drift of the total signal |
 | 03 peak-height distribution | log10 height boxplots per injection |
-| 04 internal standards, per polarity | each standard normalize used, its height relative to its mean over the non-Blank injections, a +/-20% band and its CV |
+| 04 internal standards, per polarity | each standard normalize used, its height relative to its mean over the non-Blank injections, a +/-20% band and its CV; the subtitle names the standards not drawn (not resolved in that polarity, or resolved but not used by normalize) |
 | 05 PCA of the injections | PC1 and PC2 of the study injections (Blank excluded) from the reference-matched features, log10(height + 1), autoscaled |
-| 06 sample-to-Blank ratio | per aligned feature, log10 of the mean sample height over the Blank's, reference-matched features in blue, and the share at 3x or more |
+| 06 sample-to-Blank ratio | per aligned feature, log10 of the mean sample height over the Blank's, reference-matched features in blue, the share at 3x or more, and beside it the QA report's criterion of the same name |
 | 07 RT-correction anchors | each anchor's observed minus reference RT, per injection, used and not used |
-| 08 lipid class totals | each class's summed concentration per sample, from `lipid_metabolome4classsummary.csv` |
+| 08 lipid class totals | each class's summed concentration per sample, from `lipid_metabolome4classsummary.csv`, one lane per group |
 
 A figure the data cannot support is not drawn, and the page says why: figure 07 needs
 the run's RT-correction audit, and a PCA at least three study injections. The figures
 are kept out of
 `analysis\quant\lipidome\`, so `metabolomics_service.R` never reads them.
+
+**If you compare them with figures drawn earlier by hand.** The QA matrix marks
+`Reference matched` per injection, not per feature. Here a feature counts as
+reference-matched when the peak of any study injection in it is, and then all of its
+study heights enter the PCA; figure 06 counts each feature once; figure 04 draws the
+standards normalize used, not every standard the resolution found. A plotting script that
+set a height to 0 wherever that injection's own peak was not matched, or counted a
+feature once per flag value, gives other numbers: for the demo, PC1/PC2 52%/15%
+(positive) and 37%/20% (negative) instead of 66%/14% and 52%/18%, and 63%/59% at 3x or
+more instead of 55%/55%. Figure 06's share also differs from the QA report's
+`sample_blank_ratio_ge_3` (45% and 23% for the demo): the figure uses means and counts a
+feature with no Blank signal as clean, while the criterion uses medians over the features
+detected in a Blank only. The figure prints both.
 
 **Reading the QA report.** The QA report evaluates prespecified criteria from QC
 injections, blanks and run order, and says which it could not assess and why. The demo

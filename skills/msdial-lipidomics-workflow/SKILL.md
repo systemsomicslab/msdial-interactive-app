@@ -592,7 +592,12 @@ every skipped figure and why (a run without the RT-correction audit has no figur
 and a PCA needs at least three study injections). The figures describe the data; they decide nothing, and they never change the QA report or
 its status. Two of them count differently from a quick script: the PCA keeps every study
 height of a feature that is reference matched in at least one study injection, and the
-sample-to-Blank histogram counts each aligned feature once.
+sample-to-Blank histogram counts each aligned feature once. Figure 06 prints two shares:
+its own, by means, where a feature with no Blank signal counts as clean, and the QA
+report's `sample_blank_ratio_ge_3`, by medians over the features detected in a Blank
+only; when you report blank separation, quote the criterion and say which is which.
+Figure 04's subtitle names the standards it does not draw (not resolved in that
+polarity, or resolved but not used by normalize); say them with the figure.
 
 ## L. Save the method, and report
 
