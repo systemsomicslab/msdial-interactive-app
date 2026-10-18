@@ -137,10 +137,18 @@ If individual control is needed after a successful run:
 
 1. Call `msdial_interactive_validate_mztab` with the completed `job_id` and report pass, warning, and failure counts.
 2. Call `msdial_interactive_preview_mztab` with the same `job_id` for a compact content sanity check.
-3. For requested LC-MS QA, call `msdial_generate_lcms_qa` with the same `job_id`. A missing job-owned QA matrix is an error; never search for an older matrix. Distinguish passed, failed, and not-evaluable checks.
+3. For requested LC-MS QA, call `msdial_generate_lcms_qa` with the same `job_id`. A missing job-owned QA matrix is an error; never search for an older matrix. Distinguish passed, failed, and not-evaluable checks. Report the QA figures it drew (see QA figures below).
 4. When requested, call `msdial_generate_publication_report` with the same `job_id`. Set `run_qa=false` when publication files should be generated without QA. Return the Materials and Methods file, QA Results file, supplementary Excel workbook, audit JSON, and bundle paths.
 5. Call `msdial_interactive_create_handoff` when downstream PCA, UMAP, HCA, chromatogram visualization, or other data-mining tools will consume the mzTab-M output.
 6. Ask whether to save the accepted scientific choices as a workset. Call `msdial_save_workset` only when the user agrees and provides a name.
+
+### QA figures
+
+Job-scoped LC-MS QA (`msdial_generate_lcms_qa` with a `job_id` or `manifest_path`, and `msdial_complete_guided_analysis`) also draws the QA figures into `<run directory>/qa_figures/`: detected features, summed height and peak-height distribution per injection, a PCA of the study injections from the reference-matched features, the sample-to-Blank ratio per feature, and the automatic RT-correction anchor offsets, each as an SVG file, with a self-contained `qa_report.html` that shows them all with a caption and a note on how to read each one. The result's `qa_figures` names the folder, the page and each figure's file and title; a figure the run cannot support (no Blank, no RT-correction audit, fewer than three study injections) is listed under `skipped` with its reason, and `warnings` says when drawing failed. The figures never change the QA report or its status. The publication bundle carries the same figures under `qa_figures/`.
+
+- Show the person the paths of `qa_report.html` and the figures, and offer to open the page; read out the skipped figures and their reasons.
+- Do not write your own plotting code (R, Python or otherwise) for these QA figures, and do not read the SVG text into the conversation: the paths are the result. Plot something else only when the person asks for a figure these do not cover.
+- A QA matrix named by `file_path` alone gets no figures (`qa_figures.status` is `not_written`): there is no run folder to write them into.
 
 Do not store raw-data paths or output directories in reusable worksets. Preserve accepted peak-picking thresholds and other scientific choices; each run supplies its own input and output locations.
 

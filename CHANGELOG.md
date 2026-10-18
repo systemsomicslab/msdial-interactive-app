@@ -4,6 +4,99 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.42] - Unreleased
+
+Contains 0.5.41 (#74), which is not merged yet; merge this after it.
+
+### Added
+- **QA figures, drawn automatically inside the analysis flow** (the user's request of
+  2026-10-18, after the laboratory lipidomics agent's first end-to-end run on a Mac:
+  QA came out as tables only, and the agent wrote and ran its own R script for the
+  figures, at a cost in tokens). `msdial_app/qa_figures.py` is a small SVG plotting
+  layer on the standard library only (no numpy, matplotlib or R): nice-number axes,
+  small multiples, points and lines, boxplots, stacked histograms, a horizontal dot
+  plot, legends, titles and wrapped subtitles, and text shortened from Helvetica's
+  metrics so that it never leaves its panel. The look follows the laboratory's reference
+  figures: group colours from the reference categorical palette in a fixed order over
+  the sorted class names (the same group, the same colour, in every figure of a page),
+  QC near-black, Blank grey and drawn as a cross. Eight figures, each a function of
+  parsed inputs that returns SVG text or the reason it was not drawn:
+  01 aligned features with a detected peak per injection; 02 summed peak height per
+  injection; 03 log10 peak-height boxplots per injection; 04 each internal standard's
+  height relative to its mean over the non-Blank injections, a +/-20% band and its CV in
+  the panel title; 05 a PCA of the study injections (Blank excluded) from the
+  reference-matched features, log10(height + 1), autoscaled, by the eigenvectors of the
+  samples x samples Gram matrix (cyclic Jacobi up to 80 injections, subspace iteration
+  above), with explained variance, feature count and labels placed so that they do not
+  overlap; 06 the sample-to-Blank ratio per feature, log10((mean sample + 1) / (mean
+  Blank + 1)), stacked by reference match, with the share at 3x or more; 07 the automatic
+  RT correction's anchor offsets per injection, used and not used, from
+  `automatic_alignment_rt_correction_anchors.tsv`; 08 the lipid class totals per sample
+  from `lipid_metabolome4classsummary.csv`, on a log scale, classes ordered by median.
+  A figure the data cannot support is skipped with its reason (no Blank, no anchor file or
+  one naming another run's files, fewer than three study injections or two varying
+  features for the PCA, one non-Blank injection for 04, no positive concentration for
+  08, a missing polarity); an empty or non-numeric height counts as not detected and the
+  page says how many there were. Nothing depends on a clock or a random number: the same
+  inputs give the same bytes.
+- **Where they are written** (`msdial_app/qa_figure_outputs.py`), each beside a step that
+  already writes, and returned by path only (`qa_figures`: the folder, `qa_report.html`,
+  each figure's file and title, skipped figures with their reasons, warnings; never SVG
+  text or image data):
+  - a job's LC-MS QA (`/api/qa/report`, so `msdial_generate_lcms_qa` with a `job_id` or
+    `manifest_path`, and `msdial_complete_guided_analysis`, which now passes `qa_figures`
+    on): 01, 02, 03, 05, 06 and 07 into `<run directory>/qa_figures/`, with a
+    self-contained `qa_report.html` (every SVG inline, a one-sentence caption and a note
+    on how to read each) and `figures.json`, which records the QA matrix and the anchor
+    file by name and sha256. A figure no longer drawn has its earlier file removed. A QA
+    matrix named by `file_path` alone gets none (`not_written`): it has no run folder;
+  - a confirmed `msdial_lipidomics_normalize`: figure 04 for its polarity, from the run's
+    Height export and the standards table just written, into
+    `<root>/quant/qa_figures/`; the preview and `msdial_lipidomics_resolve_standards`
+    stay without side effects;
+  - a confirmed `msdial_lipidomics_merge`: the batch's page,
+    `<root>/quant/qa_figures/qa_report.html`, with both polarities side by side for 01 to
+    03 and 05 to 07 (each run's QA matrix found beside its candidate table, as the
+    normalize record names it), 04 for both polarities from normalize's standards tables
+    and Height matrices, 08, and relative links to each run's own page. They are kept out
+    of `quant/lipidome`, whose every subfolder `metabolomics_service.R` reads; the preview
+    writes nothing.
+  A figure that fails, or a step whose figures cannot be written at all, is a warning in
+  the result: the QA report and its status, the normalize and the merge are exactly as
+  before.
+
+### Changed
+- **The publication bundle carries the run's QA figures** (`qa_figures/`: the SVG files,
+  `qa_report.html` and `figures.json`) when the report is made for a job with QA. The
+  figures are drawn first when the ones in `<run directory>/qa_figures` were not drawn
+  from the same QA matrix (`figures.json`'s sha256), so a standalone
+  `msdial_generate_publication_report` has them too. Each is scanned as the bundle is;
+  one that names what a shared report may not is left out with a warning
+  (`bundle_warnings`) rather than refusing the report. Without figures the report, its
+  audit and its bundle are as before.
+- The skills say where the figures appear, that the agent gives the person the paths of
+  the page and the figures (and may open the page), reads out skipped figures, and never
+  writes its own plotting code for them (`msdial-guided-analysis`, "QA figures";
+  `msdial-lipidomics-workflow`, "The QA figures"). The README and the laboratory
+  lipidomics tutorial describe them where the outputs are described.
+
+### Validated
+- On the laboratory's Mac output of the public demo (mouse plasma, SPF vs GF, 6 samples
+  and a Blank per polarity), read only, every figure and both pages were drawn and
+  checked against the R script the agent had written. The internal-standard CVs agree
+  with its panel titles for every standard (positive CE 11%, TG 13%, MG 4%, ...;
+  negative 3% to 7%); figure 04 uses the standards normalize used, so the negative
+  figure has no FA 16:0(d3), which the R script took from the resolution table. Two
+  numbers differ, deliberately, because the R script read the per-injection
+  `Reference matched` flag of the QA matrix as if it were the feature's: its PCA set a
+  study height to 0 wherever that injection's own peak was not matched (positive PC1/PC2
+  52%/15%, negative 37%/20%), and its ratio histogram counted each feature whose flag
+  differed between injections twice (1,637 and 1,696 rows for 1,323 and 1,490 features:
+  63% and 59% at 3x or more). Here a feature matched in any study injection keeps every
+  study height and each feature counts once: PC1/PC2 66%/14% and 52%/18% (R's prcomp on
+  the same matrix gives the same), and 55% and 55% at 3x or more. Fed the R script's
+  matrix, the PCA here reproduces its 52.06%/15.36% and 37.07%/19.74%.
+
 ## [0.5.41] - Unreleased
 
 ### Added

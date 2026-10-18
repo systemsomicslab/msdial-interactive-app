@@ -6,7 +6,7 @@ import json
 import math
 import zipfile
 from pathlib import Path, PureWindowsPath
-from typing import Any
+from typing import Any, Iterable
 
 from .automatic_rt_evidence import (
     OUTLIER_TEST_LOCAL,
@@ -38,7 +38,14 @@ def generate_publication_report(
     app_version: str,
     console_version: str,
     qa_criteria: dict[str, Any] | None = None,
+    supplementary_files: Iterable[tuple[str | Path, str]] = (),
 ) -> dict[str, Any]:
+    """Write the Materials and Methods, QA Results, supplementary tables, audit and bundle.
+
+    supplementary_files are (path, name in the bundle) pairs the bundle carries beside the five
+    report files: the run's QA figures. Each is scanned as the bundle is; one that still names what
+    a shared report may not is left out with a warning, never a refusal of the report.
+    """
     root = Path(output_root).expanduser().resolve()
     # A unit whose run left an mzTab-M naming a location of this machine, or MS-DIAL's library copy in its
     # output, is held: its outputs are not published until a retry has done what the run could not. So is a
@@ -144,10 +151,28 @@ def generate_publication_report(
         console_version=console_version,
         libraries=libraries,
     )
+    supplementary = [(Path(source), str(name)) for source, name in supplementary_files]
+    bundle_extras: list[tuple[str, bytes]] = []
+    bundle_warnings: list[str] = []
+    for path, name in supplementary:
+        try:
+            data = path.read_bytes()
+        except OSError as error:
+            bundle_warnings.append(f"{name} was left out of the bundle: it could not be read ({type(error).__name__}).")
+            continue
+        findings = sharing.scan(name, data)
+        if findings:
+            bundle_warnings.append(f"{name} was left out of the bundle: " + "; ".join(findings) + ".")
+            continue
+        bundle_extras.append((name, data))
     audit = {
         **(
             # Any value binds the artifacts written with this report, as the gate reads it.
             {"shared_path_policy": PATH_POLICY, "shared_paths": sharing.describe()} if sharing.full else {}
+        ),
+        **(
+            {"bundle_supplementary_files": [name for name, _ in bundle_extras], "bundle_warnings": bundle_warnings}
+            if supplementary else {}
         ),
         "generated_at": dt.datetime.now().astimezone().isoformat(),
         "software": {
@@ -169,6 +194,8 @@ def generate_publication_report(
     with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in (methods_path, results_path, workbook_path, table_path, audit_path):
             archive.write(path, path.name)
+        for name, data in bundle_extras:
+            archive.writestr(name, data)
     written = (methods_path, results_path, table_path, workbook_path, audit_path, bundle_path)
     try:
         for path in written:
@@ -189,6 +216,10 @@ def generate_publication_report(
         "supplementary_table": str(table_path),
         "audit_file": str(audit_path),
         "bundle": str(bundle_path),
+        **(
+            {"bundle_supplementary_files": [name for name, _ in bundle_extras], "bundle_warnings": bundle_warnings}
+            if supplementary else {}
+        ),
     }
 
 

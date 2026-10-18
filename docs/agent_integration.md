@@ -152,7 +152,8 @@ Agent Skills packages.
 7. Optionally configure LC-MS QA and internal standards.
 8. Prepare the reproducible workflow, show the command, and request confirmation.
 9. Run MS-DIAL and call `msdial_complete_guided_analysis` to wait for the exact
-   job, validate and preview mzTab-M, generate requested QA/publication files,
+   job, validate and preview mzTab-M, generate requested QA/publication files
+   (QA draws its figures into `<run directory>/qa_figures`, returned by path),
    and create the data-mining handoff.
 10. Optionally save the accepted scientific choices as a reusable workset.
 

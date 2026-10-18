@@ -273,7 +273,9 @@ D:\lipidomics-demo\
   analysis\
     inputs\              the contract and what was derived from your inputs
     pos\, neg\           each polarity's MS-DIAL project, exports, mzTab-M and QA
+      qa_figures\        the run's QA figures and qa_report.html
     quant\               normalized matrices and the standards each one used
+      qa_figures\        the batch's QA figures and qa_report.html
       lipidome\          lipid_metabolome.csv and the tables for statistics
 ```
 
@@ -433,7 +435,8 @@ exact command and the lines of the method file that matter (the salt line, the l
 both RT tolerances, the internal-standard search, the threshold, the smoothing, the RT
 correction), and starts MS-DIAL only on your yes. The negative run starts after the
 positive one has finished. `msdial_complete_guided_analysis` then waits for the run,
-validates the mzTab-M file and writes the QA report and the Materials and Methods text.
+validates the mzTab-M file and writes the QA report, the QA figures
+(`analysis\pos\qa_figures\qa_report.html`) and the Materials and Methods text.
 The laboratory's runs aligned about 2,200 spots in positive and about 2,450 in negative
 mode; yours will differ somewhat.
 
@@ -462,7 +465,9 @@ alignment ID chosen), the unit and the exact `MSDIALCUI normalize` command, with
 flag is there (`--peak-ids-only` always: a standard is taken by its alignment ID, never
 looked up by name). Each polarity starts on its own yes. Afterwards the job compares
 MS-DIAL's report with the table and recomputes every quantified cell from the heights
-the same call wrote; Claude reports whether every cell was verified.
+the same call wrote; Claude reports whether every cell was verified. The confirmed call
+also draws each standard's response across the samples
+(`analysis\quant\qa_figures\04_internal_standards_positive.svg` and `..._negative.svg`).
 
 ### 11. Merge the polarities
 
@@ -473,7 +478,8 @@ and the reconciliation of BMP and PE P- between the polarities (a negative PG or
 row that positive mode names BMP or PE P-, by exact name within 0.1 min). In the
 laboratory's run six PE P- rows were matched this way. On your yes it writes
 `analysis\quant\lipidome\`. The laboratory's lipidome held about 390 lipids in about 46
-classes.
+classes. It then writes the batch's QA page, `analysis\quant\qa_figures\qa_report.html`,
+and Claude gives you its path.
 
 ### 12. Save the method, and the report
 
@@ -556,8 +562,30 @@ against GF) and the unit, then run it. It needs the R packages it loads at its t
   the annotation candidates the standards were resolved from;
 - `MS_DIAL_QA_Results.txt`, `AlignResult-*.qa.tsv` and `Supplementary_Table_MS_DIAL.xlsx`:
   the QA report, its matrix and the supplementary tables;
+- `qa_figures\`: the run's QA figures (01 to 03, 05 to 07) and `qa_report.html`;
 - `MS_DIAL_Materials_and_Methods.txt`: a methods paragraph for this run;
 - `method.txt`, `command.txt`, `run-manifest.json`, `REPRODUCE.txt`: how to run it again.
+
+**The QA figures.** You do not need to draw anything: the tools write the figures and
+Claude gives you their paths. Open `analysis\quant\qa_figures\qa_report.html` in a
+browser for the whole batch on one page, both polarities side by side; each figure is
+also an SVG file beside it, and each run has its own page in its `qa_figures` folder.
+
+| Figure | What it shows |
+| --- | --- |
+| 01 detected features per injection | aligned features with a peak (height > 0, gap-filled included) in each injection, in injection order; the Blank far below the samples |
+| 02 summed peak height per injection | run-order drift of the total signal |
+| 03 peak-height distribution | log10 height boxplots per injection |
+| 04 internal standards, per polarity | each standard normalize used, its height relative to its mean over the non-Blank injections, a +/-20% band and its CV |
+| 05 PCA of the injections | PC1 and PC2 of the study injections (Blank excluded) from the reference-matched features, log10(height + 1), autoscaled |
+| 06 sample-to-Blank ratio | per aligned feature, log10 of the mean sample height over the Blank's, reference-matched features in blue, and the share at 3x or more |
+| 07 RT-correction anchors | each anchor's observed minus reference RT, per injection, used and not used |
+| 08 lipid class totals | each class's summed concentration per sample, from `lipid_metabolome4classsummary.csv` |
+
+A figure the data cannot support is not drawn, and the page says why: figure 07 needs
+the run's RT-correction audit, and a PCA at least three study injections. The figures
+are kept out of
+`analysis\quant\lipidome\`, so `metabolomics_service.R` never reads them.
 
 **Reading the QA report.** The QA report evaluates prespecified criteria from QC
 injections, blanks and run order, and says which it could not assess and why. The demo

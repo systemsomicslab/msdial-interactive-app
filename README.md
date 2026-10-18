@@ -275,7 +275,9 @@ saves the fixed inputs for the next batch's check.
 The **7. Publication report** workspace generates an English Materials and
 Methods draft, a separate QA Results draft, an Excel supplementary workbook, a
 long-format supplementary TSV, and a machine-readable JSON audit file. The
-complete reporting bundle contains all five files. The two manuscript drafts
+complete reporting bundle contains all five files and, when the report is made
+for a job with QA, the run's QA figures under `qa_figures/` (drawn first when the
+figures beside the run were not drawn from the same QA matrix). The two manuscript drafts
 remain editable in the browser and can be copied or downloaded after editing.
 
 The Excel workbook is the primary human-readable supplementary output:
@@ -396,6 +398,24 @@ They are transparent report defaults, not universal acceptance criteria. The
 Methods draft describes how QA was assessed and how many evaluable criteria
 were met; the separate Results draft reports observed values and identifies
 criteria requiring review.
+
+### QA figures
+
+QA for a job also draws the run's QA figures into `<run directory>/qa_figures/`,
+with the Python standard library only: aligned features with a detected peak,
+summed peak height and the peak-height distribution per injection, a PCA of the
+study injections from the reference-matched features (log10(height + 1),
+autoscaled, Blank excluded), the sample-to-Blank ratio per feature, and the
+automatic RT-correction anchor offsets per injection. Each is an SVG file, and
+`qa_report.html` shows them all on one self-contained page with a caption and a
+note on how to read each. `figures.json` records the QA matrix they were drawn
+from by name and sha256; the same inputs give the same bytes. A figure the run
+cannot support (no Blank, no RT-correction audit, fewer than three study
+injections) is skipped with its reason, and a figure that fails is a warning: the
+QA report and its status are never changed by the figures. The tools return the
+figures by path (`qa_figures`), never as image data, so an agent shows the page
+rather than drawing its own. A laboratory lipidomics batch adds the internal
+standards and the lipid class totals (see the tutorial).
 
 Catalog libraries carry a Zenodo DOI, record URL, checksum, and license. For a
 user-supplied library, the Publication workspace requests a version and DOI or
@@ -667,7 +687,8 @@ Core MCP tools:
 - `msdial_cancel_job`: stop a queued or running run, diagnostic, or repository download
   (the two start tools also take `timeout_seconds` and `idle_timeout_seconds`; none by default)
 - `msdial_interactive_validate_mztab`: validate mzTab-M outputs
-- `msdial_generate_lcms_qa`: build the LC-MS QA report
+- `msdial_generate_lcms_qa`: build the LC-MS QA report and, for a job, draw its QA
+  figures (SVG and a self-contained `qa_report.html`) into `<run directory>/qa_figures`
 - `msdial_generate_publication_report`: create text, Excel, audit, and ZIP files
 - `msdial_complete_guided_analysis`: wait for one job and complete validation,
   QA, publication, and handoff without browser interaction
