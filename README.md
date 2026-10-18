@@ -3,6 +3,27 @@
 Cross-platform local web application for building and running MS-DIAL Console
 LC-MS and GC-MS workflows.
 
+## Quick start: ask Claude Code to set it up
+
+Install [Claude Code](https://claude.com/claude-code) (the terminal CLI, the Claude
+desktop app's Code tab, or an IDE extension) and Python 3.10 or newer. Then open Claude
+Code in any folder and say:
+
+```text
+Set up https://github.com/systemsomicslab/msdial-interactive-app so that I can run
+MS-DIAL agent analyses in Claude Code.
+```
+
+Claude Code follows [the instructions for Claude Code](#instructions-for-claude-code-setting-this-repository-up)
+below. It checks Python and Git, downloads this repository, shows you the setup plan,
+and changes your computer only after your yes. The setup:
+
+- registers the `msdial-interactive` MCP server and copies the skills for Claude Code;
+- installs the official MS-DIAL Console 5.5.261018 for Windows, macOS or Linux, after
+  checking its SHA-256.
+
+When it has finished, open a new Claude Code session; the MS-DIAL tools appear there.
+
 ## Quick start: laboratory lipidomics with Claude
 
 Claude Code or Claude Desktop can run a whole lipidomics batch with internal standards
@@ -10,17 +31,73 @@ through this app: from a positive and a negative raw-data folder to a quantified
 `lipid_metabolome.csv`, asking every scientific question and starting MS-DIAL only after
 your yes. Everything runs on your computer.
 
-1. Install Python 3.10 or newer and Claude Code or Claude Desktop, and get an MS-DIAL
-   Console new enough for laboratory lipidomics (the Console prerelease 5.5.2610xx or
-   later; the tutorial says where, and how to build one from source meanwhile).
-2. Run the setup: on Windows double-click `Setup MS-DIAL for Claude.cmd`; elsewhere run
-   `python3 scripts/setup_claude.py`. It explains each step and asks before it changes
-   anything (`--dry-run` shows the plan only; on Windows, `py -3 scripts\setup_claude.py
-   --dry-run`).
+1. Install Python 3.10 or newer and Claude Code or Claude Desktop.
+2. Run the setup, or let Claude Code run it (above): on Windows double-click
+   `Setup MS-DIAL for Claude.cmd`; elsewhere run `python3 scripts/setup_claude.py`. It
+   explains each step and asks before it changes anything (`--dry-run` shows the plan
+   only; on Windows, `py -3 scripts\setup_claude.py --dry-run`). If no Console new
+   enough is found, it offers the official MS-DIAL Console prerelease 5.5.261018 for
+   your system.
 3. Follow [the tutorial](docs/tutorials/lab-lipidomics.md) with the public demo data
    (Zenodo [10.5281/zenodo.10957708](https://doi.org/10.5281/zenodo.10957708), CC BY 4.0)
    and the example workbook and standard texts in
    [`examples/lab-lipidomics`](examples/lab-lipidomics/README.md).
+
+The macOS and Linux Consoles are x64 builds that read mzML, ABF and netCDF, not vendor
+formats: convert vendor files such as SCIEX `.wiff` to mzML first (ProteoWizard
+msconvert). On Apple silicon the macOS Console runs under Rosetta 2.
+
+## Instructions for Claude Code: setting this repository up
+
+*For an AI coding agent asked to set this repository up for someone. A person can read
+the quick starts above instead.*
+
+The person is often a beginner. Explain each step in a sentence, ask before anything
+that changes their computer, and report what actually happened.
+
+1. **Check the prerequisites.**
+   - Git: `git --version`.
+   - Python 3.10 or newer: `python3 --version`, or `py -3 --version` on Windows. The
+     `python3` of Apple's Command Line Tools is 3.9, which is too old.
+   - If one is missing, tell the person what to install and wait until they have:
+     Python from <https://www.python.org/downloads/>, Git from <https://git-scm.com/>
+     (`xcode-select --install` on macOS). Do not install either yourself unless they
+     ask you to.
+2. **Get the repository into a folder that will stay.** The MCP registration and the
+   Console point into it, so it must not be moved afterwards.
+   - Clone it in the person's home folder, or a short path such as `D:\msdial` on
+     Windows:
+     `git clone https://github.com/systemsomicslab/msdial-interactive-app.git`
+   - If it is already there, update it: `git -C <folder> pull --ff-only`.
+   - Without Git, download and unpack
+     <https://github.com/systemsomicslab/msdial-interactive-app/archive/refs/heads/main.zip>.
+3. **Show the plan.** In that folder run `python3 scripts/setup_claude.py --dry-run`
+   (`py -3 scripts\setup_claude.py --dry-run` on Windows). It changes nothing. Summarise
+   what it would do:
+   - the `pip install` of the MCP dependency;
+   - the Claude Code registration, and any existing one it would replace;
+   - the skills it would copy, and the Claude Desktop configuration if Desktop is
+     installed;
+   - the MS-DIAL Console download: its size, URL and folder.
+4. **Run it after the person says yes.**
+   - Use `--yes`: the setup cannot ask questions through your tool, so without it every
+     change is declined. Add `--no-desktop` if they do not use Claude Desktop.
+   - Allow up to 10 minutes; pip and the Console download (about 45 MB) take a while.
+   - If pip refuses because the Python is "externally managed" (Homebrew), make a
+     virtual environment in the folder (`python3 -m venv .venv`) and run the setup
+     with its Python (`.venv/bin/python`, or `.venv\Scripts\python.exe` on Windows).
+5. **Report the summary it prints.**
+   - Mark every step shown as `attention` or `failed`, with what the setup says to do
+     about it.
+   - Never call a step done unless the summary shows it as `done`, `ok` or `unchanged`.
+6. **Hand over.**
+   - The MS-DIAL tools appear only in a new session. Tell the person to open a new
+     Claude Code session, or to run `/mcp` in the terminal CLI. You cannot use the
+     tools in this session.
+   - Give them this first prompt for the new session: *Check that MS-DIAL Interactive
+     is ready for laboratory lipidomics: start its backend, list the MS-DIAL Consoles
+     you can find and say whether one is new enough. Do not run any analysis yet.*
+   - Point them to [the tutorial](docs/tutorials/lab-lipidomics.md) for the demo data.
 
 ## Why Python + local web UI
 

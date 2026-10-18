@@ -79,10 +79,13 @@ the person still answers each question.
   (MsdialWorkbench#830), the annotation candidate table and the automatic-RT local test
   (MsdialWorkbench#826). `check_inputs` refuses any other. `msdial_check_console_path`
   lists the Consoles it finds; prefer one whose `provenance_status` is `verified`.
-- Where to get one: the official MS-DIAL Console prerelease 5.5.2610xx or later. Call
+- Where to get one: the official MS-DIAL Console prerelease 5.5.261018 or later (tag
+  `MSDIAL-v5.5.261018`). Interactive's `scripts/setup_claude.py` offers to install it,
+  checked against a pinned SHA-256, beside the Interactive folder. Call
   `msdial_check_official_console_releases` for the newest stable and prerelease Console
   packages and their tags, and name the one it returns rather than a version from
-  memory. Releases dated 2026-08-20 and earlier lack both. Otherwise, from a local clone
+  memory. Releases dated 2026-08-20 and earlier lack both. The macOS and Linux builds
+  read mzML, ABF and netCDF only. Otherwise, from a local clone
   of MsdialWorkbench, `msdial_check_local_console_source` compares it with
   `origin/master`, and `msdial_build_console_from_local_source(...,
   select_after_build=false)` previews the build, which runs only on the person's yes.

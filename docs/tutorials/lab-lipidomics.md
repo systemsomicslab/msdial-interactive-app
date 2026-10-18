@@ -64,41 +64,30 @@ what it is about to do, and starts MS-DIAL only after your yes.
   the automatic-RT local test (MsdialWorkbench#826). Releases up to 5.5.260820
   (2026-08-20) lack them, and Interactive refuses those for this workflow.
 
-<!-- PLACEHOLDER(console-prerelease): once the prerelease is cut, replace "5.5.2610xx" (and
-"MSDIAL-v5.5.2610xx") with the published version and tag in every place that holds it: this file
-(this section, the answers table and the example answers of step 2), README.md (the quick start),
-skills/msdial-lipidomics-workflow/SKILL.md (step A), and scripts/setup_claude.py
-(CONSOLE_PRERELEASE_LABEL, and CONSOLE_PRERELEASE_TAG, which is empty until then).
-"git grep 2610xx" lists them all. -->
-> [!IMPORTANT]
-> **The Console prerelease is not published yet.** Use **the MS-DIAL Console
-> prerelease 5.5.2610xx or later** from the
-> [MsdialWorkbench releases page](https://github.com/systemsomicslab/MsdialWorkbench/releases)
-> (tag `MSDIAL-v5.5.2610xx`, *placeholder: the exact tag will be filled in here once
-> the prerelease is cut*). Download its Windows Console ZIP (the asset whose name
-> contains `MSDIAL.console`) and unpack it into a folder of your own, for example
-> `D:\msdial\MSDIAL.console.v5.5.2610xx`. The file you will name is `MSDIALCUI.exe`
-> inside it.
+> [!NOTE]
+> **The setup below installs the Console for you.** When it finds no Console new
+> enough, it offers **the MS-DIAL Console prerelease 5.5.261018** (tag
+> `MSDIAL-v5.5.261018`) from the
+> [MsdialWorkbench releases page](https://github.com/systemsomicslab/MsdialWorkbench/releases).
+> It checks the archive's size and SHA-256 against the values it pins, then unpacks it
+> beside the MS-DIAL Interactive folder, for example
+> `D:\msdial\MSDIAL.console.v5.5.261018-windows-net48\MSDIALCUI.exe`. To do it by hand,
+> download the asset whose name contains `MSDIAL.console` and `windows-net48`, unpack it
+> into a folder of your own, and name its `MSDIALCUI.exe`.
 >
-> Until the prerelease exists, build the Console from source. Install
-> [Git for Windows](https://git-scm.com/download/win) and the
-> [.NET SDK](https://dotnet.microsoft.com/download), version 8 or later, and clone
-> [MsdialWorkbench](https://github.com/systemsomicslab/MsdialWorkbench). Claude's MCP
-> server runs `git` and `dotnet` itself, so it must find both on its `PATH`: if Claude
-> Code or Claude Desktop was running while you installed them, quit it completely and
-> start it again. Then, once the setup below is done, ask Claude:
->
-> ```text
-> My MsdialWorkbench clone is in D:\msdial\MsdialWorkbench. Check it against
-> origin/master with msdial_check_local_console_source, then show me the build
-> command of msdial_build_console_from_local_source with select_after_build=false.
-> ```
->
-> Claude shows the exact `dotnet build` command and runs it only after your yes. The
-> Console it builds is `tests\MSDIAL5\MsdialCoreTestApp\bin\Release\net48\MSDIALCUI.exe`
-> inside the clone.
+> The macOS and Linux archives (`osx-net8`, `linux-net8`) are x64 builds that read
+> mzML, ABF and netCDF, not vendor formats, so the demo's `.wiff` files must be
+> converted to mzML first (ProteoWizard msconvert). On Apple silicon the macOS Console
+> runs under Rosetta 2. A Console can also be built from source with
+> `msdial_check_local_console_source` and `msdial_build_console_from_local_source`; the
+> setup says how when it has no archive for your system.
 
 ## Set up, in one command
+
+Claude Code can do this section for you: open it in any folder and ask it to *set up
+https://github.com/systemsomicslab/msdial-interactive-app so that you can run MS-DIAL
+agent analyses in Claude Code*. It follows the README's instructions for Claude Code,
+shows you the plan below and runs it after your yes.
 
 In the MS-DIAL Interactive folder, double-click **`Setup MS-DIAL for Claude.cmd`**. On
 macOS or Linux, run `python3 scripts/setup_claude.py` in a terminal in that folder.
@@ -135,7 +124,10 @@ check; `--help` lists the rest. Its eight steps:
    Documents) and says for each whether it is new enough, by what its program file
    holds, without starting it. `--console <path to MSDIALCUI.exe>` checks one you name,
    and also starts it for its `--help`, as the agent's input check will; the Consoles it
-   found are started that way only if you say yes. A dry run starts none.
+   found are started that way only if you say yes. A dry run starts none. If none is
+   new enough, it offers to download the official Console 5.5.261018 for your system,
+   checks its SHA-256, unpacks it beside the Interactive folder and starts it for its
+   `--help` (`--no-console-download` turns the offer off).
 8. **Summary**, and a first prompt to try.
 
 Then:
@@ -319,7 +311,7 @@ Claude asks every open question at once. The demo's answers:
 | Its amount column | the unit: F per mg tissue, G per 10^6 cells, H per µL plasma | H |
 | The analysis root | where everything is written | `D:\lipidomics-demo\analysis` |
 | Where MS-DIAL reads the raw data | `copy` or `in_place` (see above) | copy, into `D:\lipidomics-demo\run` |
-| The Console | the `MSDIALCUI.exe` for both runs and normalize | e.g. `D:\msdial\MSDIAL.console.v5.5.2610xx\MSDIALCUI.exe` |
+| The Console | the `MSDIALCUI.exe` for both runs and normalize | e.g. `D:\msdial\MSDIAL.console.v5.5.261018-windows-net48\MSDIALCUI.exe` |
 
 For example:
 
@@ -334,7 +326,7 @@ D:\lipidomics-demo\data2\EquiSPLASH_Neg.txt (negative)
 Workbook: D:\lipidomics-demo\data2\quant_utility_table.xlsx, amount column H
 Analysis root: D:\lipidomics-demo\analysis
 Raw data: make a copy in D:\lipidomics-demo\run
-Console: D:\msdial\MSDIAL.console.v5.5.2610xx\MSDIALCUI.exe
+Console: D:\msdial\MSDIAL.console.v5.5.261018-windows-net48\MSDIALCUI.exe
 ```
 
 In Claude Desktop, make the copy yourself first (step 3) and answer instead

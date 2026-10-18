@@ -4,6 +4,45 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.43] - Unreleased
+
+Contains 0.5.41 (#74) and 0.5.42 (#75), which are not merged yet; merge this after them.
+
+### Added
+- **Set up by asking Claude Code.** A beginner opens Claude Code anywhere and asks it to
+  set up this repository for MS-DIAL agent analyses. README.md gains a quick start with
+  that one prompt, and instructions for the agent to follow:
+  - check Git and Python 3.10+, without installing either unasked;
+  - clone into a folder that will stay;
+  - show the `--dry-run` plan, and run the setup with `--yes` only after the person
+    agrees, since the setup cannot ask through the agent's tool;
+  - report every `attention` or `failed` step;
+  - hand over to a new session, with the first prompt.
+
+  The tutorial points to it as well.
+- **The setup installs the official Console** (`scripts/setup_claude.py`, step 7). When
+  no Console found is new enough, it offers the MS-DIAL Console prerelease 5.5.261018
+  (tag `MSDIAL-v5.5.261018`, Yuki's release of 2026-10-18) for Windows, macOS or Linux:
+  - It downloads the archive from GitHub and checks its size and SHA-256 against
+    values pinned in the script.
+  - It unpacks it beside the checkout, where both this setup and Interactive's Console
+    search look, refusing any member outside that folder.
+  - It makes the launcher executable, since the archives carry no Unix modes, then
+    judges the Console and starts it for its `--help`.
+  - On a Mac without Rosetta 2 it prints the install command and downloads nothing.
+  - A dry run downloads nothing; `--no-console-download` turns the offer off.
+- The Claude Code registration also works where `claude` is not on `PATH`, as in the
+  Claude desktop app's Code tab: the setup then uses the Claude Code that started it
+  (`CLAUDE_CODE_EXECPATH`).
+
+### Changed
+- The Console placeholder "5.5.2610xx" is replaced by the published 5.5.261018 in the
+  README, the tutorial, the lipidomics skill and the setup. MsdialWorkbench's tag
+  `MSDIAL-v5.5.261018` contains #826, #830, #832 and #837.
+- Interactive's Console search (`discover_console_paths`) and the setup's find a
+  self-contained Linux or macOS Console by its `MSDIALCUI` launcher, not by its dll,
+  which would need a separate `dotnet`.
+
 ## [0.5.42] - Unreleased
 
 Contains 0.5.41 (#74), which is not merged yet; merge this after it.
