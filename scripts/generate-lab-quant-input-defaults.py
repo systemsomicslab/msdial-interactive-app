@@ -28,7 +28,7 @@ EXAMPLE = ROOT / "examples" / "lab-lipidomics"
 
 
 def converted() -> dict:
-    tables, problems, _ = lab_quant_input.converted_tables(
+    tables, problems, _, _ = lab_quant_input.converted_tables(
         EXAMPLE / "quant_utility_table.xlsx", "H", EXAMPLE / "EquiSPLASH_Pos.txt", EXAMPLE / "EquiSPLASH_Neg.txt"
     )
     if problems:

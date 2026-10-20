@@ -341,6 +341,9 @@ def _read_cell(element: ET.Element, ref: str, shared: list[str]) -> XlsxCell | N
         inline = element.find(f"{_MAIN}is")
         return XlsxCell(ref, "string", _rich_text(inline) if inline is not None else "", formula=formula)
     if raw is None:
+        if formula is not None and kind == "str" and value_element is not None:
+            # A formula whose result is an empty string, as Excel saves it (<v/>): calculated, and blank.
+            return XlsxCell(ref, "string", "", raw="", formula=formula)
         if formula is not None:
             return XlsxCell(ref, "uncached_formula", None, formula=formula)
         return None
@@ -644,7 +647,8 @@ def salt_drops(salt: str, adduct: str) -> bool:
 
 
 def salt_evidence(
-    salt: str | None, negative_standards: Iterable["InternalStandard"], quant_info: dict[str, Any] | None
+    salt: str | None, negative_standards: Iterable["InternalStandard"], quant_info: dict[str, Any] | None,
+    *, selection_label: str = "sheet 3", library_label: str = "the internal-standard text library",
 ) -> dict[str, Any]:
     """What the negative-mode standards and sheet 3 say about the salt, and what the salt would drop.
 
@@ -674,7 +678,7 @@ def salt_evidence(
                 standard_conflicts.extend(names)
                 warnings.append(
                     f"{salt} removes negative-mode LBM records of {adduct}, so the LBM library cannot "
-                    f"annotate {', '.join(names)}; only the internal-standard text library can."
+                    f"annotate {', '.join(names)}; only {library_label} can."
                 )
         for row in (quant_info or {}).get("rows", []):
             if row.get("selected") and row.get("ion_mode") == NEGATIVE and salt_drops(salt, row["adduct"]):
@@ -682,9 +686,9 @@ def salt_evidence(
         if selected_conflicts:
             listed = ", ".join(f"{item['class']} {item['adduct']}" for item in selected_conflicts)
             blockers.append(
-                f"{salt} removes the negative-mode LBM records sheet 3 selects for "
+                f"{salt} removes the negative-mode LBM records {selection_label} selects for "
                 f"{len(selected_conflicts)} class(es) ({listed}); those classes could never be annotated. "
-                "Check the salt, or the selection in sheet 3."
+                f"Check the salt, or the selection in {selection_label}."
             )
     return {
         "salt": salt,

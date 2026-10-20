@@ -3281,11 +3281,14 @@ def msdial_lipidomics_quant_input_template(
     names sheets beside the four tables. prefill='lab-defaults' fills Class standards and Selection
     with the laboratory's EquiSPLASH defaults and Standards with its standards' names, classes,
     formulas and adducts, leaving every spiked amount and retention time for the person to fill in
-    (the m/z is computed from the formula); prefill='none' writes the headers only. salt='HCOONH4'
-    (ammonium formate) takes formate adducts in negative mode in place of acetate.
+    (the m/z is computed from the formula); prefill='none' writes the Settings rows and the other
+    tables' headers only. salt='HCOONH4' (ammonium formate) turns the negative-mode acetate adducts into
+    formate adducts, in Standards and Selection. Ask the person their salt and their standard mix first.
 
     To convert the earlier form instead, give from_quant_table_path (quant_utility_table.xlsx),
-    amount_column, is_text_pos and is_text_neg: the same content is written in format 1.
+    amount_column, is_text_pos and is_text_neg: the same content is written in format 1. Read the
+    preview's warnings to the person before confirming: a converted sample amount that differs from
+    sheet 1's row 4 (its per-10^6-cells column multiplies by row 4) is theirs to settle.
 
     confirmed=false (the default) shows what would be written; show it to the person, and call again
     with confirmed=true to write. The written input is then checked: for a template, its blockers are

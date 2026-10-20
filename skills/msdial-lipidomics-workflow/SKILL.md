@@ -71,17 +71,22 @@ and let the person confirm.
 A person who has no input yet, or whose standards are in some other file of their own,
 prepares format 1. Help them get it right the first time; never fill it in for them.
 
-1. **Offer a template.** `msdial_lipidomics_quant_input_template(output_path=...)`
-   previews and writes only with `confirmed=true`, and never overwrites a file.
+1. **Ask three things first, in one message:** the mobile-phase salt (see "The salt"),
+   whether their standards are the EquiSPLASH mixture, and where the file should go
+   (the analyst's own folder, not a raw-data folder or a code checkout).
+2. **Offer a template.** `msdial_lipidomics_quant_input_template(output_path=...,
+   salt=...)` previews and writes only with `confirmed=true`, and never overwrites a
+   file.
    - By default it holds the laboratory's EquiSPLASH set: names, classes, formulas and
      adducts, with every spiked amount and retention time left blank. Class standards
      and Selection come filled with the laboratory's defaults.
-   - For ammonium formate, pass `salt="HCOONH4"`, which takes formate adducts in
-     negative mode.
-   - `prefill="none"` writes the headers only. `layout="tsv"` writes a folder.
-   - Ask where it should go: the analyst's own folder, not a raw-data folder or a code
-     checkout.
-2. **Say what each sheet holds and what they fill in.** The template's Instructions
+   - With `salt="HCOONH4"` (ammonium formate), its negative-mode acetate adducts become
+     formate adducts.
+   - For a mix other than EquiSPLASH, the person deletes those rows and writes their
+     own, or you pass `prefill="none"`. That writes the Settings rows and the other
+     tables' headers only; Class standards and Selection are then theirs to write too.
+   - `layout="tsv"` writes a folder.
+3. **Say what each sheet holds and what they fill in.** The template's Instructions
    sheet says the same:
    - Settings: the sample amount and its basis.
    - Standards: the spiked amount of each standard (the amount in the extract of one
@@ -89,15 +94,16 @@ prepares format 1. Help them get it right the first time; never fill it in for t
    - The rest: delete the standards they did not add, and review Class standards and
      Selection.
    - The m/z may stay blank where a formula is given.
-3. **Check it** with `msdial_lipidomics_check_quant_input(quant_table_path=...)`, which
-   needs no raw data. Read each blocker as it is written: it names the sheet, the row
+4. **Check it** with `msdial_lipidomics_check_quant_input(quant_table_path=...,
+   solvent_type=<their salt>)`, which needs no raw data. Read each blocker as it is written: it names the sheet, the row
    and the column. They fix it in their own file and save it, and you check again.
    - Never guess a value for them: not an RT, an amount, an adduct or a class.
    - Never edit their file.
-4. **Convert the earlier form.** With `from_quant_table_path`, `amount_column`,
+5. **Convert the earlier form.** With `from_quant_table_path`, `amount_column`,
    `is_text_pos` and `is_text_neg`, the same tool writes the earlier form's content in
-   format 1. The workflow reads the earlier form as it is too, so converting is the
-   person's choice, not a requirement.
+   format 1. Read the preview's `warnings` before confirming. A converted sample amount
+   that differs from sheet 1's row 4 is the person's to settle. The workflow reads the
+   earlier form as it is too, so converting is the person's choice, not a requirement.
 
 A complete example in both containers is in `examples/lab-lipidomics`:
 `quant_input.xlsx` and `quant_input_tsv/`.

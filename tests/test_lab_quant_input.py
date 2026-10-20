@@ -98,7 +98,8 @@ class TheExampleSaysWhatTheEarlierFormSays(unittest.TestCase):
     def check(self, path: Path) -> None:
         read = q.read_quant_input(path)
         self.assertEqual([], read["blockers"])
-        self.assertEqual([], read["warnings"])
+        self.assertEqual(1, len(read["warnings"]), read["warnings"])
+        self.assertIn("13 class(es) are reported by more than one adduct", read["warnings"][0])
         self.assertEqual(self.legacy["unit"], read["unit"])
         self.assertEqual(
             [(item["name"], item["class_name"], item["amount"]) for item in self.legacy["preparation"]["standards"]],
@@ -164,7 +165,7 @@ class TheSettings(_Folder):
         self.assertEqual("pmol_per_microL_plasma", read["unit"])
 
     def test_the_format_must_be_this_one(self) -> None:
-        self.assertBlocks(self.read(settings=SETTINGS[1:]), "has no Format row")
+        self.assertBlocks(self.read(settings=SETTINGS[1:]), "Format is required, and must read msdial-lipidomics-quant-input/1")
         self.assertBlocks(self.read(settings=[["Format", "msdial-lipidomics-quant-input/2"]] + SETTINGS[1:]),
                           "this reader knows only msdial-lipidomics-quant-input/1")
 
@@ -280,19 +281,41 @@ class TheClassStandards(_Folder):
 
 
 class TheSelection(_Folder):
-    def test_use_is_true_when_blank_or_absent(self) -> None:
-        read = self.read(selection=[["PC", "[M+H]+", "Positive", ""], ["FA", "[M-H]-", "Neg", "FALSE"]])
-        self.assertEqual({("PC", "[M+H]+")}, read["quant_info"]["selected"])
+    def test_without_a_use_column_every_row_is_used_and_with_one_every_row_says(self) -> None:
         read = self.read(selection_header=["Class", "Adduct", "Polarity"],
                          selection=[["PC", "[M+H]+", "Positive"], ["FA", "[M-H]-", "Negative"]])
         self.assertEqual({("PC", "[M+H]+"), ("FA", "[M-H]-")}, read["quant_info"]["selected"])
+        read = self.read(selection=[["PC", "[M+H]+", "Positive", "yes"], ["FA", "[M-H]-", "Neg", "0"]])
+        self.assertEqual({("PC", "[M+H]+")}, read["quant_info"]["selected"])
+        # A cleared cell in a list that says TRUE or FALSE is more likely an untick than a TRUE.
+        self.assertBlocks(self.read(selection=[["PC", "[M+H]+", "Positive", ""], ["FA", "[M-H]-", "Neg", "FALSE"]]),
+                          "selection.tsv row 2, Use: write TRUE or FALSE")
+
+    def test_a_true_false_column_under_another_header_is_read_or_said(self) -> None:
+        read = self.read(selection_header=["Class", "Adduct", "Polarity", "Include"],
+                         selection=[["PC", "[M+H]+", "Positive", "TRUE"], ["FA", "[M-H]-", "Negative", "FALSE"]])
+        self.assertEqual({("PC", "[M+H]+")}, read["quant_info"]["selected"])
+        self.assertBlocks(
+            self.read(selection_header=["Class", "Adduct", "Polarity", "Wanted"],
+                      selection=[["PC", "[M+H]+", "Positive", "TRUE"], ["FA", "[M-H]-", "Negative", "FALSE"]]),
+            "the column 'Wanted' holds TRUE and FALSE but is not read; name it Use",
+        )
 
     def test_problems_in_a_used_row_block_and_in_an_unused_row_are_said(self) -> None:
         read = self.read(selection=SELECTION + [["PC", "[M+H]+", "Negative", "TRUE"], ["PE", "[M-H]-", "Positive", "FALSE"],
                                                 ["PC", "[M+Na]+", "Positive", "maybe"]])
-        self.assertBlocks(read, "selection.tsv row 4 (PC [M+H]+): [M+H]+ is a positive ion in a Negative row",
+        self.assertBlocks(read, "selection.tsv row 4, Adduct: [M+H]+ is a positive ion in a Negative row",
                           "selection.tsv row 6, Use: 'maybe' is not TRUE or FALSE")
-        self.assertTrue(any("selection.tsv row 5 (PE [M-H]-)" in item for item in read["warnings"]))
+        self.assertIn("selection.tsv row 5, Adduct: [M-H]- is a negative ion in a Positive row.", read["warnings"])
+        self.assertBlocks(self.read(selection=SELECTION + [["Phospholipid", "[M+H]+", "Positive", "TRUE"],
+                                                           ["PC", "[M+H]+", "Both", "TRUE"]]),
+                          "selection.tsv row 4, Class: 'Phospholipid' is a class MS-DIAL knows in neither spelling",
+                          "selection.tsv row 5, Polarity: 'Both' is not Positive or Negative")
+
+    def test_a_class_reported_by_two_adducts_is_warned_about(self) -> None:
+        read = self.read(selection=SELECTION + [["PC", "[M+CH3COO]-", "Negative", "TRUE"]])
+        self.assertTrue(any("1 class(es) are reported by more than one adduct" in item and "PC ([M+H]+ (Positive), "
+                            "[M+CH3COO]- (Negative))" in item for item in read["warnings"]), read["warnings"])
 
     def test_a_class_in_the_class_definition_spelling_is_read_in_the_lbm_spelling(self) -> None:
         read = self.read(selection=SELECTION + [["Cer-NS", "[M+CH3COO]-", "Negative", "TRUE"]])
@@ -325,7 +348,7 @@ class TheContainers(_Folder):
         self.assertBlocks(q.read_quant_input(folder), "standards.tsv row 5, Neg RT: '6,96' is not a number")
 
     def test_a_workbook_needs_its_four_sheets(self) -> None:
-        tables, _, _ = q.converted_tables(EXAMPLE / "quant_utility_table.xlsx", "H", EXAMPLE / "EquiSPLASH_Pos.txt",
+        tables, _, _, _ = q.converted_tables(EXAMPLE / "quant_utility_table.xlsx", "H", EXAMPLE / "EquiSPLASH_Pos.txt",
                                           EXAMPLE / "EquiSPLASH_Neg.txt")
         from msdial_app.supplementary_excel import _write_xlsx
 
@@ -338,6 +361,94 @@ class TheContainers(_Folder):
         old = self.base / "old.xls"
         old.write_bytes(b"\xd0\xcf\x11\xe0")
         self.assertBlocks(q.read_quant_input(old), "old.xls is an old .xls workbook; save it as .xlsx")
+
+
+class WhatTheReviewFound(_Folder):
+    def test_the_settings_drop_downs_sit_on_the_basis_and_unit_rows(self) -> None:
+        import re
+        import zipfile
+
+        target = self.base / "lists.xlsx"
+        q.quant_input_template({"output_path": str(target), "confirmed": True})
+        with zipfile.ZipFile(target) as archive:
+            names = re.findall(r'<sheet name="([^"]+)"', archive.read("xl/workbook.xml").decode("utf-8"))
+            settings = archive.read(f"xl/worksheets/sheet{names.index('Settings') + 1}.xml").decode("utf-8")
+        lists = dict(re.findall(r'sqref="([^"]+)"><formula1>&quot;([^&]+)&quot;</formula1>', settings)
+                     or re.findall(r'sqref="([^"]+)"><formula1>"([^"]+)"</formula1>', settings))
+        self.assertEqual({"B4": "uL plasma,mg tissue,10^6 cells", "B5": "pmol,nmol,fmol"}, lists)
+        self.assertIn('<c r="A4"', settings)
+        self.assertIn("Sample basis", settings.split('<c r="A4"')[1].split("</c>")[0])
+
+    def test_a_unit_in_a_header_must_agree(self) -> None:
+        header = list(HEADER["standards"])
+        header[2] = "Spiked amount (nmol)"
+        self.assertBlocks(self.read(standards_header=header), "Spiked amount: the header says (nmol), but the amounts are read in pmol")
+        header[2] = "Spiked amount (pmol)"
+        header[8] = "Pos RT (s)"
+        self.assertBlocks(self.read(standards_header=header), "Pos RT: the header says (s), but retention times are read in minutes")
+        header[8] = "Pos RT (min)"
+        self.assertEqual([], self.read(standards_header=header)["blockers"])
+        self.assertBlocks(self.read(settings=SETTINGS + [["Spiked unit", "nmol"]]), "'Spiked unit' is not a setting this format reads")
+
+    def test_numbers_that_are_not_plain_ascii_or_finite_are_problems(self) -> None:
+        wide = list(PC)
+        wide[7] = "７５３.６１３４"
+        self.assertBlocks(self.read(standards=[wide, FA]), "Pos m/z: '７５３.６１３４' is not a number (it holds non-ASCII")
+        infinite = list(PC)
+        infinite[2] = "inf"
+        self.assertBlocks(self.read(standards=[infinite, FA]), "Spiked amount: 'inf' is not a number")
+        late = list(PC)
+        late[8] = "46151"
+        self.assertBlocks(self.read(standards=[late, FA]), "Pos RT: 46151 is not a retention time in minutes")
+        foreign = list(PC)
+        foreign[1] = "ＰＣ"
+        self.assertBlocks(self.read(standards=[foreign, FA]), "Class: 'ＰＣ' holds non-ASCII characters")
+
+    def test_a_csv_row_split_by_a_decimal_comma_is_said(self) -> None:
+        folder = self.folder()
+        (folder / "standards.tsv").unlink()
+        text = ",".join(HEADER["standards"]) + "\n" + ",".join(PC) + "\n" + ",".join(FA[:12]) + ",6,96,177.7\n"
+        (folder / "standards.csv").write_text(text, encoding="utf-8")
+        self.assertBlocks(q.read_quant_input(folder), "standards.csv row 3: the row has more cells than the header has columns. "
+                                                      "In a .csv file a number written with a decimal comma splits in two")
+
+    def test_the_mz_columns_may_be_left_out_when_every_standard_has_a_formula(self) -> None:
+        header = [title for title in HEADER["standards"] if "m/z" not in title]
+        rows = [[value for title, value in zip(HEADER["standards"], row) if "m/z" not in title] for row in (PC, FA)]
+        read = self.read(standards_header=header, standards=rows)
+        self.assertEqual([], read["blockers"])
+        self.assertTrue(all(record.mz > 0 for record in read["libraries"][NEGATIVE]))
+
+    def test_an_empty_formula_result_is_blank_and_an_uncached_one_a_problem(self) -> None:
+        import xml.etree.ElementTree as ET
+
+        from msdial_app.lab_lipidomics import _read_cell
+
+        main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        empty = ET.fromstring(f'<c xmlns="{main}" r="B2" t="str"><f>IF(A2="","",A2)</f><v/></c>')
+        self.assertEqual(("string", ""), (_read_cell(empty, "B2", []).kind, _read_cell(empty, "B2", []).value))
+        uncached = ET.fromstring(f'<c xmlns="{main}" r="B2"><f>A2*2</f></c>')
+        self.assertEqual("uncached_formula", _read_cell(uncached, "B2", []).kind)
+
+    def test_a_workbook_with_format_one_sheets_but_no_settings_is_format_one(self) -> None:
+        from msdial_app.supplementary_excel import _write_xlsx
+
+        path = self.base / "nosettings.xlsx"
+        _write_xlsx(path, [{"name": q.SHEET_NAMES[key], "widths": [10], "rows": [{"values": q.HEADERS[key]}]}
+                           for key in ("standards", "class_standards", "selection")])
+        self.assertEqual(q.FORMAT_ID, q.detect_format(path))
+        self.assertBlocks(q.read_quant_input(path), "nosettings.xlsx has no 'Settings' sheet")
+        broken = self.base / "broken.xlsx"
+        broken.write_bytes(b"PK\x03\x04 not really a workbook")
+        self.assertEqual("unreadable", q.describe_workbook(broken))
+        self.assertEqual(q.LEGACY_FORMAT, q.describe_workbook(EXAMPLE / "quant_utility_table.xlsx"))
+        self.assertEqual(q.FORMAT_ID, q.describe_workbook(EXAMPLE / "quant_input.xlsx"))
+
+    def test_an_adduct_without_charge_is_a_problem_not_a_crash(self) -> None:
+        neutral = list(PC)
+        neutral[6], neutral[7] = "[M]", ""
+        read = self.read(standards=[neutral, FA])
+        self.assertTrue(read["blockers"])
 
 
 class TheTemplate(_Folder):
@@ -358,9 +469,10 @@ class TheTemplate(_Folder):
         target = self.base / "fill"
         written = q.quant_input_template({"output_path": str(target), "layout": "tsv", "confirmed": True})
         blockers = "\n".join(written["check"]["blockers"])
-        for fragment in ("Settings: Sample amount is required", "Settings: Sample basis is required",
+        for fragment in ("settings.tsv row 3, Value: Sample amount is required", "settings.tsv row 4, Value: Sample basis is required",
                          "standards.tsv row 2, Spiked amount", "standards.tsv row 2, Pos RT", "standards.tsv row 2, Neg RT"):
-            self.assertIn(fragment, blockers.replace("settings.tsv", "Settings"))
+            self.assertIn(fragment, blockers)
+        self.assertTrue((target / "class_names.tsv").is_file() and (target / "instructions.txt").is_file())
         self.assertNotIn("Pos m/z", blockers)  # computed from the formula
         # Fill in what it asked for: the amounts and RTs of the example, and the sample amount.
         example = {row[0]: row for row in q.converted_tables(
@@ -405,8 +517,25 @@ class TheTemplate(_Folder):
             "amount_column": "H", "is_text_pos": str(EXAMPLE / "EquiSPLASH_Pos.txt"),
             "is_text_neg": str(EXAMPLE / "EquiSPLASH_Neg.txt"), "confirmed": True,
         })
-        self.assertEqual(([], []), (result["check"]["blockers"], result["check"]["warnings"]))
+        self.assertEqual([], result["check"]["blockers"])
+        self.assertEqual(1, len(result["check"]["warnings"]))  # the two-adduct classes of the laboratory's selection
         self.assertEqual("converted", result["kind"])
+        self.assertEqual([], result["warnings"])
+
+    def test_converting_the_per_cells_column_says_its_sample_amount_is_row_fours_reciprocal(self) -> None:
+        tables, problems, _, warnings = q.converted_tables(
+            EXAMPLE / "quant_utility_table.xlsx", "G", EXAMPLE / "EquiSPLASH_Pos.txt", EXAMPLE / "EquiSPLASH_Neg.txt")
+        self.assertEqual([], problems)
+        settings = dict((row[0], row[1]) for row in tables["settings"])
+        self.assertEqual((4.0, "10^6 cells"), (settings["Sample amount"], settings["Sample basis"]))
+        self.assertTrue(any("multiplies by it" in item and "holds 0.25, its reciprocal" in item for item in warnings), warnings)
+        legacy = read_quant_workbook(EXAMPLE / "quant_utility_table.xlsx", "G")
+        target = self.base / "cells.xlsx"
+        q.write_input(target, "xlsx", tables, q.load_lipid_class_vocabulary())
+        read = q.read_quant_input(target)
+        self.assertEqual([], read["blockers"])
+        for before, after in zip(legacy["preparation"]["standards"], read["preparation"]["standards"]):
+            self.assertTrue(math.isclose(before["amount"], after["amount"], rel_tol=1e-12), (before, after))
 
 
 class TheWorkflowReadsEitherForm(unittest.TestCase):
@@ -423,7 +552,7 @@ class TheWorkflowReadsEitherForm(unittest.TestCase):
         batch = Batch(Path(self.directory.name) / name)
         if layout is None:
             return batch, {}
-        tables, problems, _ = q.converted_tables(batch.workbook, "H", batch.is_pos, batch.is_neg)
+        tables, problems, _, _ = q.converted_tables(batch.workbook, "H", batch.is_pos, batch.is_neg)
         self.assertEqual([], problems)
         target = batch.workbook.parent / ("quant_input.xlsx" if layout == "xlsx" else "quant_input")
         q.write_input(target, layout, tables, q.load_lipid_class_vocabulary())
@@ -469,6 +598,10 @@ class TheWorkflowReadsEitherForm(unittest.TestCase):
                 batch.is_pos if polarity == POSITIVE else batch.is_neg, polarity)["records"]},
             {item["name"] for item in check["quant_input"]["standards"]},
         )
+        missing = lab_lipidomics_agent.check_inputs(batch.request(quant_table_path=str(batch.root / "typo.xlsx"),
+                                                                  is_text_pos="", is_text_neg="", amount_column=""))
+        self.assertTrue(any("typo.xlsx does not exist" in item for item in missing["blockers"]))
+        self.assertNotIn("is_text_pos/is_text_neg", [item["id"] for item in missing["questions"]])
         both = lab_lipidomics_agent.check_inputs(batch.request(quant_table_path=extra["quant_table_path"]))
         self.assertTrue(any("is_text_pos is not given with a format-1 input" in item for item in both["blockers"]))
         self.assertTrue(any("amount_column is not given with a format-1 input" in item for item in both["blockers"]))
@@ -478,7 +611,7 @@ class TheWorkflowReadsEitherForm(unittest.TestCase):
         contract = lab_lipidomics_agent.load_contract(batch.contract(**extra))
         settings = Path(extra["quant_table_path"]) / "settings.tsv"
         settings.write_text(settings.read_text(encoding="utf-8").replace("\t10\n", "\t20\n"), encoding="utf-8")
-        self.assertTrue(any("quant_input has changed" in item for item in lab_lipidomics_agent.contract_drift(contract)))
+        self.assertEqual(["the quantification input quant_input has changed"], lab_lipidomics_agent.contract_drift(contract))
 
     def test_a_workset_of_a_format_one_contract_carries_the_one_input(self) -> None:
         batch, extra = self.batch("workset", "xlsx")

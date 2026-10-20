@@ -70,6 +70,56 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - It never guesses a value and never edits the person's file.
   - R4 to R6 now cover both forms.
 
+### Fixed before release (review)
+- The template's Settings drop-down lists were one row too high, so Excel refused a
+  typed sample amount and basis. They are now placed from the rows written, and a
+  test reads them back.
+- **Units in headers:** a unit in a header's parentheses must agree with what the
+  column is read in. `Spiked amount (nmol)` under pmol, or `Pos RT (s)`, was read
+  1000 times off, or in the wrong unit, without a word; now it is a problem. So is an
+  unknown setting whose name says "unit".
+- **Selection, Use column:**
+  - With a Use column, every row says TRUE or FALSE; a cleared cell is a problem.
+  - Use may also be headed Include or Report.
+  - A TRUE/FALSE column under another header, with no Use column, is a problem rather
+    than every row being used.
+  - Classes reported by more than one adduct are now a warning, as the specification
+    says.
+- **Text the library could not hold:** non-ASCII text that MS-DIAL's ASCII library
+  cannot hold is now a problem in the check, instead of making the contract write fail
+  later. This covers a class, an adduct, and full-width digits in a number. Infinite
+  and NaN numbers, an RT over 300 min (a date, or seconds) and an adduct without charge
+  are problems too.
+- **Rows and formulas:**
+  - In a `.csv` file, a row with more cells than the header (a decimal comma splits a
+    number in two) is a problem.
+  - An Excel formula showing nothing is blank, not "never calculated".
+  - A row is read only when a column of the format holds something, so helper columns
+    of the person's own make no rows.
+  - Error values are named as such.
+- The m/z columns may be left out when every standard has a formula.
+- **Telling the forms apart:**
+  - A workbook with format-1 sheets but a misnamed Settings sheet is format 1, and its
+    missing sheet is named.
+  - A missing `quant_table_path` is said as missing, and the earlier form's questions
+    are not asked.
+  - Workbooks beside the raw data are described by their sheet names alone: format 1,
+    the earlier form, another workbook, or unreadable. A damaged one no longer stops
+    the check.
+- **The converter:**
+  - It passes on the earlier workbook's warnings.
+  - It works the spiked amounts back in the direction sheet 1's formula takes, since
+    the per-10^6-cells column multiplies by row 4.
+  - It says when the converted sample amount differs from row 4.
+  - It uses sheet 1's pmol column only when the amount column is in pmol.
+- **Wording:**
+  - The standalone check warns about the classes each polarity cannot quantify.
+  - Messages, the salt evidence, the drift check and the merge use format 1's names
+    (Selection, Class standards, quantification input), and say each changed input
+    once.
+  - check_inputs returns the tables compactly.
+- The folder template also writes `instructions.txt` and `class_names.tsv`.
+
 ## [0.5.43] - Unreleased
 
 Contains 0.5.41 (#74) and 0.5.42 (#75), which are not merged yet; merge this after them.

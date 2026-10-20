@@ -47,17 +47,32 @@ given with it.
 
 ## 2. Rules for every table
 
-- **Row 1 is the header.** Columns are found by their header, in any order. Headers are
-  compared ignoring case, spaces, punctuation and any text in parentheses, so
-  `Spiked amount (pmol)`, `spiked_amount` and `SpikedAmount` are the same column.
-- **Missing required column:** a problem. **Unknown column:** listed and ignored, so a
-  column of your own notes is allowed. **The same column twice:** a problem.
-- **Rows** run from row 2 to the last row with any content. A blank row is skipped; it
-  does not end the table.
-- **Numbers** are written with a decimal point: `0.5`, not `0,5`. An Excel number cell
-  is read as its value. A formula cell is read as the value Excel last saved. A formula
-  that was never calculated (a file written by a program and never opened in Excel) is
-  a problem: open the workbook in Excel and save it.
+- **Row 1 is the header.** In a text file it is the first line that is not a comment.
+  Columns are found by their header, in any order.
+- **Headers are compared ignoring case, spaces, punctuation and any text in
+  parentheses.** So `Spiked amount (pmol)`, `spiked_amount` and `SpikedAmount` are the
+  same column.
+- **A unit in parentheses must agree** with what the column is read in. In `Spiked
+  amount` it must be the Settings' `Spiked amount unit`; in an RT header, minutes.
+  `Spiked amount (nmol)` with pmol in Settings, or `Pos RT (s)`, is a problem. Units are
+  never converted for you.
+- **Columns:**
+  - a required column that is missing is a problem;
+  - an unknown column is listed and ignored, so a column of your own notes or helper
+    formulas is allowed;
+  - the same column twice is a problem.
+- **Rows** run from row 2 to the last row with something in a column this format reads.
+  A blank row is skipped; it does not end the table. In a text file, a row with more
+  cells than the header has columns is a problem: in a `.csv` file a number written
+  with a decimal comma splits in two.
+- **Numbers** are written with a decimal point: `0.5`, not `0,5`.
+  - Full-width digits are not numbers, and neither are infinity or NaN.
+  - An Excel number cell is read as its value.
+  - A formula cell is read as the value Excel last saved; a formula showing nothing is
+    blank.
+  - A formula that was never calculated (a file written by a program and never opened
+    in Excel) is a problem: open the workbook in Excel and save it. So is an error
+    value such as `#N/A`.
 - **Text** is trimmed of leading and trailing spaces.
 - **Names, adducts and formulas are ASCII.** MS-DIAL reads its internal-standard library
   as ASCII, so a `µ` or a full-width character in a standard's name would never match.
@@ -83,7 +98,9 @@ Two columns: `Setting` and `Value`. One row per setting.
   for example a tissue piece of another weight, is corrected by its dilution factor in
   the sample table. That factor multiplies the sample's concentrations, so it is
   nominal amount / actual amount (10 mg nominal, 8 mg weighed: 1.25).
-- An unknown setting is listed and ignored. A setting given twice is a problem.
+- An unknown setting is listed and ignored, except one whose name says "unit": that is
+  a problem, because the amounts would be read in pmol without a word. A setting given
+  twice is a problem.
 
 ## 4. Standards
 
@@ -99,7 +116,7 @@ same row.
 | `InChIKey` | no | copied into MS-DIAL's library | |
 | `SMILES` | no | copied into MS-DIAL's library | |
 | `Pos adduct` | per polarity | the adduct MS-DIAL finds it as in positive mode | `[M+H]+` |
-| `Pos m/z` | per polarity | that adduct's m/z | `753.6134` |
+| `Pos m/z` | per polarity, or from `Formula` | that adduct's m/z | `753.6134` |
 | `Pos RT` | per polarity | its retention time in minutes, on your chromatography | `9.5` |
 | `Pos CCS` | no | its collision cross-section, for ion-mobility data | |
 | `Neg adduct`, `Neg m/z`, `Neg RT`, `Neg CCS` | per polarity | the same in negative mode | `[M+CH3COO]-`, `811.6199`, `9.5` |
@@ -114,9 +131,11 @@ same row.
 - **m/z from the formula.** With `Formula` given and the m/z blank, the m/z is computed
   from the monoisotopic masses and the adduct. With both given, a difference of more
   than 5 mDa is reported, because it usually means a mistyped m/z or the wrong adduct.
+- **The m/z columns may be left out** altogether when every standard has a `Formula`.
 - **The RT is yours to measure.** The internal standard is looked for near this RT
   (within 0.5 min unless the workflow is told otherwise). An RT copied from another
-  laboratory's gradient finds nothing, or the wrong peak.
+  laboratory's gradient finds nothing, or the wrong peak. An RT over 300 min is a
+  problem: it is a date, or seconds.
 - **Adducts are written as MS-DIAL writes them**: `[M+H]+`, `[M+NH4]+`, `[M+Na]+`,
   `[M-H]-`, `[M+CH3COO]-`, `[M+HCOO]-` and so on. An adduct of the wrong charge for its
   polarity is a problem.
@@ -149,10 +168,16 @@ Which class and adduct each polarity reports in the final lipidome:
 | `Class` | yes | a lipid class (section 7) | `PC` |
 | `Adduct` | yes | the adduct that class is reported by | `[M+CH3COO]-` |
 | `Polarity` | yes | `Positive` or `Negative` (`Pos`, `Neg`, `+` and `-` also work) | `Negative` |
-| `Use` | no | `TRUE` or `FALSE`; without the column, or in a blank cell, `TRUE` | `TRUE` |
+| `Use` | no | `TRUE` or `FALSE` (also `yes`/`no`, `1`/`0`) | `TRUE` |
 
-- List only the rows you report, or every row with `Use` saying which. Rows with
-  `FALSE` are kept as a record and never reach the lipidome.
+- **List only the rows you report, without a `Use` column**: every row is then used.
+- **Or list every row with `Use` saying which.** With a `Use` column, every row says
+  `TRUE` or `FALSE`, and a blank cell is a problem: in a filled-in list, a cleared cell
+  is more likely meant as `FALSE` than as `TRUE`.
+  - Rows with `FALSE` are kept as a record and never reach the lipidome.
+  - `Use` may also be headed `Selected`, `IsSelected`, `Include` or `Report`.
+  - A column of `TRUE`/`FALSE` under another header, with no `Use` column, is a
+    problem: every row would otherwise be used.
 - An adduct of the wrong charge for its polarity is a problem in a used row. In a row
   marked `FALSE` it is only reported.
 - **One class reported by two adducts counts each lipid twice.** This is reported and
@@ -175,9 +200,10 @@ MS-DIAL has two spellings for some classes:
 
 **Either spelling is accepted in every table of format 1.** Each name is converted to
 the one its use needs, and the check lists every conversion, for example "Class
-standards row 18: Cer_NS read as Cer-NS". A name MS-DIAL knows in neither spelling is a
-problem in Class standards and Selection, because no lipid would ever carry it. In
-Standards it is only reported, because there it only labels the standard.
+standards row 18, Class: Cer_NS read as Cer-NS." A name MS-DIAL knows in neither spelling
+is a problem in Class standards and Selection, because no lipid would ever carry it. In
+Standards it is only reported, because there it only labels the standard; it must still
+be ASCII.
 
 The template's `Class names` sheet lists every class with both spellings.
 
@@ -189,8 +215,12 @@ everything else. Both are read-only.
 
 - **Problems (`blockers`)** stop the contract. Each names its place: `Standards row 7,
   Pos m/z: '753,6134' is not a number written with a decimal point`.
-- **Warnings** do not stop anything: an m/z that differs from the formula, a class
-  quantified against `Any others`, a class reported by two adducts.
+- **Warnings** do not stop anything:
+  - an m/z that differs from the formula;
+  - classes reported by more than one adduct;
+  - a selected class that MS-DIAL has no class definition for, which is quantified
+    against `Any others`;
+  - the classes a polarity cannot quantify.
 - **Notes** list what was read differently from how it was written: converted class
   spellings, computed m/z values, ignored columns and sheets.
 - **The tables as read**, for the person to look over: each standard with its amount per
@@ -201,20 +231,31 @@ everything else. Both are read-only.
 
 `msdial_lipidomics_quant_input_template` writes a new input. It shows what it would
 write first, and writes only when the call is repeated with `confirmed=true`. It never
-overwrites a file. It writes:
+overwrites a file. It writes one of:
 
-- an empty template (the default): the tables with their headers, an `Instructions`
-  sheet and a `Class names` sheet. Class standards and Selection hold the laboratory's
-  defaults for the EquiSPLASH mixture: review them, then fill in Settings and one
-  Standards row per standard you added.
-  - With `salt="HCOONH4"`, the default selection takes negative-mode formate adducts in
-    place of acetate where the defaults list both.
-- a converted input: given the earlier `quant_utility_table.xlsx`, its amount column and
-  both internal-standard text libraries, the same content in format 1. The spiked
-  amount is sheet 1's `pmol` column where there is one, and otherwise the amount per
-  sample unit times the sample amount (sheet 1, row 4).
+- **A template, prefilled (the default).** An `Instructions` sheet and a `Class names`
+  sheet come beside the four tables.
+  - Settings holds its rows, with Sample amount and Sample basis left blank.
+  - Standards holds the laboratory's EquiSPLASH set: names, classes, formulas and
+    adducts. Every spiked amount and RT is left blank, and the m/z is computed from the
+    formula. Delete the standards you did not add, and add any others.
+  - Class standards and Selection hold the laboratory's defaults; review them.
+  - With `salt="HCOONH4"`, ammonium formate, the negative-mode acetate adducts become
+    formate adducts, in Standards and in Selection.
+  - The check that follows the writing lists every cell still to fill in.
+- **A template with `prefill="none"`.** The Settings rows and the other tables'
+  headers only.
+- **A converted input.** Given the earlier `quant_utility_table.xlsx`, its amount
+  column and both internal-standard text libraries, the same content in format 1. It
+  gives the amounts per sample unit that sheet 1 gives.
+  - The spiked amount is sheet 1's `pmol` column where there is one; otherwise it is
+    worked back from the amount column and the sample amount in row 4.
+  - Sheet 1's per-10^6-cells column multiplies by row 4 where the others divide. A
+    converted sample amount that differs from row 4 is therefore said before anything
+    is written, for the person to decide.
 
-`layout="tsv"` writes the folder form instead of a workbook.
+`layout="tsv"` writes the folder form instead of a workbook. Beside the four tables it
+writes `instructions.txt` and `class_names.tsv`, which the reader ignores.
 
 A complete example is in [`examples/lab-lipidomics`](../examples/lab-lipidomics/README.md):
 `quant_input.xlsx`, and the same tables as text files in `quant_input_tsv/`. Both are the

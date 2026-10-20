@@ -84,12 +84,13 @@ COLUMNS = {
         "class": ("class", "lipidclass", "ontology"),
         "adduct": ("adduct", "adducttype"),
         "polarity": ("polarity", "ionmode"),
-        "use": ("use", "isselected", "selected"),
+        "use": ("use", "isselected", "selected", "used", "include", "included", "report", "reported", "keep"),
     },
 }
 REQUIRED = {
     "settings": ("setting", "value"),
-    "standards": ("name", "class", "spiked", "pos_adduct", "pos_mz", "pos_rt", "neg_adduct", "neg_mz", "neg_rt"),
+    # The m/z columns may be left out where every standard has a Formula to compute them from.
+    "standards": ("name", "class", "spiked", "pos_adduct", "pos_rt", "neg_adduct", "neg_rt"),
     "class_standards": ("class", "standard"),
     "selection": ("class", "adduct", "polarity"),
 }
@@ -169,7 +170,13 @@ class Table:
     columns: dict[str, int] = field(default_factory=dict)
     rows: list[tuple[int, list[Cell]]] = field(default_factory=list)
     ignored_columns: list[str] = field(default_factory=list)
+    # Columns not read, by position, with what they hold: a TRUE/FALSE column under another name than Use.
+    ignored_indexes: list[int] = field(default_factory=list)
+    # The text in a bound header's parentheses: 'Spiked amount (nmol)' -> {'spiked': 'nmol'}.
+    header_units: dict[str, str] = field(default_factory=dict)
+    header_row: int = 1
     problems: list[str] = field(default_factory=list)
+    row_problems: dict[int, list[str]] = field(default_factory=dict)
 
     def where(self, row: int, column: str | None = None) -> str:
         title = COLUMN_TITLES[self.key].get(column, column) if column else ""
@@ -182,6 +189,14 @@ class Table:
     def text(self, cells: list[Cell], column: str) -> str:
         return self.cell(cells, column).text.strip()
 
+    def cell_problems(self, row: int, cells: list[Cell]) -> list[str]:
+        """What is wrong with the row's cells themselves, in the columns read: error values, uncalculated formulas."""
+        found = list(self.row_problems.get(row, []))
+        for column, index in self.columns.items():
+            if index < len(cells) and cells[index].problem:
+                found.append(f"{self.where(row, column)}: {cells[index].problem}")
+        return found
+
 
 def _bind_columns(table: Table, header: list[str]) -> None:
     aliases = COLUMNS[table.key]
@@ -192,14 +207,18 @@ def _bind_columns(table: Table, header: list[str]) -> None:
         field_name = next((name for name, names in aliases.items() if key in names), None)
         if field_name is None:
             table.ignored_columns.append(title.strip())
+            table.ignored_indexes.append(index)
         elif field_name in table.columns:
             table.problems.append(f"{table.label} has the column {COLUMN_TITLES[table.key][field_name]} twice.")
         else:
             table.columns[field_name] = index
+            unit = re.search(r"\(([^)]*)\)", title)
+            if unit and unit.group(1).strip():
+                table.header_units[field_name] = unit.group(1).strip()
     missing = [COLUMN_TITLES[table.key][name] for name in REQUIRED[table.key] if name not in table.columns]
     if missing:
         table.problems.append(
-            f"{table.label} row 1 has no {', '.join(missing)} column(s); its header is: "
+            f"{table.label} row {table.header_row} has no {', '.join(missing)} column(s); its header is: "
             f"{' | '.join(title for title in header if title.strip()) or '(empty)'}."
         )
 
@@ -214,18 +233,21 @@ def table_from_sheet(sheet: XlsxSheet, key: str, source: str) -> Table:
         if found is None:
             return Cell("")
         if found.kind == "error":
-            return Cell("", None, f"{found.ref} is an error value ({found.raw})")
+            return Cell("", None, f"the cell holds the error value {found.raw}")
         try:
             value = sheet.value(ref)
         except LabInputError:
-            return Cell("", None, f"{found.ref} holds a formula Excel never calculated; open the workbook in Excel and save it")
+            return Cell("", None, "the cell holds a formula Excel never calculated; open the workbook in Excel and save it")
         return Cell(sheet.text(ref), value)
 
     header = [read(1, column).text for column in range(width)]
     _bind_columns(table, header)
+    bound = set(table.columns.values())
     for row in range(2, sheet.max_row + 1):
         cells = [read(row, column) for column in range(width)]
-        if any(cell.text.strip() or cell.problem for cell in cells):
+        # A row is there when a column this format reads holds something: a helper column of your own
+        # (a formula showing nothing, a note) does not make a row of a table.
+        if any(cells[index].text.strip() or cells[index].problem for index in bound if index < len(cells)):
             table.rows.append((row, cells))
     return table
 
@@ -248,9 +270,14 @@ def table_from_text(path: Path, key: str) -> Table:
     delimiter = TEXT_SUFFIXES[path.suffix.casefold()]
     numbered = [(number, line) for number, line in enumerate(lines, start=1) if not line.lstrip().startswith("#")]
     if not numbered or not numbered[0][1].strip():
-        table.problems.append(f"{path.name} has no header on its first line.")
+        table.problems.append(f"{path.name} has no header line.")
         return table
-    parsed = list(csv.reader(io.StringIO("\n".join(line for _, line in numbered)), delimiter=delimiter))
+    table.header_row = numbered[0][0]
+    try:
+        parsed = list(csv.reader(io.StringIO("\n".join(line for _, line in numbered)), delimiter=delimiter))
+    except csv.Error as error:
+        table.problems.append(f"{path.name} cannot be read as {'tab' if delimiter == chr(9) else 'comma'}-separated text: {error}.")
+        return table
     if len(parsed) != len(numbered):
         # A quoted field holding a line break: rare, and it would shift every line number after it.
         table.problems.append(f"{path.name} has a quoted field across lines; keep each row on one line.")
@@ -259,27 +286,44 @@ def table_from_text(path: Path, key: str) -> Table:
     _bind_columns(table, header)
     for (number, _), values in zip(numbered[1:], parsed[1:]):
         cells = [Cell(value, value) for value in values]
-        if any(value.strip() for value in values):
-            table.rows.append((number, cells))
+        if not any(value.strip() for value in values):
+            continue
+        table.rows.append((number, cells))
+        if len(values) > len(header) and any(value.strip() for value in values[len(header):]):
+            hint = (" In a .csv file a number written with a decimal comma splits in two: write a decimal point."
+                    if delimiter == "," else "")
+            table.row_problems.setdefault(number, []).append(
+                f"{table.where(number)}: the row has more cells than the header has columns.{hint}"
+            )
     return table
 
 
 def _number(cell: Cell, where: str, problems: list[str]) -> float | None:
-    """A number from a cell, or None when it is blank; a problem is said for anything else."""
+    """A number from a cell, or None when it is blank; a problem is said for anything else.
+
+    A cell's own problem (an error value, an uncalculated formula) is said by Table.cell_problems.
+    """
     if cell.problem:
-        problems.append(f"{where}: {cell.problem}")
         return None
     if isinstance(cell.value, bool):
         problems.append(f"{where}: {cell.text} is not a number")
         return None
     if isinstance(cell.value, (int, float)):
+        if not math.isfinite(float(cell.value)):
+            problems.append(f"{where}: {cell.text or cell.value} is not a finite number")
+            return None
         return float(cell.value)
     text = cell.text.strip()
     if not text:
         return None
-    number = parse_number(text)
+    number = parse_number(text) if _ascii(text) else None
     if number is None:
-        hint = " written with a decimal point" if re.fullmatch(r"[+-]?\d+,\d+", text) else ""
+        if not _ascii(text):
+            hint = " (it holds non-ASCII characters, such as full-width digits)"
+        elif re.fullmatch(r"[+-]?\d+,\d+", text):
+            hint = " written with a decimal point"
+        else:
+            hint = ""
         problems.append(f"{where}: '{text}' is not a number{hint}")
     return number
 
@@ -292,20 +336,52 @@ def _cell_number(table: Table, row: int, cells: list[Cell], column: str, problem
 # Finding the tables
 # ---------------------------------------------------------------------------------------------
 
+# The earlier form's three sheets, by the names the laboratory gives them.
+LEGACY_SHEET_KEYS = ("ispreparation", "lookuptable", "quantinfo")
+
+
+def workbook_sheet_names(path: Path) -> list[str] | None:
+    """A workbook's sheet names from xl/workbook.xml alone, without reading a cell; None when unreadable."""
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            root = ET.fromstring(archive.read("xl/workbook.xml"))
+    except Exception:  # noqa: BLE001  (a damaged or foreign file is only 'unreadable' here)
+        return None
+    return [element.get("name", "") for element in root.iter() if element.tag.endswith("}sheet")]
+
 
 def detect_format(path: str | Path) -> str:
-    """FORMAT_ID for a folder or a workbook with a Settings sheet, LEGACY_FORMAT for another workbook, '' otherwise."""
+    """FORMAT_ID for a folder, or a workbook with any of format 1's sheets; LEGACY_FORMAT for another workbook.
+
+    '' for anything else, a path that is not there included. A workbook that cannot be read is the
+    earlier form's to refuse, as it always has been.
+    """
     source = Path(path).expanduser()
     if source.is_dir():
         return FORMAT_ID
     if not source.is_file() or source.suffix.casefold() not in WORKBOOK_SUFFIXES:
         return ""
-    try:
-        workbook = read_xlsx(source)
-    except (LabInputError, OSError, ValueError):
+    names = workbook_sheet_names(source)
+    if names is None:
         return LEGACY_FORMAT
-    names = {_table_key(sheet.name) for sheet in workbook.sheets}
-    return FORMAT_ID if "settings" in names else LEGACY_FORMAT
+    keys = {_table_key(name) for name in names}
+    return FORMAT_ID if keys & {_table_key(SHEET_NAMES[key]) for key in TABLES} else LEGACY_FORMAT
+
+
+def describe_workbook(path: Path) -> str:
+    """What a workbook beside the raw data looks like, for the person: never parsed beyond its sheet names."""
+    names = workbook_sheet_names(path)
+    if names is None:
+        return "unreadable"
+    keys = {_table_key(name) for name in names}
+    if keys & {_table_key(SHEET_NAMES[key]) for key in TABLES}:
+        return FORMAT_ID
+    if sum(any(key.endswith(legacy) for key in keys) for legacy in LEGACY_SHEET_KEYS) >= 2:
+        return LEGACY_FORMAT
+    return "workbook"
 
 
 def folder_files(folder: Path) -> tuple[dict[str, Path], list[str]]:
@@ -389,11 +465,21 @@ def parse_settings(table: Table) -> dict[str, Any]:
     notes: list[str] = []
     values: dict[str, tuple[int, Cell]] = {}
     for row, cells in table.rows:
+        own = table.cell_problems(row, cells)
+        if own:
+            problems.extend(item + "." for item in own)
+            continue
         name = table.text(cells, "setting")
         key = _column_key(name)
         setting = next((item for item, aliases in SETTINGS.items() if key in aliases), None)
         if setting is None:
-            if name:
+            if name and "unit" in key:
+                # A unit this format does not read would leave the amounts in pmol without a word.
+                problems.append(
+                    f"{table.where(row)}: '{name}' is not a setting this format reads; the unit of the spiked "
+                    "amounts is the setting 'Spiked amount unit'."
+                )
+            elif name:
                 notes.append(f"{table.where(row)}: the setting '{name}' is not one this format reads; ignored.")
             continue
         if setting in values:
@@ -406,14 +492,17 @@ def parse_settings(table: Table) -> dict[str, Any]:
     def setting_text(name: str) -> str:
         return values[name][1].text.strip() if name in values else ""
 
+    def place(name: str) -> str:
+        return table.where(values[name][0], "value") if name in values else table.label
+
     written = setting_text("format")
     result["format"] = written
     if not written:
-        problems.append(f"{table.label} has no Format row; it must read {FORMAT_ID}.")
+        problems.append(f"{place('format')}: Format is required, and must read {FORMAT_ID}.")
     elif written.casefold() != FORMAT_ID:
-        problems.append(f"{table.label} row {values['format'][0]}: Format is '{written}'; this reader knows only {FORMAT_ID}.")
-    if "sample_amount" not in values or not setting_text("sample_amount"):
-        problems.append(f"{table.label}: Sample amount is required, a positive number (10 for 10 uL plasma).")
+        problems.append(f"{place('format')}: Format is '{written}'; this reader knows only {FORMAT_ID}.")
+    if not setting_text("sample_amount"):
+        problems.append(f"{place('sample_amount')}: Sample amount is required, a positive number (10 for 10 uL plasma).")
     else:
         row, cell = values["sample_amount"]
         amount = _number(cell, table.where(row, "value"), problems)
@@ -424,20 +513,15 @@ def parse_settings(table: Table) -> dict[str, Any]:
     basis_text = setting_text("sample_basis")
     basis = BASES.get(_basis_key(basis_text))
     if not basis_text:
-        problems.append(f"{table.label}: Sample basis is required: {', '.join(BASIS_CHOICES)}.")
+        problems.append(f"{place('sample_basis')}: Sample basis is required: {', '.join(BASIS_CHOICES)}.")
     elif basis is None:
-        problems.append(
-            f"{table.where(values['sample_basis'][0], 'value')}: Sample basis '{basis_text}' is not one of "
-            f"{', '.join(BASIS_CHOICES)}."
-        )
+        problems.append(f"{place('sample_basis')}: Sample basis '{basis_text}' is not one of {', '.join(BASIS_CHOICES)}.")
     else:
         result["sample_basis"] = basis[0]
     unit_text = setting_text("spiked_unit") or "pmol"
     prefix = SPIKED_UNITS.get(unit_text.strip().lower())
     if prefix is None:
-        problems.append(
-            f"{table.where(values['spiked_unit'][0], 'value')}: Spiked amount unit '{unit_text}' is not pmol, nmol or fmol."
-        )
+        problems.append(f"{place('spiked_unit')}: Spiked amount unit '{unit_text}' is not pmol, nmol or fmol.")
     else:
         result["spiked_unit"] = unit_text.strip().lower()
         if basis is not None:
@@ -453,8 +537,39 @@ def _known_class(name: str, vocabulary: LipidClassVocabulary) -> str:
     return vocabulary.canonical_vs2(name)
 
 
-def parse_standards(table: Table, settings: dict[str, Any], vocabulary: LipidClassVocabulary) -> dict[str, Any]:
+# A unit written in a header's parentheses must agree with what the format reads the column in.
+RT_UNITS = {"min", "mins", "minute", "minutes"}
+
+
+def _header_unit_problems(table: Table, settings: dict[str, Any]) -> list[str]:
     problems: list[str] = []
+    written = table.header_units.get("spiked", "")
+    if written:
+        unit = written.lower().replace(" ", "")
+        expected = settings.get("spiked_unit") or "pmol"
+        per_sample = unit.split("/")[0]
+        if per_sample != expected:
+            problems.append(
+                f"{table.label} row {table.header_row}, Spiked amount: the header says ({written}), but the amounts "
+                f"are read in {expected}, the Settings' Spiked amount unit. Write the unit in Settings and leave the "
+                "header without it, or make the two agree."
+            )
+    for column in ("pos_rt", "neg_rt"):
+        written = table.header_units.get(column, "")
+        if written and written.lower().replace(" ", "") not in RT_UNITS:
+            problems.append(
+                f"{table.label} row {table.header_row}, {COLUMN_TITLES['standards'][column]}: the header says "
+                f"({written}), but retention times are read in minutes."
+            )
+    return problems
+
+
+# A retention time beyond this is no LC gradient: a date, or seconds.
+RT_PLAUSIBLE_MINUTES = 300.0
+
+
+def parse_standards(table: Table, settings: dict[str, Any], vocabulary: LipidClassVocabulary) -> dict[str, Any]:
+    problems: list[str] = list(_header_unit_problems(table, settings))
     warnings: list[str] = []
     notes: list[str] = []
     standards: list[dict[str, Any]] = []
@@ -462,20 +577,28 @@ def parse_standards(table: Table, settings: dict[str, Any], vocabulary: LipidCla
     seen: dict[str, int] = {}
     sample_amount = settings.get("sample_amount")
     for row, cells in table.rows:
-        row_problems: list[str] = []
+        own = table.cell_problems(row, cells)
         name = table.text(cells, "name")
+        if name and name.casefold() not in seen:
+            seen[name.casefold()] = row
+        if own:
+            problems.extend(item + "." for item in own)
+            continue
+        row_problems: list[str] = []
         klass = table.text(cells, "class")
         formula = table.text(cells, "formula")
         if not name:
             row_problems.append(f"{table.where(row, 'name')}: a standard needs a name")
         elif not _ascii(name):
             row_problems.append(f"{table.where(row, 'name')}: '{name}' holds non-ASCII characters, which MS-DIAL reads as '?'")
-        elif name.casefold() in seen:
+        elif seen.get(name.casefold()) != row:
             row_problems.append(f"{table.where(row, 'name')}: {name} is also on row {seen[name.casefold()]}")
         label = name or "this standard"
         ontology = klass
         if not klass:
             row_problems.append(f"{table.where(row, 'class')}: {label} needs its lipid class")
+        elif not _ascii(klass):
+            row_problems.append(f"{table.where(row, 'class')}: '{klass}' holds non-ASCII characters")
         else:
             known = _known_class(klass, vocabulary)
             if known == UNDEFINED:
@@ -484,7 +607,7 @@ def parse_standards(table: Table, settings: dict[str, Any], vocabulary: LipidCla
                 notes.append(f"{table.where(row, 'class')}: {klass} read as {known}.")
                 ontology = known
         spiked = _cell_number(table, row, cells, "spiked", row_problems)
-        if spiked is None and not table.text(cells, "spiked") and not table.cell(cells, "spiked").problem:
+        if spiked is None and not table.text(cells, "spiked"):
             row_problems.append(f"{table.where(row, 'spiked')}: the amount of {label} added to each sample is required")
         elif spiked is not None and spiked <= 0:
             row_problems.append(f"{table.where(row, 'spiked')}: the amount must be positive")
@@ -509,15 +632,11 @@ def parse_standards(table: Table, settings: dict[str, Any], vocabulary: LipidCla
         if not ions and not any(
             table.text(cells, f"{POLARITY_PREFIX[p]}_{part}") for p in POLARITIES for part in ("adduct", "mz", "rt", "ccs")
         ):
-            row_problems.append(f"{table.where(row)}: {label} has a peak in neither polarity; fill Pos or Neg adduct, m/z and RT")
-        if name and name.casefold() not in seen:
-            seen[name.casefold()] = row
+            row_problems.append(f"{table.where(row)}: {label} has a peak in neither polarity; fill Pos or Neg adduct and RT")
         if row_problems:
             problems.extend(item + "." for item in row_problems)
             continue
-        amount = None
-        if spiked is not None and sample_amount:
-            amount = spiked / sample_amount
+        amount = spiked / sample_amount if spiked is not None and sample_amount else None
         standards.append({
             "name": name, "class_name": ontology, "spiked_amount": spiked, "amount": amount, "row": row,
             "formula": formula or None,
@@ -544,17 +663,22 @@ def _parse_ion(
 ) -> dict[str, Any] | None:
     prefix = POLARITY_PREFIX[polarity]
     columns = {part: f"{prefix}_{part}" for part in ("adduct", "mz", "rt", "ccs")}
-    if not any(table.text(cells, column) or table.cell(cells, column).problem for column in columns.values()):
+    if not any(table.text(cells, column) for column in columns.values()):
         return None
     before = len(problems)
     adduct = table.text(cells, columns["adduct"])
     ion = None
     if not adduct:
         problems.append(f"{table.where(row, columns['adduct'])}: {label} has a {polarity.lower()}-mode peak but no adduct")
+    elif not _ascii(adduct):
+        problems.append(f"{table.where(row, columns['adduct'])}: '{adduct}' holds non-ASCII characters")
     else:
         try:
             ion = parse_adduct(adduct)
-            if ion.polarity != polarity:
+            if ion.charge == 0:
+                problems.append(f"{table.where(row, columns['adduct'])}: {adduct} carries no charge")
+                ion = None
+            elif ion.polarity != polarity:
                 problems.append(f"{table.where(row, columns['adduct'])}: {adduct} is a {ion.polarity.lower()} ion")
         except ValueError as error:
             problems.append(f"{table.where(row, columns['adduct'])}: {error}")
@@ -563,21 +687,30 @@ def _parse_ion(
     rt = _cell_number(table, row, cells, columns["rt"], problems)
     ccs = _cell_number(table, row, cells, columns["ccs"], problems)
     rt_text = table.text(cells, columns["rt"])
-    if rt is None and not rt_text and not table.cell(cells, columns["rt"]).problem:
+    if rt is None and not rt_text:
         problems.append(f"{table.where(row, columns['rt'])}: the retention time of {label} on your chromatography is required")
     elif rt is not None and rt < 0:
         problems.append(f"{table.where(row, columns['rt'])}: a retention time cannot be negative")
+    elif rt is not None and rt > RT_PLAUSIBLE_MINUTES:
+        problems.append(
+            f"{table.where(row, columns['rt'])}: {rt:g} is not a retention time in minutes; is the cell a date, "
+            "or in seconds?"
+        )
     if ccs is not None and ccs <= 0:
         problems.append(f"{table.where(row, columns['ccs'])}: CCS must be positive")
     computed = None
     if neutral is not None and ion is not None and ion.polarity == polarity:
-        computed = adduct_mz(neutral, ion)
-    if mz is None and not mz_text and not table.cell(cells, columns["mz"]).problem:
+        try:
+            computed = adduct_mz(neutral, ion)
+        except (ValueError, ZeroDivisionError) as error:
+            problems.append(f"{table.where(row, columns['adduct'])}: the m/z cannot be computed for {adduct}: {error}")
+    if mz is None and not mz_text:
         if computed is None:
-            problems.append(f"{table.where(row, columns['mz'])}: the m/z is required, or a Formula to compute it from")
+            # Unless a formula is there and only the adduct, already said, kept it from being computed.
+            if neutral is None or ion is not None:
+                problems.append(f"{table.where(row, columns['mz'])}: the m/z is required, or a Formula to compute it from")
         else:
             mz = round(computed, 6)
-            mz_text = ""
             notes.append(f"{table.where(row, columns['mz'])}: computed from {table.text(cells, 'formula')} {adduct}: {mz:.4f}.")
     elif mz is not None and mz <= 0:
         problems.append(f"{table.where(row, columns['mz'])}: the m/z must be positive")
@@ -588,8 +721,9 @@ def _parse_ion(
         )
     if len(problems) > before or mz is None or rt is None or ion is None:
         return None
+    # What MS-DIAL's library is written from: a number as the person wrote it, where that is plain ASCII.
     record = InternalStandard(
-        name=label, mz=mz, rt=rt, adduct=adduct, ontology="", ccs=ccs, mz_text=mz_text if mz_text else "",
+        name=label, mz=mz, rt=rt, adduct=adduct, ontology="", ccs=ccs, mz_text=mz_text,
         rt_text=rt_text, ccs_text=table.text(cells, columns["ccs"]), line=row,
     )
     return {"adduct": adduct, "mz": mz, "rt": rt, "ccs": ccs, "mz_computed": not mz_text, "record": record}
@@ -608,6 +742,10 @@ def parse_class_standards(
     seen: dict[str, int] = {}
     others = 0
     for row, cells in table.rows:
+        own = table.cell_problems(row, cells)
+        if own:
+            problems.extend(item + "." for item in own)
+            continue
         klass = table.text(cells, "class")
         standard = table.text(cells, "standard")
         if not klass or not standard:
@@ -620,10 +758,7 @@ def parse_class_standards(
         else:
             target = _known_class(klass, vocabulary)
             if target == UNDEFINED:
-                problems.append(
-                    f"{table.where(row, 'class')}: '{klass}' is a class MS-DIAL knows in neither spelling, so no lipid "
-                    f"would carry it; see the template's Class names sheet."
-                )
+                problems.append(f"{table.where(row, 'class')}: '{klass}' is {CLASS_UNKNOWN}.")
                 continue
             if target != klass:
                 notes.append(f"{table.where(row, 'class')}: {klass} read as {target}.")
@@ -649,49 +784,98 @@ def parse_class_standards(
             "blockers": problems, "warnings": warnings, "notes": notes}
 
 
+CLASS_UNKNOWN = ("a class MS-DIAL knows in neither spelling, so no lipid would carry it; see the Class names sheet "
+                 "of a template, or class_names.tsv")
+POLARITY_WORDS = {"positive": POSITIVE, "pos": POSITIVE, "+": POSITIVE, "negative": NEGATIVE, "neg": NEGATIVE, "-": NEGATIVE}
+FLAG_WORDS = {"true": True, "1": True, "yes": True, "false": False, "0": False, "no": False}
+
+
 def parse_selection(table: Table, vocabulary: LipidClassVocabulary, source: str) -> dict[str, Any]:
     """Which class and adduct each polarity reports, in the shape parse_quant_info gives.
 
-    The rows are checked by parse_quant_info itself, on a sheet that holds them as read: classes in
-    the LBM spelling, Use blank or absent as TRUE.
+    Each row is checked here, in this format's words; the rows that pass go to parse_quant_info, which
+    counts them as the earlier form's sheet 3 is counted. Without a Use column every row is used; with
+    one, every row says TRUE or FALSE.
     """
     problems: list[str] = []
+    warnings: list[str] = []
     notes: list[str] = []
+    has_use = "use" in table.columns
+    if not has_use:
+        for index in table.ignored_indexes:
+            values = {row_cells[index].text.strip().lower() for _, row_cells in table.rows if index < len(row_cells)}
+            values.discard("")
+            if values and values <= set(FLAG_WORDS):
+                problems.append(
+                    f"{table.label}: the column '{table.ignored_columns[table.ignored_indexes.index(index)]}' holds TRUE "
+                    "and FALSE but is not read; name it Use, or every row is used, its FALSE rows too."
+                )
     cells_by_ref: dict[tuple[int, int], XlsxCell] = {}
     for column, title in enumerate(("Class", "Adduct", "Ion mode", "IsSelected")):
         cells_by_ref[(1, column)] = XlsxCell(f"{column_letters(column)}1", "string", title)
     last = 1
     for row, cells in table.rows:
+        own = table.cell_problems(row, cells)
+        if own:
+            problems.extend(item + "." for item in own)
+            continue
         klass = table.text(cells, "class")
-        if klass and not vocabulary.is_lbm_class(klass):
+        adduct = table.text(cells, "adduct")
+        polarity_text = table.text(cells, "polarity")
+        use_cell = table.cell(cells, "use")
+        if isinstance(use_cell.value, bool):
+            use = use_cell.value
+        elif not has_use:
+            use = True
+        else:
+            use = FLAG_WORDS.get(use_cell.text.strip().lower())
+        row_problems: list[str] = []
+        if use is None:
+            written = use_cell.text.strip()
+            row_problems.append(f"{table.where(row, 'use')}: " + (f"'{written}' is not TRUE or FALSE" if written
+                                                                   else "write TRUE or FALSE"))
+        if not klass:
+            row_problems.append(f"{table.where(row, 'class')}: the row has no class")
+        elif not vocabulary.is_lbm_class(klass):
             converted = vocabulary.lbm_class(klass)
             if converted != UNDEFINED:
                 notes.append(f"{table.where(row, 'class')}: {klass} read as {converted}.")
                 klass = converted
-        use_cell = table.cell(cells, "use")
-        use_text = use_cell.text.strip()
-        if isinstance(use_cell.value, bool):
-            use = use_cell.value
-        elif not use_text:
-            use = True
+            else:
+                row_problems.append(f"{table.where(row, 'class')}: '{klass}' is {CLASS_UNKNOWN}")
+        polarity = POLARITY_WORDS.get(polarity_text.lower())
+        if polarity is None:
+            row_problems.append(f"{table.where(row, 'polarity')}: '{polarity_text}' is not Positive or Negative")
+        if not adduct:
+            row_problems.append(f"{table.where(row, 'adduct')}: the row has no adduct")
         else:
-            use = {"true": True, "1": True, "yes": True, "false": False, "0": False, "no": False}.get(use_text.lower())
-        if use_cell.problem:
-            problems.append(f"{table.where(row, 'use')}: {use_cell.problem}.")
+            try:
+                ion = parse_adduct(adduct)
+                if polarity and ion.polarity != polarity:
+                    row_problems.append(f"{table.where(row, 'adduct')}: {adduct} is a {ion.polarity.lower()} ion in a {polarity} row")
+            except ValueError as error:
+                row_problems.append(f"{table.where(row, 'adduct')}: {error}")
+        if row_problems:
+            # A row marked FALSE never reaches the lipidome, so its problem is only reported.
+            (warnings if use is False else problems).extend(item + "." for item in row_problems)
             continue
-        if use is None:
-            problems.append(f"{table.where(row, 'use')}: '{use_text}' is not TRUE or FALSE.")
-            continue
-        values = (klass, table.text(cells, "adduct"), table.text(cells, "polarity"), "TRUE" if use else "FALSE")
+        values = (klass, adduct, polarity, "TRUE" if use else "FALSE")
         for column, value in enumerate(values):
             cells_by_ref[(row, column)] = XlsxCell(f"{column_letters(column)}{row}", "string", value)
         last = max(last, row)
     sheet = XlsxSheet(table.label, "", cells_by_ref, [], last)
     result = parse_quant_info(sheet, vocabulary, source)
-    # parse_quant_info quotes a sheet's name; this table is named as every other message names it.
+    # parse_quant_info quotes a sheet's name and says 'sheet'; this table is named as every other message names it.
     quoted = f"'{table.label}'"
-    result["blockers"] = problems + [item.replace(quoted, table.label) for item in result["blockers"]]
-    result["warnings"] = [item.replace(quoted, table.label) for item in result["warnings"]]
+    result["blockers"] = problems + [item.replace(f"Sheet {quoted}", table.label).replace(quoted, table.label)
+                                     for item in result["blockers"]]
+    result["warnings"] = warnings + [item.replace(quoted, table.label) for item in result["warnings"]]
+    if result["multi_adduct_classes"]:
+        listed = "; ".join(f"{item['class']} ({', '.join(item['adducts'])})" for item in result["multi_adduct_classes"])
+        result["warnings"].append(
+            f"{table.label}: {len(result['multi_adduct_classes'])} class(es) are reported by more than one adduct, so each "
+            f"of their lipids is counted once per adduct: {listed}."
+        )
     result["notes"] = notes
     return result
 
@@ -718,8 +902,8 @@ def read_quant_input(path: str | Path, vocabulary: LipidClassVocabulary | None =
         return result
     try:
         loaded = _load_tables(source)
-    except (LabInputError, OSError) as error:
-        blockers.append(str(error))
+    except (LabInputError, OSError, ValueError) as error:
+        blockers.append(f"{source.name} cannot be read: {error}")
         return result
     result.update({key: loaded[key] for key in ("layout", "sha256", "sheet_names", "files")})
     blockers.extend(loaded["problems"])
@@ -735,10 +919,8 @@ def read_quant_input(path: str | Path, vocabulary: LipidClassVocabulary | None =
     settings = parse_settings(tables["settings"])
     result["settings"] = {key: value for key, value in settings.items() if key not in {"problems", "warnings", "notes"}}
     standards = parse_standards(tables["standards"], settings, vocabulary)
-    lookup = parse_class_standards(
-        tables["class_standards"], standards["standards"],
-        set(_standard_names(tables["standards"])), vocabulary,
-    )
+    lookup = parse_class_standards(tables["class_standards"], standards["standards"],
+                                   set(_standard_names(tables["standards"])), vocabulary)
     quant_info = parse_selection(tables["selection"], vocabulary, str(source))
     for part in (settings, standards):
         blockers.extend(part["problems"])
@@ -751,6 +933,8 @@ def read_quant_input(path: str | Path, vocabulary: LipidClassVocabulary | None =
     unit = settings.get("unit")
     sample_amount = settings.get("sample_amount")
     basis = settings.get("sample_basis")
+    settings_label = tables["settings"].label
+    sample_row = settings["rows"].get("sample_amount")
     preparation = {
         "sheet": tables["standards"].label, "amount_column": "",
         "amount_header": f"Spiked amount ({settings.get('spiked_unit')}) / Sample amount ({basis})",
@@ -759,10 +943,10 @@ def read_quant_input(path: str | Path, vocabulary: LipidClassVocabulary | None =
                       for item in standards["standards"]],
         "sample_parameter": {
             "label": f"Sample amount ({basis})" if basis else "Sample amount", "value": sample_amount,
-            "label_ref": f"{tables['settings'].label} row {settings['rows'].get('sample_amount', '')}".strip(),
-            "value_ref": f"{tables['settings'].label} row {settings['rows'].get('sample_amount', '')}".strip(),
+            "label_ref": f"{settings_label} row {sample_row}" if sample_row else settings_label,
+            "value_ref": f"{settings_label} row {sample_row}" if sample_row else settings_label,
         },
-        "notes": [{"ref": f"{tables['settings'].label} Description", "text": settings["description"]}]
+        "notes": [{"ref": f"{settings_label} Description", "text": settings["description"]}]
         if settings.get("description") else [],
         "blockers": [], "warnings": [],
     }
@@ -783,18 +967,31 @@ def _standard_names(table: Table) -> list[str]:
 
 
 def summary(read: dict[str, Any]) -> dict[str, Any]:
-    """What a person looks over: the tables as read, without the library records."""
+    """What a person looks over, compact: each standard on one line, the class standards by standard."""
     quant_info = read.get("quant_info") or {}
     lookup = read.get("lookup") or {}
+    by_standard: dict[str, list[str]] = {}
+    for row in lookup.get("rows", []):
+        by_standard.setdefault(row["standard"], []).append(row["target_class"])
+    standards = []
+    for item in read.get("standards_table", []):
+        line = {"name": item["name"], "class": item["class"], "spiked": item["spiked_amount"],
+                "amount_per_sample_unit": item["amount"]}
+        for polarity, ion in item["ions"].items():
+            line[POLARITY_TITLE[polarity].lower()] = {
+                "adduct": ion["adduct"], "mz": ion["mz"], "rt": ion["rt"], **({"mz_computed": True} if ion["mz_computed"] else {}),
+            }
+        standards.append(line)
     return {
         "format": read.get("format"), "path": read.get("path"), "layout": read.get("layout"),
-        "sha256": read.get("sha256"), "settings": read.get("settings"), "unit": read.get("unit"),
-        "standards": read.get("standards_table", []),
-        "class_standards": [{"class": row["target_class"], "standard": row["standard"]} for row in lookup.get("rows", [])],
+        "settings": {key: (read.get("settings") or {}).get(key) for key in ("sample_amount", "sample_basis", "spiked_unit", "description")},
+        "unit": read.get("unit"),
+        "standards": standards,
+        "classes_by_standard": by_standard,
         "unused_standards": lookup.get("unused_standards", []),
         "selected_by_ion_mode": quant_info.get("selected_by_ion_mode", {}),
         "selected_classes": quant_info.get("selected_classes", 0),
-        "multi_adduct_classes": quant_info.get("multi_adduct_classes", []),
+        "multi_adduct_classes": [item["class"] for item in quant_info.get("multi_adduct_classes", [])],
         "undefined_classes": quant_info.get("undefined_classes", []),
     }
 
@@ -838,12 +1035,13 @@ INSTRUCTIONS = (
     ("Which standard quantifies which lipid class. 'Any others' covers every class not listed, and is required "
      "exactly once.", "body"),
     ("Selection", "section"),
-    ("Which class and adduct each polarity reports. Use TRUE or FALSE; a blank cell counts as TRUE. Ammonium "
-     "acetate gives [M+CH3COO]- in negative mode, ammonium formate [M+HCOO]-.", "body"),
+    ("Which class and adduct each polarity reports. Write TRUE or FALSE in every row's Use cell; a blank cell is "
+     "a problem. Ammonium acetate gives [M+CH3COO]- in negative mode, ammonium formate [M+HCOO]-.", "body"),
     ("Class names", "section"),
     ("Either spelling of a class is accepted (Cer_NS or Cer-NS). The Class names sheet lists both for every class.",
      "body"),
-    ("Numbers are written with a decimal point (0.5, not 0,5). Names, adducts and formulas are ASCII.", "body"),
+    ("Numbers are written with a decimal point (0.5, not 0,5). Names, adducts and formulas are ASCII. A unit in a "
+     "header's parentheses must agree with Settings (Spiked amount) or be minutes (RT).", "body"),
 )
 
 
@@ -900,11 +1098,14 @@ def _default_tables(prefill: str, salt: str) -> tuple[dict[str, list[list[Any]]]
 def converted_tables(
     quant_table_path: str | Path, amount_column: str, is_text_pos: str | Path, is_text_neg: str | Path,
     vocabulary: LipidClassVocabulary | None = None,
-) -> tuple[dict[str, list[list[Any]]], list[str], list[str]]:
+) -> tuple[dict[str, list[list[Any]]], list[str], list[str], list[str]]:
     """The earlier form (quant_utility_table.xlsx, its amount column, two text libraries) as format-1 tables.
 
-    Returns (tables, problems, notes). The spiked amount is sheet 1's pmol column where it has one,
-    and otherwise the amount per sample unit times the sample amount in row 4.
+    Returns (tables, problems, notes, warnings). The converted input gives the amounts per sample unit
+    that sheet 1 gives. The spiked amount is sheet 1's pmol column where it has one and the amount
+    column is in pmol. Otherwise it is worked back from the amount column and the sample amount in
+    row 4, in the direction sheet 1's formula takes. Where sheet 1's formula multiplies by row 4, as
+    its per-10^6-cells column does, the sample amount that reproduces it is 1/row 4, and that is said.
     """
     from .lab_lipidomics import read_internal_standard_text, read_quant_workbook, split_by_polarity
 
@@ -914,50 +1115,74 @@ def converted_tables(
     workbook_path = Path(quant_table_path).expanduser()
     workbook = read_quant_workbook(workbook_path, amount_column, vocabulary)
     problems.extend(workbook.get("blockers", []))
+    # What the earlier check says about the workbook (a formula that multiplies, a lock file) goes along.
+    warnings: list[str] = list(workbook.get("warnings", []))
     preparation = workbook.get("preparation") or {}
     if problems or not preparation.get("standards"):
-        return {}, problems or ["The workbook lists no standard."], notes
+        return {}, problems or ["The workbook lists no standard."], notes, warnings
     unit = preparation.get("unit") or ""
     prefix, _, basis_unit = unit.partition("mol_per_")
     basis = next((written for written, normalize_unit in BASES.values() if normalize_unit == basis_unit), "")
     spiked_unit = {value: key for key, value in SPIKED_UNITS.items()}.get(prefix, "pmol")
-    # Sheet 1's pmol column: what is in the extract, before the laboratory divides by the sample amount.
     sheet = read_xlsx(workbook_path).sheets[0]
     header_row = preparation["header_row"]
+    column = preparation["amount_column"]
+    parameter = (preparation.get("sample_parameter") or {}).get("value")
+    # Which way sheet 1's amount column uses row 4: '=E6/$H$4' divides, '=E6*$G$4' multiplies.
+    formula = (preparation["standards"][0].get("formula") or "").replace(" ", "").replace("$", "")
+    row_four = f"{column}{header_row - 1}"
+    multiplies = bool(re.search(rf"\*{row_four}(?![0-9])|(?<![A-Z]){row_four}\*", formula))
     pmol_column = next(
-        (column_letters(column) for column in range(26)
-         if _column_key(sheet.text(f"{column_letters(column)}{header_row}")) == "pmol"),
+        (column_letters(index) for index in range(26)
+         if _column_key(sheet.text(f"{column_letters(index)}{header_row}")) == "pmol"),
         None,
     )
     spiked: dict[str, float] = {}
     ratios: list[float] = []
-    for item in preparation["standards"]:
-        value = sheet.number(f"{pmol_column}{item['row']}") if pmol_column else None
-        if value is not None and item["amount"]:
-            spiked[item["name"]] = value
-            ratios.append(value / item["amount"])
-    parameter = (preparation.get("sample_parameter") or {}).get("value")
-    consistent = len(ratios) == len(preparation["standards"]) and all(
+    if pmol_column and prefix == "p":
+        # Sheet 1's pmol column: what is in the extract, before the laboratory divides by the sample amount.
+        for item in preparation["standards"]:
+            value = sheet.number(f"{pmol_column}{item['row']}")
+            if value is not None and item["amount"]:
+                spiked[item["name"]] = value
+                ratios.append(value / item["amount"])
+    consistent = bool(ratios) and len(ratios) == len(preparation["standards"]) and all(
         math.isclose(ratio, ratios[0], rel_tol=1e-9) for ratio in ratios
     )
-    if ratios and consistent:
+    if consistent:
         sample_amount = float(f"{ratios[0]:.12g}")
         notes.append(
             f"Spiked amounts are sheet 1's column {pmol_column}; the sample amount, {sample_amount:g} {basis}, is "
-            f"their ratio to column {amount_column}."
+            f"their ratio to column {column}."
         )
     elif parameter:
-        sample_amount = float(parameter)
-        spiked = {item["name"]: float(f"{item['amount'] * sample_amount:.12g}") for item in preparation["standards"]}
+        spiked = {}
+        if multiplies:
+            sample_amount = float(f"{1 / float(parameter):.12g}")
+            for item in preparation["standards"]:
+                spiked[item["name"]] = float(f"{item['amount'] / float(parameter):.12g}")
+        else:
+            sample_amount = float(parameter)
+            for item in preparation["standards"]:
+                spiked[item["name"]] = float(f"{item['amount'] * sample_amount:.12g}")
         notes.append(
-            f"Spiked amounts are column {amount_column} times the sample amount in row {header_row - 1} "
-            f"({sample_amount:g} {basis})."
+            f"Spiked amounts are worked back from column {column} and the sample amount in row {header_row - 1} "
+            f"({float(parameter):g})."
         )
     else:
         return {}, [
             f"Sheet 1 gives neither a pmol column nor a sample amount in row {header_row - 1}, so the spiked amounts "
             "are unknown."
-        ], notes
+        ], notes, warnings
+    if parameter and not math.isclose(sample_amount, float(parameter), rel_tol=1e-9):
+        reciprocal = math.isclose(sample_amount * float(parameter), 1.0, rel_tol=1e-9)
+        warnings.append(
+            f"The converted Sample amount is {sample_amount:g} {basis}, so that the amounts are the ones sheet 1 gives; "
+            f"row {header_row - 1} of column {column} holds {float(parameter):g}"
+            + (", its reciprocal, because sheet 1's formula multiplies by it" if reciprocal else "")
+            + f". If your samples were {float(parameter):g} {basis}, write that in Settings: every concentration "
+            f"then changes by {sample_amount / float(parameter):g} times. Decide before the input is used."
+        )
     texts: dict[str, list[InternalStandard]] = {POSITIVE: [], NEGATIVE: []}
     sources: list[str] = []
     positive_path, negative_path = Path(is_text_pos).expanduser(), Path(is_text_neg).expanduser()
@@ -973,7 +1198,7 @@ def converted_tables(
             texts[polarity] = read["records"]
             sources.append(path.name)
     if problems:
-        return {}, problems, notes
+        return {}, problems, notes, warnings
     by_name = {polarity: {record.name: record for record in records} for polarity, records in texts.items()}
     names = [item["name"] for item in preparation["standards"]]
     extra = list(dict.fromkeys(name for polarity in POLARITIES for name in by_name[polarity] if name not in names))
@@ -1006,7 +1231,10 @@ def converted_tables(
         "class_standards": [[row["target_class"], row["standard"]] for row in workbook["lookup"]["rows"]],
         "selection": [[row["class"], row["adduct"], row["ion_mode"], "TRUE" if row["selected"] else "FALSE"]
                       for row in workbook["quant_info"]["rows"]],
-    }, problems, notes
+    }, problems, notes, warnings
+
+
+CLASS_NAMES_HEADER = ("LBM spelling (Selection)", "Class-definition spelling (Class standards)")
 
 
 def _class_names_rows(vocabulary: LipidClassVocabulary) -> list[list[Any]]:
@@ -1035,6 +1263,15 @@ def write_input(target: Path, layout: str, tables: dict[str, list[list[Any]]], v
                 writer.writerow([_text_value(value) for value in row])
             path.write_bytes(buffer.getvalue().encode("utf-8"))  # LF on every system
             written.append(str(path))
+        # Beside the tables, what a workbook template holds in its Instructions and Class names sheets.
+        names = io.StringIO()
+        writer = csv.writer(names, delimiter="\t", lineterminator="\n")
+        writer.writerow(CLASS_NAMES_HEADER)
+        writer.writerows(_class_names_rows(vocabulary))
+        (target / "class_names.tsv").write_bytes(names.getvalue().encode("utf-8"))
+        (target / "instructions.txt").write_bytes(
+            ("\n".join(text for text, _ in INSTRUCTIONS) + "\n").encode("utf-8"))
+        written += [str(target / "class_names.tsv"), str(target / "instructions.txt")]
         return written
     from .supplementary_excel import _write_xlsx
 
@@ -1046,15 +1283,20 @@ def write_input(target: Path, layout: str, tables: dict[str, list[list[Any]]], v
 
     last = 2000
     styles = {"title": "section", "section": "header", "body": "body_left"}
+    # The drop-downs sit on the rows the Settings table was written with: row 1 is the header.
+    setting_rows = {str(row[0]): index for index, row in enumerate(tables.get("settings", []), start=2)}
+    setting_lists = [(f"B{setting_rows[name]}", values) for name, values in
+                     (("Sample basis", list(BASIS_CHOICES)), ("Spiked amount unit", list(SPIKED_UNITS)))
+                     if name in setting_rows]
     sheets = [
         {"name": "Instructions", "widths": [120],
          "rows": [{"values": [text], "style": styles[style]} for text, style in INSTRUCTIONS]},
-        sheet("settings", [22, 48], [("B3", list(BASIS_CHOICES)), ("B4", list(SPIKED_UNITS))]),
+        sheet("settings", [22, 48], setting_lists),
         sheet("standards", [30, 12, 15, 18, 30, 30, 14, 12, 9, 10, 14, 12, 9, 10]),
         sheet("class_standards", [18, 30]),
         sheet("selection", [16, 18, 12, 9], [(f"C2:C{last}", ["Positive", "Negative"]), (f"D2:D{last}", ["TRUE", "FALSE"])]),
         {"name": "Class names", "widths": [26, 40], "freeze_rows": 1,
-         "rows": [{"values": ["LBM spelling (Selection)", "Class-definition spelling (Class standards)"], "style": "header"}]
+         "rows": [{"values": list(CLASS_NAMES_HEADER), "style": "header"}]
          + [{"values": row, "style": "body_left"} for row in _class_names_rows(vocabulary)]},
     ]
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1094,16 +1336,18 @@ def quant_input_template(request: dict[str, Any]) -> dict[str, Any]:
         amount_column = str(request.get("amount_column") or "").strip()
         if not all(texts) or not amount_column:
             raise ValueError("Converting the earlier form needs from_quant_table_path, amount_column, is_text_pos and is_text_neg.")
-        tables, problems, notes = converted_tables(source, amount_column, texts[0], texts[1], vocabulary)
+        tables, problems, notes, warnings = converted_tables(source, amount_column, texts[0], texts[1], vocabulary)
         kind = "converted"
     else:
         tables, notes = _default_tables(prefill, salt)
+        warnings = []
         kind = "template"
     preview = {
         "kind": kind, "layout": layout, "path": str(target), "format": FORMAT_ID,
         "rows": {SHEET_NAMES[key]: len(tables.get(key, [])) for key in TABLES},
         "standards": [row[0] for row in tables.get("standards", [])], "notes": notes, "problems": problems,
-        "specification": SPEC,
+        # To read to the person before confirmed=true: a converted sample amount that differs from row 4.
+        "warnings": warnings, "specification": SPEC,
     }
     if problems:
         return {"written": False, **preview, "message": "Nothing was written: the source has problems; fix them first."}
