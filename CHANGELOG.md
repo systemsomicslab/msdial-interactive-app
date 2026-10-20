@@ -4,6 +4,72 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.44] - Unreleased
+
+### Added
+- **A defined quantification input for laboratory lipidomics, format 1**
+  (`msdial-lipidomics-quant-input/1`, specified in `docs/lab-lipidomics-quant-input.md`).
+  A first-time user can prepare one correctly, and Interactive reads it without a
+  language model.
+  - **What it holds:** what `quant_utility_table.xlsx` and the two internal-standard
+    text libraries hold, in four tables: Settings, Standards, Class standards and
+    Selection.
+  - **Containers:** the recommended one is one workbook; the same tables as
+    `.tsv`/`.csv` files in one folder also work.
+  - **Settings:** the sample amount and its basis (uL plasma, mg tissue, 10^6 cells),
+    and the unit of the spiked amounts.
+  - **Standards:** one row per standard, with the amount added to each sample and the
+    adduct, m/z and RT in each polarity. The amount per sample unit is computed as
+    spiked amount / sample amount. A blank m/z is computed from the formula; a given one
+    is checked against it.
+  - **Columns and class names:** columns are found by header, in any order and any
+    case. Lipid class names are accepted in either MS-DIAL spelling (Cer_NS or Cer-NS)
+    and converted, with a note.
+  - **Reporting:** every problem is named by table, row and column.
+- **Reading it** (`msdial_app/lab_quant_input.py`):
+  - It gives the shapes the earlier form gives: the standards and their amounts, the
+    lookup, the selection and an `InternalStandard` library per polarity. The contract,
+    the resolution, normalize, the merge and worksets are therefore unchanged.
+  - `quant_table_path` takes either form, and `quant_format` says which was read. A
+    format-1 input is given alone, without `is_text_pos`, `is_text_neg` or
+    `amount_column`.
+  - The contract records `quant_format`. A folder input is bound by one digest of its
+    four tables.
+- **`msdial_lipidomics_quant_input_template`** writes a new input. It previews by
+  default, writes with `confirmed=true`, and never overwrites.
+  - By default it holds the laboratory's EquiSPLASH set without amounts or retention
+    times, the laboratory's class standards and selection, an Instructions sheet and a
+    Class names sheet. In Excel, the Polarity, Use, Sample basis and unit cells are
+    drop-down lists.
+  - `salt="HCOONH4"` takes formate adducts in negative mode.
+  - It can also convert the earlier form, with `from_quant_table_path`,
+    `amount_column` and both texts.
+  - After writing, it checks the input, so a template lists the cells still to fill
+    in.
+- **`msdial_lipidomics_check_quant_input`** checks an input on its own, before any raw
+  data are at hand. It reports the tables as read, the classes each polarity cannot
+  quantify, the selection's reconciliation warnings and, with `solvent_type`, the salt
+  evidence.
+- **Examples:** `examples/lab-lipidomics/quant_input.xlsx` and `quant_input_tsv/` are
+  the demo's inputs in format 1. They are generated, with
+  `resources/lab_quant_input_defaults.json`, by
+  `scripts/generate-lab-quant-input-defaults.py`.
+  - The tests check that they match the earlier form.
+  - They also check that the same batch gives a byte-identical `lipid_metabolome.csv`
+    from the earlier form, the workbook and the folder.
+
+### Changed
+- `msdial_lipidomics_check_inputs` asks for the quantification input first. It asks
+  for the texts and the amount column only for the earlier form; until the form is
+  known, those two questions are marked not required.
+- `msdial_lipidomics_write_contract`: `is_text_pos`, `is_text_neg` and
+  `amount_column` are optional, since a format-1 input does not take them.
+- The lipidomics skill:
+  - It says how to help a person prepare the input: offer the template, say what to
+    fill in, and check with `msdial_lipidomics_check_quant_input`.
+  - It never guesses a value and never edits the person's file.
+  - R4 to R6 now cover both forms.
+
 ## [0.5.43] - Unreleased
 
 Contains 0.5.41 (#74) and 0.5.42 (#75), which are not merged yet; merge this after them.

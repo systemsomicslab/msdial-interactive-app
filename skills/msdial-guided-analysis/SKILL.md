@@ -22,7 +22,7 @@ Do not infer GC-MS versus LC-MS, ion mode, or target omics from a filename alone
 
 ## Laboratory Lipidomics
 
-A lipidomics batch quantified with internal standards (a positive and a negative raw folder, an LBM2, internal-standard text libraries and `quant_utility_table.xlsx`, merged into `lipid_metabolome.csv`) has its own skill, `msdial-lipidomics-workflow`, and its own tools (`msdial_lipidomics_check_inputs` to `msdial_lipidomics_merge`). Use that skill for it rather than this guided flow.
+A lipidomics batch quantified with internal standards (a positive and a negative raw folder, an LBM2, and a quantification input (format 1, or internal-standard text libraries and `quant_utility_table.xlsx`), merged into `lipid_metabolome.csv`) has its own skill, `msdial-lipidomics-workflow`, and its own tools (`msdial_lipidomics_check_inputs` to `msdial_lipidomics_merge`). Use that skill for it rather than this guided flow.
 
 ## Public Repository Reanalysis
 

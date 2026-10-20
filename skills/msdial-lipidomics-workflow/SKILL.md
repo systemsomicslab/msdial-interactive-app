@@ -1,6 +1,6 @@
 ---
 name: msdial-lipidomics-workflow
-description: Run an LC-MS/MS lipidomics batch with internal standards end to end through MS-DIAL Interactive - check the inputs, agree the sample table, run MS-DIAL in both polarities with the laboratory's LBM2, salt and internal-standard libraries, find each internal standard, normalize to concentration from quant_utility_table.xlsx, and merge positive and negative into lipid_metabolome.csv. Use when someone points at folders of positive and negative raw lipidomics data and asks for a quantified lipidome, asks to normalize or merge such a run, or wants to run the public MS-DIAL lipidomics demo.
+description: Run an LC-MS/MS lipidomics batch with internal standards end to end through MS-DIAL Interactive - check the inputs, agree the sample table, run MS-DIAL in both polarities with the laboratory's LBM2, salt and internal-standard libraries, find each internal standard, normalize to concentration from the laboratory's quantification input (format 1, or quant_utility_table.xlsx), and merge positive and negative into lipid_metabolome.csv. Use when someone points at folders of positive and negative raw lipidomics data and asks for a quantified lipidome, asks to normalize or merge such a run, or wants to run the public MS-DIAL lipidomics demo.
 ---
 
 # Laboratory lipidomics workflow
@@ -13,8 +13,10 @@ standard quantifies which class.
 Five MCP tools of the `msdial-interactive` server carry it, with the guided-run tools in
 between: `msdial_lipidomics_check_inputs`, `msdial_lipidomics_write_contract`,
 `msdial_lipidomics_resolve_standards`, `msdial_lipidomics_normalize` and
-`msdial_lipidomics_merge`. If they are not among your tools, the MCP server is not
-connected or the Interactive in use predates 0.5.38. Say so, point the person to
+`msdial_lipidomics_merge`. Two more help a person prepare the quantification input
+before any of it: `msdial_lipidomics_quant_input_template` and
+`msdial_lipidomics_check_quant_input` (0.5.44 and later). If the five are not among your
+tools, the MCP server is not connected or the Interactive in use predates 0.5.38. Say so, point the person to
 Interactive's setup (`scripts/setup_claude.py`, or `Setup MS-DIAL for Claude.cmd` on
 Windows) and its tutorial (`docs/tutorials/lab-lipidomics.md`), and stop.
 
@@ -48,13 +50,57 @@ and let the person confirm.
   previews, and downloads only with the person's yes (`confirmed=true`). Whether its
   retention times fit their chromatography is theirs to judge.
 - **The salt** in the mobile phase.
-- **A text library of internal standards** per polarity, or one file holding both.
-- **`quant_utility_table.xlsx`**: sheet 1 the standards and their amounts, sheet 2 which
-  standard quantifies which class, sheet 3 which class and adduct each polarity keeps.
-  A laboratory without one can start from Interactive's example,
-  `examples/lab-lipidomics/quant_utility_table.xlsx` (its `README.md` explains the three
-  sheets), and edit its own copy in Excel. You never edit a workbook.
+- **The quantification input**: the standards added and how much of each, each
+  standard's peak in each polarity, which standard quantifies which class, and which
+  class and adduct each polarity reports. It comes in one of two forms:
+  - **Format 1** (`docs/lab-lipidomics-quant-input.md` in Interactive): one workbook
+    with the sheets Settings, Standards, Class standards and Selection, or a folder of
+    the same four tables as `.tsv` or `.csv`. It holds the standards' peaks itself.
+    For anyone preparing an input for the first time, this is the form to use; see
+    "Preparing the quantification input" below.
+  - **The earlier form**: `quant_utility_table.xlsx` (sheet 1 the standards and their
+    amounts, sheet 2 which standard quantifies which class, sheet 3 the selection), its
+    amount column, and a text library of internal standards per polarity (or one file
+    holding both).
+
+  You never edit either.
 - **An MS-DIAL Console** new enough (step A).
+
+## Preparing the quantification input
+
+A person who has no input yet, or whose standards are in some other file of their own,
+prepares format 1. Help them get it right the first time; never fill it in for them.
+
+1. **Offer a template.** `msdial_lipidomics_quant_input_template(output_path=...)`
+   previews and writes only with `confirmed=true`, and never overwrites a file.
+   - By default it holds the laboratory's EquiSPLASH set: names, classes, formulas and
+     adducts, with every spiked amount and retention time left blank. Class standards
+     and Selection come filled with the laboratory's defaults.
+   - For ammonium formate, pass `salt="HCOONH4"`, which takes formate adducts in
+     negative mode.
+   - `prefill="none"` writes the headers only. `layout="tsv"` writes a folder.
+   - Ask where it should go: the analyst's own folder, not a raw-data folder or a code
+     checkout.
+2. **Say what each sheet holds and what they fill in.** The template's Instructions
+   sheet says the same:
+   - Settings: the sample amount and its basis.
+   - Standards: the spiked amount of each standard (the amount in the extract of one
+     sample), and each RT they observe on their own chromatography.
+   - The rest: delete the standards they did not add, and review Class standards and
+     Selection.
+   - The m/z may stay blank where a formula is given.
+3. **Check it** with `msdial_lipidomics_check_quant_input(quant_table_path=...)`, which
+   needs no raw data. Read each blocker as it is written: it names the sheet, the row
+   and the column. They fix it in their own file and save it, and you check again.
+   - Never guess a value for them: not an RT, an amount, an adduct or a class.
+   - Never edit their file.
+4. **Convert the earlier form.** With `from_quant_table_path`, `amount_column`,
+   `is_text_pos` and `is_text_neg`, the same tool writes the earlier form's content in
+   format 1. The workflow reads the earlier form as it is too, so converting is the
+   person's choice, not a requirement.
+
+A complete example in both containers is in `examples/lab-lipidomics`:
+`quant_input.xlsx` and `quant_input_tsv/`.
 
 The public demo is Zenodo record 10.5281/zenodo.10957708 (CC BY 4.0), file
 `metabolomics_hands-on.zip`, which holds `metabolomics_hands-on/data2.zip`; that unpacks
@@ -131,15 +177,18 @@ bears on it:
 - **R2. The salt** in the mobile phase (see "The salt" below).
 - **R3. The annotation RT tolerance**, in minutes: how far from the LBM2's retention time
   an annotation is accepted. Usually 0.1–3.
-- **R4. The internal-standard texts**, positive and negative. They are tab-separated,
-  with Name, MZ, RT, Adduct and Ontology (InChIKey, Formula, SMILES and CCS may follow),
-  and MZ is the adduct's m/z. One file holding both polarities may be named for both; it
-  is split by the adducts' charge.
-- **R5. The quant workbook**, `quant_utility_table.xlsx`: sheet 1 the standards and
-  their amounts, sheet 2 which standard quantifies which class, sheet 3 which class and
-  adduct each polarity keeps. It is read as last saved and never edited.
-- **R6. The amount column** of sheet 1: F (pmol/mg tissue), G (pmol/10^6 cells) or H
-  (pmol/µL plasma). It sets the unit.
+- **R4. The quantification input**, as `quant_table_path`: a format-1 workbook or
+  folder, or `quant_utility_table.xlsx`. It is read as last saved and never edited.
+  - A format-1 input is given alone. It holds the standards' amounts and peaks, so R5
+    and R6 are not asked.
+  - If the person has none, offer to prepare one (see "Preparing the quantification
+    input") before going on.
+- **R5. Only with `quant_utility_table.xlsx`: the internal-standard texts**, positive
+  and negative. They are tab-separated, with Name, MZ, RT, Adduct and Ontology
+  (InChIKey, Formula, SMILES and CCS may follow), and MZ is the adduct's m/z. One file
+  holding both polarities may be named for both; it is split by the adducts' charge.
+- **R6. Only with `quant_utility_table.xlsx`: the amount column** of sheet 1: F
+  (pmol/mg tissue), G (pmol/10^6 cells) or H (pmol/µL plasma). It sets the unit.
 - **R7. The analysis root.** `pos`, `neg`, `inputs` and `quant` are made inside it. It
   must not be a raw-data folder, a code checkout or a temporary folder.
 - **Where MS-DIAL reads the raw data** (`raw_location`), with this sentence: *MS-DIAL
@@ -229,10 +278,18 @@ Call `msdial_lipidomics_check_inputs` again with every answer. It is still read-
 Report:
 - `blockers` (each one stops the contract) and `warnings`.
 - The salt as mapped, with its evidence.
-- The workbook: the amount column's header and unit, the sample amount behind it
-  (row 4), and any note below the standards. Read the sample amount aloud, because every
-  concentration scales with it. If it is wrong, the person corrects and saves the
-  workbook and you check again. Never edit it.
+- The quantification input. `quant_format` says which form was read.
+  - **Format 1:** read back `quant_input`:
+    - Settings: the sample amount with its basis, and the unit;
+    - each standard's spiked amount and amount per sample unit, and its peaks;
+    - every note on a class spelling converted or an m/z computed.
+  - **The earlier form:** read back the amount column's header and unit, the sample
+    amount behind it (row 4), and any note below the standards.
+  - Either way, read the sample amount aloud, because every concentration scales with
+    it. If it is wrong, the person corrects and saves their file and you check again.
+    Never edit it.
+  - In format 1, sheet 2 is the Class standards table and sheet 3 the Selection table,
+    here and in every step below.
 - `expected_resolution`: for each polarity, the classes that can only come out NOT
   QUANTIFIED, because the standard sheet 2 names for them is not in that polarity's
   text. It also names the standard that covers "Any others".
