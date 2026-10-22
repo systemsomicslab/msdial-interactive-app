@@ -76,8 +76,10 @@ parsing (`repository_reanalysis._summarize_raw_metadata`), but with limits of it
   name that appears beside or inside an input meanwhile (raw data, a copy's files, MS-DIAL's intermediates,
   a sync client's file) is said in that check's warnings as having appeared (`appeared_during_read`),
   without naming a writer, and is neither kept nor bound. `write_contract`'s preview and its result give
-  its own check's warnings (`warnings`), so a name that appears during its reads is shown, and the
-  contract records its `appeared_during_read`.
+  its own check's warnings (`warnings`), so a name that appears during its reads is shown. Every name a
+  check saw appear is also kept in the backend process under that check's `check_digest`, and the
+  contract records, as `appeared_during_read`, every one kept for the digest it confirms: seen by the
+  person's check, a preview or the confirm itself, whose own reads are often all kept already.
 
 Each file's type is the one its header gives the Console (`header_console_acquisition_type`): DDA, AIF or
 SWATH as the header says; DIA with two or more isolation targets is SWATH, with none AIF, with one
@@ -115,7 +117,8 @@ and AIF whose header was not read, are warnings. The check counts every file of 
 no sample table. `write_contract` judges the guards again over the rows the confirmed table includes, with
 the types it states, so a file left out (`included` false) no longer counts, and a check's energy blocker
 does not by itself refuse the contract. The table's AIF warnings are in the preview and the result
-(`acquisition_warnings`, and among `warnings`) and are recorded in the contract (`raw_headers.aif_warnings`).
+(`acquisition_warnings`, and among `warnings`, where they replace the check's own AIF warnings over every
+file) and are recorded in the contract (`raw_headers.aif_warnings`).
 
 A header recording the other polarity than its folder's is a blocker, as file names saying so already
 are; so is one recording both (PolaritySwitching, MixedFunctions), since MS-DIAL runs one ion mode per

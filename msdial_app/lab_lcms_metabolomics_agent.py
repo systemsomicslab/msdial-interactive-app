@@ -267,6 +267,11 @@ _HEADER_DEFERRED: dict[str, bool] = {}
 _HEADER_IN_FLIGHT: dict[str, threading.Event] = {}
 # The extractor build by the state of its folder (each file's path, size and modification time).
 _EXTRACTOR_IDENTITIES: dict[tuple[Any, ...], dict[str, Any]] = {}
+# The names any check of this process saw appear during its reads (appeared_during_read), by its check_digest
+# and polarity: not bound into the digest, so a contract written for that digest records every one the person
+# was shown, by the check, a preview or the confirm itself, though the confirm's own reads may be cached.
+_APPEARED_BY_DIGEST: dict[str, dict[str, list[str]]] = {}
+APPEARED_DIGESTS_KEPT = 64
 _HEADER_CACHE_LOCK = threading.Lock()
 
 
@@ -675,8 +680,10 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
     aif = aif_problems(header_types, header_entries, header_names, console.get("capabilities"))
     blockers.extend(aif["blockers"])
     warnings.extend(aif["warnings"])
-    # Judged over every file here; write_contract judges them again over the rows its sample table runs.
+    # Judged over every file here; write_contract judges them again over the rows its sample table runs, and
+    # says only its own then.
     aif_blockers = list(aif["blockers"])
+    aif_warnings = list(aif["warnings"])
     proposal = _sample_table_proposal(inventory, polarities, args.get("sample_pairs"), {
         "types": header_types,
         "bases": {polarity: {name: basis for name, (_value, basis) in items.items()} for polarity, items in proposed.items()},
@@ -751,6 +758,7 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         "input_identity": identity,
         "check_digest": _digest(identity),
     })
+    _keep_appeared(result["check_digest"], headers["polarities"])
     result["_parsed"] = {
         "args": args, "folders": folders, "inventory": inventory, "libraries": libraries, "salt": salt,
         "analysis_root": analysis_root, "is_rt_tolerance": is_rt_tolerance, "console": console,
@@ -758,8 +766,29 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         "normalizing": normalizing, "polarities": polarities, "merge_choices": merge_choices,
         "alignment_rt_tolerance": alignment_rt_tolerance, "acquisition_answers": acquisition_answers,
         "header_entries": header_entries, "header_names": header_names, "aif_blockers": aif_blockers,
+        "aif_warnings": aif_warnings,
     }
     return result
+
+
+def _keep_appeared(digest: str, polarities: dict[str, Any]) -> None:
+    """Keep the names this check saw appear during its reads, under its check_digest, for the contract."""
+    seen = {polarity: list(report.get("appeared_during_read") or []) for polarity, report in polarities.items()}
+    if not any(seen.values()):
+        return
+    with _HEADER_CACHE_LOCK:
+        kept = _APPEARED_BY_DIGEST.pop(digest, {})
+        for polarity, names in seen.items():
+            kept[polarity] = list(dict.fromkeys([*kept.get(polarity, []), *names]))
+        _APPEARED_BY_DIGEST[digest] = kept
+        while len(_APPEARED_BY_DIGEST) > APPEARED_DIGESTS_KEPT:
+            _APPEARED_BY_DIGEST.pop(next(iter(_APPEARED_BY_DIGEST)))
+
+
+def appeared_for_digest(digest: str) -> dict[str, list[str]]:
+    """Every name a check of this check_digest saw appear during its reads, by polarity."""
+    with _HEADER_CACHE_LOCK:
+        return {polarity: list(names) for polarity, names in (_APPEARED_BY_DIGEST.get(digest) or {}).items()}
 
 
 def public_check(result: dict[str, Any]) -> dict[str, Any]:
@@ -1839,7 +1868,9 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
     aif = aif_problems(stated_types, parsed["header_entries"], parsed["header_names"],
                        parsed["console"].get("capabilities"))
     # What the person confirms against: the check's warnings, and the table's own AIF ones.
-    shown = list(dict.fromkeys([*check["warnings"], *aif["warnings"]]))
+    # The check's own AIF warnings were judged over every file; the table's replace them.
+    shown = list(dict.fromkeys([*(item for item in check["warnings"] if item not in parsed["aif_warnings"]),
+                                *aif["warnings"]]))
     if aif["blockers"]:
         return {**refusal, "check": {**refusal["check"], "warnings": shown}, "acquisition_warnings": aif["warnings"],
                 "error": "The sample table cannot run as it stands: " + " ".join(aif["blockers"])}
@@ -1882,6 +1913,7 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
                 "message": "Show the person what would be written, then call again with confirmed=true."}
 
     inputs.mkdir(parents=True, exist_ok=True)
+    appeared = appeared_for_digest(check["check_digest"])
     replaced = ""
     if contract_path.exists():
         stamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -1944,8 +1976,15 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
         "alignment_rt_tolerance": parsed["alignment_rt_tolerance"],
         # What each file's acquisition type and the analytical order were proposed from; the rows carry the types.
         # The table's AIF warnings (energy sets that differ, energies not recorded or not read) are recorded with
-        # the headers, as the campaign records energy sets that differ; appeared_during_read is this write's.
-        "raw_headers": {**check["raw_headers"], "answers": parsed["acquisition_answers"], "aif_warnings": aif["warnings"]},
+        # the headers, as the campaign records energy sets that differ; appeared_during_read holds every name a
+        # check of this digest saw appear (the person's check, a preview, this confirm).
+        "raw_headers": {
+            **check["raw_headers"], "answers": parsed["acquisition_answers"], "aif_warnings": aif["warnings"],
+            "polarities": {
+                polarity: {**report, "appeared_during_read": appeared.get(polarity, [])}
+                for polarity, report in check["raw_headers"]["polarities"].items()
+            },
+        },
         "normalizing_standards": parsed["normalizing"],
         "sample_table": {
             "rows": table["rows"],

@@ -87,8 +87,10 @@ Built on 0.5.45 (#78), which is not merged yet; merge this after it.
       too. What a reader leaves beside a file input under that file's name, or inside a folder input where a
       known reader rule names it (`reader_created`), is detected afterwards, not prevented: it is said on every
       later check, bound into `check_digest` and recorded in the contract. Any other name that appears
-      meanwhile is said in that check only (`appeared_during_read`), without naming a writer;
-      `write_contract`'s preview and result give its own check's warnings, and the contract records them.
+      meanwhile is said in that check only (`appeared_during_read`), without naming a writer and unbound;
+      `write_contract`'s preview and result give its own check's warnings (the check's AIF warnings over every
+      file replaced by the table's), and the contract records every name a check of the digest it confirms saw
+      appear, a preview's included.
     - Sample metadata is compared with the table proposed, whose order and classes may be the headers' and
       the letters', rather than with the names.
     - The contract schema is `...lab-lcms-metabolomics-contract.v2`: a v1 contract, written before this, is

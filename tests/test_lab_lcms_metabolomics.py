@@ -1727,6 +1727,23 @@ class RawHeaders(unittest.TestCase):
             left_out = [dict(row, included=False) if row["stem"] == "QC1" else row for row in rows]
             written = self.write(batch, check, left_out, acquisition_type_pos="AIF")
             self.assertTrue(written.get("written"), written)
+        # With #825 the check warns that the energy sets differ; with QC1 left out, nothing the contract call
+        # says, in warnings or acquisition_warnings, still does.
+        with_825 = {**EVERY_CAPABILITY, "capabilities": sorted({*EVERY_CAPABILITY["capabilities"], MULTI_ENERGY_AIF_CAPABILITY})}
+        said = "record different sets of MS2 collision energies"
+        with capabilities_patches(with_825, extractor=extractor):
+            check = agent.check_inputs(batch.request(acquisition_type_pos="AIF",
+                                                     analysis_root=str(batch.root / "analysis_825")))
+            self.assertTrue(any(said in item for item in check["warnings"]), check["warnings"])
+            request = {**batch.request(acquisition_type_pos="AIF", analysis_root=str(batch.root / "analysis_825")),
+                       "check_digest": check["check_digest"], "sample_table_confirmed": True,
+                       "sample_table": left_out, "confirmed_by": "the analyst"}
+            for result in (agent.write_contract(request), agent.write_contract({**request, "confirmed": True})):
+                self.assertIn("contract_path", result, result)
+                self.assertFalse(any(said in item for item in [*result["warnings"], *result["acquisition_warnings"]]),
+                                 result["warnings"])
+            self.assertTrue(result["written"], result)
+            self.assertEqual([], agent.load_contract(result["contract_path"])["raw_headers"]["aif_warnings"])
 
     def test_the_tables_aif_warnings_are_shown_and_recorded(self) -> None:
         batch = MetabolomicsBatch(self.root)
@@ -1781,6 +1798,28 @@ class RawHeaders(unittest.TestCase):
                     contract = agent.load_contract(result["contract_path"])
                     self.assertEqual([str(folder.resolve() / "sync0.tmp")],
                                      contract["raw_headers"]["polarities"]["Positive"]["appeared_during_read"])
+        # A preview, then the confirm: the confirm reads nothing (every read is kept), and the contract still
+        # records the name the preview showed.
+        with capabilities_patches(extractor=extractor):
+            state["QC1_Pos"] = "late"
+            for item in folder.glob("sync*.tmp"):
+                item.unlink()
+            check = agent.check_inputs(batch.request(acquisition_type_pos="DDA",
+                                                     analysis_root=str(batch.root / "analysis_preview")))
+            state["QC1_Pos"] = None
+            request = {**batch.request(acquisition_type_pos="DDA", analysis_root=str(batch.root / "analysis_preview")),
+                       "check_digest": check["check_digest"], "sample_table_confirmed": True,
+                       "confirmed_by": "the analyst"}
+            preview = agent.write_contract(request)
+            self.assertTrue(any("sync0.tmp appeared in the positive raw folder" in item for item in preview["warnings"]),
+                            preview.get("warnings"))
+            calls = len(extractor.calls)
+            written = agent.write_contract({**request, "confirmed": True})
+            self.assertEqual(calls, len(extractor.calls))
+            self.assertTrue(written["written"], written)
+        contract = agent.load_contract(written["contract_path"])
+        self.assertEqual([str(folder.resolve() / "sync0.tmp")],
+                         contract["raw_headers"]["polarities"]["Positive"]["appeared_during_read"])
 
     def test_sample_metadata_is_compared_with_the_table_proposed(self) -> None:
         batch = MetabolomicsBatch(self.root)
