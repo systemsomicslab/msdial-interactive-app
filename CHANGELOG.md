@@ -4,6 +4,17 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.45] - Unreleased
+
+0.5.44 is #77, which is not merged yet. Merge that first; this section then sits above its own.
+
+### Fixed
+- **The analyst's retention-time decision now reaches MSP libraries.**
+  - Each MSP annotator row in `msp_annotator_settings.tsv` carries its own RT settings, and the Console reads the row.
+  - `_apply_retention_time_use` wrote the answer to `use_retention_time_for_annotation` and `retention_time_tolerance` into the LBM lines and the Text annotator rows only. An MSP with retention times was therefore always searched without them, with a tolerance of 0.5 min, whatever the analyst answered.
+  - The decision is now written into every MSP and Text row, except the internal-standard row and a row marked `rt_fixed`, whose RT use was decided for that library alone. The laboratory metabolomics presets planned next need such rows.
+  - Not affected: laboratory lipidomics, which uses only the LBM2, and the repository campaign, which gives no RT answer.
+
 ## [0.5.43] - Unreleased
 
 Contains 0.5.41 (#74) and 0.5.42 (#75), which are not merged yet; merge this after them.
