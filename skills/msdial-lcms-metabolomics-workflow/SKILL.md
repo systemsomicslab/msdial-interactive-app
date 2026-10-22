@@ -119,9 +119,11 @@ material such as NIST SRM 1950 plasma is a Standard), class, analytical order, b
 dilution factor, acquisition type and included. Read `class_proposal` and
 `order_proposal` aloud. Corrections go in `sample_table` by stem, every sample listed.
 Classes and acquisition types reach the Console's ASCII analysis file: give them in
-printable ASCII without commas or quotes (a Japanese class name as a romanized word). A raw
-file whose own name the Console cannot carry may be left out (`included: false`); the
-contract refuses it included.
+printable ASCII without commas or quotes (a Japanese class name as a romanized word). The
+acquisition type is DDA, SWATH or AIF, the words the Console reads; it reads any other as
+DDA, so DIA data are SWATH or AIF by the person's word. Analytical and batch orders are
+ranks from 1. A raw file whose own name the Console cannot carry may be left out
+(`included: false`); the contract refuses it included.
 
 On their yes, call `msdial_lcms_metabolomics_write_contract(..., check_digest,
 sample_table_confirmed=true, sample_table=<corrections>, confirmed_by=<who>)`. It
