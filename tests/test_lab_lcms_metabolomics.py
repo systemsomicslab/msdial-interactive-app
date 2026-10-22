@@ -11,6 +11,7 @@ import csv
 import io
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import time
@@ -974,6 +975,37 @@ class PairingAndStandardsText(unittest.TestCase):
                                  {name: [row["class_id"] for row in table["rows"]].count(name) for name in [*groups, "Blank"]})
                 self.assertNotEqual("shared_sample_word_letters", table["class_proposal"].get("derived_from"))
                 self.assertFalse(any("shared sample word's letters" in item for item in check["warnings"]), check["warnings"])
+        # Plate wells beside a factor one polarity names in lower case, and beside one file name with a typo: every
+        # pair keeps its names' class, and each pair whose two classes differ is said.
+        wells = [f"{row}{column}" for row in "ABCD" for column in (1, 2, 3)]
+        for label, negative_class in (
+            ("case only", lambda well, group: group.lower()),
+            ("one typo", lambda well, group: "WT" if well == "C1" else group),
+        ):
+            with self.subTest(label):
+                positive = [{"file_name": f"20230101_Pos_{group}_{well}_{index:03d}", "file_type": "Sample",
+                             "class_id": group}
+                            for index, well in enumerate(wells, start=1) for group in ["WT" if well[0] in "AB" else "KO"]]
+                negative = [{"file_name": f"20230105_Neg_{negative_class(well, group)}_{well}_{index:03d}",
+                             "file_type": "Sample", "class_id": negative_class(well, group)}
+                            for index, well in enumerate(wells, start=1) for group in ["WT" if well[0] in "AB" else "KO"]]
+                paired = core.pair_by_shared_tokens(positive, negative)
+                self.assertEqual([], paired["problems"])
+                self.assertEqual({}, paired["class_proposal"])
+                self.assertEqual({"WT": 6, "KO": 6}, {name: [row["class_id"] for row in paired["rows"]].count(name)
+                                                      for name in ("WT", "KO")})
+                said = [item for item in paired["warnings"] if "class_id is" in item]
+                self.assertEqual(12 if label == "case only" else 1, len(said), said)
+        # Where the letters decide, each pair whose two classes differ is still said, and recorded.
+        positive = [{"file_name": f"20230125_SWATH_{name}_C_CE20_d1", "file_type": "Sample", "class_id": "Sample"}
+                    for name in ("A1", "A2", "B1", "B2")]
+        negative = [{"file_name": f"20230208_SWATH_{name}_A_CE20_{suffix}", "file_type": "Sample", "class_id": suffix}
+                    for name, suffix in (("A1", "d2"), ("A2", "d2r2"), ("B1", "d2"), ("B2", "d2"))]
+        paired = core.pair_by_shared_tokens(positive, negative)
+        self.assertEqual(["A", "A", "B", "B"], sorted(row["class_id"] for row in paired["rows"]))
+        self.assertEqual(4, len(paired["class_proposal"]["polarity_disagreements"]))
+        self.assertTrue(any("A2: class_id is 'Sample' in positive and 'd2r2' in negative; the class is proposed from the "
+                            "letters." in item for item in paired["warnings"]), paired["warnings"])
         # Paired by their sample numbers, with a factor both polarities name: the factor stands.
         positive = [{"file_name": f"20230125_S{index}_{group}_C_d1", "file_type": "Sample", "class_id": group}
                     for index, group in ((1, "Ctrl"), (2, "Ctrl"), (3, "Case"), (4, "Case"))]
@@ -1152,15 +1184,23 @@ class RawHeaders(unittest.TestCase):
     def test_aif_meets_the_campaigns_collision_energy_guards(self) -> None:
         batch = MetabolomicsBatch(self.root)
         with_825 = {**EVERY_CAPABILITY, "capabilities": sorted({*EVERY_CAPABILITY["capabilities"], MULTI_ENERGY_AIF_CAPABILITY})}
+        # The QC acquired at 40 eV, the rest at 20 eV: one energy each, two over the polarity, as the campaign counts.
+        apart = {"QC1_Pos": [40.0]}
         for energies, found, refused, warned in (
-            ([20.0, 40.0], None, "lacks MsdialWorkbench#825", ""),
+            ([20.0, 40.0], None, "record 2 MS2 collision energies among them (20, 40 eV: Blank_Pos, QC1_Pos, S1_Pos, "
+                                 "S2_Pos)", ""),
             ([20.0, 40.0], with_825, "", ""),
+            (apart, None, "record 2 MS2 collision energies among them (20 eV: Blank_Pos, S1_Pos, S2_Pos; 40 eV: QC1_Pos)",
+             ""),
+            (apart, with_825, "", "record different sets of MS2 collision energies (20 eV: Blank_Pos, S1_Pos, S2_Pos; "
+                                  "40 eV: QC1_Pos)"),
             (None, with_825, "which stops on an AIF file", ""),
             (None, None, "", "the repository campaign holds such AIF data"),
             ([20.0], None, "", ""),
         ):
             with self.subTest(energies=energies, console_825=found is not None):
-                extractor = FakeExtractor(lambda path: header_record(path, "DIA", [], energies=energies))
+                extractor = FakeExtractor(lambda path: header_record(path, "DIA", [], energies=(
+                    energies.get(Path(path).stem, [20.0]) if isinstance(energies, dict) else energies)))
                 with capabilities_patches(found, extractor=extractor):
                     check = agent.check_inputs(batch.request(acquisition_type_pos="AIF"))
                 self.assertEqual({"AIF"}, set(types_by_stem(check).values()))
@@ -1170,15 +1210,20 @@ class RawHeaders(unittest.TestCase):
                     self.assertEqual([], check["blockers"])
                 if warned:
                     self.assertTrue(any(warned in item for item in check["warnings"]), check["warnings"])
-        # A type stated in sample_table meets the same guard.
-        extractor = FakeExtractor(lambda path: header_record(path, "DIA", [], energies=[20.0, 40.0]))
+        # A type stated in sample_table meets the same guard, over the files stated AIF.
+        extractor = FakeExtractor(lambda path: header_record(path, "DIA", [], energies=apart.get(Path(path).stem, [20.0])))
         with capabilities_patches(extractor=extractor):
             check = agent.check_inputs(batch.request(acquisition_type_pos="SWATH"))
             self.assertTrue(check["ready_for_contract"], (check["questions"], check["blockers"]))
-            rows = [{"stem": stem, "class_id": CLASSES[stem], "acquisition_type": "AIF" if stem == "S1" else "SWATH",
-                     **({} if kind == "Sample" else {"file_type": kind})} for stem, kind in STEMS]
-            refused = self.write(batch, check, rows, acquisition_type_pos="SWATH")
-        self.assertIn("S1_Pos (MS2 collision energies 20, 40 eV) are to run as AIF", refused.get("error", ""))
+            for aif, refused in ((("S1", "QC1"), True), (("S1", "S2"), False)):
+                with self.subTest(stated_aif=aif):
+                    rows = [{"stem": stem, "class_id": CLASSES[stem], "acquisition_type": "AIF" if stem in aif else "SWATH",
+                             **({} if kind == "Sample" else {"file_type": kind})} for stem, kind in STEMS]
+                    result = self.write(batch, check, rows, acquisition_type_pos="SWATH")
+                    if refused:
+                        self.assertIn("(20 eV: S1_Pos; 40 eV: QC1_Pos)", result.get("error", ""))
+                    else:
+                        self.assertTrue(result.get("written"), result)
 
     def test_a_header_that_cannot_be_read_is_asked_kept_and_the_answer_fills_only_that_file(self) -> None:
         batch = MetabolomicsBatch(self.root)
@@ -1409,6 +1454,8 @@ class RawHeaders(unittest.TestCase):
             check = agent.check_inputs(batch.request())
             options = extractor.options[0]
             self.assertEqual(agent.HEADER_TIMEOUT_POLICY, options["timeout_policy"])
+            # Chunks of 4 files at 30 s each take at most half the check's 240 s.
+            self.assertEqual(4, options["chunk_inputs"])
             self.assertEqual(agent.HEADER_INPUT_TIMEOUT_CEILING_SECONDS, options["timeout_ceiling_seconds"])
             self.assertLessEqual(options["deadline"], time.monotonic() + agent.HEADER_READ_BUDGET_SECONDS)
             self.assertGreaterEqual(options["deadline"], before + agent.HEADER_READ_BUDGET_SECONDS - 1)
@@ -1416,11 +1463,13 @@ class RawHeaders(unittest.TestCase):
             self.assertEqual(["QC1_Pos"], report["not_read_in_time"])
             self.assertIn({"file": "QC1_Pos", "read": "not_read_time_limit"}, report["per_file"])
             question = next(item for item in check["questions"] if item["id"] == "acquisition_type_pos")
-            self.assertIn("QC1_Pos were not read within the check's 240 s", question["prompt"])
-            # A read the time limit cut short is not kept: the next check reads that file, and only it.
+            self.assertIn("QC1_Pos were not read within the check's 240 s; checking again reads them first, one at a "
+                          "time", question["prompt"])
+            # A read the time limit cut short is not kept: the next check reads that file, and only it, on its own.
             late.clear()
             check = agent.check_inputs(batch.request())
             self.assertEqual(["QC1_Pos.mzML"], extractor.calls[-1])
+            self.assertEqual(1, extractor.options[-1]["chunk_inputs"])
             self.assertTrue(check["ready_for_contract"], (check["questions"], check["blockers"]))
 
     def test_a_second_check_waits_for_the_read_in_flight(self) -> None:
@@ -1516,6 +1565,133 @@ class RawHeaders(unittest.TestCase):
             self.assertEqual([str(waters.resolve() / "_INDEX.idx")],
                              result["raw_headers"]["polarities"]["Positive"]["reader_created_files"])
 
+    def test_a_file_that_hangs_costs_no_other_file_its_read_and_is_kept_as_failed(self) -> None:
+        from msdial_app import raw_metadata_preflight as preflight
+
+        stems = [(f"S{index:02d}", "Sample") for index in range(1, 21)]
+        batch = MetabolomicsBatch(self.root, stems=stems)
+        commands: list[list[str]] = []
+
+        def extractor_process(command, **options):
+            inputs = [command[index + 1] for index, token in enumerate(command) if token == "--input"]
+            commands.append([Path(item).stem for item in inputs])
+            if any(Path(item).stem == "S07_Pos" for item in inputs):
+                # It hangs until the time limit it is given ends.
+                time.sleep(options["timeout"])
+                raise subprocess.TimeoutExpired(command, options["timeout"])
+            output = Path(command[command.index("--output") + 1])
+            output.write_text(json.dumps([header_record(item, "DIA", WINDOWS) for item in inputs]), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        quick = {name: {"base_seconds": 0.2, "seconds_per_gb": 0.0} for name in agent.HEADER_TIMEOUT_POLICY}
+        with capabilities_patches(extractor=FakeExtractor()), \
+                patch.object(agent, "run_extractor", preflight.run_extractor), \
+                patch("msdial_app.raw_metadata_preflight.subprocess.run", side_effect=extractor_process), \
+                patch.object(agent, "HEADER_TIMEOUT_POLICY", quick), \
+                patch.object(agent, "HEADER_READ_BUDGET_SECONDS", 2.0):
+            check = agent.check_inputs(batch.request())
+            # Chunks of 5 (half the time each at most): the hanging one ends on its own limit, its other files are
+            # read one at a time, and the hanging file fails on its own.
+            self.assertEqual(5, max(len(command) for command in commands))
+            self.assertIn(["S07_Pos"], commands)
+            report = check["raw_headers"]["polarities"]["Positive"]
+            self.assertEqual(["S07_Pos"], report["unreadable"])
+            self.assertEqual([], report["not_read_in_time"])
+            self.assertEqual({"SWATH": 19, "unresolved": 1}, report["acquisition_types"])
+            # Kept as a failed read: checking again does not wait for it again.
+            count = len(commands)
+            again = agent.check_inputs(batch.request())
+            self.assertEqual(count, len(commands))
+            self.assertEqual(check["check_digest"], again["check_digest"])
+
+    def test_a_read_is_kept_for_the_input_as_it_became_only_when_its_reader_changed_it(self) -> None:
+        batch = MetabolomicsBatch(self.root)
+        source = batch.folders["Positive"] / "S1_Pos.mzML"
+
+        def copying(path: Path, work: Path) -> None:
+            # A copy still writing the file while it is read.
+            if path.name == "S1_Pos.mzML" and not source.read_text(encoding="ascii"):
+                source.write_text("the rest of the file", encoding="ascii")
+
+        extractor = FakeExtractor(during=copying)
+        with capabilities_patches(extractor=extractor):
+            agent.check_inputs(batch.request())
+            agent.check_inputs(batch.request())
+        self.assertEqual(["S1_Pos.mzML"], extractor.calls[-1])
+        # A folder its reader wrote into is read once.
+        batch = MetabolomicsBatch(self.root / "second")
+        waters = batch.folders["Positive"] / "S3_Pos.raw"
+        waters.mkdir()
+        (waters / "_FUNC001.DAT").write_bytes(b"x")
+
+        def writing(path: Path, work: Path) -> None:
+            if path.suffix == ".raw":
+                (path / "_INDEX.idx").write_bytes(b"index")
+
+        extractor = FakeExtractor(during=writing, created=lambda path: [path / "_INDEX.idx"] if path.suffix == ".raw" else [])
+        with capabilities_patches(extractor=extractor):
+            agent.check_inputs(batch.request())
+            agent.check_inputs(batch.request())
+        self.assertEqual(1, len(extractor.calls))
+
+    def test_a_file_answered_unread_and_read_as_aif_before_the_contract_is_shown_again(self) -> None:
+        batch = MetabolomicsBatch(self.root)
+        late = {"QC1_Pos"}
+        # No header records an energy or a time: only why QC1 was asked, and what its header now suggests, change.
+        extractor = FakeExtractor(lambda path: "late" if Path(path).stem in late
+                                  else header_record(path, "DIA", [] if Path(path).stem == "QC1_Pos" else WINDOWS))
+        with capabilities_patches(extractor=extractor):
+            check = agent.check_inputs(batch.request(acquisition_type_pos="SWATH"))
+            self.assertTrue(check["ready_for_contract"], (check["questions"], check["blockers"]))
+            late.clear()
+            refused = self.write(batch, check, acquisition_type_pos="SWATH")
+        self.assertIn("changed after it was checked", refused.get("error", ""))
+
+    def test_a_file_that_appears_meanwhile_is_said_but_not_put_down_to_the_reader(self) -> None:
+        batch = MetabolomicsBatch(self.root)
+        folder = batch.folders["Positive"]
+
+        def meanwhile(path: Path, work: Path) -> None:
+            if path.name == "S1_Pos.mzML":
+                (folder / "sync.tmp").write_text("", encoding="ascii")
+                (folder / "S2_Pos.dcl").write_text("", encoding="ascii")
+
+        extractor = FakeExtractor(during=meanwhile)
+        with capabilities_patches(extractor=extractor):
+            check = agent.check_inputs(batch.request())
+            again = agent.check_inputs(batch.request())
+        self.assertEqual([], check["raw_headers"]["polarities"]["Positive"]["reader_created_files"])
+        said = [item for item in check["warnings"] if "appeared in the positive raw folder" in item]
+        self.assertTrue(said and "sync.tmp" in said[0] and "S2_Pos.dcl" in said[0], check["warnings"])
+        self.assertFalse(any("appeared in the positive raw folder" in item for item in again["warnings"]))
+        self.assertFalse(any("left files in or beside the raw data" in item for item in check["warnings"]))
+        self.assertEqual(check["check_digest"], again["check_digest"])
+
+    def test_a_contract_of_an_earlier_version_or_with_a_row_of_no_type_is_refused(self) -> None:
+        with capabilities_patches():
+            batch = MetabolomicsBatch(self.root)
+            contract = batch.contract()
+            path = Path(contract)
+            original = path.read_text(encoding="utf-8")
+            answers = {agent.CONTRACT_KEY: contract, "ion_mode": "Positive", "minimum_peak_height": 500}
+            data = json.loads(original)
+            data["schema"] = "msdial-interactive.lab-lcms-metabolomics-contract.v1"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            plan = build_guided_plan(str(batch.folders["Positive"]), answers)
+            self.assertFalse(plan["ready_to_prepare"])
+            self.assertTrue(any("written by an earlier version of the laboratory metabolomics agent" in item
+                                for item in plan["blockers"]), plan["blockers"])
+            for value in ("", "MRM"):
+                with self.subTest(acquisition_type=value):
+                    data = json.loads(original)
+                    data["sample_table"]["rows"][0]["acquisition_type"] = value
+                    path.write_text(json.dumps(data), encoding="utf-8")
+                    plan = build_guided_plan(str(batch.folders["Positive"]), answers)
+                    self.assertFalse(plan["ready_to_prepare"])
+                    self.assertTrue(any("gives no acquisition type the Console reads for "
+                                        + data["sample_table"]["rows"][0]["stem"] in item for item in plan["blockers"]),
+                                    plan["blockers"])
+
     def test_sample_metadata_is_compared_with_the_table_proposed(self) -> None:
         batch = MetabolomicsBatch(self.root)
         order = {"S1": 1, "S2": 2, "QC1": 3, "Blank": 4}
@@ -1573,8 +1749,14 @@ class AlignmentTolerance(Batched):
                 self.assertEqual(expected, lines["Retention time tolerance for alignment"])
         for given in (1.5, None):
             with self.subTest(changed=given):
-                # A plan's answer (a workset's alike) cannot move one polarity off the contract's value.
+                # A plan's answer cannot move one polarity off the contract's value, nor can a workset's.
                 plan = self.plan(contracts[given], alignment_rt_tolerance=0.3)
+                self.assertTrue(any("alignment_rt_tolerance is fixed by the contract" in item for item in plan["blockers"]),
+                                plan["blockers"])
+                workset = {"id": "w", "kind": "user", "answers": {"alignment_rt_tolerance": 0.3}}
+                with patch("msdial_app.agent_workflow.get_workset", return_value=workset):
+                    plan = build_guided_plan(str(self.batch.folders["Positive"]), {
+                        agent.CONTRACT_KEY: contracts[given], "ion_mode": "Positive", "minimum_peak_height": 500}, "w")
                 self.assertTrue(any("alignment_rt_tolerance is fixed by the contract" in item for item in plan["blockers"]),
                                 plan["blockers"])
                 self.assertTrue(self.plan(contracts[given], alignment_rt_tolerance=1.5 if given else 0.1)["ready_to_prepare"])

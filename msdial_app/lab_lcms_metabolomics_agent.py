@@ -120,7 +120,16 @@ from .lab_lipidomics_agent import (
 )
 from .lab_lipidomics import lab_method_answers
 from .lipidome_merge import strip_polarity
-from .raw_metadata_preflight import READ_OUTCOMES, file_key, input_format, input_signature, run_extractor
+from .raw_metadata_preflight import (
+    CHUNK_INPUTS,
+    COLLISION_ENERGY_DECIMALS,
+    READ_OUTCOMES,
+    file_key,
+    input_format,
+    input_signature,
+    input_timeout_seconds,
+    run_extractor,
+)
 from .workflow import (
     ANNOTATION_CANDIDATES_CAPABILITY,
     AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY,
@@ -132,7 +141,10 @@ from .workflow import (
 )
 
 CHECK_SCHEMA = "msdial-interactive.lab-lcms-metabolomics-check.v1"
-CONTRACT_SCHEMA = "msdial-interactive.lab-lcms-metabolomics-contract.v1"
+# v2 since each file's acquisition type is read from its header, a pair of two types carries the one the person
+# states, and AIF meets the collision-energy guards; a v1 contract's rows may carry types nobody stated.
+CONTRACT_SCHEMA = "msdial-interactive.lab-lcms-metabolomics-contract.v2"
+EARLIER_CONTRACT_SCHEMAS = frozenset({"msdial-interactive.lab-lcms-metabolomics-contract.v1"})
 NORMALIZE_RECORD_SCHEMA = "msdial-interactive.lab-lcms-metabolomics-normalize.v1"
 CONTRACT_NAME = "lab-lcms-metabolomics-contract.json"
 RECORD_NAME = "lab-lcms-metabolomics-record.jsonl"
@@ -198,8 +210,9 @@ ACQUISITION_TYPES = ("DDA", "SWATH", "AIF")
 HEADER_READ_ALL_LIMIT = 200
 # A check answers within the MCP request (600 s), write_contract's included. So its header reads stop starting
 # extractor processes after HEADER_READ_BUDGET_SECONDS, and each input is given HEADER_TIMEOUT_POLICY's limit
-# rather than the campaign's, which runs to hours for a large Waters folder. A file not read in time is asked
-# about, and the next check reads it: the reads done are kept.
+# rather than the campaign's, which runs to hours for a large Waters folder. Chunks take at most half that time
+# (_chunk_inputs). A file not read in time is asked about, and the next check reads it first, on its own and
+# within its own limit, so one that hangs is then kept as a failed read; the reads done are kept.
 HEADER_READ_BUDGET_SECONDS = 240.0
 HEADER_TIMEOUT_POLICY: dict[str, dict[str, float]] = {
     "metadata_reader": {"base_seconds": 30.0, "seconds_per_gb": 0.0},
@@ -231,6 +244,12 @@ OPEN_BASES = {
     "unresolved": "read, without a type the Console reads",
     "raw_header_aif": "read as AIF",
 }
+# Names never put down to a header reader when they appear beside the raw files: raw data, and what MS-DIAL
+# itself writes there.
+NOT_READER_SUFFIXES = frozenset({
+    ".mzml", ".raw", ".wiff", ".wiff2", ".scan", ".lcd", ".abf", ".cdf", ".ibf", ".mzxml", ".mzdata", ".d",
+    ".dcl", ".pai2", ".pai", ".tag", ".mddata", ".arf2", ".dbs",
+})
 # A header polarity that is no single ion mode: MS-DIAL runs one per analysis.
 SWITCHING_POLARITIES = frozenset({"PolaritySwitching", "MixedFunctions"})
 # Header reads in this process, by the extractor build and the file as it was (path, size, modification time):
@@ -240,6 +259,8 @@ _HEADER_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 # What a header read left in a folder input, or beside a file input, by that folder: kept for the process, so
 # every later check, write_contract's included, says so again.
 _HEADER_CREATED: dict[str, list[str]] = {}
+# The inputs a deadline left unread: the next check reads them first, one at a time.
+_HEADER_DEFERRED: dict[str, bool] = {}
 # The inputs a check is reading now: a second check waits for that read rather than start another extractor on
 # the same files.
 _HEADER_IN_FLIGHT: dict[str, threading.Event] = {}
@@ -323,6 +344,9 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
     header_names = headers.pop("_names")
     header_orders = headers.pop("_orders")
     acquisition_answers: dict[str, str] = {}
+    # Why each answered file was open: bound into check_digest with what its header suggested, so a file the
+    # person answered as not read, and read as AIF by the time the contract is written, is shown again.
+    answered_from: dict[str, dict[str, str]] = {}
     # Asked after the other questions, beside the sample table they belong to.
     acquisition_questions: list[tuple[str, str, list[str]]] = []
     for polarity in [polarity for polarity in polarities if polarity in inventory]:
@@ -344,6 +368,7 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         hints = _count(suggested[polarity][name] for name in open_files if name in suggested[polarity])
         if open_files and answer:
             acquisition_answers[key] = answer
+            answered_from[polarity] = {name: items[name][1] for name in open_files}
             for name in open_files:
                 items[name] = (answer, ANSWERED)
             if set(settled) - {answer}:
@@ -707,8 +732,11 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
     # What the headers proposed for every file, and what a read left beside the raw data, so a re-read that
     # proposes otherwise is a changed input.
     identity["raw_headers"] = _digest({
-        polarity: sorted([name, value, basis, (header_orders.get(polarity) or {}).get(name) if order_used else None]
-                         for name, (value, basis) in items.items())
+        polarity: sorted([
+            name, value, basis, (header_orders.get(polarity) or {}).get(name) if order_used else None,
+            (answered_from.get(polarity) or {}).get(name), (suggested.get(polarity) or {}).get(name),
+            ((header_entries.get(polarity) or {}).get(name) or {}).get("ms2_collision_energies"),
+        ] for name, (value, basis) in items.items())
         for polarity, items in sorted(proposed.items())
     } | {"reader_created_files": {polarity: report["reader_created_files"]
                                   for polarity, report in sorted(headers["polarities"].items())}})
@@ -817,11 +845,14 @@ def aif_problems(
 ) -> dict[str, list[str]]:
     """What the Console does with the files to run as AIF, from the MS2 collision energies their headers record.
 
-    The repository campaign's guards (raw_metadata_preflight, AIF as SWATH): AIF of more than one MS2 collision
-    energy needs a Console with MsdialWorkbench#825 to settle each spot's representative energy, and that Console
-    stops on an AIF file whose MS2 scans carry none. types: {polarity: {file name casefolded: type}}; entries:
-    the header summaries by the same keys; capabilities None while the Console is not named, when nothing is
-    said yet. Whether AIF of one energy runs as SWATH, as the campaign runs it, is the person's answer.
+    The repository campaign's guards (raw_metadata_preflight.decide_disposition), per polarity: the distinct
+    energies (to 0.1 eV) over every file to run as AIF. More than one needs a Console with MsdialWorkbench#825
+    to settle each spot's representative energy, whether one file records several or files record different
+    ones (#825 chooses among one file's energies, never across files), so without it that is a blocker; with
+    it, files whose energy sets differ are said (the campaign records them), and a file that records no energy
+    is a blocker, since that Console stops on one. types: {polarity: {file name casefolded: type}}; entries: the
+    header summaries by the same keys; capabilities None while the Console is not named, when nothing is said
+    yet. Whether AIF of one energy runs as SWATH, as the campaign runs it, is the person's answer.
     """
     blockers: list[str] = []
     warnings: list[str] = []
@@ -829,7 +860,7 @@ def aif_problems(
         return {"blockers": blockers, "warnings": warnings}
     ready = MULTI_ENERGY_AIF_CAPABILITY in set(capabilities)
     for polarity, items in types.items():
-        multi: list[str] = []
+        sets: dict[tuple[float, ...], list[str]] = {}
         unrecorded: list[str] = []
         unread: list[str] = []
         for key, value in items.items():
@@ -838,19 +869,34 @@ def aif_problems(
             name = (names.get(polarity) or {}).get(key, key)
             entry = (entries.get(polarity) or {}).get(key)
             energies = (entry or {}).get("ms2_collision_energies")
+            own: set[float] = set()
+            for item in energies if isinstance(energies, list) else []:
+                try:
+                    own.add(round(float(item), COLLISION_ENERGY_DECIMALS))
+                except (TypeError, ValueError):
+                    continue
             if entry is None:
                 unread.append(name)
-            elif not isinstance(energies, list) or not energies:
+            elif not own:
                 unrecorded.append(name)
-            elif len(set(energies)) > 1:
-                multi.append(f"{name} ({_energies_text(entry)})")
+            else:
+                sets.setdefault(tuple(sorted(own)), []).append(name)
         side = polarity.lower()
-        if multi and not ready:
+        union = sorted({value for values in sets for value in values})
+        listed = "; ".join(", ".join(f"{value:g}" for value in values) + " eV: " + _names_text(files)
+                           for values, files in sorted(sets.items()))
+        if len(union) > 1 and not ready:
             blockers.append(
-                f"The {side} files {_names_text(multi)} are to run as AIF, and their headers record more than one MS2 "
-                "collision energy. The Console lacks MsdialWorkbench#825's multi-energy AIF processing, so nothing "
-                "settles a spot's representative energy, and the repository campaign holds such data. Name a Console "
-                "with #825, or another type on the person's word."
+                f"The {side} files to run as AIF record {len(union)} MS2 collision energies among them ({listed}). "
+                "The Console lacks MsdialWorkbench#825's multi-energy AIF processing, so nothing settles a spot's "
+                "representative energy, and the repository campaign holds such data. Name a Console with #825, or "
+                "another type on the person's word."
+            )
+        elif len(sets) > 1:
+            warnings.append(
+                f"The {side} files to run as AIF record different sets of MS2 collision energies ({listed}). The "
+                "Console's MsdialWorkbench#825 chooses among each file's own energies, so representative energies "
+                "can differ between files; the repository campaign runs such data as it is, on record."
             )
         if unrecorded and ready:
             blockers.append(
@@ -1034,24 +1080,63 @@ def created_beside_raw(paths: Iterable[Path]) -> list[str]:
         return list(dict.fromkeys(item for key in keys for item in _HEADER_CREATED.get(key, [])))
 
 
+def _reader_wrote(name: str, stems: set[str]) -> bool:
+    """Whether a name that appeared beside the files read is one of theirs (S1_Pos.mzML.index beside S1_Pos.mzML),
+    rather than raw data or MS-DIAL's intermediates written by something else meanwhile."""
+    lowered = name.casefold()
+    if Path(lowered).suffix in NOT_READER_SUFFIXES:
+        return False
+    return any(lowered.startswith(stem + ".") for stem in stems)
+
+
+def _changed_by_reader(before: dict[str, Any], after: Any, created: list[str]) -> bool:
+    """Whether a folder input's signature after the read differs from before by exactly the files its reader
+    created; any other change is someone else's, and the read is not kept for the folder as it became."""
+    if not created or not isinstance(after, dict):
+        return False
+    try:
+        added = sum(Path(item).stat().st_size for item in created)
+    except OSError:
+        return False
+    return (after.get("file_count") == int(before.get("file_count") or 0) + len(created)
+            and after.get("size_bytes") == int(before.get("size_bytes") or 0) + added)
+
+
+def _chunk_inputs(paths: list[Path]) -> int:
+    """Inputs per extractor process, so that a chunk's summed limits take at most half the check's time.
+
+    A chunk the deadline cuts loses every file in it, the ones already read included, and one that ends on its
+    own limit still leaves time to read its files one at a time.
+    """
+    largest = max((input_timeout_seconds(path, policy=HEADER_TIMEOUT_POLICY,
+                                         ceiling_seconds=HEADER_INPUT_TIMEOUT_CEILING_SECONDS) for path in paths),
+                  default=HEADER_INPUT_TIMEOUT_CEILING_SECONDS)
+    return max(1, min(CHUNK_INPUTS, int(HEADER_READ_BUDGET_SECONDS / 2 / max(largest, 0.001) + 1e-9)))
+
+
 def _read_headers(extractor: Path, extractor_key: tuple[Any, ...], paths: list[Path], deadline: float) -> dict[str, Any]:
     """Each path's header, summarized as the repository campaign summarizes it (by file_key).
 
     A file read before by the same extractor build, at the same size and modification time, is taken from
     this process's cache, a read that failed included. A file another check is reading now is waited for, up
-    to the deadline. The rest are read in one run_extractor call: bounded chunks, HEADER_TIMEOUT_POLICY per
-    input, the deadline over all of them, into a temporary folder that is removed afterwards. The folder of
-    each file input is listed before and after, so a reader that writes beside a file is seen as one that
-    writes into a folder is (created_beside_raw).
+    to the deadline. The rest are read with run_extractor, HEADER_TIMEOUT_POLICY per input and the deadline
+    over all of them, into a temporary folder that is removed afterwards: first, one at a time, the files a
+    deadline left unread before (so a file that hangs meets its own limit and is kept as a failed read, and
+    no longer costs the files beside it their read again); then the others in chunks of _chunk_inputs. The
+    folder of each file input is listed before and after: a new name that is one of the files read with
+    another ending (S1_Pos.mzML.index) is put down to the reader (created_beside_raw); any other new name
+    only appeared meanwhile, and is said for this check alone.
 
-    Returns entries and failures (the outcome of each read that failed) by file_key, and deferred: the files
-    the deadline left unread, which the next check reads.
+    Returns entries and failures (the outcome of each read that failed) by file_key, deferred (the files the
+    deadline left unread, which the next check reads first) and appeared (new names not put down to the reader).
     """
     from .repository_reanalysis import _summarize_raw_metadata
 
     entries: dict[str, dict[str, Any]] = {}
     failures: dict[str, str] = {}
     deferred: list[str] = []
+    appeared: list[str] = []
+    signatures: dict[str, dict[str, Any]] = {}
     cache_keys: dict[str, tuple[Any, ...]] = {}
     claimed: list[Path] = []
     waiting: list[tuple[Path, threading.Event]] = []
@@ -1068,6 +1153,7 @@ def _read_headers(extractor: Path, extractor_key: tuple[Any, ...], paths: list[P
         if signature is None:
             failures[key] = "missing"
             continue
+        signatures[key] = signature
         cache_keys[key] = (*extractor_key, key, json.dumps(signature, sort_keys=True))
         with _HEADER_CACHE_LOCK:
             cached = _HEADER_CACHE.get(cache_keys[key])
@@ -1083,42 +1169,63 @@ def _read_headers(extractor: Path, extractor_key: tuple[Any, ...], paths: list[P
     try:
         if claimed and time.monotonic() < deadline:
             beside = {file_key(path.parent): path.parent for path in claimed if not path.is_dir()}
+            stems = {key: {Path(path.name).stem.casefold() for path in claimed if file_key(path.parent) == key}
+                     for key in beside}
             before = {key: _folder_names(folder) for key, folder in beside.items()}
             with _HEADER_CACHE_LOCK:
                 earlier = {file_key(path): list(_HEADER_CREATED.get(file_key(path), [])) for path in claimed if path.is_dir()}
+                again = [path for path in claimed if file_key(path) in _HEADER_DEFERRED]
+            rest = [path for path in claimed if path not in again]
+            outcomes: dict[str, dict[str, Any]] = {}
+            records: list[dict[str, Any]] = []
             work = Path(tempfile.mkdtemp(prefix="msdial-lab-headers-"))
             try:
-                execution = run_extractor(
-                    extractor, claimed, work, created_before=earlier, timeout_policy=HEADER_TIMEOUT_POLICY,
-                    timeout_ceiling_seconds=HEADER_INPUT_TIMEOUT_CEILING_SECONDS, deadline=deadline,
-                )
+                for group, size in ((again, 1), (rest, _chunk_inputs(rest))):
+                    if not group:
+                        continue
+                    execution = run_extractor(
+                        extractor, group, work, created_before={key: earlier[key] for key in map(file_key, group)
+                                                                if key in earlier},
+                        timeout_policy=HEADER_TIMEOUT_POLICY, timeout_ceiling_seconds=HEADER_INPUT_TIMEOUT_CEILING_SECONDS,
+                        deadline=deadline, chunk_inputs=size,
+                    )
+                    outcomes.update(execution.get("outcomes") or {})
+                    records.extend(execution.get("records") or [])
             finally:
                 shutil.rmtree(work, ignore_errors=True)
             for key, folder in beside.items():
                 after = _folder_names(folder)
-                if before[key] is not None and after is not None:
-                    _record_created(key, (str(folder / name) for name in sorted(after - before[key])))
-            summary = _summarize_raw_metadata(list(execution.get("records") or []))
+                if before[key] is None or after is None:
+                    continue
+                new = sorted(after - before[key])
+                _record_created(key, (str(folder / name) for name in new if _reader_wrote(name, stems[key])))
+                appeared.extend(str(folder / name) for name in new if not _reader_wrote(name, stems[key]))
+            summary = _summarize_raw_metadata(records)
             by_file = {file_key(item["file"]): item for item in summary.get("per_file", []) if item.get("file")}
             for path in claimed:
                 key = file_key(path)
-                outcome = (execution.get("outcomes") or {}).get(key) or {}
-                _record_created(key, outcome.get("reader_created_files") or [])
+                outcome = outcomes.get(key) or {}
+                created = [str(item) for item in outcome.get("reader_created_files") or []]
+                _record_created(key, created)
                 entry = by_file.get(key)
                 if outcome.get("outcome") in READ_OUTCOMES and entry is not None:
                     value: dict[str, Any] = {"entry": {name: entry.get(name) for name in HEADER_FIELDS}, "failure": ""}
                 elif outcome.get("deadline"):
                     deferred.append(key)
+                    with _HEADER_CACHE_LOCK:
+                        _HEADER_DEFERRED[key] = True
                     continue
                 else:
                     value = {"entry": None, "failure": str(outcome.get("outcome") or "no_record")}
                 keys = {cache_keys[key]}
-                if isinstance(outcome.get("input_signature"), dict):
-                    # As the read left it: a reader that wrote into a folder changed its signature.
+                fresh = [item for item in created if item not in earlier.get(key, [])]
+                if path.is_dir() and _changed_by_reader(signatures[key], outcome.get("input_signature"), fresh):
+                    # As the read left it: the folder grew by what its reader wrote, and by nothing else.
                     keys.add((*extractor_key, key, json.dumps(outcome["input_signature"], sort_keys=True)))
                 with _HEADER_CACHE_LOCK:
                     for cache_key in keys:
                         _HEADER_CACHE[cache_key] = dict(value)
+                    _HEADER_DEFERRED.pop(key, None)
                 take(key, value)
         else:
             deferred.extend(file_key(path) for path in claimed)
@@ -1137,7 +1244,7 @@ def _read_headers(extractor: Path, extractor_key: tuple[Any, ...], paths: list[P
             take(key, cached)
         else:
             deferred.append(key)
-    return {"entries": entries, "failures": failures, "deferred": deferred}
+    return {"entries": entries, "failures": failures, "deferred": deferred, "appeared": appeared}
 
 
 def _parse_start_time(value: Any) -> dt.datetime | None:
@@ -1236,7 +1343,7 @@ def read_raw_headers(inventory: dict[str, Any], polarities: list[str]) -> dict[s
             "chosen": chosen, "skipped": skipped, "to_read": [index for index in chosen if index not in skipped],
         }
     # One read for every polarity, under one time limit: what it leaves unread is asked, and read next time.
-    read: dict[str, Any] = {"entries": {}, "failures": {}, "deferred": []}
+    read: dict[str, Any] = {"entries": {}, "failures": {}, "deferred": [], "appeared": []}
     wanted = [plan["paths"][index] for plan in plans.values() for index in plan["to_read"]]
     if extractor.get("path") and wanted:
         path = Path(extractor["path"])
@@ -1320,7 +1427,8 @@ def read_raw_headers(inventory: dict[str, Any], polarities: list[str]) -> dict[s
                              "writes analysis.sqlite into such a .d folder, and the check writes nothing beside the raw data")
             if late:
                 parts.append(f"the headers of {_names_text(late)} were not read within the check's "
-                             f"{HEADER_READ_BUDGET_SECONDS:g} s; checking again reads them (the headers read are kept)")
+                             f"{HEADER_READ_BUDGET_SECONDS:g} s; checking again reads them first, one at a time, each "
+                             "within its own limit (the headers read are kept, a failed read too)")
             if unreadable:
                 parts.append(f"the headers of {_names_text(unreadable)} could not be read")
             if unresolved:
@@ -1381,6 +1489,14 @@ def read_raw_headers(inventory: dict[str, Any], polarities: list[str]) -> dict[s
             report["warnings"].append(
                 "Reading the headers left files in or beside the raw data (a reader wrote them; the check does not): "
                 + _names_text(created) + "."
+            )
+        folders = {file_key(path.parent) for path in paths if not path.is_dir()}
+        meanwhile = [item for item in read["appeared"] if file_key(Path(item).parent) in folders]
+        if meanwhile:
+            # Not one of the files read with another ending: who wrote it is not known, and it is not kept.
+            report["warnings"].append(
+                f"While the headers were read, {_names_text(meanwhile)} appeared in the {polarity.lower()} raw folder, "
+                "written by something the check cannot name (an acquisition, a copy or a run, say); check the folder."
             )
         report["polarities"][polarity] = {
             "files": len(names),
@@ -1906,6 +2022,11 @@ def load_contract(contract_path: str | Path, *, verify: bool = True) -> dict[str
         contract = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as error:
         raise LabMetabolomicsError(f"The laboratory metabolomics contract {path} cannot be read: {error}") from None
+    if isinstance(contract, dict) and contract.get("schema") in EARLIER_CONTRACT_SCHEMAS:
+        raise LabMetabolomicsError(
+            f"{path} was written by an earlier version of the laboratory metabolomics agent ({contract['schema']}), "
+            "whose rows may carry acquisition types nobody stated. Check the inputs again and write a new contract."
+        )
     if not isinstance(contract, dict) or contract.get("schema") != CONTRACT_SCHEMA:
         raise LabMetabolomicsError(f"{path} is not a laboratory metabolomics contract ({CONTRACT_SCHEMA}).")
     contract["_path"] = str(path)

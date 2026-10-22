@@ -29,7 +29,7 @@ merge). Agent Skill: `skills/msdial-lcms-metabolomics-workflow`.
 | Salt | As for lipidomics; formic acid reads as `HCOONH4`. It also chooses the negative adduct the merge prefers. |
 | Internal standards | An MS-DIAL text library per polarity (Name, MZ or Pos-m/z, RT, Adduct; Ontology, Formula, InChIKey optional; a standard without a class is written as "Internal standard"). One file may hold both. |
 | Duplicates | `duplicate_rule` (evidence, intensity or keep_all) and `inchikey_match` (first_block or first_two_blocks), asked before anything runs. |
-| Pairing | Two polarities pair by name, otherwise by the words that set each polarity's files apart, or by `sample_pairs` the person gives. Paired by those words, the class is proposed from letters (section 1b) only where the file names give the samples no class both polarities agree on. |
+| Pairing | Two polarities pair by name, otherwise by the words that set each polarity's files apart, or by `sample_pairs` the person gives. Paired by those words, the class is proposed from letters (section 1b) only where the file names give no Sample pair a class both polarities agree on. |
 | Acquisition type | Read from each file's raw header (section 1a). `acquisition_type_pos` / `acquisition_type_neg` (DDA, SWATH or AIF) is asked for every file whose own header does not settle it; `acquisition_type_mixed_pos` / `acquisition_type_mixed_neg` (`as_read`) where the files' own headers give more than one type. |
 | Normalizing standard | One name per polarity (`normalizing_standard_pos`, `normalizing_standard_neg`), from that polarity's library. |
 | Internal-standard RT tolerance | 0.5 min unless given. |
@@ -53,20 +53,29 @@ parsing (`repository_reanalysis._summarize_raw_metadata`), but with limits of it
 - A check, and the check `write_contract` runs, returns within the MCP tool's 600 s: each file gets at most
   30 s (plus 120 s per GB where the reader reads every spectrum, as for Waters, and 30 s per GB for
   ion-mobility data; 180 s at most), and no extractor process starts, or runs on, past 240 s for the whole
-  check. A file not read in time is asked about (`not_read_in_time`); checking again reads it, since the
-  reads done are kept.
+  check. Files go to the extractor in chunks whose summed limits take at most half that time (4 files at
+  30 s), so a file that hangs costs its chunk its own limit, and the chunk's other files are then read one
+  at a time and kept; a chunk the 240 s cut loses every file in it. A file not read in time is asked about
+  (`not_read_in_time`); the next check reads such files first, one at a time, each within its own limit,
+  so one that hangs is then kept as a failed read and the others are read.
 - A header read is kept in the backend process by the extractor build (the sha256 of its exe and of every
   file beside it, as `inspect_raw_metadata_extractor` reports them) and the file's path, size and
-  modification time, a read that failed included. So a check repeated does not read an unchanged file
-  again, nor wait again for one that could not be read: that file is read again only once it changes, the
-  extractor changes, or the backend restarts. A read the 240 s cut short is not kept. A check that finds a
-  file being read by another check waits for that read rather than start a second extractor on it.
+  modification time as they were before the read, a read that failed included. So a check repeated does
+  not read an unchanged file again, nor wait again for one that could not be read: that file is read again
+  only once it changes, the extractor changes, or the backend restarts. A read the 240 s cut short is not
+  kept. A file input that changed during its read (a copy still writing it) is read again by the next
+  check; a folder input is kept as the read left it too only where it grew by exactly what its reader
+  wrote. A check that finds a file being read by another check waits for that read rather than start a
+  second extractor on it.
 - The extractor works in a temporary folder outside the raw data, removed afterwards. Its Bruker BAF reader
   writes `analysis.sqlite` into a `.d` folder, so such a folder is never given to it, and its type is asked.
   Any other reader is not prevented from writing: what appears in a folder input, or beside a file input
-  (its folder is listed before and after the read), is detected afterwards, said in a warning
-  (`reader_created_files`), kept for the life of the backend process so every later check says it again,
-  bound into `check_digest`, and recorded in the contract.
+  under that file's name with another ending (`S1_Pos.mzML.index`; its folder is listed before and after
+  the read), is detected afterwards, said in a warning (`reader_created_files`), kept for the life of the
+  backend process so every later check says it again, bound into `check_digest`, and recorded in the
+  contract. Any other name that appears in the folder meanwhile (raw data, MS-DIAL's intermediates, a sync
+  client's file) is said in that check's warnings as having appeared, without naming a writer, and is
+  neither kept nor bound.
 
 Each file's type is the one its header gives the Console (`header_console_acquisition_type`): DDA, AIF or
 SWATH as the header says; DIA with two or more isolation targets is SWATH, with none AIF, with one
@@ -83,18 +92,24 @@ question (DDA, SWATH or AIF), and the answer fills exactly those files; its prom
 - the file lies between the first and the last of more than 200.
 
 A type is never assumed or inferred. An answer is warned about when the files read from their own headers
-give another type; the warning counts those files and the answered ones apart. Where the files' own
+give another type; the warning counts those files and the answered ones apart. For every answered file,
+why it was asked and what its header suggested (the type, the collision energies) are bound into
+`check_digest`, so a file answered while not read, and read as AIF before the contract is written, is
+shown again. Where the files' own
 headers give more than one type within a polarity (a misread header and a batch acquired so look alike),
 `acquisition_type_mixed_pos` / `acquisition_type_mixed_neg` is asked, naming the files of each type:
 `as_read` keeps each file's own header type, and a header the person says is wrong is corrected in
 `sample_table`.
 
-A file to run as AIF meets the repository campaign's collision-energy guards, from what its header records:
-AIF of more than one MS2 collision energy needs a Console with MsdialWorkbench#825, which settles each
-spot's representative energy, so another Console is a blocker; and the #825 Console stops on an AIF file
-whose MS2 scans carry no energy, so such a file is a blocker with it. AIF whose energies are not recorded,
-with a Console without #825, and AIF whose header was not read, are warnings. The same guards apply to a
-type stated in `sample_table`.
+The files to run as AIF meet the repository campaign's collision-energy guards
+(`raw_metadata_preflight.decide_disposition`), per polarity, from what their headers record: the distinct
+MS2 collision energies (to 0.1 eV) over all of them. More than one, whether one file records several or
+files record different ones (pooled QCs at 40 eV beside samples at 20 eV), needs a Console with
+MsdialWorkbench#825, which settles each spot's representative energy among each file's own energies, so
+another Console is a blocker, naming each energy set and its files. With #825, files whose energy sets
+differ are a warning (the campaign runs them, on record), and a file whose MS2 scans carry no energy is a
+blocker, since that Console stops on it. AIF whose energies are not recorded, with a Console without #825,
+and AIF whose header was not read, are warnings. The same guards apply to types stated in `sample_table`.
 
 A header recording the other polarity than its folder's is a blocker, as file names saying so already
 are; so is one recording both (PolaritySwitching, MixedFunctions), since MS-DIAL runs one ion mode per
@@ -128,21 +143,27 @@ On the CE demo (16 + 16 Thermo Q Exactive SWATH files with 8 isolation windows),
 SWATH for 31 files and AIF for one positive file whose sampled headers show broad isolation: that file is
 asked about, and once answered SWATH its pair agrees.
 
-A contract written before the acquisition types were read from the headers (it has no `raw_headers`) is
-refused by every plan: its rows took DDA by default. Check the inputs again and write the contract again.
+The contract's schema is `msdial-interactive.lab-lcms-metabolomics-contract.v2`. A contract of the earlier
+v1 schema (its rows may carry DDA nobody stated, the positive file's type for a pair of two types, or AIF
+taken from a header) is refused by every step that loads it, and a contract without `raw_headers` by every
+plan; so is a plan from a contract whose included row carries no type the Console reads. Check the inputs
+again and write the contract again.
 
 ## 1b. Classes from the letters of shared words
 
 Paired by the words that set each polarity's files apart, each pair's class is first the one its file names
-give (`sample_grouping.propose_grouping`, per polarity). Only where those fail for this pairing, because some
-Sample pair's two files were given different classes (d2 against a re-injection's d2r2) or no Sample file was
-given one, is each Sample pair's class read from the letters of its one shared letter+number word (A1 -> A).
-Letters that name a blank, a QC or a standard (Blank1, QC2, Std3) make no group, and such a pair keeps its own
-class; every other Sample pair must have exactly one such word, and the letters must make at least two groups
-of at least two pairs each. So sample numbers (S1 to S16, even beside QC1 to QC3), subject numbers beside a
-numbered blank (Ctrl_Mouse1 ... Blank1) and plate wells beside a factor both polarities name (WT_A1 ...
-KO_D3) keep the names' classes. `class_proposal` and `pairing_warnings` say when the letters set the class,
-for the person to confirm.
+give (`sample_grouping.propose_grouping`, per polarity). Only where those fail for this pairing, because no
+Sample pair's two files were given one class (case aside) other than none or "Sample" (the positive files
+give no class and the negative ones d2 against a re-injection's d2r2, say), is each Sample pair's class read
+from the letters of its one shared letter+number word (A1 -> A). Where even one Sample pair's names agree,
+every pair keeps its names' class: one pair's typo, or WT against wt, never relabels the batch, and each pair
+whose two classes differ is said in `pairing_warnings`. Letters that name a blank, a QC or a standard (Blank1,
+QC2, Std3) make no group, and such a pair keeps its own class; every other Sample pair must have exactly one
+such word, and the letters must make at least two groups of at least two pairs each. So sample numbers (S1 to
+S16, even beside QC1 to QC3), subject numbers beside a numbered blank (Ctrl_Mouse1 ... Blank1) and plate wells
+beside a factor the names give (WT_A1 ... KO_D3) keep the names' classes. `class_proposal` and
+`pairing_warnings` say when the letters set the class, for the person to confirm, and
+`class_proposal.polarity_disagreements` keeps each pair whose names' classes differed.
 
 ## 2. Annotation: an ordered list of libraries
 

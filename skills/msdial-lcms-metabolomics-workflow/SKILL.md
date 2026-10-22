@@ -44,7 +44,8 @@ person's choice.
 It also reads each raw file's header with the configured raw-metadata extractor
 (`raw_headers`): every file up to 200 per polarity, past that the first and the last, within
 240 s for the whole check, so that it returns within the tool's time limit. A file not read
-in time is asked about, and checking again reads it. Report per polarity the methods, the
+in time is asked about, and checking again reads it first, on its own, so a file that hangs is
+then kept as a failed read. Report per polarity the methods, the
 isolation target counts, the MS2 collision energies, the instrument, the acquisition types
 proposed and from what (`proposed_by`), the files that could not be read or not in time, and
 whether the analytical order follows the acquisition start times. Only a DDA or SWATH verdict
@@ -108,9 +109,11 @@ never assumed.
   first and the last of more than 200. Its prompt counts the files by why, and gives what
   the headers suggest only as a suggestion. The answer fills exactly those files. For AIF,
   say that the repository campaign runs AIF of one MS2 collision energy as SWATH (the Console
-  deconvolutes it alike), that AIF of more than one energy needs a Console with
-  MsdialWorkbench#825, and that such a Console stops on AIF that records no energy; the
-  check refuses either case. SWATH or AIF data run as DDA give almost no MS/MS, so never
+  deconvolutes it alike), that AIF of more than one MS2 collision energy over the polarity's
+  AIF files (one file with several, or files with different ones, such as QCs at 40 eV
+  beside samples at 20 eV) needs a Console with MsdialWorkbench#825, and that such a
+  Console stops on AIF that records no energy; the check refuses either case and names each
+  energy set with its files. SWATH or AIF data run as DDA give almost no MS/MS, so never
   answer it for the person.
 - **Files whose own headers give different types** (`acquisition_type_mixed_pos`,
   `acquisition_type_mixed_neg`), only when asked: read the files of each type from the
@@ -166,11 +169,12 @@ the words that set each polarity's files apart (A1 in 20230125_SWATH_A1_C_CE20_d
 20230208_SWATH_A1_A_CE20_d2), shown in `pairing` and each row's `paired_by`: read every pair
 to the person. When the pairing fails or is wrong, they give `sample_pairs`
 (`[{sample, positive_file, negative_file}]`). The merge pairs the columns by this table.
-Paired by those words, a class both polarities' file names agree on stands. Only where the
-names give the samples no such class (d2 against a re-injection's d2r2, or no class at all)
-is each Sample pair's class proposed from the letters of its letter+number word (A1 to D4 ->
-A), and never from a blank, QC or standard (Blank1, QC2, Std3); read that warning and the
-classes to the person.
+Paired by those words, where even one Sample pair's file names give both polarities one
+class (case aside), every pair keeps its names' class, and each pair whose two classes differ
+is a warning to read out. Only where no pair agrees (d2 against a re-injection's d2r2, or no
+class at all) is each Sample pair's class proposed from the letters of its letter+number word
+(A1 to D4 -> A), and never from a blank, QC or standard (Blank1, QC2, Std3); read that
+warning, the classes and `class_proposal.polarity_disagreements` to the person.
 Classes and acquisition types reach the Console's ASCII analysis file: give them in
 printable ASCII without commas or quotes (a Japanese class name as a romanized word). The
 acquisition type is DDA, SWATH or AIF, the words the Console reads; it reads any other as

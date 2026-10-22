@@ -408,6 +408,17 @@ class PlanFromAContract(unittest.TestCase):
             plan["lab_lipidomics"]["deviations"],
         )
 
+    def test_an_alignment_rt_tolerance_the_contract_does_not_fix_is_a_recorded_deviation(self) -> None:
+        # The lipidomics contract fixes no alignment tolerance: a plan given one applies it and records it.
+        plan = self.plan(alignment_rt_tolerance=0.3)
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        self.assertEqual([{"key": "alignment_rt_tolerance", "contract": None, "given": 0.3}],
+                         plan["lab_lipidomics"]["deviations"])
+        self.assertEqual("0.3", method_lines(prepare_run(plan["workflow"])["method_file"])[
+            "Retention time tolerance for alignment"])
+        self.assertEqual("0.1", method_lines(prepare_run(self.plan()["workflow"])["method_file"])[
+            "Retention time tolerance for alignment"])
+
     def test_the_exports_cannot_be_sent_into_a_raw_folder(self) -> None:
         plan = self.plan(export_folder_path=str(self.batch.neg))
         self.assertFalse(plan["ready_to_prepare"])

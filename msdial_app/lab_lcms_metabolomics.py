@@ -517,14 +517,22 @@ def replicate_classes(shared: dict[str, list[str]], file_types: dict[str, str] |
     return classes
 
 
-def name_classes_fail(rows: list[dict[str, Any]], differences: list[tuple[str, str, Any, Any]]) -> bool:
-    """Whether the classes the file names proposed fail this pairing: some Sample pair's two files were given
-    different classes, or no Sample file was given one (every class "Sample"). Only then do letters decide."""
-    samples = {row["stem"] for row in rows if str(row.get("file_type") or "Sample") == "Sample"}
-    if any(key == "class_id" and stem in samples for stem, key, _value, _other in differences):
-        return True
-    return bool(samples) and all(str(row.get("class_id") or "").strip().casefold() in {"", "sample"}
-                                 for row in rows if row["stem"] in samples)
+def name_classes_fail(rows: list[dict[str, Any]], classes: dict[str, tuple[Any, Any]]) -> bool:
+    """Whether the classes the file names proposed fail this pairing: no Sample pair's two files were given one
+    class (case aside) other than none or "Sample". Only then do letters decide, for every Sample pair alike;
+    one pair that agrees keeps every pair's names' class, so one vocabulary is never mixed with another.
+
+    classes: each pair's (positive, negative) class_id by stem.
+    """
+    def named(value: Any) -> str:
+        text = str(value or "").strip().casefold()
+        return "" if text == "sample" else text
+
+    samples = [row["stem"] for row in rows if str(row.get("file_type") or "Sample") == "Sample"]
+    return bool(samples) and not any(
+        named(classes.get(stem, (None, None))[0]) and named(classes[stem][0]) == named(classes[stem][1])
+        for stem in samples
+    )
 
 
 def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[str, Any]]) -> dict[str, Any]:
@@ -535,10 +543,11 @@ def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[st
     (A1) name the sample. A file pairs with the one file of the other polarity that shares the most of them,
     and only when that is mutual. The sample takes the shared words' name. The person confirms the pairing.
 
-    Where the file names give the samples no class both polarities agree on (one polarity's word d2 against the
-    other's re-injection d2r2, or no class at all) and the shared words are letter+number replicates (A1 to D4),
-    each Sample pair's class is read from the letters (A) (replicate_classes), and the warnings say so. A class
-    both polarities' names agree on (Ctrl and Treat beside Mouse1 to Mouse12) is never replaced.
+    Where the file names give no Sample pair a class both polarities agree on, case aside (one polarity's word d2
+    against the other's re-injection d2r2, or no class at all), and the shared words are letter+number replicates
+    (A1 to D4), each Sample pair's class is read from the letters (A) (replicate_classes), and the warnings say so.
+    Where even one Sample pair's names agree (Ctrl and Treat beside Mouse1 to Mouse12, WT beside wt), every pair
+    keeps its names' class, and each pair whose two classes differ is said.
     """
     def varying(rows: list[dict[str, Any]]) -> list[list[str]]:
         words = [name_tokens(row["file_name"]) for row in rows]
@@ -565,6 +574,7 @@ def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[st
         claimed.setdefault(number, []).append(index)
     rows: list[dict[str, Any]] = []
     differences: list[tuple[str, str, Any, Any]] = []
+    name_classes: dict[str, tuple[Any, Any]] = {}
     for number, indices in sorted(claimed.items(), key=lambda item: min(item[1])):
         if len(indices) > 1:
             problems.append(
@@ -580,18 +590,20 @@ def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[st
             row[key] = source.get(key)
             if other.get(key) != source.get(key):
                 differences.append((row["stem"], key, source.get(key), other.get(key)))
+        name_classes[row["stem"]] = (source.get("class_id"), other.get("class_id"))
         rows.append(row)
-    # A class both polarities' file names agree on stands: letters decide only where the names fail.
+    # A class both polarities' file names agree on stands: letters decide only where no Sample pair agrees.
     classes = (
         replicate_classes({row["stem"]: row["paired_by"] for row in rows},
                           {row["stem"]: str(row.get("file_type") or "Sample") for row in rows})
-        if rows and name_classes_fail(rows, differences) else None
+        if rows and name_classes_fail(rows, name_classes) else None
     )
+    # Every pair whose two files differ is said, the class included when the letters then decide it.
     for stem, key, value, other_value in differences:
-        if key == "class_id" and classes and stem in classes:
-            continue
         warnings.append(
-            f"{stem}: {key} is {value!r} in positive and {other_value!r} in negative; the positive value is proposed."
+            f"{stem}: {key} is {value!r} in positive and {other_value!r} in negative; "
+            + ("the class is proposed from the letters." if key == "class_id" and classes and stem in classes
+               else "the positive value is proposed.")
         )
     class_proposal: dict[str, Any] = {}
     if classes:
@@ -602,15 +614,19 @@ def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[st
         class_proposal = {
             "derived_from": REPLICATE_CLASS_SOURCE,
             "reason": "each Sample pair's shared sample word is letters and a number (A1); its letters name the class "
-                      "(A), since the file names gave the samples no class both polarities agree on",
+                      "(A), since the file names gave no Sample pair a class both polarities agree on",
             "groups": counts,
             "kept_own_class": kept,
+            "polarity_disagreements": [
+                {"stem": stem, "positive": value, "negative": other_value}
+                for stem, key, value, other_value in differences if key == "class_id"
+            ],
             "confirmation_required": True,
         }
         warnings.append(
             "The class of each Sample pair was read from its shared sample word's letters ("
             + ", ".join(f"{name}: {count}" for name, count in counts.items())
-            + "), because the file names gave the samples no class both polarities agree on"
+            + "), because the file names gave no Sample pair a class both polarities agree on"
             + (f"; {', '.join(kept)} keep their own" if kept else "")
             + ". Confirm it, or correct class_id in sample_table."
         )

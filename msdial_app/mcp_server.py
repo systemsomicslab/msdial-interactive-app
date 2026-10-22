@@ -3441,23 +3441,26 @@ def msdial_lcms_metabolomics_check_inputs(
     each polarity's files apart (A1 in 20230125_SWATH_A1_C_CE20_d1 and 20230208_SWATH_A1_A_CE20_d2), which
     paired_sample_table shows with how it paired (pairing, paired_by) for the person to confirm. When that
     fails or is wrong, give sample_pairs: [{"sample": ..., "positive_file": ..., "negative_file": ...}].
-    Where the file names give the samples no class both polarities agree on and the shared words are
-    letter+number replicates (A1 to D4), each Sample pair's class is proposed from the letters (A), and
-    pairing_warnings says so; a class both polarities' names agree on is never replaced, and letters naming a
-    blank, QC or standard (Blank1, QC2, Std3) make no group.
+    Where the file names give no Sample pair a class both polarities agree on (case aside) and the shared
+    words are letter+number replicates (A1 to D4), each Sample pair's class is proposed from the letters (A),
+    and pairing_warnings says so. Where even one pair agrees, every pair keeps its names' class and each pair
+    whose classes differ is a warning; letters naming a blank, QC or standard (Blank1, QC2, Std3) make no group.
 
     Each raw file's header is read with the configured raw-metadata extractor, as the repository preflight
     reads it but with limits of the check's own: every file up to 200 per polarity, past that the first and
     the last; at most 30 s per file (more for a large Waters or ion-mobility folder) and 240 s for the whole
-    check, so it returns within this tool's time limit. A file not read in time is asked about, and checking
-    again reads it (reads, failed ones included, are kept in the backend process). raw_headers shows per
+    check, so it returns within this tool's time limit: files go to the extractor in chunks that take at most
+    half that time. A file not read in time is asked about, and checking again reads it first, on its own,
+    so one that hangs is then kept as a failed read (reads, failed ones included, are kept in the backend
+    process). raw_headers shows per
     polarity the methods, isolation targets, MS2 collision energies, instruments, acquisition types and
     start times, and the extractor build by its hashes. Only a DDA or SWATH verdict of a file's own header
     (DIA with isolation windows is SWATH) settles its type. acquisition_type_pos / acquisition_type_neg (DDA,
     SWATH or AIF) is asked for every other file: no extractor, a header not read or giving no type, an AIF
     verdict (DIA without isolation; the campaign runs single-energy AIF as SWATH), or a file between the
-    first and the last, whose type those two only suggest. AIF of more than one MS2 collision energy needs a
-    Console with MsdialWorkbench#825, and that Console stops on AIF that records none; either is a blocker.
+    first and the last, whose type those two only suggest. AIF of more than one MS2 collision energy over a
+    polarity's AIF files (one file with several, or files with different ones) needs a Console with
+    MsdialWorkbench#825, and that Console stops on AIF that records none; either is a blocker.
     Files whose own headers give different types ask acquisition_type_mixed_pos / _neg (as_read); a header
     recording the other polarity, or both, is a blocker. The analytical order follows the acquisition start
     times when every file of every polarity records one. alignment_rt_tolerance (minutes, optional) replaces

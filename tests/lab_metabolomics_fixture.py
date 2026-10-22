@@ -150,7 +150,7 @@ class FakeExtractor:
         ))
         stack.enter_context(patch.object(lab_lcms_metabolomics_agent, "run_extractor", side_effect=self.run))
         stack.enter_context(patch.object(lab_lcms_metabolomics_agent, "_extractor_identity", side_effect=self.identity))
-        for cache in ("_HEADER_CACHE", "_HEADER_CREATED", "_HEADER_IN_FLIGHT", "_EXTRACTOR_IDENTITIES"):
+        for cache in ("_HEADER_CACHE", "_HEADER_CREATED", "_HEADER_DEFERRED", "_HEADER_IN_FLIGHT", "_EXTRACTOR_IDENTITIES"):
             stack.enter_context(patch.dict(getattr(lab_lcms_metabolomics_agent, cache), clear=True))
         return stack
 
