@@ -166,6 +166,53 @@ class RetentionTimeReachesTheParameterFileTests(unittest.TestCase):
         self.assertEqual("False", lines["Use retention information for LBM-based annotation scoring"])
         self.assertNotEqual("2.0", lines["RT tolerance for LBM-based annotation"])
 
+    def _msp_settings(self, **extra) -> list[dict[str, str]]:
+        """The MSP annotator table a metabolomics run with one MSP library writes."""
+        msp = self.root / "library.msp"
+        msp.write_text("NAME: Alanine\nPRECURSORMZ: 90.055\nRETENTIONTIME: 0.9\nNum Peaks: 1\n44.05 100\n\n", encoding="ascii")
+        answers = _base_answers(self.console, self.lbm)
+        answers.update({
+            "target_omics": "Metabolomics", "ion_mode": "Positive", "libraries": {"msp_paths": [str(msp)]},
+            "output_root": str(self.root / "out"),
+        })
+        answers.update(extra)
+        plan = build_guided_plan(str(self.root), answers)
+        self.assertIsNotNone(plan["workflow"], plan["blockers"])
+        prepared = prepare_run(plan["workflow"])
+        settings = Path(prepared["method_file"]).parent / "msp_annotator_settings.tsv"
+        lines = settings.read_text(encoding="ascii").splitlines()
+        header = lines[0].split("\t")
+        return [dict(zip(header, line.split("\t"))) for line in lines[1:]]
+
+    def test_the_decision_reaches_an_msp_library_too(self) -> None:
+        # Each MSP annotator row carries its own RT settings, and the row is what the Console reads, so
+        # before this an MSP with retention times was searched without them whatever was answered.
+        (row,) = self._msp_settings(use_retention_time_for_annotation=True, retention_time_tolerance=0.5)
+        self.assertEqual(("True", "True", "0.5"), (
+            row["use_retention_information_for_scoring"], row["use_retention_information_for_filtering"], row["rt_tolerance"]))
+        (row,) = self._msp_settings(use_retention_time_for_annotation=False)
+        self.assertEqual(("False", "False"), (
+            row["use_retention_information_for_scoring"], row["use_retention_information_for_filtering"]))
+
+    def test_a_row_whose_rt_use_was_decided_for_that_library_keeps_it(self) -> None:
+        from msdial_app.agent_workflow import _apply_retention_time_use
+
+        state = {
+            "msp_annotators": [
+                {"annotator_id": "in_house", "rt_fixed": True, "use_rt_scoring": True, "use_rt_filtering": True, "rt_tolerance": 0.5},
+                {"annotator_id": "public", "use_rt_scoring": False, "use_rt_filtering": False, "rt_tolerance": 0.5},
+            ],
+            "text_annotators": [{"annotator_id": "is", "internal_standards": True, "use_rt_scoring": True, "rt_tolerance": 0.2}],
+        }
+        _apply_retention_time_use(state, {"use_retention_time_for_annotation": False})
+        fixed, public = state["msp_annotators"]
+        self.assertEqual((True, True, 0.5), (fixed["use_rt_scoring"], fixed["use_rt_filtering"], fixed["rt_tolerance"]))
+        self.assertEqual((False, False), (public["use_rt_scoring"], public["use_rt_filtering"]))
+        self.assertEqual((True, 0.2), (state["text_annotators"][0]["use_rt_scoring"], state["text_annotators"][0]["rt_tolerance"]))
+        _apply_retention_time_use(state, {"use_retention_time_for_annotation": True, "retention_time_tolerance": 2})
+        self.assertEqual((True, 2.0), (public["use_rt_scoring"], public["rt_tolerance"]))
+        self.assertEqual(0.5, fixed["rt_tolerance"])
+
     def test_the_thread_count_reaches_the_method_file(self) -> None:
         self.assertEqual("8", self._method_lines(number_of_threads=8)["Number of threads"])
 

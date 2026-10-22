@@ -1241,11 +1241,18 @@ def _apply_retention_time_use(state: dict[str, Any], answers: dict[str, Any]) ->
     for kind in ("lbm", "msp", "text"):
         state[f"{kind}_use_rt_scoring"] = use_rt
         state[f"{kind}_use_rt_filtering"] = use_rt
-    # The state keys above reach the LBM lines only: each Text annotator row carries its own RT
-    # settings, and the row wins in text_annotator_settings.tsv, so the decision is written into the
-    # rows of the analyst's text libraries too. The internal-standard row keeps its own tolerance.
-    text_rows = [row for row in state.get("text_annotators", []) if not row.get("internal_standards")]
-    for row in text_rows:
+    # The state keys above reach the LBM lines only. Each MSP and Text annotator row carries its own
+    # RT settings, and the row wins in msp_annotator_settings.tsv and text_annotator_settings.tsv, so
+    # the decision is written into the rows of the analyst's libraries too. Before this, an MSP with
+    # retention times was searched without them whatever the analyst answered. The internal-standard
+    # row keeps its own tolerance, and a row whose RT use was decided for that library alone
+    # (rt_fixed) keeps its own.
+    rows = [
+        row
+        for row in [*state.get("msp_annotators", []), *state.get("text_annotators", [])]
+        if not row.get("internal_standards") and not row.get("rt_fixed")
+    ]
+    for row in rows:
         row["use_rt_scoring"] = use_rt
         row["use_rt_filtering"] = use_rt
     tolerance = answers.get("retention_time_tolerance")
@@ -1256,7 +1263,7 @@ def _apply_retention_time_use(state: dict[str, Any], answers: dict[str, Any]) ->
         return
     for kind in ("lbm", "msp", "text"):
         state[f"{kind}_rt_tolerance"] = value
-    for row in text_rows:
+    for row in rows:
         row["rt_tolerance"] = value
 
 
