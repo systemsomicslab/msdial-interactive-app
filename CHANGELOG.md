@@ -4,6 +4,138 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.46] - Unreleased
+
+Built on 0.5.45 (#78), which is not merged yet; merge this after it.
+
+### Added
+- **A laboratory LC-MS metabolomics agent** for hydrophilic metabolomics (HILIC, or a polar-retaining
+  reversed phase such as HSS T3), in one polarity or both. Five MCP tools carry it, with the guided-run
+  tools in between: `msdial_lcms_metabolomics_check_inputs`, `msdial_lcms_metabolomics_write_contract`,
+  `msdial_lcms_metabolomics_resolve_standards`, `msdial_lcms_metabolomics_normalize` and
+  `msdial_lcms_metabolomics_merge`. The Agent Skill `skills/msdial-lcms-metabolomics-workflow` walks
+  through them, and `docs/lab-lcms-metabolomics.md` is the specification.
+  - **Annotation is an ordered list of libraries**, each with its own retention-time use and thresholds.
+    Three presets cover the cases seen so far:
+    - `single_msp`: one MSP without RT;
+    - `campaign`: the LBM2, one MSP searched strictly and mildly, optionally an in-silico MSP, all without RT;
+    - `lab_rt_tiers`: an in-house MSP at RT 0.5 min, a predicted-RT MSP at RT 2.0 min, and an MSP of MS/MS
+      without RT.
+    Each row is written with its own settings into `msp_annotator_settings.tsv` and marked `rt_fixed`, so the
+    run-wide retention-time answer leaves it as it is. The internal-standard text row keeps priority 1, below
+    every library. The guided plan takes the list as `library_strategy: "annotators"`.
+  - **Normalization by one internal standard per polarity**, computed in Python from the run's Height export:
+    height / the standard's height in that injection x the standard's mean over the Sample and QC injections,
+    x the dilution factor. A Sample or QC without the standard refuses; a Blank or Standard injection without
+    it keeps its raw height and is reported. Every written cell is checked again. MS-DIAL's own normalization
+    is not used, because it averages over every file, Blank included, and replaces a zero with 1.
+  - **The merge** keeps one row per compound, within and across polarities. What one compound is
+    (`inchikey_match`: the InChIKey's first block, or its first two blocks) and which row is kept
+    (`duplicate_rule`: `evidence`, a match with the laboratory's own RT and MS/MS before an MS/MS-only one
+    even if weaker; `intensity`, the preferred adduct then the larger intensity; or `keep_all`) are asked
+    before anything runs and fixed in the contract. Internal standards and unannotated rows are dropped
+    first. `reference_matched_only` (default on) and `preferred_adducts_only` (default off) are options of
+    each merge. It writes `metabolome.csv`, `metabolome_samples.csv`, `metabolome_removed.tsv` and
+    `merge-report.json`.
+  - **Polarities acquired under other names pair** by the words that set each polarity's files apart (A1 in
+    `20230125_SWATH_A1_C_CE20_d1` and `20230208_SWATH_A1_A_CE20_d2`), for the person to confirm, or by the
+    pairs they give (`sample_pairs`); the merge pairs the columns by the confirmed table. Only where the file
+    names give no Sample pair a class both polarities agree on, case aside (d2 against a re-injection's d2r2,
+    or no class at all), is each Sample pair's class proposed from the letters of its shared letter+number
+    word (A1 to D4 -> A), and `pairing_warnings` says so. Where even one pair agrees, every pair keeps its
+    names' class, and each pair whose classes differ is a warning (one typo, or WT against wt, never relabels
+    the batch). Letters naming a blank, QC or standard (Blank1, QC2, Std3) make no group, and the letters must
+    make at least two groups of at least two pairs each, so sample numbers, subject numbers and plate wells
+    beside a factor the names give keep the names' classes.
+  - **Each file's acquisition type is read from its raw header**, never assumed or inferred. Before this,
+    every file was proposed as DDA, and SWATH or AIF data run as DDA get almost no MS/MS.
+    - The check reads the headers with the configured raw-metadata extractor, through the repository
+      preflight's bounded reader and parsing, with limits of its own so that a check (and the one
+      `write_contract` runs) returns within the MCP tool's 600 s: every file up to 200 per polarity, past
+      that the first and the last; at most 30 s per file (more for a large Waters or ion-mobility folder) and
+      240 s for the whole check, in chunks that take at most half of it. `run_extractor` takes those limits
+      and the deadline as optional arguments; a campaign passes none.
+    - Reads are kept in the backend process by the extractor build (the sha256 of its exe and of every file
+      beside it) and the file's path, size and modification time before the read, failed reads included; a
+      read the deadline cut short is not kept, and the next check reads such files first, one at a time, so a
+      file that hangs meets its own limit and is kept as a failed read. An input that changed during its read,
+      a file or a folder, is read again. A check waits for a read another check has in flight rather than
+      start a second extractor on the same files.
+    - Only a DDA or SWATH verdict of a file's own header settles its type (DIA with isolation windows is
+      SWATH). `acquisition_type_pos` / `acquisition_type_neg` (DDA, SWATH or AIF) is asked for every other
+      file: no extractor, a header not read (or not in time, or a Bruker BAF folder, which is never given to
+      the reader), no type the Console reads, an AIF verdict, or a file between the first and the last,
+      whose type those two only suggest. The prompt and the warnings count header-read and answered files
+      apart. Files whose own headers give more than one type ask `acquisition_type_mixed_pos` /
+      `acquisition_type_mixed_neg` (`as_read`).
+    - AIF meets the repository campaign's collision-energy guards, over all of a polarity's AIF files: more
+      than one MS2 collision energy among them (in one file or across files) with a Console lacking
+      MsdialWorkbench#825, and AIF recording no energy with a Console carrying it (which stops on such a
+      file), are blockers; with #825, files whose energy sets differ are a warning. `write_contract` judges
+      them again over the rows the confirmed table includes and the types it states, so a file left out no
+      longer counts; the table's AIF warnings are in the preview and the result (`acquisition_warnings`) and
+      recorded in the contract (`raw_headers.aif_warnings`).
+    - A header recording the other polarity than its folder's, or both (polarity switching), is a blocker.
+    - A pair whose two files are of different types is proposed with no type (`acquisition_type_conflicts`
+      gives both, `acquisition_type_required` the rows), and the contract refuses every included row without
+      one until the person states it in `sample_table`; a table sent back as proposed, or a blank type, never
+      passes for the person's word.
+    - The analytical order follows the headers' acquisition start times when every file of every polarity
+      records one. `raw_headers` shows the evidence per polarity (methods, isolation targets, MS2 collision
+      energies, the extractor build), the proposal is bound into `check_digest`, and the contract records it
+      with the answers taken; for an answered file, why it was asked and what its header suggested are bound
+      too. What a reader leaves beside a file input under that file's name, or inside a folder input where a
+      known reader rule names it (`reader_created`), is detected afterwards, not prevented: it is said on every
+      later check, bound into `check_digest` and recorded in the contract. Any other name that appears
+      meanwhile is said in that check only (`appeared_during_read`), without naming a writer and unbound;
+      `write_contract`'s preview and result give its own check's warnings (the check's AIF warnings over every
+      file replaced by the table's), and the contract records every name a check of the digest it confirms saw
+      appear, a preview's included.
+    - Sample metadata is compared with the table proposed, whose order and classes may be the headers' and
+      the letters', rather than with the names.
+    - The contract schema is `...lab-lcms-metabolomics-contract.v2`: a v1 contract, written before this, is
+      refused wherever it is loaded, and a plan refuses a contract row of no type the Console reads. Check and
+      write again.
+  - **`alignment_rt_tolerance`** (minutes, optional) is recorded in the contract and reaches both polarities'
+    runs ("Retention time tolerance for alignment"); unset, the template's 0.1 min stands. Either value is
+    fixed for both polarities: a plan's or a workset's other value is a blocker, as `workflow_overrides` for it
+    is. Capillary electrophoresis migration times usually need more, and the person decides it.
+  - MS-DIAL's four-column internal-standard text (Name, Pos-m/z, RT, Adduct) is read as it is.
+  - The contract and its record (`lab-lcms-metabolomics-contract.json`, `lab-lcms-metabolomics-record.jsonl`)
+    name the libraries and the raw data by location, and are local only.
+  - An in-silico MSP is searched as `library_kind: predicted`, so MS-DIAL publishes its matches as in-silico
+    evidence. `msp_annotator_settings.tsv` carries the column only when a row states it.
+  - A library searched with retention time is read for its records' RTs: none refuses the library, and some
+    missing is a warning, because MS-DIAL matches a record without an RT on MS/MS alone.
+  - The two laboratory agents refuse an analysis root that holds the other's contract, since both write the
+    same file names there.
+  - Gap-filled standards: the run's `<alignment>.mdpeakid.tsv` says where MS-DIAL did not detect the
+    normalizing standard. A Sample or QC there refuses normalization unless the person accepts the heights
+    (`accept_gap_filled`); a Blank or Standard injection there, without the standard, or with it below 10% of
+    the lowest Sample or QC height keeps its raw heights, with the reason.
+  - Which spots are internal standards: every spot a library or a standard's own text row annotated as that
+    standard (tiers A and B), whatever else the resolver said of it. A spot only searched for a standard (C,
+    D) stays a feature, kept as its own row outside the InChIKey groups, so a labelled standard never takes
+    its endogenous compound's place; the merge names each, with any row it shares a first block with.
+  - The merge reports possible isomers: InChIKey groups whose rows differ in stereo block or lie more than
+    0.5 min apart, with the row kept.
+  - The check refuses what a later step would: an annotation key it does not read, a library path or
+    analysis root outside ASCII, and folder raw data (`.d`, `.raw`) with a Console that cannot be shown to
+    read them.
+
+### Changed
+- `lab_lipidomics.resolve_standards` takes which spots tier A reads as a library annotation
+  (`library_annotated`, the LBM library's by default), and `lab_lipidomics_agent.run_outputs` takes the
+  contract's key and whether the library copy is needed. Laboratory lipidomics is otherwise unchanged, but for
+  the next item.
+- The guided plan takes `alignment_rt_tolerance` as an answer (a positive number of minutes; anything else is
+  a blocker). Unset, the parameter template's value stands, as before. A laboratory lipidomics contract does
+  not fix it, so a lipidomics plan given it applies it as a deviation the plan records, as it applies
+  `workflow_overrides.alignment_rt_tolerance`; before, the answer was not applied.
+- `raw_metadata_preflight.run_extractor` and `input_timeout_seconds` take optional per-input limits, and
+  `run_extractor` a deadline, after which no extractor process starts or runs on (an input it leaves unread
+  is `timed_out` with `deadline` true). A campaign passes neither, and its reads are as before.
+
 ## [0.5.45] - Unreleased
 
 ### Fixed

@@ -3460,6 +3460,332 @@ def msdial_lipidomics_merge(
 
 @mcp.tool()
 @_structured_validation_errors
+def msdial_lcms_metabolomics_check_inputs(
+    pos_path: str = "",
+    neg_path: str = "",
+    annotation: dict[str, Any] | None = None,
+    solvent_type: str = "",
+    is_text_pos: str = "",
+    is_text_neg: str = "",
+    normalizing_standard_pos: str = "",
+    normalizing_standard_neg: str = "",
+    internal_standard_rt_tolerance: float | None = None,
+    sample_metadata_path: str = "",
+    analysis_root: str = "",
+    analysis_purpose: str = "",
+    console_path: str = "",
+    raw_location: str = "",
+    number_of_threads: int | None = None,
+    duplicate_rule: str = "",
+    inchikey_match: str = "",
+    sample_pairs: list[dict[str, Any]] | None = None,
+    acquisition_type_pos: str = "",
+    acquisition_type_neg: str = "",
+    acquisition_type_mixed_pos: str = "",
+    acquisition_type_mixed_neg: str = "",
+    alignment_rt_tolerance: float | None = None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Check a laboratory LC-MS metabolomics batch's inputs; read-only: it writes nothing and runs no analysis.
+
+    For hydrophilic metabolomics (HILIC, or a polar-retaining reversed phase such as HSS T3), one polarity
+    or both: give pos_path, neg_path or both. Call it first with only the raw folders: it lists what is
+    there (raw files, MS-DIAL intermediates already beside them, candidate text libraries, MSP and LBM2
+    files beside the data, which are listed and never proposed) and every question still open. Then ask
+    the person every open question in one message and call it again with the answers.
+
+    annotation is an ordered list of libraries, highest priority first, each with its own retention-time
+    use and thresholds. Either a preset with its files, {"preset": "lab_rt_tiers", "libraries":
+    {"in_house": ..., "predicted_rt": ..., "no_rt": ...}}, or the list itself, {"libraries": [{"kind":
+    "msp", "path": ..., "thresholds": "standard", "retention_time": "use", "rt_tolerance": 0.5, "label":
+    "...", "library_kind": "acquired"}, ...]}. A path is one file for every polarity or {"Positive": ...,
+    "Negative": ...}; a preset slot may also be {"path": ..., "library_kind": "predicted"}. library_kind says
+    whether an MSP's spectra were acquired (the default) or computed in silico (predicted); MS-DIAL then
+    publishes a predicted library's matches as in-silico evidence. Ask it of every library whose spectra the
+    person has not described. Any other key is refused, not ignored. A library searched with RT is read for
+    its records' retention times: none refuses it, some missing is a warning. Presets:
+    single_msp (slot msp: one MSP, no RT); campaign (slots lbm, msp, optional in_silico: the LBM2, the MSP
+    strictly and mildly, an in-silico MSP mildly, all without RT); lab_rt_tiers (in_house at RT 0.5 min,
+    predicted_rt at RT 2.0 min, no_rt without RT). Thresholds: standard (dot products 0.6/0.6/0.8, 3
+    matched peaks), strict and mild (the repository campaign's MSP tiers). The internal-standard text row
+    is searched at priority 1, below every library.
+
+    solvent_type is the salt or acid in the mobile phase (formic acid reads as HCOONH4); it sets the
+    negative adduct the merge prefers besides [M-H]-. is_text_pos/is_text_neg are MS-DIAL text libraries
+    of the internal standards (Name, MZ, RT, Adduct, Ontology); one file may hold both polarities.
+    normalizing_standard_pos/neg name the one standard per polarity every feature is divided by.
+    raw_location is in_place or copy, asked with the sentence the question carries: MS-DIAL writes .dcl,
+    .pai2 and tag files beside the raw files it reads, and no output setting prevents it.
+
+    duplicate_rule and inchikey_match are asked before anything runs: which row of one compound the merge
+    keeps (evidence, recommended: the more reliable library match, your own RT and MS/MS before MS/MS alone,
+    then the library's priority, the preferred adduct and the intensity; intensity: the preferred adduct,
+    then the intensity; keep_all), and what one compound is (first_block of the InChIKey, or
+    first_two_blocks, which keeps stereoisomers apart).
+
+    Two polarities pair by file name (S1_Pos with S1_Neg) where they can; otherwise by the words that set
+    each polarity's files apart (A1 in 20230125_SWATH_A1_C_CE20_d1 and 20230208_SWATH_A1_A_CE20_d2), which
+    paired_sample_table shows with how it paired (pairing, paired_by) for the person to confirm. When that
+    fails or is wrong, give sample_pairs: [{"sample": ..., "positive_file": ..., "negative_file": ...}].
+    Where the file names give no Sample pair a class both polarities agree on (case aside) and the shared
+    words are letter+number replicates (A1 to D4), each Sample pair's class is proposed from the letters (A),
+    and pairing_warnings says so. Where even one pair agrees, every pair keeps its names' class and each pair
+    whose classes differ is a warning; letters naming a blank, QC or standard (Blank1, QC2, Std3) make no group.
+
+    Each raw file's header is read with the configured raw-metadata extractor, as the repository preflight
+    reads it but with limits of the check's own: every file up to 200 per polarity, past that the first and
+    the last; at most 30 s per file (more for a large Waters or ion-mobility folder) and 240 s for the whole
+    check, so it returns within this tool's time limit: files go to the extractor in chunks that take at most
+    half that time. A file not read in time is asked about, and checking again reads it first, on its own,
+    so one that hangs is then kept as a failed read (reads, failed ones included, are kept in the backend
+    process). raw_headers shows per
+    polarity the methods, isolation targets, MS2 collision energies, instruments, acquisition types and
+    start times, and the extractor build by its hashes. Only a DDA or SWATH verdict of a file's own header
+    (DIA with isolation windows is SWATH) settles its type. acquisition_type_pos / acquisition_type_neg (DDA,
+    SWATH or AIF) is asked for every other file: no extractor, a header not read or giving no type, an AIF
+    verdict (DIA without isolation; the campaign runs single-energy AIF as SWATH), or a file between the
+    first and the last, whose type those two only suggest. AIF of more than one MS2 collision energy over a
+    polarity's AIF files (one file with several, or files with different ones) needs a Console with
+    MsdialWorkbench#825, and that Console stops on AIF that records none; either is a blocker.
+    Files whose own headers give different types ask acquisition_type_mixed_pos / _neg (as_read); a header
+    recording the other polarity, or both, is a blocker. The analytical order follows the acquisition start
+    times when every file of every polarity records one. alignment_rt_tolerance (minutes, optional) replaces
+    the template's 0.1 min for both polarities: capillary electrophoresis migration times usually need more,
+    and the person decides it.
+
+    The result holds the blockers, the questions, the libraries as they will be searched (annotation), the
+    salt with its preferred adducts, the normalizing standards, and the sample table proposed
+    (paired_sample_table), which the person must confirm. A pair whose two files are of different types is
+    proposed with no type (acquisition_type_conflicts names both, acquisition_type_required the rows): the
+    person states it in write_contract's sample_table. check_digest binds what was read; pass it to
+    msdial_lcms_metabolomics_write_contract.
+    """
+    body: dict[str, Any] = {
+        "pos_path": pos_path, "neg_path": neg_path, "annotation": annotation or {}, "solvent_type": solvent_type,
+        "is_text_pos": is_text_pos, "is_text_neg": is_text_neg,
+        "normalizing_standard_pos": normalizing_standard_pos, "normalizing_standard_neg": normalizing_standard_neg,
+        "internal_standard_rt_tolerance": internal_standard_rt_tolerance, "sample_metadata_path": sample_metadata_path,
+        "analysis_root": analysis_root, "analysis_purpose": analysis_purpose, "console_path": console_path,
+        "raw_location": raw_location, "number_of_threads": number_of_threads,
+        "duplicate_rule": duplicate_rule, "inchikey_match": inchikey_match, "sample_pairs": sample_pairs or [],
+        "acquisition_type_pos": acquisition_type_pos, "acquisition_type_neg": acquisition_type_neg,
+        "acquisition_type_mixed_pos": acquisition_type_mixed_pos, "acquisition_type_mixed_neg": acquisition_type_mixed_neg,
+        "alignment_rt_tolerance": alignment_rt_tolerance,
+    }
+    return _request_json("POST", "/api/lcms-metabolomics/check", host=host, port=port, body=body, timeout=600)
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_lcms_metabolomics_write_contract(
+    annotation: dict[str, Any],
+    solvent_type: str,
+    analysis_root: str,
+    analysis_purpose: str,
+    console_path: str,
+    raw_location: str,
+    check_digest: str,
+    pos_path: str = "",
+    neg_path: str = "",
+    is_text_pos: str = "",
+    is_text_neg: str = "",
+    normalizing_standard_pos: str = "",
+    normalizing_standard_neg: str = "",
+    sample_table_confirmed: StrictFlag = False,
+    sample_table: list[dict[str, Any]] | None = None,
+    confirmed_by: str = "",
+    sample_metadata_path: str = "",
+    internal_standard_rt_tolerance: float | None = None,
+    number_of_threads: int | None = None,
+    replace_existing: StrictFlag = False,
+    confirmed: StrictFlag = False,
+    duplicate_rule: str = "",
+    inchikey_match: str = "",
+    sample_pairs: list[dict[str, Any]] | None = None,
+    acquisition_type_pos: str = "",
+    acquisition_type_neg: str = "",
+    acquisition_type_mixed_pos: str = "",
+    acquisition_type_mixed_neg: str = "",
+    alignment_rt_tolerance: float | None = None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Write the laboratory LC-MS metabolomics contract under <analysis_root>/inputs, after confirmation.
+
+    The inputs are checked again and must be what check_digest bound. sample_table_confirmed=true says the
+    person confirmed paired_sample_table; sample_table carries their corrections by stem (file_type,
+    class_id, analytical_order, batch_order, factor, included, acquisition_type), every sample listed.
+    confirmed=false (the default) previews; confirmed=true writes the contract, the internal-standard
+    libraries in the layout MS-DIAL reads, and the record. An existing contract there refuses even the
+    preview until replace_existing=true; show its existing_contract to the person first.
+
+    Then plan each polarity with msdial_guided_analysis_plan(input_path=<its raw folder>, answers=
+    {"lab_lcms_metabolomics_contract_path": ..., "ion_mode": ...}). The contract fixes the libraries with
+    their RT settings and thresholds, the salt, the internal-standard library, the sample table, the
+    output and export folder, the Console and the parameter template, and states the method (peak-height
+    diagnostic, TimeBasedLinearWeightedMovingAverage, automatic RT correction with 12 anchors and the
+    1.5 min local window, annotation candidates, QA). acquisition_type_pos / acquisition_type_neg,
+    acquisition_type_mixed_pos / _neg and alignment_rt_tolerance are the check's answers, passed again. Every
+    included row needs an acquisition type: a row proposed without one (acquisition_type_required) is refused
+    until sample_table gives it as the person states it, and a table sent back as proposed carries none. The
+    contract records the raw headers the acquisition types and the order were proposed from, and fixes the
+    alignment RT tolerance for both polarities: the person's, else the template's. The AIF collision-energy
+    guards are judged again over the rows the table includes, so a file left out (included false) no longer
+    counts; the preview and the result give this call's own check warnings (warnings, a name that appeared
+    beside the raw data during its reads included, the check's AIF warnings over every file replaced by the
+    table's) and the table's AIF warnings (acquisition_warnings), which the contract records
+    (raw_headers.aif_warnings). The contract also records every name a check with this check_digest saw appear
+    during its reads in this backend process (appeared_during_read), a preview's included.
+    """
+    body: dict[str, Any] = {
+        "pos_path": pos_path, "neg_path": neg_path, "annotation": annotation or {}, "solvent_type": solvent_type,
+        "is_text_pos": is_text_pos, "is_text_neg": is_text_neg,
+        "normalizing_standard_pos": normalizing_standard_pos, "normalizing_standard_neg": normalizing_standard_neg,
+        "internal_standard_rt_tolerance": internal_standard_rt_tolerance, "sample_metadata_path": sample_metadata_path,
+        "analysis_root": analysis_root, "analysis_purpose": analysis_purpose, "console_path": console_path,
+        "raw_location": raw_location, "number_of_threads": number_of_threads, "check_digest": check_digest,
+        "sample_table_confirmed": sample_table_confirmed is True, "sample_table": sample_table or [],
+        "confirmed_by": confirmed_by, "replace_existing": replace_existing is True,
+        "duplicate_rule": duplicate_rule, "inchikey_match": inchikey_match, "sample_pairs": sample_pairs or [],
+        "acquisition_type_pos": acquisition_type_pos, "acquisition_type_neg": acquisition_type_neg,
+        "acquisition_type_mixed_pos": acquisition_type_mixed_pos, "acquisition_type_mixed_neg": acquisition_type_mixed_neg,
+        "alignment_rt_tolerance": alignment_rt_tolerance,
+        # The gate is here and again in the backend: only a literal true writes.
+        "confirmed": confirmed is True,
+    }
+    return _request_json("POST", "/api/lcms-metabolomics/write-contract", host=host, port=port, body=body, timeout=600)
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_lcms_metabolomics_resolve_standards(
+    contract_path: str,
+    pos_job_id: str = "",
+    neg_job_id: str = "",
+    read_output_folders: StrictFlag = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Find each internal standard in a production run of the metabolomics contract; read-only.
+
+    Every candidate sits at the m/z of the adduct the internal-standard library names, within the
+    internal-standard RT tolerance. Tier A: one of the contract's libraries annotated it by its name; B:
+    its own text row annotated it as a reference match; C: its row matched but another annotation won; D:
+    any spot there. C and D need the person's acceptance. Only the normalizing standard must be found:
+    read it to the person first (summary.normalizing_standard: tier, alignment ID, MS-DIAL's name, m/z and
+    RT error, files without a height, gap_filled_files where MS-DIAL did not detect it, its CVs,
+    valid_alternatives), then the others with their CV over the QC injections, and every warning (a
+    library that left no candidate, a missing peak-ID matrix). Pass the polarity's resolution_digest to
+    msdial_lcms_metabolomics_normalize.
+    """
+    return _request_json(
+        "POST", "/api/lcms-metabolomics/resolve", host=host, port=port,
+        body={"contract_path": contract_path, "pos_job_id": pos_job_id, "neg_job_id": neg_job_id,
+              "read_output_folders": read_output_folders is True},
+        timeout=300,
+    )
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_lcms_metabolomics_normalize(
+    contract_path: str,
+    job_id: str,
+    resolution_digest: str,
+    accept_searched: list[str] | None = None,
+    accept_spot: dict[str, int] | None = None,
+    accept_gap_filled: StrictFlag = False,
+    confirmed: StrictFlag = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Normalize one polarity's run by its internal standard, writing only after explicit confirmation.
+
+    normalized = height / the normalizing standard's height in that injection x the standard's mean height
+    over the Sample and QC injections, x the injection's dilution factor. It is computed here from the
+    run's Height export and starts no Console: MS-DIAL's own internal-standard normalization averages over
+    every file, Blank included. A Sample or QC without the standard refuses, and so does one in which MS-DIAL
+    did not detect it (the run's peak-ID matrix says -1, the height is a gap fill) unless the person accepts
+    those heights (accept_gap_filled=true). A Blank or Standard injection without the standard, with it
+    undetected, or below 10% of the lowest Sample or QC height keeps its raw height, and the plan says which
+    and why (raw_height_reasons); multipliers gives each injection's factor. accept_searched (the normalizing
+    standard's name) accepts a tier C or D spot; accept_spot ({name: alignment ID}) takes another listed spot.
+    The plan's warnings say, for every other standard's spot, what the merge will do with it: drop it as
+    an internal standard (tiers A and B, or annotated by the internal-standard text row), drop it as
+    unannotated or not reference matched, or keep it as its own row.
+    confirmed=false previews the standard, its mean and the injections; confirmed=true writes
+    <analysis_root>/quant/NormalizedHeight_<Pos|Neg>.txt in MS-DIAL's export layout (the per-class Average
+    and Stdev columns left empty), a copy of the Height export, is_resolution_<pos|neg>.tsv and the record,
+    checks every written cell against the formula, and draws figure 04 (every internal standard's response)
+    into <analysis_root>/quant/qa_figures.
+    """
+    return _request_json(
+        "POST", "/api/lcms-metabolomics/normalize", host=host, port=port,
+        body={"contract_path": contract_path, "job_id": job_id, "resolution_digest": resolution_digest,
+              "accept_searched": list(accept_searched or []), "accept_spot": dict(accept_spot or {}),
+              "accept_gap_filled": accept_gap_filled is True, "confirmed": confirmed is True},
+        timeout=300,
+    )
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_lcms_metabolomics_merge(
+    contract_path: str,
+    reference_matched_only: StrictFlag | None = None,
+    preferred_adducts_only: StrictFlag | None = None,
+    duplicate_rule: str = "",
+    inchikey_match: str = "",
+    output_folder: str = "metabolome",
+    confirmed: StrictFlag = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Merge the normalized polarities of the contract into one metabolome, writing only once confirmed.
+
+    Every polarity the contract covers must have been normalized and checked. Dropped first: unannotated
+    rows and every internal standard (the spots a library or a standard's own text row annotated as that
+    standard, tiers A and B, and every row the internal-standard text row annotated). A spot only searched for
+    a standard nobody confirmed (C, D) is kept as its own row, outside the InChIKey groups, and named in
+    unconfirmed_standard_spots with any kept row it shares a first block with. possible_isomers lists the
+    groups whose rows differ in stereo block or lie more than 0.5 min apart: read them to the person. The
+    matrices are the exports the run wrote, so curation in the GUI after the run does not reach them. Then
+    the options:
+    reference_matched_only (default true: only rows whose representative annotation is a reference match,
+    what the GUI calls Ref. matched) and preferred_adducts_only (default false: only [M+H]+, [M-H]- and the
+    salt's negative adduct, [M+HCOO]- for formate or formic acid, [M+CH3COO]- for acetate). Rows of one
+    compound (inchikey_match: the InChIKey's first block, or its first two blocks) are one, within and across
+    polarities, and duplicate_rule says which row is kept: evidence (RT and MS/MS matched, then MS/MS alone,
+    then the library's priority, the preferred adduct and the intensity), intensity (the preferred adduct,
+    then MS/MS matched, then the larger mean normalized height over Sample and QC, then the library's
+    priority), or keep_all (every row kept, the duplicates counted). Both follow the contract's answers
+    unless given; a different one is applied and reported in deviations_from_contract. A row without an
+    InChIKey is kept as its own. The two flags are JSON true or false; absent follows the contract. The
+    polarities' samples are paired by the contract's sample table, whatever the file names.
+
+    confirmed=false returns the counts and writes nothing; confirmed=true writes metabolome.csv (quoted CSV:
+    polarity, alignment ID, InChIKey first block, library, reference matched, preferred adduct, MS-DIAL's
+    metadata, the normalized sample columns), metabolome_samples.csv, metabolome_removed.tsv (every removed
+    row with its reason and, for a duplicate, the row kept) and merge-report.json into
+    <analysis_root>/quant/<output_folder>. Merges with other options can sit side by side under other
+    output_folder names.
+    """
+    body: dict[str, Any] = {"contract_path": contract_path, "output_folder": output_folder, "confirmed": confirmed is True}
+    if reference_matched_only is not None:
+        body["reference_matched_only"] = reference_matched_only
+    if preferred_adducts_only is not None:
+        body["preferred_adducts_only"] = preferred_adducts_only
+    # Empty follows the contract's answer; another is applied and said as a deviation.
+    if duplicate_rule:
+        body["duplicate_rule"] = duplicate_rule
+    if inchikey_match:
+        body["inchikey_match"] = inchikey_match
+    return _request_json("POST", "/api/lcms-metabolomics/merge", host=host, port=port, body=body, timeout=300)
+
+
+@mcp.tool()
+@_structured_validation_errors
 def msdial_download_official_library(
     catalog_id: str,
     confirmed: bool = False,

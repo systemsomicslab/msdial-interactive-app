@@ -111,6 +111,8 @@ CHECK_SCHEMA = "msdial-interactive.lab-lipidomics-check.v1"
 CONTRACT_SCHEMA = "msdial-interactive.lab-lipidomics-contract.v1"
 NORMALIZE_RECORD_SCHEMA = "msdial-interactive.lab-lipidomics-normalize.v1"
 CONTRACT_NAME = "lab-lipidomics-contract.json"
+# The laboratory metabolomics agent's contract (lab_lcms_metabolomics_agent.CONTRACT_NAME), which shares this layout.
+METABOLOMICS_CONTRACT_NAME = "lab-lcms-metabolomics-contract.json"
 RECORD_NAME = "lab-lipidomics-record.jsonl"
 INPUTS_FOLDER = "inputs"
 QUANT_FOLDER = "quant"
@@ -413,6 +415,13 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         blockers.extend(verdict["blockers"])
         warnings.extend(verdict["warnings"])
         blockers.extend(raw_folder_overlaps(analysis_root, _analysis_subfolders(analysis_root), folders))
+        # A laboratory metabolomics analysis writes the same file names into its root.
+        if (analysis_root / INPUTS_FOLDER / METABOLOMICS_CONTRACT_NAME).exists():
+            blockers.append(
+                f"{analysis_root} holds a laboratory LC-MS metabolomics analysis ({METABOLOMICS_CONTRACT_NAME}); its "
+                "internal-standard libraries, run folders and normalized matrices have the names this analysis would "
+                "write. Give the lipidomics analysis its own root."
+            )
         result["outputs"] = {
             "inputs": str(analysis_root / INPUTS_FOLDER), "quant": str(analysis_root / QUANT_FOLDER),
             **{polarity: str(analysis_root / FOLDERS[polarity]) for polarity in POLARITIES},
@@ -1503,13 +1512,19 @@ def _same_path(left: Any, right: Any) -> bool:
 # ---------------------------------------------------------------------------------------------
 
 
-def run_outputs(contract: dict[str, Any], polarity: str, job: dict[str, Any] | None) -> dict[str, Any]:
+def run_outputs(
+    contract: dict[str, Any], polarity: str, job: dict[str, Any] | None, *,
+    contract_key: str = "lab_lipidomics_contract_path", plan_block: str = "lab_lipidomics",
+    require_library_copy: bool = True,
+) -> dict[str, Any]:
     """The run's Height export, candidate table and project, found from its job or its folder.
 
     The run must be the contract's: written into the contract's output folder, planned from this
     contract, with the contract's salt in its method. A rerun into the same folder leaves several
     exports there; only the job's own files are taken, and without the job an ambiguous folder is
-    refused rather than guessed.
+    refused rather than guessed. contract_key and plan_block name the contract in guided-answers.json
+    (laboratory metabolomics has its own); require_library_copy is for normalize, which loads the
+    run's library copy.
     """
     output_root = Path(contract["output_roots"][polarity])
     problems: list[str] = []
@@ -1577,7 +1592,7 @@ def run_outputs(contract: dict[str, Any], polarity: str, job: dict[str, Any] | N
         copy = projects[0].with_name(projects[0].stem + "_Loaded.msp2.dbs")
         if copy.is_file():
             outcome["loaded_library_copy"] = str(copy)
-        else:
+        elif require_library_copy:
             problems.append(
                 f"{copy.name} is not beside the project; normalize loads the run's library copy from there. "
                 "Do not move the run's intermediates before normalize."
@@ -1589,9 +1604,9 @@ def run_outputs(contract: dict[str, Any], polarity: str, job: dict[str, Any] | N
     except (OSError, ValueError, AttributeError):
         recorded, answers = {}, {}
         problems.append(f"{answers_file} cannot be read, so this run cannot be shown to come from the contract.")
-    if answers and not _same_path(answers.get("lab_lipidomics_contract_path", ""), contract["_path"]):
+    if answers and not _same_path(answers.get(contract_key, ""), contract["_path"]):
         problems.append(f"The run in {output_root} was not planned from this contract.")
-    elif answers and (recorded.get("lab_lipidomics") or {}).get("contract_sha256") != contract["_sha256"]:
+    elif answers and (recorded.get(plan_block) or {}).get("contract_sha256") != contract["_sha256"]:
         # A contract replaced at the same path rewrites the internal-standard libraries in place;
         # the run was annotated with the earlier ones.
         problems.append(

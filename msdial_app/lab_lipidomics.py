@@ -37,7 +37,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .lipidome_merge import MergeRefused, describe_export, strip_polarity
 
@@ -1083,12 +1083,18 @@ class InternalStandard:
         return asdict(self)
 
 
-def read_internal_standard_text(path: str | Path, polarity: str | None = None) -> dict[str, Any]:
+def read_internal_standard_text(
+    path: str | Path, polarity: str | None = None, *,
+    columns: dict[str, tuple[str, ...]] | None = None, required: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     """Read an MS-DIAL text library of internal standards, by its header, in any column order.
 
     Name, MZ, RT, Adduct and Ontology are required; MZ is the adduct's m/z, because MS-DIAL
-    matches the text library by m/z and the adduct column only labels the result.
+    matches the text library by m/z and the adduct column only labels the result. columns and
+    required replace IS_TEXT_COLUMNS and IS_TEXT_REQUIRED (laboratory metabolomics needs no class).
     """
+    columns_by_field = columns or IS_TEXT_COLUMNS
+    required_fields = required or IS_TEXT_REQUIRED
     source = Path(path)
     blockers: list[str] = []
     warnings: list[str] = []
@@ -1119,13 +1125,13 @@ def read_internal_standard_text(path: str | Path, polarity: str | None = None) -
         return result
     header = [cell.strip().strip('"') for cell in lines[header_index].split("\t")]
     result["header"] = header
-    columns: dict[str, int] = {}
+    found: dict[str, int] = {}
     for index, cell in enumerate(header):
         key = _header_key(cell)
-        for field_name, aliases in IS_TEXT_COLUMNS.items():
-            if key in aliases and field_name not in columns:
-                columns[field_name] = index
-    missing = [name for name in IS_TEXT_REQUIRED if name not in columns]
+        for field_name, aliases in columns_by_field.items():
+            if key in aliases and field_name not in found:
+                found[field_name] = index
+    missing = [name for name in required_fields if name not in found]
     if missing:
         blockers.append(
             f"{source.name} has no {', '.join(missing)} column(s); its header is: {' | '.join(header)}."
@@ -1141,7 +1147,7 @@ def read_internal_standard_text(path: str | Path, polarity: str | None = None) -
         cells = [cell.strip().strip('"') for cell in line.split("\t")]
 
         def cell(name: str) -> str:
-            index = columns.get(name, -1)
+            index = found.get(name, -1)
             return cells[index] if 0 <= index < len(cells) else ""
 
         problems: list[str] = []
@@ -1162,7 +1168,7 @@ def read_internal_standard_text(path: str | Path, polarity: str | None = None) -
         if rt is None or rt < 0:
             # The Console drops a row whose RT does not parse; an IS with no RT cannot be searched.
             problems.append(f"RT '{cell('rt')}' is not a retention time in minutes")
-        if not ontology:
+        if not ontology and "ontology" in required_fields:
             problems.append("has no Ontology")
         if ccs_text and (ccs is None or ccs <= 0):
             problems.append(f"CCS '{ccs_text}' is not a number")
@@ -1594,6 +1600,9 @@ def resolve_standards(
     ms1_tolerance: float = MS1_TOLERANCE,
     standard_names: Iterable[str] = (),
     annotator_id: str | None = None,
+    library_annotated: Callable[[dict[str, Any]], bool] | None = None,
+    library_label: str = "LBM library",
+    not_found: str = "{name} was not found; every class it quantifies will be NOT QUANTIFIED.",
 ) -> dict[str, Any]:
     """Decide which aligned spot is each internal standard of one polarity.
 
@@ -1621,6 +1630,10 @@ def resolve_standards(
     Every candidate is listed with the files it has no height in, and the valid ones other than
     the chosen spot as valid_alternatives: the person may take any of them instead (an invalid
     choice included), which plan_normalize accepts as accept_spot.
+
+    library_annotated says which spots tier A reads as a library's annotation, the LBM library's by
+    default; laboratory metabolomics passes its MSP libraries, named library_label in what is said, and
+    its own not_found sentence ({name} is the standard), since it quantifies no class.
     """
     annotator_id = annotator_id or INTERNAL_STANDARD_ANNOTATOR_IDS.get(polarity, "")
     spots = export["spots"]
@@ -1659,7 +1672,7 @@ def resolve_standards(
                 continue
             representative = representative_candidate(candidates, spot["id"])
             tier = None
-            lbm = spot["method"].startswith("LbmDB")
+            lbm = library_annotated(spot) if library_annotated else spot["method"].startswith("LbmDB")
             # Without a candidate table, an old export's name prefix is the only sign of a suggestion.
             # MS-DIAL names the annotator in the Comment for any database hit, a suggestion below the
             # score cutoff included, and the export no longer prefixes such a name.
@@ -1727,7 +1740,7 @@ def resolve_standards(
                 f"no spot within {window_mz * 1000:.1f} mDa of {record.mz} ({record.adduct}) and "
                 f"{internal_standard_rt_tolerance} min of {record.rt} min"
             )
-            entry["warnings"].append(f"{record.name} was not found; every class it quantifies will be NOT QUANTIFIED.")
+            entry["warnings"].append(not_found.format(name=record.name))
             entries.append(entry)
             continue
         spot = chosen["spot"]
@@ -1742,7 +1755,7 @@ def resolve_standards(
             "delta_mz_mda": round(delta_mz * 1000, 4), "delta_mz_ppm": round(delta_mz / record.mz * 1e6, 3),
             "delta_rt": round(delta_rt, 4),
             "reason": {
-                "A": "the LBM library annotated it at the library adduct's m/z",
+                "A": f"the {library_label} annotated it at the library adduct's m/z",
                 "B": "its internal-standard text row annotated it",
                 "C": "its text row matched, but another annotation was kept for the spot or the match is only "
                      "a suggestion below the score cutoff",
@@ -1754,7 +1767,7 @@ def resolve_standards(
             entry["label_disagreement"] = {"label": spot["adduct"], "library_adduct": record.adduct}
         if abs(delta_rt) > internal_standard_rt_tolerance:
             entry["warnings"].append(
-                f"{record.name} was annotated by the LBM library {delta_rt:+.2f} min from the library RT "
+                f"{record.name} was annotated by the {library_label} {delta_rt:+.2f} min from the library RT "
                 f"{record.rt}; the library RT may be stale."
             )
             in_window = [item["spot"]["id"] for item in listed if within(item["spot"], internal_standard_rt_tolerance)]

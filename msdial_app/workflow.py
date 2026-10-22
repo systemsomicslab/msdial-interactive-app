@@ -4365,12 +4365,18 @@ def _write_msp_annotator_settings(run_directory: Path, state: dict[str, Any]) ->
         "target_omics",
         "evidence_tier",
     ]
+    # Whether a library's spectra were acquired or predicted (ConfigParser.ReadLibraryKind): written only when
+    # a row says, so that every other settings file stays as it was. The Console reads silence as acquired.
+    with_kind = any(str(row.get("library_kind", "")).strip() for row in rows)
+    if with_kind:
+        header.append("library_kind")
     with settings_path.open("w", encoding="ascii", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=header, delimiter="\t", lineterminator="\n")
         writer.writeheader()
         for index, row in enumerate(rows, start=1):
             writer.writerow(
                 {
+                    **({"library_kind": str(row.get("library_kind", "")).strip() or "acquired"} if with_kind else {}),
                     "annotator_id": str(row.get("annotator_id", "")).strip() or f"msp_annotator_{index}",
                     "msp_file_path": str(Path(str(row["msp_file_path"])).expanduser().resolve()),
                     "priority": int(row.get("priority") or index),

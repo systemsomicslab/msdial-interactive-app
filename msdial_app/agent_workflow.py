@@ -68,6 +68,10 @@ SUPPORTED_ANSWER_KEYS = {
     "solvent_type", "sample_table", "internal_standard_text_path",
     "internal_standard_rt_tolerance", "export_annotation_candidates",
     "lab_lipidomics_contract_path", "analysis_purpose",
+    # The laboratory LC-MS metabolomics profile (lab_lcms_metabolomics, lab_lcms_metabolomics_agent).
+    "lab_lcms_metabolomics_contract_path",
+    # Minutes; unset, the parameter template's value stands.
+    "alignment_rt_tolerance",
 }
 SAMPLE_TABLE_FILE_TYPES = ("Sample", "QC", "Blank", "Standard")
 # The LBM score cutoffs a parameter template states, by the state key the method writer reads. Only
@@ -209,6 +213,13 @@ def build_guided_plan(
     contract_blockers: list[str] = []
     lab_contract: dict[str, Any] | None = None
     contract_text = str(supplied.get("lab_lipidomics_contract_path") or "").strip()
+    metabolomics_text = str(supplied.get("lab_lcms_metabolomics_contract_path") or "").strip()
+    # Which laboratory contract the plan is from, by the plan block that reports it.
+    lab_kind = "lab_lipidomics" if contract_text else "lab_lcms_metabolomics" if metabolomics_text else ""
+    if contract_text and metabolomics_text:
+        contract_blockers.append(
+            "A plan comes from one laboratory contract; this one names a lipidomics and a metabolomics contract."
+        )
     if contract_text:
         # The contract's answers sit under the caller's and a workset's: the caller names the
         # polarity, and may change a method default (a recorded deviation); what the contract
@@ -218,6 +229,14 @@ def build_guided_plan(
 
         given = {**dict((workset or {}).get("answers", {})), **supplied}
         lab_contract = contract_plan_answers(contract_text, given, input_path)
+        contract_blockers.extend(lab_contract["blockers"])
+        supplied = {**lab_contract["answers"], **given, **lab_contract["fixed"]}
+    elif metabolomics_text:
+        # As for lipidomics: the contract fixes the libraries, the salt, the standards and the files.
+        from .lab_lcms_metabolomics_agent import contract_plan_answers as metabolomics_plan_answers
+
+        given = {**dict((workset or {}).get("answers", {})), **supplied}
+        lab_contract = metabolomics_plan_answers(metabolomics_text, given, input_path)
         contract_blockers.extend(lab_contract["blockers"])
         supplied = {**lab_contract["answers"], **given, **lab_contract["fixed"]}
     merged = dict((workset or {}).get("answers", {}))
@@ -230,11 +249,17 @@ def build_guided_plan(
         **dict(supplied.get("workflow_overrides") or {}),
     }
     merged.update(supplied)
+    if lab_kind != "lab_lcms_metabolomics":
+        # Reached through a workset, the key would tie this run to a contract nothing here loaded or checked.
+        merged.pop("lab_lcms_metabolomics_contract_path", None)
     if overrides:
         merged["workflow_overrides"] = overrides
     if lab_contract is not None and overrides:
         # Overrides reach the state last, after everything the contract fixed was set.
-        from .lab_lipidomics_agent import contract_override_problems
+        if lab_kind == "lab_lipidomics":
+            from .lab_lipidomics_agent import contract_override_problems
+        else:
+            from .lab_lcms_metabolomics_agent import contract_override_problems
 
         overridden = contract_override_problems(overrides)
         contract_blockers.extend(overridden["blockers"])
@@ -255,6 +280,8 @@ def build_guided_plan(
     if merged.get("sample_table"):
         contract_blockers.extend(sample_table_problems(inspection["files"], merged["sample_table"]))
     blockers: list[str] = list(contract_blockers)
+    if merged.get("alignment_rt_tolerance") not in (None, "") and _alignment_rt_tolerance(merged) is None:
+        blockers.append(f"alignment_rt_tolerance '{merged['alignment_rt_tolerance']}' is not a positive number of minutes.")
     official_library: dict[str, Any] | None = None
     if not inspection["files"]:
         blockers.append("No supported analysis files were found at input_path.")
@@ -355,10 +382,10 @@ def build_guided_plan(
                 merged.get("generate_materials_methods")
             ),
         },
-        "profile": "lab_lipidomics" if lab_profile else "",
+        "profile": "lab_lipidomics" if lab_profile else lab_kind,
         **(
             {
-                "lab_lipidomics": {
+                lab_kind: {
                     key: lab_contract[key]
                     for key in ("contract_path", "contract_sha256", "polarity", "deviations", "fixed_keys")
                 }
@@ -870,7 +897,13 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
         ask(
             "library_strategy",
             "Which annotation libraries should be used?",
-            ["official", "existing", "tiered_lipid_msp", "none"],
+            ["official", "existing", "tiered_lipid_msp", "annotators", "none"],
+        )
+    elif answers.get("library_strategy") == "annotators" and not (answers.get("libraries") or {}).get("annotators"):
+        ask(
+            "libraries",
+            "Provide libraries.annotators: each library's kind (msp or lbm), path, priority, thresholds, "
+            "retention_time (none or use) and rt_tolerance, as msdial_lcms_metabolomics_write_contract writes them.",
         )
     elif (
         lab_profile
@@ -976,6 +1009,18 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+def _alignment_rt_tolerance(answers: dict[str, Any]) -> float | None:
+    """The alignment_rt_tolerance answer in minutes, or None when it is not given or not a positive number."""
+    value = answers.get("alignment_rt_tolerance")
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
 def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, Any]:
     project_type = str(answers["project_type"]).casefold()
     settings = load_user_settings()
@@ -1056,6 +1101,8 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             ),
         }
     )
+    if _alignment_rt_tolerance(answers) is not None:
+        state["alignment_rt_tolerance"] = _alignment_rt_tolerance(answers)
     # Unlike the keys above it has no default here: unset, it is not written, and a Console with
     # MsdialWorkbench#826 uses its own 1.5 min while one without it is never handed a key it does
     # not know. A template line for it reached the state through load_parameter_template.
@@ -1105,6 +1152,10 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
         contract_path = str(answers.get("lab_lipidomics_contract_path") or "").strip()
         if contract_path:
             state["lab_lipidomics_contract_path"] = str(Path(contract_path).expanduser().resolve())
+    metabolomics_contract = str(answers.get("lab_lcms_metabolomics_contract_path") or "").strip()
+    if metabolomics_contract:
+        state["lab_lcms_metabolomics_contract_path"] = str(Path(metabolomics_contract).expanduser().resolve())
+        state["analysis_purpose"] = str(answers.get("analysis_purpose") or "").strip()
     if project_type == "lcms":
         ion_mode = str(state["ion_mode"])
         state["selected_adducts"] = [
@@ -1482,6 +1533,12 @@ def _apply_libraries(
         ]
         return
     libraries = dict(answers.get("libraries") or {})
+    if strategy == "annotators":
+        # An ordered list of libraries, each with its own RT use and thresholds (laboratory metabolomics).
+        from .lab_lcms_metabolomics import apply_annotators
+
+        apply_annotators(state, libraries.get("annotators") or [])
+        return
     msp_paths = _path_list(libraries.get("msp_paths"))
     text_paths = _path_list(libraries.get("text_paths"))
     if strategy == "tiered_lipid_msp":

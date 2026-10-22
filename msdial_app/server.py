@@ -152,6 +152,18 @@ from .lab_lipidomics_agent import (
     write_contract as lab_write_contract,
     write_normalize_inputs as lab_write_normalize_inputs,
 )
+from .lab_lcms_metabolomics_agent import (
+    CONTRACT_KEY as LCMS_CONTRACT_KEY,
+    check_inputs as lcms_check_inputs,
+    finish_normalize as lcms_finish_normalize,
+    merge as lcms_merge,
+    plan_normalize as lcms_plan_normalize,
+    public_check as lcms_public_check,
+    public_normalize_plan as lcms_public_normalize_plan,
+    record_event as lcms_record_event,
+    resolve_standards_for_contract as lcms_resolve_standards,
+    write_contract as lcms_write_contract,
+)
 from .lab_quant_input import quant_input_template as lab_quant_input_template
 from .diagnostic_paths import diagnostic_run_directory, is_diagnostic_artifact
 
@@ -269,6 +281,22 @@ def _record_peak_height_diagnostic(
 
     manifest = str(preparation.get("repository_run_manifest") or "").strip()
     contract = str(preparation.get("lab_lipidomics_contract_path") or "").strip()
+    metabolomics = str(preparation.get(LCMS_CONTRACT_KEY) or "").strip()
+    if not manifest and metabolomics:
+        # A laboratory metabolomics run keeps its decisions beside its contract too.
+        try:
+            record = lcms_record_event(metabolomics, {
+                "event": "peak_height_diagnostic", "polarity": preparation.get("lab_lcms_metabolomics_polarity"),
+                "job_id": job_id, "representative": {
+                    key: representative.get(key)
+                    for key in ("file_name", "selection_reason", "instrument_family", "threshold_step")
+                },
+                "estimate": estimate,
+                "diagnostic_directory": str(preparation.get("diagnostic_run_directory") or ""),
+            })
+        except OSError as error:
+            return {"recorded": False, "reason": f"lab_lcms_metabolomics_record_unwritable: {error}"}
+        return {"recorded": True, "lab_lcms_metabolomics_record": record}
     if not manifest and contract:
         # A laboratory lipidomics run keeps its decisions beside its contract instead.
         try:
@@ -1137,6 +1165,7 @@ def _write_guided_answers(preparation: dict, plan: dict) -> str:
         # A laboratory lipidomics run is bound to the contract it was planned from by content: a contract
         # replaced at the same path afterwards is another contract.
         **({"lab_lipidomics": plan["lab_lipidomics"]} if plan.get("lab_lipidomics") else {}),
+        **({"lab_lcms_metabolomics": plan["lab_lcms_metabolomics"]} if plan.get("lab_lcms_metabolomics") else {}),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1948,6 +1977,9 @@ class Handler(BaseHTTPRequestHandler):
                     if workflow.get("lab_lipidomics_contract_path"):
                         preparation["lab_lipidomics_contract_path"] = workflow["lab_lipidomics_contract_path"]
                         preparation["lab_lipidomics_polarity"] = workflow.get("ion_mode")
+                    if workflow.get(LCMS_CONTRACT_KEY):
+                        preparation[LCMS_CONTRACT_KEY] = workflow[LCMS_CONTRACT_KEY]
+                        preparation["lab_lcms_metabolomics_polarity"] = workflow.get("ion_mode")
                     if authorized:
                         record_campaign_authorization(authorized[0], {**authorized[1], "job_id": job_id})
                     _write_diagnostic_record(job_id, preparation, "queued")
@@ -2037,6 +2069,36 @@ class Handler(BaseHTTPRequestHandler):
                         "representative": profile,
                         "estimate": estimate,
                         "provenance": recorded,
+                    }
+                )
+            elif parsed.path == "/api/lcms-metabolomics/check":
+                self._json(lcms_public_check(lcms_check_inputs(body)))
+            elif parsed.path == "/api/lcms-metabolomics/write-contract":
+                self._json(lcms_write_contract(body))
+            elif parsed.path == "/api/lcms-metabolomics/resolve":
+                self._json(lcms_resolve_standards(str(body.get("contract_path") or ""), _laboratory_runs(body)))
+            elif parsed.path == "/api/lcms-metabolomics/normalize":
+                self._json(_laboratory_metabolomics_normalize(body))
+            elif parsed.path == "/api/lcms-metabolomics/merge":
+                confirmed = body.get("confirmed") is True
+                report = lcms_merge(
+                    str(body.get("contract_path") or ""),
+                    # Absent follows the contract; true or false is applied; anything else is refused.
+                    reference_matched_only=body.get("reference_matched_only"),
+                    preferred_adducts_only=body.get("preferred_adducts_only"),
+                    duplicate_rule=body.get("duplicate_rule") or None,
+                    inchikey_match=body.get("inchikey_match") or None,
+                    output_folder=str(body.get("output_folder") or "metabolome"),
+                    write=confirmed,
+                )
+                self._json(
+                    {
+                        "written": confirmed,
+                        **({} if confirmed else {
+                            "confirmation_required": True,
+                            "message": "Show the person the options and the counts, then call again with confirmed=true to write.",
+                        }),
+                        "report": report,
                     }
                 )
             elif parsed.path == "/api/lipidomics/check":
@@ -3335,20 +3397,65 @@ def _run_tuning_job(job_id: str, preparation: dict[str, Any]) -> None:
 
 
 def _record_laboratory_run_start(plan: dict[str, Any], job_id: str, preparation: dict[str, Any]) -> None:
-    """A laboratory lipidomics production run, in its contract's record. Never stops the run."""
+    """A laboratory lipidomics or metabolomics production run, in its contract's record. Never stops the run."""
     workflow = plan.get("workflow") or {}
     contract = str(workflow.get("lab_lipidomics_contract_path") or "").strip()
+    block, record = "lab_lipidomics", lab_record_event
+    if not contract:
+        contract = str(workflow.get(LCMS_CONTRACT_KEY) or "").strip()
+        block, record = "lab_lcms_metabolomics", lcms_record_event
     if not contract:
         return
     try:
-        lab_record_event(contract, {
+        record(contract, {
             "event": "production_run_started", "polarity": workflow.get("ion_mode"), "job_id": job_id,
             "minimum_peak_height": workflow.get("minimum_peak_height"),
-            "deviations": (plan.get("lab_lipidomics") or {}).get("deviations", []),
+            "deviations": (plan.get(block) or {}).get("deviations", []),
             "method_file": preparation.get("method_file"), "command": preparation.get("command"),
         })
     except OSError:
         pass
+
+
+def _laboratory_metabolomics_normalize(body: dict[str, Any]) -> dict[str, Any]:
+    """Preview, or once confirmed write, one polarity's matrix normalized by its internal standard.
+
+    It runs here, in Python, and starts no Console: MS-DIAL's own normalization averages the standard over
+    every file, Blank included.
+    """
+    job_id = str(body.get("job_id") or "").strip()
+    with JOBS_LOCK:
+        run = copy.deepcopy(JOBS.get(job_id))
+    if run is None:
+        raise ValueError(f"Run job {job_id} is not known to this backend.")
+    plan = lcms_plan_normalize(
+        str(body.get("contract_path") or ""), run, str(body.get("resolution_digest") or ""),
+        body.get("accept_searched") or [], body.get("accept_spot") or None,
+        accept_gap_filled=body.get("accept_gap_filled") is True,
+    )
+    shown = lcms_public_normalize_plan(plan)
+    if body.get("confirmed") is not True:
+        return {
+            "written": False,
+            "confirmation_required": True,
+            "plan": shown,
+            "message": "Show the person the normalizing standard, its mean and the injections it leaves raw, then call "
+                       "again with confirmed=true.",
+        }
+    record = lcms_finish_normalize(plan)
+    # Figure 04 from the run's Height export, every standard the resolution found; a figure that fails is a
+    # warning, never a refusal.
+    try:
+        # Every standard at the spot it was found at, the normalizing standard at the one taken: the figure is the
+        # standards' response across the run, whatever the merge decides of them.
+        figure = write_internal_standard_figure(
+            plan["polarity"], plan["outputs"]["height_export"], plan["figure_rows"],
+            Path(plan["paths"]["normalized"]).parent / QA_FIGURES_FOLDER,
+            resolution_rows=plan["resolution"]["standards"],
+        )
+    except Exception as error:
+        figure = qa_figures_failed(f"the {plan['polarity'].lower()} internal standards", error)
+    return {"written": True, "plan": shown, "record": record, "qa_figures": figure}
 
 
 def _laboratory_runs(body: dict[str, Any]) -> dict[str, dict[str, Any] | None]:

@@ -11,7 +11,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILL_NAMES = ["msdial-guided-analysis", "msdial-lipidomics-workflow"]
+SKILL_NAMES = ["msdial-guided-analysis", "msdial-lcms-metabolomics-workflow", "msdial-lipidomics-workflow"]
 
 
 def load(name: str, filename: str):
@@ -36,7 +36,7 @@ def write_skill(root: Path, folder: str, frontmatter: str, extra: dict[str, str]
 
 
 class BundledSkillsTests(unittest.TestCase):
-    def test_both_skills_are_bundled_with_valid_frontmatter(self) -> None:
+    def test_every_skill_is_bundled_with_valid_frontmatter(self) -> None:
         self.assertEqual(SKILL_NAMES, packager.skill_names())
         for name in SKILL_NAMES:
             fields = packager.skill_frontmatter(ROOT / "skills" / name)
@@ -135,7 +135,7 @@ class SkillFolderTests(unittest.TestCase):
 
 
 class DistributionTests(unittest.TestCase):
-    def test_the_distribution_carries_the_setup_the_examples_and_both_skills(self) -> None:
+    def test_the_distribution_carries_the_setup_the_examples_and_every_skill(self) -> None:
         distribution = load("build_distribution_under_test", "build-distribution.py")
         names = {path.relative_to(distribution.ROOT).as_posix() for path in distribution.iter_files()}
         for expected in (
@@ -147,6 +147,7 @@ class DistributionTests(unittest.TestCase):
             "docs/tutorials/lab-lipidomics.md",
             "skills/msdial-guided-analysis/SKILL.md",
             "skills/msdial-lipidomics-workflow/SKILL.md",
+            "skills/msdial-lcms-metabolomics-workflow/SKILL.md",
         ):
             self.assertIn(expected, names)
 

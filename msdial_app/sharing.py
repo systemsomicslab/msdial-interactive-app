@@ -95,8 +95,10 @@ LIBRARY_FILE = re.compile(r"\.(?:msp|msp2|dbs|lbm|lbm2)$|_Loaded\.msp2", re.IGNO
 LOCAL_ONLY_FILE = re.compile(
     r"\.(?:mdproject|mddata|dcl|pai2?|arf2?|aef|rtc|sfs)$|^(?:datamining-handoff|guided-answers)\.json$"
     r"|\.local\.json$"
-    # A laboratory lipidomics contract and its record name the LBM2 and the raw data where they are kept.
-    r"|^lab-lipidomics-contract(?:\.\d+)?\.json$|^lab-lipidomics-record\.jsonl$",
+    # A laboratory lipidomics contract and its record name the LBM2 and the raw data where they are kept;
+    # a laboratory metabolomics contract and its record name its libraries and raw data the same way.
+    r"|^lab-lipidomics-contract(?:\.\d+)?\.json$|^lab-lipidomics-record\.jsonl$"
+    r"|^lab-lcms-metabolomics-contract(?:\.\d+)?\.json$|^lab-lcms-metabolomics-record\.jsonl$",
     re.IGNORECASE,
 )
 PRIVATE_LICENCE = re.compile(r"private|institutional|proprietary|in-house", re.IGNORECASE)
