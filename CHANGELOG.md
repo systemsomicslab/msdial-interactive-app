@@ -43,6 +43,19 @@ Built on 0.5.45 (#78), which is not merged yet; merge this after it.
     missing is a warning, because MS-DIAL matches a record without an RT on MS/MS alone.
   - The two laboratory agents refuse an analysis root that holds the other's contract, since both write the
     same file names there.
+  - Gap-filled standards: the run's `<alignment>.mdpeakid.tsv` says where MS-DIAL did not detect the
+    normalizing standard. A Sample or QC there refuses normalization unless the person accepts the heights
+    (`accept_gap_filled`); a Blank or Standard injection there, without the standard, or with it below 10% of
+    the lowest Sample or QC height keeps its raw heights, with the reason.
+  - Which spots are internal standards: every spot a library or a standard's own text row annotated as that
+    standard (tiers A and B), whatever else the resolver said of it. A spot only searched for a standard (C,
+    D) stays a feature, kept as its own row outside the InChIKey groups, so a labelled standard never takes
+    its endogenous compound's place; the merge names each, with any row it shares a first block with.
+  - The merge reports possible isomers: InChIKey groups whose rows differ in stereo block or lie more than
+    0.5 min apart, with the row kept.
+  - The check refuses what a later step would: an annotation key it does not read, a library path or
+    analysis root outside ASCII, and folder raw data (`.d`, `.raw`) with a Console that cannot be shown to
+    read them.
 
 ### Changed
 - `lab_lipidomics.resolve_standards` takes which spots tier A reads as a library annotation

@@ -61,8 +61,14 @@ person's choice.
     MSP of MS/MS without RT, no RT filter.
   Or the person lists the libraries: `{"libraries": [{"kind": "msp", "path": ...,
   "thresholds": "standard"|"strict"|"mild", "retention_time": "none"|"use",
-  "rt_tolerance": ..., "label": ...}, ...]}`. Each library's RT use is its own and no
-  run-wide answer changes it.
+  "rt_tolerance": ..., "label": ..., "library_kind": "acquired"|"predicted"}, ...]}`.
+  Each library's RT use is its own and no run-wide answer changes it. Any other key is
+  refused rather than ignored, so a setting the preset does not take needs the list form.
+- **What each MSP's spectra are**: acquired, or computed in silico (`library_kind`
+  `predicted`, which MS-DIAL reports as in-silico evidence rather than a reference
+  spectrum). The campaign's `in_silico` slot is predicted; any other slot may say so as
+  `{"path": ..., "library_kind": "predicted"}`. Ask it of every library whose spectra the
+  person has not described, the predicted-RT library included.
 - **The salt or acid** in the mobile phase (`solvent_type`). Formic acid and ammonium
   formate read as `HCOONH4`, acetic acid and ammonium acetate as `CH3COONH4`, ammonium
   bicarbonate as `NH4HCO3`. It sets the negative adduct the merge prefers besides
@@ -98,8 +104,13 @@ contract.
 
 Call `msdial_lcms_metabolomics_check_inputs` again with every answer. Report the blockers
 and warnings, the libraries as they will be searched (`annotation.libraries`: priority,
-label, thresholds, RT use, file names with sha256 in `annotation.files`), the salt with
-its preferred adducts, and the normalizing standards.
+label, thresholds, RT use, library_kind, file names with sha256 in `annotation.files`), the
+salt with its preferred adducts, and the normalizing standards. A library searched with RT
+is read for its records' retention times (`annotation.retention_time_census`): MS-DIAL
+matches a record without one on MS/MS alone, so none refuses the library and some missing
+is a warning to read out. Library paths and the analysis root must be ASCII, and raw data
+in `.d` or `.raw` folders need a Console built from MsdialWorkbench#739 with its build
+record; the check says so before the contract fixes the Console.
 
 Show `paired_sample_table`: file, type (Sample, QC, Blank, Standard; a reference
 material such as NIST SRM 1950 plasma is a Standard), class, analytical order, batch,
@@ -152,8 +163,10 @@ word.
 Read the normalizing standard first (`summary.normalizing_standard`): tier, alignment
 ID, MS-DIAL's name, Δm/z and ΔRT, files without a height (`zero_height_files`: a Sample
 or QC without it makes it invalid; `tolerated_zero_height_files`: Blank or Standard
-injections, which may lack it), and `valid_alternatives`. Then the other standards with
-`cv_percent_qc` and `cv_percent_sample_qc`, the run's stability in one number each. The
+injections, which may lack it), `gap_filled_files` (injections where MS-DIAL did not
+detect it and filled the gap, from the run's peak-ID matrix), its CVs and
+`valid_alternatives`. Then the other standards with `cv_percent_qc` and
+`cv_percent_sample_qc`, the run's stability in one number each, and every warning. The
 person accepts a C or D normalizing standard (`accept_searched`) or takes another listed
 spot (`accept_spot`); never decide it yourself.
 
@@ -163,9 +176,15 @@ spot (`accept_spot`); never decide it yourself.
 accept_searched=[...], accept_spot={name: alignment ID})` previews:
 `normalized = height / height of the standard in that injection x the standard's mean
 height over the Sample and QC injections`, times the injection's dilution factor. Read
-the standard, its mean and the injections it averages over, the injections left as raw
-height (Blank or Standard without the standard) and any dilution factor. A Sample or QC
-without the standard refuses. On a yes, call again with `confirmed=true`: it writes
+the standard, its mean and the injections it averages over, each injection's multiplier,
+the injections left at raw height with why (`raw_height_reasons`: a Blank or Standard
+without the standard, with it undetected, or below 10% of the lowest Sample or QC height)
+and any dilution factor. A Sample or QC without the standard refuses. So does one where
+MS-DIAL did not detect it: its height is a gap fill, and dividing by it scales every
+feature of that injection. Read those heights to the person; normalize them only if they
+accept (`accept_gap_filled=true`). Read every warning: each other standard's spot is either
+dropped by the merge as an internal standard (a library or its own text row annotated it
+as the standard) or kept as its own row. On a yes, call again with `confirmed=true`: it writes
 `<root>/quant/NormalizedHeight_<Pos|Neg>.txt` in MS-DIAL's layout (the per-class Average
 and Stdev columns empty, since MS-DIAL computed them from heights), checks every cell
 against the formula, and draws figure 04 into `<root>/quant/qa_figures`. MS-DIAL's own
@@ -176,8 +195,10 @@ used.
 
 `msdial_lcms_metabolomics_merge(contract_path)` previews the counts. Every polarity of
 the contract must be normalized. Dropped first: unannotated rows and every internal
-standard. A spot that was only searched for a standard nobody confirmed stays a feature;
-read `unconfirmed_standard_spots` to the person. Options, read to the person:
+standard. A spot that was only searched for a standard nobody confirmed stays a feature,
+kept as its own row outside the InChIKey groups, so that a labelled standard never takes
+the place of its endogenous compound; read `unconfirmed_standard_spots` to the person,
+with any row each shares a first block with. Options, read to the person:
 - `reference_matched_only`, default true: only rows MS-DIAL calls Ref. matched.
 - `preferred_adducts_only`, default false: only `[M+H]+`, `[M-H]-` and the salt's
   negative adduct.
@@ -187,7 +208,10 @@ one is kept: a preferred adduct first, then matched on MS/MS, then the larger me
 normalized height over Sample and QC, then the higher library priority, the higher total
 score, positive before negative. A labelled standard shares its first block with the
 endogenous compound, which is why standards go first. A row without an InChIKey is kept
-as its own; say how many (`counts.kept_without_inchikey`).
+as its own; say how many (`counts.kept_without_inchikey`). The first block joins
+stereoisomers, and the intensity can pick an MS/MS-only match at another RT over an
+RT-confirmed one: read `possible_isomers` (groups whose rows differ in stereo block or lie
+more than 0.5 min apart) to the person, with the row kept and the rows removed.
 
 On a yes, `confirmed=true` writes into `<root>/quant/<output_folder>` (default
 `metabolome`): `metabolome.csv`, `metabolome_samples.csv`, `metabolome_removed.tsv` (each

@@ -3423,6 +3423,7 @@ def _laboratory_metabolomics_normalize(body: dict[str, Any]) -> dict[str, Any]:
     plan = lcms_plan_normalize(
         str(body.get("contract_path") or ""), run, str(body.get("resolution_digest") or ""),
         body.get("accept_searched") or [], body.get("accept_spot") or None,
+        accept_gap_filled=body.get("accept_gap_filled") is True,
     )
     shown = lcms_public_normalize_plan(plan)
     if body.get("confirmed") is not True:
@@ -3437,8 +3438,8 @@ def _laboratory_metabolomics_normalize(body: dict[str, Any]) -> dict[str, Any]:
     # Figure 04 from the run's Height export, every standard the resolution found; a figure that fails is a
     # warning, never a refusal.
     try:
-        # The spots as decided: the normalizing standard's as taken, the others only where a library or their own
-        # text row found them, every other standard at -1 so that the figure names it.
+        # Every standard at the spot it was found at, the normalizing standard at the one taken: the figure is the
+        # standards' response across the run, whatever the merge decides of them.
         figure = write_internal_standard_figure(
             plan["polarity"], plan["outputs"]["height_export"], plan["figure_rows"],
             Path(plan["paths"]["normalized"]).parent / QA_FIGURES_FOLDER,

@@ -160,15 +160,31 @@ def export_spot(item: dict[str, Any]) -> dict[str, Any]:
 
 def write_run(
     batch: MetabolomicsBatch, contract_path: str, polarity: str, *, salt: str = "HCOONH4",
-    spots: list[dict[str, Any]] | None = None,
+    spots: list[dict[str, Any]] | None = None, gap_filled: dict[int, list[str]] | None = None,
+    peak_ids: bool = True,
 ) -> dict[str, Any]:
-    """What a production run of the contract leaves in its output folder, and the job that made it."""
+    """What a production run of the contract leaves in its output folder, and the job that made it.
+
+    The peak-ID matrix marks a zero height and every injection gap_filled names (by stem) as -1.
+    """
     label = "Pos" if polarity == "Positive" else "Neg"
     output = batch.analysis / label.lower()
     output.mkdir(parents=True, exist_ok=True)
     items = spots if spots is not None else (POSITIVE_SPOTS if polarity == "Positive" else NEGATIVE_SPOTS)
-    height = write_export(output / f"{ALIGNMENT}_Height.txt", [export_spot(item) for item in items],
-                          _samples(label, batch.stems))
+    samples = _samples(label, batch.stems)
+    height = write_export(output / f"{ALIGNMENT}_Height.txt", [export_spot(item) for item in items], samples)
+    matrix = output / f"{ALIGNMENT}.mdpeakid.tsv"
+    if peak_ids:
+        lines = ["\t".join(["alignment_master_id", *(name for name, _, _ in samples)])]
+        for item in items:
+            filled = set((gap_filled or {}).get(item["alignment_id"], []))
+            lines.append("\t".join([str(item["alignment_id"]), *(
+                "-1" if float(cell) == 0 or stem in filled else str(index)
+                for index, (cell, (stem, _)) in enumerate(zip(item["cells"], batch.stems))
+            )]))
+        matrix.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    elif matrix.exists():
+        matrix.unlink()
     priorities = {"lib1_in_house": "4", "lib2_predicted_rt": "3", "lib3_no_rt": "2"}
     rows = []
     for item in items:

@@ -3404,7 +3404,12 @@ def msdial_lcms_metabolomics_check_inputs(
     use and thresholds. Either a preset with its files, {"preset": "lab_rt_tiers", "libraries":
     {"in_house": ..., "predicted_rt": ..., "no_rt": ...}}, or the list itself, {"libraries": [{"kind":
     "msp", "path": ..., "thresholds": "standard", "retention_time": "use", "rt_tolerance": 0.5, "label":
-    "..."}, ...]}. A path is one file for every polarity or {"Positive": ..., "Negative": ...}. Presets:
+    "...", "library_kind": "acquired"}, ...]}. A path is one file for every polarity or {"Positive": ...,
+    "Negative": ...}; a preset slot may also be {"path": ..., "library_kind": "predicted"}. library_kind says
+    whether an MSP's spectra were acquired (the default) or computed in silico (predicted); MS-DIAL then
+    publishes a predicted library's matches as in-silico evidence. Ask it of every library whose spectra the
+    person has not described. Any other key is refused, not ignored. A library searched with RT is read for
+    its records' retention times: none refuses it, some missing is a warning. Presets:
     single_msp (slot msp: one MSP, no RT); campaign (slots lbm, msp, optional in_silico: the LBM2, the MSP
     strictly and mildly, an in-silico MSP mildly, all without RT); lab_rt_tiers (in_house at RT 0.5 min,
     predicted_rt at RT 2.0 min, no_rt without RT). Thresholds: standard (dot products 0.6/0.6/0.8, 3
@@ -3508,9 +3513,11 @@ def msdial_lcms_metabolomics_resolve_standards(
     internal-standard RT tolerance. Tier A: one of the contract's libraries annotated it by its name; B:
     its own text row annotated it as a reference match; C: its row matched but another annotation won; D:
     any spot there. C and D need the person's acceptance. Only the normalizing standard must be found:
-    read it to the person first (summary.normalizing_standard: tier, alignment ID, m/z and RT error, files
-    without a height, valid_alternatives), then the others with their CV over the QC injections. Pass the
-    polarity's resolution_digest to msdial_lcms_metabolomics_normalize.
+    read it to the person first (summary.normalizing_standard: tier, alignment ID, MS-DIAL's name, m/z and
+    RT error, files without a height, gap_filled_files where MS-DIAL did not detect it, its CVs,
+    valid_alternatives), then the others with their CV over the QC injections, and every warning (a
+    library that left no candidate, a missing peak-ID matrix). Pass the polarity's resolution_digest to
+    msdial_lcms_metabolomics_normalize.
     """
     return _request_json(
         "POST", "/api/lcms-metabolomics/resolve", host=host, port=port,
@@ -3528,6 +3535,7 @@ def msdial_lcms_metabolomics_normalize(
     resolution_digest: str,
     accept_searched: list[str] | None = None,
     accept_spot: dict[str, int] | None = None,
+    accept_gap_filled: StrictFlag = False,
     confirmed: StrictFlag = False,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
@@ -3537,9 +3545,14 @@ def msdial_lcms_metabolomics_normalize(
     normalized = height / the normalizing standard's height in that injection x the standard's mean height
     over the Sample and QC injections, x the injection's dilution factor. It is computed here from the
     run's Height export and starts no Console: MS-DIAL's own internal-standard normalization averages over
-    every file, Blank included. A Sample or QC without the standard refuses; a Blank or Standard injection
-    without it keeps its raw height, and the plan says which. accept_searched (the normalizing standard's
-    name) accepts a tier C or D spot; accept_spot ({name: alignment ID}) takes another listed spot.
+    every file, Blank included. A Sample or QC without the standard refuses, and so does one in which MS-DIAL
+    did not detect it (the run's peak-ID matrix says -1, the height is a gap fill) unless the person accepts
+    those heights (accept_gap_filled=true). A Blank or Standard injection without the standard, with it
+    undetected, or below 10% of the lowest Sample or QC height keeps its raw height, and the plan says which
+    and why (raw_height_reasons); multipliers gives each injection's factor. accept_searched (the normalizing
+    standard's name) accepts a tier C or D spot; accept_spot ({name: alignment ID}) takes another listed spot.
+    The plan's warnings say, for every other standard's spot, whether the merge drops it as an internal
+    standard (tiers A and B, or annotated by the internal-standard text row) or keeps it as its own row.
     confirmed=false previews the standard, its mean and the injections; confirmed=true writes
     <analysis_root>/quant/NormalizedHeight_<Pos|Neg>.txt in MS-DIAL's export layout (the per-class Average
     and Stdev columns left empty), a copy of the Height export, is_resolution_<pos|neg>.tsv and the record,
@@ -3550,7 +3563,7 @@ def msdial_lcms_metabolomics_normalize(
         "POST", "/api/lcms-metabolomics/normalize", host=host, port=port,
         body={"contract_path": contract_path, "job_id": job_id, "resolution_digest": resolution_digest,
               "accept_searched": list(accept_searched or []), "accept_spot": dict(accept_spot or {}),
-              "confirmed": confirmed is True},
+              "accept_gap_filled": accept_gap_filled is True, "confirmed": confirmed is True},
         timeout=300,
     )
 
@@ -3569,10 +3582,13 @@ def msdial_lcms_metabolomics_merge(
     """Merge the normalized polarities of the contract into one metabolome, writing only once confirmed.
 
     Every polarity the contract covers must have been normalized and checked. Dropped first: unannotated
-    rows and every internal standard (the spots decided as standards, and every row the internal-standard
-    text row annotated). A spot only searched for a standard nobody confirmed is kept, and named in
-    unconfirmed_standard_spots. The matrices are the exports the run wrote, so curation in the GUI after the
-    run does not reach them. Then the options:
+    rows and every internal standard (the spots a library or a standard's own text row annotated as that
+    standard, tiers A and B, and every row the internal-standard text row annotated). A spot only searched for
+    a standard nobody confirmed (C, D) is kept as its own row, outside the InChIKey groups, and named in
+    unconfirmed_standard_spots with any kept row it shares a first block with. possible_isomers lists the
+    groups whose rows differ in stereo block or lie more than 0.5 min apart: read them to the person. The
+    matrices are the exports the run wrote, so curation in the GUI after the run does not reach them. Then
+    the options:
     reference_matched_only (default true: only rows whose representative annotation is a reference match,
     what the GUI calls Ref. matched) and preferred_adducts_only (default false: only [M+H]+, [M-H]- and the
     salt's negative adduct, [M+HCOO]- for formate or formic acid, [M+CH3COO]- for acetate). Rows sharing the

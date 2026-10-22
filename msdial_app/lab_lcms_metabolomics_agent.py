@@ -22,6 +22,7 @@ only (sharing.py). The Console is named per contract, never through Interactive'
 
 from __future__ import annotations
 
+import csv
 import datetime as dt
 import json
 import math
@@ -105,6 +106,7 @@ from .lipidome_merge import strip_polarity
 from .workflow import (
     ANNOTATION_CANDIDATES_CAPABILITY,
     AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY,
+    _console_supports_folder_type_csv as console_supports_folder_type_csv,
     console_capabilities,
 )
 
@@ -130,7 +132,9 @@ ANNOTATION_QUESTION = (
     "Which libraries annotate the features, highest priority first? Choose a preset and name its files "
     "(annotation={'preset': ..., 'libraries': {slot: path or {'Positive': path, 'Negative': path}}}), or list "
     "the libraries yourself (annotation={'libraries': [{kind, path, thresholds, retention_time, rt_tolerance, "
-    "label}, ...]}). Presets: "
+    "label, library_kind}, ...]}). For each MSP: are its spectra acquired, or computed in silico (library_kind "
+    "'predicted', which MS-DIAL then reports as in-silico evidence)? A preset slot may say so as "
+    "{'path': ..., 'library_kind': 'predicted'}. Presets: "
     + "; ".join(
         f"{name}: {PRESET_PURPOSES[name]} (slots: {', '.join(dict.fromkeys(item['slot'] for item in PRESETS[name]))})"
         for name in PRESETS
@@ -145,8 +149,11 @@ LAB_CONSOLE_NEEDS = {
 }
 # Neither ending in a dot nor a space, which Windows strips from a folder name: "qa_figures." is qa_figures.
 _FOLDER_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9_-])?$")
-# The resolver's statuses for a standard a library or its own text row annotated (tiers A and B).
-DECIDED_STATUSES = ("resolved_lbm", "resolved_text")
+# The resolver's tiers for a spot a library or the standard's own text row annotated as that standard.
+DECIDED_TIERS = ("A", "B")
+WINDOWS_DEVICE_NAMES = frozenset(
+    {"con", "prn", "aux", "nul", *(f"com{number}" for number in range(10)), *(f"lpt{number}" for number in range(10))}
+)
 # A project saved this long after the run's exports was saved again, as after curation in the GUI.
 CURATION_SLACK_SECONDS = 30 * 60
 
@@ -340,6 +347,12 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         warnings.extend(verdict["warnings"])
         blockers.extend(raw_folder_overlaps(analysis_root, _analysis_subfolders(analysis_root), folders))
         blockers.extend(other_contract_problems(analysis_root))
+        if not all(" " <= character <= "~" for character in str(analysis_root)):
+            # inputs/is_<pol>.txt reaches text_annotator_settings.tsv, which is written and read as ASCII.
+            blockers.append(
+                f"{analysis_root} is not an ASCII path, which the Console's annotator settings file cannot carry; choose "
+                "an analysis root whose path is ASCII."
+            )
         result["outputs"] = {
             "inputs": str(analysis_root / INPUTS_FOLDER), "quant": str(analysis_root / QUANT_FOLDER),
             **{polarity: str(analysis_root / FOLDERS[polarity]) for polarity in polarities},
@@ -359,6 +372,17 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
     else:
         console = _console_verdict(Path(console_text).expanduser())
         blockers.extend(console.pop("blockers"))
+        # Agilent and Bruker .d or Waters .raw folders reach the Console as folder paths, which only a build
+        # from MsdialWorkbench#739 reads; every plan would refuse another, after the contract fixed it.
+        folder_inputs = any(Path(str(item.get("file_path", ""))).is_dir()
+                            for entry in inventory.values() for item in entry["files"])
+        if folder_inputs and Path(console_text).expanduser().is_file() and not console_supports_folder_type_csv(console_text):
+            blockers.append(
+                f"The raw data are folders (.d or .raw), and the Console {Path(console_text).name} cannot be shown to read "
+                "them: a Console qualifies when its build record (msdial-console-build-provenance.json) verifies against "
+                "the binary and records a commit descending from MsdialWorkbench#739. "
+                "msdial_build_console_from_local_source writes that record."
+            )
     result["console"] = console
 
     proposal = _sample_table_proposal(inventory, polarities)
@@ -857,6 +881,8 @@ def contract_plan_answers(contract_path: str, supplied: dict[str, Any], input_pa
         "internal_standard_text_path": contract["derived"]["internal_standard_libraries"][polarity]["path"],
         "internal_standard_rt_tolerance": contract["internal_standard_rt_tolerance"],
         "sample_table": polarity_sample_table(contract["sample_table"]["rows"], polarity),
+        # Each file's factor is the sample table's; a run-wide one would be overridden by it, yet reported.
+        "dilution_factor": None,
         "class_assignment_confirmed": True,
         "analysis_purpose": contract["analysis_purpose"],
         "output_root": contract["output_roots"][polarity],
@@ -925,6 +951,29 @@ def _same_answer(key: str, left: Any, right: Any) -> bool:
 def _outputs(contract: dict[str, Any], polarity: str, job: dict[str, Any] | None) -> dict[str, Any]:
     return run_outputs(contract, polarity, job, contract_key=CONTRACT_KEY, plan_block=PLAN_BLOCK,
                        require_library_copy=False)
+
+
+def read_peak_ids(path: str | Path) -> dict[str, Any]:
+    """The run's <alignment>.mdpeakid.tsv: each spot's peak ID per injection, -1 where MS-DIAL filled the gap."""
+    target = Path(path)
+    with target.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.reader(handle, delimiter="\t")
+        header = next(reader, [])
+        files = [name.strip() for name in header[1:]]
+        by_spot: dict[str, list[int]] = {}
+        for row in reader:
+            if not row or not row[0].strip():
+                continue
+            by_spot[row[0].strip()] = [int(value) if re.fullmatch(r"-?\d+", value.strip()) else -1 for value in row[1:]]
+    return {"path": str(target.resolve()), "sha256": file_sha256(target), "files": files, "by_spot": by_spot}
+
+
+def gap_filled_injections(peak_ids: dict[str, Any], alignment_id: Any) -> list[str]:
+    """The injections in which MS-DIAL did not detect this spot: its height there is a gap fill."""
+    row = (peak_ids or {}).get("by_spot", {}).get(str(alignment_id))
+    if row is None:
+        return []
+    return [name for name, value in zip(peak_ids["files"], row) if value < 0]
 
 
 def standard_profile(export: dict[str, Any], alignment_id: str) -> dict[str, Any]:
@@ -1005,11 +1054,27 @@ def resolve_polarity(contract: dict[str, Any], polarity: str, job: dict[str, Any
         name: standard_profile(export, entry["alignment_id"])
         for name, entry in by_name.items() if entry.get("alignment_id")
     }
-    digest = resolution_digest({"contract_sha256": contract["_sha256"], "resolution": resolution})
+    # Which heights MS-DIAL detected and which it filled: written beside the exports by every Console run.
+    peak_ids: dict[str, Any] = {}
+    alignment = outputs.get("alignment_name") or ""
+    for folder in (Path(outputs["height_export"]).parent, Path(contract["output_roots"][polarity])):
+        candidate = folder / f"{alignment}.mdpeakid.tsv"
+        if alignment and candidate.is_file():
+            peak_ids = read_peak_ids(candidate)
+            break
+    if not peak_ids:
+        resolution["warnings"].append(
+            f"{alignment}.mdpeakid.tsv is not beside the exports, so a gap-filled standard height cannot be told from a "
+            "detected one."
+        )
+    digest = resolution_digest({"contract_sha256": contract["_sha256"], "resolution": resolution,
+                                "peak_id_matrix_sha256": peak_ids.get("sha256")})
     entry = by_name.get(normalizing, {})
+    profile = profiles.get(normalizing, {})
     result.update({
         "resolution": resolution,
         "resolution_digest": digest,
+        "peak_ids": peak_ids,
         # Kept when the resolution itself is left out of what is shown.
         "warnings": list(resolution["warnings"]),
         "summary": {
@@ -1017,8 +1082,13 @@ def resolve_polarity(contract: dict[str, Any], polarity: str, job: dict[str, Any
                 "name": normalizing, "status": entry.get("status"), "tier": entry.get("tier"),
                 "alignment_id": entry.get("alignment_id"), "needs_confirmation": bool(entry.get("needs_confirmation")),
                 "reason": entry.get("reason"), "valid_alternatives": entry.get("valid_alternatives", []),
+                "ms_dial_name": (entry.get("spot") or {}).get("name"),
+                **{key: entry.get(key) for key in ("delta_mz_mda", "delta_mz_ppm", "delta_rt", "label_disagreement")},
                 "zero_height_files": entry.get("zero_height_files", []),
                 "tolerated_zero_height_files": entry.get("tolerated_zero_height_files", []),
+                "gap_filled_files": gap_filled_injections(peak_ids, entry.get("alignment_id")) if entry.get("alignment_id") else [],
+                "cv_percent_qc": profile.get("cv_percent_qc"),
+                "cv_percent_sample_qc": profile.get("cv_percent_sample_qc"),
             },
             "standards": [
                 {key: item.get(key) for key in ("name", "tier", "status", "alignment_id", "needs_confirmation",
@@ -1055,6 +1125,8 @@ def resolve_standards_for_contract(contract_path: str, jobs: dict[str, dict[str,
         if resolved.get("resolution") is not None:
             resolved["resolution_table"] = _resolution_rows(resolved["resolution"])
             del resolved["resolution"]
+        # Every spot's peak IDs: kept for normalize, not shown.
+        resolved.pop("peak_ids", None)
         polarities[polarity] = resolved
     return {
         "contract_path": contract["_path"], "contract_sha256": contract["_sha256"], "polarities": polarities,
@@ -1087,8 +1159,13 @@ def plan_normalize(
     resolution_digest_text: str,
     accept_searched: Iterable[str] = (),
     accept_spot: dict[str, Any] | None = None,
+    accept_gap_filled: bool = False,
 ) -> dict[str, Any]:
-    """The normalizing standard's spot, the normalized matrix and where it is written, or why not."""
+    """The normalizing standard's spot, the normalized matrix and where it is written, or why not.
+
+    A Sample or QC in which MS-DIAL did not detect the standard (its peak ID is -1, the height a gap fill)
+    refuses unless the person accepts those heights (accept_gap_filled).
+    """
     contract = load_contract(contract_path)
     polarity = polarity_of_job(contract, job)
     resolved = resolve_polarity(contract, polarity, job)
@@ -1145,34 +1222,56 @@ def plan_normalize(
         if name in accepted:
             raise LabMetabolomicsError(f"accept_searched names {name}, which this resolution does not ask the person to accept.")
         alignment_id = str(entry["alignment_id"])
-    # What is an internal standard from here on: the normalizing standard's spot as decided, and the other
-    # standards found by a library or their own text row (tiers A and B). A spot only searched for a standard
-    # nobody confirmed stays a feature; the merge names it, and keeps it.
-    decided: dict[str, str] = {name: alignment_id}
+    # What is an internal standard from here on: the normalizing standard's spot as decided, and every spot a
+    # library or a standard's own text row annotated as that standard (tiers A and B), whatever else the
+    # resolver said of it (invalid, contested, outside the window). A spot only found by m/z and RT, or matched
+    # under another annotation (C, D), nobody confirmed: it stays a feature, which the merge keeps on its own.
+    annotator = INTERNAL_STANDARD_ANNOTATOR_IDS[polarity]
+    decided_ids: set[str] = {alignment_id}
+    figure_spots: dict[str, str] = {}
+    for item in resolution["standards"]:
+        decided_ids.update(str(candidate["alignment_id"]) for candidate in item.get("candidates", [])
+                           if candidate.get("tier") in DECIDED_TIERS)
+        if item.get("alignment_id"):
+            figure_spots[item["name"]] = str(item["alignment_id"])
+    figure_spots[name] = alignment_id
     unconfirmed: list[dict[str, Any]] = []
     for item in resolution["standards"]:
-        if item["name"] == name or not item.get("alignment_id"):
+        spot_id = str(item.get("alignment_id") or "")
+        if not spot_id or spot_id in decided_ids or item.get("tier") in DECIDED_TIERS:
             continue
-        if item["status"] in DECIDED_STATUSES and not item.get("needs_confirmation"):
-            decided[item["name"]] = str(item["alignment_id"])
-        else:
-            unconfirmed.append({"standard": item["name"], "alignment_id": str(item["alignment_id"]),
-                                "tier": item.get("tier"), "status": item["status"],
-                                "ms_dial_name": (item.get("spot") or {}).get("name")})
-    figure_rows = [
-        {"StandardName": item["name"], "PeakID": int(decided[item["name"]]) if item["name"] in decided else -1}
-        for item in resolution["standards"]
-    ]
-    if name not in {item["name"] for item in resolution["standards"]}:
-        figure_rows.insert(0, {"StandardName": name, "PeakID": int(alignment_id)})
+        if item["name"] == name and spot_id == alignment_id:
+            continue
+        found = next((candidate for candidate in item.get("candidates", []) if str(candidate["alignment_id"]) == spot_id), {})
+        unconfirmed.append({
+            "standard": item["name"], "alignment_id": spot_id, "tier": item.get("tier"), "status": item["status"],
+            "ms_dial_name": (item.get("spot") or {}).get("name"), "method": found.get("method") or (item.get("spot") or {}).get("method"),
+            "passed_over": item["name"] == name,
+        })
+    figure_rows = [{"StandardName": standard, "PeakID": int(spot_id)} for standard, spot_id in figure_spots.items()]
     sample_rows = polarity_sample_table(contract["sample_table"]["rows"], polarity)
     factors = {
         row["file_name"]: float(row.get("factor", 1) or 1)
         for row in sample_rows if str(row.get("included", True)).casefold() not in {"false", "0", "no"}
     }
-    export_names = read_alignment_export(resolved["outputs"]["height_export"])["sample_names"]
+    height_export = read_alignment_export(resolved["outputs"]["height_export"])
+    export_names = height_export["sample_names"]
     by_column = _factors_by_column(export_names, factors)
-    normalized = normalize_heights(resolved["outputs"]["height_export"], alignment_id, by_column)
+    # MS-DIAL fills a gap with the signal there: a standard it did not detect still has a height.
+    peak_ids = resolved.get("peak_ids") or {}
+    not_detected = gap_filled_injections(peak_ids, alignment_id)
+    kinds = dict(zip(export_names, (kind.casefold() for kind in height_export["file_types"])))
+    gap_filled_required = [item for item in not_detected if kinds.get(item) in {"sample", "qc"}]
+    if gap_filled_required and accept_gap_filled is not True:
+        heights = {item: (next(spot for spot in height_export["spots"] if spot["id"] == alignment_id)["cells"][export_names.index(item)])
+                   for item in gap_filled_required}
+        raise LabMetabolomicsError(
+            f"MS-DIAL did not detect {name} (alignment ID {alignment_id}) in "
+            + ", ".join(f"{item} (gap-filled height {heights[item]})" for item in gap_filled_required)
+            + ": the height there is the signal where the peak should be, and dividing by it scales every feature of "
+            "that injection. Normalize only if the person accepts these heights (accept_gap_filled=true)."
+        )
+    normalized = normalize_heights(resolved["outputs"]["height_export"], alignment_id, by_column, not_detected)
     if normalized["problems"]:
         raise LabMetabolomicsError(f"The {polarity.lower()} run cannot be normalized by {name}: " + " ".join(normalized["problems"]))
     quant = Path(contract["quant_folder"])
@@ -1184,15 +1283,22 @@ def plan_normalize(
         "record": quant / f"normalize_{folder}.local.json",
     }
     warnings = []
-    if normalized["raw_height_kept"]:
+    for injection, reason in normalized["raw_height_reasons"].items():
+        warnings.append(f"{injection} keeps its raw heights: {reason} ({name}).")
+    if gap_filled_required:
         warnings.append(
-            f"{', '.join(normalized['raw_height_kept'])} carry no {name}; as Blank or Standard injections they keep "
-            "their raw heights."
+            f"The person accepted the gap-filled {name} heights of {', '.join(gap_filled_required)} (accept_gap_filled)."
         )
     for item in unconfirmed:
+        how = ("its text row matched it, but another annotation was kept for the spot" if item["tier"] == "C"
+               else "it was found only by m/z and RT")
+        fate = ("the merge drops it as an internal standard, since the internal-standard text row annotated it"
+                if item["method"] == annotator else
+                "nobody confirmed it as the standard, so the merge keeps it as its own row, outside the InChIKey groups")
+        passed = " The person took another spot for it." if item["passed_over"] else ""
         warnings.append(
-            f"Spot {item['alignment_id']} ('{item['ms_dial_name']}') was only searched for {item['standard']} (tier "
-            f"{item['tier']}, {item['status']}); nobody confirmed it, so it stays a feature in the merge."
+            f"Spot {item['alignment_id']} ('{item['ms_dial_name']}') is where {item['standard']} was looked for: {how} "
+            f"(tier {item['tier']}, {item['status']}); {fate}.{passed}"
         )
     project = Path(str(resolved["outputs"].get("project") or ""))
     height = Path(resolved["outputs"]["height_export"])
@@ -1207,14 +1313,19 @@ def plan_normalize(
         "job_id": job.get("id"), "resolution_digest": resolved["resolution_digest"],
         "normalizing_standard": {"name": name, "alignment_id": alignment_id, "decision": decision,
                                  "tier": tier, "status": status},
-        "internal_standard_ids": sorted(set(decided.values()), key=lambda value: (len(value), value)),
+        "internal_standard_ids": sorted(decided_ids, key=lambda value: (len(value), value)),
         "unconfirmed_standard_spots": unconfirmed,
         "figure_rows": figure_rows,
         "export_column_factors": by_column,
+        "not_detected": not_detected,
+        "accepted_gap_filled": gap_filled_required,
+        "peak_id_matrix": {key: peak_ids.get(key) for key in ("path", "sha256")} if peak_ids else None,
         "standard_mean": normalized["standard_mean"],
         "mean_over": normalized["mean_over"],
         "standard_heights": normalized["standard_heights"],
+        "multipliers": normalized["multipliers"],
         "raw_height_kept": normalized["raw_height_kept"],
+        "raw_height_reasons": normalized["raw_height_reasons"],
         "dilution_factors": normalized["dilution_factors"],
         "features": len(normalized["values"]),
         "outputs": {key: resolved["outputs"][key] for key in ("height_export", "candidate_table", "project", "alignment_name")},
@@ -1253,7 +1364,7 @@ def finish_normalize(plan: dict[str, Any]) -> dict[str, Any]:
     # Recomputed on its own from the copy just taken, which must be the export normalize read.
     verification = verify_normalized(
         target, paths["height_copy"], plan["normalizing_standard"]["alignment_id"], plan["export_column_factors"],
-        expected_height_sha256=normalized["height_export_sha256"],
+        expected_height_sha256=normalized["height_export_sha256"], not_detected=plan["not_detected"],
     )
     record: dict[str, Any] = {
         "schema": NORMALIZE_RECORD_SCHEMA,
@@ -1263,7 +1374,10 @@ def finish_normalize(plan: dict[str, Any]) -> dict[str, Any]:
         "polarity": plan["polarity"], "run_job_id": plan["job_id"], "resolution_digest": plan["resolution_digest"],
         "normalizing_standard": plan["normalizing_standard"],
         "standard_mean": plan["standard_mean"], "mean_over": plan["mean_over"],
-        "raw_height_kept": plan["raw_height_kept"], "dilution_factors": plan["dilution_factors"],
+        "raw_height_kept": plan["raw_height_kept"], "raw_height_reasons": plan["raw_height_reasons"],
+        "dilution_factors": plan["dilution_factors"],
+        "not_detected": plan["not_detected"], "accepted_gap_filled": plan["accepted_gap_filled"],
+        "peak_id_matrix": plan["peak_id_matrix"],
         "internal_standard_ids": plan["internal_standard_ids"],
         "unconfirmed_standard_spots": plan["unconfirmed_standard_spots"],
         "candidate_table": plan["outputs"]["candidate_table"],
@@ -1307,11 +1421,15 @@ def merge(
         if value is not None and not isinstance(value, bool):
             raise LabMetabolomicsError(f"{key} is true or false, not {value!r}.")
     name = str(output_folder or "").strip()
-    if not _FOLDER_NAME.match(name) or name.casefold() in RESERVED_QUANT_FOLDERS:
+    if (not _FOLDER_NAME.match(name) or name.casefold() in RESERVED_QUANT_FOLDERS
+            or name.split(".")[0].casefold() in WINDOWS_DEVICE_NAMES):
         raise LabMetabolomicsError(
             "output_folder is one folder name inside quant (letters, digits, _ . -, not ending in a dot), not pos, "
-            "neg or qa_figures."
+            "neg, qa_figures or a Windows device name."
         )
+    target_folder = Path(contract["quant_folder"]) / name
+    if target_folder.exists() and not target_folder.is_dir():
+        raise LabMetabolomicsError(f"{target_folder} is a file normalize or an earlier step wrote; choose another output_folder.")
     defaults = (contract.get("merge") or {}).get("defaults") or {}
     options = {
         "reference_matched_only": defaults.get("reference_matched_only", True) if reference_matched_only is None else reference_matched_only,
@@ -1355,6 +1473,8 @@ def merge(
         )
     except LabInputError as error:
         raise LabMetabolomicsError(str(error)) from None
+    except OSError as error:
+        raise LabMetabolomicsError(f"The metabolome could not be written into {quant / name}: {error}") from None
     report["contract_defaults"] = {"reference_matched_only": defaults.get("reference_matched_only", True),
                                    "preferred_adducts_only": defaults.get("preferred_adducts_only", False)}
     if write:

@@ -168,11 +168,44 @@ class AnnotationLibraries(unittest.TestCase):
         self.assertEqual({"Positive": "lib2_msp_strict"}, core.export_annotator_ids(read["entries"][1]))
         self.assertEqual("LbmDB", core.console_lbm_annotator_id(""))
 
-    def test_the_retention_time_census_counts_records_with_an_rt(self) -> None:
+    def test_the_retention_time_census_reads_as_ms_dial_reads(self) -> None:
         path = self.root / "census.msp"
-        path.write_text("NAME: a\nRETENTIONTIME: 1.5\n\nNAME: b\nRETENTIONTIME: \n\nName: c\nRT: 0\n\nNAME: d\nrt: 2\n",
-                        encoding="ascii")
+        path.write_text("NAME: a\nRETENTIONTIME: 1.5\nNum Peaks: 0\n\nNAME: b\nRETENTIONTIME: \nNum Peaks: 0\n\n"
+                        "Name: c\nRT: 0\nNum Peaks: 0\n\nNAME: d\nrt: 2\nNum Peaks: 0\n", encoding="ascii")
         self.assertEqual({"records": 4, "with_retention_time": 2}, core.retention_time_census(path))
+        # Without a peak count a record does not end: MS-DIAL reads the next NAME line as a field of it.
+        path.write_text("NAME: a\nRETENTIONTIME: 1.5\n\nNAME: b\nRETENTIONTIME: 0\n", encoding="ascii")
+        self.assertEqual({"records": 1, "with_retention_time": 0}, core.retention_time_census(path))
+        # A space before the colon is another field name; the last parseable RT wins; the peak count ends a
+        # record; a byte-order mark does not hide the first record; a comment line is skipped.
+        path = self.root / "census2.msp"
+        path.write_bytes(
+            "﻿NAME: a\nRT : 5.2\nNum Peaks: 1\n100\t1\nRETENTIONTIME: 3\n"
+            "NAME: b\nRETENTIONTIME: 3\n# RT: 9\nRETENTIONTIME: 0\nNum Peaks: 0\n"
+            "NAME: c\nRETENTIONTIME: 0\nretention_time: 4\nNum Peaks: 0\n".encode("utf-8"))
+        self.assertEqual({"records": 3, "with_retention_time": 1}, core.retention_time_census(path))
+
+    def test_a_setting_the_annotation_does_not_read_is_refused(self) -> None:
+        read = core.read_annotation({"preset": "lab_rt_tiers", "libraries": {"in_house": self.files["in_house"],
+                                     "predicted_rt": self.files["predicted_rt"], "no_rt": self.files["no_rt"]},
+                                     "rt_tolerance": {"in_house": 0.2}}, ["Positive"])
+        self.assertTrue(any("annotation.rt_tolerance is not read" in item for item in read["blockers"]))
+        read = core.read_annotation({"libraries": [{"kind": "msp", "path": self.files["public"], "retention_time": "none",
+                                                    "ms2_tolerance": 0.01}]}, ["Positive"])
+        self.assertTrue(any("ms2_tolerance is not read" in item for item in read["blockers"]))
+        read = core.read_annotation({"preset": "lab_rt_tiers", "libraries": {
+            "in_house": self.files["in_house"], "no_rt": self.files["no_rt"],
+            "predicted_rt": {"path": self.files["predicted_rt"], "library_kind": "predicted"}}}, ["Positive"])
+        self.assertEqual([], read["blockers"] + read["missing"])
+        self.assertEqual(["", "predicted", ""], [entry["library_kind"] for entry in read["entries"]])
+
+    def test_a_library_path_outside_ascii_is_refused(self) -> None:
+        folder = self.root / "共有"
+        folder.mkdir()
+        path = folder / "x.msp"
+        path.write_text("NAME: x\n", encoding="ascii")
+        read = core.read_annotation({"preset": "single_msp", "libraries": {"msp": str(path)}}, ["Positive"])
+        self.assertTrue(any("is not an ASCII path" in item for item in read["blockers"]))
 
 
 class PreferredAdducts(unittest.TestCase):
@@ -256,6 +289,19 @@ class CheckAndContract(Batched):
         self.assertTrue(any("1 of the 2 records" in item for item in check["warnings"]), check["warnings"])
         self.assertEqual({"records": 2, "with_retention_time": 1},
                          check["annotation"]["retention_time_census"]["in-house RT and MS/MS (positive)"])
+
+    def test_folder_raw_data_need_a_console_that_reads_them(self) -> None:
+        folder = self.batch.root / "agilent" / "pos"
+        for stem in ("S1_POS", "QC1_POS"):
+            (folder / f"{stem}.d").mkdir(parents=True)
+            (folder / f"{stem}.d" / "AcqData").mkdir()
+        with patch.object(agent, "console_supports_folder_type_csv", return_value=False):
+            check = agent.check_inputs(self.batch.request(pos_path=str(folder)))
+        self.assertTrue(any("The raw data are folders" in item for item in check["blockers"]), check["blockers"])
+
+    def test_an_analysis_root_outside_ascii_is_refused(self) -> None:
+        check = agent.check_inputs(self.batch.request(analysis_root=str(self.batch.root / "解析")))
+        self.assertTrue(any("is not an ASCII path" in item for item in check["blockers"]))
 
     def test_a_root_holding_the_other_laboratory_analysis_is_refused(self) -> None:
         inputs = self.batch.analysis / "inputs"
@@ -503,14 +549,116 @@ class StandardsNormalizeAndMerge(Batched):
         self.assertEqual(["1"], plan["internal_standard_ids"])
         self.assertEqual([("CUDA", "20")], [(item["standard"], item["alignment_id"])
                                             for item in plan["unconfirmed_standard_spots"]])
-        self.assertIn({"StandardName": "CUDA", "PeakID": -1}, plan["figure_rows"])
-        self.assertTrue(any("stays a feature" in item for item in plan["warnings"]))
+        # Figure 04 draws the response where the standard was looked for, whatever the merge decides.
+        self.assertIn({"StandardName": "CUDA", "PeakID": 20}, plan["figure_rows"])
+        self.assertTrue(any("keeps it as its own row" in item for item in plan["warnings"]), plan["warnings"])
         agent.finish_normalize(plan)
         self.normalize("Negative")
         report = agent.merge(self.contract, write=True)
         self.assertEqual([{"standard": "CUDA", "alignment_id": "20", "kept": True}],
                          [{key: item[key] for key in ("standard", "alignment_id", "kept")}
                           for item in report["unconfirmed_standard_spots"]["Positive"]])
+
+    def test_a_standard_a_library_named_is_a_standard_even_when_invalid(self) -> None:
+        from lab_metabolomics_fixture import POSITIVE_SPOTS
+
+        spots = [dict(item) for item in POSITIVE_SPOTS]
+        # CUDA annotated by the in-house library by its own name, missing from one Sample: tier A, invalid.
+        spots[1] = dict(spots[1], method="lib1_in_house", cells=[5000, 0, 5100, 4900])
+        job = write_run(self.batch, self.contract, "Positive", spots=spots)
+        resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": job})
+        cuda = next(item for item in resolved["polarities"]["Positive"]["summary"]["standards"] if item["name"] == "CUDA")
+        self.assertEqual(("A", "invalid"), (cuda["tier"], cuda["status"]))
+        plan = agent.plan_normalize(self.contract, job, resolved["polarities"]["Positive"]["resolution_digest"])
+        self.assertEqual(["1", "2"], plan["internal_standard_ids"])
+        self.assertEqual([], plan["unconfirmed_standard_spots"])
+
+    def test_an_unconfirmed_standard_spot_never_removes_the_endogenous_compound(self) -> None:
+        from lab_metabolomics_fixture import POSITIVE_SPOTS, TRYPTOPHAN
+
+        spots = [dict(item) for item in POSITIVE_SPOTS if item["alignment_id"] != 2]
+        # CUDA's window holds a labelled tryptophan under another name, spiked high: tier D, nobody confirms it.
+        spots.append(dict(alignment_id=21, mz=341.2799, rt=2.88, name="L-Tryptophan-d5", method="lib1_in_house",
+                          inchikey="QIVBCDIJIAJPQS-DUAAAAAAAA-N", cells=[90000, 90000, 90000, 90000]))
+        job = write_run(self.batch, self.contract, "Positive", spots=spots)
+        resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": job})
+        plan = agent.plan_normalize(self.contract, job, resolved["polarities"]["Positive"]["resolution_digest"])
+        agent.finish_normalize(plan)
+        self.normalize("Negative")
+        report = agent.merge(self.contract, write=True)
+        kept = {(row["Polarity"], row["Alignment ID"]) for row in csv.DictReader(io.StringIO(
+            Path(report["outputs"]["metabolome"]["path"]).read_text(encoding="utf-8")))}
+        self.assertIn(("Positive", "21"), kept)
+        self.assertIn(("Positive", "15"), kept, "the endogenous tryptophan stays")
+        spot = report["unconfirmed_standard_spots"]["Positive"][0]
+        self.assertEqual(("21", True), (spot["alignment_id"], spot["kept"]))
+        self.assertEqual([("Positive", "15")], [(item["polarity"], item["alignment_id"])
+                                                for item in spot["shares_first_block_with"]])
+        self.assertEqual(1, report["counts"]["kept_unconfirmed_standard_spots"])
+        self.assertTrue(TRYPTOPHAN.startswith("QIVBCDIJIAJPQS"))
+
+    def test_a_gap_filled_standard_in_a_sample_needs_the_persons_word(self) -> None:
+        job = write_run(self.batch, self.contract, "Positive", gap_filled={1: ["S2"]})
+        resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": job})
+        summary = resolved["polarities"]["Positive"]["summary"]["normalizing_standard"]
+        self.assertEqual(["S2_Pos", "Blank_Pos"], summary["gap_filled_files"])
+        self.assertEqual("Methionine-d3", summary["ms_dial_name"])
+        self.assertIsNotNone(summary["delta_rt"])
+        digest = resolved["polarities"]["Positive"]["resolution_digest"]
+        with self.assertRaises(agent.LabMetabolomicsError) as raised:
+            agent.plan_normalize(self.contract, job, digest)
+        self.assertIn("S2_Pos (gap-filled height 2000)", str(raised.exception))
+        plan = agent.plan_normalize(self.contract, job, digest, accept_gap_filled=True)
+        self.assertEqual(["S2_Pos"], plan["accepted_gap_filled"])
+        self.assertTrue(agent.finish_normalize(plan)["verified"])
+
+    def test_a_blank_with_a_noise_standard_keeps_its_raw_heights(self) -> None:
+        from lab_metabolomics_fixture import POSITIVE_SPOTS
+
+        spots = [dict(item) for item in POSITIVE_SPOTS]
+        # Gap filling put 50 counts where Met-d3 would be in the Blank: under 10% of the lowest Sample (1000).
+        spots[0] = dict(spots[0], cells=[1000, 2000, 1500, 50])
+        job = write_run(self.batch, self.contract, "Positive", spots=spots, peak_ids=False)
+        resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": job})
+        self.assertTrue(any("mdpeakid.tsv is not beside" in item for item in resolved["polarities"]["Positive"]["warnings"]))
+        plan = agent.plan_normalize(self.contract, job, resolved["polarities"]["Positive"]["resolution_digest"])
+        self.assertIn("below 10%", plan["raw_height_reasons"]["Blank_Pos"])
+        self.assertIsNone(plan["multipliers"]["Blank_Pos"])
+        self.assertEqual(10.0, plan["_normalized"]["values"]["10"][3])
+        self.assertTrue(agent.finish_normalize(plan)["verified"])
+
+    def test_a_plan_cannot_change_a_dilution_factor(self) -> None:
+        plan = build_guided_plan(str(self.batch.folders["Positive"]), {
+            agent.CONTRACT_KEY: self.contract, "ion_mode": "Positive", "minimum_peak_height": 500, "dilution_factor": 2})
+        self.assertTrue(any("dilution_factor is fixed by the contract" in item for item in plan["blockers"]))
+        plan = build_guided_plan(str(self.batch.folders["Positive"]), {
+            agent.CONTRACT_KEY: self.contract, "ion_mode": "Positive", "minimum_peak_height": 500})
+        self.assertNotIn("dilution_factor", [item["id"] for item in plan["remaining_questions"]])
+
+    def test_possible_isomers_are_reported(self) -> None:
+        from lab_metabolomics_fixture import NEGATIVE_SPOTS
+
+        spots = [dict(item) for item in NEGATIVE_SPOTS]
+        # Mannose 6-phosphate and glucose 6-phosphate share a first block and lie 0.5+ min apart.
+        spots.append(dict(alignment_id=120, mz=259.0224, rt=8.10, name="Glucose 6-phosphate", adduct="[M-H]-",
+                          method="lib1_in_house", inchikey="NBSCHQHZLSJFNQ-GASJEMHNSA-N", cells=[1000, 1000, 1000, 0]))
+        spots.append(dict(alignment_id=121, mz=259.0224, rt=8.70, name="Mannose 6-phosphate", adduct="[M-H]-",
+                          method="lib1_in_house", inchikey="NBSCHQHZLSJFNQ-QTVWNMPRSA-N", cells=[3000, 3000, 3000, 0]))
+        self.jobs["Negative"] = write_run(self.batch, self.contract, "Negative", spots=spots)
+        self.normalize("Positive")
+        self.normalize("Negative")
+        report = agent.merge(self.contract)
+        self.assertEqual(1, report["counts"]["possible_isomer_groups"])
+        group = report["possible_isomers"][0]
+        self.assertEqual(("NBSCHQHZLSJFNQ", "121", ["GASJEMHNSA", "QTVWNMPRSA"]),
+                         (group["first_block"], group["kept"]["alignment_id"], group["stereo_blocks"]))
+
+    def test_a_merge_folder_that_is_a_file_or_a_device_is_refused(self) -> None:
+        self.normalize("Positive")
+        self.normalize("Negative")
+        for name in ("Height_Pos.txt", "nul", "COM1.txt"):
+            with self.subTest(output_folder=name), self.assertRaises(agent.LabMetabolomicsError):
+                agent.merge(self.contract, output_folder=name)
 
     def test_a_project_saved_long_after_the_run_is_said(self) -> None:
         job = self.jobs["Positive"]

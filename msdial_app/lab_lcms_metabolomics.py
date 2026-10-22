@@ -102,6 +102,9 @@ INTERNAL_STANDARD_PRIORITY = 1
 # publishes a match against a predicted library as in-silico evidence, never as a reference spectrum.
 LIBRARY_KINDS_OF_SPECTRA = ("acquired", "predicted")
 _LABEL = re.compile(r"^[ -~]{1,60}$")
+ANNOTATION_KEYS = frozenset({"preset", "libraries"})
+SLOT_KEYS = frozenset({"path", "library_kind"})
+ENTRY_KEYS = frozenset({"kind", "path", "paths", "thresholds", "retention_time", "rt_tolerance", "label", "library_kind"})
 _IDENTIFIER = re.compile(r"[^a-z0-9]+")
 _POLARITY_KEYS = {"positive": POSITIVE, "pos": POSITIVE, "negative": NEGATIVE, "neg": NEGATIVE}
 
@@ -121,12 +124,15 @@ def console_lbm_annotator_id(path: str | Path) -> str:
 
 
 _RETENTION_TIME_CENSUS: dict[tuple[str, int, int], dict[str, int]] = {}
-# The field names MS-DIAL's MSP parser reads as a retention time (MspFileParcer).
-_MSP_RETENTION_TIME = re.compile(r"^\s*(?:RETENTIONTIME|RETENTION_TIME|RT)\s*:\s*(.*)$", re.IGNORECASE)
+# As MS-DIAL's MSP reader (MspFileParcer.MspFileReader, ReadMspField, SetMspField) reads a record: it starts
+# at a line beginning "NAME:" (any case), a field's name is everything before the first ':' as written, the
+# last parseable retention time wins, and the record ends at its peak count.
+_MSP_RETENTION_TIME_FIELDS = frozenset({"retentiontime", "retention_time", "rt"})
+_MSP_PEAK_COUNT_FIELDS = frozenset({"num peaks", "numpeaks", "num_peaks"})
 
 
 def retention_time_census(path: str | Path) -> dict[str, int]:
-    """How many records an MSP holds, and how many give a retention time above zero.
+    """How many records an MSP holds, and how many MS-DIAL reads a retention time above zero for.
 
     MS-DIAL keeps a reference without a retention time in every RT window and counts its RT requirement
     as met, so such a record in a library searched with RT is matched on MS/MS alone. Read once per
@@ -138,22 +144,45 @@ def retention_time_census(path: str | Path) -> dict[str, int]:
     if key in _RETENTION_TIME_CENSUS:
         return dict(_RETENTION_TIME_CENSUS[key])
     records = with_rt = 0
-    current = False
-    with target.open("r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            if line[:5].casefold() == "name:":
-                records += 1
-                current = False
+    in_record = False
+    rt: float | None = None
+
+    def close() -> None:
+        nonlocal with_rt, in_record
+        if in_record and rt is not None and rt > 0:
+            with_rt += 1
+        in_record = False
+
+    # utf-8-sig: .NET's StreamReader drops a byte-order mark before the first NAME line.
+    with target.open("r", encoding="utf-8-sig", errors="replace", newline=None) as handle:
+        for raw in handle:
+            line = raw.rstrip("\r\n")
+            if line.startswith("#"):
                 continue
-            match = _MSP_RETENTION_TIME.match(line)
-            if match and not current:
-                value = parse_number(match.group(1).strip())
-                if value is not None and value > 0:
-                    with_rt += 1
-                    current = True
+            if not in_record:
+                if line[:5].casefold() == "name:":
+                    records += 1
+                    in_record, rt = True, None
+                continue
+            if line == "" or ":" not in line:
+                continue
+            name, _, value = line.partition(":")
+            field = name.casefold()
+            if field in _MSP_RETENTION_TIME_FIELDS:
+                number = parse_number(value.strip())
+                if number is not None:
+                    rt = number
+            elif field in _MSP_PEAK_COUNT_FIELDS:
+                close()
+    close()
     census = {"records": records, "with_retention_time": with_rt}
     _RETENTION_TIME_CENSUS[key] = census
     return dict(census)
+
+
+def _printable_ascii(text: str) -> bool:
+    """What the Console reads back from its ASCII settings files as written."""
+    return all(" " <= character <= "~" for character in str(text))
 
 
 def _paths_by_polarity(value: Any) -> dict[str, str] | None:
@@ -189,6 +218,12 @@ def read_annotation(spec: Any, polarities: Iterable[str]) -> dict[str, Any]:
     if not isinstance(spec, dict) or not spec:
         missing.append("annotation")
         return result
+    # A setting given where it is not read would otherwise be dropped without a word.
+    for key in sorted(set(spec) - ANNOTATION_KEYS):
+        blockers.append(
+            f"annotation.{key} is not read; the annotation takes preset and libraries. A library's own settings go "
+            "in the list form, one entry per library."
+        )
     preset = str(spec.get("preset") or "").strip()
     libraries = spec.get("libraries")
     entries: list[dict[str, Any]] = []
@@ -206,13 +241,24 @@ def read_annotation(spec: Any, polarities: Iterable[str]) -> dict[str, Any]:
         for key in sorted(set(libraries) - slots):
             blockers.append(f"annotation.libraries.{key} is no slot of the preset {preset} ({', '.join(sorted(slots))}).")
         for template in PRESETS[preset]:
-            paths = _paths_by_polarity(libraries.get(template["slot"]))
+            value = libraries.get(template["slot"])
+            kind_of_spectra = None
+            if isinstance(value, dict) and ("path" in value or "library_kind" in value):
+                # A slot may say what its spectra are: {"path": ..., "library_kind": "predicted"}.
+                for key in sorted(set(value) - SLOT_KEYS):
+                    blockers.append(f"annotation.libraries.{template['slot']}.{key} is not read; a slot takes path and library_kind.")
+                kind_of_spectra = value.get("library_kind")
+                value = value.get("path")
+            paths = _paths_by_polarity(value)
             if paths is None:
                 blockers.append(f"annotation.libraries.{template['slot']} is a path, or a path per polarity.")
                 continue
             if not paths and template.get("optional"):
                 continue
-            entries.append({**template, "paths": paths})
+            entry = {**template, "paths": paths}
+            if kind_of_spectra not in (None, ""):
+                entry["library_kind"] = kind_of_spectra
+            entries.append(entry)
     else:
         if not isinstance(libraries, list) or not libraries:
             blockers.append("annotation names no preset and lists no libraries.")
@@ -221,6 +267,10 @@ def read_annotation(spec: Any, polarities: Iterable[str]) -> dict[str, Any]:
             if not isinstance(item, dict):
                 blockers.append(f"annotation.libraries[{number}] is not an object.")
                 continue
+            for key in sorted(set(item) - ENTRY_KEYS):
+                blockers.append(
+                    f"annotation.libraries[{number}].{key} is not read; an entry takes {', '.join(sorted(ENTRY_KEYS))}."
+                )
             kind = str(item.get("kind") or "").strip().casefold()
             paths = _paths_by_polarity(item.get("path", item.get("paths")))
             if paths is None:
@@ -249,6 +299,8 @@ def read_annotation(spec: Any, polarities: Iterable[str]) -> dict[str, Any]:
             entry["rt_tolerance"] = None
             entry["paths"] = {polarity: entry["paths"][polarity] for polarity in wanted if entry["paths"].get(polarity)}
             continue
+        if entry["kind"] == "lbm" and entry["library_kind"]:
+            blockers.append(f"{where}: library_kind is said of an MSP; an LBM2's spectra are the library's own rules.")
         if entry["kind"] == "msp" and entry["library_kind"] not in ("", *LIBRARY_KINDS_OF_SPECTRA):
             blockers.append(f"{where}: library_kind '{entry['library_kind']}' is neither acquired nor predicted.")
         if entry["kind"] == "lbm":
@@ -276,7 +328,13 @@ def read_annotation(spec: Any, polarities: Iterable[str]) -> dict[str, Any]:
                     missing.append(f"{entry['slot']} ({polarity.lower()})")
                 continue
             target = Path(path).expanduser()
-            if not target.is_file():
+            if not _printable_ascii(str(target.resolve())):
+                # msp_annotator_settings.tsv is written and read as ASCII.
+                blockers.append(
+                    f"{where}: {target} is not an ASCII path, which the Console's annotator settings file cannot carry; "
+                    "move the library or give it a path in ASCII."
+                )
+            elif not target.is_file():
                 blockers.append(f"{where}: {target} is not a file.")
             elif target.suffix.casefold() not in LIBRARY_SUFFIXES[entry["kind"]]:
                 blockers.append(f"{where}: {target.name} is not an {' or '.join(LIBRARY_SUFFIXES[entry['kind']])} library.")
@@ -453,14 +511,45 @@ def _rows_with_cells(path: str | Path) -> dict[str, Any]:
     return export
 
 
+# A Blank or Standard injection whose standard is below this share of the lowest Sample or QC height carries
+# no spike: gap filling put noise there, and dividing by it would multiply the injection by its inverse.
+RAW_HEIGHT_FRACTION = 0.1
+
+
+def raw_height_injections(
+    standard: list[float], kinds: list[str], names: list[str], not_detected: Iterable[str] = (),
+) -> dict[str, str]:
+    """The Blank and Standard injections kept at their raw height, each with why.
+
+    No height; not detected (MS-DIAL filled the gap: its peak ID is -1); or below RAW_HEIGHT_FRACTION of the
+    lowest Sample or QC height. Samples and QCs are never among them: without the standard they refuse.
+    """
+    missing = set(not_detected)
+    counted = [height for height, kind in zip(standard, kinds) if kind in NORMALIZATION_FILE_TYPES and height > 0]
+    floor = min(counted) * RAW_HEIGHT_FRACTION if counted else 0.0
+    kept: dict[str, str] = {}
+    for height, kind, name in zip(standard, kinds, names):
+        if kind in NORMALIZATION_FILE_TYPES:
+            continue
+        if height <= 0:
+            kept[name] = "the standard has no height"
+        elif name in missing:
+            kept[name] = "the standard was not detected; MS-DIAL filled the gap"
+        elif height < floor:
+            kept[name] = f"the standard's height {height:g} is below {RAW_HEIGHT_FRACTION:.0%} of the lowest Sample or QC height"
+    return kept
+
+
 def normalize_heights(
     height_export: str | Path, standard_id: str, factors: dict[str, float] | None = None,
+    not_detected: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Every feature's height divided by the standard's in its injection, times the standard's mean.
 
     normalized[s][i] = height[s][i] / height[IS][i] x mean(height[IS] over the Sample and QC injections),
     times the injection's dilution factor. A Sample or QC whose standard has no height blocks; a Blank or
-    Standard injection without it is left as its raw height and reported. Nothing is written.
+    Standard injection without the standard (raw_height_injections) is left as its raw height and reported.
+    not_detected names the injections where MS-DIAL filled the standard's gap. Nothing is written.
     """
     export = _rows_with_cells(height_export)
     start = export["first_sample_column"]
@@ -485,7 +574,8 @@ def normalize_heights(
             f"The standard (alignment ID {standard_id}) has no height in {', '.join(zero_required)}; a Sample or "
             "QC divided by nothing is not normalized."
         )
-    raw_kept = [names[index] for index, kind in enumerate(kinds) if kind not in NORMALIZATION_FILE_TYPES and standard[index] <= 0]
+    raw_reasons = raw_height_injections(standard, kinds, names, not_detected)
+    raw_kept = [name for name in names if name in raw_reasons]
     mean = sum(standard[index] for index in counted) / len(counted) if counted else 0.0
     multipliers = [float((factors or {}).get(name, 1.0) or 1.0) for name in names]
     values: dict[str, list[float | None]] = {}
@@ -499,7 +589,7 @@ def normalize_heights(
                 height = parse_number(text)
                 if height is None:
                     line.append(None)
-                elif standard[offset] <= 0:
+                elif names[offset] in raw_reasons:
                     line.append(height)
                 else:
                     line.append(height / standard[offset] * mean * multipliers[offset])
@@ -512,6 +602,11 @@ def normalize_heights(
         "standard_mean": mean,
         "mean_over": [names[index] for index in counted],
         "raw_height_kept": raw_kept,
+        "raw_height_reasons": raw_reasons,
+        "multipliers": {
+            name: (None if name in raw_reasons or standard[index] <= 0 else mean / standard[index] * multipliers[index])
+            for index, name in enumerate(names)
+        },
         "dilution_factors": {name: factor for name, factor in zip(names, multipliers) if factor != 1.0},
         "problems": problems,
         "values": values,
@@ -546,14 +641,15 @@ def normalized_text(normalized: dict[str, Any]) -> str:
 
 def verify_normalized(
     path: str | Path, height_export: str | Path, standard_id: str, factors: dict[str, float] | None = None,
-    *, expected_height_sha256: str = "",
+    *, expected_height_sha256: str = "", not_detected: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Every cell of the written matrix recomputed on its own from the Height export, and compared.
 
     Read through lab_lipidomics.read_alignment_export, not the rows normalize_heights computed from: the
     standard's heights, its Sample and QC mean and each injection's factor are taken again, and each cell
     must be height / standard x mean x factor, or the raw height in a Blank or Standard injection without
-    the standard. expected_height_sha256 binds the Height export to the one normalize read.
+    the standard (raw_height_injections, with the same not_detected). expected_height_sha256 binds the
+    Height export to the one normalize read.
     """
     problems: list[str] = []
     if expected_height_sha256 and file_sha256(height_export) != expected_height_sha256:
@@ -574,6 +670,7 @@ def verify_normalized(
     counted = [standard[index] for index, kind in enumerate(kinds) if kind in NORMALIZATION_FILE_TYPES]
     mean = sum(counted) / len(counted) if counted else 0.0
     multipliers = [float((factors or {}).get(name, 1.0) or 1.0) for name in names]
+    raw = raw_height_injections(standard, kinds, names, not_detected)
     by_id = {spot["id"]: spot for spot in written["spots"]}
     failed: list[dict[str, Any]] = []
     checked = 0
@@ -590,12 +687,12 @@ def verify_normalized(
                 if text != "":
                     failed.append({"alignment_id": spot["id"], "sample": names[offset], "written": text, "expected": ""})
                 continue
-            if standard[offset] <= 0:
-                if kinds[offset] in NORMALIZATION_FILE_TYPES:
-                    failed.append({"alignment_id": spot["id"], "sample": names[offset], "written": text,
-                                   "expected": "no value: the standard has no height in a Sample or QC"})
-                    continue
+            if names[offset] in raw:
                 expected = height
+            elif standard[offset] <= 0:
+                failed.append({"alignment_id": spot["id"], "sample": names[offset], "written": text,
+                               "expected": "no value: the standard has no height in a Sample or QC"})
+                continue
             else:
                 expected = height / standard[offset] * mean * multipliers[offset]
             got = parse_number(text)
@@ -646,7 +743,7 @@ def _read_polarity(item: dict[str, Any]) -> dict[str, Any]:
     names = export["header"][4]
     columns = {key: _column(names, title) for key, title in (
         ("name", "Metabolite name"), ("adduct", "Adduct type"), ("inchikey", "INCHIKEY"),
-        ("comment", "Comment"), ("total_score", "Total score"),
+        ("comment", "Comment"), ("total_score", "Total score"), ("rt", "Average Rt(min)"),
     )}
     missing = [title for key, title in (("name", "Metabolite name"), ("adduct", "Adduct type"),
                                          ("inchikey", "INCHIKEY"), ("comment", "Comment")) if columns[key] < 0]
@@ -674,6 +771,7 @@ def _read_polarity(item: dict[str, Any]) -> dict[str, Any]:
             "inchikey": cell("inchikey"), "comment": raw[columns["comment"]] if columns["comment"] < len(raw) else "",
             "method": annotation_method(cell("comment")),
             "total_score": parse_number(cell("total_score")) or 0.0,
+            "rt": parse_number(cell("rt")),
             "matched": bool(representative.get("is_reference_matched")),
             "priority": int(parse_number(representative.get("priority", "")) or 0),
             "mean": sum(values) / len(values) if values else 0.0,
@@ -685,6 +783,22 @@ def _read_polarity(item: dict[str, Any]) -> dict[str, Any]:
 def _id_key(value: str) -> tuple[int, str]:
     number = parse_number(value)
     return (int(number), value) if number is not None else (1 << 62, value)
+
+
+# Rows of one first block further apart than this are reported as possible isomers.
+ISOMER_RT_SPREAD = 0.5
+
+
+def _unconfirmed_report(
+    spot: dict[str, Any], polarity: str, kept: list[dict[str, Any]], blocks_kept: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """An unconfirmed standard spot as the merge left it, and any kept row it shares a first block with."""
+    row = next((item for item in kept if item["polarity"] == polarity and item["id"] == str(spot.get("alignment_id"))), None)
+    sharing = []
+    if row is not None and row["block"]:
+        sharing = [{"polarity": other["polarity"], "alignment_id": other["id"], "name": other["name"]}
+                   for other in blocks_kept.get(row["block"], []) if other is not row]
+    return {**spot, "kept": row is not None, "shares_first_block_with": sharing}
 
 
 def merge_metabolome(
@@ -702,8 +816,10 @@ def merge_metabolome(
     polarities: [{polarity, normalized, candidate_table, internal_standard_ids, internal_standard_annotator,
     unconfirmed_standard_spots}]. Rows dropped first: unannotated, and an internal standard (a spot decided
     as one, or one the internal-standard text row annotated); then, as the options say, rows not reference
-    matched and adducts not preferred. A spot only searched for a standard nobody confirmed is kept, and
-    named in the report (unconfirmed_standard_spots). The matrices are the exports the run wrote, so no
+    matched and adducts not preferred. A spot only searched for a standard nobody confirmed is kept as its
+    own row, outside the InChIKey groups, and named in the report (unconfirmed_standard_spots, with any kept
+    row it shares a first block with). Groups whose rows differ in stereo block or lie more than
+    ISOMER_RT_SPREAD minutes apart are reported (possible_isomers). The matrices are the exports the run wrote, so no
     curation made later in the GUI reaches them; nothing here reads a Comment. Rows sharing an InChIKey's first
     block are one compound, within and across polarities; one is kept, by: a preferred adduct, matched on
     MS/MS, the larger mean normalized height over Sample and QC, then the higher library priority, the higher
@@ -735,8 +851,10 @@ def merge_metabolome(
         item = read[polarity]
         standards = {str(value) for value in item["input"].get("internal_standard_ids", [])}
         annotator = str(item["input"].get("internal_standard_annotator") or "")
+        unconfirmed = {str(spot.get("alignment_id")) for spot in item["input"].get("unconfirmed_standard_spots", [])}
         counts[polarity]["rows"] = len(item["rows"])
         for row in item["rows"]:
+            row["unconfirmed_standard"] = row["id"] in unconfirmed
             if row["name"].casefold() in UNANNOTATED_NAMES:
                 drop(row, "unannotated")
             elif row["id"] in standards or (annotator and row["method"] == annotator):
@@ -757,11 +875,15 @@ def merge_metabolome(
     groups: dict[str, list[dict[str, Any]]] = {}
     kept: list[dict[str, Any]] = []
     for row in candidates:
-        if row["block"]:
+        # A spot only searched for a standard nobody confirmed may be the labelled standard itself, which shares
+        # the endogenous compound's first block: it is kept as its own row and never removes another.
+        if row["block"] and not row["unconfirmed_standard"]:
             groups.setdefault(row["block"], []).append(row)
         else:
             kept.append(row)
     duplicates = {"within_polarity": 0, "across_polarities": 0}
+    # Rows one first block joins that may be different compounds: other stereo blocks, or far apart in RT.
+    possible_isomers: list[dict[str, Any]] = []
     for block, rows in groups.items():
         ranked = sorted(rows, key=rank)
         winner = ranked[0]
@@ -769,7 +891,23 @@ def merge_metabolome(
         for other in ranked[1:]:
             duplicates["across_polarities" if other["polarity"] != winner["polarity"] else "within_polarity"] += 1
             drop(other, "duplicate InChIKey first block", winner)
+        if len(ranked) > 1:
+            second = {row["inchikey"].strip()[15:25] for row in ranked if len(row["inchikey"].strip()) >= 25}
+            times = [row["rt"] for row in ranked if row["rt"] is not None]
+            spread = max(times) - min(times) if times else 0.0
+            if len(second) > 1 or spread > ISOMER_RT_SPREAD:
+                possible_isomers.append({
+                    "first_block": block, "rt_spread_min": round(spread, 3), "stereo_blocks": sorted(second),
+                    "kept": {"polarity": winner["polarity"], "alignment_id": winner["id"]},
+                    "rows": [{"polarity": row["polarity"], "alignment_id": row["id"], "name": row["name"],
+                              "adduct": row["adduct"], "rt": row["rt"], "inchikey": row["inchikey"],
+                              "library": (labels or {}).get(row["method"], row["method"])} for row in ranked],
+                })
     kept.sort(key=lambda row: (order.index(row["polarity"]), _id_key(row["id"])))
+    blocks_kept = {}
+    for row in kept:
+        if row["block"]:
+            blocks_kept.setdefault((row["block"]), []).append(row)
 
     label_of = dict(labels or {})
     header = ["Polarity", "Alignment ID", "InChIKey first block", "Library", "Reference matched", "Preferred adduct",
@@ -849,16 +987,17 @@ def merge_metabolome(
             "kept": len(kept),
             "kept_by_polarity": kept_counts,
             "kept_without_inchikey": sum(1 for row in kept if not row["block"]),
+            "kept_unconfirmed_standard_spots": sum(1 for row in kept if row["unconfirmed_standard"]),
+            "possible_isomer_groups": len(possible_isomers),
             "removed": len(removed),
         },
         "samples": sample_names,
         "unconfirmed_standard_spots": {
-            polarity: [
-                {**spot, "kept": str(spot.get("alignment_id")) in {row["id"] for row in kept if row["polarity"] == polarity}}
-                for spot in read[polarity]["input"].get("unconfirmed_standard_spots", [])
-            ]
+            polarity: [_unconfirmed_report(spot, polarity, kept, blocks_kept)
+                       for spot in read[polarity]["input"].get("unconfirmed_standard_spots", [])]
             for polarity in order if read[polarity]["input"].get("unconfirmed_standard_spots")
         },
+        "possible_isomers": possible_isomers,
         "outputs": outputs,
     }
     if write:

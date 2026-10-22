@@ -66,10 +66,12 @@ The thresholds are those MS-DIAL Interactive already uses:
 - `mild`: the campaign's broad tier: MS/MS tolerance 0.25, dot products 0.5/0.5/0.5, at least 1 matched
   peak.
 
-A library searched with retention time is read for its records' RTs first: MS-DIAL keeps a record without an
-RT in every RT window and counts its RT as met, so such a record is matched on MS/MS alone under the RT tier's
-label. None with an RT refuses the library; some without one is a warning with the count. An optional preset
-library may serve one polarity only.
+A library searched with retention time is read for its records' RTs first, as MS-DIAL's MSP reader reads
+them: MS-DIAL keeps a record without an RT in every RT window and counts its RT as met, so such a record is
+matched on MS/MS alone under the RT tier's label. None with an RT refuses the library; some without one is a
+warning with the count. An optional preset library may serve one polarity only. A preset slot may be
+`{"path": ..., "library_kind": "predicted"}`. Any key the annotation does not read is refused. Library paths
+must be ASCII, since msp_annotator_settings.tsv is written and read as ASCII.
 
 With n libraries, the first takes priority n+1 and the last 2; the internal-standard text row keeps
 priority 1, below every library. MS-DIAL picks a feature's representative annotation by reference match
@@ -120,8 +122,12 @@ For every feature `s` and injection `i`:
 
 - The mean is taken over the Sample and QC injections only. Blank and Standard injections are normalized
   by the same formula but do not enter the mean.
-- A Sample or QC without the normalizing standard refuses normalization. A Blank or Standard injection
-  without it keeps its raw height and is reported.
+- A Sample or QC without the normalizing standard refuses normalization, and so does one in which MS-DIAL
+  did not detect it (the run's `<alignment>.mdpeakid.tsv` gives -1: the height is a gap fill), unless the
+  person accepts those heights (`accept_gap_filled`).
+- A Blank or Standard injection keeps its raw height, and is reported with why, when the standard has no
+  height there, was not detected there, or is below 10% of the lowest Sample or QC height: a gap fill puts
+  noise where the spike would be, and dividing by it would multiply the injection by its inverse.
 - `factor[i]` is the injection's dilution factor from the sample table, 1 unless given.
 - It is computed from the run's raw Height export. MS-DIAL's own internal-standard normalization averages
   over every file, Blank included, and replaces a zero with 1, so it is not used.
@@ -138,11 +144,13 @@ The result is one metabolome from the normalized matrices of every polarity the 
 
 1. **Rows dropped before anything else:**
    - unannotated rows (name empty, "Unknown" or "null");
-   - internal standards: the normalizing standard's spot as decided, the other standards found by a library
-     or their own text row (tiers A and B), and every row the internal-standard text row annotated. A labelled
-     standard shares its InChIKey's first block with the endogenous compound, because the label sits in the
-     second block. A spot only searched for a standard nobody confirmed (C, D, invalid, contested) stays a
-     feature, and the report names it (`unconfirmed_standard_spots`).
+   - internal standards: the normalizing standard's spot as decided, every spot a library or a standard's own
+     text row annotated as that standard (tiers A and B, whatever else the resolver said of it), and every row
+     the internal-standard text row annotated. A labelled standard shares its InChIKey's first block with the
+     endogenous compound, because the label sits in the second block. A spot only searched for a standard
+     nobody confirmed (tiers C and D) stays a feature, kept as its own row outside the InChIKey groups so that
+     it never removes another, and the report names it with any kept row it shares a first block with
+     (`unconfirmed_standard_spots`).
 
    The matrices are the exports the run wrote. Names, Unknowns and comments set in the GUI after the run do not
    reach them; normalize warns when the project was saved well after the exports.
@@ -160,6 +168,9 @@ The result is one metabolome from the normalized matrices of every polarity the 
    4. then, deterministically: the higher library priority, the higher total score, positive before
       negative, and the lower alignment ID.
 4. **Rows without a usable InChIKey** are kept as their own rows and never merged with anything.
+   **Possible isomers:** the first block joins stereoisomers (glucose and mannose 6-phosphate), and the ranking
+   puts intensity before library priority, as the laboratory asked. A group whose rows differ in stereo block
+   or lie more than 0.5 min apart is reported (`possible_isomers`) with the row kept; nothing is split.
 5. **Sample columns:** both polarities must describe the same samples in the same order (the names with the
    polarity suffix removed). A merge of two polarities names the columns by stem; one polarity keeps the
    exported names.
