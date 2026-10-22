@@ -63,19 +63,21 @@ parsing (`repository_reanalysis._summarize_raw_metadata`), but with limits of it
   modification time as they were before the read, a read that failed included. So a check repeated does
   not read an unchanged file again, nor wait again for one that could not be read: that file is read again
   only once it changes, the extractor changes, or the backend restarts. A read the 240 s cut short is not
-  kept. A file input that changed during its read (a copy still writing it) is read again by the next
-  check; a folder input is kept as the read left it too only where it grew by exactly what its reader
-  wrote. A check that finds a file being read by another check waits for that read rather than start a
-  second extractor on it.
+  kept. An input that changed during its read (a copy still writing a file, or completing a Waters
+  folder) is read once more by the next check, as it then is. A check that finds a file being read by
+  another check waits for that read rather than start a second extractor on it.
 - The extractor works in a temporary folder outside the raw data, removed afterwards. Its Bruker BAF reader
   writes `analysis.sqlite` into a `.d` folder, so such a folder is never given to it, and its type is asked.
-  Any other reader is not prevented from writing: what appears in a folder input, or beside a file input
-  under that file's name with another ending (`S1_Pos.mzML.index`; its folder is listed before and after
-  the read), is detected afterwards, said in a warning (`reader_created_files`), kept for the life of the
-  backend process so every later check says it again, bound into `check_digest`, and recorded in the
-  contract. Any other name that appears in the folder meanwhile (raw data, MS-DIAL's intermediates, a sync
-  client's file) is said in that check's warnings as having appeared, without naming a writer, and is
-  neither kept nor bound.
+  Any other reader is not prevented from writing: what appears beside a file input under that file's name
+  with another ending (`S1_Pos.mzML.index`; its folder is listed before and after the read), or inside a
+  folder input where a known reader rule names it (`reader_created`: baf2sql's `analysis.sqlite`), is
+  detected afterwards, said in a warning (`reader_created_files`), kept for the life of the backend process
+  so every later check says it again, bound into `check_digest`, and recorded in the contract. Any other
+  name that appears beside or inside an input meanwhile (raw data, a copy's files, MS-DIAL's intermediates,
+  a sync client's file) is said in that check's warnings as having appeared (`appeared_during_read`),
+  without naming a writer, and is neither kept nor bound. `write_contract`'s preview and its result give
+  its own check's warnings (`warnings`), so a name that appears during its reads is shown, and the
+  contract records its `appeared_during_read`.
 
 Each file's type is the one its header gives the Console (`header_console_acquisition_type`): DDA, AIF or
 SWATH as the header says; DIA with two or more isolation targets is SWATH, with none AIF, with one
@@ -109,7 +111,11 @@ MsdialWorkbench#825, which settles each spot's representative energy among each 
 another Console is a blocker, naming each energy set and its files. With #825, files whose energy sets
 differ are a warning (the campaign runs them, on record), and a file whose MS2 scans carry no energy is a
 blocker, since that Console stops on it. AIF whose energies are not recorded, with a Console without #825,
-and AIF whose header was not read, are warnings. The same guards apply to types stated in `sample_table`.
+and AIF whose header was not read, are warnings. The check counts every file of the polarity, since it reads
+no sample table. `write_contract` judges the guards again over the rows the confirmed table includes, with
+the types it states, so a file left out (`included` false) no longer counts, and a check's energy blocker
+does not by itself refuse the contract. The table's AIF warnings are in the preview and the result
+(`acquisition_warnings`, and among `warnings`) and are recorded in the contract (`raw_headers.aif_warnings`).
 
 A header recording the other polarity than its folder's is a blocker, as file names saying so already
 are; so is one recording both (PolaritySwitching, MixedFunctions), since MS-DIAL runs one ion mode per

@@ -58,9 +58,9 @@ Built on 0.5.45 (#78), which is not merged yet; merge this after it.
     - Reads are kept in the backend process by the extractor build (the sha256 of its exe and of every file
       beside it) and the file's path, size and modification time before the read, failed reads included; a
       read the deadline cut short is not kept, and the next check reads such files first, one at a time, so a
-      file that hangs meets its own limit and is kept as a failed read. A file that changed during its read is
-      read again. A check waits for a read another check has in flight rather than start a second extractor
-      on the same files.
+      file that hangs meets its own limit and is kept as a failed read. An input that changed during its read,
+      a file or a folder, is read again. A check waits for a read another check has in flight rather than
+      start a second extractor on the same files.
     - Only a DDA or SWATH verdict of a file's own header settles its type (DIA with isolation windows is
       SWATH). `acquisition_type_pos` / `acquisition_type_neg` (DDA, SWATH or AIF) is asked for every other
       file: no extractor, a header not read (or not in time, or a Bruker BAF folder, which is never given to
@@ -71,8 +71,10 @@ Built on 0.5.45 (#78), which is not merged yet; merge this after it.
     - AIF meets the repository campaign's collision-energy guards, over all of a polarity's AIF files: more
       than one MS2 collision energy among them (in one file or across files) with a Console lacking
       MsdialWorkbench#825, and AIF recording no energy with a Console carrying it (which stops on such a
-      file), are blockers; with #825, files whose energy sets differ are a warning. Types stated in
-      `sample_table` meet them too.
+      file), are blockers; with #825, files whose energy sets differ are a warning. `write_contract` judges
+      them again over the rows the confirmed table includes and the types it states, so a file left out no
+      longer counts; the table's AIF warnings are in the preview and the result (`acquisition_warnings`) and
+      recorded in the contract (`raw_headers.aif_warnings`).
     - A header recording the other polarity than its folder's, or both (polarity switching), is a blocker.
     - A pair whose two files are of different types is proposed with no type (`acquisition_type_conflicts`
       gives both, `acquisition_type_required` the rows), and the contract refuses every included row without
@@ -82,9 +84,11 @@ Built on 0.5.45 (#78), which is not merged yet; merge this after it.
       records one. `raw_headers` shows the evidence per polarity (methods, isolation targets, MS2 collision
       energies, the extractor build), the proposal is bound into `check_digest`, and the contract records it
       with the answers taken; for an answered file, why it was asked and what its header suggested are bound
-      too. What a reader leaves in a folder input, or beside a file input under that file's name, is detected
-      afterwards, not prevented: it is said on every later check, bound into `check_digest` and recorded in
-      the contract. Any other name that appears meanwhile is said in that check only, without naming a writer.
+      too. What a reader leaves beside a file input under that file's name, or inside a folder input where a
+      known reader rule names it (`reader_created`), is detected afterwards, not prevented: it is said on every
+      later check, bound into `check_digest` and recorded in the contract. Any other name that appears
+      meanwhile is said in that check only (`appeared_during_read`), without naming a writer;
+      `write_contract`'s preview and result give its own check's warnings, and the contract records them.
     - Sample metadata is compared with the table proposed, whose order and classes may be the headers' and
       the letters', rather than with the names.
     - The contract schema is `...lab-lcms-metabolomics-contract.v2`: a v1 contract, written before this, is

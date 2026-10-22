@@ -1552,18 +1552,25 @@ class RawHeaders(unittest.TestCase):
         contract = agent.load_contract(written["contract_path"])
         self.assertEqual([str(folder.resolve() / "S1_Pos.mzML.index")],
                          contract["raw_headers"]["polarities"]["Positive"]["reader_created_files"])
-        # A folder input: what run_extractor says its reader created is said, and kept the same way.
+        # Inside a folder input, only a file a reader is known to write there is put down to it: baf2sql's
+        # analysis.sqlite in a BAF .d (read here only because the skip is lifted), kept the same way.
         batch = MetabolomicsBatch(self.root / "second")
-        waters = batch.folders["Positive"] / "S3_Pos.raw"
-        waters.mkdir()
-        (waters / "_FUNC001.DAT").write_bytes(b"x")
-        extractor = FakeExtractor(created=lambda path: [path / "_INDEX.idx"] if path.suffix == ".raw" else [])
-        with capabilities_patches(extractor=extractor):
+        baf = batch.folders["Positive"] / "S3_Pos.d"
+        baf.mkdir()
+        (baf / "analysis.baf").write_bytes(b"baf")
+
+        def baf2sql(path: Path, work: Path) -> None:
+            if path.suffix == ".d" and not (path / "analysis.sqlite").exists():
+                (path / "analysis.sqlite").write_bytes(b"sqlite")
+
+        extractor = FakeExtractor(during=baf2sql, created=lambda path: [path / "analysis.sqlite"] if path.suffix == ".d" else [])
+        with patch.object(agent, "WRITING_HEADER_FORMATS", frozenset()), capabilities_patches(extractor=extractor):
             check = agent.check_inputs(batch.request())
             again = agent.check_inputs(batch.request())
         for result in (check, again):
-            self.assertEqual([str(waters.resolve() / "_INDEX.idx")],
-                             result["raw_headers"]["polarities"]["Positive"]["reader_created_files"])
+            report = result["raw_headers"]["polarities"]["Positive"]
+            self.assertEqual([str(baf.resolve() / "analysis.sqlite")], report["reader_created_files"])
+            self.assertEqual([], report["appeared_during_read"])
 
     def test_a_file_that_hangs_costs_no_other_file_its_read_and_is_kept_as_failed(self) -> None:
         from msdial_app import raw_metadata_preflight as preflight
@@ -1604,7 +1611,7 @@ class RawHeaders(unittest.TestCase):
             self.assertEqual(count, len(commands))
             self.assertEqual(check["check_digest"], again["check_digest"])
 
-    def test_a_read_is_kept_for_the_input_as_it_became_only_when_its_reader_changed_it(self) -> None:
+    def test_a_read_is_kept_for_the_input_as_it_was_and_a_file_inside_a_folder_is_no_readers_unless_known(self) -> None:
         batch = MetabolomicsBatch(self.root)
         source = batch.folders["Positive"] / "S1_Pos.mzML"
 
@@ -1618,21 +1625,32 @@ class RawHeaders(unittest.TestCase):
             agent.check_inputs(batch.request())
             agent.check_inputs(batch.request())
         self.assertEqual(["S1_Pos.mzML"], extractor.calls[-1])
-        # A folder its reader wrote into is read once.
+        # A Waters folder a copy completes during its read: what appeared is said for that check only, never put
+        # down to the reader, and the folder is read once more as it now is.
         batch = MetabolomicsBatch(self.root / "second")
         waters = batch.folders["Positive"] / "S3_Pos.raw"
         waters.mkdir()
         (waters / "_FUNC001.DAT").write_bytes(b"x")
 
-        def writing(path: Path, work: Path) -> None:
-            if path.suffix == ".raw":
-                (path / "_INDEX.idx").write_bytes(b"index")
+        def completing(path: Path, work: Path) -> None:
+            if path.suffix == ".raw" and not (path / "_FUNC002.DAT").exists():
+                (path / "_FUNC002.DAT").write_bytes(b"function 2")
 
-        extractor = FakeExtractor(during=writing, created=lambda path: [path / "_INDEX.idx"] if path.suffix == ".raw" else [])
+        extractor = FakeExtractor(during=completing, created=lambda path: (
+            [path / "_FUNC002.DAT"] if path.suffix == ".raw" and len(extractor.calls) == 1 else []))
         with capabilities_patches(extractor=extractor):
+            first = agent.check_inputs(batch.request())
+            second = agent.check_inputs(batch.request())
             agent.check_inputs(batch.request())
-            agent.check_inputs(batch.request())
-        self.assertEqual(1, len(extractor.calls))
+        appeared = [str(waters.resolve() / "_FUNC002.DAT")]
+        self.assertEqual(appeared, first["raw_headers"]["polarities"]["Positive"]["appeared_during_read"])
+        self.assertTrue(any("_FUNC002.DAT appeared in the positive raw folder" in item for item in first["warnings"]),
+                        first["warnings"])
+        for result in (first, second):
+            self.assertEqual([], result["raw_headers"]["polarities"]["Positive"]["reader_created_files"])
+        self.assertEqual([], second["raw_headers"]["polarities"]["Positive"]["appeared_during_read"])
+        # Read again once, as it became; then kept.
+        self.assertEqual([["S3_Pos.raw"]], [call for call in extractor.calls[1:] if "S3_Pos.raw" in call])
 
     def test_a_file_answered_unread_and_read_as_aif_before_the_contract_is_shown_again(self) -> None:
         batch = MetabolomicsBatch(self.root)
@@ -1691,6 +1709,78 @@ class RawHeaders(unittest.TestCase):
                     self.assertTrue(any("gives no acquisition type the Console reads for "
                                         + data["sample_table"]["rows"][0]["stem"] in item for item in plan["blockers"]),
                                     plan["blockers"])
+
+    def test_a_file_left_out_of_the_table_does_not_count_in_the_aif_energies(self) -> None:
+        batch = MetabolomicsBatch(self.root)
+        # QC1 at 40 eV, the rest at 20 eV, on a Console without #825: the check names the two energies.
+        extractor = FakeExtractor(lambda path: header_record(path, "DIA", [], energies=(
+            [40.0] if Path(path).stem == "QC1_Pos" else [20.0])))
+        with capabilities_patches(extractor=extractor):
+            check = agent.check_inputs(batch.request(acquisition_type_pos="AIF"))
+            self.assertTrue(any("record 2 MS2 collision energies" in item and "included false" in item
+                                for item in check["blockers"]), check["blockers"])
+            rows = [{"stem": stem, "class_id": CLASSES[stem], **({} if kind == "Sample" else {"file_type": kind})}
+                    for stem, kind in STEMS]
+            refused = self.write(batch, check, rows, acquisition_type_pos="AIF")
+            self.assertIn("(20 eV: ", refused.get("error", ""))
+            self.assertIn("40 eV: QC1_Pos)", refused.get("error", ""))
+            left_out = [dict(row, included=False) if row["stem"] == "QC1" else row for row in rows]
+            written = self.write(batch, check, left_out, acquisition_type_pos="AIF")
+            self.assertTrue(written.get("written"), written)
+
+    def test_the_tables_aif_warnings_are_shown_and_recorded(self) -> None:
+        batch = MetabolomicsBatch(self.root)
+        with_825 = {**EVERY_CAPABILITY, "capabilities": sorted({*EVERY_CAPABILITY["capabilities"], MULTI_ENERGY_AIF_CAPABILITY})}
+        extractor = FakeExtractor(lambda path: header_record(path, "DIA", WINDOWS, energies=(
+            [40.0] if Path(path).stem == "QC1_Pos" else [20.0])))
+        with capabilities_patches(with_825, extractor=extractor):
+            check = agent.check_inputs(batch.request())
+            self.assertTrue(check["ready_for_contract"], (check["questions"], check["blockers"]))
+            # Every file read as SWATH; the person says S1 and QC1 were acquired All Ions.
+            rows = [{"stem": stem, "class_id": CLASSES[stem], "acquisition_type": "AIF" if stem in {"S1", "QC1"} else "SWATH",
+                     **({} if kind == "Sample" else {"file_type": kind})} for stem, kind in STEMS]
+            request = {**batch.request(), "check_digest": check["check_digest"], "sample_table_confirmed": True,
+                       "sample_table": rows, "confirmed_by": "the analyst"}
+            preview = agent.write_contract(request)
+            written = agent.write_contract({**request, "confirmed": True})
+        said = "record different sets of MS2 collision energies (20 eV: S1_Pos; 40 eV: QC1_Pos)"
+        for result in (preview, written):
+            self.assertTrue(any(said in item for item in result["acquisition_warnings"]), result)
+            self.assertTrue(any(said in item for item in result["warnings"]), result["warnings"])
+        self.assertTrue(written["written"], written)
+        contract = agent.load_contract(written["contract_path"])
+        self.assertTrue(any(said in item for item in contract["raw_headers"]["aif_warnings"]))
+
+    def test_a_name_that_appears_during_the_contracts_own_reads_is_shown_and_recorded(self) -> None:
+        batch = MetabolomicsBatch(self.root)
+        folder = batch.folders["Positive"]
+        state = {"QC1_Pos": "late"}
+
+        def meanwhile(path: Path, work: Path) -> None:
+            if path.name == "QC1_Pos.mzML" and state["QC1_Pos"] is None:
+                (folder / f"sync{len(list(folder.glob('sync*.tmp')))}.tmp").write_text("", encoding="ascii")
+
+        extractor = FakeExtractor(lambda path: state.get(Path(path).stem, header_record(path)), during=meanwhile)
+        for confirmed in (False, True):
+            with self.subTest(confirmed=confirmed), capabilities_patches(extractor=extractor):
+                state["QC1_Pos"] = "late"
+                for item in folder.glob("sync*.tmp"):
+                    item.unlink()
+                check = agent.check_inputs(batch.request(acquisition_type_pos="DDA"))
+                self.assertTrue(check["ready_for_contract"], (check["questions"], check["blockers"]))
+                # The contract's own check reads QC1 first, which fails; meanwhile a file appears beside it.
+                state["QC1_Pos"] = None
+                result = agent.write_contract({
+                    **batch.request(acquisition_type_pos="DDA"), "check_digest": check["check_digest"],
+                    "sample_table_confirmed": True, "confirmed_by": "the analyst", "confirmed": confirmed,
+                })
+                self.assertIn("contract_path", result, result)
+                self.assertTrue(any("sync0.tmp appeared in the positive raw folder" in item for item in result["warnings"]),
+                                result.get("warnings"))
+                if confirmed:
+                    contract = agent.load_contract(result["contract_path"])
+                    self.assertEqual([str(folder.resolve() / "sync0.tmp")],
+                                     contract["raw_headers"]["polarities"]["Positive"]["appeared_during_read"])
 
     def test_sample_metadata_is_compared_with_the_table_proposed(self) -> None:
         batch = MetabolomicsBatch(self.root)

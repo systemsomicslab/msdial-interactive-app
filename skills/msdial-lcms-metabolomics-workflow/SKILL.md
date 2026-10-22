@@ -190,9 +190,13 @@ Where the negative files were acquired in another order, read that warning.
 Analytical and batch orders are ranks from 1. A raw file whose own name the Console cannot
 carry may be left out (`included: false`); the contract refuses it included.
 
-On their yes, call `msdial_lcms_metabolomics_write_contract(..., check_digest,
-sample_table_confirmed=true, sample_table=<corrections>, confirmed_by=<who>)`. It
-previews; check it, then call again with `confirmed=true`. An existing contract there
+An AIF collision-energy blocker of the check counts every file of the polarity: leaving the
+files of the other energy out (`included: false`, on the person's word) clears it, since the
+contract judges the guards over the rows it runs. On their yes, call
+`msdial_lcms_metabolomics_write_contract(..., check_digest, sample_table_confirmed=true,
+sample_table=<corrections>, confirmed_by=<who>)`. It previews; read its `warnings` and
+`acquisition_warnings` to the person (a file that appeared beside the raw data during its own
+reads, AIF energy sets that differ), then call again with `confirmed=true`. An existing contract there
 refuses even the preview: read `existing_contract` to the person, and replace it
 (`replace_existing=true`) only if they want it replaced.
 

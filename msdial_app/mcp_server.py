@@ -3543,7 +3543,11 @@ def msdial_lcms_metabolomics_write_contract(
     included row needs an acquisition type: a row proposed without one (acquisition_type_required) is refused
     until sample_table gives it as the person states it, and a table sent back as proposed carries none. The
     contract records the raw headers the acquisition types and the order were proposed from, and fixes the
-    alignment RT tolerance for both polarities: the person's, else the template's.
+    alignment RT tolerance for both polarities: the person's, else the template's. The AIF collision-energy
+    guards are judged again over the rows the table includes, so a file left out (included false) no longer
+    counts; the preview and the result give this call's own check warnings (warnings, a name that appeared
+    beside the raw data during its reads included) and the table's AIF warnings (acquisition_warnings), which
+    the contract records (raw_headers.aif_warnings).
     """
     body: dict[str, Any] = {
         "pos_path": pos_path, "neg_path": neg_path, "annotation": annotation or {}, "solvent_type": solvent_type,
