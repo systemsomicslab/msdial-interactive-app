@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import __version__
+from .agent_workflow import apply_sample_table
 from .lab_lcms_metabolomics import (
     INTERNAL_STANDARD_PRIORITY,
     MERGE_REPORT_NAME,
@@ -208,16 +209,21 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         inventory[polarity] = _folder_inventory(folder, polarity)
         blockers.extend(inventory[polarity]["blockers"])
         warnings.extend(inventory[polarity]["warnings"])
-        # Each raw file reaches the Console through analysis_files.csv, read as ASCII and split on commas.
-        unreadable = [str(item.get("file_name")) for item in inventory[polarity]["files"]
-                      if not console_safe_text(analysis_input_path(str(item.get("file_path", ""))))
-                      or not console_safe_text(item.get("file_name", ""))]
-        if unreadable:
+        # Each raw file reaches the Console through analysis_files.csv, read as ASCII and split on commas. A
+        # folder of such a path refuses every file; a file of its own may be left out of the sample table.
+        unreadable = unreadable_raw_files(inventory[polarity]["files"])
+        if unreadable and not console_safe_text(analysis_input_path(str(folder))):
             blockers.append(
+                f"The Console cannot read the {polarity.lower()} raw folder {folder} by its path: analysis_files.csv "
+                "carries printable ASCII without commas or quotes. Move or rename the raw data (a copy, raw_location "
+                "'copy', is one way) before the contract."
+            )
+        elif unreadable:
+            warnings.append(
                 f"The Console cannot read the {polarity.lower()} raw files {', '.join(unreadable[:5])}"
                 + (f" and {len(unreadable) - 5} more" if len(unreadable) > 5 else "")
-                + " by their paths: analysis_files.csv carries printable ASCII without commas or quotes. Move or rename "
-                "the raw data (a copy, raw_location 'copy', is one way) before the contract."
+                + " by their names (printable ASCII without commas or quotes): leave them out of the sample table "
+                "(included false) or rename them; the contract refuses one that is included."
             )
     if folders.get(POSITIVE) and folders.get(NEGATIVE):
         blockers.extend(folder_layout_problems(folders[POSITIVE], folders[NEGATIVE]))
@@ -417,6 +423,8 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         warnings.extend(metadata_report.pop("warnings"))
     result["paired_sample_table"] = proposal
     result["sample_metadata"] = metadata_report
+    # The proposal as it stands, so that a class read from a name the Console cannot carry is said before it is confirmed.
+    warnings.extend(analysis_csv_problems(proposal.get("rows", []), {}))
     if proposal.get("rows") and not any(str(row.get("file_type")) in {"Sample", "QC"} for row in proposal["rows"]):
         warnings.append("The proposed table has no Sample or QC injection; the normalizing standard has nothing to average over.")
 
@@ -474,6 +482,42 @@ def _analysis_subfolders(root: Path) -> dict[str, Path]:
         **{f"{polarity.lower()} output folder": root / FOLDERS[polarity] for polarity in POLARITIES},
         "inputs folder": root / INPUTS_FOLDER, "quant folder": root / QUANT_FOLDER,
     }
+
+
+def unreadable_raw_files(files: Iterable[dict[str, Any]]) -> list[str]:
+    """The raw files analysis_files.csv cannot name: a path or file name outside printable ASCII, or with a comma or quote."""
+    return [str(item.get("file_name")) for item in files
+            if not console_safe_text(analysis_input_path(str(item.get("file_path", ""))))
+            or not console_safe_text(item.get("file_name", ""))]
+
+
+def analysis_csv_problems(rows: Iterable[dict[str, Any]], inventory: dict[str, Any]) -> list[str]:
+    """What the included rows would write into analysis_files.csv that the Console reads otherwise.
+
+    It is read as ASCII and split on commas without quoting: an unreadable file of an included row fails the
+    run at prepare, and a class or acquisition type with a quote or outside ASCII is read as another word.
+    """
+    problems: list[str] = []
+    rows = list(rows)
+    for polarity, item in inventory.items():
+        kept = apply_sample_table(item["files"], polarity_sample_table(rows, polarity))["files"]
+        unreadable = unreadable_raw_files(kept)
+        if unreadable:
+            problems.append(
+                f"The included {polarity.lower()} raw files {', '.join(unreadable[:5])} have names analysis_files.csv "
+                "cannot carry (printable ASCII without commas or quotes); leave them out (included false) or rename them."
+            )
+    for row in rows:
+        if str(row.get("included", True)).casefold() in {"false", "0", "no"}:
+            continue
+        for key in ("class_id", "acquisition_type"):
+            value = row.get(key)
+            if value not in (None, "") and not console_safe_text(str(value).strip()):
+                problems.append(
+                    f"{row['stem']}: {key} '{value}' is not printable ASCII without commas or quotes, which "
+                    "analysis_files.csv carries; give it in ASCII (a Japanese class name, for one, as a romanized word)."
+                )
+    return problems
 
 
 def other_contract_problems(root: Path) -> list[str]:
@@ -632,6 +676,9 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
     table = _confirmed_sample_table(check["paired_sample_table"], request.get("sample_table"), parsed["inventory"])
     if table["problems"]:
         return {**refusal, "error": "The sample table cannot be used: " + " ".join(table["problems"])}
+    unsafe = analysis_csv_problems(table["rows"], parsed["inventory"])
+    if unsafe:
+        return {**refusal, "error": "The sample table cannot reach the Console as it stands: " + " ".join(unsafe)}
 
     polarities: list[str] = parsed["polarities"]
     root: Path = parsed["analysis_root"]
@@ -1329,19 +1376,23 @@ def plan_normalize(
     defaults = (contract.get("merge") or {}).get("defaults") or {}
     identities_preferred = adduct_identities(preferred_adducts(contract["salt"]["salt"]))
     spots_by_id = {spot["id"]: spot for spot in height_export["spots"]}
+    # Every spot the merge drops as an internal standard besides the one normalized by, once each: each
+    # standard's A or B candidates, the one chosen for it or not, the normalizing standard's included.
+    named: set[str] = set()
     for item in resolution["standards"]:
-        spot_id = str(item.get("alignment_id") or "")
-        if item["name"] == name or not spot_id or item.get("tier") not in DECIDED_TIERS:
-            continue
-        warnings.append(
-            f"Spot {spot_id} ('{(item.get('spot') or {}).get('name')}') was annotated as {item['name']} "
-            f"(tier {item['tier']}, {item['status']}): the merge drops it as an internal standard."
-        )
-    if entry.get("alignment_id") and str(entry["alignment_id"]) != alignment_id and entry.get("tier") in DECIDED_TIERS:
-        warnings.append(
-            f"Spot {entry['alignment_id']} ('{(entry.get('spot') or {}).get('name')}'), which a library or its text row "
-            f"annotated as {name} and the person passed over, is dropped by the merge as an internal standard all the same."
-        )
+        for candidate in item.get("candidates", []):
+            spot_id = str(candidate.get("alignment_id") or "")
+            if candidate.get("tier") not in DECIDED_TIERS or spot_id == alignment_id or spot_id in named:
+                continue
+            named.add(spot_id)
+            chosen_here = spot_id == str(item.get("alignment_id") or "")
+            role = ("the spot chosen for it" if chosen_here and item["name"] != name
+                    else "a spot the person passed over" if item["name"] == name and chosen_here
+                    else "not the spot chosen for it")
+            warnings.append(
+                f"Spot {spot_id} ('{candidate.get('name')}') was annotated as {item['name']} (tier {candidate['tier']}, "
+                f"{role}): the merge drops it as an internal standard."
+            )
     for item in unconfirmed:
         how = ("its text row matched it, but another annotation was kept for the spot" if item["tier"] == "C"
                else "it was found only by m/z and RT")

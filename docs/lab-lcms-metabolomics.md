@@ -72,7 +72,9 @@ matched on MS/MS alone under the RT tier's label. None with an RT refuses the li
 warning with the count. An optional preset library may serve one polarity only. A preset slot may be
 `{"path": ..., "library_kind": "predicted"}`. Any key the annotation does not read is refused. Library paths
 must be ASCII, since msp_annotator_settings.tsv is written and read as ASCII; so must the analysis root, and the
-raw files' paths must be ASCII without commas or quotes, which analysis_files.csv cannot carry.
+raw files' paths must be ASCII without commas or quotes, which analysis_files.csv cannot carry. A raw folder of
+such a path refuses the check; a file of its own is a warning, and the contract refuses it only when it is included.
+The sample table's classes and acquisition types must be printable ASCII without commas or quotes too.
 
 With n libraries, the first takes priority n+1 and the last 2; the internal-standard text row keeps
 priority 1, below every library. MS-DIAL picks a feature's representative annotation by reference match

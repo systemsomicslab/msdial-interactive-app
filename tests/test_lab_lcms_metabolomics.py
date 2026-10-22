@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 from lab_metabolomics_fixture import (
     ALIGNMENT,
+    CLASSES,
     GLUTAMINE,
     MetabolomicsBatch,
     STEMS,
@@ -306,8 +307,34 @@ class CheckAndContract(Batched):
                 folder.mkdir()
                 (folder / "S1_Pos.mzML").write_text("", encoding="ascii")
                 check = agent.check_inputs(self.batch.request(pos_path=str(folder)))
-                self.assertTrue(any("The Console cannot read the positive raw files" in item for item in check["blockers"]),
+                self.assertTrue(any("The Console cannot read the positive raw folder" in item for item in check["blockers"]),
                                 check["blockers"])
+
+    def test_a_raw_file_the_console_cannot_name_may_be_left_out(self) -> None:
+        (self.batch.folders["Positive"] / "テスト_Pos.mzML").write_text("", encoding="ascii")
+        check = agent.check_inputs(self.batch.request())
+        self.assertTrue(check["ready_for_contract"], check["blockers"])
+        self.assertTrue(any("by their names" in item for item in check["warnings"]))
+        rows = [{"stem": stem, "class_id": CLASSES[stem], **({} if kind == "Sample" else {"file_type": kind})}
+                for stem, kind in STEMS]
+        request = {**self.batch.request(), "check_digest": check["check_digest"], "sample_table_confirmed": True,
+                   "confirmed_by": "the analyst"}
+        refused = agent.write_contract({**request, "sample_table": rows + [{"stem": "テスト"}]})
+        self.assertIn("cannot reach the Console", refused.get("error", ""))
+        written = agent.write_contract({**request, "sample_table": rows + [{"stem": "テスト", "included": False}],
+                                        "confirmed": True})
+        self.assertTrue(written["written"], written)
+
+    def test_a_class_the_console_cannot_read_is_refused(self) -> None:
+        check = agent.check_inputs(self.batch.request())
+        for class_id in ("症例", 'Case "A"'):
+            with self.subTest(class_id=class_id):
+                refused = agent.write_contract({
+                    **self.batch.request(), "check_digest": check["check_digest"], "sample_table_confirmed": True,
+                    "sample_table": [{"stem": stem, "class_id": class_id if stem == "S1" else CLASSES[stem],
+                                      **({} if kind == "Sample" else {"file_type": kind})} for stem, kind in STEMS],
+                })
+                self.assertIn("class_id", refused.get("error", ""))
 
     def test_each_library_file_is_listed_by_label_and_polarity(self) -> None:
         check = agent.check_inputs(self.batch.request())
@@ -620,6 +647,17 @@ class StandardsNormalizeAndMerge(Batched):
         plan = agent.plan_normalize(self.contract, self.jobs["Positive"], resolved["polarities"]["Positive"]["resolution_digest"])
         self.assertTrue(any("Spot 2 ('CUDA') was annotated as CUDA (tier B" in item and "drops it as an internal standard" in item
                             for item in plan["warnings"]), plan["warnings"])
+        # Two library spots named as CUDA: both are dropped, and both are named.
+        spots = [dict(item) for item in POSITIVE_SPOTS if item["alignment_id"] != 2]
+        spots += [dict(alignment_id=9, mz=341.2799, rt=2.88, name="CUDA", method="lib1_in_house", cells=[5000] * 4),
+                  dict(alignment_id=19, mz=341.2799, rt=3.10, name="CUDA", method="lib1_in_house", cells=[50] * 4)]
+        job = write_run(self.batch, self.contract, "Positive", spots=spots)
+        resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": job})
+        plan = agent.plan_normalize(self.contract, job, resolved["polarities"]["Positive"]["resolution_digest"])
+        self.assertEqual(["1", "9", "19"], plan["internal_standard_ids"])
+        for spot_id in ("9", "19"):
+            self.assertTrue(any(f"Spot {spot_id} ('CUDA')" in item and "drops it as an internal standard" in item
+                                for item in plan["warnings"]), (spot_id, plan["warnings"]))
         # CUDA absent; the only spot at its m/z and RT is unannotated.
         spots = [dict(item) for item in POSITIVE_SPOTS if item["alignment_id"] != 2]
         spots.append(dict(alignment_id=30, mz=341.2799, rt=2.88, name="Unknown", cells=[100, 100, 100, 0]))
