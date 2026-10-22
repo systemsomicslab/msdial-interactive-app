@@ -588,13 +588,22 @@ def _sheet_xml(sheet: dict[str, Any]) -> str:
         ) + "</mergeCells>"
     auto_filter = sheet.get("auto_filter")
     filter_xml = f'<autoFilter ref="{escape(str(auto_filter))}"/>' if auto_filter else ""
+    # Drop-down lists: (cell range, the values offered). Excel keeps a list's formula under 256 characters.
+    validations = sheet.get("validations") or []
+    validation_xml = ""
+    if validations:
+        validation_xml = f'<dataValidations count="{len(validations)}">' + "".join(
+            f'<dataValidation type="list" allowBlank="1" showErrorMessage="1" sqref="{escape(ranges)}">'
+            f'<formula1>{escape(chr(34) + ",".join(values) + chr(34))}</formula1></dataValidation>'
+            for ranges, values in validations
+        ) + "</dataValidations>"
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
         f'<dimension ref="A1:{last_cell}"/><sheetViews><sheetView workbookViewId="0" showGridLines="0">'
         f'{pane}</sheetView></sheetViews><sheetFormatPr defaultRowHeight="18"/>'
         f'<cols>{column_xml}</cols><sheetData>{"".join(row_xml)}</sheetData>'
-        f'{merge_xml}{filter_xml}</worksheet>'
+        f'{merge_xml}{filter_xml}{validation_xml}</worksheet>'
     )
 
 

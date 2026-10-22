@@ -1,0 +1,6 @@
+Setting	Value
+Format	msdial-lipidomics-quant-input/1
+Sample amount	10
+Sample basis	uL plasma
+Spiked amount unit	pmol
+Description	Converted from quant_utility_table.xlsx (column H) and EquiSPLASH_Pos.txt, EquiSPLASH_Neg.txt.
