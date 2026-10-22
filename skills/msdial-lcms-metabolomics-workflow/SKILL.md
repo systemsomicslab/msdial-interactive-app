@@ -104,11 +104,13 @@ contract.
 
 Call `msdial_lcms_metabolomics_check_inputs` again with every answer. Report the blockers
 and warnings, the libraries as they will be searched (`annotation.libraries`: priority,
-label, thresholds, RT use, library_kind, file names with sha256 in `annotation.files`), the
+label, thresholds, RT use, library_kind; `annotation.files` lists each library's file by
+label and polarity with its sha256), the
 salt with its preferred adducts, and the normalizing standards. A library searched with RT
 is read for its records' retention times (`annotation.retention_time_census`): MS-DIAL
 matches a record without one on MS/MS alone, so none refuses the library and some missing
-is a warning to read out. Library paths and the analysis root must be ASCII, and raw data
+is a warning to read out. Library paths, raw-data paths and the analysis root must be
+printable ASCII (raw paths also without commas or quotes), and raw data
 in `.d` or `.raw` folders need a Console built from MsdialWorkbench#739 with its build
 record; the check says so before the contract fixes the Console.
 
@@ -182,9 +184,10 @@ without the standard, with it undetected, or below 10% of the lowest Sample or Q
 and any dilution factor. A Sample or QC without the standard refuses. So does one where
 MS-DIAL did not detect it: its height is a gap fill, and dividing by it scales every
 feature of that injection. Read those heights to the person; normalize them only if they
-accept (`accept_gap_filled=true`). Read every warning: each other standard's spot is either
-dropped by the merge as an internal standard (a library or its own text row annotated it
-as the standard) or kept as its own row. On a yes, call again with `confirmed=true`: it writes
+accept (`accept_gap_filled=true`). Read every warning: each says what the merge will do with
+another standard's spot, dropped as an internal standard (a library or its own text row
+annotated it as the standard), dropped as unannotated or not reference matched, or kept as
+its own row. On a yes, call again with `confirmed=true`: it writes
 `<root>/quant/NormalizedHeight_<Pos|Neg>.txt` in MS-DIAL's layout (the per-class Average
 and Stdev columns empty, since MS-DIAL computed them from heights), checks every cell
 against the formula, and draws figure 04 into `<root>/quant/qa_figures`. MS-DIAL's own

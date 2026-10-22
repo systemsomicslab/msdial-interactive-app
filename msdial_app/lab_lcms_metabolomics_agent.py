@@ -37,9 +37,12 @@ from .lab_lcms_metabolomics import (
     MERGE_REPORT_NAME,
     PRESET_PURPOSES,
     PRESETS,
+    UNANNOTATED_NAMES,
+    adduct_identities,
     annotation_summary,
     annotator_settings,
     export_annotator_ids,
+    is_preferred,
     lbm_retention_time,
     library_identity,
     merge_metabolome,
@@ -69,6 +72,7 @@ from .lab_lipidomics import (
     read_alignment_export,
     read_candidate_table,
     read_internal_standard_text,
+    representative_candidate,
     resolution_digest,
     resolve_standards,
     split_by_polarity,
@@ -107,7 +111,9 @@ from .workflow import (
     ANNOTATION_CANDIDATES_CAPABILITY,
     AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY,
     _console_supports_folder_type_csv as console_supports_folder_type_csv,
+    analysis_input_path,
     console_capabilities,
+    console_safe_text,
 )
 
 CHECK_SCHEMA = "msdial-interactive.lab-lcms-metabolomics-check.v1"
@@ -202,6 +208,17 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         inventory[polarity] = _folder_inventory(folder, polarity)
         blockers.extend(inventory[polarity]["blockers"])
         warnings.extend(inventory[polarity]["warnings"])
+        # Each raw file reaches the Console through analysis_files.csv, read as ASCII and split on commas.
+        unreadable = [str(item.get("file_name")) for item in inventory[polarity]["files"]
+                      if not console_safe_text(analysis_input_path(str(item.get("file_path", ""))))
+                      or not console_safe_text(item.get("file_name", ""))]
+        if unreadable:
+            blockers.append(
+                f"The Console cannot read the {polarity.lower()} raw files {', '.join(unreadable[:5])}"
+                + (f" and {len(unreadable) - 5} more" if len(unreadable) > 5 else "")
+                + " by their paths: analysis_files.csv carries printable ASCII without commas or quotes. Move or rename "
+                "the raw data (a copy, raw_location 'copy', is one way) before the contract."
+            )
     if folders.get(POSITIVE) and folders.get(NEGATIVE):
         blockers.extend(folder_layout_problems(folders[POSITIVE], folders[NEGATIVE]))
     result["polarities"] = polarities
@@ -253,7 +270,12 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         "preset": annotation["preset"],
         "libraries": annotation_summary(annotation["entries"]),
         "internal_standard_priority": INTERNAL_STANDARD_PRIORITY,
-        "files": {item["name"]: {"sha256": item["sha256"], "size_bytes": item["size_bytes"]} for item in identities.values()},
+        # One row per library and polarity: two libraries may share a file name and not their content.
+        "files": [
+            {"label": entry["label"], "polarity": polarity, "name": Path(path).name,
+             **{key: identities.get(_path_key(path), {}).get(key) for key in ("sha256", "size_bytes")}}
+            for entry in annotation["entries"] for polarity, path in entry["paths"].items()
+        ],
         "retention_time_census": census,
     }
 
@@ -412,7 +434,9 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         "normalization": (
             "normalized = height / height of the normalizing standard in that injection x the standard's mean "
             "height over the Sample and QC injections, x the injection's dilution factor; a Sample or QC without "
-            "the standard blocks, a Blank or Standard injection without it keeps its raw height"
+            "the standard blocks, and so does one where MS-DIAL did not detect it (a gap fill) unless the person "
+            "accepts those heights; a Blank or Standard injection without it, with it undetected, or below 10% of "
+            "the lowest Sample or QC height keeps its raw height"
         ),
         "merge": (
             "unannotated rows and internal standards are dropped; by default only reference-matched rows are kept "
@@ -1018,7 +1042,18 @@ def resolve_polarity(contract: dict[str, Any], polarity: str, job: dict[str, Any
         export, candidates, library["records"], polarity=polarity,
         annotation_rt_tolerance=tolerance, internal_standard_rt_tolerance=tolerance,
         library_annotated=library_annotated, library_label="annotation library",
+        # No class is quantified here: a standard not found is only absent from figure 04, unless it normalizes.
+        not_found="{name} was not found at its adduct's m/z within " + f"{tolerance:g}" + " min of its text RT.",
     )
+    normalizing_name = contract["normalizing_standards"][polarity]["name"]
+    for item in resolution["standards"]:
+        if item["name"] == normalizing_name and item["status"] == "unresolved_missing":
+            item["warnings"] = [
+                warning + " It is the normalizing standard: nothing can be normalized by it as found."
+                if warning.startswith(f"{normalizing_name} was not found") else warning
+                for warning in item["warnings"]
+            ]
+    resolution["warnings"] = [warning for item in resolution["standards"] for warning in item.get("warnings", [])]
     normalizing = contract["normalizing_standards"][polarity]["name"]
     annotated = sum(1 for spot in export["spots"] if spot["method"] in library_ids or spot["method"].startswith("LbmDB"))
     text_annotated = sum(1 for spot in export["spots"] if spot["method"] == annotator)
@@ -1289,12 +1324,39 @@ def plan_normalize(
         warnings.append(
             f"The person accepted the gap-filled {name} heights of {', '.join(gap_filled_required)} (accept_gap_filled)."
         )
+    # What the merge will do with each other standard's spot, by the rules it applies (lab_lcms_metabolomics).
+    candidates = read_candidate_table(resolved["outputs"]["candidate_table"])
+    defaults = (contract.get("merge") or {}).get("defaults") or {}
+    identities_preferred = adduct_identities(preferred_adducts(contract["salt"]["salt"]))
+    spots_by_id = {spot["id"]: spot for spot in height_export["spots"]}
+    for item in resolution["standards"]:
+        spot_id = str(item.get("alignment_id") or "")
+        if item["name"] == name or not spot_id or item.get("tier") not in DECIDED_TIERS:
+            continue
+        warnings.append(
+            f"Spot {spot_id} ('{(item.get('spot') or {}).get('name')}') was annotated as {item['name']} "
+            f"(tier {item['tier']}, {item['status']}): the merge drops it as an internal standard."
+        )
+    if entry.get("alignment_id") and str(entry["alignment_id"]) != alignment_id and entry.get("tier") in DECIDED_TIERS:
+        warnings.append(
+            f"Spot {entry['alignment_id']} ('{(entry.get('spot') or {}).get('name')}'), which a library or its text row "
+            f"annotated as {name} and the person passed over, is dropped by the merge as an internal standard all the same."
+        )
     for item in unconfirmed:
         how = ("its text row matched it, but another annotation was kept for the spot" if item["tier"] == "C"
                else "it was found only by m/z and RT")
-        fate = ("the merge drops it as an internal standard, since the internal-standard text row annotated it"
-                if item["method"] == annotator else
-                "nobody confirmed it as the standard, so the merge keeps it as its own row, outside the InChIKey groups")
+        spot = spots_by_id.get(item["alignment_id"], {})
+        representative = representative_candidate(candidates, item["alignment_id"]) or {}
+        if str(spot.get("name", "")).strip().casefold() in UNANNOTATED_NAMES:
+            fate = "the merge drops it as unannotated"
+        elif item["method"] == annotator:
+            fate = "the merge drops it as an internal standard, since the internal-standard text row annotated it"
+        elif not representative.get("is_reference_matched") and defaults.get("reference_matched_only", True):
+            fate = "the merge drops it as not reference matched, unless it runs with reference_matched_only=false"
+        else:
+            fate = "nobody confirmed it as the standard, so the merge keeps it as its own row, outside the InChIKey groups"
+            if not is_preferred(str(spot.get("adduct", "")), identities_preferred):
+                fate += f", unless preferred_adducts_only drops its adduct {spot.get('adduct')}"
         passed = " The person took another spot for it." if item["passed_over"] else ""
         warnings.append(
             f"Spot {item['alignment_id']} ('{item['ms_dial_name']}') is where {item['standard']} was looked for: {how} "

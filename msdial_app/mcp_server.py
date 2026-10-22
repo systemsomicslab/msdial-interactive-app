@@ -3551,8 +3551,9 @@ def msdial_lcms_metabolomics_normalize(
     undetected, or below 10% of the lowest Sample or QC height keeps its raw height, and the plan says which
     and why (raw_height_reasons); multipliers gives each injection's factor. accept_searched (the normalizing
     standard's name) accepts a tier C or D spot; accept_spot ({name: alignment ID}) takes another listed spot.
-    The plan's warnings say, for every other standard's spot, whether the merge drops it as an internal
-    standard (tiers A and B, or annotated by the internal-standard text row) or keeps it as its own row.
+    The plan's warnings say, for every other standard's spot, what the merge will do with it: drop it as
+    an internal standard (tiers A and B, or annotated by the internal-standard text row), drop it as
+    unannotated or not reference matched, or keep it as its own row.
     confirmed=false previews the standard, its mean and the injections; confirmed=true writes
     <analysis_root>/quant/NormalizedHeight_<Pos|Neg>.txt in MS-DIAL's export layout (the per-class Average
     and Stdev columns left empty), a copy of the Height export, is_resolution_<pos|neg>.tsv and the record,

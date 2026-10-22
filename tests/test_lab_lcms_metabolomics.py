@@ -299,6 +299,22 @@ class CheckAndContract(Batched):
             check = agent.check_inputs(self.batch.request(pos_path=str(folder)))
         self.assertTrue(any("The raw data are folders" in item for item in check["blockers"]), check["blockers"])
 
+    def test_raw_files_the_console_cannot_name_are_refused(self) -> None:
+        for folder_name in ("データ_pos", "a,b_pos"):
+            with self.subTest(folder=folder_name):
+                folder = self.batch.root / "data" / folder_name
+                folder.mkdir()
+                (folder / "S1_Pos.mzML").write_text("", encoding="ascii")
+                check = agent.check_inputs(self.batch.request(pos_path=str(folder)))
+                self.assertTrue(any("The Console cannot read the positive raw files" in item for item in check["blockers"]),
+                                check["blockers"])
+
+    def test_each_library_file_is_listed_by_label_and_polarity(self) -> None:
+        check = agent.check_inputs(self.batch.request())
+        self.assertEqual(["in-house RT and MS/MS", "predicted RT", "MS/MS without RT"],
+                         [item["label"] for item in check["annotation"]["files"]])
+        self.assertTrue(all(item["sha256"] and item["polarity"] == "Positive" for item in check["annotation"]["files"]))
+
     def test_an_analysis_root_outside_ascii_is_refused(self) -> None:
         check = agent.check_inputs(self.batch.request(analysis_root=str(self.batch.root / "解析")))
         self.assertTrue(any("is not an ASCII path" in item for item in check["blockers"]))
@@ -596,6 +612,29 @@ class StandardsNormalizeAndMerge(Batched):
                                                 for item in spot["shares_first_block_with"]])
         self.assertEqual(1, report["counts"]["kept_unconfirmed_standard_spots"])
         self.assertTrue(TRYPTOPHAN.startswith("QIVBCDIJIAJPQS"))
+
+    def test_the_warnings_say_what_the_merge_does_with_each_standards_spot(self) -> None:
+        from lab_metabolomics_fixture import POSITIVE_SPOTS
+
+        resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": self.jobs["Positive"]})
+        plan = agent.plan_normalize(self.contract, self.jobs["Positive"], resolved["polarities"]["Positive"]["resolution_digest"])
+        self.assertTrue(any("Spot 2 ('CUDA') was annotated as CUDA (tier B" in item and "drops it as an internal standard" in item
+                            for item in plan["warnings"]), plan["warnings"])
+        # CUDA absent; the only spot at its m/z and RT is unannotated.
+        spots = [dict(item) for item in POSITIVE_SPOTS if item["alignment_id"] != 2]
+        spots.append(dict(alignment_id=30, mz=341.2799, rt=2.88, name="Unknown", cells=[100, 100, 100, 0]))
+        job = write_run(self.batch, self.contract, "Positive", spots=spots)
+        resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": job})
+        plan = agent.plan_normalize(self.contract, job, resolved["polarities"]["Positive"]["resolution_digest"])
+        self.assertTrue(any("Spot 30" in item and "drops it as unannotated" in item for item in plan["warnings"]),
+                        plan["warnings"])
+        # A standard not found: no class is quantified here, so nothing says so.
+        spots = [dict(item) for item in POSITIVE_SPOTS if item["alignment_id"] != 2]
+        job = write_run(self.batch, self.contract, "Positive", spots=spots)
+        resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": job})
+        warnings = resolved["polarities"]["Positive"]["warnings"]
+        self.assertTrue(any(item.startswith("CUDA was not found at its adduct's m/z within 0.5 min") for item in warnings), warnings)
+        self.assertFalse(any("NOT QUANTIFIED" in item for item in warnings))
 
     def test_a_gap_filled_standard_in_a_sample_needs_the_persons_word(self) -> None:
         job = write_run(self.batch, self.contract, "Positive", gap_filled={1: ["S2"]})

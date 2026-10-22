@@ -71,7 +71,8 @@ them: MS-DIAL keeps a record without an RT in every RT window and counts its RT 
 matched on MS/MS alone under the RT tier's label. None with an RT refuses the library; some without one is a
 warning with the count. An optional preset library may serve one polarity only. A preset slot may be
 `{"path": ..., "library_kind": "predicted"}`. Any key the annotation does not read is refused. Library paths
-must be ASCII, since msp_annotator_settings.tsv is written and read as ASCII.
+must be ASCII, since msp_annotator_settings.tsv is written and read as ASCII; so must the analysis root, and the
+raw files' paths must be ASCII without commas or quotes, which analysis_files.csv cannot carry.
 
 With n libraries, the first takes priority n+1 and the last 2; the internal-standard text row keeps
 priority 1, below every library. MS-DIAL picks a feature's representative annotation by reference match

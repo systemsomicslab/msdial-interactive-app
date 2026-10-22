@@ -1592,6 +1592,7 @@ def resolve_standards(
     annotator_id: str | None = None,
     library_annotated: Callable[[dict[str, Any]], bool] | None = None,
     library_label: str = "LBM library",
+    not_found: str = "{name} was not found; every class it quantifies will be NOT QUANTIFIED.",
 ) -> dict[str, Any]:
     """Decide which aligned spot is each internal standard of one polarity.
 
@@ -1621,7 +1622,8 @@ def resolve_standards(
     choice included), which plan_normalize accepts as accept_spot.
 
     library_annotated says which spots tier A reads as a library's annotation, the LBM library's by
-    default; laboratory metabolomics passes its MSP libraries, named library_label in what is said.
+    default; laboratory metabolomics passes its MSP libraries, named library_label in what is said, and
+    its own not_found sentence ({name} is the standard), since it quantifies no class.
     """
     annotator_id = annotator_id or INTERNAL_STANDARD_ANNOTATOR_IDS.get(polarity, "")
     spots = export["spots"]
@@ -1728,7 +1730,7 @@ def resolve_standards(
                 f"no spot within {window_mz * 1000:.1f} mDa of {record.mz} ({record.adduct}) and "
                 f"{internal_standard_rt_tolerance} min of {record.rt} min"
             )
-            entry["warnings"].append(f"{record.name} was not found; every class it quantifies will be NOT QUANTIFIED.")
+            entry["warnings"].append(not_found.format(name=record.name))
             entries.append(entry)
             continue
         spot = chosen["spot"]
