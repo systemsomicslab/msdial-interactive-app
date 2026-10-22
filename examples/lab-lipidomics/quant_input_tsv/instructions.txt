@@ -1,0 +1,17 @@
+MS-DIAL lipidomics quantification input, format 1
+Fill in the four sheets Settings, Standards, Class standards and Selection. The full specification is docs/lab-lipidomics-quant-input.md in the MS-DIAL Interactive repository.
+Settings
+Format must stay msdial-lipidomics-quant-input/1.
+Sample amount: how much sample one extract was made from (10 for 10 uL plasma). Sample basis: uL plasma, mg tissue or 10^6 cells. Spiked amount unit: pmol unless you write nmol or fmol.
+Standards: one row per internal standard
+Spiked amount: how much of the standard is in the extract of one sample. It is divided by the sample amount, so 663.917 pmol in an extract of 10 uL plasma is 66.3917 pmol/uL plasma.
+Pos adduct, Pos m/z, Pos RT: the standard's peak in positive mode; Neg ... the same in negative mode. Leave a polarity's cells blank where the standard is not used in it.
+RT: the retention time in minutes you observe on your own chromatography. The prefilled rows leave it blank.
+m/z: leave it blank to have it computed from Formula and the adduct, or write it; a difference of more than 5 mDa from the formula is reported.
+Class standards
+Which standard quantifies which lipid class. 'Any others' covers every class not listed, and is required exactly once.
+Selection
+Which class and adduct each polarity reports. Write TRUE or FALSE in every row's Use cell; a blank cell is a problem. Ammonium acetate gives [M+CH3COO]- in negative mode, ammonium formate [M+HCOO]-.
+Class names
+Either spelling of a class is accepted (Cer_NS or Cer-NS). The Class names sheet lists both for every class.
+Numbers are written with a decimal point (0.5, not 0,5). Names, adducts and formulas are ASCII. A unit in a header's parentheses must agree with Settings (Spiked amount) or be minutes (RT).

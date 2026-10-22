@@ -3107,10 +3107,17 @@ def msdial_lipidomics_check_inputs(
     MS-DIAL intermediates already beside them, candidate text libraries, workbooks and LBM2 files
     beside the data, which are listed and never proposed, and Excel lock files) and every question
     still open. Then ask the person every open question in one message and call it again with the
-    answers. is_text_pos and is_text_neg may name one file holding both polarities; it is split by the
-    adducts' charge. amount_column is the sheet-1 column (F per mg tissue, G per 10^6 cells, H per uL
-    plasma); its sample amount (row 4) and any note below the standards are read back for the person.
-    internal_standard_rt_tolerance is 0.5 min unless given or carried by the workset.
+    answers.
+
+    quant_table_path is the quantification input, in either form. Format 1
+    (docs/lab-lipidomics-quant-input.md: one workbook with Settings, Standards, Class standards and
+    Selection, or a folder of the same four tables as .tsv or .csv) holds the standards' amounts and
+    peaks itself: give it alone, without is_text_pos, is_text_neg or amount_column; quant_input then
+    shows its tables as read. The earlier form is quant_utility_table.xlsx with amount_column (the
+    sheet-1 column: F per mg tissue, G per 10^6 cells, H per uL plasma; its sample amount in row 4 and
+    any note below the standards are read back) and is_text_pos and is_text_neg (one file holding both
+    polarities may be named for both; it is split by the adducts' charge). quant_format says which
+    was read. internal_standard_rt_tolerance is 0.5 min unless given or carried by the workset.
 
     The result says what blocks a contract (blockers), what is still to be asked (questions), the
     salt beside the adducts the negative standards and sheet 3 use (salt_evidence), the classes each
@@ -3152,15 +3159,15 @@ def msdial_lipidomics_write_contract(
     lbm_path: str,
     solvent_type: str,
     retention_time_tolerance: float,
-    is_text_pos: str,
-    is_text_neg: str,
     quant_table_path: str,
-    amount_column: str,
     analysis_root: str,
     analysis_purpose: str,
     console_path: str,
     raw_location: str,
     check_digest: str,
+    is_text_pos: str = "",
+    is_text_neg: str = "",
+    amount_column: str = "",
     sample_table_confirmed: StrictFlag = False,
     sample_table: list[dict[str, Any]] | None = None,
     confirmed_by: str = "",
@@ -3177,7 +3184,8 @@ def msdial_lipidomics_write_contract(
     """Write the laboratory lipidomics contract under <analysis_root>/inputs, after confirmation.
 
     The inputs are checked again and must be what check_digest bound: a file changed since the
-    person saw the check refuses the write. A check filled from a workset binds the workset's
+    person saw the check refuses the write. Give the inputs as the check was given them: a format-1
+    quant_table_path alone, or quant_utility_table.xlsx with is_text_pos, is_text_neg and amount_column. A check filled from a workset binds the workset's
     answers too (filled_from_workset): pass the same workset_id here. sample_table_confirmed=true
     says the person confirmed paired_sample_table; sample_table carries their corrections by stem
     (file_type, class_id, analytical_order, batch_order, factor, included, acquisition_type), every
@@ -3216,6 +3224,85 @@ def msdial_lipidomics_write_contract(
         "confirmed": confirmed is True,
     }
     return _request_json("POST", "/api/lipidomics/write-contract", host=host, port=port, body=body, timeout=600)
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_lipidomics_check_quant_input(
+    quant_table_path: str,
+    amount_column: str = "",
+    is_text_pos: str = "",
+    is_text_neg: str = "",
+    solvent_type: str = "",
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Check a laboratory lipidomics quantification input on its own; read-only, no raw data needed.
+
+    Use it while a person prepares the input, before any analysis: it reads format 1
+    (docs/lab-lipidomics-quant-input.md; a workbook with Settings, Standards, Class standards and
+    Selection, or a folder of the same tables as .tsv or .csv) from its path alone, and the earlier
+    quant_utility_table.xlsx with amount_column, is_text_pos and is_text_neg. blockers name each
+    problem by table, row and column, in words to read to the person as they are: never edit their
+    file, and never guess a value for them (a retention time, an amount, an adduct). warnings do not
+    stop anything; notes list what was read differently from how it was written (class spellings
+    converted, m/z computed from the formula, columns and sheets not read). tables shows what was read:
+    each standard with its amount per sample unit and its peaks, the class standards, the classes
+    selected per polarity. expected_resolution lists the classes each polarity can only leave NOT
+    QUANTIFIED. With solvent_type, salt_evidence sets the salt beside the negative adducts. ready is
+    true when nothing blocks.
+    """
+    body = {
+        "quant_table_path": quant_table_path, "amount_column": amount_column, "is_text_pos": is_text_pos,
+        "is_text_neg": is_text_neg, "solvent_type": solvent_type,
+    }
+    return _request_json("POST", "/api/lipidomics/check-quant-input", host=host, port=port, body=body, timeout=120)
+
+
+@mcp.tool()
+@_structured_validation_errors
+def msdial_lipidomics_quant_input_template(
+    output_path: str,
+    layout: str = "xlsx",
+    prefill: str = "lab-defaults",
+    salt: str = "",
+    from_quant_table_path: str = "",
+    amount_column: str = "",
+    is_text_pos: str = "",
+    is_text_neg: str = "",
+    confirmed: StrictFlag = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Write a new laboratory lipidomics quantification input in format 1; previews unless confirmed.
+
+    For a person who has none yet: output_path is the new .xlsx (layout='xlsx', the default) or a new
+    or empty folder (layout='tsv'); it never overwrites. The template has Instructions and Class
+    names sheets beside the four tables. prefill='lab-defaults' fills Class standards and Selection
+    with the laboratory's EquiSPLASH defaults and Standards with its standards' names, classes,
+    formulas and adducts, leaving every spiked amount and retention time for the person to fill in
+    (the m/z is computed from the formula); prefill='none' writes the Settings rows and the other
+    tables' headers only. salt='HCOONH4' (ammonium formate) turns the negative-mode acetate adducts into
+    formate adducts, in Standards and Selection. Ask the person their salt and their standard mix first.
+
+    To convert the earlier form instead, give from_quant_table_path (quant_utility_table.xlsx),
+    amount_column, is_text_pos and is_text_neg: the same content is written in format 1. Read the
+    preview's warnings to the person before confirming: a converted sample amount that differs from
+    sheet 1's row 4 (its per-10^6-cells column multiplies by row 4) is theirs to settle.
+
+    confirmed=false (the default) shows what would be written; show it to the person, and call again
+    with confirmed=true to write. The written input is then checked: for a template, its blockers are
+    the cells still to fill in. Tell the person which, by sheet, and check it again with
+    msdial_lipidomics_check_quant_input once they have saved it.
+    """
+    body = {
+        "output_path": output_path, "layout": layout, "prefill": prefill, "salt": salt,
+        "from_quant_table_path": from_quant_table_path, "amount_column": amount_column,
+        "is_text_pos": is_text_pos, "is_text_neg": is_text_neg,
+        # The gate is here and again in the backend: only a literal true writes.
+        "confirmed": confirmed is True,
+    }
+    return _request_json("POST", "/api/lipidomics/quant-input-template", host=host, port=port, body=body, timeout=120)
 
 
 @mcp.tool()

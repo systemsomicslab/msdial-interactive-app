@@ -80,10 +80,14 @@ class CheckingTheInputs(_Batch):
         (self.batch.pos / "S1_Pos.dcl").write_bytes(b"intermediate")
         result = public_check(check_inputs({"pos_path": str(self.batch.pos), "neg_path": str(self.batch.neg)}))
         self.assertEqual(
-            ["analysis_purpose", "lbm_path", "is_text_pos/is_text_neg", "quant_table_path", "amount_column",
+            ["analysis_purpose", "lbm_path", "quant_table_path", "is_text_pos/is_text_neg", "amount_column",
              "solvent_type", "retention_time_tolerance", "analysis_root", "raw_location", "console_path"],
             [item["id"] for item in result["questions"]],
         )
+        # The quantification input is asked first; the texts and the amount column only for the earlier form.
+        required = {item["id"]: item["required"] for item in result["questions"]}
+        self.assertEqual((True, False, False), (required["quant_table_path"], required["is_text_pos/is_text_neg"],
+                                                required["amount_column"]))
         self.assertEqual(3, result["folders"]["Positive"]["file_count"])
         self.assertEqual(1, result["folders"]["Positive"]["existing_intermediates"])
         found = result["candidate_inputs"]
