@@ -42,14 +42,20 @@ libraries found, but never propose one: which library matches this chromatograph
 person's choice.
 
 It also reads each raw file's header with the configured raw-metadata extractor
-(`raw_headers`): every file up to 40 per polarity, past that the first and the last. Report
-per polarity the methods, the isolation target counts, the instrument, the acquisition
-types proposed and from what (`proposed_by`), the files that could not be read, and whether
-the analytical order follows the acquisition start times. DIA with isolation windows is
-SWATH and without isolation AIF. A file whose type differs from the rest of its folder
-(one file of a SWATH batch whose sampled headers the extractor reads as AIF, for one) is
-read out with its method and isolation targets from `raw_headers.per_file`. Without a configured
-extractor (`msdial_check_raw_metadata_extractor`), the type is asked, never assumed.
+(`raw_headers`): every file up to 200 per polarity, past that the first and the last, within
+240 s for the whole check, so that it returns within the tool's time limit. A file not read
+in time is asked about, and checking again reads it. Report per polarity the methods, the
+isolation target counts, the MS2 collision energies, the instrument, the acquisition types
+proposed and from what (`proposed_by`), the files that could not be read or not in time, and
+whether the analytical order follows the acquisition start times. Only a DDA or SWATH verdict
+of a file's own header (DIA with isolation windows is SWATH) settles its type; an AIF verdict
+(DIA without isolation) is asked, because a SWATH file whose sampled headers show no
+isolation reads as AIF too. Read out every file the headers did not settle with its method,
+isolation targets and collision energies from `raw_headers.per_file`. A header recording the
+other polarity, or both, is a blocker: the files belong in another folder or out of the
+batch. If `reader_created_files` names anything, a reader wrote beside the raw data: say so.
+Without a configured extractor (`msdial_check_raw_metadata_extractor`), the type is asked,
+never assumed.
 
 ## C. Ask everything in one message
 
@@ -96,10 +102,20 @@ extractor (`msdial_check_raw_metadata_extractor`), the type is asked, never assu
 - **The normalizing standard** of each polarity (`normalizing_standard_pos`,
   `normalizing_standard_neg`), one name from that polarity's text.
 - **The acquisition type** (`acquisition_type_pos`, `acquisition_type_neg`: DDA, SWATH or
-  AIF), only when it is among the questions: no extractor is configured, a header could
-  not be read, or a header gives no type the Console reads. Its prompt says which. The
-  answer fills only the files the headers did not settle. SWATH or AIF data run as DDA give
-  almost no MS/MS, so never answer it for the person.
+  AIF), only when it is among the questions: no extractor is configured; a header was not
+  read (could not be, not in time, or a Bruker BAF folder the check never gives the reader);
+  a header gives no type the Console reads; a header gives AIF; or the file lies between the
+  first and the last of more than 200. Its prompt counts the files by why, and gives what
+  the headers suggest only as a suggestion. The answer fills exactly those files. For AIF,
+  say that the repository campaign runs AIF of one MS2 collision energy as SWATH (the Console
+  deconvolutes it alike), that AIF of more than one energy needs a Console with
+  MsdialWorkbench#825, and that such a Console stops on AIF that records no energy; the
+  check refuses either case. SWATH or AIF data run as DDA give almost no MS/MS, so never
+  answer it for the person.
+- **Files whose own headers give different types** (`acquisition_type_mixed_pos`,
+  `acquisition_type_mixed_neg`), only when asked: read the files of each type from the
+  prompt. `as_read` keeps each file's header type; a header the person says is wrong is
+  corrected in `sample_table`. Never answer it for them.
 - **For capillary electrophoresis** (migration time on the RT axis), say that the template
   aligns within 0.1 min, which CE migration times usually exceed, and ask whether they want
   a wider `alignment_rt_tolerance` (minutes). The value is the person's; leave it unset
@@ -150,18 +166,22 @@ the words that set each polarity's files apart (A1 in 20230125_SWATH_A1_C_CE20_d
 20230208_SWATH_A1_A_CE20_d2), shown in `pairing` and each row's `paired_by`: read every pair
 to the person. When the pairing fails or is wrong, they give `sample_pairs`
 (`[{sample, positive_file, negative_file}]`). The merge pairs the columns by this table.
-Paired by words that are letter+number replicates (A1 to D4), each pair's class is proposed
-from the letters (A), not from a word only one polarity varies in (d2 against a
-re-injection's d2r2); read that warning and the classes to the person.
+Paired by those words, a class both polarities' file names agree on stands. Only where the
+names give the samples no such class (d2 against a re-injection's d2r2, or no class at all)
+is each Sample pair's class proposed from the letters of its letter+number word (A1 to D4 ->
+A), and never from a blank, QC or standard (Blank1, QC2, Std3); read that warning and the
+classes to the person.
 Classes and acquisition types reach the Console's ASCII analysis file: give them in
 printable ASCII without commas or quotes (a Japanese class name as a romanized word). The
 acquisition type is DDA, SWATH or AIF, the words the Console reads; it reads any other as
 DDA. Each row's type is its files' headers', or the person's answer where a header did not
-settle it; read it out, and correct a row only on the person's word. A paired row carries
-one type and one analytical order for both polarities, the positive file's: where the
-headers give a pair's files different types (`acquisition_type_conflicts`), ask which it is
-and give that row's `acquisition_type` in `sample_table`, since the contract refuses the
-row until then; where the negative files were acquired in another order, read that warning.
+settle it (`acquisition_type_basis`); read it out, and correct a row only on the person's
+word. A paired row carries one type and one analytical order for both polarities. Where a
+pair's two files are of different types (`acquisition_type_conflicts` gives both), the row is
+proposed with no type and listed in `acquisition_type_required`: ask which it is and give
+that row's `acquisition_type` in `sample_table`. The contract refuses every included row
+without a type, so sending the table back as proposed never passes for the person's word.
+Where the negative files were acquired in another order, read that warning.
 `order_proposal` says whether the order follows the acquisition start times or the names.
 Analytical and batch orders are ranks from 1. A raw file whose own name the Console cannot
 carry may be left out (`included: false`); the contract refuses it included.
@@ -178,7 +198,8 @@ Plan with `msdial_guided_analysis_plan(input_path=<the polarity's raw folder>,
 answers={"lab_lcms_metabolomics_contract_path": ..., "ion_mode": "Positive"})`. The
 contract fixes the libraries with their RT settings and thresholds, the salt, the
 internal-standard library, the sample table with each file's acquisition type, the output
-and export folder, the Console, the template and an alignment RT tolerance the person gave;
+and export folder, the Console, the template and the alignment RT tolerance (the person's,
+else the template's, alike for both polarities);
 `lab_lcms_metabolomics.deviations` must be empty unless the person asked for a change, and
 every deviation is read to them.
 

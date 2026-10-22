@@ -58,6 +58,32 @@ class AgentWorkflowTests(unittest.TestCase):
             self.assertEqual([], plan["workflow"]["msp_annotators"])
             self.assertTrue(plan["workflow"]["selected_adducts"])
 
+    def test_guided_plan_takes_an_alignment_rt_tolerance_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "sample.mzML").write_text("", encoding="ascii")
+            console = root / "MSDIALCUI.exe"
+            console.write_text("", encoding="ascii")
+            answers = {
+                "project_type": "lcms", "ion_mode": "Negative", "target_omics": "Metabolomics",
+                "parameter_strategy": "default", "smoothing_method": "TimeBasedLinearWeightedMovingAverage",
+                "execute_rt_correction": False, "library_strategy": "none", "run_qa": False,
+                "generate_materials_methods": True, "class_assignment_confirmed": True, "console_path": str(console),
+                "template_path": str(ROOT / "resources" / "msdial_console_param4lipidomics.txt"),
+            }
+            unset = build_guided_plan(str(root), answers)
+            plan = build_guided_plan(str(root), {**answers, "alignment_rt_tolerance": 0.3})
+            self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+            self.assertNotIn("alignment_rt_tolerance", plan.get("unknown_answer_keys", []))
+            self.assertEqual(0.3, plan["workflow"]["alignment_rt_tolerance"])
+            self.assertNotEqual(0.3, unset["workflow"].get("alignment_rt_tolerance"))
+            for value in (0, -1, "abc", True):
+                with self.subTest(value=value):
+                    refused = build_guided_plan(str(root), {**answers, "alignment_rt_tolerance": value})
+                    self.assertFalse(refused["ready_to_prepare"])
+                    self.assertIn(f"alignment_rt_tolerance '{value}' is not a positive number of minutes.",
+                                  refused["blockers"])
+
     def test_guided_plan_returns_first_scientific_question(self) -> None:
         plan = build_guided_plan("", {})
 

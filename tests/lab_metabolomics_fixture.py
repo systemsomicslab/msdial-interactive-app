@@ -69,8 +69,11 @@ NEGATIVE_SPOTS = [
 
 
 def header_record(path: str | Path, method: str = "DDA", targets: list[float] | None = None,
-                  start: str | None = None, polarity: str | None = None) -> dict[str, Any]:
-    """One record as RawMetadataConsoleApp writes it for a file, with only what the campaign's summary reads."""
+                  start: str | None = None, polarity: str | None = None,
+                  energies: list[float] | None = None) -> dict[str, Any]:
+    """One record as RawMetadataConsoleApp writes it for a file, with only what the campaign's summary reads.
+
+    energies: the MS2 collision energies it records (acquisition.collisionEnergies); None records none."""
     record: dict[str, Any] = {
         "source": {"filePath": str(path), "fileName": Path(path).name, "readerName": "ThermoMetadataReader"},
         "instrument": {"model": {"value": "Q Exactive Plus Orbitrap"}},
@@ -82,6 +85,8 @@ def header_record(path: str | Path, method: str = "DDA", targets: list[float] | 
         },
         "run": {},
     }
+    if energies is not None:
+        record["acquisition"]["collisionEnergies"] = list(energies)
     if polarity:
         record["acquisition"]["polarity"] = {"value": polarity}
     if start:
@@ -92,28 +97,49 @@ def header_record(path: str | Path, method: str = "DDA", targets: list[float] | 
 class FakeExtractor:
     """The configured raw-metadata extractor and its reads, stood in for.
 
-    records(path) gives a file's record, or None for a file the extractor cannot read. calls lists the
-    files each read was given.
+    records(path) gives a file's record, None for a file the extractor cannot read, or "late" for one the
+    check's deadline leaves unread. calls lists the files each read was given, options the keyword arguments
+    and work_directories the folder it was given to work in. during(path, work_directory) runs as each file
+    is read, and created(path) names the files a reader left in a folder input.
     """
 
-    def __init__(self, records: Any = None, configured: bool = True) -> None:
+    def __init__(self, records: Any = None, configured: bool = True, during: Any = None, created: Any = None,
+                 inventory: str = "a" * 64) -> None:
         self.records = records or (lambda path: header_record(path))
         self.configured = configured
+        self.during = during
+        self.created = created
+        self.inventory = inventory
         self.calls: list[list[str]] = []
+        self.options: list[dict[str, Any]] = []
+        self.work_directories: list[Path] = []
 
-    def run(self, extractor: Path, inputs: list[Path], work_directory: Path, **_: Any) -> dict[str, Any]:
-        from msdial_app.raw_metadata_preflight import file_key
+    def run(self, extractor: Path, inputs: list[Path], work_directory: Path, **options: Any) -> dict[str, Any]:
+        from msdial_app.raw_metadata_preflight import file_key, input_signature
 
         self.calls.append([Path(path).name for path in inputs])
+        self.options.append(dict(options))
+        self.work_directories.append(Path(work_directory))
         records, outcomes = [], {}
         for path in inputs:
+            if self.during is not None:
+                self.during(Path(path), Path(work_directory))
             record = self.records(path)
-            if record is None:
-                outcomes[file_key(path)] = {"outcome": "failed", "exit_code": 1}
+            created = [str(item) for item in (self.created(Path(path)) if self.created else [])]
+            if record == "late":
+                outcomes[file_key(path)] = {"outcome": "timed_out", "exit_code": None, "deadline": True,
+                                            "not_started": True, "reader_created_files": created}
+            elif record is None:
+                outcomes[file_key(path)] = {"outcome": "failed", "exit_code": 1, "reader_created_files": created}
             else:
                 records.append(record)
-                outcomes[file_key(path)] = {"outcome": "ok", "exit_code": 0, "reader_created_files": []}
+                outcomes[file_key(path)] = {"outcome": "ok", "exit_code": 0, "reader_created_files": created,
+                                            "input_signature": input_signature(path)}
         return {"records": records, "outcomes": outcomes}
+
+    def identity(self, path: Any) -> dict[str, Any]:
+        return {"binary_sha256": "b" * 64, "inventory_sha256": self.inventory, "file_count": 3,
+                "product_version": "1.0.0+test", "provenance_status": "verified"}
 
     def patches(self) -> ExitStack:
         stack = ExitStack()
@@ -123,7 +149,9 @@ class FakeExtractor:
             if self.configured else {"path": "", "source": ""},
         ))
         stack.enter_context(patch.object(lab_lcms_metabolomics_agent, "run_extractor", side_effect=self.run))
-        stack.enter_context(patch.dict(lab_lcms_metabolomics_agent._HEADER_CACHE, clear=True))
+        stack.enter_context(patch.object(lab_lcms_metabolomics_agent, "_extractor_identity", side_effect=self.identity))
+        for cache in ("_HEADER_CACHE", "_HEADER_CREATED", "_HEADER_IN_FLIGHT", "_EXTRACTOR_IDENTITIES"):
+            stack.enter_context(patch.dict(getattr(lab_lcms_metabolomics_agent, cache), clear=True))
         return stack
 
 

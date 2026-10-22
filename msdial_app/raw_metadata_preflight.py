@@ -12,7 +12,9 @@ indefinitely. Now:
 - inputs go in chunks of at most CHUNK_INPUTS, and no command line reaches COMMAND_LINE_LIMIT;
 - each chunk has a time limit, the sum of its inputs' limits (input_timeout_seconds). These are the only
   limits on a preflight. The campaign runner watches for a stall and does not time a preflight out itself,
-  because a unit of 165 Waters folders legitimately reads for hours;
+  because a unit of 165 Waters folders legitimately reads for hours. (The laboratory metabolomics check,
+  which must answer within an MCP request, passes shorter limits and a deadline of its own; a campaign never
+  does);
 - a chunk that fails or times out is run again one input at a time, so every input gets its own outcome;
 - OSError and TimeoutExpired become outcomes and are never raised;
 - only a tail of stderr is kept;
@@ -190,15 +192,27 @@ def _folder_listing(path: Path) -> set[str] | None:
         return None
 
 
-def input_timeout_seconds(path: str | Path, fmt: str | None = None, size_bytes: int | None = None) -> float:
-    """The time one extractor read of this input may take, from its format and, where it matters, size."""
+def input_timeout_seconds(
+    path: str | Path,
+    fmt: str | None = None,
+    size_bytes: int | None = None,
+    *,
+    policy: Mapping[str, Mapping[str, float]] | None = None,
+    ceiling_seconds: float | None = None,
+) -> float:
+    """The time one extractor read of this input may take, from its format and, where it matters, size.
+
+    policy and ceiling_seconds replace TIMEOUT_POLICY and INPUT_TIMEOUT_CEILING_SECONDS for a caller that must
+    answer sooner (the laboratory metabolomics check); a campaign never passes them.
+    """
     kind = fmt or input_format(path)
-    policy = TIMEOUT_POLICY[_FORMAT_TIMEOUT_CLASS.get(kind, "metadata_reader")]
+    limits = (policy or TIMEOUT_POLICY)[_FORMAT_TIMEOUT_CLASS.get(kind, "metadata_reader")]
     if size_bytes is None:
         signature = input_signature(path) or {}
         size_bytes = int(signature.get("size_bytes") or 0)
-    seconds = policy["base_seconds"] + policy["seconds_per_gb"] * max(int(size_bytes), 0) / 1024**3
-    return round(min(seconds, INPUT_TIMEOUT_CEILING_SECONDS), 1)
+    seconds = limits["base_seconds"] + limits["seconds_per_gb"] * max(int(size_bytes), 0) / 1024**3
+    ceiling = INPUT_TIMEOUT_CEILING_SECONDS if ceiling_seconds is None else ceiling_seconds
+    return round(min(seconds, ceiling), 1)
 
 
 # ------------------------------------------------------------------------------------------------------
@@ -323,6 +337,9 @@ def run_extractor(
     command_line_limit: int = COMMAND_LINE_LIMIT,
     runner: Callable[..., Any] | None = None,
     progress: Callable[[dict[str, Any]], None] | None = None,
+    timeout_policy: Mapping[str, Mapping[str, float]] | None = None,
+    timeout_ceiling_seconds: float | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Read every input's header. Never raises for anything the extractor or the operating system does.
 
@@ -333,6 +350,11 @@ def run_extractor(
     the earlier read left it in.
     ``progress`` is told, before each extractor process starts, which attempt it is and its time limit;
     it is how a watcher tells a long read from a stalled one, and nothing it raises stops the reads.
+    ``timeout_policy`` and ``timeout_ceiling_seconds`` replace each input's limit (input_timeout_seconds), and
+    ``deadline`` (a time.monotonic() value) is when the reads must stop: no extractor process starts after it,
+    and none runs past it. An input the deadline left unread is timed_out with deadline true, beside
+    not_started true when no process was started for it; its own limit did not expire. A campaign passes
+    none of the three, so only the per-input limits bound its reads.
     Returns the records read (input order), one outcome per input keyed by file_key, and the chunk log.
     """
     run = runner or subprocess.run
@@ -384,7 +406,10 @@ def run_extractor(
     listings = {file_key(path): _folder_listing(path) for path in to_read}
     sizes = {key: int((signatures[key] or {}).get("size_bytes") or 0) for key in signatures}
     timeouts = {
-        file_key(path): input_timeout_seconds(path, formats[file_key(path)], sizes[file_key(path)])
+        file_key(path): input_timeout_seconds(
+            path, formats[file_key(path)], sizes[file_key(path)],
+            policy=timeout_policy, ceiling_seconds=timeout_ceiling_seconds,
+        )
         for path in to_read
     }
     longest_output = work_directory / "chunk-9999-input-9999.json"
@@ -402,6 +427,18 @@ def run_extractor(
     def attempt(label: str, group: list[Path], output: Path) -> dict[str, Any]:
         output.unlink(missing_ok=True)
         timeout = round(sum(timeouts[file_key(path)] for path in group), 1)
+        capped = False
+        if deadline is not None:
+            left = round(deadline - time.monotonic(), 1)
+            if left <= 0:
+                # Past the caller's deadline nothing more starts; the inputs keep no verdict of their own.
+                entry = {"chunk": label, "inputs": len(group), "timeout_seconds": 0.0, "result": OUTCOME_TIMED_OUT,
+                         "exit_code": None, "not_started": True, "deadline": True, "elapsed_seconds": 0.0,
+                         "records": 0}
+                chunk_log.append(entry)
+                return {"entry": entry, "records": {}}
+            if left < timeout:
+                timeout, capped = left, True
         command = extractor_command(extractor, group, output)
         if progress is not None:
             try:
@@ -419,6 +456,8 @@ def run_extractor(
                 pass
         started = time.monotonic()
         entry: dict[str, Any] = {"chunk": label, "inputs": len(group), "timeout_seconds": timeout}
+        if capped:
+            entry["deadline"] = True
         try:
             completed = run(
                 command,
@@ -467,6 +506,11 @@ def run_extractor(
             # Exit 1 (a reader failed), 2 (a missing path), or 0 with no record for this input.
             outcome = OUTCOME_FAILED
         detail: dict[str, Any] = {"outcome": outcome, "exit_code": entry.get("exit_code")}
+        if outcome == OUTCOME_TIMED_OUT and entry.get("deadline"):
+            # The caller's deadline stopped the read, not the input's own limit.
+            detail["deadline"] = True
+            if entry.get("not_started"):
+                detail["not_started"] = True
         if own:
             detail["elapsed_seconds"] = entry["elapsed_seconds"]
             if entry.get("stderr_tail"):

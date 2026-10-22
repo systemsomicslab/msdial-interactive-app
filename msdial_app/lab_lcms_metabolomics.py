@@ -36,6 +36,7 @@ from .lab_lipidomics import (
     representative_candidate,
 )
 from .lipidome_merge import MergeRefused, compare_sample_order, describe_export, net_double_tostring, strip_polarity
+from .sample_grouping import is_blank, is_quality_control
 from .workflow import file_identity
 
 # ---------------------------------------------------------------------------------------------
@@ -475,6 +476,10 @@ PAIRED_FIELDS = ("file_type", "class_id", "analytical_order", "batch_order", "fa
 # A sample word of letters and a number (A1, QC12): a replicate of the group its letters name.
 _REPLICATE_WORD = re.compile(r"^([A-Za-z]+)(\d+)$")
 REPLICATE_CLASS_SOURCE = "shared_sample_word_letters"
+# Letters of a sample word that name an injection of another kind (Blank1, QC2, Std3, IS1), beside what
+# sample_grouping already reads as a blank or a QC.
+NON_REPLICATE_LETTERS = frozenset({"blank", "blk", "qc", "pqc", "pool", "pooled", "std", "standard", "sst", "is",
+                                   "istd", "mb", "solvent"})
 
 
 def name_tokens(name: str) -> list[str]:
@@ -482,22 +487,44 @@ def name_tokens(name: str) -> list[str]:
     return [token for token in _TOKEN_SPLIT.split(Path(str(name)).stem) if token]
 
 
-def replicate_classes(shared: dict[str, list[str]]) -> dict[str, str] | None:
-    """Each pair's class read from its one letter+number sample word (A1 -> A), or None.
+def _names_no_group(letters: str) -> bool:
+    """Letters that name a blank, a QC or a standard injection (Blank1, QC2, Std3), never a group of replicates."""
+    text = letters.casefold()
+    return text in NON_REPLICATE_LETTERS or is_blank(letters) or is_quality_control(letters)
 
-    Only when every pair has exactly one such word, and the letters make at least two groups of which one
-    holds more than one pair: S1 to S16 are sample numbers, not replicates of a group.
+
+def replicate_classes(shared: dict[str, list[str]], file_types: dict[str, str] | None = None) -> dict[str, str] | None:
+    """Each Sample pair's class read from its one letter+number sample word (A1 -> A), or None.
+
+    Only Sample pairs count (file_types by stem, Sample when not given), and letters that name a blank, a QC
+    or a standard (Blank1, QC2, Std3) are never a group: such a pair keeps its own class. Every other Sample
+    pair must have exactly one such word, and the letters must make at least two groups of at least two pairs
+    each: S1 to S16 are sample numbers, not replicates of a group, even beside QC1 to QC3.
     """
     classes: dict[str, str] = {}
     for stem, words in shared.items():
+        if str((file_types or {}).get(stem) or "Sample") != "Sample":
+            continue
         found = [match.group(1) for match in (_REPLICATE_WORD.match(word) for word in words) if match]
         if len(found) != 1:
             return None
+        if _names_no_group(found[0]):
+            continue
         classes[stem] = found[0]
-    groups = list(classes.values())
-    if len(set(groups)) < 2 or len(set(groups)) == len(groups):
+    counts = [list(classes.values()).count(name) for name in set(classes.values())]
+    if len(counts) < 2 or min(counts) < 2:
         return None
     return classes
+
+
+def name_classes_fail(rows: list[dict[str, Any]], differences: list[tuple[str, str, Any, Any]]) -> bool:
+    """Whether the classes the file names proposed fail this pairing: some Sample pair's two files were given
+    different classes, or no Sample file was given one (every class "Sample"). Only then do letters decide."""
+    samples = {row["stem"] for row in rows if str(row.get("file_type") or "Sample") == "Sample"}
+    if any(key == "class_id" and stem in samples for stem, key, _value, _other in differences):
+        return True
+    return bool(samples) and all(str(row.get("class_id") or "").strip().casefold() in {"", "sample"}
+                                 for row in rows if row["stem"] in samples)
 
 
 def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[str, Any]]) -> dict[str, Any]:
@@ -508,8 +535,10 @@ def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[st
     (A1) name the sample. A file pairs with the one file of the other polarity that shares the most of them,
     and only when that is mutual. The sample takes the shared words' name. The person confirms the pairing.
 
-    Where the shared words are letter+number replicates (A1 to D4), the class is read from the letters (A),
-    not from a word only one polarity varies in (d2 and d2r2, a re-injection), and the warnings say so.
+    Where the file names give the samples no class both polarities agree on (one polarity's word d2 against the
+    other's re-injection d2r2, or no class at all) and the shared words are letter+number replicates (A1 to D4),
+    each Sample pair's class is read from the letters (A) (replicate_classes), and the warnings say so. A class
+    both polarities' names agree on (Ctrl and Treat beside Mouse1 to Mouse12) is never replaced.
     """
     def varying(rows: list[dict[str, Any]]) -> list[list[str]]:
         words = [name_tokens(row["file_name"]) for row in rows]
@@ -552,9 +581,14 @@ def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[st
             if other.get(key) != source.get(key):
                 differences.append((row["stem"], key, source.get(key), other.get(key)))
         rows.append(row)
-    classes = replicate_classes({row["stem"]: row["paired_by"] for row in rows}) if rows else None
+    # A class both polarities' file names agree on stands: letters decide only where the names fail.
+    classes = (
+        replicate_classes({row["stem"]: row["paired_by"] for row in rows},
+                          {row["stem"]: str(row.get("file_type") or "Sample") for row in rows})
+        if rows and name_classes_fail(rows, differences) else None
+    )
     for stem, key, value, other_value in differences:
-        if key == "class_id" and classes:
+        if key == "class_id" and classes and stem in classes:
             continue
         warnings.append(
             f"{stem}: {key} is {value!r} in positive and {other_value!r} in negative; the positive value is proposed."
@@ -562,18 +596,23 @@ def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[st
     class_proposal: dict[str, Any] = {}
     if classes:
         for row in rows:
-            row["class_id"] = classes[row["stem"]]
+            row["class_id"] = classes.get(row["stem"], row["class_id"])
         counts = {name: list(classes.values()).count(name) for name in sorted(set(classes.values()))}
+        kept = sorted(row["stem"] for row in rows if row["stem"] not in classes)
         class_proposal = {
             "derived_from": REPLICATE_CLASS_SOURCE,
-            "reason": "each pair's shared sample word is letters and a number (A1); its letters name the class (A)",
+            "reason": "each Sample pair's shared sample word is letters and a number (A1); its letters name the class "
+                      "(A), since the file names gave the samples no class both polarities agree on",
             "groups": counts,
+            "kept_own_class": kept,
             "confirmation_required": True,
         }
         warnings.append(
-            "The class of each pair was read from its shared sample word's letters ("
+            "The class of each Sample pair was read from its shared sample word's letters ("
             + ", ".join(f"{name}: {count}" for name, count in counts.items())
-            + "), not from the words that vary within one polarity; confirm it, or correct class_id in sample_table."
+            + "), because the file names gave the samples no class both polarities agree on"
+            + (f"; {', '.join(kept)} keep their own" if kept else "")
+            + ". Confirm it, or correct class_id in sample_table."
         )
     for number, other in enumerate(negative):
         if number not in claimed:

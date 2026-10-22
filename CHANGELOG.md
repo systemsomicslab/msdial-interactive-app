@@ -39,23 +39,51 @@ Built on 0.5.45 (#78), which is not merged yet; merge this after it.
     `merge-report.json`.
   - **Polarities acquired under other names pair** by the words that set each polarity's files apart (A1 in
     `20230125_SWATH_A1_C_CE20_d1` and `20230208_SWATH_A1_A_CE20_d2`), for the person to confirm, or by the
-    pairs they give (`sample_pairs`); the merge pairs the columns by the confirmed table. Where every pair's
-    shared word is letters and a number and the letters group replicates (A1 to D4), the class is proposed
-    from the letters (A) rather than from a word only one polarity varies in (d2 against a re-injection's
-    d2r2), and `pairing_warnings` says so.
-  - **Each file's acquisition type is read from its raw header**, never assumed. The check reads the headers
-    with the configured raw-metadata extractor, the repository preflight's bounded reader and parsing (every
-    file up to 40 per polarity, past that the first and the last), cached in the process by path, size and
-    modification time. DIA with isolation windows is SWATH, without isolation AIF. Where no extractor is
-    configured, or a header cannot be read or gives no type the Console reads, `acquisition_type_pos` /
-    `acquisition_type_neg` (DDA, SWATH or AIF) is asked. The analytical order follows the headers'
-    acquisition start times when every file records one. `raw_headers` shows the evidence per polarity, the
-    proposal is bound into `check_digest`, and the contract records it. A pair whose two files' headers give
-    different types is refused by the contract until the person states that row's type. Before this, every
-    file was proposed as DDA, and SWATH or AIF data run as DDA get almost no MS/MS.
-  - **`alignment_rt_tolerance`** (minutes, optional) is recorded in the contract and fixed for both
-    polarities' runs ("Retention time tolerance for alignment"); unset, the template's 0.1 min stands.
-    Capillary electrophoresis migration times usually need more, and the person decides it.
+    pairs they give (`sample_pairs`); the merge pairs the columns by the confirmed table. Only where the file
+    names give the samples no class both polarities agree on (d2 against a re-injection's d2r2, or no class at
+    all) is each Sample pair's class proposed from the letters of its shared letter+number word (A1 to D4 ->
+    A), and `pairing_warnings` says so. Letters naming a blank, QC or standard (Blank1, QC2, Std3) make no
+    group, and the letters must make at least two groups of at least two pairs each, so sample numbers, subject
+    numbers and plate wells beside a factor both polarities name keep the names' classes.
+  - **Each file's acquisition type is read from its raw header**, never assumed or inferred. Before this,
+    every file was proposed as DDA, and SWATH or AIF data run as DDA get almost no MS/MS.
+    - The check reads the headers with the configured raw-metadata extractor, through the repository
+      preflight's bounded reader and parsing, with limits of its own so that a check (and the one
+      `write_contract` runs) returns within the MCP tool's 600 s: every file up to 200 per polarity, past
+      that the first and the last; at most 30 s per file (more for a large Waters or ion-mobility folder) and
+      240 s for the whole check. `run_extractor` takes those limits and the deadline as optional arguments; a
+      campaign passes none.
+    - Reads are kept in the backend process by the extractor build (the sha256 of its exe and of every file
+      beside it) and the file's path, size and modification time, failed reads included; a read the deadline
+      cut short is not kept, so the next check reads it. A check waits for a read another check has in
+      flight rather than start a second extractor on the same files.
+    - Only a DDA or SWATH verdict of a file's own header settles its type (DIA with isolation windows is
+      SWATH). `acquisition_type_pos` / `acquisition_type_neg` (DDA, SWATH or AIF) is asked for every other
+      file: no extractor, a header not read (or not in time, or a Bruker BAF folder, which is never given to
+      the reader), no type the Console reads, an AIF verdict, or a file between the first and the last,
+      whose type those two only suggest. The prompt and the warnings count header-read and answered files
+      apart. Files whose own headers give more than one type ask `acquisition_type_mixed_pos` /
+      `acquisition_type_mixed_neg` (`as_read`).
+    - AIF meets the repository campaign's collision-energy guards: AIF of more than one MS2 collision energy
+      with a Console lacking MsdialWorkbench#825, and AIF recording no energy with a Console carrying it
+      (which stops on such a file), are blockers, for a type stated in `sample_table` too.
+    - A header recording the other polarity than its folder's, or both (polarity switching), is a blocker.
+    - A pair whose two files are of different types is proposed with no type (`acquisition_type_conflicts`
+      gives both, `acquisition_type_required` the rows), and the contract refuses every included row without
+      one until the person states it in `sample_table`; a table sent back as proposed, or a blank type, never
+      passes for the person's word.
+    - The analytical order follows the headers' acquisition start times when every file of every polarity
+      records one. `raw_headers` shows the evidence per polarity (methods, isolation targets, MS2 collision
+      energies, the extractor build), the proposal is bound into `check_digest`, and the contract records it
+      with the answers taken. What a reader leaves in or beside the raw data is detected afterwards, not
+      prevented: it is said on every later check, bound into `check_digest` and recorded in the contract.
+    - Sample metadata is compared with the table proposed, whose order and classes may be the headers' and
+      the letters', rather than with the names.
+    - A contract without `raw_headers`, written before this, is refused by every plan: check and write again.
+  - **`alignment_rt_tolerance`** (minutes, optional) is recorded in the contract and reaches both polarities'
+    runs ("Retention time tolerance for alignment"); unset, the template's 0.1 min stands. Either value is
+    fixed for both polarities: a plan's or a workset's other value is a blocker, as `workflow_overrides` for it
+    is. Capillary electrophoresis migration times usually need more, and the person decides it.
   - MS-DIAL's four-column internal-standard text (Name, Pos-m/z, RT, Adduct) is read as it is.
   - The contract and its record (`lab-lcms-metabolomics-contract.json`, `lab-lcms-metabolomics-record.jsonl`)
     name the libraries and the raw data by location, and are local only.
@@ -82,9 +110,15 @@ Built on 0.5.45 (#78), which is not merged yet; merge this after it.
 ### Changed
 - `lab_lipidomics.resolve_standards` takes which spots tier A reads as a library annotation
   (`library_annotated`, the LBM library's by default), and `lab_lipidomics_agent.run_outputs` takes the
-  contract's key and whether the library copy is needed. Laboratory lipidomics is unchanged.
+  contract's key and whether the library copy is needed. Laboratory lipidomics is otherwise unchanged, but for
+  the next item.
 - The guided plan takes `alignment_rt_tolerance` as an answer (a positive number of minutes; anything else is
-  a blocker). Unset, the parameter template's value stands, as before.
+  a blocker). Unset, the parameter template's value stands, as before. A laboratory lipidomics contract does
+  not fix it, so a lipidomics plan given it applies it as a deviation the plan records, as it applies
+  `workflow_overrides.alignment_rt_tolerance`; before, the answer was not applied.
+- `raw_metadata_preflight.run_extractor` and `input_timeout_seconds` take optional per-input limits, and
+  `run_extractor` a deadline, after which no extractor process starts or runs on (an input it leaves unread
+  is `timed_out` with `deadline` true). A campaign passes neither, and its reads are as before.
 
 ## [0.5.45] - Unreleased
 

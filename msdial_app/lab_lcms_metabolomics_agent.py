@@ -7,8 +7,8 @@ standard each polarity is normalized by. The sequence and what stops it follow t
 agent, whose helpers this module uses:
 
 1. check_inputs reads everything and changes nothing; check_digest binds what it read. Each raw file's
-   header gives its acquisition type and the analytical order (read_raw_headers); a type the headers do
-   not settle is asked.
+   header gives its acquisition type and the analytical order (read_raw_headers); a type no header of the
+   file's own settles, an AIF verdict included, is asked.
 2. write_contract writes <analysis root>/inputs/: the contract, the internal-standard libraries in the
    layout MS-DIAL reads, and the record. Each polarity's guided plan is built from the contract.
 3. resolve_standards finds every internal standard in each run (lab_lipidomics.resolve_standards, with the
@@ -32,6 +32,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -77,12 +78,14 @@ from .lab_lipidomics import (
     chosen_candidate,
     file_sha256,
     folder_layout_problems,
+    join_sample_metadata,
     normalize_salt,
     parse_number,
     raw_folder_overlaps,
     read_alignment_export,
     read_candidate_table,
     read_internal_standard_text,
+    read_sample_metadata,
     representative_candidate,
     resolution_digest,
     resolve_standards,
@@ -108,7 +111,6 @@ from .lab_lipidomics_agent import (
     _resolution_rows,
     _same_answer as _lipidomics_same_answer,
     _same_path,
-    _sample_metadata_report,
     _sample_row,
     _sample_table_proposal as _paired_sample_table_proposal,
     _size,
@@ -122,6 +124,7 @@ from .raw_metadata_preflight import READ_OUTCOMES, file_key, input_format, input
 from .workflow import (
     ANNOTATION_CANDIDATES_CAPABILITY,
     AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY,
+    MULTI_ENERGY_AIF_CAPABILITY,
     _console_supports_folder_type_csv as console_supports_folder_type_csv,
     analysis_input_path,
     console_capabilities,
@@ -139,6 +142,8 @@ INPUTS_FOLDER = "inputs"
 QUANT_FOLDER = "quant"
 FOLDERS = {POSITIVE: "pos", NEGATIVE: "neg"}
 LABELS = {POSITIVE: "Pos", NEGATIVE: "Neg"}
+# A sample-table row's file of each polarity.
+FILE_KEYS = {POSITIVE: "positive_file", NEGATIVE: "negative_file"}
 MERGE_FOLDER = "metabolome"
 # Folder names inside quant that a merge may not take: normalize's, and the QA figures'.
 RESERVED_QUANT_FOLDERS = frozenset({"pos", "neg", "qa_figures"})
@@ -188,8 +193,21 @@ CURATION_SLACK_SECONDS = 30 * 60
 # The acquisition types the Console reads (AnalysisFilesParser), in the case it writes them.
 ACQUISITION_TYPES = ("DDA", "SWATH", "AIF")
 # Up to this many raw files of a polarity have every header read: a Thermo or mzML header takes about half a
-# second, a Waters one a few (raw_metadata_preflight). Past it only the first and the last file are read.
-HEADER_READ_ALL_LIMIT = 40
+# second, a Waters one a few (raw_metadata_preflight). Past it only the first and the last file are read, and
+# the type of the files between them is asked, with the type those two give as a suggestion only.
+HEADER_READ_ALL_LIMIT = 200
+# A check answers within the MCP request (600 s), write_contract's included. So its header reads stop starting
+# extractor processes after HEADER_READ_BUDGET_SECONDS, and each input is given HEADER_TIMEOUT_POLICY's limit
+# rather than the campaign's, which runs to hours for a large Waters folder. A file not read in time is asked
+# about, and the next check reads it: the reads done are kept.
+HEADER_READ_BUDGET_SECONDS = 240.0
+HEADER_TIMEOUT_POLICY: dict[str, dict[str, float]] = {
+    "metadata_reader": {"base_seconds": 30.0, "seconds_per_gb": 0.0},
+    # About three times the worst measured Waters rate (42 s/GB) and five times the ion-mobility one.
+    "full_spectrum": {"base_seconds": 30.0, "seconds_per_gb": 120.0},
+    "ion_mobility": {"base_seconds": 30.0, "seconds_per_gb": 30.0},
+}
+HEADER_INPUT_TIMEOUT_CEILING_SECONDS = 180.0
 # The extractor's Bruker BAF reader writes analysis.sqlite into a .d folder that has none, and the check
 # writes nothing beside the raw data, so such a folder's header is not read.
 WRITING_HEADER_FORMATS = frozenset({"bruker_baf"})
@@ -199,9 +217,34 @@ HEADER_FIELDS = (
     "acquisition_mode", "method_source", "polarity", "separation", "isolation_window_count",
     "header_console_acquisition_type", "header_console_acquisition_basis", "instrument_model",
     "acquisition_start_time", "acquisition_start_time_evidence", "has_ms2",
+    "ms2_collision_energies", "ms2_collision_energies_unresolved",
 )
-# Header reads in this process, by the extractor and the file as they were (path, size, modification time).
+# The answer to acquisition_type_mixed_pos / _neg: the person keeps each file's own header type.
+MIXED_AS_READ = "as_read"
+# How a file's acquisition type was proposed. Only RAW_HEADER settles it; every other file is asked about
+# (acquisition_type_pos / acquisition_type_neg), and the answer is ANSWERED.
+RAW_HEADER = "raw_header"
+ANSWERED = "answer"
+OPEN_BASES = {
+    "first_and_last_files": "inferred from the first and the last file, not read",
+    "unread": "not read",
+    "unresolved": "read, without a type the Console reads",
+    "raw_header_aif": "read as AIF",
+}
+# A header polarity that is no single ion mode: MS-DIAL runs one per analysis.
+SWITCHING_POLARITIES = frozenset({"PolaritySwitching", "MixedFunctions"})
+# Header reads in this process, by the extractor build and the file as it was (path, size, modification time):
+# {"entry": the summary, or None for a read that failed, "failure": its outcome}. A failed read is kept like a
+# good one, so a check repeated does not wait for it again; a read the check's time limit cut short is not.
 _HEADER_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+# What a header read left in a folder input, or beside a file input, by that folder: kept for the process, so
+# every later check, write_contract's included, says so again.
+_HEADER_CREATED: dict[str, list[str]] = {}
+# The inputs a check is reading now: a second check waits for that read rather than start another extractor on
+# the same files.
+_HEADER_IN_FLIGHT: dict[str, threading.Event] = {}
+# The extractor build by the state of its folder (each file's path, size and modification time).
+_EXTRACTOR_IDENTITIES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _HEADER_CACHE_LOCK = threading.Lock()
 
 
@@ -269,10 +312,15 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         blockers.extend(folder_layout_problems(folders[POSITIVE], folders[NEGATIVE]))
 
     # Each file's acquisition type and the order of acquisition, from its raw header where it can be read.
-    # A type the headers do not settle is asked, never assumed: SWATH or AIF data run as DDA get almost no MS/MS.
+    # A type no header of the file's own settles is asked, never assumed: SWATH or AIF data run as DDA get
+    # almost no MS/MS. A suggestion (the header's AIF, the two end files' type) is said, never filled in.
     headers = read_raw_headers(inventory, [polarity for polarity in polarities if polarity in inventory])
     warnings.extend(headers.pop("warnings"))
+    blockers.extend(headers.pop("blockers"))
     proposed = headers.pop("_proposed")
+    suggested = headers.pop("_suggested")
+    header_entries = headers.pop("_entries")
+    header_names = headers.pop("_names")
     header_orders = headers.pop("_orders")
     acquisition_answers: dict[str, str] = {}
     # Asked after the other questions, beside the sample table they belong to.
@@ -280,6 +328,8 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
     for polarity in [polarity for polarity in polarities if polarity in inventory]:
         key = f"acquisition_type_{FOLDERS[polarity]}"
         report = headers["polarities"][polarity]
+        items = proposed[polarity]
+        names = header_names[polarity]
         text = str(args.get(key) or "").strip()
         answer = next((value for value in ACQUISITION_TYPES if value.casefold() == text.casefold()), "")
         if text and not answer:
@@ -287,13 +337,22 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
                 f"{key} '{text}' is none of DDA, SWATH or AIF, the words the Console reads; DIA data with isolation "
                 "windows are SWATH, and without isolation AIF."
             )
-        if answer:
-            acquisition_answers[key] = answer
-        open_files = [name for name, (value, _basis) in proposed[polarity].items() if not value]
-        settled = {value for value, basis in proposed[polarity].values() if value and basis == "raw_header"}
+        open_files = [name for name, (value, _basis) in items.items() if value is None]
+        open_bases = _count(items[name][1] for name in open_files)
+        open_text = ", ".join(f"{count} {OPEN_BASES.get(basis, basis)}" for basis, count in open_bases.items())
+        settled = _count(value for value, basis in items.values() if basis == RAW_HEADER)
+        hints = _count(suggested[polarity][name] for name in open_files if name in suggested[polarity])
         if open_files and answer:
+            acquisition_answers[key] = answer
             for name in open_files:
-                proposed[polarity][name] = (answer, "answer")
+                items[name] = (answer, ANSWERED)
+            if set(settled) - {answer}:
+                warnings.append(
+                    f"{key} is {answer} for the {len(open_files)} {polarity.lower()} file(s) no header of their own "
+                    f"settled ({open_text}); the {sum(settled.values())} file(s) read from their own headers keep their "
+                    "headers' type (" + ", ".join(f"{name} {count}" for name, count in settled.items()) + "). Correct a "
+                    "row in sample_table if a header is wrong."
+                )
         elif open_files:
             acquisition_questions.append((
                 key,
@@ -301,17 +360,43 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
                 "or AIF (DIA without isolation)? MS-DIAL deconvolutes SWATH and AIF spectra and takes DDA spectra as "
                 "they are; data run as the wrong type get almost no MS/MS. "
                 + (report["unresolved_why"] + " " if report["unresolved_why"] else "")
-                + f"The answer is taken for the {len(open_files)} file(s) the headers did not settle.",
+                + f"The answer is taken for the {len(open_files)} file(s) no header of their own settled ({open_text})."
+                + (" The headers suggest " + ", ".join(f"{name} for {count}" for name, count in hints.items())
+                   + " of them, a suggestion only." if hints else "")
+                + (f" The {sum(settled.values())} file(s) read from their own headers keep their type ("
+                   + ", ".join(f"{name} {count}" for name, count in settled.items()) + ")." if settled else ""),
                 list(ACQUISITION_TYPES),
             ))
-        if answer and settled - {answer}:
+        elif answer:
             warnings.append(
-                f"{key} is {answer}, but the {polarity.lower()} headers give {', '.join(sorted(settled))}; each file the "
-                "headers settled keeps its header's type. Correct a row in sample_table if a header is wrong."
+                f"{key} is {answer}, but every {polarity.lower()} file's own header settled its type, so the answer "
+                "is not used."
             )
-        final = [value for value, _basis in proposed[polarity].values()]
+        # Files whose own headers give different types: a misread header and a batch acquired so look alike.
+        if len(settled) > 1:
+            mixed_key = f"acquisition_type_mixed_{FOLDERS[polarity]}"
+            mixed = str(args.get(mixed_key) or "").strip().casefold()
+            if mixed and mixed != MIXED_AS_READ:
+                blockers.append(f"{mixed_key} '{args.get(mixed_key)}' is not {MIXED_AS_READ}.")
+            elif mixed:
+                acquisition_answers[mixed_key] = MIXED_AS_READ
+            else:
+                listed = "; ".join(
+                    f"{value} {count}: " + _names_text([names[name] for name, (kind, basis) in items.items()
+                                                        if basis == RAW_HEADER and kind == value])
+                    for value, count in sorted(settled.items(), key=lambda item: (item[1], item[0]))
+                )
+                acquisition_questions.append((
+                    mixed_key,
+                    f"The {polarity.lower()} files' own headers give more than one acquisition type ({listed}); "
+                    "raw_headers.per_file gives each file's method and isolation targets. Were they acquired so? "
+                    f"Answer {MIXED_AS_READ} to keep each file's header type. A row whose header is wrong is corrected "
+                    "in sample_table (its acquisition_type), on the person's word.",
+                    [MIXED_AS_READ],
+                ))
+        final = [value for value, _basis in items.values()]
         report["acquisition_types"] = _count(value or "unresolved" for value in final)
-        report["proposed_by"] = _count(basis for _value, basis in proposed[polarity].values())
+        report["proposed_by"] = _count(basis for _value, basis in items.values())
         if len({value for value in final if value}) > 1:
             warnings.append(
                 f"The {polarity.lower()} files are of more than one acquisition type ("
@@ -319,11 +404,11 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
                 + "); each row is proposed with its own, and raw_headers.per_file gives each file's method and "
                 "isolation targets. Confirm them."
             )
-        if report["coverage"] == "first_and_last" and report["proposed_by"].get("first_and_last_files"):
+        if report["coverage"] == "first_and_last":
             warnings.append(
-                f"Only the first and the last of the {report['files']} {polarity.lower()} raw files were read (more than "
-                f"{HEADER_READ_ALL_LIMIT}); the other files are proposed with the type both of those give. Confirm it, "
-                "or correct the rows in sample_table."
+                f"Only the first and the last of the {report['files']} {polarity.lower()} raw files were read (more "
+                f"than {HEADER_READ_ALL_LIMIT}); the {open_bases.get('first_and_last_files', 0)} files between them "
+                f"are asked about ({key}), and the type those two give is never filled in for them."
             )
     readable_orders = [polarity for polarity in polarities if polarity in inventory]
     order_used = bool(readable_orders) and all(header_orders.get(polarity) for polarity in readable_orders)
@@ -560,8 +645,13 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
     for item in acquisition_questions:
         ask(*item)
     header_types = {polarity: {name: value for name, (value, _basis) in items.items()} for polarity, items in proposed.items()}
+    # What the Console does with the files to run as AIF: the repository campaign's collision-energy guards.
+    aif = aif_problems(header_types, header_entries, header_names, console.get("capabilities"))
+    blockers.extend(aif["blockers"])
+    warnings.extend(aif["warnings"])
     proposal = _sample_table_proposal(inventory, polarities, args.get("sample_pairs"), {
         "types": header_types,
+        "bases": {polarity: {name: basis for name, (_value, basis) in items.items()} for polarity, items in proposed.items()},
         "orders": {polarity: header_orders[polarity] for polarity in header_orders} if order_used else {},
         "order": headers["order"],
     })
@@ -570,7 +660,9 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
     metadata_text = str(args.get("sample_metadata_path") or "").strip()
     metadata_report: dict[str, Any] = {}
     if metadata_text and inventory:
-        metadata_report = _sample_metadata_report(Path(metadata_text).expanduser(), inventory)
+        # Compared with the table proposed, whose order and classes may be the headers' and the letters'.
+        metadata_report = _sample_metadata_against_proposal(Path(metadata_text).expanduser(), inventory,
+                                                            proposal.get("rows", []))
         blockers.extend(metadata_report.pop("blockers"))
         warnings.extend(metadata_report.pop("warnings"))
     result["paired_sample_table"] = proposal
@@ -612,12 +704,14 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         "method_files": {key: {"name": item["name"], "sha256": item["sha256"]} for key, item in lab_method_files().items()},
     }
     identity = _input_identity(args, inventory, identities, annotation, library_reports, metadata_report, normalizing)
-    # What the headers proposed for every file, so a re-read that proposes otherwise is a changed input.
+    # What the headers proposed for every file, and what a read left beside the raw data, so a re-read that
+    # proposes otherwise is a changed input.
     identity["raw_headers"] = _digest({
         polarity: sorted([name, value, basis, (header_orders.get(polarity) or {}).get(name) if order_used else None]
                          for name, (value, basis) in items.items())
         for polarity, items in sorted(proposed.items())
-    })
+    } | {"reader_created_files": {polarity: report["reader_created_files"]
+                                  for polarity, report in sorted(headers["polarities"].items())}})
     result.update({
         "questions": questions,
         "blockers": list(dict.fromkeys(blockers)),
@@ -632,6 +726,7 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         "metadata": metadata_report, "annotation": annotation, "identities": identities,
         "normalizing": normalizing, "polarities": polarities, "merge_choices": merge_choices,
         "alignment_rt_tolerance": alignment_rt_tolerance, "acquisition_answers": acquisition_answers,
+        "header_entries": header_entries, "header_names": header_names,
     }
     return result
 
@@ -710,6 +805,106 @@ def row_included(row: dict[str, Any]) -> bool:
     return str(value).strip().casefold() in {"true", "1", "yes"}
 
 
+def console_acquisition_type(value: Any) -> str | None:
+    """The Console's word for an acquisition type given in any case (DDA, SWATH, AIF), or None."""
+    text = str(value or "").strip().casefold()
+    return next((word for word in ACQUISITION_TYPES if word.casefold() == text), None)
+
+
+def aif_problems(
+    types: dict[str, dict[str, Any]], entries: dict[str, dict[str, dict[str, Any]]], names: dict[str, dict[str, str]],
+    capabilities: Iterable[str] | None,
+) -> dict[str, list[str]]:
+    """What the Console does with the files to run as AIF, from the MS2 collision energies their headers record.
+
+    The repository campaign's guards (raw_metadata_preflight, AIF as SWATH): AIF of more than one MS2 collision
+    energy needs a Console with MsdialWorkbench#825 to settle each spot's representative energy, and that Console
+    stops on an AIF file whose MS2 scans carry none. types: {polarity: {file name casefolded: type}}; entries:
+    the header summaries by the same keys; capabilities None while the Console is not named, when nothing is
+    said yet. Whether AIF of one energy runs as SWATH, as the campaign runs it, is the person's answer.
+    """
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if capabilities is None:
+        return {"blockers": blockers, "warnings": warnings}
+    ready = MULTI_ENERGY_AIF_CAPABILITY in set(capabilities)
+    for polarity, items in types.items():
+        multi: list[str] = []
+        unrecorded: list[str] = []
+        unread: list[str] = []
+        for key, value in items.items():
+            if console_acquisition_type(value) != "AIF":
+                continue
+            name = (names.get(polarity) or {}).get(key, key)
+            entry = (entries.get(polarity) or {}).get(key)
+            energies = (entry or {}).get("ms2_collision_energies")
+            if entry is None:
+                unread.append(name)
+            elif not isinstance(energies, list) or not energies:
+                unrecorded.append(name)
+            elif len(set(energies)) > 1:
+                multi.append(f"{name} ({_energies_text(entry)})")
+        side = polarity.lower()
+        if multi and not ready:
+            blockers.append(
+                f"The {side} files {_names_text(multi)} are to run as AIF, and their headers record more than one MS2 "
+                "collision energy. The Console lacks MsdialWorkbench#825's multi-energy AIF processing, so nothing "
+                "settles a spot's representative energy, and the repository campaign holds such data. Name a Console "
+                "with #825, or another type on the person's word."
+            )
+        if unrecorded and ready:
+            blockers.append(
+                f"The {side} files {_names_text(unrecorded)} are to run as AIF, and their headers record no MS2 "
+                "collision energy. The Console carries MsdialWorkbench#825, which stops on an AIF file whose MS2 scans "
+                "carry none."
+            )
+        elif unrecorded:
+            warnings.append(
+                f"The {side} files {_names_text(unrecorded)} are to run as AIF, and their headers record no MS2 collision "
+                "energy, so that they share one cannot be shown; the repository campaign holds such AIF data."
+            )
+        if unread:
+            warnings.append(
+                f"The {side} files {_names_text(unread)} are to run as AIF, and their headers were not read, so their MS2 "
+                "collision energies are not known: AIF of more than one energy needs a Console with MsdialWorkbench#825, "
+                "which stops on an AIF file that records none."
+            )
+    return {"blockers": blockers, "warnings": warnings}
+
+
+def _sample_metadata_against_proposal(path: Path, inventory: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The person's sample metadata, compared with the table proposed (lab_lipidomics_agent._sample_metadata_report
+    compares it with the names): the headers may set the order, and the letters of shared words the classes."""
+    if not path.is_file():
+        return {"path": str(path), "blockers": [f"sample_metadata_path {path} is not a file."], "warnings": []}
+    try:
+        metadata = read_sample_metadata(path)
+    except (LabInputError, OSError, UnicodeDecodeError) as error:
+        return {"path": str(path), "blockers": [f"{path.name} cannot be read: {error}"], "warnings": []}
+    warnings: list[str] = list(metadata["warnings"])
+    joined = {}
+    for polarity in inventory:
+        report = join_sample_metadata(metadata, polarity_sample_table(rows, polarity))
+        joined[polarity] = {
+            "matched": sum(1 for entry in report["files"] if entry["metadata"]),
+            "unmatched": report["unmatched"],
+            "disagreements": report["disagreements"],
+        }
+        for disagreement in report["disagreements"]:
+            warnings.append(
+                f"{path.name} gives {disagreement['field']} {disagreement['metadata']!r} for "
+                f"{disagreement['file_name']}; the proposed table gives {disagreement['proposed']!r}."
+            )
+    rows_read = metadata["rows"]
+    return {
+        "path": metadata["path"], "sha256": file_sha256(path), "rows": len(rows_read), "joined": joined,
+        "excluded": [row["file_name"] for row in rows_read if not row["included"]],
+        "factors": sorted({row["factor"] for row in rows_read if row.get("factor")}),
+        "acquisition_types": sorted({row["acquisition_type"] for row in rows_read if row.get("acquisition_type")}),
+        "blockers": list(metadata["blockers"]), "warnings": warnings,
+    }
+
+
 def other_contract_problems(root: Path) -> list[str]:
     """A laboratory lipidomics analysis in this root: the two agents write the same file names there."""
     other = root / INPUTS_FOLDER / LIPIDOMICS_CONTRACT_NAME
@@ -774,21 +969,99 @@ def _configured_extractor() -> dict[str, Any]:
     return {"path": str(selected.get("path") or ""), "source": str(selected.get("source") or "")}
 
 
-def _read_headers(extractor: Path, paths: list[Path]) -> dict[str, Any]:
+def _extractor_identity(path: str | Path) -> dict[str, Any]:
+    """The extractor build headers are read with: its exe and every file beside it (the vendor readers), hashed.
+
+    inspect_raw_metadata_extractor's hashes and provenance, worked out once per state of the extractor's
+    folder in this process: a reader assembly replaced beside an unchanged exe is another build.
+    """
+    from .raw_metadata_extractor import inspect_raw_metadata_extractor
+
+    binary = Path(str(path))
+    try:
+        state: tuple[Any, ...] | None = tuple(sorted(
+            (item.relative_to(binary.parent).as_posix(), stat.st_size, stat.st_mtime_ns)
+            for item in binary.parent.rglob("*") if item.is_file() for stat in (item.stat(),)
+        ))
+    except (OSError, ValueError):
+        state = None
+    key = (file_key(binary), state)
+    with _HEADER_CACHE_LOCK:
+        cached = _EXTRACTOR_IDENTITIES.get(key) if state is not None else None
+    if cached is not None:
+        return dict(cached)
+    try:
+        inspection = inspect_raw_metadata_extractor(binary)
+    except Exception:  # noqa: BLE001 - an extractor that cannot be hashed is recorded without hashes
+        inspection = {}
+    identity = {name: inspection.get(name) for name in (
+        "binary_sha256", "inventory_sha256", "file_count", "product_version", "msrawdataworkbench_commit",
+        "msdialworkbench_commit", "pin_state", "provenance_status",
+    )}
+    if state is not None:
+        with _HEADER_CACHE_LOCK:
+            _EXTRACTOR_IDENTITIES[key] = dict(identity)
+    return identity
+
+
+def _extractor_key(path: Path, identity: dict[str, Any]) -> tuple[Any, ...]:
+    """What a cached header read is keyed by: the extractor's build, or its exe as it was when it has no hash."""
+    if identity.get("inventory_sha256"):
+        return ("inventory", identity["inventory_sha256"])
+    own = input_signature(path) or {}
+    return ("exe", file_key(path), own.get("size_bytes"), own.get("mtime_ns"))
+
+
+def _folder_names(folder: Path) -> set[str] | None:
+    try:
+        return {item.name for item in folder.iterdir()}
+    except OSError:
+        return None
+
+
+def _record_created(key: str, paths: Iterable[str]) -> None:
+    found = [str(item) for item in paths if str(item).strip()]
+    if not found:
+        return
+    with _HEADER_CACHE_LOCK:
+        _HEADER_CREATED[key] = list(dict.fromkeys([*_HEADER_CREATED.get(key, []), *found]))
+
+
+def created_beside_raw(paths: Iterable[Path]) -> list[str]:
+    """The files header reads of this process left in these inputs (folders) or beside them (files)."""
+    keys = list(dict.fromkeys(file_key(path) if path.is_dir() else file_key(path.parent) for path in paths))
+    with _HEADER_CACHE_LOCK:
+        return list(dict.fromkeys(item for key in keys for item in _HEADER_CREATED.get(key, [])))
+
+
+def _read_headers(extractor: Path, extractor_key: tuple[Any, ...], paths: list[Path], deadline: float) -> dict[str, Any]:
     """Each path's header, summarized as the repository campaign summarizes it (by file_key).
 
-    A file read before by the same extractor, at the same size and modification time, is taken from this
-    process's cache; the rest are read in one run_extractor call (bounded chunks, a time limit per input),
-    into a temporary folder that is removed afterwards. A file that could not be read is in failures.
+    A file read before by the same extractor build, at the same size and modification time, is taken from
+    this process's cache, a read that failed included. A file another check is reading now is waited for, up
+    to the deadline. The rest are read in one run_extractor call: bounded chunks, HEADER_TIMEOUT_POLICY per
+    input, the deadline over all of them, into a temporary folder that is removed afterwards. The folder of
+    each file input is listed before and after, so a reader that writes beside a file is seen as one that
+    writes into a folder is (created_beside_raw).
+
+    Returns entries and failures (the outcome of each read that failed) by file_key, and deferred: the files
+    the deadline left unread, which the next check reads.
     """
     from .repository_reanalysis import _summarize_raw_metadata
 
-    own = input_signature(extractor) or {}
-    extractor_key = (file_key(extractor), own.get("size_bytes"), own.get("mtime_ns"))
     entries: dict[str, dict[str, Any]] = {}
     failures: dict[str, str] = {}
+    deferred: list[str] = []
     cache_keys: dict[str, tuple[Any, ...]] = {}
-    unread: list[Path] = []
+    claimed: list[Path] = []
+    waiting: list[tuple[Path, threading.Event]] = []
+
+    def take(key: str, cached: dict[str, Any]) -> None:
+        if cached.get("entry") is not None:
+            entries[key] = dict(cached["entry"])
+        else:
+            failures[key] = str(cached.get("failure") or "failed")
+
     for path in paths:
         key = file_key(path)
         signature = input_signature(path)
@@ -798,31 +1071,73 @@ def _read_headers(extractor: Path, paths: list[Path]) -> dict[str, Any]:
         cache_keys[key] = (*extractor_key, key, json.dumps(signature, sort_keys=True))
         with _HEADER_CACHE_LOCK:
             cached = _HEADER_CACHE.get(cache_keys[key])
+            if cached is None:
+                running = _HEADER_IN_FLIGHT.get(key)
+                if running is None:
+                    _HEADER_IN_FLIGHT[key] = threading.Event()
+                    claimed.append(path)
+                else:
+                    waiting.append((path, running))
         if cached is not None:
-            entries[key] = dict(cached)
-        else:
-            unread.append(path)
-    created: list[str] = []
-    if unread:
-        work = Path(tempfile.mkdtemp(prefix="msdial-lab-headers-"))
-        try:
-            execution = run_extractor(extractor, unread, work)
-        finally:
-            shutil.rmtree(work, ignore_errors=True)
-        summary = _summarize_raw_metadata(list(execution.get("records") or []))
-        by_file = {file_key(item["file"]): item for item in summary.get("per_file", []) if item.get("file")}
-        for path in unread:
-            key = file_key(path)
-            outcome = (execution.get("outcomes") or {}).get(key) or {}
-            created.extend(str(item) for item in outcome.get("reader_created_files") or [])
-            entry = by_file.get(key)
-            if outcome.get("outcome") in READ_OUTCOMES and entry is not None:
-                entries[key] = {name: entry.get(name) for name in HEADER_FIELDS}
+            take(key, cached)
+    try:
+        if claimed and time.monotonic() < deadline:
+            beside = {file_key(path.parent): path.parent for path in claimed if not path.is_dir()}
+            before = {key: _folder_names(folder) for key, folder in beside.items()}
+            with _HEADER_CACHE_LOCK:
+                earlier = {file_key(path): list(_HEADER_CREATED.get(file_key(path), [])) for path in claimed if path.is_dir()}
+            work = Path(tempfile.mkdtemp(prefix="msdial-lab-headers-"))
+            try:
+                execution = run_extractor(
+                    extractor, claimed, work, created_before=earlier, timeout_policy=HEADER_TIMEOUT_POLICY,
+                    timeout_ceiling_seconds=HEADER_INPUT_TIMEOUT_CEILING_SECONDS, deadline=deadline,
+                )
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+            for key, folder in beside.items():
+                after = _folder_names(folder)
+                if before[key] is not None and after is not None:
+                    _record_created(key, (str(folder / name) for name in sorted(after - before[key])))
+            summary = _summarize_raw_metadata(list(execution.get("records") or []))
+            by_file = {file_key(item["file"]): item for item in summary.get("per_file", []) if item.get("file")}
+            for path in claimed:
+                key = file_key(path)
+                outcome = (execution.get("outcomes") or {}).get(key) or {}
+                _record_created(key, outcome.get("reader_created_files") or [])
+                entry = by_file.get(key)
+                if outcome.get("outcome") in READ_OUTCOMES and entry is not None:
+                    value: dict[str, Any] = {"entry": {name: entry.get(name) for name in HEADER_FIELDS}, "failure": ""}
+                elif outcome.get("deadline"):
+                    deferred.append(key)
+                    continue
+                else:
+                    value = {"entry": None, "failure": str(outcome.get("outcome") or "no_record")}
+                keys = {cache_keys[key]}
+                if isinstance(outcome.get("input_signature"), dict):
+                    # As the read left it: a reader that wrote into a folder changed its signature.
+                    keys.add((*extractor_key, key, json.dumps(outcome["input_signature"], sort_keys=True)))
                 with _HEADER_CACHE_LOCK:
-                    _HEADER_CACHE[cache_keys[key]] = dict(entries[key])
-            else:
-                failures[key] = str(outcome.get("outcome") or "no_record")
-    return {"entries": entries, "failures": failures, "created": created}
+                    for cache_key in keys:
+                        _HEADER_CACHE[cache_key] = dict(value)
+                take(key, value)
+        else:
+            deferred.extend(file_key(path) for path in claimed)
+    finally:
+        with _HEADER_CACHE_LOCK:
+            for path in claimed:
+                event = _HEADER_IN_FLIGHT.pop(file_key(path), None)
+                if event is not None:
+                    event.set()
+    for path, running in waiting:
+        key = file_key(path)
+        running.wait(max(0.0, deadline - time.monotonic()))
+        with _HEADER_CACHE_LOCK:
+            cached = _HEADER_CACHE.get(cache_keys[key])
+        if cached is not None:
+            take(key, cached)
+        else:
+            deferred.append(key)
+    return {"entries": entries, "failures": failures, "deferred": deferred}
 
 
 def _parse_start_time(value: Any) -> dt.datetime | None:
@@ -870,76 +1185,127 @@ def _count(values: Iterable[Any]) -> dict[str, int]:
     return dict(sorted(counted.items()))
 
 
+def _names_text(names: list[str], limit: int = 5) -> str:
+    return ", ".join(names[:limit]) + (f" and {len(names) - limit} more" if len(names) > limit else "")
+
+
+def _energies_text(entry: dict[str, Any]) -> str:
+    energies = entry.get("ms2_collision_energies")
+    if isinstance(energies, list) and energies:
+        return "MS2 collision energies " + ", ".join(f"{float(value):g}" for value in energies) + " eV"
+    return "no MS2 collision energy recorded"
+
+
 def read_raw_headers(inventory: dict[str, Any], polarities: list[str]) -> dict[str, Any]:
     """What each polarity's raw headers say, read with the configured extractor as the campaign reads them.
 
-    For each file read: the method, the MS2 isolation targets, the acquisition type the header gives the
-    Console (raw_metadata_preflight.header_console_acquisition_type: DIA with two or more isolation targets
-    is SWATH, with none AIF, with one unresolved), the instrument and the acquisition start time. Up to
-    HEADER_READ_ALL_LIMIT files of a polarity are all read; past it the first and the last, and the others
-    are proposed with their type when the two agree. Nothing is written beside the raw data.
+    For each file read: the method, the MS2 isolation targets and collision energies, the acquisition type
+    the header gives the Console (raw_metadata_preflight.header_console_acquisition_type: DIA with two or
+    more isolation targets is SWATH, with none AIF, with one unresolved), the polarity, the instrument and
+    the acquisition start time. Up to HEADER_READ_ALL_LIMIT files of a polarity are all read; past it the
+    first and the last, and the files between them are asked about, with the type those two give as a
+    suggestion only. Every read of one check stops at HEADER_READ_BUDGET_SECONDS; a file left unread is
+    asked about too. Only a DDA or SWATH verdict of a file's own header settles its type: an AIF verdict is
+    asked (a SWATH file whose sampled headers show no isolation reads as AIF, and the campaign runs
+    single-energy AIF as SWATH). A Bruker BAF folder is never read, because its reader writes into it; what
+    any other reader leaves in or beside the raw data is detected afterwards, not prevented, and said.
 
-    Returns the public report ("polarities", "extractor", "warnings") and, under "_proposed" and "_orders",
-    each file's (acquisition type or None, basis) by file name and the header ranks where the times order
-    the files.
+    Returns the public report ("polarities", "extractor", "warnings", "blockers"), and under "_proposed"
+    each file's (acquisition type or None, basis) by casefolded file name, under "_suggested" the type an
+    unsettled file's header or the two end files give, under "_entries" each file's header summary, under
+    "_names" the file names, and under "_orders" the header ranks where the times order the files.
     """
     extractor = _configured_extractor()
+    identity = _extractor_identity(extractor["path"]) if extractor.get("path") else {}
     report: dict[str, Any] = {
-        "extractor": {key: extractor[key] for key in ("path", "source")} if extractor.get("path") else None,
-        "polarities": {}, "warnings": [], "_proposed": {}, "_orders": {},
+        "extractor": (
+            {"path": extractor["path"], "source": extractor["source"], **identity} if extractor.get("path") else None
+        ),
+        "polarities": {}, "warnings": [], "blockers": [],
+        "_proposed": {}, "_suggested": {}, "_entries": {}, "_names": {}, "_orders": {},
     }
+    plans: dict[str, dict[str, Any]] = {}
     for polarity in polarities:
         files = list((inventory.get(polarity) or {}).get("files") or [])
-        names = [str(item.get("file_name", "")) for item in files]
         paths = [Path(str(item.get("file_path", ""))) for item in files]
         partial = len(files) > HEADER_READ_ALL_LIMIT
         chosen = sorted({0, len(files) - 1}) if partial else list(range(len(files)))
         skipped = [index for index in chosen if input_format(paths[index]) in WRITING_HEADER_FORMATS]
-        to_read = [index for index in chosen if index not in skipped]
-        read: dict[str, Any] = {"entries": {}, "failures": {}, "created": []}
-        if extractor.get("path") and to_read:
-            read = _read_headers(Path(extractor["path"]), [paths[index] for index in to_read])
+        plans[polarity] = {
+            "names": [str(item.get("file_name", "")) for item in files], "paths": paths, "partial": partial,
+            "chosen": chosen, "skipped": skipped, "to_read": [index for index in chosen if index not in skipped],
+        }
+    # One read for every polarity, under one time limit: what it leaves unread is asked, and read next time.
+    read: dict[str, Any] = {"entries": {}, "failures": {}, "deferred": []}
+    wanted = [plan["paths"][index] for plan in plans.values() for index in plan["to_read"]]
+    if extractor.get("path") and wanted:
+        path = Path(extractor["path"])
+        read = _read_headers(path, _extractor_key(path, identity), wanted,
+                             time.monotonic() + HEADER_READ_BUDGET_SECONDS)
+    deferred = set(read["deferred"])
+    for polarity, plan in plans.items():
+        names, paths, chosen, skipped = plan["names"], plan["paths"], plan["chosen"], plan["skipped"]
+        partial = plan["partial"]
         entries = {index: read["entries"].get(file_key(paths[index])) for index in chosen}
         proposed: dict[str, tuple[str | None, str]] = {}
+        suggested: dict[str, str] = {}
         per_file: list[dict[str, Any]] = []
         unreadable: list[str] = []
+        late: list[str] = []
         unresolved: list[str] = []
+        aif: list[str] = []
         for index in chosen:
             entry = entries[index]
+            name = names[index]
             if not extractor.get("path"):
                 continue
             if index in skipped:
-                per_file.append({"file": names[index], "read": "not_read_reader_writes_into_folder"})
+                per_file.append({"file": name, "read": "not_read_reader_writes_into_folder"})
                 continue
             if entry is None:
-                unreadable.append(names[index])
-                per_file.append({"file": names[index],
-                                 "read": read["failures"].get(file_key(paths[index]), "failed")})
+                if file_key(paths[index]) in deferred:
+                    late.append(name)
+                    per_file.append({"file": name, "read": "not_read_time_limit"})
+                else:
+                    unreadable.append(name)
+                    per_file.append({"file": name, "read": read["failures"].get(file_key(paths[index]), "failed")})
                 continue
             console = entry.get("header_console_acquisition_type")
-            proposed[names[index].casefold()] = (console, "raw_header" if console else "unresolved")
-            if not console:
+            if console == "AIF":
+                proposed[name.casefold()] = (None, "raw_header_aif")
+                suggested[name.casefold()] = console
+                aif.append(f"{name} ({_energies_text(entry)})")
+            elif console:
+                proposed[name.casefold()] = (console, RAW_HEADER)
+            else:
+                proposed[name.casefold()] = (None, "unresolved")
                 unresolved.append(
-                    f"{names[index]} ({entry.get('acquisition_mode') or 'no method'}"
+                    f"{name} ({entry.get('acquisition_mode') or 'no method'}"
                     + (f", {entry.get('isolation_window_count')} isolation target"
                        if entry.get("isolation_window_count") == 1 else "") + ")"
                 )
             per_file.append({
-                "file": names[index], "read": "ok", "method": entry.get("acquisition_mode") or None,
+                "file": name, "read": "ok", "method": entry.get("acquisition_mode") or None,
                 "method_source": entry.get("method_source") or None,
                 "isolation_targets": entry.get("isolation_window_count"),
                 "acquisition_type": console, "basis": entry.get("header_console_acquisition_basis") or None,
+                "ms2_collision_energies": entry.get("ms2_collision_energies"),
+                "ms2_collision_energies_unresolved": entry.get("ms2_collision_energies_unresolved") or None,
                 "polarity": entry.get("polarity") or None,
                 "acquisition_start_time": entry.get("acquisition_start_time") or None,
             })
-        read_types = {proposed[names[index].casefold()][0] for index in chosen if names[index].casefold() in proposed}
-        # The files between the first and the last take their type only when both were read and agree.
-        ends_agree = partial and len(proposed) == len(chosen) and len(read_types) == 1 and None not in read_types
+        end_types = {(proposed.get(names[index].casefold()) or (None, ""))[0] for index in chosen}
+        # The files between the first and the last are never read: the type both ends give is a suggestion.
+        ends_agree = partial and len(end_types) == 1 and None not in end_types
+        between = 0
         for index, name in enumerate(names):
             if name.casefold() in proposed:
                 continue
-            if ends_agree and index not in chosen:
-                proposed[name.casefold()] = (next(iter(read_types)), "first_and_last_files")
+            if partial and index not in chosen and extractor.get("path"):
+                between += 1
+                proposed[name.casefold()] = (None, "first_and_last_files")
+                if ends_agree:
+                    suggested[name.casefold()] = next(iter(end_types))
             else:
                 proposed[name.casefold()] = (None, "unread")
         if extractor.get("error"):
@@ -952,54 +1318,85 @@ def read_raw_headers(inventory: dict[str, Any], polarities: list[str]) -> dict[s
             if skipped:
                 parts.append(f"{', '.join(names[index] for index in skipped)} were not read: the extractor's reader "
                              "writes analysis.sqlite into such a .d folder, and the check writes nothing beside the raw data")
+            if late:
+                parts.append(f"the headers of {_names_text(late)} were not read within the check's "
+                             f"{HEADER_READ_BUDGET_SECONDS:g} s; checking again reads them (the headers read are kept)")
             if unreadable:
-                parts.append(f"the headers of {', '.join(unreadable[:5])}"
-                             + (f" and {len(unreadable) - 5} more" if len(unreadable) > 5 else "") + " could not be read")
+                parts.append(f"the headers of {_names_text(unreadable)} could not be read")
             if unresolved:
-                parts.append("the headers of " + ", ".join(unresolved[:5])
-                             + (f" and {len(unresolved) - 5} more" if len(unresolved) > 5 else "")
-                             + " give no type the Console reads (DIA with one isolation target is one wide window or one "
-                             "targeted precursor)")
-            if partial and len(read_types - {None}) > 1:
-                parts.append(f"only the first and the last of {len(files)} files were read, and they disagree")
+                parts.append(f"the headers of {_names_text(unresolved)} give no type the Console reads (DIA with one "
+                             "isolation target is one wide window or one targeted precursor)")
+            if aif:
+                parts.append(
+                    f"the headers of {_names_text(aif)} give AIF (DIA without isolation), which is asked: a SWATH file "
+                    "whose sampled headers show no isolation reads as AIF too, the repository campaign runs AIF of one "
+                    "MS2 collision energy as SWATH (the Console deconvolutes it alike), and AIF of more than one energy "
+                    "needs a Console with MsdialWorkbench#825, which stops on an AIF file that records none"
+                )
+            if partial and ends_agree:
+                parts.append(f"only the first and the last of {len(names)} files were read (more "
+                             f"than {HEADER_READ_ALL_LIMIT}), and both give {next(iter(end_types))}: the {between} files "
+                             "between them were not read, so that type is only a suggestion for them")
+            elif partial:
+                parts.append(f"only the first and the last of {len(names)} files were read (more "
+                             f"than {HEADER_READ_ALL_LIMIT}), and they settle no type for the {between} files between them")
             why = "; ".join(parts)
             why = (why[:1].upper() + why[1:] + ".") if why else ""
         if not extractor.get("path"):
             order: dict[str, Any] = {"derived_from": None, "reason": "no raw-metadata extractor is configured"}
         elif partial:
-            order = {"derived_from": None, "reason": f"only the first and the last of {len(files)} files were read"}
-        elif not files:
+            order = {"derived_from": None, "reason": f"only the first and the last of {len(names)} files were read"}
+        elif not names:
             order = {"derived_from": None, "reason": "the folder holds no raw file"}
         else:
             # None: the header was not read; "": it was, and records no time.
             times = [(entries[index].get("acquisition_start_time") or "") if entries.get(index) else None
-                     for index in range(len(files))]
+                     for index in range(len(names))]
             order = _header_order(names, times)
         report["_orders"][polarity] = order.pop("ranks", None)
         report["_proposed"][polarity] = proposed
+        report["_suggested"][polarity] = suggested
+        report["_entries"][polarity] = {names[index].casefold(): entry for index, entry in entries.items() if entry}
+        report["_names"][polarity] = {name.casefold(): name for name in names}
         read_entries = [entry for entry in entries.values() if entry]
-        wrong_polarity = [names[index] for index in chosen if entries.get(index)
-                          and entries[index].get("polarity") in POLARITIES and entries[index]["polarity"] != polarity]
-        if wrong_polarity:
-            report["warnings"].append(
-                f"The headers of {', '.join(wrong_polarity[:5])} in the {polarity.lower()} folder record the other "
-                "polarity; check that the folders are the right way round."
+        # A header is stronger evidence of a file's polarity than its name, which already refuses the folder.
+        other = [names[index] for index in chosen if entries.get(index)
+                 and entries[index].get("polarity") in POLARITIES and entries[index]["polarity"] != polarity]
+        if other:
+            report["blockers"].append(
+                f"The headers of {_names_text(other)} in the {polarity.lower()} folder record the other polarity. "
+                "Move such files to the folder of their polarity, or out of the batch, before the contract; if the "
+                "folders are the wrong way round, give them the other way."
             )
-        if read["created"]:
+        switching = [f"{names[index]} ({entries[index]['polarity']})" for index in chosen if entries.get(index)
+                     and entries[index].get("polarity") in SWITCHING_POLARITIES]
+        if switching:
+            report["blockers"].append(
+                f"The headers of {_names_text(switching)} in the {polarity.lower()} folder record both polarities. "
+                "MS-DIAL runs one ion mode per analysis, and a polarity-switching file is outside what this agent "
+                "runs: take such files out of the batch (the repository campaign excludes them too)."
+            )
+        created = created_beside_raw(paths)
+        if created:
             report["warnings"].append(
-                "Reading the headers left files beside the raw data: " + ", ".join(read["created"][:5]) + "."
+                "Reading the headers left files in or beside the raw data (a reader wrote them; the check does not): "
+                + _names_text(created) + "."
             )
         report["polarities"][polarity] = {
-            "files": len(files),
+            "files": len(names),
             "coverage": ("none" if not extractor.get("path") else "first_and_last" if partial else "all"),
             "files_read": len(read_entries),
             "methods": _count(entry.get("acquisition_mode") or "none" for entry in read_entries),
             "isolation_targets": sorted({entry["isolation_window_count"] for entry in read_entries
                                          if isinstance(entry.get("isolation_window_count"), int)}),
+            "ms2_collision_energies": sorted({float(value) for entry in read_entries
+                                              for value in entry.get("ms2_collision_energies") or []}),
             "instruments": sorted({str(entry["instrument_model"]) for entry in read_entries
                                    if entry.get("instrument_model")}),
             "separations": sorted({str(entry["separation"]) for entry in read_entries if entry.get("separation")}),
             "unreadable": unreadable,
+            "not_read_in_time": late,
+            "reader_created_files": created,
             "unresolved_why": why,
             "per_file": per_file,
             "order": order,
@@ -1080,13 +1477,16 @@ def _sample_table_proposal(
 def _apply_headers(proposal: dict[str, Any], headers: dict[str, Any]) -> dict[str, Any]:
     """Each row's acquisition type from its files' headers (or the person's answer), and its order from them.
 
-    headers: {"types": {polarity: {file name casefolded: type or None}}, "orders": {polarity: {name: rank}},
-    "order": the order proposal to show}. A paired row carries one acquisition type and one order for both
-    polarities: the positive file's, else the negative's. A pair whose files' types differ is named in
-    acquisition_type_conflicts; the contract refuses it until the person gives that row's type. Orders that
-    differ are a warning.
+    headers: {"types": {polarity: {file name casefolded: type or None}}, "bases": the same keys' bases,
+    "orders": {polarity: {name: rank}}, "order": the order proposal to show}. A row carries a type only when
+    every file of it has one and they agree: one file still asked about leaves the row without one, and so
+    does a pair whose two files' types differ, which acquisition_type_conflicts names with both. The
+    contract refuses a row without a type until the person states it in sample_table, so a table sent back
+    as proposed can never carry a type nobody gave. A paired row carries one order for both polarities: the
+    positive file's, else the negative's; orders that differ are a warning.
     """
     types = headers.get("types") or {}
+    bases = headers.get("bases") or {}
     orders = headers.get("orders") or {}
     if not types and not orders:
         return proposal
@@ -1097,11 +1497,20 @@ def _apply_headers(proposal: dict[str, Any], headers: dict[str, Any]) -> dict[st
         files = {POSITIVE: row.get("positive_file"), NEGATIVE: row.get("negative_file")}
         if types:
             found = {polarity: types.get(polarity, {}).get(str(name).casefold()) for polarity, name in files.items() if name}
-            resolved = [value for value in (found.get(POSITIVE), found.get(NEGATIVE)) if value]
-            row["acquisition_type"] = resolved[0] if resolved else None
-            if len(set(resolved)) > 1:
+            how = {polarity: bases.get(polarity, {}).get(str(name).casefold(), "unread")
+                   for polarity, name in files.items() if name}
+            known = [value for value in found.values() if value]
+            if len(set(known)) > 1:
                 conflicts[row["stem"]] = {POSITIVE: found[POSITIVE], NEGATIVE: found[NEGATIVE]}
                 differing_types.append(f"{row['stem']} ({found[POSITIVE]} positive, {found[NEGATIVE]} negative)")
+                row["acquisition_type"] = None
+                row["acquisition_type_basis"] = "polarities_disagree"
+            else:
+                row["acquisition_type"] = known[0] if known and len(known) == len(found) else None
+                row["acquisition_type_basis"] = (
+                    next(iter(how.values())) if len(set(how.values())) == 1
+                    else "; ".join(f"{polarity.lower()} {basis}" for polarity, basis in how.items())
+                )
         if orders:
             ranks = {polarity: orders.get(polarity, {}).get(str(name).casefold()) for polarity, name in files.items() if name}
             row["analytical_order"] = ranks.get(POSITIVE) or ranks.get(NEGATIVE)
@@ -1113,14 +1522,18 @@ def _apply_headers(proposal: dict[str, Any], headers: dict[str, Any]) -> dict[st
     elif headers.get("order"):
         proposal["order_proposal"] = {**proposal.get("order_proposal", {}), "raw_headers": headers["order"]}
     proposal["acquisition_type_conflicts"] = conflicts
+    # The rows the person still states a type for in sample_table before the contract (the files' questions
+    # answered): ready_for_contract does not cover them, since a check never reads the sample table.
+    proposal["acquisition_type_required"] = [
+        row["stem"] for row in proposal.get("rows", []) if row_included(row) and not row.get("acquisition_type")
+    ] if types else []
     if differing_types:
         proposal["pairing_warnings"] = [*proposal.get("pairing_warnings", []), (
-            "The headers give the positive and negative files of " + ", ".join(differing_types[:5])
-            + (f" and {len(differing_types) - 5} more" if len(differing_types) > 5 else "")
-            + " different acquisition types, and a paired row carries one type for both: the positive file's is "
-            "proposed. Give each such row's acquisition_type in sample_table; the contract refuses the row until "
-            "then. If the polarities really were acquired as different types, check each polarity on its own (one "
-            "contract each)."
+            "The positive and negative files of " + _names_text(differing_types)
+            + " are of different acquisition types (acquisition_type_conflicts), and a paired row carries one type "
+            "for both, so such a row is proposed with none. Ask the person which it is and give the row's "
+            "acquisition_type in sample_table; the contract refuses the row until then. If the polarities really "
+            "were acquired as different types, check each polarity on its own (one contract each)."
         )]
     if differing_orders:
         proposal["pairing_warnings"] = [*proposal.get("pairing_warnings", []), (
@@ -1130,18 +1543,6 @@ def _apply_headers(proposal: dict[str, Any], headers: dict[str, Any]) -> dict[st
             "the positive one was acquired. Correct analytical_order in sample_table to change it for both."
         )]
     return proposal
-
-
-def _stems_given(table: Any, key: str) -> set[str]:
-    """The samples (casefolded stems) whose sample_table correction gives key, matched as the table matches them."""
-    if not isinstance(table, list):
-        return set()
-    return {
-        str(item.get("stem") or strip_polarity(str(item.get("positive_file") or item.get("negative_file")
-                                                    or item.get("file_name") or ""))).strip().casefold()
-        for item in table
-        if isinstance(item, dict) and item.get(key) not in (None, "")
-    }
 
 
 def _given_pairs(pairs: Any, rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
@@ -1218,7 +1619,9 @@ def _input_identity(
                 args.get("internal_standard_rt_tolerance", DEFAULT_INTERNAL_STANDARD_RT_TOLERANCE)
             )),
             "alignment_rt_tolerance": repr(_positive_number(args.get("alignment_rt_tolerance"))),
-            **{key: str(args.get(key, "")).strip().casefold() for key in ("acquisition_type_pos", "acquisition_type_neg")},
+            **{key: str(args.get(key, "")).strip().casefold() for key in (
+                "acquisition_type_pos", "acquisition_type_neg", "acquisition_type_mixed_pos", "acquisition_type_mixed_neg",
+            )},
             **{key: _path_key(args.get(key)) for key in ("analysis_root", "console_path", "pos_path", "neg_path")},
         },
     }
@@ -1237,10 +1640,11 @@ def lab_method_files() -> dict[str, dict[str, Any]]:
     }
 
 
-def template_alignment_rt_tolerance() -> float | None:
-    """The alignment RT tolerance the laboratory template states, which a run keeps unless the contract gives one."""
+def template_alignment_rt_tolerance(template: str | Path = LAB_PARAMETER_TEMPLATE) -> float | None:
+    """The alignment RT tolerance a parameter template states (the laboratory one unless named), which every
+    run of a contract keeps unless the contract gives one."""
     try:
-        lines = LAB_PARAMETER_TEMPLATE.read_text(encoding="utf-8-sig").splitlines()
+        lines = Path(template).read_text(encoding="utf-8-sig").splitlines()
     except OSError:
         return None
     for line in lines:
@@ -1279,21 +1683,39 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
     table = _confirmed_sample_table(check["paired_sample_table"], request.get("sample_table"), parsed["inventory"])
     if table["problems"]:
         return {**refusal, "error": "The sample table cannot be used: " + " ".join(table["problems"])}
-    # A pair whose headers disagree carries the type the person states, never one picked for them.
-    stated = _stems_given(request.get("sample_table"), "acquisition_type")
-    unstated = [stem for stem in check["paired_sample_table"].get("acquisition_type_conflicts", {})
-                if stem.casefold() not in stated]
-    if unstated:
-        conflicts = check["paired_sample_table"]["acquisition_type_conflicts"]
-        return {**refusal, "error": (
-            "The headers give the two files of " + ", ".join(
-                f"{stem} ({conflicts[stem][POSITIVE]} positive, {conflicts[stem][NEGATIVE]} negative)" for stem in unstated
-            ) + " different acquisition types, and a paired row carries one: give each such row's acquisition_type "
-            "in sample_table, as the person states it."
-        )}
+    # Every included row runs as the type it carries, and a row proposed without one (a pair whose files'
+    # types differ) carries only the type the person states: an empty one would reach the Console as DDA.
+    conflicts = check["paired_sample_table"].get("acquisition_type_conflicts", {})
+    untyped = [row["stem"] for row in table["rows"] if row_included(row) and not str(row.get("acquisition_type") or "").strip()]
+    if untyped:
+        stated = [stem for stem in untyped if stem in conflicts]
+        return {**refusal, "error": " ".join(part for part in (
+            ("The two files of " + ", ".join(
+                f"{stem} ({conflicts[stem][POSITIVE]} positive, {conflicts[stem][NEGATIVE]} negative)" for stem in stated
+            ) + " are of different acquisition types, and a paired row carries one: give each such row's "
+             "acquisition_type in sample_table, as the person states it.") if stated else "",
+            ("The sample table gives no acquisition type for " + ", ".join(stem for stem in untyped if stem not in conflicts)
+             + "; give it in sample_table, as the person states it.") if len(stated) < len(untyped) else "",
+        ) if part)}
     unsafe = analysis_csv_problems(table["rows"], parsed["inventory"])
     if unsafe:
         return {**refusal, "error": "The sample table cannot reach the Console as it stands: " + " ".join(unsafe)}
+    proposed_types = {row["stem"].casefold(): row.get("acquisition_type") for row in check["paired_sample_table"].get("rows", [])}
+    for row in table["rows"]:
+        if row.get("acquisition_type") not in (None, ""):
+            row["acquisition_type"] = console_acquisition_type(row["acquisition_type"])
+        if row.get("acquisition_type") != proposed_types.get(row["stem"].casefold()):
+            row["acquisition_type_basis"] = "sample_table"
+    # A type stated in sample_table meets the same collision-energy guards as one the check proposed.
+    stated_types = {
+        polarity: {item["file_name"].casefold(): item.get("acquisition_type")
+                   for item in polarity_sample_table(table["rows"], polarity) if row_included(item)}
+        for polarity in parsed["polarities"]
+    }
+    aif = aif_problems(stated_types, parsed["header_entries"], parsed["header_names"],
+                       parsed["console"].get("capabilities"))
+    if aif["blockers"]:
+        return {**refusal, "error": "The sample table cannot run as it stands: " + " ".join(aif["blockers"])}
 
     polarities: list[str] = parsed["polarities"]
     root: Path = parsed["analysis_root"]
@@ -1544,9 +1966,24 @@ def contract_plan_answers(contract_path: str, supplied: dict[str, Any], input_pa
         )
         return outcome
     outcome["polarity"] = polarity
+    if "raw_headers" not in contract:
+        # Written before the acquisition types were read from the raw headers: its rows took DDA by default.
+        outcome["blockers"].append(
+            f"The contract {contract['_path']} was written before each file's acquisition type was read from its raw "
+            "header, so its rows may carry DDA that nobody stated (SWATH or AIF data run as DDA get almost no MS/MS). "
+            "Check the inputs again and write the contract again."
+        )
+        return outcome
     raw = contract["raw_folders"][polarity]
     if not input_path or not _same_path(input_path, raw):
         outcome["blockers"].append(f"input_path must be the contract's {polarity.lower()} raw-data folder, {raw}.")
+    untyped = [row.get("stem") for row in contract["sample_table"]["rows"]
+               if row.get(FILE_KEYS[polarity]) and row_included(row) and console_acquisition_type(row.get("acquisition_type")) is None]
+    if untyped:
+        outcome["blockers"].append(
+            f"The contract gives no acquisition type the Console reads for {_names_text([str(stem) for stem in untyped])}; "
+            "write a new contract."
+        )
     root = Path(contract["analysis_root"])
     outcome["blockers"].extend(raw_folder_overlaps(root, _analysis_subfolders(root), contract["raw_folders"]))
     # A lipidomics contract written into this root afterwards would share every file name with this one.
@@ -1590,9 +2027,13 @@ def contract_plan_answers(contract_path: str, supplied: dict[str, Any], input_pa
         "template_path": method_files["parameter_template"].get("path", ""),
         "queries_path": method_files["lbm_queries"].get("path", ""),
     }
-    if contract.get("alignment_rt_tolerance") is not None:
-        # The person's value, for both polarities; without one the template's stands.
-        fixed["alignment_rt_tolerance"] = contract["alignment_rt_tolerance"]
+    # The person's value, for both polarities; without one the template's, fixed alike, so that neither a plan's
+    # answer nor a workset's changes one polarity (workflow_overrides is refused for the same key).
+    alignment = contract.get("alignment_rt_tolerance")
+    if alignment is None:
+        alignment = template_alignment_rt_tolerance(method_files["parameter_template"].get("path") or LAB_PARAMETER_TEMPLATE)
+    if alignment is not None:
+        fixed["alignment_rt_tolerance"] = alignment
     given = {key: value for key, value in supplied.items() if value is not None and value != ""}
     for key, value in fixed.items():
         if key in given and not _same_answer(key, given[key], value):

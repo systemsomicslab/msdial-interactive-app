@@ -3394,11 +3394,13 @@ def msdial_lcms_metabolomics_check_inputs(
     sample_pairs: list[dict[str, Any]] | None = None,
     acquisition_type_pos: str = "",
     acquisition_type_neg: str = "",
+    acquisition_type_mixed_pos: str = "",
+    acquisition_type_mixed_neg: str = "",
     alignment_rt_tolerance: float | None = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
-    """Check a laboratory LC-MS metabolomics batch's inputs; read-only, nothing is written or run.
+    """Check a laboratory LC-MS metabolomics batch's inputs; read-only: it writes nothing and runs no analysis.
 
     For hydrophilic metabolomics (HILIC, or a polar-retaining reversed phase such as HSS T3), one polarity
     or both: give pos_path, neg_path or both. Call it first with only the raw folders: it lists what is
@@ -3439,22 +3441,34 @@ def msdial_lcms_metabolomics_check_inputs(
     each polarity's files apart (A1 in 20230125_SWATH_A1_C_CE20_d1 and 20230208_SWATH_A1_A_CE20_d2), which
     paired_sample_table shows with how it paired (pairing, paired_by) for the person to confirm. When that
     fails or is wrong, give sample_pairs: [{"sample": ..., "positive_file": ..., "negative_file": ...}].
-    Where the shared words are letter+number replicates (A1 to D4), each pair's class is proposed from the
-    letters (A), and pairing_warnings says so.
+    Where the file names give the samples no class both polarities agree on and the shared words are
+    letter+number replicates (A1 to D4), each Sample pair's class is proposed from the letters (A), and
+    pairing_warnings says so; a class both polarities' names agree on is never replaced, and letters naming a
+    blank, QC or standard (Blank1, QC2, Std3) make no group.
 
-    Each raw file's header is read with the configured raw-metadata extractor (as the repository preflight
-    reads it; every file up to 40 per polarity, past that the first and the last), and raw_headers shows
-    per polarity the methods, isolation targets, instruments, acquisition types and start times. Each row's
-    acquisition type is the header's (DIA with isolation windows is SWATH, without isolation AIF), and the
-    analytical order follows the acquisition start times when every file records one. Where no extractor is
-    configured or a header does not settle it, acquisition_type_pos / acquisition_type_neg (DDA, SWATH or
-    AIF) is asked; it is never assumed. alignment_rt_tolerance (minutes, optional) replaces the template's
-    0.1 min for both polarities: capillary electrophoresis migration times usually need more, and the person
-    decides it.
+    Each raw file's header is read with the configured raw-metadata extractor, as the repository preflight
+    reads it but with limits of the check's own: every file up to 200 per polarity, past that the first and
+    the last; at most 30 s per file (more for a large Waters or ion-mobility folder) and 240 s for the whole
+    check, so it returns within this tool's time limit. A file not read in time is asked about, and checking
+    again reads it (reads, failed ones included, are kept in the backend process). raw_headers shows per
+    polarity the methods, isolation targets, MS2 collision energies, instruments, acquisition types and
+    start times, and the extractor build by its hashes. Only a DDA or SWATH verdict of a file's own header
+    (DIA with isolation windows is SWATH) settles its type. acquisition_type_pos / acquisition_type_neg (DDA,
+    SWATH or AIF) is asked for every other file: no extractor, a header not read or giving no type, an AIF
+    verdict (DIA without isolation; the campaign runs single-energy AIF as SWATH), or a file between the
+    first and the last, whose type those two only suggest. AIF of more than one MS2 collision energy needs a
+    Console with MsdialWorkbench#825, and that Console stops on AIF that records none; either is a blocker.
+    Files whose own headers give different types ask acquisition_type_mixed_pos / _neg (as_read); a header
+    recording the other polarity, or both, is a blocker. The analytical order follows the acquisition start
+    times when every file of every polarity records one. alignment_rt_tolerance (minutes, optional) replaces
+    the template's 0.1 min for both polarities: capillary electrophoresis migration times usually need more,
+    and the person decides it.
 
     The result holds the blockers, the questions, the libraries as they will be searched (annotation), the
     salt with its preferred adducts, the normalizing standards, and the sample table proposed
-    (paired_sample_table), which the person must confirm. check_digest binds what was read; pass it to
+    (paired_sample_table), which the person must confirm. A pair whose two files are of different types is
+    proposed with no type (acquisition_type_conflicts names both, acquisition_type_required the rows): the
+    person states it in write_contract's sample_table. check_digest binds what was read; pass it to
     msdial_lcms_metabolomics_write_contract.
     """
     body: dict[str, Any] = {
@@ -3466,6 +3480,7 @@ def msdial_lcms_metabolomics_check_inputs(
         "raw_location": raw_location, "number_of_threads": number_of_threads,
         "duplicate_rule": duplicate_rule, "inchikey_match": inchikey_match, "sample_pairs": sample_pairs or [],
         "acquisition_type_pos": acquisition_type_pos, "acquisition_type_neg": acquisition_type_neg,
+        "acquisition_type_mixed_pos": acquisition_type_mixed_pos, "acquisition_type_mixed_neg": acquisition_type_mixed_neg,
         "alignment_rt_tolerance": alignment_rt_tolerance,
     }
     return _request_json("POST", "/api/lcms-metabolomics/check", host=host, port=port, body=body, timeout=600)
@@ -3500,6 +3515,8 @@ def msdial_lcms_metabolomics_write_contract(
     sample_pairs: list[dict[str, Any]] | None = None,
     acquisition_type_pos: str = "",
     acquisition_type_neg: str = "",
+    acquisition_type_mixed_pos: str = "",
+    acquisition_type_mixed_neg: str = "",
     alignment_rt_tolerance: float | None = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
@@ -3518,10 +3535,12 @@ def msdial_lcms_metabolomics_write_contract(
     their RT settings and thresholds, the salt, the internal-standard library, the sample table, the
     output and export folder, the Console and the parameter template, and states the method (peak-height
     diagnostic, TimeBasedLinearWeightedMovingAverage, automatic RT correction with 12 anchors and the
-    1.5 min local window, annotation candidates, QA). acquisition_type_pos / acquisition_type_neg and
-    alignment_rt_tolerance are the check's answers, passed again; the contract records the raw headers the
-    acquisition types and the order were proposed from, and an alignment_rt_tolerance it fixes for both
-    polarities.
+    1.5 min local window, annotation candidates, QA). acquisition_type_pos / acquisition_type_neg,
+    acquisition_type_mixed_pos / _neg and alignment_rt_tolerance are the check's answers, passed again. Every
+    included row needs an acquisition type: a row proposed without one (acquisition_type_required) is refused
+    until sample_table gives it as the person states it, and a table sent back as proposed carries none. The
+    contract records the raw headers the acquisition types and the order were proposed from, and fixes the
+    alignment RT tolerance for both polarities: the person's, else the template's.
     """
     body: dict[str, Any] = {
         "pos_path": pos_path, "neg_path": neg_path, "annotation": annotation or {}, "solvent_type": solvent_type,
@@ -3534,6 +3553,7 @@ def msdial_lcms_metabolomics_write_contract(
         "confirmed_by": confirmed_by, "replace_existing": replace_existing is True,
         "duplicate_rule": duplicate_rule, "inchikey_match": inchikey_match, "sample_pairs": sample_pairs or [],
         "acquisition_type_pos": acquisition_type_pos, "acquisition_type_neg": acquisition_type_neg,
+        "acquisition_type_mixed_pos": acquisition_type_mixed_pos, "acquisition_type_mixed_neg": acquisition_type_mixed_neg,
         "alignment_rt_tolerance": alignment_rt_tolerance,
         # The gate is here and again in the backend: only a literal true writes.
         "confirmed": confirmed is True,

@@ -452,6 +452,54 @@ class TimeoutPolicyTests(unittest.TestCase):
         self.assertAlmostEqual(expected, fake.timeouts[0], places=1)
         self.assertEqual("waters_raw", result["outcomes"][file_key(waters)]["format"])
 
+    def test_a_caller_may_give_shorter_limits_and_a_deadline_past_which_nothing_starts(self) -> None:
+        policy = {
+            "metadata_reader": {"base_seconds": 30.0, "seconds_per_gb": 0.0},
+            "full_spectrum": {"base_seconds": 30.0, "seconds_per_gb": 120.0},
+            "ion_mobility": {"base_seconds": 30.0, "seconds_per_gb": 30.0},
+        }
+        gigabyte = 1024**3
+        self.assertEqual(30.0 + 120.0 * 2, input_timeout_seconds("a.raw", "waters_raw", 2 * gigabyte, policy=policy))
+        self.assertEqual(100.0, input_timeout_seconds("a.raw", "waters_raw", 10 * gigabyte, policy=policy,
+                                                      ceiling_seconds=100.0))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inputs = [root / f"{name}.mzML" for name in ("a", "b", "c")]
+            for path in inputs:
+                path.write_bytes(b"x")
+            extractor = root / "RawMetadataConsoleApp.exe"
+            extractor.write_bytes(b"stub")
+            fake = _Extractor({})
+            with patch("msdial_app.raw_metadata_preflight.subprocess.run", side_effect=fake):
+                read = run_extractor(extractor, inputs, root / "work", timeout_policy=policy,
+                                     deadline=time.monotonic() + 3600)
+            # The caller's limit per input, summed for the chunk; the deadline far off caps nothing.
+            self.assertEqual([90.0], fake.timeouts)
+            self.assertEqual({"ok"}, {item["outcome"] for item in read["outcomes"].values()})
+            self.assertFalse(any(item.get("deadline") for item in read["outcomes"].values()))
+            # A deadline nearer than the chunk's limit caps it, and a hang then is the deadline's, not the input's.
+            fake = _Extractor({"b.mzML": "hang"})
+            with patch("msdial_app.raw_metadata_preflight.subprocess.run", side_effect=fake):
+                read = run_extractor(extractor, inputs, root / "work", timeout_policy=policy,
+                                     deadline=time.monotonic() + 20)
+            self.assertLessEqual(fake.timeouts[0], 20.0)
+            self.assertTrue(all(item.get("deadline") for item in read["outcomes"].values()
+                                if item["outcome"] == "timed_out"))
+            # Past the deadline no process starts at all.
+            fake = _Extractor({})
+            with patch("msdial_app.raw_metadata_preflight.subprocess.run", side_effect=fake):
+                read = run_extractor(extractor, inputs, root / "work", deadline=time.monotonic() - 1)
+            self.assertEqual([], fake.commands)
+            self.assertEqual([{"outcome": "timed_out", "deadline": True, "not_started": True}] * 3, [
+                {key: item[key] for key in ("outcome", "deadline", "not_started")} for item in read["outcomes"].values()
+            ])
+            # Without a deadline, a hang is the input's own limit, as a campaign reads it.
+            fake = _Extractor({"b.mzML": "hang"})
+            with patch("msdial_app.raw_metadata_preflight.subprocess.run", side_effect=fake):
+                read = run_extractor(extractor, inputs, root / "work")
+            self.assertEqual("timed_out", read["outcomes"][file_key(inputs[1])]["outcome"])
+            self.assertNotIn("deadline", read["outcomes"][file_key(inputs[1])])
+
     def test_vendor_folders_are_told_apart_by_what_they_hold(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
