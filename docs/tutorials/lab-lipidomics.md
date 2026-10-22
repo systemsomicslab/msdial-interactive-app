@@ -332,6 +332,16 @@ Console: D:\msdial\MSDIAL.console.v5.5.261018-windows-net48\MSDIALCUI.exe
 In Claude Desktop, make the copy yourself first (step 3) and answer instead
 *Raw data: copy, which I made in D:\lipidomics-demo\run\pos and D:\lipidomics-demo\run\neg*.
 
+> [!TIP]
+> **The same inputs in one file.** `examples\lab-lipidomics\quant_input.xlsx` holds the
+> workbook and both standard texts in format 1, the form the agent asks first-time users
+> for ([specification](../lab-lipidomics-quant-input.md)). Copy it into `data2` as well
+> and answer *Quantification input: D:\lipidomics-demo\data2\quant_input.xlsx* in place
+> of the internal-standards and workbook lines. The result is the same. For your own
+> data, ask Claude for a template to fill in: it writes one with
+> `msdial_lipidomics_quant_input_template` and checks what you fill in with
+> `msdial_lipidomics_check_quant_input`, cell by cell.
+
 In the same message Claude tells you what is set without asking, so that you can object
 in a word: the internal standards' own RT tolerance (0.5 min), the peak-height
 diagnostic, `TimeBasedLinearWeightedMovingAverage` smoothing, automatic RT correction

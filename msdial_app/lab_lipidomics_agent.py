@@ -78,6 +78,13 @@ from .lab_lipidomics import (
     write_resolution_tsv,
     write_standards_tsv,
 )
+from .lab_quant_input import FORMAT_ID as QUANT_INPUT_FORMAT
+from .lab_quant_input import as_workbook as quant_input_workbook
+from .lab_quant_input import describe_workbook
+from .lab_quant_input import detect_format as detect_quant_format
+from .lab_quant_input import input_sha256 as quant_input_sha256
+from .lab_quant_input import read_quant_input
+from .lab_quant_input import summary as quant_input_summary
 from .lipidome_merge import (
     DEFAULT_RECONCILIATION_RT_TOLERANCE,
     SAMPLE_FILE_TYPES,
@@ -169,8 +176,8 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
     if filled is not None:
         result["filled_from_workset"] = filled
 
-    def ask(identifier: str, prompt: str, choices: list[str] | None = None) -> None:
-        questions.append({"id": identifier, "prompt": prompt, "choices": choices or [], "required": True})
+    def ask(identifier: str, prompt: str, choices: list[str] | None = None, required: bool = True) -> None:
+        questions.append({"id": identifier, "prompt": prompt, "choices": choices or [], "required": required})
 
     # The folders, read before anything else is asked: the person is shown what is there first.
     folders: dict[str, Path | None] = {}
@@ -214,19 +221,84 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         blockers.extend(lbm.pop("blockers"))
     result["lbm"] = lbm
 
-    # R4: the internal-standard text libraries.
+    # R4-R6: the quantification input. Format 1 (docs/lab-lipidomics-quant-input.md) holds the
+    # standards, their amounts and their peaks in one workbook or folder; the earlier form is
+    # quant_utility_table.xlsx with an amount column and a text library per polarity.
     libraries: dict[str, list[InternalStandard]] = {POSITIVE: [], NEGATIVE: []}
     library_reports: dict[str, Any] = {}
+    workbook: dict[str, Any] = {}
+    quant_text = str(args.get("quant_table_path") or "").strip()
+    quant_format = detect_quant_format(Path(quant_text).expanduser()) if quant_text else ""
+    format_one = quant_format == QUANT_INPUT_FORMAT
+    result["quant_format"] = quant_format or None
+    quant_missing = bool(quant_text) and not Path(quant_text).expanduser().exists()
+    if quant_missing:
+        blockers.append(f"quant_table_path {Path(quant_text).expanduser()} does not exist.")
+    table_label = "the Class standards table" if format_one else "sheet 2"
+    selection_label = "Selection" if format_one else "Sheet 3"
+    if not quant_text:
+        ask(
+            "quant_table_path",
+            "Which quantification input gives the standards, their amounts and peaks, which standard quantifies "
+            "which class, and the selection? Either a format-1 workbook or folder (docs/lab-lipidomics-quant-input.md; "
+            "msdial_lipidomics_quant_input_template writes one), or the laboratory's quant_utility_table.xlsx.",
+        )
+        given = {key for key in ("is_text_pos", "is_text_neg", "is_text") if str(args.get(key) or "").strip()}
+        if not ("is_text" in given or {"is_text_pos", "is_text_neg"} <= given):
+            ask(
+                "is_text_pos/is_text_neg",
+                "Only with quant_utility_table.xlsx: which text library lists the internal standards of each polarity?",
+                required=False,
+            )
+        if not str(args.get("amount_column") or "").strip():
+            ask(
+                "amount_column",
+                "Only with quant_utility_table.xlsx: which sheet-1 column holds the amounts for these samples: F (per "
+                "mg tissue), G (per 10^6 cells) or H (per uL plasma)?",
+                ["F", "G", "H"],
+                required=False,
+            )
+    if format_one:
+        from_workset = set(((filled or {}).get("answers") or {}).keys())
+        for key in ("is_text_pos", "is_text_neg", "is_text", "amount_column"):
+            if not str(args.get(key) or "").strip():
+                continue
+            if key in from_workset:
+                # A workset of the earlier form: the format-1 input named now replaces what it carried.
+                args.pop(key)
+                notes.append(f"{key} from the workset is not used: the format-1 input holds the standards itself.")
+            else:
+                blockers.append(
+                    f"{key} is not given with a format-1 input: {Path(quant_text).name} holds the standards' amounts "
+                    "and peaks itself."
+                )
+        read = read_quant_input(Path(quant_text).expanduser())
+        blockers.extend(read["blockers"])
+        warnings.extend(read["warnings"])
+        notes.extend(read["notes"])
+        libraries = read["libraries"]
+        for polarity in POLARITIES:
+            library_reports[polarity] = {
+                "path": read["path"], "sha256": read["sha256"], "encoding": "", "shared_by_polarities": True,
+                "polarity": polarity, "standards": [record.name for record in libraries[polarity]],
+                "adducts": sorted({record.adduct for record in libraries[polarity]}), "source": "quant_input",
+            }
+        workbook = quant_input_workbook(read) if read.get("preparation") else {"path": read["path"], "sha256": read["sha256"]}
+        result["quant_input"] = quant_input_summary(read)
     texts = {POSITIVE: str(args.get("is_text_pos") or "").strip(), NEGATIVE: str(args.get("is_text_neg") or "").strip()}
     both = str(args.get("is_text") or "").strip()
     if both and not any(texts.values()):
         texts = {POSITIVE: both, NEGATIVE: both}
-    if not texts[POSITIVE] or not texts[NEGATIVE]:
-        ask(
-            "is_text_pos/is_text_neg",
-            "Which text library lists the internal standards of each polarity (Name, MZ, RT, Adduct and "
-            "Ontology, MZ being the adduct's m/z)? One file holding both polarities may be given for both.",
-        )
+    if format_one:
+        pass
+    elif not texts[POSITIVE] or not texts[NEGATIVE]:
+        if quant_text and not quant_missing:
+            # Without a quant input yet, the question above asks for the texts as well.
+            ask(
+                "is_text_pos/is_text_neg",
+                "Which text library lists the internal standards of each polarity (Name, MZ, RT, Adduct and "
+                "Ontology, MZ being the adduct's m/z)? One file holding both polarities may be given for both.",
+            )
     elif Path(texts[POSITIVE]).expanduser().resolve() == Path(texts[NEGATIVE]).expanduser().resolve():
         read = read_internal_standard_text(Path(texts[POSITIVE]).expanduser())
         blockers.extend(read["blockers"])
@@ -247,20 +319,18 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
             blockers.append(f"The {polarity.lower()} internal-standard library lists no standard of that polarity.")
     result["internal_standard_libraries"] = library_reports
 
-    # R5, R6: quant_utility_table.xlsx and the amount column.
-    workbook: dict[str, Any] = {}
-    quant_text = str(args.get("quant_table_path") or "").strip()
+    # R5, R6 in the earlier form: quant_utility_table.xlsx and the amount column.
     amount_column = str(args.get("amount_column") or "").strip()
-    if not quant_text:
-        ask("quant_table_path", "Which quant_utility_table.xlsx gives the standards' amounts and the selection?")
-    if not amount_column:
+    if not format_one and quant_text and not quant_missing and not amount_column:
         ask(
             "amount_column",
             "Which sheet-1 column holds the amounts for these samples: F (per mg tissue), G (per 10^6 "
             "cells) or H (per uL plasma)?",
             ["F", "G", "H"],
         )
-    if quant_text and amount_column:
+    if format_one or quant_missing:
+        pass
+    elif quant_text and amount_column:
         try:
             workbook = read_quant_workbook(Path(quant_text).expanduser(), amount_column)
         except LabInputError as error:
@@ -280,12 +350,15 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         # [M-H]-; a sheet 3 that says otherwise is the person's to change, before anything runs. After
         # the contract it cannot change without a new contract and new runs (the contract binds the
         # workbook), so a sheet 3 kept as it is is the person's explicit answer, recorded.
-        selection = reconciliation_selection_warnings(workbook["quant_info"]["selected"], "Sheet 3")
+        selection = reconciliation_selection_warnings(workbook["quant_info"]["selected"], selection_label)
         warnings.extend(selection)
         result["merge_selection_warnings"] = selection
         selection_accepted = bool(selection) and args.get("merge_selection_accepted") is True
         if selection and not selection_accepted:
-            ask("merge_selection_accepted", MERGE_SELECTION_QUESTION + " " + " ".join(selection), ["change sheet 3", "true"])
+            question = MERGE_SELECTION_QUESTION if not format_one else MERGE_SELECTION_QUESTION.replace(
+                "Sheet 3", "The Selection table").replace("sheet 3", "the Selection table").replace("the workbook", "the input")
+            change = "change sheet 3" if not format_one else "change the Selection table"
+            ask("merge_selection_accepted", question + " " + " ".join(selection), [change, "true"])
         result["merge_selection_accepted"] = selection_accepted
 
     # R2: the salt, beside what the libraries and sheet 3 say about it.
@@ -301,7 +374,7 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         salt = normalize_salt(salt_text)
         if salt["problem"]:
             blockers.append(f"solvent_type: {salt['problem']}")
-    evidence = salt_evidence(salt.get("salt"), libraries[NEGATIVE], workbook.get("quant_info"))
+    evidence = salt_evidence(salt.get("salt"), libraries[NEGATIVE], workbook.get("quant_info"), **_salt_labels(format_one))
     blockers.extend(evidence["blockers"])
     warnings.extend(evidence["warnings"])
     result["salt"] = salt
@@ -367,20 +440,17 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
     # Across the inputs: every prepared standard searchable, and what each selected class will be
     # quantified by. A class that can only come out NOT QUANTIFIED is said now, not after hours.
     if workbook.get("preparation") and library_reports:
-        cross = cross_check_standards(workbook["preparation"], workbook["lookup"], libraries[POSITIVE], libraries[NEGATIVE])
-        blockers.extend(cross["blockers"])
-        warnings.extend(cross["warnings"])
-        notes.extend(cross["notes"])
+        if not format_one:
+            # Format 1 holds the amounts and the peaks on one row per standard, so they cannot disagree.
+            cross = cross_check_standards(workbook["preparation"], workbook["lookup"], libraries[POSITIVE], libraries[NEGATIVE])
+            blockers.extend(cross["blockers"])
+            warnings.extend(cross["warnings"])
+            notes.extend(cross["notes"])
         matrix = expected_resolution_matrix(workbook["lookup"], workbook["quant_info"], libraries[POSITIVE], libraries[NEGATIVE])
         result["expected_resolution"] = {
             "by_polarity": matrix["by_polarity"], "any_others_standard": matrix["any_others_standard"],
         }
-        for polarity, item in matrix["by_polarity"].items():
-            if item["not_quantified"]:
-                warnings.append(
-                    f"{polarity}: {', '.join(item['not_quantified'])} will be NOT QUANTIFIED, because the standard "
-                    f"sheet 2 names for them is not in the {polarity.lower()} internal-standard library."
-                )
+        warnings.extend(_not_quantified_warnings(matrix, table_label))
 
     # P3: one sample table for both polarities, from the file names; the metadata table only corroborates.
     proposal = _sample_table_proposal(inventory)
@@ -446,8 +516,105 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _salt_labels(format_one: bool) -> dict[str, str]:
+    if not format_one:
+        return {}
+    return {"selection_label": "the Selection table", "library_label": "the standard's own row in the Standards table"}
+
+
+def _not_quantified_warnings(matrix: dict[str, Any], table_label: str) -> list[str]:
+    return [
+        f"{polarity}: {', '.join(item['not_quantified'])} will be NOT QUANTIFIED, because the standard "
+        f"{table_label} names for them has no {polarity.lower()}-mode peak in the internal-standard library."
+        for polarity, item in matrix["by_polarity"].items() if item["not_quantified"]
+    ]
+
+
 def public_check(result: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in result.items() if not key.startswith("_")}
+
+
+def check_quant_input(request: dict[str, Any]) -> dict[str, Any]:
+    """Read a quantification input on its own, before any raw data are at hand; nothing is written.
+
+    Format 1 needs only its path. The earlier form needs its amount column and both text libraries.
+    With solvent_type, the salt is set beside the negative standards' adducts and the selection.
+    """
+    args = {key: value for key, value in dict(request or {}).items() if value not in (None, "")}
+    path_text = str(args.get("quant_table_path") or "").strip()
+    if not path_text:
+        raise ValueError("quant_table_path is required: a format-1 workbook or folder, or quant_utility_table.xlsx.")
+    path = Path(path_text).expanduser()
+    quant_format = detect_quant_format(path)
+    blockers: list[str] = []
+    warnings: list[str] = []
+    notes: list[str] = []
+    result: dict[str, Any] = {"quant_table_path": str(path), "format": quant_format or None, "specification":
+                              "docs/lab-lipidomics-quant-input.md"}
+    libraries: dict[str, list[InternalStandard]] = {POSITIVE: [], NEGATIVE: []}
+    workbook: dict[str, Any] = {}
+    if not path.exists():
+        blockers.append(f"{path} does not exist.")
+    elif quant_format == QUANT_INPUT_FORMAT:
+        read = read_quant_input(path)
+        blockers.extend(read["blockers"])
+        warnings.extend(read["warnings"])
+        notes.extend(read["notes"])
+        libraries = read["libraries"]
+        workbook = quant_input_workbook(read) if read.get("preparation") else {}
+        result["tables"] = quant_input_summary(read)
+    elif quant_format:
+        amount_column = str(args.get("amount_column") or "").strip()
+        texts = {POSITIVE: str(args.get("is_text_pos") or "").strip(), NEGATIVE: str(args.get("is_text_neg") or "").strip()}
+        if not amount_column or not all(texts.values()):
+            blockers.append(
+                f"{path.name} is the earlier quant_utility_table.xlsx: give amount_column (F, G or H), is_text_pos and "
+                "is_text_neg as well, or convert it with msdial_lipidomics_quant_input_template."
+            )
+        else:
+            try:
+                workbook = read_quant_workbook(path, amount_column)
+            except LabInputError as error:
+                blockers.append(str(error))
+            blockers.extend(workbook.get("blockers", []))
+            warnings.extend(workbook.get("warnings", []))
+            same = Path(texts[POSITIVE]).expanduser().resolve() == Path(texts[NEGATIVE]).expanduser().resolve()
+            for polarity in POLARITIES:
+                read = read_internal_standard_text(Path(texts[polarity]).expanduser(), None if same else polarity)
+                blockers.extend(read["blockers"])
+                warnings.extend(read["warnings"])
+                libraries[polarity] = split_by_polarity(read["records"])[polarity] if same else read["records"]
+            if workbook.get("preparation"):
+                result["tables"] = _workbook_report(workbook)
+                cross = cross_check_standards(workbook["preparation"], workbook["lookup"], libraries[POSITIVE], libraries[NEGATIVE])
+                blockers.extend(cross["blockers"])
+                warnings.extend(cross["warnings"])
+                notes.extend(cross["notes"])
+    else:
+        blockers.append(f"{path.name} is neither a workbook (.xlsx) nor a folder of format-1 tables.")
+    if workbook.get("preparation") and workbook.get("quant_info"):
+        label = "Selection" if quant_format == QUANT_INPUT_FORMAT else "Sheet 3"
+        result["merge_selection_warnings"] = reconciliation_selection_warnings(workbook["quant_info"]["selected"], label)
+        warnings.extend(result["merge_selection_warnings"])
+        matrix = expected_resolution_matrix(workbook["lookup"], workbook["quant_info"], libraries[POSITIVE], libraries[NEGATIVE])
+        result["expected_resolution"] = {"by_polarity": matrix["by_polarity"], "any_others_standard": matrix["any_others_standard"]}
+        format_one = quant_format == QUANT_INPUT_FORMAT
+        warnings.extend(_not_quantified_warnings(matrix, "the Class standards table" if format_one else "sheet 2"))
+        solvent = str(args.get("solvent_type") or "").strip()
+        if solvent:
+            salt = normalize_salt(solvent)
+            if salt["problem"]:
+                blockers.append(f"solvent_type: {salt['problem']}")
+            evidence = salt_evidence(salt.get("salt"), libraries[NEGATIVE], workbook["quant_info"], **_salt_labels(format_one))
+            blockers.extend(evidence["blockers"])
+            warnings.extend(evidence["warnings"])
+            result["salt"] = salt
+            result["salt_evidence"] = {key: value for key, value in evidence.items() if key not in {"blockers", "warnings"}}
+    result.update({
+        "blockers": list(dict.fromkeys(blockers)), "warnings": list(dict.fromkeys(warnings)), "notes": notes,
+        "ready": not blockers and bool(workbook.get("preparation")),
+    })
+    return result
 
 
 def _analysis_subfolders(root: Path) -> dict[str, Path]:
@@ -477,7 +644,13 @@ def _arguments(request: dict[str, Any]) -> dict[str, Any]:
             args[key] = filled[key] = value
     for key, recorded in settings.get("files", {}).items():
         path = args.get(key)
-        if path and recorded.get("sha256") and Path(str(path)).expanduser().is_file():
+        if path and recorded.get("sha256") and Path(str(path)).expanduser().is_dir():
+            current = quant_input_sha256(Path(str(path)).expanduser())
+            if current != recorded["sha256"] and _same_path(path, recorded.get("path", "")):
+                warnings.append(
+                    f"{Path(str(path)).name} has changed since workset '{workset_id}' was saved; it is checked as it is now."
+                )
+        elif path and recorded.get("sha256") and Path(str(path)).expanduser().is_file():
             current = _identity_sha256(Path(str(path)).expanduser())
             if current != recorded["sha256"] and _same_path(path, recorded.get("path", "")):
                 warnings.append(
@@ -574,8 +747,8 @@ def _candidate_inputs(folders: list[Path]) -> dict[str, Any]:
                 suffix = path.suffix.casefold()
                 if name.startswith("~$"):
                     found["excel_lock_files"].append({"path": str(path)})
-                elif suffix == ".xlsx":
-                    found["workbooks"].append({"path": str(path)})
+                elif suffix in {".xlsx", ".xlsm"}:
+                    found["workbooks"].append({"path": str(path), "format": describe_workbook(path)})
                 elif suffix == ".lbm2":
                     found["lbm2_libraries"].append({"path": str(path), "size_bytes": path.stat().st_size,
                                                     "proposed": False})
@@ -657,6 +830,7 @@ def _workbook_report(workbook: dict[str, Any]) -> dict[str, Any]:
     preparation = workbook["preparation"]
     return {
         "path": workbook["path"], "sha256": workbook["sha256"], "sheet_names": workbook["sheet_names"],
+        "format": workbook.get("format") or "quant_utility_table", "layout": workbook.get("layout") or "xlsx",
         "amount_column": preparation.get("amount_column"), "amount_header": preparation.get("amount_header"),
         "unit": workbook.get("unit"),
         # Read back for the person, never interpreted: the sample amount the chosen column divides by,
@@ -751,7 +925,7 @@ def _input_identity(
         "internal_standard_texts": {
             polarity: {"path": item.get("path"), "sha256": item.get("sha256")} for polarity, item in sorted(libraries.items())
         },
-        "quant_table": {"path": workbook.get("path"), "sha256": workbook.get("sha256")},
+        "quant_table": {"path": workbook.get("path"), "sha256": workbook.get("sha256"), "format": workbook.get("format")},
         "sample_metadata": {"path": metadata.get("path"), "sha256": metadata.get("sha256")},
         # As read, so that 2 and 2.0, or a path spelled two ways, do not count as a change.
         "answers": {
@@ -947,7 +1121,8 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
         "salt": {key: parsed["salt"].get(key) for key in ("salt", "answer", "matched")},
         "retention_time_tolerance": parsed["rt_tolerance"],
         "internal_standard_rt_tolerance": parsed["is_rt_tolerance"],
-        "amount_column": workbook["preparation"]["amount_column"],
+        "amount_column": workbook["preparation"]["amount_column"] or None,
+        "quant_format": workbook.get("format") or "quant_utility_table",
         "unit": workbook["unit"],
         "standards": [
             {"name": item["name"], "class_name": item["class_name"], "amount": item["amount"]}
@@ -1145,8 +1320,13 @@ def contract_drift(contract: dict[str, Any]) -> list[str]:
     drift: list[str] = []
     inputs = contract.get("inputs", {})
     checked = [("LBM2 library", inputs.get("lbm"))]
-    checked += [(f"{polarity} internal-standard text", item) for polarity, item in inputs.get("internal_standard_texts", {}).items()]
-    checked += [("quant table", inputs.get("quant_table")), ("sample metadata", inputs.get("sample_metadata"))]
+    quant = inputs.get("quant_table") or {}
+    if contract.get("quant_format") == QUANT_INPUT_FORMAT:
+        # Format 1 holds the standards' peaks: the internal-standard texts are the same input, checked once.
+        checked += [("quantification input", quant), ("sample metadata", inputs.get("sample_metadata"))]
+    else:
+        checked += [(f"{polarity} internal-standard text", item) for polarity, item in inputs.get("internal_standard_texts", {}).items()]
+        checked += [("quant table", quant), ("sample metadata", inputs.get("sample_metadata"))]
     derived = contract.get("derived", {})
     checked += [(f"{polarity} canonical internal-standard library", item)
                 for polarity, item in derived.get("internal_standard_libraries", {}).items()]
@@ -1155,6 +1335,11 @@ def contract_drift(contract: dict[str, Any]) -> list[str]:
         if not item or not item.get("sha256"):
             continue
         path = Path(str(item.get("path")))
+        if path.is_dir():
+            # A format-1 input given as a folder of text files: one digest of its four tables.
+            if quant_input_sha256(path) != item["sha256"]:
+                drift.append(f"the {label} {path.name} has changed")
+            continue
         if not path.is_file():
             drift.append(f"the {label} {path} is gone")
             continue
@@ -1918,7 +2103,7 @@ def merge_lipidome(
         if file_sha256(record["candidate_table"]) != record["candidate_table_sha256"]:
             raise LabContractError(f"The {polarity.lower()} run's candidate table has changed since normalize.")
         records[polarity] = record
-    workbook = read_quant_workbook(contract["inputs"]["quant_table"]["path"], contract["amount_column"])
+    workbook = contract_quant_tables(contract)
     labels = {POSITIVE: "positive", NEGATIVE: "negative"}
     # The dotplot files the last merge here wrote, which this one may replace, and its lipidome.
     try:
@@ -1948,7 +2133,7 @@ def merge_lipidome(
             reconciliation_rt_tolerance=tolerance,
             sample_file_types=sample_file_types,
             replaceable_dotplot_files=replaceable,
-            rules_label="Sheet 3",
+            rules_label="Selection" if contract.get("quant_format") == QUANT_INPUT_FORMAT else "Sheet 3",
             selection_bound=_selection_bound(contract),
             write=write,
         )
@@ -2018,9 +2203,12 @@ def merge_lipidome(
 def _selection_bound(contract: dict[str, Any]) -> str:
     """Why sheet 3 can no longer change at the merge: the contract holds the workbook."""
     accepted = (contract.get("merge") or {}).get("selection_warnings_accepted") or []
+    table = "the Selection table" if contract.get("quant_format") == QUANT_INPUT_FORMAT else "sheet 3"
+    accepted_table = "this sheet 3" if table == "sheet 3" else table
     return (
-        ("The contract accepted this sheet 3 as it is (merge_selection_accepted). " if accepted else "")
-        + "Sheet 3 is part of the contract: changing it now needs a new contract and new runs of both polarities."
+        (f"The contract accepted {accepted_table} as it is (merge_selection_accepted). " if accepted else "")
+        + f"{table[0].upper()}{table[1:]} is part of the contract: changing it now needs a new contract and new runs "
+        "of both polarities."
     )
 
 
@@ -2052,6 +2240,14 @@ def _reconciled_standards(contract: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------------------------
 
 
+def contract_quant_tables(contract: dict[str, Any]) -> dict[str, Any]:
+    """The contract's quantification input read again, in read_quant_workbook's shape, whichever form it is."""
+    quant = contract["inputs"]["quant_table"]
+    if quant.get("format") == QUANT_INPUT_FORMAT or contract.get("quant_format") == QUANT_INPUT_FORMAT:
+        return quant_input_workbook(read_quant_input(quant["path"]))
+    return read_quant_workbook(quant["path"], contract["amount_column"])
+
+
 def lab_workset_settings(contract_path: str) -> dict[str, Any]:
     """What a laboratory lipidomics workset carries from a contract to the next batch.
 
@@ -2061,6 +2257,25 @@ def lab_workset_settings(contract_path: str) -> dict[str, Any]:
     contract = load_contract(contract_path)
     inputs = contract["inputs"]
     texts = inputs["internal_standard_texts"]
+    if contract.get("quant_format") == QUANT_INPUT_FORMAT:
+        # Format 1 holds the standards, their amounts and peaks: the one input stands for all three.
+        return {
+            "answers": {
+                "lbm_path": inputs["lbm"]["path"],
+                "solvent_type": contract["salt"]["salt"],
+                "retention_time_tolerance": contract["retention_time_tolerance"],
+                "internal_standard_rt_tolerance": contract["internal_standard_rt_tolerance"],
+                "quant_table_path": inputs["quant_table"]["path"],
+                "console_path": contract["console_path"],
+                **({"number_of_threads": contract["number_of_threads"]} if contract.get("number_of_threads") else {}),
+            },
+            "files": {
+                "lbm_path": {"path": inputs["lbm"]["path"], "sha256": inputs["lbm"]["sha256"]},
+                "quant_table_path": {"path": inputs["quant_table"]["path"], "sha256": inputs["quant_table"]["sha256"]},
+            },
+            "method": contract["method"],
+            "source_contract_sha256": contract["_sha256"],
+        }
     return {
         "answers": {
             "lbm_path": inputs["lbm"]["path"],

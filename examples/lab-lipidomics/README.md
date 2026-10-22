@@ -8,12 +8,19 @@ in a form the agent cannot use as it is:
 | --- | --- |
 | `quant_utility_table.xlsx` | the quant workbook: standards and amounts, class-to-standard lookup, class and adduct selection |
 | `EquiSPLASH_Pos.txt`, `EquiSPLASH_Neg.txt` | the internal-standard texts, positive and negative, edited from the archive's (see [below](#the-internal-standard-texts)) |
+| `quant_input.xlsx` | the three files above in [format 1](../../docs/lab-lipidomics-quant-input.md): one workbook with the sheets Settings, Standards, Class standards and Selection |
+| `quant_input_tsv/` | the same four tables as text files |
+
+`quant_input.xlsx` and `quant_input_tsv/` are generated from the other three files by
+`scripts/generate-lab-quant-input-defaults.py`. The tests check that all three forms give
+the agent the same standards, amounts, peaks, class standards and selection, and the
+same lipidome.
 
 **The demo data:** *Lecture files* (2024), Zenodo,
 [doi:10.5281/zenodo.10957708](https://doi.org/10.5281/zenodo.10957708), licensed
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); the record names its creator.
 The demo is `metabolomics_hands-on.zip` > `data2.zip` > `data2`. Credit the record this
-way when you share the data, or results built on it. The three files here belong to that
+way when you share the data, or results built on it. The files here belong to that
 demo and are offered under the same CC BY 4.0 licence, with that credit.
 
 ## The internal-standard texts

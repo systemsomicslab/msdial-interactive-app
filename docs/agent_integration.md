@@ -295,6 +295,8 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 - `msdial_complete_guided_analysis`
 - `msdial_save_workset` (with `lab_lipidomics_contract_path`, a laboratory lipidomics workset)
 - `msdial_interactive_create_handoff`
+- `msdial_lipidomics_quant_input_template` (preview by default; writing requires `confirmed=true`; never overwrites)
+- `msdial_lipidomics_check_quant_input` (read-only; no raw data needed)
 - `msdial_lipidomics_check_inputs` (read-only)
 - `msdial_lipidomics_write_contract` (preview by default; writing requires `confirmed=true`)
 - `msdial_lipidomics_resolve_standards` (read-only)

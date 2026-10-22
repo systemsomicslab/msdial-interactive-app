@@ -770,6 +770,11 @@ Core MCP tools:
 - `msdial_generate_publication_report`: create text, Excel, audit, and ZIP files
 - `msdial_complete_guided_analysis`: wait for one job and complete validation,
   QA, publication, and handoff without browser interaction
+- `msdial_lipidomics_quant_input_template` / `msdial_lipidomics_check_quant_input`:
+  write a laboratory lipidomics quantification input in
+  [format 1](docs/lab-lipidomics-quant-input.md) to fill in, or convert the earlier
+  `quant_utility_table.xlsx` (preview by default, never overwrites), and check one on
+  its own, each problem by sheet, row and column (read-only)
 - `msdial_lipidomics_check_inputs` / `msdial_lipidomics_write_contract`: check a
   laboratory lipidomics batch's inputs (read-only) and fix them in a contract after
   explicit confirmation

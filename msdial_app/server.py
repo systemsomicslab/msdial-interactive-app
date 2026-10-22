@@ -140,6 +140,7 @@ from .worksets import describe_workset_candidate, list_worksets, save_lab_lipido
 from .lab_lipidomics import NEGATIVE as LAB_NEGATIVE, POSITIVE as LAB_POSITIVE
 from .lab_lipidomics_agent import (
     check_inputs as lab_check_inputs,
+    check_quant_input as lab_check_quant_input,
     finish_normalize as lab_finish_normalize,
     lab_workset_settings,
     merge_lipidome as lab_merge_lipidome,
@@ -151,6 +152,7 @@ from .lab_lipidomics_agent import (
     write_contract as lab_write_contract,
     write_normalize_inputs as lab_write_normalize_inputs,
 )
+from .lab_quant_input import quant_input_template as lab_quant_input_template
 from .diagnostic_paths import diagnostic_run_directory, is_diagnostic_artifact
 
 
@@ -2039,6 +2041,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/lipidomics/check":
                 self._json(lab_public_check(lab_check_inputs(body)))
+            elif parsed.path == "/api/lipidomics/check-quant-input":
+                self._json(lab_check_quant_input(body))
+            elif parsed.path == "/api/lipidomics/quant-input-template":
+                self._json(lab_quant_input_template(body))
             elif parsed.path == "/api/lipidomics/write-contract":
                 self._json(lab_write_contract(body))
             elif parsed.path == "/api/lipidomics/resolve":
