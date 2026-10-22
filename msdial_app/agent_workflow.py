@@ -247,6 +247,9 @@ def build_guided_plan(
         **dict(supplied.get("workflow_overrides") or {}),
     }
     merged.update(supplied)
+    if lab_kind != "lab_lcms_metabolomics":
+        # Reached through a workset, the key would tie this run to a contract nothing here loaded or checked.
+        merged.pop("lab_lcms_metabolomics_contract_path", None)
     if overrides:
         merged["workflow_overrides"] = overrides
     if lab_contract is not None and overrides:

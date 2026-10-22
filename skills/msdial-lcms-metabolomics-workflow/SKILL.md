@@ -175,8 +175,9 @@ used.
 ## I. Merge
 
 `msdial_lcms_metabolomics_merge(contract_path)` previews the counts. Every polarity of
-the contract must be normalized. Dropped first: unannotated rows, every internal
-standard, rows whose Comment starts with `x`. Options, read to the person:
+the contract must be normalized. Dropped first: unannotated rows and every internal
+standard. A spot that was only searched for a standard nobody confirmed stays a feature;
+read `unconfirmed_standard_spots` to the person. Options, read to the person:
 - `reference_matched_only`, default true: only rows MS-DIAL calls Ref. matched.
 - `preferred_adducts_only`, default false: only `[M+H]+`, `[M-H]-` and the salt's
   negative adduct.
@@ -214,7 +215,9 @@ and its record name them by location (`sharing: local_only`) and stay on this co
 
 ## Not automated yet
 
-- Reviewing annotations for false positives is manual.
+- Reviewing annotations for false positives is manual, and curation in the GUI after the
+  run does not reach these tools: they read the exports the run wrote. Normalize warns when
+  the project was saved well after them; say so to the person.
 - Worksets for the next batch are not saved for metabolomics contracts yet.
 - A run not made under a contract cannot be resolved, normalized or merged by these
   tools; offer to run it under one.

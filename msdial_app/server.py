@@ -3437,12 +3437,10 @@ def _laboratory_metabolomics_normalize(body: dict[str, Any]) -> dict[str, Any]:
     # Figure 04 from the run's Height export, every standard the resolution found; a figure that fails is a
     # warning, never a refusal.
     try:
-        rows = [
-            {"StandardName": entry["name"], "PeakID": int(entry["alignment_id"])}
-            for entry in plan["resolution"]["standards"] if entry.get("alignment_id")
-        ]
+        # The spots as decided: the normalizing standard's as taken, the others only where a library or their own
+        # text row found them, every other standard at -1 so that the figure names it.
         figure = write_internal_standard_figure(
-            plan["polarity"], plan["outputs"]["height_export"], rows,
+            plan["polarity"], plan["outputs"]["height_export"], plan["figure_rows"],
             Path(plan["paths"]["normalized"]).parent / QA_FIGURES_FOLDER,
             resolution_rows=plan["resolution"]["standards"],
         )

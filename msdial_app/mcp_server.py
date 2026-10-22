@@ -3569,7 +3569,10 @@ def msdial_lcms_metabolomics_merge(
     """Merge the normalized polarities of the contract into one metabolome, writing only once confirmed.
 
     Every polarity the contract covers must have been normalized and checked. Dropped first: unannotated
-    rows, every internal standard, and rows whose Comment starts with x. Then the options:
+    rows and every internal standard (the spots decided as standards, and every row the internal-standard
+    text row annotated). A spot only searched for a standard nobody confirmed is kept, and named in
+    unconfirmed_standard_spots. The matrices are the exports the run wrote, so curation in the GUI after the
+    run does not reach them. Then the options:
     reference_matched_only (default true: only rows whose representative annotation is a reference match,
     what the GUI calls Ref. matched) and preferred_adducts_only (default false: only [M+H]+, [M-H]- and the
     salt's negative adduct, [M+HCOO]- for formate or formic acid, [M+CH3COO]- for acetate). Rows sharing the

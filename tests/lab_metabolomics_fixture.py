@@ -65,10 +65,6 @@ NEGATIVE_SPOTS = [
          inchikey=TRYPTOPHAN, cells=[10, 10, 10, 0]),
     dict(alignment_id=112, mz=146.0459, rt=0.75, name="L-Glutamic acid", adduct="[M-H]-", method="lib2_predicted_rt",
          inchikey=GLUTAMATE, cells=[5000, 6000, 5500, 0]),
-    # Marked removable by the analyst.
-    dict(alignment_id=113, mz=300.0000, rt=4.00, name="Removed compound", adduct="[M-H]-", method="lib3_no_rt",
-         inchikey="AAAAAAAAAAAAAA-BBBBBBBBBB-N", cells=[100, 100, 100, 0],
-         comment="x Normalized unit: Height; Annotation method: lib3_no_rt"),
 ]
 
 
@@ -107,7 +103,10 @@ class MetabolomicsBatch:
         self.libraries = {}
         for slot in ("in_house", "predicted_rt", "no_rt"):
             path = library / f"{slot}.msp"
-            path.write_text(f"NAME: a {slot} record\nPRECURSORMZ: 100\nNum Peaks: 0\n", encoding="ascii")
+            # The libraries searched with retention time give one; the third gives none.
+            rt = "" if slot == "no_rt" else "1.25"
+            path.write_text(f"NAME: a {slot} record\nPRECURSORMZ: 100\nRETENTIONTIME: {rt}\nNum Peaks: 0\n",
+                            encoding="ascii")
             self.libraries[slot] = path
         self.console = root / "console" / "MSDIALCUI.exe"
         self.console.parent.mkdir()

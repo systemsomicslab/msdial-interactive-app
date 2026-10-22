@@ -50,6 +50,7 @@ entries in priority order. A path is one file for every polarity or `{"Positive"
 | `retention_time` | `none` (neither filtering nor scoring) or `use` (filtering and scoring) |
 | `rt_tolerance` | minutes, required when `retention_time` is `use` |
 | `label` | what the results and the report call it; printable ASCII, at most 60 characters |
+| `library_kind` | `acquired` (default) or `predicted` (in silico; the campaign's `in_silico` slot), MSP only |
 
 | Preset | Libraries, highest priority first |
 |---|---|
@@ -65,11 +66,18 @@ The thresholds are those MS-DIAL Interactive already uses:
 - `mild`: the campaign's broad tier: MS/MS tolerance 0.25, dot products 0.5/0.5/0.5, at least 1 matched
   peak.
 
+A library searched with retention time is read for its records' RTs first: MS-DIAL keeps a record without an
+RT in every RT window and counts its RT as met, so such a record is matched on MS/MS alone under the RT tier's
+label. None with an RT refuses the library; some without one is a warning with the count. An optional preset
+library may serve one polarity only.
+
 With n libraries, the first takes priority n+1 and the last 2; the internal-standard text row keeps
 priority 1, below every library. MS-DIAL picks a feature's representative annotation by reference match
 first, then by suggestion, evidence and priority, so a lower-priority MS/MS match still outranks a
-higher-priority precursor-only suggestion. Annotator IDs are `lib<position>_<id>` (`lib1_in_house`, ...);
-an export's Comment names them, and the merge reports each row's library by its label.
+higher-priority precursor-only suggestion. MSP annotator IDs are `lib<position>_<id>` (`lib1_in_house`, ...);
+the LBM2's is the Console's own, `LbmDB: <file stem>`. An export's Comment names them, and the merge reports
+each row's library by its label. resolve_standards warns about a library that left no annotation candidate,
+since the Console skips a library it reads as empty without a word.
 
 The guided plan takes the list as `library_strategy: "annotators"`, `libraries.annotators`. Each MSP row is
 written into `msp_annotator_settings.tsv` with its own RT settings and `target_omics` Metabolomics, and is
@@ -119,7 +127,8 @@ For every feature `s` and injection `i`:
   over every file, Blank included, and replaces a zero with 1, so it is not used.
 - The matrix keeps MS-DIAL's export layout and is written as `<root>/quant/NormalizedHeight_<Pos|Neg>.txt`.
   Only the sample cells change; MS-DIAL's per-class Average and Stdev columns are left empty, since they
-  were computed from heights. Every cell is then read back and checked against the formula.
+  were computed from heights. Every cell is then recomputed on its own from the copy of the Height export
+  (which must be the export normalize read) and compared.
 - Beside it: a copy of the Height export, `is_resolution_<pos|neg>.tsv`, `normalize_<pos|neg>.local.json`,
   and figure 04 (every internal standard's response) in `<root>/quant/qa_figures`.
 
@@ -129,10 +138,14 @@ The result is one metabolome from the normalized matrices of every polarity the 
 
 1. **Rows dropped before anything else:**
    - unannotated rows (name empty, "Unknown" or "null");
-   - internal standards: every spot the resolution chose, and every row the internal-standard text row
-     annotated. A labelled standard shares its InChIKey's first block with the endogenous compound, because
-     the label sits in the second block.
-   - rows whose Comment starts with `x`, the analyst's mark.
+   - internal standards: the normalizing standard's spot as decided, the other standards found by a library
+     or their own text row (tiers A and B), and every row the internal-standard text row annotated. A labelled
+     standard shares its InChIKey's first block with the endogenous compound, because the label sits in the
+     second block. A spot only searched for a standard nobody confirmed (C, D, invalid, contested) stays a
+     feature, and the report names it (`unconfirmed_standard_spots`).
+
+   The matrices are the exports the run wrote. Names, Unknowns and comments set in the GUI after the run do not
+   reach them; normalize warns when the project was saved well after the exports.
 2. **Options**, chosen when the merge is called and recorded with it:
    - `reference_matched_only`: keep only rows whose representative annotation is a reference match, what
      the GUI shows as "Ref. matched". Default on.
@@ -160,7 +173,10 @@ The result is one metabolome from the normalized matrices of every polarity the 
      the counts.
 
 Merges with different options may sit side by side under different `output_folder` names; `pos`, `neg` and
-`qa_figures` are refused.
+`qa_figures` are refused, and so is a name ending in a dot, which Windows strips.
+
+The two laboratory agents write the same file names into an analysis root, so each refuses a root that holds
+the other's contract.
 
 ## 7. Tools
 
@@ -186,4 +202,6 @@ The guided-analysis tools run the diagnostic and the production runs. Their plan
 
 - Worksets that carry a metabolomics contract's method to the next batch.
 - A batch QA page across both polarities; each run has its own, and normalize draws figure 04.
+- Curation in the GUI between the run and normalize. Lipidomics carries it, because its normalize runs the
+  Console on the saved project; here the run's own exports are read.
 - GC-MS metabolomics, which comes next.

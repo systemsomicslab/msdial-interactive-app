@@ -129,6 +129,50 @@ class AnnotationLibraries(unittest.TestCase):
                          [(row["annotator_id"], row["priority"], row["ms2_tolerance"]) for row in state["msp_annotators"]])
         self.assertTrue(all(row["rt_fixed"] and not row["use_rt_scoring"] for row in state["msp_annotators"]))
         self.assertTrue(all(item["license"] == "institutional/private" for item in state["library_provenance"]))
+        self.assertEqual({"acquired"}, {row["library_kind"] for row in state["msp_annotators"]})
+
+    def test_an_unknown_kind_is_a_blocker_and_still_shown(self) -> None:
+        for kind in ("MSP2", ""):
+            with self.subTest(kind=kind):
+                read = core.read_annotation({"libraries": [{"kind": kind, "path": self.files["public"],
+                                                            "retention_time": "none"}]}, ["Positive"])
+                self.assertTrue(any("is neither msp nor lbm" in item for item in read["blockers"]))
+                self.assertEqual(2, core.annotation_summary(read["entries"])[0]["priority"])
+
+    def test_an_optional_library_may_serve_one_polarity(self) -> None:
+        read = core.read_annotation({"preset": "campaign", "libraries": {
+            "lbm": str(self.lbm), "msp": self.files["public"], "in_silico": {"Positive": self.files["insilico"]}}},
+            ["Positive", "Negative"])
+        self.assertEqual([], read["blockers"] + read["missing"])
+        positive = core.annotator_settings(read["entries"], "Positive")["annotators"]
+        negative = core.annotator_settings(read["entries"], "Negative")["annotators"]
+        self.assertEqual(4, len(positive))
+        self.assertEqual(3, len(negative))
+        self.assertEqual("predicted", positive[-1]["library_kind"], "an in-silico MSP is searched as predicted")
+
+    def test_one_file_is_either_acquired_or_predicted(self) -> None:
+        read = core.read_annotation({"libraries": [
+            {"kind": "msp", "path": self.files["public"], "retention_time": "none", "thresholds": "strict"},
+            {"kind": "msp", "path": self.files["public"], "retention_time": "none", "thresholds": "mild",
+             "library_kind": "predicted"},
+        ]}, ["Positive"])
+        self.assertTrue(any("both acquired and predicted" in item for item in read["blockers"]))
+        read = core.read_annotation({"libraries": [{"kind": "msp", "path": self.files["public"], "retention_time": "none",
+                                                    "library_kind": "simulated"}]}, ["Positive"])
+        self.assertTrue(any("neither acquired nor predicted" in item for item in read["blockers"]))
+
+    def test_the_lbm2_is_named_as_the_console_names_it(self) -> None:
+        read = core.read_annotation({"preset": "campaign", "libraries": {"lbm": str(self.lbm), "msp": self.files["public"]}},
+                                    ["Positive"])
+        self.assertEqual({"Positive": "LbmDB: lab"}, core.export_annotator_ids(read["entries"][0]))
+        self.assertEqual({"Positive": "lib2_msp_strict"}, core.export_annotator_ids(read["entries"][1]))
+        self.assertEqual("LbmDB", core.console_lbm_annotator_id(""))
+
+    def test_the_retention_time_census_counts_records_with_an_rt(self) -> None:
+        path = self.root / "census.msp"
+        path.write_text("NAME: a\nRETENTIONTIME: 1.5\n\nNAME: b\nRETENTIONTIME: \n\nName: c\nRT: 0\n\nNAME: d\nrt: 2\n",
+                        encoding="ascii")
+        self.assertEqual({"records": 4, "with_retention_time": 2}, core.retention_time_census(path))
 
 
 class PreferredAdducts(unittest.TestCase):
@@ -201,6 +245,35 @@ class CheckAndContract(Batched):
         with self.assertRaises(agent.LabMetabolomicsError):
             agent.load_contract(contract_path)
 
+    def test_a_library_searched_with_rt_must_give_rts(self) -> None:
+        self.batch.libraries["in_house"].write_text("NAME: a\nRETENTIONTIME: \nNum Peaks: 0\n", encoding="ascii")
+        check = agent.check_inputs(self.batch.request())
+        self.assertTrue(any("none of the 1 records" in item for item in check["blockers"]), check["blockers"])
+        self.batch.libraries["in_house"].write_text(
+            "NAME: a\nRETENTIONTIME: 1.0\nNum Peaks: 0\n\nNAME: b\nNum Peaks: 0\n", encoding="ascii")
+        check = agent.check_inputs(self.batch.request())
+        self.assertTrue(check["ready_for_contract"], check["blockers"])
+        self.assertTrue(any("1 of the 2 records" in item for item in check["warnings"]), check["warnings"])
+        self.assertEqual({"records": 2, "with_retention_time": 1},
+                         check["annotation"]["retention_time_census"]["in-house RT and MS/MS (positive)"])
+
+    def test_a_root_holding_the_other_laboratory_analysis_is_refused(self) -> None:
+        inputs = self.batch.analysis / "inputs"
+        inputs.mkdir(parents=True)
+        (inputs / "lab-lipidomics-contract.json").write_text("{}", encoding="utf-8")
+        check = agent.check_inputs(self.batch.request())
+        self.assertTrue(any("holds a laboratory lipidomics analysis" in item for item in check["blockers"]))
+        (inputs / "lab-lipidomics-contract.json").unlink()
+        contract = self.batch.contract()
+        self.assertTrue(Path(contract).is_file())
+        from lab_batch_fixture import Batch, capabilities_patches as lipidomics_patches
+        from msdial_app import lab_lipidomics_agent
+
+        lipidomics = Batch(self.batch.root / "lipidomics")
+        with lipidomics_patches():
+            check = lab_lipidomics_agent.check_inputs(lipidomics.request(analysis_root=str(self.batch.analysis)))
+        self.assertTrue(any("holds a laboratory LC-MS metabolomics analysis" in item for item in check["blockers"]))
+
     def test_the_contract_and_its_record_are_local_only(self) -> None:
         for name in ("lab-lcms-metabolomics-contract.json", "lab-lcms-metabolomics-contract.20261022120000.json",
                      "lab-lcms-metabolomics-record.jsonl"):
@@ -220,8 +293,14 @@ class OnePolarity(Batched):
         kept = list(csv.DictReader(io.StringIO(Path(report["outputs"]["metabolome"]["path"]).read_text(encoding="utf-8"))))
         self.assertEqual(["10", "14", "15"], [row["Alignment ID"] for row in kept])
         self.assertIn("S1_Pos", kept[0], "one polarity keeps its sample names as exported")
+        # A folder read asks for both polarities; the one the contract lacks is passed over, a named job is refused.
+        resolved = agent.resolve_standards_for_contract(contract, {"Positive": job, "Negative": None})
+        self.assertEqual(["Positive"], list(resolved["polarities"]))
         with self.assertRaises(agent.LabMetabolomicsError):
-            agent.resolve_standards_for_contract(contract, {"Negative": None})
+            agent.resolve_standards_for_contract(contract, {"Negative": job})
+        for name in ("qa_figures.", "metabolome.", "pos", "a b"):
+            with self.subTest(output_folder=name), self.assertRaises(agent.LabMetabolomicsError):
+                agent.merge(contract, output_folder=name)
 
 
 class PlanFromTheContract(Batched):
@@ -249,6 +328,7 @@ class PlanFromTheContract(Batched):
              for row in msp],
         )
         self.assertEqual({"Metabolomics"}, {row["target_omics"] for row in msp})
+        self.assertEqual({"acquired"}, {row["library_kind"] for row in msp})
         text = tsv_rows(run / "text_annotator_settings.tsv")
         self.assertEqual([("internal_standards_pos", "1", "True")],
                          [(row["annotator_id"], row["priority"], row["use_retention_information_for_filtering"]) for row in text])
@@ -267,6 +347,36 @@ class PlanFromTheContract(Batched):
         self.assertTrue(any("workflow_overrides.msp_annotators would replace" in item for item in plan["blockers"]))
         plan = self.plan(use_retention_time_for_annotation=True, retention_time_tolerance=1.0)
         self.assertTrue(any("use_retention_time_for_annotation is fixed" in item for item in plan["blockers"]))
+
+    def test_the_contract_is_never_carried_to_another_dataset(self) -> None:
+        plan = self.plan()
+        self.assertIn(agent.CONTRACT_KEY, plan["workset_suggestion"]["not_reusable"])
+        self.assertNotIn(agent.CONTRACT_KEY, plan["workset_suggestion"].get("reusable_answers", {}))
+        # Reached through a workset, the key is not one this plan loaded.
+        workset = {"id": "w", "kind": "", "answers": {agent.CONTRACT_KEY: self.contract}}
+        with patch("msdial_app.agent_workflow.get_workset", return_value=workset):
+            other = build_guided_plan(str(self.batch.folders["Positive"]), {
+                "project_type": "lcms", "ion_mode": "Positive", "target_omics": "Metabolomics",
+                "library_strategy": "none", "class_assignment_confirmed": True, "run_qa": False,
+                "generate_materials_methods": False,
+            }, workset_id="w")
+        self.assertEqual("", other["profile"])
+        self.assertNotIn(agent.CONTRACT_KEY, other["answers"])
+        self.assertNotIn(agent.CONTRACT_KEY, other["workflow"] or {})
+
+    def test_a_settings_file_without_a_library_kind_is_written_as_before(self) -> None:
+        plan = build_guided_plan(str(self.batch.folders["Positive"]), {
+            "project_type": "lcms", "ion_mode": "Positive", "target_omics": "Metabolomics",
+            "parameter_strategy": "default", "execute_rt_correction": False,
+            "library_strategy": "existing", "libraries": {"msp_paths": [str(self.batch.libraries["no_rt"])]},
+            "use_retention_time_for_annotation": False, "class_assignment_confirmed": True, "run_qa": False,
+            "generate_materials_methods": False, "output_root": str(self.batch.root / "guided"),
+            "console_path": str(self.batch.console),
+        })
+        self.assertIsNotNone(plan["workflow"], plan["remaining_questions"])
+        prepared = prepare_run(plan["workflow"])
+        header = (Path(prepared["run_directory"]) / "msp_annotator_settings.tsv").read_text(encoding="ascii").splitlines()[0]
+        self.assertNotIn("library_kind", header.split("\t"))
 
 
 class StandardsNormalizeAndMerge(Batched):
@@ -335,13 +445,93 @@ class StandardsNormalizeAndMerge(Batched):
         self.assertEqual({"S1_Pos": 2.0}, plan["dilution_factors"])
         self.assertEqual(4000 / 1000 * 1500 * 2, plan["_normalized"]["values"]["10"][0])
 
-    def test_the_written_matrix_is_checked_cell_by_cell(self) -> None:
+    def test_the_written_matrix_is_recomputed_on_its_own(self) -> None:
         record = self.normalize("Positive")
         path = Path(record["outputs"]["normalized"])
-        normalized = core.normalize_heights(record["height_export"], "1", {})
-        self.assertTrue(core.verify_normalized(path, normalized)["passed"])
-        path.write_bytes(core.normalized_text(normalized).replace("\t1500\t", "\t1501\t", 1).encode("utf-8"))
-        self.assertFalse(core.verify_normalized(path, normalized)["passed"])
+        height = record["outputs"]["height_copy"]
+        self.assertTrue(core.verify_normalized(path, height, "1", {})["passed"])
+        # A matrix printed from wrong values reads back as itself; recomputing from the heights catches it.
+        normalized = core.normalize_heights(height, "1", {})
+        normalized["values"]["10"][0] *= 2
+        path.write_bytes(core.normalized_text(normalized).encode("utf-8"))
+        checked = core.verify_normalized(path, height, "1", {})
+        self.assertFalse(checked["passed"])
+        self.assertEqual([("10", "S1_Pos")], [(item["alignment_id"], item["sample"]) for item in checked["failed"]])
+        self.assertFalse(core.verify_normalized(path, height, "1", {}, expected_height_sha256="0" * 64)["passed"])
+
+    def test_a_spot_taken_instead_is_the_standard_and_the_one_passed_over_stays_a_feature(self) -> None:
+        from lab_metabolomics_fixture import POSITIVE_SPOTS
+
+        spots = [dict(item) for item in POSITIVE_SPOTS]
+        # Met-d3 has no text-row annotation; the most intense spot in its window is an MSP-matched metabolite.
+        spots[0] = dict(spots[0], name="Unknown", method="", cells=[1000, 2000, 1500, 0])
+        spots.append(dict(alignment_id=3, mz=153.0770, rt=0.95, name="Isobaric metabolite Y", method="lib3_no_rt",
+                          inchikey="YYYYYYYYYYYYYY-YYYYYYYYYY-N", cells=[50000, 50000, 50000, 0]))
+        job = write_run(self.batch, self.contract, "Positive", spots=spots)
+        resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": job})
+        summary = resolved["polarities"]["Positive"]["summary"]["normalizing_standard"]
+        self.assertEqual(("D", "3", True), (summary["tier"], summary["alignment_id"], summary["needs_confirmation"]))
+        digest = resolved["polarities"]["Positive"]["resolution_digest"]
+        with self.assertRaises(agent.LabMetabolomicsError):
+            agent.plan_normalize(self.contract, job, digest)
+        plan = agent.plan_normalize(self.contract, job, digest, accept_spot={"Methionine-d3": 1})
+        self.assertEqual(("1", "taken_by_person", "D"), (plan["normalizing_standard"]["alignment_id"],
+                                                         plan["normalizing_standard"]["status"],
+                                                         plan["normalizing_standard"]["tier"]))
+        self.assertIn("1", plan["internal_standard_ids"])
+        self.assertNotIn("3", plan["internal_standard_ids"], "the spot the person passed over is no standard")
+        self.assertIn({"StandardName": "Methionine-d3", "PeakID": 1}, plan["figure_rows"])
+        record = agent.finish_normalize(plan)
+        self.assertTrue(record["verified"], record["verification"])
+        self.normalize("Negative")
+        self.jobs["Positive"] = job
+        report = agent.merge(self.contract, write=True)
+        kept = {row["Alignment ID"] for row in csv.DictReader(io.StringIO(
+            Path(report["outputs"]["metabolome"]["path"]).read_text(encoding="utf-8"))) if row["Polarity"] == "Positive"}
+        self.assertIn("3", kept)
+
+    def test_a_standard_found_only_by_search_is_named_and_kept(self) -> None:
+        from lab_metabolomics_fixture import POSITIVE_SPOTS
+
+        spots = [dict(item) for item in POSITIVE_SPOTS if item["alignment_id"] != 2]
+        # CUDA is absent; an MSP-matched metabolite sits at its m/z and RT.
+        spots.append(dict(alignment_id=20, mz=341.2800, rt=2.90, name="Endogenous Z", method="lib1_in_house",
+                          inchikey="ZZZZZZZZZZZZZZ-ZZZZZZZZZZ-N", cells=[700, 800, 750, 0]))
+        job = write_run(self.batch, self.contract, "Positive", spots=spots)
+        resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": job})
+        plan = agent.plan_normalize(self.contract, job, resolved["polarities"]["Positive"]["resolution_digest"])
+        self.assertEqual(["1"], plan["internal_standard_ids"])
+        self.assertEqual([("CUDA", "20")], [(item["standard"], item["alignment_id"])
+                                            for item in plan["unconfirmed_standard_spots"]])
+        self.assertIn({"StandardName": "CUDA", "PeakID": -1}, plan["figure_rows"])
+        self.assertTrue(any("stays a feature" in item for item in plan["warnings"]))
+        agent.finish_normalize(plan)
+        self.normalize("Negative")
+        report = agent.merge(self.contract, write=True)
+        self.assertEqual([{"standard": "CUDA", "alignment_id": "20", "kept": True}],
+                         [{key: item[key] for key in ("standard", "alignment_id", "kept")}
+                          for item in report["unconfirmed_standard_spots"]["Positive"]])
+
+    def test_a_project_saved_long_after_the_run_is_said(self) -> None:
+        job = self.jobs["Positive"]
+        project = Path(job["artifacts"]["other"][2])
+        height = Path(job["artifacts"]["other"][0])
+        os.utime(project, (height.stat().st_mtime + 2 * 3600, height.stat().st_mtime + 2 * 3600))
+        resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": job})
+        plan = agent.plan_normalize(self.contract, job, resolved["polarities"]["Positive"]["resolution_digest"])
+        self.assertTrue(any("do not reach it" in item for item in plan["warnings"]), plan["warnings"])
+
+    def test_a_library_that_left_no_candidate_is_named(self) -> None:
+        resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": self.jobs["Positive"]})
+        polarity = resolved["polarities"]["Positive"]
+        self.assertEqual({"in-house RT and MS/MS": 3, "predicted RT": 1, "MS/MS without RT": 1},
+                         polarity["summary"]["candidates_by_library"])
+        spots = [dict(item) for item in __import__("lab_metabolomics_fixture").POSITIVE_SPOTS
+                 if item.get("method") != "lib2_predicted_rt"]
+        job = write_run(self.batch, self.contract, "Positive", spots=spots)
+        resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": job})
+        self.assertEqual(0, resolved["polarities"]["Positive"]["summary"]["candidates_by_library"]["predicted RT"])
+        self.assertTrue(any("The library 'predicted RT'" in item for item in resolved["polarities"]["Positive"]["warnings"]))
 
     def test_the_merge_keeps_one_row_per_compound_and_says_why_each_other_went(self) -> None:
         self.normalize("Positive")
@@ -369,8 +559,8 @@ class StandardsNormalizeAndMerge(Batched):
         self.assertEqual("internal standard", removed[("Negative", "101")])
         self.assertEqual("unannotated", removed[("Positive", "12")])
         self.assertEqual("not reference matched", removed[("Positive", "13")])
-        self.assertEqual("marked removable (Comment starts with x)", removed[("Negative", "113")])
         self.assertEqual("duplicate InChIKey first block", removed[("Positive", "10")])
+        self.assertEqual({}, report["unconfirmed_standard_spots"])
         # Counted against the row kept: both positive glutamine rows lost to the negative one.
         self.assertEqual({"within_polarity": 0, "across_polarities": 3}, report["counts"]["duplicates_removed"])
         self.assertTrue(Path(report["merge_report"]).is_file())

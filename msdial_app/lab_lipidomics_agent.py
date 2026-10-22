@@ -104,6 +104,8 @@ CHECK_SCHEMA = "msdial-interactive.lab-lipidomics-check.v1"
 CONTRACT_SCHEMA = "msdial-interactive.lab-lipidomics-contract.v1"
 NORMALIZE_RECORD_SCHEMA = "msdial-interactive.lab-lipidomics-normalize.v1"
 CONTRACT_NAME = "lab-lipidomics-contract.json"
+# The laboratory metabolomics agent's contract (lab_lcms_metabolomics_agent.CONTRACT_NAME), which shares this layout.
+METABOLOMICS_CONTRACT_NAME = "lab-lcms-metabolomics-contract.json"
 RECORD_NAME = "lab-lipidomics-record.jsonl"
 INPUTS_FOLDER = "inputs"
 QUANT_FOLDER = "quant"
@@ -340,6 +342,13 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         blockers.extend(verdict["blockers"])
         warnings.extend(verdict["warnings"])
         blockers.extend(raw_folder_overlaps(analysis_root, _analysis_subfolders(analysis_root), folders))
+        # A laboratory metabolomics analysis writes the same file names into its root.
+        if (analysis_root / INPUTS_FOLDER / METABOLOMICS_CONTRACT_NAME).exists():
+            blockers.append(
+                f"{analysis_root} holds a laboratory LC-MS metabolomics analysis ({METABOLOMICS_CONTRACT_NAME}); its "
+                "internal-standard libraries, run folders and normalized matrices have the names this analysis would "
+                "write. Give the lipidomics analysis its own root."
+            )
         result["outputs"] = {
             "inputs": str(analysis_root / INPUTS_FOLDER), "quant": str(analysis_root / QUANT_FOLDER),
             **{polarity: str(analysis_root / FOLDERS[polarity]) for polarity in POLARITIES},

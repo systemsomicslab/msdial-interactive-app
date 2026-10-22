@@ -38,6 +38,7 @@ from .lab_lcms_metabolomics import (
     PRESETS,
     annotation_summary,
     annotator_settings,
+    export_annotator_ids,
     lbm_retention_time,
     library_identity,
     merge_metabolome,
@@ -45,6 +46,7 @@ from .lab_lcms_metabolomics import (
     normalized_text,
     preferred_adducts,
     read_annotation,
+    retention_time_census,
     verify_normalized,
 )
 from .lab_lipidomics import (
@@ -72,6 +74,7 @@ from .lab_lipidomics import (
     write_canonical_text_db,
     write_resolution_tsv,
 )
+from .lab_lipidomics_agent import CONTRACT_NAME as LIPIDOMICS_CONTRACT_NAME
 from .lab_lipidomics_agent import (
     CONSOLE_BUILD_KEYS,
     LAB_LBM_QUERIES,
@@ -140,7 +143,12 @@ LAB_CONSOLE_NEEDS = {
     ANNOTATION_CANDIDATES_CAPABILITY: "the annotation candidate table",
     AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY: "automatic RT correction's local test (MsdialWorkbench#826)",
 }
-_FOLDER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+# Neither ending in a dot nor a space, which Windows strips from a folder name: "qa_figures." is qa_figures.
+_FOLDER_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9_-])?$")
+# The resolver's statuses for a standard a library or its own text row annotated (tiers A and B).
+DECIDED_STATUSES = ("resolved_lbm", "resolved_text")
+# A project saved this long after the run's exports was saved again, as after curation in the GUI.
+CURATION_SLACK_SECONDS = 30 * 60
 
 
 class LabMetabolomicsError(ValueError):
@@ -212,15 +220,34 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
             f" Still missing: {', '.join(annotation['missing'])}." if annotation["missing"] != ["annotation"] else ""
         ))
     identities: dict[str, dict[str, Any]] = {}
+    census: dict[str, dict[str, Any]] = {}
     if not annotation["blockers"] and not annotation["missing"]:
         for entry in annotation["entries"]:
             for polarity, path in entry["paths"].items():
                 identities.setdefault(_path_key(path), library_identity(path))
+                if entry["kind"] != "msp" or entry["retention_time"] != "use":
+                    continue
+                # MS-DIAL keeps a record without an RT in every RT window and counts the RT as met: in a
+                # library searched with RT, such a record is matched on MS/MS alone under the RT tier's label.
+                counted = retention_time_census(path)
+                census[f"{entry['label']} ({polarity.lower()})"] = counted
+                if counted["records"] and not counted["with_retention_time"]:
+                    blockers.append(
+                        f"{entry['label']} is searched with retention time, but none of the {counted['records']} records "
+                        f"of {Path(path).name} gives one; search it without RT (retention_time 'none')."
+                    )
+                elif counted["with_retention_time"] < counted["records"]:
+                    warnings.append(
+                        f"{counted['records'] - counted['with_retention_time']} of the {counted['records']} records of "
+                        f"{Path(path).name} give no retention time; MS-DIAL matches those on MS/MS alone, under the "
+                        f"label '{entry['label']}'."
+                    )
     result["annotation"] = {
         "preset": annotation["preset"],
         "libraries": annotation_summary(annotation["entries"]),
         "internal_standard_priority": INTERNAL_STANDARD_PRIORITY,
         "files": {item["name"]: {"sha256": item["sha256"], "size_bytes": item["size_bytes"]} for item in identities.values()},
+        "retention_time_census": census,
     }
 
     # The salt: the LBM2's negative records, and the negative adduct the merge prefers.
@@ -312,6 +339,7 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         blockers.extend(verdict["blockers"])
         warnings.extend(verdict["warnings"])
         blockers.extend(raw_folder_overlaps(analysis_root, _analysis_subfolders(analysis_root), folders))
+        blockers.extend(other_contract_problems(analysis_root))
         result["outputs"] = {
             "inputs": str(analysis_root / INPUTS_FOLDER), "quant": str(analysis_root / QUANT_FOLDER),
             **{polarity: str(analysis_root / FOLDERS[polarity]) for polarity in polarities},
@@ -363,10 +391,11 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
             "the standard blocks, a Blank or Standard injection without it keeps its raw height"
         ),
         "merge": (
-            "unannotated rows, internal standards and rows whose Comment starts with x are dropped; by default only "
-            "reference-matched rows are kept (reference_matched_only) and every adduct is (preferred_adducts_only "
-            "off); rows sharing the InChIKey's first block are one compound, within and across polarities, and the "
-            "row kept is the preferred adduct, then the MS/MS-matched, then the larger mean over Sample and QC"
+            "unannotated rows and internal standards are dropped; by default only reference-matched rows are kept "
+            "(reference_matched_only) and every adduct is (preferred_adducts_only off); rows sharing the InChIKey's "
+            "first block are one compound, within and across polarities, and the row kept is the preferred adduct, "
+            "then the MS/MS-matched, then the larger mean over Sample and QC. The matrices are the exports the run "
+            "wrote: curation in the GUI afterwards does not reach them"
         ),
         "method_files": {key: {"name": item["name"], "sha256": item["sha256"]} for key, item in lab_method_files().items()},
     }
@@ -397,6 +426,18 @@ def _analysis_subfolders(root: Path) -> dict[str, Path]:
         **{f"{polarity.lower()} output folder": root / FOLDERS[polarity] for polarity in POLARITIES},
         "inputs folder": root / INPUTS_FOLDER, "quant folder": root / QUANT_FOLDER,
     }
+
+
+def other_contract_problems(root: Path) -> list[str]:
+    """A laboratory lipidomics analysis in this root: the two agents write the same file names there."""
+    other = root / INPUTS_FOLDER / LIPIDOMICS_CONTRACT_NAME
+    if other.exists():
+        return [
+            f"{root} holds a laboratory lipidomics analysis ({other.name}); its internal-standard libraries, run "
+            "folders and normalized matrices have the names this analysis would write. Give the metabolomics "
+            "analysis its own root."
+        ]
+    return []
 
 
 def _metabolomics_candidate_inputs(folders: list[Path]) -> dict[str, Any]:
@@ -477,7 +518,7 @@ def _input_identity(
             "preset": annotation.get("preset"),
             "libraries": [
                 {key: entry.get(key) for key in ("kind", "thresholds", "retention_time", "rt_tolerance", "label",
-                                                 "priority", "annotator_id")}
+                                                 "priority", "annotator_id", "library_kind")}
                 | {"files": {polarity: identities.get(_path_key(path), {}).get("sha256") or _path_key(path)
                              for polarity, path in sorted(entry["paths"].items())},
                    "paths": {polarity: _path_key(path) for polarity, path in sorted(entry["paths"].items())}}
@@ -607,7 +648,7 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
             "preset": annotation["preset"],
             "libraries": [
                 {key: entry.get(key) for key in ("id", "slot", "kind", "thresholds", "retention_time", "rt_tolerance",
-                                                 "label", "priority", "annotator_id")}
+                                                 "label", "priority", "annotator_id", "library_kind")}
                 | {"files": {polarity: identities[_path_key(path)] for polarity, path in entry["paths"].items()}}
                 for entry in annotation["entries"]
             ],
@@ -785,6 +826,8 @@ def contract_plan_answers(contract_path: str, supplied: dict[str, Any], input_pa
         outcome["blockers"].append(f"input_path must be the contract's {polarity.lower()} raw-data folder, {raw}.")
     root = Path(contract["analysis_root"])
     outcome["blockers"].extend(raw_folder_overlaps(root, _analysis_subfolders(root), contract["raw_folders"]))
+    # A lipidomics contract written into this root afterwards would share every file name with this one.
+    outcome["blockers"].extend(other_contract_problems(root))
     method_files = {key: contract["inputs"].get(key) or {} for key in ("parameter_template", "lbm_queries")}
     for key, item in method_files.items():
         label = key.replace("_", " ")
@@ -939,6 +982,24 @@ def resolve_polarity(contract: dict[str, Any], polarity: str, job: dict[str, Any
         resolution["warnings"].append(
             f"No spot is annotated by the internal-standard library ({annotator}); check that MS-DIAL loaded it."
         )
+    # Each library on its own, over every candidate MS-DIAL kept: the Console skips a library that parses to
+    # no record without a word, and a lower tier that always loses still leaves candidates.
+    candidate_counts: dict[str, int] = {}
+    for rows in candidates["by_spot"].values():
+        for row in rows:
+            name = str(row.get("annotator_id") or "")
+            candidate_counts[name] = candidate_counts.get(name, 0) + 1
+    by_library: dict[str, int] = {}
+    for entry in contract["annotation"]["libraries"]:
+        if polarity not in entry.get("files", {}):
+            continue
+        ids = set(export_annotator_ids({**entry, "paths": {polarity: entry["files"][polarity]["path"]}}).values())
+        by_library[entry["label"]] = sum(candidate_counts.get(identifier, 0) for identifier in ids)
+        if annotated and not by_library[entry["label"]]:
+            resolution["warnings"].append(
+                f"The library '{entry['label']}' ({entry['files'][polarity]['name']}) left no annotation candidate in "
+                "this run; MS-DIAL skips a library it reads as empty without a word."
+            )
     by_name = {entry["name"]: entry for entry in resolution["standards"]}
     profiles = {
         name: standard_profile(export, entry["alignment_id"])
@@ -949,6 +1010,8 @@ def resolve_polarity(contract: dict[str, Any], polarity: str, job: dict[str, Any
     result.update({
         "resolution": resolution,
         "resolution_digest": digest,
+        # Kept when the resolution itself is left out of what is shown.
+        "warnings": list(resolution["warnings"]),
         "summary": {
             "normalizing_standard": {
                 "name": normalizing, "status": entry.get("status"), "tier": entry.get("tier"),
@@ -971,6 +1034,7 @@ def resolve_polarity(contract: dict[str, Any], polarity: str, job: dict[str, Any
             "unresolved": [item["name"] for item in resolution["standards"]
                            if item["status"] in {"unresolved_missing", "invalid", "conflict"}],
             "library_annotated_spots": annotated,
+            "candidates_by_library": by_library,
             "internal_standard_library_spots": text_annotated,
         },
     })
@@ -983,6 +1047,9 @@ def resolve_standards_for_contract(contract_path: str, jobs: dict[str, dict[str,
     polarities: dict[str, Any] = {}
     for polarity, job in jobs.items():
         if polarity not in contract["polarities"]:
+            if job is None:
+                # A folder read asked for every polarity; this contract has no run of this one.
+                continue
             raise LabMetabolomicsError(f"The contract covers {', '.join(contract['polarities'])}, not {polarity}.")
         resolved = resolve_polarity(contract, polarity, job)
         if resolved.get("resolution") is not None:
@@ -1048,6 +1115,7 @@ def plan_normalize(
     if accepted and chosen:
         raise LabMetabolomicsError(f"{name} is given two decisions; accept_searched and accept_spot exclude one another.")
     decision = "as resolved"
+    tier, status = entry.get("tier"), entry.get("status")
     if name in chosen:
         try:
             candidate = chosen_candidate(entry, chosen[name])
@@ -1055,6 +1123,7 @@ def plan_normalize(
             raise LabMetabolomicsError(f"accept_spot: {error}") from None
         alignment_id = str(candidate["alignment_id"])
         decision = "taken by the person (accept_spot)"
+        tier, status = candidate.get("tier"), "taken_by_person"
     elif entry.get("status") in {"unresolved_missing", "unresolved_expected", "invalid", "conflict"}:
         alternatives = entry.get("valid_alternatives") or []
         raise LabMetabolomicsError(
@@ -1071,10 +1140,31 @@ def plan_normalize(
             )
         alignment_id = str(entry["alignment_id"])
         decision = "accepted by the person (accept_searched)"
+        status = "accepted_by_person"
     else:
         if name in accepted:
             raise LabMetabolomicsError(f"accept_searched names {name}, which this resolution does not ask the person to accept.")
         alignment_id = str(entry["alignment_id"])
+    # What is an internal standard from here on: the normalizing standard's spot as decided, and the other
+    # standards found by a library or their own text row (tiers A and B). A spot only searched for a standard
+    # nobody confirmed stays a feature; the merge names it, and keeps it.
+    decided: dict[str, str] = {name: alignment_id}
+    unconfirmed: list[dict[str, Any]] = []
+    for item in resolution["standards"]:
+        if item["name"] == name or not item.get("alignment_id"):
+            continue
+        if item["status"] in DECIDED_STATUSES and not item.get("needs_confirmation"):
+            decided[item["name"]] = str(item["alignment_id"])
+        else:
+            unconfirmed.append({"standard": item["name"], "alignment_id": str(item["alignment_id"]),
+                                "tier": item.get("tier"), "status": item["status"],
+                                "ms_dial_name": (item.get("spot") or {}).get("name")})
+    figure_rows = [
+        {"StandardName": item["name"], "PeakID": int(decided[item["name"]]) if item["name"] in decided else -1}
+        for item in resolution["standards"]
+    ]
+    if name not in {item["name"] for item in resolution["standards"]}:
+        figure_rows.insert(0, {"StandardName": name, "PeakID": int(alignment_id)})
     sample_rows = polarity_sample_table(contract["sample_table"]["rows"], polarity)
     factors = {
         row["file_name"]: float(row.get("factor", 1) or 1)
@@ -1099,11 +1189,28 @@ def plan_normalize(
             f"{', '.join(normalized['raw_height_kept'])} carry no {name}; as Blank or Standard injections they keep "
             "their raw heights."
         )
+    for item in unconfirmed:
+        warnings.append(
+            f"Spot {item['alignment_id']} ('{item['ms_dial_name']}') was only searched for {item['standard']} (tier "
+            f"{item['tier']}, {item['status']}); nobody confirmed it, so it stays a feature in the merge."
+        )
+    project = Path(str(resolved["outputs"].get("project") or ""))
+    height = Path(resolved["outputs"]["height_export"])
+    if project.is_file() and project.stat().st_mtime - height.stat().st_mtime > CURATION_SLACK_SECONDS:
+        warnings.append(
+            f"{project.name} was saved {int((project.stat().st_mtime - height.stat().st_mtime) // 60)} min after the "
+            "run's exports, as after curation in the GUI. This normalizes the exports the run wrote; names, Unknowns "
+            "and comments set in the GUI afterwards do not reach it."
+        )
     return {
         "contract_path": contract["_path"], "contract_sha256": contract["_sha256"], "polarity": polarity,
         "job_id": job.get("id"), "resolution_digest": resolved["resolution_digest"],
         "normalizing_standard": {"name": name, "alignment_id": alignment_id, "decision": decision,
-                                 "tier": entry.get("tier"), "status": entry.get("status")},
+                                 "tier": tier, "status": status},
+        "internal_standard_ids": sorted(set(decided.values()), key=lambda value: (len(value), value)),
+        "unconfirmed_standard_spots": unconfirmed,
+        "figure_rows": figure_rows,
+        "export_column_factors": by_column,
         "standard_mean": normalized["standard_mean"],
         "mean_over": normalized["mean_over"],
         "standard_heights": normalized["standard_heights"],
@@ -1143,7 +1250,11 @@ def finish_normalize(plan: dict[str, Any]) -> dict[str, Any]:
     target.write_bytes(normalized_text(normalized).encode("utf-8"))
     shutil.copyfile(plan["outputs"]["height_export"], paths["height_copy"])
     resolution_file = write_resolution_tsv(plan["resolution"], paths["resolution"])
-    verification = verify_normalized(target, normalized)
+    # Recomputed on its own from the copy just taken, which must be the export normalize read.
+    verification = verify_normalized(
+        target, paths["height_copy"], plan["normalizing_standard"]["alignment_id"], plan["export_column_factors"],
+        expected_height_sha256=normalized["height_export_sha256"],
+    )
     record: dict[str, Any] = {
         "schema": NORMALIZE_RECORD_SCHEMA,
         "sharing": "local_only",
@@ -1153,8 +1264,8 @@ def finish_normalize(plan: dict[str, Any]) -> dict[str, Any]:
         "normalizing_standard": plan["normalizing_standard"],
         "standard_mean": plan["standard_mean"], "mean_over": plan["mean_over"],
         "raw_height_kept": plan["raw_height_kept"], "dilution_factors": plan["dilution_factors"],
-        "internal_standard_ids": sorted({str(entry["alignment_id"]) for entry in plan["resolution"]["standards"]
-                                         if entry.get("alignment_id")} | {plan["normalizing_standard"]["alignment_id"]}),
+        "internal_standard_ids": plan["internal_standard_ids"],
+        "unconfirmed_standard_spots": plan["unconfirmed_standard_spots"],
         "candidate_table": plan["outputs"]["candidate_table"],
         "candidate_table_sha256": file_sha256(plan["outputs"]["candidate_table"]),
         "height_export": plan["outputs"]["height_export"],
@@ -1198,7 +1309,8 @@ def merge(
     name = str(output_folder or "").strip()
     if not _FOLDER_NAME.match(name) or name.casefold() in RESERVED_QUANT_FOLDERS:
         raise LabMetabolomicsError(
-            "output_folder is one folder name inside quant (letters, digits, _ . -), not pos, neg or qa_figures."
+            "output_folder is one folder name inside quant (letters, digits, _ . -, not ending in a dot), not pos, "
+            "neg or qa_figures."
         )
     defaults = (contract.get("merge") or {}).get("defaults") or {}
     options = {
@@ -1229,8 +1341,14 @@ def merge(
             "polarity": polarity, "normalized": outputs["normalized"], "candidate_table": record["candidate_table"],
             "internal_standard_ids": record.get("internal_standard_ids", []),
             "internal_standard_annotator": INTERNAL_STANDARD_ANNOTATOR_IDS[polarity],
+            "unconfirmed_standard_spots": record.get("unconfirmed_standard_spots", []),
         })
-    labels = {entry["annotator_id"]: entry["label"] for entry in contract["annotation"]["libraries"]}
+    # By the annotator ID an export's Comment gives each library: the LBM2's is the Console's own.
+    labels: dict[str, str] = {}
+    for entry in contract["annotation"]["libraries"]:
+        paths = {polarity: item["path"] for polarity, item in entry.get("files", {}).items()}
+        for identifier in export_annotator_ids({**entry, "paths": paths}).values():
+            labels[identifier] = entry["label"]
     try:
         report = merge_metabolome(
             inputs, quant / name, salt=contract["salt"]["salt"], labels=labels, write=write, **options,

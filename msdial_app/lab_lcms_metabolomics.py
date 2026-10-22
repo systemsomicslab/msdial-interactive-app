@@ -30,6 +30,7 @@ from .lab_lipidomics import (
     file_sha256,
     parse_adduct,
     parse_number,
+    read_alignment_export,
     read_candidate_table,
     representative_candidate,
 )
@@ -77,7 +78,7 @@ PRESETS: dict[str, list[dict[str, Any]]] = {
         {"id": "msp_mild", "slot": "msp", "kind": "msp", "thresholds": "mild", "retention_time": "none",
          "label": "MSP mild"},
         {"id": "in_silico", "slot": "in_silico", "kind": "msp", "thresholds": "mild", "retention_time": "none",
-         "label": "in-silico MSP", "optional": True},
+         "label": "in-silico MSP", "library_kind": "predicted", "optional": True},
     ],
     "lab_rt_tiers": [
         {"id": "in_house", "slot": "in_house", "kind": "msp", "thresholds": "standard", "retention_time": "use",
@@ -97,6 +98,9 @@ PRESET_PURPOSES = {
 }
 # The internal-standard text row is searched at priority 1, below every library.
 INTERNAL_STANDARD_PRIORITY = 1
+# Whether an MSP's spectra were acquired or computed (in silico): the Console reads library_kind and
+# publishes a match against a predicted library as in-silico evidence, never as a reference spectrum.
+LIBRARY_KINDS_OF_SPECTRA = ("acquired", "predicted")
 _LABEL = re.compile(r"^[ -~]{1,60}$")
 _IDENTIFIER = re.compile(r"[^a-z0-9]+")
 _POLARITY_KEYS = {"positive": POSITIVE, "pos": POSITIVE, "negative": NEGATIVE, "neg": NEGATIVE}
@@ -108,6 +112,48 @@ def library_identity(path: str | Path) -> dict[str, Any]:
     size = target.stat().st_size
     sha256 = file_identity(target).get("sha256", "") if size >= (64 << 20) else file_sha256(target)
     return {"path": str(target), "name": target.name, "size_bytes": size, "sha256": sha256}
+
+
+def console_lbm_annotator_id(path: str | Path) -> str:
+    """What the Console calls the LBM2's annotator in an export's Comment (CommonProcess.LbmAnnotatorId)."""
+    stem = Path(str(path)).stem if str(path or "").strip() else ""
+    return f"LbmDB: {stem}" if stem.strip() else "LbmDB"
+
+
+_RETENTION_TIME_CENSUS: dict[tuple[str, int, int], dict[str, int]] = {}
+# The field names MS-DIAL's MSP parser reads as a retention time (MspFileParcer).
+_MSP_RETENTION_TIME = re.compile(r"^\s*(?:RETENTIONTIME|RETENTION_TIME|RT)\s*:\s*(.*)$", re.IGNORECASE)
+
+
+def retention_time_census(path: str | Path) -> dict[str, int]:
+    """How many records an MSP holds, and how many give a retention time above zero.
+
+    MS-DIAL keeps a reference without a retention time in every RT window and counts its RT requirement
+    as met, so such a record in a library searched with RT is matched on MS/MS alone. Read once per
+    file version and kept for the process.
+    """
+    target = Path(path).expanduser().resolve()
+    stat = target.stat()
+    key = (str(target).casefold(), stat.st_size, stat.st_mtime_ns)
+    if key in _RETENTION_TIME_CENSUS:
+        return dict(_RETENTION_TIME_CENSUS[key])
+    records = with_rt = 0
+    current = False
+    with target.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line[:5].casefold() == "name:":
+                records += 1
+                current = False
+                continue
+            match = _MSP_RETENTION_TIME.match(line)
+            if match and not current:
+                value = parse_number(match.group(1).strip())
+                if value is not None and value > 0:
+                    with_rt += 1
+                    current = True
+    census = {"records": records, "with_retention_time": with_rt}
+    _RETENTION_TIME_CENSUS[key] = census
+    return dict(census)
 
 
 def _paths_by_polarity(value: Any) -> dict[str, str] | None:
@@ -166,7 +212,7 @@ def read_annotation(spec: Any, polarities: Iterable[str]) -> dict[str, Any]:
                 continue
             if not paths and template.get("optional"):
                 continue
-            entries.append({**{key: value for key, value in template.items() if key != "optional"}, "paths": paths})
+            entries.append({**template, "paths": paths})
     else:
         if not isinstance(libraries, list) or not libraries:
             blockers.append("annotation names no preset and lists no libraries.")
@@ -187,15 +233,26 @@ def read_annotation(spec: Any, polarities: Iterable[str]) -> dict[str, Any]:
                 "retention_time": str(item.get("retention_time") or "").strip().casefold(),
                 "rt_tolerance": item.get("rt_tolerance"),
                 "label": str(item.get("label") or "").strip() or f"{kind.upper()} {number}",
+                "library_kind": str(item.get("library_kind") or "").strip().casefold(),
                 "paths": paths,
             })
 
     count = len(entries)
     for index, entry in enumerate(entries, start=1):
         where = f"annotation library {index} ({entry.get('label') or entry['slot']})"
+        # Set before anything can stop this entry: the person is shown every entry, refused or not.
+        entry["priority"] = count - index + 1 + INTERNAL_STANDARD_PRIORITY
+        entry["annotator_id"] = f"lib{index}_" + _IDENTIFIER.sub("_", str(entry["id"]).casefold()).strip("_")
+        entry["library_kind"] = str(entry.get("library_kind") or "").strip().casefold()
         if entry["kind"] not in LIBRARY_KINDS:
             blockers.append(f"{where}: kind '{entry['kind']}' is neither msp nor lbm.")
+            entry["rt_tolerance"] = None
+            entry["paths"] = {polarity: entry["paths"][polarity] for polarity in wanted if entry["paths"].get(polarity)}
             continue
+        if entry["kind"] == "msp" and entry["library_kind"] not in ("", *LIBRARY_KINDS_OF_SPECTRA):
+            blockers.append(f"{where}: library_kind '{entry['library_kind']}' is neither acquired nor predicted.")
+        if entry["kind"] == "lbm":
+            entry["library_kind"] = ""
         if entry["kind"] == "msp" and entry.get("thresholds") not in THRESHOLDS:
             blockers.append(f"{where}: thresholds '{entry.get('thresholds')}' is none of {', '.join(THRESHOLDS)}.")
         if entry["retention_time"] not in RETENTION_TIME_USES:
@@ -211,12 +268,12 @@ def read_annotation(spec: Any, polarities: Iterable[str]) -> dict[str, Any]:
         if not _LABEL.match(str(entry.get("label") or "")) or "\t" in str(entry.get("label")):
             # The label reaches msp_annotator_settings.tsv, which the Console reads as ASCII.
             blockers.append(f"{where}: label is printable ASCII of at most 60 characters.")
-        entry["priority"] = count - index + 1 + INTERNAL_STANDARD_PRIORITY
-        entry["annotator_id"] = f"lib{index}_" + _IDENTIFIER.sub("_", str(entry["id"]).casefold()).strip("_")
         for polarity in wanted:
             path = entry["paths"].get(polarity)
             if not path:
-                missing.append(f"{entry['slot']} ({polarity.lower()})")
+                # An optional library may serve one polarity only; the other runs without it.
+                if not entry.get("optional"):
+                    missing.append(f"{entry['slot']} ({polarity.lower()})")
                 continue
             target = Path(path).expanduser()
             if not target.is_file():
@@ -242,19 +299,34 @@ def read_annotation(spec: Any, polarities: Iterable[str]) -> dict[str, Any]:
                 warnings.append(
                     f"{polarity}: {', '.join(entry['label'] for entry in same)} search one file with the same settings."
                 )
+            # The Console loads a file once and gives every row of it the first row's kind.
+            if len({entry.get("library_kind") or "acquired" for entry in same}) > 1:
+                blockers.append(
+                    f"{polarity}: {', '.join(entry['label'] for entry in same)} search one file as both acquired and "
+                    "predicted spectra; a file is one or the other."
+                )
     result["entries"] = entries
     return result
+
+
+def export_annotator_ids(entry: dict[str, Any]) -> dict[str, str]:
+    """The annotator ID an export's Comment gives this library, by polarity."""
+    if entry.get("kind") == "lbm":
+        return {polarity: console_lbm_annotator_id(path) for polarity, path in entry.get("paths", {}).items()}
+    return {polarity: str(entry.get("annotator_id") or "") for polarity in entry.get("paths", {})}
 
 
 def annotation_summary(entries: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """The libraries as the person is shown them: no path, the settings each is searched with."""
     return [
         {
-            "priority": entry["priority"], "label": entry["label"], "kind": entry["kind"],
-            "annotator_id": entry["annotator_id"], "thresholds": entry.get("thresholds") or None,
-            "threshold_values": THRESHOLDS.get(entry.get("thresholds") or "", {}) if entry["kind"] == "msp" else None,
-            "retention_time": entry["retention_time"], "rt_tolerance": entry["rt_tolerance"],
-            "files": {polarity: Path(path).name for polarity, path in entry["paths"].items()},
+            "priority": entry.get("priority"), "label": entry.get("label"), "kind": entry.get("kind"),
+            "annotator_id": entry.get("annotator_id"), "export_annotator_ids": export_annotator_ids(entry),
+            "thresholds": entry.get("thresholds") or None,
+            "threshold_values": THRESHOLDS.get(entry.get("thresholds") or "", {}) if entry.get("kind") == "msp" else None,
+            "library_kind": (entry.get("library_kind") or "acquired") if entry.get("kind") == "msp" else None,
+            "retention_time": entry.get("retention_time"), "rt_tolerance": entry.get("rt_tolerance"),
+            "files": {polarity: Path(path).name for polarity, path in entry.get("paths", {}).items()},
         }
         for entry in entries
     ]
@@ -276,6 +348,7 @@ def annotator_settings(entries: Iterable[dict[str, Any]], polarity: str) -> dict
             "path": str(Path(path).expanduser().resolve()), "priority": entry["priority"],
             "thresholds": entry.get("thresholds") or "", "retention_time": entry["retention_time"],
             "rt_tolerance": entry["rt_tolerance"],
+            **({"library_kind": entry.get("library_kind") or "acquired"} if entry["kind"] == "msp" else {}),
         })
     return {"annotators": rows}
 
@@ -304,6 +377,8 @@ def apply_annotators(state: dict[str, Any], annotators: Iterable[dict[str, Any]]
                 "use_rt_filtering": use_rt,
                 # Decided for this library: the run-wide retention-time answer does not reach it.
                 "rt_fixed": True,
+                # A predicted library's matches are published as in silico, never as reference spectra.
+                "library_kind": str(item.get("library_kind") or "acquired"),
                 **THRESHOLDS.get(str(item.get("thresholds") or "standard"), THRESHOLDS["standard"]),
             }
             if use_rt and item.get("rt_tolerance") not in (None, ""):
@@ -469,38 +544,70 @@ def normalized_text(normalized: dict[str, Any]) -> str:
     return "\r\n".join(lines) + "\r\n"
 
 
-def verify_normalized(path: str | Path, normalized: dict[str, Any]) -> dict[str, Any]:
-    """Every cell of the written matrix recomputed from the Height export, and compared."""
-    written = _rows_with_cells(path)
-    start = written["first_sample_column"]
-    failed: list[dict[str, Any]] = []
-    checked = 0
-    if written["sample_names"] != normalized["export"]["sample_names"]:
+def verify_normalized(
+    path: str | Path, height_export: str | Path, standard_id: str, factors: dict[str, float] | None = None,
+    *, expected_height_sha256: str = "",
+) -> dict[str, Any]:
+    """Every cell of the written matrix recomputed on its own from the Height export, and compared.
+
+    Read through lab_lipidomics.read_alignment_export, not the rows normalize_heights computed from: the
+    standard's heights, its Sample and QC mean and each injection's factor are taken again, and each cell
+    must be height / standard x mean x factor, or the raw height in a Blank or Standard injection without
+    the standard. expected_height_sha256 binds the Height export to the one normalize read.
+    """
+    problems: list[str] = []
+    if expected_height_sha256 and file_sha256(height_export) != expected_height_sha256:
+        return {"passed": False, "checked": 0, "failed": [],
+                "problems": [f"{Path(height_export).name} is not the Height export normalize read."]}
+    heights = read_alignment_export(height_export)
+    written = read_alignment_export(path)
+    if written["sample_names"] != heights["sample_names"]:
         return {"passed": False, "checked": 0, "failed": [],
                 "problems": ["The written matrix lists other samples than the Height export."]}
-    for row in written["rows"]:
-        identifier = row[written["id_column"]].strip() if len(row) > written["id_column"] else ""
-        expected = normalized["values"].get(identifier)
-        if expected is None:
+    names = heights["sample_names"]
+    kinds = [kind.casefold() for kind in heights["file_types"]]
+    standard_spot = next((spot for spot in heights["spots"] if spot["id"] == str(standard_id)), None)
+    if standard_spot is None:
+        return {"passed": False, "checked": 0, "failed": [],
+                "problems": [f"Alignment ID {standard_id} is not in {Path(height_export).name}."]}
+    standard = [0.0 if _is_zero_height(cell) else float(parse_number(cell)) for cell in standard_spot["cells"]]
+    counted = [standard[index] for index, kind in enumerate(kinds) if kind in NORMALIZATION_FILE_TYPES]
+    mean = sum(counted) / len(counted) if counted else 0.0
+    multipliers = [float((factors or {}).get(name, 1.0) or 1.0) for name in names]
+    by_id = {spot["id"]: spot for spot in written["spots"]}
+    failed: list[dict[str, Any]] = []
+    checked = 0
+    for spot in heights["spots"]:
+        target = by_id.get(spot["id"])
+        if target is None:
+            failed.append({"alignment_id": spot["id"], "sample": None, "written": None, "expected": "a row"})
             continue
-        for offset, value in enumerate(expected):
-            text = row[start + offset].strip() if start + offset < len(row) else ""
-            got = parse_number(text)
+        for offset, cell in enumerate(spot["cells"]):
+            height = parse_number(cell)
+            text = target["cells"][offset] if offset < len(target["cells"]) else ""
             checked += 1
-            if value is None and text == "":
+            if height is None:
+                if text != "":
+                    failed.append({"alignment_id": spot["id"], "sample": names[offset], "written": text, "expected": ""})
                 continue
-            if value is None or got is None or not math.isclose(got, value, rel_tol=1e-12, abs_tol=1e-9):
-                failed.append({"alignment_id": identifier, "sample": written["sample_names"][offset],
-                               "written": text, "expected": value})
-    missing = sorted(set(normalized["values"]) - {
-        row[written["id_column"]].strip() for row in written["rows"] if len(row) > written["id_column"]
-    })
-    problems = []
-    if missing:
-        problems.append(f"{len(missing)} feature(s) of the Height export are missing from the written matrix.")
+            if standard[offset] <= 0:
+                if kinds[offset] in NORMALIZATION_FILE_TYPES:
+                    failed.append({"alignment_id": spot["id"], "sample": names[offset], "written": text,
+                                   "expected": "no value: the standard has no height in a Sample or QC"})
+                    continue
+                expected = height
+            else:
+                expected = height / standard[offset] * mean * multipliers[offset]
+            got = parse_number(text)
+            if got is None or not math.isclose(got, expected, rel_tol=1e-12, abs_tol=1e-9):
+                failed.append({"alignment_id": spot["id"], "sample": names[offset], "written": text, "expected": expected})
+    extra = sorted(set(by_id) - {spot["id"] for spot in heights["spots"]})
+    if extra:
+        problems.append(f"{len(extra)} row(s) of the written matrix are not in the Height export.")
     if failed:
-        problems.append(f"{len(failed)} cell(s) do not follow the formula.")
-    return {"passed": not problems, "checked": checked, "failed": failed[:50], "problems": problems}
+        problems.append(f"{len(failed)} cell(s) or row(s) do not follow the formula.")
+    return {"passed": not problems, "checked": checked, "failed": failed[:50], "problems": problems,
+            "standard_mean": mean}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -509,7 +616,6 @@ def verify_normalized(path: str | Path, normalized: dict[str, Any]) -> dict[str,
 
 _INCHIKEY = re.compile(r"^([A-Z]{14})(?:-[A-Z]{10}-[A-Z])?$")
 UNANNOTATED_NAMES = frozenset({"", "unknown", "null"})
-MANUAL_EXCLUSION_COMMENT_PREFIX = "x"
 MERGE_FILE_TYPES = ("Sample", "QC")
 METABOLOME_NAME = "metabolome.csv"
 REMOVED_NAME = "metabolome_removed.tsv"
@@ -593,9 +699,12 @@ def merge_metabolome(
 ) -> dict[str, Any]:
     """One metabolome from the normalized matrices of one or both polarities.
 
-    polarities: [{polarity, normalized, candidate_table, internal_standard_ids, internal_standard_annotator}].
-    Rows dropped first: unannotated, an internal standard, a Comment that starts with x; then, as the
-    options say, rows not reference matched and adducts not preferred. Rows sharing an InChIKey's first
+    polarities: [{polarity, normalized, candidate_table, internal_standard_ids, internal_standard_annotator,
+    unconfirmed_standard_spots}]. Rows dropped first: unannotated, and an internal standard (a spot decided
+    as one, or one the internal-standard text row annotated); then, as the options say, rows not reference
+    matched and adducts not preferred. A spot only searched for a standard nobody confirmed is kept, and
+    named in the report (unconfirmed_standard_spots). The matrices are the exports the run wrote, so no
+    curation made later in the GUI reaches them; nothing here reads a Comment. Rows sharing an InChIKey's first
     block are one compound, within and across polarities; one is kept, by: a preferred adduct, matched on
     MS/MS, the larger mean normalized height over Sample and QC, then the higher library priority, the higher
     total score, positive before negative, and the lower alignment ID. A row without an InChIKey is kept as
@@ -632,8 +741,6 @@ def merge_metabolome(
                 drop(row, "unannotated")
             elif row["id"] in standards or (annotator and row["method"] == annotator):
                 drop(row, "internal standard")
-            elif row["comment"].startswith(MANUAL_EXCLUSION_COMMENT_PREFIX):
-                drop(row, "marked removable (Comment starts with x)")
             elif reference_matched_only and not row["matched"]:
                 drop(row, "not reference matched")
             elif preferred_adducts_only and not is_preferred(row["adduct"], identities):
@@ -745,6 +852,13 @@ def merge_metabolome(
             "removed": len(removed),
         },
         "samples": sample_names,
+        "unconfirmed_standard_spots": {
+            polarity: [
+                {**spot, "kept": str(spot.get("alignment_id")) in {row["id"] for row in kept if row["polarity"] == polarity}}
+                for spot in read[polarity]["input"].get("unconfirmed_standard_spots", [])
+            ]
+            for polarity in order if read[polarity]["input"].get("unconfirmed_standard_spots")
+        },
         "outputs": outputs,
     }
     if write:

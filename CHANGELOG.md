@@ -31,12 +31,18 @@ Built on 0.5.45 (#78), which is not merged yet; merge this after it.
     is not used, because it averages over every file, Blank included, and replaces a zero with 1.
   - **The merge** keeps one row per InChIKey first block, within and across polarities: the preferred adduct
     (`[M+H]+`, `[M-H]-`, and the salt's `[M+HCOO]-` or `[M+CH3COO]-`) first, then the MS/MS-matched row,
-    then the larger mean normalized height over Sample and QC. Internal standards, unannotated rows and rows
-    whose Comment starts with x are dropped first. `reference_matched_only` (default on) and
+    then the larger mean normalized height over Sample and QC. Internal standards and unannotated rows are
+    dropped first. `reference_matched_only` (default on) and
     `preferred_adducts_only` (default off) are options of each merge. It writes `metabolome.csv`,
     `metabolome_samples.csv`, `metabolome_removed.tsv` and `merge-report.json`.
   - The contract and its record (`lab-lcms-metabolomics-contract.json`, `lab-lcms-metabolomics-record.jsonl`)
     name the libraries and the raw data by location, and are local only.
+  - An in-silico MSP is searched as `library_kind: predicted`, so MS-DIAL publishes its matches as in-silico
+    evidence. `msp_annotator_settings.tsv` carries the column only when a row states it.
+  - A library searched with retention time is read for its records' RTs: none refuses the library, and some
+    missing is a warning, because MS-DIAL matches a record without an RT on MS/MS alone.
+  - The two laboratory agents refuse an analysis root that holds the other's contract, since both write the
+    same file names there.
 
 ### Changed
 - `lab_lipidomics.resolve_standards` takes which spots tier A reads as a library annotation

@@ -34,6 +34,7 @@ DATASET_SCOPED_ANSWERS: dict[str, str] = {
     "sample_table": "is one person's agreement about these files; the next dataset has its own",
     "analysis_purpose": "is what this study is asked to answer; the next one is asked again",
     "lab_lipidomics_contract_path": "names this batch's contract",
+    "lab_lcms_metabolomics_contract_path": "names this batch's contract",
     "internal_standard_text_path": "names this batch's copy of the internal-standard library",
 }
 
