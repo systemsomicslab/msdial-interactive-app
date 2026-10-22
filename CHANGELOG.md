@@ -29,12 +29,18 @@ Built on 0.5.45 (#78), which is not merged yet; merge this after it.
     x the dilution factor. A Sample or QC without the standard refuses; a Blank or Standard injection without
     it keeps its raw height and is reported. Every written cell is checked again. MS-DIAL's own normalization
     is not used, because it averages over every file, Blank included, and replaces a zero with 1.
-  - **The merge** keeps one row per InChIKey first block, within and across polarities: the preferred adduct
-    (`[M+H]+`, `[M-H]-`, and the salt's `[M+HCOO]-` or `[M+CH3COO]-`) first, then the MS/MS-matched row,
-    then the larger mean normalized height over Sample and QC. Internal standards and unannotated rows are
-    dropped first. `reference_matched_only` (default on) and
-    `preferred_adducts_only` (default off) are options of each merge. It writes `metabolome.csv`,
-    `metabolome_samples.csv`, `metabolome_removed.tsv` and `merge-report.json`.
+  - **The merge** keeps one row per compound, within and across polarities. What one compound is
+    (`inchikey_match`: the InChIKey's first block, or its first two blocks) and which row is kept
+    (`duplicate_rule`: `evidence`, a match with the laboratory's own RT and MS/MS before an MS/MS-only one
+    even if weaker; `intensity`, the preferred adduct then the larger intensity; or `keep_all`) are asked
+    before anything runs and fixed in the contract. Internal standards and unannotated rows are dropped
+    first. `reference_matched_only` (default on) and `preferred_adducts_only` (default off) are options of
+    each merge. It writes `metabolome.csv`, `metabolome_samples.csv`, `metabolome_removed.tsv` and
+    `merge-report.json`.
+  - **Polarities acquired under other names pair** by the words that set each polarity's files apart (A1 in
+    `20230125_SWATH_A1_C_CE20_d1` and `20230208_SWATH_A1_A_CE20_d2`), for the person to confirm, or by the
+    pairs they give (`sample_pairs`); the merge pairs the columns by the confirmed table.
+  - MS-DIAL's four-column internal-standard text (Name, Pos-m/z, RT, Adduct) is read as it is.
   - The contract and its record (`lab-lcms-metabolomics-contract.json`, `lab-lcms-metabolomics-record.jsonl`)
     name the libraries and the raw data by location, and are local only.
   - An in-silico MSP is searched as `library_kind: predicted`, so MS-DIAL publishes its matches as in-silico

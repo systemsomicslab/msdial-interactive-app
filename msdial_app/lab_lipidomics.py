@@ -1079,12 +1079,18 @@ class InternalStandard:
         return asdict(self)
 
 
-def read_internal_standard_text(path: str | Path, polarity: str | None = None) -> dict[str, Any]:
+def read_internal_standard_text(
+    path: str | Path, polarity: str | None = None, *,
+    columns: dict[str, tuple[str, ...]] | None = None, required: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     """Read an MS-DIAL text library of internal standards, by its header, in any column order.
 
     Name, MZ, RT, Adduct and Ontology are required; MZ is the adduct's m/z, because MS-DIAL
-    matches the text library by m/z and the adduct column only labels the result.
+    matches the text library by m/z and the adduct column only labels the result. columns and
+    required replace IS_TEXT_COLUMNS and IS_TEXT_REQUIRED (laboratory metabolomics needs no class).
     """
+    columns_by_field = columns or IS_TEXT_COLUMNS
+    required_fields = required or IS_TEXT_REQUIRED
     source = Path(path)
     blockers: list[str] = []
     warnings: list[str] = []
@@ -1115,13 +1121,13 @@ def read_internal_standard_text(path: str | Path, polarity: str | None = None) -
         return result
     header = [cell.strip().strip('"') for cell in lines[header_index].split("\t")]
     result["header"] = header
-    columns: dict[str, int] = {}
+    found: dict[str, int] = {}
     for index, cell in enumerate(header):
         key = _header_key(cell)
-        for field_name, aliases in IS_TEXT_COLUMNS.items():
-            if key in aliases and field_name not in columns:
-                columns[field_name] = index
-    missing = [name for name in IS_TEXT_REQUIRED if name not in columns]
+        for field_name, aliases in columns_by_field.items():
+            if key in aliases and field_name not in found:
+                found[field_name] = index
+    missing = [name for name in required_fields if name not in found]
     if missing:
         blockers.append(
             f"{source.name} has no {', '.join(missing)} column(s); its header is: {' | '.join(header)}."
@@ -1137,7 +1143,7 @@ def read_internal_standard_text(path: str | Path, polarity: str | None = None) -
         cells = [cell.strip().strip('"') for cell in line.split("\t")]
 
         def cell(name: str) -> str:
-            index = columns.get(name, -1)
+            index = found.get(name, -1)
             return cells[index] if 0 <= index < len(cells) else ""
 
         problems: list[str] = []
@@ -1158,7 +1164,7 @@ def read_internal_standard_text(path: str | Path, polarity: str | None = None) -
         if rt is None or rt < 0:
             # The Console drops a row whose RT does not parse; an IS with no RT cannot be searched.
             problems.append(f"RT '{cell('rt')}' is not a retention time in minutes")
-        if not ontology:
+        if not ontology and "ontology" in required_fields:
             problems.append("has no Ontology")
         if ccs_text and (ccs is None or ccs <= 0):
             problems.append(f"CCS '{ccs_text}' is not a number")

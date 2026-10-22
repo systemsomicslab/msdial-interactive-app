@@ -34,7 +34,13 @@ from typing import Any, Iterable
 from . import __version__
 from .agent_workflow import apply_sample_table
 from .lab_lcms_metabolomics import (
+    DUPLICATE_RULES,
+    INCHIKEY_MATCHES,
     INTERNAL_STANDARD_PRIORITY,
+    IS_TEXT_COLUMNS_METABOLOMICS,
+    IS_TEXT_REQUIRED_METABOLOMICS,
+    PAIRED_FIELDS,
+    pair_by_shared_tokens,
     MERGE_REPORT_NAME,
     PRESET_PURPOSES,
     PRESETS,
@@ -147,6 +153,17 @@ ANNOTATION_QUESTION = (
         for name in PRESETS
     )
     + "."
+)
+DUPLICATE_RULE_QUESTION = (
+    "When one compound is found more than once (several adducts, both polarities, or several spots), which row "
+    "should the merge keep? evidence (recommended): the more reliable library match, one with your own RT and "
+    "MS/MS before an MS/MS-only one, then the library's priority, then the preferred adduct and the intensity; "
+    "intensity: the preferred adduct ([M+H]+, [M-H]-, the salt's adduct), then the larger intensity; keep_all: keep "
+    "every row and only count the duplicates."
+)
+INCHIKEY_MATCH_QUESTION = (
+    "What counts as one compound: the InChIKey's first block (the skeleton, so stereoisomers such as glucose and "
+    "mannose 6-phosphate are one compound), or its first two blocks (stereoisomers apart)?"
 )
 # What a laboratory metabolomics run needs of its Console. Normalize runs in Python, so the Console's
 # normalize --peak-ids-only is not among them.
@@ -302,6 +319,21 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
             blockers.append(f"solvent_type: {salt['problem']}")
     result["salt"] = {**salt, "preferred_adducts": preferred_adducts(salt.get("salt")) if salt.get("salt") else []}
 
+    # How the merge treats one compound found more than once: the person's choices, asked before anything runs.
+    merge_choices: dict[str, str] = {}
+    for key, choices, prompt in (
+        ("duplicate_rule", DUPLICATE_RULES, DUPLICATE_RULE_QUESTION),
+        ("inchikey_match", INCHIKEY_MATCHES, INCHIKEY_MATCH_QUESTION),
+    ):
+        answer = str(args.get(key) or "").strip().casefold()
+        if not answer:
+            ask(key, prompt, list(choices))
+        elif answer not in choices:
+            blockers.append(f"{key} '{args.get(key)}' is none of {', '.join(choices)}.")
+        else:
+            merge_choices[key] = answer
+    result["merge_choices"] = merge_choices
+
     # The internal-standard text libraries and the normalizing standard of each polarity.
     libraries: dict[str, list[InternalStandard]] = {}
     library_reports: dict[str, Any] = {}
@@ -318,7 +350,9 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
                 "Ontology, MZ being the adduct's m/z)? One file holding both polarities may be named for both.",
             )
             continue
-        read = read_internal_standard_text(Path(text).expanduser())
+        # MS-DIAL's own text library may be four columns (Name, m/z, RT, Adduct): no class is needed here.
+        read = read_internal_standard_text(Path(text).expanduser(), columns=IS_TEXT_COLUMNS_METABOLOMICS,
+                                           required=IS_TEXT_REQUIRED_METABOLOMICS)
         blockers.extend(read["blockers"])
         warnings.extend(read["warnings"])
         records = split_by_polarity(read["records"])[polarity] if not read["blockers"] else []
@@ -413,8 +447,9 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
             )
     result["console"] = console
 
-    proposal = _sample_table_proposal(inventory, polarities)
+    proposal = _sample_table_proposal(inventory, polarities, args.get("sample_pairs"))
     blockers.extend(proposal.pop("blockers"))
+    warnings.extend(proposal.get("pairing_warnings", []))
     metadata_text = str(args.get("sample_metadata_path") or "").strip()
     metadata_report: dict[str, Any] = {}
     if metadata_text and inventory:
@@ -468,7 +503,7 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         "args": args, "folders": folders, "inventory": inventory, "libraries": libraries, "salt": salt,
         "analysis_root": analysis_root, "is_rt_tolerance": is_rt_tolerance, "console": console,
         "metadata": metadata_report, "annotation": annotation, "identities": identities,
-        "normalizing": normalizing, "polarities": polarities,
+        "normalizing": normalizing, "polarities": polarities, "merge_choices": merge_choices,
     }
     return result
 
@@ -595,10 +630,39 @@ def _console_verdict(path: Path) -> dict[str, Any]:
     return verdict
 
 
-def _sample_table_proposal(inventory: dict[str, Any], polarities: list[str]) -> dict[str, Any]:
-    """One table for the polarities given: paired by stem for two, the one polarity's files for one."""
+def _sample_table_proposal(
+    inventory: dict[str, Any], polarities: list[str], pairs: Any = None,
+) -> dict[str, Any]:
+    """One table for the polarities given: paired for two, the one polarity's files for one.
+
+    Two polarities pair by stem (S1_Pos with S1_Neg) where they can; otherwise by the words that set each
+    polarity's files apart (pair_by_shared_tokens), which the person confirms, or by the pairs they give.
+    """
     if len(polarities) == 2:
-        return _paired_sample_table_proposal(inventory)
+        if set(inventory) != set(POLARITIES):
+            return {"rows": [], "problems": [], "matched": False, "blockers": []}
+        rows = {polarity: [_sample_row(item) for item in inventory[polarity]["files"]] for polarity in POLARITIES}
+        if pairs not in (None, "", []):
+            paired = _given_pairs(pairs, rows)
+            how = "as the person gave them (sample_pairs)"
+        else:
+            by_name = _paired_sample_table_proposal(inventory)
+            if not by_name.get("blockers"):
+                return {**by_name, "pairing": "by file name (the same name but for _Pos/_Neg)"}
+            paired = pair_by_shared_tokens(rows[POSITIVE], rows[NEGATIVE])
+            how = "by the words that set each polarity's files apart; confirm every pair"
+        for row in paired["rows"]:
+            row["included"] = True
+        return {
+            "rows": paired["rows"], "problems": paired["problems"], "matched": not paired["problems"],
+            "pairing": how, "pairing_warnings": paired.get("warnings", []),
+            "class_proposal": inventory[POSITIVE].get("class_proposal", {}),
+            "order_proposal": inventory[POSITIVE].get("sample_table_proposal", {}).get("analytical_order", {}),
+            "confirmation_required": True,
+            "blockers": [f"The two polarities do not pair: {problem}" for problem in paired["problems"]]
+                        + (["Give the pairs as sample_pairs: [{sample, positive_file, negative_file}, ...]."]
+                           if paired["problems"] else []),
+        }
     if not polarities or polarities[0] not in inventory:
         return {"rows": [], "problems": [], "matched": False, "blockers": []}
     polarity = polarities[0]
@@ -622,6 +686,45 @@ def _sample_table_proposal(inventory: dict[str, Any], polarities: list[str]) -> 
         "confirmation_required": True,
         "blockers": [f"The sample table cannot be proposed: {problem}" for problem in problems],
     }
+
+
+def _given_pairs(pairs: Any, rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    """The pairs the person gave: [{sample, positive_file, negative_file}], every file of each folder once."""
+    problems: list[str] = []
+    if not isinstance(pairs, list) or not all(isinstance(item, dict) for item in pairs):
+        return {"rows": [], "problems": ["sample_pairs is a list of {sample, positive_file, negative_file}."]}
+    by_name = {polarity: {row["file_name"].casefold(): row for row in items} for polarity, items in rows.items()}
+    used: dict[str, set[str]] = {POSITIVE: set(), NEGATIVE: set()}
+    result: list[dict[str, Any]] = []
+    for number, item in enumerate(pairs, start=1):
+        sample = str(item.get("sample") or "").strip()
+        files = {POSITIVE: str(item.get("positive_file") or "").strip(), NEGATIVE: str(item.get("negative_file") or "").strip()}
+        if not sample:
+            problems.append(f"sample_pairs[{number}] names no sample.")
+            continue
+        found = {}
+        for polarity, name in files.items():
+            row = by_name[polarity].get(name.casefold())
+            if row is None:
+                problems.append(f"sample_pairs[{number}] names {name or 'no file'}, which is not in the {polarity.lower()} folder.")
+            elif name.casefold() in used[polarity]:
+                problems.append(f"sample_pairs names {name} twice.")
+            else:
+                used[polarity].add(name.casefold())
+                found[polarity] = row
+        if len(found) == 2:
+            row = {"stem": sample, "positive_file": found[POSITIVE]["file_name"],
+                   "negative_file": found[NEGATIVE]["file_name"], "paired_by": "the person"}
+            row.update({key: found[POSITIVE].get(key) for key in PAIRED_FIELDS})
+            result.append(row)
+    for polarity, items in rows.items():
+        for row in items:
+            if row["file_name"].casefold() not in used[polarity]:
+                problems.append(f"sample_pairs has no pair for {row['file_name']}.")
+    names = [row["stem"] for row in result]
+    problems.extend(f"sample_pairs names the sample {name} twice." for name in sorted({n for n in names if names.count(n) > 1}))
+    result.sort(key=lambda row: (row.get("analytical_order") or 0, row["stem"].casefold()))
+    return {"rows": result, "problems": problems}
 
 
 def _input_identity(
@@ -648,6 +751,8 @@ def _input_identity(
             polarity: {"path": item.get("path"), "sha256": item.get("sha256")} for polarity, item in sorted(libraries.items())
         },
         "normalizing_standards": {polarity: item["name"] for polarity, item in sorted(normalizing.items())},
+        "sample_pairs": json.dumps(args.get("sample_pairs"), sort_keys=True, default=str),
+        "merge_choices": {key: str(args.get(key, "")).strip().casefold() for key in ("duplicate_rule", "inchikey_match")},
         "sample_metadata": {"path": metadata.get("path"), "sha256": metadata.get("sha256")},
         "answers": {
             **{key: str(args.get(key, "")).strip() for key in ("solvent_type", "analysis_purpose")},
@@ -746,6 +851,10 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
         kept = contract_path.with_name(f"lab-lcms-metabolomics-contract.{stamp}.json")
         contract_path.replace(kept)
         replaced = str(kept)
+    # A standard given without a class is written as one, which the canonical layout and the plan's check expect.
+    for polarity in polarities:
+        for record in parsed["libraries"][polarity]:
+            record.ontology = record.ontology or "Internal standard"
     derived = {polarity: write_canonical_text_db(parsed["libraries"][polarity], derived_paths[polarity])
                for polarity in polarities}
     identities = parsed["identities"]
@@ -803,8 +912,11 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
             "corrected": table["corrected"],
         },
         "method": lab_method_answers(),
-        "merge": {"defaults": {"reference_matched_only": True, "preferred_adducts_only": False},
+        "merge": {"defaults": {"reference_matched_only": True, "preferred_adducts_only": False,
+                               "duplicate_rule": parsed["merge_choices"]["duplicate_rule"],
+                               "inchikey_match": parsed["merge_choices"]["inchikey_match"]},
                   "preferred_adducts": preferred_adducts(parsed["salt"]["salt"])},
+        "pairing": check["paired_sample_table"].get("pairing"),
         "number_of_threads": int(float(args["number_of_threads"])) if args.get("number_of_threads") else None,
         "check_digest": check["check_digest"],
         "replaced_contract": replaced,
@@ -1565,14 +1677,23 @@ def merge(
     *,
     reference_matched_only: bool | None = None,
     preferred_adducts_only: bool | None = None,
+    duplicate_rule: str | None = None,
+    inchikey_match: str | None = None,
     output_folder: str = MERGE_FOLDER,
     write: bool = False,
 ) -> dict[str, Any]:
-    """The metabolome of every polarity the contract covers, from the matrices normalize wrote."""
+    """The metabolome of every polarity the contract covers, from the matrices normalize wrote.
+
+    Each option follows the contract unless given; one given otherwise is applied and said as a deviation.
+    """
     contract = load_contract(contract_path)
     for key, value in (("reference_matched_only", reference_matched_only), ("preferred_adducts_only", preferred_adducts_only)):
         if value is not None and not isinstance(value, bool):
             raise LabMetabolomicsError(f"{key} is true or false, not {value!r}.")
+    for key, value, choices in (("duplicate_rule", duplicate_rule, DUPLICATE_RULES),
+                                ("inchikey_match", inchikey_match, INCHIKEY_MATCHES)):
+        if value is not None and value not in choices:
+            raise LabMetabolomicsError(f"{key} is one of {', '.join(choices)}, not {value!r}.")
     name = str(output_folder or "").strip()
     if (not _FOLDER_NAME.match(name) or name.casefold() in RESERVED_QUANT_FOLDERS
             or name.split(".")[0].casefold() in WINDOWS_DEVICE_NAMES):
@@ -1584,10 +1705,25 @@ def merge(
     if target_folder.exists() and not target_folder.is_dir():
         raise LabMetabolomicsError(f"{target_folder} is a file normalize or an earlier step wrote; choose another output_folder.")
     defaults = (contract.get("merge") or {}).get("defaults") or {}
-    options = {
-        "reference_matched_only": defaults.get("reference_matched_only", True) if reference_matched_only is None else reference_matched_only,
-        "preferred_adducts_only": defaults.get("preferred_adducts_only", False) if preferred_adducts_only is None else preferred_adducts_only,
+    contract_options = {
+        "reference_matched_only": defaults.get("reference_matched_only", True),
+        "preferred_adducts_only": defaults.get("preferred_adducts_only", False),
+        "duplicate_rule": defaults.get("duplicate_rule") or "intensity",
+        "inchikey_match": defaults.get("inchikey_match") or "first_block",
     }
+    given = {"reference_matched_only": reference_matched_only, "preferred_adducts_only": preferred_adducts_only,
+             "duplicate_rule": duplicate_rule, "inchikey_match": inchikey_match}
+    options = {key: contract_options[key] if given[key] is None else given[key] for key in contract_options}
+    deviations = [f"{key} is {options[key]}; the contract says {contract_options[key]}"
+                  for key in options if options[key] != contract_options[key]]
+    # The confirmed table names each export column's sample, which pairs the polarities whatever their file names.
+    sample_map: dict[str, dict[str, str]] = {}
+    for row in contract["sample_table"]["rows"]:
+        if not row_included(row):
+            continue
+        for polarity, key in ((POSITIVE, "positive_file"), (NEGATIVE, "negative_file")):
+            if row.get(key):
+                sample_map.setdefault(polarity, {})[Path(str(row[key])).stem] = row["stem"]
     quant = Path(contract["quant_folder"])
     inputs = []
     for polarity in contract["polarities"]:
@@ -1622,19 +1758,25 @@ def merge(
             labels[identifier] = entry["label"]
     try:
         report = merge_metabolome(
-            inputs, quant / name, salt=contract["salt"]["salt"], labels=labels, write=write, **options,
+            inputs, quant / name, salt=contract["salt"]["salt"], labels=labels, write=write, sample_map=sample_map,
+            **options,
         )
     except LabInputError as error:
         raise LabMetabolomicsError(str(error)) from None
     except OSError as error:
         raise LabMetabolomicsError(f"The metabolome could not be written into {quant / name}: {error}") from None
-    report["contract_defaults"] = {"reference_matched_only": defaults.get("reference_matched_only", True),
-                                   "preferred_adducts_only": defaults.get("preferred_adducts_only", False)}
+    report["contract_defaults"] = contract_options
+    report["deviations_from_contract"] = deviations
+    report.setdefault("warnings", []).extend(f"Not as the contract states: {item}." for item in deviations)
     if write:
+        # The report again, with what this step adds: the contract's options and any deviation from them.
+        target = quant / name / MERGE_REPORT_NAME
+        target.write_text(json.dumps({key: value for key, value in report.items() if key != "report"}, indent=2,
+                                     ensure_ascii=False, default=str) + "\n", encoding="utf-8")
         record_event(contract["_path"], {
-            "event": "merged", "output_folder": str(quant / name), "options": options,
+            "event": "merged", "output_folder": str(quant / name), "options": options, "deviations": deviations,
             "outputs": {key: item["sha256"] for key, item in report["outputs"].items()},
             "kept": report["counts"]["kept"], "removed": report["counts"]["removed"],
         })
-        report["merge_report"] = str((quant / name / MERGE_REPORT_NAME).resolve())
+        report["merge_report"] = str(target.resolve())
     return report

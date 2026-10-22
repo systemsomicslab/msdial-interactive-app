@@ -75,7 +75,14 @@ person's choice.
   `[M-H]-` (formate `[M+HCOO]-`, acetate `[M+CH3COO]-`, none for bicarbonate) and the
   negative LBM2 records MS-DIAL searches. Read the mapping back.
 - **The internal-standard texts** (`is_text_pos`, `is_text_neg`): tab-separated, with
-  Name, MZ, RT, Adduct and Ontology, MZ being the adduct's m/z.
+  Name, MZ (or MS-DIAL's Pos-m/z), RT and Adduct, MZ being the adduct's m/z; Ontology may
+  be left out.
+- **When one compound is found more than once** (`duplicate_rule`): `evidence`
+  (recommended: the more reliable library match, the person's own RT and MS/MS before an
+  MS/MS-only hit even if weaker, then the library's priority, the preferred adduct and the
+  intensity), `intensity` (the preferred adduct, then the larger intensity) or `keep_all`.
+- **What one compound is** (`inchikey_match`): the InChIKey's `first_block` (stereoisomers
+  are one compound) or `first_two_blocks` (they stay apart).
 - **The normalizing standard** of each polarity (`normalizing_standard_pos`,
   `normalizing_standard_neg`), one name from that polarity's text.
 - **The analysis root** (`analysis_root`): `pos`, `neg`, `inputs` and `quant` are made
@@ -118,6 +125,11 @@ Show `paired_sample_table`: file, type (Sample, QC, Blank, Standard; a reference
 material such as NIST SRM 1950 plasma is a Standard), class, analytical order, batch,
 dilution factor, acquisition type and included. Read `class_proposal` and
 `order_proposal` aloud. Corrections go in `sample_table` by stem, every sample listed.
+Two polarities pair by name (S1_Pos with S1_Neg); files acquired under other names pair by
+the words that set each polarity's files apart (A1 in 20230125_SWATH_A1_C_CE20_d1 and
+20230208_SWATH_A1_A_CE20_d2), shown in `pairing` and each row's `paired_by`: read every pair
+to the person. When the pairing fails or is wrong, they give `sample_pairs`
+(`[{sample, positive_file, negative_file}]`). The merge pairs the columns by this table.
 Classes and acquisition types reach the Console's ASCII analysis file: give them in
 printable ASCII without commas or quotes (a Japanese class name as a romanized word). The
 acquisition type is DDA, SWATH or AIF, the words the Console reads; it reads any other as
@@ -212,10 +224,10 @@ with any row each shares a first block with. Options, read to the person:
 - `preferred_adducts_only`, default false: only `[M+H]+`, `[M-H]-` and the salt's
   negative adduct.
 
-Rows sharing the InChIKey's first block are one compound, within and across polarities;
-one is kept: a preferred adduct first, then matched on MS/MS, then the larger mean
-normalized height over Sample and QC, then the higher library priority, the higher total
-score, positive before negative. A labelled standard shares its first block with the
+Rows of one compound (the contract's `inchikey_match`) are one, within and across
+polarities, and the contract's `duplicate_rule` says which is kept (`evidence`,
+`intensity` or `keep_all`); either may be given otherwise to one merge, which then reports
+it in `deviations_from_contract`. A labelled standard shares its first block with the
 endogenous compound, which is why standards go first. A row without an InChIKey is kept
 as its own; say how many (`counts.kept_without_inchikey`). The first block joins
 stereoisomers, and the intensity can pick an MS/MS-only match at another RT over an

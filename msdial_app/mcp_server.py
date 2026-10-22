@@ -3389,6 +3389,9 @@ def msdial_lcms_metabolomics_check_inputs(
     console_path: str = "",
     raw_location: str = "",
     number_of_threads: int | None = None,
+    duplicate_rule: str = "",
+    inchikey_match: str = "",
+    sample_pairs: list[dict[str, Any]] | None = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
@@ -3423,6 +3426,17 @@ def msdial_lcms_metabolomics_check_inputs(
     raw_location is in_place or copy, asked with the sentence the question carries: MS-DIAL writes .dcl,
     .pai2 and tag files beside the raw files it reads, and no output setting prevents it.
 
+    duplicate_rule and inchikey_match are asked before anything runs: which row of one compound the merge
+    keeps (evidence, recommended: the more reliable library match, your own RT and MS/MS before MS/MS alone,
+    then the library's priority, the preferred adduct and the intensity; intensity: the preferred adduct,
+    then the intensity; keep_all), and what one compound is (first_block of the InChIKey, or
+    first_two_blocks, which keeps stereoisomers apart).
+
+    Two polarities pair by file name (S1_Pos with S1_Neg) where they can; otherwise by the words that set
+    each polarity's files apart (A1 in 20230125_SWATH_A1_C_CE20_d1 and 20230208_SWATH_A1_A_CE20_d2), which
+    paired_sample_table shows with how it paired (pairing, paired_by) for the person to confirm. When that
+    fails or is wrong, give sample_pairs: [{"sample": ..., "positive_file": ..., "negative_file": ...}].
+
     The result holds the blockers, the questions, the libraries as they will be searched (annotation), the
     salt with its preferred adducts, the normalizing standards, and the sample table proposed
     (paired_sample_table), which the person must confirm. check_digest binds what was read; pass it to
@@ -3435,6 +3449,7 @@ def msdial_lcms_metabolomics_check_inputs(
         "internal_standard_rt_tolerance": internal_standard_rt_tolerance, "sample_metadata_path": sample_metadata_path,
         "analysis_root": analysis_root, "analysis_purpose": analysis_purpose, "console_path": console_path,
         "raw_location": raw_location, "number_of_threads": number_of_threads,
+        "duplicate_rule": duplicate_rule, "inchikey_match": inchikey_match, "sample_pairs": sample_pairs or [],
     }
     return _request_json("POST", "/api/lcms-metabolomics/check", host=host, port=port, body=body, timeout=600)
 
@@ -3463,6 +3478,9 @@ def msdial_lcms_metabolomics_write_contract(
     number_of_threads: int | None = None,
     replace_existing: StrictFlag = False,
     confirmed: StrictFlag = False,
+    duplicate_rule: str = "",
+    inchikey_match: str = "",
+    sample_pairs: list[dict[str, Any]] | None = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
@@ -3491,6 +3509,7 @@ def msdial_lcms_metabolomics_write_contract(
         "raw_location": raw_location, "number_of_threads": number_of_threads, "check_digest": check_digest,
         "sample_table_confirmed": sample_table_confirmed is True, "sample_table": sample_table or [],
         "confirmed_by": confirmed_by, "replace_existing": replace_existing is True,
+        "duplicate_rule": duplicate_rule, "inchikey_match": inchikey_match, "sample_pairs": sample_pairs or [],
         # The gate is here and again in the backend: only a literal true writes.
         "confirmed": confirmed is True,
     }
@@ -3575,6 +3594,8 @@ def msdial_lcms_metabolomics_merge(
     contract_path: str,
     reference_matched_only: StrictFlag | None = None,
     preferred_adducts_only: StrictFlag | None = None,
+    duplicate_rule: str = "",
+    inchikey_match: str = "",
     output_folder: str = "metabolome",
     confirmed: StrictFlag = False,
     host: str = DEFAULT_HOST,
@@ -3592,11 +3613,15 @@ def msdial_lcms_metabolomics_merge(
     the options:
     reference_matched_only (default true: only rows whose representative annotation is a reference match,
     what the GUI calls Ref. matched) and preferred_adducts_only (default false: only [M+H]+, [M-H]- and the
-    salt's negative adduct, [M+HCOO]- for formate or formic acid, [M+CH3COO]- for acetate). Rows sharing the
-    InChIKey's first block are one compound, within and across polarities; the row kept is the preferred
-    adduct, then the one matched on MS/MS, then the larger mean normalized height over Sample and QC, then
-    the higher library priority, the higher total score, positive before negative. A row without an
-    InChIKey is kept as its own. Both options are JSON true or false; absent follows the contract.
+    salt's negative adduct, [M+HCOO]- for formate or formic acid, [M+CH3COO]- for acetate). Rows of one
+    compound (inchikey_match: the InChIKey's first block, or its first two blocks) are one, within and across
+    polarities, and duplicate_rule says which row is kept: evidence (RT and MS/MS matched, then MS/MS alone,
+    then the library's priority, the preferred adduct and the intensity), intensity (the preferred adduct,
+    then MS/MS matched, then the larger mean normalized height over Sample and QC, then the library's
+    priority), or keep_all (every row kept, the duplicates counted). Both follow the contract's answers
+    unless given; a different one is applied and reported in deviations_from_contract. A row without an
+    InChIKey is kept as its own. The two flags are JSON true or false; absent follows the contract. The
+    polarities' samples are paired by the contract's sample table, whatever the file names.
 
     confirmed=false returns the counts and writes nothing; confirmed=true writes metabolome.csv (quoted CSV:
     polarity, alignment ID, InChIKey first block, library, reference matched, preferred adduct, MS-DIAL's
@@ -3610,6 +3635,11 @@ def msdial_lcms_metabolomics_merge(
         body["reference_matched_only"] = reference_matched_only
     if preferred_adducts_only is not None:
         body["preferred_adducts_only"] = preferred_adducts_only
+    # Empty follows the contract's answer; another is applied and said as a deviation.
+    if duplicate_rule:
+        body["duplicate_rule"] = duplicate_rule
+    if inchikey_match:
+        body["inchikey_match"] = inchikey_match
     return _request_json("POST", "/api/lcms-metabolomics/merge", host=host, port=port, body=body, timeout=300)
 
 

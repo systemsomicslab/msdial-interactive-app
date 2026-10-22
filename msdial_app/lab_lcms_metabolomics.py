@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .lab_lipidomics import (
+    IS_TEXT_COLUMNS,
     NEGATIVE,
     POLARITIES,
     POSITIVE,
@@ -456,6 +457,90 @@ def lbm_retention_time(entries: Iterable[dict[str, Any]]) -> tuple[bool, float |
 
 
 # ---------------------------------------------------------------------------------------------
+# Internal-standard texts
+# ---------------------------------------------------------------------------------------------
+
+# MS-DIAL's own text library may be Name, Pos-m/z (or Neg-m/z), RT, Adduct and nothing else: no class is needed
+# to normalize by a standard, so Ontology is not required here as it is for lipidomics.
+IS_TEXT_COLUMNS_METABOLOMICS = {**IS_TEXT_COLUMNS, "mz": (*IS_TEXT_COLUMNS["mz"], "posmz", "negmz")}
+IS_TEXT_REQUIRED_METABOLOMICS = ("name", "mz", "rt", "adduct")
+
+
+# ---------------------------------------------------------------------------------------------
+# Pairing the polarities when their file names differ
+# ---------------------------------------------------------------------------------------------
+
+_TOKEN_SPLIT = re.compile(r"[_\-.\s]+")
+PAIRED_FIELDS = ("file_type", "class_id", "analytical_order", "batch_order", "factor", "acquisition_type")
+
+
+def name_tokens(name: str) -> list[str]:
+    """A file name's words, without its extension: 20230125_SWATH_A1_C_CE20_d1.raw -> [20230125, SWATH, A1, ...]."""
+    return [token for token in _TOKEN_SPLIT.split(Path(str(name)).stem) if token]
+
+
+def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[str, Any]]) -> dict[str, Any]:
+    """Positive and negative files paired by the words that tell the files of each polarity apart.
+
+    Positive and negative runs are often acquired on other days under other names (20230125_SWATH_A1_C_CE20_d1
+    and 20230208_SWATH_A1_A_CE20_d2): the words all files of a polarity share say nothing, and the ones left
+    (A1) name the sample. A file pairs with the one file of the other polarity that shares the most of them,
+    and only when that is mutual. The sample takes the shared words' name. The person confirms the pairing.
+    """
+    def varying(rows: list[dict[str, Any]]) -> list[list[str]]:
+        words = [name_tokens(row["file_name"]) for row in rows]
+        common = set.intersection(*(set(item) for item in words)) if words else set()
+        return [[word for word in item if word not in common] for item in words]
+
+    left, right = varying(positive), varying(negative)
+    problems: list[str] = []
+    warnings: list[str] = []
+    best_for_left: dict[int, int] = {}
+    for index, words in enumerate(left):
+        scores = [(len(set(words) & set(other)), number) for number, other in enumerate(right)]
+        top = max((score for score, _ in scores), default=0)
+        chosen = [number for score, number in scores if score == top and top > 0]
+        if len(chosen) == 1:
+            best_for_left[index] = chosen[0]
+        else:
+            problems.append(
+                f"{positive[index]['file_name']} has {'no' if not chosen else 'more than one'} negative counterpart by the "
+                f"words that set it apart ({', '.join(words) or 'none'})."
+            )
+    claimed: dict[int, list[int]] = {}
+    for index, number in best_for_left.items():
+        claimed.setdefault(number, []).append(index)
+    rows: list[dict[str, Any]] = []
+    for number, indices in sorted(claimed.items(), key=lambda item: min(item[1])):
+        if len(indices) > 1:
+            problems.append(
+                f"{negative[number]['file_name']} would pair with {', '.join(positive[index]['file_name'] for index in indices)}."
+            )
+            continue
+        index = indices[0]
+        shared = [word for word in left[index] if word in set(right[number])]
+        source, other = positive[index], negative[number]
+        row = {"stem": "_".join(shared), "positive_file": source["file_name"], "negative_file": other["file_name"],
+               "paired_by": shared}
+        for key in PAIRED_FIELDS:
+            row[key] = source.get(key)
+            if other.get(key) != source.get(key):
+                warnings.append(
+                    f"{row['stem']}: {key} is {source.get(key)!r} in positive and {other.get(key)!r} in negative; the "
+                    "positive value is proposed."
+                )
+        rows.append(row)
+    for number, other in enumerate(negative):
+        if number not in claimed:
+            problems.append(f"{other['file_name']} has no positive counterpart by the words that set it apart.")
+    names = [row["stem"] for row in rows]
+    for name in sorted({name for name in names if names.count(name) > 1}):
+        problems.append(f"Two pairs would both be named {name}.")
+    rows.sort(key=lambda row: (row.get("analytical_order") or 0, row["stem"].casefold()))
+    return {"rows": rows, "problems": problems, "warnings": warnings, "matched": not problems}
+
+
+# ---------------------------------------------------------------------------------------------
 # Preferred adducts
 # ---------------------------------------------------------------------------------------------
 
@@ -744,6 +829,7 @@ def _read_polarity(item: dict[str, Any]) -> dict[str, Any]:
     columns = {key: _column(names, title) for key, title in (
         ("name", "Metabolite name"), ("adduct", "Adduct type"), ("inchikey", "INCHIKEY"),
         ("comment", "Comment"), ("total_score", "Total score"), ("rt", "Average Rt(min)"),
+        ("rt_matched", "RT matched"), ("ms2_matched", "MS/MS matched"),
     )}
     missing = [title for key, title in (("name", "Metabolite name"), ("adduct", "Adduct type"),
                                          ("inchikey", "INCHIKEY"), ("comment", "Comment")) if columns[key] < 0]
@@ -772,6 +858,8 @@ def _read_polarity(item: dict[str, Any]) -> dict[str, Any]:
             "method": annotation_method(cell("comment")),
             "total_score": parse_number(cell("total_score")) or 0.0,
             "rt": parse_number(cell("rt")),
+            "rt_matched": cell("rt_matched").casefold() == "true",
+            "ms2_matched": cell("ms2_matched").casefold() == "true",
             "matched": bool(representative.get("is_reference_matched")),
             "priority": int(parse_number(representative.get("priority", "")) or 0),
             "mean": sum(values) / len(values) if values else 0.0,
@@ -787,6 +875,64 @@ def _id_key(value: str) -> tuple[int, str]:
 
 # Rows of one first block further apart than this are reported as possible isomers.
 ISOMER_RT_SPREAD = 0.5
+# Which row of one compound the merge keeps, and what one compound is: the person's choices, asked at the check.
+DUPLICATE_RULES = ("evidence", "intensity", "keep_all")
+INCHIKEY_MATCHES = ("first_block", "first_two_blocks")
+_MEAN = "the larger mean normalized height over the Sample and QC injections"
+RANKINGS = {
+    "intensity": ["a preferred adduct", "matched on MS/MS (reference matched)", _MEAN, "the higher library priority",
+                  "the higher total score", "positive before negative", "the lower alignment ID"],
+    "evidence": ["matched on RT and MS/MS, then on MS/MS alone, then on RT alone", "the higher library priority",
+                 "a preferred adduct", _MEAN, "the higher total score", "positive before negative", "the lower alignment ID"],
+    "keep_all": ["every row is kept; groups of one compound are counted (duplicates_kept)"],
+}
+
+
+def compound_key(inchikey: str, match: str) -> str:
+    """What one compound is by its InChIKey: the first block, or the first two (stereoisomers apart).
+
+    A key without a second block is its first block either way, and groups only with keys like it.
+    """
+    block = inchikey_first_block(inchikey)
+    if not block or match == "first_block":
+        return block
+    text = str(inchikey or "").strip()
+    return text[:25] if len(text) >= 25 and text[14] == "-" else block
+
+
+def evidence_level(row: dict[str, Any]) -> int:
+    """How a row's annotation was matched: 3 RT and MS/MS, 2 MS/MS alone, 1 RT alone, 0 neither."""
+    return {(True, True): 3, (False, True): 2, (True, False): 1}.get((row.get("rt_matched", False), row.get("ms2_matched", False)), 0)
+
+
+def _pair_columns(read: dict[str, Any], order: list[str], sample_map: dict[str, dict[str, str]]) -> list[str]:
+    """Each polarity's export columns named as the confirmed samples; the negative put in the positive's order."""
+    names: dict[str, list[str]] = {}
+    for polarity in order:
+        mapping = {str(key).casefold(): value for key, value in (sample_map.get(polarity) or {}).items()}
+        columns = read[polarity]["export"]["sample_names"]
+        unknown = [column for column in columns if column.casefold() not in mapping]
+        if unknown:
+            raise LabInputError(
+                f"The {polarity.lower()} matrix has columns the sample table does not name: {', '.join(unknown)}."
+            )
+        names[polarity] = [mapping[column.casefold()] for column in columns]
+    if len(order) == 2:
+        positive, negative = names[POSITIVE], names[NEGATIVE]
+        if sorted(positive) != sorted(negative) or len(set(positive)) != len(positive):
+            raise LabInputError(
+                "The two polarities do not describe the same samples: positive "
+                f"{', '.join(positive)}; negative {', '.join(negative)}."
+            )
+        position = {name: index for index, name in enumerate(negative)}
+        permutation = [position[name] for name in positive]
+        for row in read[NEGATIVE]["rows"]:
+            row["samples"] = [row["samples"][index] for index in permutation]
+        negative_types = [read[NEGATIVE]["export"]["file_types"][index] for index in permutation]
+        for name, left, right in zip(positive, read[POSITIVE]["export"]["file_types"], negative_types):
+            if left.strip() != right.strip():
+                raise LabInputError(f"{name} is a {left} in positive and a {right} in negative.")
+    return names[order[0]]
 
 
 def _unconfirmed_report(
@@ -808,10 +954,19 @@ def merge_metabolome(
     salt: str | None,
     reference_matched_only: bool = True,
     preferred_adducts_only: bool = False,
+    duplicate_rule: str = "intensity",
+    inchikey_match: str = "first_block",
+    sample_map: dict[str, dict[str, str]] | None = None,
     labels: dict[str, str] | None = None,
     write: bool = False,
 ) -> dict[str, Any]:
     """One metabolome from the normalized matrices of one or both polarities.
+
+    duplicate_rule decides which row of one compound is kept (DUPLICATE_RULES): "intensity", "evidence" (a
+    library match with RT and MS/MS first, then MS/MS alone, then the library's priority), or "keep_all".
+    inchikey_match says what one compound is: the InChIKey's first block, or its first two blocks (stereo
+    isomers apart). sample_map gives, by polarity, each export column's sample name, which pairs the
+    polarities when their file names differ; the negative columns are put in the positive's sample order.
 
     polarities: [{polarity, normalized, candidate_table, internal_standard_ids, internal_standard_annotator,
     unconfirmed_standard_spots}]. Rows dropped first: unannotated, and an internal standard (a spot decided
@@ -827,17 +982,24 @@ def merge_metabolome(
     its own. labels maps an annotator ID to the library label the person knows.
     """
     folder = Path(folder)
+    if duplicate_rule not in DUPLICATE_RULES:
+        raise LabInputError(f"duplicate_rule '{duplicate_rule}' is none of {', '.join(DUPLICATE_RULES)}.")
+    if inchikey_match not in INCHIKEY_MATCHES:
+        raise LabInputError(f"inchikey_match '{inchikey_match}' is none of {', '.join(INCHIKEY_MATCHES)}.")
     identities = adduct_identities(preferred_adducts(salt))
     read = {item["polarity"]: {**_read_polarity(item), "input": item} for item in polarities}
     order = [polarity for polarity in POLARITIES if polarity in read]
     if not order:
         raise LabInputError("No polarity to merge.")
-    if len(order) == 2:
-        compared = compare_sample_order(read[POSITIVE]["export"], read[NEGATIVE]["export"])
-        if compared.get("problems"):
-            raise LabInputError("The two polarities do not describe the same samples: " + " ".join(compared["problems"]))
+    if sample_map is not None:
+        sample_names = _pair_columns(read, order, sample_map)
+    else:
+        if len(order) == 2:
+            compared = compare_sample_order(read[POSITIVE]["export"], read[NEGATIVE]["export"])
+            if compared.get("problems"):
+                raise LabInputError("The two polarities do not describe the same samples: " + " ".join(compared["problems"]))
+        sample_names = [strip_polarity(name) if len(order) == 2 else name for name in read[order[0]]["export"]["sample_names"]]
     first = read[order[0]]["export"]
-    sample_names = [strip_polarity(name) if len(order) == 2 else name for name in first["sample_names"]]
     metadata_titles = first["header"][4][: first["first_sample_column"]]
     removed: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
@@ -866,9 +1028,15 @@ def merge_metabolome(
             else:
                 row["preferred"] = is_preferred(row["adduct"], identities)
                 row["block"] = inchikey_first_block(row["inchikey"])
+                row["key"] = compound_key(row["inchikey"], inchikey_match)
+                row["evidence"] = evidence_level(row)
                 candidates.append(row)
 
     def rank(row: dict[str, Any]) -> tuple[Any, ...]:
+        if duplicate_rule == "evidence":
+            # The more reliable library match first: RT and MS/MS, then MS/MS alone, then the library's priority.
+            return (-row["evidence"], -row["priority"], not row["preferred"], -row["mean"], -row["total_score"],
+                    order.index(row["polarity"]), _id_key(row["id"]))
         return (not row["preferred"], not row["matched"], -row["mean"], -row["priority"], -row["total_score"],
                 order.index(row["polarity"]), _id_key(row["id"]))
 
@@ -877,27 +1045,33 @@ def merge_metabolome(
     for row in candidates:
         # A spot only searched for a standard nobody confirmed may be the labelled standard itself, which shares
         # the endogenous compound's first block: it is kept as its own row and never removes another.
-        if row["block"] and not row["unconfirmed_standard"]:
-            groups.setdefault(row["block"], []).append(row)
+        if row["key"] and not row["unconfirmed_standard"]:
+            groups.setdefault(row["key"], []).append(row)
         else:
             kept.append(row)
     duplicates = {"within_polarity": 0, "across_polarities": 0}
-    # Rows one first block joins that may be different compounds: other stereo blocks, or far apart in RT.
+    duplicates_kept = 0
+    # Rows one compound key joins that may be different compounds: other stereo blocks, or far apart in RT.
     possible_isomers: list[dict[str, Any]] = []
+    reason = "duplicate InChIKey " + ("first block" if inchikey_match == "first_block" else "first two blocks")
     for block, rows in groups.items():
         ranked = sorted(rows, key=rank)
         winner = ranked[0]
-        kept.append(winner)
-        for other in ranked[1:]:
-            duplicates["across_polarities" if other["polarity"] != winner["polarity"] else "within_polarity"] += 1
-            drop(other, "duplicate InChIKey first block", winner)
+        if duplicate_rule == "keep_all":
+            kept.extend(ranked)
+            duplicates_kept += len(ranked) - 1
+        else:
+            kept.append(winner)
+            for other in ranked[1:]:
+                duplicates["across_polarities" if other["polarity"] != winner["polarity"] else "within_polarity"] += 1
+                drop(other, reason, winner)
         if len(ranked) > 1:
             second = {row["inchikey"].strip()[15:25] for row in ranked if len(row["inchikey"].strip()) >= 25}
             times = [row["rt"] for row in ranked if row["rt"] is not None]
             spread = max(times) - min(times) if times else 0.0
             if len(second) > 1 or spread > ISOMER_RT_SPREAD:
                 possible_isomers.append({
-                    "first_block": block, "rt_spread_min": round(spread, 3), "stereo_blocks": sorted(second),
+                    "compound_key": block, "rt_spread_min": round(spread, 3), "stereo_blocks": sorted(second),
                     "kept": {"polarity": winner["polarity"], "alignment_id": winner["id"]},
                     "rows": [{"polarity": row["polarity"], "alignment_id": row["id"], "name": row["name"],
                               "adduct": row["adduct"], "rt": row["rt"], "inchikey": row["inchikey"],
@@ -973,17 +1147,15 @@ def merge_metabolome(
             }
             for polarity in order
         },
-        "options": {"reference_matched_only": reference_matched_only, "preferred_adducts_only": preferred_adducts_only},
+        "options": {"reference_matched_only": reference_matched_only, "preferred_adducts_only": preferred_adducts_only,
+                    "duplicate_rule": duplicate_rule, "inchikey_match": inchikey_match},
         "preferred_adducts": preferred_adducts(salt),
         "salt": salt,
-        "ranking": [
-            "a preferred adduct", "matched on MS/MS (reference matched)",
-            f"the larger mean normalized height over the {' and '.join(MERGE_FILE_TYPES)} injections",
-            "the higher library priority", "the higher total score", "positive before negative", "the lower alignment ID",
-        ],
+        "ranking": RANKINGS[duplicate_rule],
         "counts": {
             "by_polarity": counts,
             "duplicates_removed": duplicates,
+            "duplicates_kept": duplicates_kept,
             "kept": len(kept),
             "kept_by_polarity": kept_counts,
             "kept_without_inchikey": sum(1 for row in kept if not row["block"]),

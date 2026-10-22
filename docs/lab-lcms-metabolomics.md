@@ -27,7 +27,9 @@ merge). Agent Skill: `skills/msdial-lcms-metabolomics-workflow`.
 | Raw folders | `pos_path`, `neg_path`, or both. A batch of one polarity is a complete batch. |
 | Annotation | An ordered list of libraries (section 2), usually from a preset. |
 | Salt | As for lipidomics; formic acid reads as `HCOONH4`. It also chooses the negative adduct the merge prefers. |
-| Internal standards | An MS-DIAL text library per polarity (Name, MZ, RT, Adduct, Ontology; Formula, InChIKey optional). One file may hold both. |
+| Internal standards | An MS-DIAL text library per polarity (Name, MZ or Pos-m/z, RT, Adduct; Ontology, Formula, InChIKey optional; a standard without a class is written as "Internal standard"). One file may hold both. |
+| Duplicates | `duplicate_rule` (evidence, intensity or keep_all) and `inchikey_match` (first_block or first_two_blocks), asked before anything runs. |
+| Pairing | Two polarities pair by name, otherwise by the words that set each polarity's files apart, or by `sample_pairs` the person gives. |
 | Normalizing standard | One name per polarity (`normalizing_standard_pos`, `normalizing_standard_neg`), from that polarity's library. |
 | Internal-standard RT tolerance | 0.5 min unless given. |
 | Analysis root, raw location, Console, threads | As for lipidomics. |
@@ -161,22 +163,29 @@ The result is one metabolome from the normalized matrices of every polarity the 
    - `reference_matched_only`: keep only rows whose representative annotation is a reference match, what
      the GUI shows as "Ref. matched". Default on.
    - `preferred_adducts_only`: keep only the preferred adducts. Default off.
-3. **Duplicates:** rows sharing the InChIKey's first 14 characters are one compound, within a polarity and
-   across polarities. One row is kept, ranked by:
-   1. a preferred adduct: `[M+H]+`, `[M-H]-`, and the salt's negative adduct (`[M+HCOO]-` for ammonium
-      formate or formic acid, `[M+CH3COO]-` for ammonium acetate, none for ammonium bicarbonate). Adducts
-      are compared as ions, so `[M+FA-H]-` counts as `[M+HCOO]-`.
-   2. matched on MS/MS before a precursor-only suggestion;
-   3. the larger mean normalized height over the Sample and QC injections;
-   4. then, deterministically: the higher library priority, the higher total score, positive before
-      negative, and the lower alignment ID.
+3. **Duplicates:** rows of one compound are one, within a polarity and across polarities. What one compound
+   is, `inchikey_match`, and which row is kept, `duplicate_rule`, are the person's answers at the check, fixed
+   in the contract; a merge may be given others, which it reports as deviations.
+   - `inchikey_match`: `first_block` (the first 14 characters: stereoisomers are one compound) or
+     `first_two_blocks` (they stay apart).
+   - `duplicate_rule` `evidence`: the annotation matched on RT and MS/MS (the export's RT matched and MS/MS
+     matched), then on MS/MS alone, then on RT alone; then the higher library priority, the preferred adduct,
+     the larger mean normalized height over Sample and QC, the higher total score, positive before negative,
+     the lower alignment ID. A match with the laboratory's own RT is kept over a stronger MS/MS-only one.
+   - `duplicate_rule` `intensity`: a preferred adduct (`[M+H]+`, `[M-H]-`, and the salt's negative adduct:
+     `[M+HCOO]-` for ammonium formate or formic acid, `[M+CH3COO]-` for ammonium acetate, none for ammonium
+     bicarbonate; compared as ions, so `[M+FA-H]-` counts as `[M+HCOO]-`); matched on MS/MS before a
+     precursor-only suggestion; the larger mean; then the library priority, the total score, positive before
+     negative, the lower alignment ID.
+   - `duplicate_rule` `keep_all`: every row is kept, and the rows of one compound are counted
+     (`duplicates_kept`).
 4. **Rows without a usable InChIKey** are kept as their own rows and never merged with anything.
-   **Possible isomers:** the first block joins stereoisomers (glucose and mannose 6-phosphate), and the ranking
-   puts intensity before library priority, as the laboratory asked. A group whose rows differ in stereo block
-   or lie more than 0.5 min apart is reported (`possible_isomers`) with the row kept; nothing is split.
-5. **Sample columns:** both polarities must describe the same samples in the same order (the names with the
-   polarity suffix removed). A merge of two polarities names the columns by stem; one polarity keeps the
-   exported names.
+   **Possible isomers:** a group whose rows differ in stereo block or lie more than 0.5 min apart is reported
+   (`possible_isomers`, by `compound_key`) with the row kept; nothing is split beyond what `inchikey_match` says.
+5. **Sample columns:** the confirmed sample table names each export column's sample, which pairs the
+   polarities whatever their file names; the negative columns are put in the positive's sample order, and a
+   sample of another file type in one polarity than the other refuses the merge. The columns take the
+   table's sample names.
 6. **Outputs** in `<root>/quant/<output_folder>` (default `metabolome`):
    - `metabolome.csv`: quoted CSV. Polarity, alignment ID, InChIKey first block, library label, reference
      matched, preferred adduct, then MS-DIAL's metadata columns and the normalized sample columns.

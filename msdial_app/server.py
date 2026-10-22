@@ -2084,6 +2084,8 @@ class Handler(BaseHTTPRequestHandler):
                     # Absent follows the contract; true or false is applied; anything else is refused.
                     reference_matched_only=body.get("reference_matched_only"),
                     preferred_adducts_only=body.get("preferred_adducts_only"),
+                    duplicate_rule=body.get("duplicate_rule") or None,
+                    inchikey_match=body.get("inchikey_match") or None,
                     output_folder=str(body.get("output_folder") or "metabolome"),
                     write=confirmed,
                 )

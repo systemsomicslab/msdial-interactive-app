@@ -119,6 +119,7 @@ class MetabolomicsBatch:
             "solvent_type": "formic acid",
             "analysis_root": str(self.analysis), "analysis_purpose": "case versus control breath metabolome",
             "console_path": str(self.console), "raw_location": "copy",
+            "duplicate_rule": "intensity", "inchikey_match": "first_block",
         }
         if "Positive" in self.polarities:
             request.update(pos_path=str(self.folders["Positive"]), is_text_pos=str(self.is_pos),
@@ -149,12 +150,15 @@ def _samples(label: str, stems: list[tuple[str, str]]) -> list[tuple[str, str, s
 
 
 def export_spot(item: dict[str, Any]) -> dict[str, Any]:
-    keys = {key: value for key, value in item.items() if key not in {"inchikey", "matched"}}
+    keys = {key: value for key, value in item.items() if key not in {"inchikey", "matched", "rt_matched", "ms2_matched"}}
     keys.setdefault("adduct", "[M+H]+")
     keys["unit"] = "Height"
     exported = spot(**keys)
     exported["INCHIKEY"] = item.get("inchikey", "null")
     exported["Total score"] = "0.9"
+    # As the Console writes them (bool.ToString()): an MS/MS match unless said, RT only where said.
+    exported["RT matched"] = str(bool(item.get("rt_matched", False)))
+    exported["MS/MS matched"] = str(bool(item.get("ms2_matched", item.get("matched", True))))
     return exported
 
 

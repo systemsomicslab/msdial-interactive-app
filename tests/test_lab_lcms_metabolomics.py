@@ -245,7 +245,8 @@ class CheckAndContract(Batched):
         check = agent.check_inputs({"pos_path": str(self.batch.folders["Positive"])})
         asked = {item["id"] for item in check["questions"]}
         self.assertEqual({"analysis_purpose", "annotation", "solvent_type", "is_text_pos", "normalizing_standard_pos",
-                          "analysis_root", "raw_location", "console_path"}, asked)
+                          "analysis_root", "raw_location", "console_path",
+                          "duplicate_rule", "inchikey_match"}, asked)
         self.assertEqual(["Positive"], check["polarities"])
         self.assertEqual(4, check["folders"]["Positive"]["file_count"])
         self.assertFalse(check["ready_for_contract"])
@@ -396,7 +397,7 @@ class OnePolarity(Batched):
         self.assertEqual({"within_polarity": 1, "across_polarities": 0}, report["counts"]["duplicates_removed"])
         kept = list(csv.DictReader(io.StringIO(Path(report["outputs"]["metabolome"]["path"]).read_text(encoding="utf-8"))))
         self.assertEqual(["10", "14", "15"], [row["Alignment ID"] for row in kept])
-        self.assertIn("S1_Pos", kept[0], "one polarity keeps its sample names as exported")
+        self.assertIn("S1", kept[0], "the columns take the confirmed sample names")
         # A folder read asks for both polarities; the one the contract lacks is passed over, a named job is refused.
         resolved = agent.resolve_standards_for_contract(contract, {"Positive": job, "Negative": None})
         self.assertEqual(["Positive"], list(resolved["polarities"]))
@@ -752,7 +753,7 @@ class StandardsNormalizeAndMerge(Batched):
         self.assertEqual(1, report["counts"]["possible_isomer_groups"])
         group = report["possible_isomers"][0]
         self.assertEqual(("NBSCHQHZLSJFNQ", "121", ["GASJEMHNSA", "QTVWNMPRSA"]),
-                         (group["first_block"], group["kept"]["alignment_id"], group["stereo_blocks"]))
+                         (group["compound_key"], group["kept"]["alignment_id"], group["stereo_blocks"]))
 
     def test_a_merge_folder_that_is_a_file_or_a_device_is_refused(self) -> None:
         self.normalize("Positive")
@@ -848,6 +849,131 @@ class StandardsNormalizeAndMerge(Batched):
             written = server._laboratory_metabolomics_normalize({**body, "confirmed": True})
         self.assertTrue(written["record"]["verified"])
         self.assertIn("qa_figures", written)
+
+
+class DuplicateRules(Batched):
+    """Which row of one compound the merge keeps, and what one compound is: the person's answers."""
+
+    polarities = ("Positive",)
+
+    def merge_with(self, spots: list[dict], **options) -> dict[str, list[str]]:
+        contract = getattr(self, "contract_path", None) or self.batch.contract()
+        self.contract_path = contract
+        job = write_run(self.batch, contract, "Positive", spots=spots)
+        resolved = agent.resolve_standards_for_contract(contract, {"Positive": job})
+        agent.finish_normalize(agent.plan_normalize(contract, job, resolved["polarities"]["Positive"]["resolution_digest"]))
+        report = agent.merge(contract, write=True, **options)
+        kept = [row["Alignment ID"] for row in csv.DictReader(io.StringIO(
+            Path(report["outputs"]["metabolome"]["path"]).read_text(encoding="utf-8")))]
+        return {"kept": kept, "report": report}
+
+    def spots(self) -> list[dict]:
+        from lab_metabolomics_fixture import POSITIVE_SPOTS
+
+        spots = [dict(item) for item in POSITIVE_SPOTS if item["alignment_id"] in (1, 2)]
+        # Glucose 6-phosphate by the in-house library with RT and MS/MS, weak; an MS/MS-only hit of the same
+        # compound elsewhere, strong; and mannose 6-phosphate, its stereoisomer, with RT and MS/MS.
+        spots += [
+            dict(alignment_id=40, mz=261.0370, rt=8.10, name="Glucose 6-phosphate", method="lib1_in_house",
+                 inchikey="NBSCHQHZLSJFNQ-GASJEMHNSA-N", cells=[1000, 1000, 1000, 0], rt_matched=True),
+            dict(alignment_id=41, mz=261.0370, rt=7.40, name="Glucose 6-phosphate", method="lib3_no_rt",
+                 inchikey="NBSCHQHZLSJFNQ-GASJEMHNSA-N", cells=[9000, 9000, 9000, 0]),
+            dict(alignment_id=42, mz=261.0370, rt=8.70, name="Mannose 6-phosphate", method="lib1_in_house",
+                 inchikey="NBSCHQHZLSJFNQ-QTVWNMPRSA-N", cells=[500, 500, 500, 0], rt_matched=True),
+        ]
+        return spots
+
+    def test_evidence_keeps_the_rt_and_ms2_match_over_a_stronger_ms2_only_one(self) -> None:
+        result = self.merge_with(self.spots(), duplicate_rule="evidence")
+        self.assertEqual(["40"], [item for item in result["kept"] if item in {"40", "41", "42"}])
+        self.assertEqual(["duplicate_rule is evidence; the contract says intensity"],
+                         result["report"]["deviations_from_contract"])
+
+    def test_intensity_keeps_the_stronger_row(self) -> None:
+        result = self.merge_with(self.spots())
+        self.assertEqual(["41"], [item for item in result["kept"] if item in {"40", "41", "42"}])
+        self.assertEqual([], result["report"]["deviations_from_contract"])
+
+    def test_keep_all_and_two_blocks(self) -> None:
+        result = self.merge_with(self.spots(), duplicate_rule="keep_all")
+        self.assertEqual(["40", "41", "42"], [item for item in result["kept"] if item in {"40", "41", "42"}])
+        self.assertEqual(2, result["report"]["counts"]["duplicates_kept"])
+        result = self.merge_with(self.spots(), duplicate_rule="evidence", inchikey_match="first_two_blocks")
+        # Mannose 6-phosphate is its own compound by its second block.
+        self.assertEqual(["40", "42"], [item for item in result["kept"] if item in {"40", "41", "42"}])
+
+    def test_the_answers_are_asked_and_fixed_in_the_contract(self) -> None:
+        check = agent.check_inputs(self.batch.request(duplicate_rule=None, inchikey_match=None))
+        self.assertEqual({"duplicate_rule", "inchikey_match"}, {item["id"] for item in check["questions"]})
+        check = agent.check_inputs(self.batch.request(duplicate_rule="loudest"))
+        self.assertTrue(any("duplicate_rule 'loudest'" in item for item in check["blockers"]))
+        contract = agent.load_contract(self.batch.contract(duplicate_rule="evidence", inchikey_match="first_two_blocks"))
+        self.assertEqual(("evidence", "first_two_blocks"), (contract["merge"]["defaults"]["duplicate_rule"],
+                                                            contract["merge"]["defaults"]["inchikey_match"]))
+
+
+class PairingAndStandardsText(unittest.TestCase):
+    def test_files_named_apart_pair_by_the_words_that_set_them_apart(self) -> None:
+        from msdial_app.lab_lcms_metabolomics import pair_by_shared_tokens
+
+        positive = [{"file_name": f"20230125_SWATH_{name}_C_CE20_d1.raw", "file_type": "Sample", "class_id": name[0]}
+                    for name in ("A1", "A2", "B1", "B2")]
+        negative = [{"file_name": f"20230208_SWATH_{name}_A_CE20_{suffix}.raw", "file_type": "Sample", "class_id": name[0]}
+                    for name, suffix in (("A1", "d2"), ("A2", "d2r2"), ("B1", "d2"), ("B2", "d2"))]
+        paired = pair_by_shared_tokens(positive, negative)
+        self.assertEqual([], paired["problems"])
+        self.assertEqual({"A1": "20230208_SWATH_A1_A_CE20_d2.raw", "A2": "20230208_SWATH_A2_A_CE20_d2r2.raw"},
+                         {row["stem"]: row["negative_file"] for row in paired["rows"] if row["stem"] in {"A1", "A2"}})
+        paired = pair_by_shared_tokens(positive, negative[:3])
+        self.assertTrue(any("no negative counterpart" in item for item in paired["problems"]))
+
+    def test_a_batch_whose_polarities_are_named_apart_is_paired_merged_and_kept_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, capabilities_patches():
+            batch = MetabolomicsBatch(Path(directory), ("Positive", "Negative"))
+            # The negative files acquired another day, under other names.
+            for stem, _ in STEMS:
+                old = batch.folders["Negative"] / f"{stem}_Neg.mzML"
+                old.rename(batch.folders["Negative"] / f"20230208_{stem}_A_d2.mzML")
+            for stem, _ in STEMS:
+                old = batch.folders["Positive"] / f"{stem}_Pos.mzML"
+                old.rename(batch.folders["Positive"] / f"20230125_{stem}_C_d1.mzML")
+            check = agent.check_inputs(batch.request())
+            self.assertTrue(check["ready_for_contract"], check["blockers"])
+            table = check["paired_sample_table"]
+            self.assertIn("words that set", table["pairing"])
+            self.assertEqual({"S1", "S2", "QC1", "Blank"}, {row["stem"] for row in table["rows"]})
+            contract = batch.contract()
+            from lab_metabolomics_fixture import NEGATIVE_SPOTS, POSITIVE_SPOTS, _samples
+            import lab_metabolomics_fixture as fixture
+
+            renamed = {"Positive": "20230125_{}_C_d1", "Negative": "20230208_{}_A_d2"}
+            original = fixture._samples
+            fixture._samples = lambda label, stems: [
+                (renamed["Positive" if label == "Pos" else "Negative"].format(stem), fixture.CLASSES[stem], kind)
+                for stem, kind in stems]
+            try:
+                jobs = {polarity: write_run(batch, contract, polarity) for polarity in ("Positive", "Negative")}
+            finally:
+                fixture._samples = original
+            for polarity, job in jobs.items():
+                resolved = agent.resolve_standards_for_contract(contract, {polarity: job})
+                plan = agent.plan_normalize(contract, job, resolved["polarities"][polarity]["resolution_digest"])
+                self.assertTrue(agent.finish_normalize(plan)["verified"])
+            report = agent.merge(contract, write=True)
+            self.assertEqual(["S1", "S2", "QC1", "Blank"], report["samples"])
+            header = Path(report["outputs"]["metabolome"]["path"]).read_text(encoding="utf-8").splitlines()[0]
+            self.assertTrue(header.endswith('"S1","S2","QC1","Blank"'), header)
+
+    def test_ms_dial_four_column_standards_text_is_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, capabilities_patches():
+            batch = MetabolomicsBatch(Path(directory))
+            text = batch.root / "data" / "Identification_cation.txt"
+            text.write_text("Name\tPos-m/z\tRT\tAdduct\r\nMethionine-d3\t153.07716\t0.896\t[M+H]+\r\n"
+                            "CUDA\t341.27987\t2.87\t[M+H]+\r\n", encoding="ascii")
+            contract = agent.load_contract(batch.contract(is_text_pos=str(text)))
+            derived = Path(contract["derived"]["internal_standard_libraries"]["Positive"]["path"])
+            lines = derived.read_text(encoding="ascii").splitlines()
+            self.assertEqual("Internal standard", lines[1].split("\t")[7], "a standard given without a class gets one")
 
 
 class TheTools(unittest.TestCase):
