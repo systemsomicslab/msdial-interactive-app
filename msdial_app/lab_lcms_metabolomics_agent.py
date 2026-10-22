@@ -508,7 +508,7 @@ def analysis_csv_problems(rows: Iterable[dict[str, Any]], inventory: dict[str, A
                 "cannot carry (printable ASCII without commas or quotes); leave them out (included false) or rename them."
             )
     for row in rows:
-        if str(row.get("included", True)).casefold() in {"false", "0", "no"}:
+        if not row_included(row):
             continue
         for key in ("class_id", "acquisition_type"):
             value = row.get(key)
@@ -517,7 +517,34 @@ def analysis_csv_problems(rows: Iterable[dict[str, Any]], inventory: dict[str, A
                     f"{row['stem']}: {key} '{value}' is not printable ASCII without commas or quotes, which "
                     "analysis_files.csv carries; give it in ASCII (a Japanese class name, for one, as a romanized word)."
                 )
+        acquisition = str(row.get("acquisition_type") or "").strip()
+        if acquisition and acquisition.casefold() not in CONSOLE_ACQUISITION_TYPES:
+            # AnalysisFilesParser parses the enum and reads any other word as DDA, without a word.
+            problems.append(
+                f"{row['stem']}: acquisition_type '{acquisition}' is none of DDA, SWATH or AIF, the words the Console "
+                "reads; it would read it as DDA. Which of them the data are (DIA as SWATH or AIF) is the person's call."
+            )
+        for key in ("analytical_order", "batch_order"):
+            number = parse_number(row.get(key)) if row.get(key) not in (None, "") else None
+            if number is not None and number > CONSOLE_INT32_MAX:
+                problems.append(
+                    f"{row['stem']}: {key} {row.get(key)} is beyond what the Console reads as a number; it would use the "
+                    "row's position instead. Give ranks from 1."
+                )
     return problems
+
+
+# What the Console's analysis-file parser reads: the AcquisitionType words, and an Int32.
+CONSOLE_ACQUISITION_TYPES = frozenset({"dda", "swath", "aif"})
+CONSOLE_INT32_MAX = 2147483647
+
+
+def row_included(row: dict[str, Any]) -> bool:
+    """Whether a sample-table row is in the run, read as apply_sample_table reads it."""
+    value = row.get("included", True)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {"true", "1", "yes"}
 
 
 def other_contract_problems(root: Path) -> list[str]:
@@ -1334,7 +1361,7 @@ def plan_normalize(
     sample_rows = polarity_sample_table(contract["sample_table"]["rows"], polarity)
     factors = {
         row["file_name"]: float(row.get("factor", 1) or 1)
-        for row in sample_rows if str(row.get("included", True)).casefold() not in {"false", "0", "no"}
+        for row in sample_rows if row_included(row)
     }
     height_export = read_alignment_export(resolved["outputs"]["height_export"])
     export_names = height_export["sample_names"]
@@ -1392,6 +1419,19 @@ def plan_normalize(
             warnings.append(
                 f"Spot {spot_id} ('{candidate.get('name')}') was annotated as {item['name']} (tier {candidate['tier']}, "
                 f"{role}): the merge drops it as an internal standard."
+            )
+    # The merge also drops every row the internal-standard text row annotated, whatever its tier.
+    unconfirmed_ids = {item["alignment_id"] for item in unconfirmed}
+    for item in resolution["standards"]:
+        for candidate in item.get("candidates", []):
+            spot_id = str(candidate.get("alignment_id") or "")
+            if (candidate.get("method") != annotator or spot_id == alignment_id or spot_id in named
+                    or spot_id in unconfirmed_ids):
+                continue
+            named.add(spot_id)
+            warnings.append(
+                f"Spot {spot_id} ('{candidate.get('name')}'): the internal-standard text row annotated it as {item['name']} "
+                f"(tier {candidate.get('tier')}, not the spot chosen for it); the merge drops it as an internal standard."
             )
     for item in unconfirmed:
         how = ("its text row matched it, but another annotation was kept for the spot" if item["tier"] == "C"

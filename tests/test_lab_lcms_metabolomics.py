@@ -325,6 +325,21 @@ class CheckAndContract(Batched):
                                         "confirmed": True})
         self.assertTrue(written["written"], written)
 
+    def test_values_the_console_reads_as_something_else_are_refused(self) -> None:
+        check = agent.check_inputs(self.batch.request())
+        rows = [{"stem": stem, "class_id": CLASSES[stem], **({} if kind == "Sample" else {"file_type": kind})}
+                for stem, kind in STEMS]
+        request = {**self.batch.request(), "check_digest": check["check_digest"], "sample_table_confirmed": True}
+        for change, word in (({"acquisition_type": "DIA"}, "is none of DDA, SWATH or AIF"),
+                             ({"analytical_order": 20261022001}, "beyond what the Console reads")):
+            with self.subTest(change=change):
+                table = [dict(row, **change) if row["stem"] == "S1" else row for row in rows]
+                refused = agent.write_contract({**request, "sample_table": table})
+                self.assertIn(word, refused.get("error", ""))
+        self.assertTrue(agent.row_included({"included": " true"}))
+        self.assertFalse(agent.row_included({"included": " false"}))
+        self.assertTrue(agent.row_included({}))
+
     def test_a_class_the_console_cannot_read_is_refused(self) -> None:
         check = agent.check_inputs(self.batch.request())
         for class_id in ("症例", 'Case "A"'):
@@ -658,6 +673,15 @@ class StandardsNormalizeAndMerge(Batched):
         for spot_id in ("9", "19"):
             self.assertTrue(any(f"Spot {spot_id} ('CUDA')" in item and "drops it as an internal standard" in item
                                 for item in plan["warnings"]), (spot_id, plan["warnings"]))
+        # A second Met-d3 spot the text row annotated below the cutoff (tier C, not chosen) is named too.
+        spots = [dict(item) for item in POSITIVE_SPOTS]
+        spots.append(dict(alignment_id=5, mz=153.0772, rt=1.00, name="Methionine-d3", method="internal_standards_pos",
+                          cells=[100, 100, 100, 0], matched=False))
+        job = write_run(self.batch, self.contract, "Positive", spots=spots)
+        resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": job})
+        plan = agent.plan_normalize(self.contract, job, resolved["polarities"]["Positive"]["resolution_digest"])
+        self.assertTrue(any("Spot 5 ('Methionine-d3')" in item and "drops it as an internal standard" in item
+                            for item in plan["warnings"]), plan["warnings"])
         # CUDA absent; the only spot at its m/z and RT is unannotated.
         spots = [dict(item) for item in POSITIVE_SPOTS if item["alignment_id"] != 2]
         spots.append(dict(alignment_id=30, mz=341.2799, rt=2.88, name="Unknown", cells=[100, 100, 100, 0]))
