@@ -4,6 +4,45 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.46] - Unreleased
+
+Built on 0.5.45 (#78), which is not merged yet; merge this after it.
+
+### Added
+- **A laboratory LC-MS metabolomics agent** for hydrophilic metabolomics (HILIC, or a polar-retaining
+  reversed phase such as HSS T3), in one polarity or both. Five MCP tools carry it, with the guided-run
+  tools in between: `msdial_lcms_metabolomics_check_inputs`, `msdial_lcms_metabolomics_write_contract`,
+  `msdial_lcms_metabolomics_resolve_standards`, `msdial_lcms_metabolomics_normalize` and
+  `msdial_lcms_metabolomics_merge`. The Agent Skill `skills/msdial-lcms-metabolomics-workflow` walks
+  through them, and `docs/lab-lcms-metabolomics.md` is the specification.
+  - **Annotation is an ordered list of libraries**, each with its own retention-time use and thresholds.
+    Three presets cover the cases seen so far:
+    - `single_msp`: one MSP without RT;
+    - `campaign`: the LBM2, one MSP searched strictly and mildly, optionally an in-silico MSP, all without RT;
+    - `lab_rt_tiers`: an in-house MSP at RT 0.5 min, a predicted-RT MSP at RT 2.0 min, and an MSP of MS/MS
+      without RT.
+    Each row is written with its own settings into `msp_annotator_settings.tsv` and marked `rt_fixed`, so the
+    run-wide retention-time answer leaves it as it is. The internal-standard text row keeps priority 1, below
+    every library. The guided plan takes the list as `library_strategy: "annotators"`.
+  - **Normalization by one internal standard per polarity**, computed in Python from the run's Height export:
+    height / the standard's height in that injection x the standard's mean over the Sample and QC injections,
+    x the dilution factor. A Sample or QC without the standard refuses; a Blank or Standard injection without
+    it keeps its raw height and is reported. Every written cell is checked again. MS-DIAL's own normalization
+    is not used, because it averages over every file, Blank included, and replaces a zero with 1.
+  - **The merge** keeps one row per InChIKey first block, within and across polarities: the preferred adduct
+    (`[M+H]+`, `[M-H]-`, and the salt's `[M+HCOO]-` or `[M+CH3COO]-`) first, then the MS/MS-matched row,
+    then the larger mean normalized height over Sample and QC. Internal standards, unannotated rows and rows
+    whose Comment starts with x are dropped first. `reference_matched_only` (default on) and
+    `preferred_adducts_only` (default off) are options of each merge. It writes `metabolome.csv`,
+    `metabolome_samples.csv`, `metabolome_removed.tsv` and `merge-report.json`.
+  - The contract and its record (`lab-lcms-metabolomics-contract.json`, `lab-lcms-metabolomics-record.jsonl`)
+    name the libraries and the raw data by location, and are local only.
+
+### Changed
+- `lab_lipidomics.resolve_standards` takes which spots tier A reads as a library annotation
+  (`library_annotated`, the LBM library's by default), and `lab_lipidomics_agent.run_outputs` takes the
+  contract's key and whether the library copy is needed. Laboratory lipidomics is unchanged.
+
 ## [0.5.45] - Unreleased
 
 0.5.44 is #77, which is not merged yet. Merge that first; this section then sits above its own.

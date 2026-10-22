@@ -105,14 +105,17 @@ Interactive process after explicit confirmation.
 
 ## Install the Agent Skills by hand
 
-Two skills are bundled under `skills/`:
+Three skills are bundled under `skills/`:
 
 - `msdial-guided-analysis`: guided LC-MS and GC-MS analysis and public repository
   reanalysis;
 - `msdial-lipidomics-workflow`: the laboratory lipidomics flow below, from two raw
   folders to `lipid_metabolome.csv`. Its tutorial is
   [`docs/tutorials/lab-lipidomics.md`](tutorials/lab-lipidomics.md), and the demo's
-  workbook is [`examples/lab-lipidomics`](../examples/lab-lipidomics/README.md).
+  workbook is [`examples/lab-lipidomics`](../examples/lab-lipidomics/README.md);
+- `msdial-lcms-metabolomics-workflow`: laboratory hydrophilic metabolomics, from one or
+  two raw folders to a metabolome normalized by an internal standard and merged by
+  InChIKey; its specification is [`docs/lab-lcms-metabolomics.md`](lab-lcms-metabolomics.md).
 
 Build the upload ZIPs:
 

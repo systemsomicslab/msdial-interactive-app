@@ -37,7 +37,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .lipidome_merge import MergeRefused, describe_export, strip_polarity
 
@@ -1590,6 +1590,8 @@ def resolve_standards(
     ms1_tolerance: float = MS1_TOLERANCE,
     standard_names: Iterable[str] = (),
     annotator_id: str | None = None,
+    library_annotated: Callable[[dict[str, Any]], bool] | None = None,
+    library_label: str = "LBM library",
 ) -> dict[str, Any]:
     """Decide which aligned spot is each internal standard of one polarity.
 
@@ -1617,6 +1619,9 @@ def resolve_standards(
     Every candidate is listed with the files it has no height in, and the valid ones other than
     the chosen spot as valid_alternatives: the person may take any of them instead (an invalid
     choice included), which plan_normalize accepts as accept_spot.
+
+    library_annotated says which spots tier A reads as a library's annotation, the LBM library's by
+    default; laboratory metabolomics passes its MSP libraries, named library_label in what is said.
     """
     annotator_id = annotator_id or INTERNAL_STANDARD_ANNOTATOR_IDS.get(polarity, "")
     spots = export["spots"]
@@ -1655,7 +1660,7 @@ def resolve_standards(
                 continue
             representative = representative_candidate(candidates, spot["id"])
             tier = None
-            lbm = spot["method"].startswith("LbmDB")
+            lbm = library_annotated(spot) if library_annotated else spot["method"].startswith("LbmDB")
             # Without a candidate table, an old export's name prefix is the only sign of a suggestion.
             # MS-DIAL names the annotator in the Comment for any database hit, a suggestion below the
             # score cutoff included, and the export no longer prefixes such a name.
@@ -1738,7 +1743,7 @@ def resolve_standards(
             "delta_mz_mda": round(delta_mz * 1000, 4), "delta_mz_ppm": round(delta_mz / record.mz * 1e6, 3),
             "delta_rt": round(delta_rt, 4),
             "reason": {
-                "A": "the LBM library annotated it at the library adduct's m/z",
+                "A": f"the {library_label} annotated it at the library adduct's m/z",
                 "B": "its internal-standard text row annotated it",
                 "C": "its text row matched, but another annotation was kept for the spot or the match is only "
                      "a suggestion below the score cutoff",
@@ -1750,7 +1755,7 @@ def resolve_standards(
             entry["label_disagreement"] = {"label": spot["adduct"], "library_adduct": record.adduct}
         if abs(delta_rt) > internal_standard_rt_tolerance:
             entry["warnings"].append(
-                f"{record.name} was annotated by the LBM library {delta_rt:+.2f} min from the library RT "
+                f"{record.name} was annotated by the {library_label} {delta_rt:+.2f} min from the library RT "
                 f"{record.rt}; the library RT may be stale."
             )
             in_window = [item["spot"]["id"] for item in listed if within(item["spot"], internal_standard_rt_tolerance)]

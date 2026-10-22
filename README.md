@@ -347,6 +347,35 @@ longer does. The contract and its record name the LBM2 where it is kept and are
 never part of a bundle. `msdial_save_workset` with `lab_lipidomics_contract_path`
 saves the fixed inputs for the next batch's check.
 
+## Laboratory LC-MS metabolomics
+
+Hydrophilic metabolomics (HILIC, or a polar-retaining reversed phase such as HSS T3)
+follows the same steps, in one polarity or both, with five tools of its own and the
+Agent Skill `skills/msdial-lcms-metabolomics-workflow`.
+[`docs/lab-lcms-metabolomics.md`](docs/lab-lcms-metabolomics.md) is the specification.
+
+1. `msdial_lcms_metabolomics_check_inputs` reads everything and changes nothing.
+   Annotation is an ordered list of libraries, each with its own retention-time use
+   and thresholds, usually from a preset:
+   - `single_msp`: one MSP without RT;
+   - `campaign`: the LBM2, one MSP searched strictly and mildly, and optionally an
+     in-silico MSP, all without RT;
+   - `lab_rt_tiers`: an in-house MSP at RT 0.5 min, a predicted-RT MSP at 2.0 min, and
+     an MSP of MS/MS without RT.
+2. `msdial_lcms_metabolomics_write_contract` fixes the inputs and the confirmed sample
+   table. Each polarity is planned with `lab_lcms_metabolomics_contract_path`, and
+   each library is written into `msp_annotator_settings.tsv` with its own settings.
+3. `msdial_lcms_metabolomics_resolve_standards` finds every internal standard in each
+   run. Only the one that normalizes must be found.
+4. `msdial_lcms_metabolomics_normalize` divides each feature by that standard's height
+   in the injection and multiplies by its mean over the Sample and QC injections, in
+   Python. Every written cell is checked again.
+5. `msdial_lcms_metabolomics_merge` keeps one row per InChIKey first block, within and
+   across polarities. The order is the preferred adduct (`[M+H]+`, `[M-H]-`, the
+   salt's `[M+HCOO]-` or `[M+CH3COO]-`), then the MS/MS-matched row, then the larger
+   mean. `reference_matched_only` (on) and `preferred_adducts_only` (off) are options
+   of each merge.
+
 ## Publication reporting
 
 The **7. Publication report** workspace generates an English Materials and
@@ -706,13 +735,16 @@ MS-DIAL Interactive combines two complementary layers:
 - the local MCP server inspects data paths, runs MS-DIAL, reports job state,
   validates mzTab-M, generates QA, and creates publication artifacts.
 
-Two skills are bundled under `skills/`:
+Three skills are bundled under `skills/`:
 
 - `msdial-guided-analysis`: guided LC-MS and GC-MS analysis of a local folder or a
   public repository accession, through mzTab-M, QA and publication artifacts;
 - `msdial-lipidomics-workflow`: a laboratory lipidomics batch with internal standards,
   from two raw folders to `lipid_metabolome.csv` (see
-  [the tutorial](docs/tutorials/lab-lipidomics.md)).
+  [the tutorial](docs/tutorials/lab-lipidomics.md));
+- `msdial-lcms-metabolomics-workflow`: a laboratory hydrophilic metabolomics batch, from
+  one or two raw folders to a metabolome normalized by an internal standard and merged
+  by InChIKey.
 
 Raw data stay on the user's PC. Guided execution currently supports LC-MS and
 GC-MS. Five built-in worksets cover GC-MS metabolomics and positive/negative
@@ -778,6 +810,10 @@ Core MCP tools:
   `--peak-ids-only` and verify every cell, and write `lipid_metabolome.csv` with the
   tables and dotplot folders the laboratory's R script reads; normalize and merge
   preview by default and act only with `confirmed=true`
+- `msdial_lcms_metabolomics_check_inputs` / `msdial_lcms_metabolomics_write_contract` /
+  `msdial_lcms_metabolomics_resolve_standards` / `msdial_lcms_metabolomics_normalize` /
+  `msdial_lcms_metabolomics_merge`: the same steps for laboratory hydrophilic
+  metabolomics, normalizing by one internal standard and merging by InChIKey
 - `msdial_interactive_create_handoff`: create `datamining-handoff.json`
 - `msdial_inspect_repository_metadata`: inspect public sample metadata and publication provenance
 - `msdial_project_repository_classes`: project a user-selected metadata hierarchy into MS-DIAL `Class`

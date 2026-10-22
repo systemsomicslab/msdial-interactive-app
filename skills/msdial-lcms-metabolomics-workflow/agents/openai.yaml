@@ -1,0 +1,12 @@
+interface:
+  display_name: "MS-DIAL Laboratory LC-MS Metabolomics"
+  short_description: "Annotate, normalize by an internal standard and merge a hydrophilic metabolomics batch"
+  default_prompt: "Use $msdial-lcms-metabolomics-workflow to analyse the hydrophilic metabolomics data in these folders with MS-DIAL."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "msdial-interactive"
+      description: "Local MS-DIAL Interactive metabolomics check, run, standards, normalize and merge tools"
+      transport: "stdio"
+policy:
+  allow_implicit_invocation: true
