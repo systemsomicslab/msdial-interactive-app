@@ -29,15 +29,58 @@ merge). Agent Skill: `skills/msdial-lcms-metabolomics-workflow`.
 | Salt | As for lipidomics; formic acid reads as `HCOONH4`. It also chooses the negative adduct the merge prefers. |
 | Internal standards | An MS-DIAL text library per polarity (Name, MZ or Pos-m/z, RT, Adduct; Ontology, Formula, InChIKey optional; a standard without a class is written as "Internal standard"). One file may hold both. |
 | Duplicates | `duplicate_rule` (evidence, intensity or keep_all) and `inchikey_match` (first_block or first_two_blocks), asked before anything runs. |
-| Pairing | Two polarities pair by name, otherwise by the words that set each polarity's files apart, or by `sample_pairs` the person gives. |
+| Pairing | Two polarities pair by name, otherwise by the words that set each polarity's files apart, or by `sample_pairs` the person gives. Paired by those words, where every pair's shared word is letters and a number and the letters group replicates (A1 to D4), the class is proposed from the letters (A), not from a word that varies within one polarity (d2 against a re-injection's d2r2); `pairing_warnings` says so, for the person to confirm. |
+| Acquisition type | Read from each file's raw header (section 1a). `acquisition_type_pos` / `acquisition_type_neg` (DDA, SWATH or AIF) is asked only where the headers do not settle it. |
 | Normalizing standard | One name per polarity (`normalizing_standard_pos`, `normalizing_standard_neg`), from that polarity's library. |
 | Internal-standard RT tolerance | 0.5 min unless given. |
+| Alignment RT tolerance | `alignment_rt_tolerance`, minutes, optional: the template's 0.1 min unless given. Capillary electrophoresis migration times usually need more; the person decides. Fixed in the contract for both polarities. |
 | Analysis root, raw location, Console, threads | As for lipidomics. |
 | Sample table | As for lipidomics. File types are Sample, QC, Blank and Standard. A reference material such as NIST SRM 1950 is a Standard. |
 | Analysis purpose | Recorded and never filled in for the person. |
 
 The Console needs the annotation candidate table and the automatic-RT local test. Normalization runs in
 Python, so normalize's `--peak-ids-only` is not needed.
+
+## 1a. Raw headers: acquisition type and analytical order
+
+SWATH or AIF data run as DDA give almost no feature an MS/MS spectrum, and annotation then fails without a
+word. So the check reads each raw file's header with the configured raw-metadata extractor (the one a
+repository preflight outside a campaign runs: the argument-free `select_raw_metadata_extractor`), with the
+campaign's bounded reader (`raw_metadata_preflight.run_extractor`, `--max-spectrum-headers 200`) and its
+parsing (`repository_reanalysis._summarize_raw_metadata`):
+- Every file of a polarity is read up to 40 files; past that, the first and the last, and the files
+  between take their type only when both were read and agree (a warning says so).
+- Each file's type is the one its header gives the Console (`header_console_acquisition_type`): DDA, AIF
+  or SWATH as the header says; DIA with two or more isolation targets is SWATH, with none AIF, with one
+  unresolved (one wide window or one targeted precursor).
+- A header read is kept in the backend process by the extractor and the file's path, size and modification
+  time, so a check repeated reads nothing again.
+- Nothing is written beside the raw data. The extractor's Bruker BAF reader writes `analysis.sqlite` into
+  a `.d` folder, so such a folder is not read, and its type is asked.
+
+Where no extractor is configured, a header cannot be read, or a header gives no type the Console reads,
+`acquisition_type_pos` / `acquisition_type_neg` is a required question (DDA, SWATH or AIF), applied to the
+files the headers did not settle. A type is never assumed. An answer that disagrees with a header leaves
+the header's type and is a warning; a polarity of more than one type is a warning.
+
+The analytical order follows the acquisition start times the headers record when every file of every
+polarity was read and records one, and the times order the files (files of one time keep their listing
+order). Otherwise the order proposed from the names or the listing stands, and `order_proposal` says why.
+
+A paired row carries one acquisition type and one order for both polarities, the positive file's. Where
+the negative files were acquired in another order, a warning names the samples. Where the headers give a
+pair's two files different types (`acquisition_type_conflicts`), the contract refuses the row until the
+person gives its `acquisition_type` in `sample_table`; polarities really acquired as different types are
+checked one contract each.
+
+`raw_headers` in the result gives per polarity the coverage, the methods, the isolation target counts, the
+instruments, the separations, the acquisition types and what proposed them (`proposed_by`), the files that
+could not be read, and per file read its method, isolation targets, type, polarity and start time. The
+proposal is bound into `check_digest`, and the contract records `raw_headers`.
+
+On the CE demo (16 + 16 Thermo Q Exactive SWATH files with 8 isolation windows), the pinned extractor gives
+SWATH for 31 files and AIF for one positive file whose sampled headers show broad isolation: its pair is a
+conflict for the person to settle.
 
 ## 2. Annotation: an ordered list of libraries
 
@@ -100,7 +143,9 @@ For each polarity, as for lipidomics:
 
 The method template is the laboratory LC-MS template, with Target omics set to Metabolomics. The method
 answers are lipidomics' (smoothing, automatic RT correction with 12 anchors and the 1.5 min local window,
-annotation candidates, QA). One Console runs at a time.
+annotation candidates, QA). A contract's `alignment_rt_tolerance` is fixed for both polarities and reaches
+the method file as "Retention time tolerance for alignment"; without one the template's 0.1 min stands, and
+a plan's own value is a recorded deviation. One Console runs at a time.
 
 ## 4. Internal standards
 

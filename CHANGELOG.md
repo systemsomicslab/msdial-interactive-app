@@ -39,7 +39,23 @@ Built on 0.5.45 (#78), which is not merged yet; merge this after it.
     `merge-report.json`.
   - **Polarities acquired under other names pair** by the words that set each polarity's files apart (A1 in
     `20230125_SWATH_A1_C_CE20_d1` and `20230208_SWATH_A1_A_CE20_d2`), for the person to confirm, or by the
-    pairs they give (`sample_pairs`); the merge pairs the columns by the confirmed table.
+    pairs they give (`sample_pairs`); the merge pairs the columns by the confirmed table. Where every pair's
+    shared word is letters and a number and the letters group replicates (A1 to D4), the class is proposed
+    from the letters (A) rather than from a word only one polarity varies in (d2 against a re-injection's
+    d2r2), and `pairing_warnings` says so.
+  - **Each file's acquisition type is read from its raw header**, never assumed. The check reads the headers
+    with the configured raw-metadata extractor, the repository preflight's bounded reader and parsing (every
+    file up to 40 per polarity, past that the first and the last), cached in the process by path, size and
+    modification time. DIA with isolation windows is SWATH, without isolation AIF. Where no extractor is
+    configured, or a header cannot be read or gives no type the Console reads, `acquisition_type_pos` /
+    `acquisition_type_neg` (DDA, SWATH or AIF) is asked. The analytical order follows the headers'
+    acquisition start times when every file records one. `raw_headers` shows the evidence per polarity, the
+    proposal is bound into `check_digest`, and the contract records it. A pair whose two files' headers give
+    different types is refused by the contract until the person states that row's type. Before this, every
+    file was proposed as DDA, and SWATH or AIF data run as DDA get almost no MS/MS.
+  - **`alignment_rt_tolerance`** (minutes, optional) is recorded in the contract and fixed for both
+    polarities' runs ("Retention time tolerance for alignment"); unset, the template's 0.1 min stands.
+    Capillary electrophoresis migration times usually need more, and the person decides it.
   - MS-DIAL's four-column internal-standard text (Name, Pos-m/z, RT, Adduct) is read as it is.
   - The contract and its record (`lab-lcms-metabolomics-contract.json`, `lab-lcms-metabolomics-record.jsonl`)
     name the libraries and the raw data by location, and are local only.
@@ -67,6 +83,8 @@ Built on 0.5.45 (#78), which is not merged yet; merge this after it.
 - `lab_lipidomics.resolve_standards` takes which spots tier A reads as a library annotation
   (`library_annotated`, the LBM library's by default), and `lab_lipidomics_agent.run_outputs` takes the
   contract's key and whether the library copy is needed. Laboratory lipidomics is unchanged.
+- The guided plan takes `alignment_rt_tolerance` as an answer (a positive number of minutes; anything else is
+  a blocker). Unset, the parameter template's value stands, as before.
 
 ## [0.5.45] - Unreleased
 

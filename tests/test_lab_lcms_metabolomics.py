@@ -20,9 +20,11 @@ from lab_metabolomics_fixture import (
     ALIGNMENT,
     CLASSES,
     GLUTAMINE,
+    FakeExtractor,
     MetabolomicsBatch,
     STEMS,
     capabilities_patches,
+    header_record,
     write_run,
 )
 
@@ -927,6 +929,18 @@ class PairingAndStandardsText(unittest.TestCase):
         paired = pair_by_shared_tokens(positive, negative[:3])
         self.assertTrue(any("no negative counterpart" in item for item in paired["problems"]))
 
+    def test_only_letter_and_number_replicates_give_a_class(self) -> None:
+        self.assertEqual({"A1": "A", "A2": "A", "B1": "B"},
+                         core.replicate_classes({"A1": ["A1"], "A2": ["A2"], "B1": ["B1"]}))
+        for shared in (
+            {"S1": ["S1"], "S2": ["S2"]},  # one group: sample numbers
+            {"A1": ["A1"], "B1": ["B1"]},  # no group holds a replicate
+            {"A1": ["A1"], "A2": ["A2"], "Blank": ["Blank"]},
+            {"A1": ["A1", "B2"], "A2": ["A2"], "B1": ["B1"]},
+        ):
+            with self.subTest(shared=shared):
+                self.assertIsNone(core.replicate_classes(shared))
+
     def test_a_batch_whose_polarities_are_named_apart_is_paired_merged_and_kept_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory, capabilities_patches():
             batch = MetabolomicsBatch(Path(directory), ("Positive", "Negative"))
@@ -976,6 +990,269 @@ class PairingAndStandardsText(unittest.TestCase):
             self.assertEqual("Internal standard", lines[1].split("\t")[7], "a standard given without a class gets one")
 
 
+# Eight recurring isolation windows, as the demo's SWATH files record them.
+WINDOWS = [100.0 + 75.0 * index for index in range(8)]
+# The demo's naming: the polarities acquired on other days, and two negative files re-injected (d2r2).
+DEMO = [("A1", "d2"), ("A2", "d2"), ("A3", "d2r2"), ("B1", "d2"), ("B2", "d2"), ("B3", "d2")]
+
+
+def demo_batch(root: Path) -> MetabolomicsBatch:
+    batch = MetabolomicsBatch(root, ("Positive", "Negative"))
+    for folder in batch.folders.values():
+        for path in folder.iterdir():
+            path.unlink()
+    for name, suffix in DEMO:
+        (batch.folders["Positive"] / f"20230125_SWATH_{name}_C_CE20_d1.mzML").write_text("", encoding="ascii")
+        (batch.folders["Negative"] / f"20230208_SWATH_{name}_A_CE20_{suffix}.mzML").write_text("", encoding="ascii")
+    return batch
+
+
+def types_by_stem(check: dict) -> dict:
+    return {row["stem"]: row["acquisition_type"] for row in check["paired_sample_table"]["rows"]}
+
+
+class RawHeaders(unittest.TestCase):
+    """Each file's acquisition type and the analytical order come from its raw header, or are asked."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def check(self, batch: MetabolomicsBatch, extractor: FakeExtractor, **extra) -> dict:
+        with capabilities_patches(extractor=extractor):
+            return agent.check_inputs(batch.request(**extra))
+
+    def test_dia_with_isolation_windows_is_swath_and_reaches_the_analysis_file(self) -> None:
+        batch = demo_batch(self.root)
+        extractor = FakeExtractor(lambda path: header_record(path, "DIA", WINDOWS))
+        check = self.check(batch, extractor)
+        self.assertTrue(check["ready_for_contract"], (check["questions"], check["blockers"]))
+        self.assertEqual({"SWATH"}, set(types_by_stem(check).values()))
+        for polarity in ("Positive", "Negative"):
+            report = check["raw_headers"]["polarities"][polarity]
+            self.assertEqual(("all", 6, {"DIA": 6}, [8], {"SWATH": 6}, {"raw_header": 6}),
+                             (report["coverage"], report["files_read"], report["methods"], report["isolation_targets"],
+                              report["acquisition_types"], report["proposed_by"]))
+            self.assertEqual(["Q Exactive Plus Orbitrap"], report["instruments"])
+            self.assertEqual({"SWATH"}, {item["acquisition_type"] for item in report["per_file"]})
+        self.assertEqual("setting", check["raw_headers"]["extractor"]["source"])
+        with capabilities_patches(extractor=extractor):
+            request = batch.request()
+            written = agent.write_contract({**request, "check_digest": check["check_digest"],
+                                            "sample_table_confirmed": True, "confirmed_by": "the analyst",
+                                            "confirmed": True})
+            self.assertTrue(written["written"], written)
+            contract = agent.load_contract(written["contract_path"])
+            self.assertEqual({"SWATH"}, {row["acquisition_type"] for row in contract["sample_table"]["rows"]})
+            self.assertEqual({"DIA": 6}, contract["raw_headers"]["polarities"]["Negative"]["methods"])
+            plan = build_guided_plan(str(batch.folders["Positive"]), {
+                agent.CONTRACT_KEY: written["contract_path"], "ion_mode": "Positive", "minimum_peak_height": 500})
+            self.assertTrue(plan["ready_to_prepare"], (plan["blockers"], plan["remaining_questions"]))
+            prepared = prepare_run(plan["workflow"])
+        rows = list(csv.DictReader(io.StringIO(
+            (Path(prepared["run_directory"]) / "analysis_files.csv").read_text(encoding="ascii"))))
+        self.assertEqual(6, len(rows))
+        self.assertEqual({"SWATH"}, {row["acquisition_type"] for row in rows})
+
+    def test_the_re_injected_files_pair_and_the_replicates_letters_are_the_class(self) -> None:
+        batch = demo_batch(self.root)
+        check = self.check(batch, FakeExtractor(lambda path: header_record(path, "DIA", WINDOWS)))
+        table = check["paired_sample_table"]
+        self.assertIn("words that set", table["pairing"])
+        self.assertEqual("20230208_SWATH_A3_A_CE20_d2r2",
+                         next(row["negative_file"] for row in table["rows"] if row["stem"] == "A3"))
+        # d2 against d2r2 varies only in the negative files: it is no class.
+        self.assertEqual({"A1": "A", "A2": "A", "A3": "A", "B1": "B", "B2": "B", "B3": "B"},
+                         {row["stem"]: row["class_id"] for row in table["rows"]})
+        self.assertEqual("shared_sample_word_letters", table["class_proposal"]["derived_from"])
+        self.assertTrue(any("shared sample word's letters (A: 3, B: 3)" in item for item in check["warnings"]),
+                        check["warnings"])
+        self.assertFalse(any("class_id is" in item for item in check["warnings"]), check["warnings"])
+
+    def test_dia_without_isolation_is_aif_dda_is_dda_and_one_target_is_asked(self) -> None:
+        batch = MetabolomicsBatch(self.root)
+        for method, targets, expected in (("DIA", [], "AIF"), ("DDA", [], "DDA"), ("DIA", [500.0], None)):
+            with self.subTest(method=method, targets=targets):
+                check = self.check(batch, FakeExtractor(lambda path: header_record(path, method, targets)))
+                self.assertEqual({expected}, set(types_by_stem(check).values()))
+                questions = {item["id"]: item for item in check["questions"]}
+                self.assertEqual(expected is None, "acquisition_type_pos" in questions)
+                if expected is None:
+                    self.assertIn("S1_Pos (DIA, 1 isolation target)", questions["acquisition_type_pos"]["prompt"])
+                    self.assertEqual(["DDA", "SWATH", "AIF"], questions["acquisition_type_pos"]["choices"])
+
+    def test_a_header_that_cannot_be_read_is_asked_and_the_answer_fills_only_that_file(self) -> None:
+        batch = MetabolomicsBatch(self.root)
+        extractor = FakeExtractor(lambda path: None if Path(path).stem == "QC1_Pos" else header_record(path))
+        check = self.check(batch, extractor)
+        question = next(item for item in check["questions"] if item["id"] == "acquisition_type_pos")
+        self.assertIn("QC1_Pos could not be read", question["prompt"])
+        self.assertFalse(check["ready_for_contract"])
+        self.assertEqual({"S1": "DDA", "S2": "DDA", "QC1": None, "Blank": "DDA"}, types_by_stem(check))
+        self.assertEqual(["QC1_Pos"], check["raw_headers"]["polarities"]["Positive"]["unreadable"])
+        check = self.check(batch, extractor, acquisition_type_pos="swath")
+        self.assertTrue(check["ready_for_contract"], (check["questions"], check["blockers"]))
+        self.assertEqual({"S1": "DDA", "S2": "DDA", "QC1": "SWATH", "Blank": "DDA"}, types_by_stem(check))
+        self.assertTrue(any("acquisition_type_pos is SWATH, but the positive headers give DDA" in item
+                            for item in check["warnings"]), check["warnings"])
+        check = self.check(batch, extractor, acquisition_type_pos="DIA")
+        self.assertTrue(any("acquisition_type_pos 'DIA' is none of DDA, SWATH or AIF" in item for item in check["blockers"]))
+
+    def test_without_an_extractor_the_type_is_asked_never_assumed(self) -> None:
+        batch = MetabolomicsBatch(self.root)
+        extractor = FakeExtractor(configured=False)
+        check = self.check(batch, extractor)
+        question = next(item for item in check["questions"] if item["id"] == "acquisition_type_pos")
+        self.assertIn("No raw-metadata extractor is configured", question["prompt"])
+        self.assertIsNone(check["raw_headers"]["extractor"])
+        self.assertEqual({None}, set(types_by_stem(check).values()))
+        self.assertEqual([], extractor.calls)
+        check = self.check(batch, extractor, acquisition_type_pos="DDA")
+        self.assertTrue(check["ready_for_contract"], (check["questions"], check["blockers"]))
+        self.assertEqual({"answer": 4}, check["raw_headers"]["polarities"]["Positive"]["proposed_by"])
+
+    def test_the_analytical_order_follows_the_acquisition_start_times(self) -> None:
+        batch = MetabolomicsBatch(self.root)
+        times = {"S1_Pos": "2023-01-25T09:00:00+00:00", "S2_Pos": "2023-01-25T09:30:00+00:00",
+                 "QC1_Pos": "2023-01-25T10:00:00.1234567+00:00", "Blank_Pos": "2023-01-25T11:00:00+00:00"}
+        extractor = FakeExtractor(lambda path: header_record(path, start=times.get(Path(path).stem)))
+        check = self.check(batch, extractor)
+        table = check["paired_sample_table"]
+        self.assertEqual([("S1", 1), ("S2", 2), ("QC1", 3), ("Blank", 4)],
+                         [(row["stem"], row["analytical_order"]) for row in table["rows"]])
+        self.assertEqual("raw_header_acquisition_start_time", table["order_proposal"]["derived_from"])
+        self.assertFalse(table["order_proposal"]["agrees_with_file_listing"])
+        per_file = {item["file"]: item["acquisition_start_time"]
+                    for item in check["raw_headers"]["polarities"]["Positive"]["per_file"]}
+        self.assertEqual(times["QC1_Pos"], per_file["QC1_Pos"])
+        # One file without a time: the order proposed from the names stands, and the reason is said.
+        del times["Blank_Pos"]
+        check = self.check(batch, extractor)
+        table = check["paired_sample_table"]
+        self.assertNotEqual("raw_header_acquisition_start_time", table["order_proposal"]["derived_from"])
+        self.assertIn("no readable acquisition start time was recorded for Blank_Pos",
+                      table["order_proposal"]["raw_headers"]["reason"])
+        self.assertEqual(["Blank", "QC1", "S1", "S2"], [row["stem"] for row in table["rows"]])
+
+    def test_polarities_acquired_in_another_order_are_said(self) -> None:
+        batch = demo_batch(self.root)
+        samples = [name for name, _ in DEMO]
+
+        def record(path: Path) -> dict:
+            stem = Path(path).stem
+            rank = samples.index(stem.split("_")[2])
+            # The positive run in the listing's order, the negative one in reverse.
+            minute = rank if "_C_" in stem else len(samples) - rank
+            return header_record(path, "DIA", WINDOWS, start=f"2023-01-25T10:{minute:02d}:00+00:00")
+
+        check = self.check(batch, FakeExtractor(record))
+        table = check["paired_sample_table"]
+        self.assertEqual([(name, rank) for rank, name in enumerate(samples, start=1)],
+                         [(row["stem"], row["analytical_order"]) for row in table["rows"]])
+        self.assertTrue(any("The negative files were acquired in another order" in item for item in check["warnings"]),
+                        check["warnings"])
+
+    def test_a_pair_whose_headers_disagree_takes_the_type_the_person_states(self) -> None:
+        batch = MetabolomicsBatch(self.root, ("Positive", "Negative"))
+        # As the demo's one positive file the extractor calls AIF beside its SWATH negative partner.
+        extractor = FakeExtractor(lambda path: header_record(path, "DIA", [] if Path(path).stem == "S2_Pos" else WINDOWS))
+        with capabilities_patches(extractor=extractor):
+            check = agent.check_inputs(batch.request())
+            self.assertTrue(check["ready_for_contract"], (check["questions"], check["blockers"]))
+            self.assertEqual({"S2": {"Positive": "AIF", "Negative": "SWATH"}},
+                             check["paired_sample_table"]["acquisition_type_conflicts"])
+            self.assertTrue(any("S2 (AIF positive, SWATH negative)" in item for item in check["warnings"]), check["warnings"])
+            rows = [{"stem": stem, "class_id": CLASSES[stem], **({} if kind == "Sample" else {"file_type": kind})}
+                    for stem, kind in STEMS]
+            request = {**batch.request(), "check_digest": check["check_digest"], "sample_table_confirmed": True,
+                       "confirmed_by": "the analyst", "confirmed": True}
+            refused = agent.write_contract({**request, "sample_table": rows})
+            self.assertIn("S2 (AIF positive, SWATH negative)", refused.get("error", ""))
+            stated = [dict(row, acquisition_type="SWATH") if row["stem"] == "S2" else row for row in rows]
+            written = agent.write_contract({**request, "sample_table": stated})
+            self.assertTrue(written["written"], written)
+        contract = agent.load_contract(written["contract_path"])
+        self.assertEqual({"SWATH"}, {row["acquisition_type"] for row in contract["sample_table"]["rows"]})
+
+    def test_a_header_of_the_other_polarity_is_said(self) -> None:
+        batch = MetabolomicsBatch(self.root)
+        check = self.check(batch, FakeExtractor(
+            lambda path: header_record(path, polarity="Negative" if Path(path).stem == "S2_Pos" else "Positive")))
+        self.assertTrue(any("S2_Pos in the positive folder record the other polarity" in item
+                            for item in check["warnings"]), check["warnings"])
+
+    def test_past_the_limit_only_the_first_and_the_last_header_are_read(self) -> None:
+        batch = MetabolomicsBatch(self.root)
+        extractor = FakeExtractor(lambda path: header_record(path, "DIA", WINDOWS))
+        with patch.object(agent, "HEADER_READ_ALL_LIMIT", 2):
+            check = self.check(batch, extractor)
+        self.assertEqual([["Blank_Pos.mzML", "S2_Pos.mzML"]], extractor.calls)
+        report = check["raw_headers"]["polarities"]["Positive"]
+        self.assertEqual(("first_and_last", 2, {"first_and_last_files": 2, "raw_header": 2}),
+                         (report["coverage"], report["files_read"], report["proposed_by"]))
+        self.assertEqual({"SWATH"}, set(types_by_stem(check).values()))
+        self.assertTrue(any("Only the first and the last of the 4 positive raw files were read" in item
+                            for item in check["warnings"]), check["warnings"])
+        self.assertIn("only the first and the last", check["paired_sample_table"]["order_proposal"]["raw_headers"]["reason"])
+        # Two that disagree settle nothing for the files between them.
+        extractor = FakeExtractor(lambda path: header_record(path, "DDA" if Path(path).stem == "Blank_Pos" else "DIA", WINDOWS))
+        with patch.object(agent, "HEADER_READ_ALL_LIMIT", 2):
+            check = self.check(batch, extractor)
+        self.assertIn("acquisition_type_pos", {item["id"] for item in check["questions"]})
+        self.assertEqual({"Blank": "DDA", "QC1": None, "S1": None, "S2": "SWATH"}, types_by_stem(check))
+
+    def test_a_check_again_reads_no_header_twice_and_the_digest_binds_what_was_read(self) -> None:
+        batch = MetabolomicsBatch(self.root)
+        extractor = FakeExtractor(lambda path: header_record(path, "DIA", WINDOWS))
+        with capabilities_patches(extractor=extractor):
+            first = agent.check_inputs(batch.request())
+            second = agent.check_inputs(batch.request())
+            self.assertEqual(1, len(extractor.calls))
+            self.assertEqual(first["check_digest"], second["check_digest"])
+        # The same files, read otherwise: the table the person saw is not the one that would be written.
+        with capabilities_patches(extractor=FakeExtractor()):
+            refused = agent.write_contract({**batch.request(), "check_digest": first["check_digest"],
+                                            "sample_table_confirmed": True})
+        self.assertIn("changed after it was checked", refused["error"])
+        # A file rewritten is read again; the others come from the cache.
+        with capabilities_patches(extractor=extractor):
+            agent.check_inputs(batch.request())
+            (batch.folders["Positive"] / "S1_Pos.mzML").write_text("changed", encoding="ascii")
+            agent.check_inputs(batch.request())
+        self.assertEqual(["S1_Pos.mzML"], extractor.calls[-1])
+
+
+class AlignmentTolerance(Batched):
+    def plan(self, contract: str, **extra) -> dict:
+        answers = {agent.CONTRACT_KEY: contract, "ion_mode": "Positive", "minimum_peak_height": 500, **extra}
+        return build_guided_plan(str(self.batch.folders["Positive"]), answers)
+
+    def test_the_persons_alignment_tolerance_reaches_the_method_file(self) -> None:
+        check = agent.check_inputs(self.batch.request(alignment_rt_tolerance=0))
+        self.assertTrue(any("alignment_rt_tolerance '0' is not a positive number" in item for item in check["blockers"]))
+        check = agent.check_inputs(self.batch.request())
+        self.assertIn("0.1 min", check["stated_defaults"]["alignment_rt_tolerance"])
+        contracts = {}
+        for index, (given, expected) in enumerate(((1.5, "1.5"), (None, "0.1"))):
+            with self.subTest(given=given):
+                contract = self.batch.contract(alignment_rt_tolerance=given,
+                                               analysis_root=str(self.batch.root / f"analysis{index}"))
+                contracts[given] = contract
+                self.assertEqual(given, agent.load_contract(contract)["alignment_rt_tolerance"])
+                plan = self.plan(contract)
+                self.assertTrue(plan["ready_to_prepare"], (plan["blockers"], plan["remaining_questions"]))
+                self.assertEqual(given is not None, "alignment_rt_tolerance" in plan["lab_lcms_metabolomics"]["fixed_keys"])
+                lines = method_lines(prepare_run(plan["workflow"])["method_file"])
+                self.assertEqual(expected, lines["Retention time tolerance for alignment"])
+        plan = self.plan(contracts[1.5], alignment_rt_tolerance=0.3)
+        self.assertTrue(any("alignment_rt_tolerance is fixed by the contract" in item for item in plan["blockers"]))
+        plan = self.plan(contracts[None], workflow_overrides={"alignment_rt_tolerance": 0.3})
+        self.assertTrue(any("workflow_overrides.alignment_rt_tolerance would replace" in item for item in plan["blockers"]))
+
+
 class TheTools(unittest.TestCase):
     def capture(self, function, **arguments) -> dict:
         captured = {}
@@ -1010,6 +1287,17 @@ class TheTools(unittest.TestCase):
                 self.assertIs(True, self.capture(function, **arguments, confirmed=True)["body"]["confirmed"])
                 for value in ("yes", "true", 1):
                     self.refused(function, **arguments, confirmed=value)
+
+    def test_the_header_answers_and_the_alignment_tolerance_reach_the_backend(self) -> None:
+        for function in (mcp_server.msdial_lcms_metabolomics_check_inputs, mcp_server.msdial_lcms_metabolomics_write_contract):
+            with self.subTest(tool=function.__name__):
+                arguments = {"pos_path": "p", "acquisition_type_pos": "SWATH", "alignment_rt_tolerance": 1.5}
+                if function is mcp_server.msdial_lcms_metabolomics_write_contract:
+                    arguments.update(annotation={"preset": "single_msp"}, solvent_type="s", analysis_root="r",
+                                     analysis_purpose="x", console_path="c", raw_location="copy", check_digest="d")
+                body = self.capture(function, **arguments)["body"]
+                self.assertEqual(("SWATH", "", 1.5), (body["acquisition_type_pos"], body["acquisition_type_neg"],
+                                                      body["alignment_rt_tolerance"]))
 
     def test_the_merge_options_are_left_out_unless_given(self) -> None:
         body = self.capture(mcp_server.msdial_lcms_metabolomics_merge, contract_path="c")["body"]

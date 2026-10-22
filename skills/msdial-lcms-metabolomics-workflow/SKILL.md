@@ -41,6 +41,16 @@ inputs beside the data (internal-standard texts, `.msp` and `.lbm2` libraries). 
 libraries found, but never propose one: which library matches this chromatography is the
 person's choice.
 
+It also reads each raw file's header with the configured raw-metadata extractor
+(`raw_headers`): every file up to 40 per polarity, past that the first and the last. Report
+per polarity the methods, the isolation target counts, the instrument, the acquisition
+types proposed and from what (`proposed_by`), the files that could not be read, and whether
+the analytical order follows the acquisition start times. DIA with isolation windows is
+SWATH and without isolation AIF. A file whose type differs from the rest of its folder
+(one file of a SWATH batch whose sampled headers the extractor reads as AIF, for one) is
+read out with its method and isolation targets from `raw_headers.per_file`. Without a configured
+extractor (`msdial_check_raw_metadata_extractor`), the type is asked, never assumed.
+
 ## C. Ask everything in one message
 
 `questions` lists what is open. Ask all of it at once:
@@ -85,6 +95,15 @@ person's choice.
   are one compound) or `first_two_blocks` (they stay apart).
 - **The normalizing standard** of each polarity (`normalizing_standard_pos`,
   `normalizing_standard_neg`), one name from that polarity's text.
+- **The acquisition type** (`acquisition_type_pos`, `acquisition_type_neg`: DDA, SWATH or
+  AIF), only when it is among the questions: no extractor is configured, a header could
+  not be read, or a header gives no type the Console reads. Its prompt says which. The
+  answer fills only the files the headers did not settle. SWATH or AIF data run as DDA give
+  almost no MS/MS, so never answer it for the person.
+- **For capillary electrophoresis** (migration time on the RT axis), say that the template
+  aligns within 0.1 min, which CE migration times usually exceed, and ask whether they want
+  a wider `alignment_rt_tolerance` (minutes). The value is the person's; leave it unset
+  unless they give one.
 - **The analysis root** (`analysis_root`): `pos`, `neg`, `inputs` and `quant` are made
   inside it. Not a raw-data folder, a code checkout or a temporary folder.
 - **Where MS-DIAL reads the raw data** (`raw_location`), with this sentence: *MS-DIAL
@@ -94,7 +113,8 @@ person's choice.
 - The Console, and the thread count if they care.
 
 Say in the same message what is set without asking: the internal-standard RT tolerance
-(0.5 min); the method (one-file peak-height diagnostic, smoothing
+(0.5 min); the alignment RT tolerance (the template's 0.1 min unless given); the method
+(one-file peak-height diagnostic, smoothing
 `TimeBasedLinearWeightedMovingAverage`, automatic RT correction with 12 anchors and the
 1.5 min local window, annotation candidates, QA); the thresholds (`standard`: dot
 products 0.6/0.6/0.8 and 3 matched peaks; `strict` and `mild`: the reanalysis campaign's
@@ -130,12 +150,21 @@ the words that set each polarity's files apart (A1 in 20230125_SWATH_A1_C_CE20_d
 20230208_SWATH_A1_A_CE20_d2), shown in `pairing` and each row's `paired_by`: read every pair
 to the person. When the pairing fails or is wrong, they give `sample_pairs`
 (`[{sample, positive_file, negative_file}]`). The merge pairs the columns by this table.
+Paired by words that are letter+number replicates (A1 to D4), each pair's class is proposed
+from the letters (A), not from a word only one polarity varies in (d2 against a
+re-injection's d2r2); read that warning and the classes to the person.
 Classes and acquisition types reach the Console's ASCII analysis file: give them in
 printable ASCII without commas or quotes (a Japanese class name as a romanized word). The
 acquisition type is DDA, SWATH or AIF, the words the Console reads; it reads any other as
-DDA, so DIA data are SWATH or AIF by the person's word. Analytical and batch orders are
-ranks from 1. A raw file whose own name the Console cannot carry may be left out
-(`included: false`); the contract refuses it included.
+DDA. Each row's type is its files' headers', or the person's answer where a header did not
+settle it; read it out, and correct a row only on the person's word. A paired row carries
+one type and one analytical order for both polarities, the positive file's: where the
+headers give a pair's files different types (`acquisition_type_conflicts`), ask which it is
+and give that row's `acquisition_type` in `sample_table`, since the contract refuses the
+row until then; where the negative files were acquired in another order, read that warning.
+`order_proposal` says whether the order follows the acquisition start times or the names.
+Analytical and batch orders are ranks from 1. A raw file whose own name the Console cannot
+carry may be left out (`included: false`); the contract refuses it included.
 
 On their yes, call `msdial_lcms_metabolomics_write_contract(..., check_digest,
 sample_table_confirmed=true, sample_table=<corrections>, confirmed_by=<who>)`. It
@@ -148,9 +177,10 @@ refuses even the preview: read `existing_contract` to the person, and replace it
 Plan with `msdial_guided_analysis_plan(input_path=<the polarity's raw folder>,
 answers={"lab_lcms_metabolomics_contract_path": ..., "ion_mode": "Positive"})`. The
 contract fixes the libraries with their RT settings and thresholds, the salt, the
-internal-standard library, the sample table, the output and export folder, the Console
-and the template; `lab_lcms_metabolomics.deviations` must be empty unless the person
-asked for a change, and every deviation is read to them.
+internal-standard library, the sample table with each file's acquisition type, the output
+and export folder, the Console, the template and an alignment RT tolerance the person gave;
+`lab_lcms_metabolomics.deviations` must be empty unless the person asked for a change, and
+every deviation is read to them.
 
 1. Confirm, then `msdial_start_peak_count_diagnostic(..., confirmed=true)`: one file at
    zero threshold, without annotation, writing intermediates beside that file.
@@ -244,10 +274,12 @@ of the result belongs to a separate data-mining tool, not here.
 
 Say what ran, on which files, with which libraries and settings, and where the artifacts
 are: each library by label, file name and sha256 (never its path in anything shared),
-its priority, thresholds and RT use; the salt and its mapping; each polarity's threshold,
-step and representative file; the normalizing standard's tier, what the person accepted
-or took, its mean and the injections left raw; the other standards' QC CVs; the merge
-options and counts. Name what was assumed rather than confirmed. When a step was skipped,
+its priority, thresholds and RT use; the salt and its mapping; each polarity's acquisition
+types and what they came from (the raw headers, the person's answer, a row they corrected),
+whether the order followed the acquisition start times, and the alignment RT tolerance;
+each polarity's threshold, step and representative file; the normalizing standard's tier,
+what the person accepted or took, its mean and the injections left raw; the other
+standards' QC CVs; the merge options and counts. Name what was assumed rather than confirmed. When a step was skipped,
 say so. The raw data, or its copy, is kept; deleting it is a separate confirmation.
 
 ## Private resources

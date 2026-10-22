@@ -70,6 +70,8 @@ SUPPORTED_ANSWER_KEYS = {
     "lab_lipidomics_contract_path", "analysis_purpose",
     # The laboratory LC-MS metabolomics profile (lab_lcms_metabolomics, lab_lcms_metabolomics_agent).
     "lab_lcms_metabolomics_contract_path",
+    # Minutes; unset, the parameter template's value stands.
+    "alignment_rt_tolerance",
 }
 SAMPLE_TABLE_FILE_TYPES = ("Sample", "QC", "Blank", "Standard")
 # The LBM score cutoffs a parameter template states, by the state key the method writer reads. Only
@@ -278,6 +280,8 @@ def build_guided_plan(
     if merged.get("sample_table"):
         contract_blockers.extend(sample_table_problems(inspection["files"], merged["sample_table"]))
     blockers: list[str] = list(contract_blockers)
+    if merged.get("alignment_rt_tolerance") not in (None, "") and _alignment_rt_tolerance(merged) is None:
+        blockers.append(f"alignment_rt_tolerance '{merged['alignment_rt_tolerance']}' is not a positive number of minutes.")
     official_library: dict[str, Any] | None = None
     if not inspection["files"]:
         blockers.append("No supported analysis files were found at input_path.")
@@ -1005,6 +1009,18 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+def _alignment_rt_tolerance(answers: dict[str, Any]) -> float | None:
+    """The alignment_rt_tolerance answer in minutes, or None when it is not given or not a positive number."""
+    value = answers.get("alignment_rt_tolerance")
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
 def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, Any]:
     project_type = str(answers["project_type"]).casefold()
     settings = load_user_settings()
@@ -1085,6 +1101,8 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             ),
         }
     )
+    if _alignment_rt_tolerance(answers) is not None:
+        state["alignment_rt_tolerance"] = _alignment_rt_tolerance(answers)
     # Unlike the keys above it has no default here: unset, it is not written, and a Console with
     # MsdialWorkbench#826 uses its own 1.5 min while one without it is never handed a key it does
     # not know. A template line for it reached the state through load_parameter_template.

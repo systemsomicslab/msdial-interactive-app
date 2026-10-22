@@ -472,11 +472,32 @@ IS_TEXT_REQUIRED_METABOLOMICS = ("name", "mz", "rt", "adduct")
 
 _TOKEN_SPLIT = re.compile(r"[_\-.\s]+")
 PAIRED_FIELDS = ("file_type", "class_id", "analytical_order", "batch_order", "factor", "acquisition_type")
+# A sample word of letters and a number (A1, QC12): a replicate of the group its letters name.
+_REPLICATE_WORD = re.compile(r"^([A-Za-z]+)(\d+)$")
+REPLICATE_CLASS_SOURCE = "shared_sample_word_letters"
 
 
 def name_tokens(name: str) -> list[str]:
     """A file name's words, without its extension: 20230125_SWATH_A1_C_CE20_d1.raw -> [20230125, SWATH, A1, ...]."""
     return [token for token in _TOKEN_SPLIT.split(Path(str(name)).stem) if token]
+
+
+def replicate_classes(shared: dict[str, list[str]]) -> dict[str, str] | None:
+    """Each pair's class read from its one letter+number sample word (A1 -> A), or None.
+
+    Only when every pair has exactly one such word, and the letters make at least two groups of which one
+    holds more than one pair: S1 to S16 are sample numbers, not replicates of a group.
+    """
+    classes: dict[str, str] = {}
+    for stem, words in shared.items():
+        found = [match.group(1) for match in (_REPLICATE_WORD.match(word) for word in words) if match]
+        if len(found) != 1:
+            return None
+        classes[stem] = found[0]
+    groups = list(classes.values())
+    if len(set(groups)) < 2 or len(set(groups)) == len(groups):
+        return None
+    return classes
 
 
 def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[str, Any]]) -> dict[str, Any]:
@@ -486,6 +507,9 @@ def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[st
     and 20230208_SWATH_A1_A_CE20_d2): the words all files of a polarity share say nothing, and the ones left
     (A1) name the sample. A file pairs with the one file of the other polarity that shares the most of them,
     and only when that is mutual. The sample takes the shared words' name. The person confirms the pairing.
+
+    Where the shared words are letter+number replicates (A1 to D4), the class is read from the letters (A),
+    not from a word only one polarity varies in (d2 and d2r2, a re-injection), and the warnings say so.
     """
     def varying(rows: list[dict[str, Any]]) -> list[list[str]]:
         words = [name_tokens(row["file_name"]) for row in rows]
@@ -511,6 +535,7 @@ def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[st
     for index, number in best_for_left.items():
         claimed.setdefault(number, []).append(index)
     rows: list[dict[str, Any]] = []
+    differences: list[tuple[str, str, Any, Any]] = []
     for number, indices in sorted(claimed.items(), key=lambda item: min(item[1])):
         if len(indices) > 1:
             problems.append(
@@ -525,11 +550,31 @@ def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[st
         for key in PAIRED_FIELDS:
             row[key] = source.get(key)
             if other.get(key) != source.get(key):
-                warnings.append(
-                    f"{row['stem']}: {key} is {source.get(key)!r} in positive and {other.get(key)!r} in negative; the "
-                    "positive value is proposed."
-                )
+                differences.append((row["stem"], key, source.get(key), other.get(key)))
         rows.append(row)
+    classes = replicate_classes({row["stem"]: row["paired_by"] for row in rows}) if rows else None
+    for stem, key, value, other_value in differences:
+        if key == "class_id" and classes:
+            continue
+        warnings.append(
+            f"{stem}: {key} is {value!r} in positive and {other_value!r} in negative; the positive value is proposed."
+        )
+    class_proposal: dict[str, Any] = {}
+    if classes:
+        for row in rows:
+            row["class_id"] = classes[row["stem"]]
+        counts = {name: list(classes.values()).count(name) for name in sorted(set(classes.values()))}
+        class_proposal = {
+            "derived_from": REPLICATE_CLASS_SOURCE,
+            "reason": "each pair's shared sample word is letters and a number (A1); its letters name the class (A)",
+            "groups": counts,
+            "confirmation_required": True,
+        }
+        warnings.append(
+            "The class of each pair was read from its shared sample word's letters ("
+            + ", ".join(f"{name}: {count}" for name, count in counts.items())
+            + "), not from the words that vary within one polarity; confirm it, or correct class_id in sample_table."
+        )
     for number, other in enumerate(negative):
         if number not in claimed:
             problems.append(f"{other['file_name']} has no positive counterpart by the words that set it apart.")
@@ -537,7 +582,8 @@ def pair_by_shared_tokens(positive: list[dict[str, Any]], negative: list[dict[st
     for name in sorted({name for name in names if names.count(name) > 1}):
         problems.append(f"Two pairs would both be named {name}.")
     rows.sort(key=lambda row: (row.get("analytical_order") or 0, row["stem"].casefold()))
-    return {"rows": rows, "problems": problems, "warnings": warnings, "matched": not problems}
+    return {"rows": rows, "problems": problems, "warnings": warnings, "matched": not problems,
+            "class_proposal": class_proposal}
 
 
 # ---------------------------------------------------------------------------------------------

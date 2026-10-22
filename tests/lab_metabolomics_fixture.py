@@ -68,7 +68,66 @@ NEGATIVE_SPOTS = [
 ]
 
 
-def capabilities_patches(found: dict[str, Any] | None = None) -> ExitStack:
+def header_record(path: str | Path, method: str = "DDA", targets: list[float] | None = None,
+                  start: str | None = None, polarity: str | None = None) -> dict[str, Any]:
+    """One record as RawMetadataConsoleApp writes it for a file, with only what the campaign's summary reads."""
+    record: dict[str, Any] = {
+        "source": {"filePath": str(path), "fileName": Path(path).name, "readerName": "ThermoMetadataReader"},
+        "instrument": {"model": {"value": "Q Exactive Plus Orbitrap"}},
+        "acquisition": {
+            "method": {"value": method, "source": "SpectrumStatistics"},
+            "separation": {"value": "LiquidChromatography"},
+            "msLevels": {"value": [1, 2]},
+            "isolationWindowTargets": list(targets or []),
+        },
+        "run": {},
+    }
+    if polarity:
+        record["acquisition"]["polarity"] = {"value": polarity}
+    if start:
+        record["run"]["acquisitionStartTime"] = {"value": start, "evidence": "Thermo FileHeader.CreationDate"}
+    return record
+
+
+class FakeExtractor:
+    """The configured raw-metadata extractor and its reads, stood in for.
+
+    records(path) gives a file's record, or None for a file the extractor cannot read. calls lists the
+    files each read was given.
+    """
+
+    def __init__(self, records: Any = None, configured: bool = True) -> None:
+        self.records = records or (lambda path: header_record(path))
+        self.configured = configured
+        self.calls: list[list[str]] = []
+
+    def run(self, extractor: Path, inputs: list[Path], work_directory: Path, **_: Any) -> dict[str, Any]:
+        from msdial_app.raw_metadata_preflight import file_key
+
+        self.calls.append([Path(path).name for path in inputs])
+        records, outcomes = [], {}
+        for path in inputs:
+            record = self.records(path)
+            if record is None:
+                outcomes[file_key(path)] = {"outcome": "failed", "exit_code": 1}
+            else:
+                records.append(record)
+                outcomes[file_key(path)] = {"outcome": "ok", "exit_code": 0, "reader_created_files": []}
+        return {"records": records, "outcomes": outcomes}
+
+    def patches(self) -> ExitStack:
+        stack = ExitStack()
+        stack.enter_context(patch.object(
+            lab_lcms_metabolomics_agent, "_configured_extractor",
+            return_value={"path": "C:/extractor/RawMetadataConsoleApp.exe", "source": "setting"}
+            if self.configured else {"path": "", "source": ""},
+        ))
+        stack.enter_context(patch.object(lab_lcms_metabolomics_agent, "run_extractor", side_effect=self.run))
+        stack.enter_context(patch.dict(lab_lcms_metabolomics_agent._HEADER_CACHE, clear=True))
+        return stack
+
+
+def capabilities_patches(found: dict[str, Any] | None = None, extractor: FakeExtractor | None = None) -> ExitStack:
     stack = ExitStack()
     value = found if found is not None else EVERY_CAPABILITY
     stack.enter_context(patch("msdial_app.workflow.console_capabilities", return_value=value))
@@ -77,6 +136,8 @@ def capabilities_patches(found: dict[str, Any] | None = None) -> ExitStack:
     stack.enter_context(patch.object(
         lab_lcms_metabolomics_agent, "analysis_root_problems", side_effect=lambda root: real(root, temporary=[])
     ))
+    # Every header reads as DDA unless a test gives its own extractor.
+    stack.enter_context((extractor or FakeExtractor()).patches())
     return stack
 
 

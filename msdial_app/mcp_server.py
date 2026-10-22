@@ -3392,6 +3392,9 @@ def msdial_lcms_metabolomics_check_inputs(
     duplicate_rule: str = "",
     inchikey_match: str = "",
     sample_pairs: list[dict[str, Any]] | None = None,
+    acquisition_type_pos: str = "",
+    acquisition_type_neg: str = "",
+    alignment_rt_tolerance: float | None = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
@@ -3436,6 +3439,18 @@ def msdial_lcms_metabolomics_check_inputs(
     each polarity's files apart (A1 in 20230125_SWATH_A1_C_CE20_d1 and 20230208_SWATH_A1_A_CE20_d2), which
     paired_sample_table shows with how it paired (pairing, paired_by) for the person to confirm. When that
     fails or is wrong, give sample_pairs: [{"sample": ..., "positive_file": ..., "negative_file": ...}].
+    Where the shared words are letter+number replicates (A1 to D4), each pair's class is proposed from the
+    letters (A), and pairing_warnings says so.
+
+    Each raw file's header is read with the configured raw-metadata extractor (as the repository preflight
+    reads it; every file up to 40 per polarity, past that the first and the last), and raw_headers shows
+    per polarity the methods, isolation targets, instruments, acquisition types and start times. Each row's
+    acquisition type is the header's (DIA with isolation windows is SWATH, without isolation AIF), and the
+    analytical order follows the acquisition start times when every file records one. Where no extractor is
+    configured or a header does not settle it, acquisition_type_pos / acquisition_type_neg (DDA, SWATH or
+    AIF) is asked; it is never assumed. alignment_rt_tolerance (minutes, optional) replaces the template's
+    0.1 min for both polarities: capillary electrophoresis migration times usually need more, and the person
+    decides it.
 
     The result holds the blockers, the questions, the libraries as they will be searched (annotation), the
     salt with its preferred adducts, the normalizing standards, and the sample table proposed
@@ -3450,6 +3465,8 @@ def msdial_lcms_metabolomics_check_inputs(
         "analysis_root": analysis_root, "analysis_purpose": analysis_purpose, "console_path": console_path,
         "raw_location": raw_location, "number_of_threads": number_of_threads,
         "duplicate_rule": duplicate_rule, "inchikey_match": inchikey_match, "sample_pairs": sample_pairs or [],
+        "acquisition_type_pos": acquisition_type_pos, "acquisition_type_neg": acquisition_type_neg,
+        "alignment_rt_tolerance": alignment_rt_tolerance,
     }
     return _request_json("POST", "/api/lcms-metabolomics/check", host=host, port=port, body=body, timeout=600)
 
@@ -3481,6 +3498,9 @@ def msdial_lcms_metabolomics_write_contract(
     duplicate_rule: str = "",
     inchikey_match: str = "",
     sample_pairs: list[dict[str, Any]] | None = None,
+    acquisition_type_pos: str = "",
+    acquisition_type_neg: str = "",
+    alignment_rt_tolerance: float | None = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
@@ -3498,7 +3518,10 @@ def msdial_lcms_metabolomics_write_contract(
     their RT settings and thresholds, the salt, the internal-standard library, the sample table, the
     output and export folder, the Console and the parameter template, and states the method (peak-height
     diagnostic, TimeBasedLinearWeightedMovingAverage, automatic RT correction with 12 anchors and the
-    1.5 min local window, annotation candidates, QA).
+    1.5 min local window, annotation candidates, QA). acquisition_type_pos / acquisition_type_neg and
+    alignment_rt_tolerance are the check's answers, passed again; the contract records the raw headers the
+    acquisition types and the order were proposed from, and an alignment_rt_tolerance it fixes for both
+    polarities.
     """
     body: dict[str, Any] = {
         "pos_path": pos_path, "neg_path": neg_path, "annotation": annotation or {}, "solvent_type": solvent_type,
@@ -3510,6 +3533,8 @@ def msdial_lcms_metabolomics_write_contract(
         "sample_table_confirmed": sample_table_confirmed is True, "sample_table": sample_table or [],
         "confirmed_by": confirmed_by, "replace_existing": replace_existing is True,
         "duplicate_rule": duplicate_rule, "inchikey_match": inchikey_match, "sample_pairs": sample_pairs or [],
+        "acquisition_type_pos": acquisition_type_pos, "acquisition_type_neg": acquisition_type_neg,
+        "alignment_rt_tolerance": alignment_rt_tolerance,
         # The gate is here and again in the backend: only a literal true writes.
         "confirmed": confirmed is True,
     }
