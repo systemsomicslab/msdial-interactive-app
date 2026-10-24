@@ -84,6 +84,13 @@ LBM_TEMPLATE_CUTOFFS = {
     "lbm_simple_dot_product": "simple_dot_product_cutoff",
     "lbm_reverse_dot_product": "reverse_dot_product_cutoff",
 }
+# The state keys that name the libraries a run loads and records (sharing._used_library_paths reads them), and
+# the tiered profile's id. workflow_overrides reach the state after the tiered profile has set them from the
+# libraries answer, so under that profile an override of one is a plan blocker (_tiered_library_problems).
+TIERED_LIBRARY_STATE_KEYS = frozenset({
+    "lbm_path", "lbm_annotator", "msp_path", "msp_annotators", "text_db_path", "text_annotators",
+    "library_provenance", "annotation_pipeline_profile",
+})
 
 
 def inspect_analysis_input(input_path: str) -> dict[str, Any]:
@@ -1618,10 +1625,18 @@ def _tiered_library_problems(answers: dict[str, Any]) -> list[str]:
 
     The profile searches one MSP in both of its tiers, so a second msp_paths entry was left out of the run; it
     searches no text library, so text_paths was left out too; and the Console skips an LBM library it cannot
-    read. A path that does not exist is validate_workflow's "LBM library not found".
+    read. A path that does not exist is validate_workflow's "LBM library not found". workflow_overrides reach
+    the state after the profile, so an lbm_path there was the LBM2 the Console loaded, unchecked, while
+    lbm_annotator, library_provenance and every record named the one checked here.
     """
     libraries = answers.get("libraries") or {}
     problems: list[str] = []
+    for key in sorted(set(dict(answers.get("workflow_overrides") or {})) & TIERED_LIBRARY_STATE_KEYS):
+        problems.append(
+            f"workflow_overrides.{key} would replace what the tiered_lipid_msp profile sets from libraries, after "
+            "the plan has checked it, so the run could load a library its records do not name. Give the "
+            "libraries in libraries."
+        )
     msp_paths = _path_list(libraries.get("msp_paths"))
     if len(msp_paths) > 1:
         problems.append(
@@ -1654,22 +1669,22 @@ def _tiered_library_problems(answers: dict[str, Any]) -> list[str]:
 def _lbm_identity(path: str | Path) -> tuple[dict[str, Any] | None, str]:
     """An LBM2's name, size and sha256 as it reads now, or None and why it does not read.
 
-    It is read before it is hashed: a large file's digest is cached against its size and modification time
-    (workflow.file_identity), and a cached digest is not a reading of it. A file of 64 MiB or more is hashed
-    through file_identity, which answers a failed read with an empty sha256 rather than an OSError, so an
-    empty sha256 is a failed read too.
+    It is read through to its end and hashed here, at any size, and never through
+    lab_lcms_metabolomics.library_identity: that takes a file of 64 MiB or more, as a campaign LBM2 is, to
+    workflow.file_identity, which answers from the digest it cached against path, size and time without
+    reading the file. A check that took that digest read the LBM2's first byte only, so one failing past it
+    planned as ready, and was recorded by its sha256, once a plan or a prepared run had cached it. A plan reads
+    the LBM2 twice, for its check and for its record.
     """
-    from .lab_lcms_metabolomics import library_identity
+    from .lab_lipidomics import file_sha256
 
+    file = Path(path).expanduser()
     try:
-        with open(path, "rb") as handle:
-            handle.read(1)
-        identity = library_identity(path)
+        size = file.stat().st_size
+        sha256 = file_sha256(file)
     except OSError as error:
         return None, str(error.strerror or error)
-    if not identity.get("sha256"):
-        return None, "a read failed while it was being hashed"
-    return identity, ""
+    return {"name": file.name, "size_bytes": size, "sha256": sha256}, ""
 
 
 def _given_lbm_provenance(path: str, libraries: dict[str, Any]) -> dict[str, Any]:

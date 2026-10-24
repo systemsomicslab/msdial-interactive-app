@@ -27,10 +27,11 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     library not found", as for any library.
   - A given `lbm_path` the plan cannot read through (denied, held by another process while it copies, or failing
     partway) is a blocker and is recorded by name only, whatever its size, rather than a `PermissionError` out
-    of the plan, which reads the file for its sha256. The plan's check hashes the file as the record does. A
-    file of 64 MiB or more, as a campaign LBM2 is, is hashed through `workflow.file_identity`, which answers a
-    failed read with an empty sha256 rather than an error; that is taken as a failed read, not recorded, and the
-    digest it caches against path, size and time is not taken as a reading of a file that cannot be read.
+    of the plan, which reads the file for its sha256. The plan's check and its record both read the file
+    through to its end and hash it themselves, at any size. Neither takes the digest `workflow.file_identity`
+    caches for a file of 64 MiB or more, as a campaign LBM2 is, against its path, size and time: the cache
+    answers without reading the file, so once it held the digest an LBM2 failing past its first byte would plan
+    as ready and be recorded by its sha256. A plan therefore reads the LBM2 twice.
   - A relative `lbm_path` is made absolute against the backend's working directory, where the plan checks and
     hashes it (`workflow.absolute_library_path`), and the state, the method file and every record name that
     path. Written as given, it would be read by the Console against the method file's folder and then its own,
@@ -39,6 +40,11 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     any further entry out of the run without a word.
   - A `text_paths` entry is a blocker. The profile has no text tier, and left a text library out of the method
     file and every record but the answers without a word; `library_strategy: "existing"` searches one.
+  - A `workflow_overrides` key that names or records a library (`lbm_path`, `lbm_annotator`, `msp_path`,
+    `msp_annotators`, `text_db_path`, `text_annotators`, `library_provenance` or `annotation_pipeline_profile`)
+    is a blocker under this profile. Overrides reach the state after the profile, so an `lbm_path` there was
+    the LBM2 the method file named, unchecked, while `lbm_annotator`, `library_provenance` and every record
+    named the given one. The other library strategies apply such an override as before.
 - `msp_annotator_settings.tsv` keeps an explicit priority 0, which the Console reads as a priority; the row's
   position replaced it. No profile writes 0 today.
 - The method file's `Lbm file path` is written absolute for every library strategy, as the MSP and text rows

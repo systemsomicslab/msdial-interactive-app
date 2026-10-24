@@ -127,7 +127,11 @@ For existing libraries:
 
 For the tiered LC-MS pipeline, provide exactly one MSP path and no text library; a
 second `msp_paths` entry or any `text_paths` entry is a blocker, never silently
-dropped. The lipid-rule tier loads `libraries.lbm_path` when it is given, and the
+dropped. So is a `workflow_overrides` key that names or records a library
+(`lbm_path`, `lbm_annotator`, `msp_path`, `msp_annotators`, `text_db_path`,
+`text_annotators`, `library_provenance` or `annotation_pipeline_profile`): overrides
+reach the run after the profile, so one would load a library the records do not name.
+The lipid-rule tier loads `libraries.lbm_path` when it is given, and the
 official versioned LBM catalog entry only when it is not:
 
 ```json
@@ -148,7 +152,8 @@ official versioned LBM catalog entry only when it is not:
 A given `lbm_path` must be a non-empty `.lbm2` file that reads through to its end; a
 missing, empty, unreadable or other file is a blocker, because the Console skips an
 LBM it cannot read without a word, and the planner records one it cannot read through
-by `name` only, at any size. A relative path is made absolute against the backend's working
+by `name` only, at any size. Every plan reads it through and hashes it, never taking
+a digest cached for it. A relative path is made absolute against the backend's working
 directory, where the planner checks and hashes it. It is written, absolute, to the
 method file's `Lbm file path`, and `library_provenance` records it by
 `name`, `size_bytes` and `sha256`, with `lbm_version`, `lbm_source`, `lbm_doi` and

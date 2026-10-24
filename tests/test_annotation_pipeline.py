@@ -18,7 +18,7 @@ from msdial_app.annotation_pipeline import (
 )
 from msdial_app.materials_methods import generate_publication_report
 from msdial_app.sharing import library_records
-from msdial_app.workflow import _write_msp_annotator_settings, prepare_run
+from msdial_app.workflow import _write_msp_annotator_settings, file_identity, prepare_run
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -368,10 +368,8 @@ class GivenLbmPathTests(unittest.TestCase):
         self.assertNotIn("size_bytes", provenance)
 
     def test_an_lbm2_that_cannot_be_hashed_is_a_blocker_and_recorded_by_name_only(self) -> None:
-        # Its first byte reads and its hash does not: the plan's check hashes it as the record does.
-        with patch(
-            "msdial_app.lab_lcms_metabolomics.file_sha256", side_effect=PermissionError(13, "Permission denied")
-        ):
+        # A read fails while it is hashed: the plan's check hashes it as the record does (_lbm_identity).
+        with patch("msdial_app.lab_lipidomics.file_sha256", side_effect=PermissionError(13, "Permission denied")):
             plan = self.plan(self.answers())
 
         self.assertFalse(plan["ready_to_prepare"])
@@ -387,10 +385,12 @@ class GivenLbmPathTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "only Windows holds a byte range of a file")
     def test_an_lbm2_that_fails_partway_through_is_a_blocker_and_recorded_by_name_only_at_any_size(self) -> None:
-        # A campaign LBM2 is hundreds of MB, which library_identity hashes through workflow.file_identity: that
-        # answers a failed read with an empty sha256, not an OSError, and the record carried it with a size.
-        # The range held lies past the first read, so only a read through the file meets it.
-        for size, label in ((2 << 20, "hashed directly"), (LARGE_LIBRARY_BYTES, "hashed through file_identity")):
+        # A campaign LBM2 is hundreds of MB, which the plan hashed through workflow.file_identity: that answers a
+        # failed read with an empty sha256, not an OSError, and the record carried it with a size.
+        # The range held lies past the first read, so only a read through the file meets it. The cache is
+        # empty here; test_a_large_lbm2_that_fails_partway_through_is_a_blocker_though_its_digest_is_cached
+        # holds the same range with the digest cached.
+        for size, label in ((2 << 20, "below 64 MiB"), (LARGE_LIBRARY_BYTES, "64 MiB or more")):
             with self.subTest(label), tempfile.TemporaryDirectory() as user_data:
                 lbm = self.libraries / f"synthetic-{size}.lbm2"
                 write_synthetic_lbm2(lbm, size)
@@ -419,6 +419,8 @@ class GivenLbmPathTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as user_data:
             with patch("msdial_app.workflow.user_data_directory", return_value=Path(user_data)):
                 readable = self.plan(self.answers(lbm_path=str(lbm)))
+                # Cached as a laboratory run's manifest records it (workflow._manifest_libraries).
+                self.assertEqual(digest, file_identity(lbm)["sha256"])
                 self.assertIn(digest, (Path(user_data) / "file-identity-cache.json").read_text(encoding="utf-8"))
                 with held_unreadable(lbm):
                     try:
@@ -444,6 +446,94 @@ class GivenLbmPathTests(unittest.TestCase):
         self.assertEqual(lbm.name, provenance["name"])
         self.assertNotIn("sha256", provenance)
         self.assertNotIn("size_bytes", provenance)
+
+    @unittest.skipUnless(os.name == "nt", "only Windows holds a byte range of a file")
+    def test_a_large_lbm2_that_fails_partway_through_is_a_blocker_though_its_digest_is_cached(self) -> None:
+        # The plan read the first byte and then took file_identity's digest, which the cache answers without
+        # reading the file. In a campaign every unit names the same LBM2, so once its digest was cached, one
+        # failing past its first byte planned as ready and was recorded by its sha256.
+        lbm = self.libraries / "synthetic-large.lbm2"
+        digest = write_synthetic_lbm2(lbm, LARGE_LIBRARY_BYTES)
+        with tempfile.TemporaryDirectory() as user_data:
+            with patch("msdial_app.workflow.user_data_directory", return_value=Path(user_data)):
+                self.assertEqual(digest, file_identity(lbm)["sha256"])
+                with held_in_part(lbm, 1 << 20, 1 << 10):
+                    with lbm.open("rb") as handle:
+                        self.assertTrue(handle.read(1))
+                    with self.assertRaises(OSError):
+                        lbm.read_bytes()
+                    # The cache still answers for the file, though it no longer reads through.
+                    self.assertEqual(digest, file_identity(lbm)["sha256"])
+                    plan = self.plan(self.answers(lbm_path=str(lbm)))
+
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertTrue(
+            any(f"libraries.lbm_path: {lbm.name} cannot be read (" in item for item in plan["blockers"]),
+            plan["blockers"],
+        )
+        provenance = plan["workflow"]["library_provenance"][0]
+        self.assertEqual(lbm.name, provenance["name"])
+        self.assertNotIn("sha256", provenance)
+        self.assertNotIn("size_bytes", provenance)
+
+    def test_a_large_lbm2_is_recorded_by_the_sha256_the_plan_reads_not_the_one_cached_for_it(self) -> None:
+        # A digest cached for content the file no longer holds, at the same size and time, shows which one the
+        # record takes: the plan reads the LBM2 through and records what it read.
+        lbm = self.libraries / "synthetic-large.lbm2"
+        cached = write_synthetic_lbm2(lbm, LARGE_LIBRARY_BYTES)
+        with tempfile.TemporaryDirectory() as user_data:
+            with patch("msdial_app.workflow.user_data_directory", return_value=Path(user_data)):
+                self.assertEqual(cached, file_identity(lbm)["sha256"])
+                stat = lbm.stat()
+                with lbm.open("r+b") as handle:
+                    handle.write(b"rewritten")
+                os.utime(lbm, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+                self.assertEqual(cached, file_identity(lbm)["sha256"])
+                plan = self.plan(self.answers(lbm_path=str(lbm)))
+
+        digest = hashlib.sha256(lbm.read_bytes()).hexdigest()
+        self.assertNotEqual(cached, digest)
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        self.assertEqual(
+            (LARGE_LIBRARY_BYTES, digest),
+            tuple(plan["workflow"]["library_provenance"][0][key] for key in ("size_bytes", "sha256")),
+        )
+
+    def test_a_workflow_override_of_a_library_is_refused_rather_than_run_unchecked(self) -> None:
+        # workflow_overrides reach the state after the profile, so an lbm_path there was the LBM2 method.txt
+        # named, unchecked, while lbm_annotator, library_provenance and every record named the given one.
+        other = self.libraries / "synthetic-other.lbm2"
+        other.write_bytes(b"another synthetic LBM2 library")
+        for key, value in (
+            ("lbm_path", str(other)),
+            ("lbm_annotator", {"lbm_file_path": str(other), "priority": 3}),
+            ("msp_path", str(self.msp)),
+            ("msp_annotators", []),
+            ("text_db_path", str(self.msp)),
+            ("text_annotators", []),
+            ("library_provenance", []),
+            ("annotation_pipeline_profile", "another-profile"),
+        ):
+            with self.subTest(key):
+                answers = self.answers()
+                answers["workflow_overrides"] = {key: value, "number_of_threads": 2}
+                plan = self.plan(answers)
+
+                self.assertFalse(plan["ready_to_prepare"])
+                self.assertEqual(
+                    [
+                        f"workflow_overrides.{key} would replace what the tiered_lipid_msp profile sets from "
+                        "libraries, after the plan has checked it, so the run could load a library its records do "
+                        "not name. Give the libraries in libraries."
+                    ],
+                    [item for item in plan["blockers"] if item.startswith("workflow_overrides.")],
+                )
+
+        answers = self.answers()
+        answers["workflow_overrides"] = {"number_of_threads": 2}
+        plan = self.plan(answers)
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        self.assertEqual(2, plan["workflow"]["number_of_threads"])
 
     def test_a_second_msp_path_is_refused_rather_than_left_out(self) -> None:
         second = self.libraries / "second.msp"
