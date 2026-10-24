@@ -125,10 +125,10 @@ For existing libraries:
 }
 ```
 
-For the tiered LC-MS pipeline, provide exactly one MSP path; a second `msp_paths`
-entry is a blocker, never silently dropped. The lipid-rule tier loads
-`libraries.lbm_path` when it is given, and the official versioned LBM catalog
-entry only when it is not:
+For the tiered LC-MS pipeline, provide exactly one MSP path and no text library; a
+second `msp_paths` entry or any `text_paths` entry is a blocker, never silently
+dropped. The lipid-rule tier loads `libraries.lbm_path` when it is given, and the
+official versioned LBM catalog entry only when it is not:
 
 ```json
 {
@@ -145,9 +145,10 @@ entry only when it is not:
 }
 ```
 
-A given `lbm_path` must be a non-empty, readable `.lbm2` file; a missing, empty,
-unreadable or other file is a blocker, because the Console skips an LBM it cannot
-read without a word. A relative path is made absolute against the backend's working
+A given `lbm_path` must be a non-empty `.lbm2` file that reads through to its end; a
+missing, empty, unreadable or other file is a blocker, because the Console skips an
+LBM it cannot read without a word, and the planner records one it cannot read through
+by `name` only, at any size. A relative path is made absolute against the backend's working
 directory, where the planner checks and hashes it. It is written, absolute, to the
 method file's `Lbm file path`, and `library_provenance` records it by
 `name`, `size_bytes` and `sha256`, with `lbm_version`, `lbm_source`, `lbm_doi` and

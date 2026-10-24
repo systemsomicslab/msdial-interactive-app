@@ -1551,8 +1551,8 @@ def _apply_libraries(
     if strategy == "tiered_lipid_msp":
         # The LBM2 the answers name is the one the method file loads and every record names. Before 0.5.47
         # only the generic branch below read libraries.lbm_path, so this profile ran the official LBM2 while
-        # the answers, and a campaign's records built from them, named another. A second MSP is a plan
-        # blocker (_tiered_library_problems), so msp_paths holds one.
+        # the answers, and a campaign's records built from them, named another. A second MSP and any text
+        # library are plan blockers (_tiered_library_problems), so msp_paths holds one and text_paths none.
         lbm_path = _tiered_lbm_path(answers)
         if lbm_path:
             lbm_provenance = _given_lbm_provenance(lbm_path, libraries)
@@ -1616,9 +1616,9 @@ def _tiered_lbm_path(answers: dict[str, Any]) -> str:
 def _tiered_library_problems(answers: dict[str, Any]) -> list[str]:
     """What the tiered profile refuses in its libraries answer, before it would run without a word.
 
-    The profile searches one MSP in both of its tiers, so a second msp_paths entry was left out of the run;
-    and the Console skips an LBM library it cannot read. A path that does not exist is validate_workflow's
-    "LBM library not found".
+    The profile searches one MSP in both of its tiers, so a second msp_paths entry was left out of the run; it
+    searches no text library, so text_paths was left out too; and the Console skips an LBM library it cannot
+    read. A path that does not exist is validate_workflow's "LBM library not found".
     """
     libraries = answers.get("libraries") or {}
     problems: list[str] = []
@@ -1628,22 +1628,48 @@ def _tiered_library_problems(answers: dict[str, Any]) -> list[str]:
             f"tiered_lipid_msp searches one MSP in both of its MSP tiers; libraries.msp_paths names "
             f"{len(msp_paths)}. Give one, or list each library with library_strategy 'annotators'."
         )
+    text_paths = _path_list(libraries.get("text_paths"))
+    if text_paths:
+        problems.append(
+            f"tiered_lipid_msp searches no text library; libraries.text_paths names {len(text_paths)}. Leave it "
+            "out, or search it with library_strategy 'existing'."
+        )
     lbm_path = _tiered_lbm_path(answers)
     problem = lbm_library_problem(lbm_path, "The tiered_lipid_msp profile") if lbm_path else ""
     if not problem and lbm_path and Path(lbm_path).is_file():
-        # The plan reads the whole LBM2 for its sha256 (_given_lbm_provenance). One it cannot read, denied or
-        # held by another process, is a blocker here rather than an exception out of the plan.
-        try:
-            with open(lbm_path, "rb") as handle:
-                handle.read(1)
-        except OSError as error:
+        # The plan records the LBM2 by its sha256 (_given_lbm_provenance). One it cannot read through, denied
+        # or held by another process, is a blocker here, rather than an exception out of the plan or a record
+        # without its checksum.
+        identity, reason = _lbm_identity(lbm_path)
+        if identity is None:
             problem = (
-                f"{Path(lbm_path).name} cannot be read ({error.strerror or error}), so its sha256 cannot be "
-                "recorded. Plan again once it can."
+                f"{Path(lbm_path).name} cannot be read ({reason}), so its sha256 cannot be recorded. Plan again "
+                "once it can."
             )
     if problem:
         problems.append(f"libraries.lbm_path: {problem}")
     return problems
+
+
+def _lbm_identity(path: str | Path) -> tuple[dict[str, Any] | None, str]:
+    """An LBM2's name, size and sha256 as it reads now, or None and why it does not read.
+
+    It is read before it is hashed: a large file's digest is cached against its size and modification time
+    (workflow.file_identity), and a cached digest is not a reading of it. A file of 64 MiB or more is hashed
+    through file_identity, which answers a failed read with an empty sha256 rather than an OSError, so an
+    empty sha256 is a failed read too.
+    """
+    from .lab_lcms_metabolomics import library_identity
+
+    try:
+        with open(path, "rb") as handle:
+            handle.read(1)
+        identity = library_identity(path)
+    except OSError as error:
+        return None, str(error.strerror or error)
+    if not identity.get("sha256"):
+        return None, "a read failed while it was being hashed"
+    return identity, ""
 
 
 def _given_lbm_provenance(path: str, libraries: dict[str, Any]) -> dict[str, Any]:
@@ -1651,7 +1677,8 @@ def _given_lbm_provenance(path: str, libraries: dict[str, Any]) -> dict[str, Any
 
     The version, source, DOI and licence are what the answers say (lbm_version, lbm_source, lbm_doi and
     lbm_license, private unless they say otherwise). A path that is not an .lbm2 file, or a file that cannot
-    be read, is recorded by name only; the plan refuses it (_tiered_library_problems).
+    be read through, whatever its size, is recorded by name only; the plan refuses it
+    (_tiered_library_problems), which reads it the same way (_lbm_identity).
     """
     entry: dict[str, Any] = {
         "path": path,
@@ -1663,13 +1690,9 @@ def _given_lbm_provenance(path: str, libraries: dict[str, Any]) -> dict[str, Any
     }
     file = Path(path).expanduser()
     if file.suffix.casefold() == ".lbm2" and file.is_file():
-        from .lab_lcms_metabolomics import library_identity
-
-        try:
-            identity = library_identity(file)
-        except OSError:
-            return entry
-        entry.update({"size_bytes": identity["size_bytes"], "sha256": identity["sha256"]})
+        identity, _ = _lbm_identity(file)
+        if identity is not None:
+            entry.update({"size_bytes": identity["size_bytes"], "sha256": identity["sha256"]})
     return entry
 
 

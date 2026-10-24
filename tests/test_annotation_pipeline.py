@@ -69,6 +69,39 @@ def held_unreadable(path: Path) -> Iterator[None]:
             path.chmod(mode)
 
 
+@contextmanager
+def held_in_part(path: Path, offset: int, length: int) -> Iterator[None]:
+    """The file with one byte range held by a byte-range lock: its first read succeeds and a read through it
+    fails, as when a network share or another process fails a read partway. Only Windows locks a range so."""
+    import msvcrt
+
+    with path.open("r+b") as handle:
+        handle.seek(offset)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, length)
+        try:
+            yield
+        finally:
+            handle.seek(offset)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, length)
+
+
+def write_synthetic_lbm2(path: Path, size: int) -> str:
+    """A synthetic .lbm2 of the given size, zero-filled after a short header; its sha256."""
+    with path.open("wb") as handle:
+        handle.write(b"synthetic laboratory LBM2 library")
+        handle.truncate(size)
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 22), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+# lab_lcms_metabolomics.library_identity hashes a file below this itself and one of this size or more through
+# workflow.file_identity, whose digest is cached and which answers a failed read with an empty sha256.
+LARGE_LIBRARY_BYTES = (64 << 20) + (1 << 20)
+
+
 class AnnotationPipelineTests(unittest.TestCase):
     def test_tiered_profile_has_auditable_priority_and_thresholds(self) -> None:
         profile = tiered_lcms_annotation("lipids.lbm2", "private.msp")
@@ -334,16 +367,83 @@ class GivenLbmPathTests(unittest.TestCase):
         self.assertNotIn("sha256", provenance)
         self.assertNotIn("size_bytes", provenance)
 
-    def test_an_lbm2_that_cannot_be_hashed_is_recorded_by_name_only(self) -> None:
-        # Readable when the plan checks it and not when it hashes it, the LBM2 is named without a checksum.
+    def test_an_lbm2_that_cannot_be_hashed_is_a_blocker_and_recorded_by_name_only(self) -> None:
+        # Its first byte reads and its hash does not: the plan's check hashes it as the record does.
         with patch(
             "msdial_app.lab_lcms_metabolomics.file_sha256", side_effect=PermissionError(13, "Permission denied")
         ):
             plan = self.plan(self.answers())
 
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertIn(
+            f"libraries.lbm_path: {self.lbm.name} cannot be read (Permission denied), so its sha256 cannot be "
+            "recorded. Plan again once it can.",
+            plan["blockers"],
+        )
         provenance = plan["workflow"]["library_provenance"][0]
         self.assertEqual(self.lbm.name, provenance["name"])
         self.assertNotIn("sha256", provenance)
+        self.assertNotIn("size_bytes", provenance)
+
+    @unittest.skipUnless(os.name == "nt", "only Windows holds a byte range of a file")
+    def test_an_lbm2_that_fails_partway_through_is_a_blocker_and_recorded_by_name_only_at_any_size(self) -> None:
+        # A campaign LBM2 is hundreds of MB, which library_identity hashes through workflow.file_identity: that
+        # answers a failed read with an empty sha256, not an OSError, and the record carried it with a size.
+        # The range held lies past the first read, so only a read through the file meets it.
+        for size, label in ((2 << 20, "hashed directly"), (LARGE_LIBRARY_BYTES, "hashed through file_identity")):
+            with self.subTest(label), tempfile.TemporaryDirectory() as user_data:
+                lbm = self.libraries / f"synthetic-{size}.lbm2"
+                write_synthetic_lbm2(lbm, size)
+                with patch("msdial_app.workflow.user_data_directory", return_value=Path(user_data)):
+                    with held_in_part(lbm, 1 << 20, 1 << 10):
+                        with lbm.open("rb") as handle:
+                            self.assertTrue(handle.read(1))
+                        plan = self.plan(self.answers(lbm_path=str(lbm)))
+
+                self.assertFalse(plan["ready_to_prepare"])
+                self.assertTrue(
+                    any(f"libraries.lbm_path: {lbm.name} cannot be read (" in item for item in plan["blockers"]),
+                    plan["blockers"],
+                )
+                provenance = plan["workflow"]["library_provenance"][0]
+                self.assertEqual(lbm.name, provenance["name"])
+                self.assertNotIn("sha256", provenance)
+                self.assertNotIn("size_bytes", provenance)
+                lbm.unlink()
+
+    def test_a_large_lbm2_is_recorded_by_its_sha256_and_never_by_a_digest_cached_while_it_is_unreadable(self) -> None:
+        # workflow.file_identity caches a large file's digest against its size and time and returns it without
+        # reading the file, so a held LBM2 the plan blocked on was still recorded with a sha256.
+        lbm = self.libraries / "synthetic-large.lbm2"
+        digest = write_synthetic_lbm2(lbm, LARGE_LIBRARY_BYTES)
+        with tempfile.TemporaryDirectory() as user_data:
+            with patch("msdial_app.workflow.user_data_directory", return_value=Path(user_data)):
+                readable = self.plan(self.answers(lbm_path=str(lbm)))
+                self.assertIn(digest, (Path(user_data) / "file-identity-cache.json").read_text(encoding="utf-8"))
+                with held_unreadable(lbm):
+                    try:
+                        with lbm.open("rb") as handle:
+                            handle.read(1)
+                    except OSError:
+                        pass
+                    else:
+                        self.skipTest("this account reads a file whatever its permissions")
+                    held = self.plan(self.answers(lbm_path=str(lbm)))
+
+        self.assertTrue(readable["ready_to_prepare"], readable["blockers"])
+        self.assertEqual(
+            (lbm.name, LARGE_LIBRARY_BYTES, digest),
+            tuple(readable["workflow"]["library_provenance"][0][key] for key in ("name", "size_bytes", "sha256")),
+        )
+        self.assertFalse(held["ready_to_prepare"])
+        self.assertTrue(
+            any(f"libraries.lbm_path: {lbm.name} cannot be read" in item for item in held["blockers"]),
+            held["blockers"],
+        )
+        provenance = held["workflow"]["library_provenance"][0]
+        self.assertEqual(lbm.name, provenance["name"])
+        self.assertNotIn("sha256", provenance)
+        self.assertNotIn("size_bytes", provenance)
 
     def test_a_second_msp_path_is_refused_rather_than_left_out(self) -> None:
         second = self.libraries / "second.msp"
@@ -354,6 +454,21 @@ class GivenLbmPathTests(unittest.TestCase):
         self.assertTrue(
             any("libraries.msp_paths names 2" in item for item in plan["blockers"]), plan["blockers"]
         )
+
+    def test_a_text_library_is_refused_rather_than_left_out(self) -> None:
+        # The profile has no text tier: a text DB given beside it reached neither method.txt nor any record but
+        # the answers.
+        text = self.libraries / "synthetic-standards.txt"
+        text.write_text("Name\tMZ\nA\t100.0\n", encoding="ascii")
+        plan = self.plan(self.answers(text_paths=[str(text)]))
+
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertIn(
+            "tiered_lipid_msp searches no text library; libraries.text_paths names 1. Leave it out, or search it "
+            "with library_strategy 'existing'.",
+            plan["blockers"],
+        )
+        self.assertEqual([], plan["workflow"]["text_annotators"])
 
     def test_without_an_lbm_path_the_official_lbm2_is_still_asked_for(self) -> None:
         answers = self.answers()

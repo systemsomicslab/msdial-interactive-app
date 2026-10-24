@@ -25,15 +25,20 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - A given `lbm_path` that is not an `.lbm2` file with content is a blocker (`workflow.lbm_library_problem`,
     the laboratory lipidomics rule, which now also refuses a folder); a path that does not exist is "LBM
     library not found", as for any library.
-  - A given `lbm_path` the plan cannot read (denied, or held by another process while it copies) is a blocker
-    and is recorded by name only, rather than a `PermissionError` out of the plan, which reads the file for its
-    sha256.
+  - A given `lbm_path` the plan cannot read through (denied, held by another process while it copies, or failing
+    partway) is a blocker and is recorded by name only, whatever its size, rather than a `PermissionError` out
+    of the plan, which reads the file for its sha256. The plan's check hashes the file as the record does. A
+    file of 64 MiB or more, as a campaign LBM2 is, is hashed through `workflow.file_identity`, which answers a
+    failed read with an empty sha256 rather than an error; that is taken as a failed read, not recorded, and the
+    digest it caches against path, size and time is not taken as a reading of a file that cannot be read.
   - A relative `lbm_path` is made absolute against the backend's working directory, where the plan checks and
     hashes it (`workflow.absolute_library_path`), and the state, the method file and every record name that
     path. Written as given, it would be read by the Console against the method file's folder and then its own,
     and the LBM2 skipped without a word while every record named it by its sha256.
   - A second `msp_paths` entry is a blocker. The profile searches one MSP in both of its MSP tiers, and left
     any further entry out of the run without a word.
+  - A `text_paths` entry is a blocker. The profile has no text tier, and left a text library out of the method
+    file and every record but the answers without a word; `library_strategy: "existing"` searches one.
 - `msp_annotator_settings.tsv` keeps an explicit priority 0, which the Console reads as a priority; the row's
   position replaced it. No profile writes 0 today.
 - The method file's `Lbm file path` is written absolute for every library strategy, as the MSP and text rows
