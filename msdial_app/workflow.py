@@ -2084,6 +2084,19 @@ def lbm_library_problem(lbm_path: str | Path, run: str) -> str:
     return ""
 
 
+def absolute_library_path(path: Any) -> str:
+    """A library path made absolute against this process's working directory, or "" for none.
+
+    The plan checks and hashes a relative path against this working directory, but the Console reads one
+    against the method file's folder and then its own (ConfigParser.ResolvePathFromMethodFile), and skips an
+    LBM library it does not find there without a word. An absolute path keeps its name, its separators and
+    dot segments aside: no link, 8.3 name or mapped drive is resolved, so the records and the answers still
+    name the same location alike.
+    """
+    text = str(path or "").strip()
+    return os.path.abspath(os.path.expanduser(text)) if text else ""
+
+
 def _stage_input(source: Path, destination_folder: Path) -> Path:
     """Copy one input, and whatever travels with it, into a working folder.
 
@@ -4091,7 +4104,9 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
     )
     replacements = {
         "msp file path": "" if msp_annotator_settings_path else (state.get("msp_path", "") or first_msp_path),
-        "lbm file path": state.get("lbm_path", ""),
+        # Absolute, as the MSP and text rows are (_write_msp_annotator_settings): the Console would read a
+        # relative path against another folder than the one the plan checked, and skip the LBM without a word.
+        "lbm file path": absolute_library_path(state.get("lbm_path")),
         "lbm annotator priority": int(state.get("lbm_annotator", {}).get("priority", state.get("lbm_priority", 1))),
         "text db file path": "" if text_annotator_settings_path else state.get("text_db_path", ""),
         "searched adduct ions": ",".join(state.get("selected_adducts", [])),

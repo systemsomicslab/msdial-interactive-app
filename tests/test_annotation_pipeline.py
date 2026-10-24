@@ -1,9 +1,12 @@
 import csv
 import hashlib
 import json
+import os
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 from unittest.mock import patch
 
 from msdial_app import __version__
@@ -29,6 +32,41 @@ def method_lines(path: str | Path) -> dict[str, str]:
             key, _, value = line.partition(":")
             lines[key.strip()] = value.strip()
     return lines
+
+
+@contextmanager
+def working_directory(path: Path) -> Iterator[None]:
+    previous = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+@contextmanager
+def held_unreadable(path: Path) -> Iterator[None]:
+    """The file as another process holds it while it copies, or as an ACL that denies reading leaves it: it
+    exists and has a size, but no read of it succeeds. On Windows a byte-range lock does that within this
+    process; elsewhere the file loses its permissions, which a superuser still reads through."""
+    if os.name == "nt":
+        import msvcrt
+
+        size = path.stat().st_size
+        with path.open("r+b") as handle:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, size)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, size)
+    else:
+        mode = path.stat().st_mode
+        path.chmod(0)
+        try:
+            yield
+        finally:
+            path.chmod(mode)
 
 
 class AnnotationPipelineTests(unittest.TestCase):
@@ -234,6 +272,78 @@ class GivenLbmPathTests(unittest.TestCase):
                 self.assertFalse(plan["ready_to_prepare"])
                 self.assertIsNone(plan["official_library"])
                 self.assertTrue(any(message in item for item in plan["blockers"]), plan["blockers"])
+
+    def test_a_relative_lbm_path_is_written_and_recorded_as_the_file_the_plan_hashed(self) -> None:
+        # The plan checks and hashes a relative path against the backend's working directory. The Console
+        # reads one against the method file's folder and then its own (ConfigParser.ResolvePathFromMethodFile),
+        # and skips an LBM it does not find without a word; neither folder holds this one.
+        digest = hashlib.sha256(self.lbm.read_bytes()).hexdigest()
+        with working_directory(self.libraries):
+            plan = self.plan(self.answers(lbm_path=self.lbm.name))
+            self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+            workflow = plan["workflow"]
+            prepared = prepare_run(workflow)
+
+        written = method_lines(prepared["method_file"])["Lbm file path"]
+        self.assertTrue(Path(written).is_absolute(), written)
+        self.assertTrue(Path(written).samefile(self.lbm))
+        self.assertFalse((Path(prepared["method_file"]).parent / self.lbm.name).exists())
+        self.assertFalse((self.console.parent / self.lbm.name).exists())
+        provenance = workflow["library_provenance"][0]
+        settings = json.loads(Path(prepared["settings_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            [written] * 4,
+            [workflow["lbm_path"], workflow["lbm_annotator"]["lbm_file_path"], provenance["path"],
+             settings["lbm_path"]],
+        )
+        self.assertEqual((self.lbm.name, digest), (provenance["name"], provenance["sha256"]))
+
+    def test_a_relative_lbm_path_of_existing_libraries_reaches_the_method_file_absolute(self) -> None:
+        # The generic strategy keeps the path as given in its state, as it keeps its MSP paths; the method
+        # file names it absolute, as msp_annotator_settings.tsv names the MSP.
+        answers = self.answers(lbm_path=self.lbm.name)
+        answers.update({"library_strategy": "existing", "target_omics": "Metabolomics"})
+        with working_directory(self.libraries):
+            plan = self.plan(answers)
+            self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+            prepared = prepare_run(plan["workflow"])
+
+        written = method_lines(prepared["method_file"])["Lbm file path"]
+        self.assertTrue(Path(written).is_absolute(), written)
+        self.assertTrue(Path(written).samefile(self.lbm))
+
+    def test_an_lbm2_the_plan_cannot_read_is_a_blocker_not_an_exception(self) -> None:
+        # The plan reads the given LBM2 in full for its sha256. Held by another process, or denied by an ACL,
+        # it raised PermissionError out of build_guided_plan, so /api/agent/plan answered with a traceback.
+        with held_unreadable(self.lbm):
+            try:
+                self.lbm.read_bytes()
+            except OSError:
+                pass
+            else:
+                self.skipTest("this account reads a file whatever its permissions")
+            plan = self.plan(self.answers())
+
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertTrue(
+            any(f"libraries.lbm_path: {self.lbm.name} cannot be read" in item for item in plan["blockers"]),
+            plan["blockers"],
+        )
+        provenance = plan["workflow"]["library_provenance"][0]
+        self.assertEqual(self.lbm.name, provenance["name"])
+        self.assertNotIn("sha256", provenance)
+        self.assertNotIn("size_bytes", provenance)
+
+    def test_an_lbm2_that_cannot_be_hashed_is_recorded_by_name_only(self) -> None:
+        # Readable when the plan checks it and not when it hashes it, the LBM2 is named without a checksum.
+        with patch(
+            "msdial_app.lab_lcms_metabolomics.file_sha256", side_effect=PermissionError(13, "Permission denied")
+        ):
+            plan = self.plan(self.answers())
+
+        provenance = plan["workflow"]["library_provenance"][0]
+        self.assertEqual(self.lbm.name, provenance["name"])
+        self.assertNotIn("sha256", provenance)
 
     def test_a_second_msp_path_is_refused_rather_than_left_out(self) -> None:
         second = self.libraries / "second.msp"

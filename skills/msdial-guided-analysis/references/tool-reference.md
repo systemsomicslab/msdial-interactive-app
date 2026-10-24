@@ -145,9 +145,11 @@ entry only when it is not:
 }
 ```
 
-A given `lbm_path` must be a non-empty `.lbm2` file; a missing, empty or other file
-is a blocker, because the Console skips an LBM it cannot read without a word. It is
-written to the method file's `Lbm file path`, and `library_provenance` records it by
+A given `lbm_path` must be a non-empty, readable `.lbm2` file; a missing, empty,
+unreadable or other file is a blocker, because the Console skips an LBM it cannot
+read without a word. A relative path is made absolute against the backend's working
+directory, where the planner checks and hashes it. It is written, absolute, to the
+method file's `Lbm file path`, and `library_provenance` records it by
 `name`, `size_bytes` and `sha256`, with `lbm_version`, `lbm_source`, `lbm_doi` and
 `lbm_license` (default `institutional/private`) as given. The planner consults the
 library catalog, and blocks on an official LBM that is not downloaded, only when no

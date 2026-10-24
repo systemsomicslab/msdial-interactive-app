@@ -16,6 +16,7 @@ from .workflow import (
     AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW,
     FAMILY_FROM_FORMAT_DEFAULT,
     FAMILY_FROM_VENDOR_FORMAT,
+    absolute_library_path,
     console_file_type,
     detect_raw_format,
     instrument_family_from_text,
@@ -1602,8 +1603,14 @@ def _apply_libraries(
 
 
 def _tiered_lbm_path(answers: dict[str, Any]) -> str:
-    """The LBM2 the answers name for the tiered profile's lipid-rule tier, or "" for the official one."""
-    return str((answers.get("libraries") or {}).get("lbm_path") or "").strip()
+    """The LBM2 the answers name for the tiered profile's lipid-rule tier, absolute, or "" for the official one.
+
+    A relative path is made absolute where the plan checks and hashes it, the backend's working directory, so
+    the method file loads the file every record names by its sha256 (workflow.absolute_library_path). Left
+    relative, it reached the method file as given, and the Console, reading it against its own folders, found
+    nothing and ran without the tier.
+    """
+    return absolute_library_path((answers.get("libraries") or {}).get("lbm_path"))
 
 
 def _tiered_library_problems(answers: dict[str, Any]) -> list[str]:
@@ -1623,6 +1630,17 @@ def _tiered_library_problems(answers: dict[str, Any]) -> list[str]:
         )
     lbm_path = _tiered_lbm_path(answers)
     problem = lbm_library_problem(lbm_path, "The tiered_lipid_msp profile") if lbm_path else ""
+    if not problem and lbm_path and Path(lbm_path).is_file():
+        # The plan reads the whole LBM2 for its sha256 (_given_lbm_provenance). One it cannot read, denied or
+        # held by another process, is a blocker here rather than an exception out of the plan.
+        try:
+            with open(lbm_path, "rb") as handle:
+                handle.read(1)
+        except OSError as error:
+            problem = (
+                f"{Path(lbm_path).name} cannot be read ({error.strerror or error}), so its sha256 cannot be "
+                "recorded. Plan again once it can."
+            )
     if problem:
         problems.append(f"libraries.lbm_path: {problem}")
     return problems
@@ -1632,8 +1650,8 @@ def _given_lbm_provenance(path: str, libraries: dict[str, Any]) -> dict[str, Any
     """The provenance of an LBM2 the answers name: its name, size and sha256, measured from the file.
 
     The version, source, DOI and licence are what the answers say (lbm_version, lbm_source, lbm_doi and
-    lbm_license, private unless they say otherwise). A path that is not an .lbm2 file is recorded by name
-    only; the plan refuses it.
+    lbm_license, private unless they say otherwise). A path that is not an .lbm2 file, or a file that cannot
+    be read, is recorded by name only; the plan refuses it (_tiered_library_problems).
     """
     entry: dict[str, Any] = {
         "path": path,
@@ -1647,7 +1665,10 @@ def _given_lbm_provenance(path: str, libraries: dict[str, Any]) -> dict[str, Any
     if file.suffix.casefold() == ".lbm2" and file.is_file():
         from .lab_lcms_metabolomics import library_identity
 
-        identity = library_identity(file)
+        try:
+            identity = library_identity(file)
+        except OSError:
+            return entry
         entry.update({"size_bytes": identity["size_bytes"], "sha256": identity["sha256"]})
     return entry
 
