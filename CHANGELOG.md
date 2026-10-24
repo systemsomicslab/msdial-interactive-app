@@ -4,6 +4,37 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.47] - Unreleased
+
+### Fixed
+- **The tiered profile loads the LBM2 its answers name, and every record names the one it loaded.**
+  - `library_strategy: "tiered_lipid_msp"` took its lipid-rule tier from the official catalog LBM2
+    (`lipidomics`) whatever `libraries.lbm_path` said: `_apply_libraries` read `lbm_path` only for the other
+    strategies. MS-DIAL loaded the official LBM2, and the method file's `Lbm file path`,
+    `workflow-settings.json`, `library_provenance` and the run manifest named it; the answers
+    (`guided-answers.json`), and the records a repository campaign built from them, named the LBM2 the
+    profile gave. A campaign whose profile named a laboratory LBM2 therefore annotated with the official
+    one while its records said otherwise. Runs already prepared are not rewritten: their `method.txt` names
+    the LBM2 that ran.
+  - A given `lbm_path` is now the tier. It reaches `Lbm file path`, `lbm_annotator`,
+    `workflow-settings.json`, `library_provenance` (by `name`, `size_bytes` and `sha256` measured from the
+    file, with `lbm_version`, `lbm_source`, `lbm_doi` and `lbm_license` as given, private by default), the
+    run manifest's libraries, the shared library identities and the Materials and Methods.
+  - The library catalog is consulted, and an official LBM2 that is not downloaded is a blocker, only when no
+    `lbm_path` is given. Without one the profile is as before.
+  - A given `lbm_path` that is not an `.lbm2` file with content is a blocker (`workflow.lbm_library_problem`,
+    the laboratory lipidomics rule, which now also refuses a folder); a path that does not exist is "LBM
+    library not found", as for any library.
+  - A second `msp_paths` entry is a blocker. The profile searches one MSP in both of its MSP tiers, and left
+    any further entry out of the run without a word.
+- `msp_annotator_settings.tsv` keeps an explicit priority 0, which the Console reads as a priority; the row's
+  position replaced it. No profile writes 0 today.
+
+### Changed
+- The plan's `libraries` question for `tiered_lipid_msp` asks for `libraries.lbm_path` beside the one MSP, and
+  says the official LBM library is the tier only without it. `scripts/create-tiered-annotation-demo.py` takes
+  `--lbm`.
+
 ## [0.5.46] - Unreleased
 
 Built on 0.5.45 (#78), which is not merged yet; merge this after it.

@@ -125,13 +125,18 @@ For existing libraries:
 }
 ```
 
-For the tiered LC-MS pipeline, provide one MSP path. The official versioned LBM
-catalog entry is used for the lipid-rule tier:
+For the tiered LC-MS pipeline, provide exactly one MSP path; a second `msp_paths`
+entry is a blocker, never silently dropped. The lipid-rule tier loads
+`libraries.lbm_path` when it is given, and the official versioned LBM catalog
+entry only when it is not:
 
 ```json
 {
   "library_strategy": "tiered_lipid_msp",
   "libraries": {
+    "lbm_path": "D:/libraries/lab-lipids.lbm2",
+    "lbm_version": "2026-10",
+    "lbm_license": "institutional/private",
     "msp_paths": ["D:/libraries/private-neg-vs20.msp"],
     "msp_version": "VS20",
     "msp_source": "institutional library",
@@ -139,6 +144,14 @@ catalog entry is used for the lipid-rule tier:
   }
 }
 ```
+
+A given `lbm_path` must be a non-empty `.lbm2` file; a missing, empty or other file
+is a blocker, because the Console skips an LBM it cannot read without a word. It is
+written to the method file's `Lbm file path`, and `library_provenance` records it by
+`name`, `size_bytes` and `sha256`, with `lbm_version`, `lbm_source`, `lbm_doi` and
+`lbm_license` (default `institutional/private`) as given. The planner consults the
+library catalog, and blocks on an official LBM that is not downloaded, only when no
+`lbm_path` is given.
 
 The generated cascade is:
 

@@ -245,6 +245,10 @@ as a tentative candidate source and should not be reported as equivalent to a
 high-quality spectral match. Private MSP files remain at their original local
 paths and are never bundled or redistributed by the app.
 
+The guided library strategy `tiered_lipid_msp` builds the same profile. Its LBM
+tier is `libraries.lbm_path` when one is given, recorded by name, size and
+sha256, and the official LBM library only when none is given.
+
 LBM score cutoffs default to the laboratory template's 0.1 (weighted, simple
 and reverse dot product) for every run, laboratory and repository alike; a
 parameter template that states others is followed.

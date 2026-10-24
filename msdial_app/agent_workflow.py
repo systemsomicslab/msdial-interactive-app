@@ -22,6 +22,7 @@ from .workflow import (
     automatic_rt_correction_value,
     expand_paths_report,
     discover_console_paths,
+    lbm_library_problem,
     load_parameter_template,
     read_adducts,
     read_analysis_csv,
@@ -311,15 +312,18 @@ def build_guided_plan(
                 f"Official library '{catalog_id}' is not downloaded. Ask for confirmation, then download it."
             )
     if merged.get("library_strategy") == "tiered_lipid_msp":
-        item = next(
-            (entry for entry in catalog_status() if entry["id"] == "lipidomics"),
-            None,
-        )
-        official_library = item
-        if item and not item.get("downloaded"):
-            blockers.append(
-                "The official lipidomics LBM library is not downloaded. Ask for confirmation, then download it."
+        blockers.extend(_tiered_library_problems(merged))
+        # The official LBM2 is the lipid-rule tier only when the answers name none of their own.
+        if not _tiered_lbm_path(merged):
+            item = next(
+                (entry for entry in catalog_status() if entry["id"] == "lipidomics"),
+                None,
             )
+            official_library = item
+            if item and not item.get("downloaded"):
+                blockers.append(
+                    "The official lipidomics LBM library is not downloaded. Ask for confirmation, then download it."
+                )
     tuning_strategy = merged.get("parameter_strategy") in {
         "target_peak_count", "auto_peak_range"
     }
@@ -923,7 +927,9 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
     elif answers.get("library_strategy") == "tiered_lipid_msp" and not _has_msp_library(answers):
         ask(
             "libraries",
-            "Provide one msp_paths entry for the high- and low-quality MSP tiers. The official LBM library is used as tier 1.",
+            "Provide one msp_paths entry, searched as both the high- and the low-quality MSP tier, and "
+            "libraries.lbm_path, the .lbm2 library of the lipid-rule tier; without lbm_path the official "
+            "LBM library is that tier.",
         )
     # Once a library is settled, how its retention times should be used is the next
     # decision, and it belongs to the analyst: a library built for this chromatography
@@ -1542,17 +1548,26 @@ def _apply_libraries(
     msp_paths = _path_list(libraries.get("msp_paths"))
     text_paths = _path_list(libraries.get("text_paths"))
     if strategy == "tiered_lipid_msp":
-        lbm_item = next(entry for entry in catalog_status() if entry["id"] == "lipidomics")
-        lbm_path = str(lbm_item.get("local_path", ""))
-        apply_tiered_lcms_annotation(state, lbm_path, msp_paths[0])
-        state["library_provenance"] = [
-            {
+        # The LBM2 the answers name is the one the method file loads and every record names. Before 0.5.47
+        # only the generic branch below read libraries.lbm_path, so this profile ran the official LBM2 while
+        # the answers, and a campaign's records built from them, named another. A second MSP is a plan
+        # blocker (_tiered_library_problems), so msp_paths holds one.
+        lbm_path = _tiered_lbm_path(answers)
+        if lbm_path:
+            lbm_provenance = _given_lbm_provenance(lbm_path, libraries)
+        else:
+            lbm_item = next(entry for entry in catalog_status() if entry["id"] == "lipidomics")
+            lbm_path = str(lbm_item.get("local_path", ""))
+            lbm_provenance = {
                 "path": lbm_path,
                 "version": str(lbm_item["record_id"]),
                 "source": lbm_item["record_url"],
                 "doi": lbm_item["doi"],
                 "license": lbm_item["license"],
-            },
+            }
+        apply_tiered_lcms_annotation(state, lbm_path, msp_paths[0])
+        state["library_provenance"] = [
+            lbm_provenance,
             {
                 "path": str(msp_paths[0]),
                 "version": str(libraries.get("msp_version", "")),
@@ -1584,6 +1599,57 @@ def _apply_libraries(
             for path in [*msp_paths, *text_paths, libraries.get("lbm_path", "")]
             if str(path).strip()
         ]
+
+
+def _tiered_lbm_path(answers: dict[str, Any]) -> str:
+    """The LBM2 the answers name for the tiered profile's lipid-rule tier, or "" for the official one."""
+    return str((answers.get("libraries") or {}).get("lbm_path") or "").strip()
+
+
+def _tiered_library_problems(answers: dict[str, Any]) -> list[str]:
+    """What the tiered profile refuses in its libraries answer, before it would run without a word.
+
+    The profile searches one MSP in both of its tiers, so a second msp_paths entry was left out of the run;
+    and the Console skips an LBM library it cannot read. A path that does not exist is validate_workflow's
+    "LBM library not found".
+    """
+    libraries = answers.get("libraries") or {}
+    problems: list[str] = []
+    msp_paths = _path_list(libraries.get("msp_paths"))
+    if len(msp_paths) > 1:
+        problems.append(
+            f"tiered_lipid_msp searches one MSP in both of its MSP tiers; libraries.msp_paths names "
+            f"{len(msp_paths)}. Give one, or list each library with library_strategy 'annotators'."
+        )
+    lbm_path = _tiered_lbm_path(answers)
+    problem = lbm_library_problem(lbm_path, "The tiered_lipid_msp profile") if lbm_path else ""
+    if problem:
+        problems.append(f"libraries.lbm_path: {problem}")
+    return problems
+
+
+def _given_lbm_provenance(path: str, libraries: dict[str, Any]) -> dict[str, Any]:
+    """The provenance of an LBM2 the answers name: its name, size and sha256, measured from the file.
+
+    The version, source, DOI and licence are what the answers say (lbm_version, lbm_source, lbm_doi and
+    lbm_license, private unless they say otherwise). A path that is not an .lbm2 file is recorded by name
+    only; the plan refuses it.
+    """
+    entry: dict[str, Any] = {
+        "path": path,
+        "name": Path(path).name,
+        "version": str(libraries.get("lbm_version", "")),
+        "source": str(libraries.get("lbm_source", "")),
+        "doi": str(libraries.get("lbm_doi", "")),
+        "license": str(libraries.get("lbm_license", "institutional/private")),
+    }
+    file = Path(path).expanduser()
+    if file.suffix.casefold() == ".lbm2" and file.is_file():
+        from .lab_lcms_metabolomics import library_identity
+
+        identity = library_identity(file)
+        entry.update({"size_bytes": identity["size_bytes"], "sha256": identity["sha256"]})
+    return entry
 
 
 def _msp_row(path: str, priority: int) -> dict[str, Any]:

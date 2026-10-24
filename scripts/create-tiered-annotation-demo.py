@@ -24,11 +24,17 @@ def main() -> int:
     parser.add_argument("--ion-mode", choices=("Positive", "Negative"), required=True)
     parser.add_argument("--msp-version", default="", help="Library version recorded in provenance")
     parser.add_argument(
+        "--lbm",
+        default="",
+        help="The .lbm2 library of the lipid-rule tier; the official LBM library when omitted",
+    )
+    parser.add_argument(
         "--target-omics",
         choices=("Metabolomics", "Lipidomics"),
         default="Metabolomics",
     )
     args = parser.parse_args()
+    lbm = {"lbm_path": str(Path(args.lbm).expanduser().resolve())} if args.lbm else {}
 
     plan = build_guided_plan(
         args.input,
@@ -40,6 +46,7 @@ def main() -> int:
             "execute_rt_correction": False,
             "library_strategy": "tiered_lipid_msp",
             "libraries": {
+                **lbm,
                 "msp_paths": [str(Path(args.msp).expanduser().resolve())],
                 "msp_version": args.msp_version,
                 "msp_source": "institutional library",

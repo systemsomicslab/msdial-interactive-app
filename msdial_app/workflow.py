@@ -2058,19 +2058,30 @@ def _laboratory_lipidomics_issues(state: dict[str, Any], project_type: str) -> l
     if not state.get("lab_lipidomics_profile") or project_type != "lcms" or diagnostic_skips_annotation(state):
         return issues
     lbm_path = str(state.get("lbm_path", "")).strip()
-    if not lbm_path:
-        issues.append(
-            {"level": "error", "message": "A laboratory lipidomics run needs the laboratory's LBM2 library (lbm_path)."}
-        )
-    elif Path(lbm_path).suffix.casefold() != ".lbm2":
-        issues.append(
-            {"level": "error", "message": f"A laboratory lipidomics run reads an .lbm2 library; {Path(lbm_path).name} is not one."}
-        )
-    elif Path(lbm_path).is_file() and Path(lbm_path).stat().st_size == 0:
-        issues.append(
-            {"level": "error", "message": f"{Path(lbm_path).name} is empty; the Console would skip it without a word."}
-        )
+    problem = (
+        lbm_library_problem(lbm_path, "A laboratory lipidomics run") if lbm_path
+        else "A laboratory lipidomics run needs the laboratory's LBM2 library (lbm_path)."
+    )
+    if problem:
+        issues.append({"level": "error", "message": problem})
     return issues
+
+
+def lbm_library_problem(lbm_path: str | Path, run: str) -> str:
+    """Why the LBM library a run names is not one the Console can load, or "" when it is.
+
+    The Console reads an .lbm2 library and skips an empty one without a word: the run then annotates no
+    lipid at all. ``run`` names the run in the message. A path that does not exist is validate_workflow's
+    "LBM library not found".
+    """
+    path = Path(str(lbm_path).strip()).expanduser()
+    if path.suffix.casefold() != ".lbm2":
+        return f"{run} reads an .lbm2 library; {path.name} is not one."
+    if path.exists() and not path.is_file():
+        return f"{path.name} is a folder, not an .lbm2 file."
+    if path.is_file() and path.stat().st_size == 0:
+        return f"{path.name} is empty; the Console would skip it without a word."
+    return ""
 
 
 def _stage_input(source: Path, destination_folder: Path) -> Path:
@@ -4379,7 +4390,8 @@ def _write_msp_annotator_settings(run_directory: Path, state: dict[str, Any]) ->
                     **({"library_kind": str(row.get("library_kind", "")).strip() or "acquired"} if with_kind else {}),
                     "annotator_id": str(row.get("annotator_id", "")).strip() or f"msp_annotator_{index}",
                     "msp_file_path": str(Path(str(row["msp_file_path"])).expanduser().resolve()),
-                    "priority": int(row.get("priority") or index),
+                    # An explicit 0 is a priority the Console reads (ConfigParser: int.TryParse), not a gap.
+                    "priority": index if row.get("priority") in (None, "") else int(row["priority"]),
                     "target_omics": str(row.get("target_omics", "")).strip(),
                     "evidence_tier": str(row.get("evidence_tier", "")).strip(),
                     "rt_tolerance": row.get("rt_tolerance", state.get("msp_rt_tolerance", 100)),
