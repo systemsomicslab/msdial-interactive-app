@@ -175,6 +175,38 @@ suggestion. Both MSP rows set matched-peak percentage to 0 and disable RT scorin
 MS-DIAL loads the shared MSP once and evaluates both settings. The low tier is
 an intentionally broad candidate search and requires downstream evidence review.
 
+An optional fourth tier searches an in-silico MSP library (GLACIER in the public-repository
+campaign): give exactly one `libraries.in_silico_msp_paths` entry, the run's own ion mode's
+file, with `in_silico_msp_version`, `in_silico_msp_source`, `in_silico_msp_license` (default
+`institutional/private`) and, where it applies, `in_silico_msp_preprocessing:
+["precursor_plus_1008_peak_removed"]`. The profile is then
+`lipid-rule-msp-high-low-insilico-v1`:
+
+| Tier | Annotator ID | Priority | Kind | MS/MS tol. | Weighted/simple/reverse | Matched peaks | Suggestions |
+|---|---|---:|---|---:|---|---:|---|
+| Lipid rules | LBM path | 4 | | LBM setting | LBM setting | LBM setting | |
+| MSP high | `msp_high_quality` | 3 | acquired | 0.05 Da | 0.6 / 0.6 / 0.8 | >= 3 | |
+| MSP low candidate | `msp_low_quality` | 2 | acquired | 0.25 Da | 0.5 / 0.5 / 0.5 | >= 1 | |
+| In-silico MSP (GLACIER) | `msp_in_silico` | 1 | predicted | 0.05 Da | 0.5 / 0.5 / 0.5 | >= 3 | false |
+
+Every MSP row is scored as Metabolomics, without RT, at MS1 0.01 Da. MS-DIAL reports an in-silico
+match with the evidence source `InSilico`, never as a reference spectrum, and the row's
+`suggestions: false` keeps it from naming a feature by precursor m/z alone. A plan with this
+tier is blocked on a Console that does not read `library_kind` or has no per-annotator
+`suggestions` switch. A second entry, a non-`.msp` file, the acquired MSP named again, a file
+named for the other ion mode (`pos`/`neg` token), or an in-silico path under another
+`library_strategy` is a blocker.
+
+`target_omics_pin` fixes the project's target omics whatever `target_omics` the repository
+metadata seeded; `target_omics_record` keeps the seed, the answer, the pin and the applied
+value. `lipid_rt_check` (an object of `mode`, `operating_point`, `chromatography`,
+`plausibility_profile`, `class_level_matches`, `minor_duplicates`, `secondary_only_features`,
+each defaulting to the Console's Auto, HighPrecision, Auto, None, Corroborated, Allow,
+Evaluate) writes all seven `Lipid RT check` keys to the method file; it is blocked on a Console
+without the check. The run records the setting, the review list
+(`<alignment>_lipidrt_review.tsv`, none meaning the check did not run) by name and sha256, and
+the rule version the Console states.
+
 For GC-MS RI analysis, add `gcms_retention_type: "RI"`, `gcms_ri_compound_type: "Alkanes"` or `"Fames"`, and an RI standard/dictionary path.
 
 ## Internal standards

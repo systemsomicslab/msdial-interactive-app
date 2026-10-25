@@ -88,6 +88,9 @@ def generate_publication_report(
     multi_energy_aif = multi_energy_aif_evidence(workflow)
     if multi_energy_aif:
         report_workflow["multi_energy_aif_evidence"] = multi_energy_aif
+    lipid_rt_evidence = lipid_rt_check_evidence(root, workflow)
+    if lipid_rt_evidence:
+        report_workflow["lipid_rt_check_evidence"] = lipid_rt_evidence
     criteria = _criteria(qa_criteria)
     qa_assessment = assess_qa(qa_report, criteria)
     provenance_warnings = _library_warnings(report_workflow, libraries)
@@ -341,6 +344,7 @@ def supplementary_rows(
         "output_root",
         "automatic_rt_correction_evidence",
         "multi_energy_aif_evidence",
+        "lipid_rt_check_evidence",
     } | annotation_keys
     for key in sorted(workflow):
         if key not in excluded:
@@ -367,13 +371,23 @@ def supplementary_rows(
     for index, library in enumerate(workflow.get("library_provenance", []), start=1):
         _add_mapping(add, "Library provenance", str(library.get("label") or f"Library {index}"), library)
     for library in libraries or []:
-        for key in ("role", "sha256", "bytes", "distribution", "doi", "source", "version", "license"):
-            if library.get(key) not in (None, ""):
+        for key in (
+            "role", "library_kind", "sha256", "bytes", "distribution", "doi", "source", "version", "license",
+            "preprocessing",
+        ):
+            if library.get(key) not in (None, "", []):
                 add("Library identity", str(library.get("name") or ""), key, library[key],
                     "Not distributed" if key == "distribution" and library.get("private") else "")
 
     for key, value in (workflow.get("multi_energy_aif_evidence") or {}).items():
         add("Acquisition", "Multi-energy AIF", key, value, "Campaign disposition (raw headers)")
+
+    lipid_rt_evidence = workflow.get("lipid_rt_check_evidence") or {}
+    for key in ("setting", "written_to_method_file", "console_capability", "ran", "review_files", "rule_version",
+                "parameter_hash", "summary"):
+        if key in lipid_rt_evidence:
+            add("Lipid RT check", "MS-DIAL lipid retention-time order check", key, lipid_rt_evidence[key],
+                "Derived from the method file and retained Console outputs", "MS-DIAL Console")
 
     automatic_rt_evidence = workflow.get("automatic_rt_correction_evidence") or {}
     if automatic_rt_evidence.get("requested"):
@@ -447,7 +461,9 @@ def _methods_text(
         (
             f"Raw mass spectrometry data ({len(files)} analysis files) were processed using "
             f"MS-DIAL Console version {console} through MS-DIAL Interactive version {interactive}. "
-            f"The workflow was configured for {project} {ion}-ion {omics} analysis. Complete sample "
+            f"The workflow was configured for {project} {ion}-ion {omics} analysis."
+            + _target_omics_sentence(workflow)
+            + " Complete sample "
             "metadata, processing parameters, annotation settings, and library provenance are provided "
             "in Supplementary Table S1."
             + _input_integrity_sentence(workflow)
@@ -455,6 +471,9 @@ def _methods_text(
         _processing_sentence(workflow, project_type),
         _annotation_sentence(workflow, libraries),
     ]
+    lipid_rt_sentence = _lipid_rt_check_sentence(workflow.get("lipid_rt_check_evidence") or {})
+    if lipid_rt_sentence:
+        paragraphs.append(lipid_rt_sentence)
     if workflow.get("execute_rt_correction"):
         paragraphs.append(
             "Retention-time correction was applied using the anchor library and reviewed peak selections documented in Supplementary Table S1."
@@ -659,13 +678,45 @@ def _multi_energy_aif_sentence(evidence: dict[str, Any]) -> str:
     )
 
 
+def _target_omics_sentence(workflow: dict[str, Any]) -> str:
+    """' The MS-DIAL target omics was set to X ...' where a campaign pinned it, else ''."""
+    record = workflow.get("target_omics_record") if isinstance(workflow.get("target_omics_record"), dict) else {}
+    pinned = str(record.get("pinned") or "").strip()
+    if not pinned:
+        return ""
+    seed = str(record.get("repository_seed") or "").strip()
+    suggested = (
+        f"; the repository metadata suggested {seed}" if seed and seed != pinned
+        else "; the repository metadata suggested the same" if seed else ""
+    )
+    return f" The MS-DIAL target omics was set to {pinned} as a campaign setting{suggested}."
+
+
 def _annotation_sentence(workflow: dict[str, Any], libraries: list[dict[str, Any]] | None = None) -> str:
-    msp_count = len(workflow.get("msp_annotators", []))
+    from .annotation_pipeline import (
+        GLACIER_CITATION, GLACIER_SCOPE, IN_SILICO_EVIDENCE_TIER, IN_SILICO_PREPROCESSING_STEPS,
+    )
+    from .workflow import is_predicted_library_kind
+
+    rows = [row for row in workflow.get("msp_annotators", []) if isinstance(row, dict)]
+    in_silico_rows = [row for row in rows if is_predicted_library_kind(row.get("library_kind"))]
+    msp_count = len(rows) - len(in_silico_rows)
+    in_silico_count = len(in_silico_rows)
     text_count = len(workflow.get("text_annotators", []))
     lbm = bool(str(workflow.get("lbm_path", "")).strip())
     types = []
     if msp_count:
-        types.append(f"{msp_count} MSP annotator{'s' if msp_count != 1 else ''}")
+        # Acquired and in-silico annotators are counted apart: a match against predicted spectra is not a
+        # reference-spectrum match, and a count that joined them would read as one.
+        types.append(
+            f"{msp_count} MSP annotator{'s' if msp_count != 1 else ''}"
+            + (" searching acquired spectra" if in_silico_count else "")
+        )
+    if in_silico_count:
+        types.append(
+            f"{in_silico_count} MSP annotator{'s' if in_silico_count != 1 else ''} searching in-silico "
+            "(predicted) spectra"
+        )
     if text_count:
         types.append(f"{text_count} text-library annotator{'s' if text_count != 1 else ''}")
     if lbm:
@@ -691,9 +742,111 @@ def _annotation_sentence(workflow: dict[str, Any], libraries: list[dict[str, Any
         f" Libraries that are not distributed are identified by file name and SHA-256 digest: {', '.join(private)}."
         if private else ""
     )
+    in_silico = ""
+    if in_silico_count:
+        in_silico = (
+            " A match against in-silico spectra is reported with the evidence source InSilico (the \"Evidence "
+            "source\" column of the MS-DIAL exports; opt_global_evidence_source in mzTab-M), never as a "
+            "reference-spectrum match, and the in-silico tier carries no retention time. MS-DIAL ranks an "
+            "accepted match against acquired spectra or LBM rules above an accepted in-silico match, so an "
+            "in-silico name is reported only where neither is accepted."
+        )
+        if any(str(row.get("evidence_tier") or "") == IN_SILICO_EVIDENCE_TIER for row in in_silico_rows):
+            in_silico += f" The in-silico library was {GLACIER_CITATION}; it covers {GLACIER_SCOPE}."
+        for library in libraries or []:
+            for step in library.get("preprocessing") or []:
+                if step in IN_SILICO_PREPROCESSING_STEPS and library.get("name"):
+                    in_silico += f" For {library['name']}, {IN_SILICO_PREPROCESSING_STEPS[step]}."
+    project_omics = str(workflow.get("target_omics") or "").strip()
+    row_omics = sorted({str(row.get("target_omics") or "").strip() for row in rows} - {""})
+    scored = (
+        f" Every MSP annotator was scored as {' or '.join(row_omics)}, as its own row of the annotator table "
+        f"states, rather than with the project's target omics ({project_omics})."
+        if rows and project_omics and row_omics and all(str(row.get("target_omics") or "").strip() for row in rows)
+        and project_omics not in row_omics
+        else ""
+    )
     return (
         f"Molecular annotation used {description} with the database-specific settings reported in "
-        f"Supplementary Table S1.{citation}{withheld}"
+        f"Supplementary Table S1.{citation}{withheld}{in_silico}{scored}"
+    )
+
+
+def lipid_rt_check_evidence(root: Path, workflow: dict[str, Any]) -> dict[str, Any]:
+    """What a report says of the lipid RT check: the setting the run asked for, and what the run left.
+
+    The review lists are read from the run directory, written no earlier than its method file; the rule version
+    is the one the Console stated, as the unit manifest's finalisation of the run recorded it. Empty for a run
+    that neither asked for the check nor was a Lipidomics project nor left a review list.
+    """
+    from .lipid_rt_check import run_outcome
+
+    method = workflow.get("lipid_rt_check_method") if isinstance(workflow.get("lipid_rt_check_method"), dict) else {}
+    setting = workflow.get("lipid_rt_check") if isinstance(workflow.get("lipid_rt_check"), dict) else None
+    if str(workflow.get("project_type", "lcms")).lower() != "lcms":
+        return {}
+    try:
+        since = (root / "method.txt").stat().st_mtime
+    except OSError:
+        since = None
+    export_folder = str(workflow.get("export_folder_path") or "").strip()
+    directories = [root, *([export_folder] if export_folder else [])]
+    outcome = run_outcome(directories, since)
+    if not setting and workflow.get("target_omics") != "Lipidomics" and not outcome["ran"]:
+        return {}
+    recorded = _finalised_lipid_rt_check(workflow)
+    return {
+        "setting": setting,
+        "written_to_method_file": bool(method.get("written_to_method_file")),
+        "console_capability": method.get("console_capability"),
+        "ran": outcome["ran"],
+        "review_files": outcome["review_files"],
+        "rule_version": str(recorded.get("rule_version") or ""),
+        "parameter_hash": str(recorded.get("parameter_hash") or ""),
+        "summary": str(recorded.get("summary") or ""),
+    }
+
+
+def _finalised_lipid_rt_check(workflow: dict[str, Any]) -> dict[str, Any]:
+    """The unit manifest's record of the run's lipid RT check (run_finalisation), or {}."""
+    manifest_path = str(workflow.get("repository_run_manifest") or "").strip()
+    if not manifest_path:
+        return {}
+    try:
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    finalisation = manifest.get("console_run_finalisation") if isinstance(manifest, dict) else None
+    record = (finalisation or {}).get("lipid_rt_check") if isinstance(finalisation, dict) else None
+    return record if isinstance(record, dict) else {}
+
+
+def _lipid_rt_check_sentence(evidence: dict[str, Any]) -> str:
+    if not evidence:
+        return ""
+    from .lipid_rt_check import SETTINGS
+
+    rules = f" (rules {evidence['rule_version']})" if evidence.get("rule_version") else ""
+    setting = evidence.get("setting") or {}
+    if setting and evidence.get("written_to_method_file"):
+        details = "; ".join(
+            f"{key[len('Lipid RT check '):] if key != 'Lipid RT check' else 'mode'} {setting.get(answer)}"
+            for answer, key, _, _ in SETTINGS
+        )
+        configured = f"was set to {details}, every setting stated in the method file"
+    else:
+        configured = "was left at the MS-DIAL Console's defaults, which run it in a Lipidomics project"
+    files = evidence.get("review_files") or []
+    if files:
+        outcome = "Its review list " + ", ".join(
+            f"{item['name']} (SHA-256 {item['sha256']}; {item['rows']} row{'s' if item['rows'] != 1 else ''})"
+            for item in files
+        ) + " is retained with the outputs; an empty list means the check found nothing to review."
+    else:
+        outcome = "No review list was written, so the check did not run."
+    return (
+        f"The lipid retention-time order check of MS-DIAL{rules}, which tags a lipid annotation Confirmed where "
+        f"its retention time follows the reversed-phase order of its class, {configured}. {outcome}"
     )
 
 

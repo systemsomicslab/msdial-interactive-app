@@ -4,6 +4,70 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.48] - Unreleased
+
+Built on 0.5.47 (#80), which is not merged yet; merge this after it. The per-annotator suggestions switch it
+asks of the Console is the companion MS-DIAL change of 2026-10-25, not yet in MS-DIAL master.
+
+### Added
+- **An in-silico MSP tier in the tiered profile** (the author's decisions of 2026-10-25). One
+  `libraries.in_silico_msp_paths` entry, the run's own ion mode's file (GLACIER, from the Coley group's ms-pred,
+  https://github.com/coleygroup/ms-pred, in the public-repository campaign; a non-public build, recorded by file
+  name and sha256 only), makes the profile `lipid-rule-msp-high-low-insilico-v1`: LBM 4, `msp_high_quality` 3,
+  `msp_low_quality` 2 and `msp_in_silico` 1. The in-silico row is scored as Metabolomics, without retention time,
+  at MS1 0.01 Da, MS/MS 0.05 Da, dot products 0.5/0.5/0.5, at least 3 matched peaks and matched-peak percentage
+  0 (`lab_lcms_metabolomics.THRESHOLDS["in_silico"]`, the one definition), with `library_kind: predicted`,
+  `suggestions: false` and evidence tier "In-silico MSP (GLACIER)"; the acquired rows then say
+  `library_kind: acquired`. Without an in-silico path the v1 profile is exactly as it was.
+  - `in_silico_msp_version`, `in_silico_msp_source`, `in_silico_msp_license` (default `institutional/private`)
+    and `in_silico_msp_preprocessing` (`precursor_plus_1008_peak_removed`, the negative-mode artefact peak the
+    author had removed) are recorded in `library_provenance` with `library_kind: predicted`.
+  - A plan is blocked on a second in-silico entry, a non-`.msp` or empty file, the acquired MSP named again as
+    in-silico, a file named for the other ion mode (a `pos`/`neg` token; a name with neither is taken as
+    given), an unknown preprocessing step, or an in-silico path under another `library_strategy`.
+  - A plan whose annotator table has a predicted row is blocked on a Console that does not read
+    `library_kind` (it would publish in-silico matches as reference spectra), and one with a row that turns
+    `suggestions` off on a Console without the per-annotator switch.
+- `msp_annotator_settings.tsv` writes a `suggestions` column (True/False) when a row sets it, as it writes
+  `library_kind`; a template's table reads both back.
+- Console capabilities `library_kind` (marker "the library will be treated as acquired"), `msp_suggestions`
+  ("annotation suggestions disabled") and `lipid_rt_check` ("lipid rt check operating point" and "Lipid RT
+  check review list: ").
+- **The lipid RT check, written and recorded.** The `lipid_rt_check` answer (mode, operating point,
+  chromatography, plausibility profile, class-level matches, minor duplicates, secondary-only features; each
+  left out at the Console's default: Auto, HighPrecision, Auto, None, Corroborated, Allow, Evaluate) writes all
+  seven `Lipid RT check` keys to the method file on a Console with the check, and is a blocker on one without
+  it. `workflow-settings.json` (`lipid_rt_check`, `lipid_rt_check_method`) and the run manifest
+  (`lipid_rt_check`) record the setting and whether the method file states it; the finalisation record
+  (`console_run_finalisation.lipid_rt_check`) records each `<alignment>_lipidrt_review.tsv` written by the run
+  by name, sha256 and row count (none: the check did not run), the Console's summary line and the rule version
+  it states; the Materials and Methods say all of it.
+- **The target omics pin.** `target_omics_pin` sets the project's target omics whatever `target_omics` the
+  repository answer seed gave (Lipidomics for every campaign unit, D7). `target_omics_record` (workflow
+  settings) and the run manifest's `target_omics` keep the repository metadata's suggestion
+  (`repository_seed`), the `target_omics` answer, the pin and the applied value apart.
+- The data-mining handoff has an `annotation` block: the pipeline profile, the target omics record, and per
+  tier the annotator id, evidence tier, priority, role, library kind, and library file name and sha256.
+- `parse_mdpeak` counts the named representatives by "Evidence source" and by the annotator the Comment names;
+  `identification_count` counts ReferenceSpectrum and RuleBased only, so an in-silico name (`in_silico_count`)
+  is never an identification.
+
+### Changed
+- Every MSP library identity (`sharing.library_records`: the run manifest of a repository unit, the
+  finalisation record, the publication report) carries `library_kind`, acquired or predicted, and an in-silico
+  library its `preprocessing`; the library-copy store's entry names carry the kind where the record states it,
+  and a laboratory run manifest where the provenance does. The Supplementary Table's library identity rows
+  show both.
+- The Materials and Methods count acquired and in-silico MSP annotators apart, name the evidence column
+  (`Evidence source`; mzTab-M `opt_global_evidence_source`, `InSilico`), state that the in-silico tier has no
+  retention time and is reported only where no acquired or LBM match is accepted, cite GLACIER with its scope
+  ([M+H]+ and [M-H]- at collision energies 10, 20 and 40) where the tier is GLACIER's, state a preprocessing
+  step the provenance records, state a pinned target omics, and say when every MSP row was scored with its own
+  target omics rather than the project's.
+- The run manifest names the annotation pipeline profile.
+- The laboratory `campaign` preset searches its optional in-silico MSP at the new `in_silico` thresholds, as
+  the campaign does; it searched it at `mild` (0.25 Da, at least 1 matched peak).
+
 ## [0.5.47] - Unreleased
 
 ### Fixed

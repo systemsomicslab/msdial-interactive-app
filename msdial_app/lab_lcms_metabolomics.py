@@ -51,7 +51,10 @@ THRESHOLD_KEYS = (
     "matched_peaks_percentage_cutoff", "minimum_spectrum_match",
 )
 # standard is a guided run's own MSP row (agent_workflow._msp_row), at the method's MS/MS tolerance;
-# strict and mild are the repository campaign's two MSP tiers (annotation_pipeline.tiered_lcms_annotation).
+# strict and mild are the repository campaign's two MSP tiers (annotation_pipeline.tiered_lcms_annotation);
+# in_silico is its in-silico MSP tier, GLACIER, as the author decided on 2026-10-25 (at least three matched
+# peaks at 0.05 Da: against dense predicted spectra one matched peak at 0.25 Da is chance), which
+# annotation_pipeline reads from here.
 THRESHOLDS = {
     "standard": {
         "weighted_dot_product_cutoff": 0.6, "simple_dot_product_cutoff": 0.6, "reverse_dot_product_cutoff": 0.8,
@@ -64,6 +67,10 @@ THRESHOLDS = {
     "mild": {
         "ms2_tolerance": 0.25, "weighted_dot_product_cutoff": 0.5, "simple_dot_product_cutoff": 0.5,
         "reverse_dot_product_cutoff": 0.5, "matched_peaks_percentage_cutoff": 0.0, "minimum_spectrum_match": 1,
+    },
+    "in_silico": {
+        "ms2_tolerance": 0.05, "weighted_dot_product_cutoff": 0.5, "simple_dot_product_cutoff": 0.5,
+        "reverse_dot_product_cutoff": 0.5, "matched_peaks_percentage_cutoff": 0.0, "minimum_spectrum_match": 3,
     },
 }
 # Highest priority first. A slot names the file the person gives; one file may fill two entries (the
@@ -79,7 +86,7 @@ PRESETS: dict[str, list[dict[str, Any]]] = {
          "label": "MSP strict"},
         {"id": "msp_mild", "slot": "msp", "kind": "msp", "thresholds": "mild", "retention_time": "none",
          "label": "MSP mild"},
-        {"id": "in_silico", "slot": "in_silico", "kind": "msp", "thresholds": "mild", "retention_time": "none",
+        {"id": "in_silico", "slot": "in_silico", "kind": "msp", "thresholds": "in_silico", "retention_time": "none",
          "label": "in-silico MSP", "library_kind": "predicted", "optional": True},
     ],
     "lab_rt_tiers": [
@@ -94,7 +101,7 @@ PRESETS: dict[str, list[dict[str, Any]]] = {
 PRESET_PURPOSES = {
     "single_msp": "one MSP library, no retention time: what most users and the reanalysis agent run",
     "campaign": "the reanalysis project's tiers: the LBM2 for the few lipids, one MSP searched strictly and "
-                "mildly, and optionally an in-silico MSP, all without retention time",
+                "mildly, and optionally an in-silico MSP at its own thresholds, all without retention time",
     "lab_rt_tiers": "the laboratory's own tiers: in-house standards (RT 0.5 min), predicted RTs (RT 2.0 min), "
                     "and MS/MS without RT",
 }

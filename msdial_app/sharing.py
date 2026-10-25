@@ -285,6 +285,23 @@ def _used_library_paths(state: dict[str, Any]) -> list[tuple[str, str]]:
     return found
 
 
+def _msp_library_kind(
+    state: dict[str, Any], keys: set[str], entry: dict[str, Any] | None, record: dict[str, Any] | None
+) -> str:
+    """An MSP's kind of spectra: its annotator rows' library_kind, else its provenance's, else the run manifest's
+    record of it; acquired where none says, which is how the Console reads silence."""
+    from .workflow import library_kind_of
+
+    for row in state.get("msp_annotators") or []:
+        if isinstance(row, dict) and str(row.get("library_kind") or "").strip():
+            if keys & {_location_key(item) for item in _locations(str(row.get("msp_file_path") or ""))}:
+                return library_kind_of(row["library_kind"])
+    for source in (entry, record):
+        if str((source or {}).get("library_kind") or "").strip():
+            return library_kind_of(source["library_kind"])
+    return "acquired"
+
+
 def _unique_by_name(entries: Iterable[dict[str, Any]], name_of: Any) -> dict[str, dict[str, Any]]:
     """Entries keyed by file name, leaving out a name two entries share: a name is evidence only when unique."""
     by_name: dict[str, list[dict[str, Any]]] = {}
@@ -356,6 +373,12 @@ def library_records(state: dict[str, Any], recorded: Iterable[dict[str, Any]] | 
             "private": not public,
             "distribution": "public" if public else "private",
         }
+        if role == "msp":
+            # Whether its spectra were acquired or predicted, as the Console reads the annotator table: a match
+            # against a predicted library is in-silico evidence, never a reference spectrum.
+            identity["library_kind"] = _msp_library_kind(state, keys, entry, record)
+        if (entry or {}).get("preprocessing"):
+            identity["preprocessing"] = [str(step) for step in entry["preprocessing"]]
         for key in ("version", "doi", "source", "license"):
             value = str((entry or {}).get(key) or (entry or {}).get("record_url" if key == "source" else key) or "")
             if value.strip() and (public or key in {"version", "license"}):

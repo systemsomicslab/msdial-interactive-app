@@ -252,6 +252,7 @@ def create_datamining_handoff(
         "primary_mztab_selection": "newest_modified_time",
         "mztab_files": mztab_files,
         "msdial_output_files": output_files,
+        "annotation": annotation_block(run_dir),
         "downstream_mcp_hint": {
             "preferred_input": "primary_mztab_file",
             "accepted_inputs": ["mztab_files", "run_directory", "msdial_output_files"],
@@ -274,6 +275,90 @@ def create_datamining_handoff(
     else:
         handoff["handoff_file"] = ""
     return handoff
+
+
+def annotation_block(run_directory: str | Path) -> dict[str, Any] | None:
+    """Which annotators named the features, for a data-mining step to weigh a name by what supports it.
+
+    The run's workflow-settings.json and run-manifest.json: the pipeline profile, and per tier its annotator id,
+    evidence tier, priority, library kind and the library by file name and sha256, never by location. A name
+    from a library_kind "predicted" tier is an in-silico prediction, reported with the evidence source InSilico,
+    not an identification. None where the run directory holds no workflow-settings.json.
+    """
+    from .lab_lcms_metabolomics import console_lbm_annotator_id
+    from .sharing import library_records
+    from .workflow import library_kind_of
+
+    directory = Path(str(run_directory or "")).expanduser()
+    try:
+        state = json.loads((directory / "workflow-settings.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    try:
+        manifest = json.loads((directory / "run-manifest.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        manifest = {}
+    recorded = manifest.get("libraries") if isinstance(manifest, dict) else None
+    libraries = library_records(state, recorded if isinstance(recorded, list) else None)
+
+    def identity(path: Any) -> dict[str, Any]:
+        name = Path(str(path or "")).name.casefold()
+        return next((library.identity for library in libraries if library.name.casefold() == name), {})
+
+    tiers: list[dict[str, Any]] = []
+    lbm = state.get("lbm_annotator") if isinstance(state.get("lbm_annotator"), dict) else {}
+    lbm_path = str(state.get("lbm_path") or lbm.get("lbm_file_path") or "").strip()
+    if lbm_path:
+        found = identity(lbm_path)
+        tiers.append({
+            "annotator_id": console_lbm_annotator_id(lbm_path),
+            "evidence_tier": str(lbm.get("evidence_tier") or "LBM rule-based lipid annotation"),
+            "priority": lbm.get("priority", state.get("lbm_priority")),
+            "role": "lbm",
+            "library_kind": None,
+            "library_name": found.get("name") or Path(lbm_path).name,
+            "sha256": found.get("sha256") or "",
+        })
+    for row in state.get("msp_annotators") or []:
+        if not isinstance(row, dict) or not str(row.get("msp_file_path") or "").strip():
+            continue
+        found = identity(row["msp_file_path"])
+        tiers.append({
+            "annotator_id": str(row.get("annotator_id") or ""),
+            "evidence_tier": str(row.get("evidence_tier") or ""),
+            "priority": row.get("priority"),
+            "role": "msp",
+            "library_kind": library_kind_of(row.get("library_kind")),
+            "library_name": found.get("name") or Path(str(row["msp_file_path"])).name,
+            "sha256": found.get("sha256") or "",
+        })
+    for row in state.get("text_annotators") or []:
+        if not isinstance(row, dict) or not str(row.get("text_db_file_path") or "").strip():
+            continue
+        found = identity(row["text_db_file_path"])
+        tiers.append({
+            "annotator_id": str(row.get("annotator_id") or ""),
+            "evidence_tier": str(row.get("evidence_tier") or ""),
+            "priority": row.get("priority"),
+            "role": "text",
+            "library_kind": None,
+            "library_name": found.get("name") or Path(str(row["text_db_file_path"])).name,
+            "sha256": found.get("sha256") or "",
+        })
+    return {
+        "pipeline_profile": str(state.get("annotation_pipeline_profile") or ""),
+        "target_omics": state.get("target_omics_record") or {"applied": state.get("target_omics")},
+        "tiers": tiers,
+        "evidence_column": "Evidence source (exports); opt_global_evidence_source (mzTab-M)",
+        "note": (
+            "A name from a tier whose library_kind is predicted is an in-silico prediction (Evidence source "
+            "InSilico), not an identification; join compounds by the first block of the InChIKey, since "
+            "predicted libraries may carry non-standard keys."
+            if any(tier["library_kind"] == "predicted" for tier in tiers) else ""
+        ),
+    }
 
 
 def summarize_job(

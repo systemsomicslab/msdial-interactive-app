@@ -542,7 +542,10 @@ def _sha256(path: Path) -> str:
 
 
 def library_names(libraries: Iterable[Any]) -> list[dict[str, Any]]:
-    """A run's library records reduced to what entry.json may carry: name, sha256, private. Never a path."""
+    """A run's library records reduced to what entry.json may carry: name, sha256, private, and an MSP's
+    library_kind (acquired or predicted) where the record states it. Never a path. Which object a run's copy
+    matches is decided by name and sha256 alone (_library_set), so a record from before the kind was written
+    matches as it did."""
     found = []
     for item in libraries or []:
         if not isinstance(item, dict):
@@ -550,7 +553,9 @@ def library_names(libraries: Iterable[Any]) -> list[dict[str, Any]]:
         name = str(item.get("name") or item.get("filename") or "").strip()
         if name:
             found.append({"name": name, "sha256": str(item.get("sha256") or "").strip().casefold(),
-                          "private": bool(item.get("private"))})
+                          "private": bool(item.get("private")),
+                          **({"library_kind": str(item["library_kind"])}
+                             if str(item.get("library_kind") or "").strip() else {})})
     return found
 
 
