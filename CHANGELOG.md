@@ -45,6 +45,12 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     is a blocker under this profile. Overrides reach the state after the profile, so an `lbm_path` there was
     the LBM2 the method file named, unchecked, while `lbm_annotator`, `library_provenance` and every record
     named the given one. The other library strategies apply such an override as before.
+  - A `libraries` key the profile does not read is a blocker. It reads `msp_paths` and `lbm_path`, with
+    `msp_version`, `msp_source`, `msp_doi`, `msp_license` and their `lbm_` counterparts; `text_paths` has the
+    blocker above. An LBM2 named
+    under any other key, such as `lbm_file_path`, the key of `lbm_annotator`, was left out without a word: the
+    official LBM2 was the tier, and the plan ready once it was downloaded, while a campaign, which resolves a
+    library reference under any key, pinned and recorded the LBM2 the key named.
 - `msp_annotator_settings.tsv` keeps an explicit priority 0, which the Console reads as a priority; the row's
   position replaced it. No profile writes 0 today.
 - The method file's `Lbm file path` is written absolute for every library strategy, as the MSP and text rows

@@ -91,6 +91,13 @@ TIERED_LIBRARY_STATE_KEYS = frozenset({
     "lbm_path", "lbm_annotator", "msp_path", "msp_annotators", "text_db_path", "text_annotators",
     "library_provenance", "annotation_pipeline_profile",
 })
+# The libraries keys the tiered profile reads. Under that profile any other is a plan blocker, text_paths with
+# a message of its own (_tiered_library_problems): an LBM2 named under another key, such as lbm_annotator's
+# lbm_file_path, left the official LBM2 as the lipid-rule tier while a campaign's records named the given one.
+TIERED_LIBRARY_KEYS = frozenset({
+    "msp_paths", "msp_version", "msp_source", "msp_doi", "msp_license",
+    "lbm_path", "lbm_version", "lbm_source", "lbm_doi", "lbm_license",
+})
 
 
 def inspect_analysis_input(input_path: str) -> dict[str, Any]:
@@ -1627,10 +1634,18 @@ def _tiered_library_problems(answers: dict[str, Any]) -> list[str]:
     searches no text library, so text_paths was left out too; and the Console skips an LBM library it cannot
     read. A path that does not exist is validate_workflow's "LBM library not found". workflow_overrides reach
     the state after the profile, so an lbm_path there was the LBM2 the Console loaded, unchecked, while
-    lbm_annotator, library_provenance and every record named the one checked here.
+    lbm_annotator, library_provenance and every record named the one checked here. A libraries key the profile
+    does not read was dropped as well: with the LBM2 under any key but lbm_path, the official LBM2 was the tier,
+    and the plan ready once it was downloaded, while a campaign pinned and recorded the LBM2 the key named.
     """
     libraries = answers.get("libraries") or {}
     problems: list[str] = []
+    for key in sorted(set(libraries) - TIERED_LIBRARY_KEYS - {"text_paths"}):
+        problems.append(
+            f"tiered_lipid_msp does not read libraries.{key}, so it would be left out of the run without a word; "
+            f"the profile reads {', '.join(sorted(TIERED_LIBRARY_KEYS))}. An LBM2 goes in lbm_path: without one "
+            "the lipid-rule tier is the official LBM library."
+        )
     for key in sorted(set(dict(answers.get("workflow_overrides") or {})) & TIERED_LIBRARY_STATE_KEYS):
         problems.append(
             f"workflow_overrides.{key} would replace what the tiered_lipid_msp profile sets from libraries, after "

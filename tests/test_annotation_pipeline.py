@@ -558,7 +558,65 @@ class GivenLbmPathTests(unittest.TestCase):
             "with library_strategy 'existing'.",
             plan["blockers"],
         )
+        self.assertEqual([], [item for item in plan["blockers"] if "does not read" in item])
         self.assertEqual([], plan["workflow"]["text_annotators"])
+
+    def test_a_libraries_key_the_profile_does_not_read_is_refused_rather_than_left_out(self) -> None:
+        # Only libraries.lbm_path names the lipid-rule tier's LBM2. Under another key, lbm_annotator's
+        # lbm_file_path among them, the plan took the official LBM2 and was ready once it was downloaded, while a
+        # campaign, which resolves a library reference under any key, pinned and recorded the one the key named.
+        official = self.libraries / "synthetic-official.lbm2"
+        official.write_bytes(b"synthetic official LBM2 library")
+        downloaded = [{
+            "id": "lipidomics", "kind": "lbm", "downloaded": True, "local_path": str(official),
+            "record_id": 1, "record_url": "https://example.org/records/1", "doi": "", "license": "CC BY 4.0",
+        }]
+        read = (
+            "the profile reads lbm_doi, lbm_license, lbm_path, lbm_source, lbm_version, msp_doi, msp_license, "
+            "msp_paths, msp_source, msp_version. An LBM2 goes in lbm_path: without one the lipid-rule tier is the "
+            "official LBM library."
+        )
+        for key, value in (
+            ("lbm_file_path", str(self.lbm)),
+            ("lbm", str(self.lbm)),
+            ("lbm_paths", [str(self.lbm)]),
+            ("msp_path", str(self.msp)),
+            ("lbm_file_path", ""),
+        ):
+            for given in (False, True):
+                with self.subTest(key=key, value=value, lbm_path=given):
+                    answers = self.answers(**{key: value})
+                    if not given:
+                        del answers["libraries"]["lbm_path"]
+                    with patch("msdial_app.agent_workflow.catalog_status", return_value=downloaded):
+                        plan = build_guided_plan(str(self.data), answers)
+
+                    self.assertFalse(plan["ready_to_prepare"])
+                    self.assertEqual(
+                        [
+                            f"tiered_lipid_msp does not read libraries.{key}, so it would be left out of the run "
+                            f"without a word; {read}"
+                        ],
+                        [item for item in plan["blockers"] if "does not read" in item],
+                    )
+
+        # Every key the profile reads still plans, and reaches the record.
+        plan = self.plan(self.answers(
+            lbm_version="synthetic-1", lbm_source="synthetic source", lbm_doi="10.0000/synthetic.lbm",
+            lbm_license="synthetic licence", msp_source="synthetic MSP source", msp_doi="10.0000/synthetic.msp",
+            msp_license="synthetic MSP licence",
+        ))
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        self.assertEqual(
+            [
+                ("synthetic-1", "synthetic source", "10.0000/synthetic.lbm", "synthetic licence"),
+                ("VS-test", "synthetic MSP source", "10.0000/synthetic.msp", "synthetic MSP licence"),
+            ],
+            [
+                (item["version"], item["source"], item["doi"], item["license"])
+                for item in plan["workflow"]["library_provenance"]
+            ],
+        )
 
     def test_without_an_lbm_path_the_official_lbm2_is_still_asked_for(self) -> None:
         answers = self.answers()

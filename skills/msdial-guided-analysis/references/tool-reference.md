@@ -131,6 +131,10 @@ dropped. So is a `workflow_overrides` key that names or records a library
 (`lbm_path`, `lbm_annotator`, `msp_path`, `msp_annotators`, `text_db_path`,
 `text_annotators`, `library_provenance` or `annotation_pipeline_profile`): overrides
 reach the run after the profile, so one would load a library the records do not name.
+A `libraries` key the profile does not read is a blocker too: it reads `msp_paths` and
+`lbm_path`, with `msp_version`, `msp_source`, `msp_doi`, `msp_license` and their `lbm_`
+counterparts, so an LBM2 given under another key, such as `lbm_file_path`, cannot leave
+the official LBM as the tier while the records name the given one.
 The lipid-rule tier loads `libraries.lbm_path` when it is given, and the
 official versioned LBM catalog entry only when it is not:
 
