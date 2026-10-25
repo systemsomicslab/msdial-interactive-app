@@ -478,7 +478,9 @@ class GivenLbmPathTests(unittest.TestCase):
 
     def test_a_large_lbm2_is_recorded_by_the_sha256_the_plan_reads_not_the_one_cached_for_it(self) -> None:
         # A digest cached for content the file no longer holds, at the same size and time, shows which one the
-        # record takes: the plan reads the LBM2 through and records what it read.
+        # records take: the plan reads the LBM2 through and records what it read. The run manifest and the shared
+        # library identities take file_identity's digest, so they named the cached content while
+        # library_provenance named the content read; the plan now stores what it read where file_identity looks.
         lbm = self.libraries / "synthetic-large.lbm2"
         cached = write_synthetic_lbm2(lbm, LARGE_LIBRARY_BYTES)
         with tempfile.TemporaryDirectory() as user_data:
@@ -490,14 +492,28 @@ class GivenLbmPathTests(unittest.TestCase):
                 os.utime(lbm, ns=(stat.st_atime_ns, stat.st_mtime_ns))
                 self.assertEqual(cached, file_identity(lbm)["sha256"])
                 plan = self.plan(self.answers(lbm_path=str(lbm)))
+                self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+                workflow = plan["workflow"]
+                prepared = prepare_run(workflow)
+                # The identities a repository unit's run manifest, its finalisation and its reports name libraries
+                # by (workflow._manifest_libraries, run_finalisation).
+                identities = [library.identity for library in library_records(workflow)]
+                identified = file_identity(lbm)["sha256"]
 
         digest = hashlib.sha256(lbm.read_bytes()).hexdigest()
         self.assertNotEqual(cached, digest)
-        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
         self.assertEqual(
             (LARGE_LIBRARY_BYTES, digest),
-            tuple(plan["workflow"]["library_provenance"][0][key] for key in ("size_bytes", "sha256")),
+            tuple(workflow["library_provenance"][0][key] for key in ("size_bytes", "sha256")),
         )
+        settings = json.loads(Path(prepared["settings_file"]).read_text(encoding="utf-8"))
+        manifest = json.loads(Path(prepared["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(digest, settings["library_provenance"][0]["sha256"])
+        self.assertEqual(
+            [digest], [item["sha256"] for item in manifest["libraries"] if item["path"].endswith(".lbm2")]
+        )
+        self.assertEqual([digest], [item["sha256"] for item in identities if item["role"] == "lbm"])
+        self.assertEqual(digest, identified)
 
     def test_a_workflow_override_of_a_library_is_refused_rather_than_run_unchecked(self) -> None:
         # workflow_overrides reach the state after the profile, so an lbm_path there was the LBM2 method.txt
@@ -617,6 +633,72 @@ class GivenLbmPathTests(unittest.TestCase):
                 for item in plan["workflow"]["library_provenance"]
             ],
         )
+
+    def test_an_answers_key_the_plan_does_not_apply_is_refused_rather_than_left_out(self) -> None:
+        # An LBM2 given beside libraries rather than in it, as a profile's by_ion_mode.Positive.lbm_path is once a
+        # campaign merges it into the answers, was only the warning "Unknown answers key was not applied": the plan
+        # took the official LBM2 and was ready once it was downloaded, while the campaign pinned and recorded the
+        # LBM2 the key named.
+        official = self.libraries / "synthetic-official.lbm2"
+        official.write_bytes(b"synthetic official LBM2 library")
+        downloaded = [{
+            "id": "lipidomics", "kind": "lbm", "downloaded": True, "local_path": str(official),
+            "record_id": 1, "record_url": "https://example.org/records/1", "doi": "", "license": "CC BY 4.0",
+        }]
+        for key, value in (
+            ("lbm_path", str(self.lbm)),
+            ("lbm_file_path", str(self.lbm)),
+            ("msp_paths", [str(self.msp)]),
+            ("number_of_thread", 2),
+        ):
+            for given in (False, True):
+                with self.subTest(key=key, lbm_path=given):
+                    answers = self.answers()
+                    answers[key] = value
+                    if not given:
+                        del answers["libraries"]["lbm_path"]
+                    with patch("msdial_app.agent_workflow.catalog_status", return_value=downloaded):
+                        plan = build_guided_plan(str(self.data), answers)
+
+                    self.assertFalse(plan["ready_to_prepare"])
+                    self.assertEqual(
+                        [
+                            f"tiered_lipid_msp does not read answers.{key}, so it would be left out of the run "
+                            "without a word. A library goes in libraries, an LBM2 in libraries.lbm_path: without "
+                            "one the lipid-rule tier is the official LBM library."
+                        ],
+                        [item for item in plan["blockers"] if "does not read answers." in item],
+                    )
+                    self.assertIn(f"Unknown answers key was not applied: {key}", plan["warnings"])
+
+        # A provenance answer naming an LBM2 is replaced by the one the profile measures from libraries.
+        for given in (False, True):
+            with self.subTest("library_provenance", lbm_path=given):
+                answers = self.answers()
+                answers["library_provenance"] = [{"path": str(self.lbm), "version": "synthetic-1"}]
+                if not given:
+                    del answers["libraries"]["lbm_path"]
+                with patch("msdial_app.agent_workflow.catalog_status", return_value=downloaded):
+                    plan = build_guided_plan(str(self.data), answers)
+
+                self.assertFalse(plan["ready_to_prepare"])
+                self.assertIn(
+                    "tiered_lipid_msp records the libraries it loads from libraries, measured from the files, and "
+                    "does not read answers.library_provenance, so it would be left out of the run without a word. "
+                    "Give lbm_version, lbm_source, lbm_doi and lbm_license, and their msp_ counterparts, in "
+                    "libraries.",
+                    plan["blockers"],
+                )
+
+        # The other library strategies still apply what they read and only warn of the rest.
+        answers = self.answers(lbm_path=str(self.lbm))
+        answers.update(
+            {"library_strategy": "existing", "target_omics": "Metabolomics", "lbm_file_path": str(official)}
+        )
+        plan = self.plan(answers)
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        self.assertIn("Unknown answers key was not applied: lbm_file_path", plan["warnings"])
+        self.assertEqual(str(self.lbm), plan["workflow"]["lbm_path"])
 
     def test_without_an_lbm_path_the_official_lbm2_is_still_asked_for(self) -> None:
         answers = self.answers()

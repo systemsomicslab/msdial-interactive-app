@@ -7,14 +7,23 @@ the binary that ran or the 700 MB library it annotated against.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from msdial_app.agent_workflow import build_guided_plan
-from msdial_app.workflow import file_identity, prepare_run
+from msdial_app.workflow import (
+    IDENTITY_CACHE_MIN_BYTES,
+    file_identity,
+    prepare_run,
+    remember_file_digest,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "resources" / "msdial_console_param4lipidomics.txt"
@@ -48,6 +57,40 @@ class FileIdentityTests(unittest.TestCase):
         identity = file_identity(self.root / "gone.lbm2")
         self.assertEqual("", identity["sha256"])
         self.assertEqual("unreadable", identity["identity_error"])
+
+    def test_a_digest_read_through_replaces_the_cached_one_unless_the_file_changed(self) -> None:
+        # A large file is answered from the digest cached against its size and time, so
+        # content rewritten at the same size and time kept the old digest. A caller that
+        # read the file through stores what it read, unless the file changed meanwhile.
+        path = self.root / "large.lbm2"
+        with path.open("wb") as handle:
+            handle.write(b"one")
+            handle.truncate(IDENTITY_CACHE_MIN_BYTES)
+        with tempfile.TemporaryDirectory() as user_data, patch(
+            "msdial_app.workflow.user_data_directory", return_value=Path(user_data)
+        ):
+            cached = file_identity(path)["sha256"]
+            stat = path.stat()
+            with path.open("r+b") as handle:
+                handle.write(b"two")
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            self.assertEqual(cached, file_identity(path)["sha256"])
+            read = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertNotEqual(cached, read)
+
+            # Its time before the read differs from its time after: it changed meanwhile.
+            changed = SimpleNamespace(st_size=stat.st_size, st_mtime_ns=stat.st_mtime_ns - 1)
+            remember_file_digest(path, read, changed)
+            self.assertEqual(cached, file_identity(path)["sha256"])
+            remember_file_digest(path, read, stat)
+            self.assertEqual(read, file_identity(path)["sha256"])
+
+            # A smaller file is hashed every time, so nothing is stored for it.
+            small = self.root / "small.lbm2"
+            small.write_bytes(b"small library")
+            remember_file_digest(small, "0" * 64, small.stat())
+            cache = (Path(user_data) / "file-identity-cache.json").read_text(encoding="utf-8")
+            self.assertNotIn("0" * 64, cache)
 
 
 class ManifestProvenanceTests(unittest.TestCase):

@@ -28,6 +28,7 @@ from .workflow import (
     read_adducts,
     read_analysis_csv,
     read_lipid_queries,
+    remember_file_digest,
     validate_workflow,
 )
 from .worksets import LAB_LIPIDOMICS_WORKSET_KIND, describe_workset_candidate, get_workset
@@ -1628,7 +1629,7 @@ def _tiered_lbm_path(answers: dict[str, Any]) -> str:
 
 
 def _tiered_library_problems(answers: dict[str, Any]) -> list[str]:
-    """What the tiered profile refuses in its libraries answer, before it would run without a word.
+    """What the tiered profile refuses in its answers, before it would run without a word.
 
     The profile searches one MSP in both of its tiers, so a second msp_paths entry was left out of the run; it
     searches no text library, so text_paths was left out too; and the Console skips an LBM library it cannot
@@ -1636,10 +1637,26 @@ def _tiered_library_problems(answers: dict[str, Any]) -> list[str]:
     the state after the profile, so an lbm_path there was the LBM2 the Console loaded, unchecked, while
     lbm_annotator, library_provenance and every record named the one checked here. A libraries key the profile
     does not read was dropped as well: with the LBM2 under any key but lbm_path, the official LBM2 was the tier,
-    and the plan ready once it was downloaded, while a campaign pinned and recorded the LBM2 the key named.
+    and the plan ready once it was downloaded, while a campaign pinned and recorded the LBM2 the key named. So
+    was an answers key the plan does not apply, which the other strategies only warn of: an LBM2 given beside
+    libraries rather than in it, as a profile's by_ion_mode.<mode>.lbm_path is once a campaign merges it into
+    the answers and pins it, left the official LBM2 as the tier in the same way. answers.library_provenance is
+    refused too, since this profile replaces it with the provenance it measures from libraries.
     """
     libraries = answers.get("libraries") or {}
     problems: list[str] = []
+    for key in sorted(set(answers) - SUPPORTED_ANSWER_KEYS):
+        problems.append(
+            f"tiered_lipid_msp does not read answers.{key}, so it would be left out of the run without a word. A "
+            "library goes in libraries, an LBM2 in libraries.lbm_path: without one the lipid-rule tier is the "
+            "official LBM library."
+        )
+    if "library_provenance" in answers:
+        problems.append(
+            "tiered_lipid_msp records the libraries it loads from libraries, measured from the files, and does not "
+            "read answers.library_provenance, so it would be left out of the run without a word. Give "
+            "lbm_version, lbm_source, lbm_doi and lbm_license, and their msp_ counterparts, in libraries."
+        )
     for key in sorted(set(libraries) - TIERED_LIBRARY_KEYS - {"text_paths"}):
         problems.append(
             f"tiered_lipid_msp does not read libraries.{key}, so it would be left out of the run without a word; "
@@ -1690,16 +1707,22 @@ def _lbm_identity(path: str | Path) -> tuple[dict[str, Any] | None, str]:
     reading the file. A check that took that digest read the LBM2's first byte only, so one failing past it
     planned as ready, and was recorded by its sha256, once a plan or a prepared run had cached it. A plan reads
     the LBM2 twice, for its check and for its record.
+
+    The digest read here replaces the one file_identity cached for the file (workflow.remember_file_digest).
+    The run manifest's libraries and the shared library identities take file_identity's digest, so with one
+    cached for content the file held at the same size and time they named that content, while
+    library_provenance named what was read here.
     """
     from .lab_lipidomics import file_sha256
 
     file = Path(path).expanduser()
     try:
-        size = file.stat().st_size
+        read_from = file.stat()
         sha256 = file_sha256(file)
     except OSError as error:
         return None, str(error.strerror or error)
-    return {"name": file.name, "size_bytes": size, "sha256": sha256}, ""
+    remember_file_digest(file, sha256, read_from)
+    return {"name": file.name, "size_bytes": read_from.st_size, "sha256": sha256}, ""
 
 
 def _given_lbm_provenance(path: str, libraries: dict[str, Any]) -> dict[str, Any]:
