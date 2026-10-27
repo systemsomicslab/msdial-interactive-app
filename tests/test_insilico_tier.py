@@ -28,16 +28,26 @@ from msdial_app.annotation_pipeline import (
     TIERED_LCMS_PROFILE_ID,
     tiered_lcms_annotation,
 )
-from msdial_app.lab_lcms_metabolomics import PRESETS, THRESHOLDS
+from msdial_app.lab_lcms_metabolomics import (
+    PRESETS,
+    THRESHOLDS,
+    annotation_summary,
+    annotator_settings,
+    apply_annotators,
+    precursor_plus_1008_census,
+    read_annotation,
+)
 from msdial_app.library_copy_store import library_names
-from msdial_app.lipid_rt_check import console_summary, read_setting
+from msdial_app.lipid_rt_check import console_summary, method_record, read_setting, template_setting
 from msdial_app.materials_methods import generate_publication_report
-from msdial_app.run_finalisation import lipid_rt_check_outcome
+from msdial_app.run_finalisation import finalise_console_run, lipid_rt_check_outcome
 from msdial_app.sharing import library_records
 from msdial_app.workflow import (
+    DIAGNOSTIC_ANNOTATION_SKIPPED,
     LIBRARY_KIND_CONSOLE_MARKERS,
     LIPID_RT_CHECK_CONSOLE_MARKERS,
     MSP_SUGGESTIONS_CONSOLE_MARKERS,
+    _annotator_capability_issues,
     _write_msp_annotator_settings,
     _write_reproduction_files,
     console_capabilities,
@@ -49,6 +59,16 @@ from msdial_app.workflow import (
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "resources" / "msdial_console_param4lipidomics.txt"
 ALL_MARKERS = (*LIBRARY_KIND_CONSOLE_MARKERS, *MSP_SUGGESTIONS_CONSOLE_MARKERS, *LIPID_RT_CHECK_CONSOLE_MARKERS)
+LIPID_RT_KEYS = (
+    "Lipid RT check", "Lipid RT check operating point", "Lipid RT check chromatography",
+    "Lipid RT check plausibility profile", "Lipid RT check class-level matches", "Lipid RT check minor duplicates",
+    "Lipid RT check secondary-only features",
+)
+RT_SUMMARY = (
+    "Lipid RT check (alignment): 12 annotated, 9 evaluable: 4 Confirmed, 5 NotEvaluable, 0 Inconsistent; "
+    "Confirmed tags set 4 (already tagged 0, Misannotation 0, suppressed 0, earlier ones withdrawn 0); "
+    "rules 1.0, parameter 1a2b3c4d."
+)
 
 
 def method_lines(path: str | Path) -> dict[str, str]:
@@ -58,6 +78,15 @@ def method_lines(path: str | Path) -> dict[str, str]:
             key, _, value = line.partition(":")
             lines[key.strip()] = value.strip()
     return lines
+
+
+def write_review(prepared: dict, name: str = "AlignResult-2026_lipidrt_review.tsv", rows: str = "") -> Path:
+    """A review list as the Console writes one, dated after the run's method file."""
+    review = Path(prepared["run_directory"]) / name
+    review.write_text("ID\tName\n" + rows, encoding="utf-8")
+    method_time = Path(prepared["method_file"]).stat().st_mtime
+    os.utime(review, (method_time + 5, method_time + 5))
+    return review
 
 
 def fake_console(path: Path, markers=ALL_MARKERS) -> Path:
@@ -406,6 +435,278 @@ class InSilicoPlanTests(unittest.TestCase):
         )["methods_text"]
         self.assertIn(f"{review.name} (SHA-256 {hashlib.sha256(review.read_bytes()).hexdigest()}; 0 rows)", text)
         self.assertNotIn("did not run", text)
+
+    def test_a_run_that_neither_set_nor_ran_the_lipid_rt_check_claims_nothing_of_it(self) -> None:
+        # A Lipidomics project with no lipid_rt_check answer: nothing here knows what the Console does by
+        # default, and a Console from before MsdialWorkbench#832 has no check at all.
+        answers = self.answers()
+        del answers["lipid_rt_check"]
+        prepared = self.prepare(self.plan(answers)["workflow"])
+        self.assertFalse(set(LIPID_RT_KEYS) & set(method_lines(prepared["method_file"])))
+        manifest = json.loads(Path(prepared["manifest"]).read_text(encoding="utf-8"))
+        self.assertIsNone(manifest["lipid_rt_check"]["setting"])
+        self.assertFalse(manifest["lipid_rt_check"]["written_to_method_file"])
+        self.assertNotIn("Lipidomics project", manifest["lipid_rt_check"]["reason"])
+        self.assertNotIn("defaults apply", method_record(None, None)["reason"])
+        settings = json.loads(Path(prepared["settings_file"]).read_text(encoding="utf-8"))
+
+        report = generate_publication_report(
+            settings, None, prepared["run_directory"], app_version=__version__, console_version="test",
+        )
+        self.assertNotIn("lipid retention-time order check", report["methods_text"])
+        self.assertNotIn("Lipid RT check", Path(report["supplementary_table"]).read_text(encoding="utf-8"))
+
+        # Not set, yet a review list shows the Console ran it: at its own defaults, whatever they are.
+        write_review(prepared)
+        text = generate_publication_report(
+            settings, None, prepared["run_directory"], app_version=__version__, console_version="test",
+        )["methods_text"]
+        self.assertIn("was not set by this run and ran at the MS-DIAL Console's own defaults", text)
+        self.assertNotIn("which run it", text)
+
+    def test_a_setting_asked_for_but_not_written_says_so(self) -> None:
+        prepared = self.prepare(self.plan(self.answers())["workflow"])
+        settings = json.loads(Path(prepared["settings_file"]).read_text(encoding="utf-8"))
+        settings["lipid_rt_check_method"] = method_record(settings["lipid_rt_check"], None)
+        text = generate_publication_report(
+            settings, None, prepared["run_directory"], app_version=__version__, console_version="test",
+        )["methods_text"]
+        self.assertIn(
+            "was asked for, but no setting of it was written to the method file (no Console to probe, so no key "
+            "was written). No review list was written, so the check did not run.",
+            text,
+        )
+        self.assertNotIn("defaults", text[text.index("lipid retention-time order check"):])
+
+    def test_a_templates_lipid_rt_check_lines_are_the_setting_it_writes_and_records(self) -> None:
+        self.assertEqual(
+            {"lipid_rt_check": read_setting({"mode": "False", "operating_point": "Balanced"})[0]},
+            template_setting({"lipid rt check": "False", "lipid rt check operating point": "balanced"}),
+        )
+        self.assertEqual({}, template_setting({"minimum peak height": "1000"}))
+        template = self.root / "console-template.txt"
+        base = TEMPLATE.read_text(encoding="utf-8-sig")
+        template.write_text(
+            base + "\nLipid RT check: False\nLipid RT check operating point: balanced\n", encoding="utf-8"
+        )
+        answers = {**self.answers(), "template_path": str(template)}
+        del answers["lipid_rt_check"]
+        plan = self.plan(answers)
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        workflow = plan["workflow"]
+        self.assertEqual(("False", "Balanced", "Auto"), (
+            workflow["lipid_rt_check"]["mode"], workflow["lipid_rt_check"]["operating_point"],
+            workflow["lipid_rt_check"]["chromatography"],
+        ))
+        prepared = self.prepare(workflow)
+        text = Path(prepared["method_file"]).read_text(encoding="utf-8")
+        for key in LIPID_RT_KEYS:
+            self.assertEqual(1, sum(1 for line in text.splitlines() if line.split(":")[0].strip() == key), key)
+        lines = method_lines(prepared["method_file"])
+        self.assertEqual(("False", "Balanced"), (lines["Lipid RT check"], lines["Lipid RT check operating point"]))
+        manifest = json.loads(Path(prepared["manifest"]).read_text(encoding="utf-8"))
+        self.assertTrue(manifest["lipid_rt_check"]["written_to_method_file"])
+        self.assertEqual(workflow["lipid_rt_check"], manifest["lipid_rt_check"]["setting"])
+        settings = json.loads(Path(prepared["settings_file"]).read_text(encoding="utf-8"))
+        text = generate_publication_report(
+            settings, None, prepared["run_directory"], app_version=__version__, console_version="test",
+        )["methods_text"]
+        self.assertIn("mode False; operating point Balanced", text)
+
+        # An answer replaces the template's lines.
+        prepared = self.prepare(self.plan({**answers, "lipid_rt_check": {"mode": "auto"}})["workflow"])
+        lines = method_lines(prepared["method_file"])
+        self.assertEqual(("Auto", "HighPrecision"), (lines["Lipid RT check"], lines["Lipid RT check operating point"]))
+
+        # A state without the setting never copies the template's lines through.
+        bare = dict(workflow)
+        del bare["lipid_rt_check"]
+        prepared = self.prepare(bare)
+        self.assertFalse(set(LIPID_RT_KEYS) & set(method_lines(prepared["method_file"])))
+        self.assertIsNone(json.loads(Path(prepared["manifest"]).read_text(encoding="utf-8"))["lipid_rt_check"]["setting"])
+
+        # On a Console without the check the template's lines are refused, as the answer is.
+        fake_console(self.console, (*LIBRARY_KIND_CONSOLE_MARKERS, *MSP_SUGGESTIONS_CONSOLE_MARKERS))
+        plan = self.plan(answers)
+        self.assertTrue(any("the parameter template's Lipid RT check lines" in item for item in plan["blockers"]),
+                        plan["blockers"])
+        # A template value the Console would refuse is refused, never left to run the default unrecorded.
+        fake_console(self.console)
+        template.write_text(base + "\nLipid RT check operating point: Fast\n", encoding="utf-8")
+        plan = self.plan(answers)
+        self.assertTrue(
+            any("The parameter template's 'Lipid RT check operating point' is 'Fast'" in item
+                for item in plan["blockers"]),
+            plan["blockers"],
+        )
+        plan = self.plan({**answers, "lipid_rt_check": "Auto"})
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+
+    def test_the_methods_say_when_an_in_silico_annotator_used_retention_time(self) -> None:
+        prepared = self.prepare(self.plan(self.answers())["workflow"])
+        settings = json.loads(Path(prepared["settings_file"]).read_text(encoding="utf-8"))
+        settings["msp_annotators"][-1]["use_rt_scoring"] = True
+        text = generate_publication_report(
+            settings, None, prepared["run_directory"], app_version=__version__, console_version="test",
+        )["methods_text"]
+        self.assertIn("every in-silico annotator was also searched with retention time", text)
+        self.assertNotIn("carries no retention time", text)
+        # The ranking holds whatever the priority: MS-DIAL compares Rank before Priority.
+        self.assertIn("an in-silico name is reported only where neither is accepted", text)
+        settings["msp_annotators"].append(
+            {**settings["msp_annotators"][-1], "annotator_id": "second", "use_rt_scoring": "false"}
+        )
+        text = generate_publication_report(
+            settings, None, prepared["run_directory"], app_version=__version__, console_version="test",
+        )["methods_text"]
+        self.assertIn("1 of the 2 in-silico annotators were also searched with retention time", text)
+
+    def test_the_peak_removal_is_checked_against_the_run_and_the_file(self) -> None:
+        # Stated for a positive-mode run, whose file has no such artefact.
+        positive = self.libraries / "Synthetic-InSilico_pos_allCE.msp"
+        positive.write_text("NAME: C\nPRECURSORMZ: 200\n", encoding="ascii")
+        plan = self.plan({**self.answers(in_silico_msp_paths=[str(positive)]), "ion_mode": "Positive"})
+        self.assertTrue(any("for a positive-mode run" in item for item in plan["blockers"]), plan["blockers"])
+        plan = self.plan({**self.answers(in_silico_msp_paths=[str(positive)], in_silico_msp_preprocessing=[]),
+                          "ion_mode": "Positive"})
+        self.assertFalse(any("in_silico" in item for item in plan["blockers"]), plan["blockers"])
+
+        # A file that still carries the peak at a record's precursor m/z + 1.008 has not had it removed.
+        self.in_silico.write_text(
+            "NAME: B\nPRECURSORMZ: 300.1\nNum Peaks: 2\n150.05\t10\n301.108\t5\n\n"
+            "NAME: C\nPRECURSORMZ: 250\nNum Peaks: 3\n120 10; 251.007 3\n249.992 1\n\n"
+            "NAME: D\nPRECURSORMZ: 400\nNum Peaks: 3\n401.0034 4\n398.992 2\n200 10\n",
+            encoding="ascii",
+        )
+        self.assertEqual({"records": 3, "with_precursor_plus_1008_peak": 2}, precursor_plus_1008_census(self.in_silico))
+        plan = self.plan(self.answers())
+        self.assertTrue(
+            any("2 of the 3 records in Synthetic-InSilico_neg_allCE.msp still carry a peak" in item
+                for item in plan["blockers"]),
+            plan["blockers"],
+        )
+        # Without the step the same file plans: nothing is claimed of it.
+        plan = self.plan(self.answers(in_silico_msp_preprocessing=[]))
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        # With the peak removed it plans. An isotope-like +1.003 peak and the H losses below the precursor are
+        # not the artefact.
+        self.in_silico.write_text(
+            "NAME: B\nPRECURSORMZ: 300.1\nNum Peaks: 1\n150.05\t10\n\n"
+            "NAME: D\nPRECURSORMZ: 400\nNum Peaks: 3\n401.0034 4\n398.992 2\n200 10\n",
+            encoding="ascii",
+        )
+        self.assertEqual({"records": 2, "with_precursor_plus_1008_peak": 0}, precursor_plus_1008_census(self.in_silico))
+        plan = self.plan(self.answers())
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+
+    def test_what_else_the_in_silico_and_lipid_rt_answers_refuse(self) -> None:
+        empty = self.libraries / "Empty-InSilico_neg.msp"
+        empty.write_bytes(b"")
+        without_paths = self.answers()
+        del without_paths["libraries"]["in_silico_msp_paths"]
+        for answers, message in (
+            (self.answers(in_silico_msp_paths=[str(empty)], in_silico_msp_preprocessing=[]),
+             "libraries.in_silico_msp_paths: Empty-InSilico_neg.msp is empty."),
+            (without_paths, "libraries.in_silico_msp_preprocessing is given without libraries.in_silico_msp_paths."),
+            ({**self.answers(), "project_type": "gcms"}, "a GC-MS run has no lipid RT check"),
+        ):
+            with self.subTest(message=message):
+                plan = self.plan(answers)
+                self.assertFalse(plan["ready_to_prepare"])
+                self.assertTrue(any(message in item for item in plan["blockers"]), plan["blockers"])
+        answers = self.answers()
+        answers["library_strategy"] = "existing"
+        plan = self.plan(answers)
+        self.assertTrue(
+            any("Use 'tiered_lipid_msp' for the GLACIER tier" in item and "without the GLACIER evidence tier" in item
+                for item in plan["blockers"]),
+            plan["blockers"],
+        )
+
+    def test_a_peak_count_diagnostic_is_not_refused_for_what_it_does_not_load(self) -> None:
+        fake_console(self.console, ())
+        state = {
+            "project_type": "lcms", "console_path": str(self.console),
+            "msp_annotators": [{"annotator_id": "msp_in_silico", "msp_file_path": str(self.in_silico),
+                                "library_kind": "predicted", "suggestions": False}],
+            "lipid_rt_check": read_setting("Auto")[0],
+        }
+        with patch("msdial_app.workflow.subprocess.run", side_effect=OSError("not a Console")):
+            self.assertEqual(3, len(_annotator_capability_issues(state, "lcms")))
+            state["diagnostic_annotation"] = {"status": DIAGNOSTIC_ANNOTATION_SKIPPED}
+            self.assertEqual([], _annotator_capability_issues(state, "lcms"))
+
+    def test_the_supplementary_table_names_each_librarys_kind(self) -> None:
+        prepared = self.prepare(self.plan(self.answers())["workflow"])
+        settings = json.loads(Path(prepared["settings_file"]).read_text(encoding="utf-8"))
+        report = generate_publication_report(
+            settings, None, prepared["run_directory"], app_version=__version__, console_version="test",
+        )
+        with Path(report["supplementary_table"]).open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle, delimiter="\t"))
+        identity = {
+            row["Record"]: row["Value"] for row in rows
+            if row["Section"] == "Library identity" and row["Parameter"] == "library_kind"
+        }
+        self.assertEqual({self.msp.name: "acquired", self.in_silico.name: "predicted"}, identity)
+
+    def test_the_finalised_run_records_the_check_and_the_methods_read_its_rule_version(self) -> None:
+        prepared = self.prepare(self.plan(self.answers())["workflow"])
+        unit_manifest = self.root / "unit" / "provenance" / "run-manifest.json"
+        unit_manifest.parent.mkdir(parents=True)
+        unit_manifest.write_text(json.dumps({
+            "schema": "msdial-public-reanalysis-run.v1", "output_directory": prepared["run_directory"],
+        }), encoding="utf-8")
+        review = write_review(prepared, rows="1\tPC 34:1\n")
+        logged: list[str] = []
+
+        record = finalise_console_run(
+            "run1", {**prepared, "repository_run_manifest": str(unit_manifest)}, {}, 0, {}, logged.append,
+            console_lines=["[12:00] other", RT_SUMMARY],
+        )
+
+        self.assertEqual(("1.0", "1a2b3c4d", True), (
+            record["lipid_rt_check"]["rule_version"], record["lipid_rt_check"]["parameter_hash"],
+            record["lipid_rt_check"]["ran"],
+        ))
+        written = json.loads(unit_manifest.read_text(encoding="utf-8"))["console_run_finalisation"]["lipid_rt_check"]
+        self.assertEqual("1.0", written["rule_version"])
+        self.assertEqual([{"name": review.name, "sha256": hashlib.sha256(review.read_bytes()).hexdigest(), "rows": 1}],
+                         written["review_files"])
+        self.assertTrue(any(line.startswith("Lipid RT check: review list") and "rules 1.0" in line for line in logged))
+
+        settings = json.loads(Path(prepared["settings_file"]).read_text(encoding="utf-8"))
+        settings["repository_run_manifest"] = str(unit_manifest)
+        text = generate_publication_report(
+            settings, None, prepared["run_directory"], app_version=__version__, console_version="test",
+        )["methods_text"]
+        self.assertIn("The lipid retention-time order check of MS-DIAL (rules 1.0), which tags", text)
+
+    def test_the_laboratory_campaign_presets_in_silico_slot_names_nothing_from_a_precursor_alone(self) -> None:
+        self.assertIs(False, next(entry for entry in PRESETS["campaign"] if entry["id"] == "in_silico")["suggestions"])
+        read = read_annotation(
+            {"preset": "campaign",
+             "libraries": {"lbm": str(self.lbm), "msp": str(self.msp), "in_silico": str(self.in_silico)}},
+            ["Negative"],
+        )
+        self.assertEqual([], read["blockers"])
+        self.assertEqual([None, True, True, False], [item["suggestions"] for item in annotation_summary(read["entries"])])
+        state: dict = {"project_type": "lcms"}
+        apply_annotators(state, annotator_settings(read["entries"], "Negative")["annotators"])
+        rows = state["msp_annotators"]
+        self.assertEqual(["acquired", "acquired", "predicted"], [row["library_kind"] for row in rows])
+        self.assertEqual([None, None, False], [row.get("suggestions") for row in rows])
+        self.assertEqual(THRESHOLDS["in_silico"], {key: rows[-1][key] for key in THRESHOLDS["in_silico"]})
+        path = _write_msp_annotator_settings(self.root, state)
+        with path.open(encoding="ascii", newline="") as handle:
+            self.assertEqual(["True", "True", "False"],
+                             [row["suggestions"] for row in csv.DictReader(handle, delimiter="\t")])
+        # On a Console without the per-annotator switch the run is refused, as the campaign's tier is.
+        fake_console(self.console, (*LIBRARY_KIND_CONSOLE_MARKERS, *LIPID_RT_CHECK_CONSOLE_MARKERS))
+        state["console_path"] = str(self.console)
+        with patch("msdial_app.workflow.subprocess.run", side_effect=OSError("not a Console")):
+            issues = _annotator_capability_issues(state, "lcms")
+        self.assertTrue(any("no per-annotator suggestions switch" in issue["message"] for issue in issues), issues)
 
     def test_the_data_mining_handoff_names_each_tier_by_library_name_and_sha256(self) -> None:
         plan = self.plan(self.answers())

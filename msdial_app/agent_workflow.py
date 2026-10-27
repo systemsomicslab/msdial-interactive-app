@@ -337,8 +337,10 @@ def build_guided_plan(
     ):
         blockers.append(
             "libraries.in_silico_msp_paths is searched only by library_strategy 'tiered_lipid_msp'; with "
-            f"'{merged.get('library_strategy') or 'none'}' it would be left out of the run without a word. List an "
-            "in-silico library with library_strategy 'annotators' and library_kind 'predicted' instead."
+            f"'{merged.get('library_strategy') or 'none'}' it would be left out of the run without a word. Use "
+            "'tiered_lipid_msp' for the GLACIER tier. library_strategy 'annotators' searches an in-silico library "
+            "with library_kind 'predicted' (and suggestions false, to name nothing from a bare precursor mass), "
+            "but under its own label, without the GLACIER evidence tier, citation or preprocessing record."
         )
     if merged.get("library_strategy") == "tiered_lipid_msp":
         blockers.extend(_tiered_library_problems(merged))
@@ -1163,10 +1165,15 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
     if project_type == "lcms":
         _apply_internal_standard_library(state, answers)
         # Every setting of the check, the ones the answer leaves out at the Console's defaults; a setting the
-        # plan refused is not applied (build_guided_plan blocks on it).
+        # plan refused is not applied (build_guided_plan blocks on it). An answer replaces the parameter
+        # template's own lines (load_parameter_template), refused ones too.
         lipid_rt_setting, _ = read_lipid_rt_check_setting(answers.get("lipid_rt_check"))
         if lipid_rt_setting:
             state["lipid_rt_check"] = lipid_rt_setting
+            state.pop("lipid_rt_check_template_problems", None)
+    else:
+        state.pop("lipid_rt_check", None)
+        state.pop("lipid_rt_check_template_problems", None)
     if answers.get("number_of_threads") is not None:
         state["number_of_threads"] = max(1, int(answers["number_of_threads"]))
     if answers.get("stage_inputs") is not None:
@@ -1753,7 +1760,8 @@ def _in_silico_library_problems(answers: dict[str, Any], msp_paths: list[str]) -
     search has no ion-mode or adduct filter, so a run must load its own polarity's in-silico file; a file whose
     name says the other polarity (a "pos" or "neg", "positive" or "negative" token, as the libraries are named)
     is refused, and one whose name says neither is taken as given. A preprocessing step must be one the
-    Materials and Methods can state (annotation_pipeline.IN_SILICO_PREPROCESSING_STEPS).
+    Materials and Methods can state (annotation_pipeline.IN_SILICO_PREPROCESSING_STEPS), and what it states of
+    the run and the file must hold (_in_silico_preprocessing_problems).
     """
     libraries = answers.get("libraries") or {}
     paths = _path_list(libraries.get("in_silico_msp_paths"))
@@ -1798,7 +1806,46 @@ def _in_silico_library_problems(answers: dict[str, Any], msp_paths: list[str]) -
             f"{ion_mode.lower()}; MS-DIAL's MSP search does not filter by ion mode, so give the {ion_mode.lower()} "
             "file."
         )
+    problems.extend(_in_silico_preprocessing_problems(path, steps, ion_mode or said))
     return problems
+
+
+def _in_silico_preprocessing_problems(path: Path, steps: list[str], ion_mode: str) -> list[str]:
+    """What a declared preprocessing step claims of the in-silico file that the run or the file contradicts.
+
+    The Materials and Methods state each step as done (annotation_pipeline.IN_SILICO_PREPROCESSING_STEPS), so
+    it is checked, not taken as given. The +1.008 peak is the negative-mode records' artefact (the author's
+    decision of 2026-10-25, Q6): a positive-mode run, by its ion mode or else its file's name, has none to
+    remove; and a file still carrying a peak at a record's precursor m/z + 1.008 has not had it removed
+    (lab_lcms_metabolomics.precursor_plus_1008_census, read once per file version).
+    """
+    step = "precursor_plus_1008_peak_removed"
+    if step not in steps:
+        return []
+    if ion_mode == "Positive":
+        return [
+            f"libraries.in_silico_msp_preprocessing names {step}, the negative-mode records' artefact, for a "
+            "positive-mode run; its file has no such peak to remove. Give the step for the negative-mode run only."
+        ]
+    if path.suffix.casefold() != ".msp" or not path.is_file() or path.stat().st_size == 0:
+        return []
+    from .lab_lcms_metabolomics import precursor_plus_1008_census
+
+    try:
+        census = precursor_plus_1008_census(path)
+    except OSError as error:
+        return [
+            f"libraries.in_silico_msp_preprocessing names {step}, but {path.name} cannot be read "
+            f"({error.strerror or error}) to check it. Plan again once it can."
+        ]
+    carrying = census["with_precursor_plus_1008_peak"]
+    if carrying:
+        return [
+            f"libraries.in_silico_msp_preprocessing names {step}, but {carrying} of the {census['records']} "
+            f"records in {path.name} still carry a peak at the precursor m/z + 1.008. Give the file with the peak "
+            "removed, or leave the step out."
+        ]
+    return []
 
 
 def _same_library_file(left: Path, right: Path) -> bool:
@@ -1823,7 +1870,8 @@ def _in_silico_provenance(path: str, libraries: dict[str, Any]) -> dict[str, Any
 
     Its name and sha256 are taken from the file where every library's are (sharing.library_records), and only
     they reach a shared record. preprocessing lists what was done to the file before use, by the ids of
-    annotation_pipeline.IN_SILICO_PREPROCESSING_STEPS, as libraries.in_silico_msp_preprocessing gives them.
+    annotation_pipeline.IN_SILICO_PREPROCESSING_STEPS, as libraries.in_silico_msp_preprocessing gives them and
+    the plan has checked them against the run and the file (_in_silico_preprocessing_problems).
     """
     steps = _path_list(libraries.get("in_silico_msp_preprocessing"))
     return {

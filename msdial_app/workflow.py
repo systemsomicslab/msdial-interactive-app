@@ -33,6 +33,7 @@ from .lipid_rt_check import (
     METHOD_TITLES as LIPID_RT_CHECK_METHOD_TITLES,
     method_record as lipid_rt_check_method_record,
     method_replacements as lipid_rt_check_method_replacements,
+    template_setting as lipid_rt_check_template_setting,
 )
 from .user_settings import load_user_settings, user_data_directory
 
@@ -1498,6 +1499,9 @@ def load_parameter_template(
             ],
         ),
         **_template_local_support_rt_window(values),
+        # A template's lipid RT check lines, as the setting they state, so the run writes and records them
+        # (lipid_rt_check.template_setting); an LC-MS project's only.
+        **(lipid_rt_check_template_setting(values) if project_type == "lcms" else {}),
         "export_folder_path": library_path("export folder path"),
         "height_matrix_export": boolean("height matrix export"),
         "solvent": value("solvent type", default="CH3COONH4"),
@@ -2062,11 +2066,16 @@ def _annotator_capability_issues(state: dict[str, Any], project_type: str) -> li
     acquired spectra and publishes every in-silico match as a reference-spectrum match. A row that turns its
     suggestions off needs the per-annotator switch: any other names a "no MS2:" or "low score:" suggestion from
     it, from a bare precursor mass. A lipid_rt_check setting needs a Console with the check, which an older one
-    does not have. With no Console to probe nothing is refused here; the run itself needs one. A peak-count
+    does not have. A parameter template's lipid RT check line the Console would refuse is refused whatever the
+    Console. With no Console to probe nothing else is refused here; the run itself needs one. A peak-count
     diagnostic loads no library.
     """
     if project_type != "lcms" or diagnostic_skips_annotation(state):
         return []
+    # A template line the Console would refuse runs its default while the template said otherwise.
+    template_problems = [
+        {"level": "error", "message": str(problem)} for problem in state.get("lipid_rt_check_template_problems") or []
+    ]
     rows = [row for row in state.get("msp_annotators") or [] if isinstance(row, dict)]
     predicted = [
         str(row.get("annotator_id") or index) for index, row in enumerate(rows, start=1)
@@ -2080,9 +2089,9 @@ def _annotator_capability_issues(state: dict[str, Any], project_type: str) -> li
     console_path = Path(str(state.get("console_path", "")).strip()).expanduser()
     named = bool(str(state.get("console_path") or "").strip())
     if not (predicted or quiet or asks_lipid_rt) or not named or not console_path.is_file():
-        return []
+        return template_problems
     found = set(console_capabilities(str(console_path))["capabilities"])
-    issues: list[dict[str, str]] = []
+    issues: list[dict[str, str]] = list(template_problems)
     if predicted and LIBRARY_KIND_CAPABILITY not in found:
         issues.append(
             {
@@ -2110,9 +2119,10 @@ def _annotator_capability_issues(state: dict[str, Any], project_type: str) -> li
             {
                 "level": "error",
                 "message": (
-                    "lipid_rt_check is set, but the selected MS-DIAL Console has no lipid retention-time check "
-                    "(MsdialWorkbench#832), so the setting would be recorded and never run. Select a Console that "
-                    "has it, or leave lipid_rt_check out."
+                    "lipid_rt_check is set, by the answers or the parameter template's Lipid RT check lines, but "
+                    "the selected MS-DIAL Console has no lipid retention-time check (MsdialWorkbench#832), so the "
+                    "setting would be recorded and never run. Select a Console that has it, or leave "
+                    "lipid_rt_check out."
                 ),
             }
         )
@@ -4467,6 +4477,11 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
         ):
             continue
         if line_key in ("solvent type", "searched lipid class"):
+            continue
+        # A template's lipid RT check line is not the state's either: load_parameter_template reads the lines
+        # into lipid_rt_check, which writes them here where the Console has the check. Copied through, a
+        # "Lipid RT check: False" would run while every record said the setting was not given.
+        if line_key in LIPID_RT_CHECK_METHOD_TITLES and line_key not in replacements:
             continue
         if line_key == "adduct list":
             output.append(

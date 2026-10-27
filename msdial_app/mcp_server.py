@@ -3506,10 +3506,10 @@ def msdial_lcms_metabolomics_check_inputs(
     person has not described. Any other key is refused, not ignored. A library searched with RT is read for
     its records' retention times: none refuses it, some missing is a warning. Presets:
     single_msp (slot msp: one MSP, no RT); campaign (slots lbm, msp, optional in_silico: the LBM2, the MSP
-    strictly and mildly, an in-silico MSP at in_silico, all without RT); lab_rt_tiers (in_house at RT 0.5 min,
-    predicted_rt at RT 2.0 min, no_rt without RT). Thresholds: standard (dot products 0.6/0.6/0.8, 3
-    matched peaks), strict and mild (the repository campaign's MSP tiers), in_silico (its in-silico tier:
-    0.05 Da, dot products 0.5/0.5/0.5, 3 matched peaks). The internal-standard text row
+    strictly and mildly, an in-silico MSP at in_silico with suggestions off, all without RT); lab_rt_tiers
+    (in_house at RT 0.5 min, predicted_rt at RT 2.0 min, no_rt without RT). Thresholds: standard (dot
+    products 0.6/0.6/0.8, 3 matched peaks), strict and mild (the repository campaign's MSP tiers), in_silico
+    (its in-silico tier: 0.05 Da, dot products 0.5/0.5/0.5, 3 matched peaks). The internal-standard text row
     is searched at priority 1, below every library.
 
     solvent_type is the salt or acid in the mobile phase (formic acid reads as HCOONH4); it sets the

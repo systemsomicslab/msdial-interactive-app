@@ -75,6 +75,30 @@ def read_setting(answer: Any) -> tuple[dict[str, str] | None, list[str]]:
     return (None if problems else setting), problems
 
 
+def template_setting(values: dict[str, str]) -> dict[str, Any]:
+    """A parameter template's own lipid RT check lines, read as the answer is, for load_parameter_template.
+
+    ``values`` is the template's lines by lowercase key (workflow.parse_method). A template the Console wrote
+    (its MethodFileTemplate) or a run's own method.txt carries all seven keys; a template with none gives {}.
+    One with any is the check's setting, as lipid_rt_check, so it is written and recorded as an answer's is;
+    one the Console would refuse is lipid_rt_check_template_problems, which validate_workflow refuses. Either
+    way the template's lines are never copied through to a method file (workflow._write_method).
+    """
+    given = {answer: values[key.casefold()] for answer, key, _, _ in SETTINGS if key.casefold() in values}
+    if not given:
+        return {}
+    setting, _ = read_setting(given)
+    if setting is None:
+        return {
+            "lipid_rt_check_template_problems": [
+                f"The parameter template's '{key}' is '{values[key.casefold()]}', none of {', '.join(choices)}."
+                for answer, key, choices, _ in SETTINGS
+                if answer in given and read_setting({answer: given[answer]})[0] is None
+            ]
+        }
+    return {"lipid_rt_check": setting}
+
+
 def method_replacements(setting: dict[str, str]) -> dict[str, str]:
     """The seven method-file keys, lowercase as the method writer keys its replacements, with their values."""
     return {key.casefold(): setting[answer] for answer, key, _, _ in SETTINGS}
@@ -90,7 +114,9 @@ def method_record(setting: dict[str, str] | None, capabilities: Iterable[str] | 
     found = None if capabilities is None else LIPID_RT_CHECK_CAPABILITY in set(capabilities)
     written = bool(setting) and found is True
     if not setting:
-        reason = "not asked for; the Console's defaults apply, which run the check in a Lipidomics project"
+        # Nothing is known here of what the Console does by default, nor whether it has the check at all: a
+        # Console from before MsdialWorkbench#832 has none. The run's review list shows whether it ran.
+        reason = "not set, so no key was written; whether the Console ran the check is what a review list shows"
     elif written:
         reason = "every key written to the method file"
     elif found is None:

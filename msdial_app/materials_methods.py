@@ -696,7 +696,7 @@ def _annotation_sentence(workflow: dict[str, Any], libraries: list[dict[str, Any
     from .annotation_pipeline import (
         GLACIER_CITATION, GLACIER_SCOPE, IN_SILICO_EVIDENCE_TIER, IN_SILICO_PREPROCESSING_STEPS,
     )
-    from .workflow import is_predicted_library_kind
+    from .workflow import _as_switch, is_predicted_library_kind
 
     rows = [row for row in workflow.get("msp_annotators", []) if isinstance(row, dict)]
     in_silico_rows = [row for row in rows if is_predicted_library_kind(row.get("library_kind"))]
@@ -744,10 +744,23 @@ def _annotation_sentence(workflow: dict[str, Any], libraries: list[dict[str, Any
     )
     in_silico = ""
     if in_silico_count:
+        # As each in-silico row was searched: a laboratory annotator list may search one with retention time
+        # (lab_lcms_metabolomics.apply_annotators), and the Console applies it to any row whatever its kind.
+        with_rt = [
+            row for row in in_silico_rows
+            if _as_switch(row.get("use_rt_scoring")) or _as_switch(row.get("use_rt_filtering"))
+        ]
+        retention = (
+            "the in-silico tier carries no retention time" if not with_rt
+            else "every in-silico annotator was also searched with retention time"
+            if len(with_rt) == len(in_silico_rows)
+            else f"{len(with_rt)} of the {len(in_silico_rows)} in-silico annotators were also searched with "
+            "retention time"
+        )
         in_silico = (
             " A match against in-silico spectra is reported with the evidence source InSilico (the \"Evidence "
             "source\" column of the MS-DIAL exports; opt_global_evidence_source in mzTab-M), never as a "
-            "reference-spectrum match, and the in-silico tier carries no retention time. MS-DIAL ranks an "
+            f"reference-spectrum match, and {retention}. MS-DIAL ranks an "
             "accepted match against acquired spectra or LBM rules above an accepted in-silico match, so an "
             "in-silico name is reported only where neither is accepted."
         )
@@ -777,7 +790,8 @@ def lipid_rt_check_evidence(root: Path, workflow: dict[str, Any]) -> dict[str, A
 
     The review lists are read from the run directory, written no earlier than its method file; the rule version
     is the one the Console stated, as the unit manifest's finalisation of the run recorded it. Empty for a run
-    that neither asked for the check nor was a Lipidomics project nor left a review list.
+    that neither set the check nor left a review list: a Lipidomics project alone says nothing of it, as a
+    Console from before MsdialWorkbench#832 has no check, and what one with it does by default is its own.
     """
     from .lipid_rt_check import run_outcome
 
@@ -792,13 +806,14 @@ def lipid_rt_check_evidence(root: Path, workflow: dict[str, Any]) -> dict[str, A
     export_folder = str(workflow.get("export_folder_path") or "").strip()
     directories = [root, *([export_folder] if export_folder else [])]
     outcome = run_outcome(directories, since)
-    if not setting and workflow.get("target_omics") != "Lipidomics" and not outcome["ran"]:
+    if not setting and not outcome["ran"]:
         return {}
     recorded = _finalised_lipid_rt_check(workflow)
     return {
         "setting": setting,
         "written_to_method_file": bool(method.get("written_to_method_file")),
         "console_capability": method.get("console_capability"),
+        "method_reason": str(method.get("reason") or ""),
         "ran": outcome["ran"],
         "review_files": outcome["review_files"],
         "rule_version": str(recorded.get("rule_version") or ""),
@@ -834,8 +849,15 @@ def _lipid_rt_check_sentence(evidence: dict[str, Any]) -> str:
             for answer, key, _, _ in SETTINGS
         )
         configured = f"was set to {details}, every setting stated in the method file"
+    elif setting:
+        # Asked for, but not handed to the Console: what ran was the Console's own, if anything.
+        reason = str(evidence.get("method_reason") or "").strip()
+        configured = "was asked for, but no setting of it was written to the method file" + (
+            f" ({reason})" if reason else ""
+        )
     else:
-        configured = "was left at the MS-DIAL Console's defaults, which run it in a Lipidomics project"
+        # Not set and still run (a review list exists): nothing here knows the Console's defaults.
+        configured = "was not set by this run and ran at the MS-DIAL Console's own defaults"
     files = evidence.get("review_files") or []
     if files:
         outcome = "Its review list " + ", ".join(

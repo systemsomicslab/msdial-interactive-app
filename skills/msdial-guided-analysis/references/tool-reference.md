@@ -178,8 +178,10 @@ an intentionally broad candidate search and requires downstream evidence review.
 An optional fourth tier searches an in-silico MSP library (GLACIER in the public-repository
 campaign): give exactly one `libraries.in_silico_msp_paths` entry, the run's own ion mode's
 file, with `in_silico_msp_version`, `in_silico_msp_source`, `in_silico_msp_license` (default
-`institutional/private`) and, where it applies, `in_silico_msp_preprocessing:
-["precursor_plus_1008_peak_removed"]`. The profile is then
+`institutional/private`) and, for the negative-mode file only, `in_silico_msp_preprocessing:
+["precursor_plus_1008_peak_removed"]`. The plan checks that step: it is a blocker on a
+positive-mode run, and on a file in which any record still carries a peak at its precursor m/z
++ 1.008. The profile is then
 `lipid-rule-msp-high-low-insilico-v1`:
 
 | Tier | Annotator ID | Priority | Kind | MS/MS tol. | Weighted/simple/reverse | Matched peaks | Suggestions |
