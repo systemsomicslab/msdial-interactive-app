@@ -95,6 +95,8 @@ TIERED_LIBRARY_STATE_KEYS = frozenset({
 # The libraries keys the tiered profile reads. Under that profile any other is a plan blocker, text_paths with
 # a message of its own (_tiered_library_problems): an LBM2 named under another key, such as lbm_annotator's
 # lbm_file_path, left the official LBM2 as the lipid-rule tier while a campaign's records named the given one.
+# A key the profile comes to read belongs here too, or every plan that gives it is refused. A change that reads
+# one merges with this set without a conflict, so a test holds the set to the libraries keys this module reads.
 TIERED_LIBRARY_KEYS = frozenset({
     "msp_paths", "msp_version", "msp_source", "msp_doi", "msp_license",
     "lbm_path", "lbm_version", "lbm_source", "lbm_doi", "lbm_license",

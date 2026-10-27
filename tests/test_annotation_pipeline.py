@@ -1,3 +1,4 @@
+import ast
 import csv
 import hashlib
 import json
@@ -10,7 +11,7 @@ from typing import Iterator
 from unittest.mock import patch
 
 from msdial_app import __version__
-from msdial_app.agent_workflow import build_guided_plan
+from msdial_app.agent_workflow import TIERED_LIBRARY_KEYS, build_guided_plan
 from msdial_app.annotation_pipeline import (
     TIERED_LCMS_PROFILE_ID,
     apply_tiered_lcms_annotation,
@@ -23,6 +24,38 @@ from msdial_app.workflow import _write_msp_annotator_settings, file_identity, pr
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "resources" / "msdial_console_param4lipidomics.txt"
+
+
+def libraries_keys_read(path: Path) -> set[str]:
+    """Every answers.libraries key a module reads by name.
+
+    That is libraries.get("key") and libraries["key"], with libraries the name the module gives the answers'
+    libraries, and (answers.get("libraries") or {}).get("key") without one.
+    """
+
+    def is_libraries(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id == "libraries"
+        if isinstance(node, ast.BoolOp):
+            return is_libraries(node.values[0])
+        return (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+            and bool(node.args) and isinstance(node.args[0], ast.Constant) and node.args[0].value == "libraries"
+        )
+
+    keys: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        key: ast.AST | None = None
+        if (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+            and node.args and is_libraries(node.func.value)
+        ):
+            key = node.args[0]
+        elif isinstance(node, ast.Subscript) and is_libraries(node.value):
+            key = node.slice
+        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+            keys.add(key.value)
+    return keys
 
 
 def method_lines(path: str | Path) -> dict[str, str]:
@@ -633,6 +666,28 @@ class GivenLbmPathTests(unittest.TestCase):
                 for item in plan["workflow"]["library_provenance"]
             ],
         )
+
+    def test_every_libraries_key_the_plan_reads_is_one_the_profile_reads_or_another_strategy_s(self) -> None:
+        # The profile refuses a libraries key outside TIERED_LIBRARY_KEYS. A change that comes to read one, as
+        # an in-silico MSP tier does, merges with that set without a conflict, and each side's tests pass on
+        # their own while the merged plan refuses every run that gives the key. So the set is held to every
+        # libraries key agent_workflow reads, less those only another strategy reads; this fails until a key
+        # the profile reads is added to the set, or one only another strategy reads is named here.
+        other_strategies = {
+            "annotators",  # library_strategy 'annotators'
+            "text_paths",  # library_strategy 'existing'; refused under this profile with a message of its own
+        }
+        read = libraries_keys_read(ROOT / "msdial_app" / "agent_workflow.py")
+
+        self.assertLessEqual({"lbm_path", "msp_paths", "annotators"}, read)  # the scan finds what it should
+        self.assertEqual(set(TIERED_LIBRARY_KEYS), read - other_strategies)
+
+        # And each is planned without the refusal of a key the profile does not read.
+        answers = self.answers()
+        for key in sorted(read - other_strategies):
+            answers["libraries"].setdefault(key, "synthetic")
+        plan = self.plan(answers)
+        self.assertEqual([], [item for item in plan["blockers"] if "does not read" in item])
 
     def test_an_answers_key_the_plan_does_not_apply_is_refused_rather_than_left_out(self) -> None:
         # An LBM2 given beside libraries rather than in it, as a profile's by_ion_mode.Positive.lbm_path is once a
