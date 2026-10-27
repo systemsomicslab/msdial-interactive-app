@@ -149,6 +149,11 @@ asks of the Console is the companion MS-DIAL change of 2026-10-25, not yet in MS
     caches for a file of 64 MiB or more, as a campaign LBM2 is, against its path, size and time: the cache
     answers without reading the file, so once it held the digest an LBM2 failing past its first byte would plan
     as ready and be recorded by its sha256. A plan therefore reads the LBM2 twice.
+  - The digest the plan reads replaces the one `workflow.file_identity` cached for the LBM2
+    (`workflow.remember_file_digest`, which stores nothing when the file's size or time changed while it was
+    read). The run manifest's libraries, the shared library identities and the Materials and Methods take
+    `file_identity`'s digest, so with a digest cached for content the file held at the same size and time they
+    named that content, while `library_provenance` and `workflow-settings.json` named the content read.
   - A relative `lbm_path` is made absolute against the backend's working directory, where the plan checks and
     hashes it (`workflow.absolute_library_path`), and the state, the method file and every record name that
     path. Written as given, it would be read by the Console against the method file's folder and then its own,
@@ -162,6 +167,17 @@ asks of the Console is the companion MS-DIAL change of 2026-10-25, not yet in MS
     is a blocker under this profile. Overrides reach the state after the profile, so an `lbm_path` there was
     the LBM2 the method file named, unchecked, while `lbm_annotator`, `library_provenance` and every record
     named the given one. The other library strategies apply such an override as before.
+  - A `libraries` key the profile does not read is a blocker. It reads `msp_paths` and `lbm_path`, with
+    `msp_version`, `msp_source`, `msp_doi`, `msp_license` and their `lbm_` counterparts; `text_paths` has the
+    blocker above. An LBM2 named
+    under any other key, such as `lbm_file_path`, the key of `lbm_annotator`, was left out without a word: the
+    official LBM2 was the tier, and the plan ready once it was downloaded, while a campaign, which resolves a
+    library reference under any key, pinned and recorded the LBM2 the key named.
+  - An answers key the plan does not apply is a blocker under this profile, not only the warning "Unknown
+    answers key was not applied" the other strategies still give. An LBM2 given beside `libraries` rather than
+    in it, as a profile's `by_ion_mode.<mode>.lbm_path` is once a campaign merges it into the answers, left the
+    official LBM2 as the tier in the same way. `library_provenance` given as an answer is a blocker too: the
+    profile replaces it with the provenance it measures from `libraries`.
 - `msp_annotator_settings.tsv` keeps an explicit priority 0, which the Console reads as a priority; the row's
   position replaced it. No profile writes 0 today.
 - The method file's `Lbm file path` is written absolute for every library strategy, as the MSP and text rows
