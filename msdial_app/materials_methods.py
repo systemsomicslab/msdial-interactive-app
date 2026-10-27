@@ -724,7 +724,9 @@ def _annotation_sentence(workflow: dict[str, Any], libraries: list[dict[str, Any
     description = ", ".join(types) if types else "the annotation resources listed in Supplementary Table S1"
     cited = []
     for path, item in _matched_library_provenance(workflow):
-        if not item:
+        # A library its record calls private was not downloaded from where its source points: an in-silico
+        # build the authors shared names their public project as its source. It is identified below instead.
+        if not item or _declared_private(item):
             continue
         identifier = item.get("doi") or item.get("record_url") or item.get("source")
         if identifier:
@@ -839,9 +841,9 @@ def _finalised_lipid_rt_check(workflow: dict[str, Any]) -> dict[str, Any]:
 def _lipid_rt_check_sentence(evidence: dict[str, Any]) -> str:
     if not evidence:
         return ""
-    from .lipid_rt_check import SETTINGS
+    from .lipid_rt_check import SETTINGS, summary_outcome
 
-    rules = f" (rules {evidence['rule_version']})" if evidence.get("rule_version") else ""
+    rules =f" (rules {evidence['rule_version']})" if evidence.get("rule_version") else ""
     setting = evidence.get("setting") or {}
     if setting and evidence.get("written_to_method_file"):
         details = "; ".join(
@@ -859,13 +861,36 @@ def _lipid_rt_check_sentence(evidence: dict[str, Any]) -> str:
         # Not set and still run (a review list exists): nothing here knows the Console's defaults.
         configured = "was not set by this run and ran at the MS-DIAL Console's own defaults"
     files = evidence.get("review_files") or []
-    if files:
-        outcome = "Its review list " + ", ".join(
-            f"{item['name']} (SHA-256 {item['sha256']}; {item['rows']} row{'s' if item['rows'] != 1 else ''})"
-            for item in files
-        ) + " is retained with the outputs; an empty list means the check found nothing to review."
+    listed = "Its review list " + ", ".join(
+        f"{item['name']} (SHA-256 {item['sha256']}; {item['rows']} row{'s' if item['rows'] != 1 else ''})"
+        for item in files
+    ) + " is retained with the outputs"
+    # The review list alone does not say what the check did: one is written also where the reversed-phase gate
+    # was not passed and nothing was evaluated, and none where the check failed. The Console's summary line,
+    # as the run's finalisation recorded it, says which.
+    ran = summary_outcome(str(evidence.get("summary") or ""))
+    if ran == "failed":
+        outcome = (
+            "The MS-DIAL Console reported that the check failed in this run and withdrew every verdict and "
+            "Confirmed tag it had written" + (f". {listed}." if files else "; no review list was written.")
+        )
+    elif ran == "not_run":
+        outcome = "The MS-DIAL Console reported that the check did not run" + (f". {listed}." if files else ".")
+    elif ran == "gate_not_passed":
+        outcome = (
+            f"{listed if files else 'No review list was written'}, but the check's run-level reversed-phase gate "
+            "was not passed, so no lipid annotation was evaluated against the retention-time order or tagged "
+            "Confirmed."
+        )
+    elif files and ran == "evaluated":
+        outcome = f"{listed}; an empty list means the check found nothing to review."
+    elif files:
+        outcome = (
+            f"{listed}; an empty list means the check listed nothing for review. The Console's summary of the "
+            "check was not recorded, so whether its reversed-phase gate was passed is not stated here."
+        )
     else:
-        outcome = "No review list was written, so the check did not run."
+        outcome = "No review list was written: the check did not run, or failed and withdrew what it had written."
     return (
         f"The lipid retention-time order check of MS-DIAL{rules}, which tags a lipid annotation Confirmed where "
         f"its retention time follows the reversed-phase order of its class, {configured}. {outcome}"
@@ -1044,6 +1069,19 @@ def _matched_library_provenance(
                 item = same_name[0]
         matches.append((path, item))
     return matches
+
+
+def _declared_private(item: dict[str, Any]) -> bool:
+    """Whether a provenance record says its library is private, by its licence or distribution, as sharing reads
+    them (sharing.PRIVATE_LICENCE)."""
+    from .sharing import PRIVATE_LICENCE
+
+    licence = str(item.get("license") or item.get("licence") or "")
+    return (
+        item.get("private") is True
+        or bool(PRIVATE_LICENCE.search(licence))
+        or str(item.get("distribution") or "").strip().casefold() == "private"
+    )
 
 
 def _used_library_paths(workflow: dict[str, Any]) -> list[str]:

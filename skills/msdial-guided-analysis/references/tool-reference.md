@@ -181,7 +181,10 @@ file, with `in_silico_msp_version`, `in_silico_msp_source`, `in_silico_msp_licen
 `institutional/private`) and, for the negative-mode file only, `in_silico_msp_preprocessing:
 ["precursor_plus_1008_peak_removed"]`. The plan checks that step: it is a blocker on a
 positive-mode run, and on a file in which any record still carries a peak at its precursor m/z
-+ 1.008. The profile is then
++ 1.008. A negative-mode run's file is checked for that peak also without the step, and is a
+blocker while any record carries it. The tier is labelled and cited as GLACIER only where the
+file's name says `GLACIER`; any other in-silico library is labelled `In-silico MSP`. The
+profile is then
 `lipid-rule-msp-high-low-insilico-v1`:
 
 | Tier | Annotator ID | Priority | Kind | MS/MS tol. | Weighted/simple/reverse | Matched peaks | Suggestions |
@@ -189,7 +192,7 @@ positive-mode run, and on a file in which any record still carries a peak at its
 | Lipid rules | LBM path | 4 | | LBM setting | LBM setting | LBM setting | |
 | MSP high | `msp_high_quality` | 3 | acquired | 0.05 Da | 0.6 / 0.6 / 0.8 | >= 3 | |
 | MSP low candidate | `msp_low_quality` | 2 | acquired | 0.25 Da | 0.5 / 0.5 / 0.5 | >= 1 | |
-| In-silico MSP (GLACIER) | `msp_in_silico` | 1 | predicted | 0.05 Da | 0.5 / 0.5 / 0.5 | >= 3 | false |
+| In-silico MSP (GLACIER), or In-silico MSP | `msp_in_silico` | 1 | predicted | 0.05 Da | 0.5 / 0.5 / 0.5 | >= 3 | false |
 
 Every MSP row is scored as Metabolomics, without RT, at MS1 0.01 Da. MS-DIAL reports an in-silico
 match with the evidence source `InSilico`, never as a reference spectrum, and the row's
@@ -197,7 +200,11 @@ match with the evidence source `InSilico`, never as a reference spectrum, and th
 tier is blocked on a Console that does not read `library_kind` or has no per-annotator
 `suggestions` switch. A second entry, a non-`.msp` file, the acquired MSP named again, a file
 named for the other ion mode (`pos`/`neg` token), or an in-silico path under another
-`library_strategy` is a blocker.
+`library_strategy` is a blocker, and so is a predicted row scored as Lipidomics (its own
+`target_omics`, or a blank one in a Lipidomics project), whose matches MS-DIAL would label
+RuleBased. In a Lipidomics project, where the lipid RT check runs unless its mode is False, a
+predicted row is also a blocker on a Console that has the check but not the per-annotator
+`suggestions` switch: that Console's check predates rules 1.1, which leave in-silico matches out.
 
 `target_omics_pin` fixes the project's target omics whatever `target_omics` the repository
 metadata seeded; `target_omics_record` keeps the seed, the answer, the pin and the applied
@@ -206,8 +213,11 @@ value. `lipid_rt_check` (an object of `mode`, `operating_point`, `chromatography
 each defaulting to the Console's Auto, HighPrecision, Auto, None, Corroborated, Allow,
 Evaluate) writes all seven `Lipid RT check` keys to the method file; it is blocked on a Console
 without the check. The run records the setting, the review list
-(`<alignment>_lipidrt_review.tsv`, none meaning the check did not run) by name and sha256, and
-the rule version the Console states.
+(`<alignment>_lipidrt_review.tsv`, none meaning the check did not run or failed) by name and
+sha256, and the Console's summary line with the rule version it states; the Materials and
+Methods read the summary for a failed check and an unpassed reversed-phase gate. A parameter
+template's `Lipid RT check` lines are read as the Console reads them (a blank value is skipped),
+also for a workflow the web page posts.
 
 For GC-MS RI analysis, add `gcms_retention_type: "RI"`, `gcms_ri_compound_type: "Alkanes"` or `"Fames"`, and an RI standard/dictionary path.
 

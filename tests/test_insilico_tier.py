@@ -24,8 +24,10 @@ from msdial_app.agent_workflow import build_guided_plan, target_omics_record
 from msdial_app.annotation_pipeline import (
     GLACIER_CITATION,
     IN_SILICO_EVIDENCE_TIER,
+    IN_SILICO_GENERIC_EVIDENCE_TIER,
     TIERED_LCMS_IN_SILICO_PROFILE_ID,
     TIERED_LCMS_PROFILE_ID,
+    in_silico_evidence_tier,
     tiered_lcms_annotation,
 )
 from msdial_app.lab_lcms_metabolomics import (
@@ -38,8 +40,15 @@ from msdial_app.lab_lcms_metabolomics import (
     read_annotation,
 )
 from msdial_app.library_copy_store import library_names
-from msdial_app.lipid_rt_check import console_summary, method_record, read_setting, template_setting
-from msdial_app.materials_methods import generate_publication_report
+from msdial_app.lipid_rt_check import (
+    console_summary,
+    method_record,
+    read_setting,
+    summary_outcome,
+    template_setting,
+    template_values,
+)
+from msdial_app.materials_methods import _annotation_sentence, _lipid_rt_check_sentence, generate_publication_report
 from msdial_app.run_finalisation import finalise_console_run, lipid_rt_check_outcome
 from msdial_app.sharing import library_records
 from msdial_app.workflow import (
@@ -54,6 +63,8 @@ from msdial_app.workflow import (
     load_parameter_template,
     parse_mdpeak,
     prepare_run,
+    validate_workflow,
+    with_template_lipid_rt_check,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -125,14 +136,14 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(TIERED_LCMS_PROFILE_ID, expected["profile_id"])
 
     def test_four_tiers_with_their_priorities_kinds_and_omics(self) -> None:
-        profile = tiered_lcms_annotation("lipids.lbm2", "private.msp", {"evidence_tier": "x"}, "insilico_neg.msp")
+        profile = tiered_lcms_annotation("lipids.lbm2", "private.msp", {"evidence_tier": "x"}, "GLACIER_neg.msp")
 
         self.assertEqual(TIERED_LCMS_IN_SILICO_PROFILE_ID, profile["profile_id"])
         self.assertEqual(4, profile["lbm_annotator"]["priority"])
         rows = profile["msp_annotators"]
         self.assertEqual(
             [("msp_high_quality", 3, "acquired", "private.msp"), ("msp_low_quality", 2, "acquired", "private.msp"),
-             ("msp_in_silico", 1, "predicted", "insilico_neg.msp")],
+             ("msp_in_silico", 1, "predicted", "GLACIER_neg.msp")],
             [(row["annotator_id"], row["priority"], row["library_kind"], row["msp_file_path"]) for row in rows],
         )
         self.assertEqual({"Metabolomics"}, {row["target_omics"] for row in rows})
@@ -149,6 +160,11 @@ class ProfileTests(unittest.TestCase):
         self.assertIs(False, in_silico["suggestions"])
         self.assertEqual(IN_SILICO_EVIDENCE_TIER, in_silico["evidence_tier"])
         self.assertEqual("In-silico MSP (GLACIER)", IN_SILICO_EVIDENCE_TIER)
+        # Only a file its name says is GLACIER is labelled, and so cited, as GLACIER; another in-silico library
+        # is searched the same way under the generic label.
+        other = tiered_lcms_annotation("lipids.lbm2", "private.msp", None, "D:\\libs\\glacier\\CFMID_neg.msp")
+        self.assertEqual(IN_SILICO_GENERIC_EVIDENCE_TIER, other["msp_annotators"][-1]["evidence_tier"])
+        self.assertEqual(in_silico_evidence_tier("/libs/Glacier_NEG_allCE.msp"), IN_SILICO_EVIDENCE_TIER)
         self.assertTrue(all("suggestions" not in row for row in rows[:2]))
         # The laboratory preset that mirrors the campaign's tiers searches its in-silico MSP the same way.
         self.assertEqual(["in_silico"], [entry["thresholds"] for entry in PRESETS["campaign"] if entry["id"] == "in_silico"])
@@ -208,7 +224,7 @@ class InSilicoPlanTests(unittest.TestCase):
         self.console = fake_console(self.root / "MSDIALCUI.exe")
         self.msp = self.libraries / "synthetic-acquired-neg.msp"
         self.msp.write_text("NAME: A\n", encoding="ascii")
-        self.in_silico = self.libraries / "Synthetic-InSilico_neg_allCE.msp"
+        self.in_silico = self.libraries / "Synthetic-GLACIER_neg_allCE.msp"
         self.in_silico.write_text("NAME: B\nPRECURSORMZ: 100\n", encoding="ascii")
         self.lbm = self.libraries / "synthetic-lab-lipids.lbm2"
         self.lbm.write_bytes(b"synthetic laboratory LBM2 library")
@@ -302,7 +318,7 @@ class InSilicoPlanTests(unittest.TestCase):
         self.assertEqual(TIERED_LCMS_PROFILE_ID, plan["workflow"]["annotation_pipeline_profile"])
 
     def test_what_the_in_silico_answer_refuses(self) -> None:
-        other = self.libraries / "Synthetic-InSilico_pos_allCE.msp"
+        other = self.libraries / "Synthetic-GLACIER_pos_allCE.msp"
         other.write_text("NAME: C\n", encoding="ascii")
         text = self.libraries / "insilico_neg.txt"
         text.write_text("x", encoding="ascii")
@@ -423,8 +439,11 @@ class InSilicoPlanTests(unittest.TestCase):
         self.assertIn("Every MSP annotator was scored as Metabolomics", text)
         self.assertIn("lipid retention-time order check", text)
         self.assertIn("operating point HighPrecision", text)
-        self.assertIn("No review list was written, so the check did not run.", text)
+        self.assertIn("No review list was written: the check did not run, or failed and withdrew", text)
         self.assertNotIn(str(self.libraries), text)
+        # The in-silico library's record names its public project as the source, yet the build is private: it
+        # was not downloaded from there, and it is identified by name and digest only.
+        self.assertNotIn("Downloaded libraries were", text)
 
         review = Path(prepared["run_directory"]) / "AlignResult-2026_lipidrt_review.tsv"
         review.write_text("ID\tName\n", encoding="utf-8")
@@ -435,6 +454,10 @@ class InSilicoPlanTests(unittest.TestCase):
         )["methods_text"]
         self.assertIn(f"{review.name} (SHA-256 {hashlib.sha256(review.read_bytes()).hexdigest()}; 0 rows)", text)
         self.assertNotIn("did not run", text)
+        # Without the Console's summary nothing says the reversed-phase gate was passed, so an empty list is not
+        # read as an order that held.
+        self.assertIn("an empty list means the check listed nothing for review", text)
+        self.assertNotIn("found nothing to review", text)
 
     def test_a_run_that_neither_set_nor_ran_the_lipid_rt_check_claims_nothing_of_it(self) -> None:
         # A Lipidomics project with no lipid_rt_check answer: nothing here knows what the Console does by
@@ -473,7 +496,8 @@ class InSilicoPlanTests(unittest.TestCase):
         )["methods_text"]
         self.assertIn(
             "was asked for, but no setting of it was written to the method file (no Console to probe, so no key "
-            "was written). No review list was written, so the check did not run.",
+            "was written). No review list was written: the check did not run, or failed and withdrew what it had "
+            "written.",
             text,
         )
         self.assertNotIn("defaults", text[text.index("lipid retention-time order check"):])
@@ -518,10 +542,21 @@ class InSilicoPlanTests(unittest.TestCase):
         lines = method_lines(prepared["method_file"])
         self.assertEqual(("Auto", "HighPrecision"), (lines["Lipid RT check"], lines["Lipid RT check operating point"]))
 
-        # A state without the setting never copies the template's lines through.
+        # A state that never read its template's lines, as the web page posts one (it has no control for the
+        # check), reads them at the run: written from the setting and recorded, never dropped for the Console's
+        # default, nor copied through.
         bare = dict(workflow)
         del bare["lipid_rt_check"]
         prepared = self.prepare(bare)
+        lines = method_lines(prepared["method_file"])
+        self.assertEqual(("False", "Balanced"), (lines["Lipid RT check"], lines["Lipid RT check operating point"]))
+        recorded = json.loads(Path(prepared["manifest"]).read_text(encoding="utf-8"))["lipid_rt_check"]
+        self.assertEqual(workflow["lipid_rt_check"], recorded["setting"])
+        self.assertTrue(recorded["written_to_method_file"])
+        # A state whose setting is known to be none (read, and the template has none) writes no key.
+        plain = {**dict(workflow), "template_path": str(TEMPLATE)}
+        del plain["lipid_rt_check"]
+        prepared = self.prepare(plain)
         self.assertFalse(set(LIPID_RT_KEYS) & set(method_lines(prepared["method_file"])))
         self.assertIsNone(json.loads(Path(prepared["manifest"]).read_text(encoding="utf-8"))["lipid_rt_check"]["setting"])
 
@@ -560,10 +595,19 @@ class InSilicoPlanTests(unittest.TestCase):
             settings, None, prepared["run_directory"], app_version=__version__, console_version="test",
         )["methods_text"]
         self.assertIn("1 of the 2 in-silico annotators were also searched with retention time", text)
+        # The annotator table hands the Console the same reading of that row: "false" is False there too.
+        written = self.root / "table"
+        written.mkdir()
+        with _write_msp_annotator_settings(written, dict(settings)).open(encoding="ascii", newline="") as handle:
+            table = {row["annotator_id"]: row for row in csv.DictReader(handle, delimiter="\t")}
+        self.assertEqual(("True", "False"), (
+            table["msp_in_silico"]["use_retention_information_for_scoring"],
+            table["second"]["use_retention_information_for_scoring"],
+        ))
 
     def test_the_peak_removal_is_checked_against_the_run_and_the_file(self) -> None:
         # Stated for a positive-mode run, whose file has no such artefact.
-        positive = self.libraries / "Synthetic-InSilico_pos_allCE.msp"
+        positive = self.libraries / "Synthetic-GLACIER_pos_allCE.msp"
         positive.write_text("NAME: C\nPRECURSORMZ: 200\n", encoding="ascii")
         plan = self.plan({**self.answers(in_silico_msp_paths=[str(positive)]), "ion_mode": "Positive"})
         self.assertTrue(any("for a positive-mode run" in item for item in plan["blockers"]), plan["blockers"])
@@ -581,13 +625,39 @@ class InSilicoPlanTests(unittest.TestCase):
         self.assertEqual({"records": 3, "with_precursor_plus_1008_peak": 2}, precursor_plus_1008_census(self.in_silico))
         plan = self.plan(self.answers())
         self.assertTrue(
-            any("2 of the 3 records in Synthetic-InSilico_neg_allCE.msp still carry a peak" in item
+            any("2 of the 3 records in Synthetic-GLACIER_neg_allCE.msp still carry a peak" in item
                 for item in plan["blockers"]),
             plan["blockers"],
         )
-        # Without the step the same file plans: nothing is claimed of it.
+        # Without the step the same file is still refused: the peak must be removed (Q6), not merely left
+        # unclaimed. A positive-mode run's file is not censused for it.
         plan = self.plan(self.answers(in_silico_msp_preprocessing=[]))
-        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        self.assertEqual(
+            ["2 of the 3 records in Synthetic-GLACIER_neg_allCE.msp carry a peak at the precursor m/z + 1.008, the "
+             "negative-mode records' artefact, which is removed before use. Give the file with the peak removed, "
+             "and name precursor_plus_1008_peak_removed in libraries.in_silico_msp_preprocessing."],
+            [item for item in plan["blockers"] if "1.008" in item],
+        )
+        positive.write_bytes(self.in_silico.read_bytes())
+        plan = self.plan({**self.answers(in_silico_msp_paths=[str(positive)], in_silico_msp_preprocessing=[]),
+                          "ion_mode": "Positive"})
+        self.assertFalse(any("1.008" in item for item in plan["blockers"]), plan["blockers"])
+        # A file that cannot be read to census is a blocker, with the step or without it, never an exception.
+        denied = PermissionError(13, "Permission denied")
+        with patch("msdial_app.lab_lcms_metabolomics.precursor_plus_1008_census", side_effect=denied):
+            declared = self.plan(self.answers())
+            undeclared = self.plan(self.answers(in_silico_msp_preprocessing=[]))
+        self.assertIn(
+            "libraries.in_silico_msp_preprocessing names precursor_plus_1008_peak_removed, but "
+            "Synthetic-GLACIER_neg_allCE.msp cannot be read (Permission denied) to check it for the peak at the "
+            "precursor m/z + 1.008. Plan again once it can.",
+            declared["blockers"],
+        )
+        self.assertIn(
+            "This negative-mode run's Synthetic-GLACIER_neg_allCE.msp cannot be read (Permission denied) to check "
+            "it for the peak at the precursor m/z + 1.008. Plan again once it can.",
+            undeclared["blockers"],
+        )
         # With the peak removed it plans. An isotope-like +1.003 peak and the H losses below the precursor are
         # not the artefact.
         self.in_silico.write_text(
@@ -628,7 +698,7 @@ class InSilicoPlanTests(unittest.TestCase):
         state = {
             "project_type": "lcms", "console_path": str(self.console),
             "msp_annotators": [{"annotator_id": "msp_in_silico", "msp_file_path": str(self.in_silico),
-                                "library_kind": "predicted", "suggestions": False}],
+                                "library_kind": "predicted", "suggestions": False, "target_omics": "Metabolomics"}],
             "lipid_rt_check": read_setting("Auto")[0],
         }
         with patch("msdial_app.workflow.subprocess.run", side_effect=OSError("not a Console")):
@@ -737,7 +807,7 @@ class SharedArtifactTests(unittest.TestCase):
     def test_the_in_silico_library_location_reaches_no_shared_artifact(self) -> None:
         from test_shared_paths import SHARED_FILES, _texts, build_unit, publish
 
-        location = "E:\\insilico libs\\GLACIER\\Synthetic-InSilico_pos_allCE.msp"
+        location = "E:\\insilico libs\\GLACIER\\Synthetic-GLACIER_pos_allCE.msp"
         encodings = ("E:\\insilico libs", "E:\\\\insilico libs", "E:/insilico libs", "insilico%20libs", "E%3A%5Cinsilico")
         with tempfile.TemporaryDirectory() as temporary:
             unit = build_unit(Path(temporary))
@@ -749,13 +819,13 @@ class SharedArtifactTests(unittest.TestCase):
                 "evidence_tier": IN_SILICO_EVIDENCE_TIER,
             })
             state["library_provenance"].append({
-                "path": location, "name": "Synthetic-InSilico_pos_allCE.msp", "version": "synthetic-1",
+                "path": location, "name": "Synthetic-GLACIER_pos_allCE.msp", "version": "synthetic-1",
                 "source": "https://github.com/coleygroup/ms-pred", "doi": "", "license": "institutional/private",
                 "library_kind": "predicted",
             })
             recorded = json.loads((output / "run-manifest.json").read_text(encoding="utf-8"))
             recorded["libraries"].append({
-                "name": "Synthetic-InSilico_pos_allCE.msp", "filename": "Synthetic-InSilico_pos_allCE.msp",
+                "name": "Synthetic-GLACIER_pos_allCE.msp", "filename": "Synthetic-GLACIER_pos_allCE.msp",
                 "role": "msp", "library_kind": "predicted", "sha256": "ef" * 32, "bytes": 2100000000,
                 "size_bytes": 2100000000, "private": True, "distribution": "private",
             })
@@ -771,7 +841,7 @@ class SharedArtifactTests(unittest.TestCase):
             handoff = create_datamining_handoff(run_directory=output, write_file=True)
 
             self.assertIn("1 MSP annotator searching in-silico (predicted) spectra", report["methods_text"])
-            self.assertIn(f"Synthetic-InSilico_pos_allCE.msp (SHA-256 {'ef' * 32})", report["methods_text"])
+            self.assertIn(f"Synthetic-GLACIER_pos_allCE.msp (SHA-256 {'ef' * 32})", report["methods_text"])
             self.assertEqual("predicted", handoff["annotation"]["tiers"][-1]["library_kind"])
             shared = [output / name for name in SHARED_FILES] + [Path(handoff["handoff_file"])]
             for path in shared:
@@ -841,6 +911,148 @@ class LipidRtSettingTests(unittest.TestCase):
         )
         self.assertEqual("1.0", console_summary(["x", "Lipid RT check (alignment): 1 annotated, 0 evaluable: 0 "
                                                      "Confirmed; rules 1.0, parameter ab12."])["rule_version"])
+
+    def test_a_blank_template_value_is_skipped_as_the_console_skips_it(self) -> None:
+        # The Console reads a key's last line with a value (ConfigParser.ReadLast): a blank one leaves the key at
+        # its default, or at an earlier line's value.
+        self.assertEqual({}, template_setting({"lipid rt check operating point": ""}))
+        self.assertEqual(
+            {"lipid rt check": "False"},
+            template_values(["Lipid RT check: False", "# Lipid RT check: True", "Lipid RT check:", "Other: x"]),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            template = Path(temporary) / "method.txt"
+            template.write_text(
+                TEMPLATE.read_text(encoding="utf-8-sig")
+                + "\nLipid RT check: False\nLipid RT check operating point:\nLipid RT check:\n",
+                encoding="utf-8",
+            )
+            workflow = load_parameter_template(template)["workflow"]
+        self.assertNotIn("lipid_rt_check_template_problems", workflow)
+        self.assertEqual(("False", "HighPrecision"), (
+            workflow["lipid_rt_check"]["mode"], workflow["lipid_rt_check"]["operating_point"],
+        ))
+
+    def test_the_methods_read_the_consoles_summary_for_a_failed_check_and_an_unpassed_gate(self) -> None:
+        counts = RT_SUMMARY.split(": ", 1)[1]
+        self.assertEqual(
+            ["", "failed", "not_run", "gate_not_passed", "evaluated"],
+            [summary_outcome(text) for text in (
+                "", "failed (InvalidOperationException: x); no verdicts or Confirmed tags were written by it, and "
+                "its earlier ones were withdrawn (0).", "not run.",
+                counts + " Reversed-phase gate not passed: 0.41 < 0.6.", counts,
+            )],
+        )
+        listed = {"name": "A_lipidrt_review.tsv", "sha256": "ab" * 32, "rows": 0}
+        evidence = {"setting": read_setting("Auto")[0], "written_to_method_file": True, "ran": True,
+                    "review_files": [listed], "rule_version": "1.1"}
+        gate = _lipid_rt_check_sentence({**evidence, "summary": counts + " Reversed-phase gate not passed: x."})
+        self.assertIn("A_lipidrt_review.tsv", gate)
+        self.assertIn("reversed-phase gate was not passed, so no lipid annotation was evaluated", gate)
+        self.assertNotIn("found nothing to review", gate)
+        evaluated = _lipid_rt_check_sentence({**evidence, "summary": counts})
+        self.assertIn("an empty list means the check found nothing to review", evaluated)
+        failed = _lipid_rt_check_sentence({
+            **evidence, "ran": False, "review_files": [],
+            "summary": "failed (IOException: disk); no verdicts or Confirmed tags were written by it, and its "
+                       "earlier ones were withdrawn (3).",
+        })
+        self.assertIn("reported that the check failed in this run and withdrew every verdict and Confirmed tag", failed)
+        self.assertNotIn("did not run", failed)
+
+
+class ReviewedCapabilityTests(unittest.TestCase):
+    """What a state is refused for whatever path built it: the web page's, a template's, or the guided plan's."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.console = fake_console(self.root / "MSDIALCUI.exe")
+        self.in_silico = self.root / "Synthetic-GLACIER_neg_allCE.msp"
+        self.in_silico.write_text("NAME: B\n", encoding="ascii")
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def issues(self, state: dict) -> list[str]:
+        with patch("msdial_app.workflow.subprocess.run", side_effect=OSError("not a Console")):
+            return [issue["message"] for issue in _annotator_capability_issues(state, "lcms")]
+
+    def test_a_template_value_the_console_would_refuse_is_refused_without_an_in_silico_row_or_a_console(self) -> None:
+        problem = "The parameter template's 'Lipid RT check operating point' is 'Fast', none of Strict."
+        state = {"project_type": "lcms", "lipid_rt_check_template_problems": [problem],
+                 "msp_annotators": [{"annotator_id": "msp_annotator_1", "msp_file_path": "a.msp"}]}
+        self.assertEqual([problem], self.issues(state))
+        self.assertEqual([problem], self.issues({**state, "console_path": str(self.console)}))
+        # A state the web page posts never read the template: the run reads it, and refuses the same value.
+        template = self.root / "method.txt"
+        template.write_text(
+            TEMPLATE.read_text(encoding="utf-8-sig") + "\nLipid RT check operating point: Fast\n", encoding="utf-8"
+        )
+        posted = dict(load_parameter_template(template)["workflow"])
+        posted.pop("lipid_rt_check_template_problems")
+        posted.update(template_path=str(template), msp_annotators=[], console_path="")
+        self.assertIn("lipid_rt_check_template_problems", with_template_lipid_rt_check(posted))
+        messages = [issue["message"] for issue in validate_workflow(posted) if issue["level"] == "error"]
+        self.assertTrue(any("'Lipid RT check operating point' is 'Fast'" in item for item in messages), messages)
+
+    def test_a_predicted_row_scored_as_lipidomics_is_refused(self) -> None:
+        # A table without a target_omics column, read back from a template: the row takes the project's.
+        table = self.root / "msp_annotator_settings.tsv"
+        table.write_text(
+            "annotator_id\tmsp_file_path\tpriority\tlibrary_kind\n"
+            f"ins\t{self.in_silico}\t1\tpredicted\n",
+            encoding="ascii",
+        )
+        template = self.root / "method.txt"
+        template.write_text(
+            f"Target omics: Lipidomics\nMSP annotator settings file path: {table.name}\n", encoding="ascii"
+        )
+        rows = load_parameter_template(template)["msp_annotators"]
+        self.assertEqual([("predicted", "")], [(row["library_kind"], row.get("target_omics", "")) for row in rows])
+        state = {"project_type": "lcms", "target_omics": "Lipidomics", "msp_annotators": rows}
+        refused = "MSP annotator(s) ins search predicted (in-silico) spectra but are scored as Lipidomics"
+        self.assertTrue(any(refused in item for item in self.issues(state)), self.issues(state))
+        rows[0]["target_omics"] = "Lipidomics"
+        self.assertTrue(any(refused in item for item in self.issues({**state, "target_omics": "Metabolomics"})))
+        rows[0]["target_omics"] = "Metabolomics"
+        self.assertFalse(any(refused in item for item in self.issues(state)))
+
+    def test_a_predicted_row_where_the_lipid_rt_check_runs_needs_its_in_silico_exclusion(self) -> None:
+        # A Console with the check and library_kind, but not the change that left in-silico matches out of the
+        # check (rules 1.1), which came with the per-annotator suggestions switch.
+        fake_console(self.console, (*LIBRARY_KIND_CONSOLE_MARKERS, *LIPID_RT_CHECK_CONSOLE_MARKERS))
+        row = {"annotator_id": "msp_in_silico", "msp_file_path": str(self.in_silico), "library_kind": "predicted",
+               "target_omics": "Metabolomics"}
+        state = {"project_type": "lcms", "target_omics": "Lipidomics", "console_path": str(self.console),
+                 "msp_annotators": [row]}
+        refused = "where the lipid RT check runs, but the selected MS-DIAL Console's check predates"
+        # Set or not: the Console runs it in a Lipidomics project by default.
+        self.assertTrue(any(refused in item for item in self.issues(state)), self.issues(state))
+        self.assertTrue(any(refused in item for item in self.issues({**state, "lipid_rt_check": read_setting("Auto")[0]})))
+        self.assertEqual([], self.issues({**state, "lipid_rt_check": read_setting("False")[0]}))
+        self.assertEqual([], self.issues({**state, "target_omics": "Metabolomics"}))
+        fake_console(self.console)
+        self.assertEqual([], self.issues(state))
+
+    def test_the_methods_cite_neither_a_private_library_as_downloaded_nor_another_in_silico_library_as_glacier(
+        self,
+    ) -> None:
+        other = tiered_lcms_annotation("lipids.lbm2", "public.msp", None, "CFMID_neg.msp")
+        workflow = {
+            "msp_annotators": other["msp_annotators"],
+            "library_provenance": [
+                {"path": "public.msp", "doi": "10.1000/example", "license": "CC BY 4.0"},
+                {"path": "CFMID_neg.msp", "source": "https://github.com/coleygroup/ms-pred",
+                 "license": "institutional/private", "library_kind": "predicted"},
+            ],
+        }
+        text = _annotation_sentence(workflow, [{"name": "CFMID_neg.msp", "sha256": "cd" * 32, "private": True}])
+        self.assertIn("Downloaded libraries were public.msp (10.1000/example).", text)
+        self.assertIn(f"identified by file name and SHA-256 digest: CFMID_neg.msp (SHA-256 {'cd' * 32})", text)
+        self.assertNotIn("ms-pred", text)
+        self.assertNotIn("GLACIER", text)
+        self.assertIn("evidence source InSilico", text)
 
 
 if __name__ == "__main__":

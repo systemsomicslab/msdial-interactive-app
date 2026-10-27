@@ -9,7 +9,11 @@ TIERED_LCMS_PROFILE_ID = "lipid-rule-msp-high-low-v1"
 # decision of 2026-10-25. A profile of its own, so a record that names v1 still means three tiers.
 TIERED_LCMS_IN_SILICO_PROFILE_ID = "lipid-rule-msp-high-low-insilico-v1"
 IN_SILICO_ANNOTATOR_ID = "msp_in_silico"
+# The tier's label, and with it the GLACIER citation and scope a Materials and Methods states, only for a file
+# its name says is GLACIER (the campaign's are named so); any other in-silico library is labelled generically,
+# so a run that searches another one is never cited as GLACIER (in_silico_evidence_tier).
 IN_SILICO_EVIDENCE_TIER = "In-silico MSP (GLACIER)"
+IN_SILICO_GENERIC_EVIDENCE_TIER = "In-silico MSP"
 # The four tiers' priorities, highest first. None is 0: a priority 0 has been read as a missing one
 # (int(row.get("priority") or index) and the like), and the order is what the Console ranks by after
 # IsReferenceMatched, so an accepted in-silico match names a feature only where no LBM2 or acquired MSP match
@@ -124,7 +128,7 @@ def _with_in_silico_tier(
         **THRESHOLDS["in_silico"],
         "annotator_id": IN_SILICO_ANNOTATOR_ID,
         "priority": IN_SILICO_PROFILE_PRIORITIES[IN_SILICO_ANNOTATOR_ID],
-        "evidence_tier": IN_SILICO_EVIDENCE_TIER,
+        "evidence_tier": in_silico_evidence_tier(in_silico_path),
         # No "no MS2:" or "low score:" name from a bare precursor mass against a library of hundreds of thousands
         # of predicted structures (the author's decision Q2).
         "suggestions": False,
@@ -135,6 +139,16 @@ def _with_in_silico_tier(
         "lbm_annotator": lbm,
         "msp_annotators": [*acquired, in_silico],
     }
+
+
+def in_silico_evidence_tier(path: str) -> str:
+    """The in-silico tier's label: GLACIER's where the file's name says GLACIER, else the generic one.
+
+    Nothing in an MSP says which model predicted it, so the name is what a person and the records go by; the
+    plan never takes a file for GLACIER on any other ground.
+    """
+    name = str(path or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return IN_SILICO_EVIDENCE_TIER if "glacier" in name.casefold() else IN_SILICO_GENERIC_EVIDENCE_TIER
 
 
 def apply_tiered_lcms_annotation(

@@ -961,7 +961,8 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
             "Provide one msp_paths entry, searched as both the high- and the low-quality MSP tier, and "
             "libraries.lbm_path, the .lbm2 library of the lipid-rule tier; without lbm_path the official "
             "LBM library is that tier. Optionally, one libraries.in_silico_msp_paths entry, this ion mode's "
-            "in-silico MSP, searched as a fourth tier below them.",
+            "in-silico MSP, searched as a fourth tier below them (labelled and cited as GLACIER only where its "
+            "file name says GLACIER).",
         )
     # Once a library is settled, how its retention times should be used is the next
     # decision, and it belongs to the analyst: a library built for this chromatography
@@ -1817,16 +1818,19 @@ def _in_silico_preprocessing_problems(path: Path, steps: list[str], ion_mode: st
     it is checked, not taken as given. The +1.008 peak is the negative-mode records' artefact (the author's
     decision of 2026-10-25, Q6): a positive-mode run, by its ion mode or else its file's name, has none to
     remove; and a file still carrying a peak at a record's precursor m/z + 1.008 has not had it removed
-    (lab_lcms_metabolomics.precursor_plus_1008_census, read once per file version).
+    (lab_lcms_metabolomics.precursor_plus_1008_census, read once per file version). The peak must be removed
+    (Q6), so a negative-mode run's file is censused also where no step is declared: one that carries the peak is
+    refused, never searched with it unrecorded.
     """
     step = "precursor_plus_1008_peak_removed"
-    if step not in steps:
-        return []
-    if ion_mode == "Positive":
+    declared = step in steps
+    if declared and ion_mode == "Positive":
         return [
             f"libraries.in_silico_msp_preprocessing names {step}, the negative-mode records' artefact, for a "
             "positive-mode run; its file has no such peak to remove. Give the step for the negative-mode run only."
         ]
+    if not declared and ion_mode != "Negative":
+        return []
     if path.suffix.casefold() != ".msp" or not path.is_file() or path.stat().st_size == 0:
         return []
     from .lab_lcms_metabolomics import precursor_plus_1008_census
@@ -1834,16 +1838,23 @@ def _in_silico_preprocessing_problems(path: Path, steps: list[str], ion_mode: st
     try:
         census = precursor_plus_1008_census(path)
     except OSError as error:
+        claim = f"libraries.in_silico_msp_preprocessing names {step}, but " if declared else "This negative-mode run's "
         return [
-            f"libraries.in_silico_msp_preprocessing names {step}, but {path.name} cannot be read "
-            f"({error.strerror or error}) to check it. Plan again once it can."
+            f"{claim}{path.name} cannot be read ({error.strerror or error}) to check it for the peak at the "
+            "precursor m/z + 1.008. Plan again once it can."
         ]
     carrying = census["with_precursor_plus_1008_peak"]
-    if carrying:
+    if carrying and declared:
         return [
             f"libraries.in_silico_msp_preprocessing names {step}, but {carrying} of the {census['records']} "
             f"records in {path.name} still carry a peak at the precursor m/z + 1.008. Give the file with the peak "
-            "removed, or leave the step out."
+            "removed."
+        ]
+    if carrying:
+        return [
+            f"{carrying} of the {census['records']} records in {path.name} carry a peak at the precursor m/z + "
+            "1.008, the negative-mode records' artefact, which is removed before use. Give the file with the peak "
+            f"removed, and name {step} in libraries.in_silico_msp_preprocessing."
         ]
     return []
 

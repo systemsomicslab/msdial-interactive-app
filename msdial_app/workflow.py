@@ -34,6 +34,7 @@ from .lipid_rt_check import (
     method_record as lipid_rt_check_method_record,
     method_replacements as lipid_rt_check_method_replacements,
     template_setting as lipid_rt_check_template_setting,
+    template_values as lipid_rt_check_template_values,
 )
 from .user_settings import load_user_settings, user_data_directory
 
@@ -1320,10 +1321,8 @@ def load_parameter_template(
     template_path = Path(path).expanduser().resolve()
     if not template_path.is_file():
         raise FileNotFoundError(f"Parameter template not found: {template_path}")
-    refuse_blank_filtering_conflict(
-        template_path,
-        template_path.read_text(encoding="utf-8-sig", errors="replace").splitlines(),
-    )
+    template_lines = template_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    refuse_blank_filtering_conflict(template_path, template_lines)
     values = parse_method(template_path)
 
     def value(*keys: str, default: str = "") -> str:
@@ -1500,8 +1499,12 @@ def load_parameter_template(
         ),
         **_template_local_support_rt_window(values),
         # A template's lipid RT check lines, as the setting they state, so the run writes and records them
-        # (lipid_rt_check.template_setting); an LC-MS project's only.
-        **(lipid_rt_check_template_setting(values) if project_type == "lcms" else {}),
+        # (lipid_rt_check.template_setting); an LC-MS project's only. Read as the Console reads them: a blank
+        # value is skipped (lipid_rt_check.template_values).
+        **(
+            lipid_rt_check_template_setting(lipid_rt_check_template_values(template_lines))
+            if project_type == "lcms" else {}
+        ),
         "export_folder_path": library_path("export folder path"),
         "height_matrix_export": boolean("height matrix export"),
         "solvent": value("solvent type", default="CH3COONH4"),
@@ -1596,7 +1599,33 @@ def load_parameter_template(
     }
 
 
+def with_template_lipid_rt_check(state: dict[str, Any]) -> dict[str, Any]:
+    """The state with its parameter template's lipid RT check lines read in, where nothing has read them.
+
+    The guided plan carries them from load_parameter_template, as lipid_rt_check or
+    lipid_rt_check_template_problems. A state the web page posts carries neither, as the page has no control for
+    the check: read here, the template's setting is written and recorded, and a value the Console would refuse is
+    refused, rather than its lines being dropped (_write_method) and the Console running its own default.
+    """
+    if (
+        str(state.get("project_type", "lcms")).lower() != "lcms"
+        or "lipid_rt_check" in state
+        or "lipid_rt_check_template_problems" in state
+        or not str(state.get("template_path") or "").strip()
+    ):
+        return state
+    try:
+        lines = Path(str(state["template_path"])).expanduser().read_text(
+            encoding="utf-8-sig", errors="replace"
+        ).splitlines()
+    except OSError:
+        return state
+    read = lipid_rt_check_template_setting(lipid_rt_check_template_values(lines))
+    return {**state, **read} if read else state
+
+
 def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
+    state = with_template_lipid_rt_check(state)
     issues: list[dict[str, str]] = []
     files = state.get("files", [])
     project_type = str(state.get("project_type", "lcms")).lower()
@@ -2066,9 +2095,12 @@ def _annotator_capability_issues(state: dict[str, Any], project_type: str) -> li
     acquired spectra and publishes every in-silico match as a reference-spectrum match. A row that turns its
     suggestions off needs the per-annotator switch: any other names a "no MS2:" or "low score:" suggestion from
     it, from a bare precursor mass. A lipid_rt_check setting needs a Console with the check, which an older one
-    does not have. A parameter template's lipid RT check line the Console would refuse is refused whatever the
-    Console. With no Console to probe nothing else is refused here; the run itself needs one. A peak-count
-    diagnostic loads no library.
+    does not have. Where the check runs (a Lipidomics project, unless its mode is False), a predicted row needs a
+    Console whose check leaves in-silico matches out (rules 1.1), or in-silico lipid names may be tagged
+    Confirmed. A parameter template's lipid RT check line the Console would refuse is refused whatever the
+    Console, and so is a predicted row scored as Lipidomics: MS-DIAL labels a Lipidomics match RuleBased before
+    it asks whether the library is predicted. With no Console to probe nothing else is refused here; the run
+    itself needs one. A peak-count diagnostic loads no library.
     """
     if project_type != "lcms" or diagnostic_skips_annotation(state):
         return []
@@ -2081,6 +2113,25 @@ def _annotator_capability_issues(state: dict[str, Any], project_type: str) -> li
         str(row.get("annotator_id") or index) for index, row in enumerate(rows, start=1)
         if is_predicted_library_kind(row.get("library_kind"))
     ]
+    # The project's target omics as the method file states it (_write_method); a row's blank cell takes it.
+    project_omics = str(state.get("target_omics", "Lipidomics") or "").strip()
+    as_lipids = [
+        str(row.get("annotator_id") or index) for index, row in enumerate(rows, start=1)
+        if is_predicted_library_kind(row.get("library_kind"))
+        and (str(row.get("target_omics") or "").strip() or project_omics).casefold() == "lipidomics"
+    ]
+    if as_lipids:
+        template_problems.append(
+            {
+                "level": "error",
+                "message": (
+                    f"MSP annotator(s) {', '.join(as_lipids)} search predicted (in-silico) spectra but are scored "
+                    "as Lipidomics, by their own target_omics or, where the row leaves it blank, the project's; "
+                    "MS-DIAL labels a Lipidomics match RuleBased before it asks whether the library is predicted, "
+                    "so their matches would be published as rule-based. Set their target_omics to Metabolomics."
+                ),
+            }
+        )
     quiet = [
         str(row.get("annotator_id") or index) for index, row in enumerate(rows, start=1)
         if row.get("suggestions") is not None and not _as_switch(row.get("suggestions"))
@@ -2123,6 +2174,30 @@ def _annotator_capability_issues(state: dict[str, Any], project_type: str) -> li
                     "the selected MS-DIAL Console has no lipid retention-time check (MsdialWorkbench#832), so the "
                     "setting would be recorded and never run. Select a Console that has it, or leave "
                     "lipid_rt_check out."
+                ),
+            }
+        )
+    # The Console runs the check in a Lipidomics project unless its mode is False (lipid_rt_check.SETTINGS),
+    # set or not. Its rules 1.1 leave in-silico matches out; 1.0 evaluates them and may tag them Confirmed (the
+    # author's decision Q5 forbids it). The Console assembly names no rule version, but 1.1 came in the MS-DIAL
+    # change that added the per-annotator suggestions switch, whose marker therefore shows it.
+    lipid_rt_mode = str((state.get("lipid_rt_check") or {}).get("mode") or "Auto") if asks_lipid_rt else "Auto"
+    if (
+        predicted
+        and project_omics.casefold() == "lipidomics"
+        and lipid_rt_mode.casefold() != "false"
+        and LIPID_RT_CHECK_CAPABILITY in found
+        and MSP_SUGGESTIONS_CAPABILITY not in found
+    ):
+        issues.append(
+            {
+                "level": "error",
+                "message": (
+                    f"MSP annotator(s) {', '.join(predicted)} search predicted (in-silico) spectra in a Lipidomics "
+                    "project, where the lipid RT check runs, but the selected MS-DIAL Console's check predates "
+                    "the one that leaves in-silico matches out (rules 1.1, which came with the per-annotator "
+                    "suggestions switch), so in-silico lipid names could be tagged Confirmed. Select a Console "
+                    "that has it, or set lipid_rt_check to False."
                 ),
             }
         )
@@ -2260,6 +2335,8 @@ def prepare_run(
     state: dict[str, Any],
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    # A web page's state has not read its template's lipid RT check lines; the run writes and records them.
+    state = with_template_lipid_rt_check(state)
     issues = validate_workflow(state)
     errors = [issue["message"] for issue in issues if issue["level"] == "error"]
     if errors:
@@ -4478,8 +4555,9 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
             continue
         if line_key in ("solvent type", "searched lipid class"):
             continue
-        # A template's lipid RT check line is not the state's either: load_parameter_template reads the lines
-        # into lipid_rt_check, which writes them here where the Console has the check. Copied through, a
+        # A template's lipid RT check line is not the state's either: load_parameter_template, or for a state
+        # the web page posted with_template_lipid_rt_check, reads the lines into lipid_rt_check, which writes
+        # them here where the Console has the check. Copied through, a
         # "Lipid RT check: False" would run while every record said the setting was not given.
         if line_key in LIPID_RT_CHECK_METHOD_TITLES and line_key not in replacements:
             continue
@@ -4624,8 +4702,9 @@ def _write_msp_annotator_settings(run_directory: Path, state: dict[str, Any]) ->
                     "reverse_dot_product_cutoff": row.get("reverse_dot_product_cutoff", state.get("msp_reverse_dot_product", 0.8)),
                     "matched_peaks_percentage_cutoff": row.get("matched_peaks_percentage_cutoff", state.get("msp_matched_peaks_percentage", 0.1)),
                     "minimum_spectrum_match": row.get("minimum_spectrum_match", state.get("msp_minimum_spectrum_match", 3)),
-                    "use_retention_information_for_scoring": str(bool(row.get("use_rt_scoring", False))),
-                    "use_retention_information_for_filtering": str(bool(row.get("use_rt_filtering", False))),
+                    # Read as the Materials and Methods read them: bool("false") would hand the Console True.
+                    "use_retention_information_for_scoring": str(_as_switch(row.get("use_rt_scoring", False))),
+                    "use_retention_information_for_filtering": str(_as_switch(row.get("use_rt_filtering", False))),
                 }
             )
     state["msp_annotator_settings_file_path"] = str(settings_path)
@@ -4675,8 +4754,8 @@ def _write_text_annotator_settings(run_directory: Path, state: dict[str, Any]) -
                     "rt_tolerance": row.get("rt_tolerance", state.get("text_rt_tolerance", 0.5)),
                     "ms1_tolerance": row.get("ms1_tolerance", state.get("ms1_tolerance", 0.01)),
                     "total_score_cutoff": row.get("total_score_cutoff", 0.8),
-                    "use_retention_information_for_scoring": str(bool(row.get("use_rt_scoring", False))),
-                    "use_retention_information_for_filtering": str(bool(row.get("use_rt_filtering", False))),
+                    "use_retention_information_for_scoring": str(_as_switch(row.get("use_rt_scoring", False))),
+                    "use_retention_information_for_filtering": str(_as_switch(row.get("use_rt_filtering", False))),
                 }
             )
     state["text_annotator_settings_file_path"] = str(settings_path)

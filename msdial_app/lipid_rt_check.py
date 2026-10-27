@@ -6,8 +6,10 @@ the ones whose retention times follow the reversed-phase rules (more carbons lat
 "Confirmed". It is on by default in a Lipidomics project. A campaign writes every one of its seven keys, so a
 later change of a Console default cannot change what the campaign ran without the method file saying so (the
 author's decision of 2026-10-25, Q5). The Console writes "<alignment stem>_lipidrt_review.tsv" next to the
-alignment exports whenever the check ran, with no rows when it found nothing to review, so a missing review
-list means the check did not run.
+alignment exports whenever the check ran, also when it listed nothing, so a missing review list means the
+check did not run, or failed and withdrew what it had written. An empty list alone does not say the order was
+evaluated: where the run-level reversed-phase gate is not passed no lipid is evaluated, and only the Console's
+summary line says so (console_summary).
 """
 
 from __future__ import annotations
@@ -75,16 +77,38 @@ def read_setting(answer: Any) -> tuple[dict[str, str] | None, list[str]]:
     return (None if problems else setting), problems
 
 
+def template_values(lines: Iterable[str]) -> dict[str, str]:
+    """A parameter template's lipid RT check lines by lowercase key, as the Console reads them.
+
+    The Console's ConfigParser reads a key's last line with a value (ReadLast): a blank value is skipped, so the
+    key keeps an earlier line's value or its default. workflow.parse_method keeps the last line whatever its
+    value, which would read a blank as a value the Console refuses, or let a later blank line hide a usable one.
+    """
+    values: dict[str, str] = {}
+    for line in lines:
+        if line.startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower()
+        if key in METHOD_TITLES and value.strip():
+            values[key] = value.strip()
+    return values
+
+
 def template_setting(values: dict[str, str]) -> dict[str, Any]:
     """A parameter template's own lipid RT check lines, read as the answer is, for load_parameter_template.
 
-    ``values`` is the template's lines by lowercase key (workflow.parse_method). A template the Console wrote
-    (its MethodFileTemplate) or a run's own method.txt carries all seven keys; a template with none gives {}.
-    One with any is the check's setting, as lipid_rt_check, so it is written and recorded as an answer's is;
-    one the Console would refuse is lipid_rt_check_template_problems, which validate_workflow refuses. Either
-    way the template's lines are never copied through to a method file (workflow._write_method).
+    ``values`` is the template's lines by lowercase key (template_values). A template the Console wrote (its
+    MethodFileTemplate) or a run's own method.txt carries all seven keys; a template with none gives {}. One
+    with any is the check's setting, as lipid_rt_check, so it is written and recorded as an answer's is; one the
+    Console would refuse is lipid_rt_check_template_problems, which validate_workflow refuses. Either way the
+    template's lines are never copied through to a method file (workflow._write_method). A blank value is no
+    line at all, as the Console reads it: the key is left at its default.
     """
-    given = {answer: values[key.casefold()] for answer, key, _, _ in SETTINGS if key.casefold() in values}
+    given = {
+        answer: values[key.casefold()] for answer, key, _, _ in SETTINGS
+        if str(values.get(key.casefold()) or "").strip()
+    }
     if not given:
         return {}
     setting, _ = read_setting(given)
@@ -182,12 +206,33 @@ def console_summary(lines: Iterable[str] | None) -> dict[str, str]:
     }
 
 
+def summary_outcome(summary: str) -> str:
+    """What the Console's summary line (LipidRtUnitRun.Describe) says the check did, or "" without one.
+
+    "failed": it stopped with an exception and withdrew its verdicts and tags, and wrote no review list.
+    "not_run": it did not run. "gate_not_passed": it ran, but its run-level reversed-phase gate was not passed,
+    so no lipid was evaluated or tagged Confirmed; its review list is still written. "evaluated": it ran and
+    evaluated the eligible lipids.
+    """
+    text = str(summary or "").strip()
+    if not text:
+        return ""
+    if text.startswith("failed"):
+        return "failed"
+    if text.startswith("not run"):
+        return "not_run"
+    if "Reversed-phase gate not passed" in text:
+        return "gate_not_passed"
+    return "evaluated"
+
+
 def run_outcome(
     directories: Iterable[str | Path], since: float | None = None, console_lines: Iterable[str] | None = None
 ) -> dict[str, Any]:
     """What a finished run left of the check: its review lists, and what the Console said of it.
 
     ran is true only where a review list exists: the Console writes one, also empty, whenever the check ran.
+    Whether it evaluated anything is the summary line's to say (summary_outcome).
     """
     files = review_files(directories, since)
     return {
@@ -195,7 +240,9 @@ def run_outcome(
         "review_files": files,
         **console_summary(console_lines),
         "note": (
-            "A review list is written whenever the check ran; an empty one means it found nothing to review."
-            if files else "No review list was written, so the check did not run."
+            "A review list is written whenever the check ran, also when it evaluated nothing; the Console's "
+            "summary line says whether its reversed-phase gate was passed."
+            if files else "No review list was written: the check did not run, or failed and withdrew what it had "
+            "written."
         ),
     }

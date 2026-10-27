@@ -17,20 +17,28 @@ asks of the Console is the companion MS-DIAL change of 2026-10-25, not yet in MS
   `msp_low_quality` 2 and `msp_in_silico` 1. The in-silico row is scored as Metabolomics, without retention time,
   at MS1 0.01 Da, MS/MS 0.05 Da, dot products 0.5/0.5/0.5, at least 3 matched peaks and matched-peak percentage
   0 (`lab_lcms_metabolomics.THRESHOLDS["in_silico"]`, the one definition), with `library_kind: predicted`,
-  `suggestions: false` and evidence tier "In-silico MSP (GLACIER)"; the acquired rows then say
-  `library_kind: acquired`. Without an in-silico path the v1 profile is exactly as it was.
+  `suggestions: false` and evidence tier "In-silico MSP (GLACIER)" where the file's name says GLACIER, else
+  "In-silico MSP", so that another in-silico library is never labelled or cited as GLACIER; the acquired rows
+  then say `library_kind: acquired`. Without an in-silico path the v1 profile is exactly as it was.
   - `in_silico_msp_version`, `in_silico_msp_source`, `in_silico_msp_license` (default `institutional/private`)
     and `in_silico_msp_preprocessing` (`precursor_plus_1008_peak_removed`, the negative-mode artefact peak the
     author had removed) are recorded in `library_provenance` with `library_kind: predicted`. The step is
     checked, not taken as given: it is a blocker on a positive-mode run (by its ion mode, or else its file's
     name), whose file has no such peak, and on a file in which any record still carries a peak within 0.0025 of
     its precursor m/z + 1.008 (`lab_lcms_metabolomics.precursor_plus_1008_census`, read once per file version).
+    The peak must be removed (Q6), so a negative-mode run's file is censused also without the step, and is a
+    blocker while any record carries it; a file that cannot be read for the census is a blocker either way.
   - A plan is blocked on a second in-silico entry, a non-`.msp` or empty file, the acquired MSP named again as
     in-silico, a file named for the other ion mode (a `pos`/`neg` token; a name with neither is taken as
     given), an unknown preprocessing step, or an in-silico path under another `library_strategy`.
   - A plan whose annotator table has a predicted row is blocked on a Console that does not read
     `library_kind` (it would publish in-silico matches as reference spectra), and one with a row that turns
-    `suggestions` off on a Console without the per-annotator switch.
+    `suggestions` off on a Console without the per-annotator switch. A predicted row scored as Lipidomics, by
+    its own `target_omics` or a blank one in a Lipidomics project (a template's table without the column), is
+    a blocker on any Console: MS-DIAL labels a Lipidomics match RuleBased before it asks whether the library
+    is predicted. In a Lipidomics project, where the lipid RT check runs unless its mode is False, a predicted
+    row is a blocker on a Console that has the check but not the per-annotator switch, whose marker is the only
+    sign of the check's rules 1.1 that leave in-silico matches out (Q5).
 - `msp_annotator_settings.tsv` writes a `suggestions` column (True/False) when a row sets it, as it writes
   `library_kind`; a template's table reads both back.
 - Console capabilities `library_kind` (marker "the library will be treated as acquired"), `msp_suggestions`
@@ -49,11 +57,18 @@ asks of the Console is the companion MS-DIAL change of 2026-10-25, not yet in MS
     carries all seven) are read into `lipid_rt_check` as the setting, written and recorded as an answer's is,
     and refused on a Console without the check; a value the Console would refuse is a blocker. An answer
     replaces them. A template line is never copied through to a method file, so the file never states a
-    setting the records do not.
+    setting the records do not. The lines are read as the Console reads them: a blank value is skipped, so the
+    key keeps an earlier line's value or its default. A workflow the web page posts, which has no control for
+    the check, reads its template's lines at validation and at the run (`with_template_lipid_rt_check`), so
+    they are written and recorded rather than dropped for the Console's default.
   - A run that neither set the check nor left a review list says nothing of it in the Materials and Methods,
     a Lipidomics project or not: a Console from before MsdialWorkbench#832 has no check, and nothing here knows
     what one with it does by default. One not set that left a review list "ran at the MS-DIAL Console's own
     defaults"; one asked for that the method file does not state says so, with the reason.
+  - The Materials and Methods read the Console's summary line for what the check did: a failed check (its
+    verdicts and tags withdrawn, no review list) and an unpassed reversed-phase gate (a review list, but no
+    lipid evaluated) are said as such; an empty list is "found nothing to review" only where the summary shows
+    the lipids were evaluated, and no review list reads "did not run, or failed".
 - **The target omics pin.** `target_omics_pin` sets the project's target omics whatever `target_omics` the
   repository answer seed gave (Lipidomics for every campaign unit, D7). `target_omics_record` (workflow
   settings) and the run manifest's `target_omics` keep the repository metadata's suggestion
@@ -78,12 +93,18 @@ asks of the Console is the companion MS-DIAL change of 2026-10-25, not yet in MS
   is GLACIER's, state a preprocessing step the provenance records, state a pinned target omics, and say when
   every MSP row was scored with its own target omics rather than the project's.
 - The run manifest names the annotation pipeline profile.
+- The Materials and Methods' "Downloaded libraries were" leaves out a library whose provenance calls it private
+  (licence or distribution), as the in-silico build's does while its source names the public project; the
+  library is identified by file name and SHA-256 instead.
+- The annotator tables write a row's retention-time switches as the Materials and Methods read them: a
+  `"false"` given as text was written `True`.
 - The laboratory `campaign` preset searches its optional in-silico MSP with its suggestions off and at the new
   `in_silico` thresholds, as the campaign does; it searched it at `mild` (0.25 Da, at least 1 matched peak).
   The slot keeps its own label (`in-silico MSP`), as it takes any in-silico library: the GLACIER evidence tier,
   citation and preprocessing record are the tiered profile's, and the preset's MSP rows keep the method's MS1
   tolerance where the campaign's set 0.01 Da. A `suggestions` value on a `libraries.annotators` row reaches its
-  annotator table row.
+  annotator table row. The contract stores each library's `suggestions`, from which the plan rebuilds the
+  rows, so the slot's switch reaches a run planned from the contract and not only the check.
 
 ## [0.5.47] - Unreleased
 
