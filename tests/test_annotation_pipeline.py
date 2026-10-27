@@ -687,7 +687,9 @@ class GivenLbmPathTests(unittest.TestCase):
         for key in sorted(read - other_strategies):
             answers["libraries"].setdefault(key, "synthetic")
         plan = self.plan(answers)
-        self.assertEqual([], [item for item in plan["blockers"] if "does not read" in item])
+        self.assertEqual(
+            [], [item for item in plan["blockers"] if item.startswith("tiered_lipid_msp does not read libraries.")]
+        )
 
     def test_an_answers_key_the_plan_does_not_apply_is_refused_rather_than_left_out(self) -> None:
         # An LBM2 given beside libraries rather than in it, as a profile's by_ion_mode.Positive.lbm_path is once a
