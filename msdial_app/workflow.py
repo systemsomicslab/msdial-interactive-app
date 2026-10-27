@@ -272,18 +272,9 @@ def file_identity(path: str | Path) -> dict[str, Any]:
     # is worse than no checksum. So the cache is used only where hashing is genuinely
     # expensive -- a multi-hundred-megabyte library, which takes seconds to write and
     # cannot be rewritten inside a tick -- and everything smaller is simply hashed.
-    key = f"{resolved}|{stat.st_size}|{stat.st_mtime_ns}"
+    key = _identity_cache_key(resolved, stat)
     cacheable = stat.st_size >= IDENTITY_CACHE_MIN_BYTES
-    cache_path = user_data_directory() / "file-identity-cache.json"
-    cache: dict[str, str] = {}
-    if cacheable:
-        try:
-            if cache_path.is_file():
-                loaded = json.loads(cache_path.read_text(encoding="utf-8-sig"))
-                if isinstance(loaded, dict):
-                    cache = {str(k): str(v) for k, v in loaded.items()}
-        except (OSError, json.JSONDecodeError):
-            cache = {}
+    cache: dict[str, str] = _read_identity_cache() if cacheable else {}
 
     digest = cache.get(key, "")
     if not digest:
@@ -302,13 +293,7 @@ def file_identity(path: str | Path) -> dict[str, Any]:
         digest = hasher.hexdigest()
     if cacheable and cache.get(key) != digest:
         cache[key] = digest
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            # Keep the cache from growing without bound; the entries are cheap to remake.
-            trimmed = dict(list(cache.items())[-256:])
-            cache_path.write_text(json.dumps(trimmed, indent=2), encoding="utf-8")
-        except OSError:
-            pass
+        _write_identity_cache(cache)
 
     return {
         "sha256": digest,
@@ -317,6 +302,63 @@ def file_identity(path: str | Path) -> dict[str, Any]:
             stat.st_mtime, tz=dt.timezone.utc
         ).astimezone().isoformat(),
     }
+
+
+def remember_file_digest(path: str | Path, sha256: str, read_from: os.stat_result) -> None:
+    """Store a digest just taken by reading a file through where file_identity looks it up.
+
+    file_identity answers a file of IDENTITY_CACHE_MIN_BYTES or more from the digest it cached against the
+    file's path, size and time, without reading it. A caller that has read such a file through to its end, and
+    records the digest it took, stores it here, so the records that take file_identity's digest afterwards (the
+    run manifest's libraries, the shared library identities) name the content that caller read rather than
+    content the file held when it was cached at the same size and time. ``read_from`` is the file's stat taken
+    before the read; nothing is stored when the size or time differs after it, since the file changed while it
+    was read.
+    """
+    try:
+        resolved = Path(path).expanduser().resolve()
+        stat = resolved.stat()
+    except (OSError, ValueError):
+        return
+    if stat.st_size < IDENTITY_CACHE_MIN_BYTES or (stat.st_size, stat.st_mtime_ns) != (
+        read_from.st_size, read_from.st_mtime_ns
+    ):
+        return
+    key = _identity_cache_key(resolved, stat)
+    cache = _read_identity_cache()
+    if cache.get(key) == sha256:
+        return
+    # Moved to the end, so the trim that keeps the newest entries keeps this one.
+    cache.pop(key, None)
+    cache[key] = sha256
+    _write_identity_cache(cache)
+
+
+def _identity_cache_key(resolved: Path, stat: os.stat_result) -> str:
+    return f"{resolved}|{stat.st_size}|{stat.st_mtime_ns}"
+
+
+def _read_identity_cache() -> dict[str, str]:
+    cache_path = user_data_directory() / "file-identity-cache.json"
+    try:
+        if cache_path.is_file():
+            loaded = json.loads(cache_path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                return {str(k): str(v) for k, v in loaded.items()}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _write_identity_cache(cache: dict[str, str]) -> None:
+    cache_path = user_data_directory() / "file-identity-cache.json"
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # Keep the cache from growing without bound; the entries are cheap to remake.
+        trimmed = dict(list(cache.items())[-256:])
+        cache_path.write_text(json.dumps(trimmed, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _console_provenance_warning(console: dict[str, Any]) -> str:
@@ -2058,19 +2100,43 @@ def _laboratory_lipidomics_issues(state: dict[str, Any], project_type: str) -> l
     if not state.get("lab_lipidomics_profile") or project_type != "lcms" or diagnostic_skips_annotation(state):
         return issues
     lbm_path = str(state.get("lbm_path", "")).strip()
-    if not lbm_path:
-        issues.append(
-            {"level": "error", "message": "A laboratory lipidomics run needs the laboratory's LBM2 library (lbm_path)."}
-        )
-    elif Path(lbm_path).suffix.casefold() != ".lbm2":
-        issues.append(
-            {"level": "error", "message": f"A laboratory lipidomics run reads an .lbm2 library; {Path(lbm_path).name} is not one."}
-        )
-    elif Path(lbm_path).is_file() and Path(lbm_path).stat().st_size == 0:
-        issues.append(
-            {"level": "error", "message": f"{Path(lbm_path).name} is empty; the Console would skip it without a word."}
-        )
+    problem = (
+        lbm_library_problem(lbm_path, "A laboratory lipidomics run") if lbm_path
+        else "A laboratory lipidomics run needs the laboratory's LBM2 library (lbm_path)."
+    )
+    if problem:
+        issues.append({"level": "error", "message": problem})
     return issues
+
+
+def lbm_library_problem(lbm_path: str | Path, run: str) -> str:
+    """Why the LBM library a run names is not one the Console can load, or "" when it is.
+
+    The Console reads an .lbm2 library and skips an empty one without a word: the run then annotates no
+    lipid at all. ``run`` names the run in the message. A path that does not exist is validate_workflow's
+    "LBM library not found".
+    """
+    path = Path(str(lbm_path).strip()).expanduser()
+    if path.suffix.casefold() != ".lbm2":
+        return f"{run} reads an .lbm2 library; {path.name} is not one."
+    if path.exists() and not path.is_file():
+        return f"{path.name} is a folder, not an .lbm2 file."
+    if path.is_file() and path.stat().st_size == 0:
+        return f"{path.name} is empty; the Console would skip it without a word."
+    return ""
+
+
+def absolute_library_path(path: Any) -> str:
+    """A library path made absolute against this process's working directory, or "" for none.
+
+    The plan checks and hashes a relative path against this working directory, but the Console reads one
+    against the method file's folder and then its own (ConfigParser.ResolvePathFromMethodFile), and skips an
+    LBM library it does not find there without a word. An absolute path keeps its name, its separators and
+    dot segments aside: no link, 8.3 name or mapped drive is resolved, so the records and the answers still
+    name the same location alike.
+    """
+    text = str(path or "").strip()
+    return os.path.abspath(os.path.expanduser(text)) if text else ""
 
 
 def _stage_input(source: Path, destination_folder: Path) -> Path:
@@ -4080,7 +4146,9 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
     )
     replacements = {
         "msp file path": "" if msp_annotator_settings_path else (state.get("msp_path", "") or first_msp_path),
-        "lbm file path": state.get("lbm_path", ""),
+        # Absolute, as the MSP and text rows are (_write_msp_annotator_settings): the Console would read a
+        # relative path against another folder than the one the plan checked, and skip the LBM without a word.
+        "lbm file path": absolute_library_path(state.get("lbm_path")),
         "lbm annotator priority": int(state.get("lbm_annotator", {}).get("priority", state.get("lbm_priority", 1))),
         "text db file path": "" if text_annotator_settings_path else state.get("text_db_path", ""),
         "searched adduct ions": ",".join(state.get("selected_adducts", [])),
@@ -4379,7 +4447,8 @@ def _write_msp_annotator_settings(run_directory: Path, state: dict[str, Any]) ->
                     **({"library_kind": str(row.get("library_kind", "")).strip() or "acquired"} if with_kind else {}),
                     "annotator_id": str(row.get("annotator_id", "")).strip() or f"msp_annotator_{index}",
                     "msp_file_path": str(Path(str(row["msp_file_path"])).expanduser().resolve()),
-                    "priority": int(row.get("priority") or index),
+                    # An explicit 0 is a priority the Console reads (ConfigParser: int.TryParse), not a gap.
+                    "priority": index if row.get("priority") in (None, "") else int(row["priority"]),
                     "target_omics": str(row.get("target_omics", "")).strip(),
                     "evidence_tier": str(row.get("evidence_tier", "")).strip(),
                     "rt_tolerance": row.get("rt_tolerance", state.get("msp_rt_tolerance", 100)),

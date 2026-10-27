@@ -16,16 +16,19 @@ from .workflow import (
     AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW,
     FAMILY_FROM_FORMAT_DEFAULT,
     FAMILY_FROM_VENDOR_FORMAT,
+    absolute_library_path,
     console_file_type,
     detect_raw_format,
     instrument_family_from_text,
     automatic_rt_correction_value,
     expand_paths_report,
     discover_console_paths,
+    lbm_library_problem,
     load_parameter_template,
     read_adducts,
     read_analysis_csv,
     read_lipid_queries,
+    remember_file_digest,
     validate_workflow,
 )
 from .worksets import LAB_LIPIDOMICS_WORKSET_KIND, describe_workset_candidate, get_workset
@@ -82,6 +85,22 @@ LBM_TEMPLATE_CUTOFFS = {
     "lbm_simple_dot_product": "simple_dot_product_cutoff",
     "lbm_reverse_dot_product": "reverse_dot_product_cutoff",
 }
+# The state keys that name the libraries a run loads and records (sharing._used_library_paths reads them), and
+# the tiered profile's id. workflow_overrides reach the state after the tiered profile has set them from the
+# libraries answer, so under that profile an override of one is a plan blocker (_tiered_library_problems).
+TIERED_LIBRARY_STATE_KEYS = frozenset({
+    "lbm_path", "lbm_annotator", "msp_path", "msp_annotators", "text_db_path", "text_annotators",
+    "library_provenance", "annotation_pipeline_profile",
+})
+# The libraries keys the tiered profile reads. Under that profile any other is a plan blocker, text_paths with
+# a message of its own (_tiered_library_problems): an LBM2 named under another key, such as lbm_annotator's
+# lbm_file_path, left the official LBM2 as the lipid-rule tier while a campaign's records named the given one.
+# A key the profile comes to read belongs here too, or every plan that gives it is refused. A change that reads
+# one merges with this set without a conflict, so a test holds the set to the libraries keys this module reads.
+TIERED_LIBRARY_KEYS = frozenset({
+    "msp_paths", "msp_version", "msp_source", "msp_doi", "msp_license",
+    "lbm_path", "lbm_version", "lbm_source", "lbm_doi", "lbm_license",
+})
 
 
 def inspect_analysis_input(input_path: str) -> dict[str, Any]:
@@ -311,15 +330,18 @@ def build_guided_plan(
                 f"Official library '{catalog_id}' is not downloaded. Ask for confirmation, then download it."
             )
     if merged.get("library_strategy") == "tiered_lipid_msp":
-        item = next(
-            (entry for entry in catalog_status() if entry["id"] == "lipidomics"),
-            None,
-        )
-        official_library = item
-        if item and not item.get("downloaded"):
-            blockers.append(
-                "The official lipidomics LBM library is not downloaded. Ask for confirmation, then download it."
+        blockers.extend(_tiered_library_problems(merged))
+        # The official LBM2 is the lipid-rule tier only when the answers name none of their own.
+        if not _tiered_lbm_path(merged):
+            item = next(
+                (entry for entry in catalog_status() if entry["id"] == "lipidomics"),
+                None,
             )
+            official_library = item
+            if item and not item.get("downloaded"):
+                blockers.append(
+                    "The official lipidomics LBM library is not downloaded. Ask for confirmation, then download it."
+                )
     tuning_strategy = merged.get("parameter_strategy") in {
         "target_peak_count", "auto_peak_range"
     }
@@ -923,7 +945,9 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
     elif answers.get("library_strategy") == "tiered_lipid_msp" and not _has_msp_library(answers):
         ask(
             "libraries",
-            "Provide one msp_paths entry for the high- and low-quality MSP tiers. The official LBM library is used as tier 1.",
+            "Provide one msp_paths entry, searched as both the high- and the low-quality MSP tier, and "
+            "libraries.lbm_path, the .lbm2 library of the lipid-rule tier; without lbm_path the official "
+            "LBM library is that tier.",
         )
     # Once a library is settled, how its retention times should be used is the next
     # decision, and it belongs to the analyst: a library built for this chromatography
@@ -1542,17 +1566,26 @@ def _apply_libraries(
     msp_paths = _path_list(libraries.get("msp_paths"))
     text_paths = _path_list(libraries.get("text_paths"))
     if strategy == "tiered_lipid_msp":
-        lbm_item = next(entry for entry in catalog_status() if entry["id"] == "lipidomics")
-        lbm_path = str(lbm_item.get("local_path", ""))
-        apply_tiered_lcms_annotation(state, lbm_path, msp_paths[0])
-        state["library_provenance"] = [
-            {
+        # The LBM2 the answers name is the one the method file loads and every record names. Before 0.5.47
+        # only the generic branch below read libraries.lbm_path, so this profile ran the official LBM2 while
+        # the answers, and a campaign's records built from them, named another. A second MSP and any text
+        # library are plan blockers (_tiered_library_problems), so msp_paths holds one and text_paths none.
+        lbm_path = _tiered_lbm_path(answers)
+        if lbm_path:
+            lbm_provenance = _given_lbm_provenance(lbm_path, libraries)
+        else:
+            lbm_item = next(entry for entry in catalog_status() if entry["id"] == "lipidomics")
+            lbm_path = str(lbm_item.get("local_path", ""))
+            lbm_provenance = {
                 "path": lbm_path,
                 "version": str(lbm_item["record_id"]),
                 "source": lbm_item["record_url"],
                 "doi": lbm_item["doi"],
                 "license": lbm_item["license"],
-            },
+            }
+        apply_tiered_lcms_annotation(state, lbm_path, msp_paths[0])
+        state["library_provenance"] = [
+            lbm_provenance,
             {
                 "path": str(msp_paths[0]),
                 "version": str(libraries.get("msp_version", "")),
@@ -1584,6 +1617,138 @@ def _apply_libraries(
             for path in [*msp_paths, *text_paths, libraries.get("lbm_path", "")]
             if str(path).strip()
         ]
+
+
+def _tiered_lbm_path(answers: dict[str, Any]) -> str:
+    """The LBM2 the answers name for the tiered profile's lipid-rule tier, absolute, or "" for the official one.
+
+    A relative path is made absolute where the plan checks and hashes it, the backend's working directory, so
+    the method file loads the file every record names by its sha256 (workflow.absolute_library_path). Left
+    relative, it reached the method file as given, and the Console, reading it against its own folders, found
+    nothing and ran without the tier.
+    """
+    return absolute_library_path((answers.get("libraries") or {}).get("lbm_path"))
+
+
+def _tiered_library_problems(answers: dict[str, Any]) -> list[str]:
+    """What the tiered profile refuses in its answers, before it would run without a word.
+
+    The profile searches one MSP in both of its tiers, so a second msp_paths entry was left out of the run; it
+    searches no text library, so text_paths was left out too; and the Console skips an LBM library it cannot
+    read. A path that does not exist is validate_workflow's "LBM library not found". workflow_overrides reach
+    the state after the profile, so an lbm_path there was the LBM2 the Console loaded, unchecked, while
+    lbm_annotator, library_provenance and every record named the one checked here. A libraries key the profile
+    does not read was dropped as well: with the LBM2 under any key but lbm_path, the official LBM2 was the tier,
+    and the plan ready once it was downloaded, while a campaign pinned and recorded the LBM2 the key named. So
+    was an answers key the plan does not apply, which the other strategies only warn of: an LBM2 given beside
+    libraries rather than in it, as a profile's by_ion_mode.<mode>.lbm_path is once a campaign merges it into
+    the answers and pins it, left the official LBM2 as the tier in the same way. answers.library_provenance is
+    refused too, since this profile replaces it with the provenance it measures from libraries.
+    """
+    libraries = answers.get("libraries") or {}
+    problems: list[str] = []
+    for key in sorted(set(answers) - SUPPORTED_ANSWER_KEYS):
+        problems.append(
+            f"tiered_lipid_msp does not read answers.{key}, so it would be left out of the run without a word. A "
+            "library goes in libraries, an LBM2 in libraries.lbm_path: without one the lipid-rule tier is the "
+            "official LBM library."
+        )
+    if "library_provenance" in answers:
+        problems.append(
+            "tiered_lipid_msp records the libraries it loads from libraries, measured from the files, and does not "
+            "read answers.library_provenance, so it would be left out of the run without a word. Give "
+            "lbm_version, lbm_source, lbm_doi and lbm_license, and their msp_ counterparts, in libraries."
+        )
+    for key in sorted(set(libraries) - TIERED_LIBRARY_KEYS - {"text_paths"}):
+        problems.append(
+            f"tiered_lipid_msp does not read libraries.{key}, so it would be left out of the run without a word; "
+            f"the profile reads {', '.join(sorted(TIERED_LIBRARY_KEYS))}. An LBM2 goes in lbm_path: without one "
+            "the lipid-rule tier is the official LBM library."
+        )
+    for key in sorted(set(dict(answers.get("workflow_overrides") or {})) & TIERED_LIBRARY_STATE_KEYS):
+        problems.append(
+            f"workflow_overrides.{key} would replace what the tiered_lipid_msp profile sets from libraries, after "
+            "the plan has checked it, so the run could load a library its records do not name. Give the "
+            "libraries in libraries."
+        )
+    msp_paths = _path_list(libraries.get("msp_paths"))
+    if len(msp_paths) > 1:
+        problems.append(
+            f"tiered_lipid_msp searches one MSP in both of its MSP tiers; libraries.msp_paths names "
+            f"{len(msp_paths)}. Give one, or list each library with library_strategy 'annotators'."
+        )
+    text_paths = _path_list(libraries.get("text_paths"))
+    if text_paths:
+        problems.append(
+            f"tiered_lipid_msp searches no text library; libraries.text_paths names {len(text_paths)}. Leave it "
+            "out, or search it with library_strategy 'existing'."
+        )
+    lbm_path = _tiered_lbm_path(answers)
+    problem = lbm_library_problem(lbm_path, "The tiered_lipid_msp profile") if lbm_path else ""
+    if not problem and lbm_path and Path(lbm_path).is_file():
+        # The plan records the LBM2 by its sha256 (_given_lbm_provenance). One it cannot read through, denied
+        # or held by another process, is a blocker here, rather than an exception out of the plan or a record
+        # without its checksum.
+        identity, reason = _lbm_identity(lbm_path)
+        if identity is None:
+            problem = (
+                f"{Path(lbm_path).name} cannot be read ({reason}), so its sha256 cannot be recorded. Plan again "
+                "once it can."
+            )
+    if problem:
+        problems.append(f"libraries.lbm_path: {problem}")
+    return problems
+
+
+def _lbm_identity(path: str | Path) -> tuple[dict[str, Any] | None, str]:
+    """An LBM2's name, size and sha256 as it reads now, or None and why it does not read.
+
+    It is read through to its end and hashed here, at any size, and never through
+    lab_lcms_metabolomics.library_identity: that takes a file of 64 MiB or more, as a campaign LBM2 is, to
+    workflow.file_identity, which answers from the digest it cached against path, size and time without
+    reading the file. A check that took that digest read the LBM2's first byte only, so one failing past it
+    planned as ready, and was recorded by its sha256, once a plan or a prepared run had cached it. A plan reads
+    the LBM2 twice, for its check and for its record.
+
+    The digest read here replaces the one file_identity cached for the file (workflow.remember_file_digest).
+    The run manifest's libraries and the shared library identities take file_identity's digest, so with one
+    cached for content the file held at the same size and time they named that content, while
+    library_provenance named what was read here.
+    """
+    from .lab_lipidomics import file_sha256
+
+    file = Path(path).expanduser()
+    try:
+        read_from = file.stat()
+        sha256 = file_sha256(file)
+    except OSError as error:
+        return None, str(error.strerror or error)
+    remember_file_digest(file, sha256, read_from)
+    return {"name": file.name, "size_bytes": read_from.st_size, "sha256": sha256}, ""
+
+
+def _given_lbm_provenance(path: str, libraries: dict[str, Any]) -> dict[str, Any]:
+    """The provenance of an LBM2 the answers name: its name, size and sha256, measured from the file.
+
+    The version, source, DOI and licence are what the answers say (lbm_version, lbm_source, lbm_doi and
+    lbm_license, private unless they say otherwise). A path that is not an .lbm2 file, or a file that cannot
+    be read through, whatever its size, is recorded by name only; the plan refuses it
+    (_tiered_library_problems), which reads it the same way (_lbm_identity).
+    """
+    entry: dict[str, Any] = {
+        "path": path,
+        "name": Path(path).name,
+        "version": str(libraries.get("lbm_version", "")),
+        "source": str(libraries.get("lbm_source", "")),
+        "doi": str(libraries.get("lbm_doi", "")),
+        "license": str(libraries.get("lbm_license", "institutional/private")),
+    }
+    file = Path(path).expanduser()
+    if file.suffix.casefold() == ".lbm2" and file.is_file():
+        identity, _ = _lbm_identity(file)
+        if identity is not None:
+            entry.update({"size_bytes": identity["size_bytes"], "sha256": identity["sha256"]})
+    return entry
 
 
 def _msp_row(path: str, priority: int) -> dict[str, Any]:

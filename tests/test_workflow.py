@@ -1,3 +1,4 @@
+import csv
 import tempfile
 import unittest
 import zipfile
@@ -16,6 +17,7 @@ from msdial_app.mztab_preview import preview_mztab_file, preview_mztab_outputs
 from msdial_app.mztab_validation import validate_mztab_file, validate_mztab_files, validate_mztab_outputs
 from msdial_app.workflow import (
     _write_method,
+    _write_msp_annotator_settings,
     build_console_command,
     console_capabilities,
     detect_raw_format,
@@ -934,6 +936,29 @@ class WorkflowTests(unittest.TestCase):
             with zipfile.ZipFile(result["bundle"]) as archive:
                 self.assertIn("msp_annotator_settings.tsv", set(archive.namelist()))
                 self.assertIn("text_annotator_settings.tsv", set(archive.namelist()))
+
+    def test_msp_annotator_settings_keep_an_explicit_priority_0(self) -> None:
+        # The Console reads 0 as a priority; only a row that gives none takes its position.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            msp = root / "synthetic.msp"
+            msp.write_text("NAME: A\n", encoding="ascii")
+            state = {
+                "project_type": "lcms",
+                "msp_annotators": [
+                    {"annotator_id": "zero", "msp_file_path": str(msp), "priority": 0},
+                    {"annotator_id": "unset", "msp_file_path": str(msp)},
+                    {"annotator_id": "blank", "msp_file_path": str(msp), "priority": ""},
+                    {"annotator_id": "text_zero", "msp_file_path": str(msp), "priority": "0"},
+                    {"annotator_id": "given", "msp_file_path": str(msp), "priority": 7},
+                ],
+            }
+
+            path = _write_msp_annotator_settings(root, state)
+            with path.open(encoding="ascii", newline="") as handle:
+                priorities = {row["annotator_id"]: row["priority"] for row in csv.DictReader(handle, delimiter="\t")}
+
+            self.assertEqual({"zero": "0", "unset": "2", "blank": "3", "text_zero": "0", "given": "7"}, priorities)
 
     def test_mztab_validation_builtin_checks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

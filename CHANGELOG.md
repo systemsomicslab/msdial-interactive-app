@@ -4,6 +4,74 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.47] - Unreleased
+
+### Fixed
+- **The tiered profile loads the LBM2 its answers name, and every record names the one it loaded.**
+  - `library_strategy: "tiered_lipid_msp"` took its lipid-rule tier from the official catalog LBM2
+    (`lipidomics`) whatever `libraries.lbm_path` said: `_apply_libraries` read `lbm_path` only for the other
+    strategies. MS-DIAL loaded the official LBM2, and the method file's `Lbm file path`,
+    `workflow-settings.json`, `library_provenance` and the run manifest named it; the answers
+    (`guided-answers.json`), and the records a repository campaign built from them, named the LBM2 the
+    profile gave. A campaign whose profile named a laboratory LBM2 therefore annotated with the official
+    one while its records said otherwise. Runs already prepared are not rewritten: their `method.txt` names
+    the LBM2 that ran.
+  - A given `lbm_path` is now the tier. It reaches `Lbm file path`, `lbm_annotator`,
+    `workflow-settings.json`, `library_provenance` (by `name`, `size_bytes` and `sha256` measured from the
+    file, with `lbm_version`, `lbm_source`, `lbm_doi` and `lbm_license` as given, private by default), the
+    run manifest's libraries, the shared library identities and the Materials and Methods.
+  - The library catalog is consulted, and an official LBM2 that is not downloaded is a blocker, only when no
+    `lbm_path` is given. Without one the profile is as before.
+  - A given `lbm_path` that is not an `.lbm2` file with content is a blocker (`workflow.lbm_library_problem`,
+    the laboratory lipidomics rule, which now also refuses a folder); a path that does not exist is "LBM
+    library not found", as for any library.
+  - A given `lbm_path` the plan cannot read through (denied, held by another process while it copies, or failing
+    partway) is a blocker and is recorded by name only, whatever its size, rather than a `PermissionError` out
+    of the plan, which reads the file for its sha256. The plan's check and its record both read the file
+    through to its end and hash it themselves, at any size. Neither takes the digest `workflow.file_identity`
+    caches for a file of 64 MiB or more, as a campaign LBM2 is, against its path, size and time: the cache
+    answers without reading the file, so once it held the digest an LBM2 failing past its first byte would plan
+    as ready and be recorded by its sha256. A plan therefore reads the LBM2 twice.
+  - The digest the plan reads replaces the one `workflow.file_identity` cached for the LBM2
+    (`workflow.remember_file_digest`, which stores nothing when the file's size or time changed while it was
+    read). The run manifest's libraries, the shared library identities and the Materials and Methods take
+    `file_identity`'s digest, so with a digest cached for content the file held at the same size and time they
+    named that content, while `library_provenance` and `workflow-settings.json` named the content read.
+  - A relative `lbm_path` is made absolute against the backend's working directory, where the plan checks and
+    hashes it (`workflow.absolute_library_path`), and the state, the method file and every record name that
+    path. Written as given, it would be read by the Console against the method file's folder and then its own,
+    and the LBM2 skipped without a word while every record named it by its sha256.
+  - A second `msp_paths` entry is a blocker. The profile searches one MSP in both of its MSP tiers, and left
+    any further entry out of the run without a word.
+  - A `text_paths` entry is a blocker. The profile has no text tier, and left a text library out of the method
+    file and every record but the answers without a word; `library_strategy: "existing"` searches one.
+  - A `workflow_overrides` key that names or records a library (`lbm_path`, `lbm_annotator`, `msp_path`,
+    `msp_annotators`, `text_db_path`, `text_annotators`, `library_provenance` or `annotation_pipeline_profile`)
+    is a blocker under this profile. Overrides reach the state after the profile, so an `lbm_path` there was
+    the LBM2 the method file named, unchecked, while `lbm_annotator`, `library_provenance` and every record
+    named the given one. The other library strategies apply such an override as before.
+  - A `libraries` key the profile does not read is a blocker. It reads `msp_paths` and `lbm_path`, with
+    `msp_version`, `msp_source`, `msp_doi`, `msp_license` and their `lbm_` counterparts; `text_paths` has the
+    blocker above. An LBM2 named
+    under any other key, such as `lbm_file_path`, the key of `lbm_annotator`, was left out without a word: the
+    official LBM2 was the tier, and the plan ready once it was downloaded, while a campaign, which resolves a
+    library reference under any key, pinned and recorded the LBM2 the key named.
+  - An answers key the plan does not apply is a blocker under this profile, not only the warning "Unknown
+    answers key was not applied" the other strategies still give. An LBM2 given beside `libraries` rather than
+    in it, as a profile's `by_ion_mode.<mode>.lbm_path` is once a campaign merges it into the answers, left the
+    official LBM2 as the tier in the same way. `library_provenance` given as an answer is a blocker too: the
+    profile replaces it with the provenance it measures from `libraries`.
+- `msp_annotator_settings.tsv` keeps an explicit priority 0, which the Console reads as a priority; the row's
+  position replaced it. No profile writes 0 today.
+- The method file's `Lbm file path` is written absolute for every library strategy, as the MSP and text rows
+  of the annotator settings files are. A relative `libraries.lbm_path` of `existing` libraries reached it as
+  given, with the same effect; the workflow state and provenance keep the path as the answers give it.
+
+### Changed
+- The plan's `libraries` question for `tiered_lipid_msp` asks for `libraries.lbm_path` beside the one MSP, and
+  says the official LBM library is the tier only without it. `scripts/create-tiered-annotation-demo.py` takes
+  `--lbm`.
+
 ## [0.5.46] - Unreleased
 
 Built on 0.5.45 (#78), which is not merged yet; merge this after it.

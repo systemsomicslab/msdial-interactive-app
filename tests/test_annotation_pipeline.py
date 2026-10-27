@@ -1,19 +1,138 @@
+import ast
 import csv
+import hashlib
+import json
+import os
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 from unittest.mock import patch
 
-from msdial_app.agent_workflow import build_guided_plan
+from msdial_app import __version__
+from msdial_app.agent_workflow import TIERED_LIBRARY_KEYS, build_guided_plan
 from msdial_app.annotation_pipeline import (
     TIERED_LCMS_PROFILE_ID,
     apply_tiered_lcms_annotation,
     tiered_lcms_annotation,
 )
-from msdial_app.workflow import _write_msp_annotator_settings
+from msdial_app.materials_methods import generate_publication_report
+from msdial_app.sharing import library_records
+from msdial_app.workflow import _write_msp_annotator_settings, file_identity, prepare_run
 
 
 ROOT = Path(__file__).resolve().parent.parent
+TEMPLATE = ROOT / "resources" / "msdial_console_param4lipidomics.txt"
+
+
+def libraries_keys_read(path: Path) -> set[str]:
+    """Every answers.libraries key a module reads by name.
+
+    That is libraries.get("key") and libraries["key"], with libraries the name the module gives the answers'
+    libraries, and (answers.get("libraries") or {}).get("key") without one.
+    """
+
+    def is_libraries(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id == "libraries"
+        if isinstance(node, ast.BoolOp):
+            return is_libraries(node.values[0])
+        return (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+            and bool(node.args) and isinstance(node.args[0], ast.Constant) and node.args[0].value == "libraries"
+        )
+
+    keys: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        key: ast.AST | None = None
+        if (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+            and node.args and is_libraries(node.func.value)
+        ):
+            key = node.args[0]
+        elif isinstance(node, ast.Subscript) and is_libraries(node.value):
+            key = node.slice
+        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+            keys.add(key.value)
+    return keys
+
+
+def method_lines(path: str | Path) -> dict[str, str]:
+    lines: dict[str, str] = {}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if ":" in line and not line.startswith("#"):
+            key, _, value = line.partition(":")
+            lines[key.strip()] = value.strip()
+    return lines
+
+
+@contextmanager
+def working_directory(path: Path) -> Iterator[None]:
+    previous = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+@contextmanager
+def held_unreadable(path: Path) -> Iterator[None]:
+    """The file as another process holds it while it copies, or as an ACL that denies reading leaves it: it
+    exists and has a size, but no read of it succeeds. On Windows a byte-range lock does that within this
+    process; elsewhere the file loses its permissions, which a superuser still reads through."""
+    if os.name == "nt":
+        import msvcrt
+
+        size = path.stat().st_size
+        with path.open("r+b") as handle:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, size)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, size)
+    else:
+        mode = path.stat().st_mode
+        path.chmod(0)
+        try:
+            yield
+        finally:
+            path.chmod(mode)
+
+
+@contextmanager
+def held_in_part(path: Path, offset: int, length: int) -> Iterator[None]:
+    """The file with one byte range held by a byte-range lock: its first read succeeds and a read through it
+    fails, as when a network share or another process fails a read partway. Only Windows locks a range so."""
+    import msvcrt
+
+    with path.open("r+b") as handle:
+        handle.seek(offset)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, length)
+        try:
+            yield
+        finally:
+            handle.seek(offset)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, length)
+
+
+def write_synthetic_lbm2(path: Path, size: int) -> str:
+    """A synthetic .lbm2 of the given size, zero-filled after a short header; its sha256."""
+    with path.open("wb") as handle:
+        handle.write(b"synthetic laboratory LBM2 library")
+        handle.truncate(size)
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 22), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+# lab_lcms_metabolomics.library_identity hashes a file below this itself and one of this size or more through
+# workflow.file_identity, whose digest is cached and which answers a failed read with an empty sha256.
+LARGE_LIBRARY_BYTES = (64 << 20) + (1 << 20)
 
 
 class AnnotationPipelineTests(unittest.TestCase):
@@ -97,6 +216,568 @@ class AnnotationPipelineTests(unittest.TestCase):
             self.assertEqual(2, len(workflow["msp_annotators"]))
             self.assertTrue(workflow["selected_lipids"])
             self.assertEqual(3, workflow["lbm_annotator"]["priority"])
+            # Without libraries.lbm_path, the official catalog LBM2 is the lipid-rule tier and its record.
+            self.assertEqual("lipidomics", plan["official_library"]["id"])
+            self.assertEqual(str(lbm), workflow["lbm_path"])
+            self.assertEqual(str(lbm), workflow["lbm_annotator"]["lbm_file_path"])
+            self.assertEqual(
+                {
+                    "path": str(lbm),
+                    "version": "21904324",
+                    "source": "https://zenodo.org/records/21904324",
+                    "doi": "10.5281/zenodo.21904324",
+                    "license": "CC BY 4.0",
+                },
+                workflow["library_provenance"][0],
+            )
+            self.assertEqual(str(msp), workflow["library_provenance"][1]["path"])
+
+
+class GivenLbmPathTests(unittest.TestCase):
+    """The tiered profile loads the LBM2 its answers name, and every record names the one it loads.
+
+    Until 0.5.47 the profile loaded the official catalog LBM2 whatever libraries.lbm_path said, while
+    the answers, and a campaign's records built from them, named the given one.
+    """
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.data = self.root / "data"
+        self.data.mkdir()
+        (self.data / "sample.mzML").write_text("", encoding="ascii")
+        self.libraries = self.root / "libraries"
+        self.libraries.mkdir()
+        self.console = self.root / "MSDIALCUI.exe"
+        self.console.write_text("", encoding="ascii")
+        self.msp = self.libraries / "synthetic-neg.msp"
+        self.msp.write_text("NAME: A\n", encoding="ascii")
+        self.lbm = self.libraries / "synthetic-lab-lipids.lbm2"
+        self.lbm.write_bytes(b"synthetic laboratory LBM2 library")
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def answers(self, **libraries) -> dict:
+        return {
+            "project_type": "lcms", "ion_mode": "Negative", "target_omics": "Lipidomics",
+            "parameter_strategy": "default", "execute_rt_correction": False,
+            "library_strategy": "tiered_lipid_msp",
+            "libraries": {"lbm_path": str(self.lbm), "msp_paths": [str(self.msp)], "msp_version": "VS-test",
+                          **libraries},
+            "run_qa": False, "generate_materials_methods": False, "class_assignment_confirmed": True,
+            "console_path": str(self.console), "template_path": str(TEMPLATE),
+            "output_root": str(self.root / "out"),
+        }
+
+    def plan(self, answers: dict) -> dict:
+        # The catalog is the official LBM2's; a plan with an LBM2 of its own never asks it.
+        with patch("msdial_app.agent_workflow.catalog_status", side_effect=AssertionError("catalog consulted")):
+            return build_guided_plan(str(self.data), answers)
+
+    def test_the_given_lbm2_reaches_the_method_file_and_every_record_by_its_sha256(self) -> None:
+        digest = hashlib.sha256(self.lbm.read_bytes()).hexdigest()
+        plan = self.plan(self.answers(lbm_version="synthetic-1"))
+
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        self.assertIsNone(plan["official_library"])
+        workflow = plan["workflow"]
+        self.assertEqual(str(self.lbm), workflow["lbm_path"])
+        self.assertEqual(str(self.lbm), workflow["lbm_annotator"]["lbm_file_path"])
+        self.assertEqual(3, workflow["lbm_annotator"]["priority"])
+        self.assertEqual(
+            {
+                "path": str(self.lbm), "name": self.lbm.name, "size_bytes": self.lbm.stat().st_size,
+                "sha256": digest, "version": "synthetic-1", "source": "", "doi": "",
+                "license": "institutional/private",
+            },
+            workflow["library_provenance"][0],
+        )
+        self.assertEqual([str(self.msp)] * 2, [row["msp_file_path"] for row in workflow["msp_annotators"]])
+
+        prepared = prepare_run(workflow)
+        self.assertEqual(str(self.lbm), method_lines(prepared["method_file"])["Lbm file path"])
+        settings = json.loads(Path(prepared["settings_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(str(self.lbm), settings["lbm_path"])
+        self.assertEqual(digest, settings["library_provenance"][0]["sha256"])
+        manifest = json.loads(Path(prepared["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            [(str(self.lbm), digest)],
+            [(item["path"], item["sha256"]) for item in manifest["libraries"] if item["path"].endswith(".lbm2")],
+        )
+        # The identities a repository unit's run manifest, its finalisation and its reports name libraries by.
+        identities = [library.identity for library in library_records(workflow)]
+        self.assertEqual(
+            [(self.lbm.name, digest, "private")],
+            [(item["name"], item["sha256"], item["distribution"]) for item in identities if item["role"] == "lbm"],
+        )
+        report = generate_publication_report(
+            workflow, None, prepared["run_directory"], app_version=__version__, console_version="test",
+        )
+        self.assertIn("one LBM annotator", report["methods_text"])
+        self.assertIn(f"{self.lbm.name} (SHA-256 {digest})", report["methods_text"])
+        recorded = json.dumps([workflow, settings, manifest, identities]) + report["methods_text"]
+        self.assertNotIn("zenodo", recorded.casefold())
+
+    def test_an_lbm_path_the_console_could_not_load_is_a_blocker(self) -> None:
+        missing = self.libraries / "missing.lbm2"
+        empty = self.libraries / "empty.lbm2"
+        empty.write_bytes(b"")
+        other = self.libraries / "lipids.msp"
+        other.write_text("NAME: A\n", encoding="ascii")
+        folder = self.libraries / "folder.lbm2"
+        folder.mkdir()
+        for path, message in (
+            (missing, f"LBM library not found: {missing}"),
+            (empty, "libraries.lbm_path: empty.lbm2 is empty"),
+            (other, "libraries.lbm_path: The tiered_lipid_msp profile reads an .lbm2 library; lipids.msp is not one."),
+            (folder, "libraries.lbm_path: folder.lbm2 is a folder"),
+        ):
+            with self.subTest(path=path.name):
+                plan = self.plan(self.answers(lbm_path=str(path)))
+                self.assertFalse(plan["ready_to_prepare"])
+                self.assertIsNone(plan["official_library"])
+                self.assertTrue(any(message in item for item in plan["blockers"]), plan["blockers"])
+
+    def test_a_relative_lbm_path_is_written_and_recorded_as_the_file_the_plan_hashed(self) -> None:
+        # The plan checks and hashes a relative path against the backend's working directory. The Console
+        # reads one against the method file's folder and then its own (ConfigParser.ResolvePathFromMethodFile),
+        # and skips an LBM it does not find without a word; neither folder holds this one.
+        digest = hashlib.sha256(self.lbm.read_bytes()).hexdigest()
+        with working_directory(self.libraries):
+            plan = self.plan(self.answers(lbm_path=self.lbm.name))
+            self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+            workflow = plan["workflow"]
+            prepared = prepare_run(workflow)
+
+        written = method_lines(prepared["method_file"])["Lbm file path"]
+        self.assertTrue(Path(written).is_absolute(), written)
+        self.assertTrue(Path(written).samefile(self.lbm))
+        self.assertFalse((Path(prepared["method_file"]).parent / self.lbm.name).exists())
+        self.assertFalse((self.console.parent / self.lbm.name).exists())
+        provenance = workflow["library_provenance"][0]
+        settings = json.loads(Path(prepared["settings_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            [written] * 4,
+            [workflow["lbm_path"], workflow["lbm_annotator"]["lbm_file_path"], provenance["path"],
+             settings["lbm_path"]],
+        )
+        self.assertEqual((self.lbm.name, digest), (provenance["name"], provenance["sha256"]))
+
+    def test_a_relative_lbm_path_of_existing_libraries_reaches_the_method_file_absolute(self) -> None:
+        # The generic strategy keeps the path as given in its state, as it keeps its MSP paths; the method
+        # file names it absolute, as msp_annotator_settings.tsv names the MSP.
+        answers = self.answers(lbm_path=self.lbm.name)
+        answers.update({"library_strategy": "existing", "target_omics": "Metabolomics"})
+        with working_directory(self.libraries):
+            plan = self.plan(answers)
+            self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+            prepared = prepare_run(plan["workflow"])
+
+        written = method_lines(prepared["method_file"])["Lbm file path"]
+        self.assertTrue(Path(written).is_absolute(), written)
+        self.assertTrue(Path(written).samefile(self.lbm))
+
+    def test_an_lbm2_the_plan_cannot_read_is_a_blocker_not_an_exception(self) -> None:
+        # The plan reads the given LBM2 in full for its sha256. Held by another process, or denied by an ACL,
+        # it raised PermissionError out of build_guided_plan, so /api/agent/plan answered with a traceback.
+        with held_unreadable(self.lbm):
+            try:
+                self.lbm.read_bytes()
+            except OSError:
+                pass
+            else:
+                self.skipTest("this account reads a file whatever its permissions")
+            plan = self.plan(self.answers())
+
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertTrue(
+            any(f"libraries.lbm_path: {self.lbm.name} cannot be read" in item for item in plan["blockers"]),
+            plan["blockers"],
+        )
+        provenance = plan["workflow"]["library_provenance"][0]
+        self.assertEqual(self.lbm.name, provenance["name"])
+        self.assertNotIn("sha256", provenance)
+        self.assertNotIn("size_bytes", provenance)
+
+    def test_an_lbm2_that_cannot_be_hashed_is_a_blocker_and_recorded_by_name_only(self) -> None:
+        # A read fails while it is hashed: the plan's check hashes it as the record does (_lbm_identity).
+        with patch("msdial_app.lab_lipidomics.file_sha256", side_effect=PermissionError(13, "Permission denied")):
+            plan = self.plan(self.answers())
+
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertIn(
+            f"libraries.lbm_path: {self.lbm.name} cannot be read (Permission denied), so its sha256 cannot be "
+            "recorded. Plan again once it can.",
+            plan["blockers"],
+        )
+        provenance = plan["workflow"]["library_provenance"][0]
+        self.assertEqual(self.lbm.name, provenance["name"])
+        self.assertNotIn("sha256", provenance)
+        self.assertNotIn("size_bytes", provenance)
+
+    @unittest.skipUnless(os.name == "nt", "only Windows holds a byte range of a file")
+    def test_an_lbm2_that_fails_partway_through_is_a_blocker_and_recorded_by_name_only_at_any_size(self) -> None:
+        # A campaign LBM2 is hundreds of MB, which the plan hashed through workflow.file_identity: that answers a
+        # failed read with an empty sha256, not an OSError, and the record carried it with a size.
+        # The range held lies past the first read, so only a read through the file meets it. The cache is
+        # empty here; test_a_large_lbm2_that_fails_partway_through_is_a_blocker_though_its_digest_is_cached
+        # holds the same range with the digest cached.
+        for size, label in ((2 << 20, "below 64 MiB"), (LARGE_LIBRARY_BYTES, "64 MiB or more")):
+            with self.subTest(label), tempfile.TemporaryDirectory() as user_data:
+                lbm = self.libraries / f"synthetic-{size}.lbm2"
+                write_synthetic_lbm2(lbm, size)
+                with patch("msdial_app.workflow.user_data_directory", return_value=Path(user_data)):
+                    with held_in_part(lbm, 1 << 20, 1 << 10):
+                        with lbm.open("rb") as handle:
+                            self.assertTrue(handle.read(1))
+                        plan = self.plan(self.answers(lbm_path=str(lbm)))
+
+                self.assertFalse(plan["ready_to_prepare"])
+                self.assertTrue(
+                    any(f"libraries.lbm_path: {lbm.name} cannot be read (" in item for item in plan["blockers"]),
+                    plan["blockers"],
+                )
+                provenance = plan["workflow"]["library_provenance"][0]
+                self.assertEqual(lbm.name, provenance["name"])
+                self.assertNotIn("sha256", provenance)
+                self.assertNotIn("size_bytes", provenance)
+                lbm.unlink()
+
+    def test_a_large_lbm2_is_recorded_by_its_sha256_and_never_by_a_digest_cached_while_it_is_unreadable(self) -> None:
+        # workflow.file_identity caches a large file's digest against its size and time and returns it without
+        # reading the file, so a held LBM2 the plan blocked on was still recorded with a sha256.
+        lbm = self.libraries / "synthetic-large.lbm2"
+        digest = write_synthetic_lbm2(lbm, LARGE_LIBRARY_BYTES)
+        with tempfile.TemporaryDirectory() as user_data:
+            with patch("msdial_app.workflow.user_data_directory", return_value=Path(user_data)):
+                readable = self.plan(self.answers(lbm_path=str(lbm)))
+                # Cached as a laboratory run's manifest records it (workflow._manifest_libraries).
+                self.assertEqual(digest, file_identity(lbm)["sha256"])
+                self.assertIn(digest, (Path(user_data) / "file-identity-cache.json").read_text(encoding="utf-8"))
+                with held_unreadable(lbm):
+                    try:
+                        with lbm.open("rb") as handle:
+                            handle.read(1)
+                    except OSError:
+                        pass
+                    else:
+                        self.skipTest("this account reads a file whatever its permissions")
+                    held = self.plan(self.answers(lbm_path=str(lbm)))
+
+        self.assertTrue(readable["ready_to_prepare"], readable["blockers"])
+        self.assertEqual(
+            (lbm.name, LARGE_LIBRARY_BYTES, digest),
+            tuple(readable["workflow"]["library_provenance"][0][key] for key in ("name", "size_bytes", "sha256")),
+        )
+        self.assertFalse(held["ready_to_prepare"])
+        self.assertTrue(
+            any(f"libraries.lbm_path: {lbm.name} cannot be read" in item for item in held["blockers"]),
+            held["blockers"],
+        )
+        provenance = held["workflow"]["library_provenance"][0]
+        self.assertEqual(lbm.name, provenance["name"])
+        self.assertNotIn("sha256", provenance)
+        self.assertNotIn("size_bytes", provenance)
+
+    @unittest.skipUnless(os.name == "nt", "only Windows holds a byte range of a file")
+    def test_a_large_lbm2_that_fails_partway_through_is_a_blocker_though_its_digest_is_cached(self) -> None:
+        # The plan read the first byte and then took file_identity's digest, which the cache answers without
+        # reading the file. In a campaign every unit names the same LBM2, so once its digest was cached, one
+        # failing past its first byte planned as ready and was recorded by its sha256.
+        lbm = self.libraries / "synthetic-large.lbm2"
+        digest = write_synthetic_lbm2(lbm, LARGE_LIBRARY_BYTES)
+        with tempfile.TemporaryDirectory() as user_data:
+            with patch("msdial_app.workflow.user_data_directory", return_value=Path(user_data)):
+                self.assertEqual(digest, file_identity(lbm)["sha256"])
+                with held_in_part(lbm, 1 << 20, 1 << 10):
+                    with lbm.open("rb") as handle:
+                        self.assertTrue(handle.read(1))
+                    with self.assertRaises(OSError):
+                        lbm.read_bytes()
+                    # The cache still answers for the file, though it no longer reads through.
+                    self.assertEqual(digest, file_identity(lbm)["sha256"])
+                    plan = self.plan(self.answers(lbm_path=str(lbm)))
+
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertTrue(
+            any(f"libraries.lbm_path: {lbm.name} cannot be read (" in item for item in plan["blockers"]),
+            plan["blockers"],
+        )
+        provenance = plan["workflow"]["library_provenance"][0]
+        self.assertEqual(lbm.name, provenance["name"])
+        self.assertNotIn("sha256", provenance)
+        self.assertNotIn("size_bytes", provenance)
+
+    def test_a_large_lbm2_is_recorded_by_the_sha256_the_plan_reads_not_the_one_cached_for_it(self) -> None:
+        # A digest cached for content the file no longer holds, at the same size and time, shows which one the
+        # records take: the plan reads the LBM2 through and records what it read. The run manifest and the shared
+        # library identities take file_identity's digest, so they named the cached content while
+        # library_provenance named the content read; the plan now stores what it read where file_identity looks.
+        lbm = self.libraries / "synthetic-large.lbm2"
+        cached = write_synthetic_lbm2(lbm, LARGE_LIBRARY_BYTES)
+        with tempfile.TemporaryDirectory() as user_data:
+            with patch("msdial_app.workflow.user_data_directory", return_value=Path(user_data)):
+                self.assertEqual(cached, file_identity(lbm)["sha256"])
+                stat = lbm.stat()
+                with lbm.open("r+b") as handle:
+                    handle.write(b"rewritten")
+                os.utime(lbm, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+                self.assertEqual(cached, file_identity(lbm)["sha256"])
+                plan = self.plan(self.answers(lbm_path=str(lbm)))
+                self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+                workflow = plan["workflow"]
+                prepared = prepare_run(workflow)
+                # The identities a repository unit's run manifest, its finalisation and its reports name libraries
+                # by (workflow._manifest_libraries, run_finalisation).
+                identities = [library.identity for library in library_records(workflow)]
+                identified = file_identity(lbm)["sha256"]
+
+        digest = hashlib.sha256(lbm.read_bytes()).hexdigest()
+        self.assertNotEqual(cached, digest)
+        self.assertEqual(
+            (LARGE_LIBRARY_BYTES, digest),
+            tuple(workflow["library_provenance"][0][key] for key in ("size_bytes", "sha256")),
+        )
+        settings = json.loads(Path(prepared["settings_file"]).read_text(encoding="utf-8"))
+        manifest = json.loads(Path(prepared["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(digest, settings["library_provenance"][0]["sha256"])
+        self.assertEqual(
+            [digest], [item["sha256"] for item in manifest["libraries"] if item["path"].endswith(".lbm2")]
+        )
+        self.assertEqual([digest], [item["sha256"] for item in identities if item["role"] == "lbm"])
+        self.assertEqual(digest, identified)
+
+    def test_a_workflow_override_of_a_library_is_refused_rather_than_run_unchecked(self) -> None:
+        # workflow_overrides reach the state after the profile, so an lbm_path there was the LBM2 method.txt
+        # named, unchecked, while lbm_annotator, library_provenance and every record named the given one.
+        other = self.libraries / "synthetic-other.lbm2"
+        other.write_bytes(b"another synthetic LBM2 library")
+        for key, value in (
+            ("lbm_path", str(other)),
+            ("lbm_annotator", {"lbm_file_path": str(other), "priority": 3}),
+            ("msp_path", str(self.msp)),
+            ("msp_annotators", []),
+            ("text_db_path", str(self.msp)),
+            ("text_annotators", []),
+            ("library_provenance", []),
+            ("annotation_pipeline_profile", "another-profile"),
+        ):
+            with self.subTest(key):
+                answers = self.answers()
+                answers["workflow_overrides"] = {key: value, "number_of_threads": 2}
+                plan = self.plan(answers)
+
+                self.assertFalse(plan["ready_to_prepare"])
+                self.assertEqual(
+                    [
+                        f"workflow_overrides.{key} would replace what the tiered_lipid_msp profile sets from "
+                        "libraries, after the plan has checked it, so the run could load a library its records do "
+                        "not name. Give the libraries in libraries."
+                    ],
+                    [item for item in plan["blockers"] if item.startswith("workflow_overrides.")],
+                )
+
+        answers = self.answers()
+        answers["workflow_overrides"] = {"number_of_threads": 2}
+        plan = self.plan(answers)
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        self.assertEqual(2, plan["workflow"]["number_of_threads"])
+
+    def test_a_second_msp_path_is_refused_rather_than_left_out(self) -> None:
+        second = self.libraries / "second.msp"
+        second.write_text("NAME: B\n", encoding="ascii")
+        plan = self.plan(self.answers(msp_paths=[str(self.msp), str(second)]))
+
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertTrue(
+            any("libraries.msp_paths names 2" in item for item in plan["blockers"]), plan["blockers"]
+        )
+
+    def test_a_text_library_is_refused_rather_than_left_out(self) -> None:
+        # The profile has no text tier: a text DB given beside it reached neither method.txt nor any record but
+        # the answers.
+        text = self.libraries / "synthetic-standards.txt"
+        text.write_text("Name\tMZ\nA\t100.0\n", encoding="ascii")
+        plan = self.plan(self.answers(text_paths=[str(text)]))
+
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertIn(
+            "tiered_lipid_msp searches no text library; libraries.text_paths names 1. Leave it out, or search it "
+            "with library_strategy 'existing'.",
+            plan["blockers"],
+        )
+        self.assertEqual([], [item for item in plan["blockers"] if "does not read" in item])
+        self.assertEqual([], plan["workflow"]["text_annotators"])
+
+    def test_a_libraries_key_the_profile_does_not_read_is_refused_rather_than_left_out(self) -> None:
+        # Only libraries.lbm_path names the lipid-rule tier's LBM2. Under another key, lbm_annotator's
+        # lbm_file_path among them, the plan took the official LBM2 and was ready once it was downloaded, while a
+        # campaign, which resolves a library reference under any key, pinned and recorded the one the key named.
+        official = self.libraries / "synthetic-official.lbm2"
+        official.write_bytes(b"synthetic official LBM2 library")
+        downloaded = [{
+            "id": "lipidomics", "kind": "lbm", "downloaded": True, "local_path": str(official),
+            "record_id": 1, "record_url": "https://example.org/records/1", "doi": "", "license": "CC BY 4.0",
+        }]
+        read = (
+            "the profile reads lbm_doi, lbm_license, lbm_path, lbm_source, lbm_version, msp_doi, msp_license, "
+            "msp_paths, msp_source, msp_version. An LBM2 goes in lbm_path: without one the lipid-rule tier is the "
+            "official LBM library."
+        )
+        for key, value in (
+            ("lbm_file_path", str(self.lbm)),
+            ("lbm", str(self.lbm)),
+            ("lbm_paths", [str(self.lbm)]),
+            ("msp_path", str(self.msp)),
+            ("lbm_file_path", ""),
+        ):
+            for given in (False, True):
+                with self.subTest(key=key, value=value, lbm_path=given):
+                    answers = self.answers(**{key: value})
+                    if not given:
+                        del answers["libraries"]["lbm_path"]
+                    with patch("msdial_app.agent_workflow.catalog_status", return_value=downloaded):
+                        plan = build_guided_plan(str(self.data), answers)
+
+                    self.assertFalse(plan["ready_to_prepare"])
+                    self.assertEqual(
+                        [
+                            f"tiered_lipid_msp does not read libraries.{key}, so it would be left out of the run "
+                            f"without a word; {read}"
+                        ],
+                        [item for item in plan["blockers"] if "does not read" in item],
+                    )
+
+        # Every key the profile reads still plans, and reaches the record.
+        plan = self.plan(self.answers(
+            lbm_version="synthetic-1", lbm_source="synthetic source", lbm_doi="10.0000/synthetic.lbm",
+            lbm_license="synthetic licence", msp_source="synthetic MSP source", msp_doi="10.0000/synthetic.msp",
+            msp_license="synthetic MSP licence",
+        ))
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        self.assertEqual(
+            [
+                ("synthetic-1", "synthetic source", "10.0000/synthetic.lbm", "synthetic licence"),
+                ("VS-test", "synthetic MSP source", "10.0000/synthetic.msp", "synthetic MSP licence"),
+            ],
+            [
+                (item["version"], item["source"], item["doi"], item["license"])
+                for item in plan["workflow"]["library_provenance"]
+            ],
+        )
+
+    def test_every_libraries_key_the_plan_reads_is_one_the_profile_reads_or_another_strategy_s(self) -> None:
+        # The profile refuses a libraries key outside TIERED_LIBRARY_KEYS. A change that comes to read one, as
+        # an in-silico MSP tier does, merges with that set without a conflict, and each side's tests pass on
+        # their own while the merged plan refuses every run that gives the key. So the set is held to every
+        # libraries key agent_workflow reads, less those only another strategy reads; this fails until a key
+        # the profile reads is added to the set, or one only another strategy reads is named here.
+        other_strategies = {
+            "annotators",  # library_strategy 'annotators'
+            "text_paths",  # library_strategy 'existing'; refused under this profile with a message of its own
+        }
+        read = libraries_keys_read(ROOT / "msdial_app" / "agent_workflow.py")
+
+        self.assertLessEqual({"lbm_path", "msp_paths", "annotators"}, read)  # the scan finds what it should
+        self.assertEqual(set(TIERED_LIBRARY_KEYS), read - other_strategies)
+
+        # And each is planned without the refusal of a key the profile does not read.
+        answers = self.answers()
+        for key in sorted(read - other_strategies):
+            answers["libraries"].setdefault(key, "synthetic")
+        plan = self.plan(answers)
+        self.assertEqual(
+            [], [item for item in plan["blockers"] if item.startswith("tiered_lipid_msp does not read libraries.")]
+        )
+
+    def test_an_answers_key_the_plan_does_not_apply_is_refused_rather_than_left_out(self) -> None:
+        # An LBM2 given beside libraries rather than in it, as a profile's by_ion_mode.Positive.lbm_path is once a
+        # campaign merges it into the answers, was only the warning "Unknown answers key was not applied": the plan
+        # took the official LBM2 and was ready once it was downloaded, while the campaign pinned and recorded the
+        # LBM2 the key named.
+        official = self.libraries / "synthetic-official.lbm2"
+        official.write_bytes(b"synthetic official LBM2 library")
+        downloaded = [{
+            "id": "lipidomics", "kind": "lbm", "downloaded": True, "local_path": str(official),
+            "record_id": 1, "record_url": "https://example.org/records/1", "doi": "", "license": "CC BY 4.0",
+        }]
+        for key, value in (
+            ("lbm_path", str(self.lbm)),
+            ("lbm_file_path", str(self.lbm)),
+            ("msp_paths", [str(self.msp)]),
+            ("number_of_thread", 2),
+        ):
+            for given in (False, True):
+                with self.subTest(key=key, lbm_path=given):
+                    answers = self.answers()
+                    answers[key] = value
+                    if not given:
+                        del answers["libraries"]["lbm_path"]
+                    with patch("msdial_app.agent_workflow.catalog_status", return_value=downloaded):
+                        plan = build_guided_plan(str(self.data), answers)
+
+                    self.assertFalse(plan["ready_to_prepare"])
+                    self.assertEqual(
+                        [
+                            f"tiered_lipid_msp does not read answers.{key}, so it would be left out of the run "
+                            "without a word. A library goes in libraries, an LBM2 in libraries.lbm_path: without "
+                            "one the lipid-rule tier is the official LBM library."
+                        ],
+                        [item for item in plan["blockers"] if "does not read answers." in item],
+                    )
+                    self.assertIn(f"Unknown answers key was not applied: {key}", plan["warnings"])
+
+        # A provenance answer naming an LBM2 is replaced by the one the profile measures from libraries.
+        for given in (False, True):
+            with self.subTest("library_provenance", lbm_path=given):
+                answers = self.answers()
+                answers["library_provenance"] = [{"path": str(self.lbm), "version": "synthetic-1"}]
+                if not given:
+                    del answers["libraries"]["lbm_path"]
+                with patch("msdial_app.agent_workflow.catalog_status", return_value=downloaded):
+                    plan = build_guided_plan(str(self.data), answers)
+
+                self.assertFalse(plan["ready_to_prepare"])
+                self.assertIn(
+                    "tiered_lipid_msp records the libraries it loads from libraries, measured from the files, and "
+                    "does not read answers.library_provenance, so it would be left out of the run without a word. "
+                    "Give lbm_version, lbm_source, lbm_doi and lbm_license, and their msp_ counterparts, in "
+                    "libraries.",
+                    plan["blockers"],
+                )
+
+        # The other library strategies still apply what they read and only warn of the rest.
+        answers = self.answers(lbm_path=str(self.lbm))
+        answers.update(
+            {"library_strategy": "existing", "target_omics": "Metabolomics", "lbm_file_path": str(official)}
+        )
+        plan = self.plan(answers)
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+        self.assertIn("Unknown answers key was not applied: lbm_file_path", plan["warnings"])
+        self.assertEqual(str(self.lbm), plan["workflow"]["lbm_path"])
+
+    def test_without_an_lbm_path_the_official_lbm2_is_still_asked_for(self) -> None:
+        answers = self.answers()
+        del answers["libraries"]["lbm_path"]
+        missing = [{
+            "id": "lipidomics", "kind": "lbm", "downloaded": False, "local_path": "", "record_id": 21904324,
+            "record_url": "https://zenodo.org/records/21904324", "doi": "10.5281/zenodo.21904324",
+            "license": "CC BY 4.0",
+        }]
+        with patch("msdial_app.agent_workflow.catalog_status", return_value=missing):
+            plan = build_guided_plan(str(self.data), answers)
+            unanswered = build_guided_plan(str(self.data), {**answers, "libraries": {}})
+
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertEqual("lipidomics", plan["official_library"]["id"])
+        self.assertIn(
+            "The official lipidomics LBM library is not downloaded. Ask for confirmation, then download it.",
+            plan["blockers"],
+        )
+        question = next(item for item in unanswered["remaining_questions"] if item["id"] == "libraries")
+        self.assertIn("libraries.lbm_path", question["prompt"])
+        self.assertNotIn("The official LBM library is used as tier 1", question["prompt"])
 
 
 if __name__ == "__main__":
