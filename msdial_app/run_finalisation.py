@@ -81,6 +81,7 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -89,7 +90,7 @@ import urllib.parse
 import uuid
 import zlib
 from pathlib import Path, PureWindowsPath
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .diagnostic_paths import INTERMEDIATES_DIRECTORY, extended_path, path_is_file
 from .library_copy_store import (
@@ -113,6 +114,7 @@ from .library_copy_store import (
     unit_ref,
     workspace_root_for,
 )
+from .lipid_rt_check import run_outcome, summary_outcome
 from .sharing import PATH_POLICY, SharingContext, local_path_of
 
 
@@ -1252,6 +1254,36 @@ def campaign_approval_recorded(manifest: dict[str, Any]) -> bool:
     return any(isinstance(item, dict) for item in _read_json(Path(parent)).get("campaign_authorizations") or [])
 
 
+def lipid_rt_check_outcome(
+    preparation: dict[str, Any], console_lines: Iterable[str] | None = None
+) -> dict[str, Any] | None:
+    """What an LC-MS run left of the lipid RT check, with the setting its run manifest recorded; None otherwise.
+
+    The review lists are looked for in the run's output and export folders, written no earlier than its method
+    file, so an earlier run's list is not taken for this one's (lipid_rt_check.run_outcome).
+    """
+    if str(preparation.get("analysis_type") or "lcms").casefold() != "lcms":
+        return None
+    run_directory = str(preparation.get("run_directory") or "").strip()
+    method_file = Path(str(preparation.get("method_file") or "")).expanduser()
+    try:
+        since = method_file.stat().st_mtime if str(preparation.get("method_file") or "").strip() else None
+    except OSError:
+        since = None
+    directories = list(dict.fromkeys(
+        item for item in (run_directory, str(preparation.get("export_folder_path") or "").strip()) if item
+    ))
+    outcome = run_outcome(directories, since, console_lines)
+    try:
+        manifest = json.loads(Path(str(preparation.get("manifest") or "")).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        manifest = {}
+    manifest = manifest if isinstance(manifest, dict) else {}
+    if isinstance(manifest.get("lipid_rt_check"), dict):
+        outcome = {"method": manifest["lipid_rt_check"], **outcome}
+    return outcome
+
+
 def finalise_console_run(
     job_id: str,
     preparation: dict[str, Any],
@@ -1259,6 +1291,7 @@ def finalise_console_run(
     exit_code: int | None,
     export_verification: dict[str, Any] | None,
     log: Callable[[str], None],
+    console_lines: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Everything above, for one production job, once the Console has returned. Never raises.
 
@@ -1268,6 +1301,10 @@ def finalise_console_run(
     outcome. ``artifacts`` loses the paths of what left the output, so no later record names a file that is
     gone. What could not be done is recorded as a hold in the unit manifest, which the steps it would make
     unsafe refuse.
+
+    An LC-MS run's record also says what its lipid RT check left (lipid_rt_check): the review lists by name and
+    sha256, none meaning the check did not run, and the summary line and rule version ``console_lines``, the
+    job's Console output, state.
     """
     record: dict[str, Any] = {
         "schema": SCHEMA, "job_id": job_id, "finalised_at": _now(), "errors": [], "holds": [],
@@ -1293,6 +1330,33 @@ def finalise_console_run(
             record["shared_path_policy"] = PATH_POLICY
         record["libraries"] = context.identities()
         complete = exit_code == 0 and not (export_verification or {}).get("missing")
+        try:
+            lipid_rt = lipid_rt_check_outcome(preparation, console_lines)
+        except Exception as error:  # a record, not a step anything waits on
+            lipid_rt = None
+            record["errors"].append(f"lipid_rt_check: {type(error).__name__}: {error}")
+        if lipid_rt is not None:
+            record["lipid_rt_check"] = lipid_rt
+            listed = ", ".join(f"{item['name']} ({item['rows']} rows)" for item in lipid_rt["review_files"])
+            # Without a review list, the Console's summary line says whether the check failed or did not run,
+            # as the Materials and Methods read it (lipid_rt_check.summary_outcome); without one, either may be.
+            outcome = summary_outcome(lipid_rt.get("summary") or "")
+            if lipid_rt["ran"]:
+                said = f"review list {listed}"
+            elif outcome == "failed":
+                said = (
+                    "no review list was written: the check failed and withdrew the verdicts and Confirmed tags it "
+                    "had written"
+                )
+            elif outcome == "not_run":
+                said = "no review list was written: the check did not run"
+            else:
+                said = "no review list was written: the check did not run, or failed and withdrew what it had written"
+            log(
+                "Lipid RT check: "
+                + said
+                + (f"; rules {lipid_rt['rule_version']}." if lipid_rt.get("rule_version") else ".")
+            )
 
         redactions: list[dict[str, Any]] = []
         unredacted: list[str] = []

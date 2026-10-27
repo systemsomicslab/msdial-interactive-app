@@ -71,8 +71,10 @@ never assumed.
   - `single_msp` (slot `msp`): one MSP, no retention time. What most users and the
     reanalysis agent run.
   - `campaign` (slots `lbm`, `msp`, optional `in_silico`): the LBM2 for the few lipids,
-    the MSP searched strictly and then mildly, and an in-silico MSP mildly, all without
-    retention time.
+    the MSP searched strictly and then mildly, and an in-silico MSP at the `in_silico`
+    thresholds (0.05 Da, 0.5/0.5/0.5, at least 3 matched peaks) with its suggestions off,
+    all without retention time. The in-silico slot is labelled `in-silico MSP`: the GLACIER
+    evidence tier, citation and preprocessing record are the guided tiered profile's.
   - `lab_rt_tiers` (slots `in_house`, `predicted_rt`, `no_rt`): the laboratory's own
     standards with measured RT and MS/MS at 0.5 min, a predicted-RT MSP at 2.0 min, and an
     MSP of MS/MS without RT, no RT filter.

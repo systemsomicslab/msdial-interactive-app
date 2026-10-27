@@ -3056,8 +3056,10 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
         # Before anything reads the outputs: the mzTab-M loses this machine's locations, and a campaign
         # unit's MS-DIAL containers leave the raw tree and its loaded-library copy goes to the library-copy
         # store. What is validated, inventoried and shared below is what the run keeps.
+        with JOBS_LOCK:
+            console_lines = list(JOBS[job_id].get("logs") or [])
         finalisation = finalise_console_run(
-            job_id, preparation, artifacts, exit_code, export_verification, log
+            job_id, preparation, artifacts, exit_code, export_verification, log, console_lines=console_lines
         )
         # What it could not do is held in the unit manifest; the job says so where a reader looks first.
         artifact_warnings.extend(

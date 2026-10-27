@@ -3,13 +3,21 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
+import re
 from bisect import bisect_left
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .annotation_pipeline import apply_tiered_lcms_annotation
+from .annotation_pipeline import (
+    IN_SILICO_EVIDENCE_TIER,
+    IN_SILICO_PREPROCESSING_STEPS,
+    apply_tiered_lcms_annotation,
+    in_silico_evidence_tier,
+)
 from .library_catalog import catalog_status
+from .lipid_rt_check import read_setting as read_lipid_rt_check_setting
 from .user_settings import load_user_settings
 from .workflow import (
     AUTOMATIC_RT_CORRECTION_DEFAULTS,
@@ -75,7 +83,13 @@ SUPPORTED_ANSWER_KEYS = {
     "lab_lcms_metabolomics_contract_path",
     # Minutes; unset, the parameter template's value stands.
     "alignment_rt_tolerance",
+    # The project's target omics as a campaign profile fixes it for every unit, whatever target_omics the
+    # repository metadata seeded (target_omics_record keeps both).
+    "target_omics_pin",
+    # The Console's lipid retention-time order check (lipid_rt_check.read_setting); every key is written.
+    "lipid_rt_check",
 }
+TARGET_OMICS_CHOICES = ("Metabolomics", "Lipidomics")
 SAMPLE_TABLE_FILE_TYPES = ("Sample", "QC", "Blank", "Standard")
 # The LBM score cutoffs a parameter template states, by the state key the method writer reads. Only
 # the template's workflow section reached the state, so its 0.1/0.1/0.1 used to be replaced by the
@@ -100,6 +114,8 @@ TIERED_LIBRARY_STATE_KEYS = frozenset({
 TIERED_LIBRARY_KEYS = frozenset({
     "msp_paths", "msp_version", "msp_source", "msp_doi", "msp_license",
     "lbm_path", "lbm_version", "lbm_source", "lbm_doi", "lbm_license",
+    "in_silico_msp_paths", "in_silico_msp_version", "in_silico_msp_source", "in_silico_msp_license",
+    "in_silico_msp_preprocessing",
 })
 
 
@@ -212,7 +228,7 @@ def _suggested_workset_name(answers: dict[str, Any], inspection: dict[str, Any])
     parts = [
         str(answers.get("project_type", "")).upper().replace("LCMS", "LC-MS").replace("GCMS", "GC-MS"),
         str(answers.get("ion_mode", "")),
-        str(answers.get("target_omics", "")),
+        _applied_target_omics(answers),
     ]
     library = (answers.get("libraries") or {})
     if isinstance(library, dict) and library.get("lbm_path"):
@@ -329,6 +345,22 @@ def build_guided_plan(
             blockers.append(
                 f"Official library '{catalog_id}' is not downloaded. Ask for confirmation, then download it."
             )
+    blockers.extend(_target_omics_pin_problems(merged))
+    blockers.extend(read_lipid_rt_check_setting(merged.get("lipid_rt_check"))[1])
+    if merged.get("lipid_rt_check") is not None and project_type == "gcms":
+        blockers.append("lipid_rt_check is an LC-MS setting; a GC-MS run has no lipid RT check. Leave it out.")
+    if _path_list((merged.get("libraries") or {}).get("in_silico_msp_paths")) and (
+        merged.get("library_strategy") != "tiered_lipid_msp"
+    ):
+        blockers.append(
+            "libraries.in_silico_msp_paths is searched only by library_strategy 'tiered_lipid_msp'; with "
+            f"'{merged.get('library_strategy') or 'none'}' it would be left out of the run without a word. Use "
+            "'tiered_lipid_msp' for the GLACIER tier. library_strategy 'annotators' searches an in-silico library "
+            "with library_kind 'predicted' (and suggestions false, to name nothing from a bare precursor mass), "
+            "but under its own label, without the GLACIER evidence tier, citation or preprocessing record."
+        )
+    if merged.get("library_strategy") == "annotators":
+        blockers.extend(_predicted_annotator_problems(merged))
     if merged.get("library_strategy") == "tiered_lipid_msp":
         blockers.extend(_tiered_library_problems(merged))
         # The official LBM2 is the lipid-rule tier only when the answers name none of their own.
@@ -857,7 +889,7 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
     if project_type == "lcms":
         if not answers.get("ion_mode"):
             ask("ion_mode", "Which ion mode was used?", ["Positive", "Negative"])
-        if not answers.get("target_omics"):
+        if not _applied_target_omics(answers):
             ask("target_omics", "Is the target Metabolomics or Lipidomics?", ["Metabolomics", "Lipidomics"])
     if not answers.get("parameter_strategy"):
         ask(
@@ -947,7 +979,9 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
             "libraries",
             "Provide one msp_paths entry, searched as both the high- and the low-quality MSP tier, and "
             "libraries.lbm_path, the .lbm2 library of the lipid-rule tier; without lbm_path the official "
-            "LBM library is that tier.",
+            "LBM library is that tier. Optionally, one libraries.in_silico_msp_paths entry, this ion mode's "
+            "in-silico MSP, searched as a fourth tier below them (labelled and cited as GLACIER only where its "
+            "file name says GLACIER).",
         )
     # Once a library is settled, how its retention times should be used is the next
     # decision, and it belongs to the analyst: a library built for this chromatography
@@ -1080,7 +1114,7 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             ),
             "project_type": project_type,
             "ion_mode": answers.get("ion_mode", "Positive"),
-            "target_omics": answers.get("target_omics", "Metabolomics"),
+            "target_omics": _applied_target_omics(answers) or "Metabolomics",
             "console_path": str(
                 answers.get("console_path")
                 or settings.get("console_path")
@@ -1150,6 +1184,16 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
     _apply_retention_time_use(state, answers)
     if project_type == "lcms":
         _apply_internal_standard_library(state, answers)
+        # Every setting of the check, the ones the answer leaves out at the Console's defaults; a setting the
+        # plan refused is not applied (build_guided_plan blocks on it). An answer replaces the parameter
+        # template's own lines (load_parameter_template), refused ones too.
+        lipid_rt_setting, _ = read_lipid_rt_check_setting(answers.get("lipid_rt_check"))
+        if lipid_rt_setting:
+            state["lipid_rt_check"] = lipid_rt_setting
+            state.pop("lipid_rt_check_template_problems", None)
+    else:
+        state.pop("lipid_rt_check", None)
+        state.pop("lipid_rt_check_template_problems", None)
     if answers.get("number_of_threads") is not None:
         state["number_of_threads"] = max(1, int(answers["number_of_threads"]))
     if answers.get("stage_inputs") is not None:
@@ -1227,7 +1271,50 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
         state["repository_metadata_source_path"] = str(
             Path(repository_metadata_path).expanduser().resolve()
         )
+    state["target_omics_record"] = target_omics_record(answers, state)
     return state
+
+
+def _applied_target_omics(answers: dict[str, Any]) -> str:
+    """The project's target omics: target_omics_pin where given, else the target_omics answer, as given.
+
+    A campaign profile pins the target omics of every unit (Lipidomics, the author's decision D7 of
+    2026-10-25) without overwriting target_omics, which keeps what Interactive's repository answer seed put
+    there. A pin is matched to its choice in any letter case; one that is neither is a plan blocker.
+    """
+    pin = str(answers.get("target_omics_pin") or "").strip()
+    if pin:
+        return next((choice for choice in TARGET_OMICS_CHOICES if choice.casefold() == pin.casefold()), pin)
+    value = answers.get("target_omics")
+    return "" if value is None else str(value)
+
+
+def _target_omics_pin_problems(answers: dict[str, Any]) -> list[str]:
+    pin = str(answers.get("target_omics_pin") or "").strip()
+    if pin and _applied_target_omics(answers) not in TARGET_OMICS_CHOICES:
+        return [f"target_omics_pin '{pin}' is none of {', '.join(TARGET_OMICS_CHOICES)}."]
+    return []
+
+
+def target_omics_record(answers: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    """The target omics as a source fact and as a decision, kept apart.
+
+    repository_seed is what the repository metadata suggests (repository_metadata: Lipidomics where the title,
+    description or first sample rows say lipidome, lipidomics or lipidomic, else Metabolomics), None where the
+    run reads no repository metadata. answered is the target_omics answer, which for a repository unit is
+    Interactive's answer seed unless a profile changed it; pinned is target_omics_pin; applied is what the
+    method file's Target omics says.
+    """
+    metadata = state.get("repository_metadata") if isinstance(state.get("repository_metadata"), dict) else {}
+    seed = str(metadata.get("target_omics") or "").strip()
+    answered = answers.get("target_omics")
+    pin = str(answers.get("target_omics_pin") or "").strip()
+    return {
+        "repository_seed": seed or None,
+        "answered": None if answered in (None, "") else str(answered),
+        "pinned": _applied_target_omics({"target_omics_pin": pin}) if pin else None,
+        "applied": str(state.get("target_omics") or ""),
+    }
 
 
 def adopted_order_proposal(
@@ -1387,7 +1474,7 @@ def _is_lab_lipidomics_profile(answers: dict[str, Any]) -> bool:
         return False
     return (
         str(answers.get("project_type", "")).casefold() == "lcms"
-        and answers.get("target_omics") == "Lipidomics"
+        and _applied_target_omics(answers) == "Lipidomics"
         and answers.get("library_strategy") == "existing"
     )
 
@@ -1583,7 +1670,12 @@ def _apply_libraries(
                 "doi": lbm_item["doi"],
                 "license": lbm_item["license"],
             }
-        apply_tiered_lcms_annotation(state, lbm_path, msp_paths[0])
+        # The in-silico tier, where the answers name one: one file, the run's ion mode's, as the acquired MSP
+        # is (a campaign profile names each by ion mode under by_ion_mode, and the runner resolves the
+        # "library:<name>" references of the unit's ion mode). _tiered_library_problems refuses anything else.
+        in_silico_paths = [absolute_library_path(path) for path in _path_list(libraries.get("in_silico_msp_paths"))]
+        in_silico_path = in_silico_paths[0] if in_silico_paths else None
+        apply_tiered_lcms_annotation(state, lbm_path, msp_paths[0], in_silico_path)
         state["library_provenance"] = [
             lbm_provenance,
             {
@@ -1592,7 +1684,10 @@ def _apply_libraries(
                 "source": str(libraries.get("msp_source", "")),
                 "doi": str(libraries.get("msp_doi", "")),
                 "license": str(libraries.get("msp_license", "institutional/private")),
+                # Only beside an in-silico tier, so a v1 profile's provenance is as it was.
+                **({"library_kind": "acquired"} if in_silico_path else {}),
             },
+            *([_in_silico_provenance(in_silico_path, libraries)] if in_silico_path else []),
         ]
         return
     for index, path in enumerate(msp_paths, start=1):
@@ -1683,6 +1778,7 @@ def _tiered_library_problems(answers: dict[str, Any]) -> list[str]:
             f"tiered_lipid_msp searches no text library; libraries.text_paths names {len(text_paths)}. Leave it "
             "out, or search it with library_strategy 'existing'."
         )
+    problems.extend(_in_silico_library_problems(answers, msp_paths))
     lbm_path = _tiered_lbm_path(answers)
     problem = lbm_library_problem(lbm_path, "The tiered_lipid_msp profile") if lbm_path else ""
     if not problem and lbm_path and Path(lbm_path).is_file():
@@ -1698,6 +1794,203 @@ def _tiered_library_problems(answers: dict[str, Any]) -> list[str]:
     if problem:
         problems.append(f"libraries.lbm_path: {problem}")
     return problems
+
+
+def _in_silico_library_problems(answers: dict[str, Any], msp_paths: list[str]) -> list[str]:
+    """What the tiered profile refuses in libraries.in_silico_msp_paths, the optional in-silico tier.
+
+    One file, an .msp, not the acquired MSP: one file searched as both would be published as reference spectra
+    and as in-silico predictions at once, and the Console keeps the first row's kind for a file. MS-DIAL's MSP
+    search has no ion-mode or adduct filter, so a run must load its own polarity's in-silico file; a file whose
+    name says the other polarity (a "pos" or "neg", "positive" or "negative" token, as the libraries are named)
+    is refused, and one whose name says neither is taken as given. A preprocessing step must be one the
+    Materials and Methods can state (annotation_pipeline.IN_SILICO_PREPROCESSING_STEPS), and what it states of
+    the run and the file must hold (_in_silico_preprocessing_problems).
+    """
+    libraries = answers.get("libraries") or {}
+    paths = _path_list(libraries.get("in_silico_msp_paths"))
+    problems: list[str] = []
+    steps = _path_list(libraries.get("in_silico_msp_preprocessing"))
+    unknown = [step for step in steps if step not in IN_SILICO_PREPROCESSING_STEPS]
+    if unknown:
+        problems.append(
+            f"libraries.in_silico_msp_preprocessing names {', '.join(unknown)}; the steps a report can state are "
+            f"{', '.join(IN_SILICO_PREPROCESSING_STEPS)}."
+        )
+    if steps and not paths:
+        problems.append("libraries.in_silico_msp_preprocessing is given without libraries.in_silico_msp_paths.")
+    if not paths:
+        return problems
+    if len(paths) > 1:
+        problems.append(
+            f"tiered_lipid_msp searches one in-silico MSP, the run's ion mode's; libraries.in_silico_msp_paths names "
+            f"{len(paths)}."
+        )
+        return problems
+    path = Path(absolute_library_path(paths[0]))
+    if path.suffix.casefold() != ".msp":
+        problems.append(
+            f"libraries.in_silico_msp_paths: the in-silico tier reads an .msp library; {path.name} is not one."
+        )
+    elif path.exists() and not path.is_file():
+        problems.append(f"libraries.in_silico_msp_paths: {path.name} is a folder, not an .msp file.")
+    elif path.is_file() and path.stat().st_size == 0:
+        problems.append(f"libraries.in_silico_msp_paths: {path.name} is empty.")
+    for acquired in msp_paths:
+        if _same_library_file(path, Path(absolute_library_path(acquired))):
+            problems.append(
+                f"libraries.in_silico_msp_paths names {path.name}, which libraries.msp_paths names as acquired "
+                "spectra; one file is either acquired or predicted."
+            )
+    ion_mode = str(answers.get("ion_mode") or "").strip()
+    said = _name_polarity(path.name)
+    if ion_mode in {"Positive", "Negative"} and said and said != ion_mode:
+        problems.append(
+            f"libraries.in_silico_msp_paths: {path.name} is named for {said.lower()} ion mode and this run is "
+            f"{ion_mode.lower()}; MS-DIAL's MSP search does not filter by ion mode, so give the {ion_mode.lower()} "
+            "file."
+        )
+    problems.extend(_in_silico_preprocessing_problems(path, steps, ion_mode or said))
+    return problems
+
+
+def _in_silico_preprocessing_problems(path: Path, steps: list[str], ion_mode: str) -> list[str]:
+    """What a declared preprocessing step claims of the in-silico file that the run or the file contradicts.
+
+    The Materials and Methods state each step as done (annotation_pipeline.IN_SILICO_PREPROCESSING_STEPS), so
+    it is checked, not taken as given. The +1.008 peak is the negative-mode records' artefact (the author's
+    decision of 2026-10-25, Q6): a positive-mode run, by its ion mode or else its file's name, has none to
+    remove; and a file still carrying a peak at a record's precursor m/z + 1.008 has not had it removed
+    (lab_lcms_metabolomics.precursor_plus_1008_census, read once per file version). The peak must be removed
+    (Q6), so a negative-mode run's file is censused also where no step is declared: one that carries the peak is
+    refused, never searched with it unrecorded. And as the negative-mode GLACIER file as published carries it, a
+    GLACIER file without it was changed before use: it is refused until the step is named, so that the records
+    and the Materials and Methods never describe it as published.
+    """
+    step = "precursor_plus_1008_peak_removed"
+    declared = step in steps
+    if declared and ion_mode == "Positive":
+        return [
+            f"libraries.in_silico_msp_preprocessing names {step}, the negative-mode records' artefact, for a "
+            "positive-mode run; its file has no such peak to remove. Give the step for the negative-mode run only."
+        ]
+    if not declared and ion_mode != "Negative":
+        return []
+    if path.suffix.casefold() != ".msp" or not path.is_file() or path.stat().st_size == 0:
+        return []
+    from .lab_lcms_metabolomics import precursor_plus_1008_census
+
+    try:
+        census = precursor_plus_1008_census(path)
+    except OSError as error:
+        claim = f"libraries.in_silico_msp_preprocessing names {step}, but " if declared else "This negative-mode run's "
+        return [
+            f"{claim}{path.name} cannot be read ({error.strerror or error}) to check it for the peak at the "
+            "precursor m/z + 1.008. Plan again once it can."
+        ]
+    carrying = census["with_precursor_plus_1008_peak"]
+    if not carrying and not declared and census["records"] and (
+        in_silico_evidence_tier(path.name) == IN_SILICO_EVIDENCE_TIER
+    ):
+        return [
+            f"No record in {path.name} carries the peak at the precursor m/z + 1.008 that the negative-mode GLACIER "
+            f"records carry as published, so it was removed before use. Name {step} in "
+            "libraries.in_silico_msp_preprocessing, so that the records and the Materials and Methods state it."
+        ]
+    if carrying and declared:
+        return [
+            f"libraries.in_silico_msp_preprocessing names {step}, but {carrying} of the {census['records']} "
+            f"records in {path.name} still carry a peak at the precursor m/z + 1.008. Give the file with the peak "
+            "removed."
+        ]
+    if carrying:
+        return [
+            f"{carrying} of the {census['records']} records in {path.name} carry a peak at the precursor m/z + "
+            "1.008, the negative-mode records' artefact, which is removed before use. Give the file with the peak "
+            f"removed, and name {step} in libraries.in_silico_msp_preprocessing."
+        ]
+    return []
+
+
+def _predicted_annotator_problems(answers: dict[str, Any]) -> list[str]:
+    """The +1.008 artefact (Q6) in a predicted MSP of libraries.annotators, as the tiered profile refuses it.
+
+    A laboratory contract's in-silico slot reaches the plan as such a row (lab_lcms_metabolomics.annotator_settings),
+    and so does a predicted library given with library_strategy 'annotators'. Its file is censused where the run,
+    by its ion mode or else the file's name, is negative-mode, and one whose records carry a peak at the
+    precursor m/z + 1.008 is refused: this strategy records no preprocessing step, so the peak is removed before
+    the file is given (_in_silico_preprocessing_problems).
+    """
+    rows = (answers.get("libraries") or {}).get("annotators") or []
+    ion_mode = str(answers.get("ion_mode") or "").strip()
+    problems: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("kind") == "lbm":
+            continue
+        if str(row.get("library_kind") or "").strip().casefold() != "predicted":
+            continue
+        path = Path(str(row.get("path") or "").strip()).expanduser()
+        if (ion_mode or _name_polarity(path.name)) != "Negative":
+            continue
+        if path.suffix.casefold() != ".msp" or not path.is_file() or path.stat().st_size == 0:
+            continue
+        from .lab_lcms_metabolomics import precursor_plus_1008_census
+
+        where = f"libraries.annotators ({row.get('label') or row.get('annotator_id') or path.name})"
+        try:
+            census = precursor_plus_1008_census(path)
+        except OSError as error:
+            problems.append(
+                f"{where}: {path.name} cannot be read ({error.strerror or error}) to check it for the peak at the "
+                "precursor m/z + 1.008. Plan again once it can."
+            )
+            continue
+        carrying = census["with_precursor_plus_1008_peak"]
+        if carrying:
+            problems.append(
+                f"{where}: {carrying} of the {census['records']} records in {path.name} carry a peak at the "
+                "precursor m/z + 1.008, the negative-mode in-silico records' artefact, which is removed before "
+                "use. Give the file with the peak removed."
+            )
+    return problems
+
+
+def _same_library_file(left: Path, right: Path) -> bool:
+    """Whether two library paths are one file: by location, or, where both exist, as the file system says."""
+    if os.path.normcase(str(left)) == os.path.normcase(str(right)):
+        return True
+    try:
+        return left.is_file() and right.is_file() and left.samefile(right)
+    except OSError:
+        return False
+
+
+def _name_polarity(name: str) -> str:
+    """The ion mode a library's file name states by a "pos"/"positive" or "neg"/"negative" token, or ""."""
+    tokens = {token for token in re.split(r"[_\-.\s]+", name.casefold()) if token}
+    positive, negative = bool(tokens & {"pos", "positive"}), bool(tokens & {"neg", "negative"})
+    return "Positive" if positive and not negative else "Negative" if negative and not positive else ""
+
+
+def _in_silico_provenance(path: str, libraries: dict[str, Any]) -> dict[str, Any]:
+    """The provenance of the in-silico library the answers name: library_kind predicted, private by default.
+
+    Its name and sha256 are taken from the file where every library's are (sharing.library_records), and only
+    they reach a shared record. preprocessing lists what was done to the file before use, by the ids of
+    annotation_pipeline.IN_SILICO_PREPROCESSING_STEPS, as libraries.in_silico_msp_preprocessing gives them and
+    the plan has checked them against the run and the file (_in_silico_preprocessing_problems).
+    """
+    steps = _path_list(libraries.get("in_silico_msp_preprocessing"))
+    return {
+        "path": path,
+        "name": Path(path).name,
+        "version": str(libraries.get("in_silico_msp_version", "")),
+        "source": str(libraries.get("in_silico_msp_source", "")),
+        "doi": "",
+        "license": str(libraries.get("in_silico_msp_license") or "institutional/private"),
+        "library_kind": "predicted",
+        **({"preprocessing": steps} if steps else {}),
+    }
 
 
 def _lbm_identity(path: str | Path) -> tuple[dict[str, Any] | None, str]:
@@ -1774,7 +2067,7 @@ def _official_catalog_id(answers: dict[str, Any]) -> str:
             if answers.get("gcms_ri_compound_type") == "Fames"
             else "gcms-kovats"
         )
-    if answers.get("target_omics") == "Lipidomics":
+    if _applied_target_omics(answers) == "Lipidomics":
         return "lipidomics"
     return (
         "metabolomics-positive"
@@ -1788,7 +2081,7 @@ def _can_resolve_official(answers: dict[str, Any]) -> bool:
     if project_type == "gcms":
         return True
     return project_type == "lcms" and bool(
-        answers.get("ion_mode") and answers.get("target_omics")
+        answers.get("ion_mode") and _applied_target_omics(answers)
     )
 
 

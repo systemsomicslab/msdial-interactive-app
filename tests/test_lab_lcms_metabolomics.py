@@ -41,7 +41,12 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
 from msdial_app.agent_workflow import _msp_row, build_guided_plan
 from msdial_app.annotation_pipeline import tiered_lcms_annotation
 from msdial_app.sharing import LOCAL_ONLY_FILE
-from msdial_app.workflow import MULTI_ENERGY_AIF_CAPABILITY, prepare_run
+from msdial_app.workflow import (
+    LIBRARY_KIND_CAPABILITY,
+    MSP_SUGGESTIONS_CAPABILITY,
+    MULTI_ENERGY_AIF_CAPABILITY,
+    prepare_run,
+)
 
 
 def tsv_rows(path: Path) -> list[dict[str, str]]:
@@ -488,6 +493,33 @@ class PlanFromTheContract(Batched):
         prepared = prepare_run(plan["workflow"])
         header = (Path(prepared["run_directory"]) / "msp_annotator_settings.tsv").read_text(encoding="ascii").splitlines()[0]
         self.assertNotIn("library_kind", header.split("\t"))
+
+
+class CampaignPresetThroughTheContract(Batched):
+    def test_the_campaign_presets_in_silico_slot_keeps_its_suggestions_off_through_the_contract(self) -> None:
+        # The plan rebuilds the annotator rows from the contract alone, so what the check showed must be stored.
+        library = self.batch.root / "lib"
+        lbm, in_silico = library / "lab.lbm2", library / "insilico_pos.msp"
+        lbm.write_bytes(b"lbm")
+        in_silico.write_text("NAME: a predicted record\nPRECURSORMZ: 100\nNum Peaks: 0\n", encoding="ascii")
+        contract = self.batch.contract(annotation={"preset": "campaign", "libraries": {
+            "lbm": str(lbm), "msp": str(self.batch.libraries["no_rt"]), "in_silico": str(in_silico)}})
+        stored = json.loads(Path(contract).read_text(encoding="utf-8"))["annotation"]["libraries"]
+        self.assertEqual([("lbm", None), ("msp_strict", None), ("msp_mild", None), ("in_silico", False)],
+                         [(entry["id"], entry["suggestions"]) for entry in stored])
+        answers = {agent.CONTRACT_KEY: contract, "ion_mode": "Positive", "minimum_peak_height": 500}
+        # On a Console without the per-annotator switch the run is refused, as the check said it would be.
+        plan = build_guided_plan(str(self.batch.folders["Positive"]), answers)
+        self.assertTrue(any("no per-annotator suggestions switch" in item for item in plan["blockers"]), plan["blockers"])
+        found = {**EVERY_CAPABILITY, "capabilities": sorted({
+            *EVERY_CAPABILITY["capabilities"], LIBRARY_KIND_CAPABILITY, MSP_SUGGESTIONS_CAPABILITY})}
+        with capabilities_patches(found):
+            plan = build_guided_plan(str(self.batch.folders["Positive"]), answers)
+            self.assertTrue(plan["ready_to_prepare"], (plan["blockers"], plan["remaining_questions"]))
+            prepared = prepare_run(plan["workflow"])
+        msp = tsv_rows(Path(prepared["run_directory"]) / "msp_annotator_settings.tsv")
+        self.assertEqual([("acquired", "True"), ("acquired", "True"), ("predicted", "False")],
+                         [(row["library_kind"], row["suggestions"]) for row in msp])
 
 
 class StandardsNormalizeAndMerge(Batched):

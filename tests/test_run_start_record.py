@@ -234,6 +234,25 @@ class TheJobsRecordTheirAttempts(_Unit, unittest.TestCase):
         self.assertEqual(os.getpid(), attempt["console_pid"])
         self.assertEqual(1, len(manifest["run_failures"]), "the failure record is written as before")
 
+    def test_the_finalisation_reads_the_lipid_rt_check_from_the_consoles_own_lines(self) -> None:
+        """The rule version and parameter hash are what the Console said, in the job's log, of this run."""
+        review = self.output / "AlignResult-2026_lipidrt_review.tsv"
+
+        def console(_preparation, log, **watch):
+            watch["on_start"](os.getpid())
+            review.write_text("ID\tName\n", encoding="utf-8")
+            log("Lipid RT check (alignment): 0 annotated, 0 evaluable: 0 Confirmed; rules 1.0, parameter ab12cd34.")
+            return 0
+
+        preparation = self.preparation(["MSDIALCUI.exe"])
+        self.job("run5", "run", preparation)
+        with patch.object(server, "run_console", console):
+            server._run_job("run5", preparation)
+        record = read_manifest(self.manifest)["console_run_finalisation"]["lipid_rt_check"]
+
+        self.assertEqual(("1.0", "ab12cd34", True), (record["rule_version"], record["parameter_hash"], record["ran"]))
+        self.assertEqual([review.name], [item["name"] for item in record["review_files"]])
+
     def test_a_diagnostic_records_its_attempt_as_tuning(self) -> None:
         directory = self.root / "unit" / "diagnostics" / "tune1"
         directory.mkdir(parents=True)

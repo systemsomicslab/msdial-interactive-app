@@ -37,7 +37,7 @@ from .lab_lipidomics import (
 )
 from .lipidome_merge import MergeRefused, compare_sample_order, describe_export, net_double_tostring, strip_polarity
 from .sample_grouping import is_blank, is_quality_control
-from .workflow import file_identity
+from .workflow import _as_switch, file_identity
 
 # ---------------------------------------------------------------------------------------------
 # Annotation: an ordered list of libraries
@@ -51,7 +51,10 @@ THRESHOLD_KEYS = (
     "matched_peaks_percentage_cutoff", "minimum_spectrum_match",
 )
 # standard is a guided run's own MSP row (agent_workflow._msp_row), at the method's MS/MS tolerance;
-# strict and mild are the repository campaign's two MSP tiers (annotation_pipeline.tiered_lcms_annotation).
+# strict and mild are the repository campaign's two MSP tiers (annotation_pipeline.tiered_lcms_annotation);
+# in_silico is its in-silico MSP tier, GLACIER, as the author decided on 2026-10-25 (at least three matched
+# peaks at 0.05 Da: against dense predicted spectra one matched peak at 0.25 Da is chance), which
+# annotation_pipeline reads from here.
 THRESHOLDS = {
     "standard": {
         "weighted_dot_product_cutoff": 0.6, "simple_dot_product_cutoff": 0.6, "reverse_dot_product_cutoff": 0.8,
@@ -64,6 +67,10 @@ THRESHOLDS = {
     "mild": {
         "ms2_tolerance": 0.25, "weighted_dot_product_cutoff": 0.5, "simple_dot_product_cutoff": 0.5,
         "reverse_dot_product_cutoff": 0.5, "matched_peaks_percentage_cutoff": 0.0, "minimum_spectrum_match": 1,
+    },
+    "in_silico": {
+        "ms2_tolerance": 0.05, "weighted_dot_product_cutoff": 0.5, "simple_dot_product_cutoff": 0.5,
+        "reverse_dot_product_cutoff": 0.5, "matched_peaks_percentage_cutoff": 0.0, "minimum_spectrum_match": 3,
     },
 }
 # Highest priority first. A slot names the file the person gives; one file may fill two entries (the
@@ -79,8 +86,12 @@ PRESETS: dict[str, list[dict[str, Any]]] = {
          "label": "MSP strict"},
         {"id": "msp_mild", "slot": "msp", "kind": "msp", "thresholds": "mild", "retention_time": "none",
          "label": "MSP mild"},
-        {"id": "in_silico", "slot": "in_silico", "kind": "msp", "thresholds": "mild", "retention_time": "none",
-         "label": "in-silico MSP", "library_kind": "predicted", "optional": True},
+        # Suggestions off, as the campaign's in-silico tier (the author's decision Q2): no "no MS2:" or "low
+        # score:" name from a bare precursor mass against predicted spectra. Its label stays general, as the
+        # slot takes any in-silico library: the GLACIER tier, citation and preprocessing record are the
+        # tiered profile's (annotation_pipeline).
+        {"id": "in_silico", "slot": "in_silico", "kind": "msp", "thresholds": "in_silico", "retention_time": "none",
+         "label": "in-silico MSP", "library_kind": "predicted", "suggestions": False, "optional": True},
     ],
     "lab_rt_tiers": [
         {"id": "in_house", "slot": "in_house", "kind": "msp", "thresholds": "standard", "retention_time": "use",
@@ -94,7 +105,8 @@ PRESETS: dict[str, list[dict[str, Any]]] = {
 PRESET_PURPOSES = {
     "single_msp": "one MSP library, no retention time: what most users and the reanalysis agent run",
     "campaign": "the reanalysis project's tiers: the LBM2 for the few lipids, one MSP searched strictly and "
-                "mildly, and optionally an in-silico MSP, all without retention time",
+                "mildly, and optionally an in-silico MSP at its own thresholds with suggestions off, all without "
+                "retention time",
     "lab_rt_tiers": "the laboratory's own tiers: in-house standards (RT 0.5 min), predicted RTs (RT 2.0 min), "
                     "and MS/MS without RT",
 }
@@ -179,6 +191,76 @@ def retention_time_census(path: str | Path) -> dict[str, int]:
     close()
     census = {"records": records, "with_retention_time": with_rt}
     _RETENTION_TIME_CENSUS[key] = census
+    return dict(census)
+
+
+_PRECURSOR_PLUS_1008_CENSUS: dict[tuple[str, int, int], dict[str, int]] = {}
+_MSP_PRECURSOR_FIELDS = frozenset({"precursormz", "precursor_mz"})
+# The artefact peak of GLACIER's negative-mode records sits at the precursor m/z + 1.008 (+1.007 in a few, as
+# written to three decimals): any peak within this much of +1.008 is taken for it. A predicted spectrum has no
+# isotope peak (+1.003) for it to be confused with.
+PRECURSOR_PLUS_1008 = 1.008
+PRECURSOR_PLUS_1008_TOLERANCE = 0.0025
+_PEAK_SEPARATOR = re.compile(r"[\s,:]+")
+
+
+def precursor_plus_1008_census(path: str | Path) -> dict[str, int]:
+    """How many records an MSP holds, and how many carry a peak at their precursor m/z + 1.008.
+
+    What libraries.in_silico_msp_preprocessing "precursor_plus_1008_peak_removed" states of a file is checked
+    against it, so a report never states a removal the file does not show. Records and fields are read as
+    retention_time_census reads them; a record's peaks are the lines after its peak count, each "m/z
+    intensity" pair separated by ';'. Read once per file version and kept for the process.
+    """
+    target = Path(path).expanduser().resolve()
+    stat = target.stat()
+    key = (str(target).casefold(), stat.st_size, stat.st_mtime_ns)
+    if key in _PRECURSOR_PLUS_1008_CENSUS:
+        return dict(_PRECURSOR_PLUS_1008_CENSUS[key])
+    records = with_peak = 0
+    precursor: float | None = None
+    in_peaks = found = False
+
+    def close() -> None:
+        nonlocal with_peak, found
+        if found:
+            with_peak += 1
+        found = False
+
+    with target.open("r", encoding="utf-8-sig", errors="replace", newline=None) as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line[:5].casefold() == "name:":
+                close()
+                records += 1
+                precursor, in_peaks = None, False
+                continue
+            if in_peaks:
+                if found or precursor is None:
+                    continue
+                for pair in line.split(";"):
+                    # float(), not parse_number: a library holds tens of millions of peaks.
+                    try:
+                        mz = float(_PEAK_SEPARATOR.split(pair.strip(), 1)[0])
+                    except ValueError:
+                        continue
+                    if abs(mz - precursor - PRECURSOR_PLUS_1008) <= PRECURSOR_PLUS_1008_TOLERANCE:
+                        found = True
+                        break
+                continue
+            if ":" not in line:
+                continue
+            name, _, value = line.partition(":")
+            field = name.strip().casefold()
+            if field in _MSP_PRECURSOR_FIELDS:
+                precursor = parse_number(value.strip())
+            elif field in _MSP_PEAK_COUNT_FIELDS:
+                in_peaks = True
+    close()
+    census = {"records": records, "with_precursor_plus_1008_peak": with_peak}
+    _PRECURSOR_PLUS_1008_CENSUS[key] = census
     return dict(census)
 
 
@@ -385,6 +467,7 @@ def annotation_summary(entries: Iterable[dict[str, Any]]) -> list[dict[str, Any]
             "thresholds": entry.get("thresholds") or None,
             "threshold_values": THRESHOLDS.get(entry.get("thresholds") or "", {}) if entry.get("kind") == "msp" else None,
             "library_kind": (entry.get("library_kind") or "acquired") if entry.get("kind") == "msp" else None,
+            "suggestions": entry.get("suggestions", True) if entry.get("kind") == "msp" else None,
             "retention_time": entry.get("retention_time"), "rt_tolerance": entry.get("rt_tolerance"),
             "files": {polarity: Path(path).name for polarity, path in entry.get("paths", {}).items()},
         }
@@ -409,6 +492,8 @@ def annotator_settings(entries: Iterable[dict[str, Any]], polarity: str) -> dict
             "thresholds": entry.get("thresholds") or "", "retention_time": entry["retention_time"],
             "rt_tolerance": entry["rt_tolerance"],
             **({"library_kind": entry.get("library_kind") or "acquired"} if entry["kind"] == "msp" else {}),
+            **({"suggestions": entry["suggestions"]}
+               if entry["kind"] == "msp" and entry.get("suggestions") is not None else {}),
         })
     return {"annotators": rows}
 
@@ -443,6 +528,10 @@ def apply_annotators(state: dict[str, Any], annotators: Iterable[dict[str, Any]]
             }
             if use_rt and item.get("rt_tolerance") not in (None, ""):
                 row["rt_tolerance"] = float(item["rt_tolerance"])
+            # Only where the library says it: the annotator table writes the column for a row that sets it,
+            # and a plan is refused on a Console without the switch (workflow._annotator_capability_issues).
+            if item.get("suggestions") is not None:
+                row["suggestions"] = _as_switch(item["suggestions"])
             state["msp_annotators"].append(row)
         provenance.append({"path": path, "version": "", "source": "", "doi": "",
                            "license": "institutional/private", "label": str(item.get("label") or "")})

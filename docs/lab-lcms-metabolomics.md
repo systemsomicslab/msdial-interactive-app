@@ -192,7 +192,7 @@ entries in priority order. A path is one file for every polarity or `{"Positive"
 | Preset | Libraries, highest priority first |
 |---|---|
 | `single_msp` | `msp`: one MSP, `standard`, no RT |
-| `campaign` | `lbm`: the LBM2, no RT; `msp` searched `strict`, then `mild`, no RT; optionally `in_silico`, `mild`, no RT |
+| `campaign` | `lbm`: the LBM2, no RT; `msp` searched `strict`, then `mild`, no RT; optionally `in_silico`, `in_silico`, no RT, suggestions off |
 | `lab_rt_tiers` | `in_house`: in-house RT and MS/MS, RT 0.5 min; `predicted_rt`: predicted RTs, RT 2.0 min; `no_rt`: MS/MS without RT. All `standard`. |
 
 The thresholds are those MS-DIAL Interactive already uses:
@@ -202,6 +202,15 @@ The thresholds are those MS-DIAL Interactive already uses:
   peaks.
 - `mild`: the campaign's broad tier: MS/MS tolerance 0.25, dot products 0.5/0.5/0.5, at least 1 matched
   peak.
+- `in_silico`: the campaign's in-silico tier (GLACIER): MS/MS tolerance 0.05, dot products 0.5/0.5/0.5, at
+  least 3 matched peaks (the author's decision of 2026-10-25; until 0.5.48 the preset searched it `mild`).
+
+The `campaign` preset's `in_silico` slot also turns the library's annotation suggestions off, as the
+campaign's in-silico tier does: no "no MS2:" or "low score:" name from a bare precursor mass. A plan with it
+is therefore refused on a Console without the per-annotator suggestions switch. The slot takes any in-silico
+library, so it keeps its own label (`in-silico MSP`); the GLACIER evidence tier, its citation and the
+preprocessing record belong to the guided `tiered_lipid_msp` profile. The preset's MSP rows also use the
+method's MS1 tolerance, where the campaign's rows set 0.01 Da.
 
 A library searched with retention time is read for its records' RTs first, as MS-DIAL's MSP reader reads
 them: MS-DIAL keeps a record without an RT in every RT window and counts its RT as met, so such a record is
