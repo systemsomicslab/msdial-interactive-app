@@ -621,7 +621,9 @@ class GivenLbmPathTests(unittest.TestCase):
             "record_id": 1, "record_url": "https://example.org/records/1", "doi": "", "license": "CC BY 4.0",
         }]
         read = (
-            "the profile reads lbm_doi, lbm_license, lbm_path, lbm_source, lbm_version, msp_doi, msp_license, "
+            "the profile reads in_silico_msp_license, in_silico_msp_paths, in_silico_msp_preprocessing, "
+            "in_silico_msp_source, in_silico_msp_version, "
+            "lbm_doi, lbm_license, lbm_path, lbm_source, lbm_version, msp_doi, msp_license, "
             "msp_paths, msp_source, msp_version. An LBM2 goes in lbm_path: without one the lipid-rule tier is the "
             "official LBM library."
         )
