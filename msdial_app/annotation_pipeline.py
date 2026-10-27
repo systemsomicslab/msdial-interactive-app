@@ -122,9 +122,11 @@ def _with_in_silico_tier(
         "library_kind": "predicted",
         "rt_tolerance": 0.5,
         "ms1_tolerance": 0.01,
-        # GLACIER has no retention time.
+        # GLACIER has no retention time (the author's Q3), so the run-wide retention-time answer does not reach
+        # this row (agent_workflow._apply_retention_time_use).
         "use_rt_scoring": False,
         "use_rt_filtering": False,
+        "rt_fixed": True,
         **THRESHOLDS["in_silico"],
         "annotator_id": IN_SILICO_ANNOTATOR_ID,
         "priority": IN_SILICO_PROFILE_PRIORITIES[IN_SILICO_ANNOTATOR_ID],

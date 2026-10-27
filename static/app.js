@@ -116,6 +116,32 @@ function numberField(selector, fallback) {
   return Number(raw);
 }
 
+// One MSP annotator row as the run receives it. library_kind and suggestions are passed on only where the
+// row states them, as a template's annotator table is read back (workflow.load_parameter_template): without
+// them the run writes neither column, and the Console reads a predicted library, an in-silico tier, as
+// acquired spectra with its suggestions on.
+function mspAnnotatorRow(item) {
+  return {
+    annotator_id: (item.annotator_id || "").trim(),
+    msp_file_path: (item.msp_file_path || "").trim(),
+    target_omics: item.target_omics || "",
+    priority: Number(item.priority || 1),
+    rt_tolerance: Number(item.rt_tolerance || 0),
+    ms1_tolerance: Number(item.ms1_tolerance ?? 0.01),
+    ms2_tolerance: Number(item.ms2_tolerance ?? 0.025),
+    use_rt_scoring: Boolean(item.use_rt_scoring),
+    use_rt_filtering: Boolean(item.use_rt_filtering),
+    weighted_dot_product_cutoff: Number(item.weighted_dot_product_cutoff ?? DEFAULT_MSP_CUTOFFS.weighted_dot_product_cutoff),
+    simple_dot_product_cutoff: Number(item.simple_dot_product_cutoff ?? DEFAULT_MSP_CUTOFFS.simple_dot_product_cutoff),
+    reverse_dot_product_cutoff: Number(item.reverse_dot_product_cutoff ?? DEFAULT_MSP_CUTOFFS.reverse_dot_product_cutoff),
+    matched_peaks_percentage_cutoff: Number(item.matched_peaks_percentage_cutoff ?? DEFAULT_MSP_CUTOFFS.matched_peaks_percentage_cutoff),
+    minimum_spectrum_match: Number(item.minimum_spectrum_match ?? DEFAULT_MSP_CUTOFFS.minimum_spectrum_match),
+    evidence_tier: item.evidence_tier || "",
+    ...(String(item.library_kind || "").trim() ? { library_kind: String(item.library_kind).trim() } : {}),
+    ...(item.suggestions === undefined || item.suggestions === null ? {} : { suggestions: Boolean(item.suggestions) }),
+  };
+}
+
 function workflow() {
   return {
     files: state.files,
@@ -198,23 +224,7 @@ function workflow() {
     msp_minimum_spectrum_match: state.mspAnnotators[0]?.minimum_spectrum_match ?? DEFAULT_MSP_CUTOFFS.minimum_spectrum_match,
     msp_annotators: state.mspAnnotators
       .filter((item) => (item.msp_file_path || "").trim())
-      .map((item) => ({
-        annotator_id: (item.annotator_id || "").trim(),
-        msp_file_path: (item.msp_file_path || "").trim(),
-        target_omics: item.target_omics || "",
-        priority: Number(item.priority || 1),
-        rt_tolerance: Number(item.rt_tolerance || 0),
-        ms1_tolerance: Number(item.ms1_tolerance ?? 0.01),
-        ms2_tolerance: Number(item.ms2_tolerance ?? 0.025),
-        use_rt_scoring: Boolean(item.use_rt_scoring),
-        use_rt_filtering: Boolean(item.use_rt_filtering),
-        weighted_dot_product_cutoff: Number(item.weighted_dot_product_cutoff ?? DEFAULT_MSP_CUTOFFS.weighted_dot_product_cutoff),
-        simple_dot_product_cutoff: Number(item.simple_dot_product_cutoff ?? DEFAULT_MSP_CUTOFFS.simple_dot_product_cutoff),
-        reverse_dot_product_cutoff: Number(item.reverse_dot_product_cutoff ?? DEFAULT_MSP_CUTOFFS.reverse_dot_product_cutoff),
-        matched_peaks_percentage_cutoff: Number(item.matched_peaks_percentage_cutoff ?? DEFAULT_MSP_CUTOFFS.matched_peaks_percentage_cutoff),
-        minimum_spectrum_match: Number(item.minimum_spectrum_match ?? DEFAULT_MSP_CUTOFFS.minimum_spectrum_match),
-        evidence_tier: item.evidence_tier || "",
-      })),
+      .map(mspAnnotatorRow),
     text_annotators: state.textAnnotators
       .filter((item) => (item.text_db_file_path || "").trim())
       .map((item) => ({

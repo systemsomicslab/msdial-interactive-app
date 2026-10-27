@@ -2132,6 +2132,28 @@ def _annotator_capability_issues(state: dict[str, Any], project_type: str) -> li
                 ),
             }
         )
+    # A row labelled with an in-silico tier but not marked predicted, as a state that lost the row's kind on
+    # its way posts it (the web page did, from a template's table, until it passed library_kind on): the
+    # Console would search it as acquired spectra and publish its matches as reference-spectrum matches, while
+    # every record names the tier.
+    from .annotation_pipeline import IN_SILICO_EVIDENCE_TIER, IN_SILICO_GENERIC_EVIDENCE_TIER
+
+    unmarked = [
+        str(row.get("annotator_id") or index) for index, row in enumerate(rows, start=1)
+        if str(row.get("evidence_tier") or "").strip() in {IN_SILICO_EVIDENCE_TIER, IN_SILICO_GENERIC_EVIDENCE_TIER}
+        and not is_predicted_library_kind(row.get("library_kind"))
+    ]
+    if unmarked:
+        template_problems.append(
+            {
+                "level": "error",
+                "message": (
+                    f"MSP annotator(s) {', '.join(unmarked)} are labelled with an in-silico tier but are not marked "
+                    "library_kind predicted, so MS-DIAL would search them as acquired spectra and publish their "
+                    "matches as reference-spectrum matches. Set their library_kind to predicted."
+                ),
+            }
+        )
     quiet = [
         str(row.get("annotator_id") or index) for index, row in enumerate(rows, start=1)
         if row.get("suggestions") is not None and not _as_switch(row.get("suggestions"))

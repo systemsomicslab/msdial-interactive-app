@@ -182,7 +182,12 @@ file, with `in_silico_msp_version`, `in_silico_msp_source`, `in_silico_msp_licen
 ["precursor_plus_1008_peak_removed"]`. The plan checks that step: it is a blocker on a
 positive-mode run, and on a file in which any record still carries a peak at its precursor m/z
 + 1.008. A negative-mode run's file is checked for that peak also without the step, and is a
-blocker while any record carries it. The tier is labelled and cited as GLACIER only where the
+blocker while any record carries it; a negative-mode GLACIER file that carries no such peak
+was changed before use, and is a blocker until the step is named. The in-silico row keeps no
+retention time whatever `use_retention_time_for_annotation` answers for the acquired tiers.
+A predicted MSP row given with `library_strategy: "annotators"` is checked for the peak on a
+negative-mode run too, and is a blocker while any record carries it; that strategy records no
+preprocessing step. The tier is labelled and cited as GLACIER only where the
 file's name says `GLACIER`; any other in-silico library is labelled `In-silico MSP`. The
 profile is then
 `lipid-rule-msp-high-low-insilico-v1`:

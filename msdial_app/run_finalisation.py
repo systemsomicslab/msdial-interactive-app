@@ -114,7 +114,7 @@ from .library_copy_store import (
     unit_ref,
     workspace_root_for,
 )
-from .lipid_rt_check import run_outcome
+from .lipid_rt_check import run_outcome, summary_outcome
 from .sharing import PATH_POLICY, SharingContext, local_path_of
 
 
@@ -1338,9 +1338,23 @@ def finalise_console_run(
         if lipid_rt is not None:
             record["lipid_rt_check"] = lipid_rt
             listed = ", ".join(f"{item['name']} ({item['rows']} rows)" for item in lipid_rt["review_files"])
+            # Without a review list, the Console's summary line says whether the check failed or did not run,
+            # as the Materials and Methods read it (lipid_rt_check.summary_outcome); without one, either may be.
+            outcome = summary_outcome(lipid_rt.get("summary") or "")
+            if lipid_rt["ran"]:
+                said = f"review list {listed}"
+            elif outcome == "failed":
+                said = (
+                    "no review list was written: the check failed and withdrew the verdicts and Confirmed tags it "
+                    "had written"
+                )
+            elif outcome == "not_run":
+                said = "no review list was written: the check did not run"
+            else:
+                said = "no review list was written: the check did not run, or failed and withdrew what it had written"
             log(
                 "Lipid RT check: "
-                + (f"review list {listed}" if lipid_rt["ran"] else "no review list was written, so the check did not run")
+                + said
                 + (f"; rules {lipid_rt['rule_version']}." if lipid_rt.get("rule_version") else ".")
             )
 

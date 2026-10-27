@@ -10,7 +10,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .annotation_pipeline import IN_SILICO_PREPROCESSING_STEPS, apply_tiered_lcms_annotation
+from .annotation_pipeline import (
+    IN_SILICO_EVIDENCE_TIER,
+    IN_SILICO_PREPROCESSING_STEPS,
+    apply_tiered_lcms_annotation,
+    in_silico_evidence_tier,
+)
 from .library_catalog import catalog_status
 from .lipid_rt_check import read_setting as read_lipid_rt_check_setting
 from .user_settings import load_user_settings
@@ -342,6 +347,8 @@ def build_guided_plan(
             "with library_kind 'predicted' (and suggestions false, to name nothing from a bare precursor mass), "
             "but under its own label, without the GLACIER evidence tier, citation or preprocessing record."
         )
+    if merged.get("library_strategy") == "annotators":
+        blockers.extend(_predicted_annotator_problems(merged))
     if merged.get("library_strategy") == "tiered_lipid_msp":
         blockers.extend(_tiered_library_problems(merged))
         # The official LBM2 is the lipid-rule tier only when the answers name none of their own.
@@ -1820,7 +1827,9 @@ def _in_silico_preprocessing_problems(path: Path, steps: list[str], ion_mode: st
     remove; and a file still carrying a peak at a record's precursor m/z + 1.008 has not had it removed
     (lab_lcms_metabolomics.precursor_plus_1008_census, read once per file version). The peak must be removed
     (Q6), so a negative-mode run's file is censused also where no step is declared: one that carries the peak is
-    refused, never searched with it unrecorded.
+    refused, never searched with it unrecorded. And as the negative-mode GLACIER file as published carries it, a
+    GLACIER file without it was changed before use: it is refused until the step is named, so that the records
+    and the Materials and Methods never describe it as published.
     """
     step = "precursor_plus_1008_peak_removed"
     declared = step in steps
@@ -1844,6 +1853,14 @@ def _in_silico_preprocessing_problems(path: Path, steps: list[str], ion_mode: st
             "precursor m/z + 1.008. Plan again once it can."
         ]
     carrying = census["with_precursor_plus_1008_peak"]
+    if not carrying and not declared and census["records"] and (
+        in_silico_evidence_tier(path.name) == IN_SILICO_EVIDENCE_TIER
+    ):
+        return [
+            f"No record in {path.name} carries the peak at the precursor m/z + 1.008 that the negative-mode GLACIER "
+            f"records carry as published, so it was removed before use. Name {step} in "
+            "libraries.in_silico_msp_preprocessing, so that the records and the Materials and Methods state it."
+        ]
     if carrying and declared:
         return [
             f"libraries.in_silico_msp_preprocessing names {step}, but {carrying} of the {census['records']} "
@@ -1857,6 +1874,49 @@ def _in_silico_preprocessing_problems(path: Path, steps: list[str], ion_mode: st
             f"removed, and name {step} in libraries.in_silico_msp_preprocessing."
         ]
     return []
+
+
+def _predicted_annotator_problems(answers: dict[str, Any]) -> list[str]:
+    """The +1.008 artefact (Q6) in a predicted MSP of libraries.annotators, as the tiered profile refuses it.
+
+    A laboratory contract's in-silico slot reaches the plan as such a row (lab_lcms_metabolomics.annotator_settings),
+    and so does a predicted library given with library_strategy 'annotators'. Its file is censused where the run,
+    by its ion mode or else the file's name, is negative-mode, and one whose records carry a peak at the
+    precursor m/z + 1.008 is refused: this strategy records no preprocessing step, so the peak is removed before
+    the file is given (_in_silico_preprocessing_problems).
+    """
+    rows = (answers.get("libraries") or {}).get("annotators") or []
+    ion_mode = str(answers.get("ion_mode") or "").strip()
+    problems: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("kind") == "lbm":
+            continue
+        if str(row.get("library_kind") or "").strip().casefold() != "predicted":
+            continue
+        path = Path(str(row.get("path") or "").strip()).expanduser()
+        if (ion_mode or _name_polarity(path.name)) != "Negative":
+            continue
+        if path.suffix.casefold() != ".msp" or not path.is_file() or path.stat().st_size == 0:
+            continue
+        from .lab_lcms_metabolomics import precursor_plus_1008_census
+
+        where = f"libraries.annotators ({row.get('label') or row.get('annotator_id') or path.name})"
+        try:
+            census = precursor_plus_1008_census(path)
+        except OSError as error:
+            problems.append(
+                f"{where}: {path.name} cannot be read ({error.strerror or error}) to check it for the peak at the "
+                "precursor m/z + 1.008. Plan again once it can."
+            )
+            continue
+        carrying = census["with_precursor_plus_1008_peak"]
+        if carrying:
+            problems.append(
+                f"{where}: {carrying} of the {census['records']} records in {path.name} carry a peak at the "
+                "precursor m/z + 1.008, the negative-mode in-silico records' artefact, which is removed before "
+                "use. Give the file with the peak removed."
+            )
+    return problems
 
 
 def _same_library_file(left: Path, right: Path) -> bool:
