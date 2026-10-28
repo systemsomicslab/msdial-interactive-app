@@ -24,14 +24,17 @@ a reference match. Built on 0.5.50 (#83).
   `In-silico matched` column after `Reference matched` (the QA's name for the same cells), so a merge with
   `reference_matched_only=false` keeps those rows and says what they are (`counts.in_silico_matched_kept`). The
   report states the definition (`reference_match`) and the in-silico annotators it used. In the duplicate
-  ranking, the intensity rule's "matched on MS/MS" is a reference match, and the evidence rule counts an MS/MS
-  match against an in-silico spectrum as no MS/MS match. An LBM2 match is rule-based MS/MS diagnostics, not an
+  ranking, the intensity rule's "matched on MS/MS" is a reference match. The evidence rule gives an accepted
+  in-silico MS/MS match its own level, below RT and MS/MS, MS/MS alone and RT alone, and above a precursor-only
+  suggestion (`evidence_level` 4/3/2/1/0): it is an MS2 match (code 450, of the 4xx series) but never an
+  identification, as the MS-DIAL author decided on 2026-10-28 (D-C). It stays out of `Reference matched` and is
+  still dropped by `reference_matched_only`, so only a merge without that option ranks it. An LBM2 match is rule-based MS/MS diagnostics, not an
   in-silico match, and stays a reference match; so does an acquired MSP searched with predicted retention times.
   normalize's warning about each other standard's spot says when the merge will drop it as in-silico matched.
 - **Internal-standard tier A no longer takes an in-silico match.** The metabolomics standard search took a spot a
   contract library annotated by the standard's name as tier A, without asking; a spot an in-silico match names is
-  now left to tiers C and D, which need the person's word. A resolution made by 0.5.50 on a run with an in-silico
-  library may therefore differ; resolve the standards again.
+  now left to tiers C and D, which need the person's word, as the MS-DIAL author confirmed on 2026-10-28. A
+  resolution made by 0.5.50 on a run with an in-silico library may therefore differ; resolve the standards again.
 
 ### Unchanged, on purpose
 - The lipidomics merge (`msdial_lipidomics_merge`, `lipid_metabolome.csv`) still reads `is_reference_matched` as

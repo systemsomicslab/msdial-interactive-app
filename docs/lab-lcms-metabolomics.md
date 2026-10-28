@@ -325,10 +325,13 @@ The result is one metabolome from the normalized matrices of every polarity the 
    - `inchikey_match`: `first_block` (the first 14 characters: stereoisomers are one compound) or
      `first_two_blocks` (they stay apart).
    - `duplicate_rule` `evidence`: the annotation matched on RT and MS/MS (the export's RT matched and MS/MS
-     matched), then on MS/MS alone, then on RT alone; then the higher library priority, the preferred adduct,
-     the larger mean normalized height over Sample and QC, the higher total score, positive before negative,
-     the lower alignment ID. A match with the laboratory's own RT is kept over a stronger MS/MS-only one. An
-     MS/MS match against an in-silico spectrum counts as no MS/MS match here.
+     matched), then on MS/MS alone, then on RT alone, then on MS/MS against an in-silico spectrum alone, then
+     a precursor-only suggestion; then the higher library priority, the preferred adduct, the larger mean
+     normalized height over Sample and QC, the higher total score, positive before negative, the lower
+     alignment ID. A match with the laboratory's own RT is kept over a stronger MS/MS-only one. An accepted
+     in-silico match is an MS2 match (code 450) but never an identification (the MS-DIAL author's decision of
+     2026-10-28): it ranks below every match a reference spectrum or RT supports, and above a precursor-only
+     suggestion. This matters only with `reference_matched_only` off, since the option drops in-silico rows.
    - `duplicate_rule` `intensity`: a preferred adduct (`[M+H]+`, `[M-H]-`, and the salt's negative adduct:
      `[M+HCOO]-` for ammonium formate or formic acid, `[M+CH3COO]-` for ammonium acetate, none for ammonium
      bicarbonate; compared as ions, so `[M+FA-H]-` counts as `[M+HCOO]-`); matched on MS/MS (a reference

@@ -68,10 +68,17 @@ class InSilicoRepresentative(unittest.TestCase):
         ]
         self.assertEqual({"lib3_in_silico", "lib4_glacier"}, core.in_silico_annotator_ids(entries))
 
-    def test_an_in_silico_ms2_match_is_no_ms2_match_to_the_evidence_rule(self) -> None:
-        self.assertEqual(2, core.evidence_level({"ms2_matched": True}))
-        self.assertEqual(0, core.evidence_level({"ms2_matched": True, "in_silico": True}))
-        self.assertEqual(1, core.evidence_level({"rt_matched": True, "ms2_matched": True, "in_silico": True}))
+    def test_an_in_silico_ms2_match_has_its_own_evidence_level(self) -> None:
+        # The author's decision of 2026-10-28: an MS2 match (450) but never an identification, so below every
+        # level a reference spectrum or RT supports and above a precursor-only suggestion.
+        level = core.evidence_level
+        self.assertEqual(4, level({"rt_matched": True, "ms2_matched": True}))
+        self.assertEqual(3, level({"ms2_matched": True}))
+        self.assertEqual(2, level({"rt_matched": True}))
+        self.assertEqual(1, level({"ms2_matched": True, "in_silico": True}))
+        self.assertEqual(0, level({}))
+        # With RT matched too, it rests on RT: the RT-alone level, not above it.
+        self.assertEqual(2, level({"rt_matched": True, "ms2_matched": True, "in_silico": True}))
 
 
 class MetabolomicsMergeLeavesInSilicoOut(unittest.TestCase):
@@ -119,8 +126,10 @@ class MetabolomicsMergeLeavesInSilicoOut(unittest.TestCase):
         ]
         return spots
 
-    def merged(self, candidate_evidence: bool, **options) -> tuple[dict, dict[str, dict], dict[str, str]]:
-        job = write_run(self.batch, self.contract, "Positive", spots=self.spots(), candidate_evidence=candidate_evidence)
+    def merged(self, candidate_evidence: bool, extra: list[dict] | None = None,
+               **options) -> tuple[dict, dict[str, dict], dict[str, str]]:
+        job = write_run(self.batch, self.contract, "Positive", spots=self.spots() + list(extra or []),
+                        candidate_evidence=candidate_evidence)
         resolved = agent.resolve_standards_for_contract(self.contract, {"Positive": job})
         record = agent.finish_normalize(agent.plan_normalize(
             self.contract, job, resolved["polarities"]["Positive"]["resolution_digest"]))
@@ -162,10 +171,24 @@ class MetabolomicsMergeLeavesInSilicoOut(unittest.TestCase):
         header = next(csv.reader(io.StringIO(Path(report["outputs"]["metabolome"]["path"]).read_text(encoding="utf-8"))))
         self.assertEqual(["Reference matched", "In-silico matched", "Preferred adduct"], header[4:7])
 
-    def test_the_evidence_rule_ranks_an_in_silico_ms2_match_below_an_acquired_one(self) -> None:
-        _report, kept, removed = self.merged(True, reference_matched_only=False, duplicate_rule="evidence")
+    def test_the_evidence_rule_ranks_an_in_silico_ms2_match_between_an_acquired_one_and_a_suggestion(self) -> None:
+        # Citrulline also as a precursor-only suggestion of the acquired MSP, more intense than the in-silico 22.
+        suggestion = dict(alignment_id=26, mz=176.1030, rt=0.66, name="Citrulline", method=self.strict,
+                          inchikey=CITRULLINE, evidence_source="PrecursorOnly", code=530, matched=False,
+                          cells=[7000, 9000, 8000, 0])
+        _report, kept, removed = self.merged(True, extra=[suggestion], reference_matched_only=False,
+                                             duplicate_rule="evidence")
+        # The acquired-spectrum match beats the more intense in-silico one ...
         self.assertIn("21", kept)
         self.assertEqual("duplicate InChIKey first block", removed["25"])
+        # ... and the in-silico match beats the more intense precursor-only suggestion.
+        self.assertIn("22", kept)
+        self.assertEqual("duplicate InChIKey first block", removed["26"])
+        self.assertEqual(("FALSE", "TRUE"), (kept["22"]["Reference matched"], kept["22"]["In-silico matched"]))
+        # With the option on, both are dropped, each for its own reason, and neither is reference matched.
+        _report, kept, removed = self.merged(True, extra=[suggestion], duplicate_rule="evidence")
+        self.assertEqual(["20", "21"], sorted(kept))
+        self.assertEqual(("in-silico matched", "not reference matched"), (removed["22"], removed["26"]))
 
     def test_an_in_silico_match_of_a_standards_name_is_not_tier_a(self) -> None:
         # CUDA's only spot is named by the in-silico library: a library annotation, but no reference match.

@@ -1514,8 +1514,9 @@ RANKINGS = {
     "intensity": ["a preferred adduct", "matched on MS/MS (reference matched; an in-silico match is not)", _MEAN,
                   "the higher library priority", "the higher total score", "positive before negative",
                   "the lower alignment ID"],
-    "evidence": ["matched on RT and MS/MS, then on MS/MS alone, then on RT alone (an MS/MS match against an "
-                 "in-silico spectrum counts as no MS/MS match)", "the higher library priority",
+    "evidence": ["matched on RT and MS/MS, then on MS/MS alone, then on RT alone, then on MS/MS against an "
+                 "in-silico spectrum (an MS2 match, never an identification), then a precursor-only suggestion",
+                 "the higher library priority",
                  "a preferred adduct", _MEAN, "the higher total score", "positive before negative", "the lower alignment ID"],
     "keep_all": ["every row is kept; groups of one compound are counted (duplicates_kept)"],
 }
@@ -1534,12 +1535,18 @@ def compound_key(inchikey: str, match: str) -> str:
 
 
 def evidence_level(row: dict[str, Any]) -> int:
-    """How a row's annotation was matched: 3 RT and MS/MS, 2 MS/MS alone, 1 RT alone, 0 neither.
+    """How a row's annotation was matched: 4 RT and MS/MS, 3 MS/MS alone, 2 RT alone, 1 MS/MS against an
+    in-silico spectrum alone, 0 neither (a precursor-only suggestion).
 
-    An MS/MS match against an in-silico (predicted) spectrum is no MS/MS match against a reference.
+    An accepted in-silico match is an MS2 match (code 450, of the 4xx series) but never an identification
+    (the MS-DIAL author's decisions of 2026-10-28): its MS/MS match is no match against a reference, so it
+    ranks below every level a reference spectrum or RT supports and above a precursor-only suggestion.
     """
-    ms2 = bool(row.get("ms2_matched", False)) and not row.get("in_silico", False)
-    return {(True, True): 3, (False, True): 2, (True, False): 1}.get((bool(row.get("rt_matched", False)), ms2), 0)
+    rt = bool(row.get("rt_matched", False))
+    ms2 = bool(row.get("ms2_matched", False))
+    in_silico = bool(row.get("in_silico", False))
+    level = {(True, True): 4, (False, True): 3, (True, False): 2}.get((rt, ms2 and not in_silico), 0)
+    return level or (1 if ms2 and in_silico else 0)
 
 
 def _pair_columns(read: dict[str, Any], order: list[str], sample_map: dict[str, dict[str, str]]) -> list[str]:

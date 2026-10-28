@@ -98,7 +98,8 @@ never assumed.
   be left out.
 - **When one compound is found more than once** (`duplicate_rule`): `evidence`
   (recommended: the more reliable library match, the person's own RT and MS/MS before an
-  MS/MS-only hit even if weaker, then the library's priority, the preferred adduct and the
+  MS/MS-only hit even if weaker, then an RT-only match, then an in-silico MS/MS match, then
+  a precursor-only suggestion; then the library's priority, the preferred adduct and the
   intensity), `intensity` (the preferred adduct, then the larger intensity) or `keep_all`.
 - **What one compound is** (`inchikey_match`): the InChIKey's `first_block` (stereoisomers
   are one compound) or `first_two_blocks` (they stay apart).

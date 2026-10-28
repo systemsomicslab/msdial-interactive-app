@@ -3977,7 +3977,8 @@ def msdial_lcms_metabolomics_merge(
     salt's negative adduct, [M+HCOO]- for formate or formic acid, [M+CH3COO]- for acetate). Rows of one
     compound (inchikey_match: the InChIKey's first block, or its first two blocks) are one, within and across
     polarities, and duplicate_rule says which row is kept: evidence (RT and MS/MS matched, then MS/MS alone,
-    then the library's priority, the preferred adduct and the intensity), intensity (the preferred adduct,
+    then RT alone, then an in-silico MS/MS match, then a precursor-only suggestion; then the library's
+    priority, the preferred adduct and the intensity), intensity (the preferred adduct,
     then MS/MS matched, then the larger mean normalized height over Sample and QC, then the library's
     priority), or keep_all (every row kept, the duplicates counted). Both follow the contract's answers
     unless given; a different one is applied and reported in deviations_from_contract. A row without an
