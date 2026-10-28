@@ -828,7 +828,11 @@ def annotation_summary(entries: Iterable[dict[str, Any]]) -> list[dict[str, Any]
             "thresholds": entry.get("thresholds") or None,
             "threshold_values": THRESHOLDS.get(entry.get("thresholds") or "", {}) if entry.get("kind") == "msp" else None,
             "library_kind": (entry.get("library_kind") or "acquired") if entry.get("kind") == "msp" else None,
-            "suggestions": entry.get("suggestions", True) if entry.get("kind") == "msp" else None,
+            # As apply_annotators writes the row: a predicted row that leaves it unset does not suggest.
+            "suggestions": (
+                entry.get("suggestions", not is_predicted_library_kind(entry.get("library_kind")))
+                if entry.get("kind") == "msp" else None
+            ),
             "retention_time": entry.get("retention_time"), "rt_tolerance": entry.get("rt_tolerance"),
             "files": {polarity: Path(path).name for polarity, path in entry.get("paths", {}).items()},
         }

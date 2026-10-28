@@ -586,7 +586,7 @@ def _load_persisted_jobs() -> dict[str, dict[str, Any]]:
                     f"{orphan['pid']}) ran; whether that Console still runs could not be read. Its outputs will "
                     "not be checked or recorded by this job."
                 )
-            elif job.get("kind") in CONSOLE_JOB_KINDS:
+            elif orphan is not None:
                 job["error"] = (
                     "The local backend stopped before this job completed, and its MS-DIAL Console is no longer "
                     "running. Its outputs were not checked or recorded by this job; start the run again."

@@ -102,8 +102,9 @@ class ReplyBudget(unittest.TestCase):
 
     def test_every_tool_is_wrapped(self) -> None:
         source = (ROOT / "msdial_app" / "mcp_server.py").read_text(encoding="utf-8")
-        tools = re.findall(r"@mcp\.tool\([^)]*\)[ \t]*\r?\n((?:@\w+[ \t]*\r?\n)*)def (\w+)", source)
-        self.assertEqual(source.count("@mcp.tool("), len(tools))
+        self.assertEqual(0, source.count("@mcp.tool("), "a tool registered past _mcp_tool is served unbudgeted")
+        tools = re.findall(r"@_mcp_tool\([^)]*\)[ \t]*\r?\n((?:@\w+[ \t]*\r?\n)*)def (\w+)", source)
+        self.assertEqual(source.count("@_mcp_tool("), len(tools))
         self.assertGreater(len(tools), 40)
         self.assertEqual(
             [], [name for decorators, name in tools if "@_structured_validation_errors" not in decorators.split()]
@@ -121,21 +122,21 @@ class ReplyBudget(unittest.TestCase):
 
         with patch.object(mcp_server, "_request_json", side_effect=slow):
             started = time.monotonic()
-            first = mcp_server.msdial_interactive_job("job-1")
+            first = mcp_server.msdial_interactive_job.mcp_reply("job-1")
             self.assertLess(time.monotonic() - started, 10)
             self.assertIs(False, first["finished"])
             self.assertEqual(("still_running", True, True), (first["reason"], first["retryable"], first["call_again"]))
             self.assertEqual("msdial_interactive_job", first["tool"])
             # A repeat while it still runs is answered the same way, and starts nothing.
-            self.assertEqual("still_running", mcp_server.msdial_interactive_job("job-1")["reason"])
+            self.assertEqual("still_running", mcp_server.msdial_interactive_job.mcp_reply("job-1")["reason"])
             release.set()
-            collected = mcp_server.msdial_interactive_job("job-1")
+            collected = mcp_server.msdial_interactive_job.mcp_reply("job-1")
         self.assertEqual("completed", collected["status"])
         self.assertIn("collected_from_earlier_call", collected)
         self.assertEqual(1, len(calls))
         # Collected once: the next call is a new one.
         with patch.object(mcp_server, "_request_json", return_value={"id": "job-1", "status": "completed"}):
-            again = mcp_server.msdial_interactive_job("job-1")
+            again = mcp_server.msdial_interactive_job.mcp_reply("job-1")
         self.assertNotIn("collected_from_earlier_call", again)
 
     def test_a_finished_call_is_kept_for_its_repeat_only_for_a_while(self) -> None:
@@ -150,7 +151,7 @@ class ReplyBudget(unittest.TestCase):
 
         with patch.object(mcp_server, "_request_json", side_effect=slow), \
                 patch.object(mcp_server, "PENDING_CALL_RETENTION_SECONDS", 0.0):
-            self.assertEqual("still_running", mcp_server.msdial_interactive_job("job-6")["reason"])
+            self.assertEqual("still_running", mcp_server.msdial_interactive_job.mcp_reply("job-6")["reason"])
             release.set()
             deadline = time.monotonic() + 10
             while not all(call.done.is_set() for call in mcp_server._PENDING_CALLS.values()):
@@ -158,7 +159,7 @@ class ReplyBudget(unittest.TestCase):
                 time.sleep(0.02)
             time.sleep(0.05)
             # Past its retention the earlier result is dropped, and the repeat asks again.
-            again = mcp_server.msdial_interactive_job("job-6")
+            again = mcp_server.msdial_interactive_job.mcp_reply("job-6")
         self.assertNotIn("collected_from_earlier_call", again)
         self.assertEqual(2, len(calls))
 
@@ -170,19 +171,37 @@ class ReplyBudget(unittest.TestCase):
         def request(method, path, **options):
             depth.append(len(depth))
             if len(depth) == 1:
-                return {"inner": mcp_server.msdial_interactive_job("job-7")}
+                return {"inner": mcp_server.msdial_interactive_job.mcp_reply("job-7")}
             return {"id": "job-7", "status": "completed"}
 
         with patch.object(mcp_server, "_request_json", side_effect=request):
             started = time.monotonic()
-            outer = mcp_server.msdial_interactive_job("job-7")
+            outer = mcp_server.msdial_interactive_job.mcp_reply("job-7")
         self.assertLess(time.monotonic() - started, 1.5)
         self.assertEqual("completed", outer["inner"]["status"])
+
+    def test_the_mcp_server_serves_the_budgeted_form_and_an_in_process_caller_waits_as_before(self) -> None:
+        import asyncio
+
+        manager = mcp_server.mcp._tool_manager
+        names = [tool.name for tool in asyncio.run(mcp_server.mcp.list_tools())]
+        self.assertGreater(len(names), 40)
+        self.assertEqual([], [name for name in names if manager.get_tool(name).fn is not getattr(mcp_server, name).mcp_reply])
+
+        def slow(method, path, **options):
+            time.sleep(0.5)
+            return {"id": "job-8", "status": "completed"}
+
+        # The campaign runner calls the module's functions: one step that outlasts the budget is still one result.
+        with patch.object(mcp_server, "TOOL_REPLY_BUDGET_SECONDS", 0.1), \
+                patch.object(mcp_server, "_request_json", side_effect=slow):
+            self.assertEqual("completed", mcp_server.msdial_interactive_job("job-8")["status"])
+            self.assertEqual("still_running", mcp_server.msdial_interactive_job.mcp_reply("job-8")["reason"])
 
     def test_an_error_the_call_raised_reaches_the_caller(self) -> None:
         with patch.object(mcp_server, "_request_json", side_effect=TypeError("broken")):
             with self.assertRaisesRegex(TypeError, "broken"):
-                mcp_server.msdial_interactive_job("job-2")
+                mcp_server.msdial_interactive_job.mcp_reply("job-2")
 
     def test_waiting_for_a_job_is_bounded_whatever_timeout_is_asked(self) -> None:
         with patch.object(mcp_server, "_request_json", return_value={"id": "job-3", "status": "running"}):
@@ -222,13 +241,13 @@ class ReplyBudget(unittest.TestCase):
             return {}
 
         with patch.object(mcp_server, "_request_json", side_effect=request):
-            first = mcp_server.msdial_complete_guided_analysis("job-5", generate_materials_methods=False)
+            first = mcp_server.msdial_complete_guided_analysis.mcp_reply("job-5", generate_materials_methods=False)
             self.assertEqual("still_running", first["reason"])
-            second = mcp_server.msdial_complete_guided_analysis("job-5", poll_seconds=3, generate_materials_methods=False)
+            second = mcp_server.msdial_complete_guided_analysis.mcp_reply("job-5", poll_seconds=3, generate_materials_methods=False)
             self.assertEqual("still_running", second["reason"])
             self.assertTrue(second["arguments_differ"])
             release.set()
-            done = mcp_server.msdial_complete_guided_analysis("job-5", poll_seconds=3, generate_materials_methods=False)
+            done = mcp_server.msdial_complete_guided_analysis.mcp_reply("job-5", poll_seconds=3, generate_materials_methods=False)
         self.assertTrue(done["success"])
         self.assertEqual({"status": "passed"}, done["mztab_validation"])
         self.assertTrue(done["collected_from_earlier_call"]["arguments_differ"])
@@ -262,7 +281,10 @@ class ReplyBudget(unittest.TestCase):
             return mcp_server._request_json("GET", "/api/jobs/x", port=port, timeout=0.3)
 
         failure = mcp_server._mapped_failures(call)()
-        self.assertEqual(("backend_timeout", True), (failure["reason"], failure["retryable"]))
+        # Named as the campaign runner has always read it (a backend fault that pauses the campaign), and said to be
+        # a timeout of a backend that may still be working.
+        self.assertEqual(("os_error", "TimeoutError", True, True),
+                         (failure["reason"], failure["error_type"], failure["timed_out"], failure["retryable"]))
         self.assertIn("may still be working on it", failure["detail"])
 
         def post() -> dict:
@@ -607,15 +629,15 @@ class AnnotatorsRoute(unittest.TestCase):
             "row does not suggest. Set their suggestions to false.", issues)
 
     def test_an_unknown_or_missing_threshold_preset_is_refused_not_searched_as_standard(self) -> None:
-        for thresholds, said in (("permissive", "thresholds 'permissive' is"), ("", "thresholds is not given, and"),
-                                 (None, "thresholds is not given, and")):
+        for thresholds, said in (("permissive", "thresholds 'permissive' is none of"), ("", "thresholds names none of"),
+                                 (None, "thresholds names none of")):
             with self.subTest(thresholds=thresholds):
                 plan = self.plan([self.row(thresholds=thresholds, library_kind="acquired", path=str(self.acquired))])
                 self.assertFalse(plan["ready_to_prepare"])
                 self.assertIsNone(plan["workflow"])
                 self.assertIn(
-                    f"libraries.annotators (probe): {said} none of {', '.join(THRESHOLDS)}. Name one; a row is not "
-                    "searched at settings nobody chose.", plan["blockers"])
+                    f"libraries.annotators (probe): {said} {', '.join(THRESHOLDS)}. Name one; a row is not searched "
+                    "at settings nobody chose.", plan["blockers"])
         plan = self.plan([self.row(kind="text", path=str(self.acquired))])
         self.assertIn("libraries.annotators (probe): kind 'text' is neither msp nor lbm.", plan["blockers"])
         with self.assertRaisesRegex(ValueError, "thresholds 'permissive' is none of"):
@@ -704,6 +726,21 @@ class GuidedRunLipidRtSummary(unittest.TestCase):
     def test_without_either_it_still_says_it_was_not_recorded(self) -> None:
         text = self.post(self.job())
         self.assertIn("summary of the check was not recorded", text)
+
+    def test_what_a_unit_manifest_recorded_stands_beside_the_jobs_summary(self) -> None:
+        from msdial_app.materials_methods import lipid_rt_check_evidence
+
+        manifest = self.root / "unit-manifest.json"
+        manifest.write_text(json.dumps({"console_run_finalisation": {"lipid_rt_check": {
+            "rule_version": "1.1", "parameter_hash": "feedbeef", "summary": ""}}}), encoding="utf-8")
+        settings = json.loads(Path(self.prepared["settings_file"]).read_text(encoding="utf-8"))
+        settings["repository_run_manifest"] = str(manifest)
+        root = Path(self.prepared["run_directory"])
+        line = RT_SUMMARY_LINE.split(": ", 1)[1]
+        merged = lipid_rt_check_evidence(root, settings, {"summary": line, "rule_version": "1.1", "parameter_hash": ""})
+        self.assertEqual((line, "feedbeef"), (merged["summary"], merged["parameter_hash"]))
+        kept = lipid_rt_check_evidence(root, settings, {"summary": "", "rule_version": ""})
+        self.assertEqual(("", "feedbeef"), (kept["summary"], kept["parameter_hash"]))
 
     def test_a_report_for_another_directory_or_job_takes_nothing_from_the_job(self) -> None:
         job = self.job(logs=[RT_SUMMARY_LINE])
@@ -798,6 +835,12 @@ class AnnotationCode450(unittest.TestCase):
         old = _in_silico_code_sentence(in_silico_code_evidence(self.root, workflow_state))
         self.assertIn("predates the in-silico annotation code 450", old)
         self.assertIn("gave these matches the code 430", old)
+        # A Console with the code that also scored some in-silico matches by retention time: no "predates".
+        both = _in_silico_code_sentence({"codes": {"450": 3, "330": 1, "null": 2}})
+        self.assertIn("Accepted in-silico matches carry the MS-DIAL annotation code 450", both)
+        self.assertIn("the code 330", both)
+        self.assertNotIn("predates", both)
+        self.assertNotIn("null", both)
 
     def test_the_handoff_says_which_code_marks_an_in_silico_match(self) -> None:
         directory = self.root / "run"

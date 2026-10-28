@@ -368,11 +368,34 @@ def _still_running_reply(call: _PendingCall, arguments: dict[str, Any]) -> dict[
 
 
 def _structured_validation_errors(function):
-    """Return a failure a caller can act on instead of raising past the MCP boundary, within the reply budget.
+    """Return a failure a caller can act on instead of raising past the MCP boundary.
 
     A raised exception reaches the client as "Error executing tool <name>" with the message gone, so
     an unattended caller learns only that something stopped. Every tool that talks to the backend is
     wrapped, not just the two that were, because the reason is equally unreachable from all of them.
+
+    The function returned is the tool as an in-process caller (the campaign runner, a test) calls it: it returns
+    when the work is done, as it always did. Its ``mcp_reply`` attribute is what an MCP client is served
+    (_mcp_tool registers it): the same call within the reply budget (_within_reply_budget).
+    """
+    mapped = _mapped_failures(function)
+    mapped.mcp_reply = _within_reply_budget(function, mapped)
+    return mapped
+
+
+def _mcp_tool(*args: Any, **kwargs: Any):
+    """mcp.tool(), registering a tool's reply-budgeted form with the MCP server and leaving the module's as it is."""
+    register = mcp.tool(*args, **kwargs)
+
+    def decorator(function):
+        register(getattr(function, "mcp_reply", function))
+        return function
+
+    return decorator
+
+
+def _within_reply_budget(function, mapped):
+    """An MCP client's call of a tool, answered within TOOL_REPLY_BUDGET_SECONDS.
 
     The call runs in a thread of its own and is answered within TOOL_REPLY_BUDGET_SECONDS: one still working then
     is answered with reason "still_running" and goes on, and the same call made again (the same arguments, or for
@@ -381,7 +404,6 @@ def _structured_validation_errors(function):
     nothing new. A call answered in time is never handed to another caller, and a tool called from inside another
     tool's call runs directly in that call's thread.
     """
-    mapped = _mapped_failures(function)
     tool = function.__name__
 
     @wraps(function)
@@ -430,6 +452,7 @@ def _structured_validation_errors(function):
 def _mapped_failures(function):
     """The tool with every failure it can name returned as {"ok": false, "reason": ...}."""
 
+    @wraps(function)
     def wrapped(*args, **kwargs):
         try:
             return function(*args, **kwargs)
@@ -442,7 +465,12 @@ def _mapped_failures(function):
                 "endpoint": error.endpoint,
             }
             if error.timed_out:
-                # The backend may still be working on it: a GET can simply be made again.
+                # Reported as it always was (reason os_error, error_type TimeoutError: the campaign runner pauses on
+                # it as a backend fault), and now said to be a timeout: the backend may still be working on it, and
+                # a GET can simply be made again.
+                failure["reason"] = "os_error"
+                failure["error_type"] = "TimeoutError"
+                failure["timed_out"] = True
                 failure["retryable"] = error.endpoint.startswith("GET ")
             refused = _refused_authorization_codes(error.detail)
             if refused is not None:
@@ -1348,7 +1376,7 @@ def _local_listener(host: str, port: int) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_interactive_status(
     host: str = DEFAULT_HOST,
@@ -1362,7 +1390,7 @@ def msdial_interactive_status(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_check_console_path(
     search_roots: list[str] | None = None,
@@ -1380,7 +1408,7 @@ def msdial_check_console_path(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_set_console_path(
     console_path: str,
@@ -1398,7 +1426,7 @@ def msdial_set_console_path(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_check_official_console_releases(
     host: str = DEFAULT_HOST,
@@ -1415,7 +1443,7 @@ def msdial_check_official_console_releases(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_check_local_console_source(
     source_root: str,
@@ -1433,7 +1461,7 @@ def msdial_check_local_console_source(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_build_console_from_local_source(
     source_root: str,
@@ -1460,7 +1488,7 @@ def msdial_build_console_from_local_source(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_interactive_launch(
     host: str = DEFAULT_HOST,
@@ -1476,7 +1504,7 @@ def msdial_interactive_launch(
     return {"launched": True, **_launch_local_app(host, port, open_browser)}
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_interactive_restart(
     host: str = DEFAULT_HOST,
@@ -1529,7 +1557,7 @@ def msdial_interactive_restart(
     return {"restarted": True, "previous_process": process_info, **_restart_code_note(), **launched}
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_interactive_open(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> dict[str, Any]:
     """Open the MS-DIAL Interactive web UI in the user's browser."""
@@ -1538,7 +1566,7 @@ def msdial_interactive_open(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) 
     return {"opened": True, "url": url, "status": _status_or_error(host, port)}
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_guided_analysis_plan(
     input_path: str,
@@ -1563,7 +1591,7 @@ def msdial_guided_analysis_plan(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_inspect_repository_metadata(
     repository: str,
@@ -1582,7 +1610,7 @@ def msdial_inspect_repository_metadata(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_project_repository_classes(
     workspace: dict[str, Any],
@@ -1610,7 +1638,7 @@ def msdial_project_repository_classes(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_save_repository_metadata(
     workspace: dict[str, Any],
@@ -1634,7 +1662,7 @@ def msdial_save_repository_metadata(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_repository_reanalysis_plan(
     repository: str,
@@ -1724,7 +1752,7 @@ def msdial_repository_reanalysis_plan(
     }
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_download_repository_raw(
     repository: str,
@@ -1868,7 +1896,7 @@ def msdial_download_repository_raw(
     return {"started": True, **started, "preview": preview}
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_repository_batch_plan(
     analysis_unit_handoffs: list[dict[str, Any]] | None = None,
@@ -2032,7 +2060,7 @@ def msdial_repository_batch_plan(
     return plan
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_check_raw_metadata_extractor(extractor_path: str = "") -> dict[str, Any]:
     """List the raw-metadata extractors a preflight would consider, with each one's build identity.
@@ -2050,7 +2078,7 @@ def msdial_check_raw_metadata_extractor(extractor_path: str = "") -> dict[str, A
     return check_raw_metadata_extractors(extractor_path, checkout_parent=ROOT.parent)
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_set_raw_metadata_extractor_path(extractor_path: str, allow_unverified: bool = False) -> dict[str, Any]:
     """Validate a RawMetadataConsoleApp.exe and persist it as the raw_metadata_extractor_path setting.
@@ -2064,7 +2092,7 @@ def msdial_set_raw_metadata_extractor_path(extractor_path: str, allow_unverified
     return set_raw_metadata_extractor_path(extractor_path, allow_unverified=allow_unverified)
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_repository_raw_metadata_preflight(
     download_job_id: str = "",
@@ -2216,7 +2244,7 @@ def msdial_repository_raw_metadata_preflight(
     }
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_split_repository_unit(
     download_job_id: str = "",
@@ -2295,7 +2323,7 @@ def _unit_manifest_path(download_job_id: str, manifest_path: str, host: str, por
     return resolved
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_cleanup_repository_raw(
     download_job_id: str = "",
@@ -2361,7 +2389,7 @@ def msdial_cleanup_repository_raw(
     return result
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_discard_repository_raw(
     download_job_id: str = "",
@@ -2415,7 +2443,7 @@ def msdial_discard_repository_raw(
     return result
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_download_store_status(
     workspace_root: str,
@@ -2449,7 +2477,7 @@ def _existing_manifest(manifest_path: str) -> Path:
     return path.resolve()
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_restore_project_for_viewing(
     manifest_path: str,
@@ -2494,7 +2522,7 @@ def msdial_restore_project_for_viewing(
     return restore_project_for_viewing(_existing_manifest(manifest_path), job_id=job_id, confirmed=bool(confirmed))
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_undo_project_restore(
     manifest_path: str,
@@ -2537,7 +2565,7 @@ def msdial_undo_project_restore(
     return undo_project_restore(_existing_manifest(manifest_path), restore_id=restore_id, confirmed=bool(confirmed))
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_prepare_repository_reanalysis(
     download_job_id: str = "",
@@ -3182,7 +3210,7 @@ def _commit_new_run_rows(
     }
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_repository_qa_evidence(
     download_job_id: str = "",
@@ -3213,7 +3241,7 @@ def msdial_repository_qa_evidence(
     }
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_list_worksets(
     host: str = DEFAULT_HOST,
@@ -3223,7 +3251,7 @@ def msdial_list_worksets(
     return _request_json("GET", "/api/agent/worksets", host=host, port=port)
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_save_workset(
     name: str,
@@ -3266,7 +3294,7 @@ def msdial_save_workset(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_lipidomics_check_inputs(
     pos_path: str,
@@ -3340,7 +3368,7 @@ def msdial_lipidomics_check_inputs(
     return _request_json("POST", "/api/lipidomics/check", host=host, port=port, body=body, timeout=600)
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_lipidomics_write_contract(
     pos_path: str,
@@ -3415,7 +3443,7 @@ def msdial_lipidomics_write_contract(
     return _request_json("POST", "/api/lipidomics/write-contract", host=host, port=port, body=body, timeout=600)
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_lipidomics_check_quant_input(
     quant_table_path: str,
@@ -3448,7 +3476,7 @@ def msdial_lipidomics_check_quant_input(
     return _request_json("POST", "/api/lipidomics/check-quant-input", host=host, port=port, body=body, timeout=120)
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_lipidomics_quant_input_template(
     output_path: str,
@@ -3494,7 +3522,7 @@ def msdial_lipidomics_quant_input_template(
     return _request_json("POST", "/api/lipidomics/quant-input-template", host=host, port=port, body=body, timeout=120)
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_lipidomics_resolve_standards(
     contract_path: str,
@@ -3536,7 +3564,7 @@ def msdial_lipidomics_resolve_standards(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_lipidomics_normalize(
     contract_path: str,
@@ -3585,7 +3613,7 @@ def msdial_lipidomics_normalize(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_lipidomics_merge(
     contract_path: str,
@@ -3647,7 +3675,7 @@ def msdial_lipidomics_merge(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_lcms_metabolomics_check_inputs(
     pos_path: str = "",
@@ -3766,7 +3794,7 @@ def msdial_lcms_metabolomics_check_inputs(
     return _request_json("POST", "/api/lcms-metabolomics/check", host=host, port=port, body=body, timeout=600)
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_lcms_metabolomics_write_contract(
     annotation: dict[str, Any],
@@ -3847,7 +3875,7 @@ def msdial_lcms_metabolomics_write_contract(
     return _request_json("POST", "/api/lcms-metabolomics/write-contract", host=host, port=port, body=body, timeout=600)
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_lcms_metabolomics_resolve_standards(
     contract_path: str,
@@ -3877,7 +3905,7 @@ def msdial_lcms_metabolomics_resolve_standards(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_lcms_metabolomics_normalize(
     contract_path: str,
@@ -3919,7 +3947,7 @@ def msdial_lcms_metabolomics_normalize(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_lcms_metabolomics_merge(
     contract_path: str,
@@ -3974,7 +4002,7 @@ def msdial_lcms_metabolomics_merge(
     return _request_json("POST", "/api/lcms-metabolomics/merge", host=host, port=port, body=body, timeout=300)
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_download_official_library(
     catalog_id: str,
@@ -4009,7 +4037,7 @@ def msdial_download_official_library(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_prepare_guided_analysis(
     input_path: str,
@@ -4029,7 +4057,7 @@ def msdial_prepare_guided_analysis(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_start_guided_analysis(
     input_path: str,
@@ -4070,7 +4098,7 @@ def msdial_start_guided_analysis(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_start_peak_count_diagnostic(
     input_path: str,
@@ -4114,7 +4142,7 @@ def msdial_start_peak_count_diagnostic(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_estimate_peak_height(
     job_id: str,
@@ -4158,7 +4186,7 @@ def msdial_estimate_peak_height(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_interactive_job(
     job_id: str,
@@ -4174,7 +4202,7 @@ def msdial_interactive_job(
     return _request_json("GET", f"/api/jobs/{job_id}?{query}", host=host, port=port, timeout=10)
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_cancel_job(
     job_id: str,
@@ -4249,7 +4277,7 @@ def _job_still_running(job_id: str, job: dict[str, Any], waited: float) -> dict[
     }
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_interactive_wait_for_completion(
     job_id: str,
@@ -4271,7 +4299,7 @@ def msdial_interactive_wait_for_completion(
     return _job_still_running(job_id, job, waited)
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_interactive_create_handoff(
     job_id: str = "",
@@ -4291,7 +4319,7 @@ def msdial_interactive_create_handoff(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_interactive_validate_mztab(
     job_id: str = "",
@@ -4311,7 +4339,7 @@ def msdial_interactive_validate_mztab(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_interactive_preview_mztab(
     job_id: str = "",
@@ -4331,7 +4359,7 @@ def msdial_interactive_preview_mztab(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_generate_lcms_qa(
     job_id: str = "",
@@ -4370,7 +4398,7 @@ def msdial_generate_lcms_qa(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_generate_publication_report(
     job_id: str = "",
@@ -4410,7 +4438,7 @@ def msdial_generate_publication_report(
     )
 
 
-@mcp.tool()
+@_mcp_tool()
 @_structured_validation_errors
 def msdial_complete_guided_analysis(
     job_id: str,

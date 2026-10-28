@@ -226,8 +226,9 @@ every deviation is read to them.
    post_run_actions.internal_standards>)`, called again while it answers
    `call_again: true` (each call waits at most 25 s).
 
-One Console at a time. A start that returns nothing within 120 s may still have started:
-look with `msdial_interactive_status`, never start it again blindly. A failed automatic
+One Console at a time. A start still working after 40 s is answered `reason: still_running`:
+make the identical call again to collect it, or look with `msdial_interactive_status`; never
+start it again with other arguments. A failed automatic
 RT correction stops the run; running uncorrected is the person's decision.
 
 A predicted-RT MSP can be large: the run loads every library in memory, and MS-DIAL keeps

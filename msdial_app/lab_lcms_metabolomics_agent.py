@@ -1947,9 +1947,9 @@ def write_contract(request: dict[str, Any]) -> dict[str, Any]:
         "annotation": {
             "preset": annotation["preset"],
             "libraries": [
-                # suggestions too: the plan rebuilds the annotator rows from these entries alone, and a row
-                # without it searches with the Console's default, suggestions on (the campaign preset's
-                # in-silico slot turns them off).
+                # suggestions too: the plan rebuilds the annotator rows from these entries alone, and an acquired
+                # row without it searches with the Console's default, suggestions on (a predicted row without it is
+                # written with them off, lab_lcms_metabolomics.apply_annotators).
                 {key: entry.get(key) for key in ("id", "slot", "kind", "thresholds", "retention_time", "rt_tolerance",
                                                  "label", "priority", "annotator_id", "library_kind", "suggestions")}
                 | {"files": {polarity: identities[_path_key(path)] for polarity, path in entry["paths"].items()}}

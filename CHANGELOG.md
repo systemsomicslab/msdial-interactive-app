@@ -12,17 +12,20 @@ The defects verification run V2 (the GLACIER in-silico tier pilot, 2026-10-28) f
 - **No MCP tool keeps its client waiting past 40 s, so a client's timeout no longer restarts the server under a
   running Console.** In V2 `msdial_complete_guided_analysis`, which polled for up to a day, was timed out by the
   client after about 60 s ("Request timed out"); the client restarted the MCP server, and the backend it embeds
-  took the running MS-DIAL Console with it 75 s into the run (job `interrupted`). Every tool now runs in a thread
-  of its own and answers within `TOOL_REPLY_BUDGET_SECONDS` (40 s): a call still working then is answered
+  took the running MS-DIAL Console with it 75 s into the run (job `interrupted`). Every tool the MCP server serves
+  now runs in a thread of its own and answers within `TOOL_REPLY_BUDGET_SECONDS` (40 s): a call still working then is answered
   `{"ok": false, "reason": "still_running", "retryable": true, "finished": false, "call_again": true}` and carries
   on, and the same call made again, while it runs or up to 10 minutes after it ended, waits for it and returns its
   result (`collected_from_earlier_call`) instead of starting the same work again. A call answered in time is never
-  handed to another caller, and a tool called from inside another tool's call runs directly in that call's thread. `msdial_interactive_wait_for_completion` and `msdial_complete_guided_analysis` wait at most
+  handed to another caller, and a tool called from inside another tool's call runs directly in that call's thread.
+  The budget is the MCP server's only (`_mcp_tool` registers each tool's `mcp_reply`): the module's functions, which
+  the campaign runner calls in-process, return when their work is done, as before. `msdial_interactive_wait_for_completion` and `msdial_complete_guided_analysis` wait at most
   `JOB_WAIT_LIMIT_SECONDS` (25 s) per call, whatever `timeout_seconds` asks, and answer a running job with
   `finished: false, still_running: true, call_again: true`; a completion is one per job, so a repeat with other
   arguments collects the running one (`arguments_differ`) instead of writing the same QA and report files beside
-  it. A backend that does not answer within an HTTP call's own timeout is `reason: backend_timeout` (retryable for
-  a GET), no longer `os_error` with `retryable: false`.
+  it. A backend that does not answer within an HTTP call's own timeout is still `reason: os_error`,
+  `error_type: TimeoutError` (what the campaign runner pauses on), now with `timed_out: true`, `retryable` for a
+  GET, and a detail that says the backend may still be working on it.
   The skills, `README.md` and `docs/agent_integration.md` say to call these tools again while they answer
   `call_again: true`.
 - **The Console no longer inherits the backend's stdin**, which inside the MCP server is the client's JSON-RPC
@@ -32,7 +35,8 @@ The defects verification run V2 (the GLACIER in-silico tier pilot, 2026-10-28) f
   `orphaned_console` and says so in its error, instead of the library-download sentence (one whose Console has
   exited says that); `msdial_cancel_job` on it stops that Console's process tree after reading its id and creation
   time again (`reason: orphaned_console`, within 20 s), never a process that has since taken its id or one whose
-  creation time cannot be read.
+  creation time cannot be read. A repository unit's next Console is refused while it runs, as before, by the run
+  attempt its manifest holds; a local run has no such check.
 - **The first plan of a run with a large in-silico MSP no longer times out on the +1.008 census.** V2's
   negative-mode plan answered `os_error … timed out` while it read a 2 GB library for the precursor m/z + 1.008
   peak. The census (`lab_lcms_metabolomics.precursor_plus_1008_census`) now reads the file as bytes, a record at a
@@ -50,7 +54,10 @@ The defects verification run V2 (the GLACIER in-silico tier pilot, 2026-10-28) f
   Console reads as predicted (`predicted`, `in_silico`, `InSilico`, …) with `suggestions: true` is a blocker (in-silico rows do not suggest, the author's decision; with suggestions on,
   MS-DIAL kept sub-threshold in-silico candidates labelled `InSilico` and wrote them to the mzTab-M, V2 §7.7), and
   so is such a row in a workflow state from any other path (`workflow._annotator_capability_issues`); a predicted
-  row that leaves `suggestions` unset is written with it false. An MSP row's `thresholds` must name one of
+  row of `libraries.annotators` (and a laboratory contract's in-silico entry) that leaves `suggestions` unset is
+  written with it false, and the library summary says so. Such a row then needs a Console with the per-annotator
+  suggestions switch, as an explicit false always did; a state from another path (the web page) that leaves it
+  unset still runs at the Console's default. An MSP row's `thresholds` must name one of
   `standard`, `strict`, `mild`, `in_silico`: an unknown or missing preset, which `apply_annotators` searched at
   `standard`, is a blocker, and `apply_annotators` itself raises on one. A row whose `kind` is neither `msp` nor
   `lbm` (in any case) is a blocker too. The +1.008 census of the route's predicted rows reads every such spelling.
@@ -71,8 +78,9 @@ The defects verification run V2 (the GLACIER in-silico tier pilot, 2026-10-28) f
     (`in_silico_annotation_codes`), and never counts a peak coded 450 as an identification, whatever its evidence
     source says; identifications are still counted by evidence source, never by code;
   - the Methods state the code the run's mzTab-M gave its in-silico matches: 450, or the 430 of a Console that
-    predates the code (then the evidence source InSilico, not the code, marks them), or, where the output shows no
-    in-silico match, both as conditions; the Supplementary Table lists them;
+    predates the code (then the evidence source InSilico, not the code, marks them), the codes beside 450 of matches
+    also scored otherwise, or, where the output shows no in-silico match, both codes as conditions; the
+    Supplementary Table lists them;
   - the data-mining handoff's annotation note names the code and says to select by the evidence source.
 
 ### Not done

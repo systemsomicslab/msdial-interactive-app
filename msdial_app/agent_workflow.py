@@ -1948,10 +1948,10 @@ def _annotator_row_problems(answers: dict[str, Any]) -> list[str]:
             continue
         thresholds = str(row.get("thresholds") or "").strip()
         if thresholds not in THRESHOLDS:
-            said = f"thresholds '{row.get('thresholds')}' is" if thresholds else "thresholds is not given, and"
+            said = f"thresholds '{row.get('thresholds')}' is none of" if thresholds else "thresholds names none of"
             problems.append(
-                f"{where}: {said} none of {', '.join(THRESHOLDS)}. Name one; a row is not searched at settings "
-                "nobody chose."
+                f"{where}: {said} {', '.join(THRESHOLDS)}. Name one; a row is not searched at settings nobody "
+                "chose."
             )
         from .workflow import is_predicted_library_kind
 

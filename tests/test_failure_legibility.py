@@ -91,7 +91,8 @@ class BackendFailureDetailTests(unittest.TestCase):
 
         source = Path(mcp_server.__file__).read_text(encoding="utf-8")
         tools = re.findall(
-            r"@mcp\.tool\(\)\s*\n(@_structured_validation_errors\s*\n)?def (\w+)", source
+            # _mcp_tool registers each tool's reply-budgeted form (0.5.49); the module keeps the function.
+            r"@_mcp_tool\(\)\s*\n(@_structured_validation_errors\s*\n)?def (\w+)", source
         )
         bare = [name for decorator, name in tools if not decorator]
 

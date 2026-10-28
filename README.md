@@ -808,12 +808,6 @@ Core MCP tools:
 - `msdial_complete_guided_analysis`: once one job has finished, complete validation,
   QA, publication, and handoff without browser interaction; while the job runs it
   answers `finished: false, call_again: true` after at most 25 s, so call it again
-
-Every MCP tool answers within 40 s, so that a client's own timeout (about 60 s) never
-restarts the server under a running job. A call still working then is answered
-`{"ok": false, "reason": "still_running", "finished": false, "call_again": true}` and
-carries on; the same call made again (for a completion: for the same `job_id`) returns its
-result.
 - `msdial_lipidomics_quant_input_template` / `msdial_lipidomics_check_quant_input`:
   write a laboratory lipidomics quantification input in
   [format 1](docs/lab-lipidomics-quant-input.md) to fill in, or convert the earlier
@@ -848,6 +842,12 @@ result.
 - `msdial_download_store_status`: show the accession download stores (objects, claims, partial transfers), read-only
 - `msdial_restore_project_for_viewing`: preview and explicitly confirm reopening a finalised campaign unit's project in the MS-DIAL GUI (containers copied back, library copy linked from the store, unit held)
 - `msdial_undo_project_restore`: preview and explicitly confirm taking such a restore back
+
+Every MCP tool answers within 40 s, so that a client's own timeout (about 60 s) never
+restarts the server under a running job. A call still working then is answered
+`{"ok": false, "reason": "still_running", "finished": false, "call_again": true}` and
+carries on; the same call made again (for a completion: for the same `job_id`) returns its
+result.
 
 Agent API 0.5 binds mzTab-M, QA, publication, and handoff operations to the
 production `job_id`. Files left by earlier runs in the same output directory are

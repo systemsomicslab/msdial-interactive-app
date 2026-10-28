@@ -401,9 +401,9 @@ the person the path of its `qa_report.html`.
 
 - **One Console at a time.** Start the negative run only after the positive one has
   finished.
-- **A silent start may still have started.** If a start returns nothing within the MCP's
-  120 s, look for the job with `msdial_interactive_status`. Never start it again
-  blindly.
+- **A start still working may still start.** A start still working after 40 s is answered
+  `reason: still_running`: make the identical call again to collect it, or look for the
+  job with `msdial_interactive_status`. Never start it again with other arguments.
 - **A failed RT correction stops the run.** If the log says "Automatic alignment RT
   correction failed", stop and report it. Running again without the correction
   (`execute_automatic_rt_correction=false`, recorded as a deviation) is the person's

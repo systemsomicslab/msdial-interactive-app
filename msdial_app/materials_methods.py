@@ -833,12 +833,19 @@ def _in_silico_code_sentence(evidence: dict[str, Any]) -> str:
     )
 
     code = f"{IN_SILICO_ANNOTATION_CODE} ({IN_SILICO_CODE_DESCRIPTION})"
-    codes = {str(key): value for key, value in (evidence.get("codes") or {}).items() if value}
+    codes = {str(key): value for key, value in (evidence.get("codes") or {}).items() if value and str(key) != "null"}
     other = sorted(key for key in codes if key != str(IN_SILICO_ANNOTATION_CODE))
     if codes and not other:
         return (
             f" Each in-silico match carries the MS-DIAL annotation code {code} (the mzTab-M reliability column and "
             "the exports' annotation tag) and is not counted as an identification."
+        )
+    if other and str(IN_SILICO_ANNOTATION_CODE) in codes:
+        # A Console with the code gives a match it also scored by retention time another one (as 330 for 430).
+        return (
+            f" Accepted in-silico matches carry the MS-DIAL annotation code {code}, and those also matched by "
+            f"retention time or another criterion the code {', '.join(other)}; the evidence source InSilico marks "
+            "every one of them, and none is counted as an identification."
         )
     if other:
         return (
@@ -886,8 +893,13 @@ def lipid_rt_check_evidence(
     if not setting and not outcome["ran"]:
         return {}
     recorded = _finalised_lipid_rt_check(workflow)
-    if not str(recorded.get("summary") or "").strip() and isinstance(job_record, dict):
-        recorded = job_record
+    if (
+        not str(recorded.get("summary") or "").strip()
+        and isinstance(job_record, dict)
+        and str(job_record.get("summary") or "").strip()
+    ):
+        # What the manifest recorded stands; the job adds the summary and what it says, where it has them.
+        recorded = {**recorded, **{key: value for key, value in job_record.items() if value not in (None, "")}}
     return {
         "setting": setting,
         "written_to_method_file": bool(method.get("written_to_method_file")),
