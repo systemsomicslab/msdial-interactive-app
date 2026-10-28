@@ -239,7 +239,8 @@ the run when a library is over a few hundred MB.
 
 `msdial_lcms_metabolomics_resolve_standards(contract_path, pos_job_id, neg_job_id)` is
 read-only. Each standard is looked for at its adduct's m/z within the internal-standard
-RT tolerance: A, a library annotated it by its name; B, its own text row annotated it; C,
+RT tolerance: A, a library annotated it by its name (never an in-silico match, which
+leaves the spot to C or D); B, its own text row annotated it; C,
 its row matched but another annotation won; D, any spot there. C and D need the person's
 word.
 
@@ -267,7 +268,8 @@ MS-DIAL did not detect it: its height is a gap fill, and dividing by it scales e
 feature of that injection. Read those heights to the person; normalize them only if they
 accept (`accept_gap_filled=true`). Read every warning: each says what the merge will do with
 another standard's spot, dropped as an internal standard (a library or its own text row
-annotated it as the standard), dropped as unannotated or not reference matched, or kept as
+annotated it as the standard), dropped as unannotated, in-silico matched or not reference
+matched, or kept as
 its own row. On a yes, call again with `confirmed=true`: it writes
 `<root>/quant/NormalizedHeight_<Pos|Neg>.txt` in MS-DIAL's layout (the per-class Average
 and Stdev columns empty, since MS-DIAL computed them from heights), checks every cell
@@ -283,7 +285,11 @@ standard. A spot that was only searched for a standard nobody confirmed stays a 
 kept as its own row outside the InChIKey groups, so that a labelled standard never takes
 the place of its endogenous compound; read `unconfirmed_standard_spots` to the person,
 with any row each shares a first block with. Options, read to the person:
-- `reference_matched_only`, default true: only rows MS-DIAL calls Ref. matched.
+- `reference_matched_only`, default true: only rows MS-DIAL calls Ref. matched, and
+  never an accepted in-silico (predicted-spectrum) match: say how many rows were
+  dropped as `in-silico matched` (`counts.in_silico_matched_removed`). An LBM2 match is
+  rule-based, not in silico, and stays. With the option off, those rows are kept with
+  `In-silico matched` TRUE and `Reference matched` FALSE in `metabolome.csv`.
 - `preferred_adducts_only`, default false: only `[M+H]+`, `[M-H]-` and the salt's
   negative adduct.
 

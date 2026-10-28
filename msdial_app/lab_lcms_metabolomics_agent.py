@@ -54,6 +54,8 @@ from .lab_lcms_metabolomics import (
     annotation_summary,
     annotator_settings,
     export_annotator_ids,
+    in_silico_annotator_ids,
+    is_in_silico_representative,
     is_preferred,
     lbm_retention_time,
     library_identity,
@@ -719,8 +721,9 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         ),
         "internal_standard_search": (
             f"each internal standard is looked for at its adduct's m/z within {is_rt_tolerance} min of its text RT: "
-            "first a spot a library annotated as it, then one its own text row annotated, then one its row matched "
-            "under another annotation, then any spot there; the last two only on the person's word"
+            "first a spot a library annotated as it (never by an in-silico match), then one its own text row "
+            "annotated, then one its row matched under another annotation, then any spot there; the last two only "
+            "on the person's word"
         ),
         "normalization": (
             "normalized = height / height of the normalizing standard in that injection x the standard's mean "
@@ -731,7 +734,8 @@ def check_inputs(request: dict[str, Any]) -> dict[str, Any]:
         ),
         "merge": (
             "unannotated rows and internal standards are dropped; by default only reference-matched rows are kept "
-            "(reference_matched_only) and every adduct is (preferred_adducts_only off); rows sharing the InChIKey's "
+            "(reference_matched_only; an accepted in-silico match is no reference match, and is dropped as "
+            "in-silico matched) and every adduct is (preferred_adducts_only off); rows sharing the InChIKey's "
             "first block are one compound, within and across polarities, and the row kept is the preferred adduct, "
             "then the MS/MS-matched, then the larger mean over Sample and QC. The matrices are the exports the run "
             "wrote: curation in the GUI afterwards does not reach them"
@@ -2333,8 +2337,17 @@ def resolve_polarity(contract: dict[str, Any], polarity: str, job: dict[str, Any
     library = read_internal_standard_text(contract["derived"]["internal_standard_libraries"][polarity]["path"], polarity)
     annotator = INTERNAL_STANDARD_ANNOTATOR_IDS[polarity]
     library_ids = {entry["annotator_id"] for entry in contract["annotation"]["libraries"] if entry["kind"] == "msp"}
+    # Tier A takes a library's reference match of the standard's name without asking. A match against predicted
+    # spectra is none (the MS-DIAL author's decision of 2026-10-28), so such a spot is left to the lower tiers,
+    # which ask the person. The LBM2's rule-based match stays a library annotation.
+    in_silico = in_silico_annotator_ids(contract["annotation"]["libraries"])
 
     def library_annotated(spot: dict[str, Any]) -> bool:
+        if spot["method"] in in_silico:
+            return False
+        representative = representative_candidate(candidates, spot["id"])
+        if representative and is_in_silico_representative(representative):
+            return False
         return spot["method"] in library_ids or spot["method"].startswith("LbmDB")
 
     tolerance = float(contract["internal_standard_rt_tolerance"])
@@ -2628,6 +2641,7 @@ def plan_normalize(
     candidates = read_candidate_table(resolved["outputs"]["candidate_table"])
     defaults = (contract.get("merge") or {}).get("defaults") or {}
     identities_preferred = adduct_identities(preferred_adducts(contract["salt"]["salt"]))
+    in_silico = in_silico_annotator_ids(contract["annotation"]["libraries"])
     spots_by_id = {spot["id"]: spot for spot in height_export["spots"]}
     # Every spot the merge drops as an internal standard besides the one normalized by, once each: each
     # standard's A or B candidates, the one chosen for it or not, the normalizing standard's included.
@@ -2668,6 +2682,10 @@ def plan_normalize(
             fate = "the merge drops it as unannotated"
         elif item["method"] == annotator:
             fate = "the merge drops it as an internal standard, since the internal-standard text row annotated it"
+        elif (representative.get("is_reference_matched") and defaults.get("reference_matched_only", True)
+              and is_in_silico_representative(representative, in_silico_annotators=in_silico)):
+            fate = ("the merge drops it as in-silico matched (a match against a predicted spectrum is no reference "
+                    "match), unless it runs with reference_matched_only=false")
         elif not representative.get("is_reference_matched") and defaults.get("reference_matched_only", True):
             fate = "the merge drops it as not reference matched, unless it runs with reference_matched_only=false"
         else:
@@ -2873,7 +2891,7 @@ def merge(
     try:
         report = merge_metabolome(
             inputs, quant / name, salt=contract["salt"]["salt"], labels=labels, write=write, sample_map=sample_map,
-            **options,
+            in_silico_annotators=in_silico_annotator_ids(contract["annotation"]["libraries"]), **options,
         )
     except LabInputError as error:
         raise LabMetabolomicsError(str(error)) from None

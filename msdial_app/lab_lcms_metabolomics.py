@@ -21,8 +21,9 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Collection, Iterable
 
+from .annotation_codes import is_in_silico_match
 from .lab_lipidomics import (
     IS_TEXT_COLUMNS,
     NEGATIVE,
@@ -819,6 +820,45 @@ def export_annotator_ids(entry: dict[str, Any]) -> dict[str, str]:
     return {polarity: str(entry.get("annotator_id") or "") for polarity in entry.get("paths", {})}
 
 
+def in_silico_annotator_ids(entries: Iterable[dict[str, Any]]) -> set[str]:
+    """The annotator IDs of the MSP libraries searched as predicted (in-silico) spectra.
+
+    An LBM2 is never one: its annotation is the rule-based MS/MS diagnostics of the lipid pipeline, not a
+    match against predicted spectra. A library of predicted retention times (lab_rt_tiers' predicted_rt) is
+    not one either: its spectra are acquired.
+    """
+    return {
+        str(entry.get("annotator_id") or "").strip()
+        for entry in entries
+        if entry.get("kind") == "msp" and is_predicted_library_kind(entry.get("library_kind"))
+        and str(entry.get("annotator_id") or "").strip()
+    }
+
+
+def is_in_silico_representative(
+    representative: dict[str, Any] | None,
+    *,
+    evidence_source: Any = None,
+    code: Any = None,
+    annotator: str = "",
+    in_silico_annotators: Collection[str] = (),
+) -> bool:
+    """Whether a spot's representative annotation rests on an in-silico (predicted) spectrum.
+
+    Such a match is never a reference match (the MS-DIAL author's decision of 2026-10-28), although the
+    candidate table's is_reference_matched is true for an accepted one. It is read as the QA reads a peak
+    (quality_assurance.ReferenceMatchReading): the candidate table's evidence_source where the Console writes
+    one, else the export's Evidence source, else code 450 (annotation_codes.is_in_silico_match), and, whatever
+    the Console wrote, an annotator the contract searched as a library of predicted spectra. An LBM2's
+    rule-based match (evidence source RuleBased), a text library's and an acquired MSP's are none of these.
+    """
+    row = representative or {}
+    evidence = str(row.get("evidence_source") or "").strip() or evidence_source
+    tag = str(row.get("annotation_tag_vs1") or "").strip() or code
+    annotator_id = str(row.get("annotator_id") or "").strip() or str(annotator or "").strip()
+    return is_in_silico_match(tag, evidence) or bool(annotator_id and annotator_id in set(in_silico_annotators))
+
+
 def annotation_summary(entries: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """The libraries as the person is shown them: no path, the settings each is searched with."""
     return [
@@ -1376,6 +1416,17 @@ REMOVED_NAME = "metabolome_removed.tsv"
 SAMPLES_NAME = "metabolome_samples.csv"
 MERGE_REPORT_NAME = "merge-report.json"
 DEFAULT_MERGE_OPTIONS = {"reference_matched_only": True, "preferred_adducts_only": False}
+# The metabolome's column, and the removal reason, for a row an accepted in-silico match represents: the QA's
+# name for the same cells (quality_assurance.IN_SILICO_MATCHED_COLUMN).
+IN_SILICO_MATCHED_COLUMN = "In-silico matched"
+IN_SILICO_REASON = "in-silico matched"
+REFERENCE_MATCH_DEFINITION = (
+    "a row is reference matched where MS-DIAL accepted its representative annotation and that annotation is no "
+    "in-silico (predicted-spectrum) match: read from the candidate table's evidence_source, else the export's "
+    "Evidence source, else code 450, and from the libraries the contract searched as predicted spectra. An "
+    "accepted in-silico match is In-silico matched instead, and reference_matched_only drops it; an LBM2's "
+    "rule-based match is a reference match"
+)
 REMOVED_COLUMNS = (
     "Polarity", "Alignment ID", "Metabolite name", "Adduct type", "InChIKey", "Reason",
     "Kept polarity", "Kept alignment ID", "Kept name", "Kept adduct",
@@ -1395,13 +1446,14 @@ def _column(names: list[str], title: str) -> int:
         return -1
 
 
-def _read_polarity(item: dict[str, Any]) -> dict[str, Any]:
+def _read_polarity(item: dict[str, Any], in_silico_annotators: Collection[str] = ()) -> dict[str, Any]:
     export = _rows_with_cells(item["normalized"])
     names = export["header"][4]
     columns = {key: _column(names, title) for key, title in (
         ("name", "Metabolite name"), ("adduct", "Adduct type"), ("inchikey", "INCHIKEY"),
         ("comment", "Comment"), ("total_score", "Total score"), ("rt", "Average Rt(min)"),
         ("rt_matched", "RT matched"), ("ms2_matched", "MS/MS matched"),
+        ("evidence_source", "Evidence source"), ("code", "Annotation tag (VS1.0)"),
     )}
     missing = [title for key, title in (("name", "Metabolite name"), ("adduct", "Adduct type"),
                                          ("inchikey", "INCHIKEY"), ("comment", "Comment")) if columns[key] < 0]
@@ -1424,6 +1476,12 @@ def _read_polarity(item: dict[str, Any]) -> dict[str, Any]:
         sample_cells = [raw[start + offset].strip() if start + offset < len(raw) else "" for offset in range(export["count"])]
         values = [parse_number(sample_cells[index]) or 0.0 for index in counted]
         representative = representative_candidate(candidates, identifier) or {}
+        accepted = bool(representative.get("is_reference_matched"))
+        # An accepted in-silico match is MS-DIAL's is_reference_matched, but never a reference match here.
+        in_silico = accepted and is_in_silico_representative(
+            representative, evidence_source=cell("evidence_source"), code=cell("code"),
+            annotator=annotation_method(cell("comment")), in_silico_annotators=in_silico_annotators,
+        )
         rows.append({
             "polarity": item["polarity"], "id": identifier, "raw": raw, "name": cell("name"), "adduct": cell("adduct"),
             "inchikey": cell("inchikey"), "comment": raw[columns["comment"]] if columns["comment"] < len(raw) else "",
@@ -1432,7 +1490,8 @@ def _read_polarity(item: dict[str, Any]) -> dict[str, Any]:
             "rt": parse_number(cell("rt")),
             "rt_matched": cell("rt_matched").casefold() == "true",
             "ms2_matched": cell("ms2_matched").casefold() == "true",
-            "matched": bool(representative.get("is_reference_matched")),
+            "matched": accepted and not in_silico,
+            "in_silico": in_silico,
             "priority": int(parse_number(representative.get("priority", "")) or 0),
             "mean": sum(values) / len(values) if values else 0.0,
             "samples": sample_cells,
@@ -1452,9 +1511,11 @@ DUPLICATE_RULES = ("evidence", "intensity", "keep_all")
 INCHIKEY_MATCHES = ("first_block", "first_two_blocks")
 _MEAN = "the larger mean normalized height over the Sample and QC injections"
 RANKINGS = {
-    "intensity": ["a preferred adduct", "matched on MS/MS (reference matched)", _MEAN, "the higher library priority",
-                  "the higher total score", "positive before negative", "the lower alignment ID"],
-    "evidence": ["matched on RT and MS/MS, then on MS/MS alone, then on RT alone", "the higher library priority",
+    "intensity": ["a preferred adduct", "matched on MS/MS (reference matched; an in-silico match is not)", _MEAN,
+                  "the higher library priority", "the higher total score", "positive before negative",
+                  "the lower alignment ID"],
+    "evidence": ["matched on RT and MS/MS, then on MS/MS alone, then on RT alone (an MS/MS match against an "
+                 "in-silico spectrum counts as no MS/MS match)", "the higher library priority",
                  "a preferred adduct", _MEAN, "the higher total score", "positive before negative", "the lower alignment ID"],
     "keep_all": ["every row is kept; groups of one compound are counted (duplicates_kept)"],
 }
@@ -1473,8 +1534,12 @@ def compound_key(inchikey: str, match: str) -> str:
 
 
 def evidence_level(row: dict[str, Any]) -> int:
-    """How a row's annotation was matched: 3 RT and MS/MS, 2 MS/MS alone, 1 RT alone, 0 neither."""
-    return {(True, True): 3, (False, True): 2, (True, False): 1}.get((row.get("rt_matched", False), row.get("ms2_matched", False)), 0)
+    """How a row's annotation was matched: 3 RT and MS/MS, 2 MS/MS alone, 1 RT alone, 0 neither.
+
+    An MS/MS match against an in-silico (predicted) spectrum is no MS/MS match against a reference.
+    """
+    ms2 = bool(row.get("ms2_matched", False)) and not row.get("in_silico", False)
+    return {(True, True): 3, (False, True): 2, (True, False): 1}.get((bool(row.get("rt_matched", False)), ms2), 0)
 
 
 def _pair_columns(read: dict[str, Any], order: list[str], sample_map: dict[str, dict[str, str]]) -> list[str]:
@@ -1530,9 +1595,16 @@ def merge_metabolome(
     inchikey_match: str = "first_block",
     sample_map: dict[str, dict[str, str]] | None = None,
     labels: dict[str, str] | None = None,
+    in_silico_annotators: Collection[str] = (),
     write: bool = False,
 ) -> dict[str, Any]:
     """One metabolome from the normalized matrices of one or both polarities.
+
+    A row whose representative annotation is an accepted in-silico (predicted-spectrum) match is never
+    reference matched (is_in_silico_representative; in_silico_annotators are the annotator IDs of the
+    libraries searched as predicted spectra): reference_matched_only drops it as "in-silico matched", counted
+    apart from "not reference matched", and a merge without that option keeps it with In-silico matched TRUE
+    and Reference matched FALSE. An LBM2's rule-based match stays a reference match.
 
     duplicate_rule decides which row of one compound is kept (DUPLICATE_RULES): "intensity", "evidence" (a
     library match with RT and MS/MS first, then MS/MS alone, then the library's priority), or "keep_all".
@@ -1559,7 +1631,7 @@ def merge_metabolome(
     if inchikey_match not in INCHIKEY_MATCHES:
         raise LabInputError(f"inchikey_match '{inchikey_match}' is none of {', '.join(INCHIKEY_MATCHES)}.")
     identities = adduct_identities(preferred_adducts(salt))
-    read = {item["polarity"]: {**_read_polarity(item), "input": item} for item in polarities}
+    read = {item["polarity"]: {**_read_polarity(item, in_silico_annotators), "input": item} for item in polarities}
     order = [polarity for polarity in POLARITIES if polarity in read]
     if not order:
         raise LabInputError("No polarity to merge.")
@@ -1593,6 +1665,9 @@ def merge_metabolome(
                 drop(row, "unannotated")
             elif row["id"] in standards or (annotator and row["method"] == annotator):
                 drop(row, "internal standard")
+            elif reference_matched_only and row["in_silico"]:
+                # Accepted by MS-DIAL, but against a predicted spectrum: never an identification.
+                drop(row, IN_SILICO_REASON)
             elif reference_matched_only and not row["matched"]:
                 drop(row, "not reference matched")
             elif preferred_adducts_only and not is_preferred(row["adduct"], identities):
@@ -1656,7 +1731,8 @@ def merge_metabolome(
             blocks_kept.setdefault((row["block"]), []).append(row)
 
     label_of = dict(labels or {})
-    header = ["Polarity", "Alignment ID", "InChIKey first block", "Library", "Reference matched", "Preferred adduct",
+    header = ["Polarity", "Alignment ID", "InChIKey first block", "Library", "Reference matched",
+              IN_SILICO_MATCHED_COLUMN, "Preferred adduct",
               *[title for title in metadata_titles if title != "Alignment ID"], *sample_names]
     buffer = io.StringIO()
     writer = csv.writer(buffer, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
@@ -1667,7 +1743,8 @@ def merge_metabolome(
         by_title = {title: (row["raw"][index] if index < len(row["raw"]) else "") for index, title in enumerate(titles)}
         writer.writerow([
             row["polarity"], row["id"], row["block"], label_of.get(row["method"], row["method"]),
-            "TRUE" if row["matched"] else "FALSE", "TRUE" if row["preferred"] else "FALSE",
+            "TRUE" if row["matched"] else "FALSE", "TRUE" if row["in_silico"] else "FALSE",
+            "TRUE" if row["preferred"] else "FALSE",
             *[by_title.get(title, "") for title in metadata_titles if title != "Alignment ID"],
             *row["samples"],
         ])
@@ -1734,7 +1811,12 @@ def merge_metabolome(
             "kept_unconfirmed_standard_spots": sum(1 for row in kept if row["unconfirmed_standard"]),
             "possible_isomer_groups": len(possible_isomers),
             "removed": len(removed),
+            # Rows an accepted in-silico match represents: dropped by reference_matched_only, kept without it.
+            "in_silico_matched_removed": sum(1 for item in removed if item["reason"] == IN_SILICO_REASON),
+            "in_silico_matched_kept": sum(1 for row in kept if row["in_silico"]),
         },
+        "reference_match": REFERENCE_MATCH_DEFINITION,
+        "in_silico_annotators": sorted(set(in_silico_annotators)),
         "samples": sample_names,
         "unconfirmed_standard_spots": {
             polarity: [_unconfirmed_report(spot, polarity, kept, blocks_kept)

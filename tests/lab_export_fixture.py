@@ -28,6 +28,8 @@ CANDIDATE_COLUMNS = [
     "ri_similarity", "ccs_similarity", "isotope_similarity", "simple_dot_product",
     "weighted_dot_product", "reverse_dot_product", "matched_peaks_count", "matched_peaks_percentage",
 ]
+# A Console that writes the evidence record into the candidates file appends these two (MS-DIAL #853).
+CANDIDATE_EVIDENCE_COLUMNS = CANDIDATE_COLUMNS + ["measured_terms", "evidence_source"]
 SAMPLES = [("S1_Pos", "SPF", "Sample"), ("S2_Pos", "GF", "Sample"), ("Blank_Pos", "Blank", "Blank")]
 LBM = "LbmDB: synthetic-lipids"
 
@@ -84,10 +86,11 @@ def candidate(
     }
 
 
-def write_candidates(path: Path, rows: list[dict[str, str]]) -> Path:
-    lines = ["\t".join(CANDIDATE_COLUMNS)]
+def write_candidates(path: Path, rows: list[dict[str, str]], columns: list[str] | None = None) -> Path:
+    columns = columns or CANDIDATE_COLUMNS
+    lines = ["\t".join(columns)]
     for row in rows:
-        lines.append("\t".join(row.get(column, "") for column in CANDIDATE_COLUMNS))
+        lines.append("\t".join(row.get(column, "") for column in columns))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="")
     return path

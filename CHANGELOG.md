@@ -4,6 +4,43 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.51] - Unreleased
+
+The MS-DIAL author's decision of 2026-10-28, applied to the laboratory merges: an accepted in-silico match is never
+a reference match. Built on 0.5.50 (#83).
+
+### Fixed
+- **The laboratory LC-MS metabolomics merge no longer keeps or labels an in-silico (predicted-spectrum, e.g.
+  GLACIER) match as reference matched.** `msdial_lcms_metabolomics_merge` read "Reference matched" from the
+  candidate table's `is_reference_matched`, which MS-DIAL sets for an accepted in-silico match too, so
+  `reference_matched_only` kept such rows and `metabolome.csv` marked them `Reference matched` TRUE. A row is now
+  in-silico matched where its representative annotation is accepted and rests on a predicted spectrum, read as the
+  QA reads a peak: the candidate table's `evidence_source` (`InSilico`) where the Console writes one, else the
+  export's `Evidence source`, else code 450, and, whatever the Console, an annotator the contract searched as a
+  library of `library_kind` `predicted` (`lab_lcms_metabolomics.is_in_silico_representative`,
+  `in_silico_annotator_ids`). Such a row is never `Reference matched`: `reference_matched_only` drops it with the
+  reason `in-silico matched`, apart from `not reference matched`, and the report counts it
+  (`counts.in_silico_matched_removed`, and per polarity under `counts.by_polarity`). `metabolome.csv` gains an
+  `In-silico matched` column after `Reference matched` (the QA's name for the same cells), so a merge with
+  `reference_matched_only=false` keeps those rows and says what they are (`counts.in_silico_matched_kept`). The
+  report states the definition (`reference_match`) and the in-silico annotators it used. In the duplicate
+  ranking, the intensity rule's "matched on MS/MS" is a reference match, and the evidence rule counts an MS/MS
+  match against an in-silico spectrum as no MS/MS match. An LBM2 match is rule-based MS/MS diagnostics, not an
+  in-silico match, and stays a reference match; so does an acquired MSP searched with predicted retention times.
+  normalize's warning about each other standard's spot says when the merge will drop it as in-silico matched.
+- **Internal-standard tier A no longer takes an in-silico match.** The metabolomics standard search took a spot a
+  contract library annotated by the standard's name as tier A, without asking; a spot an in-silico match names is
+  now left to tiers C and D, which need the person's word. A resolution made by 0.5.50 on a run with an in-silico
+  library may therefore differ; resolve the standards again.
+
+### Unchanged, on purpose
+- The lipidomics merge (`msdial_lipidomics_merge`, `lipid_metabolome.csv`) still reads `is_reference_matched` as
+  written. A laboratory lipidomics run searches the LBM2 and the internal-standard text libraries only, and the
+  contract refuses any other library (`libraries` beyond `lbm_path`, and every `msp_` override), so no in-silico
+  match reaches it; tests pin both that and that an LBM2 representative stays reference matched. The lipidomics
+  standard tiers, the predicted name mismatches and the quantified class (`annotated_lipid_class`) mirror what
+  MS-DIAL's own normalize reads, and are left as the Console reads them.
+
 ## [0.5.50] - Unreleased
 
 The MS-DIAL author's decision of 2026-10-28: the QA's "Reference matched" never counts an in-silico match. Built on
