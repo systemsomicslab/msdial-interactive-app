@@ -100,6 +100,7 @@ class MsdialRequestError(RuntimeError):
         endpoint: str = "",
         trace: str = "",
         payload: dict[str, Any] | None = None,
+        timed_out: bool = False,
     ) -> None:
         super().__init__(detail)
         self.detail = detail
@@ -109,9 +110,12 @@ class MsdialRequestError(RuntimeError):
         # The backend's whole answer, for the refusals that carry more than a sentence: a busy unit
         # names the job that holds it.
         self.payload = dict(payload or {})
+        self.timed_out = timed_out
 
     @property
     def reason(self) -> str:
+        if self.timed_out:
+            return "backend_timeout"
         if self.status is None:
             return "backend_unavailable"
         if 400 <= self.status < 500:
@@ -158,10 +162,25 @@ def _request_json(
             payload=payload if isinstance(payload, dict) else None,
         ) from error
     except urllib.error.URLError as error:
+        if isinstance(error.reason, TimeoutError):
+            raise _timed_out(method, path, timeout) from error
         raise MsdialRequestError(
             f"Could not connect to MS-DIAL Interactive at {url}: {error.reason}",
             endpoint=f"{method} {path}",
         ) from error
+    except TimeoutError as error:
+        # A read that waited past its timeout: before, an OSError that reached the caller as os_error,
+        # retryable false, although the backend had carried on (V2: the plan's +1.008 census).
+        raise _timed_out(method, path, timeout) from error
+
+
+def _timed_out(method: str, path: str, timeout: float) -> MsdialRequestError:
+    return MsdialRequestError(
+        f"MS-DIAL Interactive did not answer {method} {path.split('?')[0]} within {timeout:g} s. It may still be "
+        "working on it: nothing was stopped. Check a job with msdial_interactive_job before starting it again.",
+        endpoint=f"{method} {path}",
+        timed_out=True,
+    )
 
 
 def _status_or_error(
@@ -236,15 +255,160 @@ def _validated_workspace_root(value: str) -> str:
     return str(resolved)
 
 
+# WHY A REPLY BUDGET. An MCP client gives up on a tool call it has waited about 60 s for ("Request timed out")
+# and may then restart the server process. The backend runs inside this process, so the restart ended every job
+# it held: in verification run V2 (2026-10-28) msdial_complete_guided_analysis, which polled for up to a day, was
+# timed out 60 s into a run, and the restart killed the MS-DIAL Console 75 s in. Every tool now answers within
+# TOOL_REPLY_BUDGET_SECONDS: the work runs in a thread of its own, and a call still working when the budget ends
+# is answered "still_running"; the same call made again collects it (_PendingCall). The tools that wait for a
+# job wait at most JOB_WAIT_LIMIT_SECONDS per call and say "call again" (msdial_interactive_wait_for_completion,
+# msdial_complete_guided_analysis).
+TOOL_REPLY_BUDGET_SECONDS = 40.0
+JOB_WAIT_LIMIT_SECONDS = 25.0
+# A call that outlived its reply is kept this long for a repeat to collect; after that its result is dropped.
+PENDING_CALL_RETENTION_SECONDS = 3600.0
+# The tools whose repeat is the same call whatever else it passes: one completion per job, so that a repeat with
+# another poll interval collects the running completion instead of writing the same QA and report files beside it.
+_CALL_KEY_ARGUMENTS: dict[str, tuple[str, ...]] = {
+    "msdial_complete_guided_analysis": ("job_id", "host", "port"),
+    "msdial_interactive_wait_for_completion": ("job_id", "host", "port"),
+}
+
+
+class _PendingCall:
+    """One tool call running in its own thread, and what it returned or raised once it ends."""
+
+    def __init__(self, tool: str, arguments: dict[str, Any]) -> None:
+        self.tool = tool
+        self.arguments = arguments
+        self.started = time.time()
+        self.finished: float | None = None
+        self.answered_still_running = False
+        self.done = threading.Event()
+        self.result: Any = None
+        self.error: BaseException | None = None
+
+    def run(self, call: Any) -> None:
+        try:
+            self.result = call()
+        except BaseException as error:  # handed to the caller that collects it, as the call itself raised it
+            self.error = error
+        finally:
+            self.finished = time.time()
+            self.done.set()
+
+
+_PENDING_CALLS: dict[tuple[str, str], _PendingCall] = {}
+_PENDING_LOCK = threading.Lock()
+
+
+def _iso(timestamp: float | None) -> str:
+    if timestamp is None:
+        return ""
+    import datetime as dt
+
+    return dt.datetime.fromtimestamp(timestamp).astimezone().isoformat(timespec="seconds")
+
+
+def _call_arguments(function: Any, args: tuple, kwargs: dict[str, Any]) -> dict[str, Any]:
+    import inspect
+
+    try:
+        bound = inspect.signature(function).bind(*args, **kwargs)
+    except TypeError:
+        return {"args": list(args), **kwargs}
+    bound.apply_defaults()
+    return dict(bound.arguments)
+
+
+def _call_key(tool: str, arguments: dict[str, Any]) -> tuple[str, str]:
+    fields = _CALL_KEY_ARGUMENTS.get(tool)
+    keyed = {name: arguments.get(name) for name in fields} if fields else arguments
+    return tool, json.dumps(keyed, sort_keys=True, default=str)
+
+
+def _forget_stale_calls_locked(now: float) -> None:
+    for key, call in list(_PENDING_CALLS.items()):
+        if call.finished is not None and now - call.finished > PENDING_CALL_RETENTION_SECONDS:
+            del _PENDING_CALLS[key]
+
+
+def _still_running_reply(call: _PendingCall, arguments: dict[str, Any]) -> dict[str, Any]:
+    reply: dict[str, Any] = {
+        "ok": False,
+        "reason": "still_running",
+        "retryable": True,
+        "call_again": True,
+        "tool": call.tool,
+        "started_at": _iso(call.started),
+        "running_seconds": round(time.time() - call.started, 1),
+        "reply_budget_seconds": TOOL_REPLY_BUDGET_SECONDS,
+        "detail": (
+            f"{call.tool} is still working after {TOOL_REPLY_BUDGET_SECONDS:g} s, the longest this server keeps a "
+            "client waiting. Nothing was stopped: it carries on, and the same call made again returns its result "
+            "once it has one. A started MS-DIAL job is not affected; follow it with msdial_interactive_job."
+        ),
+    }
+    if arguments != call.arguments:
+        # A repeat that differs in what does not decide the call: the running one's result is what it collects.
+        reply["arguments_differ"] = True
+    return reply
+
+
 def _structured_validation_errors(function):
-    """Return a failure a caller can act on instead of raising past the MCP boundary.
+    """Return a failure a caller can act on instead of raising past the MCP boundary, within the reply budget.
 
     A raised exception reaches the client as "Error executing tool <name>" with the message gone, so
     an unattended caller learns only that something stopped. Every tool that talks to the backend is
     wrapped, not just the two that were, because the reason is equally unreachable from all of them.
+
+    The call runs in a thread of its own and is answered within TOOL_REPLY_BUDGET_SECONDS: one still working then
+    is answered with reason "still_running" and goes on, and the same call made again waits for it (another budget)
+    and returns its result, so a repeat never starts the same work twice.
     """
+    mapped = _mapped_failures(function)
+    tool = function.__name__
 
     @wraps(function)
+    def wrapped(*args, **kwargs):
+        arguments = _call_arguments(function, args, kwargs)
+        key = _call_key(tool, arguments)
+        with _PENDING_LOCK:
+            _forget_stale_calls_locked(time.time())
+            call = _PENDING_CALLS.get(key)
+            if call is None:
+                call = _PendingCall(tool, arguments)
+                _PENDING_CALLS[key] = call
+                threading.Thread(
+                    target=call.run, args=(lambda: mapped(*args, **kwargs),), name=f"mcp-{tool}", daemon=True
+                ).start()
+        if not call.done.wait(TOOL_REPLY_BUDGET_SECONDS):
+            call.answered_still_running = True
+            return _still_running_reply(call, arguments)
+        with _PENDING_LOCK:
+            if _PENDING_CALLS.get(key) is call:
+                del _PENDING_CALLS[key]
+        if call.error is not None:
+            raise call.error
+        result = call.result
+        if call.answered_still_running and isinstance(result, dict):
+            # Collected by a repeat: say so, and when the work ran, since the caller did not see it start.
+            result = {
+                **result,
+                "collected_from_earlier_call": {
+                    "started_at": _iso(call.started),
+                    "finished_at": _iso(call.finished),
+                    **({"arguments_differ": True} if arguments != call.arguments else {}),
+                },
+            }
+        return result
+
+    return wrapped
+
+
+def _mapped_failures(function):
+    """The tool with every failure it can name returned as {"ok": false, "reason": ...}."""
+
     def wrapped(*args, **kwargs):
         try:
             return function(*args, **kwargs)
@@ -256,6 +420,9 @@ def _structured_validation_errors(function):
                 "error_type": type(error).__name__,
                 "endpoint": error.endpoint,
             }
+            if error.timed_out:
+                # The backend may still be working on it: a GET can simply be made again.
+                failure["retryable"] = error.endpoint.startswith("GET ")
             refused = _refused_authorization_codes(error.detail)
             if refused is not None:
                 # Refused by the backend, which checks the approval again before it writes anything.
@@ -1370,7 +1537,8 @@ def msdial_guided_analysis_plan(
             "answers": answers or {},
             "workset_id": workset_id,
         },
-        timeout=30,
+        # Long enough for the backend to finish what it started; the reply itself is bounded by the reply budget.
+        timeout=300,
     )
 
 
@@ -4001,6 +4169,10 @@ def msdial_cancel_job(
     reason cancelled, keeping the partial file for a resume. Returns at once with cancel_requested; poll
     the job to see it end. Stopping polling, as msdial_interactive_wait_for_completion does on its
     timeout, never stopped anything; this does.
+
+    An interrupted run or diagnostic whose Console a stopped backend left running (the job's orphaned_console,
+    read when the backend started again) has that Console's process tree stopped, once its process id and
+    creation time are read again (reason orphaned_console).
     """
     return _request_json(
         "POST",
@@ -4012,6 +4184,50 @@ def msdial_cancel_job(
     )
 
 
+FINISHED_JOB_STATUSES = frozenset({"completed", "failed", "interrupted"})
+
+
+def _wait_for_job(
+    job_id: str, host: str, port: int, timeout_seconds: float, poll_seconds: float, *, request_timeout: float
+) -> tuple[dict[str, Any], bool, float]:
+    """Poll a job until it has finished or the bounded wait is over: (job, finished, seconds waited)."""
+    try:
+        wanted = float(timeout_seconds)
+    except (TypeError, ValueError):
+        wanted = JOB_WAIT_LIMIT_SECONDS
+    limit = min(max(0.0, wanted), JOB_WAIT_LIMIT_SECONDS)
+    try:
+        interval = max(1.0, float(poll_seconds))
+    except (TypeError, ValueError):
+        interval = 10.0
+    started = time.monotonic()
+    while True:
+        job = _request_json("GET", f"/api/jobs/{job_id}", host=host, port=port, timeout=request_timeout)
+        waited = time.monotonic() - started
+        if job.get("status") in FINISHED_JOB_STATUSES:
+            return job, True, waited
+        left = limit - waited
+        if left <= 0:
+            return job, False, waited
+        time.sleep(min(interval, left))
+
+
+def _job_still_running(job_id: str, job: dict[str, Any], waited: float) -> dict[str, Any]:
+    return {
+        "finished": False,
+        "still_running": True,
+        "call_again": True,
+        "job_id": job_id,
+        "status": job.get("status"),
+        "waited_seconds": round(waited, 1),
+        "job": job,
+        "detail": (
+            f"Job {job_id} is {job.get('status') or 'not finished'}. This call waited {waited:.0f} s, as long as "
+            "one call waits; call again to go on waiting. Nothing was stopped."
+        ),
+    }
+
+
 @mcp.tool()
 @_structured_validation_errors
 def msdial_interactive_wait_for_completion(
@@ -4021,15 +4237,17 @@ def msdial_interactive_wait_for_completion(
     timeout_seconds: int = 3600,
     poll_seconds: int = 10,
 ) -> dict[str, Any]:
-    """Poll until the specified MS-DIAL job completes or fails."""
-    deadline = time.time() + max(1, timeout_seconds)
-    while True:
-        job = _request_json("GET", f"/api/jobs/{job_id}", host=host, port=port, timeout=5)
-        if job.get("status") in {"completed", "failed", "interrupted"}:
-            return {"finished": True, "job": job}
-        if time.time() >= deadline:
-            return {"finished": False, "job": job}
-        time.sleep(max(1, poll_seconds))
+    """Wait a bounded time for an MS-DIAL job to complete or fail; call again while it runs.
+
+    One call waits at most timeout_seconds or JOB_WAIT_LIMIT_SECONDS (25 s), whichever is less, so that it
+    answers before an MCP client gives up on it: a client that times a call out may restart this server, and
+    with it the backend and the job's Console (V2). A job still running is answered with finished false,
+    still_running and call_again true; call again to go on waiting. Stopping waiting stops nothing.
+    """
+    job, finished, waited = _wait_for_job(job_id, host, port, timeout_seconds, poll_seconds, request_timeout=5)
+    if finished:
+        return {"finished": True, "job": job}
+    return _job_still_running(job_id, job, waited)
 
 
 @mcp.tool()
@@ -4184,19 +4402,22 @@ def msdial_complete_guided_analysis(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
-    """Wait for one run, then validate/preview mzTab-M and generate requested QA/publication artifacts.
+    """Once a run has finished, validate/preview mzTab-M and generate requested QA/publication artifacts.
+
+    It waits for the run a bounded time only: at most timeout_seconds or JOB_WAIT_LIMIT_SECONDS (25 s),
+    whichever is less. While the run goes on, the answer is finished false, still_running and call_again true,
+    and the same call made later does the rest; it never blocks until a run ends, since an MCP client that
+    times the call out may restart this server, and with it the backend and the run's Console (V2, where a
+    wait of up to a day did exactly that 75 s into a run). The validation, QA and report that follow can
+    outlast one reply as well: the call is then answered still_running and carries on, and calling it again
+    for the same job_id collects its result.
 
     With LC-MS QA the result carries qa_figures: the folder, qa_report.html and each SVG figure's file
     and title (see msdial_generate_lcms_qa). The publication bundle carries the same figures.
     """
-    deadline = time.time() + max(1, timeout_seconds)
-    while True:
-        job = _request_json("GET", f"/api/jobs/{job_id}", host=host, port=port, timeout=10)
-        if job.get("status") in {"completed", "failed", "interrupted"}:
-            break
-        if time.time() >= deadline:
-            return {"finished": False, "job": job}
-        time.sleep(max(1, poll_seconds))
+    job, finished, waited = _wait_for_job(job_id, host, port, timeout_seconds, poll_seconds, request_timeout=10)
+    if not finished:
+        return _job_still_running(job_id, job, waited)
     if job.get("status") != "completed":
         return {"finished": True, "success": False, "job": job}
 

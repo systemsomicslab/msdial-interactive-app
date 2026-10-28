@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 from typing import Any
+from .annotation_codes import in_silico_code_notes, in_silico_codes
 from .diagnostic_paths import is_diagnostic_artifact, is_intermediate_artifact, is_reproduction_artifact
 
 
@@ -113,6 +114,10 @@ def validate_mztab_file(path: str | Path) -> dict[str, Any]:
     header_widths: dict[str, int] = {}
     unknown_prefixes: dict[str, int] = {}
     column_mismatch_examples: dict[tuple[str, int, int], list[int]] = {}
+    # The SML reliability column (MS-DIAL's annotation code) beside the evidence source, read for what it says of
+    # in-silico matches (annotation_codes); recorded, never a reason to fail or warn on the file's structure.
+    code_columns: tuple[int, int | None] | None = None
+    coded_rows: list[tuple[str, str]] = []
 
     if not target.is_file():
         return _result(target, "failed", ["File does not exist."], [], counts)
@@ -130,11 +135,22 @@ def validate_mztab_file(path: str | Path) -> dict[str, Any]:
                 counts[prefix] = counts.get(prefix, 0) + 1
                 if prefix in HEADER_TO_DATA:
                     header_widths[prefix] = len(parts)
+                    if prefix == "SMH" and "reliability" in parts:
+                        code_columns = (
+                            parts.index("reliability"),
+                            parts.index("opt_global_evidence_source") if "opt_global_evidence_source" in parts else None,
+                        )
                 elif prefix in HEADER_TO_DATA.values():
                     header_prefix = next(
                         key for key, value in HEADER_TO_DATA.items() if value == prefix
                     )
                     expected = header_widths.get(header_prefix)
+                    if prefix == "SML" and code_columns is not None:
+                        code_at, source_at = code_columns
+                        coded_rows.append((
+                            parts[code_at] if code_at < len(parts) else "",
+                            parts[source_at] if source_at is not None and source_at < len(parts) else "",
+                        ))
                     if expected is not None and len(parts) != expected:
                         key = (prefix, len(parts), expected)
                         column_mismatch_examples.setdefault(key, []).append(line_number)
@@ -168,7 +184,18 @@ def validate_mztab_file(path: str | Path) -> dict[str, Any]:
         warnings.append(f"Unknown mzTab line prefixes were found: {examples}.")
 
     status = "failed" if errors else "warning" if warnings else "passed"
-    return _result(target, status, errors, warnings, counts)
+    result = _result(target, status, errors, warnings, counts)
+    if code_columns is not None:
+        found = in_silico_codes(coded_rows)
+        result["annotation_codes"] = {
+            "column": "reliability",
+            "evidence_source_column": "opt_global_evidence_source" if code_columns[1] is not None else "",
+            "in_silico_match_codes": found["codes"],
+            "with_code_450_not_in_silico": found["with_code_450_not_in_silico"],
+            "unknown_codes": found["unknown_codes"],
+            "notes": in_silico_code_notes(found),
+        }
+    return result
 
 
 def _looks_like_mztab(path: Path) -> bool:

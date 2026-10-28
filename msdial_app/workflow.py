@@ -26,6 +26,7 @@ from typing import Any, Callable, Iterable
 
 from . import __version__
 from .sample_grouping import file_type_for, propose_grouping, propose_injection_order
+from .annotation_codes import IN_SILICO_ANNOTATION_CODE, in_silico_codes, parse_annotation_code
 from .diagnostic_paths import REPRODUCTION_DIRECTORY_NAME
 from .lipid_rt_check import (
     LIPID_RT_CHECK_CAPABILITY,
@@ -2196,6 +2197,23 @@ def _annotator_capability_issues(state: dict[str, Any], project_type: str) -> li
                 ),
             }
         )
+    # In-silico rows do not suggest (the author's decision): with suggestions on, MS-DIAL keeps the row's
+    # candidates below its cut-offs, labelled InSilico like accepted matches and written to the mzTab-M (V2).
+    suggesting = [
+        str(row.get("annotator_id") or index) for index, row in enumerate(rows, start=1)
+        if is_predicted_library_kind(row.get("library_kind"))
+        and row.get("suggestions") is not None and _as_switch(row.get("suggestions"))
+    ]
+    if suggesting:
+        template_problems.append(
+            {
+                "level": "error",
+                "message": (
+                    f"MSP annotator(s) {', '.join(suggesting)} search predicted (in-silico) spectra with annotation "
+                    "suggestions on; an in-silico row does not suggest. Set their suggestions to false."
+                ),
+            }
+        )
     quiet = [
         str(row.get("annotator_id") or index) for index, row in enumerate(rows, start=1)
         if row.get("suggestions") is not None and not _as_switch(row.get("suggestions"))
@@ -3036,6 +3054,11 @@ def parse_mdpeak(path: str | Path) -> dict[str, Any]:
     ...) and by the annotator the Comment names ("Annotation method: <id>"). identification_count is the
     representatives an acquired reference spectrum or an LBM2 rule supports; an in-silico library's names are
     in_silico_count and never among them.
+
+    annotation_code_counts counts the named peaks by MS-DIAL's annotation code (the "Annotation tag" column), and
+    in_silico_annotation_codes the codes the in-silico matches carry: 450 from a Console that has the in-silico
+    code (the author's decision of 2026-10-28), 430 from one before it (annotation_codes). No count is taken by
+    code alone, and a peak coded 450 is never an identification, whatever its evidence source says.
     """
     mdpeak = Path(path)
     heights: list[float] = []
@@ -3043,21 +3066,33 @@ def parse_mdpeak(path: str | Path) -> dict[str, Any]:
     candidate_count = 0
     by_evidence: dict[str, int] = {}
     by_annotator: dict[str, int] = {}
+    by_code: dict[str, int] = {}
+    coded: list[tuple[Any, Any]] = []
+    identifications = 0
     with mdpeak.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {"Height", "Simple dot product", "Weighted dot product", "Reverse dot product"}
         if not reader.fieldnames or not required.issubset(reader.fieldnames):
             raise ValueError(f"Unsupported mdpeak header: {mdpeak}")
         with_evidence = "Evidence source" in reader.fieldnames
+        code_column = next((name for name in reader.fieldnames if name.startswith("Annotation tag")), "")
         for row in reader:
             height = _nullable_float(row.get("Height"))
             if height is not None:
                 heights.append(height)
             if _names_a_reference_candidate(row.get("Name")):
                 candidate_count += 1
+                code = parse_annotation_code(row.get(code_column)) if code_column else None
+                if code_column:
+                    by_code[str(code) if code is not None else "null"] = by_code.get(
+                        str(code) if code is not None else "null", 0) + 1
                 if with_evidence:
                     evidence = str(row.get("Evidence source") or "").strip() or "null"
                     by_evidence[evidence] = by_evidence.get(evidence, 0) + 1
+                    if evidence in IDENTIFICATION_EVIDENCE_SOURCES and code != IN_SILICO_ANNOTATION_CODE:
+                        identifications += 1
+                    if code_column:
+                        coded.append((code, evidence))
                 annotator = _comment_annotator(row.get("Comment"))
                 if annotator:
                     by_annotator[annotator] = by_annotator.get(annotator, 0) + 1
@@ -3085,10 +3120,11 @@ def parse_mdpeak(path: str | Path) -> dict[str, Any]:
         # read as "no identification" when it means "not recorded".
         "evidence_source_counts": dict(sorted(by_evidence.items())) if with_evidence else None,
         "annotator_counts": dict(sorted(by_annotator.items())),
-        "identification_count": (
-            sum(by_evidence.get(source, 0) for source in IDENTIFICATION_EVIDENCE_SOURCES) if with_evidence else None
-        ),
+        "identification_count": identifications if with_evidence else None,
         "in_silico_count": by_evidence.get(IN_SILICO_EVIDENCE_SOURCE, 0) if with_evidence else None,
+        # None where the export has no annotation-code column.
+        "annotation_code_counts": dict(sorted(by_code.items())) if code_column else None,
+        "in_silico_annotation_codes": in_silico_codes(coded)["codes"] if code_column and with_evidence else None,
     }
 
 
@@ -3879,6 +3915,9 @@ def run_console(
         cwd=str(Path(preparation["command"][0]).parent)
         if Path(preparation["command"][0]).is_absolute()
         else None,
+        # Not the backend's stdin. Inside the MCP server that is the client's JSON-RPC pipe, which the Console
+        # inherited, held open and could read from; nothing the Console needs comes on stdin.
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -4111,6 +4150,55 @@ def _stop_console_tree(process: subprocess.Popen, group: bool) -> dict[str, Any]
             process.wait(timeout=_WATCH_KILL_WAIT_SECONDS)
         except subprocess.TimeoutExpired:
             record["still_running"] = True
+    return record
+
+
+def stop_orphaned_console(pid: Any, created_at: float | None) -> dict[str, Any]:
+    """End a Console this process did not start - one a stopped backend left running - and everything it started.
+
+    The process is read first (process_liveness): only the very process recorded, by id and creation time, is
+    stopped, never one that has since taken its id. Windows ends the tree with taskkill /T /F; elsewhere the
+    Console was started in its own process group (run_console), which is killed.
+    """
+    from .process_liveness import process_is_alive
+
+    record: dict[str, Any] = {"pid": pid, "process_created_at": created_at}
+    if created_at is None:
+        record["result"] = "not_stopped"
+        record["reason"] = "the Console's creation time was not recorded, so its process id cannot be trusted"
+        return record
+    alive = process_is_alive(pid, created_at)
+    if alive is False:
+        record["result"] = "already_exited"
+        return record
+    if alive is None:
+        record["result"] = "not_stopped"
+        record["reason"] = "whether the recorded process still runs cannot be read"
+        return record
+    if os.name == "nt":
+        record["method"] = "taskkill /T /F"
+        system_taskkill = Path(os.environ.get("SystemRoot") or r"C:\Windows") / "System32" / "taskkill.exe"
+        try:
+            completed = subprocess.run(
+                [str(system_taskkill) if system_taskkill.is_file() else "taskkill", "/T", "/F", "/PID", str(int(pid))],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=_WATCH_KILL_WAIT_SECONDS,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            record["returncode"] = completed.returncode
+        except (OSError, subprocess.SubprocessError) as error:
+            record["error"] = str(error)
+    else:
+        record["method"] = "killpg SIGKILL"
+        try:
+            os.killpg(int(pid), signal.SIGKILL)
+        except OSError as error:
+            record["error"] = str(error)
+    deadline = time.monotonic() + _WATCH_KILL_WAIT_SECONDS
+    while time.monotonic() < deadline and process_is_alive(pid, created_at):
+        time.sleep(0.1)
+    record["result"] = "stopped" if process_is_alive(pid, created_at) is False else "still_running"
     return record
 
 
