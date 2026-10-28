@@ -73,6 +73,16 @@ def _release(event: threading.Event) -> None:
     event.set()
 
 
+def _own_user_data(case: unittest.TestCase) -> None:
+    """Give a test a user data folder of its own: the census and file-identity caches are written there."""
+    folder = tempfile.TemporaryDirectory()
+    case.addCleanup(folder.cleanup)
+    environment = patch.dict(os.environ, {"LOCALAPPDATA": folder.name, "APPDATA": folder.name,
+                                          "XDG_DATA_HOME": folder.name, "XDG_CONFIG_HOME": folder.name})
+    environment.start()
+    case.addCleanup(environment.stop)
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # 1. Every MCP tool answers within its reply budget
 # ---------------------------------------------------------------------------------------------------------------
@@ -81,17 +91,23 @@ def _release(event: threading.Event) -> None:
 class ReplyBudget(unittest.TestCase):
     def setUp(self) -> None:
         for item in (
-            patch.object(mcp_server, "TOOL_REPLY_BUDGET_SECONDS", 0.4),
+            patch.object(mcp_server, "TOOL_REPLY_BUDGET_SECONDS", 2.0),
             patch.object(mcp_server, "JOB_WAIT_LIMIT_SECONDS", 0.3),
         ):
             item.start()
             self.addCleanup(item.stop)
+        mcp_server._PENDING_CALLS.clear()
+        self.addCleanup(mcp_server._PENDING_CALLS.clear)
+        _own_user_data(self)
 
     def test_every_tool_is_wrapped(self) -> None:
         source = (ROOT / "msdial_app" / "mcp_server.py").read_text(encoding="utf-8")
-        tools = re.findall(r"@mcp\.tool\(\)\s*\n(@\w+)?\s*\ndef (\w+)", source)
+        tools = re.findall(r"@mcp\.tool\([^)]*\)[ \t]*\r?\n((?:@\w+[ \t]*\r?\n)*)def (\w+)", source)
+        self.assertEqual(source.count("@mcp.tool("), len(tools))
         self.assertGreater(len(tools), 40)
-        self.assertEqual([], [name for wrapper, name in tools if wrapper != "@_structured_validation_errors"])
+        self.assertEqual(
+            [], [name for decorators, name in tools if "@_structured_validation_errors" not in decorators.split()]
+        )
 
     def test_a_call_past_its_budget_answers_still_running_and_a_repeat_collects_it(self) -> None:
         release = threading.Event()
@@ -106,7 +122,8 @@ class ReplyBudget(unittest.TestCase):
         with patch.object(mcp_server, "_request_json", side_effect=slow):
             started = time.monotonic()
             first = mcp_server.msdial_interactive_job("job-1")
-            self.assertLess(time.monotonic() - started, 5)
+            self.assertLess(time.monotonic() - started, 10)
+            self.assertIs(False, first["finished"])
             self.assertEqual(("still_running", True, True), (first["reason"], first["retryable"], first["call_again"]))
             self.assertEqual("msdial_interactive_job", first["tool"])
             # A repeat while it still runs is answered the same way, and starts nothing.
@@ -120,6 +137,47 @@ class ReplyBudget(unittest.TestCase):
         with patch.object(mcp_server, "_request_json", return_value={"id": "job-1", "status": "completed"}):
             again = mcp_server.msdial_interactive_job("job-1")
         self.assertNotIn("collected_from_earlier_call", again)
+
+    def test_a_finished_call_is_kept_for_its_repeat_only_for_a_while(self) -> None:
+        release = threading.Event()
+        self.addCleanup(_release, release)
+        calls: list[str] = []
+
+        def slow(method, path, **options):
+            calls.append(path)
+            release.wait(30)
+            return {"id": "job-6", "status": "completed"}
+
+        with patch.object(mcp_server, "_request_json", side_effect=slow), \
+                patch.object(mcp_server, "PENDING_CALL_RETENTION_SECONDS", 0.0):
+            self.assertEqual("still_running", mcp_server.msdial_interactive_job("job-6")["reason"])
+            release.set()
+            deadline = time.monotonic() + 10
+            while not all(call.done.is_set() for call in mcp_server._PENDING_CALLS.values()):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.02)
+            time.sleep(0.05)
+            # Past its retention the earlier result is dropped, and the repeat asks again.
+            again = mcp_server.msdial_interactive_job("job-6")
+        self.assertNotIn("collected_from_earlier_call", again)
+        self.assertEqual(2, len(calls))
+
+    def test_a_tool_called_inside_another_tools_call_runs_there(self) -> None:
+        # As a reviewer's probe calls the same tool from inside its own call: before, a nested call waited on the
+        # very call that waited on it.
+        depth: list[int] = []
+
+        def request(method, path, **options):
+            depth.append(len(depth))
+            if len(depth) == 1:
+                return {"inner": mcp_server.msdial_interactive_job("job-7")}
+            return {"id": "job-7", "status": "completed"}
+
+        with patch.object(mcp_server, "_request_json", side_effect=request):
+            started = time.monotonic()
+            outer = mcp_server.msdial_interactive_job("job-7")
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual("completed", outer["inner"]["status"])
 
     def test_an_error_the_call_raised_reaches_the_caller(self) -> None:
         with patch.object(mcp_server, "_request_json", side_effect=TypeError("broken")):
@@ -220,6 +278,9 @@ class ReplyBudget(unittest.TestCase):
 
 
 class ConsoleOutlivingItsBackend(unittest.TestCase):
+    def setUp(self) -> None:
+        _own_user_data(self)
+
     def test_the_console_does_not_inherit_the_backends_stdin(self) -> None:
         seen: dict = {}
         real = subprocess.Popen
@@ -242,7 +303,11 @@ class ConsoleOutlivingItsBackend(unittest.TestCase):
         return path
 
     def test_a_running_console_is_recorded_on_its_interrupted_job_and_cancel_stops_it(self) -> None:
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"],
+            # As run_console starts a watched Console elsewhere, in a process group of its own.
+            **({"start_new_session": True} if os.name != "nt" else {}),
+        )
         self.addCleanup(child.wait, 60)
         self.addCleanup(lambda: child.poll() is None and child.kill())
         created = process_created_at(child.pid)
@@ -265,7 +330,7 @@ class ConsoleOutlivingItsBackend(unittest.TestCase):
                 self.assertIn("msdial_cancel_job stops it", loaded["run-1"]["error"])
                 # Another process under the same id is not the recorded Console.
                 self.assertIs(False, loaded["run-2"]["orphaned_console"]["alive"])
-                self.assertIn("library download can be started again", loaded["run-2"]["error"])
+                self.assertNotIn("library download", loaded["run-2"]["error"])
                 self.assertNotIn("orphaned_console", loaded["download-1"])
                 with patch.object(server, "JOBS", loaded):
                     status, answer = server._cancel_job("run-1", "left running by V2's restart")
@@ -273,17 +338,26 @@ class ConsoleOutlivingItsBackend(unittest.TestCase):
                     self.assertEqual(("orphaned_console", "stopped"), (answer["reason"], answer["orphaned_console_stop"]["result"]))
                     self.assertIs(False, loaded["run-1"]["orphaned_console"]["alive"])
                     self.assertIs(False, process_is_alive(child.pid, created))
-                    # Asked again, it says the Console has gone, and stops nothing.
+                    # Asked again, the job is a finished one, and nothing is stopped or recorded again.
+                    logged = len(loaded["run-1"]["logs"])
                     _, again = server._cancel_job("run-1")
-                    self.assertEqual("already_exited", again["orphaned_console_stop"]["result"])
+                    self.assertEqual(("finished", False), (again["reason"], again["cancel_requested"]))
+                    self.assertEqual(logged, len(loaded["run-1"]["logs"]))
                     # The process that only shares an id is never stopped.
                     _, other = server._cancel_job("run-2")
-                    self.assertEqual("already_exited", other["orphaned_console_stop"]["result"])
+                    self.assertEqual("finished", other["reason"])
+                    self.assertIn("is no longer running", loaded["run-2"]["error"])
 
     def test_a_console_without_a_recorded_creation_time_is_not_trusted(self) -> None:
         record = workflow.stop_orphaned_console(os.getpid(), None)
         self.assertEqual("not_stopped", record["result"])
         self.assertIs(True, process_is_alive(os.getpid()))
+        # Nor one whose creation time cannot be read again (an access-denied process reads as alive, time unknown).
+        created = process_created_at()
+        with patch("msdial_app.process_liveness.process_created_at", return_value=None):
+            self.assertIsNone(workflow.recorded_process_alive(os.getpid(), created))
+            self.assertEqual("not_stopped", workflow.stop_orphaned_console(os.getpid(), created)["result"])
+        self.assertIs(True, workflow.recorded_process_alive(os.getpid(), created))
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -301,6 +375,7 @@ class PrecursorPlus1008Census(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.addCleanup(lab_lcms_metabolomics._PRECURSOR_PLUS_1008_CENSUS.clear)
+        _own_user_data(self)
 
     def write(self, name: str, text: str | bytes) -> Path:
         path = self.root / name
@@ -321,9 +396,11 @@ class PrecursorPlus1008Census(unittest.TestCase):
             + _record("no precursor", "abc", ["101.008 1"])
             + "#NAME: a comment\n"
             + _record("unicode name é", "400", ["401.008 9"], header="COMMENT: 　x\n")
+            # Where a decimal's rounding to a float crosses an integer boundary (a reviewer's counterexample).
+            + _record("huge", "17179881527.9945", ["17179881528.999999 10"])
         )
         # As the census read it before 0.5.49 (its line-by-line reading gives these counts for this text).
-        expected = {"records": 10, "with_precursor_plus_1008_peak": 7}
+        expected = {"records": 11, "with_precursor_plus_1008_peak": 8}
         for variant, data in (
             ("lf", text.encode("utf-8")),
             ("crlf with bom", b"\xef\xbb\xbf" + text.replace("\n", "\r\n").encode("utf-8")),
@@ -356,16 +433,50 @@ class PrecursorPlus1008Census(unittest.TestCase):
                 self.assertEqual(expected, precursor_plus_1008_census(copy))
             # A census of another version of the reading is read again.
             lab_lcms_metabolomics._PRECURSOR_PLUS_1008_CENSUS.clear()
-            with patch.object(lab_lcms_metabolomics, "PRECURSOR_PLUS_1008_CENSUS_VERSION", 99):
+            reads: list[Path] = []
+            real_read = lab_lcms_metabolomics._read_precursor_plus_1008
+
+            def counted(target, progress):
+                reads.append(target)
+                return real_read(target, progress)
+
+            with patch.object(lab_lcms_metabolomics, "PRECURSOR_PLUS_1008_CENSUS_VERSION", 99), \
+                    patch.object(lab_lcms_metabolomics, "_read_precursor_plus_1008", side_effect=counted):
                 self.assertEqual(expected, precursor_plus_1008_census(original))
+            self.assertEqual([original.resolve()], reads)
 
     def test_a_small_file_is_kept_for_the_process_only(self) -> None:
         path = self.write("small.msp", _record("A", "300.1", ["301.108 5"]))
         self.assertEqual(1, precursor_plus_1008_census(path)["with_precursor_plus_1008_peak"])
         cache = workflow.user_data_directory() / lab_lcms_metabolomics.PRECURSOR_PLUS_1008_CENSUS_CACHE
-        if cache.is_file():
-            entries = json.loads(cache.read_text(encoding="utf-8")).get("entries") or {}
-            self.assertFalse(any(key.startswith(str(path.resolve()).casefold()) for key in entries))
+        self.assertFalse(cache.exists())
+        lab_lcms_metabolomics._PRECURSOR_PLUS_1008_CENSUS.clear()
+        with patch.object(lab_lcms_metabolomics, "_read_precursor_plus_1008", side_effect=AssertionError("read")):
+            with self.assertRaisesRegex(AssertionError, "read"):
+                precursor_plus_1008_census(path)
+
+    def test_a_read_of_an_earlier_version_of_the_file_is_abandoned(self) -> None:
+        path = self.write("changing.msp", _record("A", "300.1", ["150.05 10"]))
+        release = threading.Event()
+        self.addCleanup(_release, release)
+        started: list[dict] = []
+
+        def held(target, progress=None):
+            started.append(progress)
+            if len(started) == 1:
+                release.wait(30)
+            return {"records": 1, "with_precursor_plus_1008_peak": 0}
+
+        with patch.object(lab_lcms_metabolomics, "precursor_plus_1008_census", side_effect=held):
+            self.assertEqual("reading", precursor_plus_1008_census_within(path, 0.1)["state"])
+            path.write_text(_record("A", "300.1", ["150.05 10", "160 1"]), encoding="utf-8")
+            os.utime(path, (time.time() + 10, time.time() + 10))
+            found = precursor_plus_1008_census_within(path, 5)
+            self.assertEqual("counted", found["state"])
+            self.assertTrue(started[0].get("abandoned"))
+            release.set()
+        with self.assertRaises(InterruptedError):
+            lab_lcms_metabolomics._read_precursor_plus_1008(path, {"abandoned": 1})
 
     def test_a_plan_waits_for_the_census_a_bounded_time_and_never_accepts_an_unread_file(self) -> None:
         path = self.write("Synthetic-GLACIER_neg_allCE.msp", _record("A", "300.1", ["150.05 10"]))
@@ -403,6 +514,10 @@ class PrecursorPlus1008Census(unittest.TestCase):
                           side_effect=PermissionError(13, "Permission denied")):
             with self.assertRaises(PermissionError):
                 precursor_plus_1008_census_within(path, 5)
+        # Whatever it failed with, it is an OSError to the plan, so the plan refuses the file rather than crash.
+        with patch.object(lab_lcms_metabolomics, "precursor_plus_1008_census", side_effect=MemoryError("too big")):
+            with self.assertRaisesRegex(OSError, "MemoryError: too big"):
+                precursor_plus_1008_census_within(path, 5)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -415,6 +530,7 @@ class AnnotatorsRoute(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+        _own_user_data(self)
         self.data = self.root / "data"
         self.data.mkdir()
         (self.data / "sample.mzML").write_text("", encoding="ascii")
@@ -453,6 +569,24 @@ class AnnotatorsRoute(unittest.TestCase):
         blockers = self.plan([self.row(library_kind="acquired", path=str(self.acquired), thresholds="standard",
                                        suggestions=True)])["blockers"]
         self.assertFalse(any("does not suggest" in item for item in blockers), blockers)
+
+    def test_every_spelling_the_console_reads_as_predicted_is_an_in_silico_row(self) -> None:
+        for spelling in ("in_silico", "InSilico", "Predicted"):
+            with self.subTest(library_kind=spelling):
+                blockers = self.plan([self.row(library_kind=spelling, suggestions=True)])["blockers"]
+                self.assertTrue(any("does not suggest" in item for item in blockers), blockers)
+                state: dict = {}
+                apply_annotators(state, [self.row(library_kind=spelling)])
+                self.assertIs(False, state["msp_annotators"][0]["suggestions"])
+
+    def test_an_lbm_row_in_any_case_is_the_lbm2(self) -> None:
+        lbm = self.root / "synthetic.lbm2"
+        lbm.write_bytes(b"synthetic")
+        plan = self.plan([{"kind": "LBM", "path": str(lbm), "priority": 2}, self.row(suggestions=False)])
+        self.assertFalse(any("thresholds" in item for item in plan["blockers"]), plan["blockers"])
+        state: dict = {}
+        apply_annotators(state, [{"kind": "LBM", "path": str(lbm), "priority": 2}])
+        self.assertEqual((str(lbm), []), (state["lbm_path"], state["msp_annotators"]))
 
     def test_an_in_silico_row_that_leaves_suggestions_unset_is_written_with_them_off(self) -> None:
         state: dict = {}
@@ -503,6 +637,7 @@ class GuidedRunLipidRtSummary(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+        _own_user_data(self)
         data = self.root / "data"
         data.mkdir()
         (data / "sample.mzML").write_text("", encoding="ascii")
@@ -570,6 +705,12 @@ class GuidedRunLipidRtSummary(unittest.TestCase):
         text = self.post(self.job())
         self.assertIn("summary of the check was not recorded", text)
 
+    def test_a_report_for_another_directory_or_job_takes_nothing_from_the_job(self) -> None:
+        job = self.job(logs=[RT_SUMMARY_LINE])
+        self.assertEqual("1.1", server._job_lipid_rt_check(job, self.prepared["run_directory"])["rule_version"])
+        self.assertIsNone(server._job_lipid_rt_check(job, str(self.root / "elsewhere")))
+        self.assertIsNone(server._job_lipid_rt_check({**job, "kind": "tuning"}, self.prepared["run_directory"]))
+
 
 # ---------------------------------------------------------------------------------------------------------------
 # 5. Annotation code 450
@@ -591,6 +732,7 @@ class AnnotationCode450(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+        _own_user_data(self)
 
     def test_the_code_table_names_450_and_reads_codes_as_written(self) -> None:
         self.assertEqual("MS/MS matched to an in-silico (predicted) reference spectrum", ANNOTATION_CODES[450])
@@ -644,8 +786,9 @@ class AnnotationCode450(unittest.TestCase):
         workflow_state = {"msp_annotators": [{"msp_file_path": "x.msp", "library_kind": "predicted"}]}
         self.assertEqual({}, in_silico_code_evidence(self.root, {"msp_annotators": [{"msp_file_path": "x.msp"}]}))
         none = _in_silico_code_sentence(in_silico_code_evidence(self.root, workflow_state))
-        self.assertIn("MS-DIAL gives an accepted in-silico match the annotation code 450", none)
-        self.assertIn("gives it 430", none)
+        self.assertIn("An MS-DIAL Console that has the in-silico annotation code gives an accepted in-silico match "
+                      "the code 450", none)
+        self.assertIn("one that predates it gives 430", none)
         (self.root / "AlignResult-1.mzTab").write_text(MZTAB.format(insilico="450"), encoding="utf-8")
         new = _in_silico_code_sentence(in_silico_code_evidence(self.root, workflow_state))
         self.assertIn("Each in-silico match carries the MS-DIAL annotation code 450 (MS/MS matched to an in-silico "

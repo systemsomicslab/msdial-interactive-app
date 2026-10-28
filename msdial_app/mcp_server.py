@@ -265,8 +265,9 @@ def _validated_workspace_root(value: str) -> str:
 # msdial_complete_guided_analysis).
 TOOL_REPLY_BUDGET_SECONDS = 40.0
 JOB_WAIT_LIMIT_SECONDS = 25.0
-# A call that outlived its reply is kept this long for a repeat to collect; after that its result is dropped.
-PENDING_CALL_RETENTION_SECONDS = 3600.0
+# A call that outlived its reply is kept this long after it ends for a repeat to collect; after that its result is
+# dropped and the same call runs anew. Only such a call is kept: one answered in time is never handed to another.
+PENDING_CALL_RETENTION_SECONDS = 600.0
 # The tools whose repeat is the same call whatever else it passes: one completion per job, so that a repeat with
 # another poll interval collects the running completion instead of writing the same QA and report files beside it.
 _CALL_KEY_ARGUMENTS: dict[str, tuple[str, ...]] = {
@@ -289,6 +290,7 @@ class _PendingCall:
         self.error: BaseException | None = None
 
     def run(self, call: Any) -> None:
+        _CALL_THREAD.inside = True
         try:
             self.result = call()
         except BaseException as error:  # handed to the caller that collects it, as the call itself raised it
@@ -297,9 +299,18 @@ class _PendingCall:
             self.finished = time.time()
             self.done.set()
 
+    def collectable(self, now: float) -> bool:
+        """Whether a repeat waits for this call: while it runs, and once it ran past its reply, for a while."""
+        if not self.done.is_set():
+            return True
+        return self.answered_still_running and now - (self.finished or now) <= PENDING_CALL_RETENTION_SECONDS
+
 
 _PENDING_CALLS: dict[tuple[str, str], _PendingCall] = {}
 _PENDING_LOCK = threading.Lock()
+# Set in a call's own thread: a tool called from inside another tool's call runs there directly, as it always did,
+# rather than waiting on a call that may be waiting on it.
+_CALL_THREAD = threading.local()
 
 
 def _iso(timestamp: float | None) -> str:
@@ -329,7 +340,7 @@ def _call_key(tool: str, arguments: dict[str, Any]) -> tuple[str, str]:
 
 def _forget_stale_calls_locked(now: float) -> None:
     for key, call in list(_PENDING_CALLS.items()):
-        if call.finished is not None and now - call.finished > PENDING_CALL_RETENTION_SECONDS:
+        if not call.collectable(now):
             del _PENDING_CALLS[key]
 
 
@@ -338,6 +349,7 @@ def _still_running_reply(call: _PendingCall, arguments: dict[str, Any]) -> dict[
         "ok": False,
         "reason": "still_running",
         "retryable": True,
+        "finished": False,
         "call_again": True,
         "tool": call.tool,
         "started_at": _iso(call.started),
@@ -363,14 +375,19 @@ def _structured_validation_errors(function):
     wrapped, not just the two that were, because the reason is equally unreachable from all of them.
 
     The call runs in a thread of its own and is answered within TOOL_REPLY_BUDGET_SECONDS: one still working then
-    is answered with reason "still_running" and goes on, and the same call made again waits for it (another budget)
-    and returns its result, so a repeat never starts the same work twice.
+    is answered with reason "still_running" and goes on, and the same call made again (the same arguments, or for
+    the tools in _CALL_KEY_ARGUMENTS the same job) waits for it, another budget, and returns its result: a repeat of
+    a call that is still running, or that ran past its reply up to PENDING_CALL_RETENTION_SECONDS before, starts
+    nothing new. A call answered in time is never handed to another caller, and a tool called from inside another
+    tool's call runs directly in that call's thread.
     """
     mapped = _mapped_failures(function)
     tool = function.__name__
 
     @wraps(function)
     def wrapped(*args, **kwargs):
+        if getattr(_CALL_THREAD, "inside", False):
+            return mapped(*args, **kwargs)
         arguments = _call_arguments(function, args, kwargs)
         key = _call_key(tool, arguments)
         with _PENDING_LOCK:
@@ -383,8 +400,12 @@ def _structured_validation_errors(function):
                     target=call.run, args=(lambda: mapped(*args, **kwargs),), name=f"mcp-{tool}", daemon=True
                 ).start()
         if not call.done.wait(TOOL_REPLY_BUDGET_SECONDS):
-            call.answered_still_running = True
-            return _still_running_reply(call, arguments)
+            with _PENDING_LOCK:
+                answered = not call.done.is_set()
+                if answered:
+                    call.answered_still_running = True
+            if answered:
+                return _still_running_reply(call, arguments)
         with _PENDING_LOCK:
             if _PENDING_CALLS.get(key) is call:
                 del _PENDING_CALLS[key]

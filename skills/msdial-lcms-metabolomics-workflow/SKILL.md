@@ -223,7 +223,8 @@ every deviation is read to them.
    the threshold.
 4. On a yes, `msdial_start_guided_analysis(..., confirmed=true)`, then
    `msdial_complete_guided_analysis(job_id, internal_standards=<the plan's
-   post_run_actions.internal_standards>)`.
+   post_run_actions.internal_standards>)`, called again while it answers
+   `call_again: true` (each call waits at most 25 s).
 
 One Console at a time. A start that returns nothing within 120 s may still have started:
 look with `msdial_interactive_status`, never start it again blindly. A failed automatic

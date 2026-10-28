@@ -4156,24 +4156,23 @@ def _stop_console_tree(process: subprocess.Popen, group: bool) -> dict[str, Any]
 def stop_orphaned_console(pid: Any, created_at: float | None) -> dict[str, Any]:
     """End a Console this process did not start - one a stopped backend left running - and everything it started.
 
-    The process is read first (process_liveness): only the very process recorded, by id and creation time, is
-    stopped, never one that has since taken its id. Windows ends the tree with taskkill /T /F; elsewhere the
-    Console was started in its own process group (run_console), which is killed.
+    The process is read first (recorded_process_alive): only the very process recorded, by id and a creation time
+    read again, is stopped, never one that has since taken its id, nor one whose creation time cannot be read.
+    Windows ends the tree with taskkill /T /F; elsewhere the Console was started in its own process group
+    (run_console), which is killed.
     """
-    from .process_liveness import process_is_alive
-
     record: dict[str, Any] = {"pid": pid, "process_created_at": created_at}
     if created_at is None:
         record["result"] = "not_stopped"
         record["reason"] = "the Console's creation time was not recorded, so its process id cannot be trusted"
         return record
-    alive = process_is_alive(pid, created_at)
+    alive = recorded_process_alive(pid, created_at)
     if alive is False:
         record["result"] = "already_exited"
         return record
     if alive is None:
         record["result"] = "not_stopped"
-        record["reason"] = "whether the recorded process still runs cannot be read"
+        record["reason"] = "whether the recorded process still runs, as the same process, cannot be read"
         return record
     if os.name == "nt":
         record["method"] = "taskkill /T /F"
@@ -4183,7 +4182,7 @@ def stop_orphaned_console(pid: Any, created_at: float | None) -> dict[str, Any]:
                 [str(system_taskkill) if system_taskkill.is_file() else "taskkill", "/T", "/F", "/PID", str(int(pid))],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=_WATCH_KILL_WAIT_SECONDS,
+                timeout=_ORPHAN_STOP_WAIT_SECONDS,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             record["returncode"] = completed.returncode
@@ -4195,11 +4194,35 @@ def stop_orphaned_console(pid: Any, created_at: float | None) -> dict[str, Any]:
             os.killpg(int(pid), signal.SIGKILL)
         except OSError as error:
             record["error"] = str(error)
-    deadline = time.monotonic() + _WATCH_KILL_WAIT_SECONDS
-    while time.monotonic() < deadline and process_is_alive(pid, created_at):
+    deadline = time.monotonic() + _ORPHAN_STOP_WAIT_SECONDS
+    while time.monotonic() < deadline and recorded_process_alive(pid, created_at):
         time.sleep(0.1)
-    record["result"] = "stopped" if process_is_alive(pid, created_at) is False else "still_running"
+    record["result"] = "stopped" if recorded_process_alive(pid, created_at) is False else "still_running"
     return record
+
+
+# A stop of an orphaned Console answers within the MCP tool's 30 s wait: taskkill and the wait after it, 10 s each.
+_ORPHAN_STOP_WAIT_SECONDS = 10.0
+
+
+def recorded_process_alive(pid: Any, created_at: float | None) -> bool | None:
+    """Whether the very process recorded (its id and creation time) runs; None unless both can be read again.
+
+    process_is_alive answers True for a live id whose creation time it cannot read (an access-denied process), which
+    cannot tell the recorded Console from a process that has since taken its id; nothing is stopped on that.
+    """
+    from .process_liveness import CREATION_TIME_TOLERANCE_SECONDS, process_created_at, process_is_alive
+
+    alive = process_is_alive(pid, created_at)
+    if not alive:
+        return alive
+    try:
+        now = process_created_at(int(pid))
+    except (TypeError, ValueError, OSError):
+        return None
+    if now is None or created_at is None:
+        return None
+    return abs(float(now) - float(created_at)) <= CREATION_TIME_TOLERANCE_SECONDS
 
 
 def _console_activity_roots(preparation: dict[str, Any]) -> list[Path]:

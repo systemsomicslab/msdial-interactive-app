@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import time
 from bisect import bisect_left
 from collections import Counter
 from pathlib import Path
@@ -1952,7 +1953,10 @@ def _annotator_row_problems(answers: dict[str, Any]) -> list[str]:
                 f"{where}: {said} none of {', '.join(THRESHOLDS)}. Name one; a row is not searched at settings "
                 "nobody chose."
             )
-        predicted = str(row.get("library_kind") or "").strip().casefold() == "predicted"
+        from .workflow import is_predicted_library_kind
+
+        # Every spelling the Console reads as predicted (in_silico, InSilico, ...), as it reads them.
+        predicted = is_predicted_library_kind(row.get("library_kind"))
         if predicted and row.get("suggestions") is not None and _as_bool(row.get("suggestions")):
             problems.append(
                 f"{where}: an in-silico (library_kind predicted) row does not suggest; set suggestions false or leave "
@@ -1974,19 +1978,31 @@ def _predicted_annotator_problems(answers: dict[str, Any]) -> list[str]:
     rows = (answers.get("libraries") or {}).get("annotators") or []
     ion_mode = str(answers.get("ion_mode") or "").strip()
     problems: list[str] = []
+    checks: list[tuple[str, Path]] = []
+    from .workflow import is_predicted_library_kind
+
     for row in rows:
-        if not isinstance(row, dict) or row.get("kind") == "lbm":
+        if not isinstance(row, dict) or str(row.get("kind") or "msp").strip().casefold() == "lbm":
             continue
-        if str(row.get("library_kind") or "").strip().casefold() != "predicted":
+        if not is_predicted_library_kind(row.get("library_kind")):
             continue
         path = Path(str(row.get("path") or "").strip()).expanduser()
         if (ion_mode or _name_polarity(path.name)) != "Negative":
             continue
         if path.suffix.casefold() != ".msp" or not path.is_file() or path.stat().st_size == 0:
             continue
-        where = f"libraries.annotators ({row.get('label') or row.get('annotator_id') or path.name})"
+        checks.append((f"libraries.annotators ({row.get('label') or row.get('annotator_id') or path.name})", path))
+    # Every file's census is started before any is waited for, and all are waited for against one deadline: two
+    # large files are read side by side, and the plan waits CENSUS_PLAN_WAIT_SECONDS at most, not that per file.
+    deadline = time.monotonic() + CENSUS_PLAN_WAIT_SECONDS
+    for _where, path in checks:
         try:
-            census, reading = _plus_1008_census(path)
+            _plus_1008_census(path, 0.0)
+        except OSError:
+            pass  # said below, by the wait that collects it
+    for where, path in checks:
+        try:
+            census, reading = _plus_1008_census(path, max(0.0, deadline - time.monotonic()))
         except OSError as error:
             problems.append(
                 f"{where}: {path.name} cannot be read ({error.strerror or error}) to check it for the peak at the "
@@ -2011,18 +2027,18 @@ def _predicted_annotator_problems(answers: dict[str, Any]) -> list[str]:
 CENSUS_PLAN_WAIT_SECONDS = 15.0
 
 
-def _plus_1008_census(path: Path) -> tuple[dict[str, Any] | None, str]:
+def _plus_1008_census(path: Path, wait_seconds: float | None = None) -> tuple[dict[str, Any] | None, str]:
     """(census, "") once a library's +1.008 census is known; (None, why) while it is still being read.
 
     The first census of a 2 GB library outlasted the plan's HTTP wait in V2, which answered "timed out" while the
     census went on. It is read in a thread of its own (precursor_plus_1008_census_within): the plan waits for it
     CENSUS_PLAN_WAIT_SECONDS at most and is otherwise refused, never accepted unchecked, with a blocker that says
     how far the read has come; the next plan collects it, and the count is kept for that file version, also
-    across a restart. A file that cannot be read raises its OSError.
+    across a restart. A file that cannot be read raises its OSError. ``wait_seconds`` replaces the wait.
     """
     from .lab_lcms_metabolomics import precursor_plus_1008_census_within
 
-    found = precursor_plus_1008_census_within(path, CENSUS_PLAN_WAIT_SECONDS)
+    found = precursor_plus_1008_census_within(path, CENSUS_PLAN_WAIT_SECONDS if wait_seconds is None else wait_seconds)
     if found["state"] == "counted":
         return found["census"], ""
     size = int(found.get("size_bytes") or 0)

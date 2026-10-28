@@ -847,11 +847,12 @@ def _in_silico_code_sentence(evidence: dict[str, Any]) -> str:
             f"{', '.join(other)}, which it also gives MS/MS matches against acquired reference spectra, so the "
             "evidence source InSilico, not the code, marks them; they are not counted as identifications."
         )
+    # No in-silico match in the output says which code this Console gives: both are stated as conditions.
     return (
-        f" MS-DIAL gives an accepted in-silico match the annotation code {code}; a Console that predates that code "
-        f"gives it {ACQUIRED_SPECTRUM_ANNOTATION_CODE}, the code of an MS/MS match against an acquired reference "
-        "spectrum, so the evidence source InSilico, not the code, marks an in-silico match, and none is counted "
-        "as an identification."
+        f" An MS-DIAL Console that has the in-silico annotation code gives an accepted in-silico match the code {code}; "
+        f"one that predates it gives {ACQUIRED_SPECTRUM_ANNOTATION_CODE}, the code of an MS/MS match against an "
+        "acquired reference spectrum, so the evidence source InSilico, not the code, marks an in-silico match, and "
+        "none is counted as an identification."
     )
 
 

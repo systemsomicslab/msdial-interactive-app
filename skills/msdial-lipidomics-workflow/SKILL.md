@@ -393,8 +393,9 @@ annotator, the threshold, the smoothing and the RT correction.
 
 On a yes, call `msdial_start_guided_analysis(..., confirmed=true)`. Then call
 `msdial_complete_guided_analysis(job_id, internal_standards=<the plan's
-post_run_actions.internal_standards>)`, which waits, validates mzTab-M and writes QA. A
-run of a few files takes minutes; say so. The QA also draws the run's figures into
+post_run_actions.internal_standards>)`, which validates mzTab-M and writes QA once the run
+has finished. Each call waits at most 25 s and answers `call_again: true` while the run goes
+on: call it again. A run of a few files takes minutes; say so. The QA also draws the run's figures into
 `<root>/pos/qa_figures` or `<root>/neg/qa_figures` (see "The QA figures" below); give
 the person the path of its `qa_report.html`.
 

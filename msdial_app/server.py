@@ -97,7 +97,7 @@ from .library_copy_store import (
 )
 from .run_finalisation import _sharing_context, finalise_console_run, record_console_temp
 from .campaign_authorization import CampaignAuthorizationError, authorize, unit_identity
-from .process_liveness import process_created_at, process_is_alive
+from .process_liveness import process_created_at
 from .workflow import (
     CONSOLE_WATCHDOG_PREFIX,
     console_version,
@@ -124,6 +124,7 @@ from .workflow import (
     read_rt_correction_anchors,
     run_console,
     save_rt_correction_anchors,
+    recorded_process_alive,
     save_rt_correction_selections,
     stop_orphaned_console,
     is_supported,
@@ -585,6 +586,11 @@ def _load_persisted_jobs() -> dict[str, dict[str, Any]]:
                     f"{orphan['pid']}) ran; whether that Console still runs could not be read. Its outputs will "
                     "not be checked or recorded by this job."
                 )
+            elif job.get("kind") in CONSOLE_JOB_KINDS:
+                job["error"] = (
+                    "The local backend stopped before this job completed, and its MS-DIAL Console is no longer "
+                    "running. Its outputs were not checked or recorded by this job; start the run again."
+                )
             else:
                 job["error"] = (
                     "The local backend stopped before this job completed. "
@@ -609,8 +615,7 @@ def _orphaned_console(job: dict[str, Any]) -> dict[str, Any] | None:
     if not pid:
         return None
     created = process.get("process_created_at")
-    alive = process_is_alive(pid, created) if created is not None else None
-    return {"pid": pid, "process_created_at": created, "alive": alive}
+    return {"pid": pid, "process_created_at": created, "alive": recorded_process_alive(pid, created)}
 
 
 def _persist_jobs_locked() -> None:
@@ -819,7 +824,11 @@ def _cancel_job(job_id: str, reason: str = "") -> tuple[HTTPStatus, dict[str, An
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         orphan = dict(job.get("orphaned_console") or {}) if job is not None else {}
-        orphaned = job is not None and job.get("status") == "interrupted" and bool(orphan.get("pid"))
+        # One already found gone needs nothing stopped: the job answers as any finished job does.
+        orphaned = (
+            job is not None and job.get("status") == "interrupted" and bool(orphan.get("pid"))
+            and orphan.get("alive") is not False
+        )
     if orphaned:
         return _stop_orphaned_console_of(job_id, orphan, reason)
     with JOBS_LOCK:
@@ -875,13 +884,17 @@ def _cancel_job(job_id: str, reason: str = "") -> tuple[HTTPStatus, dict[str, An
         }
 
 
-def _job_lipid_rt_check(job: dict[str, Any] | None) -> dict[str, Any] | None:
+def _job_lipid_rt_check(job: dict[str, Any] | None, run_directory: str = "") -> dict[str, Any] | None:
     """What a run's job recorded of the lipid RT check: its finalisation's record, or the Console's summary line.
 
     The finalisation (run_finalisation.finalise_console_run) records the Console's summary line from the job's
-    Console output, for every run; a job finalised before it did is read for the line itself.
+    Console output, for every run; a job finalised before it did is read for the line itself. Only a production
+    run's job, and only for its own run directory: a report written for another directory takes nothing from it.
     """
-    if not job:
+    if not job or str(job.get("kind") or "run") != "run":
+        return None
+    own = str((job.get("preparation") or {}).get("run_directory") or "").strip()
+    if not own or not _same_path(own, run_directory):
         return None
     finalisation = job.get("console_run_finalisation") if isinstance(job.get("console_run_finalisation"), dict) else {}
     record = finalisation.get("lipid_rt_check") if isinstance(finalisation.get("lipid_rt_check"), dict) else None
@@ -902,9 +915,13 @@ def _stop_orphaned_console_of(job_id: str, orphan: dict[str, Any], reason: str) 
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job is not None:
+            previous = dict(job.get("orphaned_console") or {})
             job["orphaned_console"] = {
-                **dict(job.get("orphaned_console") or {}),
-                "alive": {"stopped": False, "already_exited": False, "still_running": True}.get(stopped["result"]),
+                **previous,
+                # Not stopped because it could not be read: what was recorded stands.
+                "alive": {"stopped": False, "already_exited": False, "still_running": True}.get(
+                    stopped["result"], previous.get("alive")
+                ),
                 "stop": stopped,
                 "checked_at": now,
             }
@@ -2465,7 +2482,7 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                     qa_criteria=body.get("qa_criteria"),
                     supplementary_files=bundle_figures,
-                    job_lipid_rt_check=_job_lipid_rt_check(job),
+                    job_lipid_rt_check=_job_lipid_rt_check(job, run_directory),
                 )
                 # The retained inventory a raw deletion is judged against was taken before this report
                 # existed; it now has to list what was just written.

@@ -40,7 +40,7 @@ from .lab_lipidomics import (
 )
 from .lipidome_merge import MergeRefused, compare_sample_order, describe_export, net_double_tostring, strip_polarity
 from .sample_grouping import is_blank, is_quality_control
-from .workflow import _as_switch, file_identity
+from .workflow import _as_switch, file_identity, is_predicted_library_kind
 
 # ---------------------------------------------------------------------------------------------
 # Annotation: an ordered list of libraries
@@ -402,7 +402,9 @@ def _peaks_may_carry(lines: list[bytes], precursor: float) -> bool:
     """
     low = precursor + PRECURSOR_PLUS_1008 - PRECURSOR_PLUS_1008_TOLERANCE
     high = precursor + PRECURSOR_PLUS_1008 + PRECURSOR_PLUS_1008_TOLERANCE
-    if not (math.isfinite(low) and math.isfinite(high)) or low < 1:
+    # Below 1, and above a million (where a decimal's rounding to a float may cross an integer boundary), the record
+    # is read pair by pair.
+    if not (math.isfinite(low) and math.isfinite(high)) or low < 1 or high > 1e6:
         return True
     block = lines[0] if len(lines) == 1 else b"\n".join(lines)
     if block.translate(None, _PLAIN_PEAK_BYTES):
@@ -432,6 +434,8 @@ def _read_precursor_plus_1008(target: Path, progress: dict[str, int] | None) -> 
     read = 0
     with target.open("rb") as handle:
         while True:
+            if progress is not None and progress.get("abandoned"):
+                raise InterruptedError(f"the census of {target.name} was abandoned: the file changed while it was read")
             chunk = handle.read(_CENSUS_READ_BYTES)
             if chunk:
                 hasher.update(chunk)
@@ -449,6 +453,9 @@ def _read_precursor_plus_1008(target: Path, progress: dict[str, int] | None) -> 
             if chunk:
                 # Whole lines only, and a lone '\r' at the end may yet be a "\r\n".
                 cut = data.rfind(b"\n") + 1
+                if cut == 0 and len(data) > 1:
+                    # '\r' line ends alone: cut after the last '\r' but one byte, never holding the whole file.
+                    cut = data.rfind(b"\r", 0, len(data) - 1) + 1
                 if cut == 0:
                     pending = data
                     continue
@@ -579,12 +586,16 @@ def precursor_plus_1008_census_within(path: str | Path, wait_seconds: float) -> 
     The first read of a 2 GB library takes longer than a plan may keep its caller waiting: the plan of V2's
     negative-mode run timed out on it. The census is read in a thread of its own, which goes on after the wait;
     "reading" says how far it has come, and a later call collects it (or the kept census). A read that fails
-    raises its OSError here, so that a file that cannot be read is a blocker, never an unchecked library.
+    raises an OSError here, whatever it failed with, so that a file that cannot be read is a blocker, never an
+    unchecked library. A census is of one file version: a read of an earlier version of the file is abandoned, and
+    one whose file changed before it was collected is read again.
     """
     target = Path(path).expanduser().resolve()
     stat = target.stat()
     key = (str(target).casefold(), stat.st_size, stat.st_mtime_ns)
     with _CENSUS_LOCK:
+        for other in [item for item in _CENSUS_SCANS if item[0] == key[0] and item != key]:
+            _CENSUS_SCANS.pop(other).progress["abandoned"] = 1
         scan = _CENSUS_SCANS.get(key)
         if scan is None:
             scan = _CensusScan(target, stat.st_size)
@@ -601,7 +612,16 @@ def precursor_plus_1008_census_within(path: str | Path, wait_seconds: float) -> 
         if _CENSUS_SCANS.get(key) is scan:
             del _CENSUS_SCANS[key]
     if scan.error is not None:
-        raise scan.error
+        if isinstance(scan.error, OSError):
+            raise scan.error
+        raise OSError(f"{type(scan.error).__name__}: {scan.error}") from scan.error
+    try:
+        after = target.stat()
+    except OSError:
+        after = None
+    if after is None or (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
+        # Changed while it was read: the count is of no version the run would search.
+        return precursor_plus_1008_census_within(target, 0.0)
     return {"state": "counted", "census": dict(scan.result or {})}
 
 
@@ -855,12 +875,14 @@ def apply_annotators(state: dict[str, Any], annotators: Iterable[dict[str, Any]]
             continue
         use_rt = str(item.get("retention_time") or "none") == "use"
         preset = str(item.get("thresholds") or "").strip()
-        if item.get("kind") != "lbm" and preset not in THRESHOLDS:
+        # As the plan reads it (agent_workflow._annotator_row_problems): any case of "lbm" is the LBM2.
+        is_lbm = str(item.get("kind") or "msp").strip().casefold() == "lbm"
+        if not is_lbm and preset not in THRESHOLDS:
             raise ValueError(
                 f"libraries.annotators ({item.get('label') or item.get('annotator_id') or Path(path).name}): thresholds "
                 f"'{item.get('thresholds') or ''}' is none of {', '.join(THRESHOLDS)}."
             )
-        if item.get("kind") == "lbm":
+        if is_lbm:
             state["lbm_path"] = path
             state["lbm_annotator"] = {**dict(state.get("lbm_annotator") or {}), "lbm_file_path": path,
                                       "priority": int(item.get("priority") or 1)}
@@ -885,7 +907,8 @@ def apply_annotators(state: dict[str, Any], annotators: Iterable[dict[str, Any]]
             # and a plan is refused on a Console without the switch (workflow._annotator_capability_issues).
             if item.get("suggestions") is not None:
                 row["suggestions"] = _as_switch(item["suggestions"])
-            elif row["library_kind"].strip().casefold() == "predicted":
+            elif is_predicted_library_kind(row["library_kind"]):
+                # Every spelling the Console reads as predicted (in_silico, InSilico, ...), as it reads them.
                 row["suggestions"] = False
             state["msp_annotators"].append(row)
         provenance.append({"path": path, "version": "", "source": "", "doi": "",
