@@ -4380,6 +4380,10 @@ def msdial_generate_lcms_qa(
     qa_report.html. The result's qa_figures names the folder, the page and each figure's file and
     title; show those paths to the person rather than writing plotting code. A figure that cannot be
     drawn is listed under skipped with its reason; the QA report itself is unchanged by them.
+
+    A reference match (each injection's reference_matched_count, the PCA's features) is never an in-silico
+    match, which is counted apart (in_silico_matched_count); report.reference_matching says where that was
+    read from, and a warning says so where it could not be established.
     """
     return _request_json(
         "POST",
