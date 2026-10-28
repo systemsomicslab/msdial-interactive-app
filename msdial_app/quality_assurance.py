@@ -47,6 +47,23 @@ NOT_ASSESSED_REASON_PHRASES = (
 # order, and a drift computed against either describes the names.
 UNRECORDED_ORDER_SOURCES = frozenset({"listing", "embedded"})
 UNRECORDED_ORDER_REASON = "the injection order was not recorded for every file"
+# The QA counts a feature-injection cell "Reference matched" only where its accepted annotation is no in-silico
+# match: an MS/MS match against a predicted spectrum is never an identification (the MS-DIAL author's decision of
+# 2026-10-28). A Console with that change (MsdialWorkbench #853) writes the in-silico cells in their own column and
+# leaves them out of "Reference matched"; a Console before it (MS-DIAL 103c3b535 and earlier) marks them "Reference
+# matched", and they are found from the run's per-file peak tables (<file>.mdpeak, their Evidence source and
+# annotator) through its peak-ID matrix (<alignment>.mdpeakid.tsv), both written beside the QA matrix.
+IN_SILICO_MATCHED_COLUMN = "In-silico matched"
+PEAK_ID_MATRIX_SUFFIX = ".mdpeakid.tsv"
+PEAK_TABLE_SUFFIX = ".mdpeak"
+MSP_ANNOTATOR_SETTINGS_NAME = "msp_annotator_settings.tsv"
+REFERENCE_MATCH_SOURCES = {
+    "qa_matrix": "the QA matrix's own In-silico matched column (a Console that leaves in-silico matches out of "
+                 "Reference matched)",
+    "peak_tables": "the run's per-file peak tables (.mdpeak: Evidence source InSilico, or an annotator that searches "
+                   "predicted spectra) through its peak-ID matrix (.mdpeakid.tsv)",
+    "not_established": "nothing beside the QA matrix says which cells are in-silico matches",
+}
 
 
 def find_qa_files(
@@ -108,6 +125,7 @@ def build_lcms_qa_report(
         reader = csv.DictReader(handle, delimiter="\t")
         _validate_headers(reader.fieldnames or [])
         msms_available = "MSMS" in (reader.fieldnames or [])
+        matching = ReferenceMatchReading.for_matrix(target, reader.fieldnames or [])
         current_id: str | None = None
         spot_rows: list[dict[str, Any]] = []
         for raw in reader:
@@ -138,7 +156,7 @@ def build_lcms_qa_report(
                     spot_observer(spot_rows)
                 spot_count += 1
                 spot_rows = []
-            row = _parse_row(raw)
+            row = _parse_row(raw, matching)
             _register_sample(row, samples, sample_reservoirs, sn_reservoirs, type_reservoirs)
             spot_rows.append(row)
             current_id = spot_id
@@ -189,8 +207,14 @@ def build_lcms_qa_report(
         "intensity_distributions": _histograms(type_reservoirs),
         "pca": pca,
         "internal_standards": _summarize_internal_standards(standards, standard_matches),
-        "warnings": _warnings(sample_summaries, pca),
+        "reference_matching": matching.record(),
+        "warnings": _warnings(sample_summaries, pca) + matching.warnings(),
         "method": {
+            "reference_match": (
+                "a feature counts as reference matched in an injection where MS-DIAL accepted an annotation of "
+                "that injection's peak that is no in-silico (predicted-spectrum) match; in-silico matches are "
+                "counted apart (in_silico_matched_count) and never as reference matches"
+            ),
             "intensity_transform": "log10(height + 1)",
             "pca": "mean-centered log10 height; up to 1000 highest-variance features and 500 samples",
             "qc_precision": "feature-wise RSD among positive QC detections, reported with QC detection rate",
@@ -240,11 +264,200 @@ def _validate_headers(headers: list[str]) -> None:
         raise ValueError(f"LC-MS QA matrix is missing columns: {', '.join(missing)}")
 
 
-def _parse_row(raw: dict[str, str]) -> dict[str, Any]:
-    height = _number(raw.get("Height"), math.nan)
+def _flag(value: Any) -> bool:
+    return str(value if value is not None else "").strip().lower() == "true"
+
+
+class ReferenceMatchReading:
+    """Which cells of one QA matrix count as Reference matched, with in-silico matches left out.
+
+    A Console with the in-silico QA change writes "In-silico matched" beside "Reference matched" and marks such
+    a cell only there. A Console before it marks it "Reference matched"; then the in-silico cells are the
+    (alignment ID, file) pairs whose per-file peak, by the run's peak-ID matrix, an in-silico match annotates in
+    that file's .mdpeak: its Evidence source InSilico (or, where the table records none, code 450), or its
+    Comment's annotator an MSP row of library kind predicted in msp_annotator_settings.tsv. This is the test the
+    Console applies per cell, the cell's own peak, so both Consoles give the same counts. Where neither is beside
+    the matrix the cells are read as the file states them, and the reading says so (warnings, record).
+    """
+
+    def __init__(self, source: str, cells: frozenset[tuple[str, str]] = frozenset(), detail: str = "") -> None:
+        self.source = source
+        self.cells = cells
+        self.detail = detail
+        self.in_silico_cells = 0
+        self.excluded_cells = 0
+
+    @classmethod
+    def for_matrix(cls, matrix: str | Path, headers: Iterable[str]) -> "ReferenceMatchReading":
+        names = {str(name).strip() for name in headers}
+        if IN_SILICO_MATCHED_COLUMN in names:
+            return cls("qa_matrix")
+        try:
+            cells, detail = in_silico_cells_from_peak_tables(Path(matrix))
+        except InSilicoCellsNotEstablished as error:
+            return cls("not_established", detail=str(error))
+        return cls("peak_tables", cells, detail)
+
+    @property
+    def established(self) -> bool:
+        return self.source != "not_established"
+
+    def classify(self, spot_id: str, file: str, reference_text: Any, in_silico_text: Any = None) -> tuple[bool, bool]:
+        """(reference matched, in-silico matched) for one cell, from its two columns as the matrix writes them."""
+        marked = _flag(reference_text)
+        in_silico = _flag(in_silico_text) or (marked and (spot_id, file) in self.cells)
+        if in_silico:
+            self.in_silico_cells += 1
+            if marked:
+                self.excluded_cells += 1
+        return marked and not in_silico, in_silico
+
+    def record(self) -> dict[str, Any]:
+        """What the report keeps of this reading: where the in-silico cells were read from, and how many."""
+        return {
+            "in_silico_excluded": self.established,
+            "source": self.source,
+            "source_description": REFERENCE_MATCH_SOURCES[self.source],
+            "detail": self.detail,
+            # Cells read as in-silico matched, at any height; of them, those the matrix itself marks Reference
+            # matched (a Console before the change) and the QA does not count as such.
+            "in_silico_matched_cells": self.in_silico_cells,
+            "excluded_from_reference_matched_cells": self.excluded_cells,
+        }
+
+    def warnings(self) -> list[str]:
+        if self.established:
+            return []
+        return [
+            "Whether a Reference matched cell of the QA matrix is an in-silico match could not be established ("
+            f"{self.detail}); reference-match counts are as the matrix states them and may include in-silico "
+            "matches, which are not identifications."
+        ]
+
+
+class InSilicoCellsNotEstablished(Exception):
+    """Why the peak tables beside a QA matrix cannot say which of its cells are in-silico matches."""
+
+
+def _predicted_annotators(folder: Path) -> set[str] | None:
+    """The annotator ids of the MSP rows that search predicted spectra, from the run's MSP annotator settings;
+    None where the run has no such table or it cannot be read."""
+    from .workflow import is_predicted_library_kind
+
+    table = folder / MSP_ANNOTATOR_SETTINGS_NAME
+    if not table.is_file():
+        return None
+    try:
+        with table.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+            rows = list(csv.DictReader(handle, delimiter="\t"))
+    except (OSError, csv.Error):
+        return None
     return {
-        "id": str(raw.get("ID", "")).strip(),
-        "file": str(raw.get("File", "")).strip(),
+        str(row.get("annotator_id") or "").strip()
+        for row in rows
+        if is_predicted_library_kind(row.get("library_kind")) and str(row.get("annotator_id") or "").strip()
+    }
+
+
+def _peak_key(value: Any) -> str:
+    text = str(value if value is not None else "").strip()
+    try:
+        return str(int(float(text)))
+    except (TypeError, ValueError, OverflowError):
+        return text
+
+
+def _in_silico_peak_ids(table: Path, predicted: set[str] | None) -> tuple[set[str], bool]:
+    """The Peak IDs of one .mdpeak whose accepted or named annotation is an in-silico match, and whether the
+    table records an evidence source."""
+    from .annotation_codes import is_in_silico_match
+    from .workflow import _comment_annotator
+
+    found: set[str] = set()
+    try:
+        with table.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            headers = reader.fieldnames or []
+            if "Peak ID" not in headers:
+                raise InSilicoCellsNotEstablished(f"the peak table {table.name} has no Peak ID column")
+            with_evidence = "Evidence source" in headers
+            code_column = next((name for name in headers if name.startswith("Annotation tag")), "")
+            for row in reader:
+                name = str(row.get("Name") or "").strip()
+                if not name or name.casefold() == "unknown":
+                    continue
+                evidence = row.get("Evidence source") if with_evidence else None
+                code = row.get(code_column) if code_column else None
+                if (with_evidence or code_column) and is_in_silico_match(code, evidence) or (
+                    predicted and _comment_annotator(row.get("Comment")) in predicted
+                ):
+                    found.add(_peak_key(row.get("Peak ID")))
+    except (OSError, csv.Error) as error:
+        raise InSilicoCellsNotEstablished(f"the peak table {table.name} could not be read ({type(error).__name__})")
+    return found, with_evidence
+
+
+def in_silico_cells_from_peak_tables(matrix: Path) -> tuple[frozenset[tuple[str, str]], str]:
+    """The (alignment ID, file) cells of a QA matrix whose per-file peak an in-silico match annotates, from the
+    peak-ID matrix and the .mdpeak tables beside it, and a sentence on what was read (files named, no paths).
+
+    Raises InSilicoCellsNotEstablished where they are not there or cannot say it: a table that records no
+    evidence source can say it only through the run's MSP annotator settings.
+    """
+    folder = matrix.parent
+    name = matrix.name
+    stem = name[: -len(QA_SUFFIX)] if name.lower().endswith(QA_SUFFIX) else matrix.stem
+    id_matrix = folder / f"{stem}{PEAK_ID_MATRIX_SUFFIX}"
+    if not id_matrix.is_file():
+        raise InSilicoCellsNotEstablished(f"no peak-ID matrix {id_matrix.name} is beside the QA matrix")
+    predicted = _predicted_annotators(folder)
+    try:
+        with id_matrix.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+            rows = csv.reader(handle, delimiter="\t")
+            header = [item.strip() for item in next(rows, [])]
+            if not header or header[0] != "alignment_master_id":
+                raise InSilicoCellsNotEstablished(f"{id_matrix.name} is not an MS-DIAL peak-ID matrix")
+            files = header[1:]
+            flagged: dict[int, set[str]] = {}
+            for index, file_name in enumerate(files):
+                table = folder / f"{file_name}{PEAK_TABLE_SUFFIX}"
+                if not table.is_file():
+                    raise InSilicoCellsNotEstablished(f"the peak table {table.name} is not beside the QA matrix")
+                peaks, with_evidence = _in_silico_peak_ids(table, predicted)
+                if not with_evidence and predicted is None:
+                    raise InSilicoCellsNotEstablished(
+                        f"the peak table {table.name} records no evidence source, and no {MSP_ANNOTATOR_SETTINGS_NAME} "
+                        "says which annotator searches predicted spectra"
+                    )
+                if peaks:
+                    flagged[index] = peaks
+            cells: set[tuple[str, str]] = set()
+            if flagged:
+                for row in rows:
+                    if not row:
+                        continue
+                    spot = row[0].strip()
+                    for index, peaks in flagged.items():
+                        if index + 1 < len(row) and _peak_key(row[index + 1]) in peaks:
+                            cells.add((spot, files[index]))
+    except (OSError, csv.Error) as error:
+        raise InSilicoCellsNotEstablished(f"{id_matrix.name} could not be read ({type(error).__name__})")
+    detail = (f"{id_matrix.name} and {len(files)} peak table(s)"
+              + (f", with {MSP_ANNOTATOR_SETTINGS_NAME}" if predicted is not None else ""))
+    return frozenset(cells), detail
+
+
+def _parse_row(raw: dict[str, str], matching: ReferenceMatchReading | None = None) -> dict[str, Any]:
+    height = _number(raw.get("Height"), math.nan)
+    spot_id = str(raw.get("ID", "")).strip()
+    file = str(raw.get("File", "")).strip()
+    reading = matching if matching is not None else ReferenceMatchReading("not_established")
+    reference_matched, in_silico_matched = reading.classify(
+        spot_id, file, raw.get("Reference matched"), raw.get(IN_SILICO_MATCHED_COLUMN)
+    )
+    return {
+        "id": spot_id,
+        "file": file,
         "class": str(raw.get("Class", "")).strip(),
         "file_type": str(raw.get("File type", "Sample")).strip() or "Sample",
         "order": _integer(raw.get("Injection order")),
@@ -257,7 +470,9 @@ def _parse_row(raw: dict[str, str]) -> dict[str, Any]:
         "mz": _number(raw.get("MZ")),
         "sn": _number(raw.get("SN")),
         "msms": str(raw.get("MSMS", "")).strip().lower() == "true",
-        "reference_matched": str(raw.get("Reference matched", "")).strip().lower() == "true",
+        # Never an in-silico match (ReferenceMatchReading), whatever the Console wrote in this column.
+        "reference_matched": reference_matched,
+        "in_silico_matched": in_silico_matched,
     }
 
 
@@ -282,6 +497,7 @@ def _register_sample(
         "detected_features": 0,
         "msms_acquired_count": 0,
         "reference_matched_count": 0,
+        "in_silico_matched_count": 0,
         "total_height": 0.0,
     }
     sample_reservoirs[name] = _Reservoir(seed=23 + len(samples))
@@ -318,6 +534,8 @@ def _consume_spot(
             sample["msms_acquired_count"] += 1
         if row["reference_matched"]:
             sample["reference_matched_count"] += 1
+        if row["in_silico_matched"]:
+            sample["in_silico_matched_count"] += 1
         if row["sn"] > 0:
             sn_reservoirs[row["file"]].add(row["sn"])
         transformed = math.log10(height + 1.0)
