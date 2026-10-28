@@ -221,14 +221,14 @@ FIGURES: dict[str, dict[str, str]] = {
     "05": {
         "file": "05_pca_injections.svg",
         "title": "PCA of injections (reference-matched features)",
-        "caption": "Principal component scores of the study injections (Blank excluded) from the reference-matched features, log10(height + 1), autoscaled.",
+        "caption": "Principal component scores of the study injections (Blank excluded) from the reference-matched features (an in-silico match is not one), log10(height + 1), autoscaled.",
         "how": "Injections of one group lie together only where the groups differ; QC injections, when present, should cluster tightly. An injection far from all others deserves a look before any statistics. The number after # is the injection order.",
     },
     "06": {
         "file": "06_sample_blank_ratio.svg",
         "title": "Sample-to-Blank ratio per aligned feature",
         "caption": "Each aligned feature's mean height over the Sample injections divided by its mean height in the Blank injections, as log10 of (sample + 1) / (blank + 1), with the share of features at or above 3x and, beside it, the QA report's criterion of the same name.",
-        "how": "Features left of the dashed line are about as high in the Blank as in the samples and are likely background or carryover; blue marks the reference-matched ones. A feature with no Blank signal counts here, at or above 3x. The QA criterion (sample_blank_ratio_ge_3 in the QA results) is computed differently: median Sample over median Blank height, over the features detected in a Blank only, so it leaves out the features this figure counts as clean and is usually the lower of the two.",
+        "how": "Features left of the dashed line are about as high in the Blank as in the samples and are likely background or carryover; blue marks the reference-matched ones (an in-silico match is not one). A feature with no Blank signal counts here, at or above 3x. The QA criterion (sample_blank_ratio_ge_3 in the QA results) is computed differently: median Sample over median Blank height, over the features detected in a Blank only, so it leaves out the features this figure counts as clean and is usually the lower of the two.",
     },
     "07": {
         "file": "07_rt_correction_offsets.svg",

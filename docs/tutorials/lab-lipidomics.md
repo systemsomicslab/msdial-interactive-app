@@ -590,7 +590,10 @@ are kept out of
 `analysis\quant\lipidome\`, so `metabolomics_service.R` never reads them.
 
 **If you compare them with figures drawn earlier by hand.** The QA matrix marks
-`Reference matched` per injection, not per feature. Here a feature counts as
+`Reference matched` per injection, not per feature, and a Console up to MS-DIAL
+103c3b535 marks an in-silico (predicted-spectrum) match there too, which the QA never
+counts as one (it reads the run's peak tables, or the matrix's own `In-silico matched`
+column). Here a feature counts as
 reference-matched when the peak of any study injection in it is, and then all of its
 study heights enter the PCA; figure 06 counts each feature once; figure 04 draws the
 standards normalize used, not every standard the resolution found. A plotting script that

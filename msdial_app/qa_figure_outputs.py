@@ -52,6 +52,7 @@ from .qa_figures import (
     safely,
     short_labels,
 )
+from .quality_assurance import IN_SILICO_MATCHED_COLUMN, ReferenceMatchReading
 from .quality_assurance import _sample_category as sample_category
 
 QA_FIGURES_FOLDER = "qa_figures"
@@ -127,7 +128,8 @@ class QaMatrixReader:
     empty or not a number counts as not detected, and is counted. A feature counts as reference
     matched when the peak of at least one study (non-Blank) injection in it is, since the matrix
     marks the match per injection; its every study height then enters the PCA, and each feature
-    counts once in the sample-to-Blank ratio.
+    counts once in the sample-to-Blank ratio. An in-silico match is never a reference match here
+    (quality_assurance.ReferenceMatchReading), whichever Console wrote the matrix.
 
     add_qa_spot never raises: the QA it observes must not change because a figure input failed.
     The first error is kept in ``error`` and the reader ignores the rest of the matrix.
@@ -293,6 +295,9 @@ def read_qa_matrix(path: str | Path, label: str = "") -> RunQa:
             position = columns.get(name, -1)
             return row[position].strip() if 0 <= position < len(row) else default
 
+        # As the QA report reads it: an in-silico match is never counted as reference matched.
+        matching = ReferenceMatchReading.for_matrix(target, header)
+
         current: str | None = None
         heights: dict[int, float] = {}
         matched: set[int] = set()
@@ -317,7 +322,10 @@ def read_qa_matrix(path: str | Path, label: str = "") -> RunQa:
                 reader.non_numeric += 1
                 value = 0.0
             heights[index] = value
-            if cell(row, "Reference matched").casefold() == "true":
+            reference_matched, _in_silico = matching.classify(
+                spot, cell(row, "File"), cell(row, "Reference matched"), cell(row, IN_SILICO_MATCHED_COLUMN)
+            )
+            if reference_matched:
                 matched.add(index)
         if current is not None:
             flush()

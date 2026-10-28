@@ -4,6 +4,36 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.50] - Unreleased
+
+The MS-DIAL author's decision of 2026-10-28: the QA's "Reference matched" never counts an in-silico match. Built on
+0.5.49 (#82).
+
+### Fixed
+- **The QA no longer counts an in-silico (predicted-spectrum, e.g. GLACIER) match as reference matched.** The
+  Console's QA matrix (`*.qa.tsv`) marks a feature-injection cell `Reference matched` by the name of that
+  injection's own peak, so a Console up to and including MS-DIAL 103c3b535 marks a peak an accepted in-silico match
+  annotates `TRUE`, and the QA counted it in each injection's `reference_matched_count`, in
+  `run_order_reference_match_correlation`, in the web page's reference-match plot, and in figures 05 (the PCA's
+  features) and 06 (blue bars). It now reads such a cell as `in_silico_matched` and not as `reference_matched`
+  (`quality_assurance.ReferenceMatchReading`, used by the QA report and by the figures' own read of the matrix): from
+  the matrix's own `In-silico matched` column where the Console writes one (the companion MS-DIAL change), and
+  otherwise from the run's per-file peak tables (`<file>.mdpeak`: Evidence source `InSilico`, code 450 where no
+  evidence source is recorded, or the Comment's annotator an MSP row of library kind predicted in
+  `msp_annotator_settings.tsv`) through its peak-ID matrix (`<alignment>.mdpeakid.tsv`), all beside the matrix. The
+  test is the cell's own peak, as the Console's is, so both Consoles give the same counts; acquired-spectrum and LBM
+  rule-based matches are counted as before. Each injection now also carries `in_silico_matched_count`, the report
+  `reference_matching` (where the in-silico cells were read from, how many, and how many the matrix itself marked
+  Reference matched), and `method.reference_match` says what a reference match is. Where nothing beside the matrix
+  can say it (no peak-ID matrix, a missing peak table, or tables that record no evidence source with no MSP
+  settings), the cells are counted as the matrix states them, `reference_matching.in_silico_excluded` is false, and
+  a warning says so. On verification run V2's four-tier MTBKS64-b (read only), the reference-matched cells of
+  detected peaks fall from 625 to 610 (242/125/162/96 to 237/121/159/93 per injection), 15 cells being in-silico:
+  the 14 the gate's LIB-3 records on features an in-silico match represents, and one whose own peak an in-silico
+  match annotates while an acquired match represents its feature. Figures 05 and 06 count 401 reference-matched
+  features instead of 411. Every number now equals the three-tier MTBKS64-a's, which searched no in-silico library.
+  Figures drawn by 0.5.49 are drawn again (their manifest records the version).
+
 ## [0.5.49] - Unreleased
 
 The defects verification run V2 (the GLACIER in-silico tier pilot, 2026-10-28) found. Built on 0.5.48 (#81).
