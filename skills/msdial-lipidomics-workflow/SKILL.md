@@ -393,16 +393,17 @@ annotator, the threshold, the smoothing and the RT correction.
 
 On a yes, call `msdial_start_guided_analysis(..., confirmed=true)`. Then call
 `msdial_complete_guided_analysis(job_id, internal_standards=<the plan's
-post_run_actions.internal_standards>)`, which waits, validates mzTab-M and writes QA. A
-run of a few files takes minutes; say so. The QA also draws the run's figures into
+post_run_actions.internal_standards>)`, which validates mzTab-M and writes QA once the run
+has finished. Each call waits at most 25 s and answers `call_again: true` while the run goes
+on: call it again. A run of a few files takes minutes; say so. The QA also draws the run's figures into
 `<root>/pos/qa_figures` or `<root>/neg/qa_figures` (see "The QA figures" below); give
 the person the path of its `qa_report.html`.
 
 - **One Console at a time.** Start the negative run only after the positive one has
   finished.
-- **A silent start may still have started.** If a start returns nothing within the MCP's
-  120 s, look for the job with `msdial_interactive_status`. Never start it again
-  blindly.
+- **A start still working may still start.** A start still working after 40 s is answered
+  `reason: still_running`: make the identical call again to collect it, or look for the
+  job with `msdial_interactive_status`. Never start it again with other arguments.
 - **A failed RT correction stops the run.** If the log says "Automatic alignment RT
   correction failed", stop and report it. Running again without the correction
   (`execute_automatic_rt_correction=false`, recorded as a deviation) is the person's

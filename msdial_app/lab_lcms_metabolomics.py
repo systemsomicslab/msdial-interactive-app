@@ -16,7 +16,10 @@ import hashlib
 import io
 import json
 import math
+import os
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -37,7 +40,7 @@ from .lab_lipidomics import (
 )
 from .lipidome_merge import MergeRefused, compare_sample_order, describe_export, net_double_tostring, strip_polarity
 from .sample_grouping import is_blank, is_quality_control
-from .workflow import _as_switch, file_identity
+from .workflow import _as_switch, file_identity, is_predicted_library_kind
 
 # ---------------------------------------------------------------------------------------------
 # Annotation: an ordered list of libraries
@@ -194,7 +197,7 @@ def retention_time_census(path: str | Path) -> dict[str, int]:
     return dict(census)
 
 
-_PRECURSOR_PLUS_1008_CENSUS: dict[tuple[str, int, int], dict[str, int]] = {}
+_PRECURSOR_PLUS_1008_CENSUS: dict[tuple[str, int, int], dict[str, Any]] = {}
 _MSP_PRECURSOR_FIELDS = frozenset({"precursormz", "precursor_mz"})
 # The artefact peak of GLACIER's negative-mode records sits at the precursor m/z + 1.008 (+1.007 in a few, as
 # written to three decimals): any peak within this much of +1.008 is taken for it. A predicted spectrum has no
@@ -202,66 +205,424 @@ _MSP_PRECURSOR_FIELDS = frozenset({"precursormz", "precursor_mz"})
 PRECURSOR_PLUS_1008 = 1.008
 PRECURSOR_PLUS_1008_TOLERANCE = 0.0025
 _PEAK_SEPARATOR = re.compile(r"[\s,:]+")
+# What the census reads, by version: a result kept from another version is read again, never trusted.
+PRECURSOR_PLUS_1008_CENSUS_VERSION = 2
+PRECURSOR_PLUS_1008_CENSUS_CACHE = "msp-precursor-plus-1008-census.json"
+_CENSUS_CACHE_ENTRIES = 256
+_CENSUS_LOCK = threading.Lock()
+_CENSUS_SCANS: dict[tuple[str, int, int], "_CensusScan"] = {}
+_CENSUS_READ_BYTES = 16 << 20
+# A peak-list block made of these bytes alone holds only plain decimal m/z values, whose integer part decides
+# whether one can lie within the tolerance of the precursor m/z + 1.008 (_peaks_may_carry). Anything else - a
+# sign, an exponent, an underscore, a letter, a non-ASCII byte - has the record read pair by pair.
+_PLAIN_PEAK_BYTES = b"0123456789.\t \n;,:"
+_INTEGER_PART_PATTERNS: dict[int, re.Pattern[bytes]] = {}
+_CENSUS_FIELDS_PRECURSOR = frozenset(name.encode("ascii") for name in _MSP_PRECURSOR_FIELDS)
+_CENSUS_FIELDS_PEAK_COUNT = frozenset(name.encode("ascii") for name in _MSP_PEAK_COUNT_FIELDS)
 
 
-def precursor_plus_1008_census(path: str | Path) -> dict[str, int]:
+def _integer_part_pattern(integer: int) -> re.Pattern[bytes]:
+    """A pair's first token, as _carries_peak reads it, whose integer part is ``integer``."""
+    pattern = _INTEGER_PART_PATTERNS.get(integer)
+    if pattern is None:
+        pattern = re.compile(rb"(?:^|;)[ \t]*0*" + str(integer).encode("ascii") + rb"(?=[.\s,:;]|$)", re.M)
+        _INTEGER_PART_PATTERNS[integer] = pattern
+    return pattern
+
+
+def _carries_peak(lines: list[bytes], precursor: float) -> bool:
+    """Whether a record's peak lines hold a pair whose m/z lies within the tolerance of the precursor + 1.008.
+
+    A line's pairs are separated by ';' and a pair's m/z is its first token, split off at whitespace, ',' or ':';
+    a token that is no number is skipped. The reading the census has always made, line by line.
+    """
+    for raw in b"\n".join(lines).split(b"\n"):
+        line = raw.decode("utf-8", "replace").strip()
+        if not line or line.startswith("#"):
+            continue
+        for pair in line.split(";"):
+            # float(), not parse_number, as before: the pair's first token as Python reads a number.
+            try:
+                mz = float(_PEAK_SEPARATOR.split(pair.strip(), 1)[0])
+            except ValueError:
+                continue
+            if abs(mz - precursor - PRECURSOR_PLUS_1008) <= PRECURSOR_PLUS_1008_TOLERANCE:
+                return True
+    return False
+
+
+class _CensusScan:
+    """One file's census being read in a thread, so a plan can wait for it a bounded time."""
+
+    def __init__(self, target: Path, size: int) -> None:
+        self.target = target
+        self.size = size
+        self.started = time.time()
+        self.progress: dict[str, int] = {"bytes_read": 0}
+        self.done = threading.Event()
+        self.result: dict[str, Any] | None = None
+        self.error: BaseException | None = None
+
+    def run(self) -> None:
+        try:
+            # Looked up when it runs, so the census a test or a caller replaced is the one read.
+            self.result = precursor_plus_1008_census(self.target, progress=self.progress)
+        except BaseException as error:  # handed to the plan that collects it
+            self.error = error
+        finally:
+            self.done.set()
+
+
+def _census_cache_path() -> Path:
+    from .user_settings import user_data_directory
+
+    return user_data_directory() / PRECURSOR_PLUS_1008_CENSUS_CACHE
+
+
+def _read_census_cache() -> dict[str, Any]:
+    try:
+        loaded = json.loads(_census_cache_path().read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    entries = loaded.get("entries") if isinstance(loaded, dict) else None
+    if not isinstance(entries, dict) or loaded.get("census_version") != PRECURSOR_PLUS_1008_CENSUS_VERSION:
+        return {}
+    return entries
+
+
+def _cached_census(target: Path, stat: os.stat_result) -> dict[str, int] | None:
+    """A census kept for this file version: by location, size and time, or by a digest already known for it.
+
+    An entry that does not hold two whole counts is no census, and the file is read again.
+    """
+    entries = _read_census_cache()
+    found = _kept_counts(entries.get(_census_key_text(target, stat)))
+    if found is not None:
+        return found
+    # Moved or copied: the digest file_identity already holds for this version, never one taken here to look.
+    from .workflow import _identity_cache_key, _read_identity_cache
+
+    digest = _read_identity_cache().get(_identity_cache_key(target, stat), "")
+    if not digest:
+        return None
+    for entry in entries.values():
+        if isinstance(entry, dict) and entry.get("sha256") == digest and entry.get("size_bytes") == stat.st_size:
+            kept = _kept_counts(entry)
+            if kept is not None:
+                return kept
+    return None
+
+
+def _kept_counts(entry: Any) -> dict[str, int] | None:
+    if not isinstance(entry, dict):
+        return None
+    counts = (entry.get("records"), entry.get("with_precursor_plus_1008_peak"))
+    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in counts):
+        return None
+    if counts[1] > counts[0] + 1:  # a pseudo-record before the first NAME may carry it as well
+        return None
+    return {"records": counts[0], "with_precursor_plus_1008_peak": counts[1]}
+
+
+def _census_key_text(target: Path, stat: os.stat_result) -> str:
+    return f"{str(target).casefold()}|{stat.st_size}|{stat.st_mtime_ns}"
+
+
+def _remember_census(target: Path, stat: os.stat_result, census: dict[str, Any]) -> None:
+    path = _census_cache_path()
+    with _CENSUS_LOCK:
+        entries = _read_census_cache()
+        key = _census_key_text(target, stat)
+        entries.pop(key, None)
+        entries[key] = census
+        trimmed = dict(list(entries.items())[-_CENSUS_CACHE_ENTRIES:])
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
+            temporary.write_text(
+                json.dumps({"census_version": PRECURSOR_PLUS_1008_CENSUS_VERSION, "entries": trimmed}, indent=1),
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+        except OSError:
+            pass
+
+
+def precursor_plus_1008_census(path: str | Path, progress: dict[str, int] | None = None) -> dict[str, Any]:
     """How many records an MSP holds, and how many carry a peak at their precursor m/z + 1.008.
 
     What libraries.in_silico_msp_preprocessing "precursor_plus_1008_peak_removed" states of a file is checked
     against it, so a report never states a removal the file does not show. Records and fields are read as
     retention_time_census reads them; a record's peaks are the lines after its peak count, each "m/z
-    intensity" pair separated by ';'. Read once per file version and kept for the process.
+    intensity" pair separated by ';'.
+
+    Read once per file version: kept for the process and, for a file of IDENTITY_CACHE_MIN_BYTES or more (one that
+    cannot be rewritten at the same size within one clock tick, as file_identity reasons), in the user's data folder
+    (census_version, the file's location, size and time, and its sha256, taken in the same read), so that a
+    restarted backend does not read a 2 GB file again; a copy of the file is found there by the digest
+    file_identity already holds for it. ``progress`` receives bytes_read as the file is read.
     """
+    from .workflow import IDENTITY_CACHE_MIN_BYTES
+
     target = Path(path).expanduser().resolve()
     stat = target.stat()
     key = (str(target).casefold(), stat.st_size, stat.st_mtime_ns)
     if key in _PRECURSOR_PLUS_1008_CENSUS:
         return dict(_PRECURSOR_PLUS_1008_CENSUS[key])
-    records = with_peak = 0
-    precursor: float | None = None
-    in_peaks = found = False
+    persist = stat.st_size >= IDENTITY_CACHE_MIN_BYTES
+    kept = _cached_census(target, stat) if persist else None
+    if kept is not None:
+        census = {"records": kept["records"], "with_precursor_plus_1008_peak": kept["with_precursor_plus_1008_peak"]}
+        _PRECURSOR_PLUS_1008_CENSUS[key] = census
+        return dict(census)
+    counted, digest = _read_precursor_plus_1008(target, progress)
+    after = target.stat()
+    census = {"records": counted[0], "with_precursor_plus_1008_peak": counted[1]}
+    if (after.st_size, after.st_mtime_ns) == (stat.st_size, stat.st_mtime_ns):
+        # Kept only for the version that was read: a file changed while it was read is read again next time.
+        _PRECURSOR_PLUS_1008_CENSUS[key] = census
+        if not persist:
+            return dict(census)
+        _remember_census(target, stat, {**census, "sha256": digest, "size_bytes": stat.st_size,
+                                        "census_version": PRECURSOR_PLUS_1008_CENSUS_VERSION})
+        from .workflow import remember_file_digest
 
-    def close() -> None:
-        nonlocal with_peak, found
-        if found:
-            with_peak += 1
-        found = False
-
-    with target.open("r", encoding="utf-8-sig", errors="replace", newline=None) as handle:
-        for raw in handle:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line[:5].casefold() == "name:":
-                close()
-                records += 1
-                precursor, in_peaks = None, False
-                continue
-            if in_peaks:
-                if found or precursor is None:
-                    continue
-                for pair in line.split(";"):
-                    # float(), not parse_number: a library holds tens of millions of peaks.
-                    try:
-                        mz = float(_PEAK_SEPARATOR.split(pair.strip(), 1)[0])
-                    except ValueError:
-                        continue
-                    if abs(mz - precursor - PRECURSOR_PLUS_1008) <= PRECURSOR_PLUS_1008_TOLERANCE:
-                        found = True
-                        break
-                continue
-            if ":" not in line:
-                continue
-            name, _, value = line.partition(":")
-            field = name.strip().casefold()
-            if field in _MSP_PRECURSOR_FIELDS:
-                precursor = parse_number(value.strip())
-            elif field in _MSP_PEAK_COUNT_FIELDS:
-                in_peaks = True
-    close()
-    census = {"records": records, "with_precursor_plus_1008_peak": with_peak}
-    _PRECURSOR_PLUS_1008_CENSUS[key] = census
+        remember_file_digest(target, digest, stat)
     return dict(census)
+
+
+def _peaks_may_carry(lines: list[bytes], precursor: float) -> bool:
+    """False only where no pair of the record can carry the peak; True sends the record to _carries_peak.
+
+    A library holds tens of millions of peaks, and reading each as a number took 80 s for a 2 GB file. A block of
+    plain decimals (_PLAIN_PEAK_BYTES) has a pair within the tolerance only where a pair's first token has the
+    integer part of the window's low or high end: such a token holds that integer's digits, and is then searched
+    for as a token (_integer_part_pattern). Only a record that has one, or that is not plain, is read pair by pair,
+    so a record is never passed over that _carries_peak would find carrying the peak.
+    """
+    low = precursor + PRECURSOR_PLUS_1008 - PRECURSOR_PLUS_1008_TOLERANCE
+    high = precursor + PRECURSOR_PLUS_1008 + PRECURSOR_PLUS_1008_TOLERANCE
+    # Below 1, and above a million (where a decimal's rounding to a float may cross an integer boundary), the record
+    # is read pair by pair.
+    if not (math.isfinite(low) and math.isfinite(high)) or low < 1 or high > 1e6:
+        return True
+    block = lines[0] if len(lines) == 1 else b"\n".join(lines)
+    if block.translate(None, _PLAIN_PEAK_BYTES):
+        return True
+    # A margin for rounding at an integer boundary.
+    for integer in range(math.floor(low - 1e-6), math.floor(high + 1e-6) + 1):
+        digits = str(integer).encode("ascii")
+        if digits in block and _integer_part_pattern(integer).search(block):
+            return True
+    return False
+
+
+def _read_precursor_plus_1008(target: Path, progress: dict[str, int] | None) -> tuple[tuple[int, int], str]:
+    """(records, records carrying the peak) and the file's sha256, in one read of its bytes.
+
+    As the text it always was (utf-8-sig, universal newlines, each line stripped): a line beginning "NAME:" in
+    any case opens a record, a field's name is what precedes its first ':', and after the peak count every line
+    up to the next NAME is a peak line. A record of plain ASCII lines that begin with no whitespace is read whole
+    (_census_record); any other stretch of the file one line at a time (_census_line). A record's peak lines are
+    judged by _peaks_may_carry, then _carries_peak, once it ends. The file is read in blocks that end where a
+    record begins, so a record read whole is never cut in two.
+    """
+    hasher = hashlib.sha256()
+    state: dict[str, Any] = {"records": 0, "with_peak": 0, "precursor": None, "in_peaks": False, "peaks": []}
+    pending = b""
+    first = True
+    read = 0
+    with target.open("rb") as handle:
+        while True:
+            if progress is not None and progress.get("abandoned"):
+                raise InterruptedError(f"the census of {target.name} was abandoned: the file changed while it was read")
+            chunk = handle.read(_CENSUS_READ_BYTES)
+            if chunk:
+                hasher.update(chunk)
+                read += len(chunk)
+                if progress is not None:
+                    progress["bytes_read"] = read
+            data = pending + chunk
+            if first and data:
+                if len(data) < 3 and chunk:
+                    pending = data
+                    continue
+                first = False
+                if data.startswith(b"\xef\xbb\xbf"):
+                    data = data[3:]
+            if chunk:
+                # Whole lines only, and a lone '\r' at the end may yet be a "\r\n".
+                cut = data.rfind(b"\n") + 1
+                if cut == 0 and len(data) > 1:
+                    # '\r' line ends alone: cut after the last '\r' but one byte, never holding the whole file.
+                    cut = data.rfind(b"\r", 0, len(data) - 1) + 1
+                if cut == 0:
+                    pending = data
+                    continue
+                block, pending = data[:cut], data[cut:]
+            else:
+                block, pending = data, b""
+            # Universal newlines, as the text reading had them.
+            if b"\r" in block:
+                block = block.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            lowered = block.lower()
+            if chunk:
+                # Up to the last line that opens a record: the record it opens is read with the next block.
+                last = lowered.rfind(b"\nname:") + 1
+                if last > 0:
+                    pending = block[last:] + pending
+                    block, lowered = block[:last], lowered[:last]
+            _census_block(block, lowered, state)
+            if not chunk:
+                break
+    _close_census_record(state)
+    return (state["records"], state["with_peak"]), hasher.hexdigest()
+
+
+# Bytes that make a record unfit to be read whole: whitespace that str.strip removes at a line's start, which the
+# record reading does not look for, and the ASCII separators str.strip removes and bytes.strip keeps.
+_NOT_WHOLE_RECORD_BYTES = (b"\n ", b"\n\t", b"\x0b", b"\x0c", b"\x1c", b"\x1d", b"\x1e", b"\x1f")
+
+
+def _close_census_record(state: dict[str, Any]) -> None:
+    peaks, precursor = state["peaks"], state["precursor"]
+    if peaks and precursor is not None and _peaks_may_carry(peaks, precursor) and _carries_peak(peaks, precursor):
+        state["with_peak"] += 1
+    peaks.clear()
+
+
+def _census_block(block: bytes, lowered: bytes, state: dict[str, Any]) -> None:
+    """Read one block of whole lines into the census state; ``lowered`` is block.lower()."""
+    position, size = 0, len(block)
+    while position < size:
+        following = lowered.find(b"\nname:", position)
+        end = following + 1 if following >= 0 else size
+        if not (lowered.startswith(b"name:", position) and _census_record(block, lowered, position, end, state)):
+            _census_lines(block, position, end, state)
+        position = end
+
+
+def _census_record(block: bytes, lowered: bytes, start: int, end: int, state: dict[str, Any]) -> bool:
+    """Read the record block[start:end], which begins with its NAME line, whole; False where it is not plain.
+
+    Plain: ASCII, and no line beginning with whitespace, so that every line's stripped text begins where the line
+    does and no other line of it opens a record. Its precursor is the last precursor field before its peak count,
+    and its peak lines everything after that.
+    """
+    record = block[start:end]
+    if not record.isascii() or any(item in record for item in _NOT_WHOLE_RECORD_BYTES):
+        return False
+    text = lowered[start:end]
+    _close_census_record(state)
+    state["records"] += 1
+    state["precursor"], state["in_peaks"] = None, False
+    header_end = peaks_start = -1
+    at = 0
+    while True:
+        at = text.find(b"\nnum", at)
+        if at < 0:
+            break
+        line_end = text.find(b"\n", at + 1)
+        line_end = len(text) if line_end < 0 else line_end
+        field, colon, _ = text[at + 1:line_end].partition(b":")
+        if colon and field.strip() in _CENSUS_FIELDS_PEAK_COUNT:
+            header_end, peaks_start = at + 1, line_end + 1
+            break
+        at = line_end
+    at = 0
+    limit = header_end if header_end >= 0 else len(text)
+    while True:
+        at = text.find(b"\nprecursor", at, limit)
+        if at < 0:
+            break
+        line_end = text.find(b"\n", at + 1)
+        line_end = len(text) if line_end < 0 else line_end
+        field, colon, value = text[at + 1:line_end].partition(b":")
+        if colon and field.strip() in _CENSUS_FIELDS_PRECURSOR:
+            state["precursor"] = parse_number(value.decode("ascii").strip())
+        at = line_end
+    if header_end >= 0:
+        state["in_peaks"] = True
+        if peaks_start < len(record):
+            state["peaks"].append(record[peaks_start:])
+    return True
+
+
+def _census_lines(block: bytes, start: int, end: int, state: dict[str, Any]) -> None:
+    position = start
+    while position < end:
+        newline = block.find(b"\n", position, end)
+        newline = end if newline < 0 else newline
+        _census_line(block[position:newline], state)
+        position = newline + 1
+
+
+def _census_line(raw: bytes, state: dict[str, Any]) -> None:
+    """One line, read as the text census read it: stripped, a NAME, a field, or a peak line."""
+    text = raw.decode("utf-8", "replace").strip()
+    if not text or text.startswith("#"):
+        return
+    if text[:5].casefold() == "name:":
+        _close_census_record(state)
+        state["records"] += 1
+        state["precursor"], state["in_peaks"] = None, False
+        return
+    if state["in_peaks"]:
+        state["peaks"].append(text.encode("utf-8"))
+        return
+    if ":" not in text:
+        return
+    name, _, value = text.partition(":")
+    field = name.strip().casefold()
+    if field in _MSP_PRECURSOR_FIELDS:
+        state["precursor"] = parse_number(value.strip())
+    elif field in _MSP_PEAK_COUNT_FIELDS:
+        state["in_peaks"] = True
+
+
+def precursor_plus_1008_census_within(path: str | Path, wait_seconds: float) -> dict[str, Any]:
+    """The census within ``wait_seconds``: {"state": "counted", "census": ...} or {"state": "reading", ...}.
+
+    The first read of a 2 GB library takes longer than a plan may keep its caller waiting: the plan of V2's
+    negative-mode run timed out on it. The census is read in a thread of its own, which goes on after the wait;
+    "reading" says how far it has come, and a later call collects it (or the kept census). A read that fails
+    raises an OSError here, whatever it failed with, so that a file that cannot be read is a blocker, never an
+    unchecked library. A census is of one file version: a read of an earlier version of the file is abandoned, and
+    one whose file changed before it was collected is read again.
+    """
+    target = Path(path).expanduser().resolve()
+    stat = target.stat()
+    key = (str(target).casefold(), stat.st_size, stat.st_mtime_ns)
+    with _CENSUS_LOCK:
+        for other in [item for item in _CENSUS_SCANS if item[0] == key[0] and item != key]:
+            _CENSUS_SCANS.pop(other).progress["abandoned"] = 1
+        scan = _CENSUS_SCANS.get(key)
+        if scan is None:
+            scan = _CensusScan(target, stat.st_size)
+            _CENSUS_SCANS[key] = scan
+            threading.Thread(target=scan.run, name=f"msp-census-{target.name}", daemon=True).start()
+    if not scan.done.wait(max(0.0, float(wait_seconds))):
+        return {
+            "state": "reading",
+            "started_at": scan.started,
+            "bytes_read": int(scan.progress.get("bytes_read") or 0),
+            "size_bytes": scan.size,
+        }
+    with _CENSUS_LOCK:
+        if _CENSUS_SCANS.get(key) is scan:
+            del _CENSUS_SCANS[key]
+    if scan.error is not None:
+        if isinstance(scan.error, OSError):
+            raise scan.error
+        raise OSError(f"{type(scan.error).__name__}: {scan.error}") from scan.error
+    try:
+        after = target.stat()
+    except OSError:
+        after = None
+    if after is None or (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
+        # Changed while it was read: the count is of no version the run would search.
+        return precursor_plus_1008_census_within(target, 0.0)
+    return {"state": "counted", "census": dict(scan.result or {})}
 
 
 def _printable_ascii(text: str) -> bool:
@@ -467,7 +828,11 @@ def annotation_summary(entries: Iterable[dict[str, Any]]) -> list[dict[str, Any]
             "thresholds": entry.get("thresholds") or None,
             "threshold_values": THRESHOLDS.get(entry.get("thresholds") or "", {}) if entry.get("kind") == "msp" else None,
             "library_kind": (entry.get("library_kind") or "acquired") if entry.get("kind") == "msp" else None,
-            "suggestions": entry.get("suggestions", True) if entry.get("kind") == "msp" else None,
+            # As apply_annotators writes the row: a predicted row that leaves it unset does not suggest.
+            "suggestions": (
+                entry.get("suggestions", not is_predicted_library_kind(entry.get("library_kind")))
+                if entry.get("kind") == "msp" else None
+            ),
             "retention_time": entry.get("retention_time"), "rt_tolerance": entry.get("rt_tolerance"),
             "files": {polarity: Path(path).name for polarity, path in entry.get("paths", {}).items()},
         }
@@ -499,7 +864,13 @@ def annotator_settings(entries: Iterable[dict[str, Any]], polarity: str) -> dict
 
 
 def apply_annotators(state: dict[str, Any], annotators: Iterable[dict[str, Any]]) -> None:
-    """Write libraries.annotators into the workflow state: MSP rows, the LBM2 and their provenance."""
+    """Write libraries.annotators into the workflow state: MSP rows, the LBM2 and their provenance.
+
+    An MSP row's thresholds name one of THRESHOLDS; any other name, or none, is refused (ValueError) rather than
+    searched at "standard", as it was until 0.5.49. A predicted (in-silico) row that leaves suggestions unset is
+    written with suggestions false: in-silico rows do not suggest (the author's decision), and the Console's own
+    default is on. The plan refuses a predicted row with suggestions true (agent_workflow._annotator_row_problems).
+    """
     state["msp_annotators"] = []
     provenance: list[dict[str, Any]] = []
     for item in annotators:
@@ -507,7 +878,15 @@ def apply_annotators(state: dict[str, Any], annotators: Iterable[dict[str, Any]]
         if not path:
             continue
         use_rt = str(item.get("retention_time") or "none") == "use"
-        if item.get("kind") == "lbm":
+        preset = str(item.get("thresholds") or "").strip()
+        # As the plan reads it (agent_workflow._annotator_row_problems): any case of "lbm" is the LBM2.
+        is_lbm = str(item.get("kind") or "msp").strip().casefold() == "lbm"
+        if not is_lbm and preset not in THRESHOLDS:
+            raise ValueError(
+                f"libraries.annotators ({item.get('label') or item.get('annotator_id') or Path(path).name}): thresholds "
+                f"'{item.get('thresholds') or ''}' is none of {', '.join(THRESHOLDS)}."
+            )
+        if is_lbm:
             state["lbm_path"] = path
             state["lbm_annotator"] = {**dict(state.get("lbm_annotator") or {}), "lbm_file_path": path,
                                       "priority": int(item.get("priority") or 1)}
@@ -524,7 +903,7 @@ def apply_annotators(state: dict[str, Any], annotators: Iterable[dict[str, Any]]
                 "rt_fixed": True,
                 # A predicted library's matches are published as in silico, never as reference spectra.
                 "library_kind": str(item.get("library_kind") or "acquired"),
-                **THRESHOLDS.get(str(item.get("thresholds") or "standard"), THRESHOLDS["standard"]),
+                **THRESHOLDS[preset],
             }
             if use_rt and item.get("rt_tolerance") not in (None, ""):
                 row["rt_tolerance"] = float(item["rt_tolerance"])
@@ -532,6 +911,9 @@ def apply_annotators(state: dict[str, Any], annotators: Iterable[dict[str, Any]]
             # and a plan is refused on a Console without the switch (workflow._annotator_capability_issues).
             if item.get("suggestions") is not None:
                 row["suggestions"] = _as_switch(item["suggestions"])
+            elif is_predicted_library_kind(row["library_kind"]):
+                # Every spelling the Console reads as predicted (in_silico, InSilico, ...), as it reads them.
+                row["suggestions"] = False
             state["msp_annotators"].append(row)
         provenance.append({"path": path, "version": "", "source": "", "doi": "",
                            "license": "institutional/private", "label": str(item.get("label") or "")})

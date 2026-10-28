@@ -131,7 +131,7 @@ Never silently overwrite the scientific meaning of an existing output folder. If
 
 ## Complete The Workflow
 
-After starting a production run, normally call `msdial_complete_guided_analysis` with the accepted QA and publication choices. It waits for that exact job and performs mzTab-M validation/preview, requested LC-MS QA, publication generation, and handoff without browser interaction.
+After starting a production run, normally call `msdial_complete_guided_analysis` with the accepted QA and publication choices. While the job runs it answers `finished: false` with `call_again: true` after at most 25 s: call it again for the same job until it has finished (a call still working after 40 s is answered `reason: still_running`, `call_again: true`, and the next call for that job collects it). It then performs mzTab-M validation/preview, requested LC-MS QA, publication generation, and handoff without browser interaction.
 
 If individual control is needed after a successful run:
 

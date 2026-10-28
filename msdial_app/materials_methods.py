@@ -39,12 +39,17 @@ def generate_publication_report(
     console_version: str,
     qa_criteria: dict[str, Any] | None = None,
     supplementary_files: Iterable[tuple[str | Path, str]] = (),
+    job_lipid_rt_check: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write the Materials and Methods, QA Results, supplementary tables, audit and bundle.
 
     supplementary_files are (path, name in the bundle) pairs the bundle carries beside the five
     report files: the run's QA figures. Each is scanned as the bundle is; one that still names what
     a shared report may not is left out with a warning, never a refusal of the report.
+
+    job_lipid_rt_check is what the run's job recorded of the lipid RT check (its finalisation's lipid_rt_check,
+    or the Console's summary line read from the job's log): the summary a run without a unit manifest - a guided
+    or laboratory run - has nowhere else (lipid_rt_check_evidence).
     """
     root = Path(output_root).expanduser().resolve()
     # A unit whose run left an mzTab-M naming a location of this machine, or MS-DIAL's library copy in its
@@ -88,9 +93,12 @@ def generate_publication_report(
     multi_energy_aif = multi_energy_aif_evidence(workflow)
     if multi_energy_aif:
         report_workflow["multi_energy_aif_evidence"] = multi_energy_aif
-    lipid_rt_evidence = lipid_rt_check_evidence(root, workflow)
+    lipid_rt_evidence = lipid_rt_check_evidence(root, workflow, job_lipid_rt_check)
     if lipid_rt_evidence:
         report_workflow["lipid_rt_check_evidence"] = lipid_rt_evidence
+    in_silico_codes = in_silico_code_evidence(root, workflow)
+    if in_silico_codes:
+        report_workflow["in_silico_code_evidence"] = in_silico_codes
     criteria = _criteria(qa_criteria)
     qa_assessment = assess_qa(qa_report, criteria)
     provenance_warnings = _library_warnings(report_workflow, libraries)
@@ -345,6 +353,7 @@ def supplementary_rows(
         "automatic_rt_correction_evidence",
         "multi_energy_aif_evidence",
         "lipid_rt_check_evidence",
+        "in_silico_code_evidence",
     } | annotation_keys
     for key in sorted(workflow):
         if key not in excluded:
@@ -388,6 +397,12 @@ def supplementary_rows(
         if key in lipid_rt_evidence:
             add("Lipid RT check", "MS-DIAL lipid retention-time order check", key, lipid_rt_evidence[key],
                 "Derived from the method file and retained Console outputs", "MS-DIAL Console")
+
+    in_silico_codes = workflow.get("in_silico_code_evidence") or {}
+    if in_silico_codes:
+        add("Annotation", "In-silico matches", "annotation_codes", in_silico_codes.get("codes") or {},
+            "MS-DIAL annotation code of each in-silico match (evidence source InSilico) in the mzTab-M; 450 is "
+            "MS/MS matched to an in-silico (predicted) reference spectrum", "MS-DIAL Console")
 
     automatic_rt_evidence = workflow.get("automatic_rt_correction_evidence") or {}
     if automatic_rt_evidence.get("requested"):
@@ -765,7 +780,7 @@ def _annotation_sentence(workflow: dict[str, Any], libraries: list[dict[str, Any
             f"reference-spectrum match, and {retention}. MS-DIAL ranks an "
             "accepted match against acquired spectra or LBM rules above an accepted in-silico match, so an "
             "in-silico name is reported only where neither is accepted."
-        )
+        ) + _in_silico_code_sentence(workflow.get("in_silico_code_evidence") or {})
         if any(str(row.get("evidence_tier") or "") == IN_SILICO_EVIDENCE_TIER for row in in_silico_rows):
             in_silico += f" The in-silico library was {GLACIER_CITATION}; it covers {GLACIER_SCOPE}."
         for library in libraries or []:
@@ -787,13 +802,80 @@ def _annotation_sentence(workflow: dict[str, Any], libraries: list[dict[str, Any
     )
 
 
-def lipid_rt_check_evidence(root: Path, workflow: dict[str, Any]) -> dict[str, Any]:
+def in_silico_code_evidence(root: Path, workflow: dict[str, Any]) -> dict[str, Any]:
+    """The annotation codes the run's mzTab-M gives its in-silico matches, for a run with an in-silico annotator.
+
+    {"codes": {code: count}, "mztab_files": n}; empty for a run without one. Read from the output, since no Console
+    capability marker tells a Console that gives such a match 450 from one that gives it 430 (annotation_codes).
+    """
+    from .mztab_validation import find_mztab_files, validate_mztab_file
+    from .workflow import is_predicted_library_kind
+
+    rows = [row for row in workflow.get("msp_annotators", []) if isinstance(row, dict)]
+    if not any(is_predicted_library_kind(row.get("library_kind")) for row in rows):
+        return {}
+    codes: dict[str, int] = {}
+    files = find_mztab_files(root)
+    for path in files:
+        try:
+            found = validate_mztab_file(path).get("annotation_codes") or {}
+        except OSError:
+            continue
+        for code, count in (found.get("in_silico_match_codes") or {}).items():
+            codes[code] = codes.get(code, 0) + int(count)
+    return {"codes": dict(sorted(codes.items())), "mztab_files": len(files)}
+
+
+def _in_silico_code_sentence(evidence: dict[str, Any]) -> str:
+    """What the Methods say of the annotation code an in-silico match carries (annotation_codes)."""
+    from .annotation_codes import (
+        ACQUIRED_SPECTRUM_ANNOTATION_CODE, IN_SILICO_ANNOTATION_CODE, IN_SILICO_CODE_DESCRIPTION,
+    )
+
+    code = f"{IN_SILICO_ANNOTATION_CODE} ({IN_SILICO_CODE_DESCRIPTION})"
+    codes = {str(key): value for key, value in (evidence.get("codes") or {}).items() if value and str(key) != "null"}
+    other = sorted(key for key in codes if key != str(IN_SILICO_ANNOTATION_CODE))
+    if codes and not other:
+        return (
+            f" Each in-silico match carries the MS-DIAL annotation code {code} (the mzTab-M reliability column and "
+            "the exports' annotation tag) and is not counted as an identification."
+        )
+    if other and str(IN_SILICO_ANNOTATION_CODE) in codes:
+        # A Console with the code gives a match it also scored by retention time another one (as 330 for 430).
+        return (
+            f" Accepted in-silico matches carry the MS-DIAL annotation code {code}, and those also matched by "
+            f"retention time or another criterion the code {', '.join(other)}; the evidence source InSilico marks "
+            "every one of them, and none is counted as an identification."
+        )
+    if other:
+        return (
+            f" The MS-DIAL Console used predates the in-silico annotation code {code}: it gave "
+            f"{'these matches' if len(codes) == len(other) else 'some of these matches'} the code "
+            f"{', '.join(other)}, which it also gives MS/MS matches against acquired reference spectra, so the "
+            "evidence source InSilico, not the code, marks them; they are not counted as identifications."
+        )
+    # No in-silico match in the output says which code this Console gives: both are stated as conditions.
+    return (
+        f" An MS-DIAL Console that has the in-silico annotation code gives an accepted in-silico match the code {code}; "
+        f"one that predates it gives {ACQUIRED_SPECTRUM_ANNOTATION_CODE}, the code of an MS/MS match against an "
+        "acquired reference spectrum, so the evidence source InSilico, not the code, marks an in-silico match, and "
+        "none is counted as an identification."
+    )
+
+
+def lipid_rt_check_evidence(
+    root: Path, workflow: dict[str, Any], job_record: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """What a report says of the lipid RT check: the setting the run asked for, and what the run left.
 
-    The review lists are read from the run directory, written no earlier than its method file; the rule version
-    is the one the Console stated, as the unit manifest's finalisation of the run recorded it. Empty for a run
-    that neither set the check nor left a review list: a Lipidomics project alone says nothing of it, as a
-    Console from before MsdialWorkbench#832 has no check, and what one with it does by default is its own.
+    The review lists are read from the run directory, written no earlier than its method file; the summary line
+    and rule version are the ones the Console stated, as the unit manifest's finalisation of the run recorded
+    them, or, for a run without a unit manifest (a guided or laboratory run), as its job recorded them
+    (``job_record``: the finalisation's lipid_rt_check, or console_summary of the job's log). Until 0.5.49 only
+    the manifest was read, so every guided run's Methods said the summary was not recorded although the Console
+    had printed it (V2). Empty for a run that neither set the check nor left a review list: a Lipidomics project
+    alone says nothing of it, as a Console from before MsdialWorkbench#832 has no check, and what one with it
+    does by default is its own.
     """
     from .lipid_rt_check import run_outcome
 
@@ -811,6 +893,13 @@ def lipid_rt_check_evidence(root: Path, workflow: dict[str, Any]) -> dict[str, A
     if not setting and not outcome["ran"]:
         return {}
     recorded = _finalised_lipid_rt_check(workflow)
+    if (
+        not str(recorded.get("summary") or "").strip()
+        and isinstance(job_record, dict)
+        and str(job_record.get("summary") or "").strip()
+    ):
+        # What the manifest recorded stands; the job adds the summary and what it says, where it has them.
+        recorded = {**recorded, **{key: value for key, value in job_record.items() if value not in (None, "")}}
     return {
         "setting": setting,
         "written_to_method_file": bool(method.get("written_to_method_file")),

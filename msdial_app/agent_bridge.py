@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .annotation_codes import ACQUIRED_SPECTRUM_ANNOTATION_CODE, IN_SILICO_ANNOTATION_CODE, IN_SILICO_CODE_DESCRIPTION
 from .mztab_validation import validate_mztab_outputs
 from .diagnostic_paths import is_diagnostic_artifact
 
@@ -354,9 +355,15 @@ def annotation_block(run_directory: str | Path) -> dict[str, Any] | None:
         "evidence_column": "Evidence source (exports); opt_global_evidence_source (mzTab-M)",
         "note": (
             "A name from a tier whose library_kind is predicted is an in-silico prediction (Evidence source "
-            "InSilico), not an identification; join compounds by the first block of the InChIKey, since "
+            f"InSilico; MS-DIAL annotation code {IN_SILICO_ANNOTATION_CODE}, {IN_SILICO_CODE_DESCRIPTION}, or "
+            f"{ACQUIRED_SPECTRUM_ANNOTATION_CODE} from a Console that predates that code), not an identification: "
+            "select by the evidence source, not the code. Join compounds by the first block of the InChIKey, since "
             "predicted libraries may carry non-standard keys."
             if any(tier["library_kind"] == "predicted" for tier in tiers) else ""
+        ),
+        **(
+            {"in_silico_annotation_code": {"code": IN_SILICO_ANNOTATION_CODE, "meaning": IN_SILICO_CODE_DESCRIPTION}}
+            if any(tier["library_kind"] == "predicted" for tier in tiers) else {}
         ),
     }
 

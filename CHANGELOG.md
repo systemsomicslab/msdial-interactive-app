@@ -4,6 +4,94 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.49] - Unreleased
+
+The defects verification run V2 (the GLACIER in-silico tier pilot, 2026-10-28) found. Built on 0.5.48 (#81).
+
+### Fixed
+- **No MCP tool keeps its client waiting past 40 s, so a client's timeout no longer restarts the server under a
+  running Console.** In V2 `msdial_complete_guided_analysis`, which polled for up to a day, was timed out by the
+  client after about 60 s ("Request timed out"); the client restarted the MCP server, and the backend it embeds
+  took the running MS-DIAL Console with it 75 s into the run (job `interrupted`). Every tool the MCP server serves
+  now runs in a thread of its own and answers within `TOOL_REPLY_BUDGET_SECONDS` (40 s): a call still working then is answered
+  `{"ok": false, "reason": "still_running", "retryable": true, "finished": false, "call_again": true}` and carries
+  on, and the same call made again, while it runs or up to 10 minutes after it ended, waits for it and returns its
+  result (`collected_from_earlier_call`) instead of starting the same work again. A call answered in time is never
+  handed to another caller, and a tool called from inside another tool's call runs directly in that call's thread.
+  The budget is the MCP server's only (`_mcp_tool` registers each tool's `mcp_reply`): the module's functions, which
+  the campaign runner calls in-process, return when their work is done, as before. `msdial_interactive_wait_for_completion` and `msdial_complete_guided_analysis` wait at most
+  `JOB_WAIT_LIMIT_SECONDS` (25 s) per call, whatever `timeout_seconds` asks, and answer a running job with
+  `finished: false, still_running: true, call_again: true`; a completion is one per job, so a repeat with other
+  arguments collects the running one (`arguments_differ`) instead of writing the same QA and report files beside
+  it. A backend that does not answer within an HTTP call's own timeout is still `reason: os_error`,
+  `error_type: TimeoutError` (what the campaign runner pauses on), now with `timed_out: true`, `retryable` for a
+  GET, and a detail that says the backend may still be working on it.
+  The skills, `README.md` and `docs/agent_integration.md` say to call these tools again while they answer
+  `call_again: true`.
+- **The Console no longer inherits the backend's stdin**, which inside the MCP server is the client's JSON-RPC
+  pipe (`stdin=DEVNULL`).
+- **A Console a stopped backend left running is recorded and can be stopped.** When the backend starts again, an
+  interrupted run or diagnostic whose recorded Console (process id and creation time) still runs carries
+  `orphaned_console` and says so in its error, instead of the library-download sentence (one whose Console has
+  exited says that); `msdial_cancel_job` on it stops that Console's process tree after reading its id and creation
+  time again (`reason: orphaned_console`, within 20 s), never a process that has since taken its id or one whose
+  creation time cannot be read. A repository unit's next Console is refused while it runs, as before, by the run
+  attempt its manifest holds; a local run has no such check.
+- **The first plan of a run with a large in-silico MSP no longer times out on the +1.008 census.** V2's
+  negative-mode plan answered `os_error … timed out` while it read a 2 GB library for the precursor m/z + 1.008
+  peak. The census (`lab_lcms_metabolomics.precursor_plus_1008_census`) now reads the file as bytes, a record at a
+  time where the record is plain ASCII and passes over every peak list whose m/z cannot lie in the window (22 s
+  for that file, from 83 s; the same counts on both GLACIER negative-mode builds and on a fuzzed corpus of
+  record forms); it takes the file's sha256 in the same read; and its count is kept for that file version across
+  restarts, in the user's data folder, for a file of 64 MB or more (by location, size and time, or by the digest
+  `file_identity` already holds for a copy). The plan waits for it at most `CENSUS_PLAN_WAIT_SECONDS` (15 s) and is
+  otherwise refused with "… is still being checked for the peak at the precursor m/z + 1.008 (n% of x GB read,
+  since hh:mm:ss) … Plan again in a minute", while the census goes on in its own thread; several files are read
+  side by side against that one wait. An unread file is never accepted: a census that fails in any way is a
+  blocker, a read of an earlier version of the file is abandoned, and one whose file changed while it was read is
+  read again.
+- **The `annotators` route refuses what it used to change without a word.** A row whose `library_kind` the
+  Console reads as predicted (`predicted`, `in_silico`, `InSilico`, …) with `suggestions: true` is a blocker (in-silico rows do not suggest, the author's decision; with suggestions on,
+  MS-DIAL kept sub-threshold in-silico candidates labelled `InSilico` and wrote them to the mzTab-M, V2 §7.7), and
+  so is such a row in a workflow state from any other path (`workflow._annotator_capability_issues`); a predicted
+  row of `libraries.annotators` (and a laboratory contract's in-silico entry) that leaves `suggestions` unset is
+  written with it false, and the library summary says so. Such a row then needs a Console with the per-annotator
+  suggestions switch, as an explicit false always did; a state from another path (the web page) that leaves it
+  unset still runs at the Console's default. An MSP row's `thresholds` must name one of
+  `standard`, `strict`, `mild`, `in_silico`: an unknown or missing preset, which `apply_annotators` searched at
+  `standard`, is a blocker, and `apply_annotators` itself raises on one. A row whose `kind` is neither `msp` nor
+  `lbm` (in any case) is a blocker too. The +1.008 census of the route's predicted rows reads every such spelling.
+- **A guided or laboratory run's Materials and Methods state the lipid RT check's summary.** The Methods read the
+  Console's summary line only from a repository unit manifest, so every V2 run said "The Console's summary of the
+  check was not recorded …" although the Console had printed it. The publication report now reads it from the
+  run's job as well, for that job's own run directory: the summary its finalisation recorded, or the Console's
+  line in the job's log.
+
+### Added
+- **MS-DIAL annotation code 450** (the MS-DIAL author's decision of 2026-10-28): an accepted match against an
+  in-silico (predicted) reference spectrum; 440 is the EI-MS match code. `msdial_app/annotation_codes.py` holds
+  MS-DIAL's code table (`DataAccess.GetAnnotationCode`) with 450 as "MS/MS matched to an in-silico (predicted)
+  reference spectrum". Interactive read, counted or described none of these codes before; now:
+  - mzTab-M validation records `annotation_codes` per file (the codes the in-silico matches carry, rows coded 450
+    with another evidence source, unknown codes, and notes); they never change a file's status;
+  - `parse_mdpeak` counts named peaks by code (`annotation_code_counts`) and the in-silico matches' codes
+    (`in_silico_annotation_codes`), and never counts a peak coded 450 as an identification, whatever its evidence
+    source says; identifications are still counted by evidence source, never by code;
+  - the Methods state the code the run's mzTab-M gave its in-silico matches: 450, or the 430 of a Console that
+    predates the code (then the evidence source InSilico, not the code, marks them), the codes beside 450 of matches
+    also scored otherwise, or, where the output shows no in-silico match, both codes as conditions; the
+    Supplementary Table lists them;
+  - the data-mining handoff's annotation note names the code and says to select by the evidence source.
+
+### Not done
+- No Console capability marker tells a Console that gives an in-silico match 450 from one that gives it 430: the
+  companion MS-DIAL change is not merged. Interactive reads the code from each run's own output; a marker check
+  is a follow-up once the MS-DIAL change lands.
+- The Console still runs as a child of the MCP server process, so whatever stops that process's tree stops the
+  Console (V2 does not show which mechanism did), and an orphaned Console's run is not adopted: its output is no
+  longer read, and nothing finalises it. Running the Console independently of the MCP process (a detached runner
+  whose log a restarted backend reads on, and a job it adopts) is a follow-up.
+
 ## [0.5.48] - Unreleased
 
 Built on 0.5.47 (#80), which is not merged yet; merge this after it. The per-annotator suggestions switch it

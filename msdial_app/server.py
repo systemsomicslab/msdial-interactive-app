@@ -124,7 +124,9 @@ from .workflow import (
     read_rt_correction_anchors,
     run_console,
     save_rt_correction_anchors,
+    recorded_process_alive,
     save_rt_correction_selections,
+    stop_orphaned_console,
     is_supported,
     validate_workflow,
 )
@@ -568,12 +570,52 @@ def _load_persisted_jobs() -> dict[str, dict[str, Any]]:
         if job.get("status") in LIVE_JOB_STATUSES:
             job["status"] = "interrupted"
             job["updated_at"] = now
-            job["error"] = (
-                "The local backend stopped before this job completed. "
-                "A library download can be started again and will resume from its .part file."
-            )
+            orphan = _orphaned_console(job)
+            if orphan is not None:
+                job["orphaned_console"] = {**orphan, "checked_at": now}
+            if orphan is not None and orphan["alive"]:
+                job["error"] = (
+                    "The local backend stopped before this job completed, while its MS-DIAL Console (process "
+                    f"{orphan['pid']}) ran, and that Console was still running when the backend started again. "
+                    "Nothing supervises it now: its output is not read, its time limits are not applied, and "
+                    "its outputs will not be checked or recorded by this job. msdial_cancel_job stops it."
+                )
+            elif orphan is not None and orphan["alive"] is None:
+                job["error"] = (
+                    "The local backend stopped before this job completed, while its MS-DIAL Console (process "
+                    f"{orphan['pid']}) ran; whether that Console still runs could not be read. Its outputs will "
+                    "not be checked or recorded by this job."
+                )
+            elif orphan is not None:
+                job["error"] = (
+                    "The local backend stopped before this job completed, and its MS-DIAL Console is no longer "
+                    "running. Its outputs were not checked or recorded by this job; start the run again."
+                )
+            else:
+                job["error"] = (
+                    "The local backend stopped before this job completed. "
+                    "A library download can be started again and will resume from its .part file."
+                )
             job.setdefault("logs", []).append(job["error"])
     return jobs
+
+
+def _orphaned_console(job: dict[str, Any]) -> dict[str, Any] | None:
+    """The Console a job recorded as running, read again: {pid, process_created_at, alive}; None without one.
+
+    A backend that stops - its MCP server process restarted, for one - does not itself stop the Console it
+    started, so the Console may still run. The record says whether it does: alive True for the very process
+    recorded (by id and creation time), False once it has exited, None where that cannot be read, or where no
+    creation time was recorded to tell a reused id apart.
+    """
+    if job.get("kind") not in CONSOLE_JOB_KINDS:
+        return None
+    process = job.get("console_process") if isinstance(job.get("console_process"), dict) else {}
+    pid = process.get("pid")
+    if not pid:
+        return None
+    created = process.get("process_created_at")
+    return {"pid": pid, "process_created_at": created, "alive": recorded_process_alive(pid, created)}
 
 
 def _persist_jobs_locked() -> None:
@@ -773,8 +815,22 @@ def _cancel_job(job_id: str, reason: str = "") -> tuple[HTTPStatus, dict[str, An
     error. A job that is still queued stops before it starts anything. A download past its last byte
     is extracting and recording, and completes. The job ends as failed and says it was cancelled
     (stop_reason); this call returns at once and does not wait for that.
+
+    An interrupted Console job whose Console a stopped backend left running (orphaned_console, read when the
+    backend started again) has that Console's process tree stopped here, after its id and creation time are read
+    again, and the job records the stop.
     """
     now = dt.datetime.now().astimezone().isoformat()
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        orphan = dict(job.get("orphaned_console") or {}) if job is not None else {}
+        # One already found gone needs nothing stopped: the job answers as any finished job does.
+        orphaned = (
+            job is not None and job.get("status") == "interrupted" and bool(orphan.get("pid"))
+            and orphan.get("alive") is not False
+        )
+    if orphaned:
+        return _stop_orphaned_console_of(job_id, orphan, reason)
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job is None:
@@ -826,6 +882,75 @@ def _cancel_job(job_id: str, reason: str = "") -> tuple[HTTPStatus, dict[str, An
             "already_requested": already,
             "console_pid": entry.get("pid"),
         }
+
+
+def _job_lipid_rt_check(job: dict[str, Any] | None, run_directory: str = "") -> dict[str, Any] | None:
+    """What a run's job recorded of the lipid RT check: its finalisation's record, or the Console's summary line.
+
+    The finalisation (run_finalisation.finalise_console_run) records the Console's summary line from the job's
+    Console output, for every run; a job finalised before it did is read for the line itself. Only a production
+    run's job, and only for its own run directory: a report written for another directory takes nothing from it.
+    """
+    if not job or str(job.get("kind") or "run") != "run":
+        return None
+    own = str((job.get("preparation") or {}).get("run_directory") or "").strip()
+    if not own or not _same_path(own, run_directory):
+        return None
+    finalisation = job.get("console_run_finalisation") if isinstance(job.get("console_run_finalisation"), dict) else {}
+    record = finalisation.get("lipid_rt_check") if isinstance(finalisation.get("lipid_rt_check"), dict) else None
+    if record is not None and str(record.get("summary") or "").strip():
+        return record
+    from .lipid_rt_check import console_summary
+
+    said = console_summary(job.get("logs") or [])
+    if said["summary"]:
+        return {**(record or {}), **said}
+    return record
+
+
+def _stop_orphaned_console_of(job_id: str, orphan: dict[str, Any], reason: str) -> tuple[HTTPStatus, dict[str, Any]]:
+    """Stop the Console an interrupted job's stopped backend left running, and record it on the job."""
+    stopped = stop_orphaned_console(orphan.get("pid"), orphan.get("process_created_at"))
+    now = dt.datetime.now().astimezone().isoformat()
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is not None:
+            previous = dict(job.get("orphaned_console") or {})
+            job["orphaned_console"] = {
+                **previous,
+                # Not stopped because it could not be read: what was recorded stands.
+                "alive": {"stopped": False, "already_exited": False, "still_running": True}.get(
+                    stopped["result"], previous.get("alive")
+                ),
+                "stop": stopped,
+                "checked_at": now,
+            }
+            if reason:
+                job["cancel_reason"] = reason
+            job["cancel_requested_at"] = now
+            job.setdefault("logs", []).append(
+                f"Cancellation requested{': ' + reason if reason else ''}. The MS-DIAL Console the stopped backend "
+                f"left running (process {orphan.get('pid')}): {stopped['result'].replace('_', ' ')}."
+            )
+            job["updated_at"] = now
+            _persist_jobs_locked()
+        status = str((job or {}).get("status") or "interrupted")
+        kind = str((job or {}).get("kind") or "")
+    return HTTPStatus.OK, {
+        "job_id": job_id,
+        "kind": kind,
+        "status": status,
+        "cancel_requested": stopped["result"] in {"stopped", "still_running"},
+        "reason": "orphaned_console",
+        "orphaned_console_stop": stopped,
+        "detail": {
+            "stopped": "The MS-DIAL Console this job's stopped backend left running was stopped.",
+            "already_exited": "The MS-DIAL Console this job's stopped backend left running has already exited.",
+            "still_running": "The MS-DIAL Console this job's stopped backend left running did not stop.",
+            "not_stopped": "The MS-DIAL Console this job's stopped backend left running was not stopped: "
+            + str(stopped.get("reason") or ""),
+        }[stopped["result"]],
+    }
 
 
 def _console_temp_for(job_id: str, preparation: dict[str, Any]) -> tuple[Path | None, str]:
@@ -2357,6 +2482,7 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                     qa_criteria=body.get("qa_criteria"),
                     supplementary_files=bundle_figures,
+                    job_lipid_rt_check=_job_lipid_rt_check(job, run_directory),
                 )
                 # The retained inventory a raw deletion is judged against was taken before this report
                 # existed; it now has to list what was just written.

@@ -159,7 +159,8 @@ Pass only accepted candidates as `internal_standards` to
 
 Prepare and start the production analysis with the normal guided tools and their
 confirmation boundary. Then call `msdial_complete_guided_analysis` with the
-exact production `job_id`. It waits, validates and previews mzTab-M, generates
+exact production `job_id`, again while it answers `call_again: true` (one call waits at
+most 25 s). Once the job has finished it validates and previews mzTab-M, generates
 requested LC-MS QA and publication files, and creates the data-mining handoff.
 
 Retain repository/publication metadata, reviewed sample metadata,

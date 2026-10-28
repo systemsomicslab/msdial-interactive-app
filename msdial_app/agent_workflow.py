@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import json
 import math
 import os
 import re
+import time
 from bisect import bisect_left
 from collections import Counter
 from pathlib import Path
@@ -359,7 +361,10 @@ def build_guided_plan(
             "with library_kind 'predicted' (and suggestions false, to name nothing from a bare precursor mass), "
             "but under its own label, without the GLACIER evidence tier, citation or preprocessing record."
         )
+    annotator_row_problems: list[str] = []
     if merged.get("library_strategy") == "annotators":
+        annotator_row_problems = _annotator_row_problems(merged)
+        blockers.extend(annotator_row_problems)
         blockers.extend(_predicted_annotator_problems(merged))
     if merged.get("library_strategy") == "tiered_lipid_msp":
         blockers.extend(_tiered_library_problems(merged))
@@ -384,7 +389,9 @@ def build_guided_plan(
     # An unanswered advisory question leaves a conservative default in place, so the
     # workflow can still be built and shown; only a required one makes it unknowable.
     pending_required = [item for item in questions if item.get("required", True)]
-    workflow = _workflow(inspection, merged) if not pending_required else None
+    # A row the annotator table cannot be written from (an unknown threshold preset) leaves the workflow unbuilt:
+    # apply_annotators refuses it rather than search the library at settings nobody chose.
+    workflow = _workflow(inspection, merged) if not pending_required and not annotator_row_problems else None
     validation: list[dict[str, str]] = []
     if workflow is not None:
         validation = validate_workflow(workflow)
@@ -1878,16 +1885,16 @@ def _in_silico_preprocessing_problems(path: Path, steps: list[str], ion_mode: st
         return []
     if path.suffix.casefold() != ".msp" or not path.is_file() or path.stat().st_size == 0:
         return []
-    from .lab_lcms_metabolomics import precursor_plus_1008_census
-
     try:
-        census = precursor_plus_1008_census(path)
+        census, reading = _plus_1008_census(path)
     except OSError as error:
         claim = f"libraries.in_silico_msp_preprocessing names {step}, but " if declared else "This negative-mode run's "
         return [
             f"{claim}{path.name} cannot be read ({error.strerror or error}) to check it for the peak at the "
             "precursor m/z + 1.008. Plan again once it can."
         ]
+    if census is None:
+        return [f"libraries.in_silico_msp_paths: {reading}"]
     carrying = census["with_precursor_plus_1008_peak"]
     if not carrying and not declared and census["records"] and (
         in_silico_evidence_tier(path.name) == IN_SILICO_EVIDENCE_TIER
@@ -1912,6 +1919,53 @@ def _in_silico_preprocessing_problems(path: Path, steps: list[str], ion_mode: st
     return []
 
 
+def _annotator_row_problems(answers: dict[str, Any]) -> list[str]:
+    """What libraries.annotators asks that the annotator table would otherwise change without a word.
+
+    A row's kind is msp or lbm; any other was searched as an MSP. An MSP row names one of the threshold presets
+    (lab_lcms_metabolomics.THRESHOLDS); any other name, or none, was searched at "standard" (apply_annotators),
+    while the laboratory contract refused the same row. And a row whose library_kind is predicted (in-silico) never
+    suggests: suggestions true would have MS-DIAL keep in-silico candidates below the cut-offs, labelled InSilico
+    like accepted ones and written to the mzTab-M (V2, 2026-10-28), and the author decided that in-silico rows do
+    not suggest. Left unset, it is written false (apply_annotators).
+    """
+    from .lab_lcms_metabolomics import THRESHOLDS
+
+    rows = (answers.get("libraries") or {}).get("annotators") or []
+    problems: list[str] = []
+    for index, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            problems.append(f"libraries.annotators row {index} is not an object.")
+            continue
+        where = (
+            f"libraries.annotators ({row.get('label') or row.get('annotator_id') or Path(str(row.get('path') or '')).name or index})"
+        )
+        kind = str(row.get("kind") or "msp").strip().casefold()
+        if kind not in {"msp", "lbm"}:
+            problems.append(f"{where}: kind '{row.get('kind')}' is neither msp nor lbm.")
+            continue
+        if kind == "lbm":
+            continue
+        thresholds = str(row.get("thresholds") or "").strip()
+        if thresholds not in THRESHOLDS:
+            said = f"thresholds '{row.get('thresholds')}' is none of" if thresholds else "thresholds names none of"
+            problems.append(
+                f"{where}: {said} {', '.join(THRESHOLDS)}. Name one; a row is not searched at settings nobody "
+                "chose."
+            )
+        from .workflow import is_predicted_library_kind
+
+        # Every spelling the Console reads as predicted (in_silico, InSilico, ...), as it reads them.
+        predicted = is_predicted_library_kind(row.get("library_kind"))
+        if predicted and row.get("suggestions") is not None and _as_bool(row.get("suggestions")):
+            problems.append(
+                f"{where}: an in-silico (library_kind predicted) row does not suggest; set suggestions false or leave "
+                "it out. With suggestions on, MS-DIAL keeps in-silico candidates below the cut-offs, labelled "
+                "InSilico like accepted matches and written to the mzTab-M."
+            )
+    return problems
+
+
 def _predicted_annotator_problems(answers: dict[str, Any]) -> list[str]:
     """The +1.008 artefact (Q6) in a predicted MSP of libraries.annotators, as the tiered profile refuses it.
 
@@ -1924,26 +1978,39 @@ def _predicted_annotator_problems(answers: dict[str, Any]) -> list[str]:
     rows = (answers.get("libraries") or {}).get("annotators") or []
     ion_mode = str(answers.get("ion_mode") or "").strip()
     problems: list[str] = []
+    checks: list[tuple[str, Path]] = []
+    from .workflow import is_predicted_library_kind
+
     for row in rows:
-        if not isinstance(row, dict) or row.get("kind") == "lbm":
+        if not isinstance(row, dict) or str(row.get("kind") or "msp").strip().casefold() == "lbm":
             continue
-        if str(row.get("library_kind") or "").strip().casefold() != "predicted":
+        if not is_predicted_library_kind(row.get("library_kind")):
             continue
         path = Path(str(row.get("path") or "").strip()).expanduser()
         if (ion_mode or _name_polarity(path.name)) != "Negative":
             continue
         if path.suffix.casefold() != ".msp" or not path.is_file() or path.stat().st_size == 0:
             continue
-        from .lab_lcms_metabolomics import precursor_plus_1008_census
-
-        where = f"libraries.annotators ({row.get('label') or row.get('annotator_id') or path.name})"
+        checks.append((f"libraries.annotators ({row.get('label') or row.get('annotator_id') or path.name})", path))
+    # Every file's census is started before any is waited for, and all are waited for against one deadline: two
+    # large files are read side by side, and the plan waits CENSUS_PLAN_WAIT_SECONDS at most, not that per file.
+    deadline = time.monotonic() + CENSUS_PLAN_WAIT_SECONDS
+    for _where, path in checks:
         try:
-            census = precursor_plus_1008_census(path)
+            _plus_1008_census(path, 0.0)
+        except OSError:
+            pass  # said below, by the wait that collects it
+    for where, path in checks:
+        try:
+            census, reading = _plus_1008_census(path, max(0.0, deadline - time.monotonic()))
         except OSError as error:
             problems.append(
                 f"{where}: {path.name} cannot be read ({error.strerror or error}) to check it for the peak at the "
                 "precursor m/z + 1.008. Plan again once it can."
             )
+            continue
+        if census is None:
+            problems.append(f"{where}: {reading}")
             continue
         carrying = census["with_precursor_plus_1008_peak"]
         if carrying:
@@ -1953,6 +2020,36 @@ def _predicted_annotator_problems(answers: dict[str, Any]) -> list[str]:
                 "use. Give the file with the peak removed."
             )
     return problems
+
+
+# How long one plan waits for a library's +1.008 census before it says the census is still being read. The MCP
+# tools answer within 40 s (mcp_server.TOOL_REPLY_BUDGET_SECONDS), and a plan does more than this.
+CENSUS_PLAN_WAIT_SECONDS = 15.0
+
+
+def _plus_1008_census(path: Path, wait_seconds: float | None = None) -> tuple[dict[str, Any] | None, str]:
+    """(census, "") once a library's +1.008 census is known; (None, why) while it is still being read.
+
+    The first census of a 2 GB library outlasted the plan's HTTP wait in V2, which answered "timed out" while the
+    census went on. It is read in a thread of its own (precursor_plus_1008_census_within): the plan waits for it
+    CENSUS_PLAN_WAIT_SECONDS at most and is otherwise refused, never accepted unchecked, with a blocker that says
+    how far the read has come; the next plan collects it, and the count is kept for that file version, also
+    across a restart. A file that cannot be read raises its OSError. ``wait_seconds`` replaces the wait.
+    """
+    from .lab_lcms_metabolomics import precursor_plus_1008_census_within
+
+    found = precursor_plus_1008_census_within(path, CENSUS_PLAN_WAIT_SECONDS if wait_seconds is None else wait_seconds)
+    if found["state"] == "counted":
+        return found["census"], ""
+    size = int(found.get("size_bytes") or 0)
+    read = int(found.get("bytes_read") or 0)
+    share = f"{read / size:.0%} of {size / 1e9:.2f} GB read" if size else "being read"
+    started = dt.datetime.fromtimestamp(float(found.get("started_at") or 0)).astimezone().strftime("%H:%M:%S")
+    return None, (
+        f"{path.name} is still being checked for the peak at the precursor m/z + 1.008 ({share}, since {started}); "
+        "it is not searched until that check is done. Plan again in a minute: the check carries on, and its count "
+        "is kept for this version of the file."
+    )
 
 
 def _same_library_file(left: Path, right: Path) -> bool:
