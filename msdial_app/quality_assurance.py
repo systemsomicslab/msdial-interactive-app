@@ -49,10 +49,10 @@ UNRECORDED_ORDER_SOURCES = frozenset({"listing", "embedded"})
 UNRECORDED_ORDER_REASON = "the injection order was not recorded for every file"
 # The QA counts a feature-injection cell "Reference matched" only where its accepted annotation is no in-silico
 # match: an MS/MS match against a predicted spectrum is never an identification (the MS-DIAL author's decision of
-# 2026-10-28). A Console with that change writes the in-silico cells in their own column and leaves them out of
-# "Reference matched"; a Console before it (MS-DIAL 103c3b535 and earlier) marks them "Reference matched", and they
-# are found from the run's per-file peak tables (<file>.mdpeak, their Evidence source and annotator) through its
-# peak-ID matrix (<alignment>.mdpeakid.tsv), both written beside the QA matrix.
+# 2026-10-28). A Console with that change (MsdialWorkbench #853) writes the in-silico cells in their own column and
+# leaves them out of "Reference matched"; a Console before it (MS-DIAL 103c3b535 and earlier) marks them "Reference
+# matched", and they are found from the run's per-file peak tables (<file>.mdpeak, their Evidence source and
+# annotator) through its peak-ID matrix (<alignment>.mdpeakid.tsv), both written beside the QA matrix.
 IN_SILICO_MATCHED_COLUMN = "In-silico matched"
 PEAK_ID_MATRIX_SUFFIX = ".mdpeakid.tsv"
 PEAK_TABLE_SUFFIX = ".mdpeak"

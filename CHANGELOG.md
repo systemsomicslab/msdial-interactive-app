@@ -17,7 +17,8 @@ The MS-DIAL author's decision of 2026-10-28: the QA's "Reference matched" never 
   `run_order_reference_match_correlation`, in the web page's reference-match plot, and in figures 05 (the PCA's
   features) and 06 (blue bars). It now reads such a cell as `in_silico_matched` and not as `reference_matched`
   (`quality_assurance.ReferenceMatchReading`, used by the QA report and by the figures' own read of the matrix): from
-  the matrix's own `In-silico matched` column where the Console writes one (the companion MS-DIAL change), and
+  the matrix's own `In-silico matched` column where the Console writes one (the companion MS-DIAL change,
+  MsdialWorkbench #853, which also leaves such a cell out of `Reference matched`), and
   otherwise from the run's per-file peak tables (`<file>.mdpeak`: Evidence source `InSilico`, code 450 where no
   evidence source is recorded, or the Comment's annotator an MSP row of library kind predicted in
   `msp_annotator_settings.tsv`) through its peak-ID matrix (`<alignment>.mdpeakid.tsv`), all beside the matrix. The
@@ -30,8 +31,10 @@ The MS-DIAL author's decision of 2026-10-28: the QA's "Reference matched" never 
   a warning says so. On verification run V2's four-tier MTBKS64-b (read only), the reference-matched cells of
   detected peaks fall from 625 to 610 (242/125/162/96 to 237/121/159/93 per injection), 15 cells being in-silico:
   the 14 the gate's LIB-3 records on features an in-silico match represents, and one whose own peak an in-silico
-  match annotates while an acquired match represents its feature. Figures 05 and 06 count 401 reference-matched
-  features instead of 411. Every number now equals the three-tier MTBKS64-a's, which searched no in-silico library.
+  match annotates while an acquired match represents its feature. Figure 05's PCA takes 401 reference-matched
+  features instead of 411 (the run has no Blank, so figure 06 is not drawn), and the run-order correlation of the
+  reference-match counts is 0.533 instead of 0.525. Every number now equals the three-tier MTBKS64-a's, which
+  searched no in-silico library.
   Figures drawn by 0.5.49 are drawn again (their manifest records the version).
 
 ## [0.5.49] - Unreleased
