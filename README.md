@@ -378,7 +378,8 @@ Agent Skill `skills/msdial-lcms-metabolomics-workflow`.
    across polarities. The order is the preferred adduct (`[M+H]+`, `[M-H]-`, the
    salt's `[M+HCOO]-` or `[M+CH3COO]-`), then the MS/MS-matched row, then the larger
    mean. `reference_matched_only` (on) and `preferred_adducts_only` (off) are options
-   of each merge.
+   of each merge; an accepted in-silico match is never reference matched, and has its
+   own `In-silico matched` column.
 
 ## Publication reporting
 

@@ -253,7 +253,8 @@ is. One Console runs at a time.
 
 Each standard of a polarity is looked for in that polarity's run with lipidomics' resolver, at the m/z of
 its adduct and within the internal-standard RT tolerance:
-- A: one of the contract's libraries annotated it by its name;
+- A: one of the contract's libraries annotated it by its name, never by an in-silico match (a library of
+  `library_kind` `predicted`, or a match whose evidence source is `InSilico`): such a spot falls to C or D;
 - B: its own text row annotated it as a reference match;
 - C: its text row matched, but another annotation won the spot or the match is below the score cutoff;
 - D: any spot there.
@@ -308,7 +309,15 @@ The result is one metabolome from the normalized matrices of every polarity the 
    reach them; normalize warns when the project was saved well after the exports.
 2. **Options**, chosen when the merge is called and recorded with it:
    - `reference_matched_only`: keep only rows whose representative annotation is a reference match, what
-     the GUI shows as "Ref. matched". Default on.
+     the GUI shows as "Ref. matched". Default on. An accepted in-silico (predicted-spectrum) match is never a
+     reference match, although MS-DIAL's candidate table marks it `is_reference_matched`: its row is dropped
+     with the reason `in-silico matched`, apart from `not reference matched`, and counted in
+     `counts.in_silico_matched_removed`. It is read from the candidate table's `evidence_source` (`InSilico`)
+     where the Console writes one, else the export's `Evidence source`, else code 450, and from the
+     libraries the contract searched as `predicted` spectra. An LBM2 match is rule-based MS/MS diagnostics,
+     not an in-silico match, and stays a reference match; so does a library of predicted retention times
+     whose spectra are acquired. With the option off, such a row is kept with `In-silico matched` TRUE and
+     `Reference matched` FALSE (`counts.in_silico_matched_kept`).
    - `preferred_adducts_only`: keep only the preferred adducts. Default off.
 3. **Duplicates:** rows of one compound are one, within a polarity and across polarities. What one compound
    is, `inchikey_match`, and which row is kept, `duplicate_rule`, are the person's answers at the check, fixed
@@ -316,13 +325,17 @@ The result is one metabolome from the normalized matrices of every polarity the 
    - `inchikey_match`: `first_block` (the first 14 characters: stereoisomers are one compound) or
      `first_two_blocks` (they stay apart).
    - `duplicate_rule` `evidence`: the annotation matched on RT and MS/MS (the export's RT matched and MS/MS
-     matched), then on MS/MS alone, then on RT alone; then the higher library priority, the preferred adduct,
-     the larger mean normalized height over Sample and QC, the higher total score, positive before negative,
-     the lower alignment ID. A match with the laboratory's own RT is kept over a stronger MS/MS-only one.
+     matched), then on MS/MS alone, then on RT alone, then on MS/MS against an in-silico spectrum alone, then
+     a precursor-only suggestion; then the higher library priority, the preferred adduct, the larger mean
+     normalized height over Sample and QC, the higher total score, positive before negative, the lower
+     alignment ID. A match with the laboratory's own RT is kept over a stronger MS/MS-only one. An accepted
+     in-silico match is an MS2 match (code 450) but never an identification (the MS-DIAL author's decision of
+     2026-10-28): it ranks below every match a reference spectrum or RT supports, and above a precursor-only
+     suggestion. This matters only with `reference_matched_only` off, since the option drops in-silico rows.
    - `duplicate_rule` `intensity`: a preferred adduct (`[M+H]+`, `[M-H]-`, and the salt's negative adduct:
      `[M+HCOO]-` for ammonium formate or formic acid, `[M+CH3COO]-` for ammonium acetate, none for ammonium
-     bicarbonate; compared as ions, so `[M+FA-H]-` counts as `[M+HCOO]-`); matched on MS/MS before a
-     precursor-only suggestion; the larger mean; then the library priority, the total score, positive before
+     bicarbonate; compared as ions, so `[M+FA-H]-` counts as `[M+HCOO]-`); matched on MS/MS (a reference
+     match, never an in-silico one) before a precursor-only suggestion; the larger mean; then the library priority, the total score, positive before
      negative, the lower alignment ID.
    - `duplicate_rule` `keep_all`: every row is kept, and the rows of one compound are counted
      (`duplicates_kept`).
@@ -335,7 +348,8 @@ The result is one metabolome from the normalized matrices of every polarity the 
    table's sample names.
 6. **Outputs** in `<root>/quant/<output_folder>` (default `metabolome`):
    - `metabolome.csv`: quoted CSV. Polarity, alignment ID, InChIKey first block, library label, reference
-     matched, preferred adduct, then MS-DIAL's metadata columns and the normalized sample columns.
+     matched, in-silico matched, preferred adduct, then MS-DIAL's metadata columns and the normalized sample
+     columns.
    - `metabolome_samples.csv`: each sample's class, file type, injection order and batch.
    - `metabolome_removed.tsv`: every row the merge removed, with its reason and, for a duplicate, the row
      that was kept.

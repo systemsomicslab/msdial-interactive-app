@@ -3971,11 +3971,14 @@ def msdial_lcms_metabolomics_merge(
     matrices are the exports the run wrote, so curation in the GUI after the run does not reach them. Then
     the options:
     reference_matched_only (default true: only rows whose representative annotation is a reference match,
-    what the GUI calls Ref. matched) and preferred_adducts_only (default false: only [M+H]+, [M-H]- and the
+    what the GUI calls Ref. matched; an accepted in-silico (predicted-spectrum) match is never one, so its row
+    is dropped as "in-silico matched" and counted in counts.in_silico_matched_removed, while an LBM2 match
+    stays a reference match) and preferred_adducts_only (default false: only [M+H]+, [M-H]- and the
     salt's negative adduct, [M+HCOO]- for formate or formic acid, [M+CH3COO]- for acetate). Rows of one
     compound (inchikey_match: the InChIKey's first block, or its first two blocks) are one, within and across
     polarities, and duplicate_rule says which row is kept: evidence (RT and MS/MS matched, then MS/MS alone,
-    then the library's priority, the preferred adduct and the intensity), intensity (the preferred adduct,
+    then RT alone, then an in-silico MS/MS match, then a precursor-only suggestion; then the library's
+    priority, the preferred adduct and the intensity), intensity (the preferred adduct,
     then MS/MS matched, then the larger mean normalized height over Sample and QC, then the library's
     priority), or keep_all (every row kept, the duplicates counted). Both follow the contract's answers
     unless given; a different one is applied and reported in deviations_from_contract. A row without an
@@ -3983,7 +3986,8 @@ def msdial_lcms_metabolomics_merge(
     polarities' samples are paired by the contract's sample table, whatever the file names.
 
     confirmed=false returns the counts and writes nothing; confirmed=true writes metabolome.csv (quoted CSV:
-    polarity, alignment ID, InChIKey first block, library, reference matched, preferred adduct, MS-DIAL's
+    polarity, alignment ID, InChIKey first block, library, reference matched, in-silico matched, preferred
+    adduct, MS-DIAL's
     metadata, the normalized sample columns), metabolome_samples.csv, metabolome_removed.tsv (every removed
     row with its reason and, for a duplicate, the row kept) and merge-report.json into
     <analysis_root>/quant/<output_folder>. Merges with other options can sit side by side under other

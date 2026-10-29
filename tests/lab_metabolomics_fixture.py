@@ -10,7 +10,7 @@ from typing import Any
 from unittest.mock import patch
 
 from lab_batch_fixture import EVERY_CAPABILITY
-from lab_export_fixture import candidate, spot, write_candidates, write_export
+from lab_export_fixture import CANDIDATE_EVIDENCE_COLUMNS, candidate, spot, write_candidates, write_export
 
 from msdial_app import lab_lcms_metabolomics_agent, lab_lipidomics
 from msdial_app.lab_lcms_metabolomics_agent import CONTRACT_KEY, PLAN_BLOCK
@@ -240,11 +240,17 @@ def _samples(label: str, stems: list[tuple[str, str]]) -> list[tuple[str, str, s
 
 
 def export_spot(item: dict[str, Any]) -> dict[str, Any]:
-    keys = {key: value for key, value in item.items() if key not in {"inchikey", "matched", "rt_matched", "ms2_matched"}}
+    keys = {key: value for key, value in item.items()
+            if key not in {"inchikey", "matched", "rt_matched", "ms2_matched", "evidence_source", "code"}}
     keys.setdefault("adduct", "[M+H]+")
     keys["unit"] = "Height"
     exported = spot(**keys)
     exported["INCHIKEY"] = item.get("inchikey", "null")
+    # The representative's evidence record, where the item says it: "null" is what a Console writes for none.
+    if "evidence_source" in item:
+        exported["Evidence source"] = item["evidence_source"] or "null"
+    if "code" in item:
+        exported["Annotation tag (VS1.0)"] = str(item["code"])
     exported["Total score"] = "0.9"
     # As the Console writes them (bool.ToString()): an MS/MS match unless said, RT only where said.
     exported["RT matched"] = str(bool(item.get("rt_matched", False)))
@@ -255,11 +261,13 @@ def export_spot(item: dict[str, Any]) -> dict[str, Any]:
 def write_run(
     batch: MetabolomicsBatch, contract_path: str, polarity: str, *, salt: str = "HCOONH4",
     spots: list[dict[str, Any]] | None = None, gap_filled: dict[int, list[str]] | None = None,
-    peak_ids: bool = True,
+    peak_ids: bool = True, candidate_evidence: bool = False,
 ) -> dict[str, Any]:
     """What a production run of the contract leaves in its output folder, and the job that made it.
 
     The peak-ID matrix marks a zero height and every injection gap_filled names (by stem) as -1.
+    candidate_evidence writes the candidates file as a Console with its evidence_source column does; an item's
+    evidence_source and code reach that column, annotation_tag_vs1 and the export either way.
     """
     label = "Pos" if polarity == "Positive" else "Neg"
     output = batch.analysis / label.lower()
@@ -288,8 +296,13 @@ def write_run(
         row = candidate(item["alignment_id"], item["name"], annotator=item["method"], source=source,
                         matched=item.get("matched", True), suggested=not item.get("matched", True))
         row["priority"] = priorities.get(item["method"], "1")
+        if "code" in item:
+            row["annotation_tag_vs1"] = str(item["code"])
+        if candidate_evidence:
+            row["evidence_source"] = str(item.get("evidence_source") or "")
         rows.append(row)
-    candidates = write_candidates(output / f"{ALIGNMENT}.mdcandidate.tsv", rows)
+    candidates = write_candidates(output / f"{ALIGNMENT}.mdcandidate.tsv", rows,
+                                  CANDIDATE_EVIDENCE_COLUMNS if candidate_evidence else None)
     project = output / f"{PROJECT}.mddata"
     project.write_bytes(b"project")
     (output / "method.txt").write_text(f"Ion mode: {polarity}\nSolvent type: {salt}\n", encoding="utf-8")
