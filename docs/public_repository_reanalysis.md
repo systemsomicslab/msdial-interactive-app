@@ -71,7 +71,19 @@ record name it, and its `campaign_disposition` lists it in `excluded_inputs`,
 as it lists an mzML excluded as `unsupported_mzml_encoding` or an mzXML as
 `polarity_contradicts_declaration`, so the gate's INP-1 accounts for the
 declared input. A unit left with no input is excluded with the reasons, and
-its preflight skips it. A full disk, or a file another process holds
+its preflight skips it.
+
+CID/HCD only (0.5.52, the user's rule of 2026-10-29). Every reference spectrum
+the campaign annotates with is CID/HCD-derived, so a campaign lease also keeps
+out, with reason `fragmentation_not_cid_hcd`, an input whose evidence names
+another fragmentation method (EAD, OAD, ECD, ETD, EThcD, EID, UVPD, IRMPD and
+the like): a whole token of its file name (`..._OAD_NEG_ddMS_10eV_...`), an
+mzML's activation cvParams, or a converted mzXML's `activationMethod`. Absence
+of evidence means run. No vendor reader reports the method (the SCIEX
+Wiff2Reader writes CID for every spectrum), so the manifest's
+`fragmentation_check` records, by format, where the method was read and where
+it was not. A unit the rule leaves with no input is excluded by its campaign
+disposition. Outside a campaign nothing is kept out for it. A full disk, or a file another process holds
 (`EACCES`/`EPERM`, after the converter has waited for it), is not a failed
 conversion: the lease stops at its `convert` stage (`download_failed`), keeping
 the records written so far, and a retry converts the rest. A re-lease reuses a
@@ -575,6 +587,11 @@ The requested count is a target, not a quota. Selection does not weaken the
 GC/LC, untargeted, scan-acquisition, sample-count, or download-size criteria to
 fill ten positions. LC-MS records reported as `Both` require confirmation of
 true polarity switching or separation into positive and negative file groups.
+In a campaign (0.5.52, the user's decision of 2026-10-29) each file's polarity
+is read from its raw header: the unit is split into single-polarity parts, a
+file whose scans switch polarity is excluded as `polarity_switching`
+(unresolved mixed polarity is outside the campaign's scope), one whose header
+gives no polarity as `polarity_unresolved`, and the rest of the unit runs.
 
 Inspect one accession without downloading raw data:
 

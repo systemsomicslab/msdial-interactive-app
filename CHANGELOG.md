@@ -4,6 +4,34 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.52] - Unreleased
+
+The user's decisions of 2026-10-29 for the public-repository campaign: a unit whose repository record says `Both`
+polarities is admitted and split by polarity, and only CID/HCD data run. Built on 0.5.50 (0.5.51 is reserved by
+#84). Goes with the runner and gate change in msdial-public-reanalysis, which must merge with it.
+
+### Added
+- **CID/HCD only, in a campaign** (`msdial_app.fragmentation`, rule `cid_hcd_only_2026_10_29`). Every reference
+  spectrum the campaign annotates with is CID/HCD-derived, so a campaign lease keeps out an input whose evidence
+  names another fragmentation method (EAD, OAD, ECD, ETD, EThcD, EID, UVPD, IRMPD and the like), with reason
+  `fragmentation_not_cid_hcd`, the methods and the evidence, in `excluded_input_candidates` and the lineage's
+  excluded rows, and the rest of the unit runs. The evidence is the input's file name (a whole token of its base
+  name: `..._OAD_NEG_ddMS_10eV_...`, `..._EAD14eV_...`; a run of eight or more hexadecimal digits names nothing),
+  an mzML's activation cvParams as the encoding scan reads them (`scan_mzml_encoding` now records `activation`),
+  and a converted mzXML's `activationMethod` as its conversion record counts it. Absence of evidence means run:
+  nothing is inferred. No vendor reader reports the method (RawMetadataExtractor records none, and the SCIEX
+  Wiff2Reader writes CID for every spectrum), so for those formats the manifest's new `fragmentation_check` says
+  the method was not read from the raw header. A unit left with no input by the rule is preflighted with nothing
+  read, and its campaign disposition excludes it (`fragmentation_not_cid_hcd`), or skips it where another input
+  was kept out for a reason that is not out of scope. Outside a campaign nothing changes.
+
+### Changed
+- **A `Both` unit's review reason says what a campaign does with it**: each file's polarity is read from its raw
+  header, the unit is split into single-polarity parts, and a file whose scans switch polarity is excluded. The
+  campaign disposition already did so; it now also says, in its detail, how many inputs were excluded as
+  `polarity_switching` (unresolved mixed polarity, outside the campaign's scope) or `polarity_unresolved`, and
+  that the rest of the unit runs.
+
 ## [0.5.50] - Unreleased
 
 The MS-DIAL author's decision of 2026-10-28: the QA's "Reference matched" never counts an in-silico match. Built on
