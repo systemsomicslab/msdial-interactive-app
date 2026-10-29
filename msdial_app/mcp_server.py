@@ -2289,6 +2289,10 @@ def msdial_split_repository_unit(
                 "analysis_unit_id": part.get("analysis_unit_id"),
                 "job_id": part.get("job_id"),
                 "acquisition_mode": part.get("acquisition_mode"),
+                # The part's polarity ("" where the split did not divide by it) and its whole split key: a campaign
+                # runs a part of a Both unit in its own polarity (2026-10-29), and records it from here.
+                "polarity": str(part.get("polarity") or ""),
+                "split_key": part.get("split_key") or {},
                 "workspace": part.get("workspace"),
                 "manifest_path": part.get("manifest_path"),
                 "file_count": part.get("file_count", len(files)),

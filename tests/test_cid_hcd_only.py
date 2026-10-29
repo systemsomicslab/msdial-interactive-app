@@ -11,15 +11,18 @@ rest runs.
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from msdial_app.fragmentation import (
     CID_HCD_ONLY_RULE,
     EVIDENCE_FILE_NAME,
     EVIDENCE_MZML_ACTIVATION,
     EVIDENCE_MZXML_ACTIVATION,
+    EVIDENCE_SAMPLE_ROW,
     NOT_CID_HCD,
     RAW_HEADER_NOT_READ,
     classify_activation_term,
@@ -28,7 +31,9 @@ from msdial_app.fragmentation import (
     instrument_can,
     methods_in_file_name,
     methods_named,
+    stated_methods,
 )
+from msdial_app import mcp_server
 from msdial_app.mzml_encoding import scan_mzml_encoding
 from msdial_app.raw_metadata_preflight import decide_disposition
 from msdial_app.repository_reanalysis import (
@@ -36,6 +41,7 @@ from msdial_app.repository_reanalysis import (
     RepositoryProject,
     create_download_lease,
     read_manifest,
+    split_unit_by_acquisition,
 )
 
 from test_download_lease_record import _Client, _project
@@ -96,6 +102,21 @@ class FileNamesNameAMethodByAWholeToken(unittest.TestCase):
                      "ecd4f2a19b0c4d1e9f8a7b6c5d4e3f21", "EADx.raw", "OADS.raw"):
             with self.subTest(name=name):
                 self.assertEqual([], methods_named(name))
+
+    def test_an_identifier_names_nothing(self) -> None:
+        # A hyphenated GUID, and an all-hexadecimal run that holds a digit, are identifiers (review L1).
+        for name in ("raw/x.d/95c44b45-ead1-43e8-afd1-de952d13d4ae_1.mcf", "ecd2_scan.raw", "S_ead1.raw",
+                     "a-ECD0-b.raw"):
+            with self.subTest(name=name):
+                self.assertEqual([], methods_in_file_name(name))
+        self.assertEqual(["EAD"], methods_in_file_name("S_EAD_1.raw"))
+        self.assertEqual(["EDD"], methods_in_file_name("x_EDD_y.raw"))
+
+    def test_a_row_states_a_method_only_in_a_field_that_states_one(self) -> None:
+        self.assertEqual(["OAD"], stated_methods({"analyticalCondition / Fragmentation method": "OAD",
+                                                  "Extract Name": "X_EAD_1"}))
+        self.assertEqual(["EAD"], stated_methods({"Dissociation": "electron-activated dissociation"}))
+        self.assertEqual([], stated_methods({"Parameter Value[Instrument] collision cell": "Orbitrap Velos ETD"}))
 
     def test_activation_terms_and_texts_are_classified(self) -> None:
         self.assertEqual("other_method", classify_activation_term("electron activated dissociation"))
@@ -260,6 +281,22 @@ class TheCampaignLeaseKeepsThemOut(unittest.TestCase):
         self.assertEqual(["AA_EAD_A_1.mzML"], [Path(item).name for item in written["input_candidates"]])
         self.assertEqual(1, written["fragmentation_check"]["names_not_credible_on_instrument"]["count"])
 
+    def test_a_sample_row_that_states_a_method_keeps_its_files_out(self) -> None:
+        # Review M2: the plan maps a row that states the method to its files, and the lease keeps the same files out.
+        payloads = {"S1.mzML": mzml(_spectra(CID)), "S2.mzML": mzml(_spectra(CID))}
+        files = [RepositoryFile(f"FILES/{name}", len(data), f"https://example.org/{name}") for name, data in payloads.items()]
+        project = _project(files, list(payloads))
+        project.sample_metadata[1]["values"] = {"analyticalCondition / Fragmentation method": "EAD"}
+        with tempfile.TemporaryDirectory() as temporary:
+            client = _Client({f"https://example.org/{name}": data for name, data in payloads.items()})
+            lease = create_download_lease(project, Path(temporary), 10_000_000, client=client,
+                                          campaign_authorization=dict(_APPROVAL))
+            written = read_manifest(lease["manifest_path"])
+
+        self.assertEqual(["S1.mzML"], [Path(item).name for item in written["input_candidates"]])
+        (item,) = written["excluded_input_candidates"]
+        self.assertEqual(("S2.mzML", EVIDENCE_SAMPLE_ROW, ["EAD"]), (Path(item["path"]).name, item["evidence"], item["methods"]))
+
     def test_outside_a_campaign_nothing_is_kept_out(self) -> None:
         payloads = {"S1_EAD.mzML": mzml(_spectra(EAD))}
         with tempfile.TemporaryDirectory() as temporary:
@@ -330,6 +367,46 @@ class ABothUnitSplitsByPolarity(unittest.TestCase):
 
         self.assertEqual(("exclude", ["polarity_switching_out_of_scope"]),
                          (disposition["disposition"], disposition["reasons"]))
+
+
+class TheSplitToolCarriesEachPartsPolarity(unittest.TestCase):
+    """Review M1: msdial_split_repository_unit projects each part of the real split, its polarity and split key among
+    them, so a campaign records a part of a Both unit in its own polarity."""
+
+    def test_a_real_polarity_split_reaches_the_tool_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "mb_post" / "MPST1" / "uboth"
+            data = root / "raw" / "data"
+            data.mkdir(parents=True)
+            (root / "provenance").mkdir()
+            files = []
+            for name in ("S1_pos.wiff2", "S1_neg.wiff2", "S2_pos.wiff2", "S2_neg.wiff2"):
+                (data / name).write_bytes(b"x")
+                files.append(str(data / name))
+            per_file = [{"file": item, "acquisition_mode": "DDA", "ms_levels": [1, 2], "outcome": "ok",
+                         "polarity": "Positive" if "_pos" in Path(item).name else "Negative"} for item in files]
+            manifest = {
+                "schema": "msdial-public-reanalysis-run.v1", "status": "preflight_review_required", "workspace": str(root),
+                "raw_directory": str(root / "raw"), "input_directory": str(data), "input_candidates": files,
+                "project": {"analysis_unit_id": "uboth", "repository": "mb_post", "accession": "MPST1", "ion_mode": "Both",
+                            "acquisition_mode": "DDA", "separation": "LC-MS", "untargeted": True,
+                            "sample_metadata": [{"sample_id": Path(item).stem, "raw_file": Path(item).name}
+                                                for item in files]},
+                "raw_metadata_preflight": {"summary": {"coverage": {"complete": True}, "acquisition_mode": "DDA",
+                                                       "per_file": per_file}},
+            }
+            path = root / "provenance" / "run-manifest.json"
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            split = split_unit_by_acquisition(path, confirmed=True)
+            with patch.object(mcp_server, "_request_json", return_value=split):
+                result = mcp_server.msdial_split_repository_unit(manifest_path=str(path), confirmed=True)
+
+        self.assertEqual([], split["blockers"])
+        self.assertEqual(
+            {"uboth-dda-pos": "Positive", "uboth-dda-neg": "Negative"},
+            {part["analysis_unit_id"]: part["polarity"] for part in result["parts"]},
+        )
+        self.assertEqual({"Positive", "Negative"}, {part["split_key"]["polarity"] for part in result["parts"]})
 
 
 if __name__ == "__main__":

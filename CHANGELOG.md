@@ -23,12 +23,21 @@ polarities is admitted and split by polarity, and only CID/HCD data run. Built o
   instrument recorded, counts as capable), else it is recorded in `names_not_credible_on_instrument` and keeps
   nothing out; an instrument's model name, such as "LTQ Orbitrap Velos ETD", is never evidence itself),
   an mzML's activation cvParams as the encoding scan reads them (`scan_mzml_encoding` now records `activation`),
-  and a converted mzXML's `activationMethod` as its conversion record counts it. Absence of evidence means run:
+  a converted mzXML's `activationMethod` as its conversion record counts it, and a sample row of the input's
+  sample that states the method in a field that states one ("analyticalCondition / Fragmentation method: OAD";
+  `stated_methods`, evidence `sample_row`), which no instrument is asked to confirm: the campaign plan maps such
+  rows to their files when only some rows state it, and the lease keeps the same files out. An identifier names
+  nothing: a hyphenated GUID, or an all-hexadecimal run that is eight long or holds a digit (`ead1`). Absence of evidence means run:
   nothing is inferred. No vendor reader reports the method (RawMetadataExtractor records none, and the SCIEX
   Wiff2Reader writes CID for every spectrum), so for those formats the manifest's new `fragmentation_check` says
   the method was not read from the raw header. A unit left with no input by the rule is preflighted with nothing
   read, and its campaign disposition excludes it (`fragmentation_not_cid_hcd`), or skips it where another input
   was kept out for a reason that is not out of scope. Outside a campaign nothing changes.
+
+### Fixed
+- **`msdial_split_repository_unit` returns each part's `polarity` and `split_key`.** The tool rebuilt each part from
+  a fixed list of keys without them, so a campaign recorded every part of a unit split by polarity with its parent's
+  ion mode (`Both`).
 
 ### Changed
 - **A `Both` unit's review reason says what a campaign does with it**: each file's polarity is read from its raw

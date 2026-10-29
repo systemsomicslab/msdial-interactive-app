@@ -56,7 +56,7 @@ from .download_store import (
     StoreLockTimeout,
     unlink_tree,
 )
-from .fragmentation import NOT_CID_HCD, exclude_non_cid_inputs
+from .fragmentation import NOT_CID_HCD, exclude_non_cid_inputs, stated_methods
 from .mzml_encoding import UNSUPPORTED_MZML_ENCODING, scan_mzml_encoding
 from .mzxml_conversion import (
     CONVERTER_NAME,
@@ -2341,7 +2341,11 @@ def create_download_lease(
             # CID/HCD only (user decision, 2026-10-29): an input whose name or header names another fragmentation
             # method is no candidate, on record with its evidence, and the rest of the unit runs.
             inputs, not_cid_hcd, fragmentation_check = _exclude_non_cid_hcd_inputs(
-                inputs, mzml_scans, conversion, _handoff_instrument(project)
+                inputs,
+                mzml_scans,
+                conversion,
+                _handoff_instrument(project),
+                _stated_inputs(project, inputs, data_root, archive_extractions),
             )
             excluded_inputs = [*excluded_inputs, *not_cid_hcd]
         ignored_inputs = len(all_inputs) - len(inputs) - len(excluded_inputs)
@@ -4131,6 +4135,7 @@ def _exclude_non_cid_hcd_inputs(
     mzml_scans: dict[str, dict[str, Any]],
     conversion: dict[str, Any] | None,
     instrument: str = "",
+    stated: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
     """(inputs that run, inputs kept out, the fragmentation_check record) under the CID/HCD-only rule.
 
@@ -4139,7 +4144,8 @@ def _exclude_non_cid_hcd_inputs(
     name, its mzML's activation terms (the encoding scan's) or, for a converted mzML, its mzXML's activationMethod
     (the conversion record's) names another method; absence of evidence means run (fragmentation.py). A file name
     counts only where ``instrument``, the unit's as its Catalog handoff records it (_handoff_instrument), could
-    fragment so. Only in a campaign, as the convert stage: outside one an EAD or OAD analysis is the analyst's choice.
+    fragment so. ``stated`` is _stated_inputs: the inputs whose sample's row states another method. Only in a
+    campaign, as the convert stage: outside one an EAD or OAD analysis is the analyst's choice.
     """
     activation: dict[str, dict[str, int]] = {}
     for record in ((conversion or {}).get("block") or {}).get("records") or []:
@@ -4149,7 +4155,43 @@ def _exclude_non_cid_hcd_inputs(
         output = str((record.get("output") or {}).get("path") or "")
         if isinstance(methods, dict) and output:
             activation[_file_key(str(Path(output).resolve()))] = methods
-    return exclude_non_cid_inputs(inputs, mzml_scans, activation, key=_file_key, instrument=instrument)
+    return exclude_non_cid_inputs(
+        inputs, mzml_scans, activation, key=_file_key, instrument=instrument, stated=stated
+    )
+
+
+def _stated_inputs(
+    project: RepositoryProject, inputs: list[str], data_root: Path, archive_extractions: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """{input's _file_key: {"sample_id", "methods"}} for each input whose sample row states a fragmentation method
+    other than CID/HCD in a field that states the method (fragmentation.stated_methods). The rows are the Catalog
+    handoff's, as the campaign plan read them; an input is its sample's as the analysis-CSV builder pairs it
+    (_input_samples), else by its sample row's raw_file name or stem."""
+    rows = [row for row in project.sample_metadata or [] if isinstance(row, dict)]
+    stated: dict[str, list[str]] = {}
+    by_name: dict[str, str] = {}
+    for row in rows:
+        sample = str(row.get("sample_id") or "").strip()
+        methods = stated_methods(row.get("values") or row.get("attributes") or {})
+        if sample and methods:
+            stated[sample] = list(dict.fromkeys([*stated.get(sample, []), *methods]))
+        raw = PurePosixPath(str(row.get("raw_file") or "").replace("\\", "/").rstrip("/")).name.casefold()
+        if sample and raw:
+            by_name.setdefault(raw, sample)
+            by_name.setdefault(PurePosixPath(raw).stem, sample)
+    if not stated:
+        return {}
+    paired = _input_samples(
+        {"project": project.as_dict(), "input_directory": str(data_root), "archive_extractions": archive_extractions},
+        inputs,
+    )
+    result: dict[str, dict[str, Any]] = {}
+    for item in inputs:
+        name = Path(str(item).rstrip("\\/")).name.casefold()
+        sample = paired.get(_file_key(item)) or by_name.get(name) or by_name.get(PurePosixPath(name).stem) or ""
+        if sample in stated:
+            result[_file_key(item)] = {"sample_id": sample, "methods": stated[sample]}
+    return result
 
 
 def _handoff_instrument(project: RepositoryProject) -> str:

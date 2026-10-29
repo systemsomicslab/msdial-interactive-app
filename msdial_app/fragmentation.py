@@ -18,7 +18,11 @@ WHAT COUNTS AS EVIDENCE OF AN INPUT, here (the campaign plan reads the repositor
 - an mzML's activation cvParams, as the encoding scan reads them over its first spectra (mzml_encoding.
   scan_mzml_encoding, activation): a dissociation-method term of another method (classify_activation_term);
 - a converted mzXML's activationMethod attributes, as its conversion record counts them
-  (precursors.activation_methods).
+  (precursors.activation_methods);
+- a row of the input's sample that states the method in a field that states one (stated_methods: "Fragmentation
+  method: OAD"), an explicit statement no instrument is asked to confirm. The campaign plan excludes a unit every
+  row of which states it, and plans one only some rows of which do, mapping those rows to their files; the lease
+  keeps the same files out (evidence sample_row).
 
 WHAT IS NOT READ. No vendor reader here reports the method. RawMetadataExtractor records none for Thermo, Shimadzu,
 Waters, Agilent or SCIEX files, and the SCIEX Wiff2Reader in RawDataHandler writes DissociationMethods.CID for
@@ -50,16 +54,37 @@ RULE_STATEMENT = (
 EVIDENCE_FILE_NAME = "file_name"
 EVIDENCE_MZML_ACTIVATION = "mzml_activation"
 EVIDENCE_MZXML_ACTIVATION = "mzxml_activation_method"
-# The methods a name may give, as they are written, keyed by their casefolded spelling. CID, HCD, CAD and PQD are
-# collisional and name nothing against an input.
+# A sample row of the input's sample that states the method ("Fragmentation method: OAD"), where not every row does:
+# the campaign plan maps such rows to their files and plans the unit, and the lease keeps those files out.
+EVIDENCE_SAMPLE_ROW = "sample_row"
+# THE TOKEN RULE, held identical in Interactive (fragmentation.py), the campaign plan and the gate. A token is whole
+# when no letter or digit stands before it and no letter after it. It names nothing inside an identifier: a run of
+# letters and digits that is all hexadecimal and either eight long or more or holds a digit (8ead4b2c, ead1), or a
+# hyphenated GUID (95c44b45-ead1-43e8-afd1-de952d13d4ae). With words, repository text may spell a method out.
 NON_CID_METHODS = ("EAD", "OAD", "ECD", "ETD", "EThcD", "ETciD", "NETD", "EDD", "EID", "UVPD", "IRMPD")
-_CANONICAL = {name.casefold(): name for name in NON_CID_METHODS}
-_TOKEN = re.compile(
-    r"(?<![A-Za-z0-9])(" + "|".join(sorted(NON_CID_METHODS, key=len, reverse=True)) + r")(?![A-Za-z])",
-    re.IGNORECASE,
+GUID_PATTERN = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+METHOD_WORDS_PATTERN = (
+    r"electron[- ]activated dissociation|oxygen[- ]attachment dissociation|electron[- ]capture dissociation|"
+    r"electron[- ]transfer dissociation|electron[- ]induced dissociation|ultraviolet photodissociation|"
+    r"infrared multiphoton dissociation"
 )
+WORD_METHODS = {"electron activated": "EAD", "oxygen attachment": "OAD", "electron capture": "ECD",
+                "electron transfer": "ETD", "electron induced": "EID", "ultraviolet photodissociation": "UVPD",
+                "infrared multiphoton": "IRMPD"}
+# A sample-row field that states how the ions were fragmented ("analyticalCondition / Fragmentation method"): an
+# explicit statement, held to no instrument and never read as the study's text. An instrument field names a model,
+# which says what the instrument can do, never what was done, and is no evidence at all.
+METHOD_STATEMENT_FIELD_PATTERN = r"fragment|dissociation|activation|collision"
+INSTRUMENT_FIELD_PATTERN = r"instrument"
+_CANONICAL_METHOD = {name.casefold(): name for name in NON_CID_METHODS}
+_METHOD_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9])(" + "|".join(sorted(NON_CID_METHODS, key=len, reverse=True)) + r")(?![A-Za-z])", re.IGNORECASE)
+_METHOD_WORDS = re.compile(METHOD_WORDS_PATTERN, re.IGNORECASE)
 _ALNUM_RUN = re.compile(r"[A-Za-z0-9]+")
-_HEX = re.compile(r"[0-9A-Fa-f]{8,}")
+_ALL_HEX = re.compile(r"[0-9A-Fa-f]+")
+_GUID = re.compile(GUID_PATTERN)
+_METHOD_STATEMENT_FIELD = re.compile(METHOD_STATEMENT_FIELD_PATTERN, re.IGNORECASE)
+_INSTRUMENT_FIELD = re.compile(INSTRUMENT_FIELD_PATTERN, re.IGNORECASE)
 # The words that make a dissociation-method term another method's (classify_activation_term), and those that make
 # it collisional. A term with neither (sustained off-resonance irradiation) is recorded and decides nothing.
 _OTHER_METHOD_WORDS = ("electron", "photo", "infrared", "ultraviolet", "oxygen", "ozone", "radical",
@@ -119,27 +144,48 @@ RAW_HEADER_NOT_READ_DETAIL = (
 )
 
 
-def methods_named(text: str) -> list[str]:
-    """The non-CID/HCD methods a name names by a whole token, in order and once each; [] for none."""
-    found: list[str] = []
+def methods_named(text: object, words: bool = False) -> list[str]:
+    """The non-CID/HCD methods a text names by a whole token (and, with `words`, by a spelled-out name), in order and
+    once each; [] for none."""
     value = str(text or "")
-    for match in _TOKEN.finditer(value):
-        run = next(
-            (item for item in _ALNUM_RUN.finditer(value) if item.start() <= match.start() < item.end()), None
-        )
-        if run is not None and _HEX.fullmatch(run.group(0)):
-            # A checksum or an identifier (8ead4b2c), not a word.
+    found: list[str] = []
+    guids = [(item.start(), item.end()) for item in _GUID.finditer(value)]
+    for match in _METHOD_TOKEN.finditer(value):
+        if any(start <= match.start() < end for start, end in guids):
             continue
-        name = _CANONICAL[match.group(1).casefold()]
+        run = next((item for item in _ALNUM_RUN.finditer(value) if item.start() <= match.start() < item.end()), None)
+        if run is not None and _ALL_HEX.fullmatch(run.group(0)) and (
+                len(run.group(0)) >= 8 or any(character.isdigit() for character in run.group(0))):
+            continue
+        name = _CANONICAL_METHOD[match.group(1).casefold()]
         if name not in found:
             found.append(name)
+    if words:
+        for match in _METHOD_WORDS.finditer(value):
+            spelled = re.sub(r"[- ]+", " ", match.group(0).casefold())
+            name = next(code for start, code in WORD_METHODS.items() if spelled.startswith(start))
+            if name not in found:
+                found.append(name)
     return found
 
 
-def methods_in_file_name(path: str | PurePath) -> list[str]:
-    """methods_named over the base name of a path (a vendor folder's own name)."""
-    text = str(path).rstrip("\\/")
+def methods_in_file_name(path: object) -> list[str]:
+    """methods_named over a path's base name (a vendor folder's own name)."""
+    text = str(path or "").rstrip("\\/")
     return methods_named(re.split(r"[\\/]", text)[-1] if text else "")
+
+
+def stated_methods(values: object) -> list[str]:
+    """The non-CID/HCD methods a sample row states in a field that states the method (METHOD_STATEMENT_FIELD_PATTERN),
+    an instrument field aside; [] for none."""
+    found: list[str] = []
+    for field, value in (values.items() if isinstance(values, dict) else []):
+        if _INSTRUMENT_FIELD.search(str(field)) or not _METHOD_STATEMENT_FIELD.search(str(field)):
+            continue
+        for name in methods_named(value, words=True):
+            if name not in found:
+                found.append(name)
+    return found
 
 
 def classify_activation_term(name: str) -> str:
@@ -173,6 +219,7 @@ def exclude_non_cid_inputs(
     mzxml_activation: Mapping[str, Mapping[str, int]] | None = None,
     key: Any = None,
     instrument: str = "",
+    stated: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
     """(the inputs that run, those kept out, the fragmentation_check record) under the rule.
 
@@ -181,8 +228,11 @@ def exclude_non_cid_inputs(
     from. An input is kept out where its file name, its mzML activation terms or its mzXML activation methods name
     another method; each exclusion records the methods, the evidence and the rule. A file name's method counts only
     where ``instrument`` (the unit's, as its Catalog handoff records it) could fragment so (instrument_can); one it
-    could not is recorded as not credible on that instrument and keeps nothing out. Never raises.
+    could not is recorded as not credible on that instrument and keeps nothing out. ``stated`` maps an input's key
+    to {"sample_id", "methods"} where its sample's row states another method (stated_methods): an explicit
+    statement, held to no instrument. Never raises.
     """
+    stated = stated or {}
     key = key or (lambda value: value)
     mzml_scans = mzml_scans or {}
     mzxml_activation = mzxml_activation or {}
@@ -206,6 +256,11 @@ def exclude_non_cid_inputs(
         if len(credible) < len(named):
             not_credible.append({"name": Path(text.rstrip("\\/")).name,
                                  "methods": [method for method in named if method not in credible]})
+        row = stated.get(key(text))
+        if row and row.get("methods"):
+            methods = [str(item) for item in row["methods"]]
+            sample = str(row.get("sample_id") or "the input's")
+            evidence.append((EVIDENCE_SAMPLE_ROW, methods, f"sample {sample}'s row states {', '.join(methods)}"))
         label = input_format_label(text)
         scan = mzml_scans.get(key(text))
         activation = mzxml_activation.get(key(text))
