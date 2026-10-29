@@ -1144,7 +1144,10 @@ class DispositionMatrixTests(unittest.TestCase):
 
         self.assertEqual("run", inferred["disposition"])
         self.assertIn("untargeted_inferred_from_headers", inferred["warnings"])
-        self.assertEqual(("skip", ["untargeted_unresolved"]), (not_inferable["disposition"], not_inferable["reasons"]))
+        # No header could be read and the unit declares DDA: since 2026-10-29 that is untargeted in the campaign's
+        # scope, inferred from the declared acquisition (untargeted_inferred_from_declared_acquisition).
+        self.assertEqual(("run", []), (not_inferable["disposition"], not_inferable["reasons"]))
+        self.assertIn("untargeted_inferred_from_declared_acquisition", not_inferable["warnings"])
 
     def test_a_targeted_study_is_excluded(self) -> None:
         disposition = self.decide([_header("a.mzML", "DDA")], declared={"untargeted": False})
@@ -1572,7 +1575,10 @@ class CampaignPreflightTests(_Scratch):
     def test_a_declared_mrm_unit_with_weak_dda_headers_is_held_back_not_run_as_dda(self) -> None:
         # The DDA headers decide the acquisition (2026-10-06), but untargeted status is never inferred over a
         # declared targeted acquisition, so a unit that does not declare it untargeted does not run.
-        manifest, _stub, _ = self.campaign_unit(["a.wiff", "b.wiff"], acquisition="MRM", untargeted=None)
+        manifest, _stub, files = self.campaign_unit(["a.wiff", "b.wiff"], acquisition="MRM", untargeted=None)
+        for path in files:
+            # The .wiff.scan the Console needs beside each .wiff (vendor_companion_missing otherwise, 0.5.53).
+            Path(str(path) + ".scan").write_bytes(b"scan")
         extractor = _PinnedExtractor.make(self.root / "build")
         weak = {name: {"method": "DDA", "confidence": 0.55} for name in ("a.wiff", "b.wiff")}
 

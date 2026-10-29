@@ -29,6 +29,7 @@ or split. It is the only place that mapping lives. The campaign runner reads the
 from __future__ import annotations
 
 import json
+import re
 import os
 import subprocess
 import time
@@ -1137,6 +1138,112 @@ DECLARATION_SOURCES = ("catalog_keyword_inference", "split_part", "unattributed"
 SPLIT_PARENT_DECLARED_FIELD = "parent_declared_acquisition_mode"
 _POLARITIES = {"Positive", "Negative"}
 _SWITCHING = {"PolaritySwitching", "MixedFunctions"}
+# A VENDOR COMPANION THE CONSOLE NEEDS (user decision, 2026-10-29). The Console reads a SCIEX .wiff only with its
+# x.wiff.scan beside it, and Interactive's run validation refuses the analysis without it ("WIFF.SCAN is not
+# accessible next to ..."; workflow.validate_state). MB-POST MPST000063 deposited 20 .wiff and no .wiff.scan: the
+# extractor read the .wiff headers and split the unit, and each part then failed at its diagnostic start, retried.
+# Such an input is excluded here with reason vendor_companion_missing and the companion's name, and a unit left with
+# none is excluded. Only that pair: it is the one the validation, and so the Console, holds an input to.
+VENDOR_COMPANION_MISSING = "vendor_companion_missing"
+REQUIRED_VENDOR_COMPANIONS = {".wiff": ".wiff.scan"}
+
+
+def missing_vendor_companion(path: str) -> str:
+    """The name of the companion the Console needs beside this input and does not find there; "" for none."""
+    text = str(path).rstrip("\\/")
+    for suffix, companion in REQUIRED_VENDOR_COMPANIONS.items():
+        if text.casefold().endswith(suffix) and Path(text).is_file():
+            needed = Path(text[: -len(suffix)] + companion)
+            return "" if needed.is_file() else needed.name
+    return ""
+
+
+# A FILE NAME'S POLARITY (user decision, 2026-10-29; FILE_NAME_POLARITY_RULE), held identical in Interactive
+# (raw_metadata_preflight.py) and the gate. Read only for an input whose raw header could not be read
+# (unsupported_format: the pinned extractor opens no ZenoTOF .wiff2), in a unit whose declaration names no single
+# polarity. The base name decides: a whole token pos, positive, neg or negative (between _ - . and spaces), or
+# ESI+ / ESI- / (+) / (-) with no letter after the sign (ESI-MS, ESI-QTOF name an ion source, not a polarity). A
+# pos/neg token beside a control or ctrl token names a sample (Neg_Ctrl_1), not a polarity; a QC or blank injection
+# keeps its polarity (QC_pos_01). A name that states both polarities, or neither, states none. A folder between the
+# unit's data root and the file (``root``) that states the opposite polarity makes the name state none, with both
+# tokens on record (POS/ER_neg_01.wiff2); one that states the same polarity is recorded beside it.
+FILE_NAME_POLARITY_RULE = "unreadable_header_polarity_from_file_name_2026_10_29"
+FILE_NAME_POLARITY_TOKENS = {"pos": "Positive", "positive": "Positive", "neg": "Negative", "negative": "Negative"}
+FILE_NAME_POLARITY_SIGNS = r"(?<![A-Za-z0-9])ESI\s*([+-])(?![A-Za-z])|\(([+-])\)(?![A-Za-z])"
+FILE_NAME_POLARITY_EXEMPTING = frozenset({"control", "ctrl"})
+_FILE_NAME_POLARITY_SIGNS = re.compile(FILE_NAME_POLARITY_SIGNS, re.IGNORECASE)
+_FILE_NAME_TOKEN_SPLIT = re.compile(r"[_\-. ]+")
+_FILE_NAME_SUFFIXES = (".wiff2", ".wiff", ".mzml", ".mzxml", ".raw", ".lcd", ".d", ".abf", ".cdf")
+
+
+def _polarity_tokens(text: str) -> dict[str, str]:
+    """{polarity: the first token that states it} in one name or folder name, by FILE_NAME_POLARITY_RULE's tokens."""
+    found: dict[str, str] = {}
+    for match in _FILE_NAME_POLARITY_SIGNS.finditer(text):
+        sign = match.group(1) or match.group(2)
+        found.setdefault("Positive" if sign == "+" else "Negative", match.group(0))
+    tokens = [token for token in _FILE_NAME_TOKEN_SPLIT.split(_FILE_NAME_POLARITY_SIGNS.sub(" ", text)) if token]
+    folded = [token.casefold() for token in tokens]
+    for index, token in enumerate(folded):
+        polarity = FILE_NAME_POLARITY_TOKENS.get(token)
+        if polarity is None:
+            continue
+        if any(neighbour in FILE_NAME_POLARITY_EXEMPTING for neighbour in folded[max(index - 1, 0):index + 2]):
+            continue
+        found.setdefault(polarity, tokens[index])
+    return found
+
+
+def file_name_polarity_reading(path: object, root: object = "") -> dict[str, object]:
+    """What FILE_NAME_POLARITY_RULE reads of a path: {"polarity": "Positive", "Negative" or "", "token": the name's
+    token, "folder_token": a folder's token stating the same polarity, "conflict": the tokens that leave it unresolved}.
+    ``root`` is the unit's data root; only folders below it are read, and none where the path is not under it."""
+    text = str(path or "").replace("\\", "/").rstrip("/")
+    parts = [part for part in text.split("/") if part]
+    name = parts[-1] if parts else ""
+    for suffix in _FILE_NAME_SUFFIXES:
+        if name.casefold().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    folders: list[str] = []
+    base = str(root or "").replace("\\", "/").rstrip("/")
+    if base and text.casefold().startswith(base.casefold() + "/"):
+        folders = [part for part in text[len(base) + 1:].split("/") if part][:-1]
+    stated = _polarity_tokens(name)
+    reading: dict[str, object] = {"polarity": "", "token": "", "folder_token": "", "conflict": []}
+    if len(stated) != 1:
+        if len(stated) > 1:
+            reading["conflict"] = sorted(stated.values())
+        return reading
+    ((polarity, token),) = stated.items()
+    same = ""
+    for folder in folders:
+        found = _polarity_tokens(folder)
+        opposite = [value for key, value in found.items() if key != polarity]
+        if opposite:
+            reading["conflict"] = [opposite[0], token]
+            return reading
+        same = same or found.get(polarity, "")
+    reading.update(polarity=polarity, token=token, folder_token=same)
+    return reading
+
+
+def file_name_polarity(path: object, root: object = "") -> tuple[str, str] | None:
+    """(polarity, the token that states it) from a path's base name, or None where it states none, both, or a folder
+    below ``root`` states the opposite (file_name_polarity_reading)."""
+    reading = file_name_polarity_reading(path, root)
+    return (str(reading["polarity"]), str(reading["token"])) if reading["polarity"] else None
+
+# Where an input's polarity came from, where it is not its header's or the unit's single declared polarity.
+POLARITY_SOURCE_FILE_NAME = "file_name"
+# UNTARGETED BY THE DECLARED ACQUISITION (user decision, 2026-10-29). A unit that runs on its declaration because no
+# input's header could be read (acquisition_declared_only), and declares DDA, DIA, AIF or SWATH, is untargeted: those
+# modes are an MS1 survey with product-ion spectra, untargeted by definition in this campaign's scope (targeted is
+# MRM, SRM, SIM or PRM). Recorded as the header path records its inference, never as a declaration; a declared
+# untargeted false still excludes, and an undeclared acquisition still skips.
+UNTARGETED_FROM_DECLARED_ACQUISITION = "untargeted_inferred_from_declared_acquisition"
+UNTARGETED_DECLARED_MODES = frozenset({"DDA", "DIA", "AIF", "SWATH"})
+POLARITY_FROM_FILE_NAME_WARNING = "polarity_inferred_from_file_name"
 _SEPARATION_NAMES = {
     "LiquidChromatography": "LC-MS",
     "GasChromatography": "GC-MS",
@@ -1146,6 +1253,7 @@ _SEPARATION_NAMES = {
 # File-level reasons that mean "out of scope" when every input has one; the others mean "unresolved".
 _OUT_OF_SCOPE_FILE_REASONS = (
     "ion_mobility_out_of_scope",
+    VENDOR_COMPANION_MISSING,
     "acquisition_out_of_scope:",
     "polarity_switching",
     "conversion_required",
@@ -1328,6 +1436,11 @@ def decide_disposition(
     detail: list[str] = []
     disagreements: list[dict[str, Any]] = []
     assignments: dict[str, dict[str, Any]] = {}
+    # Each input whose polarity was read from its file name (FILE_NAME_POLARITY_RULE): recorded in the disposition,
+    # on its assignment, and, for a split part, carried from its parent's split (manifest polarity_inferences).
+    polarity_inferences: list[dict[str, Any]] = []
+    # The untargeted inference a unit that runs on its declaration alone carries (UNTARGETED_FROM_DECLARED_ACQUISITION).
+    untargeted_inference: dict[str, Any] = {}
 
     def warn(code: str) -> None:
         if code and code not in warnings:
@@ -1392,6 +1505,8 @@ def decide_disposition(
             **({"split_parent_declared_acquisition_mode": parent_mode} if parent_mode else {}),
             "declared_vs_header": disagreements[:50],
             "detail": detail,
+            **({"polarity_inferences": polarity_inferences} if polarity_inferences else {}),
+            **({"untargeted_inference": dict(untargeted_inference)} if untargeted_inference else {}),
             **extra,
             "assignments": assignments,
         }
@@ -1464,6 +1579,16 @@ def decide_disposition(
                 + "); the declaration decides none of them."
             )
 
+    carried = [
+        dict(item) for item in manifest.get("polarity_inferences") or []
+        if isinstance(item, dict) and item.get("polarity_source") == POLARITY_SOURCE_FILE_NAME
+        and file_key(str(item.get("path") or "")) in {file_key(str(path)) for path in manifest.get("input_candidates") or []}
+    ]
+    if carried:
+        # A part split by the polarities its parent read from file names: its declared polarity is that inference,
+        # and it stays on record in every disposition of the part.
+        polarity_inferences.extend(carried)
+        warn(POLARITY_FROM_FILE_NAME_WARNING)
     if not preflight or not summary:
         reasons.append("raw_metadata_preflight_missing")
         detail.append("No raw-header preflight is recorded, so nothing is known from the data.")
@@ -1565,8 +1690,12 @@ def decide_disposition(
     uninspected: list[str] = []
     for path in candidates:
         entry = per_file.get(file_key(path)) or {}
+        companion = missing_vendor_companion(path)
         if path.casefold().endswith((".mzxml", ".mzdata", ".mzdata.xml")):
             exclude(path, "conversion_required")
+        elif companion:
+            # The Console cannot open it without its companion, whatever its header says (MPST000063).
+            excluded.append({"path": path, "reason": VENDOR_COMPANION_MISSING, "companion": companion})
         elif entry.get("has_ion_mobility") is True or _entry_format(path, entry) in ION_MOBILITY_FORMATS:
             exclude(path, "ion_mobility_out_of_scope")
         elif not entry:
@@ -1732,6 +1861,22 @@ def decide_disposition(
                 polarity_warned = True
         elif declared_polarity in _POLARITIES:
             polarity = declared_polarity
+        elif basis == "declaration" and entry.get("outcome") == OUTCOME_UNSUPPORTED:
+            # FILE_NAME_POLARITY_RULE (2026-10-29): the header could not be read (the pinned extractor opens no
+            # ZenoTOF .wiff2), the unit runs on its declared acquisition, and declares no single polarity: the
+            # name's one polarity token decides, on record, unless a folder below the data root states the other.
+            reading = file_name_polarity_reading(path, manifest.get("input_directory") or "")
+            if not reading["polarity"]:
+                excluded.append({"path": path, "reason": "polarity_unresolved",
+                                 **({"tokens": list(reading["conflict"])} if reading["conflict"] else {})})
+                continue
+            polarity = str(reading["polarity"])
+            warn(POLARITY_FROM_FILE_NAME_WARNING)
+            polarity_inferences.append({
+                "path": path, "polarity": polarity, "polarity_source": POLARITY_SOURCE_FILE_NAME,
+                "token": str(reading["token"]), "rule": FILE_NAME_POLARITY_RULE,
+                **({"folder_token": str(reading["folder_token"])} if reading["folder_token"] else {}),
+            })
         else:
             exclude(path, "polarity_unresolved")
             continue
@@ -1743,6 +1888,16 @@ def decide_disposition(
         assignments[file_key(path)] = {
             "path": path, "console_acquisition_type": console, "polarity": polarity, "basis": basis,
         }
+        inferred = next((item for item in polarity_inferences if file_key(item["path"]) == file_key(path)), None)
+        if inferred is not None:
+            assignments[file_key(path)].update(polarity_source=POLARITY_SOURCE_FILE_NAME, polarity_token=inferred["token"])
+    if polarity_inferences:
+        detail.append(
+            f"{len(polarity_inferences)} input(s) whose raw header could not be read (unsupported_format) take their "
+            "polarity from one polarity token in their file name ("
+            + "; ".join(f"{Path(item['path']).name}: {item['token']} -> {item['polarity']}" for item in polarity_inferences[:4])
+            + f"), the unit declaring no single polarity: an inference, on record ({FILE_NAME_POLARITY_RULE})."
+        )
 
     switching = sum(1 for item in excluded if item["reason"] == "polarity_switching")
     unresolved_polarity = sum(1 for item in excluded if item["reason"] == "polarity_unresolved")
@@ -1799,7 +1954,22 @@ def decide_disposition(
             and _entry_flag(per_file.get(file_key(path), {}), "has_ms2", 2) is True
             for path in runnable
         )
-        if not inferred:
+        on_declaration = bool(included) and all(basis == "declaration" for _p, _e, _c, basis in included)
+        if not inferred and not declared_targeted and on_declaration and declared_mode.upper() in UNTARGETED_DECLARED_MODES:
+            # UNTARGETED_FROM_DECLARED_ACQUISITION (2026-10-29): no header could be read, and the unit runs on its
+            # declared acquisition, which is untargeted by definition in this campaign's scope.
+            warn(UNTARGETED_FROM_DECLARED_ACQUISITION)
+            untargeted_inference.update(
+                basis="declared_acquisition", declared_acquisition_mode=declared_mode.upper(),
+                declaration_source=declared_source, rule=UNTARGETED_FROM_DECLARED_ACQUISITION,
+            )
+            detail.append(
+                f"The repository does not say whether the study is untargeted, no input's header could be read, and the "
+                f"unit runs on its declared {declared_mode.upper()} acquisition: an MS1 survey with product-ion spectra, "
+                f"untargeted in this campaign's scope, recorded as an inference ({UNTARGETED_FROM_DECLARED_ACQUISITION})."
+            )
+            inferred = True
+        elif not inferred:
             reasons.append("untargeted_unresolved")
             detail.append(
                 f"The repository does not say whether the study is untargeted, and declares {declared_as} "
@@ -1810,7 +1980,8 @@ def decide_disposition(
             )
             return result("skip")
         # An inference from how the data were acquired, recorded as one; never as a confirmation.
-        warn("untargeted_inferred_from_headers")
+        if not untargeted_inference:
+            warn("untargeted_inferred_from_headers")
 
     if len(groups) > 1:
         acquisitions = {console for console, _polarity in groups}

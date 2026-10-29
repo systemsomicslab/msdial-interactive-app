@@ -68,6 +68,7 @@ from .mzxml_conversion import (
 from .process_liveness import process_created_at, process_is_alive
 from .raw_metadata_preflight import (
     DECLARED_ARCHIVE_COPIES_WARNING,
+    missing_vendor_companion,
     INFERRED_PAIRING_WARNING,
     UNATTRIBUTED_MEMBER_PAIRING,
     UNATTRIBUTED_MEMBERS_RULE,
@@ -4632,6 +4633,9 @@ def _choose_encodings(
             return scanned[key]
         if key in unfinished:
             return encoding_rule.INCOMPLETE_CONTAINER
+        if missing_vendor_companion(item):
+            # A .wiff without its .wiff.scan the Console cannot open (2026-10-29): the sample's next encoding runs.
+            return encoding_rule.VENDOR_COMPANION_MISSING
         reason = headers.get(key, "")
         return "" if lenient and reason in encoding_rule.RAW_HEADER_REASONS else reason
 
@@ -6726,6 +6730,14 @@ def _apply_disposition(
                 "Untargeted status was inferred from the raw headers, which show DDA, DIA or AIF acquisition "
                 "with MS1 and MS2 in every input that runs: an inference, not a repository declaration."
             )
+        if "untargeted_inferred_from_declared_acquisition" in warnings and project.untargeted is None:
+            project.untargeted = True
+            mode = str((disposition.get("untargeted_inference") or {}).get("declared_acquisition_mode") or "")
+            lines.append(
+                f"Untargeted status was inferred from the declared {mode or 'untargeted'} acquisition, the raw headers "
+                "being unreadable: an MS1 survey with product-ion spectra, untargeted in this campaign's scope (user "
+                "decision, 2026-10-29). An inference, not a repository declaration."
+            )
         lines.append(
             f"Campaign disposition: run as {project.acquisition_mode} {project.ion_mode}"
             + (
@@ -8466,6 +8478,15 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 per_file[_file_key(item)] for item in part["input_candidates"] if _file_key(item) in per_file
             ],
         }
+        # The polarity the parent's disposition read from a file name for an input whose header could not be read
+        # (raw_metadata_preflight.FILE_NAME_POLARITY_RULE): the part's ion mode rests on it, so it stays on record.
+        part_keys_for_polarity = {_file_key(item) for item in part["input_candidates"]}
+        inferred = [
+            dict(item) for item in (parent.get("campaign_disposition") or {}).get("polarity_inferences") or []
+            if isinstance(item, dict) and _file_key(str(item.get("path") or "")) in part_keys_for_polarity
+        ]
+        if inferred:
+            part_manifest["polarity_inferences"] = inferred
         lineage = parent.get("input_lineage")
         if isinstance(lineage, dict):
             # The part reads the parent's files, so their lineage is the parent's, row for row. Without

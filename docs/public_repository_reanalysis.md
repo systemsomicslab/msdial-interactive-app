@@ -594,6 +594,12 @@ is read from its raw header: the unit is split into single-polarity parts, a
 file whose scans switch polarity is excluded as `polarity_switching`
 (unresolved mixed polarity is outside the campaign's scope), one whose header
 gives no polarity as `polarity_unresolved`, and the rest of the unit runs.
+Where an input's header cannot be read (`unsupported_format`: the pinned
+extractor opens no ZenoTOF .wiff2) and the unit runs on its declared
+acquisition, one polarity token of the file name (pos, neg, positive,
+negative, ESI+/ESI-, (+)/(-)) gives its polarity, recorded in the disposition's
+`polarity_inferences` (0.5.53). A SCIEX .wiff without its .wiff.scan is
+excluded as `vendor_companion_missing`; the Console cannot open it.
 
 Inspect one accession without downloading raw data:
 

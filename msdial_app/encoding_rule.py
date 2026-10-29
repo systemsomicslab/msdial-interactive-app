@@ -44,7 +44,7 @@ WHAT "READABLE" IS, AT THE LEASE. The caller's ``readability`` says what the lea
 whose arrays RawDataHandler cannot decode (mzml_encoding) is UNDECODABLE; an mzXML whose conversion failed, or whose
 scans contradict the declared polarity, is not readable (CONVERSION_FAILED, or the convert stage's own reason); an
 mzXML outside a campaign is no input (REQUIRES_CONVERSION). A vendor folder the unit lists member by member that did
-not arrive whole is INCOMPLETE_CONTAINER. A vendor file or folder whose raw header the raw-metadata extractor cannot
+not arrive whole is INCOMPLETE_CONTAINER, and a .wiff without its .wiff.scan VENDOR_COMPANION_MISSING. A vendor file or folder whose raw header the raw-metadata extractor cannot
 read is RAW_HEADER_UNREADABLE, or RAW_HEADER_UNSUPPORTED_FORMAT where the extractor has no reader for it: the same
 reasons the raw-header preflight excludes an input for, so a file the rule uses is one the preflight can read. The
 lease reads a vendor header only where the rule reaches a vendor candidate of a sample that has another candidate,
@@ -89,6 +89,9 @@ REQUIRES_CONVERSION = "requires_conversion"
 # A vendor candidate the lease could not take (clause 3): a listed folder that did not arrive whole, and a header the
 # raw-metadata extractor could not read (the raw-header preflight's own exclusion reasons).
 INCOMPLETE_CONTAINER = "incomplete_container"
+# A SCIEX .wiff whose .wiff.scan is not beside it, which the Console cannot open (raw_metadata_preflight.
+# missing_vendor_companion, user decision 2026-10-29): the sample's next encoding is taken (S1.wiff, S1.mzML).
+VENDOR_COMPANION_MISSING = "vendor_companion_missing"
 RAW_HEADER_UNREADABLE = "raw_header_unreadable"
 RAW_HEADER_UNSUPPORTED_FORMAT = "raw_header_unsupported_format"
 RAW_HEADER_REASONS = frozenset({RAW_HEADER_UNREADABLE, RAW_HEADER_UNSUPPORTED_FORMAT})

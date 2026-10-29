@@ -1,3 +1,3 @@
 """MS-DIAL Interactive cross-platform application."""
 
-__version__ = "0.5.52"
+__version__ = "0.5.53"
