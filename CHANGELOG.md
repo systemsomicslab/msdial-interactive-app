@@ -16,7 +16,12 @@ polarities is admitted and split by polarity, and only CID/HCD data run. Built o
   names another fragmentation method (EAD, OAD, ECD, ETD, EThcD, EID, UVPD, IRMPD and the like), with reason
   `fragmentation_not_cid_hcd`, the methods and the evidence, in `excluded_input_candidates` and the lineage's
   excluded rows, and the rest of the unit runs. The evidence is the input's file name (a whole token of its base
-  name: `..._OAD_NEG_ddMS_10eV_...`, `..._EAD14eV_...`; a run of eight or more hexadecimal digits names nothing),
+  name: `..._OAD_NEG_ddMS_10eV_...`, `..._EAD14eV_...`; a run of eight or more hexadecimal digits names nothing,
+  and a token counts only where the unit's instrument, as its Catalog handoff records it, could fragment so
+  (`METHOD_INSTRUMENTS`: EAD a ZenoTOF, OAD an LCMS-9030/9050, ETD/EThcD a Tribrid or an ETD instrument, ECD/EID
+  FT-ICR or ExD, UVPD a Tribrid, IRMPD FT-ICR or an ion trap; a capable vendor named without a model, or no
+  instrument recorded, counts as capable), else it is recorded in `names_not_credible_on_instrument` and keeps
+  nothing out; an instrument's model name, such as "LTQ Orbitrap Velos ETD", is never evidence itself),
   an mzML's activation cvParams as the encoding scan reads them (`scan_mzml_encoding` now records `activation`),
   and a converted mzXML's `activationMethod` as its conversion record counts it. Absence of evidence means run:
   nothing is inferred. No vendor reader reports the method (RawMetadataExtractor records none, and the SCIEX

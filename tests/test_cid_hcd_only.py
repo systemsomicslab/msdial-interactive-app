@@ -25,6 +25,7 @@ from msdial_app.fragmentation import (
     classify_activation_term,
     classify_activation_text,
     exclude_non_cid_inputs,
+    instrument_can,
     methods_in_file_name,
     methods_named,
 )
@@ -106,6 +107,46 @@ class FileNamesNameAMethodByAWholeToken(unittest.TestCase):
         self.assertEqual("other_method", classify_activation_text("EThcD"))
         self.assertEqual("collisional", classify_activation_text("HCD"))
         self.assertEqual("unclassified", classify_activation_text("unrecorded"))
+
+
+class ANameCountsOnlyOnAnInstrumentThatCouldFragmentSo(unittest.TestCase):
+    """User decision, 2026-10-29: a file name's token is credible only where the unit's instrument could perform the
+    method, or none is recorded; an instrument's model name is never evidence of a method itself."""
+
+    def test_capable_families_vendors_and_unrecorded_instruments(self) -> None:
+        cases = [
+            ("EAD", "Nexera/ZenoTof 7600", True), ("EAD", "SCIEX", True), ("EAD", "", True), ("EAD", "Unknown", True),
+            ("EAD", "Thermo Scientific Exactive", False), ("EAD", "TripleTOF 6600", False),
+            ("OAD", "LCMS-9030　Shimadzu", True), ("OAD", "Shimadzu, LCMS-9050", True), ("OAD", "Shimadzu", True),
+            ("OAD", "LCMS-8060 (Shimadzu Co.)", False),
+            ("ETD", "Thermo Scientific LTQ Orbitrap Velos ETD", True), ("ETD", "Orbitrap Fusion Lumos", True),
+            ("ETD", "Thermo Fisher Scientific", True), ("ETD", "Q Exactive HF (Thermo Fisher Scientific Inc.)", False),
+            ("ECD", "Bruker solariX 7T", True), ("ECD", "Agilent 6545XT AdvanceBio LC/Q-TOF with ExD", True),
+            ("ECD", "Agilent 6545 Q-TOF", False), ("UVPD", "Orbitrap Eclipse", True), ("UVPD", "Q Exactive", False),
+            ("IRMPD", "Thermo LTQ", True), ("EID", "Waters Xevo G2-XS", False),
+        ]
+        for method, instrument, capable in cases:
+            with self.subTest(method=method, instrument=instrument):
+                self.assertIs(capable, instrument_can(method, instrument))
+
+    def test_a_name_an_instrument_could_not_produce_keeps_nothing_out_and_is_recorded(self) -> None:
+        names = ["AA_EAD_A_1.raw", "AA_EAD_A_2.raw"]
+        kept, excluded, record = exclude_non_cid_inputs(names, instrument="Thermo Scientific Exactive")
+
+        self.assertEqual((names, []), (kept, excluded))
+        self.assertEqual("Thermo Scientific Exactive", record["instrument"])
+        self.assertEqual({"count": 2, "examples": [{"name": "AA_EAD_A_1.raw", "methods": ["EAD"]},
+                                                    {"name": "AA_EAD_A_2.raw", "methods": ["EAD"]}]},
+                         record["names_not_credible_on_instrument"])
+        kept, excluded, _record = exclude_non_cid_inputs(names, instrument="ZenoTOF 7600")
+        self.assertEqual(([], names), (kept, [item["path"] for item in excluded]))
+
+    def test_an_activation_term_is_not_held_to_the_instrument(self) -> None:
+        scans = {"s.mzML": {"activation": [{"accession": "MS:1003294", "name": "electron activated dissociation",
+                                            "count": 1}]}}
+        _kept, excluded, _record = exclude_non_cid_inputs(["s.mzML"], scans, instrument="Q Exactive")
+
+        self.assertEqual([EVIDENCE_MZML_ACTIVATION], [item["evidence"] for item in excluded])
 
 
 class TheScanRecordsActivationTerms(unittest.TestCase):
@@ -204,6 +245,20 @@ class TheCampaignLeaseKeepsThemOut(unittest.TestCase):
         (item,) = written["excluded_input_candidates"]
         self.assertEqual((NOT_CID_HCD, ["EThcD"]), (item["reason"], item["methods"]))
         self.assertEqual(EVIDENCE_MZXML_ACTIVATION, item["evidence"])
+
+    def test_the_handoffs_instrument_decides_whether_a_name_is_credible(self) -> None:
+        payloads = {"AA_EAD_A_1.mzML": mzml(_spectra(CID))}
+        files = [RepositoryFile(f"FILES/{name}", len(data), f"https://example.org/{name}") for name, data in payloads.items()]
+        project = _project(files, list(payloads))
+        project.repository_metadata = {"catalog_handoff": {"technical_settings": {"instrument": "Thermo Scientific Exactive"}}}
+        with tempfile.TemporaryDirectory() as temporary:
+            client = _Client({f"https://example.org/{name}": data for name, data in payloads.items()})
+            lease = create_download_lease(project, Path(temporary), 10_000_000, client=client,
+                                          campaign_authorization=dict(_APPROVAL))
+            written = read_manifest(lease["manifest_path"])
+
+        self.assertEqual(["AA_EAD_A_1.mzML"], [Path(item).name for item in written["input_candidates"]])
+        self.assertEqual(1, written["fragmentation_check"]["names_not_credible_on_instrument"]["count"])
 
     def test_outside_a_campaign_nothing_is_kept_out(self) -> None:
         payloads = {"S1_EAD.mzML": mzml(_spectra(EAD))}

@@ -77,9 +77,11 @@ CID/HCD only (0.5.52, the user's rule of 2026-10-29). Every reference spectrum
 the campaign annotates with is CID/HCD-derived, so a campaign lease also keeps
 out, with reason `fragmentation_not_cid_hcd`, an input whose evidence names
 another fragmentation method (EAD, OAD, ECD, ETD, EThcD, EID, UVPD, IRMPD and
-the like): a whole token of its file name (`..._OAD_NEG_ddMS_10eV_...`), an
-mzML's activation cvParams, or a converted mzXML's `activationMethod`. Absence
-of evidence means run. No vendor reader reports the method (the SCIEX
+the like): a whole token of its file name (`..._OAD_NEG_ddMS_10eV_...`), where
+the unit's instrument could fragment so or none is recorded
+(`fragmentation.METHOD_INSTRUMENTS`), an mzML's activation cvParams, or a
+converted mzXML's `activationMethod`. An instrument's model name is no evidence.
+Absence of evidence means run. No vendor reader reports the method (the SCIEX
 Wiff2Reader writes CID for every spectrum), so the manifest's
 `fragmentation_check` records, by format, where the method was read and where
 it was not. A unit the rule leaves with no input is excluded by its campaign

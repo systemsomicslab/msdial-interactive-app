@@ -2340,7 +2340,9 @@ def create_download_lease(
         if campaign_authorization:
             # CID/HCD only (user decision, 2026-10-29): an input whose name or header names another fragmentation
             # method is no candidate, on record with its evidence, and the rest of the unit runs.
-            inputs, not_cid_hcd, fragmentation_check = _exclude_non_cid_hcd_inputs(inputs, mzml_scans, conversion)
+            inputs, not_cid_hcd, fragmentation_check = _exclude_non_cid_hcd_inputs(
+                inputs, mzml_scans, conversion, _handoff_instrument(project)
+            )
             excluded_inputs = [*excluded_inputs, *not_cid_hcd]
         ignored_inputs = len(all_inputs) - len(inputs) - len(excluded_inputs)
         if conversion is not None:
@@ -4125,15 +4127,19 @@ def _exclude_undecodable_inputs(
 
 
 def _exclude_non_cid_hcd_inputs(
-    inputs: list[str], mzml_scans: dict[str, dict[str, Any]], conversion: dict[str, Any] | None
+    inputs: list[str],
+    mzml_scans: dict[str, dict[str, Any]],
+    conversion: dict[str, Any] | None,
+    instrument: str = "",
 ) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
     """(inputs that run, inputs kept out, the fragmentation_check record) under the CID/HCD-only rule.
 
     The user decided on 2026-10-29 that the campaign runs CID/HCD data only, since every reference spectrum is
     CID/HCD-derived: an input is kept out, with reason fragmentation_not_cid_hcd and the evidence, where its file
     name, its mzML's activation terms (the encoding scan's) or, for a converted mzML, its mzXML's activationMethod
-    (the conversion record's) names another method; absence of evidence means run (fragmentation.py). Only in a
-    campaign, as the convert stage: outside one an EAD or OAD analysis is the analyst's choice.
+    (the conversion record's) names another method; absence of evidence means run (fragmentation.py). A file name
+    counts only where ``instrument``, the unit's as its Catalog handoff records it (_handoff_instrument), could
+    fragment so. Only in a campaign, as the convert stage: outside one an EAD or OAD analysis is the analyst's choice.
     """
     activation: dict[str, dict[str, int]] = {}
     for record in ((conversion or {}).get("block") or {}).get("records") or []:
@@ -4143,7 +4149,16 @@ def _exclude_non_cid_hcd_inputs(
         output = str((record.get("output") or {}).get("path") or "")
         if isinstance(methods, dict) and output:
             activation[_file_key(str(Path(output).resolve()))] = methods
-    return exclude_non_cid_inputs(inputs, mzml_scans, activation, key=_file_key)
+    return exclude_non_cid_inputs(inputs, mzml_scans, activation, key=_file_key, instrument=instrument)
+
+
+def _handoff_instrument(project: RepositoryProject) -> str:
+    """The unit's instrument as its Catalog handoff's technical settings record it (the Catalog's unit instrument), or
+    "" where none is recorded."""
+    metadata = project.repository_metadata if isinstance(project.repository_metadata, dict) else {}
+    handoff = metadata.get("catalog_handoff") if isinstance(metadata.get("catalog_handoff"), dict) else {}
+    settings = handoff.get("technical_settings") if isinstance(handoff.get("technical_settings"), dict) else {}
+    return str(settings.get("instrument") or "").strip()
 
 
 # ---- The convert stage: mzXML written as the mzML MS-DIAL reads ------------------------------------------
