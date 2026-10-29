@@ -21,6 +21,7 @@ from pathlib import Path
 from msdial_app.raw_metadata_preflight import (
     FILE_NAME_POLARITY_RULE,
     POLARITY_FROM_FILE_NAME_WARNING,
+    UNTARGETED_FROM_DECLARED_ACQUISITION,
     VENDOR_COMPANION_MISSING,
     decide_disposition,
     file_name_polarity,
@@ -75,6 +76,15 @@ class AVendorCompanionTheConsoleNeeds(_Folder):
         )
         self.assertEqual({VENDOR_COMPANION_MISSING}, {item["reason"] for item in disposition["excluded_inputs"]})
         self.assertEqual({}, disposition["assignments"])
+
+    def test_mpst000048s_deposit_has_its_companions_and_nothing_is_excluded_for_them(self) -> None:
+        # Its .wiff2 inputs need none, and its .wiff (raw_alternate there) has its .wiff.scan, delivered as a sidecar
+        # in the same folder: were the .wiff the inputs, none would be excluded either.
+        names = []
+        for stem in ("241202_Tomita_18_neg", "241202_Tomita_18_pos"):
+            names += self.touch(f"{stem}.wiff2", f"{stem}.wiff", f"{stem}.wiff.scan", f"{stem}.timeseries.data")[:2]
+        for path in names:
+            self.assertEqual("", missing_vendor_companion(path), path)
 
     def test_the_rest_of_the_unit_runs_and_splits(self) -> None:
         paths = self.touch(*self.NAMES)
@@ -139,11 +149,28 @@ class APolarityReadFromAFileName(unittest.TestCase):
         self.assertEqual("skip", disposition["disposition"])
         self.assertNotIn("polarity_inferences", disposition)
 
-    def test_an_untargeted_status_nobody_declared_still_skips(self) -> None:
-        # MPST000048's Catalog record leaves untargeted unset; unreadable headers cannot show it either.
+    def test_an_unset_untargeted_status_is_inferred_from_the_declared_acquisition(self) -> None:
+        # MPST000048's Catalog record leaves untargeted unset, and no header can show it; it declares DDA, which is
+        # untargeted in this campaign's scope (user decision, 2026-10-29), recorded as an inference.
         disposition = decide_disposition(self.unreadable(untargeted=None))
 
-        self.assertEqual(("skip", ["untargeted_unresolved"]), (disposition["disposition"], disposition["reasons"]))
+        self.assertEqual("split", disposition["disposition"])
+        self.assertIn(UNTARGETED_FROM_DECLARED_ACQUISITION, disposition["warnings"])
+        self.assertNotIn("untargeted_inferred_from_headers", disposition["warnings"])
+        self.assertEqual({"basis": "declared_acquisition", "declared_acquisition_mode": "DDA",
+                          "rule": UNTARGETED_FROM_DECLARED_ACQUISITION},
+                         {key: value for key, value in disposition["untargeted_inference"].items()
+                          if key != "declaration_source"})
+
+    def test_a_declared_targeted_study_and_an_undeclared_acquisition_never_are(self) -> None:
+        targeted = decide_disposition(self.unreadable(untargeted=False))
+        self.assertEqual(("exclude", ["targeted_out_of_scope"]), (targeted["disposition"], targeted["reasons"]))
+        unknown = decide_disposition(self.unreadable(untargeted=None, acquisition_mode="Unknown"))
+        self.assertEqual("skip", unknown["disposition"])
+        self.assertNotIn("untargeted_inference", unknown)
+        mrm = decide_disposition(self.unreadable(untargeted=None, acquisition_mode="MRM"))
+        self.assertNotEqual("run", mrm["disposition"])
+        self.assertNotIn("untargeted_inference", mrm)
 
     def test_a_single_declared_polarity_and_a_readable_header_win_over_the_name(self) -> None:
         declared = decide_disposition(self.unreadable(ion_mode="Positive"))

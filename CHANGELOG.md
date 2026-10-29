@@ -27,8 +27,15 @@ Two defects the verification campaign v4-both-20261029 found, fixed as the user 
   `polarity_inferences` (`polarity_source: file_name`, the token, the rule) and on its assignment, with the
   warning `polarity_inferred_from_file_name`; the split writes the inferences of its inputs into each part's
   manifest, and the part's disposition carries them. A readable header, and a single declared polarity, always
-  win over a name; a unit whose acquisition is undeclared, or whose untargeted status nobody declared, is still
-  skipped (MPST000048's Catalog record leaves untargeted unset).
+  win over a name; a unit whose acquisition is undeclared is still skipped.
+- **A unit that runs on its declaration alone, declaring DDA, DIA, AIF or SWATH, is untargeted, on record.** No
+  header could show MPST000048's untargeted status, which its Catalog record leaves unset, so it was skipped as
+  `untargeted_unresolved`. Where no input's header could be read and the unit runs on its declared acquisition, a
+  declared DDA, DIA, AIF or SWATH (an MS1 survey with product-ion spectra, untargeted in this campaign's scope) now
+  infers untargeted, recorded as the header path records its inference: the warning
+  `untargeted_inferred_from_declared_acquisition`, the disposition's `untargeted_inference` (basis
+  `declared_acquisition`, the declared mode and its source), and an evidence line on the project. A declared
+  untargeted false still excludes, and an undeclared or targeted acquisition never infers it.
 
 ## [0.5.52] - Unreleased
 

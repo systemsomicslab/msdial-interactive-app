@@ -1144,7 +1144,10 @@ class DispositionMatrixTests(unittest.TestCase):
 
         self.assertEqual("run", inferred["disposition"])
         self.assertIn("untargeted_inferred_from_headers", inferred["warnings"])
-        self.assertEqual(("skip", ["untargeted_unresolved"]), (not_inferable["disposition"], not_inferable["reasons"]))
+        # No header could be read and the unit declares DDA: since 2026-10-29 that is untargeted in the campaign's
+        # scope, inferred from the declared acquisition (untargeted_inferred_from_declared_acquisition).
+        self.assertEqual(("run", []), (not_inferable["disposition"], not_inferable["reasons"]))
+        self.assertIn("untargeted_inferred_from_declared_acquisition", not_inferable["warnings"])
 
     def test_a_targeted_study_is_excluded(self) -> None:
         disposition = self.decide([_header("a.mzML", "DDA")], declared={"untargeted": False})

@@ -1200,6 +1200,13 @@ def file_name_polarity(path: object) -> tuple[str, str] | None:
 
 # Where an input's polarity came from, where it is not its header's or the unit's single declared polarity.
 POLARITY_SOURCE_FILE_NAME = "file_name"
+# UNTARGETED BY THE DECLARED ACQUISITION (user decision, 2026-10-29). A unit that runs on its declaration because no
+# input's header could be read (acquisition_declared_only), and declares DDA, DIA, AIF or SWATH, is untargeted: those
+# modes are an MS1 survey with product-ion spectra, untargeted by definition in this campaign's scope (targeted is
+# MRM, SRM, SIM or PRM). Recorded as the header path records its inference, never as a declaration; a declared
+# untargeted false still excludes, and an undeclared acquisition still skips.
+UNTARGETED_FROM_DECLARED_ACQUISITION = "untargeted_inferred_from_declared_acquisition"
+UNTARGETED_DECLARED_MODES = frozenset({"DDA", "DIA", "AIF", "SWATH"})
 POLARITY_FROM_FILE_NAME_WARNING = "polarity_inferred_from_file_name"
 _SEPARATION_NAMES = {
     "LiquidChromatography": "LC-MS",
@@ -1396,6 +1403,8 @@ def decide_disposition(
     # Each input whose polarity was read from its file name (FILE_NAME_POLARITY_RULE): recorded in the disposition,
     # on its assignment, and, for a split part, carried from its parent's split (manifest polarity_inferences).
     polarity_inferences: list[dict[str, Any]] = []
+    # The untargeted inference a unit that runs on its declaration alone carries (UNTARGETED_FROM_DECLARED_ACQUISITION).
+    untargeted_inference: dict[str, Any] = {}
 
     def warn(code: str) -> None:
         if code and code not in warnings:
@@ -1461,6 +1470,7 @@ def decide_disposition(
             "declared_vs_header": disagreements[:50],
             "detail": detail,
             **({"polarity_inferences": polarity_inferences} if polarity_inferences else {}),
+            **({"untargeted_inference": dict(untargeted_inference)} if untargeted_inference else {}),
             **extra,
             "assignments": assignments,
         }
@@ -1902,7 +1912,22 @@ def decide_disposition(
             and _entry_flag(per_file.get(file_key(path), {}), "has_ms2", 2) is True
             for path in runnable
         )
-        if not inferred:
+        on_declaration = bool(included) and all(basis == "declaration" for _p, _e, _c, basis in included)
+        if not inferred and not declared_targeted and on_declaration and declared_mode.upper() in UNTARGETED_DECLARED_MODES:
+            # UNTARGETED_FROM_DECLARED_ACQUISITION (2026-10-29): no header could be read, and the unit runs on its
+            # declared acquisition, which is untargeted by definition in this campaign's scope.
+            warn(UNTARGETED_FROM_DECLARED_ACQUISITION)
+            untargeted_inference.update(
+                basis="declared_acquisition", declared_acquisition_mode=declared_mode.upper(),
+                declaration_source=declared_source, rule=UNTARGETED_FROM_DECLARED_ACQUISITION,
+            )
+            detail.append(
+                f"The repository does not say whether the study is untargeted, no input's header could be read, and the "
+                f"unit runs on its declared {declared_mode.upper()} acquisition: an MS1 survey with product-ion spectra, "
+                f"untargeted in this campaign's scope, recorded as an inference ({UNTARGETED_FROM_DECLARED_ACQUISITION})."
+            )
+            inferred = True
+        elif not inferred:
             reasons.append("untargeted_unresolved")
             detail.append(
                 f"The repository does not say whether the study is untargeted, and declares {declared_as} "
@@ -1913,7 +1938,8 @@ def decide_disposition(
             )
             return result("skip")
         # An inference from how the data were acquired, recorded as one; never as a confirmation.
-        warn("untargeted_inferred_from_headers")
+        if not untargeted_inference:
+            warn("untargeted_inferred_from_headers")
 
     if len(groups) > 1:
         acquisitions = {console for console, _polarity in groups}

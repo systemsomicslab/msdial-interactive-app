@@ -6726,6 +6726,14 @@ def _apply_disposition(
                 "Untargeted status was inferred from the raw headers, which show DDA, DIA or AIF acquisition "
                 "with MS1 and MS2 in every input that runs: an inference, not a repository declaration."
             )
+        if "untargeted_inferred_from_declared_acquisition" in warnings and project.untargeted is None:
+            project.untargeted = True
+            mode = str((disposition.get("untargeted_inference") or {}).get("declared_acquisition_mode") or "")
+            lines.append(
+                f"Untargeted status was inferred from the declared {mode or 'untargeted'} acquisition, the raw headers "
+                "being unreadable: an MS1 survey with product-ion spectra, untargeted in this campaign's scope (user "
+                "decision, 2026-10-29). An inference, not a repository declaration."
+            )
         lines.append(
             f"Campaign disposition: run as {project.acquisition_mode} {project.ion_mode}"
             + (
