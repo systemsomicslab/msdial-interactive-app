@@ -15,14 +15,19 @@ Two defects the verification campaign v4-both-20261029 found, fixed as the user 
   each part then failed at its diagnostic start ("WIFF.SCAN is not accessible next to ..."), which the runner
   retried. The campaign disposition now excludes such an input with reason `vendor_companion_missing` and the
   companion's name (`raw_metadata_preflight.missing_vendor_companion`, `REQUIRED_VENDOR_COMPANIONS`: a .wiff's
-  .wiff.scan, the one pair the run validation holds an input to), and a unit left with no input is excluded.
+  .wiff.scan, the one pair the run validation holds an input to), and a unit left with no input is excluded. The
+  lease's one encoding rule counts such a .wiff as unreadable (`encoding_rule.VENDOR_COMPANION_MISSING`), so a
+  sample deposited as S1.wiff without its scan and as S1.mzML runs on S1.mzML, the .wiff on record unused.
 - **An input whose header the extractor cannot read takes its polarity from its file name, on record.** The pinned
   extractor opens no ZenoTOF .wiff2 (unsupported_format), so MB-POST MPST000048 (declared Both and DDA,
   `241202_Tomita_18_neg.wiff2` and `_pos.wiff2`) had every input polarity_unresolved and was skipped. Where an
   input's header is unsupported_format, it runs on the unit's declared acquisition (the existing declared-only
   rule), and the unit declares no single polarity, one polarity token of its base name decides: a whole token
-  pos, positive, neg or negative, or ESI+/ESI-/(+)/(-), never one beside a control, ctrl, blank or QC token, and
-  a name that states both or neither stays polarity_unresolved (`file_name_polarity`, rule
+  pos, positive, neg or negative, or ESI+/ESI-/(+)/(-) with no letter after the sign (ESI-MS and ESI-QTOF name an
+  ion source), never one beside a control or ctrl token (a QC or blank injection keeps its polarity:
+  QC_pos_01), and a name that states both or neither stays polarity_unresolved. A folder below the unit's data
+  root that states the other polarity leaves the name unresolved, both tokens on record (POS/ER_neg_01.wiff2);
+  one that states the same is recorded beside the inference (`folder_token`) (`file_name_polarity`, rule
   `unreadable_header_polarity_from_file_name_2026_10_29`). Each such input is recorded in the disposition's
   `polarity_inferences` (`polarity_source: file_name`, the token, the rule) and on its assignment, with the
   warning `polarity_inferred_from_file_name`; the split writes the inferences of its inputs into each part's

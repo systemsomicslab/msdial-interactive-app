@@ -68,6 +68,7 @@ from .mzxml_conversion import (
 from .process_liveness import process_created_at, process_is_alive
 from .raw_metadata_preflight import (
     DECLARED_ARCHIVE_COPIES_WARNING,
+    missing_vendor_companion,
     INFERRED_PAIRING_WARNING,
     UNATTRIBUTED_MEMBER_PAIRING,
     UNATTRIBUTED_MEMBERS_RULE,
@@ -4632,6 +4633,9 @@ def _choose_encodings(
             return scanned[key]
         if key in unfinished:
             return encoding_rule.INCOMPLETE_CONTAINER
+        if missing_vendor_companion(item):
+            # A .wiff without its .wiff.scan the Console cannot open (2026-10-29): the sample's next encoding runs.
+            return encoding_rule.VENDOR_COMPANION_MISSING
         reason = headers.get(key, "")
         return "" if lenient and reason in encoding_rule.RAW_HEADER_REASONS else reason
 

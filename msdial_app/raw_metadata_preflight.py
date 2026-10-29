@@ -1161,30 +1161,28 @@ def missing_vendor_companion(path: str) -> str:
 # A FILE NAME'S POLARITY (user decision, 2026-10-29; FILE_NAME_POLARITY_RULE), held identical in Interactive
 # (raw_metadata_preflight.py) and the gate. Read only for an input whose raw header could not be read
 # (unsupported_format: the pinned extractor opens no ZenoTOF .wiff2), in a unit whose declaration names no single
-# polarity. The base name only, never a folder: a whole token pos, positive, neg or negative (between _ - . and
-# spaces), or ESI+ / ESI- / (+) / (-). A pos/neg token beside a control, ctrl, blank or QC token names a sample
-# (Neg_Ctrl_1), not a polarity. A name that states both polarities, or neither, states none.
+# polarity. The base name decides: a whole token pos, positive, neg or negative (between _ - . and spaces), or
+# ESI+ / ESI- / (+) / (-) with no letter after the sign (ESI-MS, ESI-QTOF name an ion source, not a polarity). A
+# pos/neg token beside a control or ctrl token names a sample (Neg_Ctrl_1), not a polarity; a QC or blank injection
+# keeps its polarity (QC_pos_01). A name that states both polarities, or neither, states none. A folder between the
+# unit's data root and the file (``root``) that states the opposite polarity makes the name state none, with both
+# tokens on record (POS/ER_neg_01.wiff2); one that states the same polarity is recorded beside it.
 FILE_NAME_POLARITY_RULE = "unreadable_header_polarity_from_file_name_2026_10_29"
 FILE_NAME_POLARITY_TOKENS = {"pos": "Positive", "positive": "Positive", "neg": "Negative", "negative": "Negative"}
-FILE_NAME_POLARITY_SIGNS = r"(?<![A-Za-z0-9])ESI\s*([+-])|\(([+-])\)"
-FILE_NAME_POLARITY_EXEMPTING = frozenset({"control", "ctrl", "blank", "qc"})
+FILE_NAME_POLARITY_SIGNS = r"(?<![A-Za-z0-9])ESI\s*([+-])(?![A-Za-z])|\(([+-])\)(?![A-Za-z])"
+FILE_NAME_POLARITY_EXEMPTING = frozenset({"control", "ctrl"})
 _FILE_NAME_POLARITY_SIGNS = re.compile(FILE_NAME_POLARITY_SIGNS, re.IGNORECASE)
 _FILE_NAME_TOKEN_SPLIT = re.compile(r"[_\-. ]+")
 _FILE_NAME_SUFFIXES = (".wiff2", ".wiff", ".mzml", ".mzxml", ".raw", ".lcd", ".d", ".abf", ".cdf")
 
 
-def file_name_polarity(path: object) -> tuple[str, str] | None:
-    """(polarity, the token that states it) from a path's base name, or None where it states none or both."""
-    name = re.split(r"[\\/]", str(path or "").rstrip("\\/"))[-1]
-    for suffix in _FILE_NAME_SUFFIXES:
-        if name.casefold().endswith(suffix):
-            name = name[: -len(suffix)]
-            break
+def _polarity_tokens(text: str) -> dict[str, str]:
+    """{polarity: the first token that states it} in one name or folder name, by FILE_NAME_POLARITY_RULE's tokens."""
     found: dict[str, str] = {}
-    for match in _FILE_NAME_POLARITY_SIGNS.finditer(name):
+    for match in _FILE_NAME_POLARITY_SIGNS.finditer(text):
         sign = match.group(1) or match.group(2)
         found.setdefault("Positive" if sign == "+" else "Negative", match.group(0))
-    tokens = [token for token in _FILE_NAME_TOKEN_SPLIT.split(_FILE_NAME_POLARITY_SIGNS.sub(" ", name)) if token]
+    tokens = [token for token in _FILE_NAME_TOKEN_SPLIT.split(_FILE_NAME_POLARITY_SIGNS.sub(" ", text)) if token]
     folded = [token.casefold() for token in tokens]
     for index, token in enumerate(folded):
         polarity = FILE_NAME_POLARITY_TOKENS.get(token)
@@ -1193,10 +1191,48 @@ def file_name_polarity(path: object) -> tuple[str, str] | None:
         if any(neighbour in FILE_NAME_POLARITY_EXEMPTING for neighbour in folded[max(index - 1, 0):index + 2]):
             continue
         found.setdefault(polarity, tokens[index])
-    if len(found) != 1:
-        return None
-    ((polarity, token),) = found.items()
-    return polarity, token
+    return found
+
+
+def file_name_polarity_reading(path: object, root: object = "") -> dict[str, object]:
+    """What FILE_NAME_POLARITY_RULE reads of a path: {"polarity": "Positive", "Negative" or "", "token": the name's
+    token, "folder_token": a folder's token stating the same polarity, "conflict": the tokens that leave it unresolved}.
+    ``root`` is the unit's data root; only folders below it are read, and none where the path is not under it."""
+    text = str(path or "").replace("\\", "/").rstrip("/")
+    parts = [part for part in text.split("/") if part]
+    name = parts[-1] if parts else ""
+    for suffix in _FILE_NAME_SUFFIXES:
+        if name.casefold().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    folders: list[str] = []
+    base = str(root or "").replace("\\", "/").rstrip("/")
+    if base and text.casefold().startswith(base.casefold() + "/"):
+        folders = [part for part in text[len(base) + 1:].split("/") if part][:-1]
+    stated = _polarity_tokens(name)
+    reading: dict[str, object] = {"polarity": "", "token": "", "folder_token": "", "conflict": []}
+    if len(stated) != 1:
+        if len(stated) > 1:
+            reading["conflict"] = sorted(stated.values())
+        return reading
+    ((polarity, token),) = stated.items()
+    same = ""
+    for folder in folders:
+        found = _polarity_tokens(folder)
+        opposite = [value for key, value in found.items() if key != polarity]
+        if opposite:
+            reading["conflict"] = [opposite[0], token]
+            return reading
+        same = same or found.get(polarity, "")
+    reading.update(polarity=polarity, token=token, folder_token=same)
+    return reading
+
+
+def file_name_polarity(path: object, root: object = "") -> tuple[str, str] | None:
+    """(polarity, the token that states it) from a path's base name, or None where it states none, both, or a folder
+    below ``root`` states the opposite (file_name_polarity_reading)."""
+    reading = file_name_polarity_reading(path, root)
+    return (str(reading["polarity"]), str(reading["token"])) if reading["polarity"] else None
 
 # Where an input's polarity came from, where it is not its header's or the unit's single declared polarity.
 POLARITY_SOURCE_FILE_NAME = "file_name"
@@ -1825,15 +1861,21 @@ def decide_disposition(
                 polarity_warned = True
         elif declared_polarity in _POLARITIES:
             polarity = declared_polarity
-        elif basis == "declaration" and entry.get("outcome") == OUTCOME_UNSUPPORTED and file_name_polarity(path):
+        elif basis == "declaration" and entry.get("outcome") == OUTCOME_UNSUPPORTED:
             # FILE_NAME_POLARITY_RULE (2026-10-29): the header could not be read (the pinned extractor opens no
             # ZenoTOF .wiff2), the unit runs on its declared acquisition, and declares no single polarity: the
-            # name's one polarity token decides, on record.
-            polarity, token = file_name_polarity(path)
+            # name's one polarity token decides, on record, unless a folder below the data root states the other.
+            reading = file_name_polarity_reading(path, manifest.get("input_directory") or "")
+            if not reading["polarity"]:
+                excluded.append({"path": path, "reason": "polarity_unresolved",
+                                 **({"tokens": list(reading["conflict"])} if reading["conflict"] else {})})
+                continue
+            polarity = str(reading["polarity"])
             warn(POLARITY_FROM_FILE_NAME_WARNING)
             polarity_inferences.append({
-                "path": path, "polarity": polarity, "polarity_source": POLARITY_SOURCE_FILE_NAME, "token": token,
-                "rule": FILE_NAME_POLARITY_RULE,
+                "path": path, "polarity": polarity, "polarity_source": POLARITY_SOURCE_FILE_NAME,
+                "token": str(reading["token"]), "rule": FILE_NAME_POLARITY_RULE,
+                **({"folder_token": str(reading["folder_token"])} if reading["folder_token"] else {}),
             })
         else:
             exclude(path, "polarity_unresolved")

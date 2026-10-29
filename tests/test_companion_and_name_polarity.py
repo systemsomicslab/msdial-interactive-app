@@ -25,6 +25,7 @@ from msdial_app.raw_metadata_preflight import (
     VENDOR_COMPANION_MISSING,
     decide_disposition,
     file_name_polarity,
+    file_name_polarity_reading,
     missing_vendor_companion,
 )
 from msdial_app.repository_reanalysis import split_unit_by_acquisition
@@ -113,11 +114,37 @@ class APolarityReadFromAFileName(unittest.TestCase):
             "S1_positive.mzML": ("Positive", "positive"), "S1_ESI+.wiff2": ("Positive", "ESI+"),
             "S1_ESI-_2.wiff2": ("Negative", "ESI-"), "S1(+).raw": ("Positive", "(+)"),
             "x_pos_neg.wiff2": None, "S1.wiff2": None, "position_1.raw": None, "Neg_Ctrl_1.wiff2": None,
-            "QC_pos_1.wiff2": None, "pos/S1.wiff2": None,
+            "pos/S1.wiff2": None,
+            # Review of #86: ESI-MS and ESI-QTOF name an ion source, not a polarity (M1); a QC or blank injection keeps
+            # its polarity, and only a control token exempts one (L1).
+            "LC-ESI-QTOF_S1.wiff2": None, "S1_ESI-MS_pos.wiff2": ("Positive", "pos"), "S1(-)MS.raw": None,
+            "QC_pos_01.wiff2": ("Positive", "pos"), "pos_QC.wiff2": ("Positive", "pos"),
+            "Blank_neg_1.wiff2": ("Negative", "neg"), "S_pos_control.wiff2": None,
         }
         for name, expected in cases.items():
             with self.subTest(name=name):
                 self.assertEqual(expected, file_name_polarity(name))
+
+    def test_a_folder_below_the_data_root_that_states_the_other_polarity_leaves_the_name_unresolved(self) -> None:
+        # Review of #86, L2: POS/ER_neg_01.wiff2 is unresolved, with both tokens on record; NEG/ER_neg_01.wiff2 records
+        # its folder beside the inference; a folder above the data root is not read.
+        root = "D:/w/raw/data"
+        self.assertIsNone(file_name_polarity(f"{root}/POS/ER_neg_01.wiff2", root))
+        self.assertEqual(["POS", "neg"], file_name_polarity_reading(f"{root}/POS/ER_neg_01.wiff2", root)["conflict"])
+        self.assertEqual(("Negative", "neg", "NEG"),
+                         tuple(file_name_polarity_reading(f"{root}/NEG/ER_neg_01.wiff2", root)[key]
+                               for key in ("polarity", "token", "folder_token")))
+        self.assertEqual(("Negative", "neg"), file_name_polarity("D:/POS/w/ER_neg_01.wiff2", "D:/POS/w"))
+        names = (f"{root}/POS/ER_neg_01.wiff2", f"{root}/NEG/ER_neg_02.wiff2", f"{root}/POS/ER_pos_01.wiff2")
+        manifest = self.unreadable(names)
+        manifest["input_directory"] = root
+        disposition = decide_disposition(manifest)
+
+        self.assertEqual("split", disposition["disposition"])
+        self.assertEqual([(names[0], "polarity_unresolved", ["POS", "neg"])],
+                         [(item["path"], item["reason"], item.get("tokens")) for item in disposition["excluded_inputs"]])
+        folders = {item["path"]: item.get("folder_token") for item in disposition["polarity_inferences"]}
+        self.assertEqual({names[1]: "NEG", names[2]: "POS"}, folders)
 
     def test_mpst000048_unreadable_wiff2_split_by_the_names_polarity_on_record(self) -> None:
         disposition = decide_disposition(self.unreadable())
@@ -235,6 +262,30 @@ class TheSplitWritesTheInferencesIntoEachPart(_Folder):
             self.assertEqual(polarity, part["project"]["ion_mode"])
             self.assertEqual({polarity}, {item["polarity"] for item in part["polarity_inferences"]})
             self.assertEqual(2, len(part["polarity_inferences"]))
+
+
+class AWiffWithoutItsScanIsNoEncodingTheLeaseTakes(unittest.TestCase):
+    """Review of #86, L3: a sample deposited as S1.wiff without its .wiff.scan and as S1.mzML runs on S1.mzML, and the
+    .wiff is on record in its sample's choice, unused for vendor_companion_missing."""
+
+    def test_the_sample_runs_on_its_mzml(self) -> None:
+        from msdial_app.repository_reanalysis import RepositoryFile, create_download_lease, read_manifest
+        from test_download_lease_record import _Client, _project
+        from test_mzml_encoding import dda_spectra, mzml
+
+        payloads = {"S1.wiff": b"wiff", "S1.mzML": mzml(dda_spectra(6))}
+        files = [RepositoryFile(f"FILES/{name}", len(data), f"https://example.org/{name}") for name, data in payloads.items()]
+        project = _project(files, ["S1.wiff"])
+        with tempfile.TemporaryDirectory() as temporary:
+            client = _Client({f"https://example.org/{name}": data for name, data in payloads.items()})
+            lease = create_download_lease(project, Path(temporary), 10_000_000, client=client)
+            written = read_manifest(lease["manifest_path"])
+
+        self.assertEqual(["S1.mzML"], [Path(item).name for item in written["input_candidates"]])
+        (choice,) = written["encoding_choices"]
+        self.assertEqual("S1.mzML", Path(choice["used"]).name)
+        self.assertEqual([("S1.wiff", "vendor_companion_missing")],
+                         [(Path(item["path"]).name, item["reason"]) for item in choice["unused"]])
 
 
 if __name__ == "__main__":
