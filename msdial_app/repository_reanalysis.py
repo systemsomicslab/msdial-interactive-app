@@ -8466,6 +8466,15 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 per_file[_file_key(item)] for item in part["input_candidates"] if _file_key(item) in per_file
             ],
         }
+        # The polarity the parent's disposition read from a file name for an input whose header could not be read
+        # (raw_metadata_preflight.FILE_NAME_POLARITY_RULE): the part's ion mode rests on it, so it stays on record.
+        part_keys_for_polarity = {_file_key(item) for item in part["input_candidates"]}
+        inferred = [
+            dict(item) for item in (parent.get("campaign_disposition") or {}).get("polarity_inferences") or []
+            if isinstance(item, dict) and _file_key(str(item.get("path") or "")) in part_keys_for_polarity
+        ]
+        if inferred:
+            part_manifest["polarity_inferences"] = inferred
         lineage = parent.get("input_lineage")
         if isinstance(lineage, dict):
             # The part reads the parent's files, so their lineage is the parent's, row for row. Without

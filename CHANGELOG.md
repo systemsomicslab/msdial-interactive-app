@@ -4,6 +4,32 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.53] - Unreleased
+
+Two defects the verification campaign v4-both-20261029 found, fixed as the user decided on 2026-10-29. Built on
+0.5.52 (#85). Goes with the runner and gate change in msdial-public-reanalysis, which must merge with it.
+
+### Fixed
+- **An input without the vendor companion the Console needs is excluded, not run into a validation refusal.**
+  MB-POST MPST000063 deposited 20 SCIEX .wiff and no .wiff.scan; the preflight split it by header polarity and
+  each part then failed at its diagnostic start ("WIFF.SCAN is not accessible next to ..."), which the runner
+  retried. The campaign disposition now excludes such an input with reason `vendor_companion_missing` and the
+  companion's name (`raw_metadata_preflight.missing_vendor_companion`, `REQUIRED_VENDOR_COMPANIONS`: a .wiff's
+  .wiff.scan, the one pair the run validation holds an input to), and a unit left with no input is excluded.
+- **An input whose header the extractor cannot read takes its polarity from its file name, on record.** The pinned
+  extractor opens no ZenoTOF .wiff2 (unsupported_format), so MB-POST MPST000048 (declared Both and DDA,
+  `241202_Tomita_18_neg.wiff2` and `_pos.wiff2`) had every input polarity_unresolved and was skipped. Where an
+  input's header is unsupported_format, it runs on the unit's declared acquisition (the existing declared-only
+  rule), and the unit declares no single polarity, one polarity token of its base name decides: a whole token
+  pos, positive, neg or negative, or ESI+/ESI-/(+)/(-), never one beside a control, ctrl, blank or QC token, and
+  a name that states both or neither stays polarity_unresolved (`file_name_polarity`, rule
+  `unreadable_header_polarity_from_file_name_2026_10_29`). Each such input is recorded in the disposition's
+  `polarity_inferences` (`polarity_source: file_name`, the token, the rule) and on its assignment, with the
+  warning `polarity_inferred_from_file_name`; the split writes the inferences of its inputs into each part's
+  manifest, and the part's disposition carries them. A readable header, and a single declared polarity, always
+  win over a name; a unit whose acquisition is undeclared, or whose untargeted status nobody declared, is still
+  skipped (MPST000048's Catalog record leaves untargeted unset).
+
 ## [0.5.52] - Unreleased
 
 The user's decisions of 2026-10-29 for the public-repository campaign: a unit whose repository record says `Both`
