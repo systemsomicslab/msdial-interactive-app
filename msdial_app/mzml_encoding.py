@@ -22,6 +22,10 @@ list is short. It stops there, so a file of any size costs a few megabytes of re
 Only the arrays RawDataHandler uses are judged: m/z and intensity in a spectrum, time and intensity in a
 chromatogram. An ion-mobility or charge array it parses and drops is left alone, whatever its encoding.
 
+The same pass records the dissociation-method terms of the spectra it reads (activation: each cvParam of a
+precursor's <activation> but its energies, with its count), which the campaign's CID/HCD-only rule reads
+(fragmentation.exclude_non_cid_inputs). It judges nothing by them.
+
 mzml_encoding_problems(path) is the call for anything that decides whether an mzML is an analysis input:
 an empty list, or one record per distinct problem, each with reason unsupported_mzml_encoding and the
 accession found. A file that cannot be scanned is not called undecodable here; scan_mzml_encoding says why
@@ -112,7 +116,7 @@ def scan_mzml_encoding(path: str | Path) -> dict[str, Any]:
     """Scan the first few spectra and chromatograms of an mzML. Never raises.
 
     Returns {schema, status, spectra_scanned, chromatograms_scanned, chromatograms_reached, bytes_read,
-    encodings, problems}. status is scanned, or unreadable with an error. encodings lists each distinct
+    encodings, problems, activation}. status is scanned, or unreadable with an error. encodings lists each distinct
     {where, array, binary_data_type, compression} seen, the evidence behind an empty problem list, and
     chromatograms_reached says whether the chromatograms were read in sequence or through the index.
     """
@@ -141,6 +145,12 @@ def scan_mzml_encoding(path: str | Path) -> dict[str, Any]:
             for where, array, data_type, compression in sorted(scan.encodings)
         ],
         problems=[dict(entry) for entry in scan.problems.values()],
+        # The dissociation-method terms of the spectra read, {accession, name, count}: what the campaign's CID/HCD-only
+        # rule reads of the file (fragmentation.py). An energy is no method, and is left out.
+        activation=[
+            {"accession": accession, "name": name, "count": count}
+            for (accession, name), count in sorted(scan.activation.items())
+        ],
     )
     if result["status"] == "scanned" and scan.root not in {"mzML", "indexedmzML"}:
         result.update(status="unreadable", error=f"the root element is <{scan.root or 'none'}>, not <mzML>")
@@ -203,6 +213,7 @@ class _Scan:
         self.stack: list[str] = []
         self.item: dict[str, Any] | None = None
         self.array: dict[str, Any] | None = None
+        self.activation: dict[tuple[str, str], int] = {}
 
     def spectra_done(self) -> bool:
         return self.spectra >= SCAN_SPECTRA_CAP or (self.spectra >= SCAN_SPECTRA and self.msn_seen)
@@ -266,6 +277,13 @@ class _Scan:
                 self.array["cv"].append((accession, str(attributes.get("name") or "")))
             elif parent == "spectrum" and accession == "MS:1000511":
                 self.item["ms_level"] = str(attributes.get("value") or "")
+            elif parent == "activation" and self.item["where"] == "spectrum":
+                name = str(attributes.get("name") or "")
+                # An energy (collision energy, its ramp, a supplemental one) is no method; a method named with an
+                # energy in it (electron transfer/higher-energy collision dissociation) is one.
+                if "energy" not in name.casefold() or "dissociation" in name.casefold():
+                    term = (accession, name)
+                    self.activation[term] = self.activation.get(term, 0) + 1
         elif local == "referenceableParamGroupRef" and self.array is not None and parent == "binaryDataArray":
             self.array["groups"].append(str(attributes.get("ref") or ""))
 

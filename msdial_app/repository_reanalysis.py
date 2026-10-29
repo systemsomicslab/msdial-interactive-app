@@ -56,6 +56,7 @@ from .download_store import (
     StoreLockTimeout,
     unlink_tree,
 )
+from .fragmentation import NOT_CID_HCD, exclude_non_cid_inputs, stated_methods
 from .mzml_encoding import UNSUPPORTED_MZML_ENCODING, scan_mzml_encoding
 from .mzxml_conversion import (
     CONVERTER_NAME,
@@ -1401,8 +1402,13 @@ def evaluate_eligibility(project: RepositoryProject, policy: EligibilityPolicy) 
         if project.ion_mode == "Unknown":
             review_reasons.append("Confirm LC-MS ion mode from raw scan metadata.")
         elif project.ion_mode == "Both":
+            # A campaign reads each file's polarity from its raw header (user decision, 2026-10-29): the unit is
+            # split into single-polarity parts, and a file whose scans switch polarity is excluded with a reason
+            # (unresolved mixed polarity is outside the campaign's scope) while the rest of the unit runs.
             review_reasons.append(
-                "Distinguish polarity-switching data from separate positive/negative files before analysis."
+                "Distinguish polarity-switching data from separate positive/negative files before analysis: read "
+                "each file's polarity from its raw header; a campaign splits the unit into single-polarity parts "
+                "and excludes a file whose scans switch polarity."
             )
     if policy.require_untargeted:
         if project.untargeted is False:
@@ -1824,7 +1830,11 @@ def create_download_lease(
       excluded_input_candidates and in input_lineage's excluded rows, with reason
       unsupported_mzml_encoding and the accessions found (_exclude_undecodable_inputs). Nor is an mzXML
       whose conversion failed (conversion_failed), or whose scans contradict the polarity the unit declares
-      (polarity_contradicts_declaration); a unit left with no input is recorded, excluded, and not raised;
+      (polarity_contradicts_declaration); a unit left with no input is recorded, excluded, and not raised.
+      Under a ``campaign_authorization``, nor is an input whose file name, mzML activation terms or converted
+      mzXML's activationMethod names a fragmentation method other than CID/HCD (fragmentation_not_cid_hcd, the
+      user's rule of 2026-10-29, _exclude_non_cid_hcd_inputs); what the rule read and did not read of each input
+      is the manifest's fragmentation_check;
     - record: the manifest.
 
     The stages are written into the manifest as they finish, so a lease that stops says where
@@ -2324,7 +2334,20 @@ def create_download_lease(
         )
         # Each sample's one file (encoding_rule): what the rule left unused is no input.
         inputs = [item for item in inputs if _file_key(item) not in unused_keys]
-        inputs, excluded_inputs, mzml_scanned = _exclude_undecodable_inputs(inputs)
+        mzml_scans: dict[str, dict[str, Any]] = {}
+        inputs, excluded_inputs, mzml_scanned = _exclude_undecodable_inputs(inputs, scans=mzml_scans)
+        fragmentation_check: dict[str, Any] | None = None
+        if campaign_authorization:
+            # CID/HCD only (user decision, 2026-10-29): an input whose name or header names another fragmentation
+            # method is no candidate, on record with its evidence, and the rest of the unit runs.
+            inputs, not_cid_hcd, fragmentation_check = _exclude_non_cid_hcd_inputs(
+                inputs,
+                mzml_scans,
+                conversion,
+                _handoff_instrument(project),
+                _stated_inputs(project, inputs, data_root, archive_extractions),
+            )
+            excluded_inputs = [*excluded_inputs, *not_cid_hcd]
         ignored_inputs = len(all_inputs) - len(inputs) - len(excluded_inputs)
         if conversion is not None:
             # An mzXML whose conversion failed, or whose scans contradict the declared polarity, is no
@@ -2455,6 +2478,11 @@ def create_download_lease(
             ignored_input_candidates=ignored_inputs,
             mzml_encodings_scanned=mzml_scanned,
             excluded_input_candidates=len(excluded_inputs),
+            **(
+                {"not_cid_hcd_excluded": fragmentation_check["excluded"]}
+                if fragmentation_check is not None
+                else {}
+            ),
             extracted_files=len(selected_extracted),
             ignored_extracted_files=len(extracted) - len(selected_extracted),
             declared_files_verified=checksum_validation.get("verified", 0),
@@ -2542,6 +2570,9 @@ def create_download_lease(
         if excluded_inputs:
             # Only where one was, so a unit with nothing excluded records what it always did.
             manifest["excluded_input_candidates"] = excluded_inputs
+        if fragmentation_check is not None:
+            # What the CID/HCD-only rule read of each input, and where it read nothing (a vendor header).
+            manifest["fragmentation_check"] = fragmentation_check
         if conversion is not None:
             # Only where the convert stage ran. The gate's SUM-1 follows each converted input to its record
             # here, and its CONV-1 holds the mzML to it; provenance\input-conversions.json is the same block.
@@ -4056,7 +4087,9 @@ def record_reader_created_files(manifest_path: str | Path, stage: str) -> dict[s
     return block
 
 
-def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict[str, Any]], int]:
+def _exclude_undecodable_inputs(
+    inputs: list[str], scans: dict[str, dict[str, Any]] | None = None
+) -> tuple[list[str], list[dict[str, Any]], int]:
     """(inputs RawDataHandler can decode, the excluded ones, the number of mzML scanned).
 
     RawDataHandler decodes an mzML array only as a 32- or 64-bit float, zlib-compressed or not, and reads
@@ -4066,6 +4099,9 @@ def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict
     problem is excluded with reason unsupported_mzml_encoding and the accessions found, and the rest of the
     unit goes on without it. A file the scan could not read is kept: the Console, which reads all of it, is
     the judge of that. Other formats are not scanned.
+
+    ``scans``, where given, receives each kept mzML's scan by _file_key, for the CID/HCD-only rule to read its
+    activation terms (_exclude_non_cid_hcd_inputs).
     """
     kept: list[str] = []
     excluded: list[dict[str, Any]] = []
@@ -4079,6 +4115,8 @@ def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict
         scan = scan_mzml_encoding(path)
         if not scan["problems"]:
             kept.append(text)
+            if scans is not None and scan.get("status") == "scanned":
+                scans[_file_key(text)] = scan
             continue
         excluded.append({
             "path": text,
@@ -4090,6 +4128,79 @@ def _exclude_undecodable_inputs(inputs: list[str]) -> tuple[list[str], list[dict
             },
         })
     return kept, excluded, scanned
+
+
+def _exclude_non_cid_hcd_inputs(
+    inputs: list[str],
+    mzml_scans: dict[str, dict[str, Any]],
+    conversion: dict[str, Any] | None,
+    instrument: str = "",
+    stated: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    """(inputs that run, inputs kept out, the fragmentation_check record) under the CID/HCD-only rule.
+
+    The user decided on 2026-10-29 that the campaign runs CID/HCD data only, since every reference spectrum is
+    CID/HCD-derived: an input is kept out, with reason fragmentation_not_cid_hcd and the evidence, where its file
+    name, its mzML's activation terms (the encoding scan's) or, for a converted mzML, its mzXML's activationMethod
+    (the conversion record's) names another method; absence of evidence means run (fragmentation.py). A file name
+    counts only where ``instrument``, the unit's as its Catalog handoff records it (_handoff_instrument), could
+    fragment so. ``stated`` is _stated_inputs: the inputs whose sample's row states another method. Only in a
+    campaign, as the convert stage: outside one an EAD or OAD analysis is the analyst's choice.
+    """
+    activation: dict[str, dict[str, int]] = {}
+    for record in ((conversion or {}).get("block") or {}).get("records") or []:
+        if not isinstance(record, dict) or record.get("status") != "converted":
+            continue
+        methods = (record.get("precursors") or {}).get("activation_methods")
+        output = str((record.get("output") or {}).get("path") or "")
+        if isinstance(methods, dict) and output:
+            activation[_file_key(str(Path(output).resolve()))] = methods
+    return exclude_non_cid_inputs(
+        inputs, mzml_scans, activation, key=_file_key, instrument=instrument, stated=stated
+    )
+
+
+def _stated_inputs(
+    project: RepositoryProject, inputs: list[str], data_root: Path, archive_extractions: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """{input's _file_key: {"sample_id", "methods"}} for each input whose sample row states a fragmentation method
+    other than CID/HCD in a field that states the method (fragmentation.stated_methods). The rows are the Catalog
+    handoff's, as the campaign plan read them; an input is its sample's as the analysis-CSV builder pairs it
+    (_input_samples), else by its sample row's raw_file name or stem."""
+    rows = [row for row in project.sample_metadata or [] if isinstance(row, dict)]
+    stated: dict[str, list[str]] = {}
+    by_name: dict[str, str] = {}
+    for row in rows:
+        sample = str(row.get("sample_id") or "").strip()
+        methods = stated_methods(row.get("values") or row.get("attributes") or {})
+        if sample and methods:
+            stated[sample] = list(dict.fromkeys([*stated.get(sample, []), *methods]))
+        raw = PurePosixPath(str(row.get("raw_file") or "").replace("\\", "/").rstrip("/")).name.casefold()
+        if sample and raw:
+            by_name.setdefault(raw, sample)
+            by_name.setdefault(PurePosixPath(raw).stem, sample)
+    if not stated:
+        return {}
+    paired = _input_samples(
+        {"project": project.as_dict(), "input_directory": str(data_root), "archive_extractions": archive_extractions},
+        inputs,
+    )
+    result: dict[str, dict[str, Any]] = {}
+    for item in inputs:
+        name = Path(str(item).rstrip("\\/")).name.casefold()
+        sample = paired.get(_file_key(item)) or by_name.get(name) or by_name.get(PurePosixPath(name).stem) or ""
+        if sample in stated:
+            result[_file_key(item)] = {"sample_id": sample, "methods": stated[sample]}
+    return result
+
+
+def _handoff_instrument(project: RepositoryProject) -> str:
+    """The unit's instrument as its Catalog handoff's technical settings record it (the Catalog's unit instrument), or
+    "" where none is recorded."""
+    metadata = project.repository_metadata if isinstance(project.repository_metadata, dict) else {}
+    handoff = metadata.get("catalog_handoff") if isinstance(metadata.get("catalog_handoff"), dict) else {}
+    settings = handoff.get("technical_settings") if isinstance(handoff.get("technical_settings"), dict) else {}
+    return str(settings.get("instrument") or "").strip()
 
 
 # ---- The convert stage: mzXML written as the mzML MS-DIAL reads ------------------------------------------
@@ -6107,6 +6218,21 @@ def _conversion_left_no_input(manifest: dict[str, Any]) -> bool:
     return bool(_no_converted_input_reason((plan or {}).get("outcome") if isinstance(plan, dict) else None))
 
 
+def _not_cid_hcd_left_no_input(manifest: dict[str, Any]) -> bool:
+    """Whether the lease kept every input out, at least one under the CID/HCD-only rule (fragmentation.py).
+
+    Such a unit has no header to read, and that is its answer: its preflight records nothing read, and its
+    campaign disposition excludes it (or skips it, where another of its inputs was kept out for a reason that is
+    not out of scope), as the unit whose every mzXML failed its conversion is skipped.
+    """
+    if [item for item in manifest.get("input_candidates") or [] if str(item).strip()]:
+        return False
+    return any(
+        isinstance(item, dict) and item.get("reason") == NOT_CID_HCD
+        for item in manifest.get("excluded_input_candidates") or []
+    )
+
+
 def run_raw_metadata_preflight(
     manifest_path: Path,
     extractor_path: Path,
@@ -6170,7 +6296,9 @@ def run_raw_metadata_preflight(
     inputs = available if not max_inputs or max_inputs <= 0 else available[0:max_inputs]
     # A unit whose every mzXML failed its conversion has no input to read, and that is its answer: the
     # preflight is recorded with nothing read, and the disposition skips the unit, rather than failing it.
-    converted_to_nothing = not candidates and _conversion_left_no_input(snapshot)
+    converted_to_nothing = not candidates and (
+        _conversion_left_no_input(snapshot) or _not_cid_hcd_left_no_input(snapshot)
+    )
     if not inputs and not converted_to_nothing:
         raise ValueError("No extracted MS-DIAL input candidate is available for metadata preflight.")
     output = manifest_path.parent / PREFLIGHT_OUTPUT_NAME
@@ -6406,6 +6534,13 @@ def _record_preflight(
             block["advisory"] = (
                 "No input of this unit survived its conversion from mzXML to mzML, so there was no header to "
                 "read. The unit has nothing to run, and its campaign disposition skips it."
+            )
+        elif not inputs and _not_cid_hcd_left_no_input(current):
+            # Nothing to read: the lease kept every input out, under the CID/HCD-only rule among others.
+            block["advisory"] = (
+                "Every input of this unit was kept out by its lease, and its file name or header named a "
+                "fragmentation method other than CID/HCD for at least one (fragmentation_not_cid_hcd, user decision "
+                "2026-10-29): there was no header to read, and the unit has nothing to run."
             )
         elif outcomes and all(item.get("outcome") == OUTCOME_UNSUPPORTED for item in outcomes.values()):
             # Fails closed exactly as an unavailable preflight does: a unit that was not

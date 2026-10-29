@@ -37,6 +37,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping
 
+from .fragmentation import NOT_CID_HCD
+
 
 CHUNK_INPUTS = 20
 # CreateProcess's lpCommandLine holds at most 32,767 characters including its terminating null.
@@ -1260,6 +1262,16 @@ def decide_disposition(
     its conversion would stop the rest of a declared unit. It decides nothing about the unit; what remains
     is decided below as before.
 
+    CID/HCD ONLY (user decision, 2026-10-29). A campaign lease keeps out an input whose file name or header names
+    another fragmentation method (fragmentation_not_cid_hcd, fragmentation.py), as one of those. Where that leaves no
+    input, the unit is excluded for it, or skipped where another input was kept out for a reason that is not out
+    of scope.
+
+    ONE POLARITY PER ANALYSIS (user decision, 2026-10-29: a unit whose repository record says Both is admitted). Each
+    input's polarity is its header's, and inputs that differ in it split the unit; an input whose scans switch
+    polarity is excluded (polarity_switching: unresolved mixed polarity is outside the campaign's scope), and one
+    whose header gives none, in a unit that declares no single polarity, as polarity_unresolved; the rest runs.
+
     THE ACQUISITION OF EACH FILE (user decision, 2026-10-06) is its header's wherever its header was read:
     one with MS2 whose header gives DDA, DIA, AIF or SWATH runs as that, over any declaration and at any
     extractor confidence, and declared_vs_header records each declaration it contradicted with its source
@@ -1461,6 +1473,18 @@ def decide_disposition(
         reasons.append("no_inputs")
         failed = [item for item in lease_excluded if item["reason"] == "conversion_failed"]
         contradicting = [item for item in lease_excluded if item["reason"] == "polarity_contradicts_declaration"]
+        not_cid_hcd = [item for item in lease_excluded if item["reason"] == NOT_CID_HCD]
+        if not_cid_hcd:
+            # CID/HCD ONLY (user decision, 2026-10-29). The lease kept out every input whose file name or header
+            # named another fragmentation method; where that was every input, the unit lies outside the campaign's
+            # scope and is excluded, as one of ion-mobility files only is. Where another input was kept out for a
+            # reason that is not out of scope, the unit is skipped with both reasons.
+            reasons.append(NOT_CID_HCD)
+            detail.append(
+                f"{len(not_cid_hcd)} of its input(s) were kept out by its lease because their file name or header "
+                "names a fragmentation method other than CID/HCD; every reference spectrum is CID/HCD-derived (user "
+                "decision, 2026-10-29)."
+            )
         if failed or contradicting:
             # The lease's convert stage was to write the unit's mzXML as mzML, and none is left: each conversion
             # failed, or the file's scans record the polarity opposite to the unit's declared ion mode beside
@@ -1477,8 +1501,11 @@ def decide_disposition(
                     "mode in some scans and none in others, and were excluded"
                 )
             detail.append(f"The unit has no input files: {'; '.join(lost)}, and no other input remains.")
-        else:
+        elif not not_cid_hcd:
             detail.append("The unit has no input files.")
+        if not_cid_hcd and len(not_cid_hcd) == len(lease_excluded):
+            detail.append("No other input remains, so the unit is excluded.")
+            return result("exclude")
         return result("skip")
     if coverage.get("capped"):
         reasons.append("raw_metadata_incomplete")
@@ -1716,6 +1743,24 @@ def decide_disposition(
         assignments[file_key(path)] = {
             "path": path, "console_acquisition_type": console, "polarity": polarity, "basis": basis,
         }
+
+    switching = sum(1 for item in excluded if item["reason"] == "polarity_switching")
+    unresolved_polarity = sum(1 for item in excluded if item["reason"] == "polarity_unresolved")
+    if switching:
+        # One polarity per analysis (user decision, 2026-10-29): a file whose scans switch polarity is unresolved
+        # mixed polarity, outside the campaign's scope; the rest of the unit runs, split by polarity where its
+        # files differ in it.
+        detail.append(
+            f"{switching} input(s) record scans of both polarities in the one file (polarity_switching): unresolved "
+            "mixed polarity is outside this campaign's scope, so they are excluded"
+            + (" and the rest of the unit runs." if groups else ".")
+        )
+    if unresolved_polarity:
+        detail.append(
+            f"{unresolved_polarity} input(s) have a raw header that gives no polarity, and the unit declares "
+            f"{declared_polarity or 'none'} rather than one polarity, so they are excluded (polarity_unresolved)"
+            + (" and the rest of the unit runs." if groups else ".")
+        )
 
     if not groups:
         file_reasons = [item["reason"] for item in excluded]
