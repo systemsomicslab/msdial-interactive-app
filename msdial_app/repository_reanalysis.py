@@ -8595,8 +8595,11 @@ CLEANUP_READY_STATUSES = {"mztab_validated", "completed", "cleanup_pending_confi
 PAST_PREFLIGHT_STATUSES = CLEANUP_READY_STATUSES | {"raw_cleaned", "discarded"}
 
 
-def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
+def evaluate_repository_execution_gate(state: dict[str, Any], *, production: bool = False) -> dict[str, Any]:
     """Decide whether a workflow may start MS-DIAL Console against a repository analysis unit.
+
+    ``production`` is true for a production run (not the peak-count diagnostic): its minimum peak height is then held,
+    in a unit switched from its .wiff2 to its .wiff (wiff_fallback), to a diagnostic measured on the files that run.
 
     execution_allowed is the gate that holds a downloaded unit back until its technical conditions are
     settled. A unit whose repository metadata already establishes untargeted LC-MS/MS with a known
@@ -8820,6 +8823,10 @@ def evaluate_repository_execution_gate(state: dict[str, Any]) -> dict[str, Any]:
                 "(classify_preflight)."
             )
     blockers.extend(_multi_energy_aif_blockers(manifest, str(state.get("console_path") or "")))
+    if production:
+        # A production threshold of a unit switched from its .wiff2 to its .wiff is measured on the .wiff (review of #88,
+        # low 4): never one only a superseded diagnostic, or one of a file that no longer runs, produced.
+        blockers.extend(wiff_fallback.threshold_blockers(manifest, state, admitted, aliases))
 
     # MS-DIAL reads every input with one MS1 and one MS2 data type, which must say what RawDataHandler hands
     # it, not what the instrument stored. Where every input that runs delivers one representation at a

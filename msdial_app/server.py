@@ -1960,7 +1960,7 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     )
                     return
-                gate = evaluate_repository_execution_gate(plan["workflow"])
+                gate = evaluate_repository_execution_gate(plan["workflow"], production=True)
                 if not gate["allowed"]:
                     self._json(
                         {
@@ -2540,7 +2540,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/run":
                 state = body.get("workflow", body)
-                gate = evaluate_repository_execution_gate(state)
+                gate = evaluate_repository_execution_gate(state, production=True)
                 if not gate["allowed"]:
                     self._json(
                         {
