@@ -4,6 +4,17 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.54] - Unreleased
+
+A defect the verification campaign v5-mpst48-20261029 found. Built on 0.5.53 (#86).
+
+### Fixed
+- **An MS-DIAL text export whose MS/MS spectrum field is longer than 131,072 characters is read.** The negative
+  part of MB-POST MPST000048 (ZenoTOF 7600 DDA) failed its peak-count diagnostic twice with "field larger than
+  field limit (131072)": 9 of the 19,623 rows of its .mdpeak carried a spectrum of 136,199-270,713 characters,
+  past Python's default csv field limit. Importing `msdial_app` now raises the limit for the process to
+  2**31 - 1, so every csv reader of an MS-DIAL export (the .mdpeak, the alignment exports) reads such a row.
+
 ## [0.5.53] - Unreleased
 
 Two defects the verification campaign v4-both-20261029 found, fixed as the user decided on 2026-10-29. Built on
