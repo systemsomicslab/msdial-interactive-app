@@ -349,6 +349,14 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
 - `msdial_split_repository_unit`: preview and, after explicit confirmation,
   split a raw-preflight result whose acquisition mode is `Mixed`. Never execute
   the parent unit; preflight and approve each generated child independently.
+- `msdial_switch_repository_unit_to_wiff`: preview and, after explicit
+  confirmation (or under a campaign approval covering boundary 4), switch a DDA
+  SCIEX unit or split part whose diagnostic or production run failed or timed
+  out on its `.wiff2` to the same samples' `.wiff` beside them, each with its
+  `.wiff.scan` (rule `wiff2_to_wiff_after_console_failure_2026_10_31`, once per
+  unit, never for DIA, SWATH or AIF). The switch is recorded in
+  `encoding_fallback`; then prepare the unit, run its diagnostic and prepare its
+  run again.
 - `msdial_prepare_repository_reanalysis`: preview Class matching first, then
   write reviewed metadata and `analysis_files.csv` after confirmation. A unit
   whose run has finished is refused (`run_finished`) and nothing is written;
@@ -413,6 +421,7 @@ These tools return a preview when `confirmed=false`:
 - `msdial_download_repository_raw`
 - `msdial_prepare_repository_reanalysis`
 - `msdial_split_repository_unit`
+- `msdial_switch_repository_unit_to_wiff`
 - `msdial_cleanup_repository_raw`
 - `msdial_discard_repository_raw`
 

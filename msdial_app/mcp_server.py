@@ -2316,6 +2316,81 @@ def msdial_split_repository_unit(
     }
 
 
+@_mcp_tool()
+@_structured_validation_errors
+def msdial_switch_repository_unit_to_wiff(
+    manifest_path: str,
+    failed_job_ids: list[str] | None = None,
+    confirmed: bool = False,
+    campaign_authorization_path: str = "",
+) -> dict[str, Any]:
+    """Switch a SCIEX unit or split part from its .wiff2 to the .wiff beside them, after a Console job failed on them.
+
+    The user's decision of 2026-10-31 (wiff_fallback.WIFF_FALLBACK_RULE): the .wiff2 stays the preferred encoding, and
+    where a peak-count diagnostic or production run of a DDA unit failed or timed out, and every .wiff2 it analyses has
+    the same sample's .wiff beside it with that .wiff's .wiff.scan, the unit's next attempt runs on the .wiff. Never for
+    a DIA, SWATH or AIF unit (ZT Scan DIA data can only be analysed from the .wiff2), never twice, and never in part.
+
+    failed_job_ids names the Console job(s) that failed, as the unit's run_attempts record them (kind tuning or run,
+    ended timeout, idle_timeout, error or a non-zero exit). With confirmed=false this previews the swaps and writes
+    nothing. With confirmed=true, or under a campaign approval covering boundary 4 for the unit (recorded in the
+    manifest), it rewrites input_candidates and the swapped inputs' lineage rows and records manifest.encoding_fallback
+    with the rule, the failed jobs and every file swapped from and to. Then prepare the unit again
+    (msdial_prepare_repository_reanalysis), run its peak-count diagnostic again for a threshold measured on the .wiff,
+    and prepare its run: what depends on the input list is made again.
+
+    A unit whose conditions do not hold is refused with ok false, switched false and a reason (already_switched,
+    no_console_failure, no_wiff2_input, not_dda, wiff_not_beside, wiff_scan_missing, wiff_already_an_input,
+    wiff_provenance_unrecorded, unit_not_switchable, run_in_progress), and nothing is written.
+    """
+    from . import wiff_fallback
+    from .repository_reanalysis import read_manifest, update_manifest
+
+    path = _existing_manifest(manifest_path)
+    manifest = read_manifest(path)
+    crossing = _campaign_authorization(
+        campaign_authorization_path, manifest, wiff_fallback.BOUNDARY, wiff_fallback.ENTRY_POINT
+    )
+    jobs = [str(item) for item in (failed_job_ids or [])]
+    try:
+        plan = wiff_fallback.plan_wiff_fallback(manifest, jobs)
+    except wiff_fallback.WiffFallbackRefused as refusal:
+        return {"ok": False, "switched": False, "reason": refusal.reason, "detail": refusal.detail,
+                "rule": wiff_fallback.WIFF_FALLBACK_RULE, **refusal.evidence}
+    preview = {
+        "rule": wiff_fallback.WIFF_FALLBACK_RULE,
+        "manifest_path": str(path),
+        "failed_jobs": plan["failed_jobs"],
+        "swaps": wiff_fallback.swap_summary({"swaps": plan["swaps"]}),
+        "swap_count": len(plan["swaps"]),
+    }
+    if not confirmed and crossing is None:
+        return {
+            "ok": True,
+            "switched": False,
+            "confirmation_required": True,
+            "preview": preview,
+            "message": "Review the swaps. Call again with confirmed=true to run the unit's next attempt on the .wiff.",
+        }
+    try:
+        written = update_manifest(path, wiff_fallback.fallback_change(plan, crossing=crossing))
+    except wiff_fallback.WiffFallbackRefused as refusal:
+        return {"ok": False, "switched": False, "reason": refusal.reason, "detail": refusal.detail,
+                "rule": wiff_fallback.WIFF_FALLBACK_RULE, **refusal.evidence}
+    return {
+        "ok": True,
+        "switched": True,
+        "confirmation_required": False,
+        "preview": preview,
+        "encoding_fallback": wiff_fallback.fallback_record(written),
+        **({"campaign_authorization": crossing} if crossing else {}),
+        "next_step": (
+            "Prepare the unit again (msdial_prepare_repository_reanalysis), run its peak-count diagnostic again, and "
+            "prepare its run: the analysis CSV, the threshold and the run bundle depend on the input list."
+        ),
+    }
+
+
 def _unit_manifest_path(download_job_id: str, manifest_path: str, host: str, port: int) -> Path:
     """The unit manifest a raw-data tool acts on: manifest_path when it exists, else its download job's."""
     resolved = Path(str(manifest_path or "")).expanduser()

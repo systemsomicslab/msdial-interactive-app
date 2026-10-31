@@ -277,6 +277,7 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 - `msdial_check_raw_metadata_extractor` / `msdial_set_raw_metadata_extractor_path`
 - `msdial_repository_raw_metadata_preflight`
 - `msdial_split_repository_unit`
+- `msdial_switch_repository_unit_to_wiff` (preview by default; the switch requires `confirmed=true` or a campaign approval)
 - `msdial_prepare_repository_reanalysis`
 - `msdial_repository_qa_evidence`
 - `msdial_cleanup_repository_raw`

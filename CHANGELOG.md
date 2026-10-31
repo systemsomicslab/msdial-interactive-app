@@ -4,6 +4,35 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.55] - Unreleased
+
+The user's decision of 2026-10-31 on the .wiff2 reader, after the verification campaign v5-mpst48-20261029. Built on
+0.5.54 (#87), which must merge first. Goes with the runner and gate change in msdial-public-reanalysis.
+
+### Added
+- **A SCIEX DDA unit whose Console job failed on its .wiff2 runs its next attempt on the .wiff beside them.** The
+  positive part of MB-POST MPST000048 (ZenoTOF 7600, DDA) ran every sample from its .wiff2, as the shared encoding
+  rule says, and its production run hung three times out of three: one or two files never wrote their .dcl, a
+  different file each time, and the Console sat at 0 % CPU until the watchdog killed it (exit -3). The .wiff reader
+  is the more stable one when files are read in parallel. `msdial_switch_repository_unit_to_wiff`
+  (`wiff_fallback`, rule `wiff2_to_wiff_after_console_failure_2026_10_31`) switches a unit or split part from its
+  .wiff2 to its .wiff where a peak-count diagnostic or production run of it failed or timed out (its `run_attempts`
+  say so: timeout, idle_timeout, error or a non-zero exit), the unit is DDA (its project, its applied disposition and
+  every decided or written type of its .wiff2), and every .wiff2 it analyses has the same sample's .wiff beside it,
+  with that .wiff's .wiff.scan and a download record of its own. Never for DIA, SWATH or AIF (ZT Scan DIA data can
+  only be analysed from the .wiff2), never in part, never twice. A preview with `confirmed=false`; a campaign
+  approval covering boundary 4 stands in for the confirmation and is recorded. The shared preference rule, its
+  vectors and the Catalog are unchanged: the .wiff2 is still what every unit runs first.
+- **The switch is on record, and what depends on the input list is made again.** `input_candidates` name each .wiff
+  in its .wiff2's place; each .wiff2's lineage row becomes the .wiff's (its own download, source and checksums; the
+  .wiff2's sample and pairing; `encoding_fallback` with the .wiff2's row unchanged); and `manifest.encoding_fallback`
+  (`msdial-encoding-fallback.v1`) records the rule, the failed job(s) with how each ended, every file swapped from
+  and to with its .wiff.scan, and the input candidates before. The one encoding rule's `encoding_choices` are not
+  rewritten. The analysis-CSV builder, the execution gate's decided types and the declared-input matching read a
+  .wiff through the .wiff2 it stands in for; the CSV record carries the warning `encoding_fallback_wiff2_to_wiff`
+  and the swaps. The analysis CSV, the diagnostic and its threshold, and the run bundle are then made again on the
+  .wiff by the steps that make them.
+
 ## [0.5.54] - Unreleased
 
 A defect the verification campaign v5-mpst48-20261029 found. Built on 0.5.53 (#86).

@@ -107,6 +107,7 @@ from .repository_reanalysis import (
     update_manifest,
     with_order_source,
 )
+from . import wiff_fallback
 from .sample_grouping import file_type_for, propose_injection_order
 from .workflow import console_safe_text
 
@@ -322,6 +323,9 @@ def build_repository_analysis_rows(
     # The declared inputs the lease's one encoding rule left unused for a sample it ran another file of (a declaration
     # that lists one sample's file in two folders): no input, and not missing either - each is on record in its
     # sample's encoding choice (manifest.encoding_choices).
+    # So is the .wiff2 a .wiff runs in place of after a Console failure (the user's decision of 2026-10-31): on record
+    # in manifest.encoding_fallback, and in the .wiff's lineage row.
+    fallback_sources = wiff_fallback.fallback_sources(manifest)
     unused_forms: set[str] = set()
     if declared:
         unused_paths = [
@@ -330,7 +334,7 @@ def build_repository_analysis_rows(
             if isinstance(choice, dict) and choice.get("used")
             for item in choice.get("unused") or []
             if isinstance(item, dict) and str(item.get("path") or "").strip()
-        ]
+        ] + list(fallback_sources.values())
         if unused_paths:
             unused_forms = {
                 form
@@ -490,8 +494,11 @@ def build_repository_analysis_rows(
                 doubled.append(f"{path.name} and {Path(used[index]).name} ({described(index)})")
             used.setdefault(index, candidate)
 
+        # A .wiff that runs in place of its .wiff2 is read through the .wiff2's header record (one acquisition).
+        in_place_of = _file_key(fallback_sources[key]) if key in fallback_sources else ""
         acquisition, source, code = _acquisition_type(
-            verdicts.get(key), unit_mode, decided_types.get(key, "" if key in decided_over else None)
+            verdicts.get(key) or (verdicts.get(in_place_of) if in_place_of else None), unit_mode,
+            decided_types.get(key, "" if key in decided_over or in_place_of in decided_over else None)
         )
         if code:
             acquisition_failures.setdefault(code, []).append(path.name)
@@ -741,6 +748,10 @@ def build_repository_analysis_rows(
     ]
     if archive_copies:
         warnings.append(DECLARED_ARCHIVE_COPIES_WARNING)
+    # The .wiff that run in place of their .wiff2 after a Console failure (2026-10-31), always on record with the CSV.
+    fallback = wiff_fallback.fallback_record(manifest)
+    if fallback:
+        warnings.append(wiff_fallback.WIFF_FALLBACK_WARNING)
     applied = _applied_disposition(manifest)
     as_swath = applied.get("aif_run_as_swath") if applied.get("disposition") == "run" else None
     multi_ce = applied.get("aif_multi_ce_run") if applied.get("disposition") == "run" else None
@@ -793,6 +804,9 @@ def build_repository_analysis_rows(
         **({"aif_multi_ce_run": dict(multi_ce)} if isinstance(multi_ce, dict) else {}),
         # The declared archives whose copies in other folders the lease left unused (2026-10-15), only where one was.
         **({"declared_archive_copies": archive_copies} if archive_copies else {}),
+        # The rule and the swaps of a unit that runs on its .wiff in place of its .wiff2 (wiff_fallback), only where one does.
+        **({"encoding_fallback": {"rule": fallback.get("rule"), "swaps": wiff_fallback.swap_summary(fallback)}}
+           if fallback else {}),
         "warnings": warnings,
     }
 
