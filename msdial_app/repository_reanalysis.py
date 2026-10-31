@@ -30,7 +30,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Iterator, Mapping
-from . import archives, encoding_preference, encoding_rule
+from . import archives, encoding_preference, encoding_rule, wiff_fallback
 from .archives import ArchiveError, ExtractionLimits
 from .diagnostic_paths import (
     INTERMEDIATES_DIRECTORY,
@@ -4979,8 +4979,10 @@ def lineage_stands_for(manifest: dict[str, Any]) -> dict[str, str]:
 
     An input the encoding rule used for a sample whose row pairs with another of its files stands for that file
     (encoding_choice.stands_for: the user's one rule of 2026-10-09, clause 4); otherwise a converted row stands for
-    the mzXML its conversion read (source.conversion.source_path). The allow-list, the split plan and the
-    analysis-CSV builder attribute such an input through it.
+    the mzXML its conversion read (source.conversion.source_path); otherwise a .wiff that runs in place of its .wiff2
+    after a Console failure stands for what that .wiff2 stood for, or the .wiff2 itself (encoding_fallback.stands_for:
+    the user's decision of 2026-10-31, wiff_fallback). The allow-list, the split plan and the analysis-CSV builder
+    attribute such an input through it.
     """
     lineage = manifest.get("input_lineage") if isinstance(manifest.get("input_lineage"), dict) else {}
     result: dict[str, str] = {}
@@ -4990,7 +4992,9 @@ def lineage_stands_for(manifest: dict[str, Any]) -> dict[str, str]:
         source = row.get("source") if isinstance(row.get("source"), dict) else {}
         conversion = source.get("conversion") if isinstance(source.get("conversion"), dict) else {}
         choice = row.get("encoding_choice") if isinstance(row.get("encoding_choice"), dict) else {}
-        stand = str(choice.get("stands_for") or conversion.get("source_path") or "").strip()
+        stand = str(
+            choice.get("stands_for") or conversion.get("source_path") or wiff_fallback.row_stands_for(row) or ""
+        ).strip()
         if stand:
             result[_file_key(str(row["path"]))] = stand
     return result
@@ -9206,7 +9210,10 @@ def _applied_disposition(manifest: dict[str, Any]) -> dict[str, Any]:
 
 
 def _decided_acquisition_by_file(manifest: dict[str, Any]) -> dict[str, str]:
-    """The Console acquisition type an applied campaign disposition decided for each file."""
+    """The Console acquisition type an applied campaign disposition decided for each file.
+
+    A .wiff that runs in place of its .wiff2 after a Console failure (wiff_fallback, 2026-10-31) is held to the type
+    decided for that .wiff2: the two are one acquisition, and the disposition read the .wiff2."""
     if not _applied_disposition(manifest):
         return {}
     summary = (manifest.get("raw_metadata_preflight") or {}).get("summary") or {}
@@ -9216,6 +9223,9 @@ def _decided_acquisition_by_file(manifest: dict[str, Any]) -> dict[str, str]:
         decided = str(item.get("console_acquisition_type") or "").strip()
         if path_text and decided:
             result[_file_key(path_text)] = decided
+    for key, source in wiff_fallback.fallback_sources(manifest).items():
+        if _file_key(source) in result:
+            result.setdefault(key, result[_file_key(source)])
     return result
 
 
@@ -11166,7 +11176,8 @@ def plan_split_parent_cleanup(manifest_path: Path, *, release_disposition_hold: 
        released.
     3. Every part's manifest is readable and names this parent, its manifest and its raw directory, as SPL-1
        reads them.
-    4. The parts' inputs, with the inputs a campaign disposition excluded, are the parent's inputs, each once.
+    4. The parts' inputs, with the inputs a campaign disposition excluded, are the parent's inputs, each once. A part
+       switched from its .wiff2 to its .wiff (wiff_fallback) is read through its record: each .wiff as its .wiff2.
     5. Every part has ended (_part_end): validated, released, failed after its retries, skipped, excluded or
        discarded; none has a Console that may still be running, and none keeps an artifact under the tree. A
        part with a new run prepared after a validated run, which has not validated, has not ended, and neither
@@ -11221,7 +11232,12 @@ def plan_split_parent_cleanup(manifest_path: Path, *, release_disposition_hold: 
         end = _part_end(part, raw_root, release_disposition_hold=release_disposition_hold)
         for problem in problems + end["blockers"]:
             blockers.append(f"Part {unit_id or part_path}: {problem}.")
-        claimed.extend(str(path) for path in part.get("input_candidates") or [] if str(path).strip())
+        # A part switched from its .wiff2 to its .wiff after a Console failure (wiff_fallback, 2026-10-31) holds each
+        # .wiff in its .wiff2's place: it claims the parent's input it stands in for, as the gate's SPL-1 reads it.
+        stands_in = wiff_fallback.fallback_sources(part)
+        claimed.extend(
+            stands_in.get(_file_key(str(path)), str(path)) for path in part.get("input_candidates") or [] if str(path).strip()
+        )
         parts.append({"analysis_unit_id": unit_id, "manifest_path": str(part_path), **end})
 
     excluded = {

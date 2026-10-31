@@ -2,7 +2,7 @@
 
 import csv as _csv
 
-__version__ = "0.5.54"
+__version__ = "0.5.55"
 
 # MS-DIAL's text exports (.mdpeak, the alignment exports) carry each peak's MS/MS spectrum in one field. A ZenoTOF
 # DDA spectrum can be longer than Python's default csv field limit of 131,072 characters (MB-POST MPST000048: 9 of
