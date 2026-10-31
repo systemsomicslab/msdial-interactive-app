@@ -25,7 +25,14 @@ peak-count diagnostic or its production run - failed or timed out (FAILED_ATTEMP
   open it (raw_metadata_preflight.missing_vendor_companion, vendor_companion_missing since 0.5.53). It is all or
   nothing: a unit some of whose .wiff2 have no such .wiff is not switched, so one run never mixes the two readers;
 - each such .wiff was downloaded as its own repository object (a download record names it, with its checksums), so
-  its lineage row says where its bytes came from, as every input's does;
+  its lineage row says where its bytes came from, as every input's does. A split part downloads nothing of its own:
+  its raw owner's (the parent's) download records are read, as its raw tree is the parent's;
+- each such .wiff's own raw header, read at the switch by the pinned raw-metadata extractor as the preflight runs it
+  (read_wiff_headers), can be read, holds one sample, gives DDA, and states the polarity the unit runs in (its ion
+  mode, or for a unit that names none, the polarity recorded for its .wiff2). The header is direct evidence of the file
+  that will run, where the .wiff2's (unreadable for every ZenoTOF .wiff2) was not; it is recorded beside the switch
+  (encoding_fallback.wiff_headers), never in raw_metadata_preflight.per_file, so the disposition's decided types stay as
+  the disposition decided them and the .wiff2's disposition remains the decision record;
 
 its next attempt runs on those .wiff instead. The switch happens once per unit or part (a unit that records one is
 refused, already_switched), and it is recorded with its evidence in manifest.encoding_fallback (RECORD_SCHEMA): the
@@ -45,7 +52,9 @@ the execution gate's decided types, the declared-input matching (lineage_stands_
 
 WHAT IS MADE AGAIN. Everything that depends on the input list: the analysis CSV and the reviewed metadata
 (msdial_prepare_repository_reanalysis), the peak-count diagnostic and its threshold, measured on the files that now
-run, and the run bundle. The campaign runner resumes such a unit at its metadata preparation (scripts/campaign in
+run, and the run bundle. The switch marks what stands of them as superseded (encoding_fallback.superseded: the
+analysis CSV record, whose status becomes superseded, the run bundle prepared from it and the latest diagnostic), so
+nothing reads them as the unit's own. The campaign runner resumes such a unit at its metadata preparation (scripts/campaign in
 msdial-public-reanalysis); a person runs the same steps in that order.
 
 WHAT IT NEVER DOES. It copies, moves and deletes no file, starts no Console, and switches no unit whose run finished,
@@ -94,6 +103,11 @@ WIFF_ALREADY_AN_INPUT = "wiff_already_an_input"
 WIFF_PROVENANCE_UNRECORDED = "wiff_provenance_unrecorded"
 UNIT_NOT_SWITCHABLE = "unit_not_switchable"
 RUN_IN_PROGRESS = "run_in_progress"
+WIFF2_NOT_A_FILE = "wiff2_not_a_file"
+# A .wiff whose own header does not support the switch: unreadable, more than one sample, not DDA, or another polarity.
+WIFF_HEADER_REFUSED = "wiff_header_refused"
+# Where the extractor's reads of the .wiff headers are written, under the unit's provenance.
+HEADER_READS_DIRECTORY = "wiff-fallback-header-reads"
 
 
 class WiffFallbackRefused(ValueError):
@@ -178,12 +192,37 @@ def _beside(path: Path, name: str) -> Path | None:
     return next((entry for entry in entries if entry.name.casefold() == wanted and entry.is_file()), None)
 
 
-def _download_of(manifest: Mapping[str, Any], path: Path) -> dict[str, Any] | None:
+def raw_owner(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """A split part's raw owner (its parent: raw_owned_by, else split_from.manifest_path), read; {} for a unit that
+    owns its raw tree, or an owner that cannot be read."""
+    from .repository_reanalysis import read_manifest
+
+    owner = str(manifest.get("raw_owned_by") or "").strip() or str(
+        (manifest.get("split_from") or {}).get("manifest_path") or "" if isinstance(manifest.get("split_from"), Mapping)
+        else "").strip()
+    if not owner:
+        return {}
+    try:
+        value = read_manifest(Path(owner))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _downloads(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The download records that vouch for the files of a unit's raw tree: its own, and a split part's raw owner's (a
+    part downloads nothing of its own; repository_reanalysis._split_unit_locked writes it no downloads)."""
+    found = [dict(item) for item in manifest.get("downloads") or [] if isinstance(item, Mapping)]
+    if isinstance(manifest.get("split_from"), Mapping) or str(manifest.get("raw_owned_by") or "").strip():
+        found += [dict(item) for item in raw_owner(manifest).get("downloads") or [] if isinstance(item, Mapping)]
+    return found
+
+
+def _download_of(manifest: Mapping[str, Any], path: Path, downloads: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
     """The download record of a file fetched as its own repository object (no archive), or None."""
     key = _key(str(path))
-    for item in manifest.get("downloads") or []:
-        if isinstance(item, Mapping) and not item.get("archive") and str(item.get("path") or "").strip() \
-                and _key(str(item["path"])) == key:
+    for item in _downloads(manifest) if downloads is None else downloads:
+        if not item.get("archive") and str(item.get("path") or "").strip() and _key(str(item["path"])) == key:
             return dict(item)
     return None
 
@@ -253,11 +292,13 @@ def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str
 
     manifest = dict(manifest)
     unit = str((manifest.get("project") or {}).get("analysis_unit_id") or "")
-    if fallback_record(manifest):
+    if manifest.get(FALLBACK_FIELD) is not None:
+        # Under any rule, as the gate reads it: one switch per unit, and a record this module does not read is not
+        # written over.
         raise WiffFallbackRefused(
             ALREADY_SWITCHED,
-            f"Unit {unit} already switched from its .wiff2 to its .wiff ({FALLBACK_FIELD}); the switch is made once.",
-            encoding_fallback=fallback_record(manifest),
+            f"Unit {unit} already records a switch of its encoding ({FALLBACK_FIELD}); the switch is made once.",
+            encoding_fallback=manifest.get(FALLBACK_FIELD),
         )
     status = str(manifest.get("status") or "")
     if status == SPLIT_PARENT_STATUS or status in RAW_RELEASED_STATUSES or finished_production_run(manifest) is not None:
@@ -301,9 +342,19 @@ def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str
     candidates = [str(item) for item in manifest.get("input_candidates") or [] if str(item).strip()]
     excluded = _campaign_excluded_inputs(manifest)
     analysed = [item for item in candidates if _key(item) not in excluded]
-    wiff2 = [item for item in analysed if item.rstrip("\\/").casefold().endswith(FROM_SUFFIX) and Path(item).is_file()]
+    wiff2 = [item for item in analysed if item.rstrip("\\/").casefold().endswith(FROM_SUFFIX)]
     if not wiff2:
         raise WiffFallbackRefused(NO_WIFF2_INPUT, f"Unit {unit} analyses no .wiff2 file; there is nothing to switch.")
+    absent = [Path(item).name for item in wiff2 if not Path(item).is_file()]
+    if absent:
+        # Never dropped in silence: a .wiff2 that is no file would be left out of the switch, and the unit would run
+        # one sample short, or on two readers.
+        raise WiffFallbackRefused(
+            WIFF2_NOT_A_FILE,
+            f"{len(absent)} .wiff2 input(s) of unit {unit} are no file on disk (the first is {absent[0]}); the switch is "
+            "of the whole unit or nothing.",
+            inputs=absent[:20],
+        )
     problem = _acquisition_problem(manifest, [_key(item) for item in wiff2])
     if problem:
         raise WiffFallbackRefused(NOT_DDA, f"Unit {unit} is not switched: {problem}.")
@@ -317,6 +368,7 @@ def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str
     already: list[str] = []
     unrecorded: list[str] = []
     swaps: list[dict[str, Any]] = []
+    downloads = _downloads(manifest)
     for item in wiff2:
         source = Path(item)
         target = _beside(source, source.name[: -len(FROM_SUFFIX)] + TO_SUFFIX)
@@ -330,7 +382,7 @@ def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str
         if _key(str(target)) in candidate_keys:
             already.append(target.name)
             continue
-        download = _download_of(manifest, target)
+        download = _download_of(manifest, target, downloads)
         if download is None:
             unrecorded.append(target.name)
             continue
@@ -382,11 +434,15 @@ def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str
     }
 
 
-def _fallback_row(manifest: Mapping[str, Any], old: Mapping[str, Any], swap: Mapping[str, Any]) -> dict[str, Any]:
-    """The lineage row of a .wiff that runs in place of a .wiff2: its own download's source and checksums, the .wiff2
-    row's sample and pairing, and the record of the switch with the .wiff2's row unchanged."""
+def _fallback_row(
+    manifest: Mapping[str, Any], old: Mapping[str, Any], swap: Mapping[str, Any],
+    downloads: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The lineage row of a .wiff that runs in place of a .wiff2: its own download's source and checksums (a split
+    part's from its raw owner's records), the .wiff2 row's sample and pairing, and the record of the switch with the
+    .wiff2's row unchanged."""
     target = Path(str(swap["to"]))
-    download = _download_of(manifest, target) or {}
+    download = _download_of(manifest, target, downloads) or {}
     choice = old.get("encoding_choice") if isinstance(old.get("encoding_choice"), Mapping) else {}
     stand = str(choice.get("stands_for") or "").strip() or str(old.get("path") or swap["from"])
     verified = bool(download.get("declared_checksum_verified"))
@@ -417,11 +473,156 @@ def _fallback_row(manifest: Mapping[str, Any], old: Mapping[str, Any], swap: Map
     return row
 
 
-def fallback_change(plan: Mapping[str, Any], *, crossing: Mapping[str, Any] | None = None, at: str = "") -> Any:
-    """The manifest change that makes a planned switch: input_candidates, the lineage rows, the record, the warning
-    and any campaign crossing, in one write. It plans again from the manifest as it is under the writer lock and
-    refuses (WiffFallbackRefused) where that differs from ``plan``: another writer switched the unit, or its files
-    moved, since the preview."""
+HeaderReader = Any  # (extractor path, list of paths, work directory) -> {_key: {"outcome", "record", "extractor_sha256"}}
+
+
+def read_wiff_headers(
+    extractor_path: str | Path, paths: Iterable[str | Path], work_directory: str | Path, *, runner: Any = None
+) -> dict[str, dict[str, Any]]:
+    """Each .wiff's own raw header, read by the raw-metadata extractor as the preflight runs it
+    (raw_metadata_preflight.run_extractor: bounded chunks, per-input time limits), by _key: {"outcome", "record"
+    (the extractor's record, or None), "extractor_sha256"}. Never raises for what the extractor does."""
+    from .raw_metadata_preflight import file_key, run_extractor
+    from .repository_reanalysis import raw_metadata_extractor_identity
+
+    extractor = Path(extractor_path).resolve()
+    sha256 = str(raw_metadata_extractor_identity(extractor).get("binary_sha256") or "")
+    inputs = [Path(item) for item in paths]
+    execution = run_extractor(extractor, inputs, Path(work_directory), extractor_sha256=sha256, runner=runner)
+    records: dict[str, dict[str, Any]] = {}
+    for record in execution.get("records") or []:
+        source = (record.get("source") or {}) if isinstance(record, Mapping) else {}
+        if str(source.get("filePath") or "").strip():
+            records[_key(str(source["filePath"]))] = dict(record)
+    outcomes = execution.get("outcomes") or {}
+    return {
+        _key(str(path)): {"outcome": str((outcomes.get(file_key(path)) or {}).get("outcome") or ""),
+                          "record": records.get(_key(str(path))), "extractor_sha256": sha256}
+        for path in inputs
+    }
+
+
+def _expected_polarity(manifest: Mapping[str, Any], source: str) -> str:
+    """The polarity a .wiff must state to run in place of ``source``: the unit's ion mode where it names one, else the
+    polarity recorded for that .wiff2 (its header record, or a file-name inference the disposition or the split
+    recorded); '' where nothing records one."""
+    mode = str((manifest.get("project") or {}).get("ion_mode") or "").strip().capitalize()
+    if mode in ("Positive", "Negative"):
+        return mode
+    key = _key(source)
+    summary = (manifest.get("raw_metadata_preflight") or {}).get("summary") or {}
+    for item in [*(summary.get("per_file") or []), *(manifest.get("header_verdicts_from_parent") or [])]:
+        if isinstance(item, Mapping) and _key(str(item.get("file") or "")) == key:
+            value = str(item.get("polarity") or "").strip()
+            if value in ("Positive", "Negative"):
+                return value
+    disposition = manifest.get("campaign_disposition") if isinstance(manifest.get("campaign_disposition"), Mapping) else {}
+    for item in [*(manifest.get("polarity_inferences") or []), *(disposition.get("polarity_inferences") or [])]:
+        if isinstance(item, Mapping) and _key(str(item.get("path") or "")) == key:
+            value = str(item.get("polarity") or "").strip()
+            if value in ("Positive", "Negative"):
+                return value
+    return ""
+
+
+def wiff_headers(
+    manifest: Mapping[str, Any], plan: Mapping[str, Any], reads: Mapping[str, Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    """The .wiff headers the switch rests on, as encoding_fallback.wiff_headers records them, or WiffFallbackRefused
+    (WIFF_HEADER_REFUSED) where one does not support it: a header the extractor could not read, one that holds more
+    than one sample, one whose acquisition is not DDA (IDA), or one that states another polarity than the unit runs in.
+
+    Each entry: the .wiff and the .wiff2 it stands in for (under the data root), the read's outcome, the polarity and
+    the one expected, the header's acquisition mode and the Console type it gives, the MS levels, the sample count
+    (None where the record lists no samples), the acquisition start time, the reader and the extractor's sha256."""
+    from .raw_metadata_preflight import READ_OUTCOMES
+    from .repository_reanalysis import _summarize_raw_metadata
+
+    unit = str((manifest.get("project") or {}).get("analysis_unit_id") or "")
+    entries: list[dict[str, Any]] = []
+    problems: list[str] = []
+    for swap in plan["swaps"]:
+        read = reads.get(_key(str(swap["to"]))) or {}
+        record = read.get("record") if isinstance(read.get("record"), Mapping) else None
+        name = Path(str(swap["to"])).name
+        outcome = str(read.get("outcome") or "")
+        if outcome not in READ_OUTCOMES or record is None:
+            problems.append(f"{name}: its header could not be read ({outcome or 'not read'})")
+            continue
+        summary = (_summarize_raw_metadata([dict(record)]).get("per_file") or [{}])[0]
+        samples = record.get("samples")
+        count = len(samples) if isinstance(samples, list) else None
+        expected = _expected_polarity(manifest, str(swap["from"]))
+        polarity = str(summary.get("polarity") or "")
+        console = str(summary.get("header_console_acquisition_type") or "")
+        entries.append({
+            "file": str(swap["to"]),
+            "file_relative": str(swap["to_relative"]),
+            "in_place_of": str(swap["from"]),
+            "in_place_of_relative": str(swap["from_relative"]),
+            "outcome": outcome,
+            "polarity": polarity,
+            "expected_polarity": expected,
+            "acquisition_mode": str(summary.get("acquisition_mode") or ""),
+            "header_console_acquisition_type": console or None,
+            "ms_levels": summary.get("ms_levels"),
+            "sample_count": count,
+            "acquisition_start_time": str(summary.get("acquisition_start_time") or ""),
+            "reader": str(summary.get("reader") or ""),
+            "extractor_sha256": str(read.get("extractor_sha256") or ""),
+        })
+        if count is not None and count > 1:
+            problems.append(f"{name}: it holds {count} samples, where a sample's input is one injection")
+        if console != "DDA":
+            problems.append(f"{name}: its header gives {console or 'no'} Console acquisition type "
+                            f"({summary.get('acquisition_mode') or 'no acquisition mode'}), not DDA")
+        if polarity not in ("Positive", "Negative"):
+            problems.append(f"{name}: its header states no single polarity ({polarity or 'none'})")
+        elif not expected:
+            problems.append(f"{name}: nothing records the polarity its .wiff2 runs in, to compare its header's with")
+        elif polarity != expected:
+            problems.append(f"{name}: its header states {polarity}, and the unit runs in {expected}")
+    if problems:
+        raise WiffFallbackRefused(
+            WIFF_HEADER_REFUSED,
+            f"Unit {unit} is not switched: the .wiff headers do not support it ({'; '.join(problems[:5])}).",
+            problems=problems[:20], wiff_headers=entries[:20],
+        )
+    return entries
+
+
+def _superseded(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """What stands of the unit's input-list-dependent artifacts, which the switch supersedes: the analysis CSV record,
+    the run bundle prepared from it (the output's run-manifest.json, where it exists) and the latest diagnostic."""
+    found: dict[str, Any] = {}
+    csv = manifest.get("analysis_csv") if isinstance(manifest.get("analysis_csv"), Mapping) else None
+    if csv:
+        found["analysis_csv"] = {"path": str(csv.get("path") or ""), "status": str(csv.get("status") or "")}
+    output = str(manifest.get("output_directory") or "").strip()
+    if output and (Path(output) / "run-manifest.json").is_file():
+        found["prepared_run"] = {"run_manifest": str(Path(output) / "run-manifest.json")}
+    diagnostics = [item for item in manifest.get("peak_height_diagnostics") or [] if isinstance(item, Mapping)]
+    if diagnostics:
+        last = diagnostics[-1]
+        found["diagnostic"] = {"job_id": str(last.get("job_id") or ""),
+                               "minimum_peak_height": last.get("minimum_peak_height"),
+                               "recorded_at": last.get("recorded_at")}
+    return found
+
+
+def fallback_change(
+    plan: Mapping[str, Any],
+    *,
+    crossing: Mapping[str, Any] | None = None,
+    at: str = "",
+    headers: list[dict[str, Any]] | None = None,
+    extractor: Mapping[str, Any] | None = None,
+) -> Any:
+    """The manifest change that makes a planned switch: input_candidates, the lineage rows, the record (with the .wiff
+    headers it rests on, ``headers``, and the extractor that read them), the superseded artifacts, the warning and any
+    campaign crossing, in one write. It plans again from the manifest as it is under the writer lock and refuses
+    (WiffFallbackRefused) where that differs from ``plan``: another writer switched the unit, or its files moved, since
+    the preview."""
     at = at or datetime.now(timezone.utc).isoformat()
     job_ids = [item["job_id"] for item in plan["failed_jobs"]]
 
@@ -430,11 +631,13 @@ def fallback_change(plan: Mapping[str, Any], *, crossing: Mapping[str, Any] | No
         if [(item["from"], item["to"]) for item in again["swaps"]] != [(item["from"], item["to"]) for item in plan["swaps"]]:
             raise WiffFallbackRefused(UNIT_NOT_SWITCHABLE, "The unit's inputs changed since the switch was planned.")
         by_source = {_key(swap["from"]): swap for swap in again["swaps"]}
+        downloads = _downloads(manifest)
+        superseded = _superseded(manifest)
         manifest["input_candidates"] = list(again["input_candidates_after"])
         lineage = manifest.get("input_lineage")
         if isinstance(lineage, dict):
             lineage["rows"] = [
-                _fallback_row(manifest, row, by_source[_key(str(row.get("path") or ""))])
+                _fallback_row(manifest, row, by_source[_key(str(row.get("path") or ""))], downloads)
                 if isinstance(row, dict) and _key(str(row.get("path") or "")) in by_source else row
                 for row in lineage.get("rows") or []
             ]
@@ -449,6 +652,9 @@ def fallback_change(plan: Mapping[str, Any], *, crossing: Mapping[str, Any] | No
             "failed_jobs": again["failed_jobs"],
             "swaps": again["swaps"],
             "input_candidates_before": again["input_candidates_before"],
+            "wiff_headers": list(headers or []),
+            **({"extractor": dict(extractor)} if extractor else {}),
+            "superseded": superseded,
         }
         if crossing:
             record["campaign_authorization"] = {
@@ -457,6 +663,14 @@ def fallback_change(plan: Mapping[str, Any], *, crossing: Mapping[str, Any] | No
             }
             manifest["campaign_authorizations"] = [*(manifest.get("campaign_authorizations") or []), dict(crossing)]
         manifest[FALLBACK_FIELD] = record
+        mark = {"rule": WIFF_FALLBACK_RULE, "switched_at": at}
+        if isinstance(manifest.get("analysis_csv"), dict):
+            # Its rows name the .wiff2: superseded, so the execution gate holds no row to a type written for them.
+            manifest["analysis_csv"]["status"] = "superseded"
+            manifest["analysis_csv"]["superseded_by_encoding_fallback"] = mark
+        diagnostics = manifest.get("peak_height_diagnostics")
+        if isinstance(diagnostics, list) and diagnostics and isinstance(diagnostics[-1], dict):
+            diagnostics[-1]["superseded_by_encoding_fallback"] = mark
         warnings = list(manifest.get("warnings") or [])
         if WIFF_FALLBACK_WARNING not in warnings:
             manifest["warnings"] = [*warnings, WIFF_FALLBACK_WARNING]
@@ -465,15 +679,27 @@ def fallback_change(plan: Mapping[str, Any], *, crossing: Mapping[str, Any] | No
 
 
 def switch_to_wiff(
-    manifest_path: str | Path, failed_job_ids: Iterable[str], *, crossing: Mapping[str, Any] | None = None
+    manifest_path: str | Path,
+    failed_job_ids: Iterable[str],
+    *,
+    extractor_path: str | Path,
+    crossing: Mapping[str, Any] | None = None,
+    extractor: Mapping[str, Any] | None = None,
+    reader: Any = None,
 ) -> dict[str, Any]:
     """Make the switch in the unit manifest at ``manifest_path``: the record (manifest.encoding_fallback) as written.
-    Raises WiffFallbackRefused, writing nothing, where the conditions do not hold."""
+    The .wiff headers are read with ``extractor_path`` (read_wiff_headers, or ``reader`` with its signature) before
+    anything is written, outside the manifest's lock. Raises WiffFallbackRefused, writing nothing, where the conditions
+    do not hold."""
     from .repository_reanalysis import read_manifest, update_manifest
 
     path = Path(manifest_path).resolve()
-    plan = plan_wiff_fallback(read_manifest(path), failed_job_ids)
-    written = update_manifest(path, fallback_change(plan, crossing=crossing))
+    manifest = read_manifest(path)
+    plan = plan_wiff_fallback(manifest, failed_job_ids)
+    reads = (reader or read_wiff_headers)(extractor_path, [swap["to"] for swap in plan["swaps"]],
+                                          path.parent / HEADER_READS_DIRECTORY)
+    headers = wiff_headers(manifest, plan, reads)
+    written = update_manifest(path, fallback_change(plan, crossing=crossing, headers=headers, extractor=extractor))
     return fallback_record(written)
 
 

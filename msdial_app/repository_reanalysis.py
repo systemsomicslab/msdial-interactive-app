@@ -11176,7 +11176,8 @@ def plan_split_parent_cleanup(manifest_path: Path, *, release_disposition_hold: 
        released.
     3. Every part's manifest is readable and names this parent, its manifest and its raw directory, as SPL-1
        reads them.
-    4. The parts' inputs, with the inputs a campaign disposition excluded, are the parent's inputs, each once.
+    4. The parts' inputs, with the inputs a campaign disposition excluded, are the parent's inputs, each once. A part
+       switched from its .wiff2 to its .wiff (wiff_fallback) is read through its record: each .wiff as its .wiff2.
     5. Every part has ended (_part_end): validated, released, failed after its retries, skipped, excluded or
        discarded; none has a Console that may still be running, and none keeps an artifact under the tree. A
        part with a new run prepared after a validated run, which has not validated, has not ended, and neither
@@ -11231,7 +11232,12 @@ def plan_split_parent_cleanup(manifest_path: Path, *, release_disposition_hold: 
         end = _part_end(part, raw_root, release_disposition_hold=release_disposition_hold)
         for problem in problems + end["blockers"]:
             blockers.append(f"Part {unit_id or part_path}: {problem}.")
-        claimed.extend(str(path) for path in part.get("input_candidates") or [] if str(path).strip())
+        # A part switched from its .wiff2 to its .wiff after a Console failure (wiff_fallback, 2026-10-31) holds each
+        # .wiff in its .wiff2's place: it claims the parent's input it stands in for, as the gate's SPL-1 reads it.
+        stands_in = wiff_fallback.fallback_sources(part)
+        claimed.extend(
+            stands_in.get(_file_key(str(path)), str(path)) for path in part.get("input_candidates") or [] if str(path).strip()
+        )
         parts.append({"analysis_unit_id": unit_id, "manifest_path": str(part_path), **end})
 
     excluded = {

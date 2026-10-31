@@ -22,17 +22,52 @@ from unittest.mock import patch
 _CONFIG = tempfile.TemporaryDirectory()
 with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
     from msdial_app import mcp_server, wiff_fallback
+    from msdial_app.materials_methods import _wiff_fallback_sentence
     from msdial_app.repository_analysis_rows import build_repository_analysis_rows
     from msdial_app.repository_reanalysis import (
         _write_json,
         evaluate_repository_execution_gate,
         lineage_stands_for,
+        plan_split_parent_cleanup,
         read_manifest,
         update_manifest,
     )
 
+from subprocess import CompletedProcess
+
+from test_raw_metadata_preflight import _header
+
 SAMPLES = ("241202_Tomita_18_pos", "241202_Tomita_19_pos", "241202_Tomita_20_pos")
 UNIT = "u48-dda-pos"
+
+
+class _WiffExtractor:
+    """A stand-in for RawMetadataConsoleApp reading .wiff headers, installed as run_extractor's runner.
+
+    ``verdicts`` maps a file name to keyword arguments for _header (polarity, method, ...) with ``samples`` (how many
+    samples the record lists, 1 by default), or to "fail" (exit 1). Every other file reads as one positive DDA sample.
+    """
+
+    def __init__(self, verdicts: dict | None = None) -> None:
+        self.verdicts = verdicts or {}
+        self.read: list[str] = []
+
+    def __call__(self, command, **kwargs):
+        inputs = [command[index + 1] for index, token in enumerate(command) if token == "--input"]
+        output = Path(command[command.index("--output") + 1])
+        records = []
+        for path in inputs:
+            self.read.append(Path(path).name)
+            verdict = self.verdicts.get(Path(path).name, {})
+            if verdict == "fail":
+                return CompletedProcess(command, 1, stdout="", stderr="System.IO.InvalidDataException")
+            verdict = dict(verdict)
+            samples = int(verdict.pop("samples", 1))
+            record = _header(path, **{"method": "DDA", "polarity": "Positive", **verdict})
+            record["samples"] = [{"id": {"value": f"s{index}"}} for index in range(samples)]
+            records.append(record)
+        output.write_text(json.dumps(records[0] if len(records) == 1 else records), encoding="utf-8")
+        return CompletedProcess(command, 0, stdout=str(output), stderr="")
 
 
 def _authorization(root: Path, covers: list) -> Path:
@@ -110,6 +145,21 @@ class _Part(unittest.TestCase):
             },
         })
 
+        # The extractor that reads the .wiff headers: a stub file chosen as a pinned build, and a runner standing in for
+        # its process (_WiffExtractor), so the records are parsed as run_extractor parses the real one's.
+        self.extractor_file = self.root / "RawMetadataConsoleApp.exe"
+        self.extractor_file.write_bytes(b"stub")
+        self.extractor = _WiffExtractor()
+        real = wiff_fallback.read_wiff_headers
+        chosen = (self.extractor_file, {"path": str(self.extractor_file), "sha256": "ab" * 32, "pinned": True})
+        for patcher in (
+            patch.object(wiff_fallback, "read_wiff_headers",
+                         side_effect=lambda extractor, paths, work: real(extractor, paths, work, runner=self.extractor)),
+            patch.object(mcp_server, "_wiff_fallback_extractor", return_value=chosen),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def tearDown(self) -> None:
         self._directory.cleanup()
 
@@ -118,6 +168,29 @@ class _Part(unittest.TestCase):
 
     def switch(self, jobs=("rn1",), **options) -> dict:
         return mcp_server.msdial_switch_repository_unit_to_wiff(str(self.manifest_path), list(jobs), **options)
+
+    def as_part(self) -> Path:
+        """The unit as the split writes a part: no downloads of its own, its raw tree its parent's, which names it."""
+        parent_path = self.data.parent.parent / "provenance" / "parent-manifest.json"
+        part = read_manifest(self.manifest_path)
+        _write_json(parent_path, {
+            "schema": "msdial-public-reanalysis-run.v1", "status": "split_by_acquisition",
+            "workspace": str(self.data.parent.parent), "raw_directory": str(self.data.parent),
+            "input_directory": str(self.data), "raw_retention_policy": "delete_after_validated_output",
+            "execution_allowed": False, "downloads": part["downloads"],
+            "input_candidates": list(part["input_candidates"]),
+            "split_into": [{"analysis_unit_id": UNIT, "manifest_path": str(self.manifest_path),
+                            "input_candidates": list(part["input_candidates"])}],
+            "project": {"analysis_unit_id": "u48"},
+        })
+
+        def split(manifest: dict) -> None:
+            manifest.pop("downloads")
+            manifest["split_from"] = {"analysis_unit_id": "u48", "manifest_path": str(parent_path), "acquisition_mode": "DDA"}
+            manifest["raw_owned_by"] = str(parent_path)
+
+        self.change(split)
+        return parent_path
 
 
 class TheSwitch(_Part):
@@ -257,6 +330,125 @@ class UnderACampaignApproval(_Part):
 
         self.assertEqual((False, "campaign_authorization_refused"), (result["ok"], result["reason"]))
         self.assertEqual(before, self.manifest_path.read_bytes())
+
+
+class ASplitPart(_Part):
+    """Review of #88: a part's manifest carries no downloads (the split writes none), and its parent's release counts
+    the parts' inputs. A switched part is read through its raw owner and its record."""
+
+    def test_a_part_without_downloads_of_its_own_is_switched_from_its_raw_owners_records(self) -> None:
+        self.as_part()
+        result = self.switch(confirmed=True)
+
+        self.assertTrue(result["switched"], result)
+        row = read_manifest(self.manifest_path)["input_lineage"]["rows"][0]
+        self.assertEqual(hashlib.sha256(f"{SAMPLES[0]}.wiff".encode()).hexdigest(), row["checksums"]["sha256"])
+        self.assertEqual(f"https://example.org/{SAMPLES[0]}.wiff", row["source"]["url"])
+
+    def test_the_parent_is_released_as_before_once_its_part_switched(self) -> None:
+        parent = self.as_part()
+        before = [item for item in plan_split_parent_cleanup(parent)["blockers"] if "each once" in item]
+        self.assertTrue(self.switch(confirmed=True)["switched"])
+        after = [item for item in plan_split_parent_cleanup(parent)["blockers"] if "each once" in item]
+
+        self.assertEqual([], before)
+        self.assertEqual([], after, "the part's .wiff claim the parent's .wiff2 they stand in for")
+
+    def test_a_part_whose_inputs_changed_otherwise_still_blocks_the_release(self) -> None:
+        parent = self.as_part()
+        self.switch(confirmed=True)
+        self.change(lambda manifest: manifest["input_candidates"].pop())
+        self.assertTrue([item for item in plan_split_parent_cleanup(parent)["blockers"] if "each once" in item])
+
+
+class TheWiffHeaders(_Part):
+    """Each .wiff's own header is read at the switch and recorded beside it, never in the preflight's per-file records:
+    the switch is refused where one cannot be read, holds several samples, is not DDA or states another polarity."""
+
+    def test_each_wiff_header_is_read_and_recorded_beside_the_switch(self) -> None:
+        self.switch(confirmed=True)
+        manifest = read_manifest(self.manifest_path)
+        headers = manifest["encoding_fallback"]["wiff_headers"]
+
+        self.assertEqual([stem + ".wiff" for stem in SAMPLES], sorted(self.extractor.read))
+        self.assertEqual([(stem + ".wiff", stem + ".wiff2", "Positive", "DDA", 1) for stem in SAMPLES],
+                         [(item["file_relative"], item["in_place_of_relative"], item["polarity"],
+                           item["header_console_acquisition_type"], item["sample_count"]) for item in headers])
+        self.assertEqual(str(self.extractor_file), manifest["encoding_fallback"]["extractor"]["path"])
+        per_file = manifest["raw_metadata_preflight"]["summary"]["per_file"]
+        self.assertTrue(all(item["file"].endswith(".wiff2") for item in per_file), "the decision record stays the .wiff2's")
+
+    def test_a_preview_reads_no_header(self) -> None:
+        self.switch()
+        self.assertEqual([], self.extractor.read)
+
+    def assertRefusedFor(self, verdict, said: str) -> None:
+        self.extractor.verdicts[SAMPLES[1] + ".wiff"] = verdict
+        before = self.manifest_path.read_bytes()
+        result = self.switch(confirmed=True)
+        self.assertEqual((False, wiff_fallback.WIFF_HEADER_REFUSED), (result["ok"], result["reason"]), result)
+        self.assertIn(said, result["detail"])
+        self.assertEqual(before, self.manifest_path.read_bytes())
+
+    def test_an_unreadable_header_refuses(self) -> None:
+        self.assertRefusedFor("fail", "could not be read")
+
+    def test_a_wiff_of_several_samples_refuses(self) -> None:
+        self.assertRefusedFor({"samples": 2}, "holds 2 samples")
+
+    def test_a_header_that_is_not_dda_refuses(self) -> None:
+        self.assertRefusedFor({"method": "DIA"}, "not DDA")
+
+    def test_a_header_of_another_polarity_refuses(self) -> None:
+        self.assertRefusedFor({"polarity": "Negative"}, "states Negative, and the unit runs in Positive")
+
+    def test_without_a_single_ion_mode_the_wiff2s_recorded_polarity_is_the_one_compared(self) -> None:
+        def both(manifest: dict) -> None:
+            manifest["project"]["ion_mode"] = "Both"
+            manifest["polarity_inferences"] = [{"path": item, "polarity": "Positive", "polarity_source": "file_name"}
+                                               for item in manifest["input_candidates"]]
+
+        self.change(both)
+        self.assertTrue(self.switch(confirmed=True)["switched"])
+
+
+class WhatTheSwitchSupersedes(_Part):
+    def test_the_csv_the_prepared_run_and_the_latest_diagnostic_are_marked_superseded(self) -> None:
+        output = self.data.parent.parent / "output"
+        (output / "run-manifest.json").write_text("{}", encoding="utf-8")
+        self.change(lambda manifest: manifest.update(
+            analysis_csv={"status": "written", "path": str(output / "analysis_files.csv"), "rows": 3},
+            peak_height_diagnostics=[{"job_id": "dg1", "minimum_peak_height": 1200, "recorded_at": "2026-10-30"}]))
+        self.switch(confirmed=True)
+        manifest = read_manifest(self.manifest_path)
+        superseded = manifest["encoding_fallback"]["superseded"]
+
+        self.assertEqual("superseded", manifest["analysis_csv"]["status"])
+        self.assertEqual(wiff_fallback.WIFF_FALLBACK_RULE,
+                         manifest["peak_height_diagnostics"][-1]["superseded_by_encoding_fallback"]["rule"])
+        self.assertEqual(("written", "dg1"), (superseded["analysis_csv"]["status"], superseded["diagnostic"]["job_id"]))
+        self.assertEqual(str(output / "run-manifest.json"), superseded["prepared_run"]["run_manifest"])
+
+    def test_the_methods_text_says_the_wiff_was_read_in_place_of_the_wiff2_and_why(self) -> None:
+        workflow = {"repository_run_manifest": str(self.manifest_path)}
+        self.assertEqual("", _wiff_fallback_sentence(workflow))
+        self.switch(confirmed=True)
+        sentence = _wiff_fallback_sentence(workflow)
+        self.assertIn("The 3 SCIEX analysis file(s)", sentence)
+        self.assertIn("production MS-DIAL Console run on the .wiff2 files failed or timed out", sentence)
+        self.assertIn(wiff_fallback.WIFF_FALLBACK_RULE, sentence)
+
+
+class TheReviewsLowFindings(_Part):
+    def test_a_wiff2_that_is_no_file_refuses_rather_than_being_dropped(self) -> None:
+        (self.data / (SAMPLES[0] + ".wiff2")).unlink()
+        result = self.switch(confirmed=True)
+        self.assertEqual(wiff_fallback.WIFF2_NOT_A_FILE, result["reason"])
+
+    def test_a_record_under_any_rule_refuses_a_second_switch(self) -> None:
+        self.change(lambda manifest: manifest.update(encoding_fallback={"rule": "some_other_rule"}))
+        result = self.switch(confirmed=True)
+        self.assertEqual(wiff_fallback.ALREADY_SWITCHED, result["reason"])
 
 
 if __name__ == "__main__":

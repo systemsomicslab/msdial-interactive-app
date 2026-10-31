@@ -32,6 +32,25 @@ The user's decision of 2026-10-31 on the .wiff2 reader, after the verification c
   .wiff through the .wiff2 it stands in for; the CSV record carries the warning `encoding_fallback_wiff2_to_wiff`
   and the swaps. The analysis CSV, the diagnostic and its threshold, and the run bundle are then made again on the
   .wiff by the steps that make them.
+- **Each .wiff's own header is read before the switch, and recorded beside it.** The switch reads every .wiff with
+  the raw-metadata extractor as the preflight runs it (`extractor_path`, else the configured one; verified and pinned
+  in a campaign) and is refused (`wiff_header_refused`) where a header cannot be read, lists more than one sample,
+  gives no DDA, or states another polarity than the unit runs in (its ion mode, else the polarity recorded for the
+  .wiff2). What it read is `encoding_fallback.wiff_headers` (polarity, acquisition, Console type, MS levels, sample
+  count, start time, reader, extractor sha256) and `encoding_fallback.extractor`; the preflight's `per_file` and the
+  disposition stay the decision record. A preview reads nothing.
+- **What the switch supersedes is marked so.** The analysis CSV record (status `superseded`), the latest diagnostic
+  (`superseded_by_encoding_fallback`) and the prepared run bundle are named in `encoding_fallback.superseded`.
+- **The publication report says the run read the .wiff in place of the .wiff2, and why.**
+
+### Fixed (review of #88)
+- **A split part is switched.** A part's manifest carries no downloads; the .wiff's download record is read from its
+  raw owner's, in the plan and in the lineage row. Every real part was refused as `wiff_provenance_unrecorded`.
+- **A split parent is released after a part switched.** `plan_split_parent_cleanup` reads a switched part's .wiff as
+  the parent's .wiff2 they stand in for, so the parts are still the parent's inputs, each once, and cleanup, discard
+  and `record_split_parent_pending` no longer refuse the parent for good.
+- A .wiff2 input that is no file refuses the switch (`wiff2_not_a_file`) instead of being left out, and a manifest
+  that records an `encoding_fallback` under any rule refuses a second switch.
 
 ## [0.5.54] - Unreleased
 

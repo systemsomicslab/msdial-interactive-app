@@ -2316,6 +2316,29 @@ def msdial_split_repository_unit(
     }
 
 
+def _wiff_fallback_extractor(extractor_path: str, campaign: bool) -> tuple[Path, dict[str, Any]]:
+    """The raw-metadata extractor that reads the .wiff headers of a switch, and its record: chosen as the preflight
+    chooses one (select_raw_metadata_extractor), and in a campaign verified and pinned, or RawMetadataExtractorRefused."""
+    from .raw_metadata_extractor import RawMetadataExtractorRefused, campaign_refusal, select_raw_metadata_extractor
+    from .repository_reanalysis import _extractor_record, raw_metadata_extractor_identity
+
+    selected = select_raw_metadata_extractor(extractor_path, campaign=campaign, checkout_parent=ROOT.parent)
+    if not selected.get("path"):
+        raise RawMetadataExtractorRefused(
+            ["extractor_absent"],
+            ["No raw-metadata extractor is named to read the .wiff headers: pass extractor_path, or set one with "
+             "msdial_set_raw_metadata_extractor_path."],
+            {},
+        )
+    path = Path(str(selected["path"])).resolve()
+    identity = raw_metadata_extractor_identity(path)
+    if campaign:
+        codes, reasons = campaign_refusal(identity)
+        if codes:
+            raise RawMetadataExtractorRefused(codes, reasons, identity)
+    return path, _extractor_record(path, identity, str(selected.get("source") or ""))
+
+
 @_mcp_tool()
 @_structured_validation_errors
 def msdial_switch_repository_unit_to_wiff(
@@ -2323,6 +2346,7 @@ def msdial_switch_repository_unit_to_wiff(
     failed_job_ids: list[str] | None = None,
     confirmed: bool = False,
     campaign_authorization_path: str = "",
+    extractor_path: str = "",
 ) -> dict[str, Any]:
     """Switch a SCIEX unit or split part from its .wiff2 to the .wiff beside them, after a Console job failed on them.
 
@@ -2332,19 +2356,24 @@ def msdial_switch_repository_unit_to_wiff(
     a DIA, SWATH or AIF unit (ZT Scan DIA data can only be analysed from the .wiff2), never twice, and never in part.
 
     failed_job_ids names the Console job(s) that failed, as the unit's run_attempts record them (kind tuning or run,
-    ended timeout, idle_timeout, error or a non-zero exit). With confirmed=false this previews the swaps and writes
-    nothing. With confirmed=true, or under a campaign approval covering boundary 4 for the unit (recorded in the
-    manifest), it rewrites input_candidates and the swapped inputs' lineage rows and records manifest.encoding_fallback
-    with the rule, the failed jobs and every file swapped from and to. Then prepare the unit again
-    (msdial_prepare_repository_reanalysis), run its peak-count diagnostic again for a threshold measured on the .wiff,
-    and prepare its run: what depends on the input list is made again.
+    ended timeout, idle_timeout, error or a non-zero exit). With confirmed=false this previews the swaps and reads and
+    writes nothing. With confirmed=true, or under a campaign approval covering boundary 4 for the unit (recorded in the
+    manifest), it first reads each .wiff's own raw header with the raw-metadata extractor (extractor_path, else the
+    configured one; in a campaign it must be verified and pinned, as for the preflight), and switches only where every
+    header can be read, holds one sample, gives DDA and states the polarity the unit runs in. It then rewrites
+    input_candidates and the swapped inputs' lineage rows (a split part's provenance from its raw owner's download
+    records), marks the analysis CSV, the prepared run and the latest diagnostic superseded, and records
+    manifest.encoding_fallback with the rule, the failed jobs, every file swapped from and to and the .wiff headers
+    (wiff_headers). Then prepare the unit again (msdial_prepare_repository_reanalysis), run its peak-count diagnostic
+    again for a threshold measured on the .wiff, and prepare its run: what depends on the input list is made again.
 
     A unit whose conditions do not hold is refused with ok false, switched false and a reason (already_switched,
-    no_console_failure, no_wiff2_input, not_dda, wiff_not_beside, wiff_scan_missing, wiff_already_an_input,
-    wiff_provenance_unrecorded, unit_not_switchable, run_in_progress), and nothing is written.
+    no_console_failure, no_wiff2_input, wiff2_not_a_file, not_dda, wiff_not_beside, wiff_scan_missing,
+    wiff_already_an_input, wiff_provenance_unrecorded, wiff_header_refused, unit_not_switchable, run_in_progress), and
+    nothing is written.
     """
     from . import wiff_fallback
-    from .repository_reanalysis import read_manifest, update_manifest
+    from .repository_reanalysis import read_manifest
 
     path = _existing_manifest(manifest_path)
     manifest = read_manifest(path)
@@ -2352,11 +2381,15 @@ def msdial_switch_repository_unit_to_wiff(
         campaign_authorization_path, manifest, wiff_fallback.BOUNDARY, wiff_fallback.ENTRY_POINT
     )
     jobs = [str(item) for item in (failed_job_ids or [])]
+
+    def refused(refusal: "wiff_fallback.WiffFallbackRefused") -> dict[str, Any]:
+        return {"ok": False, "switched": False, "reason": refusal.reason, "detail": refusal.detail,
+                "rule": wiff_fallback.WIFF_FALLBACK_RULE, **refusal.evidence}
+
     try:
         plan = wiff_fallback.plan_wiff_fallback(manifest, jobs)
     except wiff_fallback.WiffFallbackRefused as refusal:
-        return {"ok": False, "switched": False, "reason": refusal.reason, "detail": refusal.detail,
-                "rule": wiff_fallback.WIFF_FALLBACK_RULE, **refusal.evidence}
+        return refused(refusal)
     preview = {
         "rule": wiff_fallback.WIFF_FALLBACK_RULE,
         "manifest_path": str(path),
@@ -2370,19 +2403,24 @@ def msdial_switch_repository_unit_to_wiff(
             "switched": False,
             "confirmation_required": True,
             "preview": preview,
-            "message": "Review the swaps. Call again with confirmed=true to run the unit's next attempt on the .wiff.",
+            "message": (
+                "Review the swaps. Call again with confirmed=true to read each .wiff's header and, where every one "
+                "supports it, run the unit's next attempt on the .wiff."
+            ),
         }
+    extractor, extractor_record = _wiff_fallback_extractor(extractor_path, crossing is not None)
     try:
-        written = update_manifest(path, wiff_fallback.fallback_change(plan, crossing=crossing))
+        record = wiff_fallback.switch_to_wiff(
+            path, jobs, extractor_path=extractor, crossing=crossing, extractor=extractor_record
+        )
     except wiff_fallback.WiffFallbackRefused as refusal:
-        return {"ok": False, "switched": False, "reason": refusal.reason, "detail": refusal.detail,
-                "rule": wiff_fallback.WIFF_FALLBACK_RULE, **refusal.evidence}
+        return refused(refusal)
     return {
         "ok": True,
         "switched": True,
         "confirmation_required": False,
         "preview": preview,
-        "encoding_fallback": wiff_fallback.fallback_record(written),
+        "encoding_fallback": record,
         **({"campaign_authorization": crossing} if crossing else {}),
         "next_step": (
             "Prepare the unit again (msdial_prepare_repository_reanalysis), run its peak-count diagnostic again, and "

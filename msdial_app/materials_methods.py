@@ -482,6 +482,7 @@ def _methods_text(
             "metadata, processing parameters, annotation settings, and library provenance are provided "
             "in Supplementary Table S1."
             + _input_integrity_sentence(workflow)
+            + _wiff_fallback_sentence(workflow)
         ),
         _processing_sentence(workflow, project_type),
         _annotation_sentence(workflow, libraries),
@@ -566,6 +567,35 @@ def _input_integrity_sentence(workflow: dict[str, Any]) -> str:
         return ""
     statement = input_integrity_statement(manifest if isinstance(manifest, dict) else None)
     return f" {statement}" if statement else ""
+
+
+def _wiff_fallback_sentence(workflow: dict[str, Any]) -> str:
+    """' The N SCIEX analysis file(s) ... were read from the .wiff' for a repository unit switched from its .wiff2 to
+    its .wiff after a Console failure (wiff_fallback, the user's decision of 2026-10-31), else ''. It says what was read
+    in place of what, and why, so the report never reads as a run of the preferred encoding."""
+    from . import wiff_fallback
+    from .repository_reanalysis import read_manifest
+
+    manifest_path = str(workflow.get("repository_run_manifest") or "").strip()
+    if not manifest_path:
+        return ""
+    try:
+        record = wiff_fallback.fallback_record(read_manifest(manifest_path))
+    except (OSError, ValueError):
+        return ""
+    swaps = [item for item in record.get("swaps") or [] if isinstance(item, dict)]
+    if not swaps:
+        return ""
+    stops = sorted({str(item.get("console_job") or item.get("kind") or "Console")
+                    for item in record.get("failed_jobs") or [] if isinstance(item, dict)})
+    return (
+        f" The {len(swaps)} SCIEX analysis file(s) were deposited both as .wiff2 and as .wiff with its .wiff.scan, and "
+        "were read from the .wiff: MS-DIAL Interactive prefers the .wiff2, but a "
+        + " and ".join(stops)
+        + " MS-DIAL Console run on the .wiff2 files failed or timed out, and the .wiff reader is the more stable one "
+        "when files are read in parallel, so the next attempt read each sample's .wiff in place of its .wiff2 "
+        f"({wiff_fallback.WIFF_FALLBACK_RULE}; each .wiff's own raw header was read and recorded with the switch)."
+    )
 
 
 def _processing_sentence(workflow: dict[str, Any], project_type: str) -> str:

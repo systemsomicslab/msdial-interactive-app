@@ -354,9 +354,11 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   SCIEX unit or split part whose diagnostic or production run failed or timed
   out on its `.wiff2` to the same samples' `.wiff` beside them, each with its
   `.wiff.scan` (rule `wiff2_to_wiff_after_console_failure_2026_10_31`, once per
-  unit, never for DIA, SWATH or AIF). The switch is recorded in
-  `encoding_fallback`; then prepare the unit, run its diagnostic and prepare its
-  run again.
+  unit, never for DIA, SWATH or AIF). Each `.wiff` header is read first with
+  the raw-metadata extractor (`extractor_path`), and the switch is refused
+  unless every header reads as one DDA sample in the unit's polarity. The
+  switch is recorded in `encoding_fallback` (with `wiff_headers`); then prepare
+  the unit, run its diagnostic and prepare its run again.
 - `msdial_prepare_repository_reanalysis`: preview Class matching first, then
   write reviewed metadata and `analysis_files.csv` after confirmation. A unit
   whose run has finished is refused (`run_finished`) and nothing is written;
