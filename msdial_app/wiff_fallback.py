@@ -104,7 +104,7 @@ WIFF_PROVENANCE_UNRECORDED = "wiff_provenance_unrecorded"
 UNIT_NOT_SWITCHABLE = "unit_not_switchable"
 RUN_IN_PROGRESS = "run_in_progress"
 WIFF2_NOT_A_FILE = "wiff2_not_a_file"
-# A .wiff whose own header does not support the switch: unreadable, more than one sample, not DDA, or another polarity.
+# A .wiff whose own header does not support the switch: unreadable, a sample count other than one, not DDA, or another polarity.
 WIFF_HEADER_REFUSED = "wiff_header_refused"
 # Where the extractor's reads of the .wiff headers are written, under the unit's provenance.
 HEADER_READS_DIRECTORY = "wiff-fallback-header-reads"
@@ -529,12 +529,14 @@ def wiff_headers(
     manifest: Mapping[str, Any], plan: Mapping[str, Any], reads: Mapping[str, Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
     """The .wiff headers the switch rests on, as encoding_fallback.wiff_headers records them, or WiffFallbackRefused
-    (WIFF_HEADER_REFUSED) where one does not support it: a header the extractor could not read, one that holds more
-    than one sample, one whose acquisition is not DDA (IDA), or one that states another polarity than the unit runs in.
+    (WIFF_HEADER_REFUSED) where one does not support it: a header the extractor could not read, one that lists other
+    than exactly one sample (none, several, or no samples at all), one whose acquisition is not DDA (IDA), or one that
+    states another polarity than the unit runs in.
 
     Each entry: the .wiff and the .wiff2 it stands in for (under the data root), the read's outcome, the polarity and
     the one expected, the header's acquisition mode and the Console type it gives, the MS levels, the sample count
-    (None where the record lists no samples), the acquisition start time, the reader and the extractor's sha256."""
+    (None where the record lists no samples, which refuses the switch as a count other than one does), the acquisition
+    start time, the reader and the extractor's sha256."""
     from .raw_metadata_preflight import READ_OUTCOMES
     from .repository_reanalysis import _summarize_raw_metadata
 
@@ -571,8 +573,11 @@ def wiff_headers(
             "reader": str(summary.get("reader") or ""),
             "extractor_sha256": str(read.get("extractor_sha256") or ""),
         })
-        if count is not None and count > 1:
-            problems.append(f"{name}: it holds {count} samples, where a sample's input is one injection")
+        if count != 1:
+            # Exactly one (review of #88, low 1): a header that lists no sample, or none at all, does not show that the
+            # file is the one injection its .wiff2 was, any more than one that lists several.
+            problems.append(f"{name}: its header lists {'no sample count' if count is None else f'{count} samples'}, "
+                            "where a sample's input is exactly one injection")
         if console != "DDA":
             problems.append(f"{name}: its header gives {console or 'no'} Console acquisition type "
                             f"({summary.get('acquisition_mode') or 'no acquisition mode'}), not DDA")
@@ -701,6 +706,69 @@ def switch_to_wiff(
     headers = wiff_headers(manifest, plan, reads)
     written = update_manifest(path, fallback_change(plan, crossing=crossing, headers=headers, extractor=extractor))
     return fallback_record(written)
+
+
+def _moment(value: Any) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def current_diagnostics(manifest: Mapping[str, Any], admitted: Iterable[Any], aliases: Mapping[str, str]) -> list[dict[str, Any]]:
+    """The peak-count diagnostics of a switched unit that measured the files that run: recorded after the switch,
+    never marked superseded_by_encoding_fallback, and whose representative file (its path, or the input its Console
+    alias stands for) is one of the unit's current input candidates (``admitted``, resolved). All of the unit's
+    diagnostics for a unit that never switched."""
+    from .repository_reanalysis import _file_key, _unit_input_of
+
+    diagnostics = [dict(item) for item in manifest.get("peak_height_diagnostics") or [] if isinstance(item, Mapping)]
+    record = fallback_record(manifest)
+    if not record:
+        return diagnostics
+    switched = _moment(record.get("switched_at"))
+    current = {_file_key(str(item)) for item in admitted}
+    kept = []
+    for item in diagnostics:
+        if item.get("superseded_by_encoding_fallback"):
+            continue
+        recorded = _moment(item.get("recorded_at"))
+        if switched is not None and (recorded is None or recorded < switched):
+            continue
+        path = str((item.get("representative") or {}).get("file_path") or "").strip()
+        if not path or _file_key(_unit_input_of(path, dict(aliases))) not in current:
+            continue
+        kept.append(item)
+    return kept
+
+
+def threshold_blockers(
+    manifest: Mapping[str, Any], state: Mapping[str, Any], admitted: Iterable[Any], aliases: Mapping[str, str]
+) -> list[str]:
+    """Why a production run of a switched unit may not start at the minimum peak height its workflow asks for: no
+    diagnostic measured on the files that run (current_diagnostics) produced that threshold. A diagnostic recorded
+    before the switch, one the switch marked superseded, and one whose representative is no current input (the .wiff2
+    it measured) do not count: the threshold must be measured on the files that actually run. [] for a unit that never
+    switched, or a workflow that asks for no threshold."""
+    if not fallback_record(manifest) or state.get("minimum_peak_height") in (None, ""):
+        return []
+    try:
+        asked = float(state["minimum_peak_height"])
+    except (TypeError, ValueError):
+        return []
+    for item in current_diagnostics(manifest, admitted, aliases):
+        try:
+            if abs(float(item.get("minimum_peak_height")) - asked) < 1e-9:
+                return []
+        except (TypeError, ValueError):
+            continue
+    return [
+        f"The run asks for a minimum peak height of {state['minimum_peak_height']}, and no peak-count diagnostic measured "
+        "on the files that now run produced it: this unit's inputs were switched from its .wiff2 to its .wiff "
+        f"({WIFF_FALLBACK_RULE}), and a threshold from a diagnostic before the switch, one marked superseded, or one "
+        "whose representative is no current input was measured on other files. Run the diagnostic again."
+    ]
 
 
 def swap_summary(record: Mapping[str, Any]) -> list[dict[str, str]]:

@@ -4,6 +4,21 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.56] - Unreleased
+
+The low findings of the re-review of #88, on 0.5.55. Goes with the gate change in msdial-public-reanalysis.
+
+### Fixed
+- **A .wiff header must list exactly one sample.** The switch from .wiff2 to .wiff refused a header that listed
+  several samples and let one through that listed none, or no sample list at all. It now refuses (`wiff_header_refused`)
+  every count other than one: the header has to show the file is the one injection its .wiff2 was.
+- **A switched unit's production run is held to a threshold measured on the .wiff.** The execution gate of a
+  production run (`evaluate_repository_execution_gate(..., production=True)`, the agent run and `/api/run`; never the
+  diagnostic) refuses, in a unit with an `encoding_fallback`, a minimum peak height that no diagnostic measured on the
+  files that now run produced: a diagnostic recorded before the switch, one marked `superseded_by_encoding_fallback`,
+  and one whose representative file is no current input do not count (`wiff_fallback.current_diagnostics`). A unit
+  that never switched is not held to it.
+
 ## [0.5.55] - Unreleased
 
 The user's decision of 2026-10-31 on the .wiff2 reader, after the verification campaign v5-mpst48-20261029. Built on

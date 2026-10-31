@@ -62,9 +62,11 @@ class _WiffExtractor:
             if verdict == "fail":
                 return CompletedProcess(command, 1, stdout="", stderr="System.IO.InvalidDataException")
             verdict = dict(verdict)
-            samples = int(verdict.pop("samples", 1))
+            samples = verdict.pop("samples", 1)
             record = _header(path, **{"method": "DDA", "polarity": "Positive", **verdict})
-            record["samples"] = [{"id": {"value": f"s{index}"}} for index in range(samples)]
+            if samples is not None:
+                # None: a record that lists no samples at all.
+                record["samples"] = [{"id": {"value": f"s{index}"}} for index in range(int(samples))]
             records.append(record)
         output.write_text(json.dumps(records[0] if len(records) == 1 else records), encoding="utf-8")
         return CompletedProcess(command, 0, stdout=str(output), stderr="")
@@ -394,7 +396,12 @@ class TheWiffHeaders(_Part):
         self.assertRefusedFor("fail", "could not be read")
 
     def test_a_wiff_of_several_samples_refuses(self) -> None:
-        self.assertRefusedFor({"samples": 2}, "holds 2 samples")
+        self.assertRefusedFor({"samples": 2}, "lists 2 samples")
+
+    def test_a_wiff_of_no_sample_or_no_sample_count_refuses(self) -> None:
+        """Review of #88, low 1: exactly one sample, so a count of 0 and a record with no sample list refuse too."""
+        self.assertRefusedFor({"samples": 0}, "lists 0 samples")
+        self.assertRefusedFor({"samples": None}, "lists no sample count")
 
     def test_a_header_that_is_not_dda_refuses(self) -> None:
         self.assertRefusedFor({"method": "DIA"}, "not DDA")
@@ -410,6 +417,60 @@ class TheWiffHeaders(_Part):
 
         self.change(both)
         self.assertTrue(self.switch(confirmed=True)["switched"])
+
+
+class AThresholdMeasuredOnTheFilesThatRun(_Part):
+    """Review of #88, low 4: a production run of a switched unit runs at a threshold a diagnostic measured on the
+    .wiff, never one a superseded diagnostic, one before the switch, or one of a file that no longer runs produced."""
+
+    def _state(self, threshold) -> dict:
+        return {"repository_run_manifest": str(self.manifest_path), "ion_mode": "Positive", "minimum_peak_height": threshold,
+                "files": [{"file_path": str(self.data / (stem + ".wiff")), "acquisition_type": "DDA"} for stem in SAMPLES]}
+
+    def _diagnostic(self, threshold: int, representative: str, recorded_at: str = "2099-01-01T00:00:00+00:00") -> dict:
+        return {"recorded_at": recorded_at, "job_id": f"dg-{threshold}", "minimum_peak_height": threshold,
+                "representative": {"file_path": str(self.data / representative), "file_name": Path(representative).stem}}
+
+    def blocked(self, threshold, *, production: bool = True) -> bool:
+        gate = evaluate_repository_execution_gate(self._state(threshold), production=production)
+        return any("no peak-count diagnostic measured on the files that now run" in item for item in gate["blockers"])
+
+    def test_the_wiff2_diagnostics_threshold_is_refused_and_the_wiffs_runs(self) -> None:
+        self.change(lambda manifest: manifest.update(
+            peak_height_diagnostics=[self._diagnostic(1200, SAMPLES[0] + ".wiff2", "2026-10-30T00:00:00+00:00")]))
+        self.switch(confirmed=True)
+
+        self.assertTrue(self.blocked(1200), "measured before the switch, on the .wiff2, and superseded")
+        self.assertFalse(self.blocked(1200, production=False), "the diagnostic itself is not held to a threshold")
+        self.change(lambda manifest: manifest["peak_height_diagnostics"].append(
+            self._diagnostic(900, SAMPLES[0] + ".wiff")))
+        self.assertFalse(self.blocked(900))
+        self.assertTrue(self.blocked(1200))
+
+    def test_a_diagnostic_after_the_switch_on_a_file_that_no_longer_runs_does_not_count(self) -> None:
+        self.switch(confirmed=True)
+        self.change(lambda manifest: manifest.setdefault("peak_height_diagnostics", []).append(
+            self._diagnostic(900, SAMPLES[0] + ".wiff2")))
+        self.assertTrue(self.blocked(900))
+
+    def test_a_diagnostic_marked_superseded_does_not_count(self) -> None:
+        self.switch(confirmed=True)
+
+        def superseded(manifest: dict) -> None:
+            item = self._diagnostic(900, SAMPLES[0] + ".wiff")
+            item["superseded_by_encoding_fallback"] = {"rule": wiff_fallback.WIFF_FALLBACK_RULE}
+            manifest.setdefault("peak_height_diagnostics", []).append(item)
+
+        self.change(superseded)
+        self.assertTrue(self.blocked(900))
+
+    def test_a_unit_that_never_switched_is_not_held_to_it(self) -> None:
+        self.change(lambda manifest: manifest.update(
+            peak_height_diagnostics=[self._diagnostic(1200, SAMPLES[0] + ".wiff2", "2026-10-30T00:00:00+00:00")]))
+        state = {**self._state(5), "files": [{"file_path": str(self.data / (stem + ".wiff2")), "acquisition_type": "DDA"}
+                                             for stem in SAMPLES]}
+        self.assertEqual([], [item for item in evaluate_repository_execution_gate(state, production=True)["blockers"]
+                              if "peak-count diagnostic" in item])
 
 
 class WhatTheSwitchSupersedes(_Part):
