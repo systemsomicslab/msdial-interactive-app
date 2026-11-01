@@ -24,9 +24,13 @@ peak-count diagnostic or its production run - failed or timed out (FAILED_ATTEMP
   S.wiff) with that .wiff's .wiff.scan beside it. A .wiff without its .wiff.scan is no candidate: the Console cannot
   open it (raw_metadata_preflight.missing_vendor_companion, vendor_companion_missing since 0.5.53). It is all or
   nothing: a unit some of whose .wiff2 have no such .wiff is not switched, so one run never mixes the two readers;
-- each such .wiff was downloaded as its own repository object (a download record names it, with its checksums), so
-  its lineage row says where its bytes came from, as every input's does. A split part downloads nothing of its own:
-  its raw owner's (the parent's) download records are read, as its raw tree is the parent's;
+- each such .wiff, and the .wiff.scan it is opened with, has its provenance on record, so its lineage row says where
+  its bytes came from, as every input's does: it was downloaded as its own repository object (a download record names
+  it, with its checksums), or it came out of an archive the unit downloaded (0.5.57: MB-POST serves an accession as
+  one tar, so every MB-POST .wiff is such a member) - it is among the extracted_files of that lease, and the member
+  listing of the archive's extraction, its sha256 still the recorded one, lists it as extracted with the size it has
+  on disk (repository_reanalysis.recorded_extraction). A split part downloads and extracts nothing of its own: its raw
+  owner's (the parent's) records are read, as its raw tree is the parent's;
 - each such .wiff's own raw header, read at the switch by the pinned raw-metadata extractor as the preflight runs it
   (read_wiff_headers), can be read, holds one sample, gives DDA, and states the polarity the unit runs in (its ion
   mode, or for a unit that names none, the polarity recorded for its .wiff2). The header is direct evidence of the file
@@ -41,8 +45,10 @@ rule, the failed job(s) with how each ended as the unit's run_attempts record it
 switch, so the swaps can be checked to be exactly what changed.
 
 WHAT THE SWITCH CHANGES. input_candidates name the .wiff in each .wiff2's place, in the same position. Each .wiff2's
-input_lineage row is replaced by a row of its .wiff: the .wiff's own download record (kind file, source and
-checksums), the .wiff2 row's sample and pairing, and encoding_fallback {rule, in_place_of: the .wiff2, stands_for: the
+input_lineage row is replaced by a row of its .wiff: where the .wiff's bytes came from, as build_input_lineage writes it
+(a download of its own: kind file, its source and checksums; a member of the raw owner's archive: kind extracted_member,
+the archive and the member as its source, its own declared checksum where the allow-list validation compared it, and
+its basis), the .wiff2 row's sample and pairing, and encoding_fallback {rule, in_place_of: the .wiff2, stands_for: the
 file whose naming gives the input its sample, in_place_of_row: the .wiff2's row unchanged}. The .wiff2's
 encoding_choice (the one encoding rule's record) stays on that kept row and in manifest.encoding_choices: the rule's
 decision is not rewritten, and the fallback says why another file runs. Nothing else is touched - not the raw-header
@@ -58,7 +64,10 @@ nothing reads them as the unit's own. The campaign runner resumes such a unit at
 msdial-public-reanalysis); a person runs the same steps in that order.
 
 WHAT IT NEVER DOES. It copies, moves and deletes no file, starts no Console, and switches no unit whose run finished,
-whose raw data were released, that is a split parent, or whose Console may still be running.
+whose raw data were released, that is a split parent, or whose Console may still be running. A .wiff it switches to
+lies in the unit's (a split part: its raw owner's) raw tree, a download or an archive member like any other file
+there, and goes with that tree: its release (plan_download_cleanup, plan_split_parent_cleanup) deletes it whole, and a
+download store's link to an extracted .wiff is released with the owner's claim.
 """
 
 from __future__ import annotations
@@ -227,6 +236,36 @@ def _download_of(manifest: Mapping[str, Any], path: Path, downloads: list[dict[s
     return None
 
 
+def _raw_tree_owner(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """The manifest whose lease extracted the unit's raw tree: a split part's raw owner (raw_owner; {} where it cannot
+    be read), else the unit's own."""
+    if isinstance(manifest.get("split_from"), Mapping) or str(manifest.get("raw_owned_by") or "").strip():
+        return raw_owner(manifest)
+    return dict(manifest)
+
+
+def _provenance_of(
+    manifest: Mapping[str, Any], path: Path, downloads: list[dict[str, Any]], owner: Mapping[str, Any],
+    listings: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None, str]:
+    """Where a file's bytes came from, as the unit's records say: ("download", its download record, '') for a file
+    fetched as its own repository object; ("extracted_member", repository_reanalysis.recorded_extraction's record,
+    '') for one that came out of an archive the unit (a split part: its raw owner) downloaded, which that lease's
+    extracted_files, archive extraction and member listing account for at the size it has on disk; else ("", None,
+    why neither does)."""
+    from .repository_reanalysis import recorded_extraction
+
+    download = _download_of(manifest, path, downloads)
+    if download is not None:
+        return "download", download, ""
+    if not owner:
+        return "", None, "its raw owner's manifest cannot be read"
+    extraction, why = recorded_extraction(dict(owner), path, listings)
+    if extraction is not None:
+        return "extracted_member", extraction, ""
+    return "", None, why
+
+
 def _declared_names(manifest: Mapping[str, Any], relative: str) -> list[str]:
     """The names the unit's file listing gives a file under the data root, by the forms the lease compares
     (repository_reanalysis.build_input_lineage: the path, less a leading FILES/, less its first folder)."""
@@ -369,6 +408,8 @@ def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str
     unrecorded: list[str] = []
     swaps: list[dict[str, Any]] = []
     downloads = _downloads(manifest)
+    owner = _raw_tree_owner(manifest)
+    listings: dict[str, Any] = {}
     for item in wiff2:
         source = Path(item)
         target = _beside(source, source.name[: -len(FROM_SUFFIX)] + TO_SUFFIX)
@@ -382,11 +423,19 @@ def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str
         if _key(str(target)) in candidate_keys:
             already.append(target.name)
             continue
-        download = _download_of(manifest, target, downloads)
-        if download is None:
-            unrecorded.append(target.name)
-            continue
         scan = _beside(target, target.name + ".scan")
+        # The .wiff and the .wiff.scan it is opened with: each a repository object of its own, or a member of an
+        # archive the unit downloaded (MB-POST serves an accession as one tar).
+        unvouched = []
+        for file in (target, scan):
+            if file is None:
+                continue
+            kind, _record, why = _provenance_of(manifest, file, downloads, owner, listings)
+            if not kind:
+                unvouched.append(f"{file.name}: {why}")
+        if unvouched:
+            unrecorded.append("; ".join(unvouched))
+            continue
         row = rows.get(_key(item)) or {}
         swaps.append({
             "from": str(source),
@@ -420,8 +469,10 @@ def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str
     if unrecorded:
         raise WiffFallbackRefused(
             WIFF_PROVENANCE_UNRECORDED,
-            f"{len(unrecorded)} .wiff beside unit {unit}'s .wiff2 were not downloaded as repository objects of their "
-            f"own (the first is {unrecorded[0]}), so no record says where their bytes came from.",
+            f"{len(unrecorded)} .wiff beside unit {unit}'s .wiff2 (or the .wiff.scan beside them) were neither "
+            "downloaded as repository objects of their own nor extracted, as their archive's member listing gives "
+            f"them, from an archive the unit downloaded (the first: {unrecorded[0]}), so no record says where their "
+            "bytes came from.",
             inputs=unrecorded[:20],
         )
     by_source = {_key(swap["from"]): swap["to"] for swap in swaps}
@@ -436,31 +487,51 @@ def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str
 
 def _fallback_row(
     manifest: Mapping[str, Any], old: Mapping[str, Any], swap: Mapping[str, Any],
-    downloads: list[dict[str, Any]] | None = None,
+    downloads: list[dict[str, Any]] | None = None, owner: Mapping[str, Any] | None = None,
+    listings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """The lineage row of a .wiff that runs in place of a .wiff2: its own download's source and checksums (a split
-    part's from its raw owner's records), the .wiff2 row's sample and pairing, and the record of the switch with the
-    .wiff2's row unchanged."""
+    """The lineage row of a .wiff that runs in place of a .wiff2: where its bytes came from, the .wiff2 row's sample
+    and pairing, and the record of the switch with the .wiff2's row unchanged.
+
+    Where its bytes came from is written as build_input_lineage writes it for any input: a .wiff fetched as its own
+    repository object is a row of kind file with its download's source and checksums (a split part's from its raw
+    owner's records); one that came out of an archive the unit (a split part: its raw owner) downloaded - every
+    MB-POST .wiff, as MB-POST serves an accession as one tar - is a row of kind extracted_member, with the archive as
+    its source and the member under the data root, its own declared checksum where the allow-list validation compared
+    it, and its basis (repository_reanalysis.extracted_member_fields over recorded_extraction's record). ``owner`` is
+    the manifest whose lease extracted the raw tree (_raw_tree_owner when not given)."""
+    from .repository_reanalysis import extracted_member_fields
+
     target = Path(str(swap["to"]))
-    download = _download_of(manifest, target, downloads) or {}
+    downloads = _downloads(manifest) if downloads is None else downloads
+    owner = _raw_tree_owner(manifest) if owner is None else owner
+    kind, record, _why = _provenance_of(manifest, target, downloads, owner, {} if listings is None else listings)
     choice = old.get("encoding_choice") if isinstance(old.get("encoding_choice"), Mapping) else {}
     stand = str(choice.get("stands_for") or "").strip() or str(old.get("path") or swap["from"])
-    verified = bool(download.get("declared_checksum_verified"))
     row: dict[str, Any] = {
         "path": str(target),
         "kind": "file",
         "declared_names": _declared_names(manifest, str(swap["to_relative"])) or list(old.get("declared_names") or []),
         "sample_id": str(old.get("sample_id") or ""),
         "file_name": "",
-        "source": {"url": download.get("source_url", ""), "download_path": download.get("path", "")},
-        "checksums": {
+    }
+    if kind == "extracted_member" and record is not None:
+        data_root = str(owner.get("input_directory") or manifest.get("input_directory") or "")
+        row.update(extracted_member_fields(
+            target, Path(data_root), record["download"], record["listed"],
+            [item for item in owner.get("archive_extractions") or [] if isinstance(item, dict)], record["verified"],
+        ))
+    else:
+        download = record or {}
+        verified = bool(download.get("declared_checksum_verified"))
+        row["source"] = {"url": download.get("source_url", ""), "download_path": download.get("path", "")}
+        row["checksums"] = {
             "sha256": download.get("sha256", ""),
             "md5": download.get("md5", ""),
             "declared": download.get("declared_checksum", ""),
             "declared_algorithm": "md5" if verified else "",
             "declared_verified": True if verified else None,
-        },
-    }
+        }
     for key in ("name_pairing", "sample_row"):
         if key in old:
             row[key] = copy.deepcopy(old[key])
@@ -637,12 +708,14 @@ def fallback_change(
             raise WiffFallbackRefused(UNIT_NOT_SWITCHABLE, "The unit's inputs changed since the switch was planned.")
         by_source = {_key(swap["from"]): swap for swap in again["swaps"]}
         downloads = _downloads(manifest)
+        owner = _raw_tree_owner(manifest)
+        listings: dict[str, Any] = {}
         superseded = _superseded(manifest)
         manifest["input_candidates"] = list(again["input_candidates_after"])
         lineage = manifest.get("input_lineage")
         if isinstance(lineage, dict):
             lineage["rows"] = [
-                _fallback_row(manifest, row, by_source[_key(str(row.get("path") or ""))], downloads)
+                _fallback_row(manifest, row, by_source[_key(str(row.get("path") or ""))], downloads, owner, listings)
                 if isinstance(row, dict) and _key(str(row.get("path") or "")) in by_source else row
                 for row in lineage.get("rows") or []
             ]

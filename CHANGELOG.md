@@ -4,6 +4,28 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.57] - Unreleased
+
+The .wiff2 to .wiff fallback of 0.5.55 could never fire for MB-POST, observed on the v6-mpst48-20261031 verification
+campaign (2026-11-01): the positive part of MPST000048 was refused with `wiff_provenance_unrecorded`.
+
+### Fixed
+- **A .wiff that came out of the raw owner's archive has its provenance on record.** MB-POST serves an accession as
+  one tar, so every .wiff, .wiff.scan and .wiff2 of an MB-POST unit is an extracted archive member, and no download
+  record names a .wiff of its own. The switch accepted only such a download record, and refused every MB-POST unit.
+  It now also accepts a .wiff, and requires its .wiff.scan, that the lease of the unit (a split part: its raw owner)
+  extracted from an archive it downloaded: the file is among that lease's `extracted_files`, and the member listing
+  of the archive's extraction, its sha256 still the recorded one, lists it as extracted with the size it has on disk
+  (`repository_reanalysis.recorded_extraction`). A .wiff or .wiff.scan that neither a download nor such a record
+  accounts for, or whose size disagrees with its listing, is still refused (`wiff_provenance_unrecorded`, which now
+  says why).
+- **The switched row of such a .wiff is the row the lease writes for an extracted member.** It is of kind
+  `extracted_member`, with the archive and the member under the data root as its source, the member's own declared
+  checksum where the allow-list validation verified it (its counts account for every checksum the unit declares, and
+  exactly one listed name is the file's), and its `basis`. `build_input_lineage` and the switch write it with the same
+  helper (`repository_reanalysis.extracted_member_fields`, factored out of `build_input_lineage` unchanged). A .wiff
+  downloaded as its own repository object keeps its row of kind `file`.
+
 ## [0.5.56] - Unreleased
 
 The low findings of the re-review of #88, on 0.5.55. Goes with the gate change in msdial-public-reanalysis.

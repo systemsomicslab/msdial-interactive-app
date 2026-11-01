@@ -86,18 +86,22 @@ def _authorization(root: Path, covers: list) -> Path:
 class _Part(unittest.TestCase):
     """A positive split part of a SCIEX DDA unit whose production run hung on its .wiff2."""
 
+    FOLDER = ""
+
     def setUp(self) -> None:
         self._directory = tempfile.TemporaryDirectory()
         self.root = Path(self._directory.name).resolve()
         self.data = self.root / "mb_post" / "MPST000048" / UNIT / "raw" / "data"
-        self.data.mkdir(parents=True)
+        # Where the samples' files lie under the data root: in it, or in the folder an archive unpacks into.
+        self.files = self.data / self.FOLDER if self.FOLDER else self.data
+        self.files.mkdir(parents=True)
         workspace = self.data.parent.parent
         (workspace / "provenance").mkdir()
         (workspace / "output").mkdir()
         downloads, files, rows, per_file, declared, samples = [], [], [], [], [], []
         for stem in SAMPLES:
             for suffix in (".wiff2", ".wiff", ".wiff.scan", ".timeseries.data"):
-                path = self.data / (stem + suffix)
+                path = self.files / (stem + suffix)
                 payload = f"{stem}{suffix}".encode("utf-8")
                 path.write_bytes(payload)
                 md5 = hashlib.md5(payload).hexdigest()
@@ -106,7 +110,7 @@ class _Part(unittest.TestCase):
                                   "declared_checksum": md5, "declared_checksum_verified": True})
                 files.append({"name": path.name, "size_bytes": len(payload), "url": f"https://example.org/{path.name}",
                               "role": "raw" if suffix == ".wiff2" else "raw_alternate" if suffix == ".wiff" else "sidecar"})
-            wiff2 = str(self.data / (stem + ".wiff2"))
+            wiff2 = str(self.files / (stem + ".wiff2"))
             rows.append({"path": wiff2, "kind": "file", "declared_names": [stem + ".wiff2"], "sample_id": stem,
                          "file_name": stem, "acquisition_type": "DDA",
                          "source": {"url": f"https://example.org/{stem}.wiff2", "download_path": wiff2},
@@ -126,7 +130,7 @@ class _Part(unittest.TestCase):
             "execution_allowed": True,
             "raw_retention_policy": "keep",
             "downloads": downloads,
-            "input_candidates": [str(self.data / (stem + ".wiff2")) for stem in SAMPLES],
+            "input_candidates": [str(self.files / (stem + ".wiff2")) for stem in SAMPLES],
             "input_lineage": {"schema": "msdial-input-lineage.v1", "rows": rows},
             "split_from": {"analysis_unit_id": "u48", "acquisition_mode": "DDA"},
             "raw_metadata_preflight": {"summary": {"per_file": per_file}},
@@ -361,6 +365,203 @@ class ASplitPart(_Part):
         self.switch(confirmed=True)
         self.change(lambda manifest: manifest["input_candidates"].pop())
         self.assertTrue([item for item in plan_split_parent_cleanup(parent)["blockers"] if "each once" in item])
+
+
+TAR_URL = "https://repository.massbank.jp/api/download/MPST000048.0"
+ARCHIVE_ROOT = "MB-POST_files_MPST000048.0"
+
+
+def _key(path: str) -> str:
+    return str(Path(path).resolve()).casefold()
+
+
+class AnArchiveMember(_Part):
+    """0.5.57. MB-POST serves an accession as one tar, so every .wiff, .wiff.scan and .wiff2 of an MB-POST unit came out
+    of it: no download record names a .wiff of its own, and the switch refused every MB-POST unit
+    (wiff_provenance_unrecorded) although the raw owner's lease recorded the .wiff as archive members. The fixture's
+    parent is shaped as the v6-mpst48-20261031 parent manifest is: one tar download whose declared checksum is its first
+    member's, never verified as the tar's; extracted_files; one archive extraction with its member listing; and an
+    allow-list validation that verified every declared member checksum."""
+
+    FOLDER = ARCHIVE_ROOT
+
+    def as_archive_part(self, sizes: dict | None = None) -> Path:
+        """The unit as a split part of a parent that downloaded one tar and extracted every file from it. ``sizes``
+        overrides the listed size of a member, by file name."""
+        workspace = self.data.parent.parent
+        provenance = workspace / "provenance"
+        tar = self.root / "mb_post" / "MPST000048" / "_dl" / "o" / "dab0caa64111410f" / "obj" / "MPST000048.tar"
+        tar.parent.mkdir(parents=True)
+        tar.write_bytes(b"tar")
+        tar_sha256 = hashlib.sha256(b"tar").hexdigest()
+        members = sorted(path for path in self.files.iterdir() if path.is_file())
+        lines = ["path\ttype\tsize\tcrc32\tmodified\tdepth\tarchive\tmember_name\tdisposition",
+                 f"{ARCHIVE_ROOT}\tdir\t0\t\t2026-10-31 14:38:05\t1\tMPST000048.tar\t{ARCHIVE_ROOT}\textracted"]
+        for path in members:
+            size = (sizes or {}).get(path.name, path.stat().st_size)
+            lines.append(f"{ARCHIVE_ROOT}/{path.name}\tfile\t{size}\t\t2025-06-17 07:48:56\t1\tMPST000048.tar\t"
+                         f"{ARCHIVE_ROOT}/{path.name}\textracted")
+        listing = provenance / f"archive-members-{tar_sha256[:12]}.tsv"
+        listing.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+        md5 = {path.name: hashlib.md5(path.read_bytes()).hexdigest() for path in members}
+        part = read_manifest(self.manifest_path)
+        parent_path = provenance / "parent-manifest.json"
+        _write_json(parent_path, {
+            "schema": "msdial-public-reanalysis-run.v1", "status": "split_by_acquisition",
+            "workspace": str(workspace), "raw_directory": str(self.data.parent), "input_directory": str(self.data),
+            "raw_retention_policy": "delete_after_validated_output", "execution_allowed": False,
+            "downloads": [{
+                "path": str(tar), "size_bytes": 3, "sha256": tar_sha256, "md5": hashlib.md5(b"tar").hexdigest(),
+                "source_url": TAR_URL, "declared_checksum": md5[members[0].name], "declared_checksum_verified": None,
+                "archive": {"format": "tar", "name_format": "tar", "signature": "tar", "name_mismatch": False},
+            }],
+            "extracted_files": [str(path) for path in members],
+            "allowlist_checksum_validation": {"required": True, "verified": len(members), "skipped": 0,
+                                              "archives_verified_at_download": 0, "archives": []},
+            "archive_extractions": [{
+                "schema": "msdial-archive-extraction.v1", "format": "tar", "archive_name": "MPST000048.tar",
+                "archive_path": str(tar), "archive_sha256": tar_sha256, "destination": str(self.data),
+                "members_tsv": {"path": str(listing), "sha256": hashlib.sha256(listing.read_bytes()).hexdigest(),
+                                "rows": len(lines) - 1},
+                "nested": [], "rejected_members": [], "crc_verified": False, "placement": "",
+                "source_url": TAR_URL, "download_path": str(tar), "extracted_file_count": len(members),
+            }],
+            "input_candidates": list(part["input_candidates"]),
+            "split_into": [{"analysis_unit_id": UNIT, "manifest_path": str(self.manifest_path),
+                            "input_candidates": list(part["input_candidates"])}],
+            "project": {"analysis_unit_id": "u48", "repository": "mb_post",
+                        "files": [{"name": path.name, "size_bytes": path.stat().st_size, "url": TAR_URL,
+                                   "checksum": md5[path.name]} for path in members]},
+        })
+
+        def split(manifest: dict) -> None:
+            # A part downloads nothing; its project lists only its own .wiff2, as the split writes it.
+            manifest.pop("downloads")
+            manifest["project"]["files"] = [item for item in manifest["project"]["files"]
+                                            if item["name"].endswith(".wiff2")]
+            manifest["split_from"] = {"analysis_unit_id": "u48", "manifest_path": str(parent_path), "acquisition_mode": "DDA"}
+            manifest["raw_owned_by"] = str(parent_path)
+
+        self.change(split)
+        self.md5 = md5
+        return parent_path
+
+    def assertRefusedUnrecorded(self, said: str) -> None:
+        before = self.manifest_path.read_bytes()
+        result = self.switch(confirmed=True)
+        self.assertEqual((False, wiff_fallback.WIFF_PROVENANCE_UNRECORDED), (result["ok"], result["reason"]), result)
+        self.assertIn(said, result["detail"])
+        self.assertEqual(before, self.manifest_path.read_bytes())
+
+    def test_a_part_whose_parent_downloaded_a_tar_is_switched_on_its_archive_members(self) -> None:
+        parent = self.as_archive_part()
+        result = self.switch(confirmed=True)
+
+        self.assertTrue(result["switched"], result)
+        manifest = read_manifest(self.manifest_path)
+        self.assertEqual([str(self.files / (stem + ".wiff")) for stem in SAMPLES], manifest["input_candidates"])
+        row = manifest["input_lineage"]["rows"][0]
+        name = SAMPLES[0] + ".wiff"
+        self.assertEqual((str(self.files / name), "extracted_member", SAMPLES[0]),
+                         (row["path"], row["kind"], row["sample_id"]))
+        tar = read_manifest(parent)["downloads"][0]
+        self.assertEqual({"archive": {"url": TAR_URL, "download_path": tar["path"], "sha256": tar["sha256"],
+                                      "md5": tar["md5"], "declared_checksum": tar["declared_checksum"],
+                                      "declared_checksum_verified": None},
+                          "member": f"{ARCHIVE_ROOT}/{name}"}, row["source"])
+        self.assertEqual({"declared": self.md5[name], "declared_algorithm": "md5", "declared_verified": True},
+                         row["checksums"], "the member's own declared MD5, which the allow-list validation verified")
+        basis = row["basis"]
+        self.assertEqual(("member_declared_checksum", "md5", self.md5[name], True),
+                         (basis["kind"], basis["algorithm"], basis["value"], basis["verified"]))
+        self.assertEqual("extracted from an archive, and its own published MD5 matched", basis["statement"])
+        self.assertEqual([tar["path"]], [item["download_path"] for item in basis["archives"]])
+        self.assertEqual([(f"{ARCHIVE_ROOT}/{name}", "MPST000048.tar")],
+                         [(item["member"], item["listed_archive"]) for item in basis["listing"]])
+        self.assertEqual(read_manifest(parent)["archive_extractions"][0]["members_tsv"]["sha256"],
+                         basis["listing"][0]["members_tsv_sha256"])
+        self.assertEqual(str(self.files / (SAMPLES[0] + ".wiff2")), row["encoding_fallback"]["in_place_of"])
+        self.assertEqual(f"{ARCHIVE_ROOT}/{name}", manifest["encoding_fallback"]["swaps"][0]["to_relative"])
+
+        built = build_repository_analysis_rows(manifest)
+        self.assertEqual([], built["failures"])
+        self.assertEqual(list(SAMPLES), [row["sample_id"] for row in built["rows"]])
+        state = {"repository_run_manifest": str(self.manifest_path), "ion_mode": "Positive",
+                 "files": [{"file_path": str(self.files / (stem + ".wiff")), "acquisition_type": "DDA"} for stem in SAMPLES]}
+        self.assertEqual([], evaluate_repository_execution_gate(state)["blockers"])
+
+    def test_the_row_is_the_one_the_lease_writes_for_an_extracted_member(self) -> None:
+        """The same helper writes both (repository_reanalysis.extracted_member_fields): the row build_input_lineage
+        would have written for the .wiff, had the encoding rule used it, is the switched row's provenance."""
+        from msdial_app.repository_reanalysis import RepositoryProject, build_input_lineage
+
+        parent = read_manifest(self.as_archive_part())
+        self.switch(confirmed=True)
+        switched = read_manifest(self.manifest_path)["input_lineage"]["rows"][0]
+        target = str(self.files / (SAMPLES[0] + ".wiff"))
+        built = build_input_lineage(
+            [target], [], {_key(target): parent["downloads"][0]}, self.data, self.root / "nowhere",
+            RepositoryProject(repository="mb_post", accession="MPST000048"),
+            {_key(target): {"declared": self.md5[SAMPLES[0] + ".wiff"], "declared_algorithm": "md5", "verified": True}},
+            extracted_members={_key(target): {"member": f"{ARCHIVE_ROOT}/{SAMPLES[0]}.wiff",
+                                              "archive": "MPST000048.tar", "extraction": 0}},
+            archive_extractions=parent["archive_extractions"],
+        )["rows"][0]
+        self.assertEqual({key: built[key] for key in ("kind", "source", "checksums", "basis")},
+                         {key: switched[key] for key in ("kind", "source", "checksums", "basis")})
+
+    def test_a_member_whose_size_disagrees_with_its_listing_is_refused(self) -> None:
+        self.as_archive_part(sizes={SAMPLES[1] + ".wiff": 4692480})
+        self.assertRefusedUnrecorded("and the member listing of MPST000048.tar gives 4692480")
+
+    def test_a_scan_whose_size_disagrees_with_its_listing_is_refused(self) -> None:
+        self.as_archive_part(sizes={SAMPLES[2] + ".wiff.scan": 32940003})
+        self.assertRefusedUnrecorded(f"{SAMPLES[2]}.wiff.scan: it is")
+
+    def test_a_wiff_no_extraction_record_and_no_download_accounts_for_is_refused(self) -> None:
+        parent = self.as_archive_part()
+        update_manifest(parent, lambda manifest: manifest.update(
+            extracted_files=[item for item in manifest["extracted_files"] if not item.endswith(SAMPLES[0] + ".wiff")]))
+        self.assertRefusedUnrecorded("none of the files the unit's lease extracted")
+
+    def test_a_member_listing_that_changed_since_the_extraction_vouches_for_nothing(self) -> None:
+        parent = self.as_archive_part()
+        listing = Path(read_manifest(parent)["archive_extractions"][0]["members_tsv"]["path"])
+        listing.write_bytes(listing.read_bytes() + b"\n")
+        self.assertRefusedUnrecorded("has changed since its sha256 was recorded")
+
+    def test_a_listing_that_does_not_list_the_wiff_as_extracted_vouches_for_nothing(self) -> None:
+        parent = self.as_archive_part()
+        listing = Path(read_manifest(parent)["archive_extractions"][0]["members_tsv"]["path"])
+        text = listing.read_text(encoding="utf-8").replace(
+            f"{ARCHIVE_ROOT}/{SAMPLES[0]}.wiff\textracted", f"{ARCHIVE_ROOT}/{SAMPLES[0]}.wiff\tdropped_metadata")
+        listing.write_bytes(text.encode("utf-8"))
+        update_manifest(parent, lambda manifest: manifest["archive_extractions"][0]["members_tsv"].update(
+            sha256=hashlib.sha256(text.encode("utf-8")).hexdigest()))
+        self.assertRefusedUnrecorded("no member listing of the unit's archives lists it as extracted")
+
+    def test_without_a_validation_that_accounts_for_every_declared_checksum_the_member_claims_none(self) -> None:
+        parent = self.as_archive_part()
+        update_manifest(parent, lambda manifest: manifest["allowlist_checksum_validation"].update(verified=3))
+        self.assertTrue(self.switch(confirmed=True)["switched"])
+        row = read_manifest(self.manifest_path)["input_lineage"]["rows"][0]
+        self.assertEqual(("extracted_member", {}), (row["kind"], row["checksums"]))
+        self.assertEqual("archive_download_hash", row["basis"]["kind"], "the tar's declared checksum was never its own")
+
+    def test_the_parent_is_released_as_before_once_its_part_switched_on_archive_members(self) -> None:
+        parent = self.as_archive_part()
+        self.assertTrue(self.switch(confirmed=True)["switched"])
+        self.assertEqual([], [item for item in plan_split_parent_cleanup(parent)["blockers"] if "each once" in item])
+
+    def test_the_methods_text_counts_the_switched_members_by_their_basis(self) -> None:
+        from msdial_app.repository_reanalysis import input_integrity_statement
+
+        self.as_archive_part()
+        self.switch(confirmed=True)
+        self.assertEqual("Of the 3 analysis inputs, 3 were extracted from an archive, and its own published MD5 "
+                         "matched.", input_integrity_statement(read_manifest(self.manifest_path)))
+        self.assertIn("The 3 SCIEX analysis file(s)",
+                      _wiff_fallback_sentence({"repository_run_manifest": str(self.manifest_path)}))
 
 
 class TheWiffHeaders(_Part):
