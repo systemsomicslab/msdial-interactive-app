@@ -260,7 +260,7 @@ def _provenance_of(
         return "download", download, ""
     if not owner:
         return "", None, "its raw owner's manifest cannot be read"
-    extraction, why = recorded_extraction(dict(owner), path, listings)
+    extraction, why = recorded_extraction(owner, path, listings)
     if extraction is not None:
         return "extracted_member", extraction, ""
     return "", None, why
@@ -519,7 +519,7 @@ def _fallback_row(
         data_root = str(owner.get("input_directory") or manifest.get("input_directory") or "")
         row.update(extracted_member_fields(
             target, Path(data_root), record["download"], record["listed"],
-            [item for item in owner.get("archive_extractions") or [] if isinstance(item, dict)], record["verified"],
+            list(owner.get("archive_extractions") or []), record["verified"],
         ))
     else:
         download = record or {}

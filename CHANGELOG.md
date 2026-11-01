@@ -25,6 +25,15 @@ campaign (2026-11-01): the positive part of MPST000048 was refused with `wiff_pr
   exactly one listed name is the file's), and its `basis`. `build_input_lineage` and the switch write it with the same
   helper (`repository_reanalysis.extracted_member_fields`, factored out of `build_input_lineage` unchanged). A .wiff
   downloaded as its own repository object keeps its row of kind `file`.
+- **Review of #90.** A listed item the allow-list validator compared with an archive's download (an archive role, or
+  the downloaded archive's own name) is never matched to an extracted file, and `archives_verified_at_download`
+  counts at most the declared names that are archives, as the gate's `validator_accounts` reads it: such an item no
+  longer gives an extracted `.wiff` a member checksum nobody compared. A `.wiff` or `.wiff.scan` that is, or lies
+  under a folder below the extraction's destination that is, a symbolic link or another reparse point (a junction) is
+  refused: a link to other bytes of the same size put in a member's place would otherwise pass. A hard link, as a
+  download store materialises a raw tree, is the member itself. The switched row's listing reference indexes the
+  owner's `archive_extractions` as recorded, what is read once per owner is read once per switch, and the unreachable
+  moved-workspace fallback for the member listing is gone.
 
 ## [0.5.56] - Unreleased
 

@@ -5365,7 +5365,7 @@ def extracted_member_fields(
 
 
 def recorded_extraction(
-    owner: dict[str, Any], path: str | Path, listings: dict[str, Any] | None = None
+    owner: Mapping[str, Any], path: str | Path, listings: dict[Any, Any] | None = None
 ) -> tuple[dict[str, Any] | None, str]:
     """How the lease of ``owner`` (the unit that downloaded a raw tree) recorded a file that came out of one of its
     archives, read back from its manifest: ({download, listed, size, verified}, '') where the record accounts for the
@@ -5381,31 +5381,32 @@ def recorded_extraction(
     downloaded archive - still the bytes whose sha256 the extraction recorded - lists a file at its path under that
     extraction's destination as extracted, with the size the file has on disk. The first such extraction is the one,
     as the lease's extracted_from keeps the first archive to write a file. ``listed`` is {member, archive,
-    extraction}, as the extract stage records each member.
+    extraction}, as the extract stage records each member; extraction indexes the owner's archive_extractions as
+    recorded.
+
+    NO LINK STANDS IN FOR A MEMBER. The file, and every folder between it and the extraction's destination, must be
+    neither a symbolic link nor another reparse point (a junction): a file put in a member's place after the lease as
+    a link to other bytes of the same size would otherwise pass, since paths are compared resolved and the size is
+    read through the link. A hard link is the file itself, and is what a download store materialises a raw tree with.
 
     ``verified`` is what the allow-list validation compared for the file ({declared, declared_algorithm,
-    declared_name, verified}, as _verify_project_allowlist_checksums records it), or None. The validator raises on any
-    mismatch and on a listed name that resolves to other than one file, and records only counts; so where they account
-    for every checksum the unit declares, a checksum declared for exactly one listed name this file carries
-    (_allowlist_forms) was compared with this file. ``listings`` caches the listings read, by path.
+    declared_name, verified}, as _verify_project_allowlist_checksums records it), or None (_validated_declaration).
+    ``listings`` caches, across one reader's calls, the listings read and what is read once per owner (_owner_facts).
     """
     listings = {} if listings is None else listings
+    facts = _owner_facts(owner, listings)
     path = Path(str(path))
-    key = _file_key(str(path))
-    if key not in {_file_key(str(item)) for item in owner.get("extracted_files") or [] if str(item).strip()}:
+    if _file_key(str(path)) not in facts["extracted"]:
         return None, "it is none of the files the unit's lease extracted"
-    downloads = {
-        _file_key(str(item["path"])): item for item in owner.get("downloads") or []
-        if isinstance(item, dict) and item.get("archive") and str(item.get("path") or "").strip()
-    }
     problems: list[str] = []
     for index, record in enumerate(owner.get("archive_extractions") or []):
         if not isinstance(record, dict) or not str(record.get("destination") or "").strip():
             continue
-        relative = _relative_to_data_root(path, Path(str(record["destination"])))
+        destination = Path(str(record["destination"]))
+        relative = _relative_to_data_root(path, destination)
         if relative is None:
             continue
-        rows, problem = _recorded_listing(owner, record, listings)
+        rows, problem = _recorded_listing(record, listings)
         if problem:
             problems.append(problem)
             continue
@@ -5414,9 +5415,12 @@ def recorded_extraction(
         if listed is None:
             continue
         name = str(record.get("archive_name") or "its archive")
-        download = downloads.get(_file_key(str(record.get("download_path") or "")))
+        download = facts["downloads"].get(_file_key(str(record.get("download_path") or "")))
         if download is None:
             return None, f"{name}, which its listing says it came out of, is no archive the unit downloaded"
+        linked = _link_in_member_path(path, destination, relative)
+        if linked:
+            return None, linked
         try:
             size = path.stat().st_size
         except OSError as error:
@@ -5428,30 +5432,95 @@ def recorded_extraction(
             "download": download,
             "listed": {"member": listed["path"], "archive": str(listed.get("archive") or ""), "extraction": index},
             "size": size,
-            "verified": _validated_declaration(owner, path),
+            "verified": _validated_declaration(owner, path, facts),
         }, ""
-    return None, (problems[0] if problems else "no member listing of the unit's archives lists it as extracted")
+    return None, (problems[0] if problems else
+                  "no member listing of the unit's archives lists it as extracted under its destination")
 
 
-def _recorded_listing(
-    owner: dict[str, Any], record: dict[str, Any], listings: dict[str, Any]
-) -> tuple[list[dict[str, str]], str]:
-    """An extraction's member listing as recorded (archive_extractions[].members_tsv), read where it was written or,
-    where the workspace moved, under the owner's provenance by its name, and only while its sha256 is the recorded
-    one: (rows, '') or ([], why not)."""
+def _owner_facts(owner: Mapping[str, Any], cache: dict[Any, Any]) -> dict[str, Any]:
+    """What recorded_extraction reads of an owner on every call, read once per owner and ``cache``: the keys of its
+    extracted_files, its archive downloads by path, and its declared checksums with whether its allow-list
+    validation's counts account for them (_validated_declaration)."""
+    slot = ("owner", id(owner))
+    held = cache.get(slot)
+    if held is not None and held[0] is owner:
+        return held[1]
+    downloads = [item for item in owner.get("downloads") or []
+                 if isinstance(item, dict) and item.get("archive") and str(item.get("path") or "").strip()]
+    # As the validator finds the archive a listed item may be: the archive download of its URL.
+    by_url = {str(item.get("source_url") or ""): item for item in downloads}
+    declared: list[tuple[str, str, str]] = []
+    count = archive_names = 0
+    for item in (owner.get("project") or {}).get("files") or []:
+        checksum = str((item or {}).get("checksum") or "").strip().casefold() if isinstance(item, dict) else ""
+        if not checksum:
+            continue
+        count += 1
+        name = str(item.get("name") or "")
+        if name.casefold().endswith(tuple(archives.ARCHIVE_SUFFIXES)):
+            archive_names += 1
+        listed_file = RepositoryFile(name=name, url=str(item.get("url") or ""), role=str(item.get("role") or "raw"),
+                                     checksum=checksum)
+        download = by_url.get(listed_file.url)
+        if download is not None and _names_archive_object(listed_file, download):
+            # The validator compared it with the archive's download, never with a file under the data root.
+            continue
+        try:
+            declared.append((_safe_relative_name(name).as_posix().casefold(), checksum, name))
+        except ValueError:
+            continue
+    validation = owner.get("allowlist_checksum_validation")
+    verified = validation.get("verified") if isinstance(validation, dict) else None
+    at_download = validation.get("archives_verified_at_download") if isinstance(validation, dict) else None
+    # As the gate's validator_accounts reads the counts: the archives compared at download are never more than the
+    # declared names that are archives.
+    at_download = min(at_download, archive_names) if (
+        isinstance(at_download, int) and not isinstance(at_download, bool) and at_download > 0) else 0
+    facts = {
+        "extracted": {_file_key(str(item)) for item in owner.get("extracted_files") or [] if str(item).strip()},
+        "downloads": {_file_key(str(item["path"])): item for item in downloads},
+        "declared": declared,
+        "accounts": bool(count) and isinstance(verified, int) and not isinstance(verified, bool)
+        and verified + at_download == count,
+    }
+    cache[slot] = (owner, facts)
+    return facts
+
+
+def _link_in_member_path(path: Path, destination: Path, relative: str) -> str:
+    """Why a member's path is not the member itself - a symbolic link or another reparse point at the file, or at a
+    folder between it and the extraction's destination - or ''. A hard link is the file itself."""
+    parts = relative.split("/")
+    # Named as the path spells them (relative is casefolded).
+    if len(path.parts) >= len(parts) and [part.casefold() for part in path.parts[-len(parts):]] == parts:
+        parts = list(path.parts[-len(parts):])
+    folders = [destination.joinpath(*parts[:depth]) for depth in range(1, len(parts))]
+    for item, what in [(path, "it"), (destination.joinpath(*parts), "it"),
+                       *((folder, f"its folder {folder.name}") for folder in folders)]:
+        try:
+            details = os.lstat(item)
+        except OSError as error:
+            return f"{item.name} cannot be read on disk ({error})"
+        if stat.S_ISLNK(details.st_mode) or getattr(details, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            return (f"{what} is a symbolic link or another reparse point, not the member the lease extracted there; "
+                    "only the file itself, or a hard link to it, is that member")
+    return ""
+
+
+def _recorded_listing(record: dict[str, Any], listings: dict[Any, Any]) -> tuple[list[dict[str, str]], str]:
+    """An extraction's member listing as recorded (archive_extractions[].members_tsv), read only while its sha256 is
+    the recorded one: (rows, '') or ([], why not)."""
     name = str(record.get("archive_name") or "an archive")
     tsv = record.get("members_tsv") if isinstance(record.get("members_tsv"), dict) else {}
     recorded = str(tsv.get("path") or "").strip()
     expected = str(tsv.get("sha256") or "").strip().casefold()
     if not recorded or not expected:
         return [], f"the extraction of {name} keeps no member listing with its sha256"
-    candidates = [Path(recorded)]
-    if str(owner.get("workspace") or "").strip():
-        candidates.append(Path(str(owner["workspace"])) / "provenance" / Path(recorded).name)
-    found = next((item for item in candidates if item.is_file()), None)
-    if found is None:
-        return [], f"the member listing of {name} ({Path(recorded).name}) is absent"
-    cache = _file_key(str(found))
+    found = Path(recorded)
+    if not found.is_file():
+        return [], f"the member listing of {name} ({found.name}) is absent"
+    cache = ("listing", _file_key(str(found)))
     if cache not in listings:
         try:
             digest = hashlib.sha256(found.read_bytes()).hexdigest()
@@ -5464,34 +5533,26 @@ def _recorded_listing(
     return listings[cache]
 
 
-def _validated_declaration(owner: dict[str, Any], path: Path) -> dict[str, Any] | None:
-    """What the owner's allow-list validation compared for a file under its data root, or None where its record
-    does not show that it compared one (recorded_extraction says why that is sound)."""
-    validation = owner.get("allowlist_checksum_validation")
+def _validated_declaration(owner: Mapping[str, Any], path: Path, facts: dict[str, Any]) -> dict[str, Any] | None:
+    """What the owner's allow-list validation compared for a file under its data root, or None where its record does
+    not show that it compared one.
+
+    The validator (_verify_project_allowlist_checksums) raises on any mismatch and on a listed name that resolves to
+    other than one file, and records only counts. So where its counts account for every checksum the unit declares
+    (_owner_facts: verified, with the archives compared at download, never more than the declared names that are
+    archives, as the gate's validator_accounts reads them), a checksum declared for exactly one listed name this file
+    carries (_allowlist_forms) was compared with this file. A listed item the validator compared with an archive's
+    download instead (an archive role, or the downloaded archive's own name: _names_archive_object) vouches for no file
+    under the data root, and is never matched."""
     data_root = str(owner.get("input_directory") or "").strip()
-    if not isinstance(validation, dict) or not data_root:
+    if not facts["accounts"] or not data_root:
         return None
     relative = _relative_to_data_root(path, Path(data_root))
     if relative is None:
         return None
     forms = _allowlist_forms(relative)
-    declared = 0
-    matched: list[tuple[str, str]] = []
-    for item in (owner.get("project") or {}).get("files") or []:
-        checksum = str((item or {}).get("checksum") or "").strip().casefold() if isinstance(item, dict) else ""
-        if not checksum:
-            continue
-        declared += 1
-        try:
-            listed = _safe_relative_name(str(item.get("name") or "")).as_posix().casefold()
-        except ValueError:
-            continue
-        if listed in forms:
-            matched.append((str(item.get("name") or ""), checksum))
-    verified = validation.get("verified")
-    at_download = validation.get("archives_verified_at_download") or 0
-    if (not isinstance(verified, int) or isinstance(verified, bool) or not isinstance(at_download, int)
-            or verified + at_download != declared or len(matched) != 1):
+    matched = [(name, checksum) for listed, checksum, name in facts["declared"] if listed in forms]
+    if len(matched) != 1:
         return None
     name, checksum = matched[0]
     algorithm = {32: "md5", 40: "sha1", 64: "sha256"}.get(len(checksum))

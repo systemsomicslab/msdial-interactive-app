@@ -385,13 +385,14 @@ class AnArchiveMember(_Part):
 
     FOLDER = ARCHIVE_ROOT
 
-    def as_archive_part(self, sizes: dict | None = None) -> Path:
-        """The unit as a split part of a parent that downloaded one tar and extracted every file from it. ``sizes``
-        overrides the listed size of a member, by file name."""
-        workspace = self.data.parent.parent
-        provenance = workspace / "provenance"
+    def archive_records(self, sizes: dict | None = None) -> dict:
+        """What the lease of a unit that downloaded one tar and extracted every file from it records, shaped as the
+        v6-mpst48-20261031 parent manifest records it: its downloads, extracted_files, allow-list validation, archive
+        extraction (with the member listing written under the provenance) and its project's file list. ``sizes``
+        overrides the listed size of a member, by file name. Sets self.md5 (each member's md5) and self.tar."""
+        provenance = self.data.parent.parent / "provenance"
         tar = self.root / "mb_post" / "MPST000048" / "_dl" / "o" / "dab0caa64111410f" / "obj" / "MPST000048.tar"
-        tar.parent.mkdir(parents=True)
+        tar.parent.mkdir(parents=True, exist_ok=True)
         tar.write_bytes(b"tar")
         tar_sha256 = hashlib.sha256(b"tar").hexdigest()
         members = sorted(path for path in self.files.iterdir() if path.is_file())
@@ -403,16 +404,12 @@ class AnArchiveMember(_Part):
                          f"{ARCHIVE_ROOT}/{path.name}\textracted")
         listing = provenance / f"archive-members-{tar_sha256[:12]}.tsv"
         listing.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
-        md5 = {path.name: hashlib.md5(path.read_bytes()).hexdigest() for path in members}
-        part = read_manifest(self.manifest_path)
-        parent_path = provenance / "parent-manifest.json"
-        _write_json(parent_path, {
-            "schema": "msdial-public-reanalysis-run.v1", "status": "split_by_acquisition",
-            "workspace": str(workspace), "raw_directory": str(self.data.parent), "input_directory": str(self.data),
-            "raw_retention_policy": "delete_after_validated_output", "execution_allowed": False,
+        self.md5 = {path.name: hashlib.md5(path.read_bytes()).hexdigest() for path in members}
+        self.tar = tar
+        return {
             "downloads": [{
                 "path": str(tar), "size_bytes": 3, "sha256": tar_sha256, "md5": hashlib.md5(b"tar").hexdigest(),
-                "source_url": TAR_URL, "declared_checksum": md5[members[0].name], "declared_checksum_verified": None,
+                "source_url": TAR_URL, "declared_checksum": self.md5[members[0].name], "declared_checksum_verified": None,
                 "archive": {"format": "tar", "name_format": "tar", "signature": "tar", "name_mismatch": False},
             }],
             "extracted_files": [str(path) for path in members],
@@ -426,12 +423,26 @@ class AnArchiveMember(_Part):
                 "nested": [], "rejected_members": [], "crc_verified": False, "placement": "",
                 "source_url": TAR_URL, "download_path": str(tar), "extracted_file_count": len(members),
             }],
+            "files": [{"name": path.name, "size_bytes": path.stat().st_size, "url": TAR_URL, "role": "raw",
+                       "checksum": self.md5[path.name]} for path in members],
+        }
+
+    def as_archive_part(self, sizes: dict | None = None) -> Path:
+        """The unit as a split part of a parent that downloaded one tar and extracted every file from it."""
+        workspace = self.data.parent.parent
+        records = self.archive_records(sizes)
+        part = read_manifest(self.manifest_path)
+        parent_path = workspace / "provenance" / "parent-manifest.json"
+        _write_json(parent_path, {
+            "schema": "msdial-public-reanalysis-run.v1", "status": "split_by_acquisition",
+            "workspace": str(workspace), "raw_directory": str(self.data.parent), "input_directory": str(self.data),
+            "raw_retention_policy": "delete_after_validated_output", "execution_allowed": False,
+            **{key: records[key] for key in ("downloads", "extracted_files", "allowlist_checksum_validation",
+                                             "archive_extractions")},
             "input_candidates": list(part["input_candidates"]),
             "split_into": [{"analysis_unit_id": UNIT, "manifest_path": str(self.manifest_path),
                             "input_candidates": list(part["input_candidates"])}],
-            "project": {"analysis_unit_id": "u48", "repository": "mb_post",
-                        "files": [{"name": path.name, "size_bytes": path.stat().st_size, "url": TAR_URL,
-                                   "checksum": md5[path.name]} for path in members]},
+            "project": {"analysis_unit_id": "u48", "repository": "mb_post", "files": records["files"]},
         })
 
         def split(manifest: dict) -> None:
@@ -443,8 +454,24 @@ class AnArchiveMember(_Part):
             manifest["raw_owned_by"] = str(parent_path)
 
         self.change(split)
-        self.md5 = md5
         return parent_path
+
+    def as_archive_unit(self) -> Path:
+        """The unit as one that downloaded the tar and extracted its raw tree itself (no split)."""
+        records = self.archive_records()
+
+        def own(manifest: dict) -> None:
+            manifest.update({key: records[key] for key in ("downloads", "extracted_files",
+                                                           "allowlist_checksum_validation", "archive_extractions")})
+            manifest["project"]["files"] = records["files"]
+            # Not split from another: the base fixture's split_from names no parent manifest.
+            manifest.pop("split_from", None)
+
+        self.change(own)
+        return self.manifest_path
+
+    def owner_change(self, owner: Path, function) -> None:
+        update_manifest(owner, function)
 
     def assertRefusedUnrecorded(self, said: str) -> None:
         before = self.manifest_path.read_bytes()
@@ -490,14 +517,49 @@ class AnArchiveMember(_Part):
                  "files": [{"file_path": str(self.files / (stem + ".wiff")), "acquisition_type": "DDA"} for stem in SAMPLES]}
         self.assertEqual([], evaluate_repository_execution_gate(state)["blockers"])
 
-    def test_the_row_is_the_one_the_lease_writes_for_an_extracted_member(self) -> None:
-        """The same helper writes both (repository_reanalysis.extracted_member_fields): the row build_input_lineage
-        would have written for the .wiff, had the encoding rule used it, is the switched row's provenance."""
+    def pre_pr_row(self) -> dict:
+        """The kind, source, checksums and basis of SAMPLES[0].wiff's row as build_input_lineage wrote an extracted
+        member's row before 0.5.57 (as in the v6-mpst48-20261031 parent's .wiff2 rows), written out literally."""
+        name = SAMPLES[0] + ".wiff"
+        extraction = read_manifest(self.manifest_path.parent / "parent-manifest.json")["archive_extractions"][0] \
+            if (self.manifest_path.parent / "parent-manifest.json").is_file() \
+            else read_manifest(self.manifest_path)["archive_extractions"][0]
+        tar_sha256 = hashlib.sha256(b"tar").hexdigest()
+        tar_md5 = hashlib.md5(b"tar").hexdigest()
+        first = self.md5[SAMPLES[0] + ".timeseries.data"]
+        return {
+            "kind": "extracted_member",
+            "source": {
+                "archive": {"url": TAR_URL, "download_path": str(self.tar), "sha256": tar_sha256, "md5": tar_md5,
+                            "declared_checksum": first, "declared_checksum_verified": None},
+                "member": f"{ARCHIVE_ROOT}/{name}",
+            },
+            "checksums": {"declared": self.md5[name], "declared_algorithm": "md5", "declared_verified": True},
+            "basis": {
+                "archives": [{"download_path": str(self.tar), "url": TAR_URL, "sha256": tar_sha256, "md5": tar_md5,
+                              "declared": first, "declared_algorithm": "", "declared_verified": None}],
+                "listing": [{"archive_name": "MPST000048.tar", "archive_sha256": tar_sha256,
+                             "members_tsv": extraction["members_tsv"]["path"],
+                             "members_tsv_sha256": extraction["members_tsv"]["sha256"],
+                             "member": f"{ARCHIVE_ROOT}/{name}", "listed_archive": "MPST000048.tar"}],
+                "kind": "member_declared_checksum",
+                "algorithm": "md5",
+                "value": self.md5[name],
+                "verified": True,
+                "statement": "extracted from an archive, and its own published MD5 matched",
+            },
+        }
+
+    def test_the_row_is_the_one_the_lease_wrote_for_an_extracted_member_before(self) -> None:
+        """The switched row, and the row build_input_lineage writes through the factored helper, are both the row the
+        lease wrote for an extracted member before 0.5.57, given literally."""
         from msdial_app.repository_reanalysis import RepositoryProject, build_input_lineage
 
         parent = read_manifest(self.as_archive_part())
         self.switch(confirmed=True)
+        expected = self.pre_pr_row()
         switched = read_manifest(self.manifest_path)["input_lineage"]["rows"][0]
+        self.assertEqual(expected, {key: switched[key] for key in expected})
         target = str(self.files / (SAMPLES[0] + ".wiff"))
         built = build_input_lineage(
             [target], [], {_key(target): parent["downloads"][0]}, self.data, self.root / "nowhere",
@@ -507,12 +569,129 @@ class AnArchiveMember(_Part):
                                               "archive": "MPST000048.tar", "extraction": 0}},
             archive_extractions=parent["archive_extractions"],
         )["rows"][0]
-        self.assertEqual({key: built[key] for key in ("kind", "source", "checksums", "basis")},
-                         {key: switched[key] for key in ("kind", "source", "checksums", "basis")})
+        self.assertEqual(expected, {key: built[key] for key in expected})
 
     def test_a_member_whose_size_disagrees_with_its_listing_is_refused(self) -> None:
         self.as_archive_part(sizes={SAMPLES[1] + ".wiff": 4692480})
         self.assertRefusedUnrecorded("and the member listing of MPST000048.tar gives 4692480")
+
+    def switched_row(self) -> dict:
+        self.assertTrue(self.switch(confirmed=True)["switched"])
+        return read_manifest(self.manifest_path)["input_lineage"]["rows"][0]
+
+    def test_a_unit_that_extracted_its_own_archive_is_switched_on_its_members(self) -> None:
+        self.as_archive_unit()
+        row = self.switched_row()
+        self.assertEqual(("extracted_member", f"{ARCHIVE_ROOT}/{SAMPLES[0]}.wiff", True),
+                         (row["kind"], row["source"]["member"], row["checksums"]["declared_verified"]))
+
+    def test_an_archive_object_listed_under_the_wiffs_name_vouches_for_no_member(self) -> None:
+        """Review of #90, 1: a listed S.wiff that is an archive object (an archive role, under the tar's URL) is compared
+        with the archive's download and counted in archives_verified_at_download, never with the extracted S.wiff."""
+        parent = self.as_archive_part()
+
+        def archive_object(manifest: dict) -> None:
+            item = next(item for item in manifest["project"]["files"] if item["name"] == SAMPLES[0] + ".wiff")
+            item["role"] = "raw_archive"
+            manifest["allowlist_checksum_validation"].update(verified=len(manifest["project"]["files"]) - 1,
+                                                             archives_verified_at_download=1)
+
+        self.owner_change(parent, archive_object)
+        row = self.switched_row()
+        self.assertEqual(("extracted_member", {}), (row["kind"], row["checksums"]))
+        self.assertEqual("archive_download_hash", row["basis"]["kind"])
+
+    def test_archives_compared_at_download_count_toward_what_the_validation_accounts_for(self) -> None:
+        """The tar itself listed with its own checksum, compared at download: the counts still account for every
+        declared checksum, and the members' claims stand."""
+        parent = self.as_archive_part()
+
+        def tar_listed(manifest: dict) -> None:
+            manifest["project"]["files"].append({"name": "MPST000048.tar", "url": TAR_URL, "role": "raw",
+                                                 "checksum": hashlib.md5(b"tar").hexdigest()})
+            manifest["allowlist_checksum_validation"]["archives_verified_at_download"] = 1
+
+        self.owner_change(parent, tar_listed)
+        self.assertTrue(self.switched_row()["checksums"]["declared_verified"])
+
+    def test_more_archives_compared_at_download_than_archive_names_account_for_nothing(self) -> None:
+        """As the gate's validator_accounts: archives_verified_at_download never counts above the declared names that
+        are archives, so it cannot make up for a member the validator did not compare."""
+        parent = self.as_archive_part()
+        self.owner_change(parent, lambda manifest: manifest["allowlist_checksum_validation"].update(
+            verified=len(manifest["project"]["files"]) - 1, archives_verified_at_download=1))
+        self.assertEqual({}, self.switched_row()["checksums"])
+
+    def test_two_listed_names_for_one_wiff_give_it_no_member_checksum(self) -> None:
+        parent = self.as_archive_part()
+
+        def colliding(manifest: dict) -> None:
+            manifest["project"]["files"].append({"name": f"{ARCHIVE_ROOT}/{SAMPLES[0]}.wiff", "url": TAR_URL,
+                                                 "role": "raw", "checksum": "0" * 32})
+            manifest["allowlist_checksum_validation"]["verified"] += 1
+
+        self.owner_change(parent, colliding)
+        self.assertEqual({}, self.switched_row()["checksums"])
+
+    def test_an_allow_list_that_declares_only_the_wiff2_gives_no_member_checksum(self) -> None:
+        parent = self.as_archive_part()
+
+        def only_wiff2(manifest: dict) -> None:
+            manifest["project"]["files"] = [item for item in manifest["project"]["files"]
+                                            if item["name"].endswith(".wiff2")]
+            manifest["allowlist_checksum_validation"]["verified"] = len(manifest["project"]["files"])
+
+        self.owner_change(parent, only_wiff2)
+        row = self.switched_row()
+        self.assertEqual(("extracted_member", {}, "archive_download_hash"),
+                         (row["kind"], row["checksums"], row["basis"]["kind"]))
+
+    def test_an_extraction_of_no_download_of_the_unit_vouches_for_nothing(self) -> None:
+        parent = self.as_archive_part()
+        self.owner_change(parent, lambda manifest: manifest["archive_extractions"][0].update(
+            download_path=str(self.root / "elsewhere.tar")))
+        self.assertRefusedUnrecorded("MPST000048.tar, which its listing says it came out of, is no archive the unit "
+                                     "downloaded")
+
+    def test_a_wiff_outside_every_extractions_destination_is_refused(self) -> None:
+        parent = self.as_archive_part()
+        self.owner_change(parent, lambda manifest: manifest["archive_extractions"][0].update(
+            destination=str(self.root / "elsewhere")))
+        self.assertRefusedUnrecorded("lists it as extracted under its destination")
+
+    def test_a_symbolic_link_in_a_members_place_is_refused(self) -> None:
+        """Review of #90, 2: a .wiff replaced after the lease by a link to other bytes of the same size."""
+        self.as_archive_part()
+        target = self.files / (SAMPLES[0] + ".wiff")
+        other = self.root / "other" / target.name
+        other.parent.mkdir()
+        other.write_bytes(b"x" * target.stat().st_size)
+        target.unlink()
+        try:
+            os.symlink(other, target)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symbolic links cannot be created here ({error})")
+        self.assertRefusedUnrecorded("is a symbolic link or another reparse point")
+
+    @unittest.skipUnless(os.name == "nt", "junctions are Windows reparse points")
+    def test_a_junction_between_a_member_and_its_destination_is_refused(self) -> None:
+        import _winapi
+
+        self.as_archive_part()
+        moved = self.root / "moved"
+        os.replace(self.files, moved)
+        _winapi.CreateJunction(str(moved), str(self.files))
+        self.assertRefusedUnrecorded(f"its folder {ARCHIVE_ROOT} is a symbolic link or another reparse point")
+
+    def test_a_hard_link_is_the_member_itself(self) -> None:
+        """A download store materialises the raw tree with hard links into its object tree."""
+        self.as_archive_part()
+        target = self.files / (SAMPLES[0] + ".wiff")
+        stored = self.root / "store" / target.name
+        stored.parent.mkdir()
+        os.replace(target, stored)
+        os.link(stored, target)
+        self.assertTrue(self.switch(confirmed=True)["switched"])
 
     def test_a_scan_whose_size_disagrees_with_its_listing_is_refused(self) -> None:
         self.as_archive_part(sizes={SAMPLES[2] + ".wiff.scan": 32940003})
