@@ -3988,26 +3988,10 @@ def build_input_lineage(
             if key in verified_checksums:
                 row["checksums"].update(_declared_verification(verified_checksums[key]))
         elif key in extracted_from:
-            row["kind"] = "extracted_member"
-            try:
-                member = path.resolve().relative_to(data_root.resolve()).as_posix()
-            except ValueError:
-                member = path.name
-            row["source"] = {"archive": _archive_source(extracted_from[key]), "member": member}
-            if key in verified_checksums:
-                # The member's own declared checksum, compared against its extracted bytes. The archive's
-                # checksum, verified or not, stays with the archive in the source.
-                row["checksums"] = _declared_verification(verified_checksums[key])
-            listed = extracted_members.get(key)
-            row["basis"] = _archive_basis(
-                [_vouching_chain(listed, archive_extractions, extracted_from[key], nesting)],
-                member_checksums=row["checksums"],
-                listing=(
-                    [_member_listing(archive_extractions, listed),
-                     *_enclosing_listing(listed, archive_extractions, nesting)]
-                    if listed else []
-                ),
-            )
+            row.update(extracted_member_fields(
+                path, data_root, extracted_from[key], extracted_members.get(key), archive_extractions,
+                verified_checksums.get(key), nesting=nesting,
+            ))
         else:
             row["kind"] = "vendor_folder" if path.is_dir() else "file"
             row["source"] = {"origin": "not_downloaded_by_this_lease"}
@@ -5338,6 +5322,243 @@ def _container_listing(record: dict[str, Any], container: Path) -> dict[str, Any
     except ValueError:
         member = ""
     return {**_listing_reference(record), "container": member}
+
+
+def extracted_member_fields(
+    path: Path,
+    data_root: Path,
+    download: dict[str, Any],
+    listed: dict[str, Any] | None,
+    archive_extractions: list[dict[str, Any]],
+    verified: dict[str, Any] | None = None,
+    *,
+    nesting: dict[int, dict[str, list[dict[str, Any]]]] | None = None,
+) -> dict[str, Any]:
+    """The kind, source, checksums and basis of the lineage row of a file that came out of an archive: the archive's
+    download as its source with the file's path under the data root as its member, the file's own declared checksum
+    where the allow-list validation compared it (``verified``, as _verify_project_allowlist_checksums records it), and
+    its basis (_archive_basis) from the archives it came out of and the listing rows that account for it (``listed``:
+    {member, archive, extraction}, as the extract stage records each member). build_input_lineage writes every
+    extracted member's row with it, and wiff_fallback the row of a .wiff that came out of the raw owner's archive."""
+    try:
+        member = path.resolve().relative_to(data_root.resolve()).as_posix()
+    except ValueError:
+        member = path.name
+    nesting = {} if nesting is None else nesting
+    # The member's own declared checksum, compared against its extracted bytes. The archive's checksum, verified or
+    # not, stays with the archive in the source.
+    checksums = _declared_verification(verified) if verified else {}
+    return {
+        "kind": "extracted_member",
+        "source": {"archive": _archive_source(download), "member": member},
+        "checksums": checksums,
+        "basis": _archive_basis(
+            [_vouching_chain(listed, archive_extractions, download, nesting)],
+            member_checksums=checksums,
+            listing=(
+                [_member_listing(archive_extractions, listed),
+                 *_enclosing_listing(listed, archive_extractions, nesting)]
+                if listed else []
+            ),
+        ),
+    }
+
+
+def recorded_extraction(
+    owner: Mapping[str, Any], path: str | Path, listings: dict[Any, Any] | None = None
+) -> tuple[dict[str, Any] | None, str]:
+    """How the lease of ``owner`` (the unit that downloaded a raw tree) recorded a file that came out of one of its
+    archives, read back from its manifest: ({download, listed, size, verified}, '') where the record accounts for the
+    file, else (None, why it does not).
+
+    WHY READ IT BACK. The lease holds which archive each extracted file came from only while it runs (the extract
+    stage's extracted_from and extracted_members, which build_input_lineage reads); its manifest keeps what they were
+    made from: extracted_files, the archive's download, archive_extractions with each member listing and that listing's
+    sha256, and the allow-list validation's counts. MB-POST serves an accession as one tar, so every file of an MB-POST
+    unit is such a member, and a reader after the lease (wiff_fallback) finds its provenance here.
+
+    A file is accounted for when it is among the owner's extracted_files, and the member listing of an extraction of a
+    downloaded archive - still the bytes whose sha256 the extraction recorded - lists a file at its path under that
+    extraction's destination as extracted, with the size the file has on disk. The first such extraction is the one,
+    as the lease's extracted_from keeps the first archive to write a file. ``listed`` is {member, archive,
+    extraction}, as the extract stage records each member; extraction indexes the owner's archive_extractions as
+    recorded.
+
+    NO LINK STANDS IN FOR A MEMBER. The file, and every folder between it and the extraction's destination, must be
+    neither a symbolic link nor another reparse point (a junction): a file put in a member's place after the lease as
+    a link to other bytes of the same size would otherwise pass, since paths are compared resolved and the size is
+    read through the link. A hard link is the file itself, and is what a download store materialises a raw tree with.
+
+    ``verified`` is what the allow-list validation compared for the file ({declared, declared_algorithm,
+    declared_name, verified}, as _verify_project_allowlist_checksums records it), or None (_validated_declaration).
+    ``listings`` caches, across one reader's calls, the listings read and what is read once per owner (_owner_facts).
+    """
+    listings = {} if listings is None else listings
+    facts = _owner_facts(owner, listings)
+    path = Path(str(path))
+    if _file_key(str(path)) not in facts["extracted"]:
+        return None, "it is none of the files the unit's lease extracted"
+    problems: list[str] = []
+    for index, record in enumerate(owner.get("archive_extractions") or []):
+        if not isinstance(record, dict) or not str(record.get("destination") or "").strip():
+            continue
+        destination = Path(str(record["destination"]))
+        relative = _relative_to_data_root(path, destination)
+        if relative is None:
+            continue
+        rows, problem = _recorded_listing(record, listings)
+        if problem:
+            problems.append(problem)
+            continue
+        listed = next((row for row in rows if row.get("type") == "file" and row.get("disposition") == "extracted"
+                       and str(row.get("path") or "").casefold() == relative), None)
+        if listed is None:
+            continue
+        name = str(record.get("archive_name") or "its archive")
+        download = facts["downloads"].get(_file_key(str(record.get("download_path") or "")))
+        if download is None:
+            return None, f"{name}, which its listing says it came out of, is no archive the unit downloaded"
+        linked = _link_in_member_path(path, destination, relative)
+        if linked:
+            return None, linked
+        try:
+            size = path.stat().st_size
+        except OSError as error:
+            return None, f"it cannot be read on disk ({error})"
+        if str(listed.get("size") or "") != str(size):
+            return None, (f"it is {size} bytes on disk, and the member listing of {name} gives "
+                          f"{listed.get('size') or 'no size'}")
+        return {
+            "download": download,
+            "listed": {"member": listed["path"], "archive": str(listed.get("archive") or ""), "extraction": index},
+            "size": size,
+            "verified": _validated_declaration(owner, path, facts),
+        }, ""
+    return None, (problems[0] if problems else
+                  "no member listing of the unit's archives lists it as extracted under its destination")
+
+
+def _owner_facts(owner: Mapping[str, Any], cache: dict[Any, Any]) -> dict[str, Any]:
+    """What recorded_extraction reads of an owner on every call, read once per owner and ``cache``: the keys of its
+    extracted_files, its archive downloads by path, and its declared checksums with whether its allow-list
+    validation's counts account for them (_validated_declaration)."""
+    slot = ("owner", id(owner))
+    held = cache.get(slot)
+    if held is not None and held[0] is owner:
+        return held[1]
+    downloads = [item for item in owner.get("downloads") or []
+                 if isinstance(item, dict) and item.get("archive") and str(item.get("path") or "").strip()]
+    # As the validator finds the archive a listed item may be: the archive download of its URL.
+    by_url = {str(item.get("source_url") or ""): item for item in downloads}
+    declared: list[tuple[str, str, str]] = []
+    count = archive_names = 0
+    for item in (owner.get("project") or {}).get("files") or []:
+        checksum = str((item or {}).get("checksum") or "").strip().casefold() if isinstance(item, dict) else ""
+        if not checksum:
+            continue
+        count += 1
+        name = str(item.get("name") or "")
+        if name.casefold().endswith(tuple(archives.ARCHIVE_SUFFIXES)):
+            archive_names += 1
+        listed_file = RepositoryFile(name=name, url=str(item.get("url") or ""), role=str(item.get("role") or "raw"),
+                                     checksum=checksum)
+        download = by_url.get(listed_file.url)
+        if download is not None and _names_archive_object(listed_file, download):
+            # The validator compared it with the archive's download, never with a file under the data root.
+            continue
+        try:
+            declared.append((_safe_relative_name(name).as_posix().casefold(), checksum, name))
+        except ValueError:
+            continue
+    validation = owner.get("allowlist_checksum_validation")
+    verified = validation.get("verified") if isinstance(validation, dict) else None
+    at_download = validation.get("archives_verified_at_download") if isinstance(validation, dict) else None
+    # As the gate's validator_accounts reads the counts: the archives compared at download are never more than the
+    # declared names that are archives.
+    at_download = min(at_download, archive_names) if (
+        isinstance(at_download, int) and not isinstance(at_download, bool) and at_download > 0) else 0
+    facts = {
+        "extracted": {_file_key(str(item)) for item in owner.get("extracted_files") or [] if str(item).strip()},
+        "downloads": {_file_key(str(item["path"])): item for item in downloads},
+        "declared": declared,
+        "accounts": bool(count) and isinstance(verified, int) and not isinstance(verified, bool)
+        and verified + at_download == count,
+    }
+    cache[slot] = (owner, facts)
+    return facts
+
+
+def _link_in_member_path(path: Path, destination: Path, relative: str) -> str:
+    """Why a member's path is not the member itself - a symbolic link or another reparse point at the file, or at a
+    folder between it and the extraction's destination - or ''. A hard link is the file itself."""
+    parts = relative.split("/")
+    # Named as the path spells them (relative is casefolded).
+    if len(path.parts) >= len(parts) and [part.casefold() for part in path.parts[-len(parts):]] == parts:
+        parts = list(path.parts[-len(parts):])
+    folders = [destination.joinpath(*parts[:depth]) for depth in range(1, len(parts))]
+    for item, what in [(path, "it"), (destination.joinpath(*parts), "it"),
+                       *((folder, f"its folder {folder.name}") for folder in folders)]:
+        try:
+            details = os.lstat(item)
+        except OSError as error:
+            return f"{item.name} cannot be read on disk ({error})"
+        if stat.S_ISLNK(details.st_mode) or getattr(details, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            return (f"{what} is a symbolic link or another reparse point, not the member the lease extracted there; "
+                    "only the file itself, or a hard link to it, is that member")
+    return ""
+
+
+def _recorded_listing(record: dict[str, Any], listings: dict[Any, Any]) -> tuple[list[dict[str, str]], str]:
+    """An extraction's member listing as recorded (archive_extractions[].members_tsv), read only while its sha256 is
+    the recorded one: (rows, '') or ([], why not)."""
+    name = str(record.get("archive_name") or "an archive")
+    tsv = record.get("members_tsv") if isinstance(record.get("members_tsv"), dict) else {}
+    recorded = str(tsv.get("path") or "").strip()
+    expected = str(tsv.get("sha256") or "").strip().casefold()
+    if not recorded or not expected:
+        return [], f"the extraction of {name} keeps no member listing with its sha256"
+    found = Path(recorded)
+    if not found.is_file():
+        return [], f"the member listing of {name} ({found.name}) is absent"
+    cache = ("listing", _file_key(str(found)))
+    if cache not in listings:
+        try:
+            digest = hashlib.sha256(found.read_bytes()).hexdigest()
+            listings[cache] = (
+                (_read_members_listing(found), "") if digest == expected
+                else ([], f"the member listing of {name} has changed since its sha256 was recorded")
+            )
+        except (OSError, UnicodeDecodeError) as error:
+            listings[cache] = ([], f"the member listing of {name} cannot be read ({error})")
+    return listings[cache]
+
+
+def _validated_declaration(owner: Mapping[str, Any], path: Path, facts: dict[str, Any]) -> dict[str, Any] | None:
+    """What the owner's allow-list validation compared for a file under its data root, or None where its record does
+    not show that it compared one.
+
+    The validator (_verify_project_allowlist_checksums) raises on any mismatch and on a listed name that resolves to
+    other than one file, and records only counts. So where its counts account for every checksum the unit declares
+    (_owner_facts: verified, with the archives compared at download, never more than the declared names that are
+    archives, as the gate's validator_accounts reads them), a checksum declared for exactly one listed name this file
+    carries (_allowlist_forms) was compared with this file. A listed item the validator compared with an archive's
+    download instead (an archive role, or the downloaded archive's own name: _names_archive_object) vouches for no file
+    under the data root, and is never matched."""
+    data_root = str(owner.get("input_directory") or "").strip()
+    if not facts["accounts"] or not data_root:
+        return None
+    relative = _relative_to_data_root(path, Path(data_root))
+    if relative is None:
+        return None
+    forms = _allowlist_forms(relative)
+    matched = [(name, checksum) for listed, checksum, name in facts["declared"] if listed in forms]
+    if len(matched) != 1:
+        return None
+    name, checksum = matched[0]
+    algorithm = {32: "md5", 40: "sha1", 64: "sha256"}.get(len(checksum))
+    if algorithm is None or not re.fullmatch(r"[0-9a-f]+", checksum):
+        return None
+    return {"declared": checksum, "declared_algorithm": algorithm, "declared_name": name, "verified": True}
 
 
 def input_integrity_statement(manifest: dict[str, Any] | None) -> str:
