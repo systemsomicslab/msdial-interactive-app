@@ -4,6 +4,31 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.58] - Unreleased
+
+The verification campaigns V6, V7 and V8 (2026-10-31 to 2026-11-04) ran MB-POST MPST000048 three times. Its multi-file
+.wiff2 production run hung on both polarities every time, until the idle watchdog stopped it after 21,600 s. The same
+samples then ran from their .wiff in 11 to 18 minutes. The user decided on 2026-11-04 that a DDA unit deposited as
+both runs on its .wiff from the start.
+
+### Added
+- **A second rule for the .wiff2 to .wiff switch, `wiff_first_for_dda_2026_11_04` (`wiff_fallback.WIFF_FIRST_RULE`).**
+  It switches a unit before its first Console job, and answers no Console failure. Its record names the rule and an
+  empty `failed_jobs`, and its `decision` says why. Everything else is the same as the fallback rule:
+  - DDA only, read from the unit, its disposition, each .wiff2's decided type and each .wiff's own header. ZT Scan DIA
+    data can only be analysed from the .wiff2, so a DIA, SWATH or AIF unit is never switched.
+  - All or nothing, once per unit, with the same provenance.
+  - The same lineage rows, the same superseded artifacts and the same campaign crossing (boundary 4).
+- **`msdial_switch_repository_unit_to_wiff` takes `rule`.** The default is the fallback rule. Under the second rule,
+  failed job ids are refused (`rule_mismatch`), and so is an unknown rule.
+- **The methods text says the .wiff was read from the first run, and why,** for a unit switched under the second rule.
+  Where the unit was switched after a failure, it still says the run failed or timed out on the .wiff2.
+
+### Unchanged
+- The shared encoding rule, its vectors and the Catalog: the .wiff2 is still the encoding chosen and declared.
+- A unit the second rule does not switch runs on its .wiff2, and the fallback rule still answers a failure there. A
+  unit switched under either rule is never switched again.
+
 ## [0.5.57] - Unreleased
 
 The .wiff2 to .wiff fallback of 0.5.55 could never fire for MB-POST, observed on the v6-mpst48-20261031 verification

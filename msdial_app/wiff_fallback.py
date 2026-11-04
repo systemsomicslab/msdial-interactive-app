@@ -63,6 +63,19 @@ analysis CSV record, whose status becomes superseded, the run bundle prepared fr
 nothing reads them as the unit's own. The campaign runner resumes such a unit at its metadata preparation (scripts/campaign in
 msdial-public-reanalysis); a person runs the same steps in that order.
 
+THE SECOND RULE (WIFF_FIRST_RULE, the user's decision of 2026-11-04). The verification campaigns V6, V7 and V8 ran
+MPST000048 three times: its multi-file .wiff2 production run hung on both polarities every time, until the idle
+watchdog stopped it after 21,600 s, and the same samples then ran from their .wiff in 11 to 18 minutes. The user
+decided that a DDA unit whose samples are deposited as both runs on its .wiff from the start, without first spending a
+failed run on the .wiff2. The switch is the same in every other respect - the same DDA conditions on the unit and on
+each .wiff's own header (ZT Scan DIA data can only be analysed from the .wiff2, so a DIA, SWATH or AIF unit is still
+never switched), the same all-or-nothing swaps, the same provenance and the same record - except that it answers no
+Console failure: its record names WIFF_FIRST_RULE and an empty failed_jobs, and plan_wiff_fallback refuses failed jobs
+named under it (RULE_MISMATCH). The shared preference rule, its vectors and the Catalog are still unchanged: the .wiff2
+is still the encoding the rule chooses and the declaration names, and the record says why another file runs. The
+campaign runner asks for it before a unit's first peak-count diagnostic; where it is refused, the unit runs on its
+.wiff2 and WIFF_FALLBACK_RULE still answers a failure.
+
 WHAT IT NEVER DOES. It copies, moves and deletes no file, starts no Console, and switches no unit whose run finished,
 whose raw data were released, that is a split parent, or whose Console may still be running. A .wiff it switches to
 lies in the unit's (a split part: its raw owner's) raw tree, a download or an archive member like any other file
@@ -78,6 +91,9 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 WIFF_FALLBACK_RULE = "wiff2_to_wiff_after_console_failure_2026_10_31"
+# A DDA unit deposited as both runs on its .wiff from the start (the user's decision of 2026-11-04).
+WIFF_FIRST_RULE = "wiff_first_for_dda_2026_11_04"
+WIFF_RULES = (WIFF_FALLBACK_RULE, WIFF_FIRST_RULE)
 RECORD_SCHEMA = "msdial-encoding-fallback.v1"
 # Where the switch is recorded: in the unit manifest, and on each .wiff's lineage row.
 FALLBACK_FIELD = "encoding_fallback"
@@ -93,6 +109,13 @@ DECISION = (
     "so where a Console job fails on the .wiff2 and the .wiff exists, the unit's next attempt runs on the .wiff. "
     "DDA only: ZT Scan DIA data can only be analysed from the .wiff2."
 )
+DECISION_FIRST = (
+    "The user's decision of 2026-11-04: the multi-file .wiff2 production runs of MB-POST MPST000048 hung on both "
+    "polarities in each of three verification campaigns, while the same samples ran from their .wiff in minutes, so a "
+    "DDA unit whose samples are deposited as both .wiff2 and .wiff runs on the .wiff from the start. DDA only: ZT Scan "
+    "DIA data can only be analysed from the .wiff2."
+)
+DECISIONS = {WIFF_FALLBACK_RULE: DECISION, WIFF_FIRST_RULE: DECISION_FIRST}
 # How a run attempt that the switch answers ended (repository_reanalysis.record_run_end's reasons): stopped for time,
 # or ended in an error or a non-zero exit. A cancel, a Console that never started, and a .wiff.scan the run's own
 # validation found missing are no reader failure.
@@ -111,6 +134,8 @@ WIFF_SCAN_MISSING = "wiff_scan_missing"
 WIFF_ALREADY_AN_INPUT = "wiff_already_an_input"
 WIFF_PROVENANCE_UNRECORDED = "wiff_provenance_unrecorded"
 UNIT_NOT_SWITCHABLE = "unit_not_switchable"
+# A rule this module does not know, or failed jobs named under WIFF_FIRST_RULE, which answers none.
+RULE_MISMATCH = "rule_mismatch"
 RUN_IN_PROGRESS = "run_in_progress"
 WIFF2_NOT_A_FILE = "wiff2_not_a_file"
 # A .wiff whose own header does not support the switch: unreadable, a sample count other than one, not DDA, or another polarity.
@@ -136,7 +161,7 @@ def _key(path_text: str) -> str:
 def fallback_record(manifest: Mapping[str, Any] | None) -> dict[str, Any]:
     """The unit's encoding_fallback, or {} where it records none (or one this module does not read)."""
     record = (manifest or {}).get(FALLBACK_FIELD)
-    if not isinstance(record, Mapping) or record.get("rule") != WIFF_FALLBACK_RULE:
+    if not isinstance(record, Mapping) or record.get("rule") not in WIFF_RULES:
         return {}
     return dict(record)
 
@@ -157,7 +182,7 @@ def row_stands_for(row: Mapping[str, Any]) -> str:
     .wiff2's own stands_for where the one encoding rule paired its sample through another file, else the .wiff2), or
     '' for a row that is no fallback's."""
     fallback = row.get(FALLBACK_FIELD) if isinstance(row, Mapping) else None
-    if not isinstance(fallback, Mapping) or fallback.get("rule") != WIFF_FALLBACK_RULE:
+    if not isinstance(fallback, Mapping) or fallback.get("rule") not in WIFF_RULES:
         return ""
     return str(fallback.get("stands_for") or fallback.get("in_place_of") or "").strip()
 
@@ -315,11 +340,14 @@ def _acquisition_problem(manifest: Mapping[str, Any], wiff2_keys: Iterable[str])
     return ""
 
 
-def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str]) -> dict[str, Any]:
+def plan_wiff_fallback(
+    manifest: Mapping[str, Any], failed_job_ids: Iterable[str], *, rule: str = WIFF_FALLBACK_RULE
+) -> dict[str, Any]:
     """What the switch would do for a unit manifest as it stands, or WiffFallbackRefused with the reason it would not.
 
-    Returns {failed_jobs, swaps, input_candidates_before, input_candidates_after, acquisition_mode}. Reads the
-    manifest and the unit's raw folders; writes nothing."""
+    ``rule`` is WIFF_FALLBACK_RULE, which answers the Console job(s) named in ``failed_job_ids``, or WIFF_FIRST_RULE,
+    which answers none and takes none. Returns {rule, failed_jobs, swaps, input_candidates_before,
+    input_candidates_after, acquisition_mode}. Reads the manifest and the unit's raw folders; writes nothing."""
     from .repository_reanalysis import (
         RAW_RELEASED_STATUSES,
         SPLIT_PARENT_STATUS,
@@ -331,6 +359,15 @@ def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str
 
     manifest = dict(manifest)
     unit = str((manifest.get("project") or {}).get("analysis_unit_id") or "")
+    jobs = [str(item).strip() for item in failed_job_ids or [] if str(item).strip()]
+    if rule not in WIFF_RULES:
+        raise WiffFallbackRefused(RULE_MISMATCH, f"{rule!r} is no rule of the switch ({', '.join(WIFF_RULES)}).")
+    if rule == WIFF_FIRST_RULE and jobs:
+        raise WiffFallbackRefused(
+            RULE_MISMATCH,
+            f"{WIFF_FIRST_RULE} runs a DDA unit on its .wiff from the start and answers no Console failure; "
+            f"failed jobs ({', '.join(jobs)}) are answered under {WIFF_FALLBACK_RULE}.",
+        )
     if manifest.get(FALLBACK_FIELD) is not None:
         # Under any rule, as the gate reads it: one switch per unit, and a record this module does not read is not
         # written over.
@@ -350,7 +387,6 @@ def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str
         raise WiffFallbackRefused(RUN_IN_PROGRESS, f"A Console of unit {unit} may still be running; nothing was switched.")
 
     attempts = [item for item in manifest.get("run_attempts") or [] if isinstance(item, Mapping)]
-    jobs = [str(item).strip() for item in failed_job_ids or [] if str(item).strip()]
     failed: list[dict[str, Any]] = []
     unanswered: list[str] = []
     for job in dict.fromkeys(jobs):
@@ -371,7 +407,7 @@ def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str
             "started_at": attempt.get("started_at"),
             "ended_at": attempt.get("ended_at"),
         })
-    if not jobs or unanswered:
+    if rule == WIFF_FALLBACK_RULE and (not jobs or unanswered):
         raise WiffFallbackRefused(
             NO_CONSOLE_FAILURE,
             "The switch answers a Console job of this unit that failed or timed out, as its run_attempts record it; "
@@ -477,6 +513,7 @@ def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str
         )
     by_source = {_key(swap["from"]): swap["to"] for swap in swaps}
     return {
+        "rule": rule,
         "failed_jobs": failed,
         "swaps": swaps,
         "input_candidates_before": candidates,
@@ -488,7 +525,7 @@ def plan_wiff_fallback(manifest: Mapping[str, Any], failed_job_ids: Iterable[str
 def _fallback_row(
     manifest: Mapping[str, Any], old: Mapping[str, Any], swap: Mapping[str, Any],
     downloads: list[dict[str, Any]] | None = None, owner: Mapping[str, Any] | None = None,
-    listings: dict[str, Any] | None = None,
+    listings: dict[str, Any] | None = None, rule: str = WIFF_FALLBACK_RULE,
 ) -> dict[str, Any]:
     """The lineage row of a .wiff that runs in place of a .wiff2: where its bytes came from, the .wiff2 row's sample
     and pairing, and the record of the switch with the .wiff2's row unchanged.
@@ -536,7 +573,7 @@ def _fallback_row(
         if key in old:
             row[key] = copy.deepcopy(old[key])
     row[FALLBACK_FIELD] = {
-        "rule": WIFF_FALLBACK_RULE,
+        "rule": rule,
         "in_place_of": str(old.get("path") or swap["from"]),
         "stands_for": stand,
         "in_place_of_row": copy.deepcopy(dict(old)),
@@ -701,9 +738,10 @@ def fallback_change(
     the preview."""
     at = at or datetime.now(timezone.utc).isoformat()
     job_ids = [item["job_id"] for item in plan["failed_jobs"]]
+    rule = str(plan.get("rule") or WIFF_FALLBACK_RULE)
 
     def change(manifest: dict[str, Any]) -> None:
-        again = plan_wiff_fallback(manifest, job_ids)
+        again = plan_wiff_fallback(manifest, job_ids, rule=rule)
         if [(item["from"], item["to"]) for item in again["swaps"]] != [(item["from"], item["to"]) for item in plan["swaps"]]:
             raise WiffFallbackRefused(UNIT_NOT_SWITCHABLE, "The unit's inputs changed since the switch was planned.")
         by_source = {_key(swap["from"]): swap for swap in again["swaps"]}
@@ -715,14 +753,15 @@ def fallback_change(
         lineage = manifest.get("input_lineage")
         if isinstance(lineage, dict):
             lineage["rows"] = [
-                _fallback_row(manifest, row, by_source[_key(str(row.get("path") or ""))], downloads, owner, listings)
+                _fallback_row(manifest, row, by_source[_key(str(row.get("path") or ""))], downloads, owner, listings,
+                              rule)
                 if isinstance(row, dict) and _key(str(row.get("path") or "")) in by_source else row
                 for row in lineage.get("rows") or []
             ]
         record: dict[str, Any] = {
             "schema": RECORD_SCHEMA,
-            "rule": WIFF_FALLBACK_RULE,
-            "decision": DECISION,
+            "rule": rule,
+            "decision": DECISIONS[rule],
             "switched_at": at,
             "acquisition_mode": again["acquisition_mode"],
             "from_suffix": FROM_SUFFIX,
@@ -741,7 +780,7 @@ def fallback_change(
             }
             manifest["campaign_authorizations"] = [*(manifest.get("campaign_authorizations") or []), dict(crossing)]
         manifest[FALLBACK_FIELD] = record
-        mark = {"rule": WIFF_FALLBACK_RULE, "switched_at": at}
+        mark = {"rule": rule, "switched_at": at}
         if isinstance(manifest.get("analysis_csv"), dict):
             # Its rows name the .wiff2: superseded, so the execution gate holds no row to a type written for them.
             manifest["analysis_csv"]["status"] = "superseded"
@@ -764,8 +803,10 @@ def switch_to_wiff(
     crossing: Mapping[str, Any] | None = None,
     extractor: Mapping[str, Any] | None = None,
     reader: Any = None,
+    rule: str = WIFF_FALLBACK_RULE,
 ) -> dict[str, Any]:
-    """Make the switch in the unit manifest at ``manifest_path``: the record (manifest.encoding_fallback) as written.
+    """Make the switch in the unit manifest at ``manifest_path``, under ``rule`` (WIFF_FALLBACK_RULE after the failed
+    jobs, or WIFF_FIRST_RULE with none): the record (manifest.encoding_fallback) as written.
     The .wiff headers are read with ``extractor_path`` (read_wiff_headers, or ``reader`` with its signature) before
     anything is written, outside the manifest's lock. Raises WiffFallbackRefused, writing nothing, where the conditions
     do not hold."""
@@ -773,7 +814,7 @@ def switch_to_wiff(
 
     path = Path(manifest_path).resolve()
     manifest = read_manifest(path)
-    plan = plan_wiff_fallback(manifest, failed_job_ids)
+    plan = plan_wiff_fallback(manifest, failed_job_ids, rule=rule)
     reads = (reader or read_wiff_headers)(extractor_path, [swap["to"] for swap in plan["swaps"]],
                                           path.parent / HEADER_READS_DIRECTORY)
     headers = wiff_headers(manifest, plan, reads)
@@ -824,7 +865,8 @@ def threshold_blockers(
     before the switch, one the switch marked superseded, and one whose representative is no current input (the .wiff2
     it measured) do not count: the threshold must be measured on the files that actually run. [] for a unit that never
     switched, or a workflow that asks for no threshold."""
-    if not fallback_record(manifest) or state.get("minimum_peak_height") in (None, ""):
+    record = fallback_record(manifest)
+    if not record or state.get("minimum_peak_height") in (None, ""):
         return []
     try:
         asked = float(state["minimum_peak_height"])
@@ -839,7 +881,7 @@ def threshold_blockers(
     return [
         f"The run asks for a minimum peak height of {state['minimum_peak_height']}, and no peak-count diagnostic measured "
         "on the files that now run produced it: this unit's inputs were switched from its .wiff2 to its .wiff "
-        f"({WIFF_FALLBACK_RULE}), and a threshold from a diagnostic before the switch, one marked superseded, or one "
+        f"({record.get('rule')}), and a threshold from a diagnostic before the switch, one marked superseded, or one "
         "whose representative is no current input was measured on other files. Run the diagnostic again."
     ]
 

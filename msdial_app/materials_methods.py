@@ -571,8 +571,9 @@ def _input_integrity_sentence(workflow: dict[str, Any]) -> str:
 
 def _wiff_fallback_sentence(workflow: dict[str, Any]) -> str:
     """' The N SCIEX analysis file(s) ... were read from the .wiff' for a repository unit switched from its .wiff2 to
-    its .wiff after a Console failure (wiff_fallback, the user's decision of 2026-10-31), else ''. It says what was read
-    in place of what, and why, so the report never reads as a run of the preferred encoding."""
+    its .wiff after a Console failure (wiff_fallback, the user's decision of 2026-10-31) or from the start (the second
+    rule, 2026-11-04), else ''. It says what was read in place of what, and why, so the report never reads as a run of
+    the preferred encoding."""
     from . import wiff_fallback
     from .repository_reanalysis import read_manifest
 
@@ -586,6 +587,14 @@ def _wiff_fallback_sentence(workflow: dict[str, Any]) -> str:
     swaps = [item for item in record.get("swaps") or [] if isinstance(item, dict)]
     if not swaps:
         return ""
+    if record.get("rule") == wiff_fallback.WIFF_FIRST_RULE:
+        return (
+            f" The {len(swaps)} SCIEX analysis file(s) were deposited both as .wiff2 and as .wiff with its .wiff.scan, and "
+            "were read from the .wiff: MS-DIAL Interactive prefers the .wiff2, but multi-file MS-DIAL Console runs on "
+            ".wiff2 files of data-dependent acquisitions stopped responding in repeated verification runs while the same "
+            "samples completed from their .wiff, so each sample's .wiff was read in place of its .wiff2 from the first "
+            f"run ({wiff_fallback.WIFF_FIRST_RULE}; each .wiff's own raw header was read and recorded with the switch)."
+        )
     stops = sorted({str(item.get("console_job") or item.get("kind") or "Console")
                     for item in record.get("failed_jobs") or [] if isinstance(item, dict)})
     return (
