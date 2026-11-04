@@ -2347,13 +2347,20 @@ def msdial_switch_repository_unit_to_wiff(
     confirmed: bool = False,
     campaign_authorization_path: str = "",
     extractor_path: str = "",
+    rule: str = "",
 ) -> dict[str, Any]:
-    """Switch a SCIEX unit or split part from its .wiff2 to the .wiff beside them, after a Console job failed on them.
+    """Switch a SCIEX unit or split part from its .wiff2 to the .wiff beside them, after a Console job failed on them
+    or, under the second rule, before its first Console job.
 
     The user's decision of 2026-10-31 (wiff_fallback.WIFF_FALLBACK_RULE): the .wiff2 stays the preferred encoding, and
     where a peak-count diagnostic or production run of a DDA unit failed or timed out, and every .wiff2 it analyses has
     the same sample's .wiff beside it with that .wiff's .wiff.scan, the unit's next attempt runs on the .wiff. Never for
     a DIA, SWATH or AIF unit (ZT Scan DIA data can only be analysed from the .wiff2), never twice, and never in part.
+
+    rule picks the rule: wiff2_to_wiff_after_console_failure_2026_10_31 (the default, WIFF_FALLBACK_RULE), which
+    answers failed_job_ids, or wiff_first_for_dda_2026_11_04 (WIFF_FIRST_RULE, the user's decision of 2026-11-04), which
+    runs a DDA unit deposited as both on its .wiff from the start: it answers no failure and takes no failed_job_ids,
+    and every other condition, read and record is the same.
 
     failed_job_ids names the Console job(s) that failed, as the unit's run_attempts record them (kind tuning or run,
     ended timeout, idle_timeout, error or a non-zero exit). With confirmed=false this previews the swaps and reads and
@@ -2369,8 +2376,8 @@ def msdial_switch_repository_unit_to_wiff(
 
     A unit whose conditions do not hold is refused with ok false, switched false and a reason (already_switched,
     no_console_failure, no_wiff2_input, wiff2_not_a_file, not_dda, wiff_not_beside, wiff_scan_missing,
-    wiff_already_an_input, wiff_provenance_unrecorded, wiff_header_refused, unit_not_switchable, run_in_progress), and
-    nothing is written.
+    wiff_already_an_input, wiff_provenance_unrecorded, wiff_header_refused, unit_not_switchable, run_in_progress,
+    rule_mismatch), and nothing is written.
     """
     from . import wiff_fallback
     from .repository_reanalysis import read_manifest
@@ -2381,17 +2388,18 @@ def msdial_switch_repository_unit_to_wiff(
         campaign_authorization_path, manifest, wiff_fallback.BOUNDARY, wiff_fallback.ENTRY_POINT
     )
     jobs = [str(item) for item in (failed_job_ids or [])]
+    rule = str(rule or "").strip() or wiff_fallback.WIFF_FALLBACK_RULE
 
     def refused(refusal: "wiff_fallback.WiffFallbackRefused") -> dict[str, Any]:
         return {"ok": False, "switched": False, "reason": refusal.reason, "detail": refusal.detail,
-                "rule": wiff_fallback.WIFF_FALLBACK_RULE, **refusal.evidence}
+                "rule": rule, **refusal.evidence}
 
     try:
-        plan = wiff_fallback.plan_wiff_fallback(manifest, jobs)
+        plan = wiff_fallback.plan_wiff_fallback(manifest, jobs, rule=rule)
     except wiff_fallback.WiffFallbackRefused as refusal:
         return refused(refusal)
     preview = {
-        "rule": wiff_fallback.WIFF_FALLBACK_RULE,
+        "rule": rule,
         "manifest_path": str(path),
         "failed_jobs": plan["failed_jobs"],
         "swaps": wiff_fallback.swap_summary({"swaps": plan["swaps"]}),
@@ -2411,7 +2419,7 @@ def msdial_switch_repository_unit_to_wiff(
     extractor, extractor_record = _wiff_fallback_extractor(extractor_path, crossing is not None)
     try:
         record = wiff_fallback.switch_to_wiff(
-            path, jobs, extractor_path=extractor, crossing=crossing, extractor=extractor_record
+            path, jobs, extractor_path=extractor, crossing=crossing, extractor=extractor_record, rule=rule
         )
     except wiff_fallback.WiffFallbackRefused as refusal:
         return refused(refusal)

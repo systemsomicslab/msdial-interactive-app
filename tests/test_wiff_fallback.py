@@ -880,6 +880,86 @@ class WhatTheSwitchSupersedes(_Part):
         self.assertIn(wiff_fallback.WIFF_FALLBACK_RULE, sentence)
 
 
+class TheWiffFirstRule(_Part):
+    """The user's decision of 2026-11-04: a DDA unit deposited as both runs on its .wiff from the start
+    (WIFF_FIRST_RULE). V6, V7 and V8 hung on the multi-file .wiff2 run of MPST000048 every time; the .wiff ran in
+    minutes. Same conditions and record as the fallback, but no Console failure is answered."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Before its first Console job: no run attempt yet.
+        self.change(lambda manifest: manifest.update(status="metadata_prepared", run_attempts=[]))
+
+    def first(self, jobs=(), **options) -> dict:
+        return self.switch(jobs, rule=wiff_fallback.WIFF_FIRST_RULE, **options)
+
+    def assertRefused(self, reason: str, **options) -> dict:
+        before = self.manifest_path.read_bytes()
+        result = self.first(confirmed=True, **options)
+        self.assertEqual((False, False, reason), (result["ok"], result["switched"], result["reason"]), result)
+        self.assertEqual(before, self.manifest_path.read_bytes())
+        return result
+
+    def test_a_dda_unit_runs_on_its_wiff_without_a_failure_on_record(self) -> None:
+        preview = self.first()
+        self.assertEqual((wiff_fallback.WIFF_FIRST_RULE, [], 3),
+                         (preview["preview"]["rule"], preview["preview"]["failed_jobs"], preview["preview"]["swap_count"]))
+
+        result = self.first(confirmed=True)
+        manifest = read_manifest(self.manifest_path)
+
+        self.assertTrue(result["switched"])
+        self.assertEqual([str(self.data / (stem + ".wiff")) for stem in SAMPLES], manifest["input_candidates"])
+        record = manifest["encoding_fallback"]
+        self.assertEqual((wiff_fallback.WIFF_FIRST_RULE, [], wiff_fallback.DECISION_FIRST),
+                         (record["rule"], record["failed_jobs"], record["decision"]))
+        self.assertEqual(3, len(record["wiff_headers"]))
+        self.assertEqual({wiff_fallback.WIFF_FIRST_RULE},
+                         {row["encoding_fallback"]["rule"] for row in manifest["input_lineage"]["rows"]})
+        self.assertEqual(record, wiff_fallback.fallback_record(manifest))
+        self.assertEqual(3, len(wiff_fallback.fallback_sources(manifest)))
+        built = build_repository_analysis_rows(manifest)
+        self.assertEqual(([], wiff_fallback.WIFF_FIRST_RULE), (built["failures"], built["encoding_fallback"]["rule"]))
+
+    def test_it_answers_no_failure_and_takes_no_failed_jobs(self) -> None:
+        self.assertRefused(wiff_fallback.RULE_MISMATCH, jobs=("rn1",))
+
+    def test_an_unknown_rule_is_refused(self) -> None:
+        before = self.manifest_path.read_bytes()
+        result = self.switch((), rule="wiff_whenever", confirmed=True)
+        self.assertEqual((False, wiff_fallback.RULE_MISMATCH), (result["ok"], result["reason"]))
+        self.assertEqual(before, self.manifest_path.read_bytes())
+
+    def test_a_dia_unit_still_runs_on_its_wiff2(self) -> None:
+        for mode in ("SWATH", "DIA", "AIF"):
+            with self.subTest(mode=mode):
+                self.change(lambda manifest: manifest["project"].update(acquisition_mode=mode))
+                self.assertRefused(wiff_fallback.NOT_DDA)
+
+    def test_a_wiff_whose_header_is_not_dda_leaves_the_unit_on_its_wiff2(self) -> None:
+        self.extractor.verdicts[SAMPLES[1] + ".wiff"] = {"method": "DIA"}
+        self.assertIn("not DDA", self.assertRefused(wiff_fallback.WIFF_HEADER_REFUSED)["detail"])
+
+    def test_a_wiff_without_its_scan_leaves_the_unit_on_its_wiff2(self) -> None:
+        (self.data / (SAMPLES[1] + ".wiff.scan")).unlink()
+        self.assertRefused(wiff_fallback.WIFF_SCAN_MISSING)
+
+    def test_a_unit_switched_from_the_start_is_not_switched_again_after_a_failure(self) -> None:
+        self.assertTrue(self.first(confirmed=True)["switched"])
+        self.change(lambda manifest: manifest.update(run_attempts=[
+            {"attempt_id": "a2", "job_id": "rn1", "kind": "run", "started_at": "2026-11-04T01:00:00+00:00",
+             "ended_at": "2026-11-04T08:00:00+00:00", "exit_code": -3, "reason": "idle_timeout"}]))
+        self.assertEqual(wiff_fallback.ALREADY_SWITCHED, self.switch(confirmed=True)["reason"])
+
+    def test_the_methods_text_says_the_wiff_was_read_from_the_first_run(self) -> None:
+        self.first(confirmed=True)
+        sentence = _wiff_fallback_sentence({"repository_run_manifest": str(self.manifest_path)})
+        self.assertIn("The 3 SCIEX analysis file(s)", sentence)
+        self.assertIn("from the first run", sentence)
+        self.assertIn(wiff_fallback.WIFF_FIRST_RULE, sentence)
+        self.assertNotIn("failed or timed out", sentence)
+
+
 class TheReviewsLowFindings(_Part):
     def test_a_wiff2_that_is_no_file_refuses_rather_than_being_dropped(self) -> None:
         (self.data / (SAMPLES[0] + ".wiff2")).unlink()
