@@ -21,7 +21,8 @@ THE RULE, as the vectors state it:
   mgf, ibd, dat, scan) is the alternate;
 - two containers of equal preference are both left: no preference was stated between them;
 - a .wiff2 always wins over the .wiff of the same sample;
-- what travels with a SCIEX acquisition (.wiff.scan, .wiff2.scan, .timeseries.data) never competes, and
+- what travels with a SCIEX acquisition (.wiff.scan, .wiff2.scan, .timeseries.data, and the index SCIEX software
+  caches beside a .wiff, x.wiff.1.~idx2) never competes, and
   files inside a vendor folder are its members.
 
 Every format MS-DIAL cannot read requires conversion; only mzXML is converted, to mzML.
@@ -44,7 +45,8 @@ UNREADABLE_SUFFIXES = (".mzxml", ".mzdata", ".mgf", ".ibd", ".dat", ".scan")
 CONVERTIBLE_SUFFIXES = (".mzxml",)
 FOLDER_SUFFIXES = (".raw", ".d")
 SIDECAR_SUFFIXES = (".wiff2.scan", ".wiff.scan")
-AUXILIARY_SUFFIXES = (".timeseries.data",)
+# A .~idx2 is a SCIEX index (x.wiff.1.~idx2): no spectra and no sample. MB-POST MPST000187 lists one as a sample.
+AUXILIARY_SUFFIXES = (".timeseries.data", ".~idx2")
 
 RAW = "raw"
 ALTERNATE = "raw_alternate"

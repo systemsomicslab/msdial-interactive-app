@@ -10,7 +10,7 @@
     "Two containers of equal preference are both left in place: no preference was stated between them, and none is invented.",
     "A .wiff2 always wins over the .wiff of the same sample, decided by the analyst on 2026-09-21.",
     "A format MS-DIAL cannot read (.mzXML, .mzData, .mgf, .ibd, .dat, .scan) is marked requires_conversion wherever it appears; only mzXML is marked for conversion to mzML (decided by the user on 2026-09-30).",
-    "The exception is what travels with a SCIEX acquisition: a .wiff.scan or .wiff2.scan is a sidecar and a .timeseries.data an auxiliary file, packed or not. Neither is an input, competes, or is marked requires_conversion, although .scan on its own is a format MS-DIAL cannot read.",
+    "The exception is what travels with a SCIEX acquisition: a .wiff.scan or .wiff2.scan is a sidecar, and a .timeseries.data or a SCIEX index (x.wiff.1.~idx2) an auxiliary file, packed or not. Neither is an input, competes, or is marked requires_conversion, although .scan on its own is a format MS-DIAL cannot read.",
     "Files inside a vendor folder are its members and never compete."
   ],
   "cases": [
@@ -101,6 +101,12 @@
       "name": "a .timeseries.data is auxiliary",
       "files": ["raw/s.wiff2", "raw/s.timeseries.data"],
       "roles": {"raw/s.wiff2": "raw", "raw/s.timeseries.data": "auxiliary"},
+      "requires_conversion": []
+    },
+    {
+      "name": "a SCIEX index is auxiliary (MB-POST MPST000187)",
+      "files": ["raw/s.wiff", "raw/s.wiff.scan", "raw/s.wiff.1.~idx2"],
+      "roles": {"raw/s.wiff": "raw", "raw/s.wiff.scan": "sidecar", "raw/s.wiff.1.~idx2": "auxiliary"},
       "requires_conversion": []
     },
     {
