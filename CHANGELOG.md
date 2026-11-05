@@ -4,6 +4,17 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.59] - Unreleased
+
+### Fixed
+- **A SCIEX index (`x.wiff.1.~idx2`) travels with its .wiff as an auxiliary file**, like a `.timeseries.data`.
+  - It never competes, is never an input and is never marked for conversion.
+  - MB-POST MPST000187's sample table lists one as a sample of its own. The Catalog declared it an analysis input, and
+    in the Stage 2 campaign (2026-11-04) the lease refused the unit three times, because that input was not in the
+    download.
+  - The Catalog now reads it the same way (msdial-repository-catalog 0.6.3), and the shared encoding vectors gain the
+    case.
+
 ## [0.5.58] - Unreleased
 
 The verification campaigns V6, V7 and V8 (2026-10-31 to 2026-11-04) ran MB-POST MPST000048 three times. Its multi-file
