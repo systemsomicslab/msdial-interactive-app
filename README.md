@@ -948,11 +948,27 @@ Optional Console path:
 
 ### macOS
 
+Double-click `Start MS-DIAL Interactive.command` at the top of the app. Terminal opens, starts the
+app on this Mac only, and the browser opens `http://127.0.0.1:8765`; keep that Terminal window
+open while you use it. From a terminal the same is:
+
 ```bash
 cd /Users/<user>/Apps/msdial_interactive_app
-chmod +x scripts/start-local-macos.command scripts/start-local-linux.sh
-./scripts/start-local-macos.command
+./"Start MS-DIAL Interactive.command"
 ```
+
+A copy that reached the Mac through Windows, a ZIP made there or a cloud drive has lost its
+execute bits. Restore the one on the launcher once (the scripts it starts run through bash and
+need none), and clear the download quarantine if macOS refuses to open it:
+
+```bash
+chmod +x "Start MS-DIAL Interactive.command"
+xattr -dr com.apple.quarantine .
+```
+
+`bash "Start MS-DIAL Interactive.command"` works without either. If Claude's MCP server already
+runs the app on port 8765, a second start stops with "Another process is already using this port":
+open `http://127.0.0.1:8765` in the browser instead.
 
 ### Linux
 
@@ -971,7 +987,8 @@ python app.py --host 127.0.0.1 --port 8765
 The source ZIP also places launchers at its top level. On Windows, double-click
 `Start MS-DIAL Interactive.cmd`; on macOS open
 `Start MS-DIAL Interactive.command`; on Linux run or open
-`start-msdial-interactive.sh` after granting execute permission once.
+`start-msdial-interactive.sh`. Only the launcher itself needs execute permission; grant it once if
+the copy lost it.
 
 ## Native packages for users without Python
 

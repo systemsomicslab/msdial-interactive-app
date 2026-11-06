@@ -6,3 +6,7 @@
 # The example internal-standard texts are kept byte for byte as the demo used them (CRLF), so that
 # their checksums and the changes their README states hold in every checkout.
 examples/lab-lipidomics/*.txt -text
+# Shell launchers keep LF in every checkout: macOS and Linux bash refuse a CRLF script ("$'\r': command not found"),
+# and a copy made on Windows reaches a Mac through a ZIP or a cloud drive.
+*.sh text eol=lf
+*.command text eol=lf
