@@ -133,6 +133,10 @@ def summarize_jobs(
             # file where the key is unique on both sides, recorded as paired_by leading_identifier_token with the
             # warning input_names_paired_by_inference; no inferred pairing crosses a polarity token.
             "repository_leading_identifier_names",
+            # A declared vendor raw file nothing carries exactly, whose depositor deposited its mzML alone, is that mzML
+            # (one sample of the stem on both sides, never across a polarity), recorded as paired_by
+            # converted_member_stem with the conversion its mzML header states.
+            "repository_converted_member_stem_names",
             # AIF as SWATH (2026-10-07): an AIF unit whose included inputs share one MS2 collision energy (0.1 eV,
             # LockSpray reference excluded) runs as SWATH, recorded as campaign_disposition.aif_run_as_swath and
             # console_acquisition_basis aif_single_ce_as_swath; one with more energies is held (skip, hold true,
