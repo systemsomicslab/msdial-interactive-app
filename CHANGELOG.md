@@ -22,6 +22,49 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
   - The README's macOS section describes the double-click and the one `chmod` a copied kit needs, and says to open
     the browser when Claude's MCP server already holds port 8765.
 
+## [0.5.61] - Unreleased
+
+### Changed
+- **The tutorial's example `quant_utility_table.xlsx` keeps only what the agent reads.** It is the copy handed out at
+  the MS-DIAL hands-on of 2026-11-08, trimmed in Excel on 2026-11-07.
+  - Sheet 1 no longer holds the worked example and the extraction notes below the standards.
+  - Sheet 2 no longer holds the old peak IDs (column D) or the stale local copy of one sheet-1 column (H:I). It gains
+    a header row, which the reader already skips, and column B now looks up sheet 1 column H directly.
+  - Sheet 1's G3 label is spelled "considered".
+  - The agent reads the same standards, amounts, class lookup and selection as before, for every amount column.
+    `tests/test_example_workbook.py` pins that against the untrimmed workbook's reading. The check no longer has
+    notes to read back.
+  - As before, the creator, the last modifier and Excel's saved folder are emptied.
+  - The example README and the tutorial say that sheet 2 may carry a header row, and that the example has no notes.
+
+## [0.5.60] - Unreleased
+
+### Fixed
+- **A declared vendor raw file whose depositor deposited only its mzML is that mzML (`converted_member_stem`).**
+  - Metabolomics Workbench ST004806 declares `Rahman_m25-L025_RIIBKO_10.raw` in a sample row, and its study archive
+    `ST004806_mzml.zip` holds `Rahman_m25-L025_RIIBKO_10.mzML`. No rule paired them. A name a row records with an
+    extension never matches by its stem, and every name of the study shares its leading identifier (`rahman_m25`).
+  - In the Stage 3b campaign (2026-11-06) the attribute stage admitted nothing, and 18 units of nine such studies
+    (ST004701, ST004705, ST004706, ST004804, ST004806, ST004808, ST004809, ST004810, ST004811) failed after their
+    download: "Refusing to fall back to accession-level inputs".
+  - A new last rule of `_member_name_pairings` pairs a declared name of a vendor encoding with the mzML members of its
+    own file stem. It applies only where nothing carries the name exactly and no earlier rule paired it, so every unit
+    those rules paired is paired as before. It also needs one sample of the stem on both sides: one sample row records
+    a file of it, and its members are one sample (one stem, one polarity their paths state). A stem compares whole
+    names, so `x_pos.raw` never takes `x_neg.mzML`, and a polarity token or folder that contradicts the unit's ion mode
+    or the declared name refuses the pairing on record.
+  - The pairing is an inference on record, like `prefixed_member_name` and `leading_identifier_token`. The lineage
+    row's `name_pairing`, `input_name_pairings.paired` and the attribute stage (`converted_member_stem_pairings`) name
+    it, and it raises `input_names_paired_by_inference`.
+  - The pairing carries `conversion`: `converted_by: depositor`, the declared and input encodings, and what the
+    mzML's header states. That is its `sourceFile` entries (name, location, cvParams, including the SHA-1 of the file
+    it was converted from) and its `software`. `source_file_agrees` says whether a source file is of the declared
+    file's stem. It is recorded and decides nothing.
+  - The token rule's `leading_identifier_not_unique` refusals of other members for a name its own mzML now carries are
+    dropped. They said nothing about the name: ST004806 had 35, all of them for its blanks and pooled MS/MS runs.
+  - What the record cannot pair still fails. ST004751's rows name two files in one field (`QC1_neg.raw QC1_pos.raw`),
+    and its archive holds only `QC1_pos.mzML`..`QC8_pos.mzML`. ST004757's rows name only `.RAW`.
+
 ## [0.5.59] - Unreleased
 
 ### Fixed

@@ -12,7 +12,7 @@ from typing import Any, Iterable
 SCHEMA = "msdial-repository-metadata.v1"
 IDENTITY_FIELDS = {"sample_id", "raw_file", "source_name"}
 # How a repository unit's analysis CSV paired a sample row's raw file with its input (exact,
-# prefixed_member_name, leading_identifier_token; '' for a row without one). Written by the repository prepare
+# prefixed_member_name, leading_identifier_token, converted_member_stem; '' for a row without one). Written by the repository prepare
 # step into the reviewed rows and their TSV; a record of the pairing, never a field to group samples by.
 RAW_FILE_PAIRED_BY = "raw_file_paired_by"
 ANALYSIS_FIELDS = [

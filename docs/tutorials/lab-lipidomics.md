@@ -380,8 +380,8 @@ and reads out:
 - **the salt** as mapped, beside the adducts your negative standards and sheet 3 of the
   workbook use (here `[M+CH3COO]-`, which agrees with ammonium acetate);
 - **the workbook**: the amount column's header (`int (pmol/ul plasma)`), the unit, and
-  the **sample amount** it divides by, H4 = 10 (`Put uL in solvent`), with the notes
-  below the standards. Every concentration scales with H4, so confirm it. If it is wrong
+  the **sample amount** it divides by, H4 = 10 (`Put uL in solvent`), with any notes
+  below the standards (the example has none). Every concentration scales with H4, so confirm it. If it is wrong
   for your samples, correct it in Excel, save, and ask Claude to check again; Claude
   never edits the workbook;
 - **what cannot be quantified**: classes whose standard is not in that polarity's
