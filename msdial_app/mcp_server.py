@@ -3220,7 +3220,7 @@ def _prepare_repository_rows_from_lineage(
 def _with_raw_file_paired_by(projected: dict[str, Any], built: dict[str, Any]) -> dict[str, Any]:
     """The projected sample rows, each saying how its raw file was paired with its input.
 
-    exact, or the inferred rule (prefixed_member_name, leading_identifier_token); a row without an input says
+    exact, or the inferred rule (prefixed_member_name, leading_identifier_token, converted_member_stem); a row without an input says
     nothing. Both the prepare of a unit's first run and of a new production run write it into the reviewed
     sample TSV, so an inferred pairing is on record in every run's table.
 

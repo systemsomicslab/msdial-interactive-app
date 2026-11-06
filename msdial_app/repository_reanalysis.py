@@ -2500,6 +2500,11 @@ def create_download_lease(
                 if paired_by_rule[LEADING_IDENTIFIER_TOKEN_PAIRING]
                 else {}
             ),
+            **(
+                {"converted_member_stem_pairings": paired_by_rule[CONVERTED_MEMBER_STEM_PAIRING]}
+                if paired_by_rule[CONVERTED_MEMBER_STEM_PAIRING]
+                else {}
+            ),
             **({"inferred_name_pairings": inferred} if inferred else {}),
             **({"unattributed_members": len(unattributed_inputs)} if unattributed_inputs else {}),
             # The samples the rule chose for among several encodings, and the files it left unused (encoding_rule).
@@ -3904,6 +3909,9 @@ def build_input_lineage(
                 "paired_by": pairing["paired_by"],
                 # The leading identifier both names share, where that is the rule that paired them.
                 **({"key": pairing["key"]} if pairing.get("key") else {}),
+                # The depositor's conversion, as its mzML's header states it, where the input is a deposited mzML
+                # of the declared vendor file (CONVERTED_MEMBER_STEM_PAIRING).
+                **({"conversion": pairing["conversion"]} if pairing.get("conversion") else {}),
             }
         if key in conversions:
             conversion = conversions[key]
@@ -11847,6 +11855,17 @@ PREFIXED_MEMBER_PAIRING = "prefixed_member_name"
 # declared name and a member are one file when their leading identifier (leading_identifier_key: VV_13) is
 # unique on both sides, and that such a pairing must always be left on record (INFERRED_PAIRING_WARNING).
 LEADING_IDENTIFIER_TOKEN_PAIRING = "leading_identifier_token"
+# A DECLARED VENDOR FILE AND THE DEPOSITOR'S mzML OF IT. Metabolomics Workbench ST004806 declares
+# Rahman_m25-L025_RIIBKO_10.raw in its sample rows, and its study archive (ST004806_mzml.zip) holds
+# Rahman_m25-L025_RIIBKO_10.mzML: the depositor converted the .raw and deposited the mzML alone. No exact rule matched
+# it, since a name a row records with an extension never matches by its stem (_sample_file_names); the leading
+# identifier rule did not, since every name of the study shares its key (rahman_m25); and in the Stage 3b campaign of
+# 2026-11-06 the attribute stage admitted nothing, and 18 units of nine such studies failed after their download. A
+# declared name of a vendor encoding that nothing carries exactly, and that no rule before this one paired, is paired
+# with the mzML members of its own file stem (encoding_preference.stem), one to one and never across polarities
+# (_member_name_pairings). The pairing records the conversion as the mzML's own header states it (its source files and
+# the software that wrote it: deposited_conversion), and is an inference on record like the other two.
+CONVERTED_MEMBER_STEM_PAIRING = "converted_member_stem"
 # The unit-level warning code every inferred pairing (prefixed or by token) raises: in the attribute stage,
 # the run manifest's warnings and the campaign disposition's warnings (raw_metadata_preflight's, imported).
 # A name's tokens: what lies between these separators, compared without case.
@@ -11983,7 +12002,11 @@ def _member_name_pairings(
     candidate member. A member of the declared name's own stem in another encoding (VV_13_HEpG2_C1_pos.mzML for
     VV_13_HEpG2_C1_pos.raw) is such a candidate: beside it, VV_13_HEpG2_C1_exp344_pos.raw does not match uniquely
     and is refused, and the row's own-stem file is never refused itself but paired by the key, as it is alone (it is
-    the row's by clause 4 of the one encoding rule, whatever encoding the row names).
+    the row's by clause 4 of the one encoding rule, whatever encoding the row names). LAST, DEPOSITED CONVERSIONS
+    (CONVERTED_MEMBER_STEM_PAIRING): a declared name of a vendor encoding still unpaired, which nothing carries exactly,
+    is paired with the mzML members of its own file stem (ST004806's Rahman_m25-L025_RIIBKO_10.mzML for
+    Rahman_m25-L025_RIIBKO_10.raw), where one sample row records a file of that stem and those members are one sample,
+    and the pairing carries the conversion as the mzML's header states it (deposited_conversion).
 
     EACH PAIRING IS ONE TO ONE: a member that ends in two declared names, or a declared name two members end
     in, pairs neither - which is why Youn_sa1.raw never takes 021518_Youn_sa11.raw, whose name ends in
@@ -12209,7 +12232,179 @@ def _member_name_pairings(
                 "paired_by": LEADING_IDENTIFIER_TOKEN_PAIRING,
                 "key": token_key,
             }
+
+    # LAST, A DEPOSITED CONVERSION (CONVERTED_MEMBER_STEM_PAIRING): a declared name of a vendor encoding that nothing
+    # carries exactly and no rule above paired or claimed is paired with the mzML members of its own file stem. Only
+    # what no rule before it settled, so every unit those rules paired is paired as it was. The stem is one sample's on
+    # both sides: one sample row records a file of it (an extensionless row of the stem, or a row of another encoding of
+    # it, counts as well), and its mzML members are one sample (sample_of: one stem, one polarity their paths state). A
+    # stem compares whole names less their encoding suffix, so x_pos.raw never takes x_neg.mzML; a member or a declared
+    # name whose path states a polarity that is not the unit's ion mode, or not the other's, is refused as above.
+    paired_names = {str(item["declared_raw_file"]).casefold() for item in paired.values()}
+    rows_of_stem: Counter[str] = Counter()
+    for raw in (
+        PurePosixPath(str((sample or {}).get("raw_file") or "").strip().replace("\\", "/")).name
+        for sample in project.sample_metadata or []
+    ):
+        if raw:
+            rows_of_stem[encoding_preference.stem(raw)] += 1
+    vendor_names: dict[str, set[str]] = {}
+    for declared_name in named:
+        stem = encoding_preference.stem(declared_name)
+        if stem and stem != declared_name and encoding_rule.encoding_rank(declared_name) == encoding_rule.VENDOR_RANK:
+            vendor_names.setdefault(stem, set()).add(declared_name)
+    for stem, declared_names in sorted(vendor_names.items()):
+        if any(name in taken or name in claimed_by or name in paired_names for name in declared_names):
+            continue
+        members = sorted(
+            key
+            for key, name in pool.items()
+            if key not in paired
+            and key not in claims
+            and not exactly(name)
+            and encoding_rule.encoding_rank(name) == encoding_rule.MZML_RANK
+            and encoding_preference.stem(name) == stem
+        )
+        if not members:
+            continue
+        declared_raw_file = written(sorted(declared_names)[0])
+        if rows_of_stem[stem] != 1:
+            for key in members:
+                refuse(key, declared_raw_file, CONVERTED_MEMBER_STEM_PAIRING, "declared_stem_not_one_sample")
+            continue
+        if len({sample_of(key) for key in members}) != 1:
+            for key in members:
+                refuse(key, declared_raw_file, CONVERTED_MEMBER_STEM_PAIRING, "member_stem_not_one_sample")
+            continue
+        for key in members:
+            reason = polarity_conflict(key, declared_raw_file)
+            if reason:
+                refuse(key, declared_raw_file, CONVERTED_MEMBER_STEM_PAIRING, reason)
+                continue
+            paired[key] = {
+                "declared_raw_file": declared_raw_file,
+                "paired_by": CONVERTED_MEMBER_STEM_PAIRING,
+                "conversion": deposited_conversion(_path_on_disk(key, data_root), declared_raw_file),
+            }
+    # A declared name its own deposited conversion now carries is, to the token rule, what a name carried exactly is:
+    # one it never pairs by its token. Its refusals of the study's other members for that name (ST004806's blanks and
+    # pooled MS/MS runs, 35 of them, all leading_identifier_not_unique) say nothing about the name, and are dropped.
+    converted = {
+        item["declared_raw_file"] for item in paired.values() if item["paired_by"] == CONVERTED_MEMBER_STEM_PAIRING
+    }
+    result["refused"] = [
+        entry
+        for entry in result["refused"]
+        if not (entry["rule"] == LEADING_IDENTIFIER_TOKEN_PAIRING and entry["declared_raw_file"] in converted)
+    ]
     return result
+
+
+def _path_on_disk(key: str, data_root: Path) -> Path:
+    """The file a casefolded key (_file_key) names, in its case on disk: on a case-sensitive file system the key itself
+    names nothing, so each part under the data root is found by its casefolded name. The key, where none is found."""
+    path = Path(key)
+    if path.exists():
+        return path
+    data_key = _file_key(str(data_root))
+    if not key.startswith(data_key):
+        return path
+    current = data_root
+    for part in Path(key[len(data_key):].lstrip("\\/")).parts:
+        try:
+            current = next(child for child in current.iterdir() if child.name.casefold() == part)
+        except (OSError, StopIteration):
+            return path
+    return current
+
+
+# How much of an mzML deposited_conversion reads for its header: everything before <run> is a few kilobytes.
+_MZML_HEADER_BYTES = 1 << 20
+_MZML_HEADER_END = re.compile(rb"<run[\s>]")
+_XML_ATTRIBUTE = re.compile(r'([A-Za-z_:][\w:.-]*)\s*=\s*"([^"]*)"')
+_MZML_BLOCK = {
+    name: re.compile(rf"<{name}\b([^>]*?)(/>|>(.*?)</{name}>)", re.DOTALL) for name in ("sourceFile", "software")
+}
+_MZML_CV_PARAM = re.compile(r"<cvParam\b([^>]*?)/?>")
+
+
+def _mzml_header(path: Path) -> dict[str, Any] | None:
+    """What an mzML's header says of where it came from: {"source_files": [...], "software": [...]}, or None where
+    the file cannot be read as one. Each source file is its name and location, and the cvParams it carries (its
+    format, its native ID format, the SHA-1 of the file it was converted from); each software is its id and version,
+    and the names of its cvParams. Read from the text before <run>, in a gzip-packed file too."""
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(_MZML_HEADER_BYTES)
+        if head[:2] == b"\x1f\x8b":
+            import gzip
+
+            with gzip.open(path, "rb") as handle:
+                head = handle.read(_MZML_HEADER_BYTES)
+    except (OSError, EOFError):
+        return None
+    end = _MZML_HEADER_END.search(head)
+    text = head[: end.start() if end else len(head)].decode("utf-8", errors="replace")
+    if "<mzML" not in text:
+        return None
+
+    def attributes(raw: str) -> dict[str, str]:
+        return {name: html.unescape(value) for name, value in _XML_ATTRIBUTE.findall(raw)}
+
+    def cv_params(body: str) -> list[dict[str, str]]:
+        params = []
+        for raw in _MZML_CV_PARAM.findall(body or ""):
+            found = attributes(raw)
+            if found.get("name"):
+                params.append({"name": found["name"], **({"value": found["value"]} if found.get("value") else {})})
+        return params
+
+    source_files = []
+    for raw, _close, body in _MZML_BLOCK["sourceFile"].findall(text):
+        found = attributes(raw)
+        source_files.append(
+            {"name": found.get("name", ""), "location": found.get("location", ""), "cv_params": cv_params(body)}
+        )
+    software = []
+    for raw, _close, body in _MZML_BLOCK["software"].findall(text):
+        found = attributes(raw)
+        software.append(
+            {
+                "id": found.get("id", ""),
+                "version": found.get("version", ""),
+                "names": [param["name"] for param in cv_params(body)],
+            }
+        )
+    return {"source_files": source_files, "software": software}
+
+
+def deposited_conversion(path: Path, declared_raw_file: str) -> dict[str, Any]:
+    """The record of a deposited mzML paired with the vendor file a sample row declares (CONVERTED_MEMBER_STEM_PAIRING).
+
+    The repository supplied the mzML, so nothing here converted it: converted_by is the depositor, and what is known of
+    the conversion is what the mzML's header states (_mzml_header), recorded as it is. source_file_agrees says whether
+    one of its source files, by its name or a folder of its location, is of the declared file's stem (True), none is
+    (False), or the header names none or could not be read (None). It is recorded, and decides nothing: a depositor
+    who renamed both the raw file and its mzML leaves a header that names neither."""
+    header = _mzml_header(path)
+    stem = encoding_preference.stem(PurePosixPath(declared_raw_file.replace("\\", "/")).name)
+    record: dict[str, Any] = {
+        "converted_by": "depositor",
+        "declared_encoding": PurePosixPath(declared_raw_file.replace("\\", "/")).suffix,
+        "input_encoding": "mzML",
+        "header_read": header is not None,
+        "source_files": (header or {}).get("source_files", []),
+        "software": (header or {}).get("software", []),
+    }
+
+    def of_stem(source: Mapping[str, Any]) -> bool:
+        location = urllib.parse.unquote(str(source.get("location") or "")).replace("\\", "/")
+        parts = [str(source.get("name") or ""), *location.split("/")]
+        return any(part and encoding_preference.stem(part.casefold()) == stem for part in parts)
+
+    sources = record["source_files"]
+    record["source_file_agrees"] = any(of_stem(source) for source in sources) if sources else None
+    return record
 
 
 def _member_pool(extracted_members: dict[str, dict[str, Any]], data_root: Path) -> dict[str, str]:
@@ -12533,6 +12728,7 @@ def inferred_name_pairings(
                 "declared_raw_file": pairing["declared_raw_file"],
                 "paired_by": pairing["paired_by"],
                 **({"key": pairing["key"]} if pairing.get("key") else {}),
+                **({"conversion": pairing["conversion"]} if pairing.get("conversion") else {}),
                 **({"encoding_used": encoding_used[key]} if encoding_used.get(key) else {}),
             }
         )
