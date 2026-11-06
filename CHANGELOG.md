@@ -4,6 +4,24 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.62] - Unreleased
+
+### Fixed
+- **Double-clicking `Start MS-DIAL Interactive.command` on macOS starts the app again.**
+  - The launcher ran `scripts/start-local-macos.command` by its path, and that script ran
+    `scripts/start-local-linux.sh` the same way. Git recorded neither script as executable, so a clone stopped at
+    "Permission denied" before the app or the browser opened. `start-msdial-interactive.sh` on Linux did the same.
+  - Each launcher now runs the next script through `bash`, so only the file a person opens needs its execute bit. That
+    is also all a copy needs after Windows or a cloud drive strips the bits, which happened to the hands-on kit of
+    2026-11-08.
+  - Git now records every shell launcher under `scripts/` as executable.
+  - `.gitattributes` keeps `*.sh` and `*.command` LF in every checkout, because bash on macOS and Linux refuses a CRLF
+    script.
+  - `tests/test_launchers.py` checks four things: the LF line endings, the `exec bash` calls, the git modes, and that
+    each top launcher reaches `app.py` when only it is executable.
+  - The README's macOS section describes the double-click and the one `chmod` a copied kit needs, and says to open
+    the browser when Claude's MCP server already holds port 8765.
+
 ## [0.5.59] - Unreleased
 
 ### Fixed
