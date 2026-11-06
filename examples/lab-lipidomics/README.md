@@ -75,24 +75,26 @@ never calculated is refused, and a workbook that asks Excel to recalculate on op
 is warned about: open it in Excel and save it once.
 
 In the demo, the amount column is **H** (pmol per µL plasma) and its sample amount,
-H4, is **10** (`Put uL in solvent`), as saved. Below the standards, the sheet keeps a
-worked example and the extraction notes (`plasma 20 uL`, the solvent volumes); the
-agent reads them out beside H4 so that you can judge whether H4 is right for your
-samples.
+H4, is **10** (`Put uL in solvent`), as saved. The example keeps nothing below the
+standards. A laboratory's own workbook often does (a worked example, the extraction
+volumes); the agent reads such notes out beside the sample amount so that you can judge
+whether it is right for your samples.
 
 `FA 16:0(d3)` is prepared on sheet 1 but used by no class on sheet 2: the agent notes
 it, searches it, and quantifies nothing with it.
 
 ## Sheet 2, `2. Lookup table`: which standard quantifies which class
 
-No header row. Every row down to the last is read, and blank rows are skipped.
+A header row is optional: when A1 is not a standard of sheet 1 and names a standard, a
+name or a compound (the example's `Internal standard`), reading starts at row 2. Every
+row down to the last is read, and blank rows are skipped.
 
 | Column | Holds |
 | --- | --- |
 | A | the standard, exactly as on sheet 1 |
-| B | Excel's lookup of its amount; the agent recomputes it from the column you chose and reports a cached value that differs |
+| B | Excel's lookup of its amount (in the example, from sheet 1 column H); the agent recomputes it from the column you chose and reports a cached value that differs |
 | C | the lipid class, in the spelling MS-DIAL's normalize uses (`PC`, `EtherPE`, `Cer-NS`, `HexCer-NS`, ...) |
-| D | old peak IDs, ignored |
+| D and beyond | not read (the laboratory's original kept old peak IDs in D) |
 
 Exactly one row must name the class `Any others`: its standard (`LPC 18:1(d7)` here)
 quantifies every class without a row of its own, and any spot that is not a reference

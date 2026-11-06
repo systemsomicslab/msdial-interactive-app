@@ -1,14 +1,24 @@
 """The example quant_utility_table.xlsx shipped for the laboratory lipidomics tutorial.
 
 It is the workbook the MS-DIAL laboratory used for the public hands-on demo (Zenodo
-10.5281/zenodo.10957708, data2), as saved on 2026-10-14, with two parts rewritten and nothing else:
-docProps/core.xml's creator and last-modified-by emptied, and xl/workbook.xml's absPath (the
-folder Excel last saved it in) removed. Every other member is the source's, byte for byte, in the
-source's order.
+10.5281/zenodo.10957708, data2), trimmed in Excel on 2026-11-07 to what the agent reads. Nothing
+the agent uses changed:
+- sheet 1 lost the worked example and the extraction notes below the standards (rows 23 to 30);
+- sheet 2 lost the old peak IDs (column D) and a stale local copy of one sheet-1 column (H:I) that
+  column B looked up; it gained a header row, and B now looks up sheet 1 column H directly;
+- sheet 1's G3 label reads "considered", where it read "cosidered".
+Then two parts were rewritten and nothing else: docProps/core.xml's creator and last-modified-by
+emptied, and xl/workbook.xml's absPath (the folder Excel last saved it in) removed. Every other
+member is the trimmed source's, byte for byte, in the source's order.
 
-SOURCE_CELLS_SHA256 is the digest of what Interactive's own reader (read_xlsx) made of the source
-workbook, every sheet and cell; the example must read to exactly that. Set
-MSDIAL_QUANT_TABLE_SOURCE to the source workbook to compare the two files directly as well.
+SOURCE_CELLS_SHA256 is the digest of what Interactive's own reader (read_xlsx) made of the trimmed
+source workbook, every sheet and cell; the example must read to exactly that. Set
+MSDIAL_QUANT_TABLE_SOURCE to the trimmed source to compare the two files directly as well.
+
+UNTRIMMED_CONTENT_SHA256 is what the agent read from the untrimmed example (as shipped up to 0.5.60),
+for each amount column, leaving out only what the trimming moves or removes: the notes below the
+standards, the sample-amount label, sheet-2 row numbers and the sheet-2 cell references in warnings,
+which shift by the new header row. The trimmed example must read to the same.
 """
 
 from __future__ import annotations
@@ -27,7 +37,12 @@ from msdial_app.lipidome_merge import reconciliation_selection_warnings
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "lab-lipidomics" / "quant_utility_table.xlsx"
-SOURCE_CELLS_SHA256 = "fada0d22ec7add0f4ddb21fbbf61af05725e67a03139a20f289eaa85df08db24"
+SOURCE_CELLS_SHA256 = "a397d8d9d890b371ba63698d70f10849303ea6742e729a28861bb6e9c4538dab"
+UNTRIMMED_CONTENT_SHA256 = {
+    "F": "ad761643444ebc10a9c7f6702a422c69139f4f90b8ebc1d8629facf2b5f757ed",
+    "G": "ba841ee9b46e3dded9177939a9f6bebbbce4b498a6a325af4c338e901cb0808e",
+    "H": "5fc6963ff88538ea5a0565fc60de944add9731864484e6e7fb791fd98a2640a0",
+}
 MEMBERS = [
     "[Content_Types].xml",
     "_rels/.rels",
@@ -81,7 +96,34 @@ def parsed(path: Path, column: str) -> str:
     return json.dumps(result, sort_keys=True, default=lambda value: sorted(value) if isinstance(value, set) else str(value))
 
 
+def content(path: Path, column: str) -> str:
+    """What the agent reads, without the notes, the sheet-2 row numbers or the sheet-2 cell references."""
+    result = read_quant_workbook(path, column)
+    result = {key: value for key, value in result.items() if key not in {"path", "sha256"}}
+    result["quant_info"] = {key: value for key, value in result["quant_info"].items() if key != "path"}
+    preparation = {key: value for key, value in result["preparation"].items() if key != "notes"}
+    preparation["sample_parameter"] = {
+        key: value for key, value in (preparation["sample_parameter"] or {}).items() if key != "label"
+    }
+    result["preparation"] = preparation
+    lookup = dict(result["lookup"])
+    lookup["rows"] = [{key: value for key, value in row.items() if key != "row"} for row in lookup["rows"]]
+    for owner in (lookup, result):
+        for key in ("warnings", "blockers"):
+            owner[key] = [re.sub(r"'2\. Lookup table'!B\d+ ", "'2. Lookup table'!B# ", text) for text in owner[key]]
+    result["lookup"] = lookup
+    text = json.dumps(result, sort_keys=True, default=lambda value: sorted(value) if isinstance(value, set) else str(value))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 class ExampleWorkbookTests(unittest.TestCase):
+    def test_trimming_changed_nothing_the_agent_uses(self) -> None:
+        for column in "FGH":
+            self.assertEqual(UNTRIMMED_CONTENT_SHA256[column], content(EXAMPLE, column), column)
+
+    def test_no_notes_are_left_below_the_standards(self) -> None:
+        self.assertEqual([], read_quant_workbook(EXAMPLE, "H")["preparation"]["notes"])
+
     def test_it_reads_exactly_as_the_source_workbook_did(self) -> None:
         self.assertEqual(SOURCE_CELLS_SHA256, cells_digest(EXAMPLE))
 

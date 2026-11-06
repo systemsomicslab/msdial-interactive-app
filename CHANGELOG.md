@@ -4,6 +4,21 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.61] - Unreleased
+
+### Changed
+- **The tutorial's example `quant_utility_table.xlsx` keeps only what the agent reads.** It is the copy handed out at
+  the MS-DIAL hands-on of 2026-11-08, trimmed in Excel on 2026-11-07.
+  - Sheet 1 no longer holds the worked example and the extraction notes below the standards.
+  - Sheet 2 no longer holds the old peak IDs (column D) or the stale local copy of one sheet-1 column (H:I). It gains
+    a header row, which the reader already skips, and column B now looks up sheet 1 column H directly.
+  - Sheet 1's G3 label is spelled "considered".
+  - The agent reads the same standards, amounts, class lookup and selection as before, for every amount column.
+    `tests/test_example_workbook.py` pins that against the untrimmed workbook's reading. The check no longer has
+    notes to read back.
+  - As before, the creator, the last modifier and Excel's saved folder are emptied.
+  - The example README and the tutorial say that sheet 2 may carry a header row, and that the example has no notes.
+
 ## [0.5.60] - Unreleased
 
 ### Fixed
