@@ -4,6 +4,27 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.63] - Unreleased
+
+### Fixed
+- **A second start on a port an MS-DIAL Interactive already serves opens that instance instead of failing.**
+  - Claude's MCP server starts the app on port 8765. Double-clicking the launcher afterwards printed "Another
+    process is already using this port" and, on Windows, closed the window at once, so nothing seemed to happen.
+  - When the port cannot be bound, the start now asks the port for `/api/agent/status`, bypassing any proxy. If an
+    MS-DIAL Interactive answers, it opens that instance in the browser (the RT correction start opens its own page),
+    says which version runs there and that the instance belongs to the program that started it, and exits 0.
+  - It exits 1 when the running instance is another version (the browser still opens it, and the message says how
+    to use this folder's version) and for a `--lab` start, which a local instance cannot serve.
+  - Any other holder of the port still stops the start. The message now says that no MS-DIAL Interactive answers
+    there, how to choose another port and, on Windows, how to see which program holds it.
+- **The Windows launcher keeps its window open when the start fails.**
+  - `scripts\start-local-windows.cmd` pauses on a non-zero exit, so the message can be read before the window
+    closes. Both `.cmd` launchers pass their arguments on, so `-Port` and `-PythonPath` work from them.
+  - `start-local-windows.ps1`, `start-rt-correction-windows.ps1` and `start-lab-windows.ps1` end with the app's
+    exit code. Before, PowerShell reported 0 for a failed start.
+- `tests/test_port_in_use.py` covers the running instance, `--no-browser`, the RT correction page, another
+  version, a lab start, a port held by another program and the Windows launchers.
+
 ## [0.5.62] - Unreleased
 
 ### Fixed
