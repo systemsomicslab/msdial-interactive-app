@@ -448,6 +448,51 @@ class MaterialsMethodsTests(unittest.TestCase):
         self.assertFalse(evidence["performed"])
         self.assertEqual("audit_older_than_method_key_record", evidence["reason"])
 
+    def test_automatic_rt_methods_word_each_anchor_mode_from_the_audit(self) -> None:
+        # MsdialWorkbench#845: the anchor mode and library are read from the audit's summary, and the
+        # outlier test is not said to reject a user anchor, which it never does.
+        summary = (
+            "0\tQC-reference\tReference\t{mode}\tRun\tapproved.txt\tabc\n"
+            "1\tSample-1\tDetectedAnchors\t{mode}\tRun\tapproved.txt\tabc\n"
+        )
+        approval = {"library_sha256": "abc", "rows": {"automatic_accepted": 4, "automatic_rejected": 1}}
+        for mode, expected, absent in (
+            ("UserOnly", "approved.txt (SHA-256 abc) alone", "learned distributed anchor features and applied"),
+            ("Hybrid", "filled the retention-time bins they left empty", "alone:"),
+            ("Automatic", "learned distributed anchor features", "anchor library approved.txt"),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self._write_automatic_rt_audit(root, summary=summary.format(mode=mode))
+                summary_path = root / "automatic_alignment_rt_correction_summary.tsv"
+                stamp = summary_path.stat().st_mtime
+                summary_path.write_text(
+                    "File ID\tFile name\tModel source\tAnchor mode\tRun\tAnchor library\tAnchor library SHA-256\n"
+                    + summary.format(mode=mode),
+                    encoding="utf-8",
+                )
+                os.utime(summary_path, (stamp, stamp))
+                workflow = {
+                    "project_type": "lcms",
+                    "ion_mode": "Negative",
+                    "target_omics": "Metabolomics",
+                    "files": [],
+                    "execute_automatic_rt_correction": True,
+                    "automatic_rt_correction_anchor_approval": approval,
+                }
+                text = generate_publication_report(
+                    workflow, None, root, app_version="0.5.64", console_version="5.5"
+                )["methods_text"]
+                self.assertIn(expected, text)
+                self.assertNotIn(absent, text)
+                if mode == "Automatic":
+                    self.assertNotIn("preview run", text)
+                    self.assertNotIn("does not reject a user anchor", text)
+                else:
+                    self.assertIn("reviewed in a preview run", text)
+                    self.assertIn("4 anchor(s) were accepted and 1 rejected", text)
+                    self.assertIn("does not reject a user anchor", text)
+
     def test_automatic_rt_reference_anchors_alone_are_not_a_correction(self) -> None:
         # The reference file's anchors are always marked used. A run in which every other file
         # kept its original RT, or where a Blank copied the reference's identity map, corrected

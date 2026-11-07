@@ -23,6 +23,13 @@ from typing import Any, Callable, Iterator
 from . import __version__
 from .agent_bridge import create_datamining_handoff, summarize_job, summarize_jobs
 from .automatic_rt_review import extract_anchor_eic, read_automatic_rt_review
+from .automatic_rt_anchors import (
+    anchor_library_text,
+    approve_anchors as approve_automatic_rt_anchors,
+    read_anchor_library,
+    timestamped_library_path,
+    write_anchor_library,
+)
 from .agent_workflow import (
     build_guided_plan,
     estimate_peak_height,
@@ -115,6 +122,7 @@ from .workflow import (
     parse_mdpeak,
     parse_mdscan,
     parse_rt_correction_result,
+    prepare_automatic_rt_preview,
     prepare_run,
     prepare_rt_correction_run,
     prepare_tuning_run,
@@ -180,8 +188,13 @@ JOBS_LOCK = threading.Lock()
 # checks, the time limits its Console runs under, and the Console's process id once it has one. In memory
 # only; a job an earlier backend process left "running" is not running in this one.
 PROCESSES: dict[str, dict[str, Any]] = {}
-CANCELLABLE_JOB_KINDS = frozenset({"run", "tuning", "repository_download", "normalize"})
-CONSOLE_JOB_KINDS = frozenset({"run", "tuning"})
+# automatic_rt_preview: the Console in "Automatic RT correction preview only" mode (MsdialWorkbench#845),
+# which chooses the automatic RT correction's anchors, writes its audit and stops before alignment.
+AUTOMATIC_RT_PREVIEW_JOB_KIND = "automatic_rt_preview"
+CANCELLABLE_JOB_KINDS = frozenset(
+    {"run", "tuning", AUTOMATIC_RT_PREVIEW_JOB_KIND, "repository_download", "normalize"}
+)
+CONSOLE_JOB_KINDS = frozenset({"run", "tuning", AUTOMATIC_RT_PREVIEW_JOB_KIND})
 # Every job that starts a Console on a repository unit's raw files: a restore for viewing waits for each.
 UNIT_JOB_KINDS = CONSOLE_JOB_KINDS | {"rt_correction"}
 # waiting_for_shared_download: a repository download whose lease waits while another lease fetches or extracts
@@ -840,8 +853,8 @@ def _cancel_job(job_id: str, reason: str = "") -> tuple[HTTPStatus, dict[str, An
         if kind not in CANCELLABLE_JOB_KINDS:
             return HTTPStatus.BAD_REQUEST, {
                 "error": (
-                    f"A {kind or 'job of unknown kind'} job cannot be cancelled; only run, tuning, normalize "
-                    "and repository_download jobs can."
+                    f"A {kind or 'job of unknown kind'} job cannot be cancelled; only run, tuning, "
+                    "automatic_rt_preview, normalize and repository_download jobs can."
                 ),
                 "code": "not_cancellable",
                 "job_id": job_id,
@@ -1596,15 +1609,87 @@ class Handler(BaseHTTPRequestHandler):
                 if job_id:
                     with JOBS_LOCK:
                         job = JOBS.get(job_id)
-                    if job and job.get("kind") != "run":
-                        raise ValueError("Select a completed analysis job or provide an output directory.")
+                    # A production run's audit, or an anchor preview's (MsdialWorkbench#845).
+                    if job and job.get("kind") not in {"run", AUTOMATIC_RT_PREVIEW_JOB_KIND}:
+                        raise ValueError(
+                            "Select a completed analysis job or anchor preview, or provide an output directory."
+                        )
                     if job and job.get("status") != "completed":
-                        raise ValueError("The selected analysis job has not completed.")
+                        raise ValueError("The selected job has not completed.")
                     if job:
                         directory = (job.get("preparation") or {}).get("run_directory", "")
                 if not directory:
                     raise ValueError("Select a run or enter its output directory to review RT correction.")
                 self._json(read_automatic_rt_review(directory))
+            elif parsed.path == "/api/automatic-rt/approve":
+                self._json(_approve_automatic_rt_anchors_request(body))
+            elif parsed.path == "/api/automatic-rt/anchors/load":
+                path = str(body.get("path") or "").strip()
+                self._json(
+                    {
+                        "path": str(Path(path).expanduser().resolve()) if path else "",
+                        "rows": read_anchor_library(path),
+                    }
+                )
+            elif parsed.path == "/api/automatic-rt/anchors/save":
+                output_root = str(body.get("output_root") or "").strip()
+                if not output_root:
+                    raise ValueError("Set Output root before saving the edited anchor library.")
+                source = str(body.get("source_path") or "").strip()
+                target = timestamped_library_path(
+                    output_root, Path(source).stem if source else "automatic_rt_anchors"
+                )
+                rows = list(body.get("rows") or [])
+                anchor_library_text(rows)
+                write_anchor_library(target, rows)
+                self._json({"path": str(target), "rows": read_anchor_library(target)})
+            elif parsed.path == "/api/automatic-rt/preview":
+                self._json(_start_automatic_rt_preview(body.get("workflow", body)))
+            elif parsed.path == "/api/agent/automatic-rt/preview":
+                plan = build_guided_plan(
+                    body.get("input_path", ""),
+                    body.get("answers", {}),
+                    body.get("workset_id", ""),
+                )
+                workflow = plan.get("workflow")
+                missing = []
+                if not workflow or not plan.get("ready_to_prepare"):
+                    missing.append("a complete guided plan (its method is the one previewed)")
+                elif str(workflow.get("project_type") or "lcms").lower() != "lcms":
+                    missing.append("an LC-MS project")
+                elif not workflow.get("execute_automatic_rt_correction"):
+                    missing.append("execute_automatic_rt_correction=true in the answers")
+                if missing:
+                    self._json(
+                        {
+                            "started": False,
+                            "plan": plan,
+                            "error": "The anchor preview is refused; it needs " + " and ".join(missing) + ".",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                watch = _console_watch_request(body)
+                # The preview starts the Console on the raw files, so it is boundary 4's as a run is.
+                authorized = _campaign_crossing(
+                    workflow, body.get("campaign_authorization_path"), 4, "automatic_rt_preview"
+                )
+                if body.get("confirmed") is not True and authorized is None:
+                    self._json(
+                        {
+                            "started": False,
+                            "confirmation_required": True,
+                            "plan": plan,
+                            "message": (
+                                "The anchor preview runs MS-DIAL on every file (peak picking and anchor "
+                                "selection, no alignment) in a directory of its own. Call again with "
+                                "confirmed=true."
+                            ),
+                        }
+                    )
+                    return
+                started = _start_automatic_rt_preview(workflow, watch=watch, authorized=authorized)
+                self._json({**started, "plan": plan})
             elif parsed.path == "/api/automatic-rt/eic":
                 self._json(extract_anchor_eic(
                     body.get("run_directory", ""),
@@ -3735,6 +3820,168 @@ def _run_normalize_job(job_id: str, plan: dict[str, Any]) -> None:
             _persist_jobs_locked()
 
 
+def _start_automatic_rt_preview(
+    workflow: dict[str, Any],
+    watch: dict[str, float] | None = None,
+    authorized: tuple[Any, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Start an anchor preview job (MsdialWorkbench#845) in a directory of its own.
+
+    The directory is a diagnostic one (diagnostic_paths.diagnostic_run_directory), as the zero-threshold
+    diagnostic's is, so the preview never touches the production output root's method file or audit. A
+    repository unit is held by the execution gate and runs one Console at a time, as a run does.
+    """
+    watch = watch or {}
+    gate = evaluate_repository_execution_gate(workflow)
+    if not gate["allowed"]:
+        raise ValueError(
+            "This repository analysis unit is not cleared to run MS-DIAL. The anchor preview starts the "
+            "Console too, so it is held by the same gate."
+        )
+    job_id = uuid.uuid4().hex
+    with _single_console_per_unit(workflow.get("repository_run_manifest"), job_id):
+        preview_root = diagnostic_run_directory(
+            workflow.get("output_root", ""),
+            job_id,
+            workspace=_repository_workspace(workflow),
+        )
+        preparation = prepare_automatic_rt_preview(workflow, preview_root, job_id)
+        preparation["diagnostic_run_directory"] = str(preview_root)
+        if authorized:
+            record_campaign_authorization(authorized[0], {**authorized[1], "job_id": job_id})
+        with JOBS_LOCK:
+            JOBS[job_id] = {
+                "id": job_id,
+                "status": "queued",
+                "kind": AUTOMATIC_RT_PREVIEW_JOB_KIND,
+                "logs": [],
+                "preparation": preparation,
+                "exit_code": None,
+                "result": None,
+                "created_at": dt.datetime.now().astimezone().isoformat(),
+                **({"console_watch": watch} if watch else {}),
+            }
+            _register_process_locked(job_id, AUTOMATIC_RT_PREVIEW_JOB_KIND, **watch)
+            _persist_jobs_locked()
+        threading.Thread(
+            target=_run_automatic_rt_preview_job,
+            args=(job_id, preparation),
+            daemon=True,
+        ).start()
+    return {
+        "started": True,
+        "job_id": job_id,
+        "preview_directory": preparation["run_directory"],
+        "preparation": preparation,
+        **({"console_watch": watch} if watch else {}),
+        **({"campaign_authorization": authorized[1]} if authorized else {}),
+    }
+
+
+def _preview_summary(review: dict[str, Any]) -> dict[str, Any]:
+    """What a finished preview job reports: its anchors as a person reviews them, and what to look at."""
+    anchor_review = review.get("anchor_review") or {}
+    return {
+        "preview_directory": review.get("run_directory", ""),
+        "run": anchor_review.get("run", ""),
+        "anchor_mode": anchor_review.get("anchor_mode", ""),
+        "anchor_library": anchor_review.get("anchor_library", ""),
+        "anchor_library_sha256": anchor_review.get("anchor_library_sha256", ""),
+        "reference_file_id": anchor_review.get("reference_file_id"),
+        "anchor_count": len(anchor_review.get("anchors") or []),
+        "user_anchor_count": anchor_review.get("user_anchor_count", 0),
+        "automatic_anchor_count": anchor_review.get("automatic_anchor_count", 0),
+        "exclusion_count": anchor_review.get("exclusion_count", 0),
+        "model_counts": review.get("model_counts", {}),
+        "warnings": review.get("warnings", []),
+        "notes": review.get("notes", []),
+    }
+
+
+def _run_automatic_rt_preview_job(job_id: str, preparation: dict[str, Any]) -> None:
+    def log(line: str) -> None:
+        with JOBS_LOCK:
+            JOBS[job_id]["logs"].append(line)
+            JOBS[job_id]["logs"] = JOBS[job_id]["logs"][-2000:]
+
+    with JOBS_LOCK:
+        JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+        _persist_jobs_locked()
+    try:
+        exit_code = _run_console_for_job(job_id, AUTOMATIC_RT_PREVIEW_JOB_KIND, preparation, log)
+        result = None
+        if exit_code == 0:
+            review = read_automatic_rt_review(preparation["run_directory"])
+            if (review.get("anchor_review") or {}).get("run") != "Preview":
+                raise RuntimeError(
+                    "The Console finished, but its audit does not say Run = Preview; it did not run as a "
+                    "preview. Check that the Console has MsdialWorkbench#845."
+                )
+            result = _preview_summary(review)
+        with JOBS_LOCK:
+            JOBS[job_id]["exit_code"] = exit_code
+            JOBS[job_id]["result"] = result
+            JOBS[job_id]["status"] = "completed" if exit_code == 0 else "failed"
+            if exit_code != 0:
+                JOBS[job_id]["error"] = _diagnose_console_failure(
+                    JOBS[job_id]["logs"],
+                    f"MS-DIAL Console exited with code {exit_code}.",
+                )
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
+    except Exception as error:
+        with JOBS_LOCK:
+            message = _diagnose_console_failure(JOBS[job_id]["logs"], str(error))
+        log(traceback.format_exc())
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "failed"
+            JOBS[job_id]["error"] = message
+            JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            _persist_jobs_locked()
+    finally:
+        _cleanup_temporary_input_folder(preparation.get("temporary_input_folder"), log)
+
+
+def _approve_automatic_rt_anchors_request(body: dict[str, Any]) -> dict[str, Any]:
+    """Write (confirmed true) or show (confirmed false) the anchor library a person approved from a preview.
+
+    The preview is named by its job id or its directory. accepted and rejected are the review keys of
+    every anchor the preview shows; confirmed_by names the person who decided. The approval is that
+    person's: a call without confirmed=true writes nothing.
+    """
+    job_id = str(body.get("job_id") or "").strip()
+    directory = str(body.get("preview_directory") or body.get("run_directory") or "").strip()
+    if job_id:
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+        if job is not None:
+            if job.get("kind") != AUTOMATIC_RT_PREVIEW_JOB_KIND:
+                raise ValueError(f"Job {job_id} is a {job.get('kind')} job, not an anchor preview.")
+            if job.get("status") != "completed":
+                raise ValueError(f"The anchor preview {job_id} has not completed ({job.get('status')}).")
+            directory = str((job.get("preparation") or {}).get("run_directory") or directory)
+    if not directory:
+        raise ValueError("Name the anchor preview: its job_id, or its preview_directory.")
+    confirmed = body.get("confirmed") is True
+    result = approve_automatic_rt_anchors(
+        directory,
+        body.get("accepted") or [],
+        body.get("rejected") or [],
+        str(body.get("confirmed_by") or ""),
+        write=confirmed,
+        output_root=str(body.get("output_root") or "").strip() or None,
+        preview_job_id=job_id,
+    )
+    if not confirmed:
+        result["confirmation_required"] = True
+        result["message"] = (
+            "Nothing was written. Show these rows to the person who reviewed the anchors; when they approve "
+            "them, call again with confirmed=true and confirmed_by naming them."
+        )
+    return result
+
+
 def _run_rt_correction_job(job_id: str, preparation: dict[str, Any]) -> None:
     def log(line: str) -> None:
         with JOBS_LOCK:
@@ -3902,6 +4149,9 @@ def _pick_reference_file(kind: str) -> str:
         elif kind == "repository-metadata":
             title = "Select repository metadata or run manifest"
             filetypes = [("Repository metadata JSON", "*.json"), ("All files", "*.*")]
+        elif kind == "automatic-rt-anchors":
+            title = "Select automatic RT correction anchor library"
+            filetypes = [("Anchor library (7-column text)", "*.txt *.tsv"), ("All files", "*.*")]
         else:
             title = "Select RT correction anchor library"
             filetypes = [("MS-DIAL text library", "*.txt *.tsv"), ("All files", "*.*")]

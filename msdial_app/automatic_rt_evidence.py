@@ -18,6 +18,8 @@ from typing import Any, Iterable
 
 SUMMARY = "automatic_alignment_rt_correction_summary.tsv"
 ANCHORS = "automatic_alignment_rt_correction_anchors.tsv"
+# MsdialWorkbench#845: the anchor library's False rows as a Hybrid run applied them.
+EXCLUSIONS = "automatic_alignment_rt_correction_exclusions.tsv"
 METHOD_KEYS = "method.keys.json"
 METHOD = "method.txt"
 AUTOMATIC_RT_KEY = "execute automatic rt correction for alignment"
@@ -77,6 +79,10 @@ PROOF_REASON_PHRASES = {
     "retained_evidence_empty": "an audit TSV has no rows",
     "audit_does_not_show_correction": (
         "no file other than the reference was corrected from its own detected anchors"
+    ),
+    "preview_only": (
+        "the audit is a preview's (Run = Preview): the Console chose the anchors and stopped before "
+        "alignment, so nothing was corrected; it is for reviewing and approving anchors"
     ),
 }
 
@@ -228,6 +234,15 @@ def unproven() -> dict[str, Any]:
         "outlier_mad_threshold": None,
         "outlier_tests": {},
         "outlier_status_counts": {},
+        # MsdialWorkbench#845, read from the audit: the anchor mode, whether the audit is a run's or a
+        # preview's, the anchor library by name and SHA-256, and the anchors by source.
+        "run_kind": "",
+        "anchor_mode": "",
+        "anchor_library": "",
+        "anchor_library_sha256": "",
+        "selected_user_anchor_count": 0,
+        "selected_automatic_anchor_count": 0,
+        "exclusion_count": 0,
         "summary_file": SUMMARY,
         "anchors_file": ANCHORS,
         "method_keys_file": METHOD_KEYS,
@@ -251,6 +266,10 @@ def automatic_rt_correction_proof(
     was written by an earlier run. Only a file other than the reference, corrected from its own
     detected anchors, shows a correction: the reference's anchors are always marked used, and a
     run in which every other file kept its original RT would otherwise have read as performed.
+
+    A preview's audit (MsdialWorkbench#845, Run = Preview in the summary) is judged by the same
+    rules and is then never performed, with reason preview_only: the preview stopped before
+    alignment, so its maps were never applied. Its counts are still filled in for the reviewer.
 
     A caller that has already parsed the TSVs passes their rows; they are read otherwise.
     """
@@ -326,14 +345,31 @@ def automatic_rt_correction_proof(
         if row.get("Model source") == "DetectedAnchors"
         and str(row.get("File ID") or "").strip() != reference_id
     }
-    selected_anchor_ids = {
-        str(row.get("Anchor ID") or "").strip()
+    selected_anchors = {
+        (
+            str(row.get("Anchor source") or "").strip() or "Automatic",
+            str(row.get("Anchor ID") or "").strip(),
+        )
         for row in anchor_rows
         if str(row.get("Used") or "").strip().casefold() == "true"
         and str(row.get("Anchor ID") or "").strip()
         and str(row.get("File ID") or "").strip() in corrected_ids
     }
-    performed = reference is not None and bool(corrected_ids) and bool(selected_anchor_ids)
+    selected_anchor_ids = {anchor_id for _, anchor_id in selected_anchors}
+    # MsdialWorkbench#845 writes the run's kind in every summary row. A preview chooses the anchors,
+    # learns the maps and writes this audit, then stops before alignment: nothing it describes was
+    # aligned, so however complete its audit looks it is never evidence of a correction. A summary
+    # without the column was written by a Console before #845, which had no preview.
+    run_kinds = {str(row.get("Run") or "").strip() for row in summary_rows} - {""}
+    is_preview = "Preview" in run_kinds
+    performed = (
+        not is_preview and reference is not None and bool(corrected_ids) and bool(selected_anchor_ids)
+    )
+    first = summary_rows[0]
+    try:
+        exclusion_count = len(_rows(root / EXCLUSIONS)) if (root / EXCLUSIONS).is_file() else 0
+    except OSError:
+        exclusion_count = 0
     proof.update(outlier_test_of(anchor_rows, _method_values(method_path)))
     proof.update(
         {
@@ -344,7 +380,20 @@ def automatic_rt_correction_proof(
             "selected_anchor_count": len(selected_anchor_ids),
             "corrected_file_count": len(corrected_ids),
             "model_sources": model_sources,
-            "reason": "performed" if performed else "audit_does_not_show_correction",
+            "run_kind": "Preview" if is_preview else (next(iter(run_kinds)) if run_kinds else ""),
+            "anchor_mode": str(first.get("Anchor mode") or "").strip() or "Automatic",
+            "anchor_library": str(first.get("Anchor library") or "").strip(),
+            "anchor_library_sha256": str(first.get("Anchor library SHA-256") or "").strip(),
+            "selected_user_anchor_count": sum(1 for source, _ in selected_anchors if source == "User"),
+            "selected_automatic_anchor_count": sum(
+                1 for source, _ in selected_anchors if source == "Automatic"
+            ),
+            "exclusion_count": exclusion_count,
+            "reason": (
+                "performed"
+                if performed
+                else "preview_only" if is_preview else "audit_does_not_show_correction"
+            ),
         }
     )
     return proof

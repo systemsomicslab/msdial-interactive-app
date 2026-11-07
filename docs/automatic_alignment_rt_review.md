@@ -1,7 +1,9 @@
 # Automatic Alignment RT Correction Audit
 
-This viewer inspects a completed Console run. It does not change the run's
-anchors, peak detections, or alignment results.
+This viewer inspects a completed Console run, or an anchor preview. It does
+not change a run's anchors, peak detections, or alignment results. For a
+preview it lists every anchor for approval and writes the approved anchors as
+the production run's anchor library.
 
 ## Use
 
@@ -93,15 +95,82 @@ original raw data, and an available Console executable.
 - Method-key warnings are not hidden. Unsupported keys are listed separately
   from invalid values; some Console exports are controlled outside `method.txt`.
 
-## Pre-Alignment Approval
+## Anchor Modes, Preview And Approval (MsdialWorkbench#845)
 
-The current CUI performs anchor selection and alignment in one invocation and
-cannot pause for user approval. This viewer therefore has no approval button.
-A future two-stage option should persist the selected RT models and the peak
-results first, allow review, then resume alignment only after explicit approval.
-The resume step must verify the input identities, method hash, feature outputs,
-and approved models. It must not silently regenerate anchors after approval.
-Unattended large-scale runs should retain the current one-pass option.
+A Console with #845 (5.5.261105 or later) takes the automatic correction's
+anchors in one of three modes, set under **Anchors** in the automatic RT
+correction panel:
+
+- **Automatic** chooses them from the detected peaks, as before.
+- **UserOnly** uses only the True rows of an anchor library. Each is found on
+  every file's MS1 extracted ion chromatogram within its own m/z and RT window,
+  one peak taken by the anchor peak selection mode.
+- **Hybrid** uses the True rows and lets automatic anchors fill the RT bins they
+  leave empty; the False rows keep automatic candidates within their m/z and RT
+  tolerances out of the selection.
+
+The library is the seven-column text `Name, RT(min), RT tol.(min), m/z, m/z
+tol., Minimum height, T/F`, read as strictly as the Console reads it (see the
+tool reference). A setting left at the Console default writes nothing, and any
+of them with an older Console is refused.
+
+The flow decided on 2026-11-07 is preview, then approval, then production:
+
+1. **Preview anchors (no alignment)** runs the current method on every file
+   with `Automatic RT correction preview only: True`, in a directory of its own
+   under Output root (`.msdial-diagnostics/<job id>`). The Console picks peaks,
+   chooses the anchors, writes the summary and anchors TSVs (and, in Hybrid,
+   `automatic_alignment_rt_correction_exclusions.tsv`) and stops. Nothing is
+   aligned, no annotation library is read, and nothing is written beside the raw
+   data. The production output root's method file and audit are not touched.
+2. The viewer opens the preview. **Anchor preview: accept or reject each
+   anchor** lists every anchor once, user and automatic, with its source, name,
+   library RT, reference RT, m/z, observed m/z, peak height, status, how many
+   non-Blank files detected it, the outlier flag (the test disagreed with a user
+   anchor, which is kept regardless) and the detection note; Hybrid adds the
+   exclusions table. Each anchor must be accepted or rejected; no anchor is
+   decided for you.
+3. **Write approved anchor library** asks for your name and writes
+   `automatic_rt_anchors_approved_<timestamp>.txt` (strict ASCII) into Output
+   root, with `<library>.approval.json` beside it: who approved, when, the
+   preview job, the SHA-256 of each preview audit file and the library's SHA-256.
+   - An accepted automatic anchor becomes a True row at the reference file's
+     observed RT and m/z, with the match RT tolerance as RT tolerance, the MS1
+     tolerance for alignment as m/z tolerance, and a minimum height of 0.
+   - A rejected automatic anchor becomes a False row at the same values.
+   - An accepted user anchor keeps its row; a rejected one stays as a False row
+     and is never deleted. The library's existing False rows stay.
+4. The production run is set to **UserOnly** with the approved library. When
+   the True rows are fewer than the minimum anchor count, UserOnly is refused
+   and the viewer offers **Use Hybrid with this library** instead; nothing is
+   chosen for you.
+
+The production run's manifest and `workflow-settings.json` record the library
+by path and SHA-256 with its approval, and the reproduction bundle carries both
+files. The approval is claimed only while the library's SHA-256 is still the
+approved one; a library edited afterwards runs as it is, with a warning, and the
+Methods text does not call its anchors approved.
+
+### How a preview audit is judged
+
+A preview audit has `Run = Preview` in every summary row. The Console has chosen
+the anchors and learned the maps but never applied them, so the audit is never
+evidence of a correction, however complete it looks.
+`automatic_rt_correction_proof` judges it by the same rules as a run (method
+hash, applied and discarded keys, audit age) and then returns
+`performed: false` with reason `preview_only`, its counts still filled in. The
+viewer shows that as a note, not a warning, and the publication report describes
+no correction from it. A summary without the `Run` column was written by a
+Console before #845, which had no preview, and is judged as before. EIC review,
+which needs verified evidence, is not available for a preview.
+
+## Legacy User-Defined RT Correction
+
+The point-by-point user-defined RT correction (anchors and reviewed peak
+selections, applied before peak detection) is now in a closed **Legacy (not
+recommended)** section of the main page. Worksets and templates that use it
+load and run unchanged, it remains mutually exclusive with automatic RT
+correction, and it gets no new features.
 
 ## Validation Record
 

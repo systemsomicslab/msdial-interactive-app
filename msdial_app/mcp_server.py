@@ -4317,6 +4317,137 @@ def msdial_estimate_peak_height(
 
 @_mcp_tool()
 @_structured_validation_errors
+def msdial_start_automatic_rt_anchor_preview(
+    input_path: str,
+    answers: dict[str, Any],
+    workset_id: str = "",
+    confirmed: bool = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    campaign_authorization_path: str = "",
+    timeout_seconds: float = 0,
+    idle_timeout_seconds: float = 0,
+) -> dict[str, Any]:
+    """Preview the automatic RT correction's anchors (MsdialWorkbench#845) after explicit confirmation.
+
+    The preview runs the guided plan's production method with "Automatic RT correction preview only:
+    True": the Console picks peaks on every file, chooses the anchors (by the answers'
+    automatic_rt_correction_anchor_mode, Automatic unless set, and anchor library), writes its audit into
+    a directory of its own and stops. Nothing is aligned, and nothing is written beside the raw data. The
+    answers must enable execute_automatic_rt_correction in an LC-MS project; a refusal names what is
+    missing. It starts the Console, so confirmed=false (the default) only returns the plan, and a campaign
+    approval must cover boundary 4 to stand in for confirmed=true. Wait for the job with
+    msdial_interactive_wait_for_completion, then read the anchors with msdial_automatic_rt_anchor_review.
+    """
+    return _request_json(
+        "POST",
+        "/api/agent/automatic-rt/preview",
+        host=host,
+        port=port,
+        body={
+            "input_path": input_path,
+            "answers": answers,
+            "workset_id": workset_id,
+            "confirmed": confirmed,
+            "campaign_authorization_path": campaign_authorization_path,
+            "timeout_seconds": timeout_seconds,
+            "idle_timeout_seconds": idle_timeout_seconds,
+        },
+        timeout=120,
+    )
+
+
+@_mcp_tool()
+@_structured_validation_errors
+def msdial_automatic_rt_anchor_review(
+    job_id: str = "",
+    preview_directory: str = "",
+    detail: bool = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Read a completed anchor preview's anchors for the person to accept or reject, one by one.
+
+    Name the preview by job_id, or by preview_directory when the backend no longer holds the job. Each
+    anchor comes once, under a key such as "Automatic-3" or "User-1", with its source (User from the
+    anchor library, Automatic from the detected peaks), name, library RT, reference-file RT, m/z, observed
+    m/z, peak height, detection note, status and outlier flag; a Hybrid preview also returns the library's
+    False rows as the exclusions it applied. Show every anchor to the person: the decision to accept or
+    reject each one is theirs, never the agent's. detail=true adds the per-file audit rows.
+    """
+    review = _request_json(
+        "POST",
+        "/api/automatic-rt/review",
+        host=host,
+        port=port,
+        body={"job_id": job_id, "run_directory": preview_directory},
+        timeout=60,
+    )
+    if detail or not isinstance(review, dict) or "anchor_review" not in review:
+        return review
+    return {
+        "preview_directory": review.get("run_directory", ""),
+        "anchor_review": review.get("anchor_review"),
+        "exclusions": review.get("exclusions", []),
+        "reference": review.get("reference"),
+        "model_counts": review.get("model_counts", {}),
+        "method_audit": review.get("method_audit", {}),
+        "warnings": review.get("warnings", []),
+        "notes": review.get("notes", []),
+    }
+
+
+@_mcp_tool()
+@_structured_validation_errors
+def msdial_approve_automatic_rt_anchors(
+    accepted: list[str],
+    rejected: list[str],
+    confirmed_by: str = "",
+    job_id: str = "",
+    preview_directory: str = "",
+    output_root: str = "",
+    confirmed: bool = False,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Write the production anchor library from a person's review of an anchor preview.
+
+    accepted and rejected hold the review keys (msdial_automatic_rt_anchor_review) of every anchor of the
+    preview, each in exactly one list, exactly as the person decided them; an undecided, unknown or doubly
+    listed key is refused by name. An accepted automatic anchor becomes a True row at the reference
+    file's RT and m/z, with the match RT tolerance, the MS1 tolerance for alignment and a minimum height
+    of 0; a rejected automatic anchor a False row at the same values; an accepted user anchor keeps its
+    own row; a rejected user anchor stays as a False row and is never deleted.
+
+    confirmed=false (the default) writes nothing and returns the rows for the person to see. With
+    confirmed=true and confirmed_by naming that person, the library is written into the production
+    output root with a timestamped name, and an approval record beside it (who, when, the preview job,
+    the preview audit's SHA-256, the library's SHA-256). The production run then defaults to anchor mode
+    UserOnly with this library: pass automatic_rt_correction_anchor_mode="UserOnly" and
+    automatic_rt_correction_anchor_library_path=<library_path> in the answers. When the True rows are
+    fewer than the minimum anchor count, user_only_allowed is false and production_anchor_mode is empty:
+    ask the person whether to run Hybrid instead; never choose it for them.
+    """
+    return _request_json(
+        "POST",
+        "/api/automatic-rt/approve",
+        host=host,
+        port=port,
+        body={
+            "job_id": job_id,
+            "preview_directory": preview_directory,
+            "accepted": list(accepted or []),
+            "rejected": list(rejected or []),
+            "confirmed_by": confirmed_by,
+            "output_root": output_root,
+            "confirmed": confirmed,
+        },
+        timeout=60,
+    )
+
+
+@_mcp_tool()
+@_structured_validation_errors
 def msdial_interactive_job(
     job_id: str,
     detail: bool = False,

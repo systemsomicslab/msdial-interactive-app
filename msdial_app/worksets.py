@@ -31,6 +31,9 @@ DATASET_SCOPED_ANSWERS: dict[str, str] = {
     "repository_metadata_path": "names this accession's metadata",
     "rt_correction_anchor_path": "names this batch's retention-time anchors",
     "rt_correction_selection_path": "names this batch's retention-time anchors",
+    "automatic_rt_correction_anchor_library_path": (
+        "names the anchors one person approved from this batch's preview; the next batch is previewed again"
+    ),
     "sample_table": "is one person's agreement about these files; the next dataset has its own",
     "analysis_purpose": "is what this study is asked to answer; the next one is asked again",
     "lab_lipidomics_contract_path": "names this batch's contract",

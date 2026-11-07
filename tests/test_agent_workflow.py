@@ -277,6 +277,56 @@ class AgentWorkflowTests(unittest.TestCase):
             self.assertEqual(3, plan["workflow"]["automatic_rt_correction_minimum_anchors"])
             self.assertEqual(6, plan["workflow"]["automatic_rt_correction_maximum_anchors"])
 
+    def test_agent_passes_the_845_anchor_answers_and_their_console_refusal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "sample.mzML").write_text("", encoding="ascii")
+            library = root / "anchors.txt"
+            library.write_text(
+                "Name\tRT(min)\tRT tol.(min)\tm/z\tm/z tol.\tMinimum height\tT/F\n"
+                "IS\t1\t0.1\t100\t0.01\t0\tTrue\n",
+                encoding="ascii",
+            )
+            console = root / "MSDIALCUI.exe"
+            answers = {
+                "project_type": "lcms",
+                "ion_mode": "Negative",
+                "target_omics": "Metabolomics",
+                "parameter_strategy": "default",
+                "execute_rt_correction": False,
+                "execute_automatic_rt_correction": True,
+                "automatic_rt_correction_anchor_mode": "Hybrid",
+                "automatic_rt_correction_anchor_library_path": str(library),
+                "automatic_rt_correction_anchor_peak_selection_mode": "ClosestToReferenceRt",
+                "library_strategy": "none",
+                "run_qa": False,
+                "generate_materials_methods": False,
+                "class_assignment_confirmed": True,
+                "console_path": str(console),
+                "template_path": str(ROOT / "resources" / "msdial_console_param4lipidomics.txt"),
+            }
+            # A Console with #810 alone would run Automatic and never read the library: refused.
+            console.write_text("execute automatic rt correction for alignment", encoding="utf-16-le")
+            plan = build_guided_plan(str(root), answers)
+            self.assertEqual("Hybrid", plan["workflow"]["automatic_rt_correction_anchor_mode"])
+            self.assertEqual(str(library), plan["workflow"]["automatic_rt_correction_anchor_library_path"])
+            self.assertEqual(
+                "ClosestToReferenceRt", plan["workflow"]["automatic_rt_correction_anchor_peak_selection_mode"]
+            )
+            self.assertFalse(plan["ready_to_prepare"])
+            self.assertTrue(any("MsdialWorkbench#845" in item for item in plan["blockers"]), plan["blockers"])
+            console.write_text(
+                "execute automatic rt correction for alignment automatic rt correction anchor mode "
+                "automatic rt correction preview only",
+                encoding="utf-16-le",
+            )
+            plan = build_guided_plan(str(root), answers)
+            self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+            # UserOnly needs the minimum anchor count of True rows; one is not three.
+            plan = build_guided_plan(str(root), {**answers, "automatic_rt_correction_anchor_mode": "UserOnly"})
+            self.assertFalse(plan["ready_to_prepare"])
+            self.assertTrue(any("1 True row(s)" in item for item in plan["blockers"]), plan["blockers"])
+
     def test_agent_does_not_truncate_a_fractional_anchor_count(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

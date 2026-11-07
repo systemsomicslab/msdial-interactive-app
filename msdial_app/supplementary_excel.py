@@ -97,6 +97,20 @@ GUIDED_SECTIONS = [
             ("automatic_rt_correction_outlier_mad_threshold", "Outlier MAD threshold", ""),
             ("automatic_rt_correction_reference_centrality_weight", "Reference centrality weight", "0-1"),
             ("automatic_rt_correction_interpolate_blanks_by_analytical_order", "Interpolate Blanks by analytical order", ""),
+            # MsdialWorkbench#845. Each listed only when set; unset, the Console ran Automatic.
+            (
+                "automatic_rt_correction_anchor_mode",
+                "Anchor mode",
+                "Automatic (detected peaks), UserOnly (anchor library True rows) or Hybrid (both)",
+            ),
+            ("automatic_rt_correction_anchor_library_path", "Anchor library", "7-column text; UserOnly and Hybrid"),
+            ("automatic_rt_correction_anchor_peak_selection_mode", "Anchor peak selection", "one peak per anchor window"),
+            ("automatic_rt_correction_anchor_peak_selection_rt_weight", "Anchor peak selection RT weight", "0-1; Weighted only"),
+            (
+                "automatic_rt_correction_anchor_approval",
+                "Anchor approval from a preview",
+                "who, when, preview job, preview audit and library SHA-256",
+            ),
             # MsdialWorkbench#826. Listed only when set; unset, the Console used its default, which
             # the evidence section below records as read from the audit.
             (

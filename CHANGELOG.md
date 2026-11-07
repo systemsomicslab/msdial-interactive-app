@@ -4,6 +4,74 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.64] - Unreleased
+
+### Added
+- **Automatic RT correction takes named anchors, previews them, and runs on the anchors a person approved
+  (MsdialWorkbench#845).**
+  - Why: a laboratory comparing two plasma batches acquired ten months apart, with RT shifts up to 23 s,
+    wanted to choose the anchors itself. Console 5.5.261105 can (anchor modes, an anchor library, and a run
+    that stops once the anchors are chosen), but only through a hand-written method file. Interactive had no
+    anchor mode, no anchor library, no preview and no approval step.
+  - Settings, in the automatic RT correction panel and as answers: `automatic_rt_correction_anchor_mode`
+    (Automatic, UserOnly, Hybrid), `automatic_rt_correction_anchor_library_path` (browse dialog and the
+    seven-column editor), `automatic_rt_correction_anchor_peak_selection_mode` (HighestIntensity,
+    ClosestToReferenceRt, Weighted) and `automatic_rt_correction_anchor_peak_selection_rt_weight` (0-1,
+    Weighted only).
+    - They are the automatic correction's own keys, not the legacy user-defined correction's
+      `rt_correction_*` keys, which the method writer still writes on every run.
+    - Each is written only when set: the library only for UserOnly and Hybrid, the weight only for Weighted.
+      A template's lines for them are read into the state and never copied past it. A template's
+      `Automatic RT correction preview only` line is never read or copied, since it would stop every
+      production run before alignment.
+    - With a Console whose assembly lacks the #845 keys (`automatic rt correction anchor mode` and
+      `automatic rt correction preview only`), any of them is refused, naming the keys
+      (capability `automatic_alignment_rt_correction_anchor_modes`).
+  - The anchor library is read as strictly as the Console's `AutomaticRtCorrectionAnchorLibrary` reads it
+    (`automatic_rt_anchors.py`): the header line first, seven tab-separated columns, a decimal point,
+    True/False/T/F, positive m/z and tolerances, an RT of 0 or more, and a True row's minimum height of
+    0 or more. UserOnly needs at least the minimum anchor count of True rows and Hybrid at least one row.
+    A library the Console would refuse is refused before a Console starts. The legacy reader is unchanged.
+  - **Preview anchors (no alignment)** (job kind `automatic_rt_preview`; `/api/automatic-rt/preview`,
+    `/api/agent/automatic-rt/preview`) runs the method with `Automatic RT correction preview only: True`.
+    - It runs in a diagnostic directory of its own, never in the output root, so the production method and
+      audit are untouched. It loads no annotation library, asks for no project, QA matrix or candidate
+      export, and writes `automatic-rt-preview.json` beside the audit with what the approval needs.
+    - The job is cancellable, counts as a Console job on its repository unit, and is held by the execution
+      gate. The Console writes nothing beside the raw data.
+  - The audit viewer reads #845's columns (anchor source and name, library RT, outlier flag, peak height,
+    observed m/z, detection, the summary's anchor mode, run kind and library SHA-256) and the Hybrid
+    exclusions TSV. It lists every anchor once, and for a preview each with Accept and Reject; no anchor is
+    decided for the person.
+  - **Write approved anchor library** (`/api/automatic-rt/approve`) writes
+    `automatic_rt_anchors_approved_<timestamp>.txt` into the output root and `<library>.approval.json`
+    beside it (who, when, the preview job, each preview audit file's SHA-256, the library's SHA-256). It
+    follows the author's decisions of 2026-11-07:
+    - D1: an accepted automatic anchor is a True row at the reference file's observed RT and m/z, with the
+      match RT tolerance, the MS1 tolerance for alignment and a minimum height of 0;
+    - D2: the production run defaults to UserOnly with the approved library; with fewer True rows than the
+      minimum anchor count UserOnly is refused, and the person chooses Hybrid explicitly;
+    - D3: a rejected user anchor stays as a False row and is never deleted;
+    - a rejected automatic anchor is written as a False row too, so that a Hybrid run does not choose it
+      again; UserOnly ignores it.
+  - The production run's manifest, `workflow-settings.json` and reproduction bundle carry the library and
+    its approval. An approval is claimed only while the library's SHA-256 is still the approved one.
+  - MCP tools: `msdial_start_automatic_rt_anchor_preview` (`confirmed=false` by default),
+    `msdial_automatic_rt_anchor_review`, and `msdial_approve_automatic_rt_anchors`, which writes only with
+    `confirmed=true` and `confirmed_by`, from explicit accepted and rejected lists. The skill says the
+    approval is the person's, never the agent's.
+  - Reports: Supplementary Table S1 lists the four settings and the approval. The Methods text words each
+    mode from the audit, says when the anchors were approved from a preview, and no longer says that the
+    outlier test rejects a user anchor (it flags one). A preview's audit is never evidence of a
+    correction: `automatic_rt_correction_proof` returns reason `preview_only`.
+  - The library path is dataset-scoped in worksets: the next batch is previewed again.
+
+### Changed
+- **The point-by-point user-defined RT correction is in a closed "Legacy (not recommended)" section.**
+  Worksets and templates that use it still load and run unchanged, it stays mutually exclusive with the
+  automatic correction, and it gets no new features. The automatic panel's note that the Console cannot pause
+  for approval is gone.
+
 ## [0.5.62] - Unreleased
 
 ### Fixed
