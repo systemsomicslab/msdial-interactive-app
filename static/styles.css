@@ -247,3 +247,7 @@ footer { height: 40px; padding: 10px 18px; background: #e9eff1; border-top: 1px 
   .repository-source-grid, .repository-metadata-layout { grid-template-columns: 1fr; }
   nav { overflow-x: auto; }
 }
+/* MsdialWorkbench#845 anchor preview: Accept and Reject stay on one line per anchor. */
+.rt-anchor-decision { white-space: nowrap; }
+.rt-anchor-decision label { display: inline-flex; align-items: center; gap: 4px; margin: 0 8px 0 0; }
+.rt-anchor-decision input { width: auto; min-width: 0; padding: 0; }

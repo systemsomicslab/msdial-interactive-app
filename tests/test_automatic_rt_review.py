@@ -361,6 +361,33 @@ class AutomaticRtReviewTests(unittest.TestCase):
         self.assertTrue(any("discarded the value it was given for automatic rt correction minimum anchors" in item
                             for item in result["warnings"]))
 
+    def test_an_audit_before_845_reads_every_anchor_as_automatic(self):
+        result = read_automatic_rt_review(self.root)
+        self.assertEqual({"Automatic"}, {item["source"] for item in result["anchors"]})
+        self.assertIsNone(result["anchors"][0]["library_rt"])
+        review = result["anchor_review"]
+        self.assertEqual(("", "Automatic", False), (review["run"], review["anchor_mode"], review["anchor_mode_columns"]))
+        self.assertEqual([], result["exclusions"])
+        self.assertEqual("", result["exclusions_file"])
+        self.assertEqual("verified", result["method_audit"]["status"])
+
+    def test_a_run_audit_says_its_kind_and_a_preview_is_noted_not_warned(self):
+        for path, column, value in ((self.summary, "Run", "Run"), (self.anchors, "Anchor source", "Automatic")):
+            lines = path.read_text(encoding="utf-8").splitlines()
+            path.write_text("\n".join([lines[0] + f"\t{column}"] + [line + f"\t{value}" for line in lines[1:]]) + "\n",
+                            encoding="utf-8")
+        self._rewrite_record()
+        self.assertEqual("verified", read_automatic_rt_review(self.root)["method_audit"]["status"])
+        lines = self.summary.read_text(encoding="utf-8").splitlines()
+        self.summary.write_text("\n".join([lines[0]] + [line.rsplit("\t", 1)[0] + "\tPreview" for line in lines[1:]]) + "\n",
+                                encoding="utf-8")
+        self._rewrite_record()
+        result = read_automatic_rt_review(self.root)
+        self.assertEqual("preview_only", result["method_audit"]["status"])
+        self.assertEqual("Preview", result["anchor_review"]["run"])
+        self.assertTrue(any("preview's" in note for note in result["notes"]))
+        self.assertFalse(any("do not prove a correction" in warning for warning in result["warnings"]))
+
 
 if __name__ == "__main__":
     unittest.main()

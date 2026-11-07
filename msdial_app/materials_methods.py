@@ -419,6 +419,14 @@ def supplementary_rows(
             "local_support_rt_window_source",
             "outlier_mad_threshold",
             "outlier_status_counts",
+            # MsdialWorkbench#845.
+            "run_kind",
+            "anchor_mode",
+            "anchor_library",
+            "anchor_library_sha256",
+            "selected_user_anchor_count",
+            "selected_automatic_anchor_count",
+            "exclusion_count",
             "reason",
             "summary_file",
             "anchors_file",
@@ -532,9 +540,8 @@ def _methods_text(
             )
         paragraphs.append(
             "After peak detection and annotation on the original retention-time axis, "
-            "MS-DIAL learned distributed anchor features and applied file-specific "
-            "piecewise-linear retention-time correction during alignment only."
-            f"{_automatic_rt_outlier_sentence(automatic_rt_evidence)} The retained "
+            f"{_automatic_rt_anchor_sentence(automatic_rt_evidence, workflow)}"
+            f"{_automatic_rt_mode_outlier_sentence(automatic_rt_evidence)} The retained "
             f"Console audit records reference file {reference}, which defines the axis and "
             f"keeps its measured retention times. Of the other {others} audited file(s), "
             f"{automatic_rt_evidence.get('corrected_file_count', 0)} were corrected from their "
@@ -1115,6 +1122,79 @@ def _library_warnings(workflow: dict[str, Any], libraries: list[dict[str, Any]] 
                 f"No persistent identifier was recorded for {Path(path).name}. Add a database version, DOI, repository URL, or checksum before publication."
             )
     return warnings
+
+
+def _automatic_rt_anchor_sentence(evidence: dict[str, Any], workflow: dict[str, Any]) -> str:
+    """How the anchors were chosen, by the anchor mode the audit records (MsdialWorkbench#845).
+
+    Automatic, and every audit written before #845, reads as it always did. UserOnly and Hybrid name the
+    anchor library by file name and SHA-256 as the audit records it. When the run's anchor library is
+    the one approved from a preview (the approval's library SHA-256 is the audit's), the sentence says
+    so; an approval of another version of the library is not claimed.
+    """
+    mode = str(evidence.get("anchor_mode") or "Automatic")
+    library = str(evidence.get("anchor_library") or "")
+    sha256 = str(evidence.get("anchor_library_sha256") or "")
+    named = f"anchor library {library} (SHA-256 {sha256})" if library and sha256 else "an anchor library"
+    if mode == "UserOnly":
+        text = (
+            "MS-DIAL used the named anchors of the True rows of "
+            f"{named} alone: each anchor was detected on every file's MS1 extracted ion chromatogram "
+            "within its own m/z and retention-time window, and file-specific piecewise-linear "
+            "retention-time correction was applied during alignment only; no anchor was learned from "
+            "the detected features."
+        )
+    elif mode == "Hybrid":
+        text = (
+            "MS-DIAL used the named anchors of the True rows of "
+            f"{named}, each detected on every file's MS1 extracted ion chromatogram within its own m/z "
+            "and retention-time window, and filled the retention-time bins they left empty with "
+            "distributed anchor features learned from the detected features; the library's False rows "
+            "kept automatic candidates within their m/z and retention-time tolerances out of that "
+            "selection. File-specific piecewise-linear retention-time correction was applied during "
+            "alignment only."
+        )
+    else:
+        text = (
+            "MS-DIAL learned distributed anchor features and applied file-specific "
+            "piecewise-linear retention-time correction during alignment only."
+        )
+    approval = workflow.get("automatic_rt_correction_anchor_approval") or {}
+    if (
+        mode in {"UserOnly", "Hybrid"}
+        and isinstance(approval, dict)
+        and sha256
+        and str(approval.get("library_sha256") or "").casefold() == sha256.casefold()
+    ):
+        rows = approval.get("rows") or {}
+        accepted = int(rows.get("user_accepted", 0)) + int(rows.get("automatic_accepted", 0))
+        rejected = int(rows.get("user_rejected", 0)) + int(rows.get("automatic_rejected", 0))
+        text += (
+            " The anchors had been reviewed in a preview run, in which MS-DIAL chose the anchors and "
+            "stopped before alignment; "
+            f"{accepted} anchor(s) were accepted and {rejected} rejected, and the rejected ones were "
+            "kept in the library as False rows."
+        )
+    return text
+
+
+def _automatic_rt_mode_outlier_sentence(evidence: dict[str, Any]) -> str:
+    """The outlier test as the anchor mode applied it (MsdialWorkbench#845).
+
+    The test never rejects a user anchor: it flags one it disagrees with and keeps it. In UserOnly every
+    anchor is a user anchor, so the rejection sentence would describe something that cannot happen; in
+    Hybrid it describes the automatic anchors, and the user anchors are said apart.
+    """
+    mode = str(evidence.get("anchor_mode") or "Automatic")
+    user = (
+        " The outlier test does not reject a user anchor; the audit flags each user anchor whose offset "
+        "it disagrees with."
+    )
+    if mode == "UserOnly":
+        return user
+    if mode == "Hybrid":
+        return _automatic_rt_outlier_sentence(evidence) + user
+    return _automatic_rt_outlier_sentence(evidence)
 
 
 def _automatic_rt_outlier_sentence(evidence: dict[str, Any]) -> str:

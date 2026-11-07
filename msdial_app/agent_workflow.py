@@ -24,6 +24,8 @@ from .user_settings import load_user_settings
 from .workflow import (
     AUTOMATIC_RT_CORRECTION_DEFAULTS,
     AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW,
+    AUTOMATIC_RT_ANCHOR_METHOD_KEYS,
+    AUTOMATIC_RT_CORRECTION_PREVIEW_ONLY,
     FAMILY_FROM_FORMAT_DEFAULT,
     FAMILY_FROM_VENDOR_FORMAT,
     absolute_library_path,
@@ -41,6 +43,7 @@ from .workflow import (
     remember_file_digest,
     validate_workflow,
 )
+from .automatic_rt_anchors import canonical_anchor_mode
 from .worksets import LAB_LIPIDOMICS_WORKSET_KIND, describe_workset_candidate, get_workset
 
 
@@ -68,6 +71,11 @@ SUPPORTED_ANSWER_KEYS = {
     "automatic_rt_correction_interpolate_blanks_by_analytical_order",
     # MsdialWorkbench#826; written to the method file only when given (Console default 1.5 min).
     "automatic_rt_correction_local_support_rt_window",
+    # MsdialWorkbench#845; each written to the method file only when given (workflow.AUTOMATIC_RT_ANCHOR_METHOD_KEYS).
+    # Not the user-defined RT correction's rt_correction_* keys: these are the automatic correction's.
+    "automatic_rt_correction_anchor_mode", "automatic_rt_correction_anchor_library_path",
+    "automatic_rt_correction_anchor_peak_selection_mode",
+    "automatic_rt_correction_anchor_peak_selection_rt_weight",
     "library_provenance", "run_qa", "internal_standards",
     "use_retention_time_for_annotation", "retention_time_tolerance", "number_of_threads",
     "stage_inputs", "dilution_factor", "class_assignment_confirmed",
@@ -930,6 +938,18 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
                 ["false", "true"],
                 required=False,
             )
+        elif _as_bool(answers.get("execute_automatic_rt_correction")) and canonical_anchor_mode(
+            answers.get("automatic_rt_correction_anchor_mode")
+        ) in {"UserOnly", "Hybrid"} and not str(
+            answers.get("automatic_rt_correction_anchor_library_path") or ""
+        ).strip():
+            ask(
+                "automatic_rt_correction_anchor_library_path",
+                (
+                    "Provide the automatic RT correction anchor library (Name, RT(min), RT tol.(min), m/z, "
+                    "m/z tol., Minimum height, T/F); UserOnly and Hybrid read their anchors from it."
+                ),
+            )
     if project_type == "gcms" and not answers.get("gcms_retention_type"):
         ask("gcms_retention_type", "Use retention time or retention index?", ["RT", "RI"])
     if project_type == "gcms" and answers.get("gcms_retention_type") == "RI":
@@ -1171,6 +1191,17 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
     # Unlike the keys above it has no default here: unset, it is not written, and a Console with
     # MsdialWorkbench#826 uses its own 1.5 min while one without it is never handed a key it does
     # not know. A template line for it reached the state through load_parameter_template.
+    # MsdialWorkbench#845's settings, as given; unset, none is written and the Console runs Automatic.
+    # The approval of an anchor library is not an answer: it is the record written beside the library,
+    # which the run finds there (workflow.automatic_rt_anchor_library_record).
+    for key in AUTOMATIC_RT_ANCHOR_METHOD_KEYS:
+        if key == AUTOMATIC_RT_CORRECTION_PREVIEW_ONLY or key not in answers:
+            continue
+        value = answers[key]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            state.pop(key, None)
+        else:
+            state[key] = value.strip() if isinstance(value, str) else value
     if AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW in answers:
         window = answers[AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW]
         if window is None or (isinstance(window, str) and not window.strip()):
