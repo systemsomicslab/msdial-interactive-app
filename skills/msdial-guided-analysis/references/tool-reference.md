@@ -63,6 +63,16 @@
   `automatic_rt_correction_minimum_anchors`: then `user_only_allowed` is false,
   `production_anchor_mode` is empty, and the user decides whether to run
   `Hybrid`. The approval is the user's decision, never the agent's.
+  The result and the approval record also carry `preview_reference_file`
+  (`file_id`, `name`, `selection`): the file whose RTs the accepted automatic
+  anchors carry. After a production run with the approved library, the job's
+  `automatic_rt_reference_check` and the review's `reference_check` compare
+  the run's reference file with it. The status is `matches`, `differs` or
+  `unknown`. A difference is a warning in the job, the review and the
+  publication report, and never a refusal. Without the audit's
+  `Reference selection` column, the Console may predate the library-RT
+  reference rule (MsdialWorkbench#876), which prefers the file closest to the
+  library's RTs. Tell the user which file each run used.
 
 ## Guided answers
 

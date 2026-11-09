@@ -2813,13 +2813,18 @@ function automaticRtAnchorReviewHtml(review) {
     + `<td>${escapeHtml(item.excluded_candidates)}</td></tr>`).join("");
   const library = anchorReview.anchor_library
     ? ` Anchor library: ${escapeHtml(anchorReview.anchor_library)} (SHA-256 ${escapeHtml(anchorReview.anchor_library_sha256)}).` : "";
-  const approval = preview ? `<p class="muted">Accept or reject every anchor. Approval writes a new anchor library under Output root: an accepted automatic anchor becomes a True row at the reference file's RT and m/z (match RT tolerance, MS1 tolerance for alignment, minimum height 0); a rejected anchor stays as a False row; an accepted user anchor keeps its own row. The production run then uses it in UserOnly mode, or, with fewer True rows than the minimum anchor count, in Hybrid if you choose it.</p>
+  // The approval records this file: accepted automatic anchors carry its RTs, and the production run is
+  // compared with it afterwards.
+  const referenceFile = anchorReview.reference_file_id !== null && anchorReview.reference_file_id !== undefined
+    ? ` Reference file: ${escapeHtml(anchorReview.reference_file_name || "(unnamed)")} (file ID ${escapeHtml(anchorReview.reference_file_id)})${anchorReview.reference_selection ? `, chosen by ${escapeHtml(anchorReview.reference_selection)}` : ""}.`
+    : " No reference file is recorded.";
+  const approval = preview ? `<p class="muted">Accept or reject every anchor. The approval records the reference file above: an accepted automatic anchor carries its RT there, and a production run mapped onto another file is flagged. Approval writes a new anchor library under Output root: an accepted automatic anchor becomes a True row at the reference file's RT and m/z (match RT tolerance, MS1 tolerance for alignment, minimum height 0); a rejected anchor stays as a False row; an accepted user anchor keeps its own row. The production run then uses it in UserOnly mode, or, with fewer True rows than the minimum anchor count, in Hybrid if you choose it.</p>
     <div class="button-row"><button id="rtAnchorAcceptRest" type="button" class="secondary">Accept every undecided anchor</button><button id="rtAnchorRejectRest" type="button" class="secondary">Reject every undecided anchor</button></div>
     <label>Approved by<input id="rtAnchorApprovedBy" placeholder="Your name; recorded with the approval"></label>
     <div class="button-row"><button id="rtAnchorApprove" type="button">Write approved anchor library</button></div>
     <div id="rtAnchorApprovalResult" class="format-summary" hidden></div>` : "";
   return `<h3>${preview ? "Anchor preview: accept or reject each anchor" : "Anchors by source"}</h3>
-    <p class="muted">Anchor mode ${escapeHtml(anchorReview.anchor_mode || "Automatic")}; ${escapeHtml(anchorReview.user_anchor_count ?? 0)} user and ${escapeHtml(anchorReview.automatic_anchor_count ?? 0)} automatic anchor(s).${library} Reference RT, observed m/z, height, status and detection are the reference file's.</p>
+    <p class="muted">Anchor mode ${escapeHtml(anchorReview.anchor_mode || "Automatic")}; ${escapeHtml(anchorReview.user_anchor_count ?? 0)} user and ${escapeHtml(anchorReview.automatic_anchor_count ?? 0)} automatic anchor(s).${library}${referenceFile} Reference RT, observed m/z, height, status and detection are the reference file's. A run whose reference differs from its approved preview's is among the warnings above.</p>
     <div class="table-wrap rt-audit-table"><table><thead><tr>${preview ? "<th>Decision</th>" : ""}<th>Key</th><th>Source</th><th>Name</th><th>Library RT</th><th>Reference RT</th><th>m/z</th><th>Observed m/z</th><th>Peak height</th><th>Status</th><th>Detected (non-Blank files)</th><th>Outlier flagged</th><th>Detection</th></tr></thead><tbody>${rows}</tbody></table></div>
     ${exclusions ? `<h4>Exclusions (the library's False rows, Hybrid)</h4><div class="table-wrap"><table><thead><tr><th>Name</th><th>m/z</th><th>RT (min)</th><th>m/z tolerance</th><th>RT tolerance (min)</th><th>Excluded automatic candidates</th></tr></thead><tbody>${exclusions}</tbody></table></div>` : ""}
     ${approval}`;

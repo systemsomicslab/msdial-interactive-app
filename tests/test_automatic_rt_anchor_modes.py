@@ -779,5 +779,149 @@ class TheAgentPathCarriesIt(unittest.TestCase):
                     server._approve_automatic_rt_anchors_request({**body, "job_id": "j"})
 
 
+def _add_reference_columns(root: Path, selection: str, deviations: dict[int, str]) -> None:
+    """Append MsdialWorkbench#876's two summary columns, as a Console with the library-RT rule writes them."""
+    summary = root / "automatic_alignment_rt_correction_summary.tsv"
+    stamp = summary.stat().st_mtime
+    lines = summary.read_text(encoding="utf-8").splitlines()
+    lines[0] += "\tReference selection\tLibrary RT deviation (RT tolerances)"
+    for index in range(1, len(lines)):
+        file_id = int(lines[index].split("\t", 1)[0])
+        lines[index] += f"\t{selection}\t{deviations.get(file_id, '')}"
+    summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.utime(summary, (stamp, stamp))
+
+
+class TheRunIsComparedWithThePreviewsReferenceFile(unittest.TestCase):
+    """An approved automatic anchor carries its RT in the preview's reference file (MsdialWorkbench#876).
+
+    A Console with the library-RT reference rule maps the production run onto that file again; one before it
+    can choose another (demo data1 pos: preview C1, run B1). The approval records the preview's reference, and
+    a run with the approved library that maps elsewhere is warned about in the job, the review and the report.
+    It is never refused.
+    """
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.base = Path(self.directory.name)
+        self.preview = self.base / "preview"
+        self.run = self.base / "run"
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def _approved_run(self, preview_reference: dict | None, *, rule: str | None = None) -> dict:
+        """A UserOnly-style run audit (reference F1) with the library the approval names."""
+        record = _write_preview(self.run, HYBRID_LIBRARY, run="Run")
+        if rule is not None:
+            _add_reference_columns(self.run, rule, {0: "0.2", 1: "0.5"})
+        approval = {"library_sha256": record["anchor_library_sha256"], "preview_directory": str(self.preview)}
+        if preview_reference is not None:
+            approval["preview_reference_file"] = preview_reference
+        (self.run / "workflow-settings.json").write_text(
+            json.dumps({"automatic_rt_correction_anchor_approval": approval}), encoding="utf-8"
+        )
+        return approval
+
+    def test_the_approval_records_the_previews_reference_file(self) -> None:
+        _write_preview(self.preview, HYBRID_LIBRARY)
+        shown = approve_anchors(self.preview, ["User-1", "Automatic-2"], ["Automatic-3", "User-4"])
+        self.assertEqual({"file_id": "1", "name": "F1", "selection": ""}, shown["preview_reference_file"])
+        _add_reference_columns(self.preview, "Automatic (coverage and centrality)", {})
+        result = approve_anchors(self.preview, ["User-1", "Automatic-2"], ["Automatic-3", "User-4"], "A. Person", write=True)
+        approval = json.loads(Path(result["approval_record"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            {"file_id": "1", "name": "F1", "selection": "Automatic (coverage and centrality)"},
+            approval["preview_reference_file"],
+        )
+
+    def test_the_review_shows_the_reference_file_and_how_it_was_chosen(self) -> None:
+        _write_preview(self.preview, HYBRID_LIBRARY)
+        _add_reference_columns(self.preview, "Automatic (coverage and centrality)", {})
+        review = read_automatic_rt_review(self.preview)
+        anchor_review = review["anchor_review"]
+        self.assertEqual(("1", "F1", "Automatic (coverage and centrality)", True), (
+            anchor_review["reference_file_id"], anchor_review["reference_file_name"],
+            anchor_review["reference_selection"], anchor_review["reference_selection_column"],
+        ))
+        self.assertIsNone(review["reference_check"], "a preview is not compared with anything")
+        self.assertIsNone(review["files"][0]["library_rt_deviation"])
+        older = self.base / "older"
+        _write_preview(older, HYBRID_LIBRARY)
+        self.assertEqual(("", False), (read_automatic_rt_review(older)["anchor_review"]["reference_selection"],
+                                       read_automatic_rt_review(older)["anchor_review"]["reference_selection_column"]))
+
+    def test_a_console_before_the_rule_mapping_elsewhere_is_warned_about_not_refused(self) -> None:
+        self._approved_run({"file_id": "0", "name": "F0"})
+        review = read_automatic_rt_review(self.run)
+        check = review["reference_check"]
+        self.assertEqual("differs", check["status"])
+        self.assertFalse(check["console_has_library_rt_reference_rule"])
+        self.assertEqual({"file_id": "1", "name": "F1"}, check["run_reference"])
+        warning = next(item for item in review["warnings"] if "not the preview's" in item)
+        self.assertIn("F1 (file ID 1)", warning)
+        self.assertIn("F0 (file ID 0)", warning)
+        self.assertIn("may predate the library-RT reference rule", warning)
+        self.assertIn("MsdialWorkbench#876", warning)
+        self.assertIn("was not refused", warning)
+        self.assertTrue(review["method_audit"]["status"] == "verified", "the correction itself stands")
+
+    def test_a_console_with_the_rule_says_how_it_chose(self) -> None:
+        self._approved_run({"file_id": "0", "name": "F0"}, rule="Automatic (most user anchors, closest to library RT)")
+        review = read_automatic_rt_review(self.run)
+        self.assertTrue(review["reference_check"]["console_has_library_rt_reference_rule"])
+        self.assertEqual([0.2, 0.5], [item["library_rt_deviation"] for item in review["files"]])
+        warning = review["reference_check"]["warning"]
+        self.assertIn("chose it by 'Automatic (most user anchors, closest to library RT)'", warning)
+        self.assertIn("User anchors detected", warning)
+        self.assertNotIn("predate", warning)
+
+    def test_the_same_file_is_a_note_not_a_warning(self) -> None:
+        self._approved_run({"file_id": "1", "name": "F1"}, rule="Automatic (most user anchors, closest to library RT)")
+        review = read_automatic_rt_review(self.run)
+        self.assertEqual("matches", review["reference_check"]["status"])
+        self.assertFalse(any("not the preview's" in item for item in review["warnings"]))
+        self.assertTrue(any("is the preview's, F1 (file ID 1)" in item for item in review["notes"]))
+
+    def test_an_approval_without_the_record_reads_the_previews_audit(self) -> None:
+        _write_preview(self.preview, HYBRID_LIBRARY)
+        self._approved_run(None)
+        self.assertEqual("matches", read_automatic_rt_review(self.run)["reference_check"]["status"])
+        for name in os.listdir(self.preview):
+            os.remove(self.preview / name)
+        check = read_automatic_rt_review(self.run)["reference_check"]
+        self.assertEqual("unknown", check["status"])
+        self.assertIn("cannot be checked", check["note"])
+
+    def test_another_library_or_no_approval_is_not_compared(self) -> None:
+        approval = self._approved_run({"file_id": "0", "name": "F0"})
+        (self.run / "workflow-settings.json").write_text(
+            json.dumps({"automatic_rt_correction_anchor_approval": {**approval, "library_sha256": "other"}}), encoding="utf-8"
+        )
+        self.assertIsNone(read_automatic_rt_review(self.run)["reference_check"])
+        (self.run / "workflow-settings.json").write_text("{}", encoding="utf-8")
+        self.assertIsNone(read_automatic_rt_review(self.run)["reference_check"])
+
+    def test_the_job_and_the_report_carry_the_warning(self) -> None:
+        from msdial_app.materials_methods import _automatic_rt_reference_check
+
+        approval = self._approved_run({"file_id": "0", "name": "F0"})
+        logged: list[str] = []
+        check = server._approved_reference_check_for_job({"run_directory": str(self.run)}, logged.append)
+        self.assertEqual("differs", check["status"])
+        self.assertIsNone(server._approved_reference_check_for_job({"run_directory": str(self.base / "absent")}, logged.append))
+        self.assertTrue(any("not compared" in line for line in logged))
+        report_check = _automatic_rt_reference_check(self.run, {"automatic_rt_correction_anchor_approval": approval})
+        self.assertEqual(check["warning"], report_check["warning"])
+        self.assertIsNone(_automatic_rt_reference_check(self.run, {}))
+        from msdial_app.agent_bridge import summarize_job
+
+        summary = summarize_job({"id": "j", "kind": "run", "status": "completed", "warnings": [check["warning"]],
+                                 "automatic_rt_reference_check": check})
+        self.assertEqual("differs", summary["automatic_rt_reference_check"]["status"])
+        self.assertIn(check["warning"], summary["warnings"])
+        self.assertNotIn("automatic_rt_reference_check", summarize_job({"id": "k", "status": "completed"}))
+
+
 if __name__ == "__main__":
     unittest.main()

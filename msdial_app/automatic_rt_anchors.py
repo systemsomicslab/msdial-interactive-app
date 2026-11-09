@@ -499,6 +499,15 @@ def approve_anchors(
             }
         )
 
+    # The file whose RTs the accepted automatic anchors carry. A run with the approved library is checked
+    # against it afterwards (automatic_rt_review.approved_reference_check): a Console before
+    # MsdialWorkbench#876 can map the run onto another file.
+    preview_reference = review.get("reference") or {}
+    preview_reference_file = {
+        "file_id": str(preview_reference.get("file_id") or ""),
+        "name": str(preview_reference.get("name") or ""),
+        "selection": str(anchor_review.get("reference_selection") or ""),
+    }
     true_rows = sum(1 for row in rows if row["include"])
     user_only_issues = anchor_library_issues(_numbered(rows), "UserOnly", minimum)
     hybrid_issues = anchor_library_issues(_numbered(rows), "Hybrid", minimum)
@@ -507,6 +516,7 @@ def approve_anchors(
         "preview_directory": str(directory),
         "preview_job_id": preview_job_id or str(record.get("job_id") or ""),
         "preview_anchor_mode": preview_mode,
+        "preview_reference_file": preview_reference_file,
         "rows": [
             {key: row[key] for key in ("name", "rt", "rt_tolerance", "mz", "mz_tolerance", "minimum_height", "include", "origin")}
             for row in rows
@@ -562,6 +572,7 @@ def approve_anchors(
             "sha256": anchor_review.get("anchor_library_sha256") or "",
         },
         "preview_audit_sha256": _audit_checksums(directory),
+        "preview_reference_file": preview_reference_file,
         "library_path": str(library),
         "library_name": library.name,
         "library_sha256": library_sha256,

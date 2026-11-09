@@ -130,6 +130,11 @@ assert.ok(html.includes("IS-a") && html.includes("1.250") && html.includes("150.
 assert.ok(html.includes("rtAnchorApprovedBy") && html.includes("rtAnchorApprove"));
 assert.ok(html.includes("Exclusions") && html.includes("old"));
 assert.ok(html.includes("lib.txt (SHA-256 abc)"));
+assert.ok(html.includes("No reference file is recorded."), "An audit without a reference says so");
+// The preview's reference file, which the approval records and the production run is compared with.
+const withReference = context.automaticRtAnchorReviewHtml({ ...previewReview, anchor_review: { ...previewReview.anchor_review,
+  reference_file_id: "2", reference_file_name: "C1", reference_selection: "Automatic (coverage and centrality)" } });
+assert.ok(withReference.includes("Reference file: C1 (file ID 2), chosen by Automatic (coverage and centrality)."));
 const runHtml = context.automaticRtAnchorReviewHtml({ ...previewReview, anchor_review: { ...previewReview.anchor_review, run: "Run" } });
 assert.ok(runHtml.includes("Anchors by source") && !runHtml.includes("rtAnchorApprove") && !runHtml.includes('type="radio"'));
 assert.equal(context.automaticRtAnchorReviewHtml({ ...previewReview, anchor_review: { run: "", anchor_mode_columns: false, anchors: [anchorEntry("Automatic-1", "Automatic", "")] } }), "");

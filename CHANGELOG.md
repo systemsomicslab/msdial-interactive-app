@@ -56,6 +56,23 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
       again; UserOnly ignores it.
   - The production run's manifest, `workflow-settings.json` and reproduction bundle carry the library and
     its approval. An approval is claimed only while the library's SHA-256 is still the approved one.
+  - **The production run is checked against the preview's reference file.**
+    - Why: on demo data1 pos, Console 5.5.261105 chose C1 as the Automatic preview's reference. The UserOnly
+      run with the five approved anchors, detected in all six files, chose B1. The run was mapped onto
+      another file's axis than the one reviewed. MsdialWorkbench#876 makes the Console choose the file closest
+      to the approved library's RTs, which is the preview's reference.
+    - The approval record (and the approval result) keeps `preview_reference_file`: file ID, name, and how
+      the Console chose it. The viewer's preview section shows the reference file. It reads #876's summary
+      columns `Reference selection` and `Library RT deviation (RT tolerances)` where present.
+    - After a production run with an approved library, the run's reference file is compared with the
+      approval's (`automatic_rt_review.approved_reference_check`). The result is in the job
+      (`automatic_rt_reference_check`) and in the review (`reference_check`). A different file is a warning
+      in the job's warnings, the review and the publication report's warnings. The run is never refused.
+      - Without the audit's `Reference selection` column, the warning says the Console may predate the
+        library-RT reference rule, and suggests a Console with it or the preview's reference file ID.
+      - With the column, the warning says how the Console chose.
+    - An approval written before this check is compared through its preview directory's audit while the
+      directory is there; otherwise the review says the reference cannot be checked.
   - MCP tools: `msdial_start_automatic_rt_anchor_preview` (`confirmed=false` by default),
     `msdial_automatic_rt_anchor_review`, and `msdial_approve_automatic_rt_anchors`, which writes only with
     `confirmed=true` and `confirmed_by`, from explicit accepted and rejected lists. The skill says the

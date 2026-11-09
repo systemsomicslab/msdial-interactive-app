@@ -117,6 +117,9 @@ def generate_publication_report(
             "aligned retention times, mzTab-M included, contain measured retention times wherever "
             "those files contribute a peak."
         )
+    reference_check = _automatic_rt_reference_check(root, workflow) if automatic_rt_evidence.get("performed") else None
+    if reference_check and reference_check.get("warning"):
+        provenance_warnings.append(reference_check["warning"])
     methods = sharing.text(_methods_text(
         report_workflow, qa_report, qa_assessment, app_version, console_version, libraries
     ))
@@ -1122,6 +1125,24 @@ def _library_warnings(workflow: dict[str, Any], libraries: list[dict[str, Any]] 
                 f"No persistent identifier was recorded for {Path(path).name}. Add a database version, DOI, repository URL, or checksum before publication."
             )
     return warnings
+
+
+def _automatic_rt_reference_check(root: Path, workflow: dict[str, Any]) -> dict[str, Any] | None:
+    """The run's RT correction reference file against the preview its approved anchor library came from.
+
+    automatic_rt_review.approved_reference_check, with the approval the workflow recorded for the library the
+    run read; None without one, or when the audit cannot be read (the evidence check reports that).
+    """
+    approval = workflow.get("automatic_rt_correction_anchor_approval")
+    if not isinstance(approval, dict) or not approval:
+        return None
+    from .automatic_rt_review import approved_reference_check, read_automatic_rt_review
+
+    try:
+        review = read_automatic_rt_review(root)
+    except (OSError, ValueError):
+        return None
+    return approved_reference_check(review.get("reference"), review.get("anchor_review") or {}, approval)
 
 
 def _automatic_rt_anchor_sentence(evidence: dict[str, Any], workflow: dict[str, Any]) -> str:

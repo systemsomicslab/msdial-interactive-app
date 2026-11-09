@@ -418,6 +418,9 @@ def summarize_job(
     if job.get("kind") == "automatic_rt_preview" and isinstance(job.get("result"), dict):
         # A finished anchor preview: how many anchors of which source it chose, and where its audit is.
         summary["automatic_rt_preview"] = dict(job["result"])
+    if isinstance(job.get("automatic_rt_reference_check"), dict):
+        # A run with an approved anchor library: its reference file against the preview's (MsdialWorkbench#876).
+        summary["automatic_rt_reference_check"] = dict(job["automatic_rt_reference_check"])
     return summary
 
 

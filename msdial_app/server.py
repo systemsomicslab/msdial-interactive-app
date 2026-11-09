@@ -3299,6 +3299,17 @@ def _run_job(job_id: str, preparation: dict[str, Any]) -> None:
             )
             artifact_warnings.append(warning)
             log("WARNING: " + warning)
+        if exit_code == 0 and ((preparation.get("automatic_rt_correction_anchor_library") or {}).get("approval") or {}).get(
+            "matches_library"
+        ):
+            # A run with an approved anchor library should map onto the preview's reference file, the axis the
+            # anchors were reviewed on; a Console before MsdialWorkbench#876 may choose another. Said, not refused.
+            reference_check = _approved_reference_check_for_job(preparation, log)
+            with JOBS_LOCK:
+                JOBS[job_id]["automatic_rt_reference_check"] = reference_check
+            if reference_check and reference_check.get("warning"):
+                artifact_warnings.append(reference_check["warning"])
+                log("WARNING: " + reference_check["warning"])
         if exit_code == 0:
             validation = validate_mztab_files(
                 artifacts["mztab"], preparation["run_directory"]
@@ -3942,6 +3953,20 @@ def _run_automatic_rt_preview_job(job_id: str, preparation: dict[str, Any]) -> N
             _persist_jobs_locked()
     finally:
         _cleanup_temporary_input_folder(preparation.get("temporary_input_folder"), log)
+
+
+def _approved_reference_check_for_job(preparation: dict[str, Any], log: Callable[[str], None]) -> dict[str, Any] | None:
+    """The run's reference file against its approved library's preview (automatic_rt_review.approved_reference_check).
+
+    Read from the run's own audit and workflow-settings.json, as the review page reads them, so the job, the
+    review and the report say the same. An audit that cannot be read is logged and checks nothing: the
+    correction's own evidence check reports a missing or broken audit.
+    """
+    try:
+        return read_automatic_rt_review(preparation["run_directory"]).get("reference_check")
+    except (OSError, ValueError) as error:
+        log(f"The RT correction reference file was not compared with the approved preview's: {error}")
+        return None
 
 
 def _approve_automatic_rt_anchors_request(body: dict[str, Any]) -> dict[str, Any]:

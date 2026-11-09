@@ -151,6 +151,40 @@ files. The approval is claimed only while the library's SHA-256 is still the
 approved one; a library edited afterwards runs as it is, with a warning, and the
 Methods text does not call its anchors approved.
 
+### The production run's reference file
+
+An accepted automatic anchor is a True row at the RT it had in the preview's
+reference file, so that file's RT axis is the one you reviewed. The preview
+section of the viewer names it ("Reference file: C1 (file ID 2), chosen by
+...") and the approval record keeps it as `preview_reference_file` (file ID,
+name, and how the Console chose it).
+
+A Console with MsdialWorkbench#876 chooses the reference again in UserOnly and
+Hybrid, when no reference file ID is set: first the file with the most user
+anchors detected, then the one whose detections lie closest to the library's
+RTs. The preview's reference file lies at a deviation of about 0, so it is
+chosen again. That Console's summary audit adds a `Reference selection` column
+and a per-file `Library RT deviation (RT tolerances)` column, and the viewer
+reads both. An older Console chose by how close each file's anchor RTs were to
+their median over the batch. On demo data1 pos, Console 5.5.261105 previewed
+on C1 and then ran on B1.
+
+After a production run with an approved library, Interactive compares the
+run's reference file with the approval's:
+
+- Same file: a note in the review.
+- Another file: a warning in the job's warnings, in the review and in the
+  publication report's warnings. The run is not refused, because its
+  correction is consistent, only on another file's axis.
+  - Without the `Reference selection` column, the warning says the Console may
+    predate the library-RT reference rule. Use a Console with it, or set the
+    reference file ID to the preview's, and run again.
+  - With the column, the warning names how the Console chose. For example, a
+    file with more approved anchors detected wins before the closest one.
+- When the preview's reference cannot be found (an approval written before this
+  check, whose preview directory is gone), the review says it cannot be
+  checked.
+
 ### How a preview audit is judged
 
 A preview audit has `Run = Preview` in every summary row. The Console has chosen
