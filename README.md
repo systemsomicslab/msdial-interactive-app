@@ -875,9 +875,11 @@ is `claude mcp add --scope user msdial-interactive -- <python> <checkout>/script
 
 If a newly added control reports `Unknown endpoint`, first refresh the browser
 and confirm `/api/config` reports the current app version. An older local app
-may still be using port 8765. Current builds use an exclusive port binding and
-exit with a clear message instead of allowing old and new servers to share the
-same port.
+may still be using port 8765. Current builds use an exclusive port binding, so
+old and new servers never share the port. A start that finds an MS-DIAL
+Interactive already on its port opens that instance in the browser and says
+which version it is; it exits 1 when that version differs from its own, and
+stops with a message when some other program holds the port.
 
 Package the cross-platform Agent Skills:
 
@@ -938,7 +940,14 @@ cd C:\path\to\msdial-interactive-app
 .\scripts\start-local-windows.ps1
 ```
 
-Users can also double-click `scripts\start-local-windows.cmd`.
+Users can also double-click `Start MS-DIAL Interactive.cmd` at the top of the app (or
+`scripts\start-local-windows.cmd`). Keep the window open while you use the app. If the start
+fails, the window stays open with the message until a key is pressed. Both `.cmd` files pass
+their arguments on, for example `-Port 8767`.
+
+If Claude's MCP server already runs the app on port 8765, a double-click opens that instance in
+the browser instead of starting a second one; the window then closes, and the app keeps running
+for as long as Claude's MCP server does.
 
 Optional Console path:
 
@@ -967,8 +976,8 @@ xattr -dr com.apple.quarantine .
 ```
 
 `bash "Start MS-DIAL Interactive.command"` works without either. If Claude's MCP server already
-runs the app on port 8765, a second start stops with "Another process is already using this port":
-open `http://127.0.0.1:8765` in the browser instead.
+runs the app on port 8765, a second start opens that instance in the browser instead of starting
+another; it keeps running for as long as Claude's MCP server does.
 
 ### Linux
 
