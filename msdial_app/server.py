@@ -12,6 +12,7 @@ import threading
 import time
 import traceback
 import urllib.parse
+import urllib.request
 import uuid
 import webbrowser
 from contextlib import contextmanager
@@ -4174,6 +4175,77 @@ class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
         super().server_bind()
 
 
+def _loopback(host: str) -> str:
+    """The address a client on this machine reaches a server bound to `host` at, bracketed for a URL."""
+    address = "127.0.0.1" if host in ("", "0.0.0.0") else "::1" if host == "::" else host
+    return f"[{address}]" if ":" in address else address
+
+
+def _running_instance(host: str, port: int, timeout: float = 2.0) -> dict[str, Any] | None:
+    """What answers on host:port, when it is an MS-DIAL Interactive: its agent status, else None.
+
+    Proxies are bypassed: the question is about this machine's port, and a proxy configured for the
+    web would answer for a server that is not there.
+    """
+    url = f"http://{_loopback(host)}:{port}/api/agent/status?limit=0"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=timeout) as response:
+            status = json.load(response)
+    except (OSError, ValueError):
+        return None
+    if isinstance(status, dict) and status.get("service") == "MS-DIAL Interactive":
+        return status
+    return None
+
+
+def _port_unavailable(args: argparse.Namespace, start_path: str, error: OSError) -> int | str:
+    """The exit for a port this process could not bind: open the instance already there, or explain.
+
+    A second start on a port an MS-DIAL Interactive already serves (most often the one Claude's MCP
+    server started) opens that instance in the browser and exits 0, so a double-click shows the app
+    instead of a window that closes on an error. It exits 1 when the running instance is another
+    version or cannot serve this start (lab mode), and returns the message for any other holder.
+    """
+    running = _running_instance(args.host, args.port)
+    if running is None:
+        hint = (
+            f" To see which program holds it: Get-NetTCPConnection -LocalPort {args.port} -State Listen."
+            if os.name == "nt"
+            else ""
+        )
+        return (
+            f"Could not start MS-DIAL Interactive on {args.host}:{args.port}, and no MS-DIAL Interactive "
+            "answers there: another program is using this port, or the address is not available. Close it "
+            f"or choose another port (--port; the Windows launcher takes -Port).{hint} Details: {error}"
+        )
+    version = str(running.get("app_version") or "unknown")
+    url = f"http://{_loopback(args.host)}:{args.port}{start_path}"
+    if args.lab:
+        print(
+            f"MS-DIAL Interactive {version} already runs on port {args.port} of this PC, so the lab "
+            "server cannot start there. Close that instance first, or choose another --port.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"MS-DIAL Interactive {version} is already running: {url}")
+    if not args.no_browser:
+        webbrowser.open(url)
+        print("Opened it in the browser.")
+    print(
+        "It belongs to the program that started it (for example Claude's MCP server) and stops when that "
+        "program stops; this window is not needed for it."
+    )
+    if version != __version__:
+        print(
+            f"It is version {version}; this folder holds {__version__}. To use this folder's version, close "
+            "the running instance first, then start again.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="MS-DIAL Interactive local web app")
     parser.add_argument("--host", default="127.0.0.1")
@@ -4193,15 +4265,11 @@ def main() -> None:
     if args.lab:
         args.host = "0.0.0.0"
         args.no_browser = True
+    start_path = "/rt-correction" if args.rt_correction else "/"
     try:
         server = ExclusiveThreadingHTTPServer((args.host, args.port), Handler)
     except OSError as error:
-        raise SystemExit(
-            f"Could not start MS-DIAL Interactive on {args.host}:{args.port}. "
-            "Another process is already using this port. Close the old MS-DIAL Interactive "
-            f"instance or choose another --port. Details: {error}"
-        ) from error
-    start_path = "/rt-correction" if args.rt_correction else "/"
+        raise SystemExit(_port_unavailable(args, start_path, error)) from error
     url = f"http://{args.host}:{args.port}{start_path}"
     print(f"MS-DIAL Interactive: {url}")
     if args.host in ("0.0.0.0", "::"):

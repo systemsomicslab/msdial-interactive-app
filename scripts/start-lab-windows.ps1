@@ -36,3 +36,4 @@ Write-Host "Python: $PythonPath"
 Write-Host "Keep this terminal open while the app is in use."
 
 & $PythonPath -B app.py --host $HostAddress --port $Port --no-browser
+exit $LASTEXITCODE

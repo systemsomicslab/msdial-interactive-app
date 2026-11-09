@@ -32,3 +32,4 @@ Write-Host "Starting MS-DIAL RT Correction Review..."
 Write-Host "URL: http://127.0.0.1:$Port/rt-correction"
 Write-Host "Keep this terminal open while the app is in use."
 & $PythonPath -B app.py --host 127.0.0.1 --port $Port --rt-correction
+exit $LASTEXITCODE
