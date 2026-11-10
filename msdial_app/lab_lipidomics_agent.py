@@ -87,6 +87,7 @@ from .lab_quant_input import read_quant_input
 from .lab_quant_input import summary as quant_input_summary
 from .lipidome_merge import (
     DEFAULT_RECONCILIATION_RT_TOLERANCE,
+    RT_CORRECTION_SUMMARY_NAME,
     SAMPLE_FILE_TYPES,
     MergeRefused,
     companion_names,
@@ -1970,6 +1971,9 @@ def finish_normalize(plan: dict[str, Any], exit_code: int | None, log_lines: Ite
         # The run's own Height export, in its run folder beside the RT correction audit: the merge reads which RT
         # axis this polarity is on there, since normalize's matrices carry no axis note (MsdialWorkbench#884).
         "run_height_export": plan["outputs"]["height_export"],
+        # Both bound, so that a merge after the polarity was run again into its folder is refused rather than
+        # naming one run's axis in the note and another's audit in the report.
+        **_run_axis_identity(plan["outputs"]["height_export"]),
         "normalize_report": {key: parsed[key] for key in ("resolved", "unresolved", "mismatched", "warnings", "unit",
                                                           "dilution_factor_applied", "redacted_rows")},
     }
@@ -2041,6 +2045,20 @@ def lab_merge_method() -> dict[str, Any]:
             "the Summary_Dotplots, "
             f"category_<category> and subclass_<ontology> folders; {NOT_QUANTIFIED_NAME} and {MERGE_REPORT_NAME}"
         ),
+    }
+
+
+def _run_axis_identity(height_export: str | Path) -> dict[str, str | None]:
+    """The sha256 of a run's Height export and of the RT correction audit summary beside it (None when absent).
+
+    The merge reads which RT axis a polarity is on from these two (lipidome_merge.merge_pos_neg's
+    rt_axis_sources), so normalize records them and the merge refuses when either changed.
+    """
+    export = Path(height_export)
+    summary = export.parent / RT_CORRECTION_SUMMARY_NAME
+    return {
+        "run_height_export_sha256": file_sha256(export) if export.is_file() else None,
+        "run_rt_correction_summary_sha256": file_sha256(summary) if summary.is_file() else None,
     }
 
 
@@ -2120,6 +2138,14 @@ def merge_lipidome(
                 raise LabContractError(f"{copy.name} is not the matrix the {polarity.lower()} normalize wrote.")
         if file_sha256(record["candidate_table"]) != record["candidate_table_sha256"]:
             raise LabContractError(f"The {polarity.lower()} run's candidate table has changed since normalize.")
+        if record.get("run_height_export") and _run_axis_identity(record["run_height_export"]) != {
+            key: record.get(key) for key in ("run_height_export_sha256", "run_rt_correction_summary_sha256")
+        }:
+            raise LabContractError(
+                f"The {polarity.lower()} run's alignment export {Path(record['run_height_export']).name} or the RT "
+                f"correction audit beside it has changed since normalize (was the polarity run again?); "
+                f"normalize it again."
+            )
         records[polarity] = record
     workbook = contract_quant_tables(contract)
     labels = {POSITIVE: "positive", NEGATIVE: "negative"}

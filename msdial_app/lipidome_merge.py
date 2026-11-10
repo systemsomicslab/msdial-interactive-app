@@ -465,40 +465,49 @@ def rt_axis_note(export: dict[str, Any]) -> str:
     return header[CLASS_ROW][0].strip()
 
 
-def source_rt_axis_note(path: str | Path) -> str:
-    """The RT axis note of the alignment export a polarity's run wrote, or "" when it has none or cannot be read.
+def source_rt_axis_note(path: str | Path) -> tuple[str | None, str]:
+    """(note, reason): the RT axis note of the alignment export a polarity's run wrote.
 
-    Only the first line is read: the note is in its first cell, and the Class label further right says the
-    line is an alignment export's class line.
+    The note is "" when the export carries none, and None, with the reason, when the export could not be
+    read as an alignment export: then which axis it is on is not known. Only the first line is read: the note
+    is in its first cell, and the Class label further right says the line is an alignment export's class line.
     """
+    name = Path(path).name
     try:
         with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as handle:
             first = handle.readline().rstrip("\r\n").split("\t")
-    except (OSError, TypeError, ValueError):
-        return ""
+    except (OSError, TypeError, ValueError) as error:
+        return None, f"its run's alignment export {name} could not be read ({type(error).__name__})"
     if "Class" not in first:
-        return ""
-    return rt_axis_note({"header": [first], "first_sample_column": first.index("Class") + 1})
+        return None, f"{name} is not an MS-DIAL alignment export: its first line names no 'Class' column"
+    return rt_axis_note({"header": [first], "first_sample_column": first.index("Class") + 1}), ""
 
 
 # What the merged first cell says of a polarity whose run's export carries no note. Only that is known: a
 # Console before MsdialWorkbench#884 corrected RTs without writing the note.
 NO_RT_AXIS_NOTE = "its run's alignment export carries no RT axis note"
+# And of a polarity whose run's export was not read.
+UNKNOWN_RT_AXIS = "its RT axis is not known (its run's alignment export was not read)"
+RT_CORRECTION_SUMMARY_NAME = "automatic_alignment_rt_correction_summary.tsv"
 
 
-def merged_header(header: list[list[str]], first_sample_column: int, notes: tuple[str, str]) -> list[list[str]]:
+def merged_header(
+    header: list[list[str]], first_sample_column: int, notes: tuple[str | None, str | None]
+) -> list[list[str]]:
     """The header lines of the merged table, with an RT axis note that is true of the merged rows.
 
     The merged table holds rows of both polarities, each aligned on its own run's RT axis, under the positive
     export's header lines. notes are the (positive, negative) notes of the alignment exports the two runs
-    wrote. When either has one, the first cell names both; with neither, the header is returned as it was.
-    Commas and tabs never reach the note, which is written unquoted into a CSV or a TSV.
+    wrote: "" for an export without one, None for one that was not read. When either has a note, the first
+    cell names both; otherwise the header is returned as it was. Commas and tabs never reach the note, which
+    is written unquoted into a CSV or a TSV.
     """
     header = [list(row) for row in header]
     if not any(notes) or first_sample_column <= 1 or not header or not header[CLASS_ROW]:
         return header
     text = " | ".join(
-        f"{label} rows: {note or NO_RT_AXIS_NOTE}" for label, note in zip(("Positive", "Negative"), notes)
+        f"{label} rows: {UNKNOWN_RT_AXIS if note is None else note or NO_RT_AXIS_NOTE}"
+        for label, note in zip(("Positive", "Negative"), notes)
     )
     header[CLASS_ROW][0] = re.sub(r"[\t,\r\n]", " ", text)
     return header
@@ -898,7 +907,7 @@ def _rt_correction_reference(export_path: str | Path) -> dict[str, Any]:
     """The automatic RT correction reference file beside an alignment export, from its summary audit, or {}."""
     import csv
 
-    summary = Path(export_path).parent / "automatic_alignment_rt_correction_summary.tsv"
+    summary = Path(export_path).parent / RT_CORRECTION_SUMMARY_NAME
     if not summary.is_file():
         return {}
     try:
@@ -919,8 +928,8 @@ def _rt_correction_reference(export_path: str | Path) -> dict[str, Any]:
 
 
 def polarity_rt_axes(
-    positive_path: str | Path,
-    negative_path: str | Path,
+    positive_path: str | Path | None,
+    negative_path: str | Path | None,
     positive_rows: list[list[str]],
     negative_rows: list[list[str]],
     columns: dict[str, int] | None = None,
@@ -929,7 +938,9 @@ def polarity_rt_axes(
 
     With automatic alignment RT correction, an export's Average Rt(min) is on its own reference file's axis,
     and the two polarities can have chosen reference files far apart in the run. The offset is the median of
-    negative minus positive RT over the lipid names each polarity annotates exactly once.
+    negative minus positive RT over the lipid names each polarity annotates exactly once. A path is the
+    alignment export of the polarity's run, whose correction audit is looked for beside it; None when no
+    export of the run is known.
     """
     columns = columns or _default_columns()
 
@@ -948,9 +959,12 @@ def polarity_rt_axes(
     if deltas:
         middle = len(deltas) // 2
         offset = deltas[middle] if len(deltas) % 2 else (deltas[middle - 1] + deltas[middle]) / 2
-    positive, negative = _rt_correction_reference(positive_path), _rt_correction_reference(negative_path)
+    paths = {"positive": positive_path, "negative": negative_path}
+    positive, negative = (_rt_correction_reference(path) if path else {} for path in (positive_path, negative_path))
 
     def describe(label: str, item: dict[str, Any]) -> str:
+        if not paths[label]:
+            return f"no alignment export of the {label} run is known, so its RT correction audit was not looked for"
         if not item:
             return f"the {label} export has no automatic RT correction audit beside it"
         if not item.get("reference_file"):
@@ -1539,7 +1553,9 @@ def merge_pos_neg(
     their run folders. They say which RT axis each polarity's rows are on: the RT axis note an automatically
     RT-corrected Console export carries in its first cell (MsdialWorkbench#884), and the correction audit
     beside it (polarity_rt_axes). A normalized matrix a later Console normalize wrote carries neither, so a
-    merge of such matrices names the run's exports here; a polarity left out is read from its own input.
+    merge of such matrices names the run's exports here. A polarity rt_axis_sources leaves out is read from
+    its own input; one it names as None, or whose export cannot be read, has an RT axis that is not known,
+    which the merged note and a warning say.
 
     With the reconciliation on, a selection that contradicts it is warned about under rules_label.
     selection_bound says why the selection can no longer change (a contract holds the workbook);
@@ -1548,11 +1564,22 @@ def merge_pos_neg(
     rules = rules if rules is not None else read_adduct_rules(rules_path)
     positive = describe_export(positive_path)
     negative = describe_export(negative_path)
-    axis_sources = {
-        "positive": Path((rt_axis_sources or {}).get("positive") or positive_path),
-        "negative": Path((rt_axis_sources or {}).get("negative") or negative_path),
-    }
-    axis_notes = (source_rt_axis_note(axis_sources["positive"]), source_rt_axis_note(axis_sources["negative"]))
+    axis_sources: dict[str, Path | None] = {}
+    axis_unread: dict[str, str] = {}
+    read_notes: dict[str, str | None] = {}
+    for label, own in (("positive", positive_path), ("negative", negative_path)):
+        if rt_axis_sources is None or label not in rt_axis_sources:
+            axis_sources[label] = Path(own)
+        else:
+            named = rt_axis_sources[label]
+            axis_sources[label] = Path(named) if named else None
+        if axis_sources[label] is None:
+            read_notes[label], reason = None, "no alignment export of its run was named"
+        else:
+            read_notes[label], reason = source_rt_axis_note(axis_sources[label])
+        if read_notes[label] is None:
+            axis_unread[label] = reason
+    axis_notes = (read_notes["positive"], read_notes["negative"])
     order = compare_sample_order(positive, negative)
     if not order["matched"]:
         raise MergeRefused(
@@ -1649,7 +1676,12 @@ def merge_pos_neg(
             "They are taken, as metaboservice took them, with an empty class and a sample name of '_' and the "
             "injection order, which metabolomics_service.R compares as a group of its own."
         )
-    delimiter = "," if output_path.suffix.lower() == ".csv" else "\t"
+    for label, reason in axis_unread.items():
+        warnings.append(
+            f"Which RT axis the {label} rows are on is not known: {reason}. The merged table says so"
+            + (" in its first cell." if any(axis_notes) else "; neither polarity's export was read with a note.")
+        )
+    delimiter ="," if output_path.suffix.lower() == ".csv" else "\t"
     header = merged_header(positive["header"], positive["first_sample_column"], axis_notes)
     main_lines = [delimiter.join(cells) for cells in header] + [delimiter.join(row) for _, row in kept]
     with_delimiter = (["header"] if any(delimiter in cell for cells in header for cell in cells) else []) + [
@@ -1733,7 +1765,7 @@ def merge_pos_neg(
         # CONF-54 (an open question for the author): each polarity's RTs are on its own automatic RT correction
         # reference file's axis. The rule is unchanged; the offset between the two axes is recorded and warned.
         reconciliation["rt_axes"] = polarity_rt_axes(
-            axis_sources["positive"], axis_sources["negative"], candidates["positive"], before, columns
+            axis_sources["positive"], axis_sources["negative"], candidates["positive"], before, columns,
         )
         offset = reconciliation["rt_axes"].get("offset_min")
         if offset is not None and abs(offset) > reconciliation_rt_tolerance / 2:
@@ -1789,8 +1821,9 @@ def merge_pos_neg(
             ],
         },
         "rt_axis": {
-            "sources": {label: str(path) for label, path in axis_sources.items()},
+            "sources": {label: (str(path) if path else None) for label, path in axis_sources.items()},
             "notes": {"positive": axis_notes[0], "negative": axis_notes[1]},
+            "unread": axis_unread,
             "header_note": header[CLASS_ROW][0] if any(axis_notes) and header and header[CLASS_ROW] else "",
         },
         "polarity_reconciliation": reconciliation,

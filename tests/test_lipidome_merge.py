@@ -373,13 +373,32 @@ class RetentionTimeAxisNoteTests(unittest.TestCase):
             positive, negative, rules = self._pair(directory)
             merge_pos_neg(positive, negative, rules, directory / "plain.txt")
             merge_pos_neg(positive, negative, rules, directory / "sourced.txt", rt_axis_sources=self._runs(directory))
-            merge_pos_neg(positive, negative, rules, directory / "missing.txt",
-                          rt_axis_sources={"positive": directory / "gone.txt", "negative": None})
+            report = merge_pos_neg(positive, negative, rules, directory / "missing.txt",
+                                   rt_axis_sources={"positive": directory / "gone.txt", "negative": None})
             plain, sourced, missing = ((directory / name).read_bytes() for name in ("plain.txt", "sourced.txt", "missing.txt"))
 
         self.assertTrue(plain.startswith(b"\t"))
         self.assertEqual(plain, sourced)
-        self.assertEqual(plain, missing, "an unreadable run export is no note, not a refusal")
+        self.assertEqual(plain, missing, "an unread run export writes no note and refuses nothing")
+        # But it is not taken for an export without a note: the report and a warning say the axis is not known.
+        self.assertEqual({"positive": None, "negative": None}, report["rt_axis"]["notes"])
+        self.assertIn("gone.txt could not be read", report["rt_axis"]["unread"]["positive"])
+        self.assertEqual("no alignment export of its run was named", report["rt_axis"]["unread"]["negative"])
+        self.assertEqual(2, sum("is not known" in item for item in report["warnings"]))
+        self.assertIn("no alignment export of the negative run is known",
+                      report["polarity_reconciliation"]["rt_axes"]["reference_sentence"])
+
+    def test_a_polarity_whose_run_export_was_not_read_is_named_unknown_beside_a_note(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            positive, negative, rules = self._pair(directory)
+            sources = self._runs(directory, positive_note=AXIS_NOTE.format("QC_Pos_02"))
+            sources["negative"] = directory / "gone.txt"
+            merge_pos_neg(positive, negative, rules, directory / "merged.txt", rt_axis_sources=sources)
+            first = (directory / "merged.txt").read_text(encoding="utf-8").splitlines()[0].split("\t")[0]
+
+        self.assertTrue(first.endswith(" | Negative rows: its RT axis is not known (its run's alignment export was "
+                                       "not read)"), first)
 
 
 class ExportGeometryTests(unittest.TestCase):

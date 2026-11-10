@@ -38,7 +38,15 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     ...`. A polarity without a note is described as "its run's alignment export carries no RT axis note",
     because a Console before #884 corrected RTs without writing one. The merge report records the sources,
     the notes and the header note under `rt_axis`. Exports without a note merge to the same bytes as before.
-    A normalize recorded before 0.5.66 names no run export, so that polarity is read from its matrix as before.
+  - The record also keeps the sha256 of that export and of the audit summary beside it (or that there was
+    none), and the merge refuses when either changed since normalize, as it refuses a changed candidate
+    table: a polarity run again into its folder replaces the audit but leaves the earlier run's
+    timestamped exports, and the merged note would then name one run's axis while the report named
+    another's.
+  - A polarity whose run export cannot be read, or whose normalize was recorded before 0.5.66 and names
+    none, is not taken for one without a note: its axis is "not known" in the merged note (when the other
+    polarity has one), in `rt_axis.unread`, in a warning, and in the CONF-54 sentence, which then says the
+    audit was not looked for.
 
 ## [0.5.65] - Unreleased
 
