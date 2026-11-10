@@ -25,12 +25,20 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
     the RT axis of reference file ..."), appends `rt_original_min` to `.mdprovenance.tsv`, and adds one
     `custom[n]` line to the mzTab-M. Interactive reads all three as before: every alignment export reader
     finds the samples from the `Class` label, the provenance table has no reader here, and the mzTab-M
-    redaction numbers its own `custom[n]` after the highest. But `msdial_lipidomics_merge` wrote the
-    positive export's header over rows of both polarities, so its note named the positive reference for
-    negative rows aligned on the negative reference's axis.
-  - Now, when either polarity carries a note, the merged table's first cell, and that of its not-quantified side
-    table, names both: `Positive rows: ... | Negative rows: ...`, with "no automatic alignment
-    RT correction" for a polarity without one. Exports without a note merge to the same bytes as before.
+    redaction numbers its own `custom[n]` after the highest. But `msdial_lipidomics_merge` reads the
+    matrices Console `normalize` wrote afterwards, copied into `quant\`, and those carry no note and have
+    no correction audit beside them. So the merged lipidome said nothing of either polarity's axis, and
+    0.5.65's CONF-54 offset warning (`polarity_rt_axes`), which looks for
+    `automatic_alignment_rt_correction_summary.tsv` beside the export it is given, always reported that
+    neither export had an audit beside it.
+  - Now the normalize record keeps the run's own Height export (`run_height_export`), and the merge reads
+    each polarity's axis from it (`merge_pos_neg(..., rt_axis_sources=...)`): the note in its first line,
+    and the correction audit in its run folder. When either polarity carries a note, the first cell of the
+    merged table and of its not-quantified side table names both, as `Positive rows: ... | Negative rows:
+    ...`. A polarity without a note is described as "its run's alignment export carries no RT axis note",
+    because a Console before #884 corrected RTs without writing one. The merge report records the sources,
+    the notes and the header note under `rt_axis`. Exports without a note merge to the same bytes as before.
+    A normalize recorded before 0.5.66 names no run export, so that polarity is read from its matrix as before.
 
 ## [0.5.65] - Unreleased
 

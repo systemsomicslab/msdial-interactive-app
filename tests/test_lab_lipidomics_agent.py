@@ -637,6 +637,25 @@ class FromTheRunToTheLipidome(_Batch):
                   for line in (self.batch.analysis / "inputs" / "lab-lipidomics-record.jsonl").read_text().splitlines()]
         self.assertEqual(["contract_written", "normalized", "normalized", "merged"], events)
 
+    def test_the_merged_lipidome_names_the_rt_axis_the_runs_exports_carry(self) -> None:
+        # Since MsdialWorkbench#884 an automatically RT-corrected run's Height export says which axis its RTs are on;
+        # Console normalize's matrices, which the merge reads, do not. The merge takes it from the run's export.
+        positive = self.normalize("Positive", accept_searched=["Cer 18:1;O2/15:0(d7)"])
+        negative = self.normalize("Negative")
+        self.assertNotEqual(positive["run_height_export"], positive["outputs"]["height_copy"])
+        note = ("RT axis: aligned RTs are on the RT axis of reference file QC_Neg (automatic alignment RT correction); "
+                "per-file peak lists and RT-match evidence are on each file's measured RT axis")
+        run_export = Path(negative["run_height_export"])
+        run_export.write_text(note + run_export.read_text(encoding="utf-8"), encoding="utf-8")
+
+        written = merge_lipidome(self.contract, write=True)
+        first = (self.batch.analysis / "quant" / "lipidome" / "lipid_metabolome.csv").read_text(encoding="utf-8")
+        first = first.splitlines()[0].split(",")[0]
+
+        self.assertEqual(f"Positive rows: its run's alignment export carries no RT axis note | Negative rows: {note}", first)
+        self.assertEqual({"positive": positive["run_height_export"], "negative": negative["run_height_export"]},
+                         written["rt_axis"]["sources"])
+
     def test_the_merge_refuses_a_polarity_not_normalized_or_changed_since(self) -> None:
         self.normalize("Positive", accept_searched=["Cer 18:1;O2/15:0(d7)"])
         with self.assertRaises(LabContractError) as raised:

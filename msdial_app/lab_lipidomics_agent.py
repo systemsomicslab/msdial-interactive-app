@@ -1967,6 +1967,9 @@ def finish_normalize(plan: dict[str, Any], exit_code: int | None, log_lines: Ite
         "internal_standard_ids": sorted({str(int(row["PeakID"])) for row in plan["rows"] if int(row["PeakID"]) >= 0}),
         "not_quantified_classes": plan["not_quantified_classes"],
         "candidate_table": plan["outputs"]["candidate_table"], "candidate_table_sha256": plan["candidate_table_sha256"],
+        # The run's own Height export, in its run folder beside the RT correction audit: the merge reads which RT
+        # axis this polarity is on there, since normalize's matrices carry no axis note (MsdialWorkbench#884).
+        "run_height_export": plan["outputs"]["height_export"],
         "normalize_report": {key: parsed[key] for key in ("resolved", "unresolved", "mismatched", "warnings", "unit",
                                                           "dilution_factor_applied", "redacted_rows")},
     }
@@ -2148,6 +2151,8 @@ def merge_lipidome(
             reconciliation_rt_tolerance=tolerance,
             sample_file_types=sample_file_types,
             replaceable_dotplot_files=replaceable,
+            # A record written before 0.5.66 names no run export; that polarity is then read from its matrix.
+            rt_axis_sources={labels[polarity]: records[polarity].get("run_height_export") for polarity in POLARITIES},
             rules_label="Selection" if contract.get("quant_format") == QUANT_INPUT_FORMAT else "Sheet 3",
             selection_bound=_selection_bound(contract),
             write=write,

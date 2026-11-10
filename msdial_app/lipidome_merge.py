@@ -465,21 +465,40 @@ def rt_axis_note(export: dict[str, Any]) -> str:
     return header[CLASS_ROW][0].strip()
 
 
-def merged_header(positive: dict[str, Any], negative: dict[str, Any]) -> list[list[str]]:
-    """The positive export's header lines, with an RT axis note that is true of the merged rows.
+def source_rt_axis_note(path: str | Path) -> str:
+    """The RT axis note of the alignment export a polarity's run wrote, or "" when it has none or cannot be read.
 
-    The merged table holds rows of both polarities, each aligned on its own run's RT axis. The positive
-    header's note names only the positive run's reference file, so a run whose either polarity was
-    automatically RT corrected gets a note naming both; with neither, the header is the positive one as it
-    was. Commas and tabs never reach the note, which is written unquoted into a CSV or a TSV.
+    Only the first line is read: the note is in its first cell, and the Class label further right says the
+    line is an alignment export's class line.
     """
-    header = [list(row) for row in positive["header"]]
-    notes = (rt_axis_note(positive), rt_axis_note(negative))
-    if not any(notes) or positive.get("first_sample_column", 0) <= 1:
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+            first = handle.readline().rstrip("\r\n").split("\t")
+    except (OSError, TypeError, ValueError):
+        return ""
+    if "Class" not in first:
+        return ""
+    return rt_axis_note({"header": [first], "first_sample_column": first.index("Class") + 1})
+
+
+# What the merged first cell says of a polarity whose run's export carries no note. Only that is known: a
+# Console before MsdialWorkbench#884 corrected RTs without writing the note.
+NO_RT_AXIS_NOTE = "its run's alignment export carries no RT axis note"
+
+
+def merged_header(header: list[list[str]], first_sample_column: int, notes: tuple[str, str]) -> list[list[str]]:
+    """The header lines of the merged table, with an RT axis note that is true of the merged rows.
+
+    The merged table holds rows of both polarities, each aligned on its own run's RT axis, under the positive
+    export's header lines. notes are the (positive, negative) notes of the alignment exports the two runs
+    wrote. When either has one, the first cell names both; with neither, the header is returned as it was.
+    Commas and tabs never reach the note, which is written unquoted into a CSV or a TSV.
+    """
+    header = [list(row) for row in header]
+    if not any(notes) or first_sample_column <= 1 or not header or not header[CLASS_ROW]:
         return header
-    uncorrected = "no automatic alignment RT correction; aligned RTs are on the alignment reference file's axis"
     text = " | ".join(
-        f"{label} rows: {note or uncorrected}" for label, note in zip(("Positive", "Negative"), notes)
+        f"{label} rows: {note or NO_RT_AXIS_NOTE}" for label, note in zip(("Positive", "Negative"), notes)
     )
     header[CLASS_ROW][0] = re.sub(r"[\t,\r\n]", " ", text)
     return header
@@ -1495,6 +1514,7 @@ def merge_pos_neg(
     reconciliation_rt_tolerance: float = DEFAULT_RECONCILIATION_RT_TOLERANCE,
     sample_file_types: Collection[str] = SAMPLE_FILE_TYPES,
     replaceable_dotplot_files: dict[str, str] | None = None,
+    rt_axis_sources: dict[str, str | Path] | None = None,
     rules_label: str = "The rule table",
     selection_bound: str | None = None,
     write: bool = True,
@@ -1515,6 +1535,12 @@ def merge_pos_neg(
     reads every file in them. With write false nothing is written and the report says what would
     be: a preview the person confirms.
 
+    rt_axis_sources ({"positive": path, "negative": path}) are the alignment exports the two runs wrote, in
+    their run folders. They say which RT axis each polarity's rows are on: the RT axis note an automatically
+    RT-corrected Console export carries in its first cell (MsdialWorkbench#884), and the correction audit
+    beside it (polarity_rt_axes). A normalized matrix a later Console normalize wrote carries neither, so a
+    merge of such matrices names the run's exports here; a polarity left out is read from its own input.
+
     With the reconciliation on, a selection that contradicts it is warned about under rules_label.
     selection_bound says why the selection can no longer change (a contract holds the workbook);
     the warnings then say what this lipidome counts instead of how to change the selection.
@@ -1522,6 +1548,11 @@ def merge_pos_neg(
     rules = rules if rules is not None else read_adduct_rules(rules_path)
     positive = describe_export(positive_path)
     negative = describe_export(negative_path)
+    axis_sources = {
+        "positive": Path((rt_axis_sources or {}).get("positive") or positive_path),
+        "negative": Path((rt_axis_sources or {}).get("negative") or negative_path),
+    }
+    axis_notes = (source_rt_axis_note(axis_sources["positive"]), source_rt_axis_note(axis_sources["negative"]))
     order = compare_sample_order(positive, negative)
     if not order["matched"]:
         raise MergeRefused(
@@ -1619,7 +1650,7 @@ def merge_pos_neg(
             "injection order, which metabolomics_service.R compares as a group of its own."
         )
     delimiter = "," if output_path.suffix.lower() == ".csv" else "\t"
-    header = merged_header(positive, negative)
+    header = merged_header(positive["header"], positive["first_sample_column"], axis_notes)
     main_lines = [delimiter.join(cells) for cells in header] + [delimiter.join(row) for _, row in kept]
     with_delimiter = (["header"] if any(delimiter in cell for cells in header for cell in cells) else []) + [
         _field(row, columns, "alignment_id") for _, row in kept if any(delimiter in cell for cell in row)
@@ -1702,7 +1733,7 @@ def merge_pos_neg(
         # CONF-54 (an open question for the author): each polarity's RTs are on its own automatic RT correction
         # reference file's axis. The rule is unchanged; the offset between the two axes is recorded and warned.
         reconciliation["rt_axes"] = polarity_rt_axes(
-            positive_path, negative_path, candidates["positive"], before, columns
+            axis_sources["positive"], axis_sources["negative"], candidates["positive"], before, columns
         )
         offset = reconciliation["rt_axes"].get("offset_min")
         if offset is not None and abs(offset) > reconciliation_rt_tolerance / 2:
@@ -1756,6 +1787,11 @@ def merge_pos_neg(
                 {"column": start + offset, "file": positive["sample_names"][offset], "file_type": kind}
                 for offset, kind in enumerate(positive["file_types"]) if kind not in file_types
             ],
+        },
+        "rt_axis": {
+            "sources": {label: str(path) for label, path in axis_sources.items()},
+            "notes": {"positive": axis_notes[0], "negative": axis_notes[1]},
+            "header_note": header[CLASS_ROW][0] if any(axis_notes) and header and header[CLASS_ROW] else "",
         },
         "polarity_reconciliation": reconciliation,
         "rules": {
