@@ -305,7 +305,7 @@
         <div id="automaticRtCorrectionPanel" class="nested-panel">
           <h3>Automatic RT correction during LC-MS alignment</h3>
           <label class="check"><input id="executeAutomaticRtCorrection" type="checkbox"> Learn anchor peaks from detected features and correct RT only during alignment</label>
-          <p class="muted">Peak picking and annotation retain the original RT axis. Before alignment, MS-DIAL selects distributed high-quality anchors, chooses a reference sample, and applies a file-specific piecewise-linear RT map. This mode cannot be combined with the user-defined anchor workflow below.</p>
+          <p class="muted">Peak picking and annotation retain the original RT axis. Before alignment, MS-DIAL selects distributed high-quality anchors, chooses a reference sample, and applies a file-specific piecewise-linear RT map. This mode cannot be combined with the legacy user-defined RT correction below.</p>
           <div class="form-grid">
             <label>Reference file ID (-1 = automatic)<input id="automaticRtReferenceFileId" type="number" step="1" value="-1"></label>
             <label>Minimum anchors<input id="automaticRtMinimumAnchors" type="number" min="2" step="1" value="3"></label>
@@ -329,19 +329,74 @@
             </div>
           </details>
           <p class="muted">The Console writes <code>automatic_alignment_rt_correction_summary.tsv</code> and <code>automatic_alignment_rt_correction_anchors.tsv</code> so the selected reference, anchors, per-file model source, and failures remain auditable.</p>
-          <p class="muted">After a run, use the RT correction audit viewer in Validate &amp; run to inspect the chosen reference, accepted and rejected anchors, and file-specific shift curves. The current Console completes alignment in one pass; it cannot pause for approval between anchor selection and alignment.</p>
+          <div id="automaticRtAnchorPanel" class="nested-panel">
+            <h3>Anchors: automatic, named, or both</h3>
+            <p class="muted">Automatic chooses anchors from the detected peaks. UserOnly uses only the True rows of an anchor library. Hybrid uses the library's True rows and lets automatic anchors fill the RT bins they leave empty; its False rows keep automatic candidates within their m/z and RT tolerances out. Each library anchor is found on every file's MS1 extracted ion chromatogram. These settings need an MS-DIAL Console with MsdialWorkbench#845 (5.5.261105 or later); left at the Console default, nothing is written.</p>
+            <div class="form-grid">
+              <label>Anchor mode
+                <select id="automaticRtAnchorMode">
+                  <option value="">Automatic (Console default; not written)</option>
+                  <option value="Automatic">Automatic</option>
+                  <option value="UserOnly">UserOnly: anchor library only</option>
+                  <option value="Hybrid">Hybrid: anchor library + automatic fill</option>
+                </select>
+              </label>
+              <label>Anchor peak selection
+                <select id="automaticRtAnchorPeakSelectionMode">
+                  <option value="">Highest intensity (Console default; not written)</option>
+                  <option value="HighestIntensity">Highest intensity</option>
+                  <option value="ClosestToReferenceRt">Closest to library RT</option>
+                  <option value="Weighted">Weighted intensity + RT</option>
+                </select>
+              </label>
+              <label id="automaticRtAnchorRtWeightField">RT weight (Weighted only; 0 = intensity, 1 = RT)
+                <input id="automaticRtAnchorRtWeight" type="number" min="0" max="1" step="0.05" placeholder="0.5 (Console default)">
+              </label>
+            </div>
+            <label>Anchor library (7-column text: Name, RT(min), RT tol.(min), m/z, m/z tol., Minimum height, T/F)
+              <div class="output-path-row rt-anchor-path-row">
+                <input id="automaticRtAnchorLibraryPath" placeholder="Used by UserOnly and Hybrid">
+                <button id="browseAutomaticRtAnchorLibrary" type="button" class="secondary">Browse</button>
+                <button id="loadAutomaticRtAnchorLibrary" type="button" class="secondary" title="Discard unsaved editor changes and reread the file currently shown in this path.">Reload file</button>
+              </div>
+              <span class="muted">Read as strictly as the Console reads it: the header line first, seven tab-separated columns, a decimal point, and True, False, T or F. In Hybrid a False row is an exclusion.</span>
+            </label>
+            <div id="automaticRtAnchorEditor" class="nested-panel" hidden>
+              <div class="section-head compact-head">
+                <div><strong>Anchor library editor</strong> <span id="automaticRtAnchorCount" class="muted"></span></div>
+                <button id="saveAutomaticRtAnchors" type="button" class="secondary">Save edited anchor library</button>
+              </div>
+              <div class="table-wrap compact-table rt-anchor-table">
+                <table>
+                  <thead><tr><th>True</th><th>Name</th><th>RT (min)</th><th>RT tolerance (min)</th><th>m/z</th><th>m/z tolerance</th><th>Minimum height</th></tr></thead>
+                  <tbody id="automaticRtAnchorRows"></tbody>
+                </table>
+              </div>
+              <p class="muted">Saving writes a new timestamped ASCII file under Output root; the original file is not changed.</p>
+            </div>
+            <div class="button-row">
+              <button id="runAutomaticRtPreview" type="button">Preview anchors (no alignment)</button>
+            </div>
+            <pre id="automaticRtPreviewLog" class="rt-correction-log" hidden></pre>
+            <p class="muted">The preview runs the Console on every file with this method and stops once the anchors are chosen: nothing is aligned, nothing is written beside the raw data, and its audit goes to a folder of its own under Output root. Review it in the RT correction audit viewer (Validate &amp; run), accept or reject each anchor, and approve: the approved anchors are written as a new anchor library under Output root, and the production run then uses it in UserOnly mode.</p>
+          </div>
+          <p class="muted">After a preview, the RT correction audit viewer in Validate &amp; run shows every anchor for approval. After a run, it shows the chosen reference, accepted and rejected anchors, and file-specific shift curves.</p>
         </div>
       </div>
       <div id="rtCorrectionLauncher" class="panel" hidden>
-        <div class="section-head compact-head">
-          <div>
-            <h2>LC-MS retention time correction</h2>
-            <p class="muted">Anchor detection and chromatogram review are handled in a dedicated workspace. When its approved selection file is returned here, this analysis can use RT correction during the production run.</p>
+        <details id="legacyRtCorrection">
+          <summary><strong>Legacy (not recommended): user-defined point-by-point RT correction</strong></summary>
+          <p class="muted">Kept so that existing worksets and templates that use it still load and run unchanged; it gets no new features. For new analyses, use automatic RT correction above, with named anchors (UserOnly or Hybrid) and the anchor preview when you want to choose the anchors yourself.</p>
+          <div class="section-head compact-head">
+            <div>
+              <h2>LC-MS retention time correction</h2>
+              <p class="muted">Anchor detection and chromatogram review are handled in a dedicated workspace. When its approved selection file is returned here, this analysis can use RT correction during the production run.</p>
+            </div>
+            <button id="openRtCorrectionWorkspace" type="button">Open RT correction workspace</button>
           </div>
-          <button id="openRtCorrectionWorkspace" type="button">Open RT correction workspace</button>
-        </div>
-        <div id="rtCorrectionLauncherStatus" class="format-summary">No approved RT correction setup has been returned yet.</div>
-        <label class="check"><input id="executeRtCorrection" type="checkbox" disabled> Use the approved RT correction setup in this MS-DIAL analysis</label>
+          <div id="rtCorrectionLauncherStatus" class="format-summary">No approved RT correction setup has been returned yet.</div>
+          <label class="check"><input id="executeRtCorrection" type="checkbox" disabled> Use the approved RT correction setup in this MS-DIAL analysis</label>
+        </details>
       </div>
       <div id="rtCorrectionSettings" class="panel">
         <div class="section-head compact-head">
@@ -753,7 +808,7 @@ Internal standard 1	7.6146	3	231.0695366	0.01	10000	TRUE</pre>
       </div>
       <div class="panel automatic-rt-review" id="automaticRtReviewPanel">
         <h2>Automatic alignment RT correction audit</h2>
-        <p class="muted">Review the Console's recorded reference sample, accepted/rejected anchors, and original-to-aligned RT offsets. Extract raw and smoothed MS1 EICs on demand. This viewer audits a completed run; it does not change anchors or approve alignment in advance.</p>
+        <p class="muted">Review the Console's recorded reference sample, accepted/rejected anchors, and original-to-aligned RT offsets. Extract raw and smoothed MS1 EICs on demand. For a completed run this viewer audits what ran. For an anchor preview it lists every anchor for you to accept or reject, and writes the approved anchors as the production run's anchor library.</p>
         <label>Analysis output directory<input id="automaticRtReviewDirectory" placeholder="Output root or selected analysis job"></label>
         <div class="button-row">
           <button id="reviewAutomaticRt" type="button" class="secondary">Review RT correction</button>

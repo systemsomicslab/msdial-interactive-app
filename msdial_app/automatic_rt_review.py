@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .automatic_rt_evidence import (
     ANCHORS,
+    EXCLUSIONS,
     METHOD,
     OUTLIER_STATUSES,
     OUTLIER_TEST_LOCAL,
@@ -37,7 +38,20 @@ ANCHOR_COLUMNS = {"File ID", "Anchor ID", "m/z", "Reference RT (min)", "Original
 # LOCAL_SUPPORT_SUMMARY_COLUMNS) are read by name where present and are None in an older audit;
 # the required column sets below are #810's and stay so.
 BLANK_ANCHOR_STATUSES = {"BlankInterpolateByOrder", "BlankNotCorrected"}
-UNMATCHED_ANCHOR_STATUSES = {"Missing", "Ambiguous"}
+# MissingInReference (MsdialWorkbench#845) is a user anchor the reference file did not show: it has no
+# reference RT, so it never reached a model either.
+UNMATCHED_ANCHOR_STATUSES = {"Missing", "Ambiguous", "MissingInReference"}
+# MsdialWorkbench#876: how the Console chose the reference file, in every summary row, and each file's
+# library RT deviation (the median over its detected user anchors of |observed RT - library RT| / RT
+# tolerance). A Console with #876 chooses, in UserOnly and Hybrid with an automatic reference, the file
+# with the most user anchors detected and then the smallest deviation: the file an approved library's
+# RTs were measured in. An audit without the column is from a Console before #876, which chose by the
+# closeness of each file's anchor RTs to their median over the batch.
+REFERENCE_SELECTION_COLUMN = "Reference selection"
+LIBRARY_RT_DEVIATION_COLUMN = "Library RT deviation (RT tolerances)"
+LIBRARY_RT_REFERENCE_PR = "MsdialWorkbench#876"
+WORKFLOW_SETTINGS = "workflow-settings.json"
+ANCHOR_APPROVAL_KEY = "automatic_rt_correction_anchor_approval"
 SMOOTHING_METHOD_KEYS = {"smoothing method", "smoothing level"}
 MAX_AUDIT_BYTES = 32 * 1024 * 1024
 MAX_ROWS = 200_000
@@ -209,6 +223,14 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
             "last_used_anchor_rt": _number(row, "Last used anchor RT (min)"),
             "peaks_before_first_used_anchor": _number(row, "Peaks before first used anchor"),
             "peaks_after_last_used_anchor": _number(row, "Peaks after last used anchor"),
+            # MsdialWorkbench#845; "" or None in an audit written before it.
+            "anchor_mode": str(row.get("Anchor mode") or "").strip(),
+            "user_anchors_detected": _number(row, "User anchors detected"),
+            "excluded_automatic_candidates": _number(row, "Excluded automatic candidates"),
+            "run": str(row.get("Run") or "").strip(),
+            # MsdialWorkbench#876; "" or None in an audit written before it.
+            "reference_selection": str(row.get(REFERENCE_SELECTION_COLUMN) or "").strip(),
+            "library_rt_deviation": _number(row, LIBRARY_RT_DEVIATION_COLUMN),
         })
 
     anchors = []
@@ -254,6 +276,18 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
             "expected_offset": _number(row, "Expected offset (min)"),
             "outlier_scale": _number(row, "Outlier scale (min)"),
             "ms1_cycle_time": _number(row, "MS1 cycle at anchor (min)"),
+            # MsdialWorkbench#845: whether the anchor came from the detected peaks or the anchor library,
+            # its library name and RT, whether the outlier test disagreed with a user anchor (which is
+            # kept regardless), the matched peak's height and m/z, and how a user anchor's peak was
+            # chosen. A user anchor has no quality score, and no reference RT when it was not found in
+            # the reference file. An audit before #845 has no source column: every anchor is automatic.
+            "source": str(row.get("Anchor source") or "").strip() or "Automatic",
+            "anchor_name": str(row.get("Anchor name") or "").strip(),
+            "library_rt": _number(row, "Library RT (min)"),
+            "outlier_flagged": str(row.get("Outlier flagged") or "").strip().casefold() == "true",
+            "peak_height": _number(row, "Peak height"),
+            "observed_mz": _number(row, "Observed m/z"),
+            "detection": str(row.get("Detection") or "").strip(),
         }
         anchors.append(anchor)
         anchors_by_file[file_id].append(anchor)
@@ -292,6 +326,32 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
             + ", ".join(f"{key} ({value})" for key, value in sorted(by_category["blank"].items()))
             + ". A Blank's model comes from neighbouring injections, or it keeps its original RT; its own anchors never fit it."
         )
+    exclusions = _exclusions(root / EXCLUSIONS)
+    anchor_review = _anchor_review(files, anchors, summary_rows, exclusions, reference)
+    reference_check = approved_reference_check(reference, anchor_review, run_anchor_approval(root))
+    if reference_check:
+        if reference_check["warning"]:
+            warnings.append(reference_check["warning"])
+        elif reference_check["note"]:
+            notes.append(reference_check["note"])
+    if anchor_review["run"] == "Preview":
+        notes.append(
+            "This audit is a preview's (Run = Preview): the Console chose the anchors and stopped before "
+            "alignment. Accept or reject each anchor; the approved anchors become the production run's "
+            "anchor library. Nothing was aligned, so this audit is not evidence of a correction."
+        )
+    for exclusion in exclusions:
+        if exclusion["excluded_candidates"] == 0:
+            notes.append(
+                f"Exclusion {exclusion['anchor_name'] or '(unnamed)'} (m/z {exclusion['mz']}, RT "
+                f"{exclusion['rt']} min) matched no automatic candidate of the reference file."
+            )
+    flagged = sorted({item["anchor_name"] or item["anchor_id"] for item in anchors if item["outlier_flagged"]})
+    if flagged:
+        warnings.append(
+            "The outlier test disagrees with user anchor(s) " + ", ".join(flagged)
+            + " in at least one file; a user anchor is kept regardless, so review it."
+        )
     missing_rt = [item for item in anchors if not item["rt_available"]]
     # A record that matched no peak has no sample RT by construction; any other is unexpected.
     unexplained_missing_rt = [item for item in missing_rt if item["status"] not in UNMATCHED_ANCHOR_STATUSES]
@@ -317,7 +377,8 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
         "unusable": list(record.get("unusable") or []),
         "blank": list(record.get("blank") or []),
     }
-    if not proof["performed"]:
+    # A preview never aligns, so it never proves a correction; the note above says so without alarm.
+    if not proof["performed"] and proof["reason"] != "preview_only":
         warnings.append(
             f"The retained records do not prove a correction in this run ({proof['reason']}): "
             f"{proof_reason_phrase(proof)}. The publication report does not describe a correction from them."
@@ -351,9 +412,249 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
             "level": method_values.get("smoothing level") or None,
             "ms1_tolerance": method_values.get("ms1 tolerance for centroid") or None,
         },
+        "anchor_review": anchor_review,
+        "reference_check": reference_check,
+        "exclusions": exclusions,
+        "exclusions_file": str(root / EXCLUSIONS) if (root / EXCLUSIONS).is_file() else "",
         "warnings": warnings,
         "notes": notes,
     }
+
+
+EXCLUSION_COLUMNS = {
+    "Anchor name",
+    "m/z",
+    "RT (min)",
+    "m/z tolerance",
+    "RT tolerance (min)",
+    "Reference file ID",
+    "Reference file name",
+    "Excluded automatic candidates",
+}
+
+
+def _exclusions(path: Path) -> list[dict]:
+    """The anchor library's False rows as a Hybrid run applied them (MsdialWorkbench#845); [] otherwise."""
+    if not path.is_file():
+        return []
+    return [
+        {
+            "anchor_name": str(row.get("Anchor name") or "").strip(),
+            "mz": _number(row, "m/z"),
+            "rt": _number(row, "RT (min)"),
+            "mz_tolerance": _number(row, "m/z tolerance"),
+            "rt_tolerance": _number(row, "RT tolerance (min)"),
+            "reference_file_id": str(row.get("Reference file ID") or "").strip(),
+            "reference_file_name": str(row.get("Reference file name") or "").strip(),
+            "excluded_candidates": int(_number(row, "Excluded automatic candidates") or 0),
+        }
+        for row in _table(path, EXCLUSION_COLUMNS)
+    ]
+
+
+def _anchor_review(
+    files: list[dict],
+    anchors: list[dict],
+    summary_rows: list[dict[str, str]],
+    exclusions: list[dict],
+    reference: dict | None,
+) -> dict:
+    """Every anchor of the audit once, as a person reviews it: source, name, RTs, m/z, height, detection.
+
+    The audit has one row per anchor and file. An anchor is the Console's Anchor ID, unique in a run,
+    keyed with its source ("Automatic-3", "User-1") so that a key never names the other kind. Its
+    reference RT, observed m/z, peak height, detection note and status are the reference file's row's;
+    it is outlier-flagged when the test disagreed with a user anchor in any file.
+    """
+    first = summary_rows[0] if summary_rows else {}
+    reference_id = (reference or {}).get("file_id")
+    blank = {item["file_id"] for item in files if item["type"].strip().casefold() == "blank"}
+    by_key: dict[str, dict] = {}
+    for anchor in anchors:
+        key = f"{anchor['source']}-{anchor['anchor_id']}"
+        entry = by_key.get(key)
+        if entry is None:
+            entry = by_key[key] = {
+                "key": key,
+                "anchor_id": anchor["anchor_id"],
+                "source": anchor["source"],
+                "name": anchor["anchor_name"],
+                "library_rt": anchor["library_rt"],
+                "mz": anchor["mz"],
+                "reference_rt": None,
+                "observed_mz": None,
+                "peak_height": None,
+                "quality_score": None,
+                "detection": "",
+                "reference_status": "",
+                "outlier_flagged": False,
+                "files_detected": 0,
+                "files_used": 0,
+                "non_blank_files": 0,
+            }
+        if anchor["reference_rt"] is not None and entry["reference_rt"] is None:
+            entry["reference_rt"] = anchor["reference_rt"]
+        if anchor["file_id"] == reference_id:
+            entry["observed_mz"] = anchor["observed_mz"]
+            entry["peak_height"] = anchor["peak_height"]
+            entry["quality_score"] = anchor["quality_score"]
+            entry["detection"] = anchor["detection"]
+            entry["reference_status"] = anchor["status"]
+        entry["outlier_flagged"] = entry["outlier_flagged"] or anchor["outlier_flagged"]
+        if anchor["file_id"] not in blank:
+            entry["non_blank_files"] += 1
+            if anchor["original_rt"] is not None:
+                entry["files_detected"] += 1
+            if anchor["used"]:
+                entry["files_used"] += 1
+    ordered = sorted(
+        by_key.values(),
+        key=lambda item: (
+            item["reference_rt"] if item["reference_rt"] is not None else float("inf"),
+            item["source"],
+            item["key"],
+        ),
+    )
+    return {
+        "run": str(first.get("Run") or "").strip(),
+        # An audit before #845 has no Anchor mode column; its correction was automatic.
+        "anchor_mode": str(first.get("Anchor mode") or "").strip() or "Automatic",
+        "anchor_mode_columns": "Anchor mode" in first,
+        "anchor_library": str(first.get("Anchor library") or "").strip(),
+        "anchor_library_sha256": str(first.get("Anchor library SHA-256") or "").strip(),
+        "reference_file_id": reference_id,
+        "reference_file_name": (reference or {}).get("name") or "",
+        # MsdialWorkbench#876: how the reference was chosen; "" in an audit before it, or when none was.
+        "reference_selection": str(first.get(REFERENCE_SELECTION_COLUMN) or "").strip(),
+        "reference_selection_column": REFERENCE_SELECTION_COLUMN in first,
+        "anchors": ordered,
+        "user_anchor_count": sum(1 for item in ordered if item["source"] == "User"),
+        "automatic_anchor_count": sum(1 for item in ordered if item["source"] == "Automatic"),
+        "exclusion_count": len(exclusions),
+    }
+
+
+def run_anchor_approval(directory: str | Path) -> dict | None:
+    """The anchor-library approval a run's workflow-settings.json records, or None.
+
+    The run keeps it only when the approval still described the library the run read
+    (workflow.automatic_rt_anchor_library_record), so a record found here is the approval of that library.
+    """
+    try:
+        settings = json.loads((Path(directory) / WORKFLOW_SETTINGS).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    approval = settings.get(ANCHOR_APPROVAL_KEY) if isinstance(settings, dict) else None
+    return approval if isinstance(approval, dict) and approval else None
+
+
+def preview_reference_from_approval(approval: dict) -> dict | None:
+    """The preview's reference file ({"file_id", "name"}) an approval was made against, or None.
+
+    An approval written since MsdialWorkbench#876 records it (preview_reference_file). An earlier one is
+    read from the preview's own summary audit while the preview directory still holds it.
+    """
+    recorded = approval.get("preview_reference_file")
+    if isinstance(recorded, dict) and (recorded.get("file_id") not in (None, "") or recorded.get("name")):
+        return {"file_id": str(recorded.get("file_id") or ""), "name": str(recorded.get("name") or "")}
+    directory = str(approval.get("preview_directory") or "").strip()
+    if not directory:
+        return None
+    try:
+        rows = _table(Path(directory) / SUMMARY, SUMMARY_COLUMNS)
+    except (OSError, ValueError):
+        return None
+    row = next((item for item in rows if item["Model source"].strip() == "Reference"), None)
+    if row is None:
+        return None
+    return {"file_id": row["File ID"].strip(), "name": row["File name"].strip()}
+
+
+def _same_file(left: dict, right: dict) -> bool:
+    # The production run and its preview read the same files, but a file's ID is its row in the run's
+    # file list; the name says which file it is wherever both are known.
+    if left.get("name") and right.get("name"):
+        return left["name"] == right["name"]
+    return str(left.get("file_id") or "") == str(right.get("file_id") or "")
+
+
+def approved_reference_check(reference: dict | None, anchor_review: dict, approval: dict | None) -> dict | None:
+    """Whether a run that read an approved anchor library mapped onto the preview's reference file.
+
+    An approved automatic anchor is a True row at the RT it had in the preview's reference file, so that is
+    the axis the person reviewed. A Console with MsdialWorkbench#876 chooses that file again (the most user
+    anchors detected, then the closest to the library's RTs); one before it chose by the closeness of each
+    file's anchor RTs to their median over the batch, and can map the run onto another file. A difference is
+    a warning, never a refusal: the run is internally consistent, on another file's axis.
+
+    None when it does not apply: no approval, a preview's audit, or a run whose audit names another anchor
+    library than the approved one. Otherwise status is "matches", "differs" or "unknown" (the preview's
+    reference could not be found), with the warning or note to show.
+    """
+    if not isinstance(approval, dict) or anchor_review.get("run") == "Preview":
+        return None
+    approved = str(approval.get("library_sha256") or "").casefold()
+    audited = str(anchor_review.get("anchor_library_sha256") or "").casefold()
+    if not approved or audited != approved:
+        return None
+    rule = bool(anchor_review.get("reference_selection_column"))
+    selection = str(anchor_review.get("reference_selection") or "")
+    run_reference = {"file_id": str((reference or {}).get("file_id") or ""), "name": str((reference or {}).get("name") or "")}
+    preview_reference = preview_reference_from_approval(approval)
+    check = {
+        "status": "unknown",
+        "preview_reference": preview_reference,
+        "run_reference": run_reference if reference else None,
+        "run_reference_selection": selection,
+        "console_has_library_rt_reference_rule": rule,
+        "warning": "",
+        "note": "",
+    }
+
+    def label(item: dict) -> str:
+        return f"{item['name'] or '(unnamed)'} (file ID {item['file_id'] or '?'})"
+
+    if preview_reference is None or reference is None:
+        check["note"] = (
+            "The run read an approved anchor library, but "
+            + ("the preview's reference file is not recorded in the approval and its audit is gone"
+               if preview_reference is None else "the run's audit records no reference file")
+            + ", so whether the run was mapped onto the file the anchors were reviewed on cannot be checked."
+        )
+        return check
+    if _same_file(preview_reference, run_reference):
+        check["status"] = "matches"
+        check["note"] = (
+            f"The run's RT correction reference file is the preview's, {label(run_reference)}: every file was "
+            "mapped onto the axis the approved anchors were reviewed on."
+        )
+        return check
+    check["status"] = "differs"
+    text = (
+        f"The run's RT correction reference file is {label(run_reference)}, not the preview's, "
+        f"{label(preview_reference)}, whose RTs the approved anchors carry: every file was mapped onto another "
+        "file's axis than the one reviewed. The run was not refused."
+    )
+    if rule:
+        if selection == "Requested":
+            reason = ": the reference file ID was set in the method."
+        elif selection.startswith("Automatic (coverage"):
+            reason = ": no eligible file had an approved anchor detected, so the automatic score chose."
+        else:
+            reason = (
+                "; a file with more approved anchors detected wins before the closest to the library's RTs, so "
+                "compare 'User anchors detected' and 'Library RT deviation (RT tolerances)' in the summary audit."
+            )
+        text += f" The Console chose it by '{selection or 'an unrecorded rule'}'{reason}"
+    else:
+        text += (
+            f" The Console that ran may predate the library-RT reference rule ({LIBRARY_RT_REFERENCE_PR}): its audit "
+            f"has no '{REFERENCE_SELECTION_COLUMN}' column, so it chose the reference by the closeness of each "
+            "file's anchor RTs to their median over the batch. Use a Console with that rule, or set the automatic "
+            f"RT correction reference file ID to the preview's ({preview_reference['file_id'] or '?'}), and run again."
+        )
+    check["warning"] = text
+    return check
 
 
 def _correct_rt(rt: float, anchors: list[dict]) -> float | None:

@@ -62,9 +62,21 @@ Use these branches:
 4. For LC-MS, choose no correction, user-defined correction before peak
    detection, or automatic alignment-only correction learned from detected
    features. The two correction modes are mutually exclusive. User-defined
-   correction requires an anchor library and reviewed peak selections;
-   alignment-only correction retains the original RT for peak picking and
-   annotation and writes two audit TSV files.
+   correction requires an anchor library and reviewed peak selections; it is
+   the legacy path, kept for existing worksets and templates, and is not
+   offered for new analyses unless the user asks for it. Alignment-only
+   correction retains the original RT for peak picking and annotation and
+   writes its audit TSV files. Its anchors are automatic unless the user
+   wants to choose them: then run the anchor preview
+   (`msdial_start_automatic_rt_anchor_preview`, after confirmation), show
+   every anchor from `msdial_automatic_rt_anchor_review`, and let the user
+   accept or reject each one. The approval is the user's, never yours: pass
+   their decisions unchanged to `msdial_approve_automatic_rt_anchors`, first
+   with `confirmed=false` to show the rows, then with `confirmed=true` and
+   `confirmed_by` naming them. The production run then uses anchor mode
+   `UserOnly` with the approved library; when the approval reports
+   `user_only_allowed: false`, ask whether to run `Hybrid` instead and never
+   choose it for them.
 5. Select official, existing, tiered lipid/MSP, or no annotation libraries.
 6. For LC-MS, decide whether to generate QA and collect internal-standard definitions when available. QA without internal standards still evaluates distributions and sample topology, but must not claim internal-standard stability.
 7. Decide whether to generate Materials and Methods and supplementary tables.

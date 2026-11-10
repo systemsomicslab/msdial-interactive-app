@@ -27,6 +27,19 @@ from typing import Any, Callable, Iterable
 from . import __version__
 from .sample_grouping import file_type_for, propose_grouping, propose_injection_order
 from .annotation_codes import IN_SILICO_ANNOTATION_CODE, in_silico_codes, parse_annotation_code
+from .automatic_rt_anchors import (
+    ANCHOR_MODES as AUTOMATIC_RT_ANCHOR_MODES,
+    PEAK_SELECTION_MODES as AUTOMATIC_RT_ANCHOR_PEAK_SELECTION_MODES,
+    AnchorLibraryError,
+    anchor_library_issues,
+    approval_for_library as automatic_rt_anchor_approval_for_library,
+    approval_record_path as automatic_rt_anchor_approval_record_path,
+    canonical_anchor_mode,
+    canonical_peak_selection_mode,
+    file_sha256 as anchor_library_sha256,
+    read_anchor_library,
+    write_preview_record as write_automatic_rt_preview_record,
+)
 from .diagnostic_paths import REPRODUCTION_DIRECTORY_NAME
 from .lipid_rt_check import (
     LIPID_RT_CHECK_CAPABILITY,
@@ -131,7 +144,48 @@ AUTOMATIC_RT_CORRECTION_METHOD_KEYS = {
     "automatic rt correction reference centrality weight",
     "automatic rt correction interpolate blanks by analytical order",
     "automatic rt correction local support rt window",
+    # MsdialWorkbench#845 (AUTOMATIC_RT_ANCHOR_METHOD_KEYS).
+    "automatic rt correction anchor mode",
+    "automatic rt correction anchor library file path",
+    "automatic rt correction anchor peak selection mode",
+    "automatic rt correction anchor peak selection rt weight",
+    "automatic rt correction preview only",
 }
+# MsdialWorkbench#845: named anchors. The automatic correction takes its anchors from the detected peaks
+# (Automatic), from an anchor library's True rows only (UserOnly), or from both, automatic anchors filling
+# the RT bins the True rows leave empty and the False rows keeping rejected candidates out (Hybrid). The
+# library's anchors are found on each file's MS1 extracted ion chromatogram, one peak per window chosen
+# by the anchor peak selection mode. "Preview only" stops the run once the anchors are chosen and the
+# audit written, so a person can approve them before the run that aligns.
+#
+# THESE ARE NOT THE USER-DEFINED RT CORRECTION'S KEYS. That older correction has its own library path,
+# peak selection mode and RT weight ("compounds library file path for rt correction", "rt correction peak
+# selection mode", "... rt weight"), which the method writer writes on every run; these are other Console
+# keys and have their own state keys. Each is written only when the state sets it, and only for a Console
+# whose assembly carries the key (AUTOMATIC_RT_ANCHOR_MODES_CAPABILITY): a Console before #845 would list
+# it as unrecognised and run Automatic, with no preview.
+AUTOMATIC_RT_ANCHOR_MODES_CAPABILITY = "automatic_alignment_rt_correction_anchor_modes"
+AUTOMATIC_RT_CORRECTION_ANCHOR_MODE = "automatic_rt_correction_anchor_mode"
+AUTOMATIC_RT_CORRECTION_ANCHOR_LIBRARY_PATH = "automatic_rt_correction_anchor_library_path"
+AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_MODE = "automatic_rt_correction_anchor_peak_selection_mode"
+AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_RT_WEIGHT = "automatic_rt_correction_anchor_peak_selection_rt_weight"
+# Set only by prepare_automatic_rt_preview, never by an answer or a template.
+AUTOMATIC_RT_CORRECTION_PREVIEW_ONLY = "automatic_rt_correction_preview_only"
+# The approval record beside an approved library (automatic_rt_anchors.approval_for_library), as
+# prepare_run found it; provenance only, never a Console key.
+AUTOMATIC_RT_CORRECTION_ANCHOR_APPROVAL = "automatic_rt_correction_anchor_approval"
+AUTOMATIC_RT_ANCHOR_METHOD_KEYS = {
+    AUTOMATIC_RT_CORRECTION_ANCHOR_MODE: "automatic rt correction anchor mode",
+    AUTOMATIC_RT_CORRECTION_ANCHOR_LIBRARY_PATH: "automatic rt correction anchor library file path",
+    AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_MODE: "automatic rt correction anchor peak selection mode",
+    AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_RT_WEIGHT: "automatic rt correction anchor peak selection rt weight",
+    AUTOMATIC_RT_CORRECTION_PREVIEW_ONLY: "automatic rt correction preview only",
+}
+# The lowercase keys #845's ConfigParser reads, in the Console assembly; both are required.
+AUTOMATIC_RT_ANCHOR_CONSOLE_MARKERS = (
+    "automatic rt correction anchor mode",
+    "automatic rt correction preview only",
+)
 # MsdialWorkbench#826 judges each anchor against the median offsets of the other compounds matched in
 # the file within this many minutes of it (0 = the run-wide test only), co-eluting reference candidates
 # (isotope peaks, adducts) counting as one compound and the anchor's own compound left out, and floors
@@ -1541,6 +1595,7 @@ def load_parameter_template(
             ],
         ),
         **_template_local_support_rt_window(values),
+        **_template_anchor_settings(values, template_path),
         # A template's lipid RT check lines, as the setting they state, so the run writes and records them
         # (lipid_rt_check.template_setting); an LC-MS project's only. Read as the Console reads them: a blank
         # value is skipped (lipid_rt_check.template_values).
@@ -1799,12 +1854,35 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                 }
             )
         issues.extend(_automatic_rt_correction_value_issues(state))
+        issues.extend(_automatic_rt_anchor_issues(state))
         console_path = Path(str(state.get("console_path", "")).strip()).expanduser()
         found = (
             console_capabilities(str(console_path))["capabilities"]
             if console_path.is_file()
             else None
         )
+        anchor_settings = automatic_rt_anchor_settings(state)
+        if (
+            found is not None
+            and anchor_settings
+            and AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY in found
+            and AUTOMATIC_RT_ANCHOR_MODES_CAPABILITY not in found
+        ):
+            # That Console would list every #845 key as unrecognised and run Automatic to the end: a
+            # preview would align, and a library of approved anchors would never be read.
+            named = ", ".join(
+                AUTOMATIC_RT_ANCHOR_METHOD_KEYS[key] for key in anchor_settings
+            )
+            issues.append(
+                {
+                    "level": "error",
+                    "message": (
+                        "The selected MS-DIAL Console predates named automatic RT correction anchors and "
+                        "the anchor preview (MsdialWorkbench#845) and would ignore " + named + ". Select a "
+                        "Console that has them (5.5.261105 or later), or leave the anchor settings unset."
+                    ),
+                }
+            )
         if found is not None and AUTOMATIC_ALIGNMENT_RT_CORRECTION_CAPABILITY not in found:
             issues.append(
                 {
@@ -2416,6 +2494,8 @@ def data_type_record(state: dict[str, Any]) -> dict[str, Any]:
 def prepare_run(
     state: dict[str, Any],
     progress: Callable[[str], None] | None = None,
+    *,
+    automatic_rt_preview: bool = False,
 ) -> dict[str, Any]:
     # A web page's state has not read its template's lipid RT check lines; the run writes and records them.
     state = with_template_lipid_rt_check(state)
@@ -2446,6 +2526,11 @@ def prepare_run(
     csv_path = run_directory / "analysis_files.csv"
     _write_analysis_csv(csv_path, files, effective_files)
     method_state = dict(state)
+    # Only prepare_automatic_rt_preview prepares a preview. A preview switch reaching any other run, through
+    # workflow_overrides or a saved state, would stop that run before alignment while it was recorded,
+    # finalised and reported as a production run.
+    if not automatic_rt_preview:
+        method_state.pop(AUTOMATIC_RT_CORRECTION_PREVIEW_ONLY, None)
     if method_state.get("height_matrix_export") and not str(
         method_state.get("export_folder_path", "")
     ).strip():
@@ -2464,6 +2549,26 @@ def prepare_run(
             if lipid_rt_setting and str(state.get("console_path") or "").strip() and console_file.is_file()
             else None,
         )
+    # Recomputed for every run, never carried over from a state an earlier run saved: the approval beside
+    # the library this run reads, when it still describes that library (automatic_rt_anchor_library_record).
+    method_state.pop(AUTOMATIC_RT_CORRECTION_ANCHOR_APPROVAL, None)
+    anchor_library_record = automatic_rt_anchor_library_record(method_state) if project_type == "lcms" else None
+    anchor_warnings: list[dict[str, str]] = []
+    if anchor_library_record:
+        approval = anchor_library_record.get("approval")
+        if approval and approval.get("matches_library"):
+            method_state[AUTOMATIC_RT_CORRECTION_ANCHOR_APPROVAL] = approval
+        elif approval:
+            anchor_warnings.append(
+                {
+                    "level": "warning",
+                    "message": (
+                        f"The anchor library {anchor_library_record['path']} was changed after it was approved "
+                        f"({approval.get('approval_record')}); the run uses it as it is now, and its records do "
+                        "not call its anchors approved. Approve the anchors again from a preview to change that."
+                    ),
+                }
+            )
     repository_metadata_files: dict[str, str] = {}
     if isinstance(state.get("repository_metadata"), dict):
         from .repository_metadata import save_metadata_review
@@ -2579,6 +2684,15 @@ def prepare_run(
         "text_annotator_settings_file": str(method_state.get("text_annotator_settings_file_path", "")),
         "rt_correction_anchor_file": str(method_state.get("rt_correction_anchor_path", "")),
         "rt_correction_selection_file": str(method_state.get("rt_correction_selection_path", "")),
+        # MsdialWorkbench#845: the anchor mode, the library by path and SHA-256, and its approval.
+        **(
+            {"automatic_rt_correction_anchor_library": anchor_library_record}
+            if anchor_library_record else {}
+        ),
+        **(
+            {"automatic_rt_correction_preview_only": True}
+            if method_state.get(AUTOMATIC_RT_CORRECTION_PREVIEW_ONLY) is True else {}
+        ),
         "repository_metadata_files": repository_metadata_files,
         "command": command,
         "expected_analysis_exports": expected_analysis_exports,
@@ -2673,8 +2787,127 @@ def prepare_run(
         # were kept without ever saying the policy had not been understood.
         "repository_raw_retention_policy": retention_policy,
         **reproduction,
-        "warnings": [issue for issue in issues if issue["level"] == "warning"] + retention_warnings,
+        **(
+            {"automatic_rt_correction_anchor_library": anchor_library_record}
+            if anchor_library_record else {}
+        ),
+        "warnings": [issue for issue in issues if issue["level"] == "warning"]
+        + retention_warnings
+        + anchor_warnings,
     }
+
+
+def automatic_rt_anchor_library_record(state: dict[str, Any]) -> dict[str, Any] | None:
+    """The anchor library a run reads (MsdialWorkbench#845) by path and SHA-256, with its approval.
+
+    None unless the run corrects RT automatically in UserOnly or Hybrid mode from a library that exists.
+    The approval is the record beside the library (automatic_rt_anchors.approval_for_library); its
+    matches_library says whether it still describes the file.
+    """
+    if not state.get("execute_automatic_rt_correction"):
+        return None
+    mode = automatic_rt_anchor_mode(state)
+    library = str(automatic_rt_anchor_settings(state).get(AUTOMATIC_RT_CORRECTION_ANCHOR_LIBRARY_PATH) or "")
+    if mode not in {"UserOnly", "Hybrid"} or not library or not Path(library).expanduser().is_file():
+        return None
+    path = Path(library).expanduser().resolve()
+    return {
+        "anchor_mode": mode,
+        "path": str(path),
+        "name": path.name,
+        "sha256": anchor_library_sha256(path),
+        "approval": automatic_rt_anchor_approval_for_library(path),
+    }
+
+
+def prepare_automatic_rt_preview(
+    state: dict[str, Any],
+    output_root: str | Path,
+    job_id: str = "",
+) -> dict[str, Any]:
+    """Prepare an anchor preview (MsdialWorkbench#845) in a directory of its own; ``state`` is not changed.
+
+    The preview is the production method with "Automatic RT correction preview only: True": the Console
+    picks peaks, chooses the anchors, writes its audit into ``output_root`` and stops. Nothing is aligned
+    and nothing is saved beside the raw data. ``output_root`` is the preview's own directory
+    (diagnostic_paths.diagnostic_run_directory), never the production output root, whose method file and
+    audit the preview would otherwise replace. No annotation library is loaded, because the Console reads
+    none in a preview, and no project, QA matrix or candidate export is asked for.
+
+    The preview record beside the audit (automatic_rt_anchors.PREVIEW_RECORD) keeps what the approval
+    needs: the tolerances an accepted automatic anchor takes, the library the preview read, and the
+    production output root, where the approved library is written.
+    """
+    project_type = str(state.get("project_type", "lcms")).lower()
+    if project_type != "lcms":
+        raise ValueError("The anchor preview is an LC-MS automatic RT correction feature.")
+    if not state.get("execute_automatic_rt_correction"):
+        raise ValueError("Enable automatic alignment RT correction before previewing its anchors.")
+    production_root = str(state.get("output_root") or "").strip()
+    if not production_root:
+        raise ValueError("Set the output root: the approved anchor library is written there.")
+    preview = copy.deepcopy(state)
+    preview["output_root"] = str(output_root)
+    preview["stage_inputs"] = False
+    preview["project_store"] = False
+    preview["run_qa"] = False
+    preview["height_matrix_export"] = False
+    preview["export_folder_path"] = ""
+    preview["export_annotation_candidates"] = False
+    preview[AUTOMATIC_RT_CORRECTION_PREVIEW_ONLY] = True
+    _skip_diagnostic_annotation(preview)
+    preview["diagnostic_annotation"]["reason"] = (
+        "automatic RT correction anchor preview: the Console picks peaks and chooses anchors only, and "
+        "reads no annotation library"
+    )
+    prepared = prepare_run(preview, automatic_rt_preview=True)
+    run_directory = Path(prepared["run_directory"])
+    expected = [str(run_directory / AUTOMATIC_RT_CORRECTION_SUMMARY), str(run_directory / AUTOMATIC_RT_CORRECTION_ANCHORS)]
+    prepared["expected_analysis_exports"] = expected
+    prepared["expected_automatic_rt_correction_exports"] = expected
+    prepared["diagnostic_result_file"] = ""
+    # A preview writes the audit and no per-file peak list, and its manifest says so.
+    manifest_path = Path(prepared["manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["expected_analysis_exports"] = expected
+    manifest["expected_automatic_rt_correction_exports"] = expected
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    prepared["diagnostic_annotation"] = dict(preview["diagnostic_annotation"])
+    mode = automatic_rt_anchor_mode(preview)
+    library_record = automatic_rt_anchor_library_record(preview)
+    record = {
+        "job_id": job_id,
+        "created_at": dt.datetime.now().astimezone().isoformat(),
+        "preview_directory": str(run_directory),
+        "output_root": str(Path(production_root).expanduser().resolve()),
+        "anchor_mode": mode,
+        "anchor_library_path": (library_record or {}).get("path", ""),
+        "anchor_library_sha256": (library_record or {}).get("sha256", ""),
+        "anchor_peak_selection_mode": automatic_rt_anchor_settings(preview).get(
+            AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_MODE, "HighestIntensity"
+        ),
+        "match_rt_tolerance": float(
+            preview.get(
+                "automatic_rt_correction_match_rt_tolerance",
+                AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_match_rt_tolerance"],
+            )
+        ),
+        "alignment_ms1_tolerance": float(preview.get("alignment_ms1_tolerance", 0.015)),
+        "minimum_anchors": int(
+            float(
+                preview.get(
+                    "automatic_rt_correction_minimum_anchors",
+                    AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_minimum_anchors"],
+                )
+            )
+        ),
+        "method_file": prepared["method_file"],
+        "console_path": str(state.get("console_path") or ""),
+        "repository_run_manifest": str(state.get("repository_run_manifest") or ""),
+    }
+    prepared["automatic_rt_preview_record"] = str(write_automatic_rt_preview_record(run_directory, record))
+    prepared["automatic_rt_preview"] = record
+    return prepared
 
 
 def _manifest_libraries(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3528,6 +3761,13 @@ def _write_reproduction_files(
             value = str(state.get(key, "")).strip()
             if value and Path(value).is_file():
                 members.append(Path(value))
+    # MsdialWorkbench#845: the anchor library the Console reads, and the record of its approval.
+    anchor_library = automatic_rt_anchor_library_record(state) if analysis_type == "lcms" else None
+    if anchor_library:
+        members.append(Path(anchor_library["path"]))
+        approval_record = automatic_rt_anchor_approval_record_path(anchor_library["path"])
+        if approval_record.is_file():
+            members.append(approval_record)
     for value in (state.get("repository_metadata_files") or {}).values():
         path = Path(str(value))
         if path.is_file():
@@ -3553,6 +3793,8 @@ _LOCAL_REPRODUCE_TEXT = (
     "- msp_annotator_settings.tsv: optional per-MSP LC-MS annotation settings\n"
     "- text_annotator_settings.tsv: optional per-Text-library LC-MS annotation settings\n"
     "- RT correction anchor/selection files: included when RT correction is enabled\n"
+    "- automatic RT correction anchor library and its .approval.json: included when the anchor\n"
+    "  mode is UserOnly or Hybrid\n"
     "- workflow-settings.json: UI settings used to generate the workflow\n"
     "- *_repository_metadata_reviewed.json / *_sample_metadata_reviewed.tsv: reviewed repository metadata and Class hierarchy\n"
     "- command.txt: exact command generated on the original machine\n"
@@ -3598,6 +3840,8 @@ _SHARED_REPRODUCE_TEXT = (
     "- msp_annotator_settings.tsv: optional per-MSP LC-MS annotation settings\n"
     "- text_annotator_settings.tsv: optional per-Text-library LC-MS annotation settings\n"
     "- RT correction anchor/selection files: included when RT correction is enabled\n"
+    "- automatic RT correction anchor library and its .approval.json: included when the anchor\n"
+    "  mode is UserOnly or Hybrid\n"
     "- workflow-settings.json and run-manifest.json: the settings and the run record, with paths\n"
     "  made relative to this directory\n"
     "- *_repository_metadata_reviewed.json / *_sample_metadata_reviewed.tsv: reviewed repository metadata and Class hierarchy\n"
@@ -4631,6 +4875,8 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
     local_window = automatic_rt_local_support_rt_window(state)
     if local_window is not None:
         automatic_rt_replacements[AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_METHOD_KEY] = local_window
+    # MsdialWorkbench#845's lines, each only when the state sets it (automatic_rt_anchor_method_replacements).
+    automatic_rt_replacements.update(automatic_rt_anchor_method_replacements(state))
     automatic_rt_enabled = bool(
         project_type == "lcms" and state.get("execute_automatic_rt_correction", False)
     )
@@ -4727,6 +4973,10 @@ def _write_method(path: Path, state: dict[str, Any]) -> None:
             line_key == AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_METHOD_KEY
             and line_key not in replacements
         ):
+            continue
+        # The same for #845's lines. Above all a template's "Automatic RT correction preview only: True"
+        # is never copied through: it would stop the production run before alignment.
+        if line_key in AUTOMATIC_RT_ANCHOR_METHOD_KEYS.values() and line_key not in replacements:
             continue
         if line_key in ("solvent type", "searched lipid class"):
             continue
@@ -5011,6 +5261,12 @@ def _title_for_key(key: str) -> str:
         "automatic rt correction reference centrality weight": "Automatic RT correction reference centrality weight",
         "automatic rt correction interpolate blanks by analytical order": "Automatic RT correction interpolate blanks by analytical order",
         "automatic rt correction local support rt window": "Automatic RT correction local support RT window",
+        # MsdialWorkbench#845, as ParameterBase writes them.
+        "automatic rt correction anchor mode": "Automatic RT correction anchor mode",
+        "automatic rt correction anchor library file path": "Automatic RT correction anchor library file path",
+        "automatic rt correction anchor peak selection mode": "Automatic RT correction anchor peak selection mode",
+        "automatic rt correction anchor peak selection rt weight": "Automatic RT correction anchor peak selection RT weight",
+        "automatic rt correction preview only": "Automatic RT correction preview only",
         "ionization": "Ionization",
         "machine category": "Machine category",
         "accuracy type": "Accuracy type",
@@ -5315,6 +5571,178 @@ def _template_local_support_rt_window(values: dict[str, str]) -> dict[str, Any]:
     return {AUTOMATIC_RT_CORRECTION_LOCAL_SUPPORT_RT_WINDOW: value}
 
 
+def _template_anchor_settings(values: dict[str, str], template_path: Path) -> dict[str, Any]:
+    """A template's #845 anchor lines as state entries; nothing for a line it does not have.
+
+    The library path is read against the template's folder, as the Console reads it against the method
+    file's. The preview switch is never read from a template: a template that said True would make
+    every production run a preview.
+    """
+    found: dict[str, Any] = {}
+    for state_key, method_key in AUTOMATIC_RT_ANCHOR_METHOD_KEYS.items():
+        if state_key == AUTOMATIC_RT_CORRECTION_PREVIEW_ONLY:
+            continue
+        raw = values.get(method_key, "").strip()
+        if not raw:
+            continue
+        if state_key == AUTOMATIC_RT_CORRECTION_ANCHOR_LIBRARY_PATH:
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                candidate = template_path.parent / candidate
+            found[state_key] = str(candidate.resolve())
+        elif state_key == AUTOMATIC_RT_CORRECTION_ANCHOR_MODE:
+            found[state_key] = canonical_anchor_mode(raw) or raw
+        elif state_key == AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_MODE:
+            found[state_key] = canonical_peak_selection_mode(raw) or raw
+        else:
+            found[state_key] = raw
+    return found
+
+
+def _set(value: Any) -> bool:
+    """A state value that sets a setting: not None, and not a blank string."""
+    return value is not None and not (isinstance(value, str) and not value.strip())
+
+
+def automatic_rt_anchor_settings(state: dict[str, Any]) -> dict[str, Any]:
+    """The #845 settings the state sets, by state key, as the method writer would write them.
+
+    The modes come back in the Console's spelling, the weight as a float when it is a number, and the
+    library path as given; a value that cannot be read comes back as given, for
+    _automatic_rt_anchor_issues to refuse. A setting left unset is absent.
+    """
+    found: dict[str, Any] = {}
+    mode = state.get(AUTOMATIC_RT_CORRECTION_ANCHOR_MODE)
+    if _set(mode):
+        found[AUTOMATIC_RT_CORRECTION_ANCHOR_MODE] = canonical_anchor_mode(mode) or mode
+    library = state.get(AUTOMATIC_RT_CORRECTION_ANCHOR_LIBRARY_PATH)
+    if _set(library):
+        found[AUTOMATIC_RT_CORRECTION_ANCHOR_LIBRARY_PATH] = str(library).strip()
+    selection = state.get(AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_MODE)
+    if _set(selection):
+        found[AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_MODE] = (
+            canonical_peak_selection_mode(selection) or selection
+        )
+    weight = state.get(AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_RT_WEIGHT)
+    if _set(weight):
+        if isinstance(weight, bool) or (isinstance(weight, str) and not _INVARIANT_NUMBER.fullmatch(weight)):
+            found[AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_RT_WEIGHT] = weight
+        else:
+            try:
+                found[AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_RT_WEIGHT] = float(weight)
+            except (TypeError, ValueError, OverflowError):
+                found[AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_RT_WEIGHT] = weight
+    if state.get(AUTOMATIC_RT_CORRECTION_PREVIEW_ONLY) is True:
+        found[AUTOMATIC_RT_CORRECTION_PREVIEW_ONLY] = True
+    return found
+
+
+def automatic_rt_anchor_mode(state: dict[str, Any]) -> str:
+    """The anchor mode the Console runs: the state's, or Automatic, its default, when unset."""
+    return automatic_rt_anchor_settings(state).get(AUTOMATIC_RT_CORRECTION_ANCHOR_MODE) or "Automatic"
+
+
+def automatic_rt_anchor_method_replacements(state: dict[str, Any]) -> dict[str, Any]:
+    """The #845 method lines for a state, keyed by method key; only the settings it sets.
+
+    The library path is written only for UserOnly and Hybrid, the modes that read it, and the RT weight
+    only for Weighted selection, the one mode that uses it. A path is written absolute, as every other
+    library path is, so the Console does not read it against another folder than the one validated.
+    """
+    settings = automatic_rt_anchor_settings(state)
+    mode = settings.get(AUTOMATIC_RT_CORRECTION_ANCHOR_MODE)
+    lines: dict[str, Any] = {}
+    if mode is not None:
+        lines[AUTOMATIC_RT_ANCHOR_METHOD_KEYS[AUTOMATIC_RT_CORRECTION_ANCHOR_MODE]] = mode
+    library = settings.get(AUTOMATIC_RT_CORRECTION_ANCHOR_LIBRARY_PATH)
+    if library and mode in {"UserOnly", "Hybrid"}:
+        lines[AUTOMATIC_RT_ANCHOR_METHOD_KEYS[AUTOMATIC_RT_CORRECTION_ANCHOR_LIBRARY_PATH]] = str(
+            Path(library).expanduser().resolve()
+        )
+    selection = settings.get(AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_MODE)
+    if selection is not None:
+        lines[AUTOMATIC_RT_ANCHOR_METHOD_KEYS[AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_MODE]] = selection
+    weight = settings.get(AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_RT_WEIGHT)
+    if weight is not None and selection == "Weighted":
+        lines[AUTOMATIC_RT_ANCHOR_METHOD_KEYS[AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_RT_WEIGHT]] = weight
+    if settings.get(AUTOMATIC_RT_CORRECTION_PREVIEW_ONLY):
+        lines[AUTOMATIC_RT_ANCHOR_METHOD_KEYS[AUTOMATIC_RT_CORRECTION_PREVIEW_ONLY]] = True
+    return lines
+
+
+def _automatic_rt_anchor_issues(state: dict[str, Any]) -> list[dict[str, str]]:
+    """Refuse every #845 setting the Console would refuse or ignore, and a library it would refuse.
+
+    The modes take the Console's names (any letter case; UserOnly also user_only or "user only"). The RT
+    weight is a number from 0 to 1. UserOnly and Hybrid need a library the Console's strict reader and
+    Check accept: the header line, seven columns, a decimal point, True/False/T/F, positive m/z and
+    tolerances, an RT of 0 or more, a True row's minimum height of 0 or more, at least the minimum
+    anchor count of True rows for UserOnly and at least one row for Hybrid.
+    """
+    issues: list[dict[str, str]] = []
+
+    def error(message: str) -> None:
+        issues.append({"level": "error", "message": message})
+
+    settings = automatic_rt_anchor_settings(state)
+    mode = settings.get(AUTOMATIC_RT_CORRECTION_ANCHOR_MODE)
+    if mode is not None and mode not in AUTOMATIC_RT_ANCHOR_MODES:
+        error(
+            f"Automatic RT correction anchor mode {mode!r} is not one of "
+            + ", ".join(AUTOMATIC_RT_ANCHOR_MODES) + "."
+        )
+        return issues
+    selection = settings.get(AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_MODE)
+    if selection is not None and selection not in AUTOMATIC_RT_ANCHOR_PEAK_SELECTION_MODES:
+        error(
+            f"Automatic RT correction anchor peak selection mode {selection!r} is not one of "
+            + ", ".join(AUTOMATIC_RT_ANCHOR_PEAK_SELECTION_MODES) + "."
+        )
+    weight = settings.get(AUTOMATIC_RT_CORRECTION_ANCHOR_PEAK_SELECTION_RT_WEIGHT)
+    if weight is not None:
+        if not isinstance(weight, float) or not math.isfinite(weight):
+            error(f"Automatic RT correction anchor peak selection RT weight must be a number, not {weight!r}.")
+        elif not 0 <= weight <= 1:
+            error("Automatic RT correction anchor peak selection RT weight must be between 0 and 1.")
+    library = settings.get(AUTOMATIC_RT_CORRECTION_ANCHOR_LIBRARY_PATH)
+    effective = mode or "Automatic"
+    if effective == "Automatic":
+        if library:
+            issues.append(
+                {
+                    "level": "warning",
+                    "message": (
+                        "An automatic RT correction anchor library is set, but the anchor mode is Automatic, "
+                        "which reads no library; it is not written to the method file."
+                    ),
+                }
+            )
+        return issues
+    if not library:
+        error(f"Automatic RT correction anchor mode {effective} needs an anchor library file.")
+        return issues
+    minimum_raw = state.get(
+        "automatic_rt_correction_minimum_anchors",
+        AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_minimum_anchors"],
+    )
+    try:
+        minimum = int(float(minimum_raw))
+    except (TypeError, ValueError, OverflowError):
+        # _automatic_rt_correction_value_issues refuses it.
+        return issues
+    try:
+        rows = read_anchor_library(library)
+    except FileNotFoundError:
+        error(f"Automatic RT correction anchor library not found: {library}")
+        return issues
+    except (AnchorLibraryError, OSError) as problem:
+        error(f"Automatic RT correction anchor library cannot be used: {problem}")
+        return issues
+    for problem in anchor_library_issues(rows, effective, minimum):
+        error(f"Automatic RT correction anchor library cannot be used: {problem}")
+    return issues
+
+
 def automatic_rt_correction_value(key: str, value: Any) -> Any:
     """Coerce one automatic RT-correction setting without hiding a value the Console refuses.
 
@@ -5400,6 +5828,9 @@ def console_capabilities(console_path: str) -> dict[str, Any]:
     ):
         capabilities.add(AUTOMATIC_RT_LOCAL_SUPPORT_CAPABILITY)
         probes.append("automatic RT local support marker")
+    if _has_every_marker(binary, AUTOMATIC_RT_ANCHOR_CONSOLE_MARKERS):
+        capabilities.add(AUTOMATIC_RT_ANCHOR_MODES_CAPABILITY)
+        probes.append("automatic RT anchor modes marker")
     if _has_every_marker(binary, MULTI_ENERGY_AIF_CONSOLE_MARKERS):
         capabilities.add(MULTI_ENERGY_AIF_CAPABILITY)
         probes.append("multi-energy AIF marker")

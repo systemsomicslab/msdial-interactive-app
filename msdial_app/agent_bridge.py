@@ -94,6 +94,10 @@ def summarize_jobs(
             # and the gate refuses a run set against a decided level.
             "repository_data_type_as_delivered",
             "automatic_alignment_rt_correction",
+            # MsdialWorkbench#845: anchor mode (Automatic, UserOnly, Hybrid) and anchor library answers, the
+            # anchor preview job (automatic_rt_preview, /api/agent/automatic-rt/preview), and the approval that
+            # writes the production anchor library from a person's accepted and rejected lists.
+            "automatic_rt_correction_anchor_modes_preview_approval",
             "console_time_limits",
             "cancel_console_and_download_jobs",
             "repository_run_attempt_records",
@@ -411,6 +415,12 @@ def summarize_job(
         # A failed repository download: the record its lease wrote into the unit manifest, verbatim, where
         # retryable false and disposition {decision "exclude", ...} say the unit is to be excluded, not retried.
         summary["download_failure"] = dict(job["download_failure"])
+    if job.get("kind") == "automatic_rt_preview" and isinstance(job.get("result"), dict):
+        # A finished anchor preview: how many anchors of which source it chose, and where its audit is.
+        summary["automatic_rt_preview"] = dict(job["result"])
+    if isinstance(job.get("automatic_rt_reference_check"), dict):
+        # A run with an approved anchor library: its reference file against the preview's (MsdialWorkbench#876).
+        summary["automatic_rt_reference_check"] = dict(job["automatic_rt_reference_check"])
     return summary
 
 

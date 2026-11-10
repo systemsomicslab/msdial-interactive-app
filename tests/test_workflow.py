@@ -535,6 +535,67 @@ class WorkflowTests(unittest.TestCase):
                 set(prepared["expected_automatic_rt_correction_exports"]),
             )
 
+    def test_prepare_run_records_and_bundles_an_approved_anchor_library(self) -> None:
+        # MsdialWorkbench#845: the library a UserOnly run reads, its approval record beside it, and a
+        # warning instead of an approval claim once the library has been edited after its approval.
+        from msdial_app.automatic_rt_anchors import approval_record_path, write_anchor_library
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "sample.mzML"
+            raw.write_text("raw", encoding="ascii")
+            console = root / "MSDIALCUI"
+            console.write_bytes(
+                "execute automatic rt correction for alignment".encode("utf-16-le")
+                + "automatic rt correction anchor mode".encode("utf-16-le")
+                + "automatic rt correction preview only".encode("utf-16-le")
+            )
+            template = root / "method.txt"
+            template.write_text("Ion mode: Positive\n", encoding="ascii")
+            library = root / "approved.txt"
+            write_anchor_library(
+                library,
+                [
+                    {"name": f"auto{index}", "rt": float(index), "rt_tolerance": 0.5, "mz": 100.0 + index,
+                     "mz_tolerance": 0.015, "minimum_height": 0, "include": True}
+                    for index in range(1, 4)
+                ],
+            )
+            digest = __import__("hashlib").sha256(library.read_bytes()).hexdigest()
+            approval_record_path(library).write_text(
+                json.dumps({"schema": "msdial-interactive/automatic-rt-anchor-approval/1",
+                            "library_sha256": digest, "approved_by": "A. Person"}),
+                encoding="utf-8",
+            )
+            state = {
+                "project_type": "lcms",
+                "files": expand_paths([str(raw)]),
+                "console_path": str(console),
+                "template_path": str(template),
+                "output_root": str(root / "output"),
+                "ion_mode": "Positive",
+                "target_omics": "Metabolomics",
+                "execute_automatic_rt_correction": True,
+                "automatic_rt_correction_anchor_mode": "UserOnly",
+                "automatic_rt_correction_anchor_library_path": str(library),
+                # An approval an earlier run's settings carried is never taken over.
+                "automatic_rt_correction_anchor_approval": {"library_sha256": "stale"},
+            }
+            prepared = prepare_run(dict(state))
+            settings = json.loads(Path(prepared["settings_file"]).read_text(encoding="utf-8"))
+            self.assertEqual(digest, settings["automatic_rt_correction_anchor_approval"]["library_sha256"])
+            self.assertTrue(prepared["automatic_rt_correction_anchor_library"]["approval"]["matches_library"])
+            with zipfile.ZipFile(prepared["bundle"]) as archive:
+                self.assertIn("approved.txt", archive.namelist())
+                self.assertIn("approved.txt.approval.json", archive.namelist())
+
+            with library.open("a", encoding="ascii") as handle:
+                handle.write("extra\t4\t0.5\t104\t0.015\t0\tFalse\n")
+            prepared = prepare_run(dict(state))
+            settings = json.loads(Path(prepared["settings_file"]).read_text(encoding="utf-8"))
+            self.assertNotIn("automatic_rt_correction_anchor_approval", settings)
+            self.assertTrue(any("changed after it was approved" in item["message"] for item in prepared["warnings"]))
+
     def test_automatic_rt_keys_are_omitted_when_disabled_or_not_lcms(self) -> None:
         for project_type in ("lcms", "gcms"):
             with self.subTest(project_type=project_type), tempfile.TemporaryDirectory() as temporary:

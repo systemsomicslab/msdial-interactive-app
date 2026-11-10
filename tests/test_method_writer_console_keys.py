@@ -85,6 +85,24 @@ class WriterTests(unittest.TestCase):
         self.assertIn("# Minimum peak height: 100", lines)
         self.assertEqual(["9000"], _settings(lines, "minimum peak height"))
 
+    def test_an_845_template_line_in_any_spelling_never_outlives_the_state(self) -> None:
+        # MsdialWorkbench#845. A preview switch left in a template would stop every production run
+        # before alignment; an anchor mode would run a mode the state never asked for.
+        template = (
+            "Automatic RT correction preview only = True\n"
+            "Automatic RT correction anchor mode : Hybrid\n"
+            "Automatic RT correction anchor peak selection mode: Weighted\n"
+        )
+        lines = _written(template, execute_automatic_rt_correction=True)
+        self.assertEqual([], _settings(lines, "automatic rt correction preview only"))
+        self.assertEqual([], _settings(lines, "automatic rt correction anchor mode"))
+        self.assertEqual([], _settings(lines, "automatic rt correction anchor peak selection mode"))
+
+        lines = _written(template, execute_automatic_rt_correction=True,
+                         automatic_rt_correction_anchor_peak_selection_mode="ClosestToReferenceRt")
+        self.assertEqual(["ClosestToReferenceRt"], _settings(lines, "automatic rt correction anchor peak selection mode"))
+        self.assertEqual([], _settings(lines, "automatic rt correction preview only"))
+
 
 if __name__ == "__main__":
     unittest.main()

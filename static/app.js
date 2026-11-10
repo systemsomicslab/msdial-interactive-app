@@ -36,6 +36,12 @@ const state = {
   qaReport: null,
   qaSourceJobId: "",
   automaticRtReview: null,
+  // MsdialWorkbench#845: the anchor library editor, the preview job, and the person's decisions per anchor.
+  automaticRtAnchors: [],
+  automaticRtAnchorsDirty: false,
+  automaticRtPreviewJobId: "",
+  automaticRtPreviewDirectory: "",
+  automaticRtDecisions: {},
   pathPicker: {
     mode: "vendor",
     currentPath: "",
@@ -182,6 +188,12 @@ function workflow() {
     automatic_rt_correction_interpolate_blanks_by_analytical_order: Boolean($("#automaticRtInterpolateBlanks")?.checked),
     // Blank stays undefined, which JSON leaves out: the method file then has no line for it.
     automatic_rt_correction_local_support_rt_window: numberField("#automaticRtLocalSupportRtWindow", undefined),
+    // MsdialWorkbench#845. Blank stays undefined, so the method file has no line and the Console keeps its
+    // default (Automatic, HighestIntensity, 0.5). These are not the legacy rt_correction_* keys below.
+    automatic_rt_correction_anchor_mode: $("#automaticRtAnchorMode")?.value || undefined,
+    automatic_rt_correction_anchor_library_path: $("#automaticRtAnchorLibraryPath")?.value.trim() || undefined,
+    automatic_rt_correction_anchor_peak_selection_mode: $("#automaticRtAnchorPeakSelectionMode")?.value || undefined,
+    automatic_rt_correction_anchor_peak_selection_rt_weight: numberField("#automaticRtAnchorRtWeight", undefined),
     run_qa: $("#projectType").value === "lcms" && Boolean($("#heightMatrixExport")?.checked),
     height_matrix_export: $("#projectType").value === "lcms" && Boolean($("#heightMatrixExport")?.checked),
     export_folder_path: $("#projectType").value === "lcms" && $("#heightMatrixExport")?.checked
@@ -1012,6 +1024,16 @@ function applyLoadedParameterTemplate(result) {
   if ($("#automaticRtLocalSupportRtWindow")) {
     $("#automaticRtLocalSupportRtWindow").value = values.automatic_rt_correction_local_support_rt_window ?? "";
   }
+  // The same for the #845 anchor lines: a template without them leaves them to the Console.
+  [
+    ["automaticRtAnchorMode", values.automatic_rt_correction_anchor_mode],
+    ["automaticRtAnchorLibraryPath", values.automatic_rt_correction_anchor_library_path],
+    ["automaticRtAnchorPeakSelectionMode", values.automatic_rt_correction_anchor_peak_selection_mode],
+    ["automaticRtAnchorRtWeight", values.automatic_rt_correction_anchor_peak_selection_rt_weight],
+  ].forEach(([id, value]) => {
+    if ($(`#${id}`)) $(`#${id}`).value = value ?? "";
+  });
+  updateAutomaticRtCorrectionUI();
   setTemplateControl("heightMatrixExport", values.height_matrix_export, true);
   if (result.path) $("#templatePath").value = result.path;
   if (Array.isArray(result.msp_annotators)) state.mspAnnotators = result.msp_annotators;
@@ -1403,9 +1425,174 @@ function updateProjectUI() {
 function updateAutomaticRtCorrectionUI() {
   const checkbox = $("#executeAutomaticRtCorrection");
   const enabled = Boolean(checkbox?.checked);
-  $$("#automaticRtCorrectionPanel input").forEach((control) => {
+  $$("#automaticRtCorrectionPanel input, #automaticRtCorrectionPanel select, #automaticRtCorrectionPanel button").forEach((control) => {
     if (control !== checkbox) control.disabled = !enabled;
   });
+  // The RT weight is read only by Weighted selection, and the library only by UserOnly and Hybrid.
+  const weighted = $("#automaticRtAnchorPeakSelectionMode")?.value === "Weighted";
+  if ($("#automaticRtAnchorRtWeight")) $("#automaticRtAnchorRtWeight").disabled = !enabled || !weighted;
+  const readsLibrary = ["UserOnly", "Hybrid"].includes($("#automaticRtAnchorMode")?.value);
+  ["automaticRtAnchorLibraryPath", "browseAutomaticRtAnchorLibrary", "loadAutomaticRtAnchorLibrary", "saveAutomaticRtAnchors"]
+    .forEach((id) => { if ($(`#${id}`)) $(`#${id}`).disabled = !enabled || !readsLibrary; });
+  $$("#automaticRtAnchorRows input").forEach((control) => { control.disabled = !enabled || !readsLibrary; });
+}
+
+function renderAutomaticRtAnchors() {
+  const rows = state.automaticRtAnchors || [];
+  $("#automaticRtAnchorEditor").hidden = !rows.length;
+  updateAutomaticRtAnchorCount();
+  $("#automaticRtAnchorRows").innerHTML = rows.map((row, index) => `
+    <tr data-index="${index}">
+      <td><input data-key="include" type="checkbox" ${row.include ? "checked" : ""}></td>
+      <td><input data-key="name" value="${escapeHtml(row.name)}"></td>
+      <td><input data-key="rt" type="number" step="any" min="0" value="${Number(row.rt)}"></td>
+      <td><input data-key="rt_tolerance" type="number" step="any" min="0" value="${Number(row.rt_tolerance)}"></td>
+      <td><input data-key="mz" type="number" step="any" min="0" value="${Number(row.mz)}"></td>
+      <td><input data-key="mz_tolerance" type="number" step="any" min="0" value="${Number(row.mz_tolerance)}"></td>
+      <td><input data-key="minimum_height" type="number" step="any" min="0" value="${Number(row.minimum_height)}"></td>
+    </tr>`).join("");
+  $$("#automaticRtAnchorRows tr").forEach((tableRow) => {
+    const row = rows[Number(tableRow.dataset.index)];
+    tableRow.querySelectorAll("[data-key]").forEach((element) => {
+      element.addEventListener("input", () => {
+        const key = element.dataset.key;
+        row[key] = element.type === "checkbox"
+          ? element.checked
+          : element.type === "number"
+            ? Number(element.value)
+            : element.value;
+        state.automaticRtAnchorsDirty = true;
+        updateAutomaticRtAnchorCount();
+      });
+    });
+  });
+  updateAutomaticRtCorrectionUI();
+}
+
+function updateAutomaticRtAnchorCount() {
+  const rows = state.automaticRtAnchors || [];
+  const dirty = state.automaticRtAnchorsDirty ? " | Unsaved changes" : "";
+  $("#automaticRtAnchorCount").textContent =
+    `${rows.filter((row) => row.include).length} True / ${rows.length} rows${dirty}`;
+}
+
+async function loadAutomaticRtAnchors(path = $("#automaticRtAnchorLibraryPath").value.trim()) {
+  if (!path) throw new Error("Select an automatic RT correction anchor library.");
+  const result = await api("/api/automatic-rt/anchors/load", {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
+  $("#automaticRtAnchorLibraryPath").value = result.path;
+  state.automaticRtAnchors = result.rows || [];
+  state.automaticRtAnchorsDirty = false;
+  renderAutomaticRtAnchors();
+  setStatus(`Loaded ${state.automaticRtAnchors.length} anchor library row(s).`);
+}
+
+async function saveEditedAutomaticRtAnchors() {
+  if (!(state.automaticRtAnchors || []).length) throw new Error("Load an anchor library before saving.");
+  if (!$("#outputRoot").value.trim()) setOutputRootFromFirstFile();
+  if (!$("#outputRoot").value.trim()) throw new Error("Set Output root before saving the edited anchor library.");
+  const result = await api("/api/automatic-rt/anchors/save", {
+    method: "POST",
+    body: JSON.stringify({
+      output_root: $("#outputRoot").value.trim(),
+      source_path: $("#automaticRtAnchorLibraryPath").value.trim(),
+      rows: state.automaticRtAnchors,
+    }),
+  });
+  $("#automaticRtAnchorLibraryPath").value = result.path;
+  state.automaticRtAnchors = result.rows || state.automaticRtAnchors;
+  state.automaticRtAnchorsDirty = false;
+  renderAutomaticRtAnchors();
+  setStatus(`Saved edited anchor library: ${result.path}`);
+}
+
+async function startAutomaticRtPreview() {
+  if (state.automaticRtAnchorsDirty) {
+    throw new Error("Save the edited anchor library first; the preview reads the file, not the editor.");
+  }
+  if (!$("#outputRoot").value.trim()) setOutputRootFromFirstFile();
+  const result = await api("/api/automatic-rt/preview", {
+    method: "POST",
+    body: JSON.stringify({ workflow: workflow() }),
+  });
+  state.automaticRtPreviewJobId = result.job_id;
+  state.automaticRtDecisions = {};
+  $("#automaticRtPreviewLog").hidden = false;
+  $("#automaticRtPreviewLog").textContent = `Anchor preview queued.\nPreview folder: ${result.preview_directory}`;
+  pollAutomaticRtPreview();
+}
+
+async function pollAutomaticRtPreview() {
+  const jobId = state.automaticRtPreviewJobId;
+  if (!jobId) return;
+  try {
+    const job = await api(`/api/jobs/${jobId}`);
+    $("#automaticRtPreviewLog").textContent = (job.log_tail || job.logs || []).join("\n") || job.status;
+    $("#automaticRtPreviewLog").scrollTop = $("#automaticRtPreviewLog").scrollHeight;
+    setStatus(`Anchor preview ${job.status}`);
+    if (jobIsLive(job)) {
+      setTimeout(pollAutomaticRtPreview, 1500);
+    } else if (job.status === "completed") {
+      const review = await api("/api/automatic-rt/review", {
+        method: "POST",
+        body: JSON.stringify({ job_id: jobId }),
+      });
+      $("#automaticRtReviewDirectory").value = review.run_directory;
+      renderAutomaticRtReview(review);
+      const count = (review.anchor_review?.anchors || []).length;
+      $("#automaticRtPreviewLog").textContent +=
+        `\nPreview completed: ${count} anchor(s). Accept or reject each one in the RT correction audit viewer (Validate & run).`;
+    } else if (job.error) {
+      $("#automaticRtPreviewLog").textContent += `\n${job.error}`;
+    }
+  } catch (error) {
+    $("#automaticRtPreviewLog").textContent += `\nAnchor preview status error: ${error.message}`;
+  }
+}
+
+async function approveAutomaticRtAnchors() {
+  const review = state.automaticRtReview || {};
+  const anchors = review.anchor_review?.anchors || [];
+  const decisions = state.automaticRtDecisions || {};
+  const undecided = anchors.filter((anchor) => decisions[anchor.key] === undefined).map((anchor) => anchor.key);
+  if (undecided.length) throw new Error(`Accept or reject every anchor first. Undecided: ${undecided.join(", ")}`);
+  const approvedBy = $("#rtAnchorApprovedBy")?.value.trim() || "";
+  if (!approvedBy) throw new Error("Enter your name: the approval records who approved the anchors.");
+  const result = await api("/api/automatic-rt/approve", {
+    method: "POST",
+    body: JSON.stringify({
+      job_id: state.automaticRtPreviewJobId && review.run_directory === state.automaticRtPreviewDirectory
+        ? state.automaticRtPreviewJobId : "",
+      preview_directory: review.run_directory,
+      accepted: anchors.filter((anchor) => decisions[anchor.key] === true).map((anchor) => anchor.key),
+      rejected: anchors.filter((anchor) => decisions[anchor.key] === false).map((anchor) => anchor.key),
+      confirmed_by: approvedBy,
+      output_root: $("#outputRoot").value.trim(),
+      confirmed: true,
+    }),
+  });
+  const panel = $("#rtAnchorApprovalResult");
+  panel.hidden = false;
+  const summary = `<strong>Approved anchor library written.</strong><br>${escapeHtml(result.library_path)}<br>`
+    + `${result.true_rows} True row(s), ${result.false_rows} False row(s); SHA-256 ${escapeHtml(result.library_sha256)}.`;
+  $("#automaticRtAnchorLibraryPath").value = result.library_path;
+  if (result.production_anchor_mode === "UserOnly") {
+    $("#automaticRtAnchorMode").value = "UserOnly";
+    panel.innerHTML = `${summary}<br>The production run is set to anchor mode UserOnly with this library.`;
+  } else {
+    panel.innerHTML = `${summary}<br>${escapeHtml(result.message || "")}<br>`
+      + '<button id="rtAnchorUseHybrid" type="button" class="secondary">Use Hybrid with this library</button>';
+    $("#rtAnchorUseHybrid").addEventListener("click", () => {
+      $("#automaticRtAnchorMode").value = "Hybrid";
+      updateAutomaticRtCorrectionUI();
+      setStatus("Anchor mode set to Hybrid with the approved library.");
+    });
+  }
+  updateAutomaticRtCorrectionUI();
+  await loadAutomaticRtAnchors(result.library_path);
+  setStatus(`Approved anchor library written: ${result.library_path}`);
 }
 
 function updateRtCorrectionSelectionUI() {
@@ -1427,6 +1614,8 @@ function updateRtCorrectionLauncher() {
   const checkbox = $("#executeRtCorrection");
   checkbox.disabled = !ready;
   if (!ready) checkbox.checked = false;
+  // The legacy panel stays closed unless a workset or template already uses it.
+  if (checkbox.checked && $("#legacyRtCorrection")) $("#legacyRtCorrection").open = true;
   $("#rtCorrectionLauncherStatus").innerHTML = ready
     ? `<strong>Approved setup is ready.</strong><br>Anchor: ${escapeHtml(anchorPath)}<br>Peak selections: ${escapeHtml(selectionPath)}`
     : "Open the review workspace, inspect the anchor peaks, and save an approved peak-selection TSV.";
@@ -1462,6 +1651,10 @@ function saveRtWorkspaceState() {
     automatic_rt_correction_reference_centrality_weight: current.automatic_rt_correction_reference_centrality_weight,
     automatic_rt_correction_interpolate_blanks_by_analytical_order: current.automatic_rt_correction_interpolate_blanks_by_analytical_order,
     automatic_rt_correction_local_support_rt_window: current.automatic_rt_correction_local_support_rt_window,
+    automatic_rt_correction_anchor_mode: current.automatic_rt_correction_anchor_mode,
+    automatic_rt_correction_anchor_library_path: current.automatic_rt_correction_anchor_library_path,
+    automatic_rt_correction_anchor_peak_selection_mode: current.automatic_rt_correction_anchor_peak_selection_mode,
+    automatic_rt_correction_anchor_peak_selection_rt_weight: current.automatic_rt_correction_anchor_peak_selection_rt_weight,
     execute_rt_correction: current.execute_rt_correction,
     rt_correction_anchor_path: current.rt_correction_anchor_path,
     rt_correction_anchor_source_path: current.rt_correction_anchor_source_path,
@@ -1514,6 +1707,10 @@ function restoreRtWorkspaceState() {
     automaticRtOutlierMadThreshold: saved.automatic_rt_correction_outlier_mad_threshold,
     automaticRtReferenceCentralityWeight: saved.automatic_rt_correction_reference_centrality_weight,
     automaticRtLocalSupportRtWindow: saved.automatic_rt_correction_local_support_rt_window,
+    automaticRtAnchorMode: saved.automatic_rt_correction_anchor_mode,
+    automaticRtAnchorLibraryPath: saved.automatic_rt_correction_anchor_library_path,
+    automaticRtAnchorPeakSelectionMode: saved.automatic_rt_correction_anchor_peak_selection_mode,
+    automaticRtAnchorRtWeight: saved.automatic_rt_correction_anchor_peak_selection_rt_weight,
     rtCorrectionAnchorPath: saved.rt_correction_anchor_path,
     rtCorrectionSelectionPath: saved.rt_correction_selection_path,
     rtCorrectionDiffMethod: saved.rt_correction_diff_method,
@@ -2589,7 +2786,75 @@ function renderAutomaticRtFile() {
   }));
 }
 
+function automaticRtAnchorReviewHtml(review) {
+  // MsdialWorkbench#845: every anchor once, with its source and name; a preview's with Accept/Reject.
+  const anchorReview = review.anchor_review || {};
+  const anchors = anchorReview.anchors || [];
+  const preview = anchorReview.run === "Preview";
+  if (!anchors.length || !(preview || anchorReview.anchor_mode_columns)) return "";
+  const decisions = state.automaticRtDecisions || {};
+  const height = (value) => (value === null || value === undefined || !Number.isFinite(Number(value))
+    ? "N/A" : Number(value).toExponential(3));
+  const rows = anchors.map((anchor) => {
+    const key = escapeHtml(anchor.key);
+    const decided = decisions[anchor.key];
+    const decision = preview
+      ? `<td class="rt-anchor-decision"><label><input type="radio" name="rtAnchor-${key}" data-anchor-key="${key}" value="accept"${decided === true ? " checked" : ""}> Accept</label> `
+        + `<label><input type="radio" name="rtAnchor-${key}" data-anchor-key="${key}" value="reject"${decided === false ? " checked" : ""}> Reject</label></td>`
+      : "";
+    return `<tr${anchor.outlier_flagged ? ' class="rt-audit-rejected"' : ""}>${decision}<td>${key}</td><td>${escapeHtml(anchor.source)}</td>`
+      + `<td>${escapeHtml(anchor.name || "")}</td><td>${rtAuditNumber(anchor.library_rt, 3)}</td><td>${rtAuditNumber(anchor.reference_rt, 3)}</td>`
+      + `<td>${rtAuditNumber(anchor.mz, 4)}</td><td>${rtAuditNumber(anchor.observed_mz, 4)}</td><td>${height(anchor.peak_height)}</td>`
+      + `<td>${escapeHtml(anchor.reference_status || "")}</td><td>${escapeHtml(`${anchor.files_detected ?? 0}/${anchor.non_blank_files ?? 0}`)}</td>`
+      + `<td>${anchor.outlier_flagged ? "Yes" : ""}</td><td>${escapeHtml(anchor.detection || "")}</td></tr>`;
+  }).join("");
+  const exclusions = (review.exclusions || []).map((item) => `<tr><td>${escapeHtml(item.anchor_name)}</td><td>${rtAuditNumber(item.mz, 4)}</td>`
+    + `<td>${rtAuditNumber(item.rt, 3)}</td><td>${rtAuditNumber(item.mz_tolerance, 4)}</td><td>${rtAuditNumber(item.rt_tolerance, 3)}</td>`
+    + `<td>${escapeHtml(item.excluded_candidates)}</td></tr>`).join("");
+  const library = anchorReview.anchor_library
+    ? ` Anchor library: ${escapeHtml(anchorReview.anchor_library)} (SHA-256 ${escapeHtml(anchorReview.anchor_library_sha256)}).` : "";
+  // The approval records this file: accepted automatic anchors carry its RTs, and the production run is
+  // compared with it afterwards.
+  const referenceFile = anchorReview.reference_file_id !== null && anchorReview.reference_file_id !== undefined
+    ? ` Reference file: ${escapeHtml(anchorReview.reference_file_name || "(unnamed)")} (file ID ${escapeHtml(anchorReview.reference_file_id)})${anchorReview.reference_selection ? `, chosen by ${escapeHtml(anchorReview.reference_selection)}` : ""}.`
+    : " No reference file is recorded.";
+  const approval = preview ? `<p class="muted">Accept or reject every anchor. The approval records the reference file above: an accepted automatic anchor carries its RT there, and a production run mapped onto another file is flagged. Approval writes a new anchor library under Output root: an accepted automatic anchor becomes a True row at the reference file's RT and m/z (match RT tolerance, MS1 tolerance for alignment, minimum height 0); a rejected anchor stays as a False row; an accepted user anchor keeps its own row. The production run then uses it in UserOnly mode, or, with fewer True rows than the minimum anchor count, in Hybrid if you choose it.</p>
+    <div class="button-row"><button id="rtAnchorAcceptRest" type="button" class="secondary">Accept every undecided anchor</button><button id="rtAnchorRejectRest" type="button" class="secondary">Reject every undecided anchor</button></div>
+    <label>Approved by<input id="rtAnchorApprovedBy" placeholder="Your name; recorded with the approval"></label>
+    <div class="button-row"><button id="rtAnchorApprove" type="button">Write approved anchor library</button></div>
+    <div id="rtAnchorApprovalResult" class="format-summary" hidden></div>` : "";
+  return `<h3>${preview ? "Anchor preview: accept or reject each anchor" : "Anchors by source"}</h3>
+    <p class="muted">Anchor mode ${escapeHtml(anchorReview.anchor_mode || "Automatic")}; ${escapeHtml(anchorReview.user_anchor_count ?? 0)} user and ${escapeHtml(anchorReview.automatic_anchor_count ?? 0)} automatic anchor(s).${library}${referenceFile} Reference RT, observed m/z, height, status and detection are the reference file's. A run whose reference differs from its approved preview's is among the warnings above.</p>
+    <div class="table-wrap rt-audit-table"><table><thead><tr>${preview ? "<th>Decision</th>" : ""}<th>Key</th><th>Source</th><th>Name</th><th>Library RT</th><th>Reference RT</th><th>m/z</th><th>Observed m/z</th><th>Peak height</th><th>Status</th><th>Detected (non-Blank files)</th><th>Outlier flagged</th><th>Detection</th></tr></thead><tbody>${rows}</tbody></table></div>
+    ${exclusions ? `<h4>Exclusions (the library's False rows, Hybrid)</h4><div class="table-wrap"><table><thead><tr><th>Name</th><th>m/z</th><th>RT (min)</th><th>m/z tolerance</th><th>RT tolerance (min)</th><th>Excluded automatic candidates</th></tr></thead><tbody>${exclusions}</tbody></table></div>` : ""}
+    ${approval}`;
+}
+
+function bindAutomaticRtApproval(panel) {
+  if (!panel || typeof panel.querySelectorAll !== "function") return;
+  panel.querySelectorAll("input[data-anchor-key]").forEach((input) => {
+    input.addEventListener("change", () => {
+      state.automaticRtDecisions = state.automaticRtDecisions || {};
+      state.automaticRtDecisions[input.dataset.anchorKey] = input.value === "accept";
+    });
+  });
+  const decideRest = (accept) => {
+    state.automaticRtDecisions = state.automaticRtDecisions || {};
+    panel.querySelectorAll(`input[data-anchor-key][value="${accept ? "accept" : "reject"}"]`).forEach((input) => {
+      if (state.automaticRtDecisions[input.dataset.anchorKey] === undefined) {
+        state.automaticRtDecisions[input.dataset.anchorKey] = accept;
+        input.checked = true;
+      }
+    });
+  };
+  panel.querySelector("#rtAnchorAcceptRest")?.addEventListener("click", () => decideRest(true));
+  panel.querySelector("#rtAnchorRejectRest")?.addEventListener("click", () => decideRest(false));
+  panel.querySelector("#rtAnchorApprove")?.addEventListener("click", () => runUiAction(approveAutomaticRtAnchors));
+}
+
 function renderAutomaticRtReview(review) {
+  if (state.automaticRtReview?.run_directory !== review.run_directory) state.automaticRtDecisions = {};
+  if (review.anchor_review?.run === "Preview") state.automaticRtPreviewDirectory = review.run_directory;
   state.automaticRtReview = review;
   const panel = $("#automaticRtReview");
   panel.hidden = false;
@@ -2630,9 +2895,11 @@ function renderAutomaticRtReview(review) {
     <h3>Run-order overview</h3>${overview}<p class="muted">This is the magnitude of fitted anchor shifts, not a measure of chromatographic peak quality. ${ordered.length > 500 ? `Displayed ${sampled.length} of ${ordered.length} ordered files.` : ""}</p>
     <h3>Inspect one file</h3><label>File ID<input id="rtAuditFileId" list="rtAuditFileChoices" value="${escapeHtml(review.reference?.file_id || review.files[0]?.file_id || "")}"></label>
     <datalist id="rtAuditFileChoices">${review.files.map((file) => `<option value="${escapeHtml(file.file_id)}">${escapeHtml(file.name)}</option>`).join("")}</datalist>
+    ${automaticRtAnchorReviewHtml(review)}
     <div id="rtAuditFileDetails"></div>
     <details><summary><strong>All files (${inspected}; first 200 shown)</strong></summary><div class="table-wrap rt-audit-table"><table><thead><tr><th>ID</th><th>File</th><th>Type</th><th>Order</th><th>Model</th><th>Used</th><th>Median |offset|</th><th>Note</th></tr></thead><tbody>${fileRows}</tbody></table></div></details>`;
   $("#rtAuditFileId").addEventListener("change", renderAutomaticRtFile);
+  bindAutomaticRtApproval(panel);
   renderAutomaticRtFile();
 }
 
@@ -3667,6 +3934,26 @@ $("#executeRtCorrection").addEventListener("change", () => {
   }
   refreshQuestion();
 });
+$("#automaticRtAnchorMode").addEventListener("change", updateAutomaticRtCorrectionUI);
+$("#automaticRtAnchorPeakSelectionMode").addEventListener("change", updateAutomaticRtCorrectionUI);
+$("#browseAutomaticRtAnchorLibrary").addEventListener("click", () => runUiAction(async () => {
+  if (state.automaticRtAnchorsDirty && !window.confirm(
+    "Discard unsaved anchor-library edits and choose another file?"
+  )) return;
+  const result = await api("/api/dialog/reference-file", {
+    method: "POST",
+    body: JSON.stringify({ kind: "automatic-rt-anchors" }),
+  });
+  if (result.path) await loadAutomaticRtAnchors(result.path);
+}));
+$("#loadAutomaticRtAnchorLibrary").addEventListener("click", () => runUiAction(async () => {
+  if (state.automaticRtAnchorsDirty && !window.confirm(
+    "Discard unsaved edits and reload the anchor library from disk?"
+  )) return;
+  await loadAutomaticRtAnchors();
+}));
+$("#saveAutomaticRtAnchors").addEventListener("click", () => runUiAction(saveEditedAutomaticRtAnchors));
+$("#runAutomaticRtPreview").addEventListener("click", () => runUiAction(startAutomaticRtPreview));
 $("#browseRtCorrectionAnchor").addEventListener("click", () => runUiAction(async () => {
   if (state.rtCorrectionAnchorsDirty && !window.confirm(
     "Discard unsaved anchor-library edits and choose another file?"

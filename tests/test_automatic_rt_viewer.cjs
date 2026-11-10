@@ -108,4 +108,37 @@ html = elements["#automaticRtReview"].innerHTML;
 assert.match(html, /<strong>1<\/strong><span>anchors rejected by the model/, "Only the model's rejections are counted");
 assert.ok(html.includes('<p class="muted">2 anchor record(s) are in Blank files, not used by design'), "Notes are not warnings");
 assert.ok(html.includes("not verified (method_key_not_applied); the publication report does not describe a correction"));
+
+// MsdialWorkbench#845: a preview lists every anchor once with Accept/Reject and the approval controls; a run's
+// audit lists them by source without; an audit before #845 shows no such table.
+const anchorEntry = (key, source, name, flagged = false) => ({ key, source, name, anchor_id: key.split("-")[1],
+  library_rt: source === "User" ? 1.25 : null, reference_rt: 1.2, mz: 150.05, observed_mz: 150.0501,
+  peak_height: 12000, reference_status: "Reference", files_detected: 5, non_blank_files: 6,
+  outlier_flagged: flagged, detection: source === "User" ? "The only peak in the window." : "" });
+const previewReview = { run_directory: "preview", files: [{ ...blankFile, type: "Sample", order: 1, median_absolute_offset: 0, note: "" }],
+  anchors: [], reference: null, model_counts: {}, method_audit: { status: "preview_only", reason: "preview_only" },
+  warnings: [], notes: [], exclusions: [{ anchor_name: "old", mz: 500, rt: 5, mz_tolerance: 0.01, rt_tolerance: 0.1, excluded_candidates: 0 }],
+  anchor_review: { run: "Preview", anchor_mode: "Hybrid", anchor_mode_columns: true, anchor_library: "lib.txt",
+    anchor_library_sha256: "abc", user_anchor_count: 1, automatic_anchor_count: 1,
+    anchors: [anchorEntry("User-1", "User", "IS-a", true), anchorEntry("Automatic-2", "Automatic", "")] } };
+context.state.automaticRtDecisions = { "User-1": false };
+html = context.automaticRtAnchorReviewHtml(previewReview);
+assert.ok(html.includes("accept or reject each anchor"));
+assert.ok(html.includes('data-anchor-key="User-1" value="reject" checked'), "A decision made is shown");
+assert.ok(!html.includes('data-anchor-key="Automatic-2" value="accept" checked'), "No anchor is accepted for the person");
+assert.ok(html.includes("IS-a") && html.includes("1.250") && html.includes("150.0501") && html.includes("1.200e+4"));
+assert.ok(html.includes("rtAnchorApprovedBy") && html.includes("rtAnchorApprove"));
+assert.ok(html.includes("Exclusions") && html.includes("old"));
+assert.ok(html.includes("lib.txt (SHA-256 abc)"));
+assert.ok(html.includes("No reference file is recorded."), "An audit without a reference says so");
+// The preview's reference file, which the approval records and the production run is compared with.
+const withReference = context.automaticRtAnchorReviewHtml({ ...previewReview, anchor_review: { ...previewReview.anchor_review,
+  reference_file_id: "2", reference_file_name: "C1", reference_selection: "Automatic (coverage and centrality)" } });
+assert.ok(withReference.includes("Reference file: C1 (file ID 2), chosen by Automatic (coverage and centrality)."));
+const runHtml = context.automaticRtAnchorReviewHtml({ ...previewReview, anchor_review: { ...previewReview.anchor_review, run: "Run" } });
+assert.ok(runHtml.includes("Anchors by source") && !runHtml.includes("rtAnchorApprove") && !runHtml.includes('type="radio"'));
+assert.equal(context.automaticRtAnchorReviewHtml({ ...previewReview, anchor_review: { run: "", anchor_mode_columns: false, anchors: [anchorEntry("Automatic-1", "Automatic", "")] } }), "");
+context.renderAutomaticRtReview(previewReview);
+assert.ok(elements["#automaticRtReview"].innerHTML.includes("Write approved anchor library"));
+assert.deepEqual({ ...context.state.automaticRtDecisions }, {}, "A review of another directory starts with no decisions");
 console.log("Automatic RT viewer regression checks passed.");

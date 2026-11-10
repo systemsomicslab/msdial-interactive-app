@@ -17,12 +17,62 @@
   and propose a stepped minimum peak height for review.
 - `msdial_interactive_job`: retrieve one job's current status and optional full
   details.
-- `msdial_cancel_job`: stop a queued or running run, peak-count diagnostic, or
-  repository download. A stopped Console fails its job with exit code -4; a
+- `msdial_cancel_job`: stop a queued or running run, peak-count diagnostic,
+  anchor preview, or repository download. A stopped Console fails its job with exit code -4; a
   `timeout_seconds` or `idle_timeout_seconds` passed to the start tools fails it
   with -3. Stopping a wait does not stop the job; this does.
 - `msdial_interactive_create_handoff`: create a data-mining handoff from one
   completed production job.
+
+## Automatic RT correction anchors (MsdialWorkbench#845)
+
+- `msdial_start_automatic_rt_anchor_preview`: run the guided plan's method with
+  `Automatic RT correction preview only: True` (job kind `automatic_rt_preview`).
+  The Console picks peaks on every file, chooses the anchors by the answers'
+  anchor mode and library, writes its audit into a directory of its own
+  (`<output_root>/.msdial-diagnostics/<job id>`, or the unit's `diagnostics`
+  directory) and stops: nothing is aligned and nothing is written beside the raw
+  data. `confirmed=false` (the default) returns the plan only; it starts a
+  Console, so a campaign approval must cover boundary 4 to stand in for
+  `confirmed=true`. It is refused, naming what is missing, without a complete
+  LC-MS plan with `execute_automatic_rt_correction: true`.
+- `msdial_automatic_rt_anchor_review`: read a completed preview by `job_id` or
+  `preview_directory`. Every anchor comes once under a key such as
+  `Automatic-3` or `User-1`, with its source, name, library RT, reference-file
+  RT, m/z, observed m/z, peak height, status, detection note and outlier flag;
+  a Hybrid preview also returns the exclusions (the library's False rows) it
+  applied. Show every anchor to the user. The audit of a preview is never
+  evidence of a correction (`method_audit.status: preview_only`).
+- `msdial_approve_automatic_rt_anchors`: from the user's explicit `accepted`
+  and `rejected` lists (every key once), write the production anchor library.
+  `confirmed=false` writes nothing and returns the rows; `confirmed=true` with
+  `confirmed_by` naming the person writes
+  `automatic_rt_anchors_approved_<timestamp>.txt` into the output root and
+  `<library>.approval.json` beside it: who, when, the preview job, the SHA-256
+  of each preview audit file, and the library's SHA-256. What it writes:
+  - an accepted automatic anchor: a True row at the reference file's RT and m/z,
+    RT tolerance = `automatic_rt_correction_match_rt_tolerance`, m/z tolerance =
+    `alignment_ms1_tolerance`, minimum height 0;
+  - a rejected automatic anchor: a False row at the same values (UserOnly ignores
+    it; in Hybrid it keeps that candidate out of the automatic selection);
+  - an accepted user anchor: its own library row, unchanged;
+  - a rejected user anchor: its row as a False row, never deleted; the library's
+    existing False rows are kept.
+  The result's `production_anchor_mode` is `UserOnly`, the default for the
+  production run, unless the True rows are fewer than
+  `automatic_rt_correction_minimum_anchors`: then `user_only_allowed` is false,
+  `production_anchor_mode` is empty, and the user decides whether to run
+  `Hybrid`. The approval is the user's decision, never the agent's.
+  The result and the approval record also carry `preview_reference_file`
+  (`file_id`, `name`, `selection`): the file whose RTs the accepted automatic
+  anchors carry. After a production run with the approved library, the job's
+  `automatic_rt_reference_check` and the review's `reference_check` compare
+  the run's reference file with it. The status is `matches`, `differs` or
+  `unknown`. A difference is a warning in the job, the review and the
+  publication report, and never a refusal. Without the audit's
+  `Reference selection` column, the Console may predate the library-RT
+  reference rule (MsdialWorkbench#876), which prefers the file closest to the
+  library's RTs. Tell the user which file each run used.
 
 ## Guided answers
 
@@ -64,6 +114,31 @@ annotation and applies a piecewise-linear map only during alignment. `-1`
 selects the reference file automatically. The Console retains
 `automatic_alignment_rt_correction_summary.tsv` and
 `automatic_alignment_rt_correction_anchors.tsv` as audit evidence.
+
+The anchor answers of MsdialWorkbench#845 are the automatic correction's own,
+not the legacy `rt_correction_*` keys, and each is written to the method file
+only when given:
+
+- `automatic_rt_correction_anchor_mode`: `Automatic` (detected peaks, the
+  Console default), `UserOnly` (only the library's True rows) or `Hybrid` (the
+  True rows, with automatic anchors filling the RT bins they leave empty and the
+  False rows excluding automatic candidates within their tolerances).
+- `automatic_rt_correction_anchor_library_path`: the anchor library, read as
+  strictly as the Console reads it: the header line
+  `Name, RT(min), RT tol.(min), m/z, m/z tol., Minimum height, T/F` first, seven
+  tab-separated columns, a decimal point, and True, False, T or F. UserOnly
+  needs at least the minimum anchor count of True rows, Hybrid at least one row;
+  m/z, both tolerances must be positive and a True row's minimum height 0 or
+  more. It is written only for UserOnly and Hybrid. A library approved from a
+  preview carries its approval record beside it, which the run, its bundle and
+  the Methods text pick up while the library's SHA-256 still matches.
+- `automatic_rt_correction_anchor_peak_selection_mode`: `HighestIntensity`
+  (Console default), `ClosestToReferenceRt` or `Weighted`, for the one peak taken
+  in each library anchor's window.
+- `automatic_rt_correction_anchor_peak_selection_rt_weight`: 0 to 1, written
+  only for `Weighted`.
+
+Any of them with a Console that predates #845 (before 5.5.261105) is refused.
 
 `automatic_rt_correction_local_support_rt_window` (minutes, 0 or more) is the
 window of the local anchor outlier test of MsdialWorkbench#826: each anchor is
