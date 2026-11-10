@@ -75,21 +75,34 @@ original raw data, and an available Console executable.
   genuine selectivity changes can reverse compound elution order too.
 - Several ions at exactly the same RT do not provide several independent RT
   control points. Duplicate positions can appear as `NonMonotonic` rejections.
-- Unused anchor records fall into three groups, reported apart. Only
-  `MadOutlier`, `NonMonotonic`, `InsufficientAnchors` (and any status the viewer
-  does not know) are rejections by the model: they are counted, warned about,
-  and highlighted in the tables and plots. `Missing` and `Ambiguous` records in
-  a non-Blank file matched no single peak and never reached a model; they are
-  listed in a note, not a warning. Every record in a Blank file
-  (`BlankInterpolateByOrder`, `BlankNotCorrected`, or a `Missing` or `Ambiguous`
-  one there) is unused by design: a Blank's own anchors never fit its model. They
-  are listed in a note and drawn in grey.
+- Unused anchor records fall into five groups, reported apart.
+  - Rejections by a test: `MadOutlier`, `LocalOutlier`, `NonMonotonic`,
+    `InsufficientAnchors`, and any status the viewer does not know. They are
+    counted, warned about, and highlighted in the tables and plots.
+  - Records that matched no single peak and never reached a model: `Missing`,
+    `Ambiguous` and `MissingInReference` (a user anchor the reference file did
+    not show) in a non-Blank file. They are listed in a note, not a warning.
+  - Records counted once by design: `Duplicate` (a True row whose reference-file
+    peak lies within two MS1 scans of an earlier row's, such as two adducts of
+    one standard) and `SameOriginalRt` (an anchor that took the same peak in a
+    file as another anchor). A note, not a warning.
+  - `Detected` records of a failed run's partial audit (no reference file, every
+    file `Uncorrected`): found, never judged. A note.
+  - Every record in a Blank file (`BlankInterpolateByOrder`,
+    `BlankNotCorrected`, or a `Missing` or `Ambiguous` one there) is unused by
+    design: a Blank's own anchors never fit its model. A note, drawn in grey.
 - `Missing` or `Ambiguous` candidates have no original RT. They remain in
   the table as `N/A`, without preventing other candidates or files from being
   plotted. No missing RT is imputed, and apex-based EIC review is restricted to
   candidates with available RT values. A record of any other status without an
-  RT is warned about. If a candidate marked `Used` lacks RT, the affected file's
-  model is not reconstructed from an incomplete subset.
+  RT, other than a `Duplicate` or a failed run's `Detected` record, is warned
+  about. If a candidate marked `Used` lacks RT, the affected file's model is not
+  reconstructed from an incomplete subset.
+- The audit TSVs are read as the Console writes them, without quote handling: a
+  quote is part of an anchor's name, as it is in the library the name came from.
+- A Console that keeps Blank interpolation within an analysis batch adds an
+  `Analysis batch` column to the summary audit. The viewer shows it in the file
+  table when it is there.
 - Blank-interpolated models are identified, but their full control points are
   absent from the current audit TSV. The viewer does not invent their curves.
 - Method-key warnings are not hidden. Unsupported keys are listed separately
@@ -111,8 +124,19 @@ correction panel:
 
 The library is the seven-column text `Name, RT(min), RT tol.(min), m/z, m/z
 tol., Minimum height, T/F`, read as strictly as the Console reads it (see the
-tool reference). A setting left at the Console default writes nothing, and any
-of them with an older Console is refused.
+tool reference). It is read as `File.ReadAllLines` reads it: UTF-8, or UTF-16 or
+UTF-32 with a byte order mark (Excel's "Unicode Text"). A setting left at the
+Console default writes nothing, and any of them with an older Console is
+refused.
+
+Before a preview or a run starts, Interactive also refuses:
+
+- A library set with the anchor mode unset or Automatic. The Console would run
+  Automatic and read no library, so an approved library's decisions would be
+  dropped. Choose UserOnly or Hybrid, or clear the library.
+- A library path, or an Output root for a preview, that is not printable ASCII.
+  The LC-MS Console reads `method.txt` as ASCII, so every other character comes
+  back as `?` and the path is not found.
 
 The flow decided on 2026-11-07 is preview, then approval, then production:
 
@@ -127,23 +151,45 @@ The flow decided on 2026-11-07 is preview, then approval, then production:
    anchor** lists every anchor once, user and automatic, with its source, name,
    library RT, reference RT, m/z, observed m/z, peak height, status, how many
    non-Blank files detected it, the outlier flag (the test disagreed with a user
-   anchor, which is kept regardless) and the detection note; Hybrid adds the
+   anchor, which is kept regardless), the detection note and, under **Before you
+   approve**, its flags (see "Flags before approval"); Hybrid adds the
    exclusions table. Each anchor must be accepted or rejected; no anchor is
    decided for you.
 3. **Write approved anchor library** asks for your name and writes
-   `automatic_rt_anchors_approved_<timestamp>.txt` (strict ASCII) into Output
-   root, with `<library>.approval.json` beside it: who approved, when, the
-   preview job, the SHA-256 of each preview audit file and the library's SHA-256.
+   `automatic_rt_anchors_approved_<timestamp>.txt` (UTF-8 without a byte order
+   mark, which the Console reads; a name is kept as the Console keeps it) into
+   Output root, with `<library>.approval.json` beside it: who approved, when, the
+   preview job, the SHA-256 of each preview audit file, the library's SHA-256,
+   and the distinct anchors counted in the preview's reference file. Each name
+   is claimed exclusively, so two approvals in the same second write two
+   libraries.
+   - The approval is of the preview on screen. A job id and a directory that
+     name two different previews are refused, and the approval records the
+     job its preview record names, not the caller's.
+   - Only a completed preview is approved. A preview that failed or was
+     cancelled leaves a partial audit that also says `Run = Preview`; it is
+     refused when its job did not complete, when no file is the reference, when
+     a file's note starts with `Not corrected:`, or when the preview's
+     method-key evidence does not show that it ran with its settings.
    - An accepted automatic anchor becomes a True row at the reference file's
      observed RT and m/z, with the match RT tolerance as RT tolerance, the MS1
      tolerance for alignment as m/z tolerance, and a minimum height of 0.
    - A rejected automatic anchor becomes a False row at the same values.
    - An accepted user anchor keeps its row; a rejected one stays as a False row
      and is never deleted. The library's existing False rows stay.
-4. The production run is set to **UserOnly** with the approved library. When
-   the True rows are fewer than the minimum anchor count, UserOnly is refused
-   and the viewer offers **Use Hybrid with this library** instead; nothing is
-   chosen for you.
+4. The production run is set to **UserOnly** with the approved library.
+   UserOnly is counted as the Console counts it: the distinct anchors detected
+   in the preview's reference file (the author's decision 4, 2026-11-10). An
+   accepted anchor the preview showed as missing (`Missing`,
+   `MissingInReference`, `Ambiguous`) or `Duplicate` there does not count, and
+   neither does one within two MS1 scans of an anchor already counted (an
+   automatic anchor and its isotope, for one: on demo data1 neg, m/z 337.0210
+   and 335.0045 lay one MS1 scan apart, so six approved rows were five
+   anchors). When the count is below the minimum anchor count, UserOnly is
+   refused, the anchor mode is left unset, and the viewer offers **Use Hybrid
+   with this library** instead; nothing is chosen for you. The approval record
+   keeps the count, and validation refuses UserOnly with that library when the
+   minimum is raised above it. The MCP dry run keeps the same refusal message.
 
 The production run's manifest and `workflow-settings.json` record the library
 by path and SHA-256 with its approval, and the reproduction bundle carries both
@@ -162,8 +208,22 @@ name, and how the Console chose it).
 A Console with MsdialWorkbench#876 chooses the reference again in UserOnly and
 Hybrid, when no reference file ID is set: first the file with the most user
 anchors detected, then the one whose detections lie closest to the library's
-RTs. The preview's reference file lies at a deviation of about 0, so it is
-chosen again. That Console's summary audit adds a `Reference selection` column
+RTs. When every True row was written from the preview, the preview's reference
+file lies at a deviation of about 0 and is chosen again, provided it detects as
+many anchors as any other file. That does not always hold:
+
+- A hand-written True row keeps its own library RT, and another file can lie
+  closer to it than the preview's reference.
+- An approved anchor that is noise or a baseline can be detected in other files
+  and not in the preview's reference. On demo data1 neg, an automatic anchor at
+  m/z 212.0746, 4.961 min was used only in the reference C1 and rejected as an
+  outlier in every other file it was matched in. Approved, it was found in B1
+  and E1 but not in C1, so E1 won on the anchor count.
+
+The reference stays automatic (decision 4); it is not pinned to the preview's.
+Instead the preview flags, before you approve, every anchor that can move it or
+that counts as less than one anchor (see "Flags before approval" below). That
+Console's summary audit adds a `Reference selection` column
 and a per-file `Library RT deviation (RT tolerances)` column, and the viewer
 reads both. An older Console chose by how close each file's anchor RTs were to
 their median over the batch. On demo data1 pos, Console 5.5.261105 previewed
@@ -185,6 +245,28 @@ run's reference file with the approval's:
   check, whose preview directory is gone), the review says it cannot be
   checked.
 
+### Flags before approval
+
+A preview's review flags each anchor whose approval could make the production
+run differ from what the preview showed. The flags are in the anchor table
+(**Before you approve**), among the review's warnings, in
+`msdial_automatic_rt_anchor_review`, and, for the accepted ones, in the
+approval's `accepted_flagged_anchors` and warnings. They are reasons to look,
+not refusals:
+
+- `rejected_in_every_other_file`: an automatic anchor the outlier test
+  (`MadOutlier`, `LocalOutlier`, and the like) rejected in every other non-Blank
+  file it was matched in.
+- `used_only_in_reference`: an automatic anchor that only the reference file
+  used. Approved, it is a named anchor matched again in every file, and the file
+  with the most named anchors detected becomes the reference.
+- `missing_in_reference`: an anchor with no single peak in the reference file;
+  it counts for nothing there.
+- `duplicate_in_reference`: a `Duplicate` in the reference file; it counts once
+  with the anchor whose peak it took.
+- `same_scan_as`: an anchor within two MS1 scans of another in the reference
+  file; approved as named anchors, the two count as one.
+
 ### How a preview audit is judged
 
 A preview audit has `Run = Preview` in every summary row. The Console has chosen
@@ -202,9 +284,20 @@ which needs verified evidence, is not available for a preview.
 
 The point-by-point user-defined RT correction (anchors and reviewed peak
 selections, applied before peak detection) is now in a closed **Legacy (not
-recommended)** section of the main page. Worksets and templates that use it
-load and run unchanged, it remains mutually exclusive with automatic RT
-correction, and it gets no new features.
+recommended)** section of the main page. It remains mutually exclusive with
+automatic RT correction, and it gets no new features.
+
+A parameter template's legacy lines are read: `Execute RT correction`, the
+compounds library and peak-selection file paths (relative ones against the
+template's folder), and the selection mode and RT weight. A template that
+enables it is therefore checked like any other run: the files must exist, and a
+template that enables both corrections is refused. Before 0.5.65 these lines
+were not read, and the method file then wrote `Execute RT correction: False`,
+so such a template ran without any RT correction. The page runs the legacy
+correction only with both an anchor library and a reviewed peak-selection file,
+and says so when a template enables it without them. A template's True/False
+line is read as the Console reads it (True or False in any case); another
+spelling is refused rather than guessed.
 
 ## Validation Record
 

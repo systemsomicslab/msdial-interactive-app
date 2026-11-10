@@ -34,15 +34,29 @@
   directory) and stops: nothing is aligned and nothing is written beside the raw
   data. `confirmed=false` (the default) returns the plan only; it starts a
   Console, so a campaign approval must cover boundary 4 to stand in for
-  `confirmed=true`. It is refused, naming what is missing, without a complete
-  LC-MS plan with `execute_automatic_rt_correction: true`.
+  `confirmed=true`. It is refused, naming what is missing (the plan's own
+  blockers included), without a complete LC-MS plan with
+  `execute_automatic_rt_correction: true`. It is the only way to preview:
+  `automatic_rt_correction_preview_only` is not an answer, and a guided plan
+  given it is refused rather than run as production. The output root must be an
+  ASCII path: the approved library is written there, and the LC-MS Console reads
+  `method.txt` as ASCII.
 - `msdial_automatic_rt_anchor_review`: read a completed preview by `job_id` or
   `preview_directory`. Every anchor comes once under a key such as
   `Automatic-3` or `User-1`, with its source, name, library RT, reference-file
   RT, m/z, observed m/z, peak height, status, detection note and outlier flag;
   a Hybrid preview also returns the exclusions (the library's False rows) it
   applied. Show every anchor to the user. The audit of a preview is never
-  evidence of a correction (`method_audit.status: preview_only`).
+  evidence of a correction (`method_audit.status: preview_only`). Each anchor
+  also carries `flags`, also among the warnings, to read to the user before they
+  decide: an automatic anchor rejected by the outlier test in every other file
+  it was matched in (`rejected_in_every_other_file`) or used only in the
+  reference file (`used_only_in_reference`), likely noise that can move the
+  production run's reference to another file; an anchor missing in the
+  reference (`missing_in_reference`) or a `Duplicate` there
+  (`duplicate_in_reference`); and one within two MS1 scans of another
+  (`same_scan_as`), which the Console counts as one. The reference is chosen
+  again in the production run, never pinned to the preview's.
 - `msdial_approve_automatic_rt_anchors`: from the user's explicit `accepted`
   and `rejected` lists (every key once), write the production anchor library.
   `confirmed=false` writes nothing and returns the rows; `confirmed=true` with
@@ -59,10 +73,19 @@
   - a rejected user anchor: its row as a False row, never deleted; the library's
     existing False rows are kept.
   The result's `production_anchor_mode` is `UserOnly`, the default for the
-  production run, unless the True rows are fewer than
+  production run, unless the distinct anchors detected in the preview's
+  reference file (`distinct_reference_anchors`; an accepted anchor missing or a
+  `Duplicate` there, or within two MS1 scans of one already counted, does not
+  count, and `not_counted_in_reference` says why) are fewer than
   `automatic_rt_correction_minimum_anchors`: then `user_only_allowed` is false,
-  `production_anchor_mode` is empty, and the user decides whether to run
-  `Hybrid`. The approval is the user's decision, never the agent's.
+  `production_anchor_mode` is empty, the `message` (dry run included) says
+  "UserOnly is refused ... Choose Hybrid explicitly", and the user decides
+  whether to run `Hybrid`. Pass the chosen mode explicitly: a library with the
+  mode unset or `Automatic` is refused. The approval is the user's decision,
+  never the agent's. Refused: a `job_id` and a `preview_directory` naming two
+  different previews; a preview that did not complete (its partial audit has no
+  reference file, or `Not corrected:` notes); a preview whose method-key
+  evidence does not show it ran with its settings; a non-ASCII output root.
   The result and the approval record also carry `preview_reference_file`
   (`file_id`, `name`, `selection`): the file whose RTs the accepted automatic
   anchors carry. After a production run with the approved library, the job's
@@ -72,7 +95,10 @@
   publication report, and never a refusal. Without the audit's
   `Reference selection` column, the Console may predate the library-RT
   reference rule (MsdialWorkbench#876), which prefers the file closest to the
-  library's RTs. Tell the user which file each run used.
+  library's RTs. That rule brings back the preview's reference only when every
+  True row was written from the preview and that file detects as many anchors
+  as any other; a hand-written row, or an approved anchor the preview flagged,
+  can move it. Tell the user which file each run used.
 
 ## Guided answers
 
@@ -126,12 +152,16 @@ only when given:
 - `automatic_rt_correction_anchor_library_path`: the anchor library, read as
   strictly as the Console reads it: the header line
   `Name, RT(min), RT tol.(min), m/z, m/z tol., Minimum height, T/F` first, seven
-  tab-separated columns, a decimal point, and True, False, T or F. UserOnly
-  needs at least the minimum anchor count of True rows, Hybrid at least one row;
-  m/z, both tolerances must be positive and a True row's minimum height 0 or
-  more. It is written only for UserOnly and Hybrid. A library approved from a
-  preview carries its approval record beside it, which the run, its bundle and
-  the Methods text pick up while the library's SHA-256 still matches.
+  tab-separated columns, a decimal point, and True, False, T or F; UTF-8, or
+  UTF-16/UTF-32 with a byte order mark. UserOnly needs at least the minimum
+  anchor count of True rows (and, for an approved library, of distinct anchors
+  detected in its preview's reference file), Hybrid at least one row; m/z, both
+  tolerances must be positive and a True row's minimum height 0 or more. The
+  path must be printable ASCII. It is written only for UserOnly and Hybrid, and
+  a library given with the mode unset or `Automatic` is refused. A library
+  approved from a preview carries its approval record beside it, which the run,
+  its bundle and the Methods text pick up while the library's SHA-256 still
+  matches.
 - `automatic_rt_correction_anchor_peak_selection_mode`: `HighestIntensity`
   (Console default), `ClosestToReferenceRt` or `Weighted`, for the one peak taken
   in each library anchor's window.

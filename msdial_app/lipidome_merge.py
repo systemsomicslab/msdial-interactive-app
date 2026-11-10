@@ -842,6 +842,82 @@ def _delta_text(delta: Decimal) -> str:
     return format(delta, "f")
 
 
+def _rt_correction_reference(export_path: str | Path) -> dict[str, Any]:
+    """The automatic RT correction reference file beside an alignment export, from its summary audit, or {}."""
+    import csv
+
+    summary = Path(export_path).parent / "automatic_alignment_rt_correction_summary.tsv"
+    if not summary.is_file():
+        return {}
+    try:
+        with summary.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle, delimiter="\t", quoting=csv.QUOTE_NONE))
+    except (OSError, csv.Error):
+        return {}
+    reference = next((row for row in rows if str(row.get("Model source") or "").strip() == "Reference"), None)
+    if reference is None:
+        return {"summary": str(summary), "reference_file": "", "analytical_order": None}
+    order = str(reference.get("Analytical order") or "").strip()
+    return {
+        "summary": str(summary),
+        "reference_file": str(reference.get("File name") or "").strip(),
+        "analytical_order": int(order) if order.lstrip("-").isdigit() else None,
+        "anchor_mode": str(reference.get("Anchor mode") or "").strip() or "Automatic",
+    }
+
+
+def polarity_rt_axes(
+    positive_path: str | Path,
+    negative_path: str | Path,
+    positive_rows: list[list[str]],
+    negative_rows: list[list[str]],
+    columns: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Each polarity's RT axis and the systematic offset between them (CONF-54).
+
+    With automatic alignment RT correction, an export's Average Rt(min) is on its own reference file's axis,
+    and the two polarities can have chosen reference files far apart in the run. The offset is the median of
+    negative minus positive RT over the lipid names each polarity annotates exactly once.
+    """
+    columns = columns or _default_columns()
+
+    def unique_rts(rows: list[list[str]]) -> dict[str, float]:
+        seen: dict[str, list[float]] = {}
+        for row in rows:
+            name = _cell(row, columns, "metabolite_name")
+            rt = _decimal_rt(_field(row, columns, "rt"))
+            if name and rt is not None:
+                seen.setdefault(name, []).append(float(rt))
+        return {name: values[0] for name, values in seen.items() if len(values) == 1}
+
+    positive_rt, negative_rt = unique_rts(positive_rows), unique_rts(negative_rows)
+    deltas = sorted(negative_rt[name] - positive_rt[name] for name in set(positive_rt) & set(negative_rt))
+    offset = None
+    if deltas:
+        middle = len(deltas) // 2
+        offset = deltas[middle] if len(deltas) % 2 else (deltas[middle - 1] + deltas[middle]) / 2
+    positive, negative = _rt_correction_reference(positive_path), _rt_correction_reference(negative_path)
+
+    def describe(label: str, item: dict[str, Any]) -> str:
+        if not item:
+            return f"the {label} export has no automatic RT correction audit beside it"
+        if not item.get("reference_file"):
+            return f"the {label} export's RT correction audit names no reference file"
+        order = item.get("analytical_order")
+        return f"the {label} RTs are on {item['reference_file']}'s axis" + (
+            f" (analytical order {order})" if order is not None else ""
+        )
+
+    return {
+        "positive": positive,
+        "negative": negative,
+        "offset_min": offset,
+        "pairs": len(deltas),
+        "method": "median of negative minus positive Average Rt(min) over lipid names annotated once in each polarity",
+        "reference_sentence": describe("positive", positive).capitalize() + "; " + describe("negative", negative) + ".",
+    }
+
+
 def reconcile_polarities(
     positive_rows: list[list[str]],
     negative_rows: list[list[str]],
@@ -1589,6 +1665,21 @@ def merge_pos_neg(
     main = written[output_path.name]
     if reconcile:
         reconciliation["renamed_rows"] = renamed_outcome
+        # CONF-54 (an open question for the author): each polarity's RTs are on its own automatic RT correction
+        # reference file's axis. The rule is unchanged; the offset between the two axes is recorded and warned.
+        reconciliation["rt_axes"] = polarity_rt_axes(
+            positive_path, negative_path, candidates["positive"], before, columns
+        )
+        offset = reconciliation["rt_axes"].get("offset_min")
+        if offset is not None and abs(offset) > reconciliation_rt_tolerance / 2:
+            warnings.append(
+                f"The negative export's RTs lie {offset:+.3f} min from the positive export's (the median over "
+                f"{reconciliation['rt_axes']['pairs']} lipid name(s) annotated in both), more than half the "
+                f"{reconciliation_rt_tolerance:g} min reconciliation tolerance. "
+                + reconciliation["rt_axes"]["reference_sentence"]
+                + " BMP/PG and PE P-/PE O- pairs are matched within the tolerance on those two axes, so pairs can be "
+                "missed or a positive row paired with the wrong negative row; check the reconciliation report."
+            )
         if renamed_outcome["not_selected"]:
             warnings.append(
                 f"{renamed_outcome['not_selected']} negative row(s) the reconciliation renamed are not selected by "

@@ -40,7 +40,9 @@ const state = {
   automaticRtAnchors: [],
   automaticRtAnchorsDirty: false,
   automaticRtPreviewJobId: "",
-  automaticRtPreviewDirectory: "",
+  // Each anchor preview's job by its own directory, so that an approval names the job of the review on
+  // screen and never another preview's (CONF-6, CONF-10).
+  automaticRtPreviewJobs: {},
   automaticRtDecisions: {},
   pathPicker: {
     mode: "vendor",
@@ -381,13 +383,13 @@ function renderFiles() {
     row.querySelectorAll("[data-key]").forEach((element) => {
       element.addEventListener("change", () => {
         const key = element.dataset.key;
-        file[key] = element.type === "number" ? Number(element.value) : element.value;
+        const blankOrder = ["analytical_order", "batch_order"].includes(key) && element.value.trim() === "";
+        file[key] = element.type === "number" && !blankOrder ? Number(element.value) : element.value;
         refreshQuestion();
       });
     });
     row.querySelector(".remove").addEventListener("click", () => {
       state.files.splice(index, 1);
-      state.files.forEach((item, order) => item.analytical_order = order + 1);
       if (state.outputRootAutomatic) setOutputRootFromFirstFile();
       renderFiles();
       refreshQuestion();
@@ -666,14 +668,22 @@ function mergeFiles(files, messages = []) {
   const conflictMessages = [...conflicts].map((sample) =>
     `Both .wiff and .wiff2 were supplied for '${sample}'. Choose exactly one; neither new file was added.`
   );
+  // The orders already in the list are the person's (or a CSV's) and are kept. Added files keep the
+  // server's proposal, after the last order already given; a file with none takes the next free order.
+  const given = state.files.map((item) => Number(item.analytical_order)).filter(Number.isFinite);
+  const offset = wasEmpty || !given.length ? 0 : Math.max(...given);
+  let next = offset;
   for (const file of files) {
     const descriptor = sciexDescriptor(file);
     if (descriptor && conflicts.has(descriptor.sample)) continue;
     if (!state.files.some((item) => item.file_path.toLowerCase() === file.file_path.toLowerCase())) {
-      state.files.push(file);
+      const proposed = Number(file.analytical_order);
+      const order = Number.isInteger(proposed) && file.analytical_order !== "" && file.analytical_order !== null
+        && file.analytical_order !== undefined ? offset + proposed : next + 1;
+      next = Math.max(next, order);
+      state.files.push({ ...file, analytical_order: order });
     }
   }
-  state.files.forEach((item, index) => item.analytical_order = index + 1);
   renderFiles();
   if (wasEmpty && state.files.length) {
     applyFormatStartingValues();
@@ -972,6 +982,28 @@ function setTemplateControl(id, value, checkbox = false) {
   control.value = text;
 }
 
+function applyTemplateLegacyRtCorrection(values) {
+  // A template's user-defined (legacy) RT correction lines, which this page used to drop: the run then
+  // aligned uncorrected while the template said otherwise. The page runs that correction only with an
+  // anchor library and a reviewed peak-selection file; without both it is said, not dropped in silence.
+  if ($("#rtCorrectionAnchorPath")) $("#rtCorrectionAnchorPath").value = values.rt_correction_anchor_path || "";
+  if ($("#rtCorrectionSelectionPath")) $("#rtCorrectionSelectionPath").value = values.rt_correction_selection_path || "";
+  if ($("#executeRtCorrection")) $("#executeRtCorrection").checked = Boolean(values.execute_rt_correction);
+  updateRtCorrectionLauncher();
+  if (values.execute_rt_correction && !$("#executeRtCorrection")?.checked) {
+    showImportMessages([
+      "This template enables the legacy user-defined RT correction (Execute RT correction: True) but does not name "
+      + "both its anchor library and a reviewed peak-selection file, which this page needs to run it. It is off. "
+      + "Open the legacy panel to set them, or use automatic RT correction instead.",
+    ], "error");
+  } else if (values.execute_rt_correction && values.execute_automatic_rt_correction) {
+    showImportMessages([
+      "This template enables both the legacy user-defined RT correction and automatic alignment RT correction, "
+      + "which would correct the RT axis twice; validation refuses it. Turn one of them off.",
+    ], "error");
+  }
+}
+
 function applyLoadedParameterTemplate(result) {
   const values = result.workflow || {};
   const controls = {
@@ -1015,6 +1047,7 @@ function applyLoadedParameterTemplate(result) {
   Object.entries(controls).forEach(([key, id]) => setTemplateControl(id, values[key]));
   setTemplateControl("alignmentLightMode", values.alignment_light_mode, true);
   setTemplateControl("executeAutomaticRtCorrection", values.execute_automatic_rt_correction, true);
+  applyTemplateLegacyRtCorrection(values);
   setTemplateControl(
     "automaticRtInterpolateBlanks",
     values.automatic_rt_correction_interpolate_blanks_by_analytical_order,
@@ -1518,6 +1551,7 @@ async function startAutomaticRtPreview() {
     body: JSON.stringify({ workflow: workflow() }),
   });
   state.automaticRtPreviewJobId = result.job_id;
+  state.automaticRtPreviewJobs = { ...(state.automaticRtPreviewJobs || {}), [result.preview_directory]: result.job_id };
   state.automaticRtDecisions = {};
   $("#automaticRtPreviewLog").hidden = false;
   $("#automaticRtPreviewLog").textContent = `Anchor preview queued.\nPreview folder: ${result.preview_directory}`;
@@ -1540,6 +1574,7 @@ async function pollAutomaticRtPreview() {
         body: JSON.stringify({ job_id: jobId }),
       });
       $("#automaticRtReviewDirectory").value = review.run_directory;
+      state.automaticRtPreviewJobs = { ...(state.automaticRtPreviewJobs || {}), [review.run_directory]: jobId };
       renderAutomaticRtReview(review);
       const count = (review.anchor_review?.anchors || []).length;
       $("#automaticRtPreviewLog").textContent +=
@@ -1563,8 +1598,8 @@ async function approveAutomaticRtAnchors() {
   const result = await api("/api/automatic-rt/approve", {
     method: "POST",
     body: JSON.stringify({
-      job_id: state.automaticRtPreviewJobId && review.run_directory === state.automaticRtPreviewDirectory
-        ? state.automaticRtPreviewJobId : "",
+      // The job of the preview on screen, or none: the server refuses a job and a directory that disagree.
+      job_id: automaticRtPreviewJobFor(review.run_directory),
       preview_directory: review.run_directory,
       accepted: anchors.filter((anchor) => decisions[anchor.key] === true).map((anchor) => anchor.key),
       rejected: anchors.filter((anchor) => decisions[anchor.key] === false).map((anchor) => anchor.key),
@@ -1578,12 +1613,18 @@ async function approveAutomaticRtAnchors() {
   const summary = `<strong>Approved anchor library written.</strong><br>${escapeHtml(result.library_path)}<br>`
     + `${result.true_rows} True row(s), ${result.false_rows} False row(s); SHA-256 ${escapeHtml(result.library_sha256)}.`;
   $("#automaticRtAnchorLibraryPath").value = result.library_path;
+  const flagged = (result.warnings || []).map((message) => `<div class="issue warning">${escapeHtml(message)}</div>`).join("");
+  const counted = `${escapeHtml(result.distinct_reference_anchors ?? "?")} of them distinct anchors detected in the preview's reference file.`;
   if (result.production_anchor_mode === "UserOnly") {
     $("#automaticRtAnchorMode").value = "UserOnly";
-    panel.innerHTML = `${summary}<br>The production run is set to anchor mode UserOnly with this library.`;
+    panel.innerHTML = `${summary} ${counted}<br>The production run is set to anchor mode UserOnly with this library.${flagged}`;
   } else {
-    panel.innerHTML = `${summary}<br>${escapeHtml(result.message || "")}<br>`
-      + '<button id="rtAnchorUseHybrid" type="button" class="secondary">Use Hybrid with this library</button>';
+    // Nothing is chosen for the person: the mode is unset, which validation refuses with a library set,
+    // until they choose Hybrid here or another mode themselves.
+    $("#automaticRtAnchorMode").value = "";
+    panel.innerHTML = `${summary} ${counted}<br>${escapeHtml(result.message || "")}<br>`
+      + '<button id="rtAnchorUseHybrid" type="button" class="secondary">Use Hybrid with this library</button>'
+      + flagged;
     $("#rtAnchorUseHybrid").addEventListener("click", () => {
       $("#automaticRtAnchorMode").value = "Hybrid";
       updateAutomaticRtCorrectionUI();
@@ -1593,6 +1634,10 @@ async function approveAutomaticRtAnchors() {
   updateAutomaticRtCorrectionUI();
   await loadAutomaticRtAnchors(result.library_path);
   setStatus(`Approved anchor library written: ${result.library_path}`);
+}
+
+function automaticRtPreviewJobFor(directory) {
+  return (state.automaticRtPreviewJobs || {})[directory] || "";
 }
 
 function updateRtCorrectionSelectionUI() {
@@ -2281,7 +2326,7 @@ function renderQaReport(report) {
       <div class="qa-chart-grid">
         <div><strong>Intensity</strong><canvas data-qa-standard="${index}" data-qa-value="log_height"></canvas></div>
         <div><strong>Mass error (ppm)</strong><canvas data-qa-standard="${index}" data-qa-value="ppm_error"></canvas></div>
-        <div><strong>RT error (min)</strong><canvas data-qa-standard="${index}" data-qa-value="rt_delta"></canvas></div>
+        <div><strong>${escapeHtml(report.rt_axis?.corrected ? report.rt_axis.label : "RT error (min)")}</strong><canvas data-qa-standard="${index}" data-qa-value="rt_delta"></canvas>${qaRtAxisNote(standard, report.rt_axis)}</div>
       </div>
     </article>`;
   }).join("");
@@ -2312,6 +2357,15 @@ function renderQaReport(report) {
       drawQaOrderSeries(canvas, standard?.values || [], canvas.dataset.qaValue, canvas.dataset.qaValue);
     });
   });
+}
+
+function qaRtAxisNote(standard, rtAxis) {
+  // On a corrected run the RT error is a residual on the reference file's axis; the injections off that axis
+  // (Uncorrected, or a Blank with an interpolated or copied model) are named under the chart.
+  if (!rtAxis?.corrected) return "";
+  const off = (standard.values || []).filter((value) => ["Uncorrected", "InterpolatedBlank", "NearestBlank"].includes(value.rt_model_source));
+  const listed = off.map((value) => `${value.file} (${value.rt_model_source})`).join(", ");
+  return `<div class="muted">On ${escapeHtml(rtAxis.reference_file || "the reference file")}'s corrected axis: the residual after alignment RT correction, not instrument drift.${listed ? ` Off that axis: ${escapeHtml(listed)}.` : ""}</div>`;
 }
 
 function qaCanvas(canvas, height = 280) {
@@ -2737,7 +2791,8 @@ function renderAutomaticRtFile() {
   const recordedTolerance = Number(review.smoothing_settings?.ms1_tolerance);
   const eicTolerance = recordedTolerance > 0 && recordedTolerance <= 1 ? recordedTolerance : 0.01;
   const missingCount = anchors.length - numericAnchors.length;
-  const rowClass = { used: "", rejected: "rt-audit-rejected", unmatched: "rt-audit-unused", blank: "rt-audit-unused" };
+  const rowClass = { used: "", rejected: "rt-audit-rejected", unmatched: "rt-audit-unused", blank: "rt-audit-unused",
+    duplicate: "rt-audit-unused", not_judged: "rt-audit-unused" };
   // MsdialWorkbench#826 records which test judged each anchor, against what offset and scale, and the
   // MS1 cycle floor; an older audit has none of it, and its table keeps its old columns.
   const localSupport = Boolean(review.local_support_columns);
@@ -2792,21 +2847,25 @@ function automaticRtAnchorReviewHtml(review) {
   const anchors = anchorReview.anchors || [];
   const preview = anchorReview.run === "Preview";
   if (!anchors.length || !(preview || anchorReview.anchor_mode_columns)) return "";
+  // A failed or cancelled preview leaves a partial audit that also says Run = Preview; it has no reference
+  // file, and the server refuses to approve it (PLAU-4, CONF-26/41/45/50). So does this page.
+  const approvable = Boolean(review.reference) && (review.method_audit?.status || "preview_only") === "preview_only";
   const decisions = state.automaticRtDecisions || {};
   const height = (value) => (value === null || value === undefined || !Number.isFinite(Number(value))
     ? "N/A" : Number(value).toExponential(3));
   const rows = anchors.map((anchor) => {
     const key = escapeHtml(anchor.key);
     const decided = decisions[anchor.key];
-    const decision = preview
+    const decision = preview && approvable
       ? `<td class="rt-anchor-decision"><label><input type="radio" name="rtAnchor-${key}" data-anchor-key="${key}" value="accept"${decided === true ? " checked" : ""}> Accept</label> `
         + `<label><input type="radio" name="rtAnchor-${key}" data-anchor-key="${key}" value="reject"${decided === false ? " checked" : ""}> Reject</label></td>`
       : "";
-    return `<tr${anchor.outlier_flagged ? ' class="rt-audit-rejected"' : ""}>${decision}<td>${key}</td><td>${escapeHtml(anchor.source)}</td>`
+    const flags = (anchor.flags || []).map((flag) => `<div>${escapeHtml(flag.message)}</div>`).join("");
+    return `<tr${anchor.outlier_flagged || flags ? ' class="rt-audit-rejected"' : ""}>${decision}<td>${key}</td><td>${escapeHtml(anchor.source)}</td>`
       + `<td>${escapeHtml(anchor.name || "")}</td><td>${rtAuditNumber(anchor.library_rt, 3)}</td><td>${rtAuditNumber(anchor.reference_rt, 3)}</td>`
       + `<td>${rtAuditNumber(anchor.mz, 4)}</td><td>${rtAuditNumber(anchor.observed_mz, 4)}</td><td>${height(anchor.peak_height)}</td>`
       + `<td>${escapeHtml(anchor.reference_status || "")}</td><td>${escapeHtml(`${anchor.files_detected ?? 0}/${anchor.non_blank_files ?? 0}`)}</td>`
-      + `<td>${anchor.outlier_flagged ? "Yes" : ""}</td><td>${escapeHtml(anchor.detection || "")}</td></tr>`;
+      + `<td>${anchor.outlier_flagged ? "Yes" : ""}</td><td>${escapeHtml(anchor.detection || "")}</td><td class="rt-anchor-flags">${flags}</td></tr>`;
   }).join("");
   const exclusions = (review.exclusions || []).map((item) => `<tr><td>${escapeHtml(item.anchor_name)}</td><td>${rtAuditNumber(item.mz, 4)}</td>`
     + `<td>${rtAuditNumber(item.rt, 3)}</td><td>${rtAuditNumber(item.mz_tolerance, 4)}</td><td>${rtAuditNumber(item.rt_tolerance, 3)}</td>`
@@ -2818,14 +2877,18 @@ function automaticRtAnchorReviewHtml(review) {
   const referenceFile = anchorReview.reference_file_id !== null && anchorReview.reference_file_id !== undefined
     ? ` Reference file: ${escapeHtml(anchorReview.reference_file_name || "(unnamed)")} (file ID ${escapeHtml(anchorReview.reference_file_id)})${anchorReview.reference_selection ? `, chosen by ${escapeHtml(anchorReview.reference_selection)}` : ""}.`
     : " No reference file is recorded.";
-  const approval = preview ? `<p class="muted">Accept or reject every anchor. The approval records the reference file above: an accepted automatic anchor carries its RT there, and a production run mapped onto another file is flagged. Approval writes a new anchor library under Output root: an accepted automatic anchor becomes a True row at the reference file's RT and m/z (match RT tolerance, MS1 tolerance for alignment, minimum height 0); a rejected anchor stays as a False row; an accepted user anchor keeps its own row. The production run then uses it in UserOnly mode, or, with fewer True rows than the minimum anchor count, in Hybrid if you choose it.</p>
+  const flaggedCount = anchors.filter((anchor) => (anchor.flags || []).length).length;
+  const refusal = `<div class="issue warning">This preview cannot be approved: ${review.reference
+    ? `its method-key evidence is ${escapeHtml(review.method_audit?.reason || review.method_audit?.status)}`
+    : "it chose no reference file, so it is the partial audit of a preview that failed"}. Run the preview again.</div>`;
+  const approval = preview && !approvable ? refusal : preview ? `${flaggedCount ? `<div class="issue warning">${escapeHtml(flaggedCount)} anchor(s) are flagged under "Before you approve": an anchor every other file rejected, or only the reference used, can move the production run's reference file to another file; one missing or a Duplicate in the reference, or within two MS1 scans of another, counts once or not at all toward UserOnly's minimum. The reference is chosen again in the production run; it is not pinned to this one.</div>` : ""}<p class="muted">Accept or reject every anchor. The approval records the reference file above: an accepted automatic anchor carries its RT there, and a production run mapped onto another file is flagged. Approval writes a new anchor library under Output root: an accepted automatic anchor becomes a True row at the reference file's RT and m/z (match RT tolerance, MS1 tolerance for alignment, minimum height 0); a rejected anchor stays as a False row; an accepted user anchor keeps its own row. The production run then uses it in UserOnly mode, or, with fewer distinct anchors detected in the reference file than the minimum anchor count, in Hybrid if you choose it.</p>
     <div class="button-row"><button id="rtAnchorAcceptRest" type="button" class="secondary">Accept every undecided anchor</button><button id="rtAnchorRejectRest" type="button" class="secondary">Reject every undecided anchor</button></div>
     <label>Approved by<input id="rtAnchorApprovedBy" placeholder="Your name; recorded with the approval"></label>
     <div class="button-row"><button id="rtAnchorApprove" type="button">Write approved anchor library</button></div>
     <div id="rtAnchorApprovalResult" class="format-summary" hidden></div>` : "";
   return `<h3>${preview ? "Anchor preview: accept or reject each anchor" : "Anchors by source"}</h3>
     <p class="muted">Anchor mode ${escapeHtml(anchorReview.anchor_mode || "Automatic")}; ${escapeHtml(anchorReview.user_anchor_count ?? 0)} user and ${escapeHtml(anchorReview.automatic_anchor_count ?? 0)} automatic anchor(s).${library}${referenceFile} Reference RT, observed m/z, height, status and detection are the reference file's. A run whose reference differs from its approved preview's is among the warnings above.</p>
-    <div class="table-wrap rt-audit-table"><table><thead><tr>${preview ? "<th>Decision</th>" : ""}<th>Key</th><th>Source</th><th>Name</th><th>Library RT</th><th>Reference RT</th><th>m/z</th><th>Observed m/z</th><th>Peak height</th><th>Status</th><th>Detected (non-Blank files)</th><th>Outlier flagged</th><th>Detection</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="table-wrap rt-audit-table"><table><thead><tr>${preview && approvable ? "<th>Decision</th>" : ""}<th>Key</th><th>Source</th><th>Name</th><th>Library RT</th><th>Reference RT</th><th>m/z</th><th>Observed m/z</th><th>Peak height</th><th>Status</th><th>Detected (non-Blank files)</th><th>Outlier flagged</th><th>Detection</th><th>Before you approve</th></tr></thead><tbody>${rows}</tbody></table></div>
     ${exclusions ? `<h4>Exclusions (the library's False rows, Hybrid)</h4><div class="table-wrap"><table><thead><tr><th>Name</th><th>m/z</th><th>RT (min)</th><th>m/z tolerance</th><th>RT tolerance (min)</th><th>Excluded automatic candidates</th></tr></thead><tbody>${exclusions}</tbody></table></div>` : ""}
     ${approval}`;
 }
@@ -2854,7 +2917,6 @@ function bindAutomaticRtApproval(panel) {
 
 function renderAutomaticRtReview(review) {
   if (state.automaticRtReview?.run_directory !== review.run_directory) state.automaticRtDecisions = {};
-  if (review.anchor_review?.run === "Preview") state.automaticRtPreviewDirectory = review.run_directory;
   state.automaticRtReview = review;
   const panel = $("#automaticRtReview");
   panel.hidden = false;
@@ -2873,7 +2935,8 @@ function renderAutomaticRtReview(review) {
   const evidence = audit.status === "verified"
     ? "verified for this run; the publication report describes this correction"
     : `not verified (${audit.reason || audit.status || "retained_evidence_missing"}); the publication report does not describe a correction`;
-  const fileRows = review.files.slice(0, 200).map((file) => `<tr><td>${escapeHtml(file.file_id)}</td><td>${escapeHtml(file.name)}</td><td>${escapeHtml(file.type)}</td><td>${escapeHtml(file.order ?? "")}</td><td>${escapeHtml(file.model_source)}</td><td>${escapeHtml(file.used_anchors ?? "")}</td><td>${rtAuditNumber(file.median_absolute_offset, 4)}</td><td>${escapeHtml(file.note)}</td></tr>`).join("");
+  const batches = review.files.some((file) => file.analysis_batch);
+  const fileRows = review.files.slice(0, 200).map((file) => `<tr><td>${escapeHtml(file.file_id)}</td><td>${escapeHtml(file.name)}</td><td>${escapeHtml(file.type)}</td>${batches ? `<td>${escapeHtml(file.analysis_batch || "")}</td>` : ""}<td>${escapeHtml(file.order ?? "")}</td><td>${escapeHtml(file.model_source)}</td><td>${escapeHtml(file.used_anchors ?? "")}</td><td>${rtAuditNumber(file.median_absolute_offset, 4)}</td><td>${escapeHtml(file.note)}</td></tr>`).join("");
   panel.innerHTML = `<div class="metric-grid">
     <div class="metric"><strong>${inspected}</strong><span>audited files</span></div>
     <div class="metric"><strong>${escapeHtml(review.reference?.file_id ?? "none")}</strong><span>reference file ID</span></div>
@@ -2897,7 +2960,7 @@ function renderAutomaticRtReview(review) {
     <datalist id="rtAuditFileChoices">${review.files.map((file) => `<option value="${escapeHtml(file.file_id)}">${escapeHtml(file.name)}</option>`).join("")}</datalist>
     ${automaticRtAnchorReviewHtml(review)}
     <div id="rtAuditFileDetails"></div>
-    <details><summary><strong>All files (${inspected}; first 200 shown)</strong></summary><div class="table-wrap rt-audit-table"><table><thead><tr><th>ID</th><th>File</th><th>Type</th><th>Order</th><th>Model</th><th>Used</th><th>Median |offset|</th><th>Note</th></tr></thead><tbody>${fileRows}</tbody></table></div></details>`;
+    <details><summary><strong>All files (${inspected}; first 200 shown)</strong></summary><div class="table-wrap rt-audit-table"><table><thead><tr><th>ID</th><th>File</th><th>Type</th>${batches ? "<th>Analysis batch</th>" : ""}<th>Order</th><th>Model</th><th>Used</th><th>Median |offset|</th><th>Note</th></tr></thead><tbody>${fileRows}</tbody></table></div></details>`;
   $("#rtAuditFileId").addEventListener("change", renderAutomaticRtFile);
   bindAutomaticRtApproval(panel);
   renderAutomaticRtFile();

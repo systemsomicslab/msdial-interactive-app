@@ -662,7 +662,39 @@ can extract one original-raw MS1 EIC on demand. See
 [the audit viewer guide](docs/automatic_alignment_rt_review.md) for interpretation
 and the boundary between completed-run review and pre-alignment approval.
 
-## LC-MS retention-time correction
+### Anchor modes, preview and approval
+
+With a Console that has MsdialWorkbench#845 (5.5.261105 or later), the automatic
+correction takes its anchors in one of three modes: **Automatic** (from the
+detected peaks), **UserOnly** (the True rows of a seven-column anchor library)
+or **Hybrid** (the True rows, with automatic anchors filling the RT bins they
+leave empty and the False rows keeping rejected candidates out). The
+recommended flow is preview, approval, production:
+
+1. **Preview anchors (no alignment)** (`msdial_start_automatic_rt_anchor_preview`)
+   runs the method on every file and stops once the anchors are chosen, in a
+   directory of its own; nothing is aligned or written beside the raw data.
+2. The audit viewer (`msdial_automatic_rt_anchor_review`) lists every anchor
+   for a person to accept or reject, and flags the anchors that could move the
+   production run's reference file or count as less than one anchor.
+3. **Write approved anchor library** (`msdial_approve_automatic_rt_anchors`)
+   writes `automatic_rt_anchors_approved_<timestamp>.txt` and
+   `<library>.approval.json` into Output root. Only a completed preview, the
+   one on screen, is approved.
+4. The production run uses the approved library in UserOnly, or, when the
+   distinct anchors detected in the preview's reference file are fewer than the
+   minimum anchor count, in Hybrid if the person chooses it. A library set
+   without UserOnly or Hybrid is refused.
+
+## Legacy user-defined RT correction (not recommended)
+
+This is the older point-by-point correction, applied before peak detection from
+a reviewed peak-selection table. It is kept for existing worksets and templates
+that use it and gets no new features; it cannot be combined with automatic RT
+correction. For new analyses, use the automatic correction above with named
+anchors and the anchor preview. A template's `Execute RT correction: True` is
+read with its anchor library and peak-selection file (relative paths against
+the template's folder) and checked like any other run.
 
 The main app and the dedicated review workspace have separate roles. The main
 app (`/`) configures and runs the complete MS-DIAL analysis. Its Guided setup
@@ -728,6 +760,8 @@ Prepare, Run, and Export reusable workflow generate a ZIP containing:
 - `run-msdial.ps1` and `run-msdial.sh`
 - `REPRODUCE.txt`, including `vim method.txt` and launch examples
 - the RT-correction anchor library and reviewed selection TSV when enabled
+- the automatic RT correction anchor library (UserOnly or Hybrid) and, for an
+  approved one, its `<library>.approval.json`
 
 The bundle contains no raw data.
 

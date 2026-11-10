@@ -37,7 +37,9 @@ from .automatic_rt_anchors import (
     canonical_anchor_mode,
     canonical_peak_selection_mode,
     file_sha256 as anchor_library_sha256,
+    method_file_readable_path,
     read_anchor_library,
+    unreadable_path_problem,
     write_preview_record as write_automatic_rt_preview_record,
 )
 from .diagnostic_paths import REPRODUCTION_DIRECTORY_NAME
@@ -1167,9 +1169,9 @@ def read_analysis_csv(path: str | Path) -> dict[str, Any]:
                     "file_type": str(row.get("file_type", "")).strip() or "Sample",
                     "class_id": str(row.get("class_id", "")).strip() or "Sample",
                     "acquisition_type": str(row.get("acquisition_type", "")).strip() or "DDA",
-                    "batch_order": _csv_number(row.get("batch_order"), 1, int),
-                    "analytical_order": _csv_number(
-                        row.get("analytical_order"), len(files) + 1, int
+                    "batch_order": _csv_order(row.get("batch_order"), 1, warnings, line_number, "batch_order"),
+                    "analytical_order": _csv_order(
+                        row.get("analytical_order"), len(files) + 1, warnings, line_number, "analytical_order"
                     ),
                     "factor": _csv_number(row.get("factor"), 1, float),
                     **format_info,
@@ -1188,6 +1190,27 @@ def read_analysis_csv(path: str | Path) -> dict[str, Any]:
         "rejected": rejected,
         "source_csv": str(csv_path),
     }
+
+
+def _csv_order(value: Any, default: int, warnings: list[str], line_number: int, column: str) -> Any:
+    """An order cell of an analysis CSV: a whole number as an int, blank as ``default``, anything else as given.
+
+    A fraction or a word used to be truncated or replaced by the row position without a word (2.5 became 2,
+    tying with another file). It is kept as written instead, with a warning here, and validate_workflow
+    refuses it (analytical_order_issues).
+    """
+    text = str(value or "").strip()
+    if not text:
+        return default
+    try:
+        number = float(text)
+    except ValueError:
+        warnings.append(f"line {line_number}: {column} '{text}' is not a whole number.")
+        return text
+    if math.isfinite(number) and number.is_integer():
+        return int(number)
+    warnings.append(f"line {line_number}: {column} '{text}' is not a whole number.")
+    return number if math.isfinite(number) else text
 
 
 def _csv_number(value: Any, default: int | float, converter: Any) -> int | float:
@@ -1399,16 +1422,103 @@ def save_rt_correction_anchors(
 
 
 def parse_method(path: str | Path) -> dict[str, str]:
+    """A method file's settings by case-folded key, read as the Console's readFieldValues reads them.
+
+    A line names its key before the first ':' or '=', whichever comes first; a line starting with '#' after
+    its leading blanks, or with neither separator, sets nothing. One pair of surrounding double or single
+    quotes is taken off a value. Since MsdialWorkbench#817 the last line that sets a key wins, and a blank
+    value leaves an earlier one in place.
+    """
     values: dict[str, str] = {}
     method_path = Path(path)
     if not method_path.exists():
         return values
     for line in method_path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
-        if line.startswith("#") or ":" not in line:
+        key = console_method_key(line)
+        if key is None:
             continue
-        key, value = line.split(":", 1)
-        values[key.strip().lower()] = value.strip()
+        separator = min(index for index in (line.find(":"), line.find("=")) if index >= 0)
+        value = line[separator + 1:].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1].strip()
+        if not value and key in values:
+            continue
+        values[key] = value
     return values
+
+
+# The user-defined (legacy) RT correction's template lines, by state key. The method writer writes every
+# one of them on every run, so a template line the loader did not read was replaced by the state's default:
+# a template's "Execute RT correction: True" went out as False, and the run aligned uncorrected.
+_LEGACY_RT_TEMPLATE_KEYS = {
+    "rt_correction_peak_selection_mode": "rt correction peak selection mode",
+    "rt_correction_diff_method": "rt diff calc method",
+    "rt_correction_extrapolation_begin": "extrapolation method (begin)",
+    "rt_correction_extrapolation_end": "extrapolation method (end)",
+}
+
+
+def template_switch(values: dict[str, str], key: str, default: bool, template_path: Path) -> bool:
+    """A template's True/False line as the Console reads it: True or False in any case, else refused.
+
+    The Console's TrueOrFalse reads nothing else and keeps its default, while this reader used to take
+    "yes", "on" and "1" as True: the state and the method file then said True for a run the Console left at
+    its default. A value neither reader agrees on is refused here, with its line.
+    """
+    text = values.get(key, "").strip()
+    if not text:
+        return default
+    if text.casefold() == "true":
+        return True
+    if text.casefold() == "false":
+        return False
+    raise ValueError(
+        f"Parameter template {template_path}: '{key}: {text}' is neither True nor False; the MS-DIAL Console "
+        "would ignore it and keep its default. Write True or False."
+    )
+
+
+def _template_legacy_rt_correction(values: dict[str, str], template_path: Path) -> dict[str, Any]:
+    """A template's user-defined RT correction lines as state entries (CONF-3).
+
+    The switch is always read (absent, False); the library and peak-selection paths are read against the
+    template's folder, as the Console reads them against the method file's; every other line only when the
+    template has it, so a template without it keeps the state's default.
+    """
+    found: dict[str, Any] = {
+        "execute_rt_correction": template_switch(values, "execute rt correction", False, template_path),
+    }
+    for state_key, method_key in (
+        ("rt_correction_anchor_path", "compounds library file path for rt correction"),
+        ("rt_correction_selection_path", "rt correction peak selection file path"),
+    ):
+        text = values.get(method_key, "").strip()
+        if text:
+            candidate = Path(text).expanduser()
+            if not candidate.is_absolute():
+                candidate = template_path.parent / candidate
+            found[state_key] = str(candidate.resolve())
+    for state_key, method_key in _LEGACY_RT_TEMPLATE_KEYS.items():
+        text = values.get(method_key, "").strip()
+        if text:
+            found[state_key] = text
+    if values.get("rt correction with smoothing for rt diff", "").strip():
+        found["rt_correction_smooth_rt_diff"] = template_switch(
+            values, "rt correction with smoothing for rt diff", False, template_path
+        )
+    for state_key, method_key in (
+        ("rt_correction_peak_selection_rt_weight", "rt correction peak selection rt weight"),
+        ("rt_correction_intercept", "user setting intercept"),
+    ):
+        text = values.get(method_key, "").strip()
+        if text:
+            try:
+                found[state_key] = float(text)
+            except ValueError:
+                raise ValueError(
+                    f"Parameter template {template_path}: '{method_key}: {text}' is not a number."
+                ) from None
+    return found
 
 
 def load_parameter_template(
@@ -1522,8 +1632,9 @@ def load_parameter_template(
         "alignment_rt_tolerance": number("retention time tolerance for alignment", default=0.1),
         "alignment_ms1_tolerance": number("ms1 tolerance for alignment", default=0.015),
         "alignment_light_mode": boolean("alignment light mode"),
-        "execute_automatic_rt_correction": boolean(
-            "execute automatic rt correction for alignment"
+        # Read as the Console reads it (template_switch): a spelling it would ignore is refused, not guessed.
+        "execute_automatic_rt_correction": template_switch(
+            values, "execute automatic rt correction for alignment", False, template_path
         ),
         # automatic_rt_correction_value, not int(): int() truncated 2.9 to 2, which then passed
         # validation, and raised on nan and inf.
@@ -1588,12 +1699,13 @@ def load_parameter_template(
             "automatic rt correction reference centrality weight",
             default=AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_reference_centrality_weight"],
         ),
-        "automatic_rt_correction_interpolate_blanks_by_analytical_order": boolean(
+        "automatic_rt_correction_interpolate_blanks_by_analytical_order": template_switch(
+            values,
             "automatic rt correction interpolate blanks by analytical order",
-            default=AUTOMATIC_RT_CORRECTION_DEFAULTS[
-                "automatic_rt_correction_interpolate_blanks_by_analytical_order"
-            ],
+            AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_interpolate_blanks_by_analytical_order"],
+            template_path,
         ),
+        **_template_legacy_rt_correction(values, template_path),
         **_template_local_support_rt_window(values),
         **_template_anchor_settings(values, template_path),
         # A template's lipid RT check lines, as the setting they state, so the run writes and records them
@@ -2206,6 +2318,104 @@ def validate_workflow(state: dict[str, Any]) -> list[dict[str, str]]:
                     issues.append({"level": "error", "message": "Set the alkane/FAME carbon-RT file for RI calculation."})
                 elif not Path(standard).exists():
                     issues.append({"level": "error", "message": f"RI carbon-RT file not found: {standard}"})
+    issues.extend(analytical_order_issues(files, bool(state.get("execute_automatic_rt_correction"))))
+    return issues
+
+
+_ORDER_MAXIMUM = 2**31 - 1
+
+
+def _whole_order(value: Any) -> int | None:
+    """An analytical or batch order as the Console's int.TryParse reads its CSV cell, or None.
+
+    A fraction, a blank, a word or a number out of range is read by the Console as nothing, and it then
+    uses the file's row position instead, without a word; so it is refused here rather than written.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        number = int(value)
+    else:
+        text = str(value).strip()
+        if not re.fullmatch(r"[+-]?\d+", text, re.ASCII):
+            return None
+        number = int(text)
+    return number if 0 <= number <= _ORDER_MAXIMUM else None
+
+
+def analytical_order_issues(files: list[dict[str, Any]], automatic_rt_correction: bool = False) -> list[dict[str, str]]:
+    """Refuse an analytical or batch order the Console would not read as given, and orders two files share.
+
+    Every entry path (the web page, an analysis CSV, a guided plan with or without a sample_table) reaches
+    the analysis CSV through here (CONF-61/62). An order must be a whole number from 0 to 2147483647. Two
+    files of one batch with one analytical order, 0 included, are refused: the automatic RT correction
+    interpolates a Blank between its neighbours by that order and ranks the reference by its centrality,
+    and a tie gives every Blank between them a 50/50 blend of whatever files were listed first and last.
+    Orders that restart in each batch are warned about when the correction is on: the order alone, not the
+    batch, places a file (a Console that writes the summary's 'Analysis batch' column keeps Blank
+    interpolation within a batch; the reference's centrality still reads the order alone).
+    """
+    issues: list[dict[str, str]] = []
+    by_batch: dict[int, dict[int, list[str]]] = {}
+    for index, item in enumerate(files or []):
+        name = str(item.get("file_name") or Path(str(item.get("file_path") or "")).stem or f"row {index + 1}")
+        order = _whole_order(item.get("analytical_order"))
+        batch = _whole_order(item.get("batch_order", 1))
+        if order is None:
+            issues.append({
+                "level": "error",
+                "message": (
+                    f"The analytical order of {name} is {item.get('analytical_order')!r}, not a whole number from 0 "
+                    f"to {_ORDER_MAXIMUM}. The MS-DIAL Console would read it as its row position, {index + 1}, "
+                    "without a word. Give each file its injection order as a whole number."
+                ),
+            })
+        if batch is None:
+            issues.append({
+                "level": "error",
+                "message": (
+                    f"The batch order of {name} is {item.get('batch_order')!r}, not a whole number from 0 to "
+                    f"{_ORDER_MAXIMUM}."
+                ),
+            })
+        if order is not None and batch is not None:
+            by_batch.setdefault(batch, {}).setdefault(order, []).append(name)
+    for batch, orders in sorted(by_batch.items()):
+        for order, names in sorted(orders.items()):
+            if len(names) > 1:
+                issues.append({
+                    "level": "error",
+                    "message": (
+                        f"Analytical order {order} is given to {len(names)} files of batch {batch}: "
+                        + ", ".join(names[:5]) + (" and others" if len(names) > 5 else "")
+                        + ". Each injection needs its own order; tied orders leave Blank RT-correction "
+                        "interpolation and QC drift plots with no order between them."
+                    ),
+                })
+    if automatic_rt_correction and len(by_batch) > 1:
+        seen: dict[int, int] = {}
+        restarted: list[int] = []
+        for batch, orders in sorted(by_batch.items()):
+            if any(order in seen for order in orders):
+                restarted.append(batch)
+            for order in orders:
+                seen.setdefault(order, batch)
+        if restarted:
+            issues.append({
+                "level": "warning",
+                "message": (
+                    "Analytical orders restart in batch " + ", ".join(str(item) for item in restarted)
+                    + ": the same order names files of different batches. The automatic RT correction places a "
+                    "file by its analytical order alone when it ranks the reference file's centrality, and a "
+                    "Console that does not write the summary's 'Analysis batch' column interpolates a Blank "
+                    "between files of other batches too. Number the injections across the whole run, or "
+                    "confirm that this is intended."
+                ),
+            })
     return issues
 
 
@@ -2846,6 +3056,14 @@ def prepare_automatic_rt_preview(
     production_root = str(state.get("output_root") or "").strip()
     if not production_root:
         raise ValueError("Set the output root: the approved anchor library is written there.")
+    if not method_file_readable_path(Path(production_root).expanduser().resolve()):
+        raise ValueError(
+            unreadable_path_problem(
+                Path(production_root).expanduser().resolve(),
+                "The output root, where the approved anchor library would be written and from where the "
+                "production run's method file names it,",
+            )
+        )
     preview = copy.deepcopy(state)
     preview["output_root"] = str(output_root)
     preview["stage_inputs"] = False
@@ -5439,6 +5657,15 @@ def _automatic_rt_correction_value_issues(state: dict[str, Any]) -> list[dict[st
     def error(message: str) -> None:
         issues.append({"level": "error", "message": f"Automatic RT correction {message}"})
 
+    interpolate = state.get(
+        "automatic_rt_correction_interpolate_blanks_by_analytical_order",
+        AUTOMATIC_RT_CORRECTION_DEFAULTS["automatic_rt_correction_interpolate_blanks_by_analytical_order"],
+    )
+    if not isinstance(interpolate, bool) and switch_value(interpolate) is None:
+        error(
+            f"Blank interpolation by analytical order must be True or False, not {interpolate!r}; it is not "
+            "read as False."
+        )
     values: dict[str, float] = {}
     for key, label in AUTOMATIC_RT_CORRECTION_LABELS.items():
         raw = state.get(key, AUTOMATIC_RT_CORRECTION_DEFAULTS[key])
@@ -5708,18 +5935,25 @@ def _automatic_rt_anchor_issues(state: dict[str, Any]) -> list[dict[str, str]]:
     effective = mode or "Automatic"
     if effective == "Automatic":
         if library:
-            issues.append(
-                {
-                    "level": "warning",
-                    "message": (
-                        "An automatic RT correction anchor library is set, but the anchor mode is Automatic, "
-                        "which reads no library; it is not written to the method file."
-                    ),
-                }
+            # An approved library run in Automatic mode would drop every decision the person made: the
+            # Console reads no library and can choose a rejected candidate again. Nothing chooses the mode
+            # for them, Hybrid least of all after UserOnly was refused (decision D2).
+            approval = automatic_rt_anchor_approval_for_library(library) if Path(str(library)).expanduser().is_file() else None
+            approved = " It is an approved anchor library." if approval and approval.get("matches_library") else ""
+            error(
+                "An automatic RT correction anchor library is set, but the anchor mode is "
+                + ("Automatic" if mode else "not set, so the Console would run Automatic")
+                + ", which reads no library." + approved + " Choose UserOnly (the library's True rows alone) or "
+                "Hybrid (its True rows, with automatic anchors filling the RT bins they leave empty and its False "
+                "rows kept out), or clear the library to run Automatic."
             )
         return issues
     if not library:
         error(f"Automatic RT correction anchor mode {effective} needs an anchor library file.")
+        return issues
+    resolved_library = Path(str(library)).expanduser().resolve()
+    if not method_file_readable_path(resolved_library):
+        error(unreadable_path_problem(resolved_library, "The automatic RT correction anchor library"))
         return issues
     minimum_raw = state.get(
         "automatic_rt_correction_minimum_anchors",
@@ -5740,19 +5974,59 @@ def _automatic_rt_anchor_issues(state: dict[str, Any]) -> list[dict[str, str]]:
         return issues
     for problem in anchor_library_issues(rows, effective, minimum):
         error(f"Automatic RT correction anchor library cannot be used: {problem}")
+    if effective == "UserOnly" and not issues:
+        # Decision 4: the Console counts the distinct anchors detected in the reference file, not the True rows.
+        # An approved library records what its preview's reference detected; a hand-written one is checked by
+        # the Console alone.
+        approval = automatic_rt_anchor_approval_for_library(resolved_library)
+        distinct = (approval or {}).get("distinct_reference_anchors")
+        if approval and approval.get("matches_library") and isinstance(distinct, int) and distinct < minimum:
+            reasons = " ".join(
+                str(item.get("reason") or "") for item in approval.get("not_counted_in_reference") or []
+            )
+            error(
+                f"Automatic RT correction anchor library cannot be used in UserOnly: of its True rows, {distinct} are "
+                f"distinct anchors detected in its preview's reference file, fewer than the minimum anchor count, "
+                f"{minimum}. The Console would refuse the run after picking peaks in every file. Choose Hybrid "
+                "explicitly, lower the minimum, or approve more anchors." + (f" {reasons}" if reasons else "")
+            )
     return issues
+
+
+# The spellings of a yes or no that an answer, a web form or a saved state can give for an RT correction
+# switch. Anything else ("T" read as True by one reader and False by another, "maybe") is refused by name
+# rather than read as False, which silently turned the correction or Blank interpolation off.
+SWITCH_TRUE = frozenset({"true", "t", "1", "yes", "y", "on"})
+SWITCH_FALSE = frozenset({"false", "f", "0", "no", "n", "off", ""})
+
+
+def switch_value(value: Any) -> bool | None:
+    """A switch's value as a bool, or None when it is no recognised spelling of yes or no."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return {1: True, 0: False}.get(value) if math.isfinite(value) else None
+    text = str(value).strip().casefold()
+    if text in SWITCH_TRUE:
+        return True
+    if text in SWITCH_FALSE:
+        return False
+    return None
 
 
 def automatic_rt_correction_value(key: str, value: Any) -> Any:
     """Coerce one automatic RT-correction setting without hiding a value the Console refuses.
 
     A whole number stays an int for the integer keys, and a fractional one stays a float so
-    validate_workflow can refuse it, rather than int() quietly writing a different number.
+    validate_workflow can refuse it, rather than int() quietly writing a different number. The Blank
+    interpolation switch becomes a bool when it is a spelling of yes or no, and stays as given
+    otherwise, for validate_workflow to refuse.
     """
     if key == "automatic_rt_correction_interpolate_blanks_by_analytical_order":
-        if isinstance(value, str):
-            return value.strip().casefold() in {"1", "true", "yes", "on"}
-        return bool(value)
+        parsed = switch_value(value)
+        return value if parsed is None else parsed
     number = float(value)
     if key in AUTOMATIC_RT_CORRECTION_INTEGER_KEYS and number.is_integer():
         return int(number)

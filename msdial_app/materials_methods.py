@@ -120,6 +120,9 @@ def generate_publication_report(
     reference_check = _automatic_rt_reference_check(root, workflow) if automatic_rt_evidence.get("performed") else None
     if reference_check and reference_check.get("warning"):
         provenance_warnings.append(reference_check["warning"])
+    if reference_check:
+        # The supplementary CSV and workbook say whether the run mapped onto the approved preview's reference.
+        automatic_rt_evidence["approved_reference_check"] = reference_check.get("status", "")
     methods = sharing.text(_methods_text(
         report_workflow, qa_report, qa_assessment, app_version, console_version, libraries
     ))
@@ -358,9 +361,13 @@ def supplementary_rows(
         "lipid_rt_check_evidence",
         "in_silico_code_evidence",
     } | annotation_keys
+    from .supplementary_excel import _unused_anchor_setting
+
     for key in sorted(workflow):
         if key not in excluded:
-            add("Guided setup", "Workflow", key, workflow[key])
+            # A #845 setting the method file did not write is said to be unused, as in the workbook (CONF-39).
+            unused = _unused_anchor_setting(key, workflow) if workflow.get("execute_automatic_rt_correction") else ""
+            add("Guided setup", "Workflow", key, workflow[key], f"not used: {unused}" if unused else "")
     for key in ("console_path", "template_path", "output_root"):
         if key in workflow:
             note = (
@@ -430,6 +437,8 @@ def supplementary_rows(
             "selected_user_anchor_count",
             "selected_automatic_anchor_count",
             "exclusion_count",
+            "excluded_candidate_count",
+            "approved_reference_check",
             "reason",
             "summary_file",
             "anchors_file",
@@ -1152,29 +1161,55 @@ def _automatic_rt_anchor_sentence(evidence: dict[str, Any], workflow: dict[str, 
     anchor library by file name and SHA-256 as the audit records it. When the run's anchor library is
     the one approved from a preview (the approval's library SHA-256 is the audit's), the sentence says
     so; an approval of another version of the library is not claimed.
+
+    The sentence is built from the audit's counts (CONF-11): the named anchors are said to be used only when
+    a corrected file used one, the False rows only when they excluded a candidate (exclusion_count above 0),
+    and a named anchor is "searched for" in each file, since a file is corrected from those it detected.
     """
     mode = str(evidence.get("anchor_mode") or "Automatic")
     library = str(evidence.get("anchor_library") or "")
     sha256 = str(evidence.get("anchor_library_sha256") or "")
     named = f"anchor library {library} (SHA-256 {sha256})" if library and sha256 else "an anchor library"
+    user = _evidence_count(evidence, "selected_user_anchor_count")
+    automatic = _evidence_count(evidence, "selected_automatic_anchor_count")
+    exclusions = _evidence_count(evidence, "exclusion_count")
+    excluded = _evidence_count(evidence, "excluded_candidate_count")
+    named_used = f"{user} named anchor(s)" if user is not None else "the named anchors"
+    searched = (
+        "each searched for in each file's MS1 extracted ion chromatogram within its own m/z and "
+        "retention-time window, a file being corrected from the anchors detected in it"
+    )
     if mode == "UserOnly":
         text = (
-            "MS-DIAL used the named anchors of the True rows of "
-            f"{named} alone: each anchor was detected on every file's MS1 extracted ion chromatogram "
-            "within its own m/z and retention-time window, and file-specific piecewise-linear "
-            "retention-time correction was applied during alignment only; no anchor was learned from "
-            "the detected features."
+            f"MS-DIAL used {named_used} of the True rows of {named} alone, {searched}; file-specific "
+            "piecewise-linear retention-time correction was applied during alignment only, and no anchor was "
+            "learned from the detected features."
         )
     elif mode == "Hybrid":
-        text = (
-            "MS-DIAL used the named anchors of the True rows of "
-            f"{named}, each detected on every file's MS1 extracted ion chromatogram within its own m/z "
-            "and retention-time window, and filled the retention-time bins they left empty with "
-            "distributed anchor features learned from the detected features; the library's False rows "
-            "kept automatic candidates within their m/z and retention-time tolerances out of that "
-            "selection. File-specific piecewise-linear retention-time correction was applied during "
-            "alignment only."
+        learned = (f"{automatic} " if automatic is not None else "") + (
+            "distributed anchor feature(s) learned from the detected features"
         )
+        if user == 0:
+            text = (
+                f"MS-DIAL searched for the named anchors of the True rows of {named}, but no corrected file used "
+                f"one, so the correction used {learned} alone"
+            )
+        else:
+            text = (
+                f"MS-DIAL used {named_used} of the True rows of {named}, {searched}, and filled the "
+                f"retention-time bins they left empty with {learned}"
+            )
+        if exclusions and excluded:
+            text += (
+                f"; the library's {exclusions} False row(s) kept {excluded} automatic candidate(s) within their "
+                "m/z and retention-time tolerances out of that selection"
+            )
+        elif exclusions:
+            text += (
+                f"; the library's {exclusions} False row(s) matched no automatic candidate of the reference file, "
+                "so they excluded none"
+            )
+        text += ". File-specific piecewise-linear retention-time correction was applied during alignment only."
     else:
         text = (
             "MS-DIAL learned distributed anchor features and applied file-specific "
@@ -1197,6 +1232,14 @@ def _automatic_rt_anchor_sentence(evidence: dict[str, Any], workflow: dict[str, 
             "kept in the library as False rows."
         )
     return text
+
+
+def _evidence_count(evidence: dict[str, Any], key: str) -> int | None:
+    """A count the audit evidence records, or None when it records none."""
+    value = evidence.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return None
+    return int(value)
 
 
 def _automatic_rt_mode_outlier_sentence(evidence: dict[str, Any]) -> str:

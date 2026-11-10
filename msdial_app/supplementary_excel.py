@@ -221,7 +221,13 @@ def _guided_sheet(workflow: dict[str, Any]) -> dict[str, Any]:
         rows.append(_section(section, 3))
         rows.append(_row(["Field", "Value", "Unit or note"], "header"))
         for key, label, note in present:
-            rows.append(_row([label, _guided_value(key, workflow.get(key)), note], "body_left"))
+            value = _guided_value(key, workflow.get(key))
+            unused = _unused_anchor_setting(key, workflow) if section == "Automatic alignment RT correction" else ""
+            if unused:
+                # The method file did not write it (workflow.automatic_rt_anchor_method_replacements), so the
+                # table says so rather than listing it as a setting the run used (CONF-39).
+                value = f"not used: {unused}"
+            rows.append(_row([label, value, note], "body_left"))
             represented.add(key)
 
     multi_energy_aif = workflow.get("multi_energy_aif_evidence") or {}
@@ -263,6 +269,16 @@ def _guided_sheet(workflow: dict[str, Any]) -> dict[str, Any]:
             ("local_support_rt_window_source", "Window source (method file or Console default)"),
             ("outlier_mad_threshold", "Outlier MAD threshold"),
             ("outlier_status_counts", "Anchors rejected as outliers, by status"),
+            # MsdialWorkbench#845, as the audit records them; the CSV rows and the Methods text read the same.
+            ("run_kind", "Run kind (Run or Preview)"),
+            ("anchor_mode", "Anchor mode the Console ran"),
+            ("anchor_library", "Anchor library the Console read"),
+            ("anchor_library_sha256", "Anchor library SHA-256 (audit)"),
+            ("selected_user_anchor_count", "Named (user) anchors used by corrected files"),
+            ("selected_automatic_anchor_count", "Automatic anchors used by corrected files"),
+            ("exclusion_count", "Exclusions applied (the library's False rows, Hybrid)"),
+            ("excluded_candidate_count", "Automatic candidates the exclusions kept out"),
+            ("approved_reference_check", "Reference file against the approved preview's (matches, differs, unknown)"),
             ("reason", "Evidence verdict"),
             ("summary_file", "Summary audit file"),
             ("anchors_file", "Anchor audit file"),
@@ -517,6 +533,21 @@ def _label(key: str) -> str:
         words.append(overrides.get(part.lower(), part))
     text = " ".join(words)
     return text[:1].upper() + text[1:]
+
+
+def _unused_anchor_setting(key: str, workflow: dict[str, Any]) -> str:
+    """Why a #845 setting the state holds was not written to the method file, or "" when it was."""
+    from .automatic_rt_anchors import canonical_anchor_mode, canonical_peak_selection_mode
+
+    mode = canonical_anchor_mode(workflow.get("automatic_rt_correction_anchor_mode")) or ""
+    if key == "automatic_rt_correction_anchor_library_path" and mode not in {"UserOnly", "Hybrid"}:
+        return f"anchor mode {mode or 'Automatic (not set)'} reads no library, and the method file names none"
+    if (
+        key == "automatic_rt_correction_anchor_peak_selection_rt_weight"
+        and canonical_peak_selection_mode(workflow.get("automatic_rt_correction_anchor_peak_selection_mode")) != "Weighted"
+    ):
+        return "only Weighted peak selection reads it, and the method file does not write it"
+    return ""
 
 
 def _guided_value(key: str, value: Any) -> Any:

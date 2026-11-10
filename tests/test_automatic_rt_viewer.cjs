@@ -116,7 +116,7 @@ const anchorEntry = (key, source, name, flagged = false) => ({ key, source, name
   peak_height: 12000, reference_status: "Reference", files_detected: 5, non_blank_files: 6,
   outlier_flagged: flagged, detection: source === "User" ? "The only peak in the window." : "" });
 const previewReview = { run_directory: "preview", files: [{ ...blankFile, type: "Sample", order: 1, median_absolute_offset: 0, note: "" }],
-  anchors: [], reference: null, model_counts: {}, method_audit: { status: "preview_only", reason: "preview_only" },
+  anchors: [], reference: { file_id: "2", name: "Blank-1" }, model_counts: {}, method_audit: { status: "preview_only", reason: "preview_only" },
   warnings: [], notes: [], exclusions: [{ anchor_name: "old", mz: 500, rt: 5, mz_tolerance: 0.01, rt_tolerance: 0.1, excluded_candidates: 0 }],
   anchor_review: { run: "Preview", anchor_mode: "Hybrid", anchor_mode_columns: true, anchor_library: "lib.txt",
     anchor_library_sha256: "abc", user_anchor_count: 1, automatic_anchor_count: 1,
@@ -141,4 +141,57 @@ assert.equal(context.automaticRtAnchorReviewHtml({ ...previewReview, anchor_revi
 context.renderAutomaticRtReview(previewReview);
 assert.ok(elements["#automaticRtReview"].innerHTML.includes("Write approved anchor library"));
 assert.deepEqual({ ...context.state.automaticRtDecisions }, {}, "A review of another directory starts with no decisions");
+
+// A failed preview's partial audit (no reference file) cannot be approved here either (CONF-50, PLAU-4).
+const failedHtml = context.automaticRtAnchorReviewHtml({ ...previewReview, reference: null });
+assert.ok(failedHtml.includes("This preview cannot be approved") && !failedHtml.includes("rtAnchorApprove")
+  && !failedHtml.includes('type="radio"'));
+const unverifiedHtml = context.automaticRtAnchorReviewHtml({ ...previewReview,
+  method_audit: { status: "method_key_record_not_from_this_method_file", reason: "method_key_record_not_from_this_method_file" } });
+assert.ok(unverifiedHtml.includes("method_key_record_not_from_this_method_file") && !unverifiedHtml.includes("rtAnchorApprove"));
+
+// Decision 4: an anchor's flags are shown before the approval, and the anchor's row stands out.
+const flaggedReview = { ...previewReview, anchor_review: { ...previewReview.anchor_review, anchors: [
+  { ...anchorEntry("Automatic-6", "Automatic", ""), flags: [{ code: "used_only_in_reference", message: "used only in the reference file." }] },
+  anchorEntry("Automatic-2", "Automatic", ""),
+] } };
+html = context.automaticRtAnchorReviewHtml(flaggedReview);
+assert.ok(html.includes("Before you approve") && html.includes("used only in the reference file."));
+assert.ok(html.includes("1 anchor(s) are flagged"), "The approval panel says how many are flagged");
+assert.ok(html.includes("it is not pinned to this one"), "The reference is said to be chosen again");
+// A Duplicate or a failed run's Detected record is not styled as a rejection (CONF-49).
+context.state.automaticRtReview = { files: [{ file_id: "0", name: "Sample", model_source: "DetectedAnchors",
+  model_reconstructable: true, used_anchors: 2, matched_anchors: 2 }],
+  anchors: [accepted("1", 2), accepted("2", 4), { ...accepted("3", 5), used: false, status: "Duplicate", category: "duplicate" }] };
+elements["#rtAuditFileId"].value = "0";
+context.renderAutomaticRtFile();
+assert.ok(elements["#rtAuditFileDetails"].innerHTML.includes('<tr class="rt-audit-unused"><td>3</td>'), "A Duplicate is unused, not rejected");
+// The analysis batch is shown when the Console writes it.
+context.renderAutomaticRtReview({ ...previewReview, run_directory: "batched",
+  files: [{ ...blankFile, type: "Sample", order: 1, median_absolute_offset: 0, note: "", analysis_batch: "2" }] });
+assert.ok(elements["#automaticRtReview"].innerHTML.includes("<th>Analysis batch</th>"));
+
+// CONF-6, CONF-10: an approval names the job of the preview on screen, or none.
+const jobContext = vm.createContext({ state: { automaticRtPreviewJobs: { "D1": "J1", "D2": "J2" } } });
+vm.runInContext(source.slice(source.indexOf("function automaticRtPreviewJobFor("),
+  source.indexOf("function updateRtCorrectionSelectionUI(")), jobContext);
+assert.equal(jobContext.automaticRtPreviewJobFor("D1"), "J1");
+assert.equal(jobContext.automaticRtPreviewJobFor("D3"), "", "A directory typed in has no job to send");
+assert.ok(!source.includes("state.automaticRtPreviewDirectory = review.run_directory"),
+  "Rendering a review never makes it the latest preview's");
+
+// CONF-21: adding or removing a file keeps every order already given.
+const fileContext = vm.createContext({
+  state: { files: [], outputRootAutomatic: false },
+  renderFiles() {}, applyFormatStartingValues() {}, setOutputRootFromFirstFile() {},
+  refreshQuestion: () => Promise.resolve(), showImportMessages() {},
+});
+vm.runInContext(source.slice(source.indexOf("function sciexDescriptor("), source.indexOf("async function addServerPaths(")), fileContext);
+fileContext.mergeFiles([{ file_path: "C:/a.mzML", analytical_order: 2 }, { file_path: "C:/b.mzML", analytical_order: 1 }]);
+fileContext.state.files[0].analytical_order = 7;
+fileContext.mergeFiles([{ file_path: "C:/c.mzML", analytical_order: 1 }, { file_path: "C:/d.mzML" }]);
+assert.deepEqual(fileContext.state.files.map((file) => file.analytical_order), [7, 1, 8, 9],
+  "Given orders are kept; added files follow the last one");
+assert.ok(!source.includes("state.files.forEach((item, order) => item.analytical_order = order + 1)"),
+  "Removing a file does not renumber the others");
 console.log("Automatic RT viewer regression checks passed.");

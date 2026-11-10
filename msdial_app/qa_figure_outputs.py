@@ -359,7 +359,8 @@ def attach_rt_anchors(run: RunQa, run_directory: str | Path) -> dict[str, Any] |
     known = {item.file for item in run.injections}
     anchors: dict[str, list[Anchor]] = {}
     with anchors_path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
-        for row in csv.DictReader(handle, delimiter="\t"):
+        # The Console writes its audit cells unquoted; a quote is part of the cell.
+        for row in csv.DictReader(handle, delimiter="\t", quoting=csv.QUOTE_NONE):
             name = str(row.get("File name") or "").strip()
             try:
                 reference = float(str(row.get("Reference RT (min)") or ""))
@@ -386,7 +387,7 @@ def attach_rt_anchors(run: RunQa, run_directory: str | Path) -> dict[str, Any] |
     summary_path = root / SUMMARY_NAME
     if summary_path.is_file():
         with summary_path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
-            for row in csv.DictReader(handle, delimiter="\t"):
+            for row in csv.DictReader(handle, delimiter="\t", quoting=csv.QUOTE_NONE):
                 models[str(row.get("File name") or "").strip()] = str(row.get("Model source") or "").strip()
     run.anchor_models = models
     from .automatic_rt_evidence import automatic_rt_correction_proof, proof_reason_phrase

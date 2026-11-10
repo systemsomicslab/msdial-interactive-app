@@ -41,6 +41,7 @@ from .workflow import (
     read_analysis_csv,
     read_lipid_queries,
     remember_file_digest,
+    switch_value,
     validate_workflow,
 )
 from .automatic_rt_anchors import canonical_anchor_mode
@@ -325,6 +326,8 @@ def build_guided_plan(
     if merged.get("sample_table"):
         contract_blockers.extend(sample_table_problems(inspection["files"], merged["sample_table"]))
     blockers: list[str] = list(contract_blockers)
+    blockers.extend(_switch_problems(merged))
+    blockers.extend(_preview_only_problem(merged))
     if merged.get("alignment_rt_tolerance") not in (None, "") and _alignment_rt_tolerance(merged) is None:
         blockers.append(f"alignment_rt_tolerance '{merged['alignment_rt_tolerance']}' is not a positive number of minutes.")
     official_library: dict[str, Any] | None = None
@@ -824,12 +827,12 @@ def select_peak_tuning_representative(
             and not _is_blank_file(item)
         ]
         candidates = qc or samples or [item for item in files if not _is_blank_file(item)] or list(files)
-        orders = [float(item.get("analytical_order") or 0) for item in files]
+        orders = [_order_number(item) for item in files]
         midpoint = (min(orders) + max(orders)) / 2 if orders else 0
         selected = min(
             candidates,
             key=lambda item: (
-                abs(float(item.get("analytical_order") or 0) - midpoint),
+                abs(_order_number(item) - midpoint),
                 str(item.get("file_path") or "").casefold(),
             ),
         )
@@ -919,7 +922,7 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
     if project_type == "lcms":
         if "execute_rt_correction" not in answers:
             ask("execute_rt_correction", "Apply retention-time correction?", ["false", "true"])
-        elif _as_bool(answers.get("execute_rt_correction")):
+        elif switch_value(answers.get("execute_rt_correction")):
             if not answers.get("rt_correction_anchor_path"):
                 ask("rt_correction_anchor_path", "Provide the RT-correction anchor library path.")
             if not answers.get("rt_correction_peak_selection_mode"):
@@ -938,7 +941,7 @@ def _questions(answers: dict[str, Any]) -> list[dict[str, Any]]:
                 ["false", "true"],
                 required=False,
             )
-        elif _as_bool(answers.get("execute_automatic_rt_correction")) and canonical_anchor_mode(
+        elif switch_value(answers.get("execute_automatic_rt_correction")) and canonical_anchor_mode(
             answers.get("automatic_rt_correction_anchor_mode")
         ) in {"UserOnly", "Hybrid"} and not str(
             answers.get("automatic_rt_correction_anchor_library_path") or ""
@@ -1160,17 +1163,34 @@ def _workflow(inspection: dict[str, Any], answers: dict[str, Any]) -> dict[str, 
             "project_store": _as_bool(answers.get("project_store", True)),
             "together_with_alignment": True,
             "stage_inputs": False,
-            "execute_rt_correction": _as_bool(answers.get("execute_rt_correction", False)),
-            "rt_correction_anchor_path": str(answers.get("rt_correction_anchor_path", "")),
-            "rt_correction_selection_path": str(answers.get("rt_correction_selection_path", "")),
+            # A template's switches and paths are the defaults an answer overrides: a template that enables a
+            # correction keeps it unless the answers say otherwise (CONF-34). A switch is a recognised yes or no
+            # (build_guided_plan refuses any other spelling).
+            "execute_rt_correction": bool(
+                switch_value(answers.get("execute_rt_correction", state.get("execute_rt_correction", False)))
+            ),
+            "rt_correction_anchor_path": str(
+                answers.get("rt_correction_anchor_path", state.get("rt_correction_anchor_path", ""))
+            ),
+            "rt_correction_selection_path": str(
+                answers.get("rt_correction_selection_path", state.get("rt_correction_selection_path", ""))
+            ),
             "rt_correction_peak_selection_mode": answers.get(
-                "rt_correction_peak_selection_mode", "HighestIntensity"
+                "rt_correction_peak_selection_mode",
+                state.get("rt_correction_peak_selection_mode", "HighestIntensity"),
             ),
             "rt_correction_peak_selection_rt_weight": float(
-                answers.get("rt_correction_peak_selection_rt_weight", 0.5)
+                answers.get(
+                    "rt_correction_peak_selection_rt_weight",
+                    state.get("rt_correction_peak_selection_rt_weight", 0.5),
+                )
             ),
-            "execute_automatic_rt_correction": _as_bool(
-                answers.get("execute_automatic_rt_correction", False)
+            "execute_automatic_rt_correction": bool(
+                switch_value(
+                    answers.get(
+                        "execute_automatic_rt_correction", state.get("execute_automatic_rt_correction", False)
+                    )
+                )
             ),
             # One table of defaults for every entry point; a fractional anchor count is kept
             # as given so validation refuses it instead of int() truncating it.
@@ -1647,10 +1667,14 @@ def apply_sample_table(files: list[dict[str, Any]], table: Any) -> dict[str, Any
         result.append(updated)
     if not result and not problems:
         problems.append("sample_table leaves every file out of the run.")
-    orders = Counter(item.get("analytical_order") for item in result if item.get("analytical_order"))
-    for order, count in sorted(orders.items()):
+    orders = Counter(
+        (item.get("batch_order", 1), item.get("analytical_order"))
+        for item in result
+        if item.get("analytical_order") not in (None, "")
+    )
+    for (batch, order), count in sorted(orders.items(), key=lambda entry: (str(entry[0][0]), str(entry[0][1]))):
         if count > 1:
-            problems.append(f"sample_table gives analytical order {order} to {count} files.")
+            problems.append(f"sample_table gives analytical order {order} to {count} files of batch {batch}.")
     return {"files": result, "problems": problems, "excluded": excluded}
 
 
@@ -2237,6 +2261,47 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _order_number(item: dict[str, Any]) -> float:
+    """A file's analytical order as a number for the run-midpoint choice; validation refuses a bad one."""
+    try:
+        number = float(item.get("analytical_order") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if math.isfinite(number) else 0.0
+
+
+# The RT correction switches, whose unrecognised spellings were read as False and silently turned a
+# correction or Blank interpolation off (CONF-38): refused by name instead.
+STRICT_SWITCH_ANSWERS = (
+    "execute_rt_correction",
+    "execute_automatic_rt_correction",
+    "automatic_rt_correction_interpolate_blanks_by_analytical_order",
+)
+
+
+def _switch_problems(answers: dict[str, Any]) -> list[str]:
+    return [
+        f"{key} is {answers[key]!r}, which is neither yes nor no. Give true or false (true/false, t/f, yes/no, "
+        "on/off or 1/0); it is not read as false."
+        for key in STRICT_SWITCH_ANSWERS
+        if key in answers and switch_value(answers[key]) is None
+    ]
+
+
+def _preview_only_problem(answers: dict[str, Any]) -> list[str]:
+    """automatic_rt_correction_preview_only is not an answer: refused, never dropped while a run goes ahead."""
+    if "automatic_rt_correction_preview_only" not in answers:
+        return []
+    if switch_value(answers["automatic_rt_correction_preview_only"]) is False:
+        return []
+    return [
+        "automatic_rt_correction_preview_only is not an answer: this plan prepares a production run, which "
+        "aligns, and the answer would be dropped. To preview the anchors, call "
+        "msdial_start_automatic_rt_anchor_preview (POST /api/agent/automatic-rt/preview) with these answers; "
+        "it writes the preview switch itself. Otherwise remove the key."
+    ]
 
 
 def _default_console_path() -> str:

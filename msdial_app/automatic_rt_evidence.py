@@ -211,8 +211,33 @@ def outlier_test_of(
 
 
 def _rows(path: Path) -> list[dict[str, str]]:
+    # The Console writes its audit cells unquoted: a quote is part of the cell (an anchor's name).
     with path.open(encoding="utf-8-sig", newline="") as handle:
-        return list(csv.DictReader(handle, delimiter="\t"))
+        return list(csv.DictReader(handle, delimiter="\t", quoting=csv.QUOTE_NONE))
+
+
+def exclusions_current(root: str | Path, summary_rows: Iterable[dict[str, str]] | None = None) -> bool:
+    """Whether the exclusions file beside an audit is this run's own (MsdialWorkbench#845).
+
+    The Console writes it only in Hybrid mode, and a Console before #845 never removes one an earlier run
+    left. It is this run's when the run's summary says Hybrid and the file is not older than the run's
+    method-key record; otherwise it is ignored, and the run applied no exclusion.
+    """
+    root = Path(root)
+    path = root / EXCLUSIONS
+    if not path.is_file():
+        return False
+    try:
+        rows = list(summary_rows) if summary_rows is not None else _rows(root / SUMMARY)
+    except OSError:
+        return False
+    if "Hybrid" not in {str(row.get("Anchor mode") or "").strip() for row in rows}:
+        return False
+    keys = root / METHOD_KEYS
+    try:
+        return not keys.is_file() or path.stat().st_mtime >= keys.stat().st_mtime
+    except OSError:
+        return False
 
 
 def unproven() -> dict[str, Any]:
@@ -243,6 +268,7 @@ def unproven() -> dict[str, Any]:
         "selected_user_anchor_count": 0,
         "selected_automatic_anchor_count": 0,
         "exclusion_count": 0,
+        "excluded_candidate_count": 0,
         "summary_file": SUMMARY,
         "anchors_file": ANCHORS,
         "method_keys_file": METHOD_KEYS,
@@ -367,9 +393,16 @@ def automatic_rt_correction_proof(
     )
     first = summary_rows[0]
     try:
-        exclusion_count = len(_rows(root / EXCLUSIONS)) if (root / EXCLUSIONS).is_file() else 0
+        exclusion_rows = _rows(root / EXCLUSIONS) if exclusions_current(root, summary_rows) else []
     except OSError:
-        exclusion_count = 0
+        exclusion_rows = []
+    exclusion_count = len(exclusion_rows)
+    excluded_candidates = 0
+    for row in exclusion_rows:
+        try:
+            excluded_candidates += max(0, int(float(str(row.get("Excluded automatic candidates") or 0))))
+        except ValueError:
+            pass
     proof.update(outlier_test_of(anchor_rows, _method_values(method_path)))
     proof.update(
         {
@@ -389,6 +422,7 @@ def automatic_rt_correction_proof(
                 1 for source, _ in selected_anchors if source == "Automatic"
             ),
             "exclusion_count": exclusion_count,
+            "excluded_candidate_count": excluded_candidates,
             "reason": (
                 "performed"
                 if performed
